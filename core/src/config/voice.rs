@@ -62,7 +62,7 @@ pub(super) const DEFAULT_HOTKEYS: [&str; 4] =
 
 /// `~/.nucleos/voice.yaml`. Every field defaults, so a partial file is valid and an absent one leaves the
 /// pillar off without comment.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct VoiceConfig {
     /// Opt-in, like the email pillar: this one opens a microphone.

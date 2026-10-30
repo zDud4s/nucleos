@@ -3,7 +3,7 @@
 use super::*;
 
 // `PartialEq` only: `model_prices` holds `f64`, which has no `Eq`.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
 pub struct ModelsConfig {
     pub claude_model: String,
     pub codex_model: String,

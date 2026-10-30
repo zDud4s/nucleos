@@ -5,7 +5,7 @@ use super::*;
 /// The devtime ingestion's settings.
 ///
 /// Derives `PartialEq` and not `Eq`, because the amber rate is an `f64`.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DevtimeConfig {
     pub enabled: bool,

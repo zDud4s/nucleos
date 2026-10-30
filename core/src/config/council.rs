@@ -50,7 +50,7 @@ pub const MAX_COUNCIL_ROUNDS: u32 = 3;
 /// Two variants and no `Auto`. Which machine a question leaves — or does not leave — is the whole
 /// reason a mixed roster is a feature, and a variant that decided it for the operator would make
 /// the roster stop being the statement of that.
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, serde::Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum SeatKind {
     /// An agent CLI, through `runner.rs`.
@@ -102,7 +102,7 @@ pub fn seat_kind_for_engine(engine: &str) -> Option<SeatKind> {
 /// rewrite it. A form retired here does not produce an error on the machines still using it;
 /// `load_council_config` returns `None` on a roster with faults, so it produces a council that
 /// silently stops existing at the next daemon start.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SeatSpec {
     pub kind: Option<SeatKind>,
@@ -231,7 +231,7 @@ impl CouncilSeat {
 /// `deny_unknown_fields`, and here it is load-bearing rather than tidy: `member:` for `members:`
 /// would otherwise parse into a council with no seats, which is a council that answers every
 /// question with the chairman's own opinion while looking like it deliberated.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CouncilConfig {
     #[serde(default = "default_council_timeout")]
@@ -270,7 +270,7 @@ pub struct CouncilConfig {
 /// `.ai/decisions.md` fixed that second half — the arbiter of an ambiguity is the person, and the
 /// council gates nothing — so a flag here that approved anything would contradict a standing
 /// decision rather than extend a feature.
-#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, serde::Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CouncilConsumers {
     /// Before a job's `review` node starts, put the job's task to the council and leave the

@@ -4,7 +4,7 @@ use super::*;
 
 /// `~/.nucleos/email.yaml` (spec §3.4). Every field has a default, so a partial file is valid and an
 /// absent one switches the pillar off in silence rather than blocking startup.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct EmailConfig {
     /// Opt-in. The pillar reads a real mailbox, so nothing about it starts by accident.
@@ -122,7 +122,7 @@ pub fn load_email_config(path: &Path) -> EmailConfig {
 /// means when the caller does not say; the working window is where a PROPOSAL may land — and it is
 /// emphatically not when you are busy. Busy comes from real events only, and keeping the two apart
 /// is what stops "I do not work Sundays" from quietly becoming "tell me nothing on Sundays".
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct CalendarConfig {
     /// An IANA name. Empty means "ask the operating system", which is right far more often than
@@ -181,7 +181,7 @@ pub fn load_calendar_config(path: &Path) -> CalendarConfig {
 }
 
 /// The verification executor's machine settings, `~/.nucleos/verify.yaml`.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct VerifyConfig {
     /// Weight units that may run at once across the whole machine.
@@ -205,7 +205,7 @@ pub struct VerifyConfig {
 pub const ADMISSION_MAX_WAIT_CEILING_SECONDS: u64 = 3000;
 
 /// `verify.yaml`'s `admission:` block: the bound on heavy commands launched at once.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct AdmissionConfig {
     /// Off means every heavy command is admitted at once.
@@ -313,7 +313,7 @@ pub fn load_verify_config(path: &Path) -> VerifyConfig {
 
 /// `~/.nucleos/web.yaml`. The web pillar's settings, including the one list in this system that decides
 /// what counts as trustworthy.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct WebConfig {
     /// Opt-in, like every pillar that reaches the network.
@@ -404,7 +404,7 @@ pub fn load_web_config(path: &Path) -> WebConfig {
 /// There is also no field that widens the fence. Spec §6.4: the boundary of §6.2 is not
 /// configurable, because a switch to loosen it is a switch somebody eventually finds a reason to
 /// flip at 2am.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct BrowserConfig {
     /// Opt-in, like every pillar that reaches the network. Ships off (spec §14.2).
@@ -497,7 +497,7 @@ where
 /// Neither list is authoritative on its own. `github::Policy` intersects both with a compiled
 /// ceiling, so what is written here can only ever NARROW what the code already allows — which is
 /// what makes a per-developer gitignored YAML a defensible place for this at all.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct GithubConfig {
     pub enabled: bool,

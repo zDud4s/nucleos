@@ -88,6 +88,7 @@ pub use nucleos_base::search;
 pub use nucleos_base::secrets;
 pub mod seed;
 pub mod sessions;
+pub mod settings;
 pub mod shutdown;
 pub mod sidecar;
 #[cfg(any(test, feature = "testkit"))]
