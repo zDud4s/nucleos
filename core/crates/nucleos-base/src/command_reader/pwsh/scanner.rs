@@ -22,6 +22,8 @@ pub(super) struct Scanner {
     pub(super) names: Vec<String>,
     /// How many `$( )` embedded in a double-quoted string the scanner is inside.
     pub(super) dq_sub: usize,
+    /// How many list commas `token` has consumed so far (a redirect target may not use one).
+    pub(super) commas: usize,
 }
 
 impl Scanner {
@@ -33,6 +35,7 @@ impl Scanner {
             allow_assign: true,
             names: Vec::new(),
             dq_sub: 0,
+            commas: 0,
         }
     }
 
@@ -49,6 +52,29 @@ impl Scanner {
         self.pos
             .checked_sub(1)
             .and_then(|i| self.chars.get(i).copied())
+    }
+
+    /// Whether the raw `(`/`)` chars of `from..to` (a `$( )` span, quotes and comments ignored)
+    /// close the first paren exactly at the last char, `to - 1`.
+    pub(super) fn raw_parens_close_at_end(&self, from: usize, to: usize) -> bool {
+        let mut depth = 0usize;
+        for (i, c) in self.chars[from..to]
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (from + i, c))
+        {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return i + 1 == to;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
     }
 
     /// Source text between two char positions.

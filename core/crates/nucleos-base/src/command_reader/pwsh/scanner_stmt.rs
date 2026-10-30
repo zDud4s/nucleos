@@ -352,7 +352,13 @@ impl Scanner {
             };
         }
         self.skip_inline()?;
-        self.token(false)
+        // pwsh: a comma list as the target ("MissingArgument") is a parse error.
+        let commas = self.commas;
+        self.token(false)?;
+        if self.commas != commas {
+            return Err("comma in a redirection target".to_string());
+        }
+        Ok(())
     }
 
     /// `( pipeline )`: no `;` and no chains inside.

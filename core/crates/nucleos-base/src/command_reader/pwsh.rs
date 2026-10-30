@@ -27,6 +27,8 @@ mod scanner_tests_s6;
 mod scanner_tests_s7;
 #[cfg(test)]
 mod scanner_tests_s8;
+#[cfg(test)]
+mod scanner_tests_s9;
 
 /// First word of every simple command, document order, nested included. Err = unreadable (fail closed).
 pub fn command_names(src: &str) -> Result<Vec<String>, String> {

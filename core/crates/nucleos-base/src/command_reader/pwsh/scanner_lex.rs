@@ -240,10 +240,18 @@ impl Scanner {
             |c: char| c.is_ascii_alphanumeric() || c == '_' || (!c.is_ascii() && c.is_alphabetic());
         match self.peek_at(1) {
             Some('(') => {
+                // pwsh finds the end of a `$( )` inside a string by counting raw parens, quotes and
+                // comments ignored, then parses what is between: if that end is not where the
+                // scanner closed the sub-expression the two readings differ, so it is refused.
+                let start = self.pos;
                 self.dq_sub += 1;
                 let r = self.sub_expression();
                 self.dq_sub -= 1;
-                return r;
+                r?;
+                if !self.raw_parens_close_at_end(start + 1, self.pos) {
+                    return Err("unbalanced raw parens in a string sub-expression".to_string());
+                }
+                return Ok(());
             }
             Some('{') => return self.braced_variable(),
             Some('$' | '?' | '^') => {
@@ -372,6 +380,7 @@ impl Scanner {
                 },
                 ',' if is_name => return Err("comma in a command name".to_string()),
                 ',' => {
+                    self.commas += 1;
                     if self.pos == start || dash_param {
                         return Err("misplaced comma".to_string());
                     }
