@@ -106,6 +106,7 @@ pub use nucleos_base::tests_map;
 pub mod token_efficiency;
 pub mod tool_loadout;
 pub use nucleos_base::transcribe;
+pub mod tree_job;
 pub use nucleos_base::trust;
 pub mod verify;
 pub use nucleos_base::verify_sched;

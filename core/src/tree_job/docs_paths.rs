@@ -1,0 +1,113 @@
+//! Rules of a docs branch (spec R6): the paths it may write and the states it may end in.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn docs_path_allows_a_file_under_each_of_the_four_directories() {
+        for path in [
+            ".ai/specs/design.md",
+            ".ai/spikes/probe.md",
+            ".ai/plans/plan.md",
+            ".ai/notes/note.md",
+            ".ai/plans/nested/deeper/plan.md",
+        ] {
+            assert!(is_allowed_docs_path(path), "should allow {path}");
+        }
+    }
+
+    #[test]
+    fn docs_path_refuses_a_tracked_path() {
+        for path in ["core/src/lib.rs", "README.md", "docs/specs/design.md"] {
+            assert!(!is_allowed_docs_path(path), "should refuse {path}");
+        }
+    }
+
+    #[test]
+    fn docs_path_refuses_a_sibling_prefix_of_an_allowed_directory() {
+        for path in [
+            ".ai/specs-old/x.md",
+            ".ai/specsx.md",
+            ".ai/plans.md",
+            ".ai/notes2/x.md",
+            "nested/.ai/specs/x.md",
+        ] {
+            assert!(!is_allowed_docs_path(path), "should refuse {path}");
+        }
+    }
+
+    #[test]
+    fn docs_path_refuses_the_ai_directory_itself_and_its_other_children() {
+        for path in [".ai", ".ai/", ".ai/memory.md", ".ai/scripts/tool.py", ""] {
+            assert!(!is_allowed_docs_path(path), "should refuse {path:?}");
+        }
+    }
+
+    #[test]
+    fn docs_path_refuses_parent_traversal_out_of_an_allowed_directory() {
+        for path in [
+            ".ai/specs/..",
+            ".ai/specs/../memory.md",
+            ".ai/specs/../../core/src/lib.rs",
+            ".ai/notes/deep/../../../core/src/lib.rs",
+            ".ai/plans/../../../outside.md",
+        ] {
+            assert!(!is_allowed_docs_path(path), "should refuse {path}");
+        }
+    }
+
+    #[test]
+    fn docs_path_refuses_absolute_paths() {
+        for path in [
+            "/etc/passwd",
+            "/.ai/specs/x.md",
+            "C:/Projects/nucleos/.ai/specs/x.md",
+            r"C:\Projects\nucleos\.ai\specs\x.md",
+            r"\.ai\specs\x.md",
+            r"\\server\share\.ai\specs\x.md",
+        ] {
+            assert!(!is_allowed_docs_path(path), "should refuse {path}");
+        }
+    }
+
+    #[test]
+    fn docs_path_treats_windows_backslashes_as_the_same_path() {
+        for path in [
+            r".ai\specs\design.md",
+            r".ai\spikes\probe.md",
+            r".ai\plans\nested\plan.md",
+            r".ai\notes\note.md",
+        ] {
+            assert!(is_allowed_docs_path(path), "should allow {path}");
+        }
+        for path in [
+            r"core\src\lib.rs",
+            r".ai\specs-old\x.md",
+            r".ai\",
+            r".ai\specs\..\..\core\src\lib.rs",
+            r".ai/specs\../../core/src/lib.rs",
+        ] {
+            assert!(!is_allowed_docs_path(path), "should refuse {path}");
+        }
+    }
+
+    #[test]
+    fn docs_branch_needs_no_worktree_and_never_merges() {
+        assert!(!docs_branch_needs_worktree());
+        assert!(!docs_branch_merges());
+    }
+
+    #[test]
+    fn docs_terminal_states_are_done_and_dropped() {
+        assert!(is_docs_terminal_state("done"));
+        assert!(is_docs_terminal_state("dropped"));
+    }
+
+    #[test]
+    fn docs_terminal_states_refuse_merge_and_non_terminal_states() {
+        for state in ["merged", "landed", "running", "pending", "failed", ""] {
+            assert!(!is_docs_terminal_state(state), "should refuse {state:?}");
+        }
+    }
+}
