@@ -163,6 +163,12 @@ mod tests {
     use super::*;
     use crate::tree_job::model::{Branch, Manifest};
 
+    use std::time::Duration;
+
+    use crate::execution::runs::CreateRunError;
+    use crate::state::AppState;
+    use crate::tree_job::node_run::{self, NodeRunError};
+
     const CREATED: &str = "2026-10-30T10:00:00+00:00";
     const LATER: &str = "2026-10-30T12:00:00+00:00";
 
@@ -331,5 +337,484 @@ mod tests {
         let listed = list_non_terminal(&reopened).await.unwrap();
         assert_eq!(listed.len(), 1);
         reopened.close().await;
+    }
+
+    // ----- boot: resume_all, clear_spent_launch, launch_recovering -----
+
+    /// A mode `create_run_inner` refuses when it has no project and no cwd, before any run row
+    /// exists: the deterministic way to make a create fail.
+    const REFUSED_WITHOUT_A_PROJECT: &str = "worktree";
+    /// High enough not to collide with an id the fake agent's runs get.
+    const DEAD_RUN: i64 = 4711;
+    const LIVE_RUN: i64 = 4712;
+
+    /// Stores job `id` with the given `created_at`, and returns it as stored.
+    async fn store_job(pool: &SqlitePool, id: &str, state: &str, created_at: &str) -> TreeJob {
+        let mut job = sample_job(id, &format!("{id}-root"), state);
+        job.created_at = created_at.to_owned();
+        save(pool, &job).await.unwrap();
+        job
+    }
+
+    async fn seed_node(
+        pool: &SqlitePool,
+        id: &str,
+        status: &str,
+        tree_job_id: Option<&str>,
+        run_id: Option<i64>,
+    ) {
+        sqlx::query(
+            "INSERT INTO work_nodes (id, root_id, depth, kind, title, goal, status, run_id,
+                                     tree_job_id, created_at, updated_at)
+             VALUES (?, ?, 0, 'leaf', 'title', 'goal', ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(id)
+        .bind(status)
+        .bind(run_id.map(|run_id| run_id.to_string()))
+        .bind(tree_job_id)
+        .bind(CREATED)
+        .bind(CREATED)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_run(pool: &SqlitePool, id: i64, status: &str) {
+        sqlx::query("INSERT INTO runs (id, prompt, status, created_at) VALUES (?, 'node', ?, ?)")
+            .bind(id)
+            .bind(status)
+            .bind(CREATED)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// What a `launch` leaves behind when it dies, or is still working, after reserving its key.
+    async fn reserve(pool: &SqlitePool, node_id: &str, key: &str) {
+        node_run::apply(pool, node_id, "launch", key, "")
+            .await
+            .unwrap();
+    }
+
+    /// The stored result of a transition, or `None` when it has no row.
+    async fn stored_result(
+        pool: &SqlitePool,
+        node_id: &str,
+        transition: &str,
+        key: &str,
+    ) -> Option<String> {
+        let stored: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT result FROM tree_transitions WHERE node_id = ? AND transition = ? AND key = ?",
+        )
+        .bind(node_id)
+        .bind(transition)
+        .bind(key)
+        .fetch_optional(pool)
+        .await
+        .unwrap();
+        stored.flatten()
+    }
+
+    async fn transition_rows(pool: &SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM tree_transitions")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn run_rows(pool: &SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn node_status(pool: &SqlitePool, id: &str) -> String {
+        sqlx::query_scalar("SELECT status FROM work_nodes WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn node_run_id(pool: &SqlitePool, id: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT run_id FROM work_nodes WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// A state whose fake agent stays alive for the test's length, with one open job `job-1`
+    /// holding the running node `node-1`, which has no run yet.
+    async fn state_with_node() -> AppState {
+        let (state, runner) = crate::execution::runs::testkit::test_state_with_runner(
+            Some(Duration::from_secs(5)),
+            Duration::from_secs(600),
+        )
+        .await;
+        runner.canned.lock().unwrap().as_mut().unwrap().session_id = None;
+        store_job(&state.pool, "job-1", "open", CREATED).await;
+        seed_node(&state.pool, "node-1", "running", Some("job-1"), None).await;
+        state
+    }
+
+    async fn recover_in_mode(state: &AppState, key: &str, mode: &str) -> Result<i64, NodeRunError> {
+        launch_recovering(state, "node-1", key, "do it".to_owned(), None, None, mode).await
+    }
+
+    async fn recover(state: &AppState, key: &str) -> Result<i64, NodeRunError> {
+        recover_in_mode(state, key, "shadow").await
+    }
+
+    // ----- resume_all -----
+
+    /// Decision 5: only `finished` is terminal, so a parked job resumes at boot like an open one.
+    #[tokio::test]
+    async fn resume_all_lists_unfinished_jobs_oldest_first_and_never_a_finished_one() {
+        let pool = crate::testdb::fresh_pool().await;
+        // Inserted out of age order, so that insertion order cannot pass for "oldest first".
+        store_job(
+            &pool,
+            "job-building",
+            "building",
+            "2026-10-30T10:00:03+00:00",
+        )
+        .await;
+        store_job(&pool, "job-open", "open", "2026-10-30T10:00:02+00:00").await;
+        store_job(&pool, "job-parked", "parked", "2026-10-30T10:00:01+00:00").await;
+        store_job(&pool, "job-done", "finished", "2026-10-30T10:00:00+00:00").await;
+
+        let resumed: Resumed = resume_all(&pool).await.unwrap();
+
+        assert_eq!(resumed.jobs, ["job-parked", "job-open", "job-building"]);
+    }
+
+    /// Resuming is not a transition of the job: even when the pass fails a node of the job and
+    /// clears one of its launches, the job's own row keeps its state, `updated_at` and park record.
+    #[tokio::test]
+    async fn resume_all_leaves_every_job_row_as_it_was() {
+        let pool = crate::testdb::fresh_pool().await;
+        let mut parked = sample_job("job-parked", "job-parked-root", "parked");
+        parked.manifest.park = Some(serde_json::json!({"needs": "a decision"}));
+        save(&pool, &parked).await.unwrap();
+        let open = store_job(&pool, "job-open", "open", CREATED).await;
+        seed_run(&pool, DEAD_RUN, "interrupted").await;
+        seed_node(
+            &pool,
+            "node-dead",
+            "running",
+            Some("job-parked"),
+            Some(DEAD_RUN),
+        )
+        .await;
+        seed_node(&pool, "node-waiting", "running", Some("job-parked"), None).await;
+        reserve(&pool, "node-waiting", "key-1").await;
+
+        let resumed = resume_all(&pool).await.unwrap();
+
+        assert_eq!(resumed.failed_nodes, ["node-dead"]);
+        assert_eq!(
+            resumed.cleared_launches,
+            [("node-waiting".to_owned(), "key-1".to_owned())]
+        );
+        let reloaded = load(&pool, "job-parked").await.unwrap().unwrap();
+        assert_eq!(reloaded.state, "parked");
+        assert_eq!(reloaded.updated_at, parked.updated_at);
+        assert_eq!(
+            reloaded.manifest.park,
+            Some(serde_json::json!({"needs": "a decision"}))
+        );
+        assert_eq!(reloaded, parked);
+        assert_eq!(load(&pool, "job-open").await.unwrap(), Some(open));
+    }
+
+    #[tokio::test]
+    async fn resume_all_fails_a_running_node_whose_run_was_interrupted_and_spares_a_live_one() {
+        let pool = crate::testdb::fresh_pool().await;
+        store_job(&pool, "job-1", "open", CREATED).await;
+        seed_run(&pool, DEAD_RUN, "interrupted").await;
+        seed_run(&pool, LIVE_RUN, "running").await;
+        seed_node(&pool, "node-dead", "running", Some("job-1"), Some(DEAD_RUN)).await;
+        seed_node(&pool, "node-live", "running", Some("job-1"), Some(LIVE_RUN)).await;
+
+        let resumed = resume_all(&pool).await.unwrap();
+
+        assert_eq!(resumed.failed_nodes, ["node-dead"]);
+        assert_eq!(node_status(&pool, "node-dead").await, "failed");
+        assert_eq!(node_status(&pool, "node-live").await, "running");
+    }
+
+    #[tokio::test]
+    async fn a_second_resume_all_reports_the_same_jobs_and_nothing_else() {
+        let pool = crate::testdb::fresh_pool().await;
+        store_job(&pool, "job-1", "open", CREATED).await;
+        store_job(&pool, "job-2", "parked", LATER).await;
+        seed_run(&pool, DEAD_RUN, "interrupted").await;
+        seed_node(&pool, "node-dead", "running", Some("job-1"), Some(DEAD_RUN)).await;
+        seed_node(&pool, "node-waiting", "running", Some("job-1"), None).await;
+        reserve(&pool, "node-waiting", "key-1").await;
+
+        let first = resume_all(&pool).await.unwrap();
+        assert_eq!(first.jobs, ["job-1", "job-2"]);
+        assert_eq!(first.failed_nodes, ["node-dead"]);
+        assert_eq!(first.cleared_launches.len(), 1);
+
+        let second = resume_all(&pool).await.unwrap();
+
+        assert_eq!(
+            second,
+            Resumed {
+                jobs: first.jobs,
+                failed_nodes: Vec::new(),
+                cleared_launches: Vec::new(),
+            }
+        );
+    }
+
+    /// Decision 4: after a restart nothing can still be creating the run of an empty reservation,
+    /// so boot frees the key of every job that is not over, a parked one included.
+    #[tokio::test]
+    async fn resume_all_clears_the_empty_launches_of_nodes_in_unfinished_jobs() {
+        let pool = crate::testdb::fresh_pool().await;
+        store_job(&pool, "job-open", "open", CREATED).await;
+        store_job(&pool, "job-parked", "parked", CREATED).await;
+        seed_node(&pool, "node-open", "running", Some("job-open"), None).await;
+        seed_node(&pool, "node-parked", "running", Some("job-parked"), None).await;
+        reserve(&pool, "node-open", "key-1").await;
+        reserve(&pool, "node-open", "key-2").await;
+        reserve(&pool, "node-parked", "key-1").await;
+
+        let mut cleared = resume_all(&pool).await.unwrap().cleared_launches;
+        cleared.sort();
+
+        assert_eq!(
+            cleared,
+            [
+                ("node-open".to_owned(), "key-1".to_owned()),
+                ("node-open".to_owned(), "key-2".to_owned()),
+                ("node-parked".to_owned(), "key-1".to_owned()),
+            ]
+        );
+        assert_eq!(transition_rows(&pool).await, 0);
+    }
+
+    #[tokio::test]
+    async fn resume_all_keeps_every_row_that_is_not_a_spent_launch_of_an_unfinished_job() {
+        let pool = crate::testdb::fresh_pool().await;
+        store_job(&pool, "job-open", "open", CREATED).await;
+        store_job(&pool, "job-done", "finished", CREATED).await;
+        seed_node(&pool, "node-open", "running", Some("job-open"), None).await;
+        seed_node(&pool, "node-done", "running", Some("job-done"), None).await;
+        seed_node(&pool, "node-alone", "running", None, None).await;
+        node_run::apply(&pool, "node-open", "launch", "key-holding", "42")
+            .await
+            .unwrap();
+        node_run::apply(&pool, "node-open", "close", "key-other", "")
+            .await
+            .unwrap();
+        reserve(&pool, "node-done", "key-finished").await;
+        reserve(&pool, "node-alone", "key-alone").await;
+
+        let resumed = resume_all(&pool).await.unwrap();
+
+        assert!(
+            resumed.cleared_launches.is_empty(),
+            "{:?}",
+            resumed.cleared_launches
+        );
+        assert_eq!(transition_rows(&pool).await, 4);
+        assert_eq!(
+            stored_result(&pool, "node-open", "launch", "key-holding")
+                .await
+                .as_deref(),
+            Some("42")
+        );
+    }
+
+    // ----- clear_spent_launch -----
+
+    #[tokio::test]
+    async fn clear_spent_launch_deletes_only_the_empty_row_it_names() {
+        let pool = crate::testdb::fresh_pool().await;
+        reserve(&pool, "node-1", "key-1").await;
+        reserve(&pool, "node-1", "key-2").await;
+        reserve(&pool, "node-2", "key-1").await;
+
+        let cleared: bool = clear_spent_launch(&pool, "node-1", "key-1").await.unwrap();
+
+        assert!(cleared);
+        assert_eq!(
+            stored_result(&pool, "node-1", "launch", "key-1").await,
+            None
+        );
+        assert_eq!(transition_rows(&pool).await, 2);
+    }
+
+    /// The row is what makes a launch replay-safe: losing a run id would start a second run.
+    #[tokio::test]
+    async fn clear_spent_launch_refuses_a_row_holding_a_run_id() {
+        let pool = crate::testdb::fresh_pool().await;
+        node_run::apply(&pool, "node-1", "launch", "key-1", "42")
+            .await
+            .unwrap();
+
+        let cleared = clear_spent_launch(&pool, "node-1", "key-1").await.unwrap();
+
+        assert!(!cleared);
+        assert_eq!(
+            stored_result(&pool, "node-1", "launch", "key-1")
+                .await
+                .as_deref(),
+            Some("42")
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_spent_launch_refuses_an_empty_row_of_another_transition() {
+        let pool = crate::testdb::fresh_pool().await;
+        node_run::apply(&pool, "node-1", "close", "key-1", "")
+            .await
+            .unwrap();
+
+        let cleared = clear_spent_launch(&pool, "node-1", "key-1").await.unwrap();
+
+        assert!(!cleared);
+        assert_eq!(transition_rows(&pool).await, 1);
+    }
+
+    #[tokio::test]
+    async fn clear_spent_launch_of_an_absent_row_answers_false_and_changes_nothing() {
+        let pool = crate::testdb::fresh_pool().await;
+        reserve(&pool, "node-1", "key-other").await;
+        reserve(&pool, "node-other", "key-1").await;
+
+        let cleared = clear_spent_launch(&pool, "node-1", "key-1").await.unwrap();
+
+        assert!(!cleared);
+        assert_eq!(transition_rows(&pool).await, 2);
+    }
+
+    // ----- launch_recovering -----
+
+    /// The whole recovery with the real `launch`: a key that answers `Unresolved` for ever until a
+    /// boot frees it, and then starts exactly one run.
+    #[tokio::test]
+    async fn a_boot_turns_an_unresolved_launch_key_into_one_run() {
+        let state = state_with_node().await;
+        let pool = &state.pool;
+        reserve(pool, "node-1", "key-1").await;
+
+        let before_boot = node_run::launch(
+            &state,
+            "node-1",
+            "key-1",
+            "do it".to_owned(),
+            None,
+            None,
+            "shadow",
+        )
+        .await;
+        assert!(
+            matches!(before_boot, Err(NodeRunError::Unresolved { .. })),
+            "{before_boot:?}"
+        );
+        assert_eq!(run_rows(pool).await, 0);
+
+        let resumed = resume_all(pool).await.unwrap();
+        assert_eq!(
+            resumed.cleared_launches,
+            [("node-1".to_owned(), "key-1".to_owned())]
+        );
+
+        let run_id = recover(&state, "key-1").await.unwrap();
+
+        assert_eq!(run_rows(pool).await, 1);
+        assert_eq!(node_run_id(pool, "node-1").await, Some(run_id.to_string()));
+        assert_eq!(
+            stored_result(pool, "node-1", "launch", "key-1").await,
+            Some(run_id.to_string())
+        );
+    }
+
+    /// Without the clear this is the key that answers `Unresolved` for ever: the call that made the
+    /// reservation knows its own create failed, so it gives the key back.
+    #[tokio::test]
+    async fn a_failing_create_gives_the_key_back_and_the_same_key_then_makes_one_run() {
+        let state = state_with_node().await;
+        let pool = &state.pool;
+
+        let failed = recover_in_mode(&state, "key-1", REFUSED_WITHOUT_A_PROJECT).await;
+
+        assert!(
+            matches!(
+                failed,
+                Err(NodeRunError::Create(CreateRunError::Invalid(_)))
+            ),
+            "{failed:?}"
+        );
+        assert_eq!(transition_rows(pool).await, 0, "the reservation is gone");
+        assert_eq!(run_rows(pool).await, 0);
+        assert_eq!(node_run_id(pool, "node-1").await, None);
+
+        let run_id = recover(&state, "key-1").await.unwrap();
+
+        assert_eq!(run_rows(pool).await, 1);
+        assert_eq!(node_run_id(pool, "node-1").await, Some(run_id.to_string()));
+    }
+
+    /// A replay never reaches the create, so input that would fail it cannot cost the stored id.
+    #[tokio::test]
+    async fn launch_recovering_replay_returns_the_same_run_with_no_second_row() {
+        let state = state_with_node().await;
+        let pool = &state.pool;
+        let first = recover(&state, "key-1").await.unwrap();
+
+        let replay = recover(&state, "key-1").await.unwrap();
+        let replay_with_bad_input = recover_in_mode(&state, "key-1", REFUSED_WITHOUT_A_PROJECT)
+            .await
+            .unwrap();
+
+        assert_eq!(replay, first);
+        assert_eq!(replay_with_bad_input, first);
+        assert_eq!(run_rows(pool).await, 1);
+        assert_eq!(
+            stored_result(pool, "node-1", "launch", "key-1").await,
+            Some(first.to_string())
+        );
+    }
+
+    /// In flight is not spent. With no boot in between, an empty reservation may belong to another
+    /// call that is creating its run right now, and a live daemon cannot tell that call from a dead
+    /// one. Clearing here would let a second run start beside the first, so only the failing call
+    /// itself and boot, when nothing can still be creating a run, may clear.
+    #[tokio::test]
+    async fn launch_recovering_does_not_clear_a_reservation_it_did_not_make() {
+        let state = state_with_node().await;
+        let pool = &state.pool;
+        reserve(pool, "node-1", "key-1").await;
+
+        let recovered = recover(&state, "key-1").await;
+        // Nor with input that would fail: this call never reaches a create, so nothing failed.
+        let with_bad_input = recover_in_mode(&state, "key-1", REFUSED_WITHOUT_A_PROJECT).await;
+
+        for answer in [recovered, with_bad_input] {
+            match answer {
+                Err(NodeRunError::Unresolved { node_id, key }) => {
+                    assert_eq!(node_id, "node-1");
+                    assert_eq!(key, "key-1");
+                }
+                other => panic!("expected Unresolved, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            stored_result(pool, "node-1", "launch", "key-1")
+                .await
+                .as_deref(),
+            Some("")
+        );
+        assert_eq!(run_rows(pool).await, 0);
+        assert_eq!(node_run_id(pool, "node-1").await, None);
     }
 }

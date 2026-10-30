@@ -664,4 +664,490 @@ mod tests {
             assert_parked(cmd, EMAIL);
         }
     }
+
+    // A `-p <crate>` scope: a branch glob inside the crate's directory, and not inside a package
+    // nested in that directory, is enough. The gate runs the crate's tests; writing stays limited
+    // by the owned paths.
+
+    #[test]
+    fn a_glob_inside_the_crate_directory_allows_its_package() {
+        for glob in [
+            "core/src/tree_job/**",
+            "core/src/tree_job/commands.rs",
+            "core/src/**",
+        ] {
+            for cmd in [
+                "cargo test -p nucleos-core",
+                "cargo check -p nucleos-core",
+                "cargo clippy -p nucleos-core",
+            ] {
+                assert_allowed(cmd, &[glob]);
+            }
+        }
+    }
+
+    #[test]
+    fn a_test_filter_stays_allowed_under_a_glob_inside_the_crate() {
+        assert_allowed(
+            "cargo test -p nucleos-core --lib tree_job::close",
+            &["core/src/tree_job/**"],
+        );
+    }
+
+    #[test]
+    fn a_glob_inside_a_nested_package_allows_that_package() {
+        assert_allowed(
+            "cargo test -p nucleos-base",
+            &["core/crates/nucleos-base/src/**"],
+        );
+    }
+
+    #[test]
+    fn one_glob_inside_the_crate_is_enough_among_mixed_globs() {
+        assert_allowed(
+            "cargo test -p nucleos-core",
+            &["sidecars/email/**", "core/src/tree_job/**"],
+        );
+    }
+
+    #[test]
+    fn a_glob_inside_a_nested_package_does_not_allow_the_outer_crate() {
+        let nested: &[&str] = &["core/crates/nucleos-base/src/**"];
+        assert_allowed("cargo test -p nucleos-base", nested);
+        assert_parked("cargo test -p nucleos-core", nested);
+    }
+
+    #[test]
+    fn a_glob_inside_the_outer_crate_does_not_allow_a_nested_package() {
+        let outer: &[&str] = &["core/src/tree_job/**"];
+        assert_allowed("cargo test -p nucleos-core", outer);
+        assert_parked("cargo test -p nucleos-base", outer);
+    }
+
+    #[test]
+    fn a_glob_outside_the_crate_directory_does_not_allow_it() {
+        assert_allowed("cargo test -p nucleos-core", &["core/src/**"]);
+        // A shared name prefix is not containment: the boundary is a whole segment.
+        assert_parked("cargo test -p nucleos-core", &["core-evil/src/**"]);
+        assert_parked("cargo test -p nucleos-core", &["shell/src/**"]);
+    }
+
+    #[test]
+    fn every_package_of_one_command_must_hold_a_branch_glob() {
+        let leaf: &[&str] = &["core/src/tree_job/**"];
+        assert_allowed("cargo test -p nucleos-core", leaf);
+        assert_parked("cargo test -p nucleos-core -p nucleos-base", leaf);
+    }
+
+    #[test]
+    fn a_glob_that_does_not_normalise_holds_no_package() {
+        assert_allowed("cargo test -p nucleos-core", &["core/src/**"]);
+        assert_parked("cargo test -p nucleos-core", &["core/../shell/**"]);
+    }
+
+    #[test]
+    fn a_manifest_path_gains_nothing_from_a_glob_inside_its_directory() {
+        let leaf: &[&str] = &["core/src/tree_job/**"];
+        assert_allowed("cargo test -p nucleos-core", leaf);
+        assert_parked("cargo test --manifest-path core/Cargo.toml", leaf);
+    }
+
+    #[test]
+    fn the_shell_is_no_package_even_for_a_glob_inside_its_directory() {
+        assert_parked("cargo test -p shell", &["shell/src-tauri/src/**"]);
+    }
+
+    // Execution: the daemon runs the allowed commands through the broker, never through a shell.
+
+    use super::{CommandRun, Invocation, RunOutcome, heavy_invocation, run_for_leaf, spawn_heavy};
+    use crate::governance::autopilot::HOOK_INTERPRETER;
+    use crate::tree_job::model::Branch;
+    use std::future::ready;
+    use std::path::{Path, PathBuf};
+
+    const HEAVY_PY: &str = "C:/nucleos/scripts/heavy.py";
+    const WORKTREE: &str = "C:/trees/leaf";
+    const TARGET_DIR: &str = "C:/targets/leaf";
+    /// Wide globs on purpose, so these tests do not lean on the `-p` containment rule above.
+    const LEAF_GLOBS: &[&str] = &["core/**", "sidecars/email/**"];
+    const CARGO_CMD: &str = "cargo test -p nucleos-core --lib tree_job::close";
+    const GO_CMD: &str = "go test -C sidecars/email -run TestSend ./...";
+    /// Past this many calls a retry is taken to be unbounded, so the test fails instead of hanging.
+    const RUNAWAY_CALLS: usize = 1000;
+
+    fn branch_with(worktree: Option<&str>, target_dir: Option<&str>) -> Branch {
+        let paths: Vec<String> = LEAF_GLOBS.iter().map(|glob| (*glob).to_owned()).collect();
+        let mut branch = Branch::new("leaf-one", &paths, "core", None);
+        branch.worktree = worktree.map(str::to_owned);
+        branch.target_dir = target_dir.map(str::to_owned);
+        branch
+    }
+
+    fn leaf_branch() -> Branch {
+        branch_with(Some(WORKTREE), Some(TARGET_DIR))
+    }
+
+    fn argv_of(cmd: &str) -> Vec<String> {
+        cmd.split(' ').map(str::to_owned).collect()
+    }
+
+    fn invocation_for(cmd: &str, branch: &Branch) -> Invocation {
+        let allowed = check(cmd, LEAF_GLOBS).expect("the command is inside the leaf's globs");
+        heavy_invocation(&allowed, branch, Path::new(HEAVY_PY))
+            .expect("the leaf can run this command")
+    }
+
+    fn assert_invocation_parks(cmd: &str, branch: &Branch) {
+        let allowed = check(cmd, LEAF_GLOBS).expect("the command is inside the leaf's globs");
+        match heavy_invocation(&allowed, branch, Path::new(HEAVY_PY)) {
+            Ok(_) => panic!("{cmd:?} must park on this branch"),
+            Err(parked) => assert!(
+                !parked.needs.trim().is_empty(),
+                "{cmd:?} was parked with a blank `needs`"
+            ),
+        }
+    }
+
+    /// What the closure of `run_for_leaf` received, so a test needs no derive on `Invocation`.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Recorded {
+        program: String,
+        args: Vec<String>,
+        cwd: PathBuf,
+        env: Vec<(String, String)>,
+    }
+
+    impl Recorded {
+        fn of(invocation: &Invocation) -> Recorded {
+            Recorded {
+                program: invocation.program.clone(),
+                args: invocation.args.clone(),
+                cwd: invocation.cwd.clone(),
+                env: invocation.env.clone(),
+            }
+        }
+
+        /// The leaf's own command: what follows the broker's `--`.
+        fn command(&self) -> String {
+            let at = self
+                .args
+                .iter()
+                .position(|arg| arg == "--")
+                .expect("the broker's arguments end in `--`");
+            self.args[at + 1..].join(" ")
+        }
+    }
+
+    /// Runs `commands` with a closure that records each call and answers `exit_for(command,
+    /// attempt)`, where `attempt` counts from 0 for each command.
+    async fn run_scripted(
+        commands: &[&str],
+        branch: &Branch,
+        mut exit_for: impl FnMut(&str, usize) -> Option<i32>,
+    ) -> (RunOutcome, Vec<Recorded>) {
+        let commands: Vec<String> = commands.iter().map(|cmd| (*cmd).to_owned()).collect();
+        let mut calls: Vec<Recorded> = Vec::new();
+        let outcome = run_for_leaf(
+            &commands,
+            branch,
+            Path::new(HEAVY_PY),
+            |invocation: Invocation| {
+                assert!(
+                    calls.len() < RUNAWAY_CALLS,
+                    "the runner kept calling past {RUNAWAY_CALLS} attempts"
+                );
+                let recorded = Recorded::of(&invocation);
+                let command = recorded.command();
+                let attempt = calls
+                    .iter()
+                    .filter(|call| call.command() == command)
+                    .count();
+                calls.push(recorded);
+                let exit_code = exit_for(&command, attempt);
+                ready(CommandRun {
+                    output: format!("{command} attempt {attempt}"),
+                    command,
+                    exit_code,
+                })
+            },
+        )
+        .await;
+        (outcome, calls)
+    }
+
+    fn expect_ran(outcome: RunOutcome) -> Vec<CommandRun> {
+        match outcome {
+            RunOutcome::Ran(runs) => runs,
+            RunOutcome::Parked(parked) => panic!("must run, parked with: {}", parked.needs),
+        }
+    }
+
+    fn expect_parked(outcome: RunOutcome) -> Parked {
+        match outcome {
+            RunOutcome::Parked(parked) => parked,
+            RunOutcome::Ran(runs) => panic!("must park, ran {} commands", runs.len()),
+        }
+    }
+
+    #[test]
+    fn heavy_invocation_runs_cargo_through_the_interpreter_and_the_broker() {
+        let invocation = invocation_for("cargo test -p nucleos-core", &leaf_branch());
+
+        // The interpreter is the program, so no shell reads any of this.
+        assert_eq!(invocation.program, HOOK_INTERPRETER);
+        let expected: Vec<String> = [
+            HEAVY_PY,
+            "--agent",
+            "leaf-one",
+            "--kind",
+            "cargo",
+            "--",
+            "cargo",
+            "test",
+            "-p",
+            "nucleos-core",
+        ]
+        .iter()
+        .map(|arg| (*arg).to_owned())
+        .collect();
+        assert_eq!(invocation.args, expected);
+        assert_eq!(invocation.cwd, PathBuf::from(WORKTREE));
+        let target_dirs: Vec<&str> = invocation
+            .env
+            .iter()
+            .filter(|(key, _)| key == "CARGO_TARGET_DIR")
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(target_dirs, [TARGET_DIR]);
+    }
+
+    #[test]
+    fn heavy_invocation_leaves_the_allowed_argv_untouched() {
+        let clippy = "cargo clippy -p nucleos-core --all-targets -- -D warnings";
+        let invocation = invocation_for(clippy, &leaf_branch());
+
+        let tail = &invocation.args[invocation.args.len() - argv_of(clippy).len()..];
+        assert_eq!(tail, argv_of(clippy).as_slice());
+    }
+
+    #[test]
+    fn heavy_invocation_runs_go_test_with_no_cargo_target_dir() {
+        // A target dir on the branch is not handed to go, and go does not need one.
+        for branch in [leaf_branch(), branch_with(Some(WORKTREE), None)] {
+            let invocation = invocation_for(GO_CMD, &branch);
+
+            assert_eq!(invocation.program, HOOK_INTERPRETER);
+            let mut expected: Vec<String> = [HEAVY_PY, "--agent", "leaf-one", "--kind", "go", "--"]
+                .iter()
+                .map(|arg| (*arg).to_owned())
+                .collect();
+            expected.extend(argv_of(GO_CMD));
+            assert_eq!(invocation.args, expected);
+            assert_eq!(invocation.cwd, PathBuf::from(WORKTREE));
+            assert!(
+                !invocation
+                    .env
+                    .iter()
+                    .any(|(key, _)| key == "CARGO_TARGET_DIR"),
+                "go must not carry CARGO_TARGET_DIR: {:?}",
+                invocation.env
+            );
+        }
+    }
+
+    #[test]
+    fn cargo_on_a_branch_with_no_target_dir_parks_rather_than_share_one() {
+        assert_invocation_parks(CARGO_CMD, &branch_with(Some(WORKTREE), None));
+    }
+
+    #[test]
+    fn a_branch_with_no_worktree_parks_every_command() {
+        // A docs branch has neither; the target dir alone does not stand in for a worktree.
+        assert_invocation_parks(CARGO_CMD, &branch_with(None, Some(TARGET_DIR)));
+        assert_invocation_parks(CARGO_CMD, &branch_with(None, None));
+        assert_invocation_parks(GO_CMD, &branch_with(None, None));
+    }
+
+    #[tokio::test]
+    async fn run_for_leaf_hands_each_command_its_heavy_invocation() {
+        let branch = leaf_branch();
+        let (outcome, calls) = run_scripted(&[CARGO_CMD, GO_CMD], &branch, |_, _| Some(0)).await;
+
+        assert_eq!(expect_ran(outcome).len(), 2);
+        assert_eq!(
+            calls,
+            [
+                Recorded::of(&invocation_for(CARGO_CMD, &branch)),
+                Recorded::of(&invocation_for(GO_CMD, &branch)),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn one_bad_command_parks_the_list_before_any_command_runs() {
+        for bad in [
+            "cargo build -p nucleos-core",
+            "cargo test -p nucleos-core; whoami",
+            "go test -C sidecars/telegram ./...",
+        ] {
+            for commands in [
+                vec![bad, CARGO_CMD],
+                vec![CARGO_CMD, bad],
+                vec![CARGO_CMD, bad, GO_CMD],
+            ] {
+                let (outcome, calls) =
+                    run_scripted(&commands, &leaf_branch(), |_, _| Some(0)).await;
+
+                let parked = expect_parked(outcome);
+                assert!(
+                    parked.needs.contains(bad),
+                    "`needs` must name {bad:?}: {}",
+                    parked.needs
+                );
+                assert!(calls.is_empty(), "{commands:?} ran before parking: {calls:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_branch_that_cannot_run_the_command_parks_with_no_call() {
+        for (cmd, branch) in [
+            (CARGO_CMD, branch_with(Some(WORKTREE), None)),
+            (CARGO_CMD, branch_with(None, Some(TARGET_DIR))),
+            (GO_CMD, branch_with(None, None)),
+        ] {
+            let (outcome, calls) = run_scripted(&[cmd], &branch, |_, _| Some(0)).await;
+
+            expect_parked(outcome);
+            assert!(calls.is_empty(), "{cmd:?} ran before parking: {calls:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_non_zero_exit_is_a_result_and_later_commands_still_run() {
+        let exit_for = |command: &str, _: usize| Some(if command == CARGO_CMD { 101 } else { 0 });
+        let (outcome, calls) = run_scripted(&[CARGO_CMD, GO_CMD], &leaf_branch(), exit_for).await;
+
+        let runs = expect_ran(outcome);
+        let results: Vec<(&str, Option<i32>)> = runs
+            .iter()
+            .map(|run| (run.command.as_str(), run.exit_code))
+            .collect();
+        assert_eq!(results, [(CARGO_CMD, Some(101)), (GO_CMD, Some(0))]);
+        assert_eq!(runs[0].output, format!("{CARGO_CMD} attempt 0"));
+        // A failure is not contention, so nothing is run twice.
+        assert_eq!(calls.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_command_that_never_started_is_a_result_and_is_not_retried() {
+        let exit_for = |command: &str, _: usize| (command != CARGO_CMD).then_some(0);
+        let (outcome, calls) = run_scripted(&[CARGO_CMD, GO_CMD], &leaf_branch(), exit_for).await;
+
+        let exits: Vec<Option<i32>> = expect_ran(outcome)
+            .iter()
+            .map(|run| run.exit_code)
+            .collect();
+        assert_eq!(exits, [None, Some(0)]);
+        assert_eq!(calls.len(), 2);
+    }
+
+    /// Paused so that a backoff between attempts costs the test no real time.
+    #[tokio::test(start_paused = true)]
+    async fn exit_75_retries_the_same_invocation() {
+        let exit_for = |_: &str, attempt: usize| Some(if attempt == 0 { 75 } else { 0 });
+        let (outcome, calls) = run_scripted(&[CARGO_CMD], &leaf_branch(), exit_for).await;
+
+        let runs = expect_ran(outcome);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].exit_code, Some(0));
+        assert_eq!(runs[0].output, format!("{CARGO_CMD} attempt 1"));
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], calls[1]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exit_75_that_never_clears_ends_in_a_bounded_result_of_75() {
+        let (outcome, calls) = run_scripted(&[CARGO_CMD], &leaf_branch(), |_, _| Some(75)).await;
+
+        let runs = expect_ran(outcome);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].exit_code, Some(75));
+        // The upper end is `RUNAWAY_CALLS`, enforced by `run_scripted`.
+        assert!(calls.len() >= 2, "it was never retried: {calls:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn contention_that_never_clears_does_not_stop_later_commands() {
+        let exit_for = |command: &str, _: usize| Some(if command == CARGO_CMD { 75 } else { 0 });
+        let (outcome, _) = run_scripted(&[CARGO_CMD, GO_CMD], &leaf_branch(), exit_for).await;
+
+        let exits: Vec<Option<i32>> = expect_ran(outcome)
+            .iter()
+            .map(|run| run.exit_code)
+            .collect();
+        assert_eq!(exits, [Some(75), Some(0)]);
+    }
+
+    #[tokio::test]
+    async fn an_empty_command_list_runs_nothing_and_never_parks() {
+        // With no command to run, a docs branch has nothing missing either.
+        for branch in [leaf_branch(), branch_with(None, None)] {
+            let (outcome, calls) = run_scripted(&[], &branch, |_, _| Some(0)).await;
+
+            assert!(expect_ran(outcome).is_empty());
+            assert!(calls.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_heavy_returns_stdout_stderr_and_the_exit_code() {
+        let scripts = tempfile::tempdir().expect("a temp dir for the script");
+        let cwd = tempfile::tempdir().expect("a temp dir for the working directory");
+        std::fs::write(cwd.path().join("cwd-marker.txt"), "").expect("the marker is written");
+        let script = scripts.path().join("probe.py");
+        std::fs::write(
+            &script,
+            "import os\n\
+             import sys\n\
+             print('stdout-line ' + os.environ['NUCLEOS_R5_PROBE'])\n\
+             print('cwd-marker ' + str(os.path.exists('cwd-marker.txt')))\n\
+             print('stderr-line', file=sys.stderr)\n\
+             sys.exit(3)\n",
+        )
+        .expect("the script is written");
+
+        let run = spawn_heavy(Invocation {
+            program: HOOK_INTERPRETER.to_owned(),
+            args: vec![script.to_string_lossy().into_owned()],
+            cwd: cwd.path().to_path_buf(),
+            env: vec![("NUCLEOS_R5_PROBE".to_owned(), "probe-value".to_owned())],
+        })
+        .await;
+
+        assert_eq!(run.exit_code, Some(3), "output: {}", run.output);
+        for expected in ["stdout-line probe-value", "cwd-marker True", "stderr-line"] {
+            assert!(
+                run.output.contains(expected),
+                "{expected:?} is missing from: {}",
+                run.output
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_heavy_explains_a_program_that_does_not_exist() {
+        let cwd = tempfile::tempdir().expect("a temp dir for the working directory");
+
+        let run = spawn_heavy(Invocation {
+            program: "nucleos-no-such-program-r5".to_owned(),
+            args: Vec::new(),
+            cwd: cwd.path().to_path_buf(),
+            env: Vec::new(),
+        })
+        .await;
+
+        assert_eq!(run.exit_code, None);
+        assert!(!run.output.trim().is_empty(), "nothing explains the failure");
+    }
 }
