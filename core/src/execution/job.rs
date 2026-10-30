@@ -5493,6 +5493,7 @@ mod tests {
         let (container, repo) = walkable_repo("nucleos-job-workflow-", "git --version");
         let root = tempfile::tempdir().unwrap();
         let _env = WorktreeRootEnv::set(root.path());
+        let _settings = crate::project::rules::testing::Home::new();
         let pool = test_pool().await;
         let mut state = with_home(test_state(pool.clone()).await, &container);
         let library = container.path().join("workflows");
@@ -5503,13 +5504,12 @@ mod tests {
         let bundle = crate::workflows::read_bundle(&bundle_dir, "dev", "1.0")
             .unwrap()
             .unwrap();
-        let pins = crate::project::state::file(
-            state.machine_config_root.as_deref(),
+        let mut pins = crate::workflows::Pins::default();
+        crate::workflows::apply_install(&mut pins, &bundle).unwrap();
+        crate::project::rules::testing::publish_pins(
             "nucleos",
-            crate::project::state::PINS_FILE,
-        )
-        .unwrap();
-        crate::workflows::install(&pins, &bundle).unwrap();
+            &crate::workflows::render_pins(&pins),
+        );
         state.workflow_library = Some(library);
         let project_root = repo.to_string_lossy().into_owned();
 

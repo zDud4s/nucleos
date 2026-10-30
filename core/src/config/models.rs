@@ -3,13 +3,16 @@
 use super::*;
 
 // `PartialEq` only: `model_prices` holds `f64`, which has no `Eq`.
-#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq)]
 pub struct ModelsConfig {
+    #[schemars(extend("x-widget" = "model-picker"))]
     pub claude_model: String,
+    #[schemars(extend("x-widget" = "model-picker"))]
     pub codex_model: String,
     /// Absent keeps the established CLI path active, which lets local triage ship dark until an
     /// operator explicitly names a model that can keep message bodies on the machine.
     #[serde(default, deserialize_with = "deserialize_optional_model")]
+    #[schemars(extend("x-widget" = "model-picker"))]
     pub local_triage_model: Option<String>,
     /// Absent leaves voice cleanup unarmed, so a transcript is delivered raw rather than not at all.
     /// Named here rather than in `~/.nucleos/voice.yaml` because pinning models is this file's whole job.
@@ -28,9 +31,11 @@ pub struct ModelsConfig {
     /// Where a job's `plan` stage runs. Absent keeps it on `claude_model`, so a file written before
     /// this key existed routes nothing anywhere.
     #[serde(default, deserialize_with = "deserialize_optional_model")]
+    #[schemars(extend("x-widget" = "model-picker"))]
     pub plan_model: Option<String>,
     /// Where a job's `review` stage runs, on the same absent-means-unrouted posture as `plan_model`.
     #[serde(default, deserialize_with = "deserialize_optional_model")]
+    #[schemars(extend("x-widget" = "model-picker"))]
     pub review_model: Option<String>,
     /// Where the queue's conflict resolution runs (`resolver.rs`), on the same absent-means-unrouted
     /// posture as `plan_model`: absent keeps it on `claude_model`.
@@ -154,6 +159,7 @@ pub struct ModelsConfig {
     /// (owner, 2026-10-18). Emptied by [`parse_models_config`] once converted.
     /// `pub` only because the daemon binary builds this struct with `..Default::default()`.
     #[serde(default, rename = "model_prices")]
+    #[schemars(with = "serde_json::Value")]
     #[doc(hidden)]
     pub raw_model_prices: serde_yaml::Value,
     /// One `"<model id>: <reason>"` per price entry [`parse_models_config`] dropped, so the drop is
@@ -163,9 +169,10 @@ pub struct ModelsConfig {
 }
 
 /// One row of the conversation's model picker.
-#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq, Eq)]
 pub struct AssistantChoice {
     /// What goes to `--model`, verbatim. An alias or a full name; the CLI accepts both.
+    #[schemars(extend("x-widget" = "model-picker"))]
     pub id: String,
     /// What the window shows. Separate from `id` because the useful name and the accepted name are
     /// not the same string — `sonnet` is what the CLI takes and "Sonnet" is what a person reads.
@@ -912,19 +919,17 @@ pub const MODELS_CONFIG_FILE: &str = "nucleos-models.yaml";
 /// [`crate::machine_config::ROOT_DISPLAY`].
 pub const MODELS_CONFIG_DISPLAY_PATH: &str = "~/.nucleos/nucleos-models.yaml";
 
-/// Held by every in-process writer of [`MODELS_CONFIG_FILE`]: the price refresh
-/// ([`crate::price_refresh::refresh_file`], around its re-read, splice and write) and the System
-/// page's write door (`http/admin.rs::post_machine_config`, around its write).
+/// Held by every in-process writer of [`MODELS_CONFIG_FILE`]. Since `POST /config/machine` went
+/// that is one: the price refresh ([`crate::price_refresh::refresh_file`], around its re-read,
+/// splice and write).
 ///
-/// Two reasons. The refresh rewrites the file from a fresh read, and the lock makes "fresh" hold
-/// until its write lands, so a settings write cannot slip in between and be overwritten by a splice
-/// of the text it replaced. And both go through [`crate::project::state::write_atomically`], which
-/// stages the text in the same `nucleos-models.yaml.nucleos-tmp` beside the target; two writes at
-/// once would collide on that temporary. It cannot order the daemon against an edit by hand or
-/// another process, which is why the refresh re-reads only after its fetch, keeping that window as
-/// short as a read and a write.
+/// The refresh rewrites the file from a fresh read, and the lock makes "fresh" hold until its write
+/// lands. [`crate::project::state::write_atomically`] stages the text in the same
+/// `nucleos-models.yaml.nucleos-tmp` beside the target, so two writes at once would collide on that
+/// temporary. It cannot order the daemon against an edit by hand or another process, which is why
+/// the refresh re-reads only after its fetch, keeping that window as short as a read and a write.
 ///
-/// A tokio mutex because the write door holds it across the `await` of its blocking write.
+/// A tokio mutex because a holder keeps it across the `await` of its blocking write.
 pub static MODELS_FILE_WRITE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// One model's published prices. A `None` field is a price the script could not read: tokens of that
@@ -940,7 +945,7 @@ pub static MODELS_FILE_WRITE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const
 ///   (2x input); both vendors publish them apart.
 /// - `fast`: the request's `speed: fast` rate (Opus 5.5: $8 / $40).
 /// - `geo_us_mult`: `inference_geo: "us"` multiplies every category (1.1 at Anthropic).
-#[derive(Debug, Clone, Default, Deserialize, serde::Serialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq)]
 pub struct ModelPrice {
     #[serde(default)]
     pub input: Option<f64>,
@@ -970,7 +975,7 @@ pub struct ModelPrice {
 /// threshold as "over N" (Anthropic's "for prompts over 100,000 tokens", OpenRouter's
 /// `min_prompt_tokens: 100000` for the same model), so it is written as N + 1. A tier carries only
 /// the rates it overrides; a `None` rate is the base one.
-#[derive(Debug, Clone, Default, Deserialize, serde::Serialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq)]
 pub struct PriceTier {
     pub min_prompt_tokens: u64,
     #[serde(default)]
@@ -986,7 +991,7 @@ pub struct PriceTier {
 }
 
 /// Fast mode's input and output rates. Caching multipliers apply on top of them.
-#[derive(Debug, Clone, Default, Deserialize, serde::Serialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq)]
 pub struct FastPrice {
     pub input: f64,
     pub output: f64,

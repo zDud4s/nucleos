@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cover the OpenRouter half of `scripts/refresh-models.py`.
+"""Cover the OpenRouter half of `scripts/refresh-models.py` and its daemon round trip.
 
 The other two halves read a catalogue and write whatever it says. This one is the
 opposite shape and needs its own cover: the hosted rows are somebody's deliberate
@@ -11,12 +11,12 @@ catalogue's job is to CHECK it.
 What that check has to get right, and what each mistake costs:
 
   dead id      An id that stopped existing is the whole reason this half was
-               written. `~/.nucleos/nucleos-models.yaml` is in no repository, so a row this
-               script silently dropped would leave no diff, no history and
+               written. The models document lives in the daemon's settings store and in
+               no repository, so a row this script silently dropped would leave no diff, no history and
                nothing to notice — while a row it keeps and complains about is a
                menu entry somebody can go fix. Kept, loudly, never dropped.
   stale label  Caught on the first run against the real catalogue:
-               `deepseek/deepseek-chat` is served as "DeepSeek V3", and the file
+               `deepseek/deepseek-chat` is served as "DeepSeek V3", and the row
                called it "DeepSeek Chat". The id was right and the name under it
                had moved, which is precisely the drift a human never re-reads.
   efforts      OpenRouter publishes a per-model effort vocabulary, and writing it
@@ -25,18 +25,29 @@ What that check has to get right, and what each mistake costs:
                what the picker draws its dial from, so writing them would put a
                slider on screen that reaches no wire. Read, reported, not written.
   ladder       When they ARE written, order is not cosmetic. OpenRouter lists them
-               strongest-first (`['high','medium','low','minimal']`) and the file's
+               strongest-first (`['high','medium','low','minimal']`) and the row's
                contract is weakest-first, because the picker draws a magnitude.
   no catalogue An unreachable endpoint must leave every hosted row exactly as it
                was. Turning "the network was down" into "you have no hosted
                models" is a worse lie than the stale list this script prevents.
 
-Hermetic: every case feeds a catalogue payload in by hand. No network.
+The document is read and written through `GET`/`PUT /settings/machine/models`, and that
+round trip has its own mistakes: a `PUT` that loses a field this script does not own, or
+that carries a version it did not read, or a stale refusal that turns into a blind retry.
+
+Hermetic: every case feeds its catalogue payload and its daemon answers in by hand. No
+network, no daemon, and no file of this machine is read or written.
 
 Run:  python scripts/test-refresh-models.py
 """
 
+import collections
+import contextlib
+import copy
 import importlib.util
+import io
+import itertools
+import json
 import os
 import sys
 
@@ -102,7 +113,7 @@ def cases():
         [hosted("anthropic/claude-sonnet-4.5", "Claude Sonnet 4.5 (OpenRouter)")],
         served(entry("anthropic/claude-sonnet-4.6", "Anthropic: Claude Sonnet 4.6")),
     )
-    yield ("a dead id is KEPT rather than dropped — a gitignored file has no diff to notice",
+    yield ("a dead id is KEPT rather than dropped — a document in no repository has no diff to notice",
            [row["id"] for row in rows], ["anthropic/claude-sonnet-4.5"])
     yield ("a dead id keeps the label it had, since nothing better is known",
            rows[0]["label"], "Claude Sonnet 4.5 (OpenRouter)")
@@ -218,10 +229,6 @@ def cases():
            refresh_models.suggest(shortlist, set())[0]["label"], "Claude Opus 5 (OpenRouter)")
     yield ("a suggestion is a hosted row and never gains a runner",
            refresh_models.suggest(shortlist, set())[0].get("runner"), None)
-    yield ("a suggested row renders as a line the file can take verbatim",
-           refresh_models.render_row(refresh_models.suggest(shortlist, {"x"})[0]),
-           '  - { id: "anthropic/claude-opus-5", label: "Claude Opus 5 (OpenRouter)", '
-           "brain: openrouter, efforts: [] }")
 
     with fake_body('{"data": [{"id": "b/b"}, {"id": "a/a"}]}'):
         yield ("a category comes back as a LIST, keeping OpenRouter's own ranking",
@@ -231,35 +238,7 @@ def cases():
         yield ("an unreachable category suggests nothing rather than an empty shortlist",
                refresh_models.openrouter_category("programming"), None)
 
-    # --- the shape the daemon has to read back ---------------------------------------
-    # `runner: None` is read back by YAML as the STRING "None", which `config.rs` falls
-    # to `claude` — filtering the row off the menu of any machine running Codex, for a
-    # value nobody wrote. The reason the key is omitted rather than emitted empty.
-    # The ROW, not the block: `render` returns the banner above it, and the banner's whole job is
-    # to explain what `runner` means — so searching the block for that word finds the prose.
-    row = refresh_models.render([hosted("a/b", "A (OpenRouter)")]).splitlines()[-1]
-    yield ("a hosted row is written with no runner key at all", "runner" in row, False)
-    yield ("a hosted row keeps its brain", "brain: openrouter" in row, True)
-    yield ("a cloud row still carries the runner that says which CLI spawns it",
-           "runner: codex" in refresh_models.render(
-               [{"id": "g", "label": "G", "brain": "cloud", "runner": "codex", "efforts": []}]
-           ).splitlines()[-1], True)
-
-    # --- splice: the daemon's price blocks are not ours -------------------------------
-    # `prices_as_of` / `model_prices` are written by the daemon (`core/src/price_refresh`). Splicing
-    # `assistant_choices` must carry them through byte for byte, banner comments included.
-    prices_tail = ('# Prices, written by the daemon.\nprices_as_of: "2026-01-01"\n'
-                   '# per-model rates\nmodel_prices:\n  old: { input: 1.0 }\n\nembedding_model: x\n')
-    original = ('local_assistant_model: "qwen"\n\n# banner\nassistant_choices:\n  - { id: "opus" }\n\n'
-                + prices_tail)
-    spliced = refresh_models.splice(original, refresh_models.KEY, refresh_models.render([hosted("a/b", "A")]))
-    yield ("an assistant_choices splice leaves the price blocks and their banners verbatim",
-           (prices_tail in spliced, 'id: "opus"' in spliced, 'id: "a/b"' in spliced,
-            'local_assistant_model: "qwen"' in spliced, spliced.count("assistant_choices:")),
-           (True, False, True, True, 1))
-    yield ("a second splice of the same block is a no-op",
-           refresh_models.splice(spliced, refresh_models.KEY, refresh_models.render([hosted("a/b", "A")])),
-           spliced)
+    # --- the daemon's price blocks are not ours -------------------------------
     yield ("the script owns assistant_choices alone: no price constant or helper is left",
            [name for name in ("OWNED_KEYS", "PRICING_DOC", "refresh_prices", "anthropic_prices",
                               "openrouter_prices", "render_prices") if hasattr(refresh_models, name)],
@@ -275,24 +254,28 @@ def refresh_hosted_one(model_id, name):
 
 
 class _Patch:
-    """Swap `fetch` for the duration of a block. The module's only seam to the network.
+    """Swap one module attribute, `fetch` by default, for the duration of a block.
+
+    `fetch` is the module's seam to the network and `daemon_request` its seam to the daemon. A name
+    the module does not have raises here, before anything runs, rather than being added to it.
 
     Takes stderr with it: every case in here drives a failure path deliberately, and the
     complaints those paths print are correct — but printed among the results they read as
     the test having broken. What is asserted is the return value, not the wording.
     """
 
-    def __init__(self, replacement):
+    def __init__(self, replacement, name="fetch"):
         self.replacement = replacement
+        self.name = name
 
     def __enter__(self):
-        self.original = refresh_models.fetch
-        refresh_models.fetch = self.replacement
+        self.original = getattr(refresh_models, self.name)
+        setattr(refresh_models, self.name, self.replacement)
         self.stderr = sys.stderr
         sys.stderr = open(os.devnull, "w", encoding="utf-8")
 
     def __exit__(self, *_):
-        refresh_models.fetch = self.original
+        setattr(refresh_models, self.name, self.original)
         sys.stderr.close()
         sys.stderr = self.stderr
 
@@ -310,10 +293,241 @@ def fake_body(text):
     return _Patch(lambda _url: text)
 
 
+MODELS_PATH = "/settings/machine/models"
+
+CLAUDE_ROW = {"id": "claude-opus-5", "label": "Opus 5", "brain": "cloud",
+              "efforts": ["low", "high"], "runner": "claude"}
+CODEX_ROW = {"id": "gpt-5.5", "label": "GPT-5.5", "brain": "cloud",
+             "efforts": ["low"], "runner": "codex"}
+HOSTED_ROW = hosted("a/b", "B (OpenRouter)")
+OTHER_HOSTED_ROW = hosted("c/d", "D (OpenRouter)")
+LOCAL_ROW = {"id": "llama", "label": "Llama", "brain": "local"}
+SERVED = served(entry("a/b", "A: B", reasoning=False), entry("c/d", "C: D", reasoning=False))
+
+# What this script owns, as a refresh writes it from the stored document below.
+REFRESHED = [CLAUDE_ROW, CODEX_ROW, HOSTED_ROW, LOCAL_ROW]
+
+
+def document(**others):
+    """A stored models document: rows due a refresh, and fields that belong to somebody else."""
+    return {
+        "local_assistant_model": "qwen",
+        "assistant_choices": [
+            {"id": "claude-opus-4", "label": "Opus 4", "brain": "cloud", "efforts": [],
+             "runner": "claude"},
+            {"id": "gpt-old", "label": "GPT old", "brain": "cloud", "efforts": [],
+             "runner": "codex"},
+            hosted("a/b", "whatever was typed"),
+            LOCAL_ROW,
+        ],
+        "prices_as_of": "2026-01-01",
+        "model_prices": {"old": {"input": 1.0}},
+        "embedding_model": "x",
+        **others,
+    }
+
+
+def others_of(body):
+    """Every field of a document this script does not own."""
+    return {key: value for key, value in body.items() if key != "assistant_choices"}
+
+
+def read_answer(version, body=None):
+    """`GET /settings/machine/models`, as `core/src/http/settings.rs` answers it."""
+    return (200, {"body": body if body is not None else document(), "version": version,
+                  "schema": {"type": "object"}})
+
+
+def stale_answer(current):
+    """The 409 of a `PUT` that carried an old version, as `settings.rs::stale` builds it."""
+    return (409, {"refusal": "stale", "current": current})
+
+
+class FakeDaemon:
+    """Stands in for `daemon_request`: `(status, payload)`, or `None` when nothing answers.
+
+    `None` is the contract `fetch` already has for "could not reach it". GET and PUT answer from
+    their own queues, in order, and every call is recorded. A call no case scripted gets a 500, so
+    a surplus request shows up in `calls` and in the exit status instead of ending the run.
+    """
+
+    def __init__(self, gets, puts=()):
+        self.gets = list(gets)
+        self.puts = list(puts)
+        self.calls = []
+
+    def __call__(self, method, path, body=None):
+        self.calls.append((method, path, copy.deepcopy(body)))
+        queue = self.gets if method == "GET" else self.puts
+        return copy.deepcopy(queue.pop(0)) if queue else (500, {"refusal": "internal"})
+
+    def methods(self):
+        return [method for method, _, _ in self.calls]
+
+    def sent(self):
+        return [body for method, _, body in self.calls if method == "PUT"]
+
+
+Run = collections.namedtuple("Run", "code out err")
+
+
+def drive(daemon, *argv, fetch=None):
+    """Run the script's `main` with the daemon, both CLI halves and the catalogue all faked.
+
+    The `_Patch` and `CONFIG` raises are what keep this hermetic: a script without `daemon_request`,
+    or still naming `CONFIG`, has a `main` that rewrites the real `~/.nucleos/nucleos-models.yaml`,
+    and that `main` must not run.
+    """
+    out, err = io.StringIO(), io.StringIO()
+    argv_before = sys.argv
+    with _Patch(daemon, "daemon_request"), \
+            _Patch(lambda **_: [dict(CLAUDE_ROW)], "claude_models"), \
+            _Patch(lambda: [dict(CODEX_ROW)], "codex_models"), \
+            _Patch(lambda: SERVED, "openrouter_catalogue"), \
+            _Patch(fetch or (lambda _url: None)):
+        if hasattr(refresh_models, "CONFIG"):
+            raise AssertionError("the script still names the YAML file it used to write")
+        sys.argv = ["refresh-models.py", *argv]
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = refresh_models.main()
+        except SystemExit as stop:
+            # `sys.exit("message")` is as good an exit as `return 1`.
+            code = 1 if isinstance(stop.code, str) else (stop.code or 0)
+            if isinstance(stop.code, str):
+                err.write(stop.code)
+        finally:
+            sys.argv = argv_before
+    return Run(code, out.getvalue(), err.getvalue())
+
+
+def get_then_put_keeps_every_other_field():
+    label = "get_then_put_keeps_every_other_field"
+    daemon = FakeDaemon([read_answer(7)], [(200, {"version": 8})])
+    run = drive(daemon)
+    yield (f"{label}: the refresh succeeds", run.code, 0)
+    yield (f"{label}: one read, then one write, both of the models document",
+           [(method, path) for method, path, _ in daemon.calls],
+           [("GET", MODELS_PATH), ("PUT", MODELS_PATH)])
+    sent = daemon.sent()[0]
+    yield (f"{label}: the write is `{{body, version}}` and nothing else",
+           sorted(sent), ["body", "version"])
+    yield (f"{label}: assistant_choices is the refreshed list",
+           sent["body"]["assistant_choices"], REFRESHED)
+    yield (f"{label}: every other field goes back exactly as it was read",
+           others_of(sent["body"]), others_of(document()))
+
+
+def put_carries_the_version_it_read():
+    label = "put_carries_the_version_it_read"
+    daemon = FakeDaemon([read_answer(7)], [(200, {"version": 4242})])
+    run = drive(daemon)
+    yield (f"{label}: the version of the read", daemon.sent()[0]["version"], 7)
+    yield (f"{label}: the closing message names the version the daemon saved",
+           "4242" in run.out, True)
+    yield (f"{label}: the closing message no longer talks about re-reading a file",
+           "re-reads" in run.out, False)
+
+    daemon = FakeDaemon([read_answer(0)], [(200, {"version": 1})])
+    drive(daemon)
+    yield (f"{label}: version 0 is sent as read, since it means no document yet",
+           daemon.sent()[0]["version"], 0)
+
+
+def a_409_rereads_and_retries_once():
+    label = "a_409_rereads_and_retries_once"
+    # Somebody else wrote between this script's read and its write: a new field value and a row.
+    theirs = document(embedding_model="theirs")
+    theirs["assistant_choices"].insert(3, hosted("c/d", "typed by them"))
+    daemon = FakeDaemon([read_answer(7), read_answer(9, theirs)],
+                        [stale_answer(9), (200, {"version": 10})])
+    run = drive(daemon)
+    yield (f"{label}: the retry succeeds", run.code, 0)
+    yield (f"{label}: read, stale write, read again, write again",
+           daemon.methods(), ["GET", "PUT", "GET", "PUT"])
+    first, second = (daemon.sent() + [{}, {}])[:2]
+    yield (f"{label}: the first write carried the first read's version", first.get("version"), 7)
+    yield (f"{label}: the retry carries the version of the second read", second.get("version"), 9)
+    yield (f"{label}: the retry keeps the other fields of the SECOND read",
+           others_of(second.get("body", {})), others_of(theirs))
+    yield (f"{label}: only assistant_choices is recalculated, from the rows of the second read",
+           second.get("body", {}).get("assistant_choices"),
+           [CLAUDE_ROW, CODEX_ROW, HOSTED_ROW, OTHER_HOSTED_ROW, LOCAL_ROW])
+
+    daemon = FakeDaemon([read_answer(7), read_answer(9), read_answer(11)],
+                        [stale_answer(9), stale_answer(11), (200, {"version": 12})])
+    run = drive(daemon)
+    yield (f"{label}: a second 409 is not retried", daemon.methods(), ["GET", "PUT", "GET", "PUT"])
+    yield (f"{label}: a second 409 is a failed run", run.code, 1)
+
+
+def dry_run_prints_the_rows_and_makes_no_put():
+    label = "dry_run_prints_the_rows_and_makes_no_put"
+    daemon = FakeDaemon([read_answer(7)], [(200, {"version": 8})])
+    run = drive(daemon, "--dry-run")
+    yield (f"{label}: nothing is written", daemon.methods(), ["GET"])
+    yield (f"{label}: the run succeeds", run.code, 0)
+    # `llama` is the row no half lists as it goes, so only the printed rows can name it.
+    yield (f"{label}: every row of the list is printed",
+           [row["id"] for row in REFRESHED if row["id"] not in run.out], [])
+
+
+def suggest_prints_json_rows():
+    label = "suggest_prints_json_rows"
+    shortlist = json.dumps({"data": [
+        {"id": "a/b", "name": "A: B", "supported_parameters": ["tools"]},
+        {"id": "moonshotai/kimi-k3", "name": "MoonshotAI: Kimi K3",
+         "supported_parameters": ["tools"]},
+        {"id": "x/y:free", "name": "Y (free)", "supported_parameters": ["tools"]},
+        {"id": "z/z", "name": "Z", "supported_parameters": ["tools"]},
+    ]})
+    daemon = FakeDaemon([read_answer(7)], [(200, {"version": 8})])
+    run = drive(daemon, "--suggest", fetch=lambda _url: shortlist)
+    yield (f"{label}: the run succeeds", run.code, 0)
+    yield (f"{label}: nothing is written", daemon.methods(), ["GET"])
+    yield (f"{label}: one JSON line per choice, minus what the document already has",
+           [json.loads(line) for line in run.out.splitlines() if line.lstrip().startswith("{")],
+           [hosted("moonshotai/kimi-k3", "Kimi K3 (OpenRouter)"), hosted("z/z", "Z (OpenRouter)")])
+
+    # `runner` is optional, and absent rather than null: only a row some CLI spawns has one to name.
+    yield (f"{label}: a row with a runner carries it",
+           json.loads(refresh_models.render_row(CODEX_ROW)), CODEX_ROW)
+    yield (f"{label}: a row with no runner has no runner key",
+           json.loads(refresh_models.render_row(HOSTED_ROW)), HOSTED_ROW)
+    yield (f"{label}: a row whose runner is None has no runner key either",
+           json.loads(refresh_models.render_row({**HOSTED_ROW, "runner": None})), HOSTED_ROW)
+
+
+def daemon_down_exits_with_a_clear_message():
+    label = "daemon_down_exits_with_a_clear_message"
+    daemon = FakeDaemon([None])
+    run = drive(daemon)
+    yield (f"{label}: a failed run", run.code, 1)
+    yield (f"{label}: stops at the read", daemon.methods(), ["GET"])
+    # The fake says nothing of its own, so this is what `main` tells a person.
+    yield (f"{label}: the message says it is the daemon", "daemon" in run.err.lower(), True)
+
+
+def daemon_cases():
+    """The round-trip cases, each isolated: one that raises is one failure, not the end of the run."""
+    for case in (
+        get_then_put_keeps_every_other_field,
+        put_carries_the_version_it_read,
+        a_409_rereads_and_retries_once,
+        dry_run_prints_the_rows_and_makes_no_put,
+        suggest_prints_json_rows,
+        daemon_down_exits_with_a_clear_message,
+    ):
+        try:
+            yield from case()
+        except Exception as error:
+            yield (case.__name__, f"raised {error!r}", "no exception")
+
+
 def main() -> int:
     failures = 0
     total = 0
-    for label, got, want in cases():
+    for label, got, want in itertools.chain(cases(), daemon_cases()):
         total += 1
         if got != want:
             failures += 1

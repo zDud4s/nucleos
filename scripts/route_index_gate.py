@@ -5,6 +5,7 @@ core/src/route_index/generated.rs in sync.
 Usage:
   python scripts/route_index_gate.py              check (exit 0 fresh, 1 stale)
   python scripts/route_index_gate.py --write      regenerate core/src/route_index/generated.rs
+                                                  and its parts in core/src/route_index/generated/
   python scripts/route_index_gate.py --self-test  run synthetic cases (no repo files)
 """
 import re
@@ -12,6 +13,20 @@ import sys
 from pathlib import Path
 
 GENERATED = "core/src/route_index/generated.rs"
+# The route table is split by the first letter of the path, in table order (the table is sorted
+# by path, so every part is one contiguous run and joining them keeps the order that search
+# ties rely on). (file stem, last letter the part holds); a path starting below "a" goes in the
+# first part and one above "z" in the last.
+PARTS_DIR = "core/src/route_index/generated"
+PARTS = [
+    ("a", "a"),
+    ("b_c", "c"),
+    ("d_h", "h"),
+    ("j_o", "o"),
+    ("p", "p"),
+    ("q_s", "s"),
+    ("t_z", "z"),
+]
 SRC = "core/src"
 
 # Routes that must exist but whose purpose is curated in hot.rs, not derived.
@@ -422,12 +437,19 @@ def _body_rs(body):
     return f'Body::Shapeless("{_rs(name)}")'
 
 
-def emit(entries):
-    """Render the deterministic generated.rs text (sorted by path, method)."""
-    ordered = sorted(entries, key=lambda e: (e["path"], e["method"]))
-    out = [HEADER, "\n", "use super::{Body, RouteEntry};\n", "\n"]
-    out.append("pub const ROUTES: &[RouteEntry] = &[\n")
-    for e in ordered:
+def _part_of(path):
+    """Index into PARTS of the part that holds this route path."""
+    first = path.lstrip("/")[:1]
+    for k, (_stem, last) in enumerate(PARTS):
+        if first <= last:
+            return k
+    return len(PARTS) - 1
+
+
+def _emit_part(entries):
+    out = [HEADER, "\n", "use crate::route_index::{Body, RouteEntry};\n", "\n"]
+    out.append("pub(super) const ROUTES: &[RouteEntry] = &[\n")
+    for e in entries:
         out.append("    RouteEntry {\n")
         out.append(f'        method: "{_rs(e["method"])}",\n')
         out.append(f'        path: "{_rs(e["path"])}",\n')
@@ -435,7 +457,63 @@ def emit(entries):
         out.append(f"        body: {_body_rs(e['body'])},\n")
         out.append(f'        handler: "{_rs(e["handler"])}",\n')
         out.append("    },\n")
+    out.append("];\n")
+    return "".join(out)
+
+
+_JOIN_FNS = """\
+const fn count(parts: &[&[RouteEntry]]) -> usize {
+    let mut total = 0;
+    let mut i = 0;
+    while i < parts.len() {
+        total += parts[i].len();
+        i += 1;
+    }
+    total
+}
+
+const BLANK: RouteEntry = RouteEntry {
+    method: "",
+    path: "",
+    purpose: "",
+    body: Body::None,
+    handler: "",
+};
+
+const fn join<const N: usize>(parts: &[&[RouteEntry]]) -> [RouteEntry; N] {
+    let mut out = [BLANK; N];
+    let mut at = 0;
+    let mut i = 0;
+    while i < parts.len() {
+        let mut j = 0;
+        while j < parts[i].len() {
+            out[at] = parts[i][j];
+            at += 1;
+            j += 1;
+        }
+        i += 1;
+    }
+    out
+}
+
+"""
+
+
+def _emit_index(ordered):
+    out = [HEADER, "\n", "use super::{Body, RouteEntry};\n", "\n"]
+    for stem, _last in PARTS:
+        out.append(f"mod {stem};\n")
+    out.append("\n")
+    out.append("/// Every route: the parts joined in order, so the table keeps its sort.\n")
+    out.append("pub const ROUTES: &[RouteEntry] = &JOINED;\n\n")
+    out.append(f"const PARTS: [&[RouteEntry]; {len(PARTS)}] = [\n")
+    for stem, _last in PARTS:
+        out.append(f"    {stem}::ROUTES,\n")
     out.append("];\n\n")
+    out.append("const COUNT: usize = count(&PARTS);\n")
+    out.append("// A `static`, not a `const`: a named const array this large trips `clippy::large_const_arrays`.\n")
+    out.append("static JOINED: [RouteEntry; COUNT] = join(&PARTS);\n\n")
+    out.append(_JOIN_FNS)
     out.append("fn schema<T: schemars::JsonSchema>() -> Option<serde_json::Value> {\n")
     out.append("    serde_json::to_value(schemars::schema_for!(T)).ok()\n")
     out.append("}\n\n")
@@ -460,6 +538,20 @@ def emit(entries):
     out.append("    }\n")
     out.append("}\n")
     return "".join(out)
+
+
+def emit(entries):
+    """Render the deterministic generated files as {repo-relative path: text}. The index
+    (generated.rs) holds the join and `schema_of`; each part holds a contiguous run of the
+    table sorted by (path, method)."""
+    ordered = sorted(entries, key=lambda e: (e["path"], e["method"]))
+    buckets = [[] for _ in PARTS]
+    for e in ordered:
+        buckets[_part_of(e["path"])].append(e)
+    files = {GENERATED: _emit_index(ordered)}
+    for (stem, _last), part in zip(PARTS, buckets):
+        files[f"{PARTS_DIR}/{stem}.rs"] = _emit_part(part)
+    return files
 
 
 _STR = r'"((?:[^"\\]|\\.)*)"'
@@ -495,13 +587,15 @@ def parse_generated(text):
 
 # ---- diff / commands ------------------------------------------------------
 
-def diff(scanned, committed_text, exempt=EXEMPT):
+def diff(scanned, committed, exempt=EXEMPT):
     """Return (problems, ok). problems is a list of human-readable strings:
     'route without entry: ...', 'entry without route: ...', text drift,
     and exemptions that are not real routes."""
     problems = []
     s_keys = {(e["method"], e["path"]) for e in scanned}
-    c_keys = {(e["method"], e["path"]) for e in parse_generated(committed_text)}
+    # The index holds a blank filler entry, not a route: only the parts are parsed.
+    joined = "".join(t for k, t in sorted(committed.items()) if k != GENERATED)
+    c_keys = {(e["method"], e["path"]) for e in parse_generated(joined)}
     for m, p in sorted(s_keys - c_keys, key=lambda k: (k[1], k[0])):
         problems.append(f"route without entry: {m} {p}")
     for m, p in sorted(c_keys - s_keys, key=lambda k: (k[1], k[0])):
@@ -511,25 +605,41 @@ def diff(scanned, committed_text, exempt=EXEMPT):
             problems.append(f"exemption is not a route: {m} {p}")
         elif (m, p) not in c_keys:
             problems.append(f"exempt route without entry: {m} {p}")
-    if emit(scanned) != committed_text:
+    if emit(scanned) != committed:
         problems.append(
-            "generated.rs differs from the regenerated text; "
+            "the generated route files differ from the regenerated text; "
             "run: python scripts/route_index_gate.py --write"
         )
     return (problems, not problems)
 
 
 def write(root):
-    text = emit(scan_repo(root))
-    with open(Path(root) / GENERATED, "w", encoding="utf-8", newline="\n") as f:
-        f.write(text)
+    for rel, text in emit(scan_repo(root)).items():
+        path = Path(root) / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
     return 0
+
+
+def _read_committed(root):
+    """The index and every .rs file under the parts folder (a stray one shows as drift)."""
+    names = [GENERATED]
+    folder = Path(root) / PARTS_DIR
+    if folder.is_dir():
+        names += sorted(p.relative_to(root).as_posix() for p in folder.glob("*.rs"))
+    committed = {}
+    for rel in names:
+        path = Path(root) / rel
+        if path.is_file():
+            with open(path, encoding="utf-8", newline="") as f:
+                committed[rel] = f.read()
+    return committed
 
 
 def check(root):
     scanned = scan_repo(root)
-    with open(Path(root) / GENERATED, encoding="utf-8", newline="") as f:
-        committed = f.read()
+    committed = _read_committed(root)
     problems, ok = diff(scanned, committed)
     for p in problems:
         print(p)

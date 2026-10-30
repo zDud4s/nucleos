@@ -99,19 +99,31 @@ pub fn by_id(id: &str) -> Option<&'static Manifest> {
     MANIFESTS.iter().copied().find(|m| m.id == id)
 }
 
-/// `~/.nucleos/channels/<id>.yaml`. Absent or malformed file = default, never fatal.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+/// The `channels/<id>` settings document. Absent or unreadable = default, never fatal.
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 pub struct ChannelConfig {
     // `pillars` is a private module of `config`; its glob re-export carries the `pub` fn.
-    #[serde(default, deserialize_with = "crate::config::deserialize_blank_as_none")]
+    #[serde(
+        default,
+        deserialize_with = "crate::config::deserialize_blank_as_none",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub doctrine: Option<String>,
     /// Project id to `conversation_ref` (a thread in Telegram).
     #[serde(default)]
     pub projects: BTreeMap<String, String>,
     /// Whether a running turn's ack message is edited with the live text (`channels.stream_edits`
     /// in the plan). Absent = on; it only ever applies to a channel that declares `edit`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_edits: Option<bool>,
+}
+
+/// Registry marker only: the real names are `channels/<id>`, built per manifest by `DocType::dynamic`.
+impl crate::settings::Document for ChannelConfig {
+    const NAME: &'static str = "channels";
+    const KIND: crate::settings::Kind = crate::settings::Kind::Machine;
 }
 
 impl ChannelConfig {
@@ -121,17 +133,18 @@ impl ChannelConfig {
     }
 }
 
-/// Reads one channel's `<root>/<settings_file>.yaml`. Absent, unreadable or malformed = default,
-/// never fatal: a typo must cost fidelity, not stop the daemon.
-pub fn load_config(machine_config_root: &Path, manifest: &Manifest) -> ChannelConfig {
-    let path = machine_config_root.join(format!("{}.yaml", manifest.settings_file));
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_yaml::from_str(&text).ok())
-        .unwrap_or_default()
+/// Reads one channel's `channels/<id>` document from the settings snapshot. Absent or unreadable = default,
+/// never fatal: a typo must cost fidelity, not stop the daemon. The root is kept for the callers' signature;
+/// the yaml directory is no longer consulted.
+pub fn load_config(_machine_config_root: &Path, manifest: &Manifest) -> ChannelConfig {
+    crate::settings::get_named::<ChannelConfig>(
+        &crate::settings::Scope::Machine,
+        &format!("channels/{}", manifest.id),
+    )
+    .unwrap_or_default()
 }
 
-/// Reads every channel's yaml. `None` (no machine-config root) gives the empty map, the inert hub.
+/// Reads every channel's document. `None` (no machine-config root) gives the empty map, the inert hub.
 pub fn load_configs(machine_config_root: Option<&Path>) -> HashMap<&'static str, ChannelConfig> {
     let Some(root) = machine_config_root else {
         return HashMap::new();
@@ -826,6 +839,9 @@ mod tests {
     #[test]
     fn load_config_missing_or_malformed_is_default() {
         let dir = tempfile::tempdir().unwrap();
+        // Chunk 5.1: `load_config` reads the settings snapshot, never the yaml file (only the importer does).
+        // `Home::new()` first and no `settings::testing::install`: the chunk-3 discipline for the global snapshot.
+        let _home = crate::project::rules::testing::Home::new();
         assert_eq!(load_config(dir.path(), &TELEGRAM), ChannelConfig::default());
 
         write_yaml(
@@ -835,22 +851,99 @@ mod tests {
         );
         assert_eq!(load_config(dir.path(), &TELEGRAM), ChannelConfig::default());
 
+        // A well-formed file is ignored too: the file is the importer's input, not a runtime source.
         write_yaml(
             dir.path(),
             "channels/telegram.yaml",
             "doctrine: be brief\nprojects:\n  nucleos: \"-100:5\"\n",
         );
-        let config = load_config(dir.path(), &TELEGRAM);
+        assert_eq!(load_config(dir.path(), &TELEGRAM), ChannelConfig::default());
+
+        let all = load_configs(Some(dir.path()));
+        assert_eq!(all.get("telegram"), Some(&ChannelConfig::default()));
+        assert_eq!(all.get("fake"), Some(&ChannelConfig::default()));
+        assert!(load_configs(None).is_empty());
+    }
+
+    #[test]
+    fn channel_config_round_trips_through_json() {
+        let config = ChannelConfig {
+            doctrine: Some("be brief".to_owned()),
+            projects: BTreeMap::from([("nucleos".to_owned(), "-100:5".to_owned())]),
+            stream_edits: Some(false),
+        };
+        let json = serde_json::to_value(&config).expect("a channel config serialises");
+        assert_eq!(json["doctrine"], "be brief");
+        assert_eq!(json["projects"]["nucleos"], "-100:5");
+        assert_eq!(json["stream_edits"], false);
+        let back: ChannelConfig = serde_json::from_value(json).expect("and reads back");
+        assert_eq!(back, config);
+
+        // Absent options are not written as nulls.
+        let sparse = serde_json::to_value(ChannelConfig::default()).unwrap();
+        assert!(sparse.get("doctrine").is_none() && sparse.get("stream_edits").is_none());
+
+        // A blank doctrine still reads as none.
+        let blank: ChannelConfig = serde_json::from_value(serde_json::json!({"doctrine": ""}))
+            .expect("a blank doctrine parses");
+        assert_eq!(blank.doctrine, None);
+    }
+
+    #[tokio::test]
+    async fn load_config_reads_the_snapshot() {
+        use crate::settings::{self, Scope};
+        // `Home::new()` first and no `settings::testing::install`: the chunk-3 discipline for the global snapshot.
+        let home = crate::project::rules::testing::Home::new();
+        let pool = crate::testdb::fresh_pool().await;
+
+        // No document: the default.
+        assert_eq!(
+            load_config(home.path(), &TELEGRAM),
+            ChannelConfig::default()
+        );
+
+        // A published document wins; the yaml directory is not consulted (it is empty here anyway).
+        settings::put(
+            &pool,
+            &Scope::Machine,
+            "channels/telegram",
+            &serde_json::json!({"doctrine": "be brief", "projects": {"nucleos": "-100:5"}}),
+            "test",
+            None,
+        )
+        .await
+        .expect("channels/telegram is a registered document");
+        let config = load_config(home.path(), &TELEGRAM);
         assert_eq!(config.doctrine.as_deref(), Some("be brief"));
         assert_eq!(
             config.projects.get("nucleos").map(String::as_str),
             Some("-100:5")
         );
+        assert_eq!(
+            load_configs(Some(home.path())).get("telegram"),
+            Some(&config)
+        );
 
-        let all = load_configs(Some(dir.path()));
-        assert_eq!(all.get("telegram"), Some(&config));
-        assert_eq!(all.get("fake"), Some(&ChannelConfig::default()));
-        assert!(load_configs(None).is_empty());
+        // An unreadable stored row: the reader is lenient (default), the settings health row carries the warning.
+        sqlx::query(
+            "INSERT OR REPLACE INTO settings (scope, name, body_json, version, updated_at, updated_by) \
+             VALUES ('machine', 'channels/telegram', '{\"projects\": \"not a map\"}', 9, \
+             '2026-10-11T00:00:00.000Z', 'test')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        settings::load(&pool).await.expect("load tolerates it");
+        assert!(
+            settings::global()
+                .snapshot()
+                .is_unreadable(&Scope::Machine, "channels/telegram"),
+            "the store must mark the channel document unreadable"
+        );
+        assert_eq!(
+            load_config(home.path(), &TELEGRAM),
+            ChannelConfig::default()
+        );
     }
 
     #[test]

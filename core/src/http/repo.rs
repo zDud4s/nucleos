@@ -250,8 +250,8 @@ pub(super) async fn post_project_write(
     let display = claim.display(&id);
     let home = claim_home(&state, &id, &root, claim)?;
     // A state directory is created by the first file anybody writes into it, and
-    // `safe_write_target` canonicalises its root before it will answer — the same order
-    // `post_machine_config` takes, and created only once the path is known to be a row.
+    // `safe_write_target` canonicalises its root before it will answer. Created only once the path
+    // is known to be a row.
     if matches!(claim.home, crate::ownership::Home::State) {
         std::fs::create_dir_all(&home).map_err(|error| {
             tracing::warn!(

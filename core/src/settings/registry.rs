@@ -1,5 +1,5 @@
 //! The document kinds the settings store knows: a trait that ties a Rust type to a name and a scope kind,
-//! and the table of the 13 documents.
+//! and the table of the documents: the 13 fixed ones plus one `channels/<id>` row per channel manifest.
 
 use std::sync::LazyLock;
 
@@ -9,6 +9,7 @@ use serde_json::Value;
 
 use super::decode::{self, Erased, Prepared};
 use super::scope::Kind;
+use crate::channels::registry::ChannelConfig;
 use crate::config::{
     AutopilotRules, BrowserConfig, CalendarConfig, CouncilConfig, DevtimeConfig, EmailConfig,
     GithubConfig, ModelsConfig, VerifyConfig, VoiceConfig, WebConfig, validate_devtime,
@@ -45,6 +46,43 @@ pub struct DocType {
     pub load: fn(&str) -> Result<Erased, String>,
     /// The default value as JSON, when the type has one.
     pub default_json: fn() -> Option<Value>,
+    /// The JSON Schema (draft 2020-12) of the document type.
+    schema_fn: fn() -> Value,
+}
+
+impl DocType {
+    /// The JSON Schema of this document, with the `x-widget` hints the settings page renders from.
+    pub fn schema(&self) -> Value {
+        (self.schema_fn)()
+    }
+
+    /// A document whose name is only known at startup (`channels/<id>`, one per manifest). The caller leaks
+    /// the strings once, at registry build, so the row stays `Copy` with `&'static str` fields.
+    pub fn dynamic<T: Document + Default + schemars::JsonSchema>(
+        name: &'static str,
+        kind: Kind,
+        origin_file: &'static str,
+        takes_effect: &'static str,
+    ) -> DocType {
+        DocType {
+            name,
+            kind,
+            origin_file,
+            takes_effect,
+            prepare: decode::prepare::<T>,
+            load: decode::load::<T>,
+            default_json: default_of::<T>,
+            schema_fn: schema_of::<T>,
+        }
+    }
+}
+
+fn schema_of<T: schemars::JsonSchema>() -> Value {
+    // The default settings of schemars 1.x emit draft 2020-12.
+    let root = schemars::generate::SchemaSettings::default()
+        .into_generator()
+        .into_root_schema_for::<T>();
+    serde_json::to_value(root).unwrap_or(Value::Null)
 }
 
 fn default_of<T: Document + Default>() -> Option<Value> {
@@ -55,7 +93,10 @@ fn no_default() -> Option<Value> {
     None
 }
 
-fn of<T: Document + Default>(origin_file: &'static str, takes_effect: &'static str) -> DocType {
+fn of<T: Document + Default + schemars::JsonSchema>(
+    origin_file: &'static str,
+    takes_effect: &'static str,
+) -> DocType {
     DocType {
         name: T::NAME,
         kind: T::KIND,
@@ -64,11 +105,15 @@ fn of<T: Document + Default>(origin_file: &'static str, takes_effect: &'static s
         prepare: decode::prepare::<T>,
         load: decode::load::<T>,
         default_json: default_of::<T>,
+        schema_fn: schema_of::<T>,
     }
 }
 
 /// A document with no `Default` (an empty roster is a mistake, not a configuration).
-fn of_optional<T: Document>(origin_file: &'static str, takes_effect: &'static str) -> DocType {
+fn of_optional<T: Document + schemars::JsonSchema>(
+    origin_file: &'static str,
+    takes_effect: &'static str,
+) -> DocType {
     DocType {
         name: T::NAME,
         kind: T::KIND,
@@ -77,11 +122,12 @@ fn of_optional<T: Document>(origin_file: &'static str, takes_effect: &'static st
         prepare: decode::prepare::<T>,
         load: decode::load::<T>,
         default_json: no_default,
+        schema_fn: schema_of::<T>,
     }
 }
 
 static DOCUMENTS: LazyLock<Vec<DocType>> = LazyLock::new(|| {
-    vec![
+    let mut docs = vec![
         of::<EmailConfig>(
             files::EMAIL_FILE,
             "when the daemon restarts — the mailbox is polled by a sidecar started with this file's contents",
@@ -119,7 +165,29 @@ static DOCUMENTS: LazyLock<Vec<DocType>> = LazyLock::new(|| {
             crate::project::state::PINS_FILE,
             "at the next run that resolves a workflow for that project",
         ),
-    ]
+    ];
+    // One machine document per channel manifest, listed after the fixed machine documents.
+    let machine_end = docs
+        .iter()
+        .take_while(|doc| doc.kind == Kind::Machine)
+        .count();
+    let channels: Vec<DocType> = crate::channels::registry::MANIFESTS
+        .iter()
+        .map(|manifest| {
+            let name: &'static str =
+                Box::leak(format!("channels/{}", manifest.id).into_boxed_str());
+            let origin: &'static str =
+                Box::leak(format!("{}.yaml", manifest.settings_file).into_boxed_str());
+            DocType::dynamic::<ChannelConfig>(
+                name,
+                Kind::Machine,
+                origin,
+                "at once — the channel hub re-reads its configuration when a document is published",
+            )
+        })
+        .collect();
+    docs.splice(machine_end..machine_end, channels);
+    docs
 });
 
 /// Every document kind, machine documents first, in the order the settings page lists them.
@@ -252,13 +320,15 @@ mod tests {
 
     #[test]
     fn there_are_thirteen_documents_with_unique_names() {
+        // 13 fixed documents plus one `channels/<id>` per manifest.
+        let channels = crate::channels::registry::MANIFESTS.len();
         let docs = documents();
-        assert_eq!(docs.len(), 13);
+        assert_eq!(docs.len(), 13 + channels);
         let names: BTreeSet<_> = docs.iter().map(|doc| doc.name).collect();
-        assert_eq!(names.len(), 13);
+        assert_eq!(names.len(), 13 + channels);
         assert_eq!(
             docs.iter().filter(|doc| doc.kind == Kind::Machine).count(),
-            11
+            11 + channels
         );
         let project: Vec<_> = docs
             .iter()
@@ -388,5 +458,59 @@ mod tests {
             Some(Kind::Project)
         );
         assert!(doc_type("nope").is_none());
+    }
+
+    #[test]
+    fn every_manifest_has_a_channels_document() {
+        for manifest in crate::channels::registry::MANIFESTS {
+            let name = format!("channels/{}", manifest.id);
+            let doc = doc_type(&name).unwrap_or_else(|| panic!("{name} is registered"));
+            assert_eq!(doc.name, name);
+            assert_eq!(doc.kind, Kind::Machine);
+            assert!(documents().iter().any(|doc| doc.name == name));
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_entry_downcasts_a_dynamic_document() {
+        use crate::channels::registry::ChannelConfig;
+        use crate::settings::Scope;
+        // `Home::new()` first and no `settings::testing::install`: the chunk-3 discipline for the global snapshot.
+        let _home = crate::project::rules::testing::Home::new();
+        let pool = crate::testdb::fresh_pool().await;
+        crate::settings::put(
+            &pool,
+            &Scope::Machine,
+            "channels/telegram",
+            &json!({"doctrine": "be brief", "stream_edits": false}),
+            "test",
+            None,
+        )
+        .await
+        .expect("channels/telegram is a registered document");
+
+        let snapshot = crate::settings::global().snapshot();
+        // Contract request: the plan types `entry` as returning `&dyn Any`, but `Snapshot::entry` already
+        // returns `&Entry`. These tests use the new `entry_as::<T>` and `get_named::<T>` only.
+        let config = snapshot
+            .entry_as::<ChannelConfig>(&Scope::Machine, "channels/telegram")
+            .expect("the published document is in the snapshot");
+        assert_eq!(config.doctrine.as_deref(), Some("be brief"));
+        assert_eq!(config.stream_edits, Some(false));
+        let named: Option<ChannelConfig> =
+            crate::settings::get_named(&Scope::Machine, "channels/telegram");
+        assert_eq!(named.as_ref(), Some(config));
+
+        assert!(
+            snapshot
+                .entry_as::<ChannelConfig>(&Scope::Machine, "channels/nope")
+                .is_none()
+        );
+        assert!(
+            snapshot
+                .entry_as::<VerifyConfig>(&Scope::Machine, "channels/telegram")
+                .is_none(),
+            "a downcast to the wrong type finds nothing"
+        );
     }
 }

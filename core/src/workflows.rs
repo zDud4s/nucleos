@@ -408,20 +408,22 @@ pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
 /// That is the canvas's question and it is the right place for it: an overlay row for a node a
 /// newer bundle removed is information — it is how somebody learns their override stopped applying
 /// — and refusing to load the pin over it would take the whole workflow away instead.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct NodeOverlay {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-widget" = "model-picker"))]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-widget" = "command"))]
     pub command: Option<String>,
 }
 
 /// One workflow this project uses, as its `workflows.yaml` records it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Pin {
     pub name: String,
     pub version: String,
@@ -447,7 +449,7 @@ pub struct Pin {
     pub nodes: BTreeMap<String, NodeOverlay>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Pins {
     #[serde(default)]
     pub workflows: Vec<Pin>,
@@ -455,6 +457,8 @@ pub struct Pins {
 
 /// A blank file, a file of nothing but comments, and a file that says `workflows: []` are one fact:
 /// this project pins nothing. A parse error is a different fact and stays one.
+///
+/// Importer only (`settings/import.rs`, and the fixtures of tests): removed with chunk 6's last task.
 pub fn parse_pins(contents: &str) -> Result<Pins, String> {
     let pins: Pins = match serde_yaml::from_str::<Option<Pins>>(contents) {
         Ok(Some(pins)) => pins,
@@ -480,21 +484,6 @@ pub fn render_pins(pins: &Pins) -> String {
          # this project overrides on their nodes. Values survive; comments do not — the app\n\
          # rewrites this file whole on every install, eject and update.\n{body}"
     )
-}
-
-/// The validator [`crate::ownership`] needs to let this file be written through the app.
-pub fn validate_pins(contents: &str) -> Result<(), String> {
-    parse_pins(contents).map(|_| ())
-}
-
-/// Read a project's pins from `pins`, the file — `~/.nucleos/projects/<id>/workflows.yaml` in
-/// production. A project with no file pins nothing.
-pub fn read_pins(pins: &Path) -> Result<Pins, String> {
-    match std::fs::read_to_string(pins) {
-        Ok(text) => parse_pins(&text),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Pins::default()),
-        Err(error) => Err(error.to_string()),
-    }
 }
 
 /* -------------------------------------------------------------- standings -- */
@@ -572,14 +561,14 @@ pub fn copy_path(project_root: &Path, pin: &Pin) -> Option<PathBuf> {
 
 /// Every workflow this project pins, measured against the library as it is right now.
 ///
-/// `pins_file` says what the project uses; `project_root` is where an ejected or adopted copy is
-/// looked for.
+/// The project's stored `workflow_pins` document says what it uses; `project_root` is where an ejected
+/// or adopted copy is looked for.
 pub fn installed(
     project_root: &Path,
-    pins_file: &Path,
+    project_id: &str,
     library_root: &Path,
 ) -> Result<Vec<Installed>, String> {
-    let pins = read_pins(pins_file)?;
+    let pins = crate::project::rules::pins(project_id).map_err(|error| error.to_string())?;
     let shelf = library(library_root).map_err(|error| error.to_string())?;
 
     let mut out = Vec::new();
@@ -753,16 +742,8 @@ impl std::fmt::Display for Refused {
     }
 }
 
-fn save_pins(path: &Path, pins: &Pins) -> Result<(), Refused> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| Refused::Io(error.to_string()))?;
-    }
-    // The same temp-then-rename `project_state::write_atomically` uses, for the same reason: a half-written
-    // pins file is not a smaller one, it is a project whose workflows all became `missing`.
-    let temp = path.with_extension("nucleos-tmp");
-    std::fs::write(&temp, render_pins(pins)).map_err(|error| Refused::Io(error.to_string()))?;
-    std::fs::rename(&temp, path).map_err(|error| Refused::Io(error.to_string()))
-}
+/// Who the settings history names as the author of a pin written by this module.
+const PINS_WRITER: &str = "daemon:workflows";
 
 /// Pin a bundle, replacing any pin of the same name.
 ///
@@ -770,11 +751,28 @@ fn save_pins(path: &Path, pins: &Pins) -> Result<(), Refused> {
 /// already configured is the ordinary upgrade, and dropping their node overrides on the floor for
 /// it would be a silent loss with nowhere to look it up. A node the new version does not have keeps
 /// its row and stops applying, which the canvas can say out loud.
-pub fn install(pins_file: &Path, bundle: &Bundle) -> Result<(), Refused> {
+pub async fn install(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+    bundle: &Bundle,
+) -> Result<(), Refused> {
     if !valid_name(&bundle.name) || !valid_name(&bundle.version) {
         return Err(Refused::BadName);
     }
-    let mut pins = read_pins(pins_file).map_err(Refused::Io)?;
+    mutate_pins(pool, project_id, PINS_WRITER, |pins| {
+        apply_install(pins, bundle)
+    })
+    .await
+}
+
+/// [`install`] on an in-memory [`Pins`]; the overlay of an existing pin survives (see there).
+///
+/// `pub`, not `pub(crate)`: `http.rs` is also compiled inside the daemon crate, where `crate::workflows`
+/// is another crate and its test fixtures call this.
+pub fn apply_install(pins: &mut Pins, bundle: &Bundle) -> Result<(), Refused> {
+    if !valid_name(&bundle.name) || !valid_name(&bundle.version) {
+        return Err(Refused::BadName);
+    }
     let existing = pins
         .workflows
         .iter()
@@ -803,7 +801,7 @@ pub fn install(pins_file: &Path, bundle: &Bundle) -> Result<(), Refused> {
         None => pins.workflows.push(pin),
     }
     pins.workflows.sort_by(|a, b| a.name.cmp(&b.name));
-    save_pins(pins_file, &pins)
+    Ok(())
 }
 
 /// Stop using a workflow. Removes the pin; never removes an ejected copy.
@@ -811,14 +809,25 @@ pub fn install(pins_file: &Path, bundle: &Bundle) -> Result<(), Refused> {
 /// Deleting `.nucleos/workflows/<name>/` here would be this app deleting somebody's files as a side
 /// effect of a list operation. The copy is theirs — that is what ejecting means — and it is under
 /// version control where they put it.
-pub fn uninstall(pins_file: &Path, name: &str) -> Result<(), Refused> {
-    let mut pins = read_pins(pins_file).map_err(Refused::Io)?;
+pub async fn uninstall(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+    name: &str,
+) -> Result<(), Refused> {
+    mutate_pins(pool, project_id, PINS_WRITER, |pins| {
+        apply_uninstall(pins, name)
+    })
+    .await
+}
+
+/// [`uninstall`] on an in-memory [`Pins`].
+pub(crate) fn apply_uninstall(pins: &mut Pins, name: &str) -> Result<(), Refused> {
     let before = pins.workflows.len();
     pins.workflows.retain(|pin| pin.name != name);
     if pins.workflows.len() == before {
         return Err(Refused::NotInstalled);
     }
-    save_pins(pins_file, &pins)
+    Ok(())
 }
 
 /// Copy the library's bundle into the project and record when it stopped receiving updates.
@@ -826,9 +835,10 @@ pub fn uninstall(pins_file: &Path, name: &str) -> Result<(), Refused> {
 /// Refuses when a copy is already there. Overwriting would throw away the edits that are the entire
 /// reason somebody ejected — and §6.3 makes eject a deliberate choice precisely so that it is never
 /// the thing that happens by accident.
-pub fn eject(
+pub async fn eject(
+    pool: &sqlx::SqlitePool,
     project_root: &Path,
-    pins_file: &Path,
+    project_id: &str,
     bundle: &Bundle,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), Refused> {
@@ -839,28 +849,47 @@ pub fn eject(
     // The pin is looked up before anything is copied. A project that does not use this workflow
     // must not end up with its files in `.nucleos/workflows/` and nothing recording why they are
     // there.
-    let mut pins = read_pins(pins_file).map_err(Refused::Io)?;
-    let Some(index) = pins
+    let (mut checked, _) = crate::project::rules::pins_versioned(project_id)
+        .map_err(|error| Refused::Io(error.to_string()))?;
+    // The pure step runs on a scratch copy first, so the refusals still come before any file is copied.
+    apply_eject(&mut checked, bundle, now)?;
+
+    let from = PathBuf::from(&bundle.path);
+    tokio::task::spawn_blocking(move || copy_tree(&from, &target))
+        .await
+        .map_err(|error| Refused::Io(error.to_string()))?
+        .map_err(|error| Refused::Io(error.to_string()))?;
+
+    mutate_pins(pool, project_id, PINS_WRITER, |pins| {
+        apply_eject(pins, bundle, now)
+    })
+    .await
+}
+
+/// [`eject`] on an in-memory [`Pins`]: records the ejection. The copy of the files stays with the caller.
+pub(crate) fn apply_eject(
+    pins: &mut Pins,
+    bundle: &Bundle,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), Refused> {
+    let Some(pin) = pins
         .workflows
-        .iter()
-        .position(|pin| pin.name == bundle.name)
+        .iter_mut()
+        .find(|pin| pin.name == bundle.name)
     else {
         return Err(Refused::NotInstalled);
     };
     // An adopted workflow is already the project's own folder. Ejecting on top of it would copy a
     // library bundle into `.nucleos/workflows/` while the pin went on naming somewhere else — two
     // copies, one of them unreferenced, and a page that could not say which was running.
-    if pins.workflows[index].path.is_some() {
+    if pin.path.is_some() {
         return Err(Refused::Adopted);
     }
-
-    copy_tree(Path::new(&bundle.path), &target).map_err(|error| Refused::Io(error.to_string()))?;
-
-    pins.workflows[index].ejected_at = Some(now.to_rfc3339());
-    pins.workflows[index].version = bundle.version.clone();
-    pins.workflows[index].origin = bundle.origin.clone();
-    pins.workflows[index].hash = bundle.hash.clone();
-    save_pins(pins_file, &pins)
+    pin.ejected_at = Some(now.to_rfc3339());
+    pin.version = bundle.version.clone();
+    pin.origin = bundle.origin.clone();
+    pin.hash = bundle.hash.clone();
+    Ok(())
 }
 
 /// Record a folder this project already has as its workflow, copying nothing.
@@ -876,9 +905,10 @@ pub fn eject(
 /// records where it was adopted from rather than a coordinate, because there is no coordinate — and
 /// a field left blank would have been the `.githooks` mistake again, a pin that cannot say what it
 /// is a pin to.
-pub fn adopt(
+pub async fn adopt(
+    pool: &sqlx::SqlitePool,
     project_root: &Path,
-    pins_file: &Path,
+    project_id: &str,
     name: &str,
     rel: &str,
     now: chrono::DateTime<chrono::Utc>,
@@ -890,9 +920,29 @@ pub fn adopt(
     if !folder.is_dir() {
         return Err(Refused::NoSuchBundle);
     }
-    let hash = digest_of(&file_hashes(&folder).map_err(|error| Refused::Io(error.to_string()))?);
+    let hash =
+        tokio::task::spawn_blocking(move || file_hashes(&folder).map(|files| digest_of(&files)))
+            .await
+            .map_err(|error| Refused::Io(error.to_string()))?
+            .map_err(|error| Refused::Io(error.to_string()))?;
 
-    let mut pins = read_pins(pins_file).map_err(Refused::Io)?;
+    mutate_pins(pool, project_id, PINS_WRITER, |pins| {
+        apply_adopt(pins, name, rel, hash.clone(), now)
+    })
+    .await
+}
+
+/// [`adopt`] on an in-memory [`Pins`]; `hash` is the digest of the folder, computed by the caller.
+pub(crate) fn apply_adopt(
+    pins: &mut Pins,
+    name: &str,
+    rel: &str,
+    hash: String,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), Refused> {
+    if !valid_name(name) {
+        return Err(Refused::BadName);
+    }
     let pin = Pin {
         name: name.to_string(),
         // Versionless is not a version this app invents. `0` says plainly that nothing has ever
@@ -909,7 +959,7 @@ pub fn adopt(
         None => pins.workflows.push(pin),
     }
     pins.workflows.sort_by(|a, b| a.name.cmp(&b.name));
-    save_pins(pins_file, &pins)
+    Ok(())
 }
 
 /// Take the origin's current bytes: re-stamp the pin, and for an ejected workflow, re-copy.
@@ -918,43 +968,69 @@ pub fn adopt(
 /// the page puts the diff in front of the button. `ejected_at` restarts, because the bundle has
 /// just received an update and the field's whole job is to say how long it has been since the last
 /// one.
-pub fn update(
+pub async fn update(
+    pool: &sqlx::SqlitePool,
     project_root: &Path,
-    pins_file: &Path,
+    project_id: &str,
     bundle: &Bundle,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), Refused> {
-    let mut pins = read_pins(pins_file).map_err(Refused::Io)?;
-    let Some(index) = pins
+    let (pins, _) = crate::project::rules::pins_versioned(project_id)
+        .map_err(|error| Refused::Io(error.to_string()))?;
+    // Validated on a scratch copy BEFORE anything is deleted: the pure step refuses `NotInstalled`
+    // and `Adopted`, and the branch below removes the project's copy before replacing it.
+    let mut checked = pins.clone();
+    apply_update(&mut checked, bundle, now)?;
+
+    let ejected = pins
         .workflows
         .iter()
-        .position(|pin| pin.name == bundle.name)
+        .any(|pin| pin.name == bundle.name && pin.ejected_at.is_some());
+    if ejected {
+        let target = ejected_path(project_root, &bundle.name).ok_or(Refused::BadName)?;
+        let from = PathBuf::from(&bundle.path);
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            if target.exists() {
+                std::fs::remove_dir_all(&target)?;
+            }
+            copy_tree(&from, &target)
+        })
+        .await
+        .map_err(|error| Refused::Io(error.to_string()))?
+        .map_err(|error| Refused::Io(error.to_string()))?;
+    }
+
+    mutate_pins(pool, project_id, PINS_WRITER, |pins| {
+        apply_update(pins, bundle, now)
+    })
+    .await
+}
+
+/// [`update`] on an in-memory [`Pins`]: re-stamps the pin, and restarts the ejection clock of an
+/// ejected one. The re-copy of the files stays with the caller.
+pub(crate) fn apply_update(
+    pins: &mut Pins,
+    bundle: &Bundle,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), Refused> {
+    let Some(pin) = pins
+        .workflows
+        .iter_mut()
+        .find(|pin| pin.name == bundle.name)
     else {
         return Err(Refused::NotInstalled);
     };
-
-    // **Before anything is deleted.** An adopted pin names a folder the project already had — in
-    // this repository, `.ai/` itself — and the branch below removes the copy before replacing it.
-    // There is no bundle to replace it WITH, so the route refuses first anyway; this is the guard
-    // that does not depend on that staying true.
-    if pins.workflows[index].path.is_some() {
+    // An adopted pin names a folder the project already had; nothing here replaces it.
+    if pin.path.is_some() {
         return Err(Refused::Adopted);
     }
-
-    if pins.workflows[index].ejected_at.is_some() {
-        let target = ejected_path(project_root, &bundle.name).ok_or(Refused::BadName)?;
-        if target.exists() {
-            std::fs::remove_dir_all(&target).map_err(|error| Refused::Io(error.to_string()))?;
-        }
-        copy_tree(Path::new(&bundle.path), &target)
-            .map_err(|error| Refused::Io(error.to_string()))?;
-        pins.workflows[index].ejected_at = Some(now.to_rfc3339());
+    if pin.ejected_at.is_some() {
+        pin.ejected_at = Some(now.to_rfc3339());
     }
-
-    pins.workflows[index].version = bundle.version.clone();
-    pins.workflows[index].origin = bundle.origin.clone();
-    pins.workflows[index].hash = bundle.hash.clone();
-    save_pins(pins_file, &pins)
+    pin.version = bundle.version.clone();
+    pin.origin = bundle.origin.clone();
+    pin.hash = bundle.hash.clone();
+    Ok(())
 }
 
 /// Add `source` to the library as `<name>/<version>`, which from then on never changes.
@@ -1033,12 +1109,13 @@ pub fn publish(
 /// the library again is a separate, deliberate `install`.
 pub fn publish_from_project(
     project_root: &Path,
-    pins_file: &Path,
+    project_id: &str,
     library_root: &Path,
     name: &str,
     version: &str,
 ) -> Result<Bundle, Refused> {
-    let pins = read_pins(pins_file).map_err(Refused::Io)?;
+    let pins =
+        crate::project::rules::pins(project_id).map_err(|error| Refused::Io(error.to_string()))?;
     let pin = pins
         .workflows
         .iter()
@@ -1068,8 +1145,23 @@ pub const MAX_NODE_ID: usize = 120;
 /// `None` removes the row, which is how a node goes back to inheriting. A row of all-absent fields
 /// would be a third state meaning the same thing, so it is normalised away: an override that
 /// overrides nothing is not an override.
-pub fn set_overlay(
-    pins_file: &Path,
+pub async fn set_overlay(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+    name: &str,
+    node: &str,
+    overlay: Option<NodeOverlay>,
+) -> Result<(), Refused> {
+    mutate_pins(pool, project_id, PINS_WRITER, |pins| {
+        apply_set_overlay(pins, name, node, overlay.clone())
+    })
+    .await
+}
+
+/// [`set_overlay`] on an in-memory [`Pins`]: the node-id bound, the `NotInstalled` refusal and the
+/// normalisation of an all-absent row live here, with no file involved.
+pub(crate) fn apply_set_overlay(
+    pins: &mut Pins,
     name: &str,
     node: &str,
     overlay: Option<NodeOverlay>,
@@ -1078,7 +1170,6 @@ pub fn set_overlay(
     if node.is_empty() || node.len() > MAX_NODE_ID {
         return Err(Refused::BadName);
     }
-    let mut pins = read_pins(pins_file).map_err(Refused::Io)?;
     let Some(pin) = pins.workflows.iter_mut().find(|pin| pin.name == name) else {
         return Err(Refused::NotInstalled);
     };
@@ -1091,7 +1182,38 @@ pub fn set_overlay(
             pin.nodes.remove(node);
         }
     }
-    save_pins(pins_file, &pins)
+    Ok(())
+}
+
+/// Longest a store write is retried when another writer keeps landing first.
+const MAX_PIN_ROUNDS: usize = 3;
+
+/// Apply `f` to the project's pins in the settings store, without losing a concurrent write.
+///
+/// Reads `(pins, version)` from the snapshot, runs `f` on a copy (a refusal returns without touching
+/// the store, so it neither bumps the version nor leaves a history row), then `put`s with the version
+/// read as `expected`. A `Stale` answer means somebody else wrote in between: read again and re-apply,
+/// up to [`MAX_PIN_ROUNDS`] times.
+pub async fn mutate_pins(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+    by: &str,
+    mut f: impl FnMut(&mut Pins) -> Result<(), Refused>,
+) -> Result<(), Refused> {
+    let scope = crate::settings::Scope::project(project_id);
+    for _ in 0..MAX_PIN_ROUNDS {
+        let (current, version) = crate::project::rules::pins_versioned(project_id)
+            .map_err(|error| Refused::Io(error.to_string()))?;
+        let mut next = current;
+        f(&mut next)?;
+        let body = serde_json::to_value(&next).map_err(|error| Refused::Io(error.to_string()))?;
+        match crate::settings::put(pool, &scope, "workflow_pins", &body, by, Some(version)).await {
+            Ok(_) => return Ok(()),
+            Err(crate::settings::SettingsError::Stale { .. }) => continue,
+            Err(error) => return Err(Refused::Io(error.to_string())),
+        }
+    }
+    Err(Refused::Io("pins changed under us".to_string()))
 }
 
 /// Copy a directory tree, files and directories only.
@@ -1127,20 +1249,21 @@ mod tests {
             .with_timezone(&chrono::Utc)
     }
 
-    /// Where a test project's pins live: a sibling of the project, standing in for
-    /// `~/.nucleos/projects/<id>/`, and deliberately OUTSIDE the project folder.
-    fn pins_of(project: &Path) -> PathBuf {
-        project
-            .parent()
-            .expect("a test project sits in a temporary directory")
-            .join("state")
-            .join(crate::project::state::PINS_FILE)
+    /// The id the fixtures below pin under; the pins live in the settings store, not in a file.
+    const PID: &str = "wf-test-project";
+
+    /// The exclusive settings hold FIRST (`Home::new()`), then a fresh database to write through.
+    async fn store() -> (crate::project::rules::testing::Home, sqlx::SqlitePool) {
+        let home = crate::project::rules::testing::Home::new();
+        let pool = crate::testdb::fresh_pool().await;
+        (home, pool)
     }
 
     /// A pin is this app's record, not the project's file: installing writes nothing into the
     /// project, and the old `.ai/workflows.yaml` is never created there again.
-    #[test]
-    fn installing_writes_the_pin_outside_the_project() {
+    #[tokio::test]
+    async fn installing_writes_the_pin_outside_the_project() {
+        let (_home, pool) = store().await;
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
@@ -1151,9 +1274,11 @@ mod tests {
             &[("g.yaml", "a")],
         );
 
-        install(&pins_of(&project), &bundle_at(&root, "harness", "1.0")).unwrap();
+        install(&pool, PID, &bundle_at(&root, "harness", "1.0"))
+            .await
+            .unwrap();
 
-        assert!(pins_of(&project).is_file());
+        assert!(crate::project::rules::is_stored(PID, "workflow_pins"));
         assert!(
             std::fs::read_dir(&project).unwrap().next().is_none(),
             "installing must leave the project folder untouched"
@@ -1177,6 +1302,450 @@ mod tests {
         read_bundle(&root.join(name).join(version), name, version)
             .unwrap()
             .unwrap()
+    }
+
+    /* ------------------------------------------- pure pin mutators (chunk 4) -- */
+
+    fn mem_pin(name: &str, version: &str) -> Pin {
+        Pin {
+            name: name.to_string(),
+            version: version.to_string(),
+            origin: format!("library:{name}"),
+            hash: format!("hash-{version}"),
+            ejected_at: None,
+            path: None,
+            nodes: BTreeMap::new(),
+        }
+    }
+
+    /// A bundle that exists only in memory: the pure mutators never open its `path`.
+    fn mem_bundle(name: &str, version: &str) -> Bundle {
+        Bundle {
+            name: name.to_string(),
+            version: version.to_string(),
+            description: None,
+            origin: format!("library:{name}"),
+            owns: Vec::new(),
+            agents_block: None,
+            hash: format!("hash-{version}"),
+            path: "unused".to_string(),
+        }
+    }
+
+    fn overlay_model(model: &str) -> NodeOverlay {
+        NodeOverlay {
+            model: Some(model.to_string()),
+            ..NodeOverlay::default()
+        }
+    }
+
+    #[test]
+    fn apply_install_replaces_the_pin_and_keeps_the_overlay() {
+        let mut old = mem_pin("harness", "1.0");
+        old.ejected_at = Some("2026-08-01T00:00:00+00:00".to_string());
+        old.path = Some(".ai".to_string());
+        old.nodes.insert("plan".to_string(), overlay_model("fast"));
+        let mut pins = Pins {
+            workflows: vec![mem_pin("zeta", "1"), old],
+        };
+
+        apply_install(&mut pins, &mem_bundle("harness", "2.0")).unwrap();
+
+        let names: Vec<&str> = pins.workflows.iter().map(|pin| pin.name.as_str()).collect();
+        assert_eq!(names, ["harness", "zeta"], "sorted by name, no duplicate");
+        let pin = &pins.workflows[0];
+        assert_eq!(pin.version, "2.0");
+        assert_eq!(pin.hash, "hash-2.0");
+        assert_eq!(pin.ejected_at, None, "installing clears the ejection");
+        assert_eq!(pin.path, None, "installing clears an adoption");
+        assert_eq!(pin.nodes.get("plan"), Some(&overlay_model("fast")));
+    }
+
+    #[test]
+    fn apply_install_rejects_a_bad_name() {
+        let mut pins = Pins {
+            workflows: vec![mem_pin("harness", "1.0")],
+        };
+        let before = pins.clone();
+
+        assert_eq!(
+            apply_install(&mut pins, &mem_bundle("../escape", "1.0")),
+            Err(Refused::BadName)
+        );
+        assert_eq!(
+            apply_install(&mut pins, &mem_bundle("harness", "a/b")),
+            Err(Refused::BadName)
+        );
+        assert_eq!(pins, before, "a refusal leaves the pins as they were");
+    }
+
+    #[test]
+    fn apply_uninstall_of_an_unknown_name_is_not_installed() {
+        let mut pins = Pins {
+            workflows: vec![mem_pin("harness", "1.0")],
+        };
+
+        assert_eq!(
+            apply_uninstall(&mut pins, "ghost"),
+            Err(Refused::NotInstalled)
+        );
+        assert_eq!(pins.workflows.len(), 1);
+
+        apply_uninstall(&mut pins, "harness").unwrap();
+        assert!(pins.workflows.is_empty());
+    }
+
+    #[test]
+    fn apply_adopt_records_an_ejected_from_birth_pin() {
+        let mut pins = Pins::default();
+
+        apply_adopt(&mut pins, "legacy", ".ai", "abc123".to_string(), now()).unwrap();
+
+        let pin = &pins.workflows[0];
+        assert_eq!(pin.name, "legacy");
+        assert_eq!(pin.version, "0");
+        assert_eq!(pin.origin, "adopted:.ai");
+        assert_eq!(pin.hash, "abc123");
+        assert_eq!(pin.path.as_deref(), Some(".ai"));
+        assert_eq!(pin.ejected_at, Some(now().to_rfc3339()));
+        assert!(pin.nodes.is_empty());
+
+        assert_eq!(
+            apply_adopt(&mut pins, "bad/name", ".ai", "x".to_string(), now()),
+            Err(Refused::BadName)
+        );
+        assert_eq!(pins.workflows.len(), 1);
+    }
+
+    #[test]
+    fn apply_eject_refuses_an_adopted_pin() {
+        let mut adopted = mem_pin("legacy", "0");
+        adopted.path = Some(".ai".to_string());
+        let mut pins = Pins {
+            workflows: vec![adopted, mem_pin("harness", "1.0")],
+        };
+        let before = pins.clone();
+
+        assert_eq!(
+            apply_eject(&mut pins, &mem_bundle("legacy", "1.0"), now()),
+            Err(Refused::Adopted)
+        );
+        assert_eq!(
+            apply_eject(&mut pins, &mem_bundle("ghost", "1.0"), now()),
+            Err(Refused::NotInstalled)
+        );
+        assert_eq!(pins, before);
+
+        apply_eject(&mut pins, &mem_bundle("harness", "1.1"), now()).unwrap();
+        let ejected = pins.workflows.iter().find(|p| p.name == "harness").unwrap();
+        assert_eq!(ejected.ejected_at, Some(now().to_rfc3339()));
+        assert_eq!(ejected.version, "1.1");
+        assert_eq!(ejected.hash, "hash-1.1");
+    }
+
+    #[test]
+    fn apply_update_restamps_an_ejected_pin() {
+        let mut ejected = mem_pin("harness", "1.0");
+        ejected.ejected_at = Some("2026-01-01T00:00:00+00:00".to_string());
+        let mut adopted = mem_pin("legacy", "0");
+        adopted.path = Some(".ai".to_string());
+        let mut pins = Pins {
+            workflows: vec![ejected, adopted, mem_pin("plain", "1")],
+        };
+
+        apply_update(&mut pins, &mem_bundle("harness", "2.0"), now()).unwrap();
+        let pin = pins.workflows.iter().find(|p| p.name == "harness").unwrap();
+        assert_eq!(pin.version, "2.0");
+        assert_eq!(pin.hash, "hash-2.0");
+        assert_eq!(
+            pin.ejected_at,
+            Some(now().to_rfc3339()),
+            "an update restarts the ejection clock"
+        );
+
+        // A pin that follows the library is re-stamped but never becomes ejected.
+        apply_update(&mut pins, &mem_bundle("plain", "2"), now()).unwrap();
+        let plain = pins.workflows.iter().find(|p| p.name == "plain").unwrap();
+        assert_eq!(plain.version, "2");
+        assert_eq!(plain.ejected_at, None);
+
+        assert_eq!(
+            apply_update(&mut pins, &mem_bundle("legacy", "1"), now()),
+            Err(Refused::Adopted)
+        );
+        assert_eq!(
+            apply_update(&mut pins, &mem_bundle("ghost", "1"), now()),
+            Err(Refused::NotInstalled)
+        );
+    }
+
+    #[test]
+    fn apply_set_overlay_round_trips() {
+        let mut pins = Pins {
+            workflows: vec![mem_pin("harness", "1.0")],
+        };
+
+        apply_set_overlay(&mut pins, "harness", " plan ", Some(overlay_model("fast"))).unwrap();
+        assert_eq!(
+            pins.workflows[0].nodes.get("plan"),
+            Some(&overlay_model("fast")),
+            "the node id is trimmed"
+        );
+
+        // An all-absent row overrides nothing, so it is the same as clearing.
+        apply_set_overlay(&mut pins, "harness", "plan", Some(NodeOverlay::default())).unwrap();
+        assert!(pins.workflows[0].nodes.is_empty());
+
+        apply_set_overlay(&mut pins, "harness", "plan", Some(overlay_model("slow"))).unwrap();
+        apply_set_overlay(&mut pins, "harness", "plan", None).unwrap();
+        assert!(pins.workflows[0].nodes.is_empty());
+
+        assert_eq!(
+            apply_set_overlay(&mut pins, "harness", "  ", None),
+            Err(Refused::BadName)
+        );
+        assert_eq!(
+            apply_set_overlay(&mut pins, "ghost", "plan", None),
+            Err(Refused::NotInstalled)
+        );
+    }
+
+    /* ----------------------------------------- mutate_pins store bridge (4.1) -- */
+
+    /// Both tests below write the process snapshot, so they take the exclusive hold FIRST
+    /// (`Home::new()`) and only then open the test database.
+    async fn store_pins(
+        pool: &sqlx::SqlitePool,
+        project_id: &str,
+        pins: &Pins,
+        expected: i64,
+    ) -> i64 {
+        crate::settings::put(
+            pool,
+            &crate::settings::Scope::project(project_id),
+            "workflow_pins",
+            &serde_json::to_value(pins).unwrap(),
+            "test",
+            Some(expected),
+        )
+        .await
+        .expect("seed the pins document")
+    }
+
+    // Multi-thread: the closure blocks this thread while the racing write runs on its own runtime, and the
+    // pool's background work must keep running on the test runtime's other workers meanwhile.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mutate_pins_retries_on_a_stale_version() {
+        let _home = crate::project::rules::testing::Home::new();
+        // A shared (file-backed) database: the racing write opens its own connection, and a `fresh_pool`
+        // database is private to the one connection that received the schema.
+        let pool = crate::testdb::fresh_shared_pool().await;
+        let project_id = "mutate-retry-project";
+        let scope = crate::settings::Scope::project(project_id);
+        let v1 = store_pins(
+            &pool,
+            project_id,
+            &Pins {
+                workflows: vec![mem_pin("alpha-flow", "1")],
+            },
+            0,
+        )
+        .await;
+        assert_eq!(v1, 1);
+
+        let mut rounds = 0;
+        let result = mutate_pins(&pool, project_id, "daemon:workflows", |pins| {
+            rounds += 1;
+            if rounds == 1 {
+                // A concurrent writer lands between our read (version 1) and our put. The closure is sync, so
+                // the competing write runs on its own thread and runtime; the pool is shared.
+                let competing = Pins {
+                    workflows: vec![mem_pin("alpha-flow", "1"), mem_pin("racer", "1")],
+                };
+                let pool = pool.clone();
+                std::thread::scope(|scope_| {
+                    scope_
+                        .spawn(|| {
+                            tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                                .unwrap()
+                                .block_on(store_pins(&pool, project_id, &competing, 1))
+                        })
+                        .join()
+                        .unwrap()
+                });
+            }
+            apply_install(pins, &mem_bundle("mine", "1"))
+        })
+        .await;
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(rounds, 2, "the stale put is retried exactly once");
+        let (stored, version) = crate::project::rules::pins_versioned(project_id).unwrap();
+        assert_eq!(version, 3, "initial 1, the racer's 2, then ours");
+        let names: Vec<&str> = stored.workflows.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["alpha-flow", "mine", "racer"],
+            "the retry re-applied on top of the racer's write, losing neither"
+        );
+        let history = crate::settings::history(&pool, &scope, "workflow_pins")
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn mutate_pins_surfaces_a_refusal_without_bumping_the_version() {
+        let _home = crate::project::rules::testing::Home::new();
+        let pool = crate::testdb::fresh_pool().await;
+        let project_id = "mutate-refusal-project";
+        let scope = crate::settings::Scope::project(project_id);
+        store_pins(
+            &pool,
+            project_id,
+            &Pins {
+                workflows: vec![mem_pin("alpha-flow", "1")],
+            },
+            0,
+        )
+        .await;
+
+        let result = mutate_pins(&pool, project_id, "daemon:workflows", |pins| {
+            apply_uninstall(pins, "ghost")
+        })
+        .await;
+
+        assert_eq!(result, Err(Refused::NotInstalled));
+        let (_, version) = crate::project::rules::pins_versioned(project_id).unwrap();
+        assert_eq!(version, 1, "a refusal must not write");
+        let history = crate::settings::history(&pool, &scope, "workflow_pins")
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 1, "and leaves no history row");
+
+        // A success moves the version by exactly one.
+        mutate_pins(&pool, project_id, "daemon:workflows", |pins| {
+            apply_install(pins, &mem_bundle("beta-flow", "1"))
+        })
+        .await
+        .unwrap();
+        let (_, version) = crate::project::rules::pins_versioned(project_id).unwrap();
+        assert_eq!(version, 2);
+    }
+
+    /* --------------------- public async mutators on the store (4.2, RED) -- */
+    // These call the NEW signatures `install(pool, project_id, bundle)` and `uninstall(pool, project_id, name)`.
+    // The old file-based `install(&Path, &Bundle)` still exists until the GREEN step, so they fail to compile.
+
+    #[tokio::test]
+    async fn install_writes_the_pins_document_and_a_history_row() {
+        let _home = crate::project::rules::testing::Home::new();
+        let pool = crate::testdb::fresh_pool().await;
+        let project_id = "install-store-project";
+        let scope = crate::settings::Scope::project(project_id);
+        let temp = tempfile::tempdir().unwrap();
+        let root = shelf(temp.path(), "harness", "1.0", &[("g.yaml", "a")]);
+
+        install(&pool, project_id, &bundle_at(&root, "harness", "1.0"))
+            .await
+            .unwrap();
+
+        let pins = crate::project::rules::pins(project_id).unwrap();
+        assert_eq!(pins.workflows.len(), 1);
+        assert_eq!(pins.workflows[0].name, "harness");
+        assert!(crate::project::rules::is_stored(
+            project_id,
+            "workflow_pins"
+        ));
+        let history = crate::settings::history(&pool, &scope, "workflow_pins")
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 1, "one write, one history row");
+    }
+
+    #[tokio::test]
+    async fn an_internal_write_bumps_the_version_and_a_put_with_the_old_version_is_stale() {
+        let _home = crate::project::rules::testing::Home::new();
+        let pool = crate::testdb::fresh_pool().await;
+        let project_id = "install-stale-project";
+        let scope = crate::settings::Scope::project(project_id);
+        let temp = tempfile::tempdir().unwrap();
+        let root = shelf(temp.path(), "harness", "1.0", &[("g.yaml", "a")]);
+
+        let (_, before) = crate::project::rules::pins_versioned(project_id).unwrap();
+        assert_eq!(before, 0, "nothing stored yet");
+        install(&pool, project_id, &bundle_at(&root, "harness", "1.0"))
+            .await
+            .unwrap();
+        let (_, after) = crate::project::rules::pins_versioned(project_id).unwrap();
+        assert_eq!(after, before + 1, "the internal write bumped the version");
+
+        // An editor that read the document before the install now writes with the version it saw.
+        let outcome = crate::settings::put(
+            &pool,
+            &scope,
+            "workflow_pins",
+            &serde_json::to_value(Pins::default()).unwrap(),
+            "test",
+            Some(before),
+        )
+        .await;
+        assert!(
+            matches!(outcome, Err(crate::settings::SettingsError::Stale { .. })),
+            "a put with the old version must be stale, got {outcome:?}"
+        );
+    }
+
+    /// Spec 11: an internal write is a write like any other, so the history carries it, attributed
+    /// to the daemon's workflows module and not marked as a deletion.
+    #[tokio::test]
+    async fn an_internal_write_bumps_the_version_and_appears_in_history() {
+        let _home = crate::project::rules::testing::Home::new();
+        let pool = crate::testdb::fresh_pool().await;
+        let project_id = "install-history-project";
+        let scope = crate::settings::Scope::project(project_id);
+        let temp = tempfile::tempdir().unwrap();
+        let root = shelf(temp.path(), "harness", "1.0", &[("g.yaml", "a")]);
+
+        let (_, before) = crate::project::rules::pins_versioned(project_id).unwrap();
+        install(&pool, project_id, &bundle_at(&root, "harness", "1.0"))
+            .await
+            .unwrap();
+        let (_, after) = crate::project::rules::pins_versioned(project_id).unwrap();
+        assert!(after > before, "the internal write bumped the version");
+
+        let history = crate::settings::history(&pool, &scope, "workflow_pins")
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 1, "one write, one history row");
+        assert_eq!(history[0].written_by, "daemon:workflows");
+        assert!(!history[0].deleted(), "an install is not a deletion");
+    }
+
+    #[tokio::test]
+    async fn a_refused_uninstall_leaves_the_version_alone() {
+        let _home = crate::project::rules::testing::Home::new();
+        let pool = crate::testdb::fresh_pool().await;
+        let project_id = "uninstall-refused-project";
+        let scope = crate::settings::Scope::project(project_id);
+        let temp = tempfile::tempdir().unwrap();
+        let root = shelf(temp.path(), "harness", "1.0", &[("g.yaml", "a")]);
+        install(&pool, project_id, &bundle_at(&root, "harness", "1.0"))
+            .await
+            .unwrap();
+        let (_, version) = crate::project::rules::pins_versioned(project_id).unwrap();
+
+        let result = uninstall(&pool, project_id, "ghost").await;
+
+        assert_eq!(result, Err(Refused::NotInstalled));
+        let (_, still) = crate::project::rules::pins_versioned(project_id).unwrap();
+        assert_eq!(still, version, "a refusal must not bump the version");
+        let history = crate::settings::history(&pool, &scope, "workflow_pins")
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 1, "and adds no history row");
     }
 
     #[test]
@@ -1322,8 +1891,9 @@ mod tests {
         assert_eq!(parse_pins(&text).unwrap(), pins);
     }
 
-    #[test]
-    fn installing_records_where_the_bundle_came_from_and_what_it_hashed_to() {
+    #[tokio::test]
+    async fn installing_records_where_the_bundle_came_from_and_what_it_hashed_to() {
+        let (_home, pool) = store().await;
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
@@ -1335,15 +1905,16 @@ mod tests {
         );
         let bundle = bundle_at(&root, "harness", "1.0");
 
-        install(&pins_of(&project), &bundle).unwrap();
-        let pins = read_pins(&pins_of(&project)).unwrap();
+        install(&pool, PID, &bundle).await.unwrap();
+        let pins = crate::project::rules::pins(PID).unwrap();
         assert_eq!(pins.workflows.len(), 1);
         assert_eq!(pins.workflows[0].origin, "library:harness@1.0");
         assert_eq!(pins.workflows[0].hash, bundle.hash);
     }
 
-    #[test]
-    fn a_bundle_edited_under_its_own_pin_is_drifted_and_not_referenced() {
+    #[tokio::test]
+    async fn a_bundle_edited_under_its_own_pin_is_drifted_and_not_referenced() {
+        let (_home, pool) = store().await;
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
@@ -1353,38 +1924,44 @@ mod tests {
             "1.0",
             &[("g.yaml", "a")],
         );
-        install(&pins_of(&project), &bundle_at(&root, "harness", "1.0")).unwrap();
+        install(&pool, PID, &bundle_at(&root, "harness", "1.0"))
+            .await
+            .unwrap();
 
         assert_eq!(
-            installed(&project, &pins_of(&project), &root).unwrap()[0].standing,
+            installed(&project, PID, &root).unwrap()[0].standing,
             Standing::Referenced
         );
 
         std::fs::write(root.join("harness/1.0/g.yaml"), "b").unwrap();
-        let after = installed(&project, &pins_of(&project), &root).unwrap();
+        let after = installed(&project, PID, &root).unwrap();
         assert_eq!(after[0].standing, Standing::Drifted);
         // Both hashes are served, so the page states a difference somebody can check rather than
         // asserting one.
         assert_ne!(after[0].hash, after[0].origin_hash.clone().unwrap());
     }
 
-    #[test]
-    fn a_newer_version_beside_the_pinned_one_is_an_offer_and_not_drift() {
+    #[tokio::test]
+    async fn a_newer_version_beside_the_pinned_one_is_an_offer_and_not_drift() {
+        let (_home, pool) = store().await;
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
         let lib = temp.path().join("lib");
         shelf(&lib, "harness", "1.0", &[("g.yaml", "a")]);
-        install(&pins_of(&project), &bundle_at(&lib, "harness", "1.0")).unwrap();
+        install(&pool, PID, &bundle_at(&lib, "harness", "1.0"))
+            .await
+            .unwrap();
         shelf(&lib, "harness", "1.1", &[("g.yaml", "b")]);
 
-        let rows = installed(&project, &pins_of(&project), &lib).unwrap();
+        let rows = installed(&project, PID, &lib).unwrap();
         assert_eq!(rows[0].standing, Standing::Referenced);
         assert_eq!(rows[0].update_available.as_deref(), Some("1.1"));
     }
 
-    #[test]
-    fn a_pin_the_library_cannot_answer_is_missing_and_still_says_where_it_came_from() {
+    #[tokio::test]
+    async fn a_pin_the_library_cannot_answer_is_missing_and_still_says_where_it_came_from() {
+        let (_home, pool) = store().await;
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
@@ -1394,19 +1971,22 @@ mod tests {
             "1.0",
             &[("g.yaml", "a")],
         );
-        install(&pins_of(&project), &bundle_at(&lib, "harness", "1.0")).unwrap();
+        install(&pool, PID, &bundle_at(&lib, "harness", "1.0"))
+            .await
+            .unwrap();
 
         // The new machine: the pin travelled with the repository, the bundle did not.
         let empty = temp.path().join("other-machine");
         std::fs::create_dir_all(&empty).unwrap();
-        let rows = installed(&project, &pins_of(&project), &empty).unwrap();
+        let rows = installed(&project, PID, &empty).unwrap();
         assert_eq!(rows[0].standing, Standing::Missing);
         assert_eq!(rows[0].origin, "library:harness@1.0");
         assert!(rows[0].origin_hash.is_none());
     }
 
-    #[test]
-    fn ejecting_copies_the_bundle_and_records_when_the_updates_stopped() {
+    #[tokio::test]
+    async fn ejecting_copies_the_bundle_and_records_when_the_updates_stopped() {
+        let (_home, pool) = store().await;
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
@@ -1417,15 +1997,15 @@ mod tests {
             &[("skills/plan.md", "plan")],
         );
         let bundle = bundle_at(&lib, "harness", "1.0");
-        install(&pins_of(&project), &bundle).unwrap();
-        eject(&project, &pins_of(&project), &bundle, now()).unwrap();
+        install(&pool, PID, &bundle).await.unwrap();
+        eject(&pool, &project, PID, &bundle, now()).await.unwrap();
 
         assert!(
             project
                 .join(".nucleos/workflows/harness/skills/plan.md")
                 .is_file()
         );
-        let rows = installed(&project, &pins_of(&project), &lib).unwrap();
+        let rows = installed(&project, PID, &lib).unwrap();
         assert_eq!(rows[0].standing, Standing::Ejected);
         assert_eq!(
             rows[0].ejected_at.as_deref(),
@@ -1433,8 +2013,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn ejecting_twice_refuses_rather_than_overwriting_the_edits_that_were_the_point() {
+    #[tokio::test]
+    async fn ejecting_twice_refuses_rather_than_overwriting_the_edits_that_were_the_point() {
+        let (_home, pool) = store().await;
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
@@ -1445,12 +2026,12 @@ mod tests {
             &[("g.yaml", "a")],
         );
         let bundle = bundle_at(&lib, "harness", "1.0");
-        install(&pins_of(&project), &bundle).unwrap();
-        eject(&project, &pins_of(&project), &bundle, now()).unwrap();
+        install(&pool, PID, &bundle).await.unwrap();
+        eject(&pool, &project, PID, &bundle, now()).await.unwrap();
 
         std::fs::write(project.join(".nucleos/workflows/harness/g.yaml"), "mine").unwrap();
         assert_eq!(
-            eject(&project, &pins_of(&project), &bundle, now()),
+            eject(&pool, &project, PID, &bundle, now()).await,
             Err(Refused::AlreadyEjected)
         );
         assert_eq!(
@@ -1459,8 +2040,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_ejected_copy_whose_folder_was_deleted_is_not_still_ejected() {
+    #[tokio::test]
+    async fn an_ejected_copy_whose_folder_was_deleted_is_not_still_ejected() {
+        let (_home, pool) = store().await;
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
@@ -1471,19 +2053,20 @@ mod tests {
             &[("g.yaml", "a")],
         );
         let bundle = bundle_at(&lib, "harness", "1.0");
-        install(&pins_of(&project), &bundle).unwrap();
-        eject(&project, &pins_of(&project), &bundle, now()).unwrap();
+        install(&pool, PID, &bundle).await.unwrap();
+        eject(&pool, &project, PID, &bundle, now()).await.unwrap();
         std::fs::remove_dir_all(project.join(".nucleos/workflows/harness")).unwrap();
 
         // The field still says it was ejected; the disk decides, and the disk says there is no copy.
         assert_eq!(
-            installed(&project, &pins_of(&project), &lib).unwrap()[0].standing,
+            installed(&project, PID, &lib).unwrap()[0].standing,
             Standing::Referenced
         );
     }
 
-    #[test]
-    fn the_diff_names_the_files_that_diverged_from_the_projects_side() {
+    #[tokio::test]
+    async fn the_diff_names_the_files_that_diverged_from_the_projects_side() {
+        let (_home, pool) = store().await;
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
@@ -1494,8 +2077,8 @@ mod tests {
             &[("a.md", "one"), ("b.md", "two")],
         );
         let bundle = bundle_at(&lib, "harness", "1.0");
-        install(&pins_of(&project), &bundle).unwrap();
-        eject(&project, &pins_of(&project), &bundle, now()).unwrap();
+        install(&pool, PID, &bundle).await.unwrap();
+        eject(&pool, &project, PID, &bundle, now()).await.unwrap();
 
         let mine_dir = project.join(".nucleos/workflows/harness");
         std::fs::write(mine_dir.join("a.md"), "one, changed").unwrap();
@@ -1525,17 +2108,20 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reinstalling_a_different_version_keeps_the_nodes_this_project_overrode() {
+    #[tokio::test]
+    async fn reinstalling_a_different_version_keeps_the_nodes_this_project_overrode() {
+        let (_home, pool) = store().await;
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
         let lib = temp.path().join("lib");
         shelf(&lib, "harness", "1.0", &[("g.yaml", "a")]);
         shelf(&lib, "harness", "1.1", &[("g.yaml", "b")]);
-        install(&pins_of(&project), &bundle_at(&lib, "harness", "1.0")).unwrap();
+        install(&pool, PID, &bundle_at(&lib, "harness", "1.0"))
+            .await
+            .unwrap();
 
-        let mut pins = read_pins(&pins_of(&project)).unwrap();
+        let mut pins = crate::project::rules::pins(PID).unwrap();
         pins.workflows[0].nodes.insert(
             "review".into(),
             NodeOverlay {
@@ -1543,42 +2129,52 @@ mod tests {
                 ..NodeOverlay::default()
             },
         );
-        save_pins(&pins_of(&project), &pins).unwrap();
+        mutate_pins(&pool, PID, "test", |stored| {
+            *stored = pins.clone();
+            Ok(())
+        })
+        .await
+        .unwrap();
 
-        install(&pins_of(&project), &bundle_at(&lib, "harness", "1.1")).unwrap();
-        let after = read_pins(&pins_of(&project)).unwrap();
+        install(&pool, PID, &bundle_at(&lib, "harness", "1.1"))
+            .await
+            .unwrap();
+        let after = crate::project::rules::pins(PID).unwrap();
         assert_eq!(after.workflows.len(), 1);
         assert_eq!(after.workflows[0].version, "1.1");
         assert_eq!(after.workflows[0].nodes["review"].disabled, Some(true));
     }
 
-    #[test]
-    fn updating_an_ejected_workflow_replaces_the_copy_and_restarts_the_clock() {
+    #[tokio::test]
+    async fn updating_an_ejected_workflow_replaces_the_copy_and_restarts_the_clock() {
+        let (_home, pool) = store().await;
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
         let lib = temp.path().join("lib");
         shelf(&lib, "harness", "1.0", &[("g.yaml", "a")]);
         let old = bundle_at(&lib, "harness", "1.0");
-        install(&pins_of(&project), &old).unwrap();
-        eject(&project, &pins_of(&project), &old, now()).unwrap();
+        install(&pool, PID, &old).await.unwrap();
+        eject(&pool, &project, PID, &old, now()).await.unwrap();
         std::fs::write(project.join(".nucleos/workflows/harness/g.yaml"), "mine").unwrap();
 
         shelf(&lib, "harness", "1.1", &[("g.yaml", "b")]);
         let later = now() + chrono::Duration::days(30);
         update(
+            &pool,
             &project,
-            &pins_of(&project),
+            PID,
             &bundle_at(&lib, "harness", "1.1"),
             later,
         )
+        .await
         .unwrap();
 
         assert_eq!(
             std::fs::read_to_string(project.join(".nucleos/workflows/harness/g.yaml")).unwrap(),
             "b"
         );
-        let rows = installed(&project, &pins_of(&project), &lib).unwrap();
+        let rows = installed(&project, PID, &lib).unwrap();
         assert_eq!(rows[0].version, "1.1");
         assert_eq!(rows[0].standing, Standing::Ejected);
         assert_eq!(
@@ -1589,8 +2185,9 @@ mod tests {
 
     /// The overlay is how a project changes a node WITHOUT taking a copy of the bundle, which is
     /// the whole reason it exists. Clearing a row is how the node goes back to inheriting.
-    #[test]
-    fn overriding_a_node_needs_no_copy_of_anything_and_clears_back_to_inherited() {
+    #[tokio::test]
+    async fn overriding_a_node_needs_no_copy_of_anything_and_clears_back_to_inherited() {
+        let (_home, pool) = store().await;
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
@@ -1600,10 +2197,13 @@ mod tests {
             "1.0",
             &[("g.yaml", "a")],
         );
-        install(&pins_of(&project), &bundle_at(&lib, "harness", "1.0")).unwrap();
+        install(&pool, PID, &bundle_at(&lib, "harness", "1.0"))
+            .await
+            .unwrap();
 
         set_overlay(
-            &pins_of(&project),
+            &pool,
+            PID,
             "harness",
             "plan",
             Some(NodeOverlay {
@@ -1611,24 +2211,28 @@ mod tests {
                 ..NodeOverlay::default()
             }),
         )
+        .await
         .unwrap();
-        let rows = installed(&project, &pins_of(&project), &lib).unwrap();
+        let rows = installed(&project, PID, &lib).unwrap();
         assert_eq!(rows[0].overridden_nodes, 1);
         // Still referenced: overriding is not ejecting, and a project that had to take a copy to
         // change a model would take one every time.
         assert_eq!(rows[0].standing, Standing::Referenced);
 
-        set_overlay(&pins_of(&project), "harness", "plan", None).unwrap();
+        set_overlay(&pool, PID, "harness", "plan", None)
+            .await
+            .unwrap();
         assert_eq!(
-            installed(&project, &pins_of(&project), &lib).unwrap()[0].overridden_nodes,
+            installed(&project, PID, &lib).unwrap()[0].overridden_nodes,
             0
         );
     }
 
     /// An override that overrides nothing is not an override, and does not become a row that would
     /// stamp the project seal on a node nobody touched.
-    #[test]
-    fn an_override_of_nothing_does_not_become_a_row() {
+    #[tokio::test]
+    async fn an_override_of_nothing_does_not_become_a_row() {
+        let (_home, pool) = store().await;
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
@@ -1638,22 +2242,20 @@ mod tests {
             "1.0",
             &[("g.yaml", "a")],
         );
-        install(&pins_of(&project), &bundle_at(&lib, "harness", "1.0")).unwrap();
+        install(&pool, PID, &bundle_at(&lib, "harness", "1.0"))
+            .await
+            .unwrap();
 
-        set_overlay(
-            &pins_of(&project),
-            "harness",
-            "plan",
-            Some(NodeOverlay::default()),
-        )
-        .unwrap();
+        set_overlay(&pool, PID, "harness", "plan", Some(NodeOverlay::default()))
+            .await
+            .unwrap();
         assert!(
-            read_pins(&pins_of(&project)).unwrap().workflows[0]
+            crate::project::rules::pins(PID).unwrap().workflows[0]
                 .nodes
                 .is_empty()
         );
         assert_eq!(
-            set_overlay(&pins_of(&project), "harness", "  ", None),
+            set_overlay(&pool, PID, "harness", "  ", None).await,
             Err(Refused::BadName)
         );
     }
@@ -1662,8 +2264,9 @@ mod tests {
     ///
     /// The folder is left byte for byte as it was — no manifest written into it, no rewrite — which
     /// is what "recognise it, do not ask for it to be recreated" has to mean.
-    #[test]
-    fn adopting_the_harness_a_project_already_has_copies_nothing_into_it() {
+    #[tokio::test]
+    async fn adopting_the_harness_a_project_already_has_copies_nothing_into_it() {
+        let (_home, pool) = store().await;
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".ai/scripts")).unwrap();
@@ -1671,11 +2274,13 @@ mod tests {
         std::fs::write(project.join(".ai/scripts/select_tests.py"), "print()").unwrap();
         let before = std::fs::read_dir(project.join(".ai")).unwrap().count();
 
-        adopt(&project, &pins_of(&project), "harness", ".ai", now()).unwrap();
+        adopt(&pool, &project, PID, "harness", ".ai", now())
+            .await
+            .unwrap();
 
         let empty = temp.path().join("no-library");
         std::fs::create_dir_all(&empty).unwrap();
-        let rows = installed(&project, &pins_of(&project), &empty).unwrap();
+        let rows = installed(&project, PID, &empty).unwrap();
         assert_eq!(rows.len(), 1);
         // Ejected from birth, and honest about having no origin in any library.
         assert_eq!(rows[0].standing, Standing::Ejected);
@@ -1698,18 +2303,21 @@ mod tests {
             std::fs::read_dir(project.join(".ai")).unwrap().count(),
             before
         );
-        assert!(pins_of(&project).is_file());
+        assert!(crate::project::rules::is_stored(PID, "workflow_pins"));
     }
 
     /// An adopted folder is not something this app replaces. The branch that would have deleted it
     /// is the one that removes an ejected copy before re-copying — and here that folder is `.ai/`.
-    #[test]
-    fn nothing_replaces_a_folder_the_project_already_had() {
+    #[tokio::test]
+    async fn nothing_replaces_a_folder_the_project_already_had() {
+        let (_home, pool) = store().await;
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".ai")).unwrap();
         std::fs::write(project.join(".ai/workflow.md"), "the pipeline").unwrap();
-        adopt(&project, &pins_of(&project), "harness", ".ai", now()).unwrap();
+        adopt(&pool, &project, PID, "harness", ".ai", now())
+            .await
+            .unwrap();
 
         let lib = shelf(
             &temp.path().join("lib"),
@@ -1719,11 +2327,11 @@ mod tests {
         );
         let bundle = bundle_at(&lib, "harness", "1.0");
         assert_eq!(
-            update(&project, &pins_of(&project), &bundle, now()),
+            update(&pool, &project, PID, &bundle, now()).await,
             Err(Refused::Adopted)
         );
         assert_eq!(
-            eject(&project, &pins_of(&project), &bundle, now()),
+            eject(&pool, &project, PID, &bundle, now()).await,
             Err(Refused::Adopted)
         );
         assert_eq!(
@@ -1734,19 +2342,14 @@ mod tests {
 
     /// A `path` in the pins file is caller-supplied input like any other — a person can edit that
     /// file — so it goes through the same guard every other path does.
-    #[test]
-    fn an_adopted_path_cannot_name_somewhere_outside_the_project() {
+    #[tokio::test]
+    async fn an_adopted_path_cannot_name_somewhere_outside_the_project() {
+        let (_home, pool) = store().await;
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
         assert_eq!(
-            adopt(
-                &project,
-                &pins_of(&project),
-                "harness",
-                "../elsewhere",
-                now()
-            ),
+            adopt(&pool, &project, PID, "harness", "../elsewhere", now()).await,
             Err(Refused::BadName)
         );
 
@@ -1762,8 +2365,9 @@ mod tests {
         assert!(copy_path(&project, &pin).is_none());
     }
 
-    #[test]
-    fn uninstalling_removes_the_pin_and_never_the_projects_own_copy() {
+    #[tokio::test]
+    async fn uninstalling_removes_the_pin_and_never_the_projects_own_copy() {
+        let (_home, pool) = store().await;
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
@@ -1774,20 +2378,26 @@ mod tests {
             &[("g.yaml", "a")],
         );
         let bundle = bundle_at(&lib, "harness", "1.0");
-        install(&pins_of(&project), &bundle).unwrap();
-        eject(&project, &pins_of(&project), &bundle, now()).unwrap();
+        install(&pool, PID, &bundle).await.unwrap();
+        eject(&pool, &project, PID, &bundle, now()).await.unwrap();
 
-        uninstall(&pins_of(&project), "harness").unwrap();
-        assert!(read_pins(&pins_of(&project)).unwrap().workflows.is_empty());
+        uninstall(&pool, PID, "harness").await.unwrap();
+        assert!(
+            crate::project::rules::pins(PID)
+                .unwrap()
+                .workflows
+                .is_empty()
+        );
         assert!(project.join(".nucleos/workflows/harness/g.yaml").is_file());
         assert_eq!(
-            uninstall(&pins_of(&project), "harness"),
+            uninstall(&pool, PID, "harness").await,
             Err(Refused::NotInstalled)
         );
     }
 
-    #[test]
-    fn ejecting_something_this_project_does_not_use_leaves_no_files_behind() {
+    #[tokio::test]
+    async fn ejecting_something_this_project_does_not_use_leaves_no_files_behind() {
+        let (_home, pool) = store().await;
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
@@ -1800,11 +2410,13 @@ mod tests {
 
         assert_eq!(
             eject(
+                &pool,
                 &project,
-                &pins_of(&project),
+                PID,
                 &bundle_at(&lib, "harness", "1.0"),
                 now()
-            ),
+            )
+            .await,
             Err(Refused::NotInstalled)
         );
         assert!(!project.join(".nucleos/workflows/harness").exists());
@@ -1945,8 +2557,9 @@ mod tests {
         assert!(lib.join("harness/1.1/a.md").is_file());
     }
 
-    #[test]
-    fn a_projects_ejected_copy_is_published_with_its_edits() {
+    #[tokio::test]
+    async fn a_projects_ejected_copy_is_published_with_its_edits() {
+        let (_home, pool) = store().await;
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
@@ -1957,12 +2570,11 @@ mod tests {
             &[("a.md", "orig")],
         );
         let bundle = bundle_at(&lib, "harness", "1.0");
-        install(&pins_of(&project), &bundle).unwrap();
-        eject(&project, &pins_of(&project), &bundle, now()).unwrap();
+        install(&pool, PID, &bundle).await.unwrap();
+        eject(&pool, &project, PID, &bundle, now()).await.unwrap();
         std::fs::write(project.join(".nucleos/workflows/harness/a.md"), "edited").unwrap();
 
-        let published =
-            publish_from_project(&project, &pins_of(&project), &lib, "harness", "1.0.1").unwrap();
+        let published = publish_from_project(&project, PID, &lib, "harness", "1.0.1").unwrap();
 
         assert_eq!(
             std::fs::read_to_string(lib.join("harness/1.0.1/a.md")).unwrap(),
@@ -1970,18 +2582,18 @@ mod tests {
         );
         assert_ne!(published.hash, bundle.hash);
         // The project's pin and copy are untouched: publishing is not installing.
-        let pins = read_pins(&pins_of(&project)).unwrap();
+        let pins = crate::project::rules::pins(PID).unwrap();
         assert_eq!(pins.workflows[0].version, "1.0");
         assert!(pins.workflows[0].ejected_at.is_some());
         assert_eq!(
-            publish_from_project(&project, &pins_of(&project), &lib, "harness", "1.0.1")
-                .unwrap_err(),
+            publish_from_project(&project, PID, &lib, "harness", "1.0.1").unwrap_err(),
             Refused::AlreadyPublished
         );
     }
 
-    #[test]
-    fn a_project_publishes_only_a_copy_it_has() {
+    #[tokio::test]
+    async fn a_project_publishes_only_a_copy_it_has() {
+        let (_home, pool) = store().await;
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
@@ -1989,12 +2601,12 @@ mod tests {
         let bundle = bundle_at(&lib, "harness", "1.0");
 
         assert_eq!(
-            publish_from_project(&project, &pins_of(&project), &lib, "harness", "2.0").unwrap_err(),
+            publish_from_project(&project, PID, &lib, "harness", "2.0").unwrap_err(),
             Refused::NotInstalled
         );
-        install(&pins_of(&project), &bundle).unwrap();
+        install(&pool, PID, &bundle).await.unwrap();
         assert_eq!(
-            publish_from_project(&project, &pins_of(&project), &lib, "harness", "2.0").unwrap_err(),
+            publish_from_project(&project, PID, &lib, "harness", "2.0").unwrap_err(),
             Refused::NotEjected
         );
         assert!(!lib.join("harness/2.0").exists());
@@ -2002,21 +2614,24 @@ mod tests {
 
     /// An adopted folder with a manifest is publishable; one without is somebody's folder, not a
     /// bundle.
-    #[test]
-    fn an_adopted_folder_publishes_only_when_it_is_a_bundle() {
+    #[tokio::test]
+    async fn an_adopted_folder_publishes_only_when_it_is_a_bundle() {
+        let (_home, pool) = store().await;
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         let lib = temp.path().join("lib");
         std::fs::create_dir_all(project.join("flow")).unwrap();
         std::fs::write(project.join("flow/a.md"), "a").unwrap();
-        adopt(&project, &pins_of(&project), "flow", "flow", now()).unwrap();
+        adopt(&pool, &project, PID, "flow", "flow", now())
+            .await
+            .unwrap();
 
         assert_eq!(
-            publish_from_project(&project, &pins_of(&project), &lib, "flow", "1.0").unwrap_err(),
+            publish_from_project(&project, PID, &lib, "flow", "1.0").unwrap_err(),
             Refused::NoSuchBundle
         );
         std::fs::write(project.join("flow").join(MANIFEST), "description: mine\n").unwrap();
-        publish_from_project(&project, &pins_of(&project), &lib, "flow", "1.0").unwrap();
+        publish_from_project(&project, PID, &lib, "flow", "1.0").unwrap();
         assert!(lib.join("flow/1.0/a.md").is_file());
     }
 }

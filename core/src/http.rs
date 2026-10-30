@@ -57,6 +57,7 @@ mod relay;
 mod remote;
 mod repo;
 mod run_queue;
+mod settings;
 mod tasks;
 mod team;
 mod themes;
@@ -148,6 +149,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(remote::routes())
         .merge(repo::routes())
         .merge(run_queue::routes())
+        .merge(settings::routes())
         .merge(crate::route_index::routes())
         .merge(team::routes())
         .merge(themes::routes())
@@ -4068,13 +4070,10 @@ mod tests {
         yaml: &str,
     ) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        if let Some(home) = state.machine_config_root.as_deref() {
-            crate::project::state::write_for_test(
-                home,
-                id,
-                crate::project::state::AUTOPILOT_FILE,
-                yaml,
-            );
+        if yaml.is_empty() {
+            crate::project::rules::testing::hold_shared();
+        } else {
+            crate::project::rules::testing::publish_rules(id, yaml);
         }
         sqlx::query(
             "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES (?, 'shadow', ?)",
@@ -4085,6 +4084,17 @@ mod tests {
         .await
         .unwrap();
         dir
+    }
+
+    /// Pins the library's `dev@1.0` for `id` in the settings store, as installing it would. The caller
+    /// already holds the settings (`project_with_rules` or `Home::new()`).
+    fn pin_dev_in_store(id: &str, library: &std::path::Path) {
+        let bundle = crate::workflows::read_bundle(&library.join("dev/1.0"), "dev", "1.0")
+            .unwrap()
+            .unwrap();
+        let mut pins = crate::project::rules::pins(id).unwrap();
+        crate::workflows::apply_install(&mut pins, &bundle).unwrap();
+        crate::project::rules::testing::publish_pins(id, &crate::workflows::render_pins(&pins));
     }
 
     async fn read_rules(state: AppState, id: &str) -> (StatusCode, serde_json::Value) {
@@ -4301,17 +4311,22 @@ mod tests {
 
     /// `deny_unknown_fields` exists so a typo is an error instead of an empty ruleset — but the
     /// error only ever reached a log line, so `schedule:` for `schedules:` stopped every scheduled
-    /// run for that project and looked exactly like having no rules.
+    /// run for that project and looked exactly like having no rules. Two halves now (Task 3.6 of
+    /// chunk 3): the parser still refuses the typo, and a document that is stored but cannot be read
+    /// is reported by name.
     #[tokio::test]
     async fn a_misspelt_key_is_reported_rather_than_read_as_no_rules_at_all() {
+        let typo =
+            "schedule:\n\x20 - name: nightly\n\x20   cron: '0 8 * * *'\n\x20   prompt: sweep\n";
+        let refusal = crate::config::parse_schedule_rules(typo)
+            .unwrap_err()
+            .to_string();
+        assert!(refusal.contains("schedule"), "{refusal}");
+
         let mut state = test_state().await;
         let home = with_project_home(&mut state);
-        let _dir = project_with_rules(
-            &state,
-            "alpha",
-            "schedule:\n\x20 - name: nightly\n\x20   cron: '0 8 * * *'\n\x20   prompt: sweep\n",
-        )
-        .await;
+        let _dir = project_with_rules(&state, "alpha", "").await;
+        crate::project::rules::testing::publish_unreadable("alpha", "autopilot", &refusal);
 
         let (_, body) = read_rules(state, "alpha").await;
         drop(home);
@@ -4351,15 +4366,21 @@ mod tests {
         let state = test_state().await;
         let _home = Home::new();
         let _dir = project_with_rules(&state, "alpha", "").await;
-        publish_rules("alpha", "gate_command: cargo test
-");
+        publish_rules(
+            "alpha",
+            "gate_command: cargo test
+",
+        );
 
         let (_, first) = read_rules(state.clone(), "alpha").await;
         assert_eq!(first["rules_file"], "present", "{first}");
         assert_eq!(first["gate_command"], "cargo test", "{first}");
 
-        publish_rules("alpha", "gate_command: cargo clippy
-");
+        publish_rules(
+            "alpha",
+            "gate_command: cargo clippy
+",
+        );
         let (_, second) = read_rules(state.clone(), "alpha").await;
         assert_eq!(second["gate_command"], "cargo clippy", "{second}");
 
@@ -4383,8 +4404,11 @@ mod tests {
         )
         .unwrap();
         let root = folder.path().to_string_lossy().into_owned();
-        crate::project::rules::testing::publish_rules("alpha", "gate_command: npm run test
-");
+        crate::project::rules::testing::publish_rules(
+            "alpha",
+            "gate_command: npm run test
+",
+        );
 
         let (status, view) = workflow_call(
             state,
@@ -4584,6 +4608,8 @@ mod tests {
     #[tokio::test]
     async fn activating_a_project_nobody_onboarded_is_refused_by_name() {
         let mut state = test_state().await;
+        // `onboard` below writes the global snapshot: take it exclusively first.
+        let _settings = crate::project::rules::testing::Home::new();
         let _home = with_project_home(&mut state);
         let folder = tempfile::tempdir().unwrap();
         crate::governance::autopilot::wire_classifier_hook(folder.path()).unwrap();
@@ -4605,12 +4631,14 @@ mod tests {
         // Onboarded, the hook refusal is still the bare status.
         let bare = tempfile::tempdir().unwrap();
         crate::onboarding::onboard(
+            &state.pool,
             state.machine_config_root.as_deref().unwrap(),
             "beta",
             bare.path(),
             None,
             "now",
         )
+        .await
         .unwrap();
         std::fs::remove_file(bare.path().join(".claude/hooks/ask_daemon.py")).unwrap();
         let (status, body) = workflow_call(
@@ -4633,7 +4661,9 @@ mod tests {
     #[tokio::test]
     async fn onboarding_proposes_then_takes_the_confirmed_gate_and_opens_activation() {
         let mut state = test_state().await;
-        let home = with_project_home(&mut state);
+        // `onboard` writes the global snapshot: take it exclusively before anything else does.
+        let _settings = crate::project::rules::testing::Home::new();
+        let _home = with_project_home(&mut state);
         let folder = tempfile::tempdir().unwrap();
         std::fs::write(
             folder.path().join("package.json"),
@@ -4669,8 +4699,20 @@ mod tests {
         assert_eq!(view["onboarded"]["gate_command"], "npm run test");
         assert_eq!(view["configured_gate"], "npm run test");
         assert_eq!(view["hook_wired"], true);
-        let rules = crate::config::load_schedule_rules(Some(home.path()), "alpha").unwrap();
+        // The writer stores the gate in the `autopilot` document, so the snapshot has it at once.
+        let rules = crate::project::rules::autopilot("alpha").unwrap();
         assert_eq!(rules.gate_command.as_deref(), Some("npm run test"));
+
+        // A GET reports the stored gate too, with no publish between the write and the read.
+        let (status, view) = workflow_call(
+            state.clone(),
+            "GET",
+            &format!("/projects/alpha/onboard?root={}", urlencoding(&root)),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{view}");
+        assert_eq!(view["configured_gate"], "npm run test");
 
         let kind: String = sqlx::query_scalar(
             "SELECT kind FROM feed WHERE project_id = 'alpha' ORDER BY id DESC LIMIT 1",
@@ -4705,6 +4747,7 @@ mod tests {
     /// placed; one already on the roster keeps what it uses, which here is nothing.
     #[tokio::test]
     async fn onboarding_pins_the_default_workflow_for_a_new_project_only() {
+        let _settings = crate::project::rules::testing::Home::new();
         let mut state = test_state().await;
         let home = with_project_home(&mut state);
         let library = home.path().join("library");
@@ -4719,12 +4762,6 @@ mod tests {
         .unwrap();
         std::fs::write(bundle.join(".nucleos/workflow/workflow.md"), "rules").unwrap();
         state.workflow_library = Some(library);
-        let pins_of = |id: &str| {
-            home.path()
-                .join("projects")
-                .join(id)
-                .join(crate::project::state::PINS_FILE)
-        };
 
         let new = tempfile::tempdir().unwrap();
         let (status, view) = workflow_call(
@@ -4735,7 +4772,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{view}");
-        let pins = crate::workflows::read_pins(&pins_of("alpha")).unwrap();
+        let pins = crate::project::rules::pins("alpha").unwrap();
         assert_eq!(pins.workflows.len(), 1);
         assert_eq!(pins.workflows[0].name, crate::onboarding::DEFAULT_WORKFLOW);
         assert_eq!(pins.workflows[0].version, "2.0.0");
@@ -4762,7 +4799,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{view}");
-        assert!(!pins_of("beta").exists());
+        assert!(!crate::project::rules::is_stored("beta", "workflow_pins"));
         assert!(!old.path().join(".nucleos").exists());
     }
 
@@ -4815,7 +4852,7 @@ mod tests {
     }
 
     /// The stop refuses onboarding before either of its two writes, the same way it refuses
-    /// `POST /write` and `POST /config/machine`: 423, `kill_switch`, and nothing written.
+    /// `POST /write` and `PUT /settings/{scope}/{name}`: 423, `kill_switch`, and nothing written.
     #[tokio::test]
     async fn the_kill_switch_stops_onboarding() {
         let mut state = test_state().await;
@@ -4892,56 +4929,39 @@ mod tests {
         (status, parsed)
     }
 
-    /// The round trip that has to hold: what the app writes is what the daemon then reads.
-    ///
-    /// Asserted through `GET /rules` rather than by reading the file back, and the difference is
-    /// the whole test. Reading the bytes back proves the write landed; asking the daemon proves the
-    /// bytes mean what the app thought they meant — which is the claim a structured editor makes
-    /// and a text editor does not.
+    /// The nucleo's own state files are in the settings store now, so `POST /write` no longer
+    /// claims them: the rules are changed through the settings route, and this one refuses by name.
     #[tokio::test]
-    async fn a_rules_file_written_from_the_app_is_the_one_the_daemon_then_reads() {
+    async fn a_rules_file_is_no_longer_written_through_the_write_route() {
+        let _settings = crate::project::rules::testing::Home::new();
         let mut state = test_state().await;
         let home = with_project_home(&mut state);
         let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        crate::project::rules::testing::publish_rules("alpha", "gate_command: cargo test\n");
 
-        let (status, _) = write_file(
-            state.clone(),
-            "alpha",
-            "autopilot.yaml",
-            "gate_command: cargo clippy\nschedules:\n  - name: nightly\n    cron: '0 3 * * *'\n    prompt: sweep\n",
-        )
-        .await;
-        assert_eq!(status, StatusCode::NO_CONTENT);
+        for path in ["autopilot.yaml", "workflows.yaml"] {
+            let (status, body) =
+                write_file(state.clone(), "alpha", path, "gate_command: cargo clippy\n").await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+            assert_eq!(body["refusal"], "not_ours", "{path}");
+        }
 
-        let (status, body) = read_rules(state.clone(), "alpha").await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["rules_file"], "present");
-        assert_eq!(body["gate_command"], "cargo clippy");
-        assert_eq!(body["schedules"].as_array().unwrap().len(), 1);
-
-        // In the feed, because a write from the app goes the same way an agent's does. A change to
-        // what a project does on its own that left no line would be the one edit nobody could find
-        // afterwards.
-        let (kind, summary): (String, String) = sqlx::query_as(
-            "SELECT kind, summary FROM feed WHERE project_id = 'alpha' ORDER BY id DESC LIMIT 1",
+        assert_eq!(
+            crate::project::rules::autopilot("alpha")
+                .unwrap()
+                .gate_command
+                .as_deref(),
+            Some("cargo test"),
+            "the stored rules were not touched"
+        );
+        assert!(!home.path().join("projects").join("alpha").exists());
+        let (feed,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM feed WHERE project_id = 'alpha' AND kind = 'config_written'",
         )
         .fetch_one(&state.pool)
         .await
         .unwrap();
-        assert_eq!(kind, "config_written");
-        assert_eq!(
-            summary,
-            "~/.nucleos/projects/alpha/autopilot.yaml written from the app"
-        );
-        // And the project's own folder was not touched: the rules are not its files any more.
-        assert!(!_dir.path().join(".ai").exists());
-        assert!(
-            home.path()
-                .join("projects")
-                .join("alpha")
-                .join("autopilot.yaml")
-                .is_file()
-        );
+        assert_eq!(feed, 0, "a refused write leaves no feed line");
     }
 
     /// Everything the registry does not name is refused, and the refusal is named so the page can
@@ -4957,6 +4977,9 @@ mod tests {
         let dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
 
         for path in [
+            // The nucleo's former state rows: they live in the settings store now.
+            "autopilot.yaml",
+            "workflows.yaml",
             // Layer 2: read, plus a door to an editor. Never written from here.
             "core/src/http.rs",
             "README.md",
@@ -4981,56 +5004,8 @@ mod tests {
         assert!(!dir.path().join(".ai").join("models.yaml").exists());
         assert!(!dir.path().parent().unwrap().join("escape.yaml").exists());
         assert!(!dir.path().join(".ai").join("autopilot.yaml").exists());
-        // The only file in the stand-in home is the one `project_with_rules` wrote.
-        assert_eq!(
-            std::fs::read_dir(home.path().join("projects").join("alpha"))
-                .unwrap()
-                .count(),
-            1
-        );
-    }
-
-    /// YAML the daemon could not read is refused **and the file that was there survives**.
-    ///
-    /// The surviving file is the assertion that matters. A validator that refused after truncating
-    /// would be worse than no validator at all: the caller would be told their edit was rejected
-    /// while the project quietly lost its rules, and the next run would report `gate errored` for a
-    /// reason nothing on the screen could explain.
-    ///
-    /// The detail comes back with it, because "unprocessable entity" and nothing else sends
-    /// somebody to a text editor — which is the surface the hatch exists to replace.
-    #[tokio::test]
-    async fn yaml_the_daemon_could_not_read_is_refused_and_the_old_file_survives() {
-        let mut state = test_state().await;
-        let home = with_project_home(&mut state);
-        let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
-        let file = home
-            .path()
-            .join("projects")
-            .join("alpha")
-            .join("autopilot.yaml");
-
-        for (contents, expected_in_detail) in [
-            ("schedules: [\n", "line"),
-            // `deny_unknown_fields`: a typo an editor would save happily, and after which the gate
-            // is silently absent for ever.
-            ("gate_commmand: cargo test\n", "gate_commmand"),
-        ] {
-            let (status, body) =
-                write_file(state.clone(), "alpha", "autopilot.yaml", contents).await;
-            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{contents}");
-            assert_eq!(body["refusal"], "invalid");
-            let detail = body["detail"].as_str().unwrap();
-            assert!(
-                detail.contains(expected_in_detail),
-                "the refusal must say what broke: {detail}"
-            );
-            assert_eq!(
-                std::fs::read_to_string(&file).unwrap(),
-                "gate_command: cargo test\n",
-                "the file that was there must survive a refusal"
-            );
-        }
+        // The stand-in home was never written to.
+        assert!(!home.path().join("projects").join("alpha").exists());
     }
 
     /// The emergency stop holds the app's write too, which is the promise that the shell is not a
@@ -5044,11 +5019,6 @@ mod tests {
         let mut state = test_state().await;
         let home = with_project_home(&mut state);
         let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
-        let file = home
-            .path()
-            .join("projects")
-            .join("alpha")
-            .join("autopilot.yaml");
 
         crate::governance::autopilot::set_kill_switch(&state.pool, true)
             .await
@@ -5079,19 +5049,20 @@ mod tests {
         assert_eq!(status, StatusCode::LOCKED);
         assert_eq!(body["refusal"], "kill_switch");
 
-        assert_eq!(
-            std::fs::read_to_string(&file).unwrap(),
-            "gate_command: cargo test\n",
+        assert!(
+            !home.path().join("projects").join("alpha").exists(),
             "nothing is written while the stop is engaged"
         );
 
-        // Released, and the same request goes through — so the refusal was the stop and not the
-        // request.
+        // Released, the same request is answered by the registry instead of the brake: the stop
+        // runs first, and `autopilot.yaml` is not a row any more.
         crate::governance::autopilot::set_scoped_kill(&state.pool, "project", "alpha", false)
             .await
             .unwrap();
-        let (status, _) = write_file(state, "alpha", "autopilot.yaml", "gate_command: x\n").await;
-        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, body) =
+            write_file(state, "alpha", "autopilot.yaml", "gate_command: x\n").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["refusal"], "not_ours");
     }
 
     /// A project the daemon has no folder for has no file to write, and no fence to draw either.
@@ -5155,27 +5126,10 @@ mod tests {
             .unwrap();
         let claims: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let claims = claims.as_array().unwrap();
-        assert_eq!(claims.len(), 2);
-        assert_eq!(claims[0]["path"], "autopilot.yaml");
-        assert_eq!(claims[0]["home"], "state");
-        assert_eq!(
-            claims[0]["display"],
-            "~/.nucleos/projects/alpha/autopilot.yaml"
-        );
-        assert_eq!(claims[0]["owner"], "core");
-        assert_eq!(claims[0]["writable"], true);
         assert!(
-            claims[0]["what"].as_str().unwrap().contains("gate command"),
-            "the fence has to say what crossing it changes"
+            claims.is_empty(),
+            "the state files are in the settings store, so the project fence names none: {claims:?}"
         );
-        // The second row arrived with the module that parses it, which is the membership rule the
-        // registry runs on: a claim and a parser come together or not at all.
-        assert_eq!(claims[1]["path"], "workflows.yaml");
-        assert_eq!(
-            claims[1]["display"],
-            "~/.nucleos/projects/alpha/workflows.yaml"
-        );
-        assert_eq!(claims[1]["writable"], true);
         drop(home);
     }
 
@@ -5187,13 +5141,11 @@ mod tests {
         let _home = with_project_home(&mut state);
         let _dir = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
 
-        let (status, text) = owned_text(state.clone(), "alpha", "autopilot.yaml").await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(text, "gate_command: cargo test\n");
-
-        let (status, text) = owned_text(state.clone(), "alpha", "workflows.yaml").await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        assert!(text.contains("absent"), "{text}");
+        for path in ["autopilot.yaml", "workflows.yaml"] {
+            let (status, text) = owned_text(state.clone(), "alpha", path).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+            assert!(text.contains("not_ours"), "{text}");
+        }
 
         // Not in the table is refused, as the write route refuses it — `cat` is the door for the
         // repository's own files.
@@ -5218,8 +5170,10 @@ mod tests {
         .unwrap();
 
         let (status, body) = write_file(state, "a:b", "autopilot.yaml", "gate_command: x\n").await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(body["refusal"], "bad_project_id");
+        // The claim check comes before the state directory is resolved, and no state file is
+        // claimed any more (the registry owns them), so the route stops at `not_ours`.
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["refusal"], "not_ours");
         assert!(std::fs::read_dir(home.path()).unwrap().next().is_none());
     }
 
@@ -8746,21 +8700,17 @@ mod tests {
         );
     }
 
-    /// Review item G: a rules file the judge cannot read leaves the judge without effect for that
-    /// project, and the panel has to be able to say so, not only the verdict rows.
+    /// Review item G: stored rules the judge cannot read leave the judge without effect for that
+    /// project, and the panel has to be able to say so, not only the verdict rows (Task 3.6 of
+    /// chunk 3: the fixture marks the stored document unreadable instead of writing a file).
     #[tokio::test]
     async fn a_projects_unreadable_rules_are_named_beside_its_judge() {
-        let mut state = test_state().await;
-        let root = tempfile::tempdir().unwrap();
-        let project_dir = root.path().join("projects").join("p");
-        std::fs::create_dir_all(&project_dir).unwrap();
-        std::fs::write(
-            project_dir.join("autopilot.yaml"),
-            "judge: [not, a, map]
-",
-        )
-        .unwrap();
-        state.machine_config_root = Some(root.path().to_path_buf());
+        let state = test_state().await;
+        crate::project::rules::testing::publish_unreadable(
+            "p",
+            "autopilot",
+            "judge: invalid type: sequence, expected struct JudgeConfig",
+        );
         sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES ('p', 'active')")
             .execute(&state.pool)
             .await
@@ -8771,7 +8721,7 @@ mod tests {
         assert!(
             body["rules_error"]
                 .as_str()
-                .is_some_and(|error| !error.is_empty())
+                .is_some_and(|error| error.contains("expected struct JudgeConfig"))
         );
     }
 
@@ -8965,22 +8915,7 @@ mod tests {
         state.workflow_library = Some(library);
         let _home = with_project_home(&mut state);
         let project = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
-        crate::workflows::install(
-            &state
-                .machine_config_root
-                .clone()
-                .unwrap()
-                .join("projects/alpha")
-                .join(crate::project::state::PINS_FILE),
-            &crate::workflows::read_bundle(
-                &state.workflow_library.clone().unwrap().join("dev/1.0"),
-                "dev",
-                "1.0",
-            )
-            .unwrap()
-            .unwrap(),
-        )
-        .unwrap();
+        pin_dev_in_store("alpha", &state.workflow_library.clone().unwrap());
         crate::governance::autopilot::set_kill_switch(&state.pool, true)
             .await
             .unwrap();
@@ -9035,16 +8970,7 @@ mod tests {
                 &tree.to_string_lossy(),
             ],
         );
-        crate::workflows::install(
-            &home
-                .path()
-                .join("projects/alpha")
-                .join(crate::project::state::PINS_FILE),
-            &crate::workflows::read_bundle(&library.join("dev/1.0"), "dev", "1.0")
-                .unwrap()
-                .unwrap(),
-        )
-        .unwrap();
+        pin_dev_in_store("alpha", &library);
 
         let (status, answer) = workflow_call(
             state.clone(),
@@ -9116,17 +9042,7 @@ mod tests {
         .await
         .unwrap();
         for id in ["alpha", "beta"] {
-            crate::workflows::install(
-                &home
-                    .path()
-                    .join("projects")
-                    .join(id)
-                    .join(crate::project::state::PINS_FILE),
-                &crate::workflows::read_bundle(&library.join("dev/1.0"), "dev", "1.0")
-                    .unwrap()
-                    .unwrap(),
-            )
-            .unwrap();
+            pin_dev_in_store(id, &library);
         }
         (lib, home, project)
     }
@@ -9352,347 +9268,27 @@ mod tests {
         assert_eq!(body["refusal"], "kill_switch");
     }
 
-    /// A state whose machine-settings root is a directory this test owns.
+    /// The machine's settings are documents in the database now, reached through `/settings*`.
     ///
-    /// The `TempDir` is returned rather than dropped, for the reason the other helpers here give:
-    /// its drop is what deletes the directory, so a test that let it fall would be asserting
-    /// against a root that had already gone.
-    async fn state_with_machine_root() -> (AppState, tempfile::TempDir) {
-        let temp = tempfile::tempdir().unwrap();
-        let mut state = test_state().await;
-        state.machine_config_root = Some(temp.path().to_path_buf());
-        (state, temp)
-    }
-
-    /// The fence lists every row, including the pillars nobody has ever configured.
-    ///
-    /// "This has never been set up" is the answer the page most needs and an absent row cannot
-    /// give it — the same reason `GET /projects/{id}/ownership` serves claims rather than files.
-    /// The resolved path is asserted too, because it is the page's answer to "which file is this",
-    /// and so is the `~/.nucleos/` spelling a person is shown instead of a username-bearing one.
+    /// An Admin key is the widest caller a route in no scope table has, so a 404 here is the route
+    /// being gone rather than the caller being refused. The POST carries a well-formed body so that
+    /// it cannot pass by being turned away for its shape.
     #[tokio::test]
-    async fn the_fence_lists_every_setting_including_the_ones_never_configured() {
-        let (state, temp) = state_with_machine_root().await;
-        let (status, body) = workflow_call(state, "GET", "/config/machine", None).await;
-        assert_eq!(status, StatusCode::OK);
-
-        let rows = body["settings"].as_array().unwrap();
-        assert_eq!(rows.len(), crate::machine_config::SETTINGS.len());
-        for row in rows {
-            assert_eq!(row["exists"], false, "{} should not exist yet", row["path"]);
-            assert!(row["contents"].is_null());
-            assert!(!row["what"].as_str().unwrap().is_empty());
-            assert!(!row["takes_effect"].as_str().unwrap().is_empty());
-            assert!(
-                row["resolved"]
-                    .as_str()
-                    .unwrap()
-                    .starts_with(temp.path().to_str().unwrap()),
-                "every row must name the file it would actually write"
-            );
-            assert_eq!(
-                row["display"],
-                format!("~/.nucleos/{}", row["path"].as_str().unwrap()),
-                "a person is shown the tilde spelling, never a username-bearing path"
-            );
-        }
-        assert_eq!(body["root_display"], "~/.nucleos");
-    }
-
-    /// Saving `channels/telegram.yaml` from the app applies `stream_edits` at once, no restart.
-    #[tokio::test]
-    async fn writing_a_channel_setting_reloads_the_channel_config() {
-        let (state, _temp) = state_with_machine_root().await;
-        assert!(state.channels.config("telegram").is_none());
-
-        let (status, _) = workflow_call(
-            state.clone(),
-            "POST",
-            "/config/machine",
-            Some(serde_json::json!({
-                "path": "channels/telegram.yaml",
-                "contents": "stream_edits: false\n",
-            })),
-        )
-        .await;
-        assert_eq!(status, StatusCode::NO_CONTENT);
-        assert!(!state.channels.config("telegram").unwrap().stream_edits());
-    }
-
-    /// The first write on a machine that has never had a settings directory creates it.
-    ///
-    /// `~/.nucleos/` exists only once something has been put in it, and `safe_write_target`
-    /// canonicalises the root before it answers — so without the route creating it, the very first
-    /// setting anybody saved from the page would be refused for a directory nobody was asked for.
-    #[tokio::test]
-    async fn the_first_write_creates_the_settings_directory() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join(".nucleos");
-        let mut state = test_state().await;
-        state.machine_config_root = Some(root.clone());
-
-        let (status, _) = workflow_call(
-            state.clone(),
-            "POST",
-            "/config/machine",
-            Some(serde_json::json!({ "path": "calendar.yaml", "contents": "" })),
-        )
-        .await;
-        assert_eq!(status, StatusCode::NO_CONTENT);
-        assert!(root.join("calendar.yaml").is_file());
-
-        // And the feed line names the file the way a person is shown it.
-        let summary: String = sqlx::query_scalar(
-            "SELECT summary FROM feed WHERE kind = 'config_written' ORDER BY id DESC LIMIT 1",
-        )
-        .fetch_one(&state.pool)
-        .await
-        .unwrap();
-        assert_eq!(summary, "~/.nucleos/calendar.yaml written from the app");
-    }
-
-    /// A write lands, and the next read is the file rather than what the caller said it was.
-    #[tokio::test]
-    async fn a_setting_is_written_and_read_back() {
-        let (state, temp) = state_with_machine_root().await;
-        let (status, _) = workflow_call(
-            state.clone(),
-            "POST",
-            "/config/machine",
-            Some(serde_json::json!({
-                "path": "calendar.yaml",
-                "contents": "working_hours_start: \"10:00\"\n",
-            })),
-        )
-        .await;
-        assert_eq!(status, StatusCode::NO_CONTENT);
-
-        // On disk, under the root the state named — not merely in the answer.
-        let written = std::fs::read_to_string(temp.path().join("calendar.yaml")).unwrap();
-        assert!(written.contains("10:00"));
-
-        let (_, body) = workflow_call(state, "GET", "/config/machine", None).await;
-        let row = body["settings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|row| row["path"] == "calendar.yaml")
-            .unwrap()
-            .clone();
-        assert_eq!(row["exists"], true);
-        assert!(row["contents"].as_str().unwrap().contains("10:00"));
-    }
-
-    /// A file that does not parse is refused, and — the half that matters — the good file that was
-    /// already there is still there.
-    ///
-    /// Validate-then-write is the whole contract of this route. A route that wrote first and
-    /// validated after would turn one bad keystroke into a pillar that stays off after the next
-    /// restart, and the loaders are fail-soft precisely so that nobody would be told.
-    #[tokio::test]
-    async fn a_file_that_does_not_parse_is_refused_and_the_old_one_survives() {
-        let (state, temp) = state_with_machine_root().await;
-        let good = "enabled: true\nmax_sessions: 3\n";
-        let (status, _) = workflow_call(
-            state.clone(),
-            "POST",
-            "/config/machine",
-            Some(serde_json::json!({ "path": "browser.yaml", "contents": good })),
-        )
-        .await;
-        assert_eq!(status, StatusCode::NO_CONTENT);
-
-        let (status, body) = workflow_call(
-            state,
-            "POST",
-            "/config/machine",
-            Some(serde_json::json!({
-                "path": "browser.yaml",
-                "contents": "max_sessions: \"not a number\"\n",
-            })),
-        )
-        .await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(body["refusal"], "invalid");
-        // The parser's own words, so somebody can fix the line rather than guess at it.
-        assert!(!body["detail"].as_str().unwrap().is_empty());
-
-        assert_eq!(
-            std::fs::read_to_string(temp.path().join("browser.yaml")).unwrap(),
-            good,
-            "a refused write must not have touched the file"
-        );
-    }
-
-    /// A path this machine does not configure is refused, whichever way it is spelled.
-    ///
-    /// The three here are three different mistakes: a file that belongs to the `.ai/` workflow
-    /// harness, a file that is a PROJECT's and has its own door, and traversal. All three get
-    /// `not_ours` because from this route's point of view they are the same answer — the table
-    /// does not name them.
-    #[tokio::test]
-    async fn a_path_this_machine_does_not_configure_is_refused() {
-        let (state, temp) = state_with_machine_root().await;
-        for path in [
-            ".ai/project.yaml",
-            // A project's rules, by the name the project door knows them and by where they sit
-            // under this same root. Neither is this machine's; the project door writes them.
-            "autopilot.yaml",
-            "projects/alpha/autopilot.yaml",
-            "../voice.yaml",
-            // The spelling every row had before the files moved to `~/.nucleos/`. A caller still
-            // sending it would be writing a file the daemon no longer reads.
-            ".ai/voice.yaml",
-        ] {
-            let (status, body) = workflow_call(
-                state.clone(),
-                "POST",
-                "/config/machine",
-                Some(serde_json::json!({ "path": path, "contents": "enabled: true\n" })),
-            )
-            .await;
-            assert_eq!(status, StatusCode::FORBIDDEN, "{path} must be refused");
-            assert_eq!(body["refusal"], "not_ours");
-        }
-        assert!(
-            std::fs::read_dir(temp.path()).unwrap().next().is_none(),
-            "a refused write must not have created so much as a directory"
-        );
-    }
-
-    /// The kill switch stops a settings write, and the reason is not symmetry with the project
-    /// route — it is that the control token reaches here and `assistant.rs` hands that token to an
-    /// MCP-only assistant turn. `~/.nucleos/github.yaml` names what a run may do without asking.
-    #[tokio::test]
-    async fn the_kill_switch_stops_a_settings_write() {
-        let (state, _temp) = state_with_machine_root().await;
-        let (status, _) = workflow_call(
-            state.clone(),
-            "POST",
-            "/autopilot/kill",
-            Some(serde_json::json!({ "engaged": true })),
-        )
-        .await;
-        assert_eq!(status, StatusCode::NO_CONTENT);
-
-        let (status, body) = workflow_call(
-            state,
-            "POST",
-            "/config/machine",
-            Some(serde_json::json!({ "path": "calendar.yaml", "contents": "" })),
-        )
-        .await;
-        assert_eq!(status, StatusCode::LOCKED);
-        assert_eq!(body["refusal"], "kill_switch");
-    }
-
-    /// Without a root, both routes refuse by name rather than guessing at one.
-    ///
-    /// A daemon on a machine with no home directory has nowhere these files belong, and picking some
-    /// other directory — the working one, say, which is where they used to be — would be editing a
-    /// file the daemon does not read.
-    #[tokio::test]
-    async fn without_a_root_every_settings_route_refuses() {
+    async fn config_machine_is_gone() {
         let state = test_state().await;
-        assert!(state.machine_config_root.is_none());
+        let admin = store_api_token_at_level(&state, "administrator", ApiTokenLevel::Admin).await;
 
-        let (status, body) = workflow_call(state.clone(), "GET", "/config/machine", None).await;
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(body["refusal"], "no_machine_root");
-
-        let (status, body) = workflow_call(
-            state,
-            "POST",
-            "/config/machine",
-            Some(serde_json::json!({ "path": "calendar.yaml", "contents": "" })),
-        )
-        .await;
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(body["refusal"], "no_machine_root");
-    }
-
-    /// The row of `path` in a `GET /config/machine` body.
-    fn machine_row(body: &serde_json::Value, path: &str) -> serde_json::Value {
-        body["settings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|row| row["path"] == path)
-            .unwrap_or_else(|| panic!("no row for {path}"))
-            .clone()
-    }
-
-    /// A file that is on disk and does not parse says so, with why; one that parses and one that is
-    /// absent say nothing is wrong. The loaders start the daemon on defaults for the first kind and
-    /// log a warning the owner does not read, so the page is where this has to be visible.
-    #[tokio::test]
-    async fn machine_config_route_reports_a_file_that_does_not_parse() {
-        let (state, temp) = state_with_machine_root().await;
-        std::fs::write(
-            temp.path().join("email.yaml"),
-            "enabled: [this is not a bool}
-",
-        )
-        .unwrap();
-        std::fs::write(temp.path().join("calendar.yaml"), "").unwrap();
-
-        let (status, body) = workflow_call(state, "GET", "/config/machine", None).await;
-        assert_eq!(status, StatusCode::OK);
-
-        let bad = machine_row(&body, "email.yaml");
-        assert_eq!(bad["exists"], true);
-        assert_eq!(bad["valid"], false);
-        assert!(!bad["problem"].as_str().unwrap().is_empty());
-        // Served as it is, so the page can show the text the person has to fix.
-        assert!(bad["contents"].as_str().unwrap().contains("not a bool"));
-
-        let good = machine_row(&body, "calendar.yaml");
-        assert_eq!(good["exists"], true);
-        assert_eq!(good["valid"], true);
-        assert!(good["problem"].is_null());
-
-        let absent = machine_row(&body, "voice.yaml");
-        assert_eq!(absent["exists"], false);
-        assert_eq!(
-            absent["valid"], true,
-            "an absent file means defaults, which is valid"
-        );
-    }
-
-    /// What the daemon started on is served beside what is on disk now, so a file fixed after the
-    /// start reads as valid today and as started-on-defaults, until the daemon restarts.
-    #[tokio::test]
-    async fn machine_config_route_reports_what_the_daemon_started_on() {
-        let (mut state, temp) = state_with_machine_root().await;
-        // The file was broken when the daemon read it ...
-        std::fs::write(
-            temp.path().join("email.yaml"),
-            "enabled: [this is not a bool}
-",
-        )
-        .unwrap();
-        state.startup_config = std::sync::Arc::new(crate::machine_config::check_all(temp.path()));
-        // ... and has been fixed since.
-        std::fs::write(
-            temp.path().join("email.yaml"),
-            "enabled: false
-",
-        )
-        .unwrap();
-
-        let (_, body) = workflow_call(state, "GET", "/config/machine", None).await;
-
-        let email = machine_row(&body, "email.yaml");
-        assert_eq!(email["valid"], true, "the file on disk now parses");
-        assert_eq!(
-            email["at_startup"]["valid"], false,
-            "but the daemon started without it"
-        );
-        assert!(!email["at_startup"]["problem"].as_str().unwrap().is_empty());
-
-        let web = machine_row(&body, "web.yaml");
-        assert_eq!(web["at_startup"]["valid"], true);
-        assert!(web["at_startup"]["problem"].is_null());
+        for (method, body) in [
+            ("GET", None),
+            (
+                "POST",
+                Some(serde_json::json!({ "path": "calendar.yaml", "contents": "" })),
+            ),
+        ] {
+            let response =
+                api_token_request(state.clone(), method, "/config/machine", &admin, body).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method}");
+        }
     }
 
     /// An installed workflow's declared file is in the fence and cannot be written from here.
@@ -9725,7 +9321,8 @@ mod tests {
         let (_, claims) =
             workflow_call(state.clone(), "GET", "/projects/alpha/ownership", None).await;
         let claims = claims.as_array().unwrap();
-        assert_eq!(claims.len(), 3);
+        // Only the workflow's own file: the two state-file claims moved to the settings registry.
+        assert_eq!(claims.len(), 1);
         let theirs = claims
             .iter()
             .find(|claim| claim["path"] == ".ai/models.yaml")
@@ -9744,16 +9341,17 @@ mod tests {
         assert_eq!(body["refusal"], "another_author");
         assert!(body["detail"].as_str().unwrap().contains("harness"));
 
-        // And the file the app DOES author still saves, so the refusal above is about authorship
-        // rather than about the route having stopped working.
-        let (status, _) = workflow_call(
+        // `workflows.yaml` is no longer a claimed file (the registry stores it), so it is
+        // `not_ours`, a different refusal from the `another_author` above.
+        let (status, body) = workflow_call(
             state,
             "POST",
             "/projects/alpha/write",
             Some(serde_json::json!({ "path": "workflows.yaml", "contents": "workflows: []\n" })),
         )
         .await;
-        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["refusal"], "not_ours");
     }
 
     /// Ejecting is a one-way door, and pressing it twice does not walk back through it.

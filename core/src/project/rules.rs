@@ -1,6 +1,6 @@
 //! What a project's `autopilot` and `workflow_pins` documents say, read from the settings snapshot.
 //!
-//! This replaces `config::load_schedule_rules` and `workflows::read_pins` as the READERS of the two project
+//! This replaced the removed `config::load_schedule_rules` and `workflows::read_pins` as the READERS of the two project
 //! documents. The old loaders read a file on every call and failed with an `io::Error` when the file did not
 //! parse; this one reads the in-memory snapshot (no I/O) and fails with [`DocumentUnreadable`] when the stored
 //! document no longer fits its type. The contract callers rely on is unchanged: nothing stored is the default,
@@ -35,6 +35,18 @@ pub fn autopilot(project_id: &str) -> Result<AutopilotRules, DocumentUnreadable>
 
 pub fn pins(project_id: &str) -> Result<Pins, DocumentUnreadable> {
     read_from(&crate::settings::global().snapshot(), project_id)
+}
+
+/// The project's pins plus the stored version they were read at, from ONE snapshot.
+///
+/// An absent document is `(Pins::default(), 0)`: `expected: Some(0)` on a `put` means "must not exist yet".
+pub fn pins_versioned(project_id: &str) -> Result<(Pins, i64), DocumentUnreadable> {
+    let snapshot = crate::settings::global().snapshot();
+    let pins = read_from::<Pins>(&snapshot, project_id)?;
+    let version = snapshot
+        .version(&Scope::project(project_id), "workflow_pins")
+        .unwrap_or(0);
+    Ok((pins, version))
 }
 
 /// Whether the project has a readable stored document called `name`.
@@ -258,8 +270,11 @@ pub mod testing {
                 return;
             }
             *held = None;
-            let gate = GATE.write().unwrap_or_else(PoisonError::into_inner);
+            // Lock order is SERIAL (inside `install`) first, then GATE, the same as a test that calls
+            // `settings::testing::install` itself and then `hold_shared()` through `test_state()`. The
+            // reverse order (GATE, then SERIAL) deadlocked against such a test.
             let installed = settings::testing::install(Settings::new());
+            let gate = GATE.write().unwrap_or_else(PoisonError::into_inner);
             *held = Some(Held::Exclusive {
                 _installed: installed,
                 _gate: gate,

@@ -5,7 +5,7 @@ use super::*;
 /// The devtime ingestion's settings.
 ///
 /// Derives `PartialEq` and not `Eq`, because the amber rate is an `f64`.
-#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DevtimeConfig {
     pub enabled: bool,
@@ -60,7 +60,7 @@ pub(super) fn owned(items: &[&str]) -> Vec<String> {
 /// The rule engine's whole configuration: every threshold, program list and vocabulary a rule reads.
 /// Rule code holds no such literal (spec §3.5), so a partial file at any nesting level is valid and
 /// every field has the default the spec states.
-#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DevtimeRulesConfig {
     pub enabled: bool,
@@ -95,7 +95,7 @@ impl Default for DevtimeRulesConfig {
 
 /// Which programs count as a test, a build, a lint, a mutation, a sleep, a commit or a revert, and
 /// which tool names are shell, edit, read or search tools.
-#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DevtimeCommandsConfig {
     pub test: Vec<String>,
@@ -178,7 +178,7 @@ impl Default for DevtimeCommandsConfig {
 }
 
 /// One project's extra test, build and lint programs.
-#[derive(Debug, Clone, Default, Deserialize, serde::Serialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DevtimeProjectCommands {
     pub test: Vec<String>,
@@ -187,7 +187,7 @@ pub struct DevtimeProjectCommands {
 }
 
 /// Case-insensitive globs (`*` only) over a subagent's `agentType`. The reviewer list is tried first.
-#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DevtimeRolesConfig {
     pub reviewer: Vec<String>,
@@ -204,7 +204,7 @@ impl Default for DevtimeRolesConfig {
 }
 
 /// The words the parser and the rules match in memory. Only the derived flag or token is ever stored.
-#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DevtimeVocabConfig {
     /// A prompt that opens with one of these counts as a correction of the previous answer.
@@ -263,7 +263,7 @@ impl Default for DevtimeVocabConfig {
 }
 
 /// Every numeric threshold a rule compares against.
-#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DevtimeThresholdsConfig {
     /// D3: a Grep/Glob streak without an edit.
@@ -306,7 +306,7 @@ impl Default for DevtimeThresholdsConfig {
 }
 
 /// What counts as an external path, and which file extensions are code.
-#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DevtimePathsConfig {
     /// Globs, case-insensitive, with `\` read as `/`.
@@ -327,7 +327,7 @@ impl Default for DevtimePathsConfig {
 }
 
 /// How a rule's precision is judged (spec §7).
-#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DevtimePrecisionConfig {
     /// A rule below this precision is flagged out of phase 2.
@@ -355,7 +355,7 @@ impl Default for DevtimePrecisionConfig {
 }
 
 /// When a slow turn that no rule explains is worth listing.
-#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DevtimeUnexplainedConfig {
     pub median_multiple: f64,
@@ -382,7 +382,7 @@ impl Default for DevtimeUnexplainedConfig {
 }
 
 /// Where the optional adapter sources live. Empty means absent.
-#[derive(Debug, Clone, Default, Deserialize, serde::Serialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DevtimeAdaptersConfig {
     pub permission_log: String,

@@ -267,12 +267,11 @@ pub async fn tick(executor: &Arc<Executor>) -> Vec<Pass> {
 
     let mut passes = Vec::new();
     for (project_id, root) in roster {
-        let rules =
-            match crate::config::load_schedule_rules(executor.machine_root.as_deref(), &project_id)
-            {
-                Ok(rules) if rules.gate_after_land => rules,
-                _ => continue,
-            };
+        // Unreadable stored rules skip the project, exactly like a pass that is switched off.
+        let rules = match crate::project::rules::autopilot(&project_id) {
+            Ok(rules) if rules.gate_after_land => rules,
+            _ => continue,
+        };
         let step = tick_project(executor, &project_id, Path::new(&root), &rules).await;
         passes.push(Pass { project_id, step });
     }
@@ -953,8 +952,7 @@ async fn report_red(
     };
     let base = state.red_base_sha.as_deref();
     let reverting = matches!(verdict, Verdict::Culprit { .. })
-        && crate::config::load_schedule_rules(executor.machine_root.as_deref(), project_id)
-            .is_ok_and(|rules| rules.revert_on_red);
+        && crate::project::rules::autopilot(project_id).is_ok_and(|rules| rules.revert_on_red);
     // A culprit always comes with a base (no base reports inconclusive); the check keeps the line
     // and the state in step should that ever change.
     let in_flight = reverting && state.revert_in_flight();
@@ -1203,7 +1201,7 @@ mod tests {
         tip: String,
         _env: WorktreeRootEnv,
         _roots: tempfile::TempDir,
-        _machine: tempfile::TempDir,
+        _machine: crate::project::rules::testing::Home,
         _repo: tempfile::TempDir,
         _lock: MutexGuard<'static, ()>,
     }
@@ -1245,14 +1243,9 @@ mod tests {
         .await
         .unwrap();
 
-        let machine = tempfile::tempdir().unwrap();
+        let machine = crate::project::rules::testing::Home::new();
         if let Some(rules) = rules {
-            crate::project::state::write_for_test(
-                machine.path(),
-                "alpha",
-                crate::project::state::AUTOPILOT_FILE,
-                rules,
-            );
+            crate::project::rules::testing::publish_rules("alpha", rules);
         }
         let ex = Executor::new(
             pool.clone(),
@@ -2274,12 +2267,7 @@ mod tests {
     async fn a_revert_dropped_by_the_switch_going_off_resumes_when_the_switch_is_back_on() {
         let f = fixture(Some(REVERT_ON)).await;
         let (c3, _c4) = confirmed_culprit(&f).await;
-        crate::project::state::write_for_test(
-            f._machine.path(),
-            "alpha",
-            crate::project::state::AUTOPILOT_FILE,
-            REVERT_OFF,
-        );
+        crate::project::rules::testing::publish_rules("alpha", REVERT_OFF);
         tick_until(&f, |s| matches!(s, Step::RevertFailed { .. })).await;
 
         let row = incident(&f).await.unwrap();
@@ -2296,12 +2284,7 @@ mod tests {
         }
         assert!(queue_rows(&f.pool).await.is_empty());
 
-        crate::project::state::write_for_test(
-            f._machine.path(),
-            "alpha",
-            crate::project::state::AUTOPILOT_FILE,
-            REVERT_ON,
-        );
+        crate::project::rules::testing::publish_rules("alpha", REVERT_ON);
         let step = tick_until(&f, |s| matches!(s, Step::IncidentTaken { .. })).await;
         assert!(
             matches!(&step, Step::IncidentTaken { merge_sha, .. } if *merge_sha == c3),
@@ -2334,8 +2317,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let rules =
-            crate::config::load_schedule_rules(f.ex.machine_root.as_deref(), "alpha").unwrap();
+        let rules = crate::project::rules::autopilot("alpha").unwrap();
         let stale_tip = "0000000000000000000000000000000000000001";
         assert!(
             incident::takeover_step(&f.ex, "alpha", &f.root, &state, stale_tip, &rules)
@@ -2650,12 +2632,7 @@ mod tests {
         let f = fixture(Some(REVERT_ON)).await;
         let (c3, c4) = confirmed_culprit(&f).await;
 
-        crate::project::state::write_for_test(
-            f._machine.path(),
-            "alpha",
-            crate::project::state::AUTOPILOT_FILE,
-            REVERT_OFF,
-        );
+        crate::project::rules::testing::publish_rules("alpha", REVERT_OFF);
         let step = tick_until(&f, |s| matches!(s, Step::RevertFailed { .. })).await;
         let Step::RevertFailed { merge_sha, .. } = step else {
             unreachable!("tick_until returned a step it was not asked for");
@@ -2684,11 +2661,10 @@ mod tests {
         let f = fixture(Some(REVERT_ON)).await;
         let (c3, c4) = confirmed_culprit(&f).await;
 
-        crate::project::state::write_for_test(
-            f._machine.path(),
+        crate::project::rules::testing::publish_unreadable(
             "alpha",
-            crate::project::state::AUTOPILOT_FILE,
-            "gate_after_land: true\nrevert_on_red: [\n",
+            "autopilot",
+            "revert_on_red: invalid type: sequence, expected a boolean",
         );
         let state = verify_postgate::load(&f.pool, "alpha")
             .await
@@ -2712,12 +2688,7 @@ mod tests {
         assert!(!last.contains("turned off"), "{last}");
         assert_eq!(git_in(&f.root, &["rev-parse", "main"]), c4);
 
-        crate::project::state::write_for_test(
-            f._machine.path(),
-            "alpha",
-            crate::project::state::AUTOPILOT_FILE,
-            REVERT_ON,
-        );
+        crate::project::rules::testing::publish_rules("alpha", REVERT_ON);
         tick_until(&f, |s| matches!(s, Step::Reverting { .. })).await;
         assert_eq!(queue_rows(&f.pool).await.len(), 1);
     }
@@ -2749,7 +2720,10 @@ mod tests {
         let lines = feed_summaries(&f.pool).await;
         let last = lines.last().expect("the owner is told");
         assert!(last.contains("could not be read"), "{last}");
-        assert!(last.contains("expected a boolean"), "the reason is in the line: {last}");
+        assert!(
+            last.contains("expected a boolean"),
+            "the reason is in the line: {last}"
+        );
         assert_eq!(git_in(&f.root, &["rev-parse", "main"]), c4);
     }
 
@@ -2757,9 +2731,12 @@ mod tests {
     /// can read. The fixture's file stays readable, so only the snapshot can say otherwise.
     #[tokio::test]
     async fn a_pass_skips_a_project_whose_stored_rules_cannot_be_read() {
-        let f = fixture(Some("gate_command: \"git --version\"
+        let f = fixture(Some(
+            "gate_command: \"git --version\"
 gate_after_land: true
-")).await;
+",
+        ))
+        .await;
         crate::project::rules::testing::publish_rules(
             "alpha",
             "gate_command: \"git --version\"
@@ -3478,10 +3455,8 @@ gate_after_land: true
         );
 
         // The machine goes quiet: the same command now answers 0.
-        crate::project::state::write_for_test(
-            f._machine.path(),
+        crate::project::rules::testing::publish_rules(
             "alpha",
-            crate::project::state::AUTOPILOT_FILE,
             "gate_command: \"git --version\"\ngate_after_land: true\n\
              postgate_idle_command: \"git --version\"\n",
         );

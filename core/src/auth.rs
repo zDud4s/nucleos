@@ -705,7 +705,7 @@ const REMOTE_ADMIN_SEGMENTS: &[&str] = &[
 /// families the shell never calls), written out so the classification is total: the guard test
 /// fails on a route prefix in none of [`REMOTE_ALLOWED_SEGMENTS`], [`REMOTE_ADMIN_SEGMENTS`] and
 /// this list. The hard-deny set is host-only by nature: the shutdown/update handshake (`daemon`,
-/// `system`), machine settings and secrets (`config`), backups (`backup`, `backups`), credential
+/// `system`), machine settings and secrets (`config`, and `settings`, which replaced it as the home of the machine and `channels/*` documents), backups (`backup`, `backups`), credential
 /// minting (`api-tokens`), sidecar control (`sidecars`), messaging identity pairing (`channels`),
 /// the whole remote owner surface including `/remote/pair` (`remote`) and live browser pixels
 /// (`browser`). The rest are families the desktop shell never calls over the API (`chats` is only a
@@ -731,6 +731,7 @@ const REMOTE_DENIED_SEGMENTS: &[&str] = &[
     "nodes",
     "pricing",
     "remote",
+    "settings",
     "sidecars",
     "system",
     "tasks",
@@ -4549,6 +4550,66 @@ mod tests {
                 !permits(&scope, &Method::GET, "/projects/7/owned"),
                 "{scope:?} must not read a project's rules file"
             );
+        }
+    }
+
+    /// A settings document holds shortcuts, accounts and gate commands, so `/settings*` is the owner's, reads
+    /// included. Safe today by being in no table; this is what says no to filing the reads beside the others.
+    #[test]
+    fn settings_routes_are_in_no_scope_table() {
+        let routes: [(Method, &str, &str); 6] = [
+            (Method::GET, "/settings", "/settings"),
+            (
+                Method::GET,
+                "/settings/{scope}/{name}",
+                "/settings/machine/verify",
+            ),
+            (
+                Method::PUT,
+                "/settings/{scope}/{name}",
+                "/settings/machine/verify",
+            ),
+            (
+                Method::GET,
+                "/settings/{scope}/{name}/history",
+                "/settings/machine/verify/history",
+            ),
+            (
+                Method::POST,
+                "/settings/{scope}/{name}/rollback/{version}",
+                "/settings/machine/verify/rollback/2",
+            ),
+            (
+                Method::GET,
+                "/settings/{scope}/{name}",
+                "/settings/project:p1/autopilot",
+            ),
+        ];
+        for (method, pattern, path) in &routes {
+            assert!(
+                !route_is_listed(READ_ONLY_ROUTES, method, pattern)
+                    && !route_is_listed(RUN_CREATING_ROUTES, method, pattern)
+                    && !route_is_listed(TEAM_ROUTES, method, pattern)
+                    && !route_is_listed(EMAIL_ROUTES, method, pattern)
+                    && !route_is_listed(COUNCIL_ROUTES, method, pattern),
+                "{method} {pattern} must stay out of every scope table"
+            );
+            for scope in [
+                Scope::Run(7),
+                Scope::ApiToken(ApiTokenLevel::ReadOnly),
+                Scope::ApiToken(ApiTokenLevel::RunCreating),
+            ] {
+                assert!(
+                    !permits(&scope, method, path),
+                    "{scope:?} must not reach {method} {path}"
+                );
+            }
+            for scope in [Scope::ApiToken(ApiTokenLevel::Admin), Scope::Control] {
+                assert!(
+                    permits(&scope, method, path),
+                    "{scope:?} must reach {method} {path}"
+                );
+            }
         }
     }
 

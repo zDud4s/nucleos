@@ -841,6 +841,9 @@ mod tests {
     };
 
     async fn test_pool() -> sqlx::SqlitePool {
+        // The queue's executor reads the project's rules from the settings snapshot: hold the shared side of
+        // the rules gate (the test that publishes upgrades itself).
+        crate::project::rules::testing::hold_shared();
         crate::testdb::fresh_pool().await
     }
 
@@ -1805,24 +1808,15 @@ mod tests {
     async fn a_red_gate_fails_the_landing_and_starts_no_agent() {
         let _lock = crate::execution::worktree::test_env_lock();
         let pool = test_pool().await;
-        let (container, repo) = repo_parked_off_target("nucleos-land-gate-", "chore/other");
+        let (_container, repo) = repo_parked_off_target("nucleos-land-gate-", "chore/other");
         assert!(git_in(&repo, &["checkout", "-q", "master"]));
         let roots = crate::execution::git_exec::testkit::space_free_tempdir("nucleos-land-wt-");
         let _env = crate::execution::git_exec::tests::WorktreeRootEnv::set(roots.path());
-        // Where the queue reads `alpha`'s rules: a temporary stand-in for `~/.nucleos`.
-        let machine_root = container.path().join("nucleos-home");
-        let rules = crate::project::state::file(
-            Some(&machine_root),
+        // Where the queue reads `alpha`'s rules: the settings snapshot, owned by this test from here on.
+        crate::project::rules::testing::publish_rules(
             "alpha",
-            crate::project::state::AUTOPILOT_FILE,
-        )
-        .unwrap();
-        std::fs::create_dir_all(rules.parent().unwrap()).unwrap();
-        std::fs::write(
-            &rules,
             "gate_before_publish: true\ngate_command: git rev-parse --verify nao-existe\n",
-        )
-        .unwrap();
+        );
         seed_project(&pool, "alpha", &repo, Some("master")).await;
 
         let repo_id = ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha");
@@ -1838,10 +1832,7 @@ mod tests {
         .await
         .expect("a red gate is discovered at execution, not at submission");
 
-        let executor = crate::execution::git_exec::GitExecutor {
-            machine_root: Some(machine_root),
-            ..crate::execution::git_exec::GitExecutor::default()
-        };
+        let executor = crate::execution::git_exec::GitExecutor::default();
         assert!(crate::execution::vcs::drain_once(&pool, "alpha", &executor).await);
 
         assert_eq!(

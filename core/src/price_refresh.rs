@@ -203,9 +203,9 @@ fn prices_as_of_in(text: &str) -> Option<String> {
 /// the reason the models file stops loading.
 ///
 /// The text spliced is read AFTER the fetch, not before: a fetch can take up to [`FETCH_TIMEOUT`],
-/// and a splice of the text read before it would put back whatever a System-page write, a hand
-/// edit or anything else changed meanwhile. The re-read, the splice and the write happen under
-/// [`crate::config::MODELS_FILE_WRITE`], so the System page's write door cannot land in between.
+/// and a splice of the text read before it would put back whatever a hand edit or anything else
+/// changed meanwhile. The re-read, the splice and the write happen under
+/// [`crate::config::MODELS_FILE_WRITE`], so no other in-process writer can land in between.
 pub async fn refresh_file(
     client: &reqwest::Client,
     sources: &PriceSources,

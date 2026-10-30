@@ -729,16 +729,15 @@ pub mod tests {
     #[tokio::test]
     async fn um_merge_que_o_gate_recusa_nao_e_publicado() {
         let _lock = crate::execution::worktree::test_env_lock();
-        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-gate-red-");
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-gate-red-");
         let roots = space_free_tempdir("nucleos-gitexec-wt-");
         let _env = WorktreeRootEnv::set(roots.path());
         write_autopilot_rules(
-            container.path(),
             "gate_before_publish: true\ngate_command: git rev-parse --verify nao-existe\n",
         );
         let before = sha_of(&repo, "master");
 
-        match land_ordinarily(&repo, container.path()).await {
+        match land_ordinarily(&repo).await {
             Outcome::Failed {
                 reason,
                 output_tail,
@@ -765,17 +764,14 @@ pub mod tests {
     #[tokio::test]
     async fn um_merge_que_o_gate_aceita_e_publicado() {
         let _lock = crate::execution::worktree::test_env_lock();
-        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-gate-green-");
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-gate-green-");
         let roots = space_free_tempdir("nucleos-gitexec-wt-");
         let _env = WorktreeRootEnv::set(roots.path());
         // `git --version` is the gate that always agrees, and it needs no shell to run.
-        write_autopilot_rules(
-            container.path(),
-            "gate_before_publish: true\ngate_command: git --version\n",
-        );
+        write_autopilot_rules("gate_before_publish: true\ngate_command: git --version\n");
         let before = sha_of(&repo, "master");
 
-        let published = match land_ordinarily(&repo, container.path()).await {
+        let published = match land_ordinarily(&repo).await {
             Outcome::Succeeded { sha, .. } => sha.expect("a merge names the commit it published"),
             other => panic!("a green gate must let the merge through, got {other:?}"),
         };
@@ -789,18 +785,16 @@ pub mod tests {
         use crate::execution::vcs::VcsExecutor;
 
         let _lock = crate::execution::worktree::test_env_lock();
-        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-gate-rec-");
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-gate-rec-");
         let roots = space_free_tempdir("nucleos-gitexec-wt-");
         let _env = WorktreeRootEnv::set(roots.path());
         write_autopilot_rules(
-            container.path(),
             "gate_before_publish: true
 gate_command: git --version
 ",
         );
         let pool = crate::testdb::fresh_pool().await;
         let outcome = GitExecutor {
-            machine_root: Some(container.path().to_path_buf()),
             pool: Some(pool.clone()),
             ..GitExecutor::default()
         }
@@ -847,16 +841,13 @@ gate_command: git --version
     #[tokio::test]
     async fn sem_a_chave_o_gate_nem_sequer_corre() {
         let _lock = crate::execution::worktree::test_env_lock();
-        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-gate-off-");
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-gate-off-");
         let roots = space_free_tempdir("nucleos-gitexec-wt-");
         let _env = WorktreeRootEnv::set(roots.path());
-        write_autopilot_rules(
-            container.path(),
-            "gate_command: git rev-parse --verify nao-existe\n",
-        );
+        write_autopilot_rules("gate_command: git rev-parse --verify nao-existe\n");
         let before = sha_of(&repo, "master");
 
-        match land_ordinarily(&repo, container.path()).await {
+        match land_ordinarily(&repo).await {
             Outcome::Succeeded { .. } => {}
             other => panic!("an ungated merge must land untouched, got {other:?}"),
         }
@@ -871,13 +862,13 @@ gate_command: git --version
     #[tokio::test]
     async fn pedir_medida_sem_gate_command_e_recusado() {
         let _lock = crate::execution::worktree::test_env_lock();
-        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-gate-nocmd-");
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-gate-nocmd-");
         let roots = space_free_tempdir("nucleos-gitexec-wt-");
         let _env = WorktreeRootEnv::set(roots.path());
-        write_autopilot_rules(container.path(), "gate_before_publish: true\n");
+        write_autopilot_rules("gate_before_publish: true\n");
         let before = sha_of(&repo, "master");
 
-        match land_ordinarily(&repo, container.path()).await {
+        match land_ordinarily(&repo).await {
             Outcome::Failed { reason, .. } => assert!(
                 reason.contains("gate_command"),
                 "the refusal must name the key that is missing: {reason}"
@@ -894,7 +885,7 @@ gate_command: git --version
     #[tokio::test]
     async fn rules_that_cannot_be_read_refuse_the_merge_and_publish_nothing() {
         let _lock = crate::execution::worktree::test_env_lock();
-        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-gate-unreadable-");
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-gate-unreadable-");
         let roots = space_free_tempdir("nucleos-gitexec-wt-");
         let _env = WorktreeRootEnv::set(roots.path());
         let _home = crate::project::rules::testing::Home::new();
@@ -905,11 +896,14 @@ gate_command: git --version
         );
         let before = sha_of(&repo, "master");
 
-        match land_ordinarily(&repo, container.path()).await {
+        match land_ordinarily(&repo).await {
             Outcome::Failed { reason, .. } => {
                 assert!(reason.contains("could not be read"), "{reason}");
                 assert!(reason.contains("nothing was published"), "{reason}");
-                assert!(reason.contains("expected a boolean"), "the reason is passed on: {reason}");
+                assert!(
+                    reason.contains("expected a boolean"),
+                    "the reason is passed on: {reason}"
+                );
             }
             other => panic!("unreadable rules must refuse the merge, got {other:?}"),
         }
@@ -921,7 +915,7 @@ gate_command: git --version
     #[tokio::test]
     async fn a_gate_stored_in_the_snapshot_refuses_a_red_merge() {
         let _lock = crate::execution::worktree::test_env_lock();
-        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-gate-stored-");
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-gate-stored-");
         let roots = space_free_tempdir("nucleos-gitexec-wt-");
         let _env = WorktreeRootEnv::set(roots.path());
         let _home = crate::project::rules::testing::Home::new();
@@ -933,7 +927,7 @@ gate_command: git rev-parse --verify nao-existe
         );
         let before = sha_of(&repo, "master");
 
-        let outcome = land_ordinarily(&repo, container.path()).await;
+        let outcome = land_ordinarily(&repo).await;
 
         assert!(
             matches!(outcome, Outcome::Failed { .. }),
@@ -942,44 +936,33 @@ gate_command: git rev-parse --verify nao-existe
         assert_eq!(sha_of(&repo, "master"), before, "master moved");
     }
 
-    /// Writes project `alpha`'s rules where the queue reads them: `<machine_root>/projects/alpha/`,
-    /// with `machine_root` a temporary directory standing in for `~/.nucleos`.
-    fn write_autopilot_rules(machine_root: &Path, contents: &str) {
-        let path = crate::project::state::file(
-            Some(machine_root),
-            "alpha",
-            crate::project::state::AUTOPILOT_FILE,
-        )
-        .expect("alpha names a directory");
-        std::fs::create_dir_all(path.parent().expect("the rules file sits in a folder"))
-            .expect("create the rules folder");
-        std::fs::write(path, contents).expect("write the rules");
+    /// Stores project `alpha`'s rules where the queue now reads them: the settings snapshot. The test owns
+    /// the snapshot from here on (`publish_rules` takes the exclusive hold), so no other test's rules leak in.
+    fn write_autopilot_rules(contents: &str) {
+        crate::project::rules::testing::publish_rules("alpha", contents);
     }
 
     /// An ordinary landing of `feat/x` into `master`, through the real executor.
-    async fn land_ordinarily(repo: &Path, machine_root: &Path) -> Outcome {
+    async fn land_ordinarily(repo: &Path) -> Outcome {
         use crate::execution::vcs::VcsExecutor;
         // Reads the project's rules from the settings snapshot: hold the shared side of the rules gate
         // (a no-op when the test already published and so holds the exclusive side).
         crate::project::rules::testing::hold_shared();
-        GitExecutor {
-            machine_root: Some(machine_root.to_path_buf()),
-            ..GitExecutor::default()
-        }
-        .execute(&crate::execution::vcs::ClaimedRequest {
-            id: 1,
-            op: crate::execution::vcs::Op::Merge {
-                source: "feat/x".into(),
-                target: "master".into(),
-            },
-            project_id: "alpha".to_owned(),
-            project_root: repo.to_string_lossy().into_owned(),
-            from_resolution: false,
-            run_id: None,
-            approved_map_blob: None,
-            integration_branch: None,
-        })
-        .await
+        GitExecutor::default()
+            .execute(&crate::execution::vcs::ClaimedRequest {
+                id: 1,
+                op: crate::execution::vcs::Op::Merge {
+                    source: "feat/x".into(),
+                    target: "master".into(),
+                },
+                project_id: "alpha".to_owned(),
+                project_root: repo.to_string_lossy().into_owned(),
+                from_resolution: false,
+                run_id: None,
+                approved_map_blob: None,
+                integration_branch: None,
+            })
+            .await
     }
 
     // ---- F3-6: `gate_before_publish` combined with `gate_after_land` ----------------------------
@@ -1040,7 +1023,6 @@ gate_command: git rev-parse --verify nao-existe
 
     async fn land_with(
         repo: &Path,
-        machine_root: &Path,
         pool: Option<sqlx::SqlitePool>,
         verify: Option<std::sync::Arc<crate::verify::exec::Executor>>,
         integration_branch: Option<&str>,
@@ -1049,7 +1031,6 @@ gate_command: git rev-parse --verify nao-existe
         use crate::execution::vcs::VcsExecutor;
         crate::project::rules::testing::hold_shared();
         GitExecutor {
-            machine_root: Some(machine_root.to_path_buf()),
             pool,
             verify,
             ..GitExecutor::default()
@@ -1094,24 +1075,15 @@ gate_command: git rev-parse --verify nao-existe
         let roots = space_free_tempdir("nucleos-gitexec-wt-");
         let _env = WorktreeRootEnv::set(roots.path());
         commit_map_on_master(&repo, GREEN_GATE);
-        write_autopilot_rules(
-            container.path(),
-            &format!("gate_before_publish: true\ngate_command: {RED_GATE}\n"),
-        );
+        write_autopilot_rules(&format!(
+            "gate_before_publish: true\ngate_command: {RED_GATE}\n"
+        ));
         let pool = crate::testdb::fresh_pool().await;
         roster(&pool, &repo).await;
         let executor = verify_executor(&pool, container.path());
         let before = sha_of(&repo, "master");
 
-        let outcome = land_with(
-            &repo,
-            container.path(),
-            Some(pool.clone()),
-            Some(executor),
-            Some("master"),
-            7,
-        )
-        .await;
+        let outcome = land_with(&repo, Some(pool.clone()), Some(executor), Some("master"), 7).await;
 
         assert!(matches!(outcome, Outcome::Failed { .. }), "{outcome:?}");
         assert!(request_callers(&pool).await.is_empty(), "no verify request");
@@ -1133,23 +1105,12 @@ gate_command: git rev-parse --verify nao-existe
         let roots = space_free_tempdir("nucleos-gitexec-wt-");
         let _env = WorktreeRootEnv::set(roots.path());
         commit_map_on_master(&repo, GREEN_GATE);
-        write_autopilot_rules(
-            container.path(),
-            &format!("{BOTH_SWITCHES}gate_command: {RED_GATE}\n"),
-        );
+        write_autopilot_rules(&format!("{BOTH_SWITCHES}gate_command: {RED_GATE}\n"));
         let pool = crate::testdb::fresh_pool().await;
         roster(&pool, &repo).await;
         let executor = verify_executor(&pool, container.path());
 
-        let outcome = land_with(
-            &repo,
-            container.path(),
-            Some(pool.clone()),
-            Some(executor),
-            Some("master"),
-            7,
-        )
-        .await;
+        let outcome = land_with(&repo, Some(pool.clone()), Some(executor), Some("master"), 7).await;
 
         assert!(matches!(outcome, Outcome::Succeeded { .. }), "{outcome:?}");
         assert_eq!(request_callers(&pool).await, vec!["merge:7".to_owned()]);
@@ -1171,24 +1132,13 @@ gate_command: git rev-parse --verify nao-existe
         let roots = space_free_tempdir("nucleos-gitexec-wt-");
         let _env = WorktreeRootEnv::set(roots.path());
         commit_map_on_master(&repo, RED_GATE);
-        write_autopilot_rules(
-            container.path(),
-            &format!("{BOTH_SWITCHES}gate_command: {GREEN_GATE}\n"),
-        );
+        write_autopilot_rules(&format!("{BOTH_SWITCHES}gate_command: {GREEN_GATE}\n"));
         let pool = crate::testdb::fresh_pool().await;
         roster(&pool, &repo).await;
         let executor = verify_executor(&pool, container.path());
         let before = sha_of(&repo, "master");
 
-        let outcome = land_with(
-            &repo,
-            container.path(),
-            Some(pool.clone()),
-            Some(executor),
-            Some("master"),
-            7,
-        )
-        .await;
+        let outcome = land_with(&repo, Some(pool.clone()), Some(executor), Some("master"), 7).await;
 
         assert!(matches!(outcome, Outcome::Failed { .. }), "{outcome:?}");
         assert_eq!(request_callers(&pool).await, vec!["merge:7".to_owned()]);
@@ -1203,23 +1153,12 @@ gate_command: git rev-parse --verify nao-existe
         let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-combine-nomap-");
         let roots = space_free_tempdir("nucleos-gitexec-wt-");
         let _env = WorktreeRootEnv::set(roots.path());
-        write_autopilot_rules(
-            container.path(),
-            &format!("{BOTH_SWITCHES}gate_command: {GREEN_GATE}\n"),
-        );
+        write_autopilot_rules(&format!("{BOTH_SWITCHES}gate_command: {GREEN_GATE}\n"));
         let pool = crate::testdb::fresh_pool().await;
         roster(&pool, &repo).await;
         let executor = verify_executor(&pool, container.path());
 
-        let outcome = land_with(
-            &repo,
-            container.path(),
-            Some(pool.clone()),
-            Some(executor),
-            Some("master"),
-            7,
-        )
-        .await;
+        let outcome = land_with(&repo, Some(pool.clone()), Some(executor), Some("master"), 7).await;
 
         let published = match outcome {
             Outcome::Succeeded { sha, .. } => sha.expect("a merge names the commit it published"),
@@ -1241,24 +1180,13 @@ gate_command: git rev-parse --verify nao-existe
         let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-combine-redfull-");
         let roots = space_free_tempdir("nucleos-gitexec-wt-");
         let _env = WorktreeRootEnv::set(roots.path());
-        write_autopilot_rules(
-            container.path(),
-            &format!("{BOTH_SWITCHES}gate_command: {RED_GATE}\n"),
-        );
+        write_autopilot_rules(&format!("{BOTH_SWITCHES}gate_command: {RED_GATE}\n"));
         let pool = crate::testdb::fresh_pool().await;
         roster(&pool, &repo).await;
         let executor = verify_executor(&pool, container.path());
         let before = sha_of(&repo, "master");
 
-        let outcome = land_with(
-            &repo,
-            container.path(),
-            Some(pool.clone()),
-            Some(executor),
-            Some("master"),
-            7,
-        )
-        .await;
+        let outcome = land_with(&repo, Some(pool.clone()), Some(executor), Some("master"), 7).await;
 
         assert!(matches!(outcome, Outcome::Failed { .. }), "{outcome:?}");
         assert_eq!(sha_of(&repo, "master"), before);
@@ -1280,23 +1208,12 @@ gate_command: git rev-parse --verify nao-existe
         let roots = space_free_tempdir("nucleos-gitexec-wt-");
         let _env = WorktreeRootEnv::set(roots.path());
         commit_map_on_master(&repo, GREEN_GATE);
-        write_autopilot_rules(
-            container.path(),
-            &format!("{BOTH_SWITCHES}gate_command: {GREEN_GATE}\n"),
-        );
+        write_autopilot_rules(&format!("{BOTH_SWITCHES}gate_command: {GREEN_GATE}\n"));
         let pool = crate::testdb::fresh_pool().await;
         // No roster row on purpose.
         let executor = verify_executor(&pool, container.path());
 
-        let outcome = land_with(
-            &repo,
-            container.path(),
-            Some(pool.clone()),
-            Some(executor),
-            Some("master"),
-            7,
-        )
-        .await;
+        let outcome = land_with(&repo, Some(pool.clone()), Some(executor), Some("master"), 7).await;
 
         let published = match outcome {
             Outcome::Succeeded { sha, .. } => sha.expect("a merge names the commit it published"),
@@ -1320,10 +1237,7 @@ gate_command: git rev-parse --verify nao-existe
         let roots = space_free_tempdir("nucleos-gitexec-wt-");
         let _env = WorktreeRootEnv::set(roots.path());
         commit_map_on_master(&repo, GREEN_GATE);
-        write_autopilot_rules(
-            container.path(),
-            &format!("{BOTH_SWITCHES}gate_command: {GREEN_GATE}\n"),
-        );
+        write_autopilot_rules(&format!("{BOTH_SWITCHES}gate_command: {GREEN_GATE}\n"));
         let pool = crate::testdb::fresh_pool().await;
         roster(&pool, &repo).await;
         // No `run_executor`: the scope's units are accepted and never run.
@@ -1337,7 +1251,6 @@ gate_command: git rev-parse --verify nao-existe
             .expect("compute the merge the gate measures");
 
         let gate = gate_the_merge(
-            Some(container.path()),
             Some(&pool),
             7,
             "alpha",
@@ -1364,10 +1277,7 @@ gate_command: git rev-parse --verify nao-existe
         let roots = space_free_tempdir("nucleos-gitexec-wt-");
         let _env = WorktreeRootEnv::set(roots.path());
         commit_map_on_master(&repo, GREEN_GATE);
-        write_autopilot_rules(
-            container.path(),
-            &format!("{BOTH_SWITCHES}gate_command: {GREEN_GATE}\n"),
-        );
+        write_autopilot_rules(&format!("{BOTH_SWITCHES}gate_command: {GREEN_GATE}\n"));
         let pool = crate::testdb::fresh_pool().await;
         roster(&pool, &repo).await;
         // No `run_executor`: the scope's units are accepted and never run.
@@ -1381,7 +1291,6 @@ gate_command: git rev-parse --verify nao-existe
             .expect("compute the merge the gate measures");
 
         let gate = gate_the_merge(
-            Some(container.path()),
             Some(&pool),
             7,
             "alpha",
@@ -1431,10 +1340,7 @@ gate_command: git rev-parse --verify nao-existe
         let roots = space_free_tempdir("nucleos-gitexec-wt-");
         let _env = WorktreeRootEnv::set(roots.path());
         commit_map_on_master(&repo, GREEN_GATE);
-        write_autopilot_rules(
-            container.path(),
-            &format!("{BOTH_SWITCHES}gate_command: {GREEN_GATE}\n"),
-        );
+        write_autopilot_rules(&format!("{BOTH_SWITCHES}gate_command: {GREEN_GATE}\n"));
         let pool = crate::testdb::fresh_pool().await;
         roster(&pool, &repo).await;
         let executor = verify_executor(&pool, container.path());
@@ -1448,7 +1354,6 @@ gate_command: git rev-parse --verify nao-existe
         std::fs::write(&map, text).expect("rewrite the map");
 
         let gate = gate_the_merge(
-            Some(container.path()),
             Some(&pool),
             7,
             "alpha",
@@ -1479,10 +1384,7 @@ gate_command: git rev-parse --verify nao-existe
         let _env = WorktreeRootEnv::set(roots.path());
         std::fs::write(repo.join("probe.txt"), "original\n").expect("write the probe");
         commit_map_on_master(&repo, "git hash-object probe.txt");
-        write_autopilot_rules(
-            container.path(),
-            &format!("{BOTH_SWITCHES}gate_command: {GREEN_GATE}\n"),
-        );
+        write_autopilot_rules(&format!("{BOTH_SWITCHES}gate_command: {GREEN_GATE}\n"));
         let pool = crate::testdb::fresh_pool().await;
         roster(&pool, &repo).await;
         let executor = verify_executor(&pool, container.path());
@@ -1494,7 +1396,6 @@ gate_command: git rev-parse --verify nao-existe
             .expect("rewrite the probe in the integration tree");
 
         let gate = gate_the_merge(
-            Some(container.path()),
             Some(&pool),
             7,
             "alpha",
@@ -1524,23 +1425,12 @@ gate_command: git rev-parse --verify nao-existe
         let roots = space_free_tempdir("nucleos-gitexec-wt-");
         let _env = WorktreeRootEnv::set(roots.path());
         commit_map_on_master(&repo, GREEN_GATE);
-        write_autopilot_rules(
-            container.path(),
-            &format!("{BOTH_SWITCHES}gate_command: {RED_GATE}\n"),
-        );
+        write_autopilot_rules(&format!("{BOTH_SWITCHES}gate_command: {RED_GATE}\n"));
         let pool = crate::testdb::fresh_pool().await;
         roster(&pool, &repo).await;
         let executor = verify_executor(&pool, container.path());
 
-        let outcome = land_with(
-            &repo,
-            container.path(),
-            Some(pool.clone()),
-            Some(executor),
-            Some("main"),
-            7,
-        )
-        .await;
+        let outcome = land_with(&repo, Some(pool.clone()), Some(executor), Some("main"), 7).await;
 
         assert!(matches!(outcome, Outcome::Failed { .. }), "{outcome:?}");
         assert!(request_callers(&pool).await.is_empty(), "no verify request");
@@ -2088,11 +1978,11 @@ gate_command: git rev-parse --verify nao-existe
     #[tokio::test]
     async fn a_revert_publishes_a_revert_of_the_merge_by_compare_and_swap() {
         let _lock = crate::execution::worktree::test_env_lock();
-        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-revert-");
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-revert-");
         let roots = space_free_tempdir("nucleos-gitexec-wt-");
         let _env = WorktreeRootEnv::set(roots.path());
 
-        let landed = match land_ordinarily(&repo, container.path()).await {
+        let landed = match land_ordinarily(&repo).await {
             Outcome::Succeeded { sha, .. } => sha.expect("a merge names what it published"),
             other => panic!("the merge to revert must land first, got {other:?}"),
         };
@@ -3498,20 +3388,13 @@ gate_command: git rev-parse --verify nao-existe
     /// A repository with a remote, a rostered project `alpha` whose rules are `rules`, and a pool.
     async fn gated_push_fixture(
         rules: &str,
-    ) -> (
-        tempfile::TempDir,
-        PathBuf,
-        PathBuf,
-        PathBuf,
-        sqlx::SqlitePool,
-    ) {
+    ) -> (tempfile::TempDir, PathBuf, PathBuf, sqlx::SqlitePool) {
         let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-gatedpush-");
         let remote = remote_beside(container.path(), &repo);
-        let machine_root = container.path().join("machine");
-        write_autopilot_rules(&machine_root, rules);
+        write_autopilot_rules(rules);
         let pool = crate::testdb::fresh_pool().await;
         roster(&pool, &repo).await;
-        (container, repo, remote, machine_root, pool)
+        (container, repo, remote, pool)
     }
 
     fn push_request(repo: &Path, branch: &str, id: i64) -> crate::execution::vcs::ClaimedRequest {
@@ -3530,15 +3413,9 @@ gate_command: git rev-parse --verify nao-existe
         }
     }
 
-    async fn execute_push(
-        repo: &Path,
-        machine_root: &Path,
-        pool: &sqlx::SqlitePool,
-        branch: &str,
-    ) -> Outcome {
+    async fn execute_push(repo: &Path, pool: &sqlx::SqlitePool, branch: &str) -> Outcome {
         use crate::execution::vcs::VcsExecutor;
         GitExecutor {
-            machine_root: Some(machine_root.to_path_buf()),
             pool: Some(pool.clone()),
             ..GitExecutor::default()
         }
@@ -3559,13 +3436,13 @@ gate_command: git rev-parse --verify nao-existe
 
     #[tokio::test]
     async fn a_push_of_a_green_integration_tip_goes_out_at_once() {
-        let (_container, repo, remote, machine_root, pool) = gated_push_fixture(GATED_RULES).await;
+        let (_container, repo, remote, pool) = gated_push_fixture(GATED_RULES).await;
         let tip = sha_of(&repo, "refs/heads/master");
         crate::verify::postgate::mark_covered(&pool, "alpha", "master", &tip)
             .await
             .expect("the gate judged the tip green");
 
-        let outcome = execute_push(&repo, &machine_root, &pool, "master").await;
+        let outcome = execute_push(&repo, &pool, "master").await;
 
         assert!(
             matches!(&outcome, Outcome::Succeeded { sha: Some(sha), .. } if *sha == tip),
@@ -3576,7 +3453,7 @@ gate_command: git rev-parse --verify nao-existe
 
     #[tokio::test]
     async fn a_tip_covered_by_a_verification_counts_as_green() {
-        let (_container, repo, remote, machine_root, pool) = gated_push_fixture(GATED_RULES).await;
+        let (_container, repo, remote, pool) = gated_push_fixture(GATED_RULES).await;
         let tip = sha_of(&repo, "refs/heads/master");
         crate::verify::postgate::mark_covered(&pool, "alpha", "master", OTHER_SHA)
             .await
@@ -3587,7 +3464,7 @@ gate_command: git rev-parse --verify nao-existe
             .await
             .expect("cover the tip");
 
-        let outcome = execute_push(&repo, &machine_root, &pool, "master").await;
+        let outcome = execute_push(&repo, &pool, "master").await;
 
         assert!(
             matches!(outcome, Outcome::Succeeded { .. }),
@@ -3598,13 +3475,13 @@ gate_command: git rev-parse --verify nao-existe
 
     #[tokio::test]
     async fn a_push_of_a_pending_integration_tip_parks_and_the_remote_does_not_move() {
-        let (_container, repo, remote, machine_root, pool) = gated_push_fixture(GATED_RULES).await;
+        let (_container, repo, remote, pool) = gated_push_fixture(GATED_RULES).await;
         let tip = sha_of(&repo, "refs/heads/master");
         crate::verify::postgate::mark_covered(&pool, "alpha", "master", OTHER_SHA)
             .await
             .expect("some other tip is green");
 
-        let outcome = execute_push(&repo, &machine_root, &pool, "master").await;
+        let outcome = execute_push(&repo, &pool, "master").await;
 
         match outcome {
             Outcome::AwaitingGate { sha, reason } => {
@@ -3625,9 +3502,9 @@ gate_command: git rev-parse --verify nao-existe
 
     #[tokio::test]
     async fn a_push_with_no_gate_state_at_all_parks_too() {
-        let (_container, repo, remote, machine_root, pool) = gated_push_fixture(GATED_RULES).await;
+        let (_container, repo, remote, pool) = gated_push_fixture(GATED_RULES).await;
 
-        let outcome = execute_push(&repo, &machine_root, &pool, "master").await;
+        let outcome = execute_push(&repo, &pool, "master").await;
 
         assert!(
             matches!(outcome, Outcome::AwaitingGate { .. }),
@@ -3638,9 +3515,9 @@ gate_command: git rev-parse --verify nao-existe
 
     #[tokio::test]
     async fn a_push_of_another_branch_ignores_the_gate() {
-        let (_container, repo, remote, machine_root, pool) = gated_push_fixture(GATED_RULES).await;
+        let (_container, repo, remote, pool) = gated_push_fixture(GATED_RULES).await;
         // The gate is not green for anything, and `feat/x` is not the integration branch.
-        let outcome = execute_push(&repo, &machine_root, &pool, "feat/x").await;
+        let outcome = execute_push(&repo, &pool, "feat/x").await;
 
         assert!(
             matches!(outcome, Outcome::Succeeded { .. }),
@@ -3654,10 +3531,9 @@ gate_command: git rev-parse --verify nao-existe
 
     #[tokio::test]
     async fn a_push_without_gate_after_land_ignores_the_gate() {
-        let (_container, repo, remote, machine_root, pool) =
-            gated_push_fixture("gate_command: x\n").await;
+        let (_container, repo, remote, pool) = gated_push_fixture("gate_command: x\n").await;
 
-        let outcome = execute_push(&repo, &machine_root, &pool, "master").await;
+        let outcome = execute_push(&repo, &pool, "master").await;
 
         assert!(
             matches!(outcome, Outcome::Succeeded { .. }),
@@ -3672,13 +3548,13 @@ gate_command: git rev-parse --verify nao-existe
     /// No `gate_command` means no gate will ever run, so parking would wait for ever: fail open.
     #[tokio::test]
     async fn gate_after_land_without_a_gate_command_pushes_at_once() {
-        let (_container, repo, remote, machine_root, pool) = gated_push_fixture(
+        let (_container, repo, remote, pool) = gated_push_fixture(
             "gate_after_land: true
 ",
         )
         .await;
 
-        let outcome = execute_push(&repo, &machine_root, &pool, "master").await;
+        let outcome = execute_push(&repo, &pool, "master").await;
 
         assert!(
             matches!(outcome, Outcome::Succeeded { .. }),
@@ -3693,14 +3569,11 @@ gate_command: git rev-parse --verify nao-existe
     #[tokio::test]
     async fn an_executor_without_a_database_pushes_as_before() {
         use crate::execution::vcs::VcsExecutor;
-        let (_container, repo, remote, machine_root, _pool) = gated_push_fixture(GATED_RULES).await;
+        let (_container, repo, remote, _pool) = gated_push_fixture(GATED_RULES).await;
 
-        let outcome = GitExecutor {
-            machine_root: Some(machine_root),
-            ..GitExecutor::default()
-        }
-        .execute(&push_request(&repo, "master", 1))
-        .await;
+        let outcome = GitExecutor::default()
+            .execute(&push_request(&repo, "master", 1))
+            .await;
 
         assert!(
             matches!(outcome, Outcome::Succeeded { .. }),
@@ -3715,7 +3588,7 @@ gate_command: git rev-parse --verify nao-existe
     async fn a_green_write_releases_a_parked_push_and_it_then_goes_out() {
         use crate::execution::vcs::{Op, Origin, ResolvedRepo};
 
-        let (_container, repo, remote, machine_root, pool) = gated_push_fixture(GATED_RULES).await;
+        let (_container, repo, remote, pool) = gated_push_fixture(GATED_RULES).await;
         let tip = sha_of(&repo, "refs/heads/master");
         let resolved = ResolvedRepo::synthetic("alpha", &repo.to_string_lossy(), "alpha");
         let op = Op::Push {
@@ -3730,7 +3603,7 @@ gate_command: git rev-parse --verify nao-existe
             .await
             .expect("claim")
             .expect("the push is queued");
-        let outcome = execute_push_claimed(&machine_root, &pool, &claimed).await;
+        let outcome = execute_push_claimed(&pool, &claimed).await;
         assert!(
             matches!(outcome, Outcome::AwaitingGate { .. }),
             "got {outcome:?}"
@@ -3763,7 +3636,7 @@ gate_command: git rev-parse --verify nao-existe
             .expect("claim")
             .expect("the green write requeued the push");
         assert_eq!(claimed.id, id);
-        let outcome = execute_push_claimed(&machine_root, &pool, &claimed).await;
+        let outcome = execute_push_claimed(&pool, &claimed).await;
         assert!(
             matches!(outcome, Outcome::Succeeded { .. }),
             "got {outcome:?}"
@@ -3772,13 +3645,11 @@ gate_command: git rev-parse --verify nao-existe
     }
 
     async fn execute_push_claimed(
-        machine_root: &Path,
         pool: &sqlx::SqlitePool,
         claimed: &crate::execution::vcs::ClaimedRequest,
     ) -> Outcome {
         use crate::execution::vcs::VcsExecutor;
         GitExecutor {
-            machine_root: Some(machine_root.to_path_buf()),
             pool: Some(pool.clone()),
             ..GitExecutor::default()
         }
@@ -3789,8 +3660,7 @@ gate_command: git rev-parse --verify nao-existe
     /// Released by every write that makes a sha green, not only `mark_covered`.
     #[tokio::test]
     async fn finish_green_requeues_a_parked_push_too() {
-        let (_container, repo, _remote, _machine_root, pool) =
-            gated_push_fixture(GATED_RULES).await;
+        let (_container, repo, _remote, pool) = gated_push_fixture(GATED_RULES).await;
         let id: i64 = sqlx::query_scalar(
             "INSERT INTO vcs_requests (op, args, project_id, project_root, origin, status, created_at, repo_key)
              VALUES ('push', '{\"op\":\"push\",\"remote\":\"origin\",\"branch\":\"master\"}', 'alpha', ?,

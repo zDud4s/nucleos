@@ -407,15 +407,12 @@ async fn submit_checked(
         None
     };
 
-    let rules = match config::load_schedule_rules(executor.machine_root.as_deref(), &project_id) {
-        Ok(rules) => rules,
-        Err(error) => {
-            // The rules only supply `gate_command`; without them `full` is refused by the planner
-            // with its own message, which says more than this read error would.
-            tracing::warn!(%error, %project_id, "verify: cannot read the project's rules");
-            config::AutopilotRules::default()
-        }
-    };
+    let rules = crate::project::rules::autopilot(&project_id).unwrap_or_else(|error| {
+        // The rules only supply `gate_command`; without them `full` is refused by the planner
+        // with its own message, which says more than this read error would.
+        tracing::warn!(%error, %project_id, "verify: cannot read the project's rules");
+        config::AutopilotRules::default()
+    });
 
     let map = {
         let root = root.clone();
@@ -1260,7 +1257,7 @@ tests:
         pool: SqlitePool,
         ex: Arc<Executor>,
         repo: tempfile::TempDir,
-        _machine: tempfile::TempDir,
+        _machine: crate::project::rules::testing::Home,
         /// The first commit: every file, the map included.
         c1: String,
         /// The second commit, on `main`: `core/a.rs` changed.
@@ -1268,7 +1265,7 @@ tests:
     }
 
     /// A git repository with two commits on `main`, rostered as project `alpha`, and an executor
-    /// whose machine root holds `alpha`'s `autopilot.yaml` when `gate` is given. The worker loop
+    /// whose settings snapshot stores `alpha`'s rules when `gate` is given. The worker loop
     /// runs only when `run` is set.
     async fn fixture(map: Option<&str>, gate: Option<&str>, run: bool) -> Fixture {
         // The executor reads the project's rules from the settings snapshot: hold the shared side of
@@ -1301,15 +1298,12 @@ tests:
         .await
         .unwrap();
 
-        let machine = tempfile::tempdir().unwrap();
+        let machine = crate::project::rules::testing::Home::new();
         if let Some(gate) = gate {
-            let dir = machine.path().join("projects").join("alpha");
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(
-                dir.join(crate::project::state::AUTOPILOT_FILE),
-                format!("gate_command: \"{gate}\"\n"),
-            )
-            .unwrap();
+            crate::project::rules::testing::publish_rules(
+                "alpha",
+                &format!("gate_command: \"{gate}\"\n"),
+            );
         }
         let ex = Executor::new(
             pool.clone(),
@@ -1929,8 +1923,11 @@ tests:
             "{refused:?}"
         );
 
-        crate::project::rules::testing::publish_rules("alpha", "gate_command: \"git --version\"
-");
+        crate::project::rules::testing::publish_rules(
+            "alpha",
+            "gate_command: \"git --version\"
+",
+        );
         let second = submit(&f.ex, Caller::Owner, &request).await;
         assert!(
             second.is_ok(),

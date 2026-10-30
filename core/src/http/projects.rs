@@ -623,8 +623,8 @@ pub(super) async fn onboarding_view(
     let project_id = id.to_string();
     tokio::task::spawn_blocking(move || {
         let found = crate::detect::inspect_folder(&root);
-        // An unreadable rules file has no gate this can name; the POST refuses it by name.
-        let configured_gate = crate::config::load_schedule_rules(Some(&machine_root), &project_id)
+        // Stored rules that cannot be read have no gate this can name; the POST refuses them by name.
+        let configured_gate = crate::project::rules::autopilot(&project_id)
             .ok()
             .and_then(|rules| rules.gate_command);
         OnboardingView {
@@ -665,7 +665,7 @@ pub(super) async fn get_project_onboarding(
 /// The one thing activation now asks of a project besides the classifier hook (`autopilot.rs`),
 /// and the act is `onboarding::onboard`'s: check the gate, detect the harnesses, install the hook
 /// with the same `wire_classifier_hook` every other door uses, store the gate as `gate_command` in
-/// the project's `autopilot.yaml` — where the gate already lives — and write the marker last.
+/// the project's `autopilot` settings document — where the gate already lives — and write the marker last.
 ///
 /// **In no table in `auth.rs`, so Admin's by default-deny**, for `POST /projects/{id}/write`'s
 /// reason and a second one: it sets what *green* means, and it writes an executable hook into a
@@ -673,8 +673,8 @@ pub(super) async fn get_project_onboarding(
 /// refuse to allow; here it is allowed because a project being brought in has no folder on record
 /// yet, and naming one is what `GET /projects/detect` already lets this same key do.
 ///
-/// **Kill-switch checked first, like `POST /write` and `POST /config/machine`.** Onboarding writes
-/// `gate_command` into the project's `autopilot.yaml` and installs an executable classifier hook —
+/// **Kill-switch checked first, like `POST /write` and `PUT /settings/{scope}/{name}`.** Onboarding writes
+/// `gate_command` into the project's `autopilot` settings document and installs an executable classifier hook —
 /// the same shape of governance write those two routes already refuse the stop for — so a stop
 /// engaged here must refuse before either lands. The shell's new-project wizard used to lean on
 /// this route succeeding while the stop was engaged, because registering a project runs onboarding
@@ -720,19 +720,16 @@ pub(super) async fn post_project_onboard(
         .map(|command| command.trim().to_string())
         .filter(|command| !command.is_empty());
 
-    let (project_id, project_root, confirmed) = (id.clone(), root.clone(), gate.clone());
     let now = chrono::Utc::now().to_rfc3339();
-    tokio::task::spawn_blocking(move || {
-        crate::onboarding::onboard(
-            &machine_root,
-            &project_id,
-            &project_root,
-            confirmed.as_deref(),
-            &now,
-        )
-    })
+    crate::onboarding::onboard(
+        &state.pool,
+        &machine_root,
+        &id,
+        &root,
+        gate.as_deref(),
+        &now,
+    )
     .await
-    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
     .map_err(|error| match error {
         crate::onboarding::OnboardError::BadId => {
             refusal(StatusCode::UNPROCESSABLE_ENTITY, "bad_project_id")
@@ -801,27 +798,21 @@ async fn pin_default_workflow(
     machine_root: PathBuf,
     library: PathBuf,
 ) {
-    let (project_id, project_root) = (id.to_string(), root.to_path_buf());
-    let pinned = tokio::task::spawn_blocking(move || {
+    let pinned = async {
         let Some(bundle) =
-            crate::onboarding::pin_default_workflow(&machine_root, &library, &project_id)?
+            crate::onboarding::pin_default_workflow(&state.pool, &machine_root, &library, id)
+                .await?
         else {
             return Ok(None);
         };
-        let state_dir = crate::project::state::dir(&machine_root, &project_id)
-            .ok_or_else(|| format!("`{project_id}` cannot name a state directory"))?;
-        let placed = super::workflows::materialize_after_pin(
-            &project_root,
-            &state_dir.join(crate::project::state::PINS_FILE),
-            &library,
-            &state_dir.join(crate::project::state::MATERIALIZED_FILE),
-            &bundle.name,
-        );
+        let state_dir = crate::project::state::dir(&machine_root, id)
+            .ok_or_else(|| format!("`{id}` cannot name a state directory"))?;
+        let placed =
+            super::workflows::materialize_after_pin(root, id, &state_dir, &library, &bundle.name)
+                .await;
         Ok::<_, String>(Some((bundle, placed)))
-    })
-    .await
-    .map_err(|error| error.to_string())
-    .and_then(|result| result);
+    }
+    .await;
     match pinned {
         Ok(Some((bundle, placed))) => {
             super::workflows::workflow_feed(
