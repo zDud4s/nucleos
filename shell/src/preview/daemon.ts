@@ -22,7 +22,15 @@ import type { MachineConfig, MachineSecret } from "../data/machine-config";
 import type { Branches } from "../data/project-git";
 import type { ProjectReadings } from "../data/project-readings";
 import type { AnalyticsDays, AnalyticsReport, QuotaHistory } from "../data/analytics";
-import type { DevtimeDay, DevtimeOverview, ModelTokens } from "../data/devtime";
+import type {
+  ActionPairs,
+  DevtimeDay,
+  DevtimeOverview,
+  ModelTokens,
+  PromotionReport,
+  ShadowItem,
+  ShadowPage,
+} from "../data/devtime";
 import type { PipelineReport } from "../data/analytics-pipeline";
 import type {
   ApiTokenSummary,
@@ -442,6 +450,50 @@ export function previewQuotaHistory(rawDays: string | null): QuotaHistory {
         })),
       },
     ],
+  };
+}
+
+/** `GET /analytics/devtime/actions`: one pair short of promotion (human review missing), one live. */
+export function previewActionPairs(): ActionPairs {
+  const report: PromotionReport = {
+    action_eligible: true, wilson_lower: 0.71, n_resolved: 14, n_sessions: 7, days_covered: 10, sample_ok: true,
+    hit_rate: 0.82, mean_hit_cost_ms: 4200, shadow_approved: true, avoidable_now: 0.1, avoidable_prev: 0.18,
+    regression_ok: true, human_marks: 2, human_rate: 0.5, human_ok: false, ready: false,
+    median_hit_cost_ms: 3800, suppress_rate: 0.12, ignored: 1,
+  };
+  return {
+    pairs: [
+      { action: "inject", rule_id: "A1", mode: "shadow", since: null, changed_by: null, report },
+      {
+        action: "propose", rule_id: "B2", mode: "live", since: "2026-10-20T09:00:00Z", changed_by: "owner",
+        report: { ...report, human_marks: 6, human_rate: 0.9, human_ok: true, ready: true },
+      },
+    ],
+  };
+}
+
+/** `GET /analytics/devtime/actions/shadow`: a fire with an outcome, a fire awaiting one, and a suppression. */
+export function previewShadowPage(action: string | null, rule: string | null): ShadowPage {
+  const items: ShadowItem[] = [
+    {
+      id: 3, action: "inject", rule_id: "A1", project_id: "alpha", decision: "fire", suppress_reason: null,
+      template_id: "tpl_reread", params: { file: "src/main.rs", limit: 3 }, decided_at: "2026-10-29T10:00:00Z",
+      outcome_state: "resolved", outcome: "hit", human_verdict: "useful",
+    },
+    {
+      id: 2, action: "inject", rule_id: "A1", project_id: "alpha", decision: "fire", suppress_reason: null,
+      template_id: "tpl_reread", params: {}, decided_at: "2026-10-29T08:30:00Z",
+      outcome_state: "pending", outcome: null, human_verdict: null,
+    },
+    {
+      id: 1, action: "inject", rule_id: "A1", project_id: "beta", decision: "suppress", suppress_reason: "budget",
+      template_id: "tpl_reread", params: {}, decided_at: "2026-10-28T16:00:00Z",
+      outcome_state: "none", outcome: null, human_verdict: null,
+    },
+  ];
+  return {
+    items: items.filter((entry) => (action === null || entry.action === action) && (rule === null || entry.rule_id === rule)),
+    next_cursor: null,
   };
 }
 
@@ -4204,6 +4256,8 @@ export function answer(path: string, init?: RequestInit): unknown {
   if (projectPipeline !== null) {
     return previewPipeline(decodeURIComponent(projectPipeline[1]), analyticsDaysParam);
   }
+  if (route === "/analytics/devtime/actions") return previewActionPairs();
+  if (route === "/analytics/devtime/actions/shadow") return previewShadowPage(query.get("action"), query.get("rule"));
   if (route === "/analytics/devtime") return previewDevtime(null, analyticsDaysParam);
   const projectDevtime = /^\/projects\/([^/]+)\/analytics\/devtime$/.exec(route);
   if (projectDevtime !== null) {
