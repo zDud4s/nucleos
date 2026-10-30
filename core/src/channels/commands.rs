@@ -1125,4 +1125,461 @@ mod tests {
             ]
         );
     }
+
+    // An `Intent` answering a pending decision from a channel.
+
+    use crate::tree_job::decisions;
+    use crate::tree_job::model::{Branch, Manifest};
+    use crate::tree_job::store::{self as tree_store, TreeJob};
+
+    const QUESTION: &str = "Postgres or SQLite?";
+    const OTHER_QUESTION: &str = "Ship it on Friday?";
+    const SEEDED_AT: &str = "2026-10-30T10:00:00+00:00";
+
+    fn explicit(id: &str, text: &str) -> Intent {
+        Intent::DecisionAnswer {
+            decision: Some(id.to_string()),
+            text: text.to_string(),
+        }
+    }
+
+    fn plain(text: &str) -> Intent {
+        Intent::DecisionAnswer {
+            decision: None,
+            text: text.to_string(),
+        }
+    }
+
+    fn parties(
+        sender_ref: &str,
+        conversation_ref: &str,
+    ) -> (contract::Conversation, contract::Sender) {
+        let conversation = contract::Conversation {
+            reference: conversation_ref.to_string(),
+            kind: contract::ConversationKind::Private,
+            parent: None,
+        };
+        let sender = contract::Sender {
+            reference: sender_ref.to_string(),
+            name: None,
+        };
+        (conversation, sender)
+    }
+
+    /// Runs `intent` as if `sender_ref` wrote it in `conversation_ref` on `channel`.
+    async fn run_as(
+        state: &AppState,
+        channel: &'static str,
+        sender_ref: &str,
+        conversation_ref: &str,
+        intent: Intent,
+    ) {
+        let (conversation, sender) = parties(sender_ref, conversation_ref);
+        let at = ingest::Inbound {
+            channel,
+            key: contract::ConversationKey::new(channel, conversation_ref),
+            conversation: &conversation,
+            sender: &sender,
+            message_ref: "m1",
+        };
+        execute(state, &at, intent).await.unwrap();
+    }
+
+    /// `pending_answer` for `text`, as if `sender_ref` wrote it in `conversation_ref` on `channel`.
+    async fn pending_as(
+        state: &AppState,
+        channel: &'static str,
+        sender_ref: &str,
+        conversation_ref: &str,
+        text: &str,
+    ) -> Option<Intent> {
+        let (conversation, sender) = parties(sender_ref, conversation_ref);
+        let at = ingest::Inbound {
+            channel,
+            key: contract::ConversationKey::new(channel, conversation_ref),
+            conversation: &conversation,
+            sender: &sender,
+            message_ref: "m1",
+        };
+        pending_answer(state, &at, text).await.unwrap()
+    }
+
+    /// Makes `u1` the owner on `channel`, paired in conversation `c1`.
+    async fn seed_owner(state: &AppState, channel: &str) {
+        sqlx::query(
+            "INSERT INTO channel_identities \
+             (channel, sender_ref, conversation_ref, conversation_kind, created_at) \
+             VALUES (?, 'u1', 'c1', 'private', ?)",
+        )
+        .bind(channel)
+        .bind(SEEDED_AT)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+
+    /// A job `job_id` whose one branch `b1` is `building`, then parked on `question`.
+    async fn seed_parked(state: &AppState, job_id: &str, question: &str) -> decisions::Decision {
+        let node_id = format!("node-{job_id}");
+        let mut branch = Branch::new("b1", &[], "core", None);
+        branch.state = "building".to_owned();
+        branch.node_id = Some(node_id.clone());
+        let mut manifest = Manifest::new(job_id, "feat/tree", "Ship it", "C:/Projects", &[]);
+        manifest.branches.insert("b1".to_owned(), branch);
+        let job = TreeJob {
+            id: job_id.to_owned(),
+            root_node_id: format!("root-{job_id}"),
+            project_id: None,
+            feature_branch: Some("feat/tree".to_owned()),
+            goal: "Ship it".to_owned(),
+            state: "open".to_owned(),
+            manifest,
+            contract: None,
+            created_at: SEEDED_AT.to_owned(),
+            updated_at: SEEDED_AT.to_owned(),
+        };
+        tree_store::save(&state.pool, &job).await.unwrap();
+        decisions::park(&state.pool, job_id, &node_id, question)
+            .await
+            .unwrap()
+    }
+
+    async fn decision_now(state: &AppState, id: &str) -> decisions::Decision {
+        decisions::list(&state.pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|decision| decision.id == id)
+            .expect("the decision is still there")
+    }
+
+    async fn branch_state(state: &AppState, job_id: &str) -> String {
+        let job = tree_store::load(&state.pool, job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        job.manifest.branches["b1"].state.clone()
+    }
+
+    /// The decision is exactly as `park` left it, and its branch still waits.
+    async fn assert_still_parked(state: &AppState, parked: &decisions::Decision, job_id: &str) {
+        let now = decision_now(state, &parked.id).await;
+        assert_eq!(now.status, decisions::STATUS_OPEN);
+        assert_eq!(now.answer, None);
+        assert_eq!(now.origin, parked.origin);
+        assert_eq!(branch_state(state, job_id).await, "parked");
+    }
+
+    /// The decision holds `answer`, written by Telegram, and its branch moves again.
+    async fn assert_answered(state: &AppState, id: &str, job_id: &str, answer: &str) {
+        let now = decision_now(state, id).await;
+        assert_eq!(now.status, decisions::STATUS_ANSWERED);
+        assert_eq!(now.answer.as_deref(), Some(answer));
+        assert_eq!(now.origin.as_deref(), Some("telegram"));
+        assert_eq!(branch_state(state, job_id).await, "building");
+    }
+
+    #[test]
+    fn route_decide_command_parses_id_and_text() {
+        assert_eq!(route("/decide d-1 sim"), explicit("d-1", "sim"));
+        assert_eq!(
+            route("  /DECIDE D-Abc   use postgres, not sqlite  "),
+            explicit("D-Abc", "use postgres, not sqlite")
+        );
+        assert_eq!(
+            route("/decide d-1\nline one\nline two"),
+            explicit("d-1", "line one\nline two")
+        );
+    }
+
+    #[test]
+    fn route_decide_malformed_is_help() {
+        for text in [
+            "/decide",
+            "/DECIDE",
+            "/decide  ",
+            "/decide d-1",
+            "/decide d-1   ",
+        ] {
+            assert_eq!(route(text), Intent::Help, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn route_plain_yes_stays_chat() {
+        for text in ["sim", "yes", "ok", "não", "talvez"] {
+            assert_eq!(route(text), chat(text), "{text:?}");
+        }
+        // Only the whole word is the command.
+        assert_eq!(route("/decided d-1 yes"), chat("/decided d-1 yes"));
+    }
+
+    #[test]
+    fn route_transcript_refuses_decide() {
+        assert_eq!(
+            route_transcript("/decide d-1 yes"),
+            Intent::Refused("/decide d-1 yes".to_string())
+        );
+        assert_eq!(route_transcript("sim"), chat("sim"));
+    }
+
+    #[test]
+    fn classify_answer_clear_forms() {
+        let table = [
+            ("sim", "sim"),
+            ("yes", "yes"),
+            ("ok", "ok"),
+            ("aprovo", "aprovo"),
+            ("não", "não"),
+            ("nao", "nao"),
+            ("no", "no"),
+            ("rejeito", "rejeito"),
+            // Case and a trailing mark do not matter, and the text stays as sent.
+            ("  Sim.  ", "Sim."),
+            ("YES!", "YES!"),
+            ("\nNÃO\n", "NÃO"),
+        ];
+        for (input, sent) in table {
+            assert_eq!(
+                classify_answer(input),
+                AnswerClass::Clear(sent.to_string()),
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_answer_ambiguous_forms() {
+        let table = [
+            "talvez",
+            "maybe",
+            "sim, mas so depois",
+            "sim nao",
+            "yes please",
+            "usa postgres",
+            "",
+            "   ",
+        ];
+        for input in table {
+            assert_eq!(classify_answer(input), AnswerClass::Ambiguous, "{input:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_explicit_answer_from_the_telegram_owner_applies_and_resumes() {
+        let state = crate::channels::testkit::state().await;
+        seed_owner(&state, "telegram").await;
+        let parked = seed_parked(&state, "job-1", QUESTION).await;
+        assert_eq!(branch_state(&state, "job-1").await, "parked");
+
+        // Naming the decision is what makes it unambiguous: this text would not pass as plain.
+        let text = "usa postgres, por favor";
+        run_as(&state, "telegram", "u1", "c1", explicit(&parked.id, text)).await;
+
+        assert_answered(&state, &parked.id, "job-1", text).await;
+        let reply = the_one_answer(&state).await;
+        assert!(reply.contains(QUESTION), "{reply}");
+    }
+
+    #[tokio::test]
+    async fn execute_explicit_answer_with_two_open_decisions_applies_only_the_named_one() {
+        let state = crate::channels::testkit::state().await;
+        seed_owner(&state, "telegram").await;
+        let first = seed_parked(&state, "job-1", QUESTION).await;
+        let second = seed_parked(&state, "job-2", OTHER_QUESTION).await;
+
+        run_as(&state, "telegram", "u1", "c1", explicit(&second.id, "sim")).await;
+
+        assert_answered(&state, &second.id, "job-2", "sim").await;
+        assert_still_parked(&state, &first, "job-1").await;
+        let reply = the_one_answer(&state).await;
+        assert!(reply.contains(OTHER_QUESTION), "{reply}");
+    }
+
+    #[tokio::test]
+    async fn execute_plain_clear_answer_with_one_open_decision_applies() {
+        let state = crate::channels::testkit::state().await;
+        seed_owner(&state, "telegram").await;
+        let parked = seed_parked(&state, "job-1", QUESTION).await;
+
+        run_as(&state, "telegram", "u1", "c1", plain("sim")).await;
+
+        assert_answered(&state, &parked.id, "job-1", "sim").await;
+        let reply = the_one_answer(&state).await;
+        assert!(reply.contains(QUESTION), "{reply}");
+    }
+
+    #[tokio::test]
+    async fn execute_ambiguous_answer_asks_and_does_not_resume() {
+        let state = crate::channels::testkit::state().await;
+        seed_owner(&state, "telegram").await;
+        let parked = seed_parked(&state, "job-1", QUESTION).await;
+
+        run_as(&state, "telegram", "u1", "c1", plain("talvez")).await;
+
+        assert_still_parked(&state, &parked, "job-1").await;
+        let reply = the_one_answer(&state).await;
+        assert!(reply.contains(QUESTION), "{reply}");
+    }
+
+    #[tokio::test]
+    async fn execute_plain_answer_with_two_open_decisions_asks_and_resumes_neither() {
+        let state = crate::channels::testkit::state().await;
+        seed_owner(&state, "telegram").await;
+        let first = seed_parked(&state, "job-1", QUESTION).await;
+        let second = seed_parked(&state, "job-2", OTHER_QUESTION).await;
+
+        run_as(&state, "telegram", "u1", "c1", plain("sim")).await;
+
+        assert_still_parked(&state, &first, "job-1").await;
+        assert_still_parked(&state, &second, "job-2").await;
+        let reply = the_one_answer(&state).await;
+        assert!(reply.contains(QUESTION), "{reply}");
+        assert!(reply.contains(OTHER_QUESTION), "{reply}");
+    }
+
+    #[tokio::test]
+    async fn execute_plain_answer_with_none_open_changes_nothing() {
+        let state = crate::channels::testkit::state().await;
+        seed_owner(&state, "telegram").await;
+
+        // No decision at all.
+        run_as(&state, "telegram", "u1", "c1", plain("sim")).await;
+        assert!(decisions::list(&state.pool).await.unwrap().is_empty());
+
+        // A decision already answered is not open any more.
+        let parked = seed_parked(&state, "job-1", QUESTION).await;
+        run_as(&state, "telegram", "u1", "c1", explicit(&parked.id, "sim")).await;
+        run_as(&state, "telegram", "u1", "c1", plain("não")).await;
+        assert_answered(&state, &parked.id, "job-1", "sim").await;
+        assert_eq!(decisions::list(&state.pool).await.unwrap().len(), 1);
+    }
+
+    /// The owner row is seeded for that very channel, so only the channel check can stop it.
+    async fn assert_owner_on_channel_does_not_approve(channel: &'static str) {
+        let state = crate::channels::testkit::state().await;
+        seed_owner(&state, channel).await;
+        let parked = seed_parked(&state, "job-1", QUESTION).await;
+
+        run_as(&state, channel, "u1", "c1", explicit(&parked.id, "sim")).await;
+        assert_still_parked(&state, &parked, "job-1").await;
+
+        run_as(&state, channel, "u1", "c1", plain("sim")).await;
+        assert_still_parked(&state, &parked, "job-1").await;
+    }
+
+    #[tokio::test]
+    async fn execute_answer_from_email_owner_does_not_approve() {
+        assert_owner_on_channel_does_not_approve("email").await;
+    }
+
+    #[tokio::test]
+    async fn execute_answer_from_fleet_owner_does_not_approve() {
+        assert_owner_on_channel_does_not_approve("fleet").await;
+    }
+
+    #[tokio::test]
+    async fn execute_answer_from_a_telegram_stranger_is_silent_and_changes_nothing() {
+        let state = crate::channels::testkit::state().await;
+        seed_owner(&state, "telegram").await;
+        let parked = seed_parked(&state, "job-1", QUESTION).await;
+
+        run_as(&state, "telegram", "u2", "c1", explicit(&parked.id, "sim")).await;
+        run_as(&state, "telegram", "u2", "c1", plain("sim")).await;
+
+        assert_still_parked(&state, &parked, "job-1").await;
+        assert!(queued(&state).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn execute_answer_from_the_owner_in_an_unpaired_conversation_changes_nothing() {
+        let state = crate::channels::testkit::state().await;
+        seed_owner(&state, "telegram").await;
+        let parked = seed_parked(&state, "job-1", QUESTION).await;
+
+        run_as(&state, "telegram", "u1", "c2", explicit(&parked.id, "sim")).await;
+        run_as(&state, "telegram", "u1", "c2", plain("sim")).await;
+
+        assert_still_parked(&state, &parked, "job-1").await;
+        assert!(queued(&state).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn execute_explicit_answer_to_an_unknown_id_says_so() {
+        let state = crate::channels::testkit::state().await;
+        seed_owner(&state, "telegram").await;
+        let parked = seed_parked(&state, "job-1", QUESTION).await;
+
+        run_as(&state, "telegram", "u1", "c1", explicit("d-nope", "sim")).await;
+
+        assert_still_parked(&state, &parked, "job-1").await;
+        let reply = the_one_answer(&state).await;
+        assert!(reply.contains("d-nope"), "{reply}");
+    }
+
+    #[tokio::test]
+    async fn execute_second_answer_keeps_the_first() {
+        let state = crate::channels::testkit::state().await;
+        seed_owner(&state, "telegram").await;
+        let parked = seed_parked(&state, "job-1", QUESTION).await;
+
+        run_as(&state, "telegram", "u1", "c1", explicit(&parked.id, "sim")).await;
+        run_as(&state, "telegram", "u1", "c1", explicit(&parked.id, "não")).await;
+
+        assert_answered(&state, &parked.id, "job-1", "sim").await;
+    }
+
+    #[tokio::test]
+    async fn pending_answer_only_for_the_telegram_owner_with_an_open_decision() {
+        let state = crate::channels::testkit::state().await;
+        seed_owner(&state, "telegram").await;
+        seed_owner(&state, "email").await;
+
+        // No decision open yet.
+        assert_eq!(
+            pending_as(&state, "telegram", "u1", "c1", "sim").await,
+            None
+        );
+
+        let parked = seed_parked(&state, "job-1", QUESTION).await;
+
+        // Whether the text is clear is for `execute` to weigh, so both forms come through.
+        assert_eq!(
+            pending_as(&state, "telegram", "u1", "c1", "sim").await,
+            Some(plain("sim"))
+        );
+        assert_eq!(
+            pending_as(&state, "telegram", "u1", "c1", "talvez").await,
+            Some(plain("talvez"))
+        );
+
+        assert_eq!(pending_as(&state, "email", "u1", "c1", "sim").await, None);
+        assert_eq!(
+            pending_as(&state, "telegram", "u2", "c1", "sim").await,
+            None
+        );
+        assert_eq!(
+            pending_as(&state, "telegram", "u1", "c2", "sim").await,
+            None
+        );
+
+        // A text `route` recognises keeps its own meaning.
+        assert_eq!(
+            pending_as(&state, "telegram", "u1", "c1", "/help").await,
+            None
+        );
+        assert_eq!(
+            pending_as(&state, "telegram", "u1", "c1", "approve 3").await,
+            None
+        );
+
+        // Answered, it is no longer open.
+        decisions::answer(&state.pool, &parked.id, "sim", "telegram")
+            .await
+            .unwrap();
+        assert_eq!(
+            pending_as(&state, "telegram", "u1", "c1", "sim").await,
+            None
+        );
+    }
 }
