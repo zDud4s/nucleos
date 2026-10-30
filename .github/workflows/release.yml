@@ -127,10 +127,42 @@ jobs:
           # A certificate-anchored requirement is what keeps the TCC grants across updates.
           codesign -d -r- "$app" 2>&1 | grep -q 'certificate leaf = H"'             || { echo "::error::the designated requirement is not anchored to the certificate"; exit 1; }
 
+  # Installs the draft's .deb/.rpm in a clean container, starts the daemon and survives a kill -9.
+  smoke-linux:
+    needs: build
+    runs-on: ubuntu-22.04
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["ubuntu:22.04", "fedora:latest"]
+    steps:
+      - name: Install gh and the tools the smoke script needs
+        run: |
+          if command -v apt-get >/dev/null 2>&1; then
+            apt-get update -y
+            apt-get install -y curl git gh ca-certificates
+          else
+            dnf install -y curl git gh
+          fi
+
+      - uses: actions/checkout@v4
+
+      - name: Download the draft's Linux packages
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir smoke-assets
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --dir smoke-assets --pattern '*.deb' --pattern '*.rpm'
+
+      - name: Smoke-test the bundle
+        run: bash scripts/smoke-bundle.sh smoke-assets
+
   # Checks the draft is complete, adds SHA256SUMS, and only then makes it public, so latest.json
   # never goes live half-filled and the install scripts always have the checksums to verify against.
+  # It also waits for the Linux smoke test: a bundle that does not install or start is never published.
   publish:
-    needs: build
+    needs: [build, smoke-linux]
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
