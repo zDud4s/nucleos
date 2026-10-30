@@ -1,5 +1,96 @@
 //! The daemon-side branch budget: the admission book's slots and the measured cost per layer.
 
+use crate::execution::admission::AdmissionBook;
+use crate::tree_job::model::Manifest;
+use serde_json::Value;
+
+/// What an unmeasured layer is assumed to cost, in GB (`seed_gb_per_layer` in the python).
+pub const SEED_COST_GB: f64 = 8.0;
+
+/// The layer that holds docs only: it builds nothing, so it costs nothing and is always admitted.
+const DOCS_LAYER: &str = "docs";
+
+/// The measured cost of `layer`, or the seed when none is recorded. A `docs` layer costs 0.
+/// A JSON `null` counts as unmeasured.
+pub fn layer_cost_gb(manifest: &Manifest, layer: &str) -> f64 {
+    if layer == DOCS_LAYER {
+        return 0.0;
+    }
+    manifest
+        .costs_gb
+        .get(layer)
+        .and_then(Value::as_f64)
+        .unwrap_or(SEED_COST_GB)
+}
+
+/// Records the first positive measure of `layer`; returns the recorded value, or `None` when
+/// nothing was recorded (docs layer, a measure that rounds to 0 or below, or one already there).
+/// The size is rounded to 2 decimals before the `> 0` check.
+pub fn record_measured_cost(manifest: &mut Manifest, layer: &str, size_gb: f64) -> Option<f64> {
+    if layer == DOCS_LAYER {
+        return None;
+    }
+    let measured = manifest.costs_gb.get(layer).and_then(Value::as_f64);
+    if measured.is_some() {
+        return None;
+    }
+    let rounded = (size_gb * 100.0).round() / 100.0;
+    if rounded.is_nan() || rounded <= 0.0 {
+        return None;
+    }
+    manifest
+        .costs_gb
+        .insert(layer.to_owned(), Value::from(rounded));
+    Some(rounded)
+}
+
+/// The verdict of [`check_admission`].
+#[derive(Debug, PartialEq)]
+pub struct Admission {
+    pub admit: bool,
+    pub cost_gb: f64,
+    pub reasons: Vec<String>,
+}
+
+/// Whether a new branch of `layer` may start: the book needs a free slot and the disk must keep
+/// at least `floor_gb` after the layer's cost. Takes no slot. Docs are always admitted.
+///
+/// The wave 6 caller subtracts the growth of live branches from `free_disk_gb` and applies
+/// `max_live_branches`; book units are not live-branch slots.
+pub fn check_admission(
+    book: &AdmissionBook,
+    manifest: &Manifest,
+    layer: &str,
+    free_disk_gb: f64,
+    floor_gb: f64,
+) -> Admission {
+    let cost_gb = layer_cost_gb(manifest, layer);
+    if layer == DOCS_LAYER {
+        return Admission {
+            admit: true,
+            cost_gb,
+            reasons: Vec::new(),
+        };
+    }
+    let mut reasons = Vec::new();
+    if book.free() == 0 {
+        reasons.push(format!(
+            "no free slot: all {} admission units are held",
+            book.capacity()
+        ));
+    }
+    if free_disk_gb - cost_gb < floor_gb {
+        reasons.push(format!(
+            "disk: {free_disk_gb:.1} GB free minus {cost_gb:.1} GB cost is below the {floor_gb:.1} GB floor"
+        ));
+    }
+    Admission {
+        admit: reasons.is_empty(),
+        cost_gb,
+        reasons,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

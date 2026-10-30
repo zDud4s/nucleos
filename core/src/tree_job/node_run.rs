@@ -1,5 +1,257 @@
 //! Keyed, replay-safe node transitions, reconciliation of false `running` nodes, and agent launch.
 
+use std::collections::HashMap;
+use std::fmt;
+
+use sqlx::SqlitePool;
+
+use crate::execution::concurrency::LIVE_RUN_STATUSES;
+use crate::execution::runs::CreateRunError;
+use crate::state::AppState;
+use crate::tree_job::engine::branch_node_may_close;
+use crate::tree_job::model::JOB_TERMINAL_STATE;
+use crate::tree_job::store::{self, StoreError, TreeJob};
+
+/// The transition name `launch` records its key under.
+const LAUNCH: &str = "launch";
+
+#[derive(Debug)]
+pub enum NodeRunError {
+    Db(sqlx::Error),
+    Store(StoreError),
+    Create(CreateRunError),
+    /// No `work_nodes` row has this id.
+    NodeNotFound(String),
+    /// The key is reserved but holds no run id: another call is creating the run right now, or an
+    /// earlier call died (or `create_run_inner` failed) after reserving it. Nothing recovers such a
+    /// reservation; the caller sees this error and decides.
+    Unresolved { node_id: String, key: String },
+}
+
+impl fmt::Display for NodeRunError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            NodeRunError::Db(error) => write!(f, "database error: {error}"),
+            NodeRunError::Store(error) => write!(f, "{error}"),
+            NodeRunError::Create(error) => write!(f, "could not create the run: {error}"),
+            NodeRunError::NodeNotFound(id) => write!(f, "work node {id} not found"),
+            NodeRunError::Unresolved { node_id, key } => write!(
+                f,
+                "launch key {key} of node {node_id} is reserved but holds no run"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for NodeRunError {}
+
+impl From<sqlx::Error> for NodeRunError {
+    fn from(error: sqlx::Error) -> Self {
+        NodeRunError::Db(error)
+    }
+}
+
+impl From<StoreError> for NodeRunError {
+    fn from(error: StoreError) -> Self {
+        NodeRunError::Store(error)
+    }
+}
+
+impl From<CreateRunError> for NodeRunError {
+    fn from(error: CreateRunError) -> Self {
+        NodeRunError::Create(error)
+    }
+}
+
+/// The outcome of a keyed transition: the stored result, and whether it was already stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Applied {
+    pub result: String,
+    pub replayed: bool,
+}
+
+/// Records `(node_id, transition, key)` with `result`, or returns the result already stored for it.
+/// One atomic insert decides the winner, so concurrent calls cannot both be the first.
+async fn claim(
+    pool: &SqlitePool,
+    node_id: &str,
+    transition: &str,
+    key: &str,
+    result: &str,
+) -> Result<Applied, sqlx::Error> {
+    let inserted = sqlx::query(
+        "INSERT INTO tree_transitions (node_id, transition, key, result, created_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT (node_id, transition, key) DO NOTHING",
+    )
+    .bind(node_id)
+    .bind(transition)
+    .bind(key)
+    .bind(result)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(pool)
+    .await?
+    .rows_affected();
+    if inserted == 1 {
+        return Ok(Applied {
+            result: result.to_owned(),
+            replayed: false,
+        });
+    }
+    let stored: Option<String> = sqlx::query_scalar(
+        "SELECT result FROM tree_transitions WHERE node_id = ? AND transition = ? AND key = ?",
+    )
+    .bind(node_id)
+    .bind(transition)
+    .bind(key)
+    .fetch_one(pool)
+    .await?;
+    Ok(Applied {
+        result: stored.unwrap_or_default(),
+        replayed: true,
+    })
+}
+
+/// Applies a keyed transition once: the first call for a (node, transition, key) stores `result`
+/// and returns it with `replayed: false`; any later call returns the stored result with
+/// `replayed: true`, whatever `result` it was given.
+pub async fn apply(
+    pool: &SqlitePool,
+    node_id: &str,
+    transition: &str,
+    key: &str,
+    result: &str,
+) -> Result<Applied, NodeRunError> {
+    Ok(claim(pool, node_id, transition, key, result).await?)
+}
+
+/// Marks `failed` every `running` node of a tree job whose run is no longer live (its status is not
+/// in `LIVE_RUN_STATUSES`, or its row is gone), naming the run in the summary. Returns the ids.
+///
+/// Spared: nodes with no `run_id`, nodes outside a tree job, and the top branch node of a branch
+/// that may not close yet (see `branch_node_may_close`) while its job is not finished.
+pub async fn reconcile_running(pool: &SqlitePool) -> Result<Vec<String>, NodeRunError> {
+    let candidates: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT id, tree_job_id, run_id FROM work_nodes
+         WHERE status = 'running' AND tree_job_id IS NOT NULL AND run_id IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut jobs: HashMap<String, Option<TreeJob>> = HashMap::new();
+    let mut marked = Vec::new();
+    for (id, job_id, run_id) in candidates {
+        let Ok(run_number) = run_id.parse::<i64>() else {
+            continue;
+        };
+        let status: Option<String> = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_number)
+            .fetch_optional(pool)
+            .await?;
+        if status
+            .as_deref()
+            .is_some_and(|status| LIVE_RUN_STATUSES.contains(&status))
+        {
+            continue;
+        }
+        if !jobs.contains_key(&job_id) {
+            let loaded = store::load(pool, &job_id).await?;
+            jobs.insert(job_id.clone(), loaded);
+        }
+        if let Some(Some(job)) = jobs.get(&job_id)
+            && job.state != JOB_TERMINAL_STATE
+            && job.manifest.branches.values().any(|branch| {
+                branch.node_id.as_deref() == Some(id.as_str()) && !branch_node_may_close(branch)
+            })
+        {
+            continue;
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        let summary = format!("run {run_id} is no longer live; the node cannot still be running");
+        let changed = sqlx::query(
+            "UPDATE work_nodes SET status = 'failed', summary = ?, closed_at = ?, updated_at = ?
+             WHERE id = ? AND status = 'running'",
+        )
+        .bind(&summary)
+        .bind(&now)
+        .bind(&now)
+        .bind(&id)
+        .execute(pool)
+        .await?
+        .rows_affected();
+        if changed == 1 {
+            marked.push(id);
+        }
+    }
+    Ok(marked)
+}
+
+/// Starts the agent run behind a node exactly once per `(node_id, key)` and returns its run id.
+///
+/// Order: the node must exist; the key is reserved with an empty result in `tree_transitions` (no
+/// connection held); the run is created; the run id becomes the stored result and the node's
+/// `run_id` and `session_id` are linked. A replay returns the stored id and touches nothing.
+///
+/// Known limit, deliberately not recovered here: a caller that finds the key reserved with an empty
+/// result gets `NodeRunError::Unresolved`, and that reservation stays after a crash between the
+/// reservation and the run id being stored, or after `create_run_inner` fails. The key is then
+/// spent: retrying with it keeps failing, so the caller must use a new key.
+pub async fn launch(
+    state: &AppState,
+    node_id: &str,
+    key: &str,
+    prompt: String,
+    project_id: Option<String>,
+    cwd: Option<String>,
+    mode: &str,
+) -> Result<i64, NodeRunError> {
+    let pool = &state.pool;
+    let exists: Option<String> = sqlx::query_scalar("SELECT id FROM work_nodes WHERE id = ?")
+        .bind(node_id)
+        .fetch_optional(pool)
+        .await?;
+    if exists.is_none() {
+        return Err(NodeRunError::NodeNotFound(node_id.to_owned()));
+    }
+
+    let reservation = claim(pool, node_id, LAUNCH, key, "").await?;
+    if reservation.replayed {
+        return reservation
+            .result
+            .parse::<i64>()
+            .map_err(|_| NodeRunError::Unresolved {
+                node_id: node_id.to_owned(),
+                key: key.to_owned(),
+            });
+    }
+
+    let run_id =
+        crate::execution::runs::create_run_inner(state, prompt, project_id, cwd, mode, false)
+            .await?;
+
+    sqlx::query(
+        "UPDATE tree_transitions SET result = ? WHERE node_id = ? AND transition = ? AND key = ?",
+    )
+    .bind(run_id.to_string())
+    .bind(node_id)
+    .bind(LAUNCH)
+    .bind(key)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "UPDATE work_nodes
+         SET run_id = ?, session_id = (SELECT session_id FROM runs WHERE id = ?), updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(run_id.to_string())
+    .bind(run_id)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(node_id)
+    .execute(pool)
+    .await?;
+    Ok(run_id)
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;

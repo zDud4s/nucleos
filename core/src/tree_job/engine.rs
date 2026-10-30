@@ -1,5 +1,211 @@
 //! The branch state machine and sub-orchestrator grouping of a tree job.
 
+use std::fmt;
+
+use crate::tree_job::docs_paths::is_docs_terminal_state;
+use crate::tree_job::model::{Branch, Manifest, BRANCH_STATES};
+use crate::work_nodes::sets_overlap;
+
+/// The layer whose branches write only gitignored docs (spec R6).
+const DOCS_LAYER: &str = "docs";
+
+/// States from which a branch may be dropped.
+const DROPPABLE: [&str; 6] = ["queued", "open", "building", "red", "fixing", "parked"];
+
+/// States from which a branch may be parked, and to which a parked branch may resume.
+const PARKABLE: [&str; 8] = [
+    "queued",
+    "open",
+    "building",
+    "gating",
+    "green",
+    "red",
+    "reviewing",
+    "fixing",
+];
+
+#[derive(Debug, PartialEq)]
+pub enum EngineError {
+    /// The branch may not move from `from` to `to`.
+    IllegalTransition { from: String, to: String },
+    /// `group_items` was given a shape it cannot split.
+    InvalidGrouping(String),
+}
+
+impl fmt::Display for EngineError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EngineError::IllegalTransition { from, to } => {
+                write!(f, "illegal branch transition: {from} to {to}")
+            }
+            EngineError::InvalidGrouping(reason) => write!(f, "invalid grouping: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for EngineError {}
+
+fn is_known_state(state: &str) -> bool {
+    BRANCH_STATES.contains(&state) || state == "done"
+}
+
+/// True when a branch of `layer` may move from `from` to `to`.
+///
+/// `parked` resumes to any parkable state here; [`apply_transition`] narrows that to the state
+/// recorded when the branch was parked. `done` exists only for the docs layer. Re-gating from
+/// `red`, `green` and `reviewing` is allowed, since `tree.py`'s `run_gate` has no source guard.
+pub fn can_transition(layer: &str, from: &str, to: &str) -> bool {
+    if !is_known_state(from) || !is_known_state(to) {
+        return false;
+    }
+    let docs = layer == DOCS_LAYER;
+    match (from, to) {
+        ("merged" | "dropped" | "done", _) => false,
+        (_, "done") => docs && from == "building",
+        (_, "merged") => !docs && from == "green",
+        (_, "dropped") => DROPPABLE.contains(&from),
+        (_, "parked") => PARKABLE.contains(&from),
+        ("parked", _) => PARKABLE.contains(&to),
+        ("queued", "open") | ("open", "building") => true,
+        ("queued", "building") => docs,
+        ("building" | "fixing", "gating") => true,
+        ("gating" | "building" | "fixing", "green" | "red") => true,
+        ("red" | "green" | "reviewing", "gating" | "green" | "red") => from != to,
+        ("red" | "green" | "reviewing", "fixing") => true,
+        ("fixing", "reviewing") => true,
+        ("green", "reviewing") => true,
+        _ => false,
+    }
+}
+
+/// Moves `branch` to `to` when its layer allows it, and leaves it unchanged otherwise.
+///
+/// A parked branch whose `park` record carries a `prev_state` resumes only to that state (or is
+/// dropped). Without such a record the plain [`can_transition`] table decides.
+pub fn apply_transition(branch: &mut Branch, to: &str) -> Result<(), EngineError> {
+    let mut allowed = can_transition(&branch.layer, &branch.state, to);
+    if allowed && branch.state == "parked" && to != "dropped" {
+        let prev = branch
+            .park
+            .as_ref()
+            .and_then(|park| park.get("prev_state"))
+            .and_then(|value| value.as_str());
+        if let Some(prev) = prev {
+            allowed = prev == to;
+        }
+    }
+    if !allowed {
+        return Err(EngineError::IllegalTransition {
+            from: branch.state.clone(),
+            to: to.to_owned(),
+        });
+    }
+    branch.state = to.to_owned();
+    Ok(())
+}
+
+/// True when the branch's top-level node may close: `merged` or `dropped` for code, `done` or
+/// `dropped` for docs.
+pub fn branch_node_may_close(branch: &Branch) -> bool {
+    if branch.layer == DOCS_LAYER {
+        is_docs_terminal_state(&branch.state)
+    } else {
+        matches!(branch.state.as_str(), "merged" | "dropped")
+    }
+}
+
+/// True while the branch still has work ahead, so a child node may attach to it.
+pub fn may_attach_child(branch: &Branch) -> bool {
+    matches!(
+        branch.state.as_str(),
+        "open" | "building" | "gating" | "red" | "green" | "reviewing" | "fixing"
+    )
+}
+
+/// Only a code branch gets a worktree; a docs branch writes gitignored files in place.
+pub fn needs_worktree(branch: &Branch) -> bool {
+    branch.layer != DOCS_LAYER
+}
+
+/// The first branch (in name order) that still holds paths overlapping `paths`.
+///
+/// `merged`, `dropped` and a `done` docs branch release their paths; a parked branch and every
+/// other state still hold them. `branch_add` (`tree.py:211-214`) also exempts the new branch's
+/// own base chain; this signature has no base, so the wave 6 caller filters that chain.
+pub fn overlapping_branch(manifest: &Manifest, paths: &[String]) -> Option<String> {
+    manifest
+        .branches
+        .iter()
+        .find(|(_, branch)| {
+            !matches!(branch.state.as_str(), "merged" | "dropped" | "done")
+                && sets_overlap(&branch.paths, paths).is_some()
+        })
+        .map(|(name, _)| name.clone())
+}
+
+/// A balanced split of item indices into sub-orchestrator children.
+#[derive(Debug, PartialEq)]
+pub enum Group {
+    Items(Vec<usize>),
+    Children(Vec<Group>),
+}
+
+/// Port of `build_plan` (`tree_plan.py`): splits `items` into a balanced tree of at most
+/// `max_width` children per node and at most `max_depth` levels.
+pub fn group_items(
+    items: usize,
+    max_width: usize,
+    max_depth: usize,
+) -> Result<Group, EngineError> {
+    if items < 1 {
+        return Err(EngineError::InvalidGrouping(format!(
+            "items must be at least 1, got {items}"
+        )));
+    }
+    if max_width < 2 {
+        return Err(EngineError::InvalidGrouping(format!(
+            "max width must be at least 2, got {max_width}"
+        )));
+    }
+    let depth = u32::try_from(max_depth).unwrap_or(u32::MAX);
+    if max_depth < 1 || items > max_width.saturating_pow(depth) {
+        return Err(EngineError::InvalidGrouping(format!(
+            "{items} items do not fit in {max_depth} level(s) of width {max_width}"
+        )));
+    }
+    Ok(split_adaptive(0, items, max_width, max_depth))
+}
+
+fn split_adaptive(start: usize, len: usize, width: usize, max_levels: usize) -> Group {
+    if len <= width {
+        return Group::Items((start..start + len).collect());
+    }
+    let mut levels: u32 = 2;
+    while width.saturating_pow(levels) < len {
+        levels += 1;
+    }
+    let levels = usize::try_from(levels).unwrap_or(usize::MAX).min(max_levels);
+    split(start, len, width, levels)
+}
+
+fn split(start: usize, len: usize, width: usize, levels: usize) -> Group {
+    if levels <= 1 {
+        return Group::Items((start..start + len).collect());
+    }
+    let exponent = u32::try_from(levels - 1).unwrap_or(u32::MAX);
+    let cap = width.saturating_pow(exponent);
+    let count = width.min(len.div_ceil(cap));
+    let (base, extra) = (len / count, len % count);
+    let mut children = Vec::with_capacity(count);
+    let mut offset = start;
+    for i in 0..count {
+        let size = base + usize::from(i < extra);
+        children.push(split_adaptive(offset, size, width, levels - 1));
+        offset += size;
+    }
+    Group::Children(children)
+}
+
 #[cfg(test)]
 mod tests {
     use std::ops::Range;
