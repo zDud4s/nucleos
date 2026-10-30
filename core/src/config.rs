@@ -596,7 +596,7 @@ pub fn parse_schedule_rules(contents: &str) -> std::io::Result<AutopilotRules> {
 ///   for something generous. An infinity is the same class of answer from the other end — a ceiling
 ///   that can never be reached is not a ceiling, and a rule that wants no ceiling of its own says so
 ///   by leaving the key out, which is what `None` already means.
-fn validate_rules(rules: &AutopilotRules) -> std::io::Result<()> {
+pub(crate) fn validate_rules(rules: &AutopilotRules) -> std::io::Result<()> {
     // Refused rather than clamped, on `budget_usd`'s reasoning below. `over_turn_ceiling` compares
     // `turns >= ceiling`, so a zero or negative ceiling is already blown before the first turn: the
     // project would stop every run at its start while the file read as though it had asked for a

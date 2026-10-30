@@ -65,7 +65,7 @@ impl EmailConfig {
     /// Clamps the two validated fields, warning about what it changed. Out-of-range values are
     /// corrected rather than fatal, for the same reason the whole file is: nothing in this config
     /// is worth refusing to start the daemon over.
-    pub(super) fn validated(mut self) -> Self {
+    pub(crate) fn validated(mut self) -> Self {
         if self.digest_hour_utc > 21 {
             tracing::warn!(
                 digest_hour_utc = self.digest_hour_utc,
@@ -259,38 +259,7 @@ pub fn parse_verify_config(contents: &str) -> Result<VerifyConfig, String> {
     }
     let config =
         serde_yaml::from_str::<VerifyConfig>(contents).map_err(|error| error.to_string())?;
-    if config.capacity < 1 {
-        return Err("capacity must be at least 1".to_string());
-    }
-    if config.aging_seconds < 1 {
-        return Err("aging_seconds must be at least 1".to_string());
-    }
-    if config.unit_timeout_seconds < 1 {
-        return Err("unit_timeout_seconds must be at least 1".to_string());
-    }
-    if config.disk_cap_gb < 1 {
-        return Err("disk_cap_gb must be at least 1".to_string());
-    }
-    if config.cache_days < 1 {
-        return Err("cache_days must be at least 1".to_string());
-    }
-    let admission = &config.admission;
-    if admission.capacity == Some(0) {
-        return Err("admission.capacity must be at least 1".to_string());
-    }
-    if admission.heavy_weight < 1 || admission.full_suite_weight < 1 {
-        return Err("admission weights must be at least 1".to_string());
-    }
-    if admission.max_wait_seconds < 1
-        || admission.max_wait_seconds > ADMISSION_MAX_WAIT_CEILING_SECONDS
-    {
-        return Err(format!(
-            "admission.max_wait_seconds must be between 1 and {ADMISSION_MAX_WAIT_CEILING_SECONDS}"
-        ));
-    }
-    if admission.grant_ttl_seconds < 60 {
-        return Err("admission.grant_ttl_seconds must be at least 60".to_string());
-    }
+    config.check()?;
     Ok(config)
 }
 

@@ -298,7 +298,7 @@ impl CouncilConfig {
     ///
     /// An operator editing this file by hand is going to get more than one thing wrong at once, and
     /// a loader that reports only the first turns a single correction into three restarts.
-    pub(super) fn faults(&self, local_available: bool) -> Vec<String> {
+    pub(crate) fn faults(&self, local_available: bool) -> Vec<String> {
         let mut faults = Vec::new();
 
         if self.members.is_empty() {
@@ -331,7 +331,7 @@ impl CouncilConfig {
         std::iter::once(&self.chairman).chain(self.members.iter())
     }
 
-    pub(super) fn validated(mut self) -> Self {
+    pub(crate) fn validated(mut self) -> Self {
         if self.timeout_seconds == 0 {
             tracing::warn!(
                 "council config: timeout_seconds must be above zero; using {DEFAULT_COUNCIL_TIMEOUT_SECONDS}"

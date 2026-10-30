@@ -23,18 +23,27 @@ impl Scope {
     }
 
     pub fn kind(&self) -> Kind {
-        todo!("RED stub: Scope::kind")
+        match self {
+            Self::Machine => Kind::Machine,
+            Self::Project(_) => Kind::Project,
+        }
     }
 
     /// The project id, for the feed line and for anything keyed on a project.
     pub fn project_id(&self) -> Option<&str> {
-        todo!("RED stub: Scope::project_id")
+        match self {
+            Self::Machine => None,
+            Self::Project(id) => Some(id),
+        }
     }
 }
 
 impl fmt::Display for Scope {
-    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("RED stub: Scope Display")
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Machine => f.write_str("machine"),
+            Self::Project(id) => write!(f, "project:{id}"),
+        }
     }
 }
 
@@ -43,8 +52,12 @@ impl fmt::Display for Scope {
 pub struct ScopeParseError(pub String);
 
 impl fmt::Display for ScopeParseError {
-    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!("RED stub: ScopeParseError Display")
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "`{}` is not a scope; write `machine` or `project:<id>`",
+            self.0
+        )
     }
 }
 
@@ -53,8 +66,16 @@ impl std::error::Error for ScopeParseError {}
 impl FromStr for Scope {
     type Err = ScopeParseError;
 
-    fn from_str(_text: &str) -> Result<Self, Self::Err> {
-        todo!("RED stub: Scope FromStr")
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        if text == "machine" {
+            return Ok(Self::Machine);
+        }
+        match text.strip_prefix("project:") {
+            Some(id) if !id.is_empty() && !id.chars().any(char::is_whitespace) => {
+                Ok(Self::Project(id.to_owned()))
+            }
+            _ => Err(ScopeParseError(text.to_owned())),
+        }
     }
 }
 
@@ -79,10 +100,22 @@ mod tests {
 
     #[test]
     fn anything_else_is_refused() {
-        for text in ["", "Machine", "projects:x", "project:", "project:a b", "project", " machine", "machine "] {
+        for text in [
+            "",
+            "Machine",
+            "projects:x",
+            "project:",
+            "project:a b",
+            "project",
+            " machine",
+            "machine ",
+        ] {
             let error = text.parse::<Scope>().expect_err(text);
             assert_eq!(error, ScopeParseError(text.to_owned()));
-            assert!(error.to_string().contains("machine"), "the message names the valid forms");
+            assert!(
+                error.to_string().contains("machine"),
+                "the message names the valid forms"
+            );
         }
     }
 
@@ -98,6 +131,9 @@ mod tests {
     fn scopes_order_machine_first() {
         let mut scopes = vec![Scope::project("b"), Scope::Machine, Scope::project("a")];
         scopes.sort();
-        assert_eq!(scopes, vec![Scope::Machine, Scope::project("a"), Scope::project("b")]);
+        assert_eq!(
+            scopes,
+            vec![Scope::Machine, Scope::project("a"), Scope::project("b")]
+        );
     }
 }

@@ -1,13 +1,22 @@
 //! The document kinds the settings store knows: a trait that ties a Rust type to a name and a scope kind,
-//! and the table of the 13 documents. RED stub: the table is not built yet.
+//! and the table of the 13 documents.
+
+use std::sync::LazyLock;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use super::decode::{Erased, Prepared};
+use super::decode::{self, Erased, Prepared};
 use super::scope::Kind;
-use crate::config::{AutopilotRules, VerifyConfig, WebConfig};
+use crate::config::{
+    AutopilotRules, BrowserConfig, CalendarConfig, CouncilConfig, DevtimeConfig, EmailConfig,
+    GithubConfig, ModelsConfig, VerifyConfig, VoiceConfig, WebConfig, validate_devtime,
+    validate_rules,
+};
+use crate::machine_config as files;
+use crate::models::route_doc::RouterDoc;
+use crate::workflows::Pins;
 
 /// A configuration document: a typed value stored as JSON under `(scope, NAME)`.
 pub trait Document: Serialize + DeserializeOwned + Clone + Send + Sync + 'static {
@@ -38,30 +47,193 @@ pub struct DocType {
     pub default_json: fn() -> Option<Value>,
 }
 
+fn default_of<T: Document + Default>() -> Option<Value> {
+    serde_json::to_value(T::default()).ok()
+}
+
+fn no_default() -> Option<Value> {
+    None
+}
+
+fn of<T: Document + Default>(origin_file: &'static str, takes_effect: &'static str) -> DocType {
+    DocType {
+        name: T::NAME,
+        kind: T::KIND,
+        origin_file,
+        takes_effect,
+        prepare: decode::prepare::<T>,
+        load: decode::load::<T>,
+        default_json: default_of::<T>,
+    }
+}
+
+/// A document with no `Default` (an empty roster is a mistake, not a configuration).
+fn of_optional<T: Document>(origin_file: &'static str, takes_effect: &'static str) -> DocType {
+    DocType {
+        name: T::NAME,
+        kind: T::KIND,
+        origin_file,
+        takes_effect,
+        prepare: decode::prepare::<T>,
+        load: decode::load::<T>,
+        default_json: no_default,
+    }
+}
+
+static DOCUMENTS: LazyLock<Vec<DocType>> = LazyLock::new(|| {
+    vec![
+        of::<EmailConfig>(
+            files::EMAIL_FILE,
+            "when the daemon restarts — the mailbox is polled by a sidecar started with this file's contents",
+        ),
+        of::<VoiceConfig>(
+            files::VOICE_FILE,
+            "when the daemon restarts — the chords are registered with the operating system at startup",
+        ),
+        of::<CalendarConfig>(files::CALENDAR_FILE, "when the daemon restarts"),
+        of::<WebConfig>(
+            files::WEB_FILE,
+            "when the daemon restarts — the search sidecar is started with this file's contents",
+        ),
+        of::<BrowserConfig>(files::BROWSER_FILE, "when the daemon restarts"),
+        of::<GithubConfig>(
+            files::GITHUB_FILE,
+            "when the daemon restarts — and note that this file EXISTING is itself the pillar's opt-in",
+        ),
+        of_optional::<CouncilConfig>(files::COUNCIL_FILE, "when the daemon restarts"),
+        of::<RouterDoc>(
+            files::ROUTER_FILE,
+            "when the daemon restarts — the router is read once at startup; an absent file leaves routing off",
+        ),
+        of::<ModelsConfig>(
+            crate::config::MODELS_CONFIG_FILE,
+            "the model picker refreshes at once; the routes themselves are built at startup and move when the daemon restarts",
+        ),
+        of::<VerifyConfig>(files::VERIFY_FILE, "when the daemon restarts"),
+        of::<DevtimeConfig>(files::DEVTIME_FILE, "when the daemon restarts"),
+        of::<AutopilotRules>(
+            crate::project::state::AUTOPILOT_FILE,
+            "at the next tick of the autopilot for that project",
+        ),
+        of::<Pins>(
+            crate::project::state::PINS_FILE,
+            "at the next run that resolves a workflow for that project",
+        ),
+    ]
+});
+
 /// Every document kind, machine documents first, in the order the settings page lists them.
 pub fn documents() -> &'static [DocType] {
-    todo!("RED stub: registry::documents")
+    &DOCUMENTS
 }
 
-pub fn doc_type(_name: &str) -> Option<&'static DocType> {
-    todo!("RED stub: registry::doc_type")
+pub fn doc_type(name: &str) -> Option<&'static DocType> {
+    documents().iter().find(|doc| doc.name == name)
 }
 
-// RED stub: only the three impls the snapshot and store tests need to compile. The `finish` bodies
-// (validators) and the other ten impls belong to the GREEN step.
+impl Document for EmailConfig {
+    const NAME: &'static str = "email";
+    const KIND: Kind = Kind::Machine;
+    fn finish(self) -> Result<Self, String> {
+        Ok(self.validated())
+    }
+}
+
+impl Document for VoiceConfig {
+    const NAME: &'static str = "voice";
+    const KIND: Kind = Kind::Machine;
+    fn finish(self) -> Result<Self, String> {
+        Ok(self.validated())
+    }
+}
+
+impl Document for CalendarConfig {
+    const NAME: &'static str = "calendar";
+    const KIND: Kind = Kind::Machine;
+}
+
 impl Document for WebConfig {
     const NAME: &'static str = "web";
     const KIND: Kind = Kind::Machine;
 }
 
+impl Document for BrowserConfig {
+    const NAME: &'static str = "browser";
+    const KIND: Kind = Kind::Machine;
+}
+
+impl Document for GithubConfig {
+    const NAME: &'static str = "github";
+    const KIND: Kind = Kind::Machine;
+}
+
+impl Document for CouncilConfig {
+    const NAME: &'static str = "council";
+    const KIND: Kind = Kind::Machine;
+    fn finish(self) -> Result<Self, String> {
+        // The local seat is assumed available: whether this machine can serve it is a runtime fact, checked
+        // when a council actually runs, not when a roster is saved.
+        let faults = self.faults(true);
+        if !faults.is_empty() {
+            return Err(faults.join("; "));
+        }
+        Ok(self.validated())
+    }
+}
+
+impl Document for RouterDoc {
+    const NAME: &'static str = "router";
+    const KIND: Kind = Kind::Machine;
+    fn finish(self) -> Result<Self, String> {
+        self.to_config().map(|config| Self::from_config(&config))
+    }
+}
+
+impl Document for ModelsConfig {
+    const NAME: &'static str = "models";
+    const KIND: Kind = Kind::Machine;
+    fn finish(self) -> Result<Self, String> {
+        self.local_engine()
+            .map(|_| ())
+            .map_err(|refusal| refusal.message())?;
+        Ok(self)
+    }
+}
+
 impl Document for VerifyConfig {
     const NAME: &'static str = "verify";
     const KIND: Kind = Kind::Machine;
+    fn finish(self) -> Result<Self, String> {
+        self.check()?;
+        Ok(self)
+    }
+}
+
+impl Document for DevtimeConfig {
+    const NAME: &'static str = "devtime";
+    const KIND: Kind = Kind::Machine;
+    fn finish(self) -> Result<Self, String> {
+        validate_devtime(&self)?;
+        Ok(self)
+    }
 }
 
 impl Document for AutopilotRules {
     const NAME: &'static str = "autopilot";
     const KIND: Kind = Kind::Project;
+    fn finish(self) -> Result<Self, String> {
+        validate_rules(&self).map_err(|error| error.to_string())?;
+        Ok(self)
+    }
+}
+
+impl Document for Pins {
+    const NAME: &'static str = "workflow_pins";
+    const KIND: Kind = Kind::Project;
+    fn finish(self) -> Result<Self, String> {
+        self.check()?;
+        Ok(self)
+    }
 }
 
 #[cfg(test)]
@@ -84,15 +256,27 @@ mod tests {
         assert_eq!(docs.len(), 13);
         let names: BTreeSet<_> = docs.iter().map(|doc| doc.name).collect();
         assert_eq!(names.len(), 13);
-        assert_eq!(docs.iter().filter(|doc| doc.kind == Kind::Machine).count(), 11);
-        let project: Vec<_> = docs.iter().filter(|doc| doc.kind == Kind::Project).map(|doc| doc.name).collect();
+        assert_eq!(
+            docs.iter().filter(|doc| doc.kind == Kind::Machine).count(),
+            11
+        );
+        let project: Vec<_> = docs
+            .iter()
+            .filter(|doc| doc.kind == Kind::Project)
+            .map(|doc| doc.name)
+            .collect();
         assert_eq!(project, vec!["autopilot", "workflow_pins"]);
     }
 
     #[test]
     fn every_document_names_its_origin_file_and_when_it_takes_effect() {
         for doc in documents() {
-            assert!(doc.origin_file.ends_with(".yaml"), "{}: {}", doc.name, doc.origin_file);
+            assert!(
+                doc.origin_file.ends_with(".yaml"),
+                "{}: {}",
+                doc.name,
+                doc.origin_file
+            );
             assert!(!doc.takes_effect.is_empty(), "{}", doc.name);
         }
     }
@@ -103,22 +287,34 @@ mod tests {
         for doc in documents() {
             match (doc.default_json)() {
                 Some(body) => {
-                    (doc.prepare)(&body)
-                        .unwrap_or_else(|why| panic!("the default of {} is refused: {why}", doc.name));
+                    (doc.prepare)(&body).unwrap_or_else(|why| {
+                        panic!("the default of {} is refused: {why}", doc.name)
+                    });
                 }
                 None => without_default.push(doc.name),
             }
         }
-        assert_eq!(without_default, vec!["council"], "only the council has no default");
+        assert_eq!(
+            without_default,
+            vec!["council"],
+            "only the council has no default"
+        );
     }
 
     #[test]
     fn preparing_a_canonical_body_again_changes_nothing() {
         for doc in documents() {
-            let Some(body) = (doc.default_json)() else { continue };
+            let Some(body) = (doc.default_json)() else {
+                continue;
+            };
             let first = prepared_text(doc.name, &body).unwrap();
             let again: Value = serde_json::from_str(&first).unwrap();
-            assert_eq!(prepared_text(doc.name, &again).unwrap(), first, "{}", doc.name);
+            assert_eq!(
+                prepared_text(doc.name, &again).unwrap(),
+                first,
+                "{}",
+                doc.name
+            );
         }
     }
 
@@ -147,8 +343,9 @@ mod tests {
         let why = (doc.prepare)(&body).unwrap_err();
         assert!(why.contains("unknown field"), "{why}");
 
-        let loaded = (doc.load)(&body.to_string()).expect("a stored row with an extra key still loads");
-        let config = loaded.downcast::<VerifyConfig>().ok().expect("a VerifyConfig");
+        let loaded =
+            (doc.load)(&body.to_string()).expect("a stored row with an extra key still loads");
+        let config = loaded.downcast::<VerifyConfig>().expect("a VerifyConfig");
         assert_eq!(config.capacity, 3);
     }
 
@@ -163,11 +360,16 @@ mod tests {
         assert!(why.contains("names no local engine"), "{why}");
 
         assert!(prepared_text("autopilot", &json!({"schedules": "daily"})).is_err());
-        assert!(prepared_text("workflow_pins", &json!({"workflows": [
-            {"name": "../x", "version": "v1", "origin": "o", "hash": "h"}
-        ]}))
-        .unwrap_err()
-        .contains("not a usable workflow name"));
+        assert!(
+            prepared_text(
+                "workflow_pins",
+                &json!({"workflows": [
+                    {"name": "../x", "version": "v1", "origin": "o", "hash": "h"}
+                ]})
+            )
+            .unwrap_err()
+            .contains("not a usable workflow name")
+        );
     }
 
     #[test]
@@ -181,7 +383,10 @@ mod tests {
     #[test]
     fn doc_type_finds_by_name_and_refuses_the_rest() {
         assert_eq!(doc_type("verify").map(|doc| doc.kind), Some(Kind::Machine));
-        assert_eq!(doc_type("autopilot").map(|doc| doc.kind), Some(Kind::Project));
+        assert_eq!(
+            doc_type("autopilot").map(|doc| doc.kind),
+            Some(Kind::Project)
+        );
         assert!(doc_type("nope").is_none());
     }
 }

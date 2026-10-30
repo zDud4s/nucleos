@@ -71,7 +71,7 @@ pub mod package;
 pub mod timeout;
 pub mod walk;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -462,23 +462,7 @@ pub fn parse_pins(contents: &str) -> Result<Pins, String> {
         Err(error) => return Err(error.to_string()),
     };
 
-    let mut seen = BTreeSet::new();
-    for pin in &pins.workflows {
-        if !valid_name(&pin.name) {
-            return Err(format!("`{}` is not a usable workflow name", pin.name));
-        }
-        if !valid_name(&pin.version) {
-            return Err(format!(
-                "`{}` is not a usable version for `{}`",
-                pin.version, pin.name
-            ));
-        }
-        // The name is the identity — `install` is an upsert on it and `uninstall` a removal by it —
-        // so a file naming one workflow twice is a file where neither of those means anything.
-        if !seen.insert(pin.name.clone()) {
-            return Err(format!("`{}` is pinned twice", pin.name));
-        }
-    }
+    pins.check()?;
     Ok(pins)
 }
 

@@ -1,8 +1,8 @@
 //! The in-memory view of the `settings` table. Readers take an `Arc<Snapshot>` and never block; a write builds
-//! a changed copy and swaps it in AFTER its transaction committed. RED stub: types are real, behaviour is not.
+//! a changed copy and swaps it in AFTER its transaction committed.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, PoisonError, RwLock};
 
 use serde_json::Value;
 
@@ -25,7 +25,7 @@ pub struct Entry {
 impl Entry {
     /// The stored body as JSON; `Null` if the text cannot be parsed.
     pub fn body(&self) -> Value {
-        todo!("RED stub: Entry::body")
+        serde_json::from_str(&self.canonical).unwrap_or(Value::Null)
     }
 }
 
@@ -41,67 +41,101 @@ pub struct Unreadable {
 /// Every stored document, by scope then name, plus the ones that could not be read.
 #[derive(Clone, Default)]
 pub struct Snapshot {
-    #[allow(dead_code)] // RED stub: read by the GREEN implementation
     entries: BTreeMap<Scope, BTreeMap<String, Entry>>,
-    #[allow(dead_code)] // RED stub: read by the GREEN implementation
     unreadable: Vec<Unreadable>,
 }
 
 impl Snapshot {
     /// The document `T` at `scope`, if one is stored and readable.
-    pub fn get_opt<T: Document>(&self, _scope: &Scope) -> Option<Arc<T>> {
-        todo!("RED stub: Snapshot::get_opt")
+    pub fn get_opt<T: Document>(&self, scope: &Scope) -> Option<Arc<T>> {
+        let entry = self.entry(scope, T::NAME)?;
+        Arc::clone(&entry.value).downcast::<T>().ok()
     }
 
     /// The document `T` at `scope`, or its default.
-    pub fn get<T: Document + Default>(&self, _scope: &Scope) -> Arc<T> {
-        todo!("RED stub: Snapshot::get")
+    pub fn get<T: Document + Default>(&self, scope: &Scope) -> Arc<T> {
+        self.get_opt(scope)
+            .unwrap_or_else(|| Arc::new(T::default()))
     }
 
-    pub fn entry(&self, _scope: &Scope, _name: &str) -> Option<&Entry> {
-        todo!("RED stub: Snapshot::entry")
+    pub fn entry(&self, scope: &Scope, name: &str) -> Option<&Entry> {
+        self.entries.get(scope)?.get(name)
     }
 
-    pub fn version(&self, _scope: &Scope, _name: &str) -> Option<i64> {
-        todo!("RED stub: Snapshot::version")
+    pub fn version(&self, scope: &Scope, name: &str) -> Option<i64> {
+        self.entry(scope, name).map(|entry| entry.version)
     }
 
     /// Every readable document, scope by scope, name by name.
     pub fn iter(&self) -> impl Iterator<Item = (&Scope, &str, &Entry)> {
-        let never: std::iter::Empty<(&Scope, &str, &Entry)> = todo!("RED stub: Snapshot::iter");
-        never
+        self.entries.iter().flat_map(|(scope, docs)| {
+            docs.iter()
+                .map(move |(name, entry)| (scope, name.as_str(), entry))
+        })
     }
 
     pub fn unreadable(&self) -> &[Unreadable] {
-        todo!("RED stub: Snapshot::unreadable")
+        &self.unreadable
     }
 
-    pub fn unreadable_for(&self, _scope: &Scope, _name: &str) -> Option<&Unreadable> {
-        todo!("RED stub: Snapshot::unreadable_for")
+    pub fn unreadable_for(&self, scope: &Scope, name: &str) -> Option<&Unreadable> {
+        self.unreadable
+            .iter()
+            .find(|record| record.scope == *scope && record.name == name)
     }
 
-    pub fn is_unreadable(&self, _scope: &Scope, _name: &str) -> bool {
-        todo!("RED stub: Snapshot::is_unreadable")
+    pub fn is_unreadable(&self, scope: &Scope, name: &str) -> bool {
+        self.unreadable_for(scope, name).is_some()
     }
 
     /// Store `entry`, and forget any earlier "unreadable" record for the same document.
-    pub(crate) fn insert(&mut self, _scope: &Scope, _name: &str, _entry: Entry) {
-        todo!("RED stub: Snapshot::insert")
+    pub(crate) fn insert(&mut self, scope: &Scope, name: &str, entry: Entry) {
+        self.clear_unreadable(scope, name);
+        self.entries
+            .entry(scope.clone())
+            .or_default()
+            .insert(name.to_owned(), entry);
     }
 
-    pub(crate) fn remove(&mut self, _scope: &Scope, _name: &str) {
-        todo!("RED stub: Snapshot::remove")
+    pub(crate) fn remove(&mut self, scope: &Scope, name: &str) {
+        // A deleted document is no longer unreadable either: forget both.
+        self.clear_unreadable(scope, name);
+        if let Some(docs) = self.entries.get_mut(scope) {
+            docs.remove(name);
+            if docs.is_empty() {
+                self.entries.remove(scope);
+            }
+        }
     }
 
     /// Record that a stored document cannot be read; readers fall back to the default.
-    pub(crate) fn mark_unreadable(&mut self, _record: Unreadable) {
-        todo!("RED stub: Snapshot::mark_unreadable")
+    pub(crate) fn mark_unreadable(&mut self, record: Unreadable) {
+        // `remove` also forgets an earlier unreadable record, so the list never holds two for one document.
+        self.remove(&record.scope, &record.name);
+        self.unreadable.push(record);
+    }
+
+    fn clear_unreadable(&mut self, scope: &Scope, name: &str) {
+        self.unreadable
+            .retain(|record| !(record.scope == *scope && record.name == name));
     }
 
     /// A snapshot holding `value` at `scope` as version 1, for a test that needs a reader to see a document.
     #[cfg(any(test, feature = "testkit"))]
-    pub fn with_document<T: Document>(self, _scope: &Scope, _value: T) -> Self {
-        todo!("RED stub: Snapshot::with_document")
+    pub fn with_document<T: Document>(mut self, scope: &Scope, value: T) -> Self {
+        let canonical = serde_json::to_string(&value).unwrap_or_default();
+        self.insert(
+            scope,
+            T::NAME,
+            Entry {
+                version: 1,
+                updated_at: "1970-01-01T00:00:00.000Z".to_owned(),
+                updated_by: "test".to_owned(),
+                canonical: Arc::from(canonical),
+                value: Arc::new(value),
+            },
+        );
+        self
     }
 }
 
@@ -109,40 +143,48 @@ impl Snapshot {
 /// a store test builds its own so it never touches the process-wide one.
 #[derive(Clone, Default)]
 pub struct Settings {
-    #[allow(dead_code)] // RED stub: read by the GREEN implementation
     inner: Arc<Inner>,
 }
 
 #[derive(Default)]
 struct Inner {
-    #[allow(dead_code)] // RED stub
     current: RwLock<Arc<Snapshot>>,
-    #[allow(dead_code)] // RED stub
     write: tokio::sync::Mutex<()>,
 }
 
 impl Settings {
     pub fn new() -> Self {
-        todo!("RED stub: Settings::new")
+        Self::default()
     }
 
-    pub fn from_snapshot(_snapshot: Snapshot) -> Self {
-        todo!("RED stub: Settings::from_snapshot")
+    pub fn from_snapshot(snapshot: Snapshot) -> Self {
+        let settings = Self::new();
+        settings.swap(snapshot);
+        settings
     }
 
     /// The current snapshot. Cheap: clones an `Arc`.
     pub fn snapshot(&self) -> Arc<Snapshot> {
-        todo!("RED stub: Settings::snapshot")
+        Arc::clone(
+            &self
+                .inner
+                .current
+                .read()
+                .unwrap_or_else(PoisonError::into_inner),
+        )
     }
 
-    pub(super) fn swap(&self, _snapshot: Snapshot) {
-        todo!("RED stub: Settings::swap")
+    pub(super) fn swap(&self, snapshot: Snapshot) {
+        *self
+            .inner
+            .current
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Arc::new(snapshot);
     }
 
     /// Held for the whole of a write, from the first read inside the transaction to the swap after the commit.
-    #[allow(dead_code)] // RED stub: used by store.rs in GREEN
     pub(super) async fn lock_writes(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        todo!("RED stub: Settings::lock_writes")
+        self.inner.write.lock().await
     }
 }
 
@@ -164,7 +206,10 @@ mod tests {
     }
 
     fn verify(capacity: u32) -> VerifyConfig {
-        VerifyConfig { capacity, ..VerifyConfig::default() }
+        VerifyConfig {
+            capacity,
+            ..VerifyConfig::default()
+        }
     }
 
     #[test]
@@ -181,7 +226,12 @@ mod tests {
         snapshot.insert(&Scope::Machine, "verify", entry(3, verify(9)));
         assert_eq!(snapshot.get::<VerifyConfig>(&Scope::Machine).capacity, 9);
         assert_eq!(snapshot.version(&Scope::Machine, "verify"), Some(3));
-        assert!(snapshot.get_opt::<VerifyConfig>(&Scope::project("p1")).is_none(), "another scope is empty");
+        assert!(
+            snapshot
+                .get_opt::<VerifyConfig>(&Scope::project("p1"))
+                .is_none(),
+            "another scope is empty"
+        );
         let (scope, name, found) = snapshot.iter().next().expect("one entry");
         assert_eq!((scope, name, found.version), (&Scope::Machine, "verify", 3));
         assert_eq!(found.body()["capacity"], 9);
@@ -191,7 +241,11 @@ mod tests {
     fn a_name_with_the_wrong_type_is_not_found() {
         let mut snapshot = Snapshot::default();
         snapshot.insert(&Scope::Machine, "verify", entry(1, verify(9)));
-        assert!(snapshot.get_opt::<crate::config::WebConfig>(&Scope::Machine).is_none());
+        assert!(
+            snapshot
+                .get_opt::<crate::config::WebConfig>(&Scope::Machine)
+                .is_none()
+        );
     }
 
     #[test]
@@ -201,8 +255,17 @@ mod tests {
         let mut next = (*before).clone();
         next.insert(&Scope::Machine, "verify", entry(1, verify(9)));
         settings.swap(next);
-        assert!(before.get_opt::<VerifyConfig>(&Scope::Machine).is_none(), "the old Arc is a frozen view");
-        assert_eq!(settings.snapshot().get::<VerifyConfig>(&Scope::Machine).capacity, 9);
+        assert!(
+            before.get_opt::<VerifyConfig>(&Scope::Machine).is_none(),
+            "the old Arc is a frozen view"
+        );
+        assert_eq!(
+            settings
+                .snapshot()
+                .get::<VerifyConfig>(&Scope::Machine)
+                .capacity,
+            9
+        );
     }
 
     #[test]
@@ -217,7 +280,11 @@ mod tests {
         });
         assert!(snapshot.is_unreadable(&Scope::Machine, "verify"));
         assert_eq!(snapshot.unreadable().len(), 1);
-        assert_eq!(snapshot.get::<VerifyConfig>(&Scope::Machine).capacity, 4, "falls back to the default");
+        assert_eq!(
+            snapshot.get::<VerifyConfig>(&Scope::Machine).capacity,
+            4,
+            "falls back to the default"
+        );
 
         snapshot.insert(&Scope::Machine, "verify", entry(3, verify(5)));
         assert!(!snapshot.is_unreadable(&Scope::Machine, "verify"));

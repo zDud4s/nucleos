@@ -178,7 +178,7 @@ impl VoiceConfig {
         self.armed() && (!self.tts_url.trim().is_empty() || !self.tts_command.trim().is_empty())
     }
 
-    pub(super) fn validated(mut self) -> Self {
+    pub(crate) fn validated(mut self) -> Self {
         if self.retain_dictations_days > 30 {
             tracing::warn!(
                 retain_dictations_days = self.retain_dictations_days,
