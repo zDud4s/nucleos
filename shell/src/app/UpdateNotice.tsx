@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { DAEMON_NAME } from "../copy";
-import { applyUpdate, useUpdate, type UpdatePhase } from "../data/updater";
+import { applyUpdate, useInstallKind, useUpdate, type UpdatePhase } from "../data/updater";
 import { Button, ErrorNote } from "../ui";
 
 const PHASE_TEXT: Record<UpdatePhase | "downloading", string> = {
@@ -15,8 +15,19 @@ const PHASE_TEXT: Record<UpdatePhase | "downloading", string> = {
  */
 export function UpdateNotice() {
   const update = useUpdate();
+  const kind = useInstallKind();
   const [phase, setPhase] = useState<UpdatePhase | "downloading" | null>(null);
   const [failure, setFailure] = useState<unknown>(null);
+
+  if (kind.data === "system-package") {
+    return (
+      <div className="app-kill">
+        <p>
+          NucleOS was installed from a .deb/.rpm package; update it with your package manager
+        </p>
+      </div>
+    );
+  }
 
   const offered = update.data;
   if (!offered) return null;

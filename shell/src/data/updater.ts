@@ -19,9 +19,25 @@ export async function updatesEnabled(): Promise<boolean> {
   return isTauri() && (await invoke<boolean>("updates_enabled"));
 }
 
-/** The offered update, or null when there is none or updates are disabled here. */
+export type InstallKind = "app-image" | "system-package" | "other";
+
+/** How this build was installed; `other` outside the desktop host. */
+export async function installKind(): Promise<InstallKind> {
+  if (!isTauri()) return "other";
+  return invoke<InstallKind>("install_kind");
+}
+
+export function useInstallKind() {
+  return useQuery({ queryKey: keys.installKind, queryFn: installKind, retry: false });
+}
+
+/**
+ * The offered update, or null when there is none, updates are disabled here, or this is a
+ * .deb/.rpm install that its package manager updates.
+ */
 export async function findUpdate(): Promise<Update | null> {
   if (!(await updatesEnabled())) return null;
+  if ((await installKind()) === "system-package") return null;
   return check();
 }
 
