@@ -405,6 +405,24 @@ class Status(CliCase):
                          ("root-1", "open", [], []))
         self.assertIn("branch add", out["next"][0])
 
+    def test_status_lists_the_pending_entries_in_seq_order(self):
+        pending = ts.tree_dir("root-1") / "pending"
+        pending.mkdir(parents=True, exist_ok=True)
+        for seq, node in ((2, "n-b"), (1, "n-a")):
+            entry = {"seq": seq, "node": node, "transition": "done", "tool": "node_close", "payload": {}}
+            (pending / f"{seq}-node_close.json").write_text(json.dumps(entry), encoding="utf-8")
+        out = self.ok("status")
+        self.assertEqual([(e["seq"], e["node"]) for e in out["pending"]], [(1, "n-a"), (2, "n-b")])
+
+    def test_status_pending_is_an_empty_list_without_a_pending_dir(self):
+        self.assertEqual(self.ok("status")["pending"], [])
+
+    def test_status_pending_is_an_empty_list_when_the_module_is_missing(self):
+        # A None entry in sys.modules makes `import tree_pending` raise ImportError.
+        with mock.patch.dict(sys.modules, {"tree_pending": None}):
+            out = self.ok("status")
+        self.assertEqual(out["pending"], [])
+
     def test_next_action_per_branch_state(self):
         self.branch("base", "core/a/**")
         self.branch("top", "core/b/**", base="base")

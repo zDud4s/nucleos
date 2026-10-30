@@ -118,6 +118,8 @@ PHASE_SKILL = {
     "green": "executor",
     "refactor": "executor",
     "orchestrate_node": "orchestrate-node",
+    "tree_orchestrate": "orchestrate-node",
+    "tree_leaf": "executor",
     "synthesize": "synthesizer",
 }
 
@@ -132,6 +134,8 @@ PHASE_COCKPIT = {
     "green": "wf-executor",
     "refactor": "wf-executor",
     "orchestrate_node": "wf-orchestrator",
+    "tree_orchestrate": "wf-tree-orchestrator",
+    "tree_leaf": "wf-leaf",
     "synthesize": "wf-synthesizer",
 }
 

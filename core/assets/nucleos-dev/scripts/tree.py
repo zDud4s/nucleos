@@ -585,7 +585,13 @@ def run_status(args) -> dict:
         nxt.append("declare the top-level branches with `branch add`")
     elif all(b["state"] in ts.TERMINAL_STATES for b in branches.values()):
         nxt.append("all branches settled: run `tree.py finish`")
-    return {"verb": "status", "tree_id": tree_id, "state": manifest["state"],
+    try:
+        # Lazy import: a missing module must not break `status`.
+        import tree_pending
+        pending = [data for data, _path in tree_pending._entries(tree_id)]
+    except Exception:
+        pending = []
+    return {"verb": "status", "tree_id": tree_id, "state": manifest["state"], "pending": pending,
             "feature_branch": manifest["feature_branch"], "goal": manifest["goal"],
             "dirty_owner_files": manifest.get("dirty_owner_files", []), "branches": summary,
             "suspect_nodes": suspects, "unverifiable_nodes": unverifiable, "park": manifest.get("park"),

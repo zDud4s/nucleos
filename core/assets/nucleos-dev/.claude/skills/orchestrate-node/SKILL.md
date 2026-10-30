@@ -1,6 +1,6 @@
 ---
 name: orchestrate-node
-description: Use when you are a node controller of a node tree — dispatched through the `wf-orchestrator` cockpit with a node packet (`packets/node.md`) as a non-leaf node, or the root controller deciding to decompose a task that will not fit one leaf budget; also when a leaf or orchestrator of a tree driven by `tree.py` has to write its report.
+description: Use when you are a node controller of a node tree — dispatched through the `wf-orchestrator` or `wf-tree-orchestrator` cockpit with a node packet (`packets/node.md`) as a non-leaf node, or the root controller deciding to decompose a task that will not fit one leaf budget; also when a leaf or orchestrator of a tree driven by `tree.py` has to write its report.
 ---
 
 # Orchestrate node
@@ -48,7 +48,7 @@ Routing and the "One controller per node" rules live in `dispatch.md`; read it o
 
 ## Boundaries
 
-- Direct children only, and only `wf-orchestrator`, `wf-planner`, `wf-executor`, `wf-reviewer`.
+- Direct children only, and only `wf-orchestrator`, `wf-planner`, `wf-executor`, `wf-reviewer` (in a tree driven by `tree.py`, a leaf `execute` may go through `wf-leaf`).
 - No build, test or verify run. In a tree driven by `tree.py` that is absolute: `subtree_verify` is
   ignored and only the controller gates. Outside a tree, with `subtree_verify` true, a branch-scoped
   `mcp__nucleos__verify` for your own branch is allowed; otherwise the root controller's single
@@ -60,6 +60,8 @@ Routing and the "One controller per node" rules live in `dispatch.md`; read it o
 When your prompt came from `tree.py prompt`, its rules block and these rules both bind you. The
 prompt block is the single source; if they differ, the prompt wins.
 
+- **The top-of-branch orchestrator does not close its node.** Dispatched through `wf-tree-orchestrator`, you return the report and your node stays `running` until the controller merges the branch (`tree.py merge` returns the `node_close`). Orchestrators below the top of a branch, and the fix-tree ones, close as in step 10.
+- **A leaf closes its own node.** Leaves run in `wf-leaf`: they write their own handoff, `node_close` their own node (only that one) and never open nodes. Do not close a leaf's node for it unless it died `running`.
 - **Your report is your handoff.** Write `<state_dir>/nodes/<root_id>/<node_id>.md` (a reviewer
   without `Write` returns the same text as its final message; the controller stores it). The
   report format and the per-role rules are in the `## Report format` and `## Rules by role` sections of the prompt `tree.py prompt`
