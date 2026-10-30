@@ -132,9 +132,41 @@ const GO_TEST_FLAGS: Flags = Flags {
     ],
 };
 
-/// **Pure.** Whether the leaf may run `cmd`, given the globs its branch owns. Every package, path
-/// and manifest the command names must lie inside one glob, and it must name at least one: a
-/// command with no scope runs over the whole workspace or the current directory.
+/// One directory a command reaches, and whether a glob inside that directory is enough to hold it.
+enum Scope {
+    /// A `-p` package: the gate runs the crate's tests, and writing stays limited by owned paths.
+    Package(String),
+    /// A `--manifest-path` or go directory, which only a glob around it holds.
+    Path(String),
+}
+
+impl Scope {
+    fn dir(&self) -> &str {
+        match self {
+            Scope::Package(dir) | Scope::Path(dir) => dir,
+        }
+    }
+
+    /// `glob` must already be `normalise_glob` output.
+    fn held_by(&self, glob: &str) -> bool {
+        path_contained(self.dir(), glob)
+            || matches!(self, Scope::Package(dir) if glob_inside_package(glob, dir))
+    }
+}
+
+/// Whether `glob` lies inside the package at `dir` and not inside a package nested in it: a glob
+/// there belongs to the nested package alone.
+fn glob_inside_package(glob: &str, dir: &str) -> bool {
+    path_contained(glob, dir)
+        && !WORKSPACE_PACKAGES.iter().any(|(_, other)| {
+            *other != dir && path_contained(other, dir) && path_contained(glob, other)
+        })
+}
+
+/// **Pure.** Whether the leaf may run `cmd`, given the globs its branch owns. Every path and
+/// manifest the command names must lie inside one glob, every package must lie inside one or hold
+/// one (see `glob_inside_package`), and it must name at least one: a command with no scope runs
+/// over the whole workspace or the current directory.
 pub fn validate(cmd: &str, branch_paths: &[String]) -> Result<Allowed, Parked> {
     allowed_argv(cmd, branch_paths)
         .map(|argv| Allowed { argv })
@@ -153,9 +185,9 @@ fn allowed_argv(cmd: &str, branch_paths: &[String]) -> Result<Vec<String>, Strin
     let [program, subcommand, args @ ..] = tokens.as_slice() else {
         return Err(off_the_list());
     };
-    let scopes = match (*program, *subcommand) {
+    let scopes: Vec<Scope> = match (*program, *subcommand) {
         ("cargo", "test" | "check" | "clippy") => cargo_scopes(subcommand, args)?,
-        ("go", "test") => go_scopes(args)?,
+        ("go", "test") => go_scopes(args)?.into_iter().map(Scope::Path).collect(),
         _ => return Err(off_the_list()),
     };
     if scopes.is_empty() {
@@ -167,9 +199,10 @@ fn allowed_argv(cmd: &str, branch_paths: &[String]) -> Result<Vec<String>, Strin
         .filter_map(|glob| normalise_glob(glob).ok())
         .collect();
     for scope in &scopes {
-        if !globs.iter().any(|glob| path_contained(scope, glob)) {
+        if !globs.iter().any(|glob| scope.held_by(glob)) {
             return Err(format!(
-                "{scope:?} is outside the branch ({})",
+                "{:?} is outside the branch ({})",
+                scope.dir(),
                 branch_paths.join(", ")
             ));
         }
@@ -184,7 +217,7 @@ fn is_plain(c: char) -> bool {
 }
 
 /// The directories one cargo command reaches: each `-p` package and each `--manifest-path`.
-fn cargo_scopes(subcommand: &str, args: &[&str]) -> Result<Vec<String>, String> {
+fn cargo_scopes(subcommand: &str, args: &[&str]) -> Result<Vec<Scope>, String> {
     let (own, trailing) = match args.iter().position(|arg| *arg == "--") {
         Some(at) => (&args[..at], &args[at + 1..]),
         None => (args, &args[args.len()..]),
@@ -201,8 +234,8 @@ fn cargo_scopes(subcommand: &str, args: &[&str]) -> Result<Vec<String>, String> 
     let mut scopes = Vec::new();
     for (flag, value) in &parsed.values {
         match *flag {
-            "-p" | "--package" => scopes.push(package_dir(value)?),
-            "--manifest-path" => scopes.push(manifest_dir(value)?),
+            "-p" | "--package" => scopes.push(Scope::Package(package_dir(value)?)),
+            "--manifest-path" => scopes.push(Scope::Path(manifest_dir(value)?)),
             _ => {}
         }
     }
