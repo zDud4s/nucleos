@@ -256,25 +256,30 @@ pub const DEFAULT_WORKFLOW: &str = "nucleos-dev";
 /// Pin [`DEFAULT_WORKFLOW`], newest version in `library_root`, for a project being rostered.
 ///
 /// The caller decides that the project is new (`POST /projects/{id}/onboard` asks the roster);
-/// this only refuses to overrule a decision already on disk: a project whose pins file exists has
-/// chosen its workflows, even if the choice was none, and is left alone. A library without the
-/// bundle is skipped with a log line rather than an error — onboarding is about the hook and the
-/// gate, and a machine that never packaged the workflow still onboards. Returns the pinned bundle.
-pub fn pin_default_workflow(
+/// this only refuses to overrule a decision already made: a project with a stored `workflow_pins`
+/// document has chosen its workflows, even if the choice was none, and is left alone. A library
+/// without the bundle is skipped with a log line rather than an error — onboarding is about the hook
+/// and the gate, and a machine that never packaged the workflow still onboards. Returns the pinned
+/// bundle.
+pub async fn pin_default_workflow(
+    pool: &sqlx::SqlitePool,
     machine_root: &Path,
     library_root: &Path,
     project_id: &str,
 ) -> Result<Option<crate::workflows::Bundle>, String> {
-    let Some(state_dir) = crate::project::state::dir(machine_root, project_id) else {
+    if crate::project::state::dir(machine_root, project_id).is_none() {
         return Err(format!("`{project_id}` cannot name a state directory"));
-    };
-    let pins = state_dir.join(crate::project::state::PINS_FILE);
-    if pins.exists() {
+    }
+    if crate::project::rules::is_stored(project_id, "workflow_pins") {
         return Ok(None);
     }
     // Newest first within a name (`workflows::library`), so the first match is the latest.
-    let newest = crate::workflows::library(library_root)
-        .map_err(|error| format!("{}: {error}", library_root.display()))?
+    let library = library_root.to_path_buf();
+    let shelf = tokio::task::spawn_blocking(move || crate::workflows::library(&library))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| format!("{}: {error}", library_root.display()))?;
+    let newest = shelf
         .into_iter()
         .find(|bundle| bundle.name == DEFAULT_WORKFLOW);
     let Some(bundle) = newest else {
@@ -285,7 +290,9 @@ pub fn pin_default_workflow(
         );
         return Ok(None);
     };
-    crate::workflows::install(&pins, &bundle).map_err(|refused| format!("{refused:?}"))?;
+    crate::workflows::install(pool, project_id, &bundle)
+        .await
+        .map_err(|refused| format!("{refused:?}"))?;
     Ok(Some(bundle))
 }
 
@@ -309,61 +316,64 @@ mod tests {
         library
     }
 
-    #[test]
-    fn a_new_project_pins_the_newest_default_workflow() {
+    #[tokio::test]
+    async fn a_new_project_pins_the_newest_default_workflow() {
+        let _settings = crate::project::rules::testing::Home::new();
+        let pool = crate::testdb::fresh_pool().await;
         let temp = tempfile::tempdir().unwrap();
         let library = library_with(temp.path(), &["1.9.0", "2.0.0", "2.0.0-rc1"]);
         let home = temp.path().join("home");
 
-        let pinned = pin_default_workflow(&home, &library, "alpha")
+        let pinned = pin_default_workflow(&pool, &home, &library, "alpha")
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(pinned.version, "2.0.0");
-        let pins = crate::workflows::read_pins(
-            &home
-                .join("projects/alpha")
-                .join(crate::project::state::PINS_FILE),
-        )
-        .unwrap();
+        let pins = crate::project::rules::pins("alpha").unwrap();
         assert_eq!(pins.workflows.len(), 1);
         assert_eq!(pins.workflows[0].name, DEFAULT_WORKFLOW);
         assert_eq!(pins.workflows[0].version, "2.0.0");
         assert_eq!(pins.workflows[0].hash, pinned.hash);
     }
 
-    #[test]
-    fn a_project_that_chose_its_workflows_or_a_library_without_the_default_pins_nothing() {
+    #[tokio::test]
+    async fn a_project_that_chose_its_workflows_or_a_library_without_the_default_pins_nothing() {
+        let _settings = crate::project::rules::testing::Home::new();
+        let pool = crate::testdb::fresh_pool().await;
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("home");
 
-        // No such bundle: skipped, not refused, and no pins file appears.
+        // No such bundle: skipped, not refused, and no pins document appears.
         let empty = library_with(temp.path(), &[]);
         assert!(
-            pin_default_workflow(&home, &empty, "alpha")
+            pin_default_workflow(&pool, &home, &empty, "alpha")
+                .await
                 .unwrap()
                 .is_none()
         );
-        assert!(
-            !home
-                .join("projects/alpha")
-                .join(crate::project::state::PINS_FILE)
-                .exists()
-        );
+        assert!(!crate::project::rules::is_stored("alpha", "workflow_pins"));
 
-        // A pins file, even an empty one, is a choice already made.
+        // A pins document, even an empty one, is a choice already made.
         let library = library_with(temp.path(), &["2.0.0"]);
-        let pins = home
-            .join("projects/beta")
-            .join(crate::project::state::PINS_FILE);
-        write(&pins, "workflows: []\n");
+        crate::project::rules::testing::publish_pins("beta", "workflows: []\n");
         assert!(
-            pin_default_workflow(&home, &library, "beta")
+            pin_default_workflow(&pool, &home, &library, "beta")
+                .await
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(std::fs::read_to_string(&pins).unwrap(), "workflows: []\n");
+        assert!(
+            crate::project::rules::pins("beta")
+                .unwrap()
+                .workflows
+                .is_empty()
+        );
 
-        assert!(pin_default_workflow(&home, &library, "a:b").is_err());
+        assert!(
+            pin_default_workflow(&pool, &home, &library, "a:b")
+                .await
+                .is_err()
+        );
     }
 
     const NOW: &str = "2026-09-27T12:00:00+00:00";

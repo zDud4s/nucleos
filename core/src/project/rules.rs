@@ -37,6 +37,18 @@ pub fn pins(project_id: &str) -> Result<Pins, DocumentUnreadable> {
     read_from(&crate::settings::global().snapshot(), project_id)
 }
 
+/// The project's pins plus the stored version they were read at, from ONE snapshot.
+///
+/// An absent document is `(Pins::default(), 0)`: `expected: Some(0)` on a `put` means "must not exist yet".
+pub fn pins_versioned(project_id: &str) -> Result<(Pins, i64), DocumentUnreadable> {
+    let snapshot = crate::settings::global().snapshot();
+    let pins = read_from::<Pins>(&snapshot, project_id)?;
+    let version = snapshot
+        .version(&Scope::project(project_id), "workflow_pins")
+        .unwrap_or(0);
+    Ok((pins, version))
+}
+
 /// Whether the project has a readable stored document called `name`.
 pub fn is_stored(project_id: &str, name: &str) -> bool {
     let snapshot = crate::settings::global().snapshot();

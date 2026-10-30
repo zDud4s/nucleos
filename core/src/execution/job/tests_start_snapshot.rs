@@ -6,23 +6,27 @@
 #![allow(clippy::await_holding_lock)]
 
 use super::engine::load_graph;
-use super::tests::{WALK_HOME, WorktreeRootEnv, test_pool, test_state, walkable_repo, with_home};
+use super::tests::{WorktreeRootEnv, test_pool, test_state, walkable_repo, with_home};
 use super::*;
 
 const GRAPH: &str = "nodes:\n  - {id: plan, type: agent, tool: claude, model: opus}\n  - {id: review, type: agent}\nedges:\n  - {from: plan, to: review}\n";
 const EDITED_GRAPH: &str = "nodes:\n  - {id: plan, type: agent}\n  - {id: other, type: agent}\nedges:\n  - {from: plan, to: other}\n";
 
-/// A library holding `dev@1.0` with `graph`, pinned by the project `nucleos`. Returns the pins
-/// file, the bundle directory and the pinned bundle.
+/// Pins `bundle` for the project `nucleos` in the settings store, as `workflows::install` would.
+/// The caller holds the settings (`Home::new()`) for the whole test.
+fn pin_in_store(bundle: &crate::workflows::Bundle) {
+    let mut pins = crate::project::rules::pins("nucleos").unwrap();
+    crate::workflows::apply_install(&mut pins, bundle).unwrap();
+    crate::project::rules::testing::publish_pins("nucleos", &crate::workflows::render_pins(&pins));
+}
+
+/// A library holding `dev@1.0` with `graph`, pinned by the project `nucleos`. Returns the bundle
+/// directory and the pinned bundle.
 fn pin_dev(
     container: &tempfile::TempDir,
     state: &mut AppState,
     graph: &str,
-) -> (
-    std::path::PathBuf,
-    std::path::PathBuf,
-    crate::workflows::Bundle,
-) {
+) -> (std::path::PathBuf, crate::workflows::Bundle) {
     let library = container.path().join("workflows");
     let bundle_dir = library.join("dev").join("1.0");
     std::fs::create_dir_all(&bundle_dir).unwrap();
@@ -31,17 +35,14 @@ fn pin_dev(
     let bundle = crate::workflows::read_bundle(&bundle_dir, "dev", "1.0")
         .unwrap()
         .unwrap();
-    let pins = crate::project::state::dir(&container.path().join(WALK_HOME), "nucleos")
-        .unwrap()
-        .join(crate::project::state::PINS_FILE);
-    crate::workflows::install(&pins, &bundle).unwrap();
+    pin_in_store(&bundle);
     state.workflow_library = Some(library);
-    (pins, bundle_dir, bundle)
+    (bundle_dir, bundle)
 }
 
 /// Gives `dev` a model override on `plan` and switches `review` off.
-fn overlay_dev(pins_file: &std::path::Path) {
-    let mut pins = crate::workflows::read_pins(pins_file).unwrap();
+fn overlay_dev() {
+    let mut pins = crate::project::rules::pins("nucleos").unwrap();
     let nodes = &mut pins.workflows[0].nodes;
     nodes.insert(
         "plan".to_string(),
@@ -57,7 +58,7 @@ fn overlay_dev(pins_file: &std::path::Path) {
             ..Default::default()
         },
     );
-    std::fs::write(pins_file, crate::workflows::render_pins(&pins)).unwrap();
+    crate::project::rules::testing::publish_pins("nucleos", &crate::workflows::render_pins(&pins));
 }
 
 fn request<'a>(root: &'a str, workflow: Option<&'a str>) -> StartRequest<'a> {
@@ -84,10 +85,11 @@ async fn a_started_job_snapshots_the_overlay_painted_graph() {
     let (container, repo) = walkable_repo("nucleos-job-c5a-", "git --version");
     let root = tempfile::tempdir().unwrap();
     let _env = WorktreeRootEnv::set(root.path());
+    let _settings = crate::project::rules::testing::Home::new();
     let pool = test_pool().await;
     let mut state = with_home(test_state(pool.clone()).await, &container);
-    let (pins, _dir, _bundle) = pin_dev(&container, &mut state, GRAPH);
-    overlay_dev(&pins);
+    pin_dev(&container, &mut state, GRAPH);
+    overlay_dev();
     let project_root = repo.to_string_lossy().into_owned();
 
     let JobStart::Started(job_id) = start(&state, &request(&project_root, Some("dev"))).await
@@ -116,9 +118,10 @@ async fn bundle_hash_in_the_snapshot_is_the_pin_hash() {
     let (container, repo) = walkable_repo("nucleos-job-c5b-", "git --version");
     let root = tempfile::tempdir().unwrap();
     let _env = WorktreeRootEnv::set(root.path());
+    let _settings = crate::project::rules::testing::Home::new();
     let pool = test_pool().await;
     let mut state = with_home(test_state(pool.clone()).await, &container);
-    let (pins, _dir, bundle) = pin_dev(&container, &mut state, GRAPH);
+    let (_dir, bundle) = pin_dev(&container, &mut state, GRAPH);
     let project_root = repo.to_string_lossy().into_owned();
 
     let JobStart::Started(job_id) = start(&state, &request(&project_root, Some("dev"))).await
@@ -126,7 +129,7 @@ async fn bundle_hash_in_the_snapshot_is_the_pin_hash() {
         panic!("the job did not start");
     };
 
-    let pinned = crate::workflows::read_pins(&pins).unwrap().workflows[0]
+    let pinned = crate::project::rules::pins("nucleos").unwrap().workflows[0]
         .hash
         .clone();
     let snapshot = load_graph_snapshot(&pool, job_id).await.unwrap().unwrap();
@@ -140,9 +143,10 @@ async fn editing_the_bundle_after_start_does_not_change_the_running_job() {
     let (container, repo) = walkable_repo("nucleos-job-c5c-", "git --version");
     let root = tempfile::tempdir().unwrap();
     let _env = WorktreeRootEnv::set(root.path());
+    let _settings = crate::project::rules::testing::Home::new();
     let pool = test_pool().await;
     let mut state = with_home(test_state(pool.clone()).await, &container);
-    let (pins, bundle_dir, _bundle) = pin_dev(&container, &mut state, GRAPH);
+    let (bundle_dir, _bundle) = pin_dev(&container, &mut state, GRAPH);
     let project_root = repo.to_string_lossy().into_owned();
 
     let JobStart::Started(job_id) = start(&state, &request(&project_root, Some("dev"))).await
@@ -156,7 +160,7 @@ async fn editing_the_bundle_after_start_does_not_change_the_running_job() {
     let edited = crate::workflows::read_bundle(&bundle_dir, "dev", "1.0")
         .unwrap()
         .unwrap();
-    crate::workflows::install(&pins, &edited).unwrap();
+    pin_in_store(&edited);
 
     let after = load_graph(&pool, job_id).await.unwrap();
     assert_eq!(
@@ -173,6 +177,7 @@ async fn no_pin_snapshots_the_embedded_autopilot_with_its_digest() {
     let (container, repo) = walkable_repo("nucleos-job-c5d-", "git --version");
     let root = tempfile::tempdir().unwrap();
     let _env = WorktreeRootEnv::set(root.path());
+    let _settings = crate::project::rules::testing::Home::new();
     let pool = test_pool().await;
     let state = with_home(test_state(pool.clone()).await, &container);
     let project_root = repo.to_string_lossy().into_owned();
@@ -197,6 +202,7 @@ async fn a_pin_with_an_unparsable_graph_refuses_the_start() {
     let (container, repo) = walkable_repo("nucleos-job-c5e-", "git --version");
     let root = tempfile::tempdir().unwrap();
     let _env = WorktreeRootEnv::set(root.path());
+    let _settings = crate::project::rules::testing::Home::new();
     let pool = test_pool().await;
     let mut state = with_home(test_state(pool.clone()).await, &container);
     // Pinned AFTER the bad graph is written, so the pin's hash matches the library bundle.
@@ -222,6 +228,7 @@ async fn a_workflow_the_project_does_not_pin_refuses_the_start() {
     let (container, repo) = walkable_repo("nucleos-job-c5f-", "git --version");
     let root = tempfile::tempdir().unwrap();
     let _env = WorktreeRootEnv::set(root.path());
+    let _settings = crate::project::rules::testing::Home::new();
     let pool = test_pool().await;
     let state = with_home(test_state(pool.clone()).await, &container);
     let project_root = repo.to_string_lossy().into_owned();
@@ -268,8 +275,8 @@ mod pure {
 
     #[test]
     fn no_state_and_no_library_resolve_to_the_embedded_autopilot() {
+        let _home = crate::project::rules::testing::Home::new();
         let resolved = resolve_graph_from(
-            None,
             None,
             "nucleos",
             std::path::Path::new("/p"),
@@ -282,8 +289,54 @@ mod pure {
 
     #[test]
     fn another_workflow_with_no_pin_is_a_refusal_not_the_autopilot() {
-        let refusal = resolve_graph_from(None, None, "nucleos", std::path::Path::new("/p"), "dev")
-            .unwrap_err();
+        let _home = crate::project::rules::testing::Home::new();
+        let refusal =
+            resolve_graph_from(None, "nucleos", std::path::Path::new("/p"), "dev").unwrap_err();
         assert!(refusal.contains("dev"), "{refusal}");
+    }
+
+    /// RED (4.2): `resolve_graph_from` loses `machine_root` and finds the pin in the store by project id. Nothing
+    /// is written to a pins file, so the resolution cannot lean on `is_file()`.
+    #[test]
+    fn resolve_graph_from_sees_a_stored_pin() {
+        let _home = crate::project::rules::testing::Home::new();
+        let container = tempfile::tempdir().unwrap();
+        let library = container.path().join("workflows");
+        let bundle_dir = library.join("dev").join("1.0");
+        std::fs::create_dir_all(&bundle_dir).unwrap();
+        std::fs::write(bundle_dir.join("bundle.yaml"), "owns: []\n").unwrap();
+        std::fs::write(bundle_dir.join("graph.yaml"), GRAPH).unwrap();
+        let bundle = crate::workflows::read_bundle(&bundle_dir, "dev", "1.0")
+            .unwrap()
+            .unwrap();
+        let project_id = "resolve-stored-pin-project";
+
+        // Not pinned yet: a workflow other than the autopilot is a refusal.
+        let refusal = resolve_graph_from(
+            Some(library.as_path()),
+            project_id,
+            std::path::Path::new("/p"),
+            "dev",
+        )
+        .unwrap_err();
+        assert!(refusal.contains("dev"), "{refusal}");
+
+        crate::project::rules::testing::publish_pins(
+            project_id,
+            &format!(
+                "workflows:\n  - name: dev\n    version: '1.0'\n    origin: library:dev@1.0\n    hash: {}\n",
+                bundle.hash
+            ),
+        );
+        let resolved = resolve_graph_from(
+            Some(library.as_path()),
+            project_id,
+            std::path::Path::new("/p"),
+            "dev",
+        )
+        .unwrap();
+        assert!(!resolved.builtin);
+        assert_eq!(resolved.bundle_ref.as_deref(), Some("dev@1.0"));
+        assert_eq!(resolved.bundle_hash.as_deref(), Some(bundle.hash.as_str()));
     }
 }

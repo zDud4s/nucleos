@@ -4100,6 +4100,17 @@ mod tests {
         );
     }
 
+    /// Pins the library's `dev@1.0` for `id` in the settings store, as installing it would. The caller
+    /// already holds the settings (`project_with_rules` or `Home::new()`).
+    fn pin_dev_in_store(id: &str, library: &std::path::Path) {
+        let bundle = crate::workflows::read_bundle(&library.join("dev/1.0"), "dev", "1.0")
+            .unwrap()
+            .unwrap();
+        let mut pins = crate::project::rules::pins(id).unwrap();
+        crate::workflows::apply_install(&mut pins, &bundle).unwrap();
+        crate::project::rules::testing::publish_pins(id, &crate::workflows::render_pins(&pins));
+    }
+
     async fn read_rules(state: AppState, id: &str) -> (StatusCode, serde_json::Value) {
         let response = build_router(state)
             .oneshot(
@@ -4755,6 +4766,7 @@ mod tests {
     /// placed; one already on the roster keeps what it uses, which here is nothing.
     #[tokio::test]
     async fn onboarding_pins_the_default_workflow_for_a_new_project_only() {
+        let _settings = crate::project::rules::testing::Home::new();
         let mut state = test_state().await;
         let home = with_project_home(&mut state);
         let library = home.path().join("library");
@@ -4769,12 +4781,6 @@ mod tests {
         .unwrap();
         std::fs::write(bundle.join(".nucleos/workflow/workflow.md"), "rules").unwrap();
         state.workflow_library = Some(library);
-        let pins_of = |id: &str| {
-            home.path()
-                .join("projects")
-                .join(id)
-                .join(crate::project::state::PINS_FILE)
-        };
 
         let new = tempfile::tempdir().unwrap();
         let (status, view) = workflow_call(
@@ -4785,7 +4791,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{view}");
-        let pins = crate::workflows::read_pins(&pins_of("alpha")).unwrap();
+        let pins = crate::project::rules::pins("alpha").unwrap();
         assert_eq!(pins.workflows.len(), 1);
         assert_eq!(pins.workflows[0].name, crate::onboarding::DEFAULT_WORKFLOW);
         assert_eq!(pins.workflows[0].version, "2.0.0");
@@ -4812,7 +4818,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{view}");
-        assert!(!pins_of("beta").exists());
+        assert!(!crate::project::rules::is_stored("beta", "workflow_pins"));
         assert!(!old.path().join(".nucleos").exists());
     }
 
@@ -9021,22 +9027,7 @@ mod tests {
         state.workflow_library = Some(library);
         let _home = with_project_home(&mut state);
         let project = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
-        crate::workflows::install(
-            &state
-                .machine_config_root
-                .clone()
-                .unwrap()
-                .join("projects/alpha")
-                .join(crate::project::state::PINS_FILE),
-            &crate::workflows::read_bundle(
-                &state.workflow_library.clone().unwrap().join("dev/1.0"),
-                "dev",
-                "1.0",
-            )
-            .unwrap()
-            .unwrap(),
-        )
-        .unwrap();
+        pin_dev_in_store("alpha", &state.workflow_library.clone().unwrap());
         crate::governance::autopilot::set_kill_switch(&state.pool, true)
             .await
             .unwrap();
@@ -9091,16 +9082,7 @@ mod tests {
                 &tree.to_string_lossy(),
             ],
         );
-        crate::workflows::install(
-            &home
-                .path()
-                .join("projects/alpha")
-                .join(crate::project::state::PINS_FILE),
-            &crate::workflows::read_bundle(&library.join("dev/1.0"), "dev", "1.0")
-                .unwrap()
-                .unwrap(),
-        )
-        .unwrap();
+        pin_dev_in_store("alpha", &library);
 
         let (status, answer) = workflow_call(
             state.clone(),
@@ -9172,17 +9154,7 @@ mod tests {
         .await
         .unwrap();
         for id in ["alpha", "beta"] {
-            crate::workflows::install(
-                &home
-                    .path()
-                    .join("projects")
-                    .join(id)
-                    .join(crate::project::state::PINS_FILE),
-                &crate::workflows::read_bundle(&library.join("dev/1.0"), "dev", "1.0")
-                    .unwrap()
-                    .unwrap(),
-            )
-            .unwrap();
+            pin_dev_in_store(id, &library);
         }
         (lib, home, project)
     }

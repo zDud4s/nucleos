@@ -198,18 +198,15 @@ pub static CLAIMS: &[Claim] = &[
 /// that decides what *green* means is the last one that should become ambiguous because somebody
 /// wrote a line in a manifest.
 ///
-/// `pins_file` is the project's `workflows.yaml` in its state directory; `None` (no home directory,
-/// or an id that cannot name one) means nothing is installed, and the núcleo's rows still stand.
+/// The project's pins are its stored `workflow_pins` document, read by `project_id`; a project with
+/// none (or an unreadable one) has nothing installed, and the núcleo's rows still stand.
 pub fn claims_for(
     project_root: &std::path::Path,
-    pins_file: Option<&std::path::Path>,
+    project_id: &str,
     library_root: &std::path::Path,
 ) -> Vec<Claim> {
     let mut claims: Vec<Claim> = CLAIMS.to_vec();
-    let Some(pins_file) = pins_file else {
-        return claims;
-    };
-    let Ok(installed) = crate::workflows::installed(project_root, pins_file, library_root) else {
+    let Ok(installed) = crate::workflows::installed(project_root, project_id, library_root) else {
         return claims;
     };
     for workflow in installed {
@@ -522,8 +519,10 @@ mod tests {
     /// Three answers where the first version of this module had two. The row exists so the page can
     /// say who authors the file and offer the right exit; the missing validator is what stops the
     /// app from becoming a second author of it.
-    #[test]
-    fn a_workflow_declared_file_is_shown_and_not_written() {
+    #[tokio::test]
+    async fn a_workflow_declared_file_is_shown_and_not_written() {
+        let _settings = crate::project::rules::testing::Home::new();
+        let pool = crate::testdb::fresh_pool().await;
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
@@ -538,13 +537,11 @@ mod tests {
         let bundle = crate::workflows::read_bundle(&bundle_dir, "harness", "1.0")
             .unwrap()
             .unwrap();
-        let pins = temp
-            .path()
-            .join("state")
-            .join(crate::project::state::PINS_FILE);
-        crate::workflows::install(&pins, &bundle).unwrap();
+        crate::workflows::install(&pool, "alpha", &bundle)
+            .await
+            .unwrap();
 
-        let claims = claims_for(&project, Some(&pins), &library);
+        let claims = claims_for(&project, "alpha", &library);
         let Owner::Declared(claim) = owner_of(&claims, ".ai/models.yaml") else {
             panic!("an installed workflow's file must be in the fence");
         };
@@ -606,8 +603,10 @@ mod tests {
     /// The rules file carries `gate_command`. A manifest naming the same identity would make the
     /// row ambiguous, and a row with no validator in its place would be write access with the check
     /// removed — which is the one substitution this merge must not perform.
-    #[test]
-    fn a_workflow_cannot_claim_a_file_the_nucleo_already_parses() {
+    #[tokio::test]
+    async fn a_workflow_cannot_claim_a_file_the_nucleo_already_parses() {
+        let _settings = crate::project::rules::testing::Home::new();
+        let pool = crate::testdb::fresh_pool().await;
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
@@ -622,13 +621,11 @@ mod tests {
         let bundle = crate::workflows::read_bundle(&bundle_dir, "greedy", "1.0")
             .unwrap()
             .unwrap();
-        let pins = temp
-            .path()
-            .join("state")
-            .join(crate::project::state::PINS_FILE);
-        crate::workflows::install(&pins, &bundle).unwrap();
+        crate::workflows::install(&pool, "alpha", &bundle)
+            .await
+            .unwrap();
 
-        let claims = claims_for(&project, Some(&pins), &library);
+        let claims = claims_for(&project, "alpha", &library);
         let Owner::Declared(rules) = owner_of(&claims, "autopilot.yaml") else {
             panic!("the rules file must still be declared");
         };
@@ -644,19 +641,16 @@ mod tests {
     /// there is an empty library rather than a failure that would empty the fence.
     #[test]
     fn a_project_with_no_workflow_has_the_nucleos_rows_and_no_others() {
+        let _settings = crate::project::rules::testing::Home::new();
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
-        let pins = temp
-            .path()
-            .join("state")
-            .join(crate::project::state::PINS_FILE);
-        let claims = claims_for(&project, Some(&pins), &temp.path().join("no-library-here"));
+        let claims = claims_for(&project, "alpha", &temp.path().join("no-library-here"));
         assert_eq!(claims.len(), CLAIMS.len());
         assert_eq!(
-            claims_for(&project, None, &temp.path().join("no-library-here")).len(),
+            claims_for(&project, "no:such:id", &temp.path().join("no-library-here")).len(),
             CLAIMS.len(),
-            "no state directory is nothing installed, never an empty fence"
+            "an id that cannot name a project is nothing installed, never an empty fence"
         );
     }
 

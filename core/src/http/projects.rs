@@ -809,27 +809,21 @@ async fn pin_default_workflow(
     machine_root: PathBuf,
     library: PathBuf,
 ) {
-    let (project_id, project_root) = (id.to_string(), root.to_path_buf());
-    let pinned = tokio::task::spawn_blocking(move || {
+    let pinned = async {
         let Some(bundle) =
-            crate::onboarding::pin_default_workflow(&machine_root, &library, &project_id)?
+            crate::onboarding::pin_default_workflow(&state.pool, &machine_root, &library, id)
+                .await?
         else {
             return Ok(None);
         };
-        let state_dir = crate::project::state::dir(&machine_root, &project_id)
-            .ok_or_else(|| format!("`{project_id}` cannot name a state directory"))?;
-        let placed = super::workflows::materialize_after_pin(
-            &project_root,
-            &state_dir.join(crate::project::state::PINS_FILE),
-            &library,
-            &state_dir.join(crate::project::state::MATERIALIZED_FILE),
-            &bundle.name,
-        );
+        let state_dir = crate::project::state::dir(&machine_root, id)
+            .ok_or_else(|| format!("`{id}` cannot name a state directory"))?;
+        let placed =
+            super::workflows::materialize_after_pin(root, id, &state_dir, &library, &bundle.name)
+                .await;
         Ok::<_, String>(Some((bundle, placed)))
-    })
-    .await
-    .map_err(|error| error.to_string())
-    .and_then(|result| result);
+    }
+    .await;
     match pinned {
         Ok(Some((bundle, placed))) => {
             super::workflows::workflow_feed(

@@ -203,7 +203,7 @@ pub(super) fn claim_home(
 
 /// The fence in force in one project, read off the disk on the thread pool.
 ///
-/// `spawn_blocking`, because assembling it opens the pins file and walks whatever bundles are
+/// `spawn_blocking`, because assembling it reads the stored pins and walks whatever bundles are
 /// installed. Small work, but filesystem work, and the runtime this daemon shares with every
 /// sidecar and every run is not the place to do it inline.
 ///
@@ -211,7 +211,7 @@ pub(super) fn claim_home(
 /// núcleo's own rows still stand, so the write boundary never disappears because a path lookup came
 /// back empty.
 ///
-/// The same is true of a project with no state directory: no pins file means nothing is installed,
+/// The same is true of a project with no stored pins: no `workflow_pins` document means nothing is installed,
 /// and the fence is the núcleo's rows alone.
 pub(super) async fn claims_for_project(
     state: &AppState,
@@ -219,13 +219,9 @@ pub(super) async fn claims_for_project(
     root: PathBuf,
 ) -> Result<Vec<crate::ownership::Claim>, StatusCode> {
     let library = state.workflow_library.clone();
-    let pins = crate::project::state::file(
-        state.machine_config_root.as_deref(),
-        id,
-        crate::project::state::PINS_FILE,
-    );
+    let project_id = id.to_string();
     tokio::task::spawn_blocking(move || match library {
-        Some(library) => crate::ownership::claims_for(&root, pins.as_deref(), &library),
+        Some(library) => crate::ownership::claims_for(&root, &project_id, &library),
         None => crate::ownership::CLAIMS.to_vec(),
     })
     .await
