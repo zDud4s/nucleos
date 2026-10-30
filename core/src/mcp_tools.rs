@@ -2966,6 +2966,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn worktree_box_serves_launch_and_read_tools() {
+        for name in [
+            "create_job",
+            "create_run",
+            "get_job",
+            "get_run",
+            "list_jobs",
+        ] {
+            assert!(
+                served_in_box(&McpBox::Worktree("/work/a".to_owned()), name),
+                "the worktree box does not serve {name}"
+            );
+            assert!(
+                WORKTREE_BOX_TOOLS.contains(&name),
+                "{name} is missing from WORKTREE_BOX_TOOLS"
+            );
+        }
+    }
+
+    #[test]
+    fn worktree_box_still_refuses_untrusted_reads() {
+        // The tools graded `ReadsUntrusted` in TOOL_EFFECTS that boxes.rs keeps out of this box.
+        for name in [
+            "browser_act",
+            "browser_open",
+            "browser_snapshot",
+            "get_email",
+            "get_email_queue",
+            "list_files",
+            "read_context",
+            "read_team_file",
+            "web_read",
+            "web_search",
+        ] {
+            assert!(
+                !served_in_box(&McpBox::Worktree("/work/a".to_owned()), name),
+                "the worktree box serves the untrusted read {name}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_finding_called_outside_a_job_node_box_is_refused_before_it_runs() {
         let (_running, context) = served_request_context().await;

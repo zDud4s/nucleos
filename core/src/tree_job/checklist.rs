@@ -1,5 +1,74 @@
 //! The node checklist close rule: a node closes only with all items `[x]` or one `[!]`.
 
+/// The items of a node checklist, each list in document order, text trimmed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Checklist {
+    pub open: Vec<String>,
+    pub done: Vec<String>,
+    pub blocked: Vec<String>,
+}
+
+/// Reads the items out of `text`, in the format of `spec_loop.parse` (spec_loop.py:65): one per
+/// line, as `<indent>(-|*)<space>[ |x|X|!]<space><text>`. Any other line is ignored, including a
+/// `status:` line, which belongs to the spec_loop hook and has no say over a node.
+pub fn parse(text: &str) -> Checklist {
+    let mut checklist = Checklist::default();
+    for (mark, item) in text.lines().filter_map(parse_item) {
+        let list = match mark {
+            ' ' => &mut checklist.open,
+            'x' | 'X' => &mut checklist.done,
+            _ => &mut checklist.blocked,
+        };
+        list.push(item.to_string());
+    }
+    checklist
+}
+
+/// The mark and trimmed text of `line`, or `None` when the line is not an item.
+fn parse_item(line: &str) -> Option<(char, &str)> {
+    let after_bullet = line.trim_start().strip_prefix(['-', '*'])?;
+    let marked = after_bullet.trim_start();
+    if marked.len() == after_bullet.len() {
+        return None;
+    }
+    let body = marked.strip_prefix('[')?;
+    let mark = body
+        .chars()
+        .next()
+        .filter(|c| matches!(c, ' ' | 'x' | 'X' | '!'))?;
+    let after_mark = body[mark.len_utf8()..].strip_prefix(']')?;
+    let item = after_mark.trim();
+    if item.is_empty() || !after_mark.starts_with(char::is_whitespace) {
+        return None;
+    }
+    Some((mark, item))
+}
+
+/// Decides whether a node with this checklist may close. A `[!]` closes it whatever else is
+/// pending. Otherwise every item must be `[x]`, and there must be at least one: a node that never
+/// listed its work cannot close. The `Err` is the message returned to the agent.
+pub fn may_close(text: &str) -> Result<(), String> {
+    let checklist = parse(text);
+    if !checklist.blocked.is_empty() {
+        return Ok(());
+    }
+    if !checklist.open.is_empty() {
+        return Err(format!(
+            "The node cannot close, these checklist items are still pending: {}. Finish each one \
+             and mark it `[x]`, or mark what stops you `[!]`.",
+            checklist.open.join("; ")
+        ));
+    }
+    if checklist.done.is_empty() {
+        return Err(
+            "The node cannot close, its checklist has no items. List the node's work as `- [ ]` \
+             items first."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

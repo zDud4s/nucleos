@@ -1,0 +1,1 @@
+//! stub: cache measurement

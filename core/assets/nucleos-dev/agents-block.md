@@ -14,6 +14,18 @@ For any development task, follow the `orchestrate` skill:
 
 Both paths resolve to the same pipeline contract; only the discovery path differs — and the repo's own copy wins. `~/.agents/skills/` is shared by every project on the machine while the workflow is versioned per repository, so a global-only entry point could hand a Codex session another project's copy.
 
+## Default routing
+
+The top-level session does not execute: it launches. Pick the route by task size (skill `conduct`):
+
+| Size | Route |
+|---|---|
+| Small: one file, no decision | `Agent` with `wf-leaf` |
+| Medium: one feature, 2-6 files | `Agent` + the `orchestrate` skill |
+| Large: several specs, or "finish everything" | `tree_launch` / `spec_finish` (if available) |
+
+The owner can opt out of the routing for one prompt by starting it with `manual:`. Before a long wait, call `wait_advice` (if available). To resume a session, ask the daemon (`POST /conductor/resume`); never `claude --resume`.
+
 Execution rules (a short copy for readers without hooks; `workflow.md` is the authority):
 1. Prefer the smallest correct change; touch only relevant files; do not broaden scope silently.
 2. If blocked, stop and report the blocker.

@@ -1,0 +1,1 @@
+//! stub: tree budgets

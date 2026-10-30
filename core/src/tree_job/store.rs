@@ -1,5 +1,163 @@
 //! Durable storage of tree jobs: one `tree_jobs` row per job, with its manifest as JSON text.
 
+use std::fmt;
+
+use sqlx::SqlitePool;
+
+use super::model::{JOB_TERMINAL_STATE, Manifest};
+
+/// One tree job. `state`, `goal` and `feature_branch` repeat fields of `manifest`; the caller keeps
+/// them in step, because this module stores what it is given.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TreeJob {
+    pub id: String,
+    pub root_node_id: String,
+    pub project_id: Option<String>,
+    pub feature_branch: Option<String>,
+    pub goal: String,
+    pub state: String,
+    pub manifest: Manifest,
+    pub contract: Option<String>,
+    /// RFC 3339 text.
+    pub created_at: String,
+    /// RFC 3339 text, set by the caller.
+    pub updated_at: String,
+}
+
+#[derive(Debug)]
+pub enum StoreError {
+    /// No row has this job id.
+    NotFound(String),
+    /// A manifest could not be written as JSON, or a stored one could not be read back.
+    Manifest(serde_json::Error),
+    Db(sqlx::Error),
+}
+
+impl fmt::Display for StoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StoreError::NotFound(id) => write!(f, "tree job {id} not found"),
+            StoreError::Manifest(error) => write!(f, "tree job manifest: {error}"),
+            StoreError::Db(error) => write!(f, "database error: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for StoreError {}
+
+impl From<sqlx::Error> for StoreError {
+    fn from(error: sqlx::Error) -> Self {
+        StoreError::Db(error)
+    }
+}
+
+impl From<serde_json::Error> for StoreError {
+    fn from(error: serde_json::Error) -> Self {
+        StoreError::Manifest(error)
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct JobRow {
+    id: String,
+    root_node_id: String,
+    project_id: Option<String>,
+    feature_branch: Option<String>,
+    goal: String,
+    state: String,
+    manifest: String,
+    contract: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+impl JobRow {
+    fn into_job(self) -> Result<TreeJob, StoreError> {
+        Ok(TreeJob {
+            manifest: serde_json::from_str(&self.manifest)?,
+            id: self.id,
+            root_node_id: self.root_node_id,
+            project_id: self.project_id,
+            feature_branch: self.feature_branch,
+            goal: self.goal,
+            state: self.state,
+            contract: self.contract,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        })
+    }
+}
+
+macro_rules! select_jobs {
+    ($tail:literal) => {
+        concat!(
+            "SELECT id, root_node_id, project_id, feature_branch, goal, state, manifest, contract, \
+             created_at, updated_at FROM tree_jobs ",
+            $tail
+        )
+    };
+}
+
+/// Inserts a new job. A second job on the same id or root node is an error, not an overwrite.
+pub async fn save(pool: &SqlitePool, job: &TreeJob) -> Result<(), StoreError> {
+    let manifest = serde_json::to_string(&job.manifest)?;
+    sqlx::query(
+        "INSERT INTO tree_jobs (id, root_node_id, project_id, feature_branch, goal, state, \
+         manifest, contract, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&job.id)
+    .bind(&job.root_node_id)
+    .bind(&job.project_id)
+    .bind(&job.feature_branch)
+    .bind(&job.goal)
+    .bind(&job.state)
+    .bind(manifest)
+    .bind(&job.contract)
+    .bind(&job.created_at)
+    .bind(&job.updated_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn load(pool: &SqlitePool, id: &str) -> Result<Option<TreeJob>, StoreError> {
+    let row: Option<JobRow> = sqlx::query_as(select_jobs!("WHERE id = ?"))
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    row.map(JobRow::into_job).transpose()
+}
+
+/// Writes `state`, `manifest` and `updated_at` exactly as the job holds them. Updating a job that
+/// does not exist is an error, since otherwise the caller's state would be lost without a word.
+pub async fn update(pool: &SqlitePool, job: &TreeJob) -> Result<(), StoreError> {
+    let manifest = serde_json::to_string(&job.manifest)?;
+    let updated = sqlx::query(
+        "UPDATE tree_jobs SET state = ?, manifest = ?, updated_at = ? WHERE id = ?",
+    )
+    .bind(&job.state)
+    .bind(manifest)
+    .bind(&job.updated_at)
+    .bind(&job.id)
+    .execute(pool)
+    .await?;
+    if updated.rows_affected() == 0 {
+        return Err(StoreError::NotFound(job.id.clone()));
+    }
+    Ok(())
+}
+
+/// Every job that is not over, oldest first. Parked jobs are included, so that boot can resume
+/// them; the branch list `TERMINAL_STATES` does not apply to a job.
+pub async fn list_non_terminal(pool: &SqlitePool) -> Result<Vec<TreeJob>, StoreError> {
+    let rows: Vec<JobRow> =
+        sqlx::query_as(select_jobs!("WHERE state != ? ORDER BY created_at, id"))
+            .bind(JOB_TERMINAL_STATE)
+            .fetch_all(pool)
+            .await?;
+    rows.into_iter().map(JobRow::into_job).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

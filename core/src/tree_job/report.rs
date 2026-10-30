@@ -1,5 +1,316 @@
 //! A node's report: parse it, list what makes it unacceptable, and render it as a handoff.
 
+use std::collections::{HashMap, HashSet};
+
+/// Each outcome a node can report, with the status that outcome requires.
+pub const OUTCOME_STATUS: [(&str, &str); 5] = [
+    ("done", "done"),
+    ("split", "done"),
+    ("contract_request", "blocked"),
+    ("blocked", "blocked"),
+    ("failed", "failed"),
+];
+
+/// The longest accepted summary, in characters.
+pub const SUMMARY_MAX: usize = 1500;
+
+const ROLES: [&str; 3] = ["leaf", "orchestrator", "review"];
+const HEADER_NAMES: [&str; 6] = [
+    "Node ID",
+    "Root ID",
+    "Status",
+    "Role",
+    "Outcome",
+    "Contract used",
+];
+
+/// A filled node handoff. A field the report leaves out or fills with `none` is empty.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Report {
+    pub node_id: String,
+    pub root_id: String,
+    pub status: String,
+    pub role: String,
+    pub outcome: String,
+    pub contract_used: Vec<String>,
+    pub contract_used_raw: String,
+    pub summary: String,
+    pub done: Vec<String>,
+    pub decisions: Vec<String>,
+    pub files: Vec<String>,
+    pub commands: Vec<String>,
+    pub open_items: String,
+    pub contract_request: String,
+    pub blocked_reason: String,
+    pub line_count: usize,
+}
+
+/// Parses a filled handoff. HTML comments count as absent, so an unfilled template yields empty
+/// fields. Headers are only read before the first `## ` section.
+pub fn parse_report(text: &str) -> Report {
+    let cleaned = strip_comments(text);
+    let lines: Vec<&str> = cleaned.lines().map(str::trim_end).collect();
+
+    let mut headers: HashMap<&str, &str> = HashMap::new();
+    let mut sections: HashMap<String, Vec<&str>> = HashMap::new();
+    let mut current: Option<String> = None;
+    for &line in &lines {
+        if let Some(name) = line.strip_prefix("## ") {
+            let name = name.trim().to_lowercase();
+            sections.insert(name.clone(), Vec::new());
+            current = Some(name);
+        } else if let Some(name) = &current {
+            if let Some(section) = sections.get_mut(name) {
+                section.push(line);
+            }
+        } else if let Some((name, value)) = line.split_once(':')
+            && HEADER_NAMES.contains(&name)
+        {
+            headers.insert(name, value.trim_matches([' ', '\t']));
+        }
+    }
+
+    let header = |name: &str| headers.get(name).copied().unwrap_or("");
+    let body = |name: &str| {
+        sections
+            .get(name)
+            .map(|section| section.join("\n"))
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    };
+    let prose = |name: &str| {
+        let text = body(name);
+        if is_none(&text) {
+            String::new()
+        } else {
+            text
+        }
+    };
+
+    let raw = header("Contract used");
+    let mut contract_used: Vec<String> = raw
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+        .collect();
+    if contract_used.len() == 1 && contract_used[0].to_lowercase() == "none" {
+        contract_used.clear();
+    }
+
+    Report {
+        node_id: header("Node ID").to_string(),
+        root_id: header("Root ID").to_string(),
+        status: header("Status").to_lowercase(),
+        role: header("Role").to_lowercase(),
+        outcome: header("Outcome").to_lowercase(),
+        contract_used,
+        contract_used_raw: raw.to_string(),
+        summary: body("summary"),
+        done: items(&body("what was done")),
+        decisions: items(&body("decisions")),
+        files: items(&body("files touched")),
+        commands: items(&body("commands for the root")),
+        open_items: prose("open items / next step"),
+        contract_request: prose("contract request"),
+        blocked_reason: prose("blocked reason"),
+        line_count: lines.iter().filter(|line| !line.trim().is_empty()).count(),
+    }
+}
+
+/// Every reason the report is not acceptable, worded for the agent that wrote it; empty means
+/// valid. `known_ids` is the contract's id set, or `None` to check only the shape of each id.
+pub fn report_problems(
+    report: &Report,
+    max_lines: usize,
+    known_ids: Option<&HashSet<String>>,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    let role = report.role.as_str();
+    let outcome = report.outcome.as_str();
+    let status = report.status.as_str();
+
+    if report.node_id.is_empty() {
+        problems.push("node_id is empty (header line `Node ID:`)".to_string());
+    }
+    if report.root_id.is_empty() {
+        problems.push("root_id is empty (header line `Root ID:`)".to_string());
+    }
+    if !ROLES.contains(&role) {
+        let roles = quoted_list(ROLES.iter().copied());
+        problems.push(format!("Role must be one of {roles}, not '{role}'"));
+    }
+    match expected_status(outcome) {
+        None => {
+            let outcomes = quoted_list(OUTCOME_STATUS.iter().map(|&(name, _)| name));
+            problems.push(format!("Outcome must be one of {outcomes}, not '{outcome}'"));
+        }
+        Some(expected) if status != expected => problems.push(format!(
+            "Status '{status}' does not match Outcome '{outcome}' (expected '{expected}')"
+        )),
+        Some(_) => {}
+    }
+    if outcome == "split" && matches!(role, "leaf" | "review") {
+        problems.push(format!("only an orchestrator can split, not a {role}"));
+    }
+    if matches!(role, "orchestrator" | "review") && !report.files.is_empty() {
+        problems.push(format!(
+            "a {role} edits no file, yet Files touched lists {}",
+            report.files.len()
+        ));
+    }
+    if report.contract_used_raw.trim().is_empty() {
+        problems.push("Contract used is empty: write the ids or `none`".to_string());
+    }
+    for id in &report.contract_used {
+        if !is_contract_id(id) {
+            problems.push(format!("Contract used '{id}' is not an id like A3 or E2"));
+        } else if known_ids.is_some_and(|known| !known.contains(id)) {
+            problems.push(format!("Contract used {id} is not in contract.md"));
+        }
+    }
+    let summary_len = report.summary.chars().count();
+    if summary_len == 0 {
+        problems.push("summary is empty".to_string());
+    } else if summary_len > SUMMARY_MAX {
+        problems.push(format!(
+            "summary is {summary_len} characters; the limit is {SUMMARY_MAX}"
+        ));
+    }
+    if outcome == "contract_request" && report.contract_request.is_empty() {
+        problems.push(
+            "Outcome contract_request needs text under `## Contract request`".to_string(),
+        );
+    }
+    if outcome != "contract_request" && !report.contract_request.is_empty() {
+        problems.push(
+            "`## Contract request` has text but Outcome is not contract_request".to_string(),
+        );
+    }
+    if matches!(outcome, "blocked" | "failed") && report.blocked_reason.is_empty() {
+        problems.push(format!(
+            "Outcome {outcome} needs text under `## Blocked reason`"
+        ));
+    }
+    if report.line_count > max_lines {
+        problems.push(format!(
+            "report has {} lines; the limit is {max_lines} (HTML comments not counted)",
+            report.line_count
+        ));
+    }
+    problems
+}
+
+/// A filled handoff, the inverse of [`parse_report`]. Empty lists and prose are written as `none`;
+/// an empty summary stays empty, because `none` is not special there.
+pub fn render_handoff(report: &Report) -> String {
+    let contract_used = if report.contract_used.is_empty() {
+        "none".to_string()
+    } else {
+        report.contract_used.join(", ")
+    };
+    format!(
+        "# Node Handoff\n\nNode ID: {}\nRoot ID: {}\nStatus: {}\nRole: {}\nOutcome: {}\n\
+         Contract used: {}\n\n## Summary\n{}\n\n## What was done\n{}\n\n## Decisions\n{}\n\n\
+         ## Files touched\n{}\n\n## Commands for the root\n{}\n\n\
+         ## Open items / next step\n{}\n\n## Contract request\n{}\n\n## Blocked reason\n{}\n",
+        report.node_id,
+        report.root_id,
+        report.status,
+        report.role,
+        report.outcome,
+        contract_used,
+        report.summary,
+        bullets(&report.done),
+        bullets(&report.decisions),
+        bullets(&report.files),
+        bullets(&report.commands),
+        or_none(&report.open_items),
+        or_none(&report.contract_request),
+        or_none(&report.blocked_reason),
+    )
+}
+
+/// Removes every closed `<!-- ... -->`, across lines. An unclosed `<!--` stays as text.
+fn strip_comments(text: &str) -> String {
+    let mut kept = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("<!--") {
+        let inside = &rest[start + "<!--".len()..];
+        let Some(end) = inside.find("-->") else {
+            break;
+        };
+        kept.push_str(&rest[..start]);
+        rest = &inside[end + "-->".len()..];
+    }
+    kept.push_str(rest);
+    kept
+}
+
+fn is_none(text: &str) -> bool {
+    let text = text.trim().trim_end_matches('.').to_lowercase();
+    text.is_empty() || text == "none"
+}
+
+/// The lines of a list section, without their bullets. `none` only means an empty list when it is
+/// the sole item.
+fn items(text: &str) -> Vec<String> {
+    let items: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| strip_bullet(line).to_string())
+        .collect();
+    if items.len() == 1 && is_none(&items[0]) {
+        return Vec::new();
+    }
+    items
+}
+
+/// Drops a leading `- ` or `* `. A bullet with no whitespace after it is ordinary text.
+fn strip_bullet(line: &str) -> &str {
+    match line.strip_prefix(['-', '*']) {
+        Some(rest) if rest.starts_with(char::is_whitespace) => rest.trim_start(),
+        _ => line,
+    }
+}
+
+fn expected_status(outcome: &str) -> Option<&'static str> {
+    OUTCOME_STATUS
+        .iter()
+        .find(|(name, _)| *name == outcome)
+        .map(|&(_, status)| status)
+}
+
+/// One uppercase ASCII letter followed by at least one digit, like `A3`.
+fn is_contract_id(id: &str) -> bool {
+    let mut chars = id.chars();
+    chars.next().is_some_and(|first| first.is_ascii_uppercase())
+        && !chars.as_str().is_empty()
+        && chars.all(|c| c.is_ascii_digit())
+}
+
+fn quoted_list<'a>(names: impl Iterator<Item = &'a str>) -> String {
+    let quoted: Vec<String> = names.map(|name| format!("'{name}'")).collect();
+    format!("[{}]", quoted.join(", "))
+}
+
+fn bullets(items: &[String]) -> String {
+    if items.is_empty() {
+        return "none".to_string();
+    }
+    let lines: Vec<String> = items.iter().map(|item| format!("- {item}")).collect();
+    lines.join("\n")
+}
+
+fn or_none(text: &str) -> &str {
+    if text.is_empty() {
+        "none"
+    } else {
+        text
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

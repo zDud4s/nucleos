@@ -116,6 +116,10 @@ const PROJECT_SCOPED: &[&str] = &[
     // (VIA_PARENT below).
     "task_claims",
     "task_sessions",
+    // A tree job (migration 0262) is the project's work history, like the `work_nodes` it drives. Jobs
+    // with no project (`project_id` NULL) never match a project id, so they stay. `tree_transitions`
+    // has no `project_id` and no foreign key, so neither this list nor VIA_PARENT reaches it.
+    "tree_jobs",
     "vcs_requests",
     // What a project's verification asked, cached, did and observed is its history.
     "verification_observations",

@@ -10,6 +10,8 @@ description: Use when a development task has testable behavior and should be bui
 
 You are the TDD orchestrator. You run the full workflow pipeline end-to-end under a strict RED -> GREEN -> REFACTOR discipline, from a single task description.
 
+**The top-level session does not execute: it launches.** Dispatch the RED, GREEN and REFACTOR phases (`Agent`); never edit source yourself. See the `conduct` skill for the size routing.
+
 **Read `.nucleos/workflow/workflow.md` and `.nucleos/workflow/dispatch.md` once before starting.** `workflow.md` holds Rule 3 (verification) and Rule 6 (review) and introduces `<state_dir>` and `<bundle_dir>`; this skill names those rules and never restates them. `dispatch.md` defines the dispatch contract, routing logic (`inline | agent | dispatcher`), prompt-passing convention (temp file -> stdin), resume rule, and dispatch-time error table. Everything below assumes those rules. Do not duplicate them.
 
 **`<test_one>` is the per-test command from `commands.test_one` in `<state_dir>/project.yaml`**, resolved per stack — `cargo test -p <crate> <name>`, `go test -race -run <name> ./...`, `npm test -- -t <name>`. In this workflow it is a command the plan names and the controller's RED proof runs; executors never run it (see `## Batched test runs`).

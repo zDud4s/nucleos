@@ -1,4 +1,132 @@
 //! The durable tree manifest: the serde port of `tree_state.py`'s branch and manifest shapes.
+//!
+//! A manifest is written by more than one hand and grows keys after it is created, so every key
+//! this port does not name is kept in an `extra` map and written back unchanged. The nested shapes
+//! (`gates`, `reviews`, `records`, ...) are not pinned yet, so they stay plain JSON.
+
+use std::collections::BTreeMap;
+
+use chrono::{SecondsFormat, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+/// The manifest version this port reads and writes (`MANIFEST_VERSION`).
+pub const MANIFEST_VERSION: u32 = 1;
+
+pub const BRANCH_STATES: [&str; 11] = [
+    "queued",
+    "open",
+    "building",
+    "gating",
+    "green",
+    "red",
+    "reviewing",
+    "fixing",
+    "merged",
+    "parked",
+    "dropped",
+];
+
+/// The states in which a BRANCH has stopped moving. A parked branch counts here, and that does not
+/// carry over to a job: see [`JOB_TERMINAL_STATE`].
+pub const TERMINAL_STATES: [&str; 3] = ["merged", "parked", "dropped"];
+
+/// The only state in which a JOB is over. A parked job is still live, so that boot can resume it.
+pub const JOB_TERMINAL_STATE: &str = "finished";
+
+/// One branch of a tree, as `new_branch` creates it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Branch {
+    pub name: String,
+    pub paths: Vec<String>,
+    pub layer: String,
+    pub base: Option<String>,
+    pub state: String,
+    pub git_branch: Option<String>,
+    pub worktree: Option<String>,
+    pub target_dir: Option<String>,
+    pub node_id: Option<String>,
+    pub gates: Vec<Value>,
+    pub reviews: Vec<Value>,
+    pub park: Option<Value>,
+    /// Keys `tree.py` adds later, such as `merged_at`, `merge_sha`, `drop_reason`, `dropped_at`.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+impl Branch {
+    pub fn new(name: &str, paths: &[String], layer: &str, base: Option<&str>) -> Branch {
+        Branch {
+            name: name.to_owned(),
+            paths: paths.to_vec(),
+            layer: layer.to_owned(),
+            base: base.map(str::to_owned),
+            state: "queued".to_owned(),
+            git_branch: None,
+            worktree: None,
+            target_dir: None,
+            node_id: None,
+            gates: Vec::new(),
+            reviews: Vec::new(),
+            park: None,
+            extra: BTreeMap::new(),
+        }
+    }
+}
+
+/// A whole tree, as `new_manifest` creates it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Manifest {
+    pub version: u32,
+    pub tree_id: String,
+    pub feature_branch: String,
+    pub goal: String,
+    /// RFC 3339 text.
+    pub created_at: String,
+    pub state: String,
+    /// Always with forward slashes.
+    pub project_root: String,
+    pub dirty_owner_files: Vec<String>,
+    pub branches: BTreeMap<String, Branch>,
+    pub records: Vec<Value>,
+    pub attempts: BTreeMap<String, Value>,
+    /// `Value` rather than `f64`, so that a whole number written by `tree.py` stays one.
+    pub costs_gb: BTreeMap<String, Value>,
+    pub disk_samples: Vec<Value>,
+    pub park: Option<Value>,
+    /// Keys `tree.py` adds later, such as `finish`, `root_closed`, `integration_reviews`.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+impl Manifest {
+    pub fn new(
+        tree_id: &str,
+        feature_branch: &str,
+        goal: &str,
+        project_root: &str,
+        dirty: &[String],
+    ) -> Manifest {
+        Manifest {
+            version: MANIFEST_VERSION,
+            tree_id: tree_id.to_owned(),
+            feature_branch: feature_branch.to_owned(),
+            goal: goal.to_owned(),
+            // Whole seconds and `+00:00`, the form `now_iso` writes.
+            created_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, false),
+            state: "open".to_owned(),
+            project_root: project_root.replace('\\', "/"),
+            dirty_owner_files: dirty.to_vec(),
+            branches: BTreeMap::new(),
+            records: Vec::new(),
+            attempts: BTreeMap::new(),
+            costs_gb: BTreeMap::new(),
+            disk_samples: Vec::new(),
+            park: None,
+            extra: BTreeMap::new(),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

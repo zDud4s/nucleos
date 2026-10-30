@@ -1,5 +1,45 @@
 //! Rules of a docs branch (spec R6): the paths it may write and the states it may end in.
 
+/// The only directories under `.ai/` a docs branch may write to.
+const DOCS_DIRS: [&str; 4] = ["specs", "spikes", "plans", "notes"];
+
+/// True when `path` names a file below one of [`DOCS_DIRS`], relative to the repository root.
+///
+/// The check is purely lexical and fails closed. Backslashes count as separators, the match is
+/// case-sensitive even on Windows, and any `..` is refused, including one that would resolve
+/// back inside an allowed directory. A directory named without a file is refused too.
+pub fn is_allowed_docs_path(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    let segments: Vec<&str> = normalized.split('/').collect();
+    match segments.as_slice() {
+        [".ai", dir, rest @ ..] if !rest.is_empty() => {
+            DOCS_DIRS.contains(dir) && rest.iter().all(|segment| is_plain_segment(segment))
+        }
+        _ => false,
+    }
+}
+
+/// False for an empty, `.` or `..` segment, for the forms Windows would resolve to one of those
+/// (`...`, `.. `), and for anything with a colon (a drive prefix or an alternate data stream).
+fn is_plain_segment(segment: &str) -> bool {
+    !segment.trim_end_matches(['.', ' ']).is_empty() && !segment.contains(':')
+}
+
+/// A docs branch only writes gitignored files, so it runs without a worktree or a cost.
+pub fn docs_branch_needs_worktree() -> bool {
+    false
+}
+
+/// A docs branch has nothing tracked to land, so it never goes through a merge.
+pub fn docs_branch_merges() -> bool {
+    false
+}
+
+/// True for the states a docs branch may end in: `done` and `dropped`.
+pub fn is_docs_terminal_state(state: &str) -> bool {
+    matches!(state, "done" | "dropped")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
