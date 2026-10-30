@@ -44,6 +44,7 @@
 
 #![allow(dead_code)] // the routes (3.4) are the caller
 
+use serde::Serialize;
 use sqlx::SqlitePool;
 
 use crate::config::DevtimeActionsConfig;
@@ -66,7 +67,7 @@ pub struct PromotionScope<'a> {
 }
 
 /// The five promotion criteria with their numbers, plus the aside figures.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PromotionReport {
     // (1) rule eligible
     pub action_eligible: bool,

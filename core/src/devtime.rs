@@ -995,6 +995,20 @@ pub async fn ingest_cycle(
     stats
 }
 
+// ---- closing the actions' outcomes ----------------------------------------------------------
+
+/// The periodic closing step of the automatic actions (plan chunk 3.4), run in every ingestion
+/// cycle after the ingest itself: closes every due `pending` row of `devtime_shadow`, `inject` rows
+/// through `actions::outcome::close_inject_outcomes` and `propose` rows through
+/// `close_propose_outcomes`, both at `now_ms` (unix milliseconds). Returns how many rows left
+/// `pending` (the sum of both calls' counts, `void` and `expired` included); a second call at the
+/// same instant returns 0. Rows not yet due stay `pending`. The caller logs an error and goes on, as
+/// it does for the rules pass.
+pub async fn close_due_outcomes(pool: &SqlitePool, now_ms: i64) -> sqlx::Result<usize> {
+    let _ = (pool, now_ms);
+    todo!("close inject and propose outcomes (plan 3.4)")
+}
+
 // ---- the loop --------------------------------------------------------------------------------
 
 fn status_row(
@@ -1074,6 +1088,59 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     const ROOT: &str = "C:/fixture/proj";
+
+    /// A due pending row of each action: `inject` with no finding of the rule (a `miss`), `propose`
+    /// in shadow with no reappearance (a `miss`), plus one `inject` row whose window is still open.
+    /// The step closes the first two, leaves the third, and a repeat closes nothing.
+    #[tokio::test]
+    async fn close_due_outcomes_closes_due_inject_and_propose_rows_only() {
+        let pool = crate::testdb::fresh_pool().await;
+        let now_ms: i64 = 1_791_196_200_000 + 14 * 86_400_000; // 2026-10-19T10:30:00.000Z
+        let row = |action: &str, rule: &str, subject: &str, session: Option<&str>, end: &str| {
+            devtime_store::ShadowRow {
+                action: action.into(),
+                rule_id: rule.into(),
+                project_id: "p1".into(),
+                session_id: session.map(Into::into),
+                subject_key: subject.into(),
+                mode: "shadow".into(),
+                decision: "fire".into(),
+                template_id: format!("{action}.{}.v1", rule.to_lowercase()),
+                rule_version: 1,
+                action_version: 1,
+                thresholds_hash: "th".into(),
+                rules_version: "rv".into(),
+                decided_at: "2026-10-05T10:00:00.000Z".into(),
+                window_end_at: end.into(),
+                outcome_state: "pending".into(),
+                ..devtime_store::ShadowRow::default()
+            }
+        };
+        for r in [
+            row("inject", "D3", "D3|p1", Some("s-close"), "2026-10-05T10:30:00.000Z"),
+            row("propose", "F1", "F1|k1", None, "2026-10-19T10:30:00.000Z"),
+            row("inject", "D6", "D6|p1", Some("s-open"), "2026-10-20T10:30:00.000Z"),
+        ] {
+            assert!(devtime_store::insert_decision(&pool, &r).await.unwrap());
+        }
+        assert_eq!(close_due_outcomes(&pool, now_ms).await.unwrap(), 2);
+        let state = |rule: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_as::<_, (String, Option<String>)>(
+                    "SELECT outcome_state, outcome FROM devtime_shadow WHERE rule_id = ?",
+                )
+                .bind(rule)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(state("D3").await, ("resolved".into(), Some("miss".into())));
+        assert_eq!(state("F1").await, ("resolved".into(), Some("miss".into())));
+        assert_eq!(state("D6").await, ("pending".into(), None));
+        assert_eq!(close_due_outcomes(&pool, now_ms).await.unwrap(), 0, "idempotent");
+    }
 
     #[test]
     fn a_found_cwd_is_scanned_once_and_a_miss_until_the_file_grows() {
