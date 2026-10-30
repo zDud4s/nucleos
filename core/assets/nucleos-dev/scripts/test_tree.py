@@ -126,6 +126,7 @@ class Registry(CliCase):
         for name in ("tree_doctor", "tree_plan", "tree_pending"):
             mod = types.ModuleType(name)
             mod.register = lambda verbs, name=name: calls.append(name)
+            mod.list_entries = lambda tree_id: []  # `status` reads the pending queue
             fakes[name] = mod
         with mock.patch.dict(sys.modules, fakes):
             self.init()

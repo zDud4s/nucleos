@@ -51,6 +51,11 @@ def _entries(tree_id: str) -> list[tuple]:
     return out[:MAX_ENTRIES]
 
 
+def list_entries(tree_id: str) -> list[dict]:
+    """The queued entries of a tree, oldest first (the public face of `_entries`)."""
+    return [data for data, _path in _entries(tree_id)]
+
+
 def run_add(args) -> dict:
     tree_id = ts.resolve_tree_id(args)
     ts.check_id(args.tool, "tool")

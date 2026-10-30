@@ -23,13 +23,18 @@ _TRUES = {"true", "True", "TRUE"}
 _FALSES = {"false", "False", "FALSE"}
 
 
+def _opens_quote(text: str, i: int) -> bool:
+    """A quote starts a quoted scalar only at a token start; `don't` has an apostrophe, not a quote."""
+    return i == 0 or text[i - 1] in " 	[{,:-"
+
+
 def _strip_comment(line: str) -> str:
     quote = None
     for i, ch in enumerate(line):
         if quote:
             if ch == quote:
                 quote = None
-        elif ch in "\"'":
+        elif ch in "\"'" and _opens_quote(line, i):
             quote = ch
         elif ch == "#" and (i == 0 or line[i - 1] in " \t"):
             return line[:i]
@@ -43,7 +48,7 @@ def _find_colon(text: str) -> int:
         if quote:
             if ch == quote:
                 quote = None
-        elif ch in "\"'":
+        elif ch in "\"'" and _opens_quote(text, i):
             quote = ch
         elif ch == ":" and (i + 1 == len(text) or text[i + 1] in " \t"):
             return i
@@ -102,7 +107,7 @@ def _split_flow(body: str) -> list:
         if quote:
             if ch == quote:
                 quote = None
-        elif ch in "\"'":
+        elif ch in "\"'" and _opens_quote(body, i):
             quote = ch
         elif ch in "[{":
             depth += 1
@@ -189,9 +194,11 @@ class _Parser:
                 else:
                     out.append(None)
             elif rest[0] not in "\"'[{" and _find_colon(rest) >= 0:
-                # "- key: value" opens an inline mapping whose keys sit two columns in.
-                self.lines[self.pos] = (indent + 2, rest)
-                out.append(self.mapping(indent + 2))
+                # "- key: value" opens an inline mapping whose keys sit where the text after the dash
+                # starts (two columns in for `- k: v`, more after `-   k: v`).
+                keys_at = indent + len(content) - len(content[1:].lstrip(" "))
+                self.lines[self.pos] = (keys_at, rest)
+                out.append(self.mapping(keys_at))
             else:
                 out.append(_scalar(rest))
                 self.pos += 1

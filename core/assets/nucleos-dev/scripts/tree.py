@@ -588,8 +588,8 @@ def run_status(args) -> dict:
     try:
         # Lazy import: a missing module must not break `status`.
         import tree_pending
-        pending = [data for data, _path in tree_pending._entries(tree_id)]
-    except Exception:
+        pending = tree_pending.list_entries(tree_id)
+    except (ImportError, OSError, ts.TreeError):
         pending = []
     return {"verb": "status", "tree_id": tree_id, "state": manifest["state"], "pending": pending,
             "feature_branch": manifest["feature_branch"], "goal": manifest["goal"],

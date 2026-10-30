@@ -433,6 +433,12 @@ class CloseTest(Env):
     def close(self):
         return tr.run_close(self.args(branch="a"))
 
+    def test_docs_branch_close_points_at_the_exit_verbs(self):
+        self.store.m["branches"]["a"].update(layer="docs", worktree=None, target_dir=None)
+        with self.assertRaises(tr.TreeError) as ctx:
+            self.close()
+        self.assertIn("merge", str(ctx.exception))
+
     def test_teardown_order_links_worktree_target_branch(self):
         res = self.close()
         self.assertEqual(self.fake.calls, [

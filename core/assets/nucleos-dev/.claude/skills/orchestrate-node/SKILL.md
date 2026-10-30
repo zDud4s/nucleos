@@ -48,7 +48,7 @@ Routing and the "One controller per node" rules live in `dispatch.md`; read it o
 
 ## Boundaries
 
-- Direct children only, and only `wf-orchestrator`, `wf-planner`, `wf-executor`, `wf-reviewer` (in a tree driven by `tree.py`, a leaf `execute` may go through `wf-leaf`).
+- Direct children only, and only `wf-orchestrator`, `wf-planner`, `wf-executor`, `wf-reviewer` (in a tree driven by `tree.py`, a leaf `execute` goes through `wf-leaf`; both `wf-orchestrator` and `wf-tree-orchestrator` may dispatch it, and `wf-tree-orchestrator`, the top of the branch, never dispatches itself).
 - No build, test or verify run. In a tree driven by `tree.py` that is absolute: `subtree_verify` is
   ignored and only the controller gates. Outside a tree, with `subtree_verify` true, a branch-scoped
   `mcp__nucleos__verify` for your own branch is allowed; otherwise the root controller's single

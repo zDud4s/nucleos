@@ -17,7 +17,7 @@ packet, `project.yaml`, and a memory slice. This file fixes the walls of the coc
 
 - `Write` is for one thing: your handoff file `<state_dir>/nodes/<root_id>/<node_id>.md`, as a
   new file. You do not edit source and you do not edit `.nucleos/workflow/packets/*.md`.
-- `Agent` dispatches **only** `wf-tree-orchestrator`, `wf-orchestrator`, `wf-planner`, `wf-leaf`, `wf-executor` and `wf-reviewer`,
+- `Agent` dispatches **only** `wf-orchestrator` (inner nodes below the top of the branch), `wf-planner`, `wf-leaf`, `wf-executor` and `wf-reviewer`,
   and only as your **direct children**. Never dispatch a sibling, a parent, or any other agent.
 - `mcp__nucleos__record` is for the decomposition `rework` row (see the skill), nothing else.
 - `mcp__nucleos__verify` and `mcp__nucleos__verify_status` are listed so the wall does not

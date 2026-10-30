@@ -118,5 +118,18 @@ class Parity(unittest.TestCase):
         self.assertEqual(load(text), real.safe_load(text))
 
 
+class Apostrophes(unittest.TestCase):
+    def test_apostrophe_in_a_value_does_not_start_a_quote(self):
+        self.assertEqual(load("a: don't stop # note\nb: 2\n"), {"a": "don't stop", "b": 2})
+
+    def test_quoted_value_still_hides_a_hash(self):
+        self.assertEqual(load("a: 'x # y'  # note\n"), {"a": "x # y"})
+
+    def test_wide_dash_scalar_and_mapping_items(self):
+        self.assertEqual(load("l:\n  -   x\n  -   y\n"), {"l": ["x", "y"]})
+        self.assertEqual(load("l:\n  -   a: 1\n      b: 2\n  -   a: 3\n"),
+                         {"l": [{"a": 1, "b": 2}, {"a": 3}]})
+
+
 if __name__ == "__main__":
     unittest.main()

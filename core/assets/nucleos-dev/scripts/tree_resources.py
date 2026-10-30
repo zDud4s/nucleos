@@ -456,6 +456,10 @@ def run_close(args):
     b = _branch(m, args.branch)
     root = m["project_root"]
     worktree, target, git_branch = b.get("worktree"), b.get("target_dir"), b.get("git_branch")
+    if not worktree and b.get("layer") == "docs":
+        # A docs branch never has a worktree: its exit is the gate/merge/drop verbs, not `close`.
+        raise TreeError(f"branch {args.branch!r} is a docs branch with no worktree, so there is nothing to close: "
+                        "finish it with `gate` then `merge` (or `branch drop`)")
     if not worktree:
         raise TreeError(f"branch {args.branch!r} has no worktree (never opened, or already closed)")
     if target:

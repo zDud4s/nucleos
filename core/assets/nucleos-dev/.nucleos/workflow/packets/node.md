@@ -78,7 +78,7 @@ Subtree verify: <!-- `nodes.subtree_verify` (true | false), as resolved for this
 - You have no Write tool: return the report as your final message; the root records it.
 
 ### template
-<!-- A fillable model report, copied into the generated prompt. Fill every field; the section headings after the header are the `## ` headings of `packets/handoff.md`, in that order. -->
+<!-- A fillable model report. `tree.py prompt` does not copy this block: its `report_block` emits only `### all` plus `### file` or `### message`. Fill every field; the section headings after the header are the `## ` headings of `packets/handoff.md`, in that order. -->
 Node ID: <your node id>
 Root ID: <the root id>
 Status: done
