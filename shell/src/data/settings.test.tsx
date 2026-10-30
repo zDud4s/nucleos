@@ -25,27 +25,32 @@ describe("settingPath", () => {
     expect(settingPath("machine", "email")).toBe("/settings/machine/email");
     expect(settingPath("project:alpha", "autopilot")).toBe("/settings/project%3Aalpha/autopilot");
   });
+
+  it("keeps a channel's name as one encoded segment", () => {
+    expect(settingPath("machine", "channels/telegram")).toBe("/settings/machine/channels%2Ftelegram");
+  });
 });
+
+/** The refusal `client.ts` builds from the núcleo's body: the name is the code, and `detail` wins as the sentence. */
+function refusalFrom(status: number, body: { refusal: string; detail?: string; [key: string]: unknown }): ApiRefusal {
+  return new ApiRefusal(status, body.refusal, body.detail ?? body.refusal, body);
+}
 
 describe("classifyWriteFailure", () => {
   it("sorts a refusal by status, not by its words", () => {
-    expect(classifyWriteFailure(new ApiRefusal(409, "refused", "stale", { error: "stale", current: 4 }))).toEqual({
+    expect(classifyWriteFailure(refusalFrom(409, { refusal: "stale", current: 4 }))).toEqual({
       kind: "stale",
     });
-    expect(classifyWriteFailure(new ApiRefusal(423, "refused", "kill_switch"))).toEqual({
+    expect(classifyWriteFailure(refusalFrom(423, { refusal: "kill_switch" }))).toEqual({
       kind: "kill_switch",
     });
-    expect(classifyWriteFailure(new ApiRefusal(403, "refused", "not_ours"))).toEqual({
+    expect(classifyWriteFailure(refusalFrom(403, { refusal: "not_ours" }))).toEqual({
       kind: "not_ours",
     });
   });
 
-  it("reads the field and the message of a 422 from the body", () => {
-    const refusal = new ApiRefusal(422, "refused", "invalid", {
-      error: "invalid",
-      field: "/hotkey",
-      message: "expected a chord",
-    });
+  it("reads the field of a 422 from the body when it names one", () => {
+    const refusal = refusalFrom(422, { refusal: "invalid", field: "/hotkey", detail: "expected a chord" });
     expect(classifyWriteFailure(refusal)).toEqual({
       kind: "invalid",
       field: "/hotkey",
@@ -54,9 +59,9 @@ describe("classifyWriteFailure", () => {
   });
 
   it("keeps a 422 without a field as a message alone", () => {
-    const refusal = new ApiRefusal(422, "refused", "bad", { error: "invalid", message: "no good" });
+    const refusal = refusalFrom(422, { refusal: "invalid", detail: "no good" });
     expect(classifyWriteFailure(refusal)).toEqual({ kind: "invalid", field: null, message: "no good" });
-    const bare = new ApiRefusal(422, "refused", "the parser said no");
+    const bare = new ApiRefusal(422, "invalid", "the parser said no");
     expect(classifyWriteFailure(bare)).toEqual({
       kind: "invalid",
       field: null,
@@ -64,10 +69,19 @@ describe("classifyWriteFailure", () => {
     });
   });
 
+  it("takes a 422's words from detail, because the wire has no message", () => {
+    const refusal = refusalFrom(422, { refusal: "invalid", detail: "from the detail", message: "not on the wire" });
+    expect(classifyWriteFailure(refusal)).toEqual({ kind: "invalid", field: null, message: "from the detail" });
+  });
+
   it("treats any other refusal as a refusal and a non-refusal as unreachable", () => {
-    expect(classifyWriteFailure(new ApiRefusal(500, "boom", "it broke"))).toEqual({
+    expect(classifyWriteFailure(refusalFrom(500, { refusal: "internal" }))).toEqual({
       kind: "refused",
-      message: "it broke",
+      message: "internal",
+    });
+    expect(classifyWriteFailure(refusalFrom(400, { refusal: "bad_scope", detail: "no such scope" }))).toEqual({
+      kind: "refused",
+      message: "no such scope",
     });
     expect(classifyWriteFailure(new Error("network"))).toEqual({ kind: "unreachable" });
   });

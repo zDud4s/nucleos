@@ -9,8 +9,8 @@ import type { SchemaNode } from "../settings/schema";
  * for real.
  *
  * Tests steer it with `failNext` (the next write or rollback fails with a canned refusal),
- * `validate` (a per-document check that answers 422 with a field) and `external` (somebody else wrote
- * the document, so the next save is stale).
+ * `validate` (a per-document check that answers 422), `unreadable` (the stored row does not parse) and
+ * `external` (somebody else wrote the document, so the next save is stale).
  */
 export interface SeedDoc {
   scope: string;
@@ -20,13 +20,27 @@ export interface SeedDoc {
   version?: number;
   takes_effect?: string;
   history?: SettingVersion[];
+  /**
+   * Test-only shape: `message` goes out as the wire's `detail`, and `field` is included only when named.
+   * The handler sends no `field` today; a test that names one pins what the form would do with it.
+   */
   validate?: (body: unknown) => { field?: string; message: string } | null;
+  /** Why the stored row does not parse. The GET answers 422 until a write replaces it. */
+  unreadable?: string;
+}
+
+/** The wire shape of a refusal: a name, an optional sentence, and whatever else the route adds. */
+interface RefusalBody {
+  refusal: string;
+  detail?: string;
+  [key: string]: unknown;
 }
 
 interface Stored {
   seed: SeedDoc;
   body: unknown;
   version: number;
+  unreadable: string | null;
   history: SettingVersion[];
   snapshots: Map<number, unknown>;
 }
@@ -37,7 +51,7 @@ export interface SettingsDouble {
   /** Every accepted rollback, in order. */
   rollbacks: { scope: string; name: string; target: number; current: number }[];
   /** The next write or rollback fails with this, once. */
-  failNext: { status: number; body: unknown } | null;
+  failNext: { status: number; body: RefusalBody } | null;
   /** Writes the document as somebody else would: the version moves and the next save is stale. */
   external: (scope: string, name: string, body: unknown) => void;
   handle: (path: string, init: RequestInit | undefined) => Promise<unknown>;
@@ -49,9 +63,9 @@ export function isSettingsPath(path: string): boolean {
 
 const NOW = "2026-10-11T10:00:00Z";
 
-function refuse(status: number, body: Record<string, unknown>): ApiRefusal {
-  const message = typeof body.message === "string" ? body.message : String(body.error ?? "refused");
-  return new ApiRefusal(status, "refused", message, body);
+/** Built as `client.ts` builds it: the name is the code, and `detail` wins as the sentence. */
+function refuse(status: number, body: RefusalBody): ApiRefusal {
+  return new ApiRefusal(status, body.refusal, body.detail ?? body.refusal, body);
 }
 
 export function settingsDouble(seed: SeedDoc[]): SettingsDouble {
@@ -65,6 +79,7 @@ export function settingsDouble(seed: SeedDoc[]): SettingsDouble {
       seed: doc,
       body: doc.body ?? {},
       version,
+      unreadable: doc.unreadable ?? null,
       history:
         doc.history ??
         (version > 0 ? [{ version, written_at: NOW, written_by: "seed", deleted: false }] : []),
@@ -81,6 +96,7 @@ export function settingsDouble(seed: SeedDoc[]): SettingsDouble {
       if (doc === undefined) throw new Error(`no seeded document ${scope}/${name}`);
       doc.version += 1;
       doc.body = body;
+      doc.unreadable = null;
       doc.snapshots.set(doc.version, body);
       doc.history = [{ version: doc.version, written_at: NOW, written_by: "elsewhere", deleted: false }, ...doc.history];
     },
@@ -104,6 +120,7 @@ export function settingsDouble(seed: SeedDoc[]): SettingsDouble {
             kind: doc.seed.scope === "machine" ? "machine" : "project",
             takes_effect: doc.seed.takes_effect ?? "when the daemon restarts",
             present: doc.version > 0,
+            unreadable: doc.unreadable !== null,
             version: doc.version,
           });
         }
@@ -112,9 +129,14 @@ export function settingsDouble(seed: SeedDoc[]): SettingsDouble {
 
       const [, scope, name, tail, target] = segments;
       const doc = docs.get(keyOf(scope, name));
-      if (doc === undefined) throw refuse(404, { error: "not_found", message: `no settings document ${scope}/${name}` });
+      if (doc === undefined) {
+        throw method === "GET" ? refuse(404, { refusal: "unknown_document" }) : refuse(403, { refusal: "not_ours" });
+      }
 
       if (tail === undefined && method === "GET") {
+        if (doc.unreadable !== null) {
+          throw refuse(422, { refusal: "unreadable", detail: doc.unreadable, version: doc.version });
+        }
         return { body: doc.body, version: doc.version, schema: doc.seed.schema };
       }
       if (tail === "history" && method === "GET") {
@@ -124,18 +146,20 @@ export function settingsDouble(seed: SeedDoc[]): SettingsDouble {
       if (double.failNext !== null) {
         const failure = double.failNext;
         double.failNext = null;
-        throw refuse(failure.status, failure.body as Record<string, unknown>);
+        throw refuse(failure.status, failure.body);
       }
 
       if (tail === undefined && method === "PUT") {
         const { body, version } = payload as { body: unknown; version: number };
-        if (version !== doc.version) throw refuse(409, { error: "stale", current: doc.version });
+        // The body before the version, as the store does.
         const verdict = doc.seed.validate?.(body) ?? null;
         if (verdict !== null) {
-          throw refuse(422, { error: "invalid", ...(verdict.field !== undefined ? { field: verdict.field } : {}), message: verdict.message });
+          throw refuse(422, { refusal: "invalid", ...(verdict.field !== undefined ? { field: verdict.field } : {}), detail: verdict.message });
         }
+        if (version !== doc.version) throw refuse(409, { refusal: "stale", current: doc.version });
         doc.version += 1;
         doc.body = body;
+        doc.unreadable = null;
         doc.snapshots.set(doc.version, body);
         doc.history = [{ version: doc.version, written_at: NOW, written_by: "test", deleted: false }, ...doc.history];
         double.writes.push({ scope, name, body, version });
@@ -145,18 +169,19 @@ export function settingsDouble(seed: SeedDoc[]): SettingsDouble {
       if (tail === "rollback" && method === "POST") {
         const wanted = Number(target);
         const { version: current } = payload as { version: number };
-        if (current !== doc.version) throw refuse(409, { error: "stale", current: doc.version });
-        if (!doc.snapshots.has(wanted)) throw refuse(404, { error: "not_found", message: `no version ${wanted}` });
+        if (current !== doc.version) throw refuse(409, { refusal: "stale", current: doc.version });
+        if (!doc.snapshots.has(wanted)) throw refuse(404, { refusal: "no_such_version" });
         const restored = doc.snapshots.get(wanted);
         doc.version += 1;
         doc.body = restored;
+        doc.unreadable = null;
         doc.snapshots.set(doc.version, restored);
         doc.history = [{ version: doc.version, written_at: NOW, written_by: "test", deleted: false }, ...doc.history];
         double.rollbacks.push({ scope, name, target: wanted, current });
         return { version: doc.version };
       }
 
-      throw refuse(404, { error: "not_found", message: `${method} ${path}` });
+      throw refuse(404, { refusal: "not_found", detail: `${method} ${path}` });
     },
   };
   return double;

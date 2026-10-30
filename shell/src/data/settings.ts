@@ -23,6 +23,8 @@ export interface SettingIndexRow {
   takes_effect: string;
   /** Whether the document was ever written. `false` is "defaults only", not "empty". */
   present: boolean;
+  /** The stored row does not parse: its GET answers 422, and a PUT at `version` replaces it. */
+  unreadable: boolean;
   version: number;
 }
 
@@ -144,7 +146,7 @@ export function classifyWriteFailure(error: unknown): WriteFailure {
       return {
         kind: "invalid",
         field: bodyString(error.body, "field"),
-        message: bodyString(error.body, "message") ?? error.detail,
+        message: error.detail !== "" ? error.detail : error.code,
       };
     default:
       return { kind: "refused", message: error.detail !== "" ? error.detail : error.code };
