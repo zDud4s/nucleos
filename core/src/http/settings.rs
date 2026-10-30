@@ -785,6 +785,57 @@ mod tests {
             assert!(verify_history(&state).await.is_empty(), "nothing written");
         }
 
+        /// A refused write leaves the document standing: same value, same version, and no line in
+        /// the history or the feed.
+        #[tokio::test]
+        async fn a_422_over_an_existing_document_leaves_it_intact() {
+            async fn config_written_lines(state: &AppState) -> usize {
+                crate::feed::list_feed(&state.pool, None, 10)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .filter(|line| line.kind == "config_written")
+                    .count()
+            }
+
+            let (_home, state) = fixture().await;
+            let (status, answer) =
+                put_doc(&state, "machine", "verify", json!({ "capacity": 5 }), 0).await;
+            assert_eq!(status, StatusCode::OK, "{answer}");
+            assert_eq!(config_written_lines(&state).await, 1);
+
+            let (status, answer) =
+                put_doc(&state, "machine", "verify", json!({ "capcity": 9 }), 1).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+            assert_eq!(answer["refusal"], "invalid");
+
+            let (status, doc) = call(&state, "GET", "/settings/machine/verify", None).await;
+            assert_eq!(status, StatusCode::OK, "{doc}");
+            assert_eq!(doc["version"], 1);
+            assert_eq!(doc["body"]["capacity"], 5);
+            assert_eq!(verify_capacity(), 5);
+            assert_eq!(verify_history(&state).await.len(), 1);
+            assert_eq!(config_written_lines(&state).await, 1);
+        }
+
+        /// A project on the roster with no folder still takes its documents: they live in the
+        /// database, and the folder is no part of writing one.
+        #[tokio::test]
+        async fn put_to_a_project_with_no_folder_is_accepted_and_reads_back() {
+            let (_home, state) = fixture().await;
+            let mut body = autopilot_body();
+            body["gate_command"] = json!("cargo test");
+
+            let (status, answer) = put_doc(&state, "project:p1", "autopilot", body, 0).await;
+            assert_eq!(status, StatusCode::OK, "{answer}");
+            assert_eq!(answer, json!({ "version": 1 }));
+
+            let (status, doc) = call(&state, "GET", "/settings/project:p1/autopilot", None).await;
+            assert_eq!(status, StatusCode::OK, "{doc}");
+            assert_eq!(doc["version"], 1);
+            assert_eq!(doc["body"]["gate_command"], "cargo test");
+        }
+
         /// A request that does not say which version it read must not fall through to a blind write.
         #[tokio::test]
         async fn put_without_a_version_is_refused() {

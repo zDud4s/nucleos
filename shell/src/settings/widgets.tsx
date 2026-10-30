@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import { useModelGroups } from "../data/chats";
 import { useMachineSecrets, type MachineSecret } from "../data/secrets";
+import { Select } from "../ui";
 import { enumOptions, type SchemaNode } from "./schema";
 
 /**
@@ -42,8 +43,7 @@ function ModelPicker(props: WidgetProps) {
     for (const model of group.models) listed.add(model.id);
   }
   return (
-    <select
-      className="sy-field-input"
+    <Select
       value={value}
       onChange={(event) => { onChange(event.target.value); }}
       {...domProps(props)}
@@ -59,7 +59,7 @@ function ModelPicker(props: WidgetProps) {
           ))}
         </optgroup>
       ))}
-    </select>
+    </Select>
   );
 }
 
@@ -79,8 +79,7 @@ function SecretRef(props: WidgetProps) {
   const known = rows.find((row) => row.key === value);
   return (
     <>
-      <select
-        className="sy-field-input"
+      <Select
         value={value}
         onChange={(event) => { onChange(event.target.value); }}
         {...domProps(props)}
@@ -92,7 +91,7 @@ function SecretRef(props: WidgetProps) {
             {row.key}
           </option>
         ))}
-      </select>
+      </Select>
       {value === "" || secrets.data === undefined ? null : <span className="sy-meta">{keyringNote(known)}</span>}
     </>
   );

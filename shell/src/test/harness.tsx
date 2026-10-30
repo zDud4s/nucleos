@@ -19,7 +19,6 @@ import type { Concurrency, HeldSlot, ProjectConcurrency } from "../data/fleet";
 import type { ClassTally } from "../data/autopilot";
 import type { Changed, Worktree } from "../data/project-code";
 import type { ProjectCommand } from "../data/project-commands";
-import type { Claim } from "../data/project-config";
 import type { ProjectFolder, ProjectRecord } from "../data/projects";
 import type {
   DeclarableOp,
@@ -156,29 +155,8 @@ export interface DaemonState {
    * would make the most common answer untestable.
    */
   text: { diff: string; cat: string | null };
-  /**
-   * The write boundary this project's daemon declares.
-   *
-   * A list rather than a flag, because the page must not know the fence by heart: an editor that
-   * appeared for a hard-coded path would keep appearing after the daemon stopped granting it. A
-   * test can hand back an empty list, which is a real answer — a project the app authors nothing
-   * in.
-   */
-  ownership: Claim[];
   /** What the classifier has been judged on, class by class. */
   scoreboard: ClassTally[];
-  /**
-   * Every write the shell has made, in order, so a test can assert what was SENT rather than what
-   * the component thinks it sent.
-   */
-  writes: { path: string; contents: string }[];
-  /**
-   * What `POST /projects/{id}/write` refuses with, or `null` to accept.
-   *
-   * Refusals are the interesting half of this route — five of them, each a different sentence — and
-   * they are reachable only if the fake can be told to give one.
-   */
-  writeRefusal: { status: number; code: string; detail: string } | null;
   /** What this project can be asked to do to itself. Empty is a real answer: nothing declared. */
   commands: ProjectCommand[];
   /** Command ids the shell asked to start, in order. */
@@ -411,18 +389,7 @@ export function daemonState(overrides: Partial<DaemonState> = {}): DaemonState {
       created_at: "2026-08-23T09:00:00Z",
     },
     text: { diff: "", cat: "" },
-    ownership: [
-      {
-        path: "autopilot.yaml",
-        home: "state",
-        display: "~/.nucleos/projects/alpha/autopilot.yaml",
-        owner: "core",
-        what: "what this project does on its own, and the gate command that decides what green means",
-      },
-    ],
     scoreboard: [],
-    writes: [],
-    writeRefusal: null,
     commands: [],
     started: [],
     declared: [],
@@ -1346,18 +1313,6 @@ export function daemonFetch(state: DaemonState): (path: string, init?: RequestIn
       if (path === "/autopilot/kill" && typeof init.body === "string") {
         state.kill = JSON.parse(init.body) as { engaged: boolean };
       }
-      if (path.includes("/write") && typeof init.body === "string") {
-        if (state.writeRefusal !== null) {
-          const { status, code, detail } = state.writeRefusal;
-          throw new ApiRefusal(status, code, detail);
-        }
-        const body = JSON.parse(init.body) as { path: string; contents: string };
-        state.writes.push(body);
-        // Applied to the text the read route serves, so the refetch after a save reads back what
-        // was written — the same thing the daemon does, and the only way a test can tell a save
-        // that landed from one that only looked like it did.
-        state.text.cat = body.contents;
-      }
       if (path.endsWith("/commands") && typeof init.body === "string") {
         const body = JSON.parse(init.body) as Partial<ProjectCommand>;
         state.declared.push(body);
@@ -1601,7 +1556,6 @@ export function daemonFetch(state: DaemonState): (path: string, init?: RequestIn
     }
     if (path.startsWith("/projects/") && path.endsWith("/readings")) return state.readings;
     if (path.startsWith("/projects/") && path.endsWith("/branches")) return state.branches;
-    if (path.startsWith("/projects/") && path.endsWith("/ownership")) return state.ownership;
     if (path.startsWith("/projects/") && path.endsWith("/commands")) return state.commands;
     if (path.startsWith("/projects/") && path.endsWith("/workflows")) {
       // The daemon resolves the library before it can measure anything against it, so a machine
@@ -1718,12 +1672,8 @@ export interface HarnessOptions {
 export function daemonText(state: DaemonState): (path: string) => Promise<string> {
   return async (path) => {
     if (path.includes("/diff")) return state.text.diff;
-    // `owned` is the claimed files' own read, and it answers exactly as `cat` does — including the
-    // 404 for a file not written yet — so the two share the one text a test sets.
-    if (path.includes("/cat") || path.includes("/owned")) {
-      // `null` is a file that is not there — a 404, and a different fact from an empty file. A
-      // project with no rules file yet is the ordinary case, and the editor says a different
-      // sentence for it.
+    if (path.includes("/cat")) {
+      // `null` is a file that is not there — a 404, and a different fact from an empty file.
       if (state.text.cat === null) throw new ApiRefusal(404, "not_found", "no such file");
       return state.text.cat;
     }

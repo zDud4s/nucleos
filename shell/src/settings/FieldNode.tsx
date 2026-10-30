@@ -1,5 +1,5 @@
 import { useState, type ReactElement, type ReactNode } from "react";
-import { Button, ErrorNote, Field, type FieldProps } from "../ui";
+import { Button, ErrorNote, Field, Select, type FieldProps } from "../ui";
 import {
   defaultFor,
   enumOptions,
@@ -326,8 +326,7 @@ export function FieldNode(props: FieldNodeProps): ReactElement {
       const options = enumOptions(inner) ?? [];
       const text = typeof value === "string" ? value : "";
       return leaf(
-        <select
-          className="sy-field-input"
+        <Select
           value={text}
           aria-invalid={invalid}
           onChange={(event) => {
@@ -342,7 +341,7 @@ export function FieldNode(props: FieldNodeProps): ReactElement {
               {option}
             </option>
           ))}
-        </select>,
+        </Select>,
       );
     }
 

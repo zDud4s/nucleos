@@ -229,15 +229,8 @@ export const keys = {
      * whenever the map's own reading fails. It is a table, like the pile above and unlike `map`.
      */
     mapSilenced: (projectId: string) => ["projects", projectId, "map", "silenced"] as const,
-    /** The write boundary. Under the roster prefix, so one write invalidates it with everything else. */
-    ownership: (projectId: string) => ["projects", projectId, "ownership"] as const,
     /** The project's `nucleos.tests.yaml` and the map the daemon proposes. */
     testsMap: (projectId: string) => ["projects", projectId, "tests-map"] as const,
-    /**
-     * The text of one file inside that boundary, read from wherever the daemon keeps it. Under the
-     * same prefix, so the write that changes it invalidates it.
-     */
-    owned: (projectId: string, path: string) => ["projects", projectId, "owned", path] as const,
     /** What this project can be asked to do to itself, and what each of them last said. */
     commands: (projectId: string) => ["projects", projectId, "commands"] as const,
     /**
@@ -266,8 +259,8 @@ export const keys = {
      *
      * Under the project prefix and NOT under `keys.workflows` below, because it is a fact about
      * this project rather than about the machine — and because installing one also changes what
-     * `ownership` answers, which is its neighbour here. The library itself is the machine's and
-     * has its own root.
+     * `GET /projects/{id}/ownership` answers. The library itself is the machine's and has its own
+     * root.
      */
     workflows: (projectId: string) => ["projects", projectId, "workflows"] as const,
     /** One workflow's divergence from its origin, asked for only when somebody opens it. */

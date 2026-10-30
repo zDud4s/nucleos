@@ -24,8 +24,7 @@
 //! be the two rows of this table, as `autopilot.yaml` and `workflows.yaml` in the project's state
 //! directory. They are rows of the settings store now (`settings.rs`), written through
 //! `settings::update`/`put` with a version check and a history line, so [`CLAIMS`] is empty: a row
-//! here would be write access to a file nobody reads any more. `POST /projects/{id}/write` of either
-//! file therefore answers `not_ours`.
+//! here would be write access to a file nobody reads any more.
 //!
 //! The machine-level files (`email`, `voice`, `calendar`, ...) were never this table's: they are the
 //! DAEMON's, and have their own table in [`crate::machine_config`] — same shape, same membership
@@ -33,8 +32,8 @@
 //! module asserts the two registries stay disjoint.
 //!
 //! Every row says which directory it is relative to ([`Home`]). A workflow's claims are files IN the
-//! project, relative to its root; `Home::State` is kept for the page and the write door that still
-//! resolve a row against the state directory, though no row uses it now.
+//! project, relative to its root; `Home::State` is kept for the page, which still draws a row's
+//! home, though no row uses it now.
 //!
 //! # A third answer: files a WORKFLOW authors
 //!
@@ -87,7 +86,7 @@ pub struct Claim {
     ///
     /// **The `None` is the whole of the middle state.** The membership rule at the top of this
     /// module is that the núcleo owns what the núcleo parses; a row with no parser is therefore not
-    /// the núcleo's to write, and the write route refuses it by asking this question rather than by
+    /// the núcleo's to write, and the fence serves it as not writable by asking this question rather than by
     /// keeping a second list of exceptions somewhere else.
     pub validate: Option<Validator>,
 }
@@ -142,7 +141,7 @@ pub static CLAIMS: &[Claim] = &[];
 /// half depends on what is installed *here* — which is the whole difference between a fence that
 /// describes a project and a fence that describes a build of this app.
 ///
-/// A workflow's row carries no validator, so the write route refuses it. See the module header:
+/// A workflow's row carries no validator, so the fence serves it as not writable. See the module header:
 /// the exit for those files is their author, not a text box in this app.
 ///
 /// A path a workflow declares that the núcleo already claims is dropped, and the núcleo keeps it

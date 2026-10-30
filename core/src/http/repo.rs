@@ -1,4 +1,4 @@
-//! Reading and writing a project's tree (`/projects/{id}/ls`, `/cat`, `/grep`, `/log`, `/diff`, `/write`…).
+//! Reading a project's tree (`/projects/{id}/ls`, `/cat`, `/grep`, `/log`, `/diff`…).
 
 use super::*;
 
@@ -14,7 +14,6 @@ pub(super) fn routes() -> Router<AppState> {
         .route("/projects/{id}/blame", get(get_project_blame))
         .route("/projects/{id}/changed", get(get_project_changed))
         .route("/projects/{id}/worktree", get(get_project_worktree))
-        .route("/projects/{id}/write", post(post_project_write))
 }
 
 /// One run's checkout, as the shell needs it to open a door to the editor.
@@ -162,149 +161,6 @@ pub(super) async fn get_project_worktree(
         base_sha,
         created_at,
     }))
-}
-
-/// Writes one file the app declares itself the author of.
-///
-/// The five refusals are five different facts and none of them is "no". In order, and the order is
-/// the design:
-///
-/// 1. **423, the emergency stop.** First, before the path is so much as looked at. A write refused
-///    for a path reason while the stop is engaged would tell somebody their path was wrong when the
-///    answer is that nothing acts right now. The scoped brake counts too: a project held on its own
-///    is held for this as well.
-///
-///    The cost of this guard is one thing and it is worth naming: the rules file cannot be edited
-///    HERE while the stop is engaged, which is a moment somebody might well want to edit it. It
-///    costs nothing they cannot recover, because layer 2's whole premise is that the editor is one
-///    click away and the file is ordinary text — and what it buys is that the shell is not a door
-///    with privileges an agent lacks, which is the promise §7.5 makes.
-/// 2. **404, no folder.** A project the daemon has no root for has no file to write.
-/// 3. **403, not ours.** Everything the table does not name, which is nearly everything. A path
-///    with `..` in it lands here rather than at the path guard, and deliberately: the app answers
-///    about names it owns, and a traversal is not one — so the filesystem is never touched for a
-///    path nobody claimed. **`another_author` is its own refusal beside it**, for a file an
-///    installed workflow declares: the fence names it, and the app still may not write it, because
-///    it has no parser for it. One code for both would tell somebody the file is nobody's when it
-///    has an author standing right there, and the exit for the two is different.
-/// 4. **400/404, unwritable.** The claimed path that nonetheless does not land inside its home,
-///    which after (3) means one thing: a directory link or junction on the way to it. (Beside it,
-///    `no_machine_root` and `bad_project_id` when the project has no state directory to write
-///    into at all — see [`project_state_dir`].)
-/// 5. **422, invalid, WITH the parser's words.** The one refusal carrying a detail, because the raw
-///    hatch is unusable without it — "unprocessable entity" sends somebody to an editor, which is
-///    the surface the hatch exists to replace.
-///
-/// **The file written is the one the registry names, never the string the caller sent.** The two
-/// normalise to the same file by the time (3) passes, and joining the caller's spelling anyway
-/// would make every future change to `normalise` a security question instead of a tidiness one.
-/// It is joined onto the claim's HOME: the núcleo's own rows land in
-/// `~/.nucleos/projects/<id>/`, not in the project — see `project/state.rs`.
-///
-/// This route is in no table in `auth.rs`, so `permits` — which is default-deny — leaves it to
-/// Control and Admin. That is not an omission: the project's `autopilot.yaml` carries
-/// `gate_command`, and a run able to rewrite it could decide what green means for every gate it
-/// will ever face.
-pub(super) async fn post_project_write(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(body): Json<WriteRequest>,
-) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
-    // Unreadable reads as engaged, the rule `assistant.rs` already pins: a stop nobody can ask
-    // about is not a stop anybody may assume is off.
-    let halted = crate::governance::autopilot::kill_switch_engaged(&state.pool)
-        .await
-        .unwrap_or(true)
-        || crate::governance::autopilot::scoped_kill_engaged(&state.pool, "project", &id)
-            .await
-            .unwrap_or(true);
-    if halted {
-        return Err(refusal(StatusCode::LOCKED, "kill_switch"));
-    }
-
-    let root = resolve_project_root(&state, &id)
-        .await
-        .map_err(|status| refusal(status, "no_project_root"))?;
-
-    let claims = claims_for_project(&state, &id, root.clone())
-        .await
-        .map_err(|status| refusal(status, "internal"))?;
-    let crate::ownership::Owner::Declared(claim) = crate::ownership::owner_of(&claims, &body.path)
-    else {
-        return Err(refusal(StatusCode::FORBIDDEN, "not_ours"));
-    };
-    let Some(validate) = claim.validate else {
-        // The middle state of §12, said in its own words: somebody authors this file and it is not
-        // this app. `detail` carries who, because the exit depends on it — a workflow's file is
-        // changed where the workflow lives.
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "refusal": "another_author",
-                "detail": format!("{} authors this file", claim.owner),
-            })),
-        ));
-    };
-
-    let path = claim.path.clone().into_owned();
-    let display = claim.display(&id);
-    let home = claim_home(&state, &id, &root, claim)?;
-    // A state directory is created by the first file anybody writes into it, and
-    // `safe_write_target` canonicalises its root before it will answer. Created only once the path
-    // is known to be a row.
-    if matches!(claim.home, crate::ownership::Home::State) {
-        std::fs::create_dir_all(&home).map_err(|error| {
-            tracing::warn!(
-                %error,
-                project_id = %id,
-                "could not create this project's state directory"
-            );
-            refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
-        })?;
-    }
-    let target = inspect::safe_write_target(&home, &path)
-        .map_err(|error| refusal(inspect_status(error), "unwritable"))?;
-
-    if let Err(detail) = validate(&body.contents) {
-        return Err((
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({ "refusal": "invalid", "detail": detail })),
-        ));
-    }
-
-    let contents = body.contents;
-    tokio::task::spawn_blocking(move || {
-        crate::project::state::write_atomically(&target, &contents)
-    })
-    .await
-    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
-    .map_err(|error| {
-        tracing::warn!(%error, project_id = %id, %path, "writing a project file failed");
-        refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
-    })?;
-
-    // After the write, not before, and loudly on failure. A feed line about a write that then failed
-    // claims something that did not happen; a write whose line was lost is recoverable from the log,
-    // and refusing the request at this point would report a failure for work already done.
-    if let Err(error) = feed::append(
-        &state.pool,
-        Some(&id),
-        "config_written",
-        &format!("{display} written from the app"),
-        None,
-        None,
-    )
-    .await
-    {
-        tracing::error!(
-            %error,
-            project_id = %id,
-            %path,
-            "a project file was written and its feed line was not recorded"
-        );
-    }
-
-    Ok(StatusCode::NO_CONTENT)
 }
 
 pub(super) async fn get_project_ls(
