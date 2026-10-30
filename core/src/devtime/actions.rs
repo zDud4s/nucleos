@@ -5,6 +5,7 @@
 #![allow(dead_code)] // the wiring step (2.4) is the caller
 
 pub mod inject;
+pub mod outcome;
 pub mod propose;
 
 use crate::devtime::precision::{RulePrecision, action_eligible};

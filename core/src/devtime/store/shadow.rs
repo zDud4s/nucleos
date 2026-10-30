@@ -292,6 +292,39 @@ pub async fn decisions_for(
     qb.build_query_as::<ShadowRow>().fetch_all(pool).await
 }
 
+/// One non-cross finding of a session, as the outcome step needs it (ids and numbers only).
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct SessionFinding {
+    pub rule_id: String,
+    pub finding_key: String,
+    pub rule_version: i64,
+    pub cost_ms: i64,
+}
+
+/// Contract (3.1 GREEN): the `devtime_findings` rows of `session_id` whose `scope <> 'cross'`, every
+/// rule and every `rule_version`, ordered by `finding_key`.
+pub async fn session_findings(
+    _pool: &SqlitePool,
+    _session_id: &str,
+) -> sqlx::Result<Vec<SessionFinding>> {
+    todo!("3.1 GREEN: read the session's non-cross findings")
+}
+
+/// Contract (3.1 GREEN): the `verified` value of every `devtime_attempt_marks` row of `session_id`
+/// (`passed` | `failed` | `not_measured`), in any order; empty when the session has no marks.
+pub async fn session_attempt_verified(
+    _pool: &SqlitePool,
+    _session_id: &str,
+) -> sqlx::Result<Vec<String>> {
+    todo!("3.1 GREEN: read the session's attempt marks")
+}
+
+/// Contract (3.1 GREEN): sets `outcome_state = 'void'` and `resolved_at = now` on row `id` only when
+/// it is still `pending` (a resolved row is never touched here). True when the row changed.
+pub async fn void_pending(_pool: &SqlitePool, _id: i64) -> sqlx::Result<bool> {
+    todo!("3.1 GREEN: void one pending row")
+}
+
 /// The owner's optional `useful` / `noise` mark on a row. Returns true when the row exists.
 pub async fn set_human_verdict(pool: &SqlitePool, id: i64, verdict: &str) -> sqlx::Result<bool> {
     if !["useful", "noise"].contains(&verdict) {
