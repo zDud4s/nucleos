@@ -209,6 +209,8 @@ def the_smoke_script_checks_the_install_and_the_daemon():
 
 def releasing_documents_the_identifier_change():
     text = (ROOT / "RELEASING.md").read_text(encoding="utf-8")
+    titles = re.findall(r"^#{1,6}[ \t]+.*Identifier change.*$", text, re.M | re.I)
+    assert len(titles) == 1, f"'Identifier change' must be exactly one heading, found {len(titles)}"
     heading = re.search(r"^(#{1,6})[ \t]+.*Identifier change.*$", text, re.M | re.I)
     assert heading, "RELEASING.md has no 'Identifier change' section"
     rest = text[heading.end() :]

@@ -135,19 +135,6 @@ irm https://github.com/zDud4s/nucleos/releases/latest/download/install.ps1 | iex
   holds `SHA256SUMS` and the assets to install from a mirror, and `NUCLEOS_INSTALL_DRY_RUN=1` to
   download and verify without installing.
 
-### Identifier change (com.pc-multimedia.shell -> com.nucleos.app)
-
-The bundle identifier changed from `com.pc-multimedia.shell` to `com.nucleos.app`. What users see:
-
-- macOS asks for the microphone and accessibility permissions again, once. The permissions are tied
-  to the bundle id, and macOS TCC cannot migrate them. The self-signed certificate is unchanged.
-- The app data folders (config, WebView profile) are copied once on first launch. The old folders
-  are left in place and may be deleted by hand.
-- The release carries a new `.rpm` asset next to the `.deb`. Both packages `Recommends`
-  `gnome-keyring`.
-- A package install (`.deb`/`.rpm`) is updated with the package manager, not the in-app updater.
-  The in-app notice saying so comes in a follow-up.
-
 ### Fallback: the browser
 
 Downloading the `.dmg` or `.exe` in a browser marks it as quarantined. macOS: open the app once,
