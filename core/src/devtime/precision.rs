@@ -279,18 +279,27 @@ mod tests {
 
     #[test]
     fn action_eligible_rejects_16_of_20_at_floor_0_6() {
-        assert!(!action_eligible(&precision_row(Level::Base, 20, 16, true), 0.6));
+        assert!(!action_eligible(
+            &precision_row(Level::Base, 20, 16, true),
+            0.6
+        ));
     }
 
     #[test]
     fn action_eligible_accepts_20_of_20_at_floor_0_6() {
-        assert!(action_eligible(&precision_row(Level::Base, 20, 20, true), 0.6));
+        assert!(action_eligible(
+            &precision_row(Level::Base, 20, 20, true),
+            0.6
+        ));
     }
 
     #[test]
     fn action_eligible_rejects_when_not_eligible() {
         // 20/20 would pass the floor, but the rule is below min_cases.
-        assert!(!action_eligible(&precision_row(Level::Base, 20, 20, false), 0.6));
+        assert!(!action_eligible(
+            &precision_row(Level::Base, 20, 20, false),
+            0.6
+        ));
     }
 
     #[test]
