@@ -1365,3 +1365,328 @@ pub(super) async fn pretooluse_decision_from(
 
     Json(classification.decision)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::conductor::context::handoff_path;
+    use serde_json::json;
+
+    /// `limits("leaf")`: warn 80k, wrap 100k. `limits("orchestrator")`: wrap 125k. Block is 200k.
+    const LEAF_IN_WARN: i64 = 90_000;
+    const LEAF_OVER_WRAP: i64 = 110_000;
+    const ORCHESTRATOR_OVER_WRAP: i64 = 130_000;
+    const AT_BLOCK: i64 = 200_000;
+
+    /// A tree node's run is `shadow` unless its launch names `worktree` (`tree_job::http::launch`).
+    const NODE_MODES: [&str; 2] = ["shadow", "worktree"];
+    const PROJECT: &str = "p";
+
+    async fn test_state() -> AppState {
+        nucleos_core::channels::testkit::state().await
+    }
+
+    /// A state whose project state directory is real, the guard that keeps it, and its path.
+    async fn state_with_state_dir() -> (AppState, tempfile::TempDir, std::path::PathBuf) {
+        let mut state = test_state().await;
+        let root = tempfile::tempdir().unwrap();
+        state.machine_config_root = Some(root.path().to_path_buf());
+        let state_dir = crate::project::state::dir(root.path(), PROJECT).unwrap();
+        (state, root, state_dir)
+    }
+
+    /// A run in flight, with no node.
+    async fn seed_run(state: &AppState, mode: &str, fill: Option<i64>) -> i64 {
+        let run_id = sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, project_id, cwd, created_at, context_fill)
+             VALUES ('x', 'running', ?, ?, 'C:\\work\\repo', '2026-10-30T00:00:00Z', ?)",
+        )
+        .bind(mode)
+        .bind(PROJECT)
+        .bind(fill)
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let task = tokio::spawn(async { tokio::time::sleep(Duration::from_secs(60)).await });
+        state
+            .run_handles
+            .lock()
+            .unwrap()
+            .insert(run_id, task.abort_handle());
+        run_id
+    }
+
+    /// A run in flight behind a node of `kind`, with the ids of the node and its root.
+    async fn seed_node_run(
+        state: &AppState,
+        mode: &str,
+        kind: &str,
+        fill: Option<i64>,
+    ) -> (i64, String, String) {
+        let run_id = seed_run(state, mode, fill).await;
+        let node_id = format!("node-{run_id}");
+        let root_id = format!("root-{run_id}");
+        sqlx::query(
+            "INSERT INTO work_nodes
+               (id, project_id, root_id, depth, kind, title, goal, status, run_id, created_at,
+                updated_at)
+             VALUES (?, ?, ?, 1, ?, 't', 'g', 'running', ?, '2026-10-30T00:00:00Z',
+                '2026-10-30T00:00:00Z')",
+        )
+        .bind(&node_id)
+        .bind(PROJECT)
+        .bind(&root_id)
+        .bind(kind)
+        .bind(run_id.to_string())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        (run_id, node_id, root_id)
+    }
+
+    fn payload(run_id: i64, tool: &str, input: Value) -> PreToolUsePayload {
+        PreToolUsePayload {
+            run_id,
+            tool_name: tool.to_owned(),
+            tool_input: input,
+        }
+    }
+
+    async fn decide(state: &AppState, run_id: i64, tool: &str, input: Value) -> Decision {
+        let Json(decision) = pretooluse_decision_from(
+            state.clone(),
+            Scope::Run(run_id),
+            payload(run_id, tool, input),
+            Instant::now(),
+        )
+        .await;
+        decision
+    }
+
+    async fn answer(state: &AppState, run_id: i64, tool: &str, input: Value) -> PreToolUseAnswer {
+        let Json(answer) = pretooluse_decision(
+            State(state.clone()),
+            Extension(Scope::Run(run_id)),
+            Json(payload(run_id, tool, input)),
+        )
+        .await;
+        answer
+    }
+
+    fn read_input() -> Value {
+        json!({"file_path": "C:\\work\\repo\\src\\lib.rs"})
+    }
+
+    fn edit_input() -> Value {
+        json!({
+            "file_path": "C:\\work\\repo\\src\\lib.rs",
+            "old_string": "a",
+            "new_string": "b",
+        })
+    }
+
+    fn write_input(path: &Path) -> Value {
+        json!({"file_path": path.to_str().unwrap(), "content": "the handoff"})
+    }
+
+    /// A refusal from the forced split and from no other rule: `shadow` refuses an edit too, but
+    /// its reason does not name the handoff.
+    fn assert_forced_deny(decision: &Decision, what: &str) {
+        assert_eq!(decision.decision, "deny", "{what}: {}", decision.reason);
+        assert!(
+            decision.reason.contains("handoff"),
+            "{what}: the reason must name the way out, got {:?}",
+            decision.reason
+        );
+    }
+
+    fn assert_allowed(decision: &Decision, what: &str) {
+        assert_eq!(decision.decision, "allow", "{what}: {}", decision.reason);
+    }
+
+    #[tokio::test]
+    async fn node_run_over_wrap_limit_denies_an_edit() {
+        let state = test_state().await;
+        for mode in NODE_MODES {
+            let (run_id, _, _) = seed_node_run(&state, mode, "leaf", Some(LEAF_OVER_WRAP)).await;
+            let decision = decide(&state, run_id, "Edit", edit_input()).await;
+            assert_forced_deny(&decision, mode);
+        }
+    }
+
+    #[tokio::test]
+    async fn node_run_over_wrap_limit_allows_node_close() {
+        // Neither mode lets this tool through by itself (`shadow` refuses what is not read-only,
+        // `worktree` parks an unrecognized tool), so the branch has to answer `allow` on its own.
+        let state = test_state().await;
+        for mode in NODE_MODES {
+            for fill in [LEAF_OVER_WRAP, AT_BLOCK] {
+                let (run_id, _, _) = seed_node_run(&state, mode, "leaf", Some(fill)).await;
+                let decision = decide(
+                    &state,
+                    run_id,
+                    "mcp__nucleos__node_close",
+                    json!({"outcome": "handoff"}),
+                )
+                .await;
+                assert_allowed(&decision, &format!("{mode} at {fill}"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn node_run_in_warn_adds_context_and_allows() {
+        let state = test_state().await;
+        let (run_id, _, _) = seed_node_run(&state, "shadow", "leaf", Some(LEAF_IN_WARN)).await;
+
+        let answer = answer(&state, run_id, "Read", read_input()).await;
+
+        assert_allowed(&answer.decision, "a read in warn");
+        let context = answer
+            .additional_context
+            .expect("a warn must reach the agent");
+        assert!(context.contains("handoff"), "got {context:?}");
+    }
+
+    #[tokio::test]
+    async fn run_without_node_is_unaffected() {
+        let state = test_state().await;
+        for (mode, tool, input) in [
+            ("shadow", "Read", read_input()),
+            ("shadow", "Edit", edit_input()),
+            ("worktree", "Read", read_input()),
+        ] {
+            let low = seed_run(&state, mode, Some(1_000)).await;
+            let high = seed_run(&state, mode, Some(AT_BLOCK * 2)).await;
+
+            let at_low = answer(&state, low, tool, input.clone()).await;
+            let at_high = answer(&state, high, tool, input).await;
+
+            assert_eq!(
+                at_high.decision.decision, at_low.decision.decision,
+                "{mode} {tool}: {}",
+                at_high.decision.reason
+            );
+            assert!(
+                !at_high.decision.reason.contains("handoff"),
+                "{mode} {tool}: {}",
+                at_high.decision.reason
+            );
+            assert!(at_low.additional_context.is_none(), "{mode} {tool}");
+            assert!(at_high.additional_context.is_none(), "{mode} {tool}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_context_fill_does_not_deny() {
+        let state = test_state().await;
+        let (run_id, _, _) = seed_node_run(&state, "shadow", "leaf", None).await;
+
+        let answer = answer(&state, run_id, "Read", read_input()).await;
+
+        assert_allowed(&answer.decision, "a read with no measure yet");
+        assert!(answer.additional_context.is_none());
+    }
+
+    #[tokio::test]
+    async fn node_run_at_block_denies_a_read() {
+        let state = test_state().await;
+        let (run_id, _, _) = seed_node_run(&state, "shadow", "leaf", Some(AT_BLOCK)).await;
+        let decision = decide(&state, run_id, "Read", read_input()).await;
+        assert_forced_deny(&decision, "a read at block");
+    }
+
+    #[tokio::test]
+    async fn leaf_over_wrap_limit_cannot_open_a_child() {
+        let state = test_state().await;
+        for mode in NODE_MODES {
+            let (run_id, _, _) = seed_node_run(&state, mode, "leaf", Some(LEAF_OVER_WRAP)).await;
+            let decision = decide(
+                &state,
+                run_id,
+                "mcp__nucleos__node_open",
+                json!({"title": "split"}),
+            )
+            .await;
+            assert_forced_deny(&decision, mode);
+        }
+    }
+
+    #[tokio::test]
+    async fn orchestrator_over_wrap_limit_may_open_a_child() {
+        let state = test_state().await;
+        for mode in NODE_MODES {
+            let (run_id, _, _) =
+                seed_node_run(&state, mode, "orchestrator", Some(ORCHESTRATOR_OVER_WRAP)).await;
+            let decision = decide(
+                &state,
+                run_id,
+                "mcp__nucleos__node_open",
+                json!({"title": "split"}),
+            )
+            .await;
+            assert_allowed(&decision, mode);
+        }
+    }
+
+    #[tokio::test]
+    async fn node_run_over_wrap_limit_may_write_its_own_handoff() {
+        let (state, _root, state_dir) = state_with_state_dir().await;
+        for mode in NODE_MODES {
+            let (run_id, node_id, root_id) =
+                seed_node_run(&state, mode, "leaf", Some(LEAF_OVER_WRAP)).await;
+            let own = handoff_path(&state_dir, &root_id, &node_id);
+            let decision = decide(&state, run_id, "Write", write_input(&own)).await;
+            assert_allowed(&decision, mode);
+        }
+    }
+
+    #[tokio::test]
+    async fn node_run_over_wrap_limit_may_not_write_another_nodes_handoff() {
+        let (state, _root, state_dir) = state_with_state_dir().await;
+        for mode in NODE_MODES {
+            let (run_id, node_id, root_id) =
+                seed_node_run(&state, mode, "leaf", Some(LEAF_OVER_WRAP)).await;
+            for other in [
+                handoff_path(&state_dir, &root_id, "another-node"),
+                handoff_path(&state_dir, "another-root", &node_id),
+            ] {
+                let decision = decide(&state, run_id, "Write", write_input(&other)).await;
+                assert_forced_deny(&decision, &format!("{mode} writing {}", other.display()));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn deny_does_not_terminate_or_mint_a_proposal() {
+        // `worktree`, and a command that parks there, so a refusal left to the classifier would
+        // show up as a proposal. Repeated, because a counted refusal stops a run after a few.
+        let state = test_state().await;
+        let (run_id, _, _) = seed_node_run(&state, "worktree", "leaf", Some(LEAF_OVER_WRAP)).await;
+
+        for _ in 0..5 {
+            let decision = decide(
+                &state,
+                run_id,
+                "Bash",
+                json!({"command": "git push origin main"}),
+            )
+            .await;
+            assert_forced_deny(&decision, "a push over the wrap limit");
+        }
+
+        let proposals: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM proposals")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(proposals, 0);
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "running");
+        assert!(state.run_handles.lock().unwrap().contains_key(&run_id));
+    }
+}
