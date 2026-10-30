@@ -3,7 +3,7 @@
 
 use crate::config::DevtimeActionsConfig;
 use crate::devtime::actions::Decision;
-use crate::devtime::precision::RulePrecision;
+use crate::devtime::precision::{RulePrecision, action_eligible};
 
 /// One cross-session finding, aggregated over the look-back window.
 #[derive(Debug, Clone, PartialEq)]
@@ -33,17 +33,59 @@ pub struct ProposeState {
 
 /// PURE: decides `propose` for one cross finding.
 pub fn decide_propose(
-    _state: &ProposeState,
-    _candidate: &CrossCandidate,
-    _cfg: &DevtimeActionsConfig,
-    _action_version: i64,
+    state: &ProposeState,
+    candidate: &CrossCandidate,
+    cfg: &DevtimeActionsConfig,
+    action_version: i64,
 ) -> Decision {
-    todo!("GREEN 2.2")
+    let rule_id = candidate.rule_id.as_str();
+    let precision = state.precisions.iter().find(|p| p.rule_id == rule_id);
+    let eligible = precision.is_some_and(|p| action_eligible(p, cfg));
+    // The closed reason list has no "duplicate": an already-proposed key reads as a cooldown.
+    let suppress_reason = if !eligible {
+        Some("not_eligible")
+    } else if state.already_proposed.contains(&candidate.finding_key) {
+        Some("cooldown")
+    } else if state.open_proposals >= i64::from(cfg.propose_max_open) {
+        Some("cap")
+    } else if candidate.sessions < i64::from(cfg.propose_min_sessions)
+        || candidate.cost_ms < i64::try_from(cfg.propose_min_cost_ms).unwrap_or(i64::MAX)
+    {
+        Some("below_threshold")
+    } else {
+        None
+    };
+    let decision = if suppress_reason.is_some() {
+        "suppress"
+    } else {
+        "fire"
+    };
+    Decision {
+        action: "propose".to_string(),
+        rule_id: rule_id.to_string(),
+        project_id: state.project_id.clone(),
+        session_id: None,
+        subject_key: candidate.finding_key.clone(),
+        mode: state.mode.clone(),
+        decision: decision.to_string(),
+        suppress_reason: suppress_reason.map(str::to_string),
+        basis_precision: precision.and_then(|p| p.precision),
+        basis_cases: precision.map(|p| p.n_cases),
+        basis_recent_count: Some(candidate.count),
+        basis_recent_cost_ms: Some(candidate.cost_ms),
+        expected_saving_ms: None,
+        rule_version: crate::devtime::rules::rule(rule_id).map_or(1, |r| i64::from(r.version)),
+        action_version,
+    }
 }
 
 /// The `proposals.kind` a rule's proposal is filed under: F1 a script, F2 a gotcha.
-pub fn proposal_kind(_rule_id: &str) -> Option<&'static str> {
-    todo!("GREEN 2.2")
+pub fn proposal_kind(rule_id: &str) -> Option<&'static str> {
+    match rule_id {
+        "F1" => Some("devtime-script"),
+        "F2" => Some("devtime-gotcha"),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
