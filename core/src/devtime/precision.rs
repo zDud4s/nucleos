@@ -173,6 +173,19 @@ pub async fn base_rates(
         .collect())
 }
 
+/// Lower bound of the 95% Wilson interval (z = 1.96) for `right` out of `n`; 0.0 when `n <= 0`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn wilson_lower(_right: i64, _n: i64) -> f64 {
+    0.0
+}
+
+/// A rule may drive an action only when it is eligible and the Wilson lower bound of its
+/// precision reaches `wilson_floor`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn action_eligible(_p: &RulePrecision, _wilson_floor: f64) -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,6 +224,67 @@ mod tests {
         (0..n)
             .map(|i| finding(&format!("{rule_id}-{i}"), rule_id, confidence))
             .collect()
+    }
+
+    fn precision_row(level: Level, n_cases: i64, right: i64, eligible: bool) -> RulePrecision {
+        RulePrecision {
+            rule_id: "r".to_string(),
+            level,
+            n_cases,
+            n_not_rework: n_cases - right,
+            precision: (n_cases > 0).then(|| right as f64 / n_cases as f64),
+            prior: 0.5,
+            eligible,
+        }
+    }
+
+    #[test]
+    fn wilson_lower_16_of_20_is_about_0_58() {
+        let v = wilson_lower(16, 20);
+        assert!((0.57..0.60).contains(&v), "got {v}");
+    }
+
+    #[test]
+    fn wilson_lower_20_of_20_is_about_0_84() {
+        let v = wilson_lower(20, 20);
+        assert!((0.83..0.85).contains(&v), "got {v}");
+    }
+
+    #[test]
+    fn wilson_lower_zero_n_is_zero() {
+        assert_eq!(wilson_lower(0, 0), 0.0);
+        assert_eq!(wilson_lower(5, -1), 0.0);
+    }
+
+    #[test]
+    fn wilson_lower_is_monotonic_in_successes() {
+        let values: Vec<f64> = (0..=30).map(|k| wilson_lower(k, 30)).collect();
+        assert!(values.windows(2).all(|w| w[0] <= w[1]), "{values:?}");
+        assert!(values[30] > values[0], "{values:?}");
+    }
+
+    #[test]
+    fn action_eligible_rejects_16_of_20_at_floor_0_6() {
+        assert!(!action_eligible(&precision_row(Level::Base, 20, 16, true), 0.6));
+    }
+
+    #[test]
+    fn action_eligible_accepts_20_of_20_at_floor_0_6() {
+        assert!(action_eligible(&precision_row(Level::Base, 20, 20, true), 0.6));
+    }
+
+    #[test]
+    fn action_eligible_rejects_when_not_eligible() {
+        // 20/20 would pass the floor, but the rule is below min_cases.
+        assert!(!action_eligible(&precision_row(Level::Base, 20, 20, false), 0.6));
+    }
+
+    #[test]
+    fn action_eligible_rejects_deferred_rule() {
+        assert!(!action_eligible(
+            &precision_row(Level::Deferred, 20, 20, false),
+            0.6
+        ));
     }
 
     async fn store(pool: &SqlitePool, rows: &[FindingRow]) {
