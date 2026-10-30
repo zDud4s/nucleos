@@ -1547,7 +1547,7 @@ function ScoreboardPanel({
           <Skeleton label="Reading the scoreboard" lines={3} />
         )}
       {evidence.length > 0 && (
-        <TallyTable label="Shadow evidence" rows={evidence} />
+        <TallyTable label="Shadow evidence" rows={evidence} projectMode={project?.mode} />
       )}
       {history.length > 0 && (
         <div className="ap-group">
@@ -1556,7 +1556,7 @@ function ScoreboardPanel({
               screen reader the enforced rows are a section of the page rather
               than a group within this one. */}
           <Section label="enforced, and not evidence for promotion" level={3}>
-            <TallyTable label="Enforced decisions" rows={history} />
+            <TallyTable label="Enforced decisions" rows={history} projectMode={project?.mode} />
           </Section>
         </div>
       )}
@@ -1569,7 +1569,15 @@ function ScoreboardPanel({
   );
 }
 
-function TallyTable({ label, rows }: { label: string; rows: ClassTally[] }) {
+function TallyTable({
+  label,
+  rows,
+  projectMode,
+}: {
+  label: string;
+  rows: ClassTally[];
+  projectMode: AutopilotMode | undefined;
+}) {
   // A class that withheld decisions and had none of them reviewed: its agreement is measured on
   // allows alone, which says nothing about the cases that mattered.
   const unreviewedWithheld = rows.filter((row) => row.would_pend > 0 && row.reviewed_pend === 0);
@@ -1630,7 +1638,9 @@ function TallyTable({ label, rows }: { label: string; rows: ClassTally[] }) {
         <p key={`${row.mode}:${row.action_class}`} className="ap-note">
           {/* Only shadow rows count toward the bar: the same table also lists enforced decisions. */}
           {`${row.action_class}: ${row.would_pend} withheld decisions, none reviewed${
-            row.mode === SHADOW_EVIDENCE_MODE ? ": this blocks promotion until one is" : ""
+            row.mode === SHADOW_EVIDENCE_MODE && projectMode === "shadow"
+              ? ": this blocks promotion until one is"
+              : ""
           }`}
         </p>
       ))}
@@ -1680,9 +1690,11 @@ function Agreement({ row }: { row: ClassTally }) {
   const verdict =
     percent < READINESS_MIN_AGREE_PERCENT
       ? "below the bar"
-      : enough
-        ? "ready"
-        : `${READINESS_MIN_REVIEWED - row.reviewed} more reviews needed`;
+      : row.mode === SHADOW_EVIDENCE_MODE && row.would_pend > 0 && row.reviewed_pend === 0
+        ? "withheld not reviewed"
+        : enough
+          ? "ready"
+          : `${READINESS_MIN_REVIEWED - row.reviewed} more reviews needed`;
   return (
     <span className="ap-agree">
       <span className="ap-agree-figure">{percent}%</span>

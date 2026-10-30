@@ -366,7 +366,9 @@ pub async fn scoreboard(pool: &SqlitePool, project_id: &str) -> sqlx::Result<Vec
 
 /// The shadow-exit bar (spec §8.2/§8.8, `.ai/decisions.md` 2026-07-27): an action class earns
 /// promotion once enough of its shadow decisions have been reviewed AND the classifier agreed with
-/// the human on nearly all of them.
+/// the human on nearly all of them. A class that withheld decisions (`would_pend > 0`) is not ready
+/// until at least one of them was reviewed (`reviewed_pend > 0`): agreement on its allows alone says
+/// nothing about the cases that mattered.
 ///
 /// **This is the single source of truth for the rule.** The shell reads the computed
 /// `classes_ready`/`promotable` off the daemon rather than recomputing them, so the button the user
