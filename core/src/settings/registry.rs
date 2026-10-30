@@ -155,7 +155,10 @@ static DOCUMENTS: LazyLock<Vec<DocType>> = LazyLock::new(|| {
             crate::config::MODELS_CONFIG_FILE,
             "the model picker refreshes at once; the routes themselves are built at startup and move when the daemon restarts",
         ),
-        of::<VerifyConfig>(files::VERIFY_FILE, "when the daemon restarts"),
+        of::<VerifyConfig>(
+            files::VERIFY_FILE,
+            "on the next command for switching admission off and for its weights; everything else, including switching it on from off, when the daemon restarts",
+        ),
         of::<DevtimeConfig>(files::DEVTIME_FILE, "when the daemon restarts"),
         of::<AutopilotRules>(
             crate::project::state::AUTOPILOT_FILE,

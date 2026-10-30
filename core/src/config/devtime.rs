@@ -487,23 +487,28 @@ pub fn load_devtime_config(path: &Path) -> DevtimeConfig {
     }
 }
 
-/// Where the thresholds a findings request ran under came from. Reported to the page so a typo in
-/// `devtime.yaml` is visible there instead of silently showing the default precision thresholds.
+/// Where the thresholds a findings request ran under came from. Reported to the page, which shows no
+/// note for `File` and one line for either of the others, so the default precision thresholds are
+/// never shown as if they were the stored ones.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ThresholdsSource {
-    /// The file parsed and applies.
+    /// The stored `devtime` document applies. Named after the file that document replaced, because
+    /// `file` is the value the shell reads.
     #[default]
     File,
-    /// The file is currently invalid; the last version that parsed applies.
+    /// A file that turned invalid, its last version that parsed applying. Only the test-only file
+    /// cache below answers this now: the daemon reads the document, and a write that does not
+    /// validate is refused rather than stored. The shell still has a line for it.
     LastGood,
-    /// No file, or an invalid one and no good version ever seen.
+    /// No document is stored, or the stored one cannot be read: the defaults apply.
     Default,
 }
 
 /// One file's cache slot: the (length, mtime) of the last stat that was read, the last config that
 /// parsed, and whether that read was a refusal (so an unchanged bad file is not re-read, or
 /// re-logged, on every request).
+#[cfg(test)]
 pub(super) struct DevtimeCacheEntry {
     len: u64,
     modified: Option<std::time::SystemTime>,
@@ -511,25 +516,22 @@ pub(super) struct DevtimeCacheEntry {
     invalid: bool,
 }
 
+#[cfg(test)]
 pub(super) type DevtimeCache =
     std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, DevtimeCacheEntry>>;
 
 /// A config and where it came from.
-pub type ResolvedDevtime = (DevtimeConfig, ThresholdsSource);
+#[cfg(test)]
+pub(super) type ResolvedDevtime = (DevtimeConfig, ThresholdsSource);
 
 /// The devtime config at `path`, re-read only when the file's length or modification time moved.
 ///
-/// Findings and mark requests call this per request; `load_devtime_config` is the startup read.
+/// Test-only: the daemon reads the `devtime` document (`http/analytics.rs`), and keeping this out of
+/// production means code still reaching for the file does not compile.
+///
 /// An invalid edit keeps the last version that parsed (defaults only if none ever did) and is
-/// logged once per file change, not once per request. A vanished file is the defaults, as for the
-/// schedule rules: deleting the file is how an owner reverts to the defaults, so the old content
-/// must not outlive it.
-pub fn devtime_config_now(path: &Path) -> ResolvedDevtime {
-    static CACHE: std::sync::OnceLock<DevtimeCache> = std::sync::OnceLock::new();
-    cached_devtime_config(path, CACHE.get_or_init(Default::default))
-}
-
-/// The stat-checked read behind [`devtime_config_now`], apart from the static so a test can drive it.
+/// logged once per file change, not once per request. A vanished file is the defaults.
+#[cfg(test)]
 pub(super) fn cached_devtime_config(path: &Path, cache: &DevtimeCache) -> ResolvedDevtime {
     let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
     let Ok(meta) = std::fs::metadata(path) else {
@@ -584,6 +586,7 @@ pub(super) fn cached_devtime_config(path: &Path, cache: &DevtimeCache) -> Resolv
 
 /// What a cache slot answers while its file is unchanged. `None` only for a slot that has nothing
 /// to answer with, which cannot be a hit.
+#[cfg(test)]
 fn devtime_answer(entry: &DevtimeCacheEntry) -> Option<ResolvedDevtime> {
     match (&entry.last_good, entry.invalid) {
         (Some(config), false) => Some((config.clone(), ThresholdsSource::File)),

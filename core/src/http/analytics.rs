@@ -148,7 +148,7 @@ async fn devtime(
     // Re-read per request, so a price refresh (or a hand edit of the file) needs no restart
     // (spec §4.4).
     let models = crate::config::models_config_now();
-    let (rules, _) = devtime_rules(state);
+    let (rules, _) = devtime_rules();
     let mut overview = crate::analytics::devtime::devtime_overview(
         &state.pool,
         &models,
@@ -229,7 +229,7 @@ async fn devtime_findings(
             .await
             .map_err(IntoResponse::into_response)?;
     }
-    let (rules, source) = devtime_rules(state);
+    let (rules, source) = devtime_rules();
     let query = crate::analytics::devtime::FindingsQuery {
         rule_id: params.rule_id.as_deref(),
         order,
@@ -250,24 +250,18 @@ async fn devtime_findings(
     .map_err(|error| failed(error, "devtime findings").into_response())
 }
 
-/// The precision thresholds from `~/.nucleos/devtime.yaml` — the file `main.rs` loads at startup,
-/// from the same root — and where they came from. Read per request through the stat cache, so an
-/// edit applies without a restart and an invalid one keeps the last good thresholds, labelled.
-/// (Ingestion still runs on the startup copy.) Not an `AppState` field: that struct has ~70
-/// literal constructors, and only these routes need it. No root (every test state) is the defaults.
-fn devtime_rules(
-    state: &AppState,
-) -> (
+/// The precision thresholds from the `devtime` document, and where they came from. Read per request
+/// from the settings snapshot, so a write through the settings door applies without a restart.
+/// (Ingestion still runs on the startup copy.) With no document, or one that cannot be read, the
+/// defaults, labelled as such so the page can say so.
+fn devtime_rules() -> (
     crate::config::DevtimeRulesConfig,
     crate::config::ThresholdsSource,
 ) {
-    match state.machine_config_root.as_deref() {
-        Some(root) => {
-            let (config, source) =
-                crate::config::devtime_config_now(&root.join(crate::machine_config::DEVTIME_FILE));
-            (config.rules, source)
-        }
-        None => Default::default(),
+    match crate::settings::get_opt::<crate::config::DevtimeConfig>(&crate::settings::Scope::Machine)
+    {
+        Some(doc) => (doc.rules.clone(), crate::config::ThresholdsSource::File),
+        None => (Default::default(), crate::config::ThresholdsSource::Default),
     }
 }
 
@@ -312,7 +306,7 @@ pub(super) async fn post_devtime_mark(
 ) -> Result<Json<crate::analytics::devtime::MarkOutcome>, Response> {
     use crate::devtime::precision::MarkError;
     let window = window_of(&query, chrono::Utc::now()).map_err(IntoResponse::into_response)?;
-    let (rules, _) = devtime_rules(&state);
+    let (rules, _) = devtime_rules();
     let verdict = body.verdict.as_str();
     let cause = body.cause.as_deref();
     crate::analytics::devtime::mark_finding(&state.pool, &rules, window, &key, verdict, cause)
@@ -325,4 +319,86 @@ pub(super) async fn post_devtime_mark(
             // Generic, no SQL echoed (spec §6.8).
             MarkError::Db(error) => failed(error, "devtime mark").into_response(),
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::devtime_rules;
+    use crate::config::{DevtimeThresholdsConfig, ThresholdsSource};
+    use crate::project::rules::testing::Home;
+    use crate::settings::{self, Scope};
+    use serde_json::json;
+
+    /// What the `devtime` document stores; the default and the stale file both say something else.
+    const STORED_BURST: u32 = 17;
+    const STALE_FILE_BURST: u32 = 8;
+
+    /// Stores the `devtime` document. `Home::new()` comes first in each test: it owns the global
+    /// snapshot.
+    async fn store_the_document() {
+        let state = super::super::tests::test_state().await;
+        settings::put(
+            &state.pool,
+            &Scope::Machine,
+            "devtime",
+            &json!({"rules": {"thresholds": {"d3_search_burst": STORED_BURST}}}),
+            "test",
+            None,
+        )
+        .await
+        .expect("devtime is a registered document");
+    }
+
+    /// As the importer leaves the machine: `devtime.yaml` is gone (renamed to
+    /// `devtime.yaml.imported`) and the document is the configuration.
+    #[tokio::test]
+    async fn devtime_rules_read_the_document_with_no_file_on_disk() {
+        let _home = Home::new();
+        store_the_document().await;
+        assert_ne!(
+            DevtimeThresholdsConfig::default().d3_search_burst,
+            STORED_BURST
+        );
+
+        let (rules, source) = devtime_rules();
+
+        assert_eq!(rules.thresholds.d3_search_burst, STORED_BURST);
+        assert_ne!(
+            source,
+            ThresholdsSource::Default,
+            "the page must not label a stored document as the defaults"
+        );
+    }
+
+    /// A file the importer did not rename (or one written after it ran) says nothing once there is a
+    /// document: the file parses, so only reading the document gives the stored value.
+    #[tokio::test]
+    async fn devtime_rules_ignore_a_stale_file_when_there_is_a_document() {
+        let home = Home::new();
+        store_the_document().await;
+        std::fs::write(
+            home.path().join(crate::machine_config::DEVTIME_FILE),
+            format!("rules:\n  thresholds:\n    d3_search_burst: {STALE_FILE_BURST}\n"),
+        )
+        .unwrap();
+
+        let (rules, _) = devtime_rules();
+
+        assert_eq!(rules.thresholds.d3_search_burst, STORED_BURST);
+    }
+
+    /// `ThresholdsSource`'s own default is `File`, which the page shows no note for: no document has
+    /// to be labelled by name, or the "Using default thresholds" note never appears.
+    #[test]
+    fn devtime_rules_with_no_document_are_labelled_the_defaults() {
+        let _home = Home::new();
+
+        let (rules, source) = devtime_rules();
+
+        assert_eq!(
+            rules.thresholds.d3_search_burst,
+            DevtimeThresholdsConfig::default().d3_search_burst
+        );
+        assert_eq!(source, ThresholdsSource::Default);
+    }
 }
