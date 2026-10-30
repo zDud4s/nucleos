@@ -183,6 +183,20 @@ pub fn apply_cap_and_cooldown(
     out
 }
 
+/// Wiring step (2.4): decides and records the automatic actions for one session the rules pass
+/// just ran for. Records, never delivers. Returns the number of `devtime_shadow` rows newly written.
+///
+/// `now_ms` is unix milliseconds and becomes `decided_at`. Contract in the wiring tests below.
+pub async fn run_for_session(
+    pool: &sqlx::SqlitePool,
+    cfg: &crate::config::DevtimeConfig,
+    session_id: &str,
+    now_ms: i64,
+) -> sqlx::Result<usize> {
+    let _ = (pool, cfg, session_id, now_ms);
+    todo!("2.4 GREEN: run_for_session")
+}
+
 /// Median of `values` (sorted in place); the mean of the two middle ones for an even count.
 fn median(values: &mut [i64]) -> Option<i64> {
     values.sort_unstable();
@@ -195,6 +209,184 @@ fn median(values: &mut [i64]) -> Option<i64> {
         Some(values[mid])
     } else {
         Some(values[mid - 1].saturating_add(values[mid]) / 2)
+    }
+}
+
+#[cfg(test)]
+mod wiring {
+    use super::*;
+    use crate::config::DevtimeConfig;
+    use sqlx::SqlitePool;
+
+    const SID: &str = "s-wire";
+    const LAST: &str = "2026-10-05T10:30:00.000Z";
+    /// `LAST` in unix ms.
+    const LAST_MS: i64 = 1_791_196_200_000;
+    const NOW_MS: i64 = LAST_MS + 60_000;
+
+    async fn pool() -> SqlitePool {
+        let pool = crate::testdb::fresh_pool().await;
+        sqlx::query(
+            "INSERT INTO devtime_sessions (session_id, project_id, started_at, ended_at, dirty, \
+             parser_version, updated_at) VALUES (?, 'p1', '2026-10-05T10:00:00.000Z', ?, 0, 1, ?)",
+        )
+        .bind(SID)
+        .bind(LAST)
+        .bind(LAST)
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
+    /// One finding row; `scope` is `session` or `cross`.
+    async fn finding(pool: &SqlitePool, key: &str, rule: &str, scope: &str, cost_ms: i64) {
+        sqlx::query(
+            "INSERT INTO devtime_findings (finding_key, project_id, session_id, scope, rule_id, \
+             rule_version, level, waste, lever, confidence, lane, started_at, ended_at, cost_ms, \
+             count, sessions, rules_version, parser_version) VALUES (?, 'p1', ?, ?, ?, 1, 'session', \
+             'rework', 'x', 'exact', 'main', ?, ?, ?, 4, ?, 'rv', 1)",
+        )
+        .bind(key)
+        .bind(SID)
+        .bind(scope)
+        .bind(rule)
+        .bind(LAST)
+        .bind(LAST)
+        .bind(cost_ms)
+        .bind(format!("[\"{SID}\",\"s2\",\"s3\"]"))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn seed(pool: &SqlitePool) {
+        for i in 0..4 {
+            finding(pool, &format!("D3-{i}"), "D3", "session", 60_000).await;
+        }
+        finding(pool, "F1-cross", "F1", "cross", 900_000).await;
+    }
+
+    async fn rows(pool: &SqlitePool, action: &str) -> Vec<(String, String, String)> {
+        sqlx::query_as(
+            "SELECT rule_id, outcome_state, window_end_at FROM devtime_shadow WHERE action = ? \
+             ORDER BY rule_id, id",
+        )
+        .bind(action)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn total(pool: &SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM devtime_shadow")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    fn ms_text(ms: i64) -> String {
+        chrono::DateTime::from_timestamp_millis(ms)
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string()
+    }
+
+    // Contract: one `inject` row per inject-pair rule (cfg.actions.pairs) that has at least one
+    // finding in the session, and one `propose` row per `cross` finding of a propose-pair rule whose
+    // `sessions` JSON lists the session. Suppressed decisions are recorded too. All rows `pending`.
+
+    #[tokio::test]
+    async fn wiring_session_with_findings_writes_pending_rows() {
+        let pool = pool().await;
+        seed(&pool).await;
+        let n = run_for_session(&pool, &DevtimeConfig::default(), SID, NOW_MS)
+            .await
+            .unwrap();
+        assert_eq!(n, 2);
+        let inject = rows(&pool, "inject").await;
+        let propose = rows(&pool, "propose").await;
+        assert_eq!(inject.len(), 1);
+        assert_eq!(inject[0].0, "D3");
+        assert_eq!(propose.len(), 1);
+        assert_eq!(propose[0].0, "F1");
+        assert!(inject.iter().chain(&propose).all(|r| r.1 == "pending"));
+    }
+
+    #[tokio::test]
+    async fn wiring_recompute_twice_does_not_duplicate() {
+        let pool = pool().await;
+        seed(&pool).await;
+        let cfg = DevtimeConfig::default();
+        run_for_session(&pool, &cfg, SID, NOW_MS).await.unwrap();
+        let first = total(&pool).await;
+        assert!(first > 0);
+        let again = run_for_session(&pool, &cfg, SID, NOW_MS + 1_000)
+            .await
+            .unwrap();
+        assert_eq!(again, 0);
+        assert_eq!(total(&pool).await, first);
+    }
+
+    #[tokio::test]
+    async fn wiring_disabled_writes_nothing() {
+        let pool = pool().await;
+        seed(&pool).await;
+        let mut cfg = DevtimeConfig::default();
+        cfg.actions.enabled = false;
+        let n = run_for_session(&pool, &cfg, SID, NOW_MS).await.unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(total(&pool).await, 0);
+    }
+
+    #[tokio::test]
+    async fn wiring_mode_off_writes_nothing() {
+        let pool = pool().await;
+        seed(&pool).await;
+        for (action, rule) in [("inject", "D3"), ("propose", "F1")] {
+            crate::devtime::store::set_action_state(
+                &pool,
+                &crate::devtime::store::ActionStateRow {
+                    action: action.to_string(),
+                    rule_id: rule.to_string(),
+                    mode: "off".to_string(),
+                    since: String::new(),
+                    changed_by: "owner".to_string(),
+                    reason: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let n = run_for_session(&pool, &DevtimeConfig::default(), SID, NOW_MS)
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(total(&pool).await, 0);
+    }
+
+    #[tokio::test]
+    async fn wiring_window_end_inject_is_last_activity_plus_idle() {
+        let pool = pool().await;
+        seed(&pool).await;
+        let cfg = DevtimeConfig::default();
+        run_for_session(&pool, &cfg, SID, NOW_MS).await.unwrap();
+        let idle_ms = i64::try_from(cfg.idle_minutes).unwrap() * 60_000;
+        let inject = rows(&pool, "inject").await;
+        assert_eq!(inject.len(), 1);
+        assert_eq!(inject[0].2, ms_text(LAST_MS + idle_ms));
+    }
+
+    #[tokio::test]
+    async fn wiring_window_end_propose_is_plus_propose_window_days() {
+        let pool = pool().await;
+        seed(&pool).await;
+        let cfg = DevtimeConfig::default();
+        run_for_session(&pool, &cfg, SID, NOW_MS).await.unwrap();
+        let window_ms = i64::from(cfg.actions.propose_window_days) * 86_400_000;
+        let propose = rows(&pool, "propose").await;
+        assert_eq!(propose.len(), 1);
+        assert_eq!(propose[0].2, ms_text(LAST_MS + window_ms));
     }
 }
 
