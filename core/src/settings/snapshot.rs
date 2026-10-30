@@ -62,6 +62,12 @@ impl Snapshot {
         self.entries.get(scope)?.get(name)
     }
 
+    /// The stored value of `name` at `scope` as `T`, when it is readable and of that type. For documents
+    /// that have no static `Document::NAME` (the `channels/<id>` family).
+    pub fn entry_as<T: 'static>(&self, scope: &Scope, name: &str) -> Option<&T> {
+        self.entry(scope, name)?.value.downcast_ref::<T>()
+    }
+
     pub fn version(&self, scope: &Scope, name: &str) -> Option<i64> {
         self.entry(scope, name).map(|entry| entry.version)
     }

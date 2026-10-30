@@ -62,7 +62,7 @@ pub(super) const DEFAULT_HOTKEYS: [&str; 4] =
 
 /// `~/.nucleos/voice.yaml`. Every field defaults, so a partial file is valid and an absent one leaves the
 /// pillar off without comment.
-#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(default)]
 pub struct VoiceConfig {
     /// Opt-in, like the email pillar: this one opens a microphone.
@@ -71,6 +71,7 @@ pub struct VoiceConfig {
     /// sidecar's transcriber already uses. Whitespace separates; double quotes protect a path that
     /// contains spaces, which anything installed under `C:\Program Files` needs. Empty means there is
     /// no transcriber, which is indistinguishable from the pillar being off and is treated as such.
+    #[schemars(extend("x-widget" = "command"))]
     pub stt_command: String,
     /// A resident transcriber on loopback, e.g. `http://127.0.0.1:5018` for whisper.cpp's own
     /// `whisper-server`.

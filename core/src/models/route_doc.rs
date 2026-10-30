@@ -11,7 +11,7 @@ use super::route_advice::{
     is_loopback,
 };
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct RouterDoc {
     /// `off`, `shadow` or `apply`.

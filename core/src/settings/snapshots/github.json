@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "`~/.nucleos/github.yaml`. The GitHub pillar's switch and the two lists that decide what runs without\nanybody watching.\n\n**`enabled` defaults to TRUE, which is the opposite of every other pillar that reaches the\nnetwork, and the asymmetry is the whole design rather than an oversight.** `WebConfig` and\n`BrowserConfig` ship off because for them \"off\" and \"grants nothing\" are the same state. Here\nthey are not: what a missing file has to produce is a pillar *capable of everything and\nautonomous in nothing* — a person can still approve any operation, and no operation runs without\none. That is what the two empty lists below deliver, and switching the pillar off as well would\ntake away the capability the owner asked for in order to withhold an autonomy the empty lists had\nalready withheld.\n\nSo the refusal in this struct lives in `autonomous_reads` and `autonomous_actions`, exactly where\n`WebConfig::trusted_hosts` puts its own: every other field's default is a convenience, and those\ntwo are a refusal. A file that is missing, unreadable or malformed asks a human about every last\n`gh` invocation.\n\nNeither list is authoritative on its own. `github::Policy` intersects both with a compiled\nceiling, so what is written here can only ever NARROW what the code already allows — which is\nwhat makes a per-developer gitignored YAML a defensible place for this at all.",
+  "properties": {
+    "autonomous_actions": {
+      "default": [],
+      "description": "`github::ActOp` kinds the núcleo executes without asking. Subset of\n`github::ACTION_CEILING`, which does not contain `api_read` and never will.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "autonomous_reads": {
+      "default": [],
+      "description": "`gh` prefixes a run may execute through Bash without asking. Subset of\n`github::READ_CEILING`; an entry outside it is dropped with a warning.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "enabled": {
+      "default": true,
+      "type": "boolean"
+    }
+  },
+  "title": "GithubConfig",
+  "type": "object"
+}

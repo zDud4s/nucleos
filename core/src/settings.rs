@@ -12,6 +12,7 @@ mod checks;
 pub mod decode;
 pub mod import;
 pub mod registry;
+pub mod schema;
 pub mod scope;
 pub mod snapshot;
 pub mod store;
@@ -112,6 +113,11 @@ pub fn get<T: Document + Default>(scope: &Scope) -> Arc<T> {
 
 pub fn get_opt<T: Document>(scope: &Scope) -> Option<Arc<T>> {
     global().snapshot().get_opt::<T>(scope)
+}
+
+/// A copy of the document `T` stored under `name` at `scope`: the reader of the dynamic `channels/<id>` family.
+pub fn get_named<T: Clone + 'static>(scope: &Scope, name: &str) -> Option<T> {
+    global().snapshot().entry_as::<T>(scope, name).cloned()
 }
 
 /// Load the table into the global handle (startup) and hand the handle back.

@@ -1,0 +1,358 @@
+{
+  "$defs": {
+    "CommandKinds": {
+      "additionalProperties": false,
+      "description": "The `command_kinds:` key. Absent means only the compiled defaults; each entry is a command\nprefix matched like a project shell rule.",
+      "properties": {
+        "build": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "check": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "test": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "GraphConfig": {
+      "additionalProperties": false,
+      "description": "Turns one scheduled rule into a job: a sequence of runs over one shared worktree, rather than a\nsingle run capped by one context window.",
+      "properties": {
+        "budget_usd": {
+          "default": null,
+          "description": "The most this one job may spend, in USD, before its own brakes stop it.\n\n`None` — the key absent — means what every `graph:` rule has always meant: only the house\nlimit governs this job. That is the behaviour of every rule already sitting in somebody's\n`autopilot.yaml`, and it must stay theirs, so there is no default number here.\n\nA PUBLIC field, unlike `max_items` and `gate_retries`. Those two are private behind an\naccessor because the accessor applies a CEILING against a per-developer file no review sees.\nA budget has no ceiling to apply: it runs UNDER the house limit rather than instead of it, so\nwhatever the file writes here can only ever tighten what this job is allowed to spend. There\nis no number a rule could put in this key that buys it more than the daemon already allows.\n\nThe value must be a finite, non-negative number; `parse_schedule_rules` refuses the rest\nrather than clamping, for the reasons written at `validate_rules`.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "gate_after_each_item": {
+          "default": false,
+          "type": "boolean"
+        },
+        "gate_retries": {
+          "default": 1,
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_items": {
+          "default": 5,
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "review": {
+          "default": true,
+          "type": "boolean"
+        },
+        "team": {
+          "default": null,
+          "description": "The team to direct this rule's jobs, by id. Absent is the sequential job in one shared\ncheckout — what every `graph:` rule already sitting in somebody's gitignored file means, and\nwhat it must keep meaning.\n\nA PUBLIC field with no accessor, like `budget_usd` and unlike `max_items`. The two private\nones are private because their accessor applies a ceiling against a per-developer file\nnobody reviews. There is nothing to clamp here: naming a team buys this job no more of\nanything the daemon pays for, because what a team spends is checkouts, and every checkout is\nstill refused by the project's slot count and by the free-disk floor.\n\nWhether the id names a team that exists is NOT checked here, and cannot be: this is a file\nand teams live in the database. `job::start` reads it at the moment the job is made, which is\nthe only moment the answer is current — a rule written last month can name a team deleted\nthis morning, and nothing in between would have said so.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "JudgeConfig": {
+      "additionalProperties": false,
+      "description": "Spec A D7: the judge's thresholds for this project. Both absent means the measured defaults.",
+      "properties": {
+        "allow_at": {
+          "default": null,
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "deny_at": {
+          "default": null,
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "JudgeResolveConfig": {
+      "additionalProperties": false,
+      "description": "Spec B D4: the resolver's thresholds for this project. All absent means 0.85 everywhere.",
+      "properties": {
+        "avoidable_at": {
+          "default": null,
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "fixable_at": {
+          "default": null,
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "needed_at": {
+          "default": null,
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "off_task_at": {
+          "default": null,
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "RepoTrigger": {
+      "additionalProperties": false,
+      "properties": {
+        "branch": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "prompt": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "branch",
+        "prompt"
+      ],
+      "type": "object"
+    },
+    "ScheduleRule": {
+      "additionalProperties": false,
+      "description": "`deny_unknown_fields` on every rule type and on the file itself: without it a typo like\n`schedule:` for `schedules:` parses cleanly into an empty ruleset, and all autonomy for that\nproject silently stops. That direction is fail-closed, which is precisely why nobody notices —\nthe contract this module advertises is \"error on malformed YAML rather than guess\", and a\nmisspelt key is malformed.",
+      "properties": {
+        "at": {
+          "default": null,
+          "description": "One-shot alternative to `cron:`: ISO 8601 with an offset, or a naive\n`YYYY-MM-DDTHH:MM[:SS]` read in `timezone` (UTC when absent). Fires once, at or after the\ninstant (late if the daemon was down), and never again.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "command": {
+          "default": null,
+          "description": "Alternative to `prompt:`: an argv-spawned command, no LLM session. Judged by the\nclassifier before it runs; runs in `cwd` (relative to the project root) or the root.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-widget": "command"
+        },
+        "cron": {
+          "default": "",
+          "description": "Recurring schedule. Empty means the rule is one-shot and carries `at:` instead.",
+          "type": "string",
+          "x-widget": "cron"
+        },
+        "cwd": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "graph": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GraphConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Absent means the rule keeps today's behaviour: one run, one gate. Opt-in per rule."
+        },
+        "name": {
+          "type": "string"
+        },
+        "prompt": {
+          "default": "",
+          "description": "The agent's instruction. Empty means the rule runs `command:` instead.",
+          "type": "string"
+        },
+        "timezone": {
+          "description": "The IANA zone the cron is read in — `Europe/Lisbon`, `America/New_York`.\n\nAbsent means UTC, which is what every rule written before this field already meant, so no\nexisting schedule moves by adding it. It exists because UTC is the one answer that is wrong\ntwice a year for most of the world: `0 8 * * *` is 08:00 local in winter and 09:00 in\nsummer, and the daily task that quietly starts an hour late for half the year is a worse\nfailure than one that never runs, because nothing about it looks broken.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "VerifyGuardMode": {
+      "description": "F2b step 2: what the PreToolUse hook does with a verification command that an unattended\nworktree run executes by itself.\n\n`Observe` only records it (step 1). `Refuse` makes the hook deny it, pointing the run at the\ndaemon's `verify` tool. Absent means `Observe`, and that default is the whole compatibility\nstory: a project that says nothing behaves exactly as before this key existed.",
+      "enum": [
+        "observe",
+        "refuse"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "attention_brake": {
+      "default": null,
+      "description": "Whether a job asks if the owner is at the keyboard before it starts its next node.\n\n`Option`, and the absent case is the brake ON. That is deliberately not the same as\n`Some(true)`: the rules reader returns `AutopilotRules::default()` for a project with\nno rules file at all, and a plain `bool` would have made that derived default `false` — a\nbrake that switched itself off on every project that never configured anything. The zero\nvalue therefore means \"not configured\", and `attention_brake()` below supplies the answer.\n\nOff, `attention::attention_permits_new_run` is never consulted for this project's jobs and\nthey start nodes with the owner watching. That is the point of switching it off — a job is\nnight work and nobody can watch night work happen — and it is also the whole cost: an\nautonomous node may move the worktree under a person who is working in it.",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "command_kinds": {
+      "$ref": "#/$defs/CommandKinds",
+      "default": {
+        "build": [],
+        "check": [],
+        "test": []
+      },
+      "description": "Extra command prefixes this project counts as a test, check or build command. Absent means\nonly the compiled defaults in `governance::command_kind`."
+    },
+    "gate_after_land": {
+      "default": false,
+      "description": "Whether the daemon runs the full gate on the target after a merge lands (spec\n2026-10-05 §6.1). Off by default — a project that says nothing behaves exactly as before\nthis key existed. Read by the post-merge worker (`verify_postgate_worker`) and by\n`git_exec::gate_the_merge`, which decides what the gate before publish measures once this is\non. Turning it on is the owner's decision (F3-8).",
+      "type": "boolean"
+    },
+    "gate_before_publish": {
+      "default": false,
+      "description": "Whether the VCS queue measures a merge before it publishes it.\n\n**Off by default, and the default is the whole of the compatibility story**: a repository\nthat says nothing lands exactly as it landed before this key existed. `deny_unknown_fields`\nabove is what makes the opposite true too — a project that MEANT to switch this on and\nmisspelled it gets a startup error rather than a queue that quietly went on publishing\nunmeasured.\n\nOn, the queue runs `gate_command` against the COMPUTED merge — the commit `compute_merge`\nleft in the integration worktree, which is what the target branch is about to become — and\npublishes only if it agrees. Nothing is ever reverted, because nothing is published until\nthe measurement agrees.\n\nIt costs the gate's own wall clock per merge, and it costs it while holding that\nrepository's queue. What that lengthens is the time until a branch appears on the target,\nand not anybody's prompt: `--land` prints a ticket and returns without waiting, and always\ndid.\n\nSetting this without a `gate_command` is refused rather than ignored — see\n`git_exec::gate_the_merge`, which is the only reader.",
+      "type": "boolean"
+    },
+    "gate_command": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ],
+      "x-widget": "command"
+    },
+    "health_breach_intent": {
+      "default": false,
+      "description": "Whether a breached health readout should be written as a new intent record.\n\n**Absent and off by default**: a repository that says nothing behaves exactly as it did\nbefore this key existed. `deny_unknown_fields` above means a misspelling is a startup error,\nrather than a silently ignored line.\n\nTurning this on records the breach as a line in the project's feed for an operator to\nreview; it does not enqueue a job, start a run, or touch the approval queue. The\n`schedules` and `repo_triggers` lists stay empty because the file's own doctrine is\n\"Creating this file must not start anything\"; this key does not overrule that doctrine.",
+      "type": "boolean"
+    },
+    "judge": {
+      "$ref": "#/$defs/JudgeConfig",
+      "default": {
+        "allow_at": null,
+        "deny_at": null
+      },
+      "description": "Spec A D7: `judge: { allow_at, deny_at }`. Read through `judge_thresholds()` only, for the\nreason `gate_retries()` gives: a caller reading the raw numbers would honour a loosening\nthe daemon promises never to honour."
+    },
+    "judge_resolve": {
+      "$ref": "#/$defs/JudgeResolveConfig",
+      "default": {
+        "avoidable_at": null,
+        "fixable_at": null,
+        "needed_at": null,
+        "off_task_at": null
+      },
+      "description": "Spec B D4: read through `resolve_thresholds()` only, for the reason `judge_thresholds()`\ngives: a caller reading the raw numbers would honour a loosening the daemon never honours."
+    },
+    "max_turns": {
+      "default": null,
+      "description": "How many turns one autonomous run of this project's work may take before it is stopped.\n\n**Absent means [`crate::execution::runner::DEFAULT_MAX_TURNS`]**, which is what every project\ngot before this key existed and what every project that says nothing still gets. The ceiling\nitself is not new; being able to say it per project is.\n\nIt exists because the ceiling is a house rule about runaway runs, while whether a given\nproject's work FITS under it is a fact about that project's tasks. A repository whose items\nare routinely large was choosing between a ceiling too low to finish and no brake at all,\nbecause the only dial was a constant shared by every run on the machine.\n\n**Raising it is not free and is not a fix for an item that is too big.** A run's cost grows\nwith the square of its length, because every turn re-reads the whole window, so a doubled\nceiling buys a run that may still fail, later and for more. The reason to raise it is that\nthe work genuinely needs the turns; the reason not to is that the plan should have been\nsmaller.\n\nRefused rather than clamped when it is not positive: see [`validate_rules`].",
+      "format": "int64",
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "postgate_idle_command": {
+      "default": null,
+      "description": "A command the post-merge worker asks before it starts a new batch gate: exit 0 means the\nmachine is idle; any other answer (another exit code, a failure to start, a timeout) means\nbusy and the gate waits. Off by default (absent never holds). Example:\n`python scripts/heavy.py idle`. Turning it on is the owner's decision; nothing in the\ndaemon sets it.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "postgate_min_interval_mins": {
+      "default": 0,
+      "description": "Minimum minutes between the starts of two post-merge batch gates on one target. Off by\ndefault (0 never holds): a project that says nothing behaves exactly as before this key\nexisted. It holds only the start of a NEW batch gate, so merges that land meanwhile join one\nlater gate; a recheck, a bisection and a revert are never held. Turning it on is the\nowner's decision; nothing in the daemon sets it.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "repo_triggers": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/RepoTrigger"
+      },
+      "type": "array"
+    },
+    "revert_on_red": {
+      "default": false,
+      "description": "Whether the daemon reverts a merge the post-merge gate bisected to a confirmed culprit\n(spec 2026-10-05 §6.2, D4). Off by default — a project that says nothing behaves exactly as\nbefore this key existed. The post-merge worker reads it only when `gate_after_land` is on as\nwell, since without that gate there is no culprit. Turning it on is the owner's decision\n(F3-8); nothing in the daemon sets it.",
+      "type": "boolean"
+    },
+    "schedules": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/ScheduleRule"
+      },
+      "type": "array"
+    },
+    "scoped_final_gate": {
+      "default": false,
+      "description": "Whether the last item of a job and a run's final gate are measured by `verify scope` over\ntheir diff instead of the full gate. Off by default. Read through `scoped_final()` only: it\nhas an effect only together with `gate_after_land`, which measures the whole target after\nlanding and is the net behind a partial measurement. Turning it on is the owner's decision\n(F3-8); nothing in the daemon sets it.",
+      "type": "boolean"
+    },
+    "verify_disk_cap_gb": {
+      "default": null,
+      "description": "This project's ceiling, in GB, on the warm state the verify executor keeps for it. Absent\nmeans the executor's own default.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "verify_guard": {
+      "$ref": "#/$defs/VerifyGuardMode",
+      "default": "observe",
+      "description": "Whether the hook refuses a verification command a worktree run runs by itself. Absent is\n`observe`. Its only reader is `hooks::observe_verification`."
+    }
+  },
+  "title": "AutopilotRules",
+  "type": "object"
+}

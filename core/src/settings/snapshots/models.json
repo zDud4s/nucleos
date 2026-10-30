@@ -1,0 +1,262 @@
+{
+  "$defs": {
+    "AssistantChoice": {
+      "description": "One row of the conversation's model picker.",
+      "properties": {
+        "brain": {
+          "description": "Which route answers this choice: `cloud` or `local`.\n\nCarried on the choice rather than inferred from the id, so picking a model sets the route\ntoo and the two cannot come apart. A `chats` row saying `local` while naming a cloud model\nwould go to Ollama and hand it a name it has never heard.",
+          "type": "string"
+        },
+        "efforts": {
+          "default": [],
+          "description": "The effort levels THIS model takes, weakest first. Empty means it has no dial.\n\nPer model and not one list for all of them, because they genuinely differ: at the time of\nwriting `gpt-5.6-terra` takes an `ultra` that `gpt-5.5` does not, and `gpt-5.5` stops at\n`xhigh` where `gpt-5.6-luna` goes to `max`. A single global list would offer every model the\nunion, and the ones that do not take the top of it would die at spawn.\n\nIt also subsumes the boolean this replaced: empty is exactly \"no dial\", which is what a\nlocal model has, and the window reads the list rather than testing `brain == \"cloud\"`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "id": {
+          "description": "What goes to `--model`, verbatim. An alias or a full name; the CLI accepts both.",
+          "type": "string",
+          "x-widget": "model-picker"
+        },
+        "installed": {
+          "default": null,
+          "description": "Whether this machine has this LOCAL model pulled, or `None` when the question does not\napply — which is every route but `local`.\n\n`Option<bool>` for a different reason than `tools` above: there, `None` means nobody asked;\nhere it means the question is meaningless. A cloud choice runs in somebody else's data\ncentre and a hosted one is fetched over HTTP, so neither is \"installed\" or \"not installed\",\nand answering `Some(false)` for them would put a warning on most of the menu — the exact\nfailure `tools`'s own doc argues against.\n\nFilled by `catalogue_with_installed` out of the `/api/tags` list its caller already read;\nnever probed from here, for the reason that function's own doc gives.\n\n`#[serde(default)]` for the same reason `tools` carries one, and it matters more here: a\n`brain: local` row written into `~/.nucleos/nucleos-models.yaml` by hand names the model and\nnothing else, because whether it is pulled is not a fact a config file can assert.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "label": {
+          "description": "What the window shows. Separate from `id` because the useful name and the accepted name are\nnot the same string — `sonnet` is what the CLI takes and \"Sonnet\" is what a person reads.",
+          "type": "string"
+        },
+        "runner": {
+          "default": null,
+          "description": "Which agent CLI runs this model: `claude` or `codex`. Absent means `claude`.\n\nA second axis from `brain`, not a finer grain of it. `brain` says whether the turn goes to\nOllama or to a CLI; this says WHICH CLI — and they are independent, because the local route\nis the same either way. Carried so one config file can hold both lists and the daemon shows\nthe one belonging to the runner it was actually started with.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tools": {
+          "default": null,
+          "description": "Whether this model declares tool calling, or `None` when nothing here knows.\n\n`Option<bool>` and not `bool`: \"declares no tools\" and \"we have not asked\" are different\nfacts and only one of them is worth warning somebody about. Filled by `marked_with`, which\nnever guesses — a choice absent from that function's map keeps `None`, never `Some(false)`.\n\n`#[serde(default)]` is required, not decoration: `AssistantChoice` is `Deserialize` and is\nread from `~/.nucleos/nucleos-models.yaml`'s `assistant_choices`, so without it every existing\nconfig file on disk — written before this field existed — stops parsing.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "brain"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "assistant_choices": {
+      "default": [
+        {
+          "brain": "cloud",
+          "efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "id": "opus",
+          "installed": null,
+          "label": "Opus",
+          "runner": null,
+          "tools": null
+        },
+        {
+          "brain": "cloud",
+          "efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "id": "sonnet",
+          "installed": null,
+          "label": "Sonnet",
+          "runner": null,
+          "tools": null
+        },
+        {
+          "brain": "cloud",
+          "efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "id": "fable",
+          "installed": null,
+          "label": "Fable",
+          "runner": null,
+          "tools": null
+        }
+      ],
+      "description": "The models a conversation may be moved to, in the order the window offers them.\n\nA list here rather than a list in the window, because the window cannot know it. The agent\nCLI has no `--list-models` (2.1.198) and nothing else enumerates them either, so any list is\nsomebody's assertion — and an assertion written into the UI goes stale where nobody who can\nfix it will see it. Written here, it is next to the model names this daemon already pins.\n\nThe default names ALIASES and not versions. `sonnet` is whatever the CLI currently resolves\nSonnet to; `claude-sonnet-5` is a specific model that stops existing. A picker built out of\nversions is a picker that has to be edited every time Anthropic ships, which is the exact\nstaleness this key exists to avoid — so pinning is available to whoever wants it, and is not\nwhat an untouched install does.\n\nCloud only. The local entry is not written here because it is not a choice: it is whatever\n`local_assistant_model` names, and a second place to say it is a second place to disagree.\n`catalogue` joins the two.",
+      "items": {
+        "$ref": "#/$defs/AssistantChoice"
+      },
+      "type": "array"
+    },
+    "auto_refresh_prices": {
+      "default": true,
+      "description": "Whether the daemon refreshes `prices_as_of` and `model_prices` by itself: when they go stale,\nand when the devtime page meets a model it has no price for. Absent means `true`.\n\nThe refresh reads two public pages (Anthropic's pricing page and OpenRouter's model\ncatalogue) and sends nothing about the user, their models or their usage. `false` stops the\nbackground refresh only; the \"refresh prices\" button still runs, because pressing it is\nasking for exactly that.",
+      "type": "boolean"
+    },
+    "claude_model": {
+      "type": "string",
+      "x-widget": "model-picker"
+    },
+    "codex_model": {
+      "type": "string",
+      "x-widget": "model-picker"
+    },
+    "embedding_model": {
+      "default": "nomic-embed-text",
+      "description": "The Ollama model that embeds knowledge rows (spec 5.4, D6). Embeddings are always local:\nno text of a project leaves the machine for this.",
+      "type": "string"
+    },
+    "hosted_assistant_model": {
+      "default": null,
+      "description": "Which model a hosted chat turn is sent to over OpenRouter — `openai_compatible.rs`'s\n`OpenAiCompatibleChat`, the second `LocalChat` implementation beside `runner::OllamaChat`. Not the\nhosted route's alone: since `local_engine` below, the model `local_assistant_model` names\nis answered by one or the other of the same two, so what distinguishes this key is the\nendpoint and the key it needs, never which client it ends up holding.\n\nShip-dark, on exactly the posture `local_assistant_model` already carries: absent, nothing\nabout a conversation's behaviour changes, and a chat row that somehow already says\n`openrouter` is refused (`assistant::NO_HOSTED_MODEL`) rather than answered by the cloud CLI\non the strength of this field never having been read. Naming a model here is what an\noperator does once they have also put a key in the OS credential store — this field alone\ngets a conversation no further, since `OpenAiCompatibleChat::new` still refuses without one.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "local_assistant_model": {
+      "default": null,
+      "description": "Absent leaves chat turns from the Telegram sidecar answered by the cloud CLI, exactly as they\nare today. Naming a model here is what moves them onto this machine.\n\nShip-dark like `local_triage_model` and `primary_runner`, and here it matters more than for\neither: this key changes the behaviour of a channel already in daily use, so an upgrade must\nchange nothing at all until somebody asks for it by name.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "local_base_url": {
+      "default": null,
+      "description": "Where that server listens. Loopback only.\n\nAbsent resolves to `runner::OLLAMA_BASE_URL` for the ollama engine — the address the runner\nalready uses, read from its constant so the two cannot drift — and is REFUSED for `openai_compatible`,\nbecause no port may be guessed. An `openai_compatible` engine quietly resolved onto Ollama's own\n`11434` would post a turn's contents — mail, a transcript, a repository — to whatever\nprogram happens to be listening there, under a file that named no address at all.\n\nWhatever is written here is checked by `is_loopback_url` before it is used. `Brain::Local`'s\npromise is that a local turn never leaves this machine, and one line in a config file must\nnot be able to turn that into \"whatever address the file says\": an off-machine URL earns\n`LocalEngineRefusal::NotLoopback` and the route leaves the menu with it, rather than being\noffered and then refusing every turn it is picked for.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "local_context_tokens": {
+      "default": null,
+      "description": "The context window this local server serves, DECLARED here because for one of the two\nengines nothing can discover it: Ollama answers `/api/show`, and an OpenAI-compatible\n`/v1/models` states no window at all.\n\nAbsent stays `None` and nothing invents a number. A guessed window is not a harmless default\n— it is a figure the daemon would then act on when deciding what fits in a turn — which is\nthe argument `AssistantChoice::tools` makes for never marking `Some(false)` on a guess,\narriving here as a count instead of a flag.",
+      "format": "uint",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "local_engine": {
+      "default": null,
+      "description": "Which local server answers a local turn: `ollama`, or `openai_compatible` for any OpenAI-compatible\nserver running on this machine (llama.cpp, LM Studio, vLLM).\n\nAbsent means `ollama`, which is the ship-dark posture `local_assistant_model` and\n`primary_runner` already carry, arriving through the one key where absence is not merely\n\"unarmed\" but \"the engine this machine has always used\": every `~/.nucleos/nucleos-models.yaml` on\ndisk was written before this key existed and names none of them, so absence has to resolve\nto exactly today's behaviour or a file that worked this morning refuses this afternoon.\n\nA name this daemon does not serve is REFUSED rather than fallen back to Ollama, and that is\nthe one place this key parts from `primary_runner` above. There, falling back keeps the\nproven path a typo was never trying to leave. Here, a mistyped `openai_compatible` would keep sending\nturns to the very server the operator wrote this line to stop using — and the silence about\nit, not the typo, is the failure.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "local_triage_model": {
+      "default": null,
+      "description": "Absent keeps the established CLI path active, which lets local triage ship dark until an\noperator explicitly names a model that can keep message bodies on the machine.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "x-widget": "model-picker"
+    },
+    "model_prices": {
+      "default": null,
+      "description": "`model_prices` exactly as the file wrote it, any shape. Read as a bare YAML value so that a\nwrong type in one price cannot fail the whole file: model routing must not depend on it\n(owner, 2026-10-18). Emptied by [`parse_models_config`] once converted.\n`pub` only because the daemon binary builds this struct with `..Default::default()`."
+    },
+    "plan_model": {
+      "default": null,
+      "description": "Where a job's `plan` stage runs. Absent keeps it on `claude_model`, so a file written before\nthis key existed routes nothing anywhere.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "x-widget": "model-picker"
+    },
+    "prices_as_of": {
+      "default": null,
+      "description": "When the vendors' price pages were last read (`YYYY-MM-DD`), or `None` when they never have\nbeen. Written by the daemon's own price refresh ([`crate::price_refresh`]), the only writer\nof the price block since `scripts/refresh-models.py` stopped writing it. Shown beside every\nestimated cost so its age is visible (spec devtime §4.4).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "primary_runner": {
+      "default": null,
+      "description": "Which agent CLI answers a run. Absent — or naming anything startup does not recognise — keeps\nthe proven Claude path, so the second runner ships dark until an operator asks for it by\nname, the same posture `local_triage_model` gives local inference.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "resolve_effort": {
+      "default": null,
+      "description": "The reasoning effort a conflict resolution is launched with. Absent sends no `--effort`, so\nthe CLI keeps its own default — exactly what every resolution got before this key existed.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "resolve_model": {
+      "default": null,
+      "description": "Where the queue's conflict resolution runs (`resolver.rs`), on the same absent-means-unrouted\nposture as `plan_model`: absent keeps it on `claude_model`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "review_model": {
+      "default": null,
+      "description": "Where a job's `review` stage runs, on the same absent-means-unrouted posture as `plan_model`.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "x-widget": "model-picker"
+    },
+    "utility_model": {
+      "default": null,
+      "description": "The cheap model background one-shots (the rotation compactor) ask the runner for. Absent\npicks the active runner's own default (`model_catalog::utility_default`), so a file written\nbefore this key existed keeps working and a Codex machine is never sent a Claude alias.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "voice_cleanup_model": {
+      "default": null,
+      "description": "Absent leaves voice cleanup unarmed, so a transcript is delivered raw rather than not at all.\nNamed here rather than in `~/.nucleos/voice.yaml` because pinning models is this file's whole job.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "claude_model",
+    "codex_model"
+  ],
+  "title": "ModelsConfig",
+  "type": "object"
+}

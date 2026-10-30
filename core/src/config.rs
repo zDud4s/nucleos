@@ -23,12 +23,13 @@ pub use self::voice::*;
 /// misspelt key is malformed.
 // `PartialEq` without `Eq`: `GraphConfig` carries an `Option<f64>` now, and floats are not `Eq`.
 // Nothing outside this module ever needed the total equality.
-#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ScheduleRule {
     pub name: String,
     /// Recurring schedule. Empty means the rule is one-shot and carries `at:` instead.
     #[serde(default)]
+    #[schemars(extend("x-widget" = "cron"))]
     pub cron: String,
     /// The agent's instruction. Empty means the rule runs `command:` instead.
     #[serde(default)]
@@ -42,6 +43,7 @@ pub struct ScheduleRule {
     /// Alternative to `prompt:`: an argv-spawned command, no LLM session. Judged by the
     /// classifier before it runs; runs in `cwd` (relative to the project root) or the root.
     #[serde(default)]
+    #[schemars(extend("x-widget" = "command"))]
     pub command: Option<String>,
     /// The IANA zone the cron is read in — `Europe/Lisbon`, `America/New_York`.
     ///
@@ -158,7 +160,7 @@ fn default_true() -> bool {
 /// Turns one scheduled rule into a job: a sequence of runs over one shared worktree, rather than a
 /// single run capped by one context window.
 // `PartialEq` without `Eq`: `budget_usd` is an `Option<f64>`, and floats have no total equality.
-#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct GraphConfig {
     #[serde(default = "default_max_items")]
@@ -225,7 +227,7 @@ impl GraphConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RepoTrigger {
     pub name: String,
@@ -234,7 +236,7 @@ pub struct RepoTrigger {
 }
 
 /// Spec A D7: the judge's thresholds for this project. Both absent means the measured defaults.
-#[derive(Debug, Clone, Default, Deserialize, serde::Serialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct JudgeConfig {
     #[serde(default)]
@@ -244,7 +246,7 @@ pub struct JudgeConfig {
 }
 
 /// Spec B D4: the resolver's thresholds for this project. All absent means 0.85 everywhere.
-#[derive(Debug, Clone, Default, Deserialize, serde::Serialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct JudgeResolveConfig {
     #[serde(default)]
@@ -263,7 +265,9 @@ pub struct JudgeResolveConfig {
 /// `Observe` only records it (step 1). `Refuse` makes the hook deny it, pointing the run at the
 /// daemon's `verify` tool. Absent means `Observe`, and that default is the whole compatibility
 /// story: a project that says nothing behaves exactly as before this key existed.
-#[derive(Debug, Clone, Copy, Default, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Copy, Default, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq, Eq,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum VerifyGuardMode {
     #[default]
@@ -272,7 +276,7 @@ pub enum VerifyGuardMode {
 }
 
 // `PartialEq` without `Eq`, transitively: a `ScheduleRule`'s `graph:` block holds a float now.
-#[derive(Debug, Clone, Default, Deserialize, serde::Serialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AutopilotRules {
     #[serde(default)]
@@ -280,6 +284,7 @@ pub struct AutopilotRules {
     #[serde(default)]
     pub repo_triggers: Vec<RepoTrigger>,
     #[serde(default)]
+    #[schemars(extend("x-widget" = "command"))]
     pub gate_command: Option<String>,
     /// How many turns one autonomous run of this project's work may take before it is stopped.
     ///
@@ -409,7 +414,7 @@ pub struct AutopilotRules {
 
 /// The `command_kinds:` key. Absent means only the compiled defaults; each entry is a command
 /// prefix matched like a project shell rule.
-#[derive(Debug, Clone, Default, Deserialize, serde::Serialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct CommandKinds {
     #[serde(default)]

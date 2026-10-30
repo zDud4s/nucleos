@@ -408,20 +408,22 @@ pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
 /// That is the canvas's question and it is the right place for it: an overlay row for a node a
 /// newer bundle removed is information — it is how somebody learns their override stopped applying
 /// — and refusing to load the pin over it would take the whole workflow away instead.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct NodeOverlay {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-widget" = "model-picker"))]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-widget" = "command"))]
     pub command: Option<String>,
 }
 
 /// One workflow this project uses, as its `workflows.yaml` records it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Pin {
     pub name: String,
     pub version: String,
@@ -447,7 +449,7 @@ pub struct Pin {
     pub nodes: BTreeMap<String, NodeOverlay>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Pins {
     #[serde(default)]
     pub workflows: Vec<Pin>,

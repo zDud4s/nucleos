@@ -4552,6 +4552,66 @@ mod tests {
         }
     }
 
+    /// A settings document holds shortcuts, accounts and gate commands, so `/settings*` is the owner's, reads
+    /// included. Safe today by being in no table; this is what says no to filing the reads beside the others.
+    #[test]
+    fn settings_routes_are_in_no_scope_table() {
+        let routes: [(Method, &str, &str); 6] = [
+            (Method::GET, "/settings", "/settings"),
+            (
+                Method::GET,
+                "/settings/{scope}/{name}",
+                "/settings/machine/verify",
+            ),
+            (
+                Method::PUT,
+                "/settings/{scope}/{name}",
+                "/settings/machine/verify",
+            ),
+            (
+                Method::GET,
+                "/settings/{scope}/{name}/history",
+                "/settings/machine/verify/history",
+            ),
+            (
+                Method::POST,
+                "/settings/{scope}/{name}/rollback/{version}",
+                "/settings/machine/verify/rollback/2",
+            ),
+            (
+                Method::GET,
+                "/settings/{scope}/{name}",
+                "/settings/project:p1/autopilot",
+            ),
+        ];
+        for (method, pattern, path) in &routes {
+            assert!(
+                !route_is_listed(READ_ONLY_ROUTES, method, pattern)
+                    && !route_is_listed(RUN_CREATING_ROUTES, method, pattern)
+                    && !route_is_listed(TEAM_ROUTES, method, pattern)
+                    && !route_is_listed(EMAIL_ROUTES, method, pattern)
+                    && !route_is_listed(COUNCIL_ROUTES, method, pattern),
+                "{method} {pattern} must stay out of every scope table"
+            );
+            for scope in [
+                Scope::Run(7),
+                Scope::ApiToken(ApiTokenLevel::ReadOnly),
+                Scope::ApiToken(ApiTokenLevel::RunCreating),
+            ] {
+                assert!(
+                    !permits(&scope, method, path),
+                    "{scope:?} must not reach {method} {path}"
+                );
+            }
+            for scope in [Scope::ApiToken(ApiTokenLevel::Admin), Scope::Control] {
+                assert!(
+                    permits(&scope, method, path),
+                    "{scope:?} must reach {method} {path}"
+                );
+            }
+        }
+    }
+
     /// The live view of a browser session is pixels of a page the agent is driving, so it is the
     /// owner's to watch and nobody else's. Safe today by being in no table; this is what says no to
     /// filing it beside the other `/browser/...` reads (spec browser-ao-vivo).
