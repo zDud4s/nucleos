@@ -68,12 +68,14 @@ owns:
   # agents of its own under the same directory) ---------------------------------------------------
   - .claude/agents/wf-bootstrap.md
   - .claude/agents/wf-executor.md
+  - .claude/agents/wf-leaf.md
   - .claude/agents/wf-maintenance.md
   - .claude/agents/wf-orchestrator.md
   - .claude/agents/wf-planner.md
   - .claude/agents/wf-rescue.md
   - .claude/agents/wf-reviewer.md
   - .claude/agents/wf-synthesizer.md
+  - .claude/agents/wf-tree-orchestrator.md
 
   # ---- the Codex-controller mirror of the skills above, one directory per skill -----------------
   - .agents/skills/bootstrap/

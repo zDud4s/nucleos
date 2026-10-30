@@ -215,23 +215,40 @@ def prompt_context(payload: dict) -> str | None:
 
 def start(argv: list[str]) -> int:
     session = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    name = None
+    rest: list[str] = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--name" and i + 1 < len(argv):
+            name = argv[i + 1]
+            i += 2
+        else:
+            rest.append(argv[i])
+            i += 1
+    argv = rest
     if not argv or not session:
-        print("usage: spec_loop.py start <spec-path> [\"item\" ...]  (needs CLAUDE_CODE_SESSION_ID)",
-              file=sys.stderr)
+        print("usage: spec_loop.py start [--name <id>] <spec-path> [\"item\" ...]  "
+              "(needs CLAUDE_CODE_SESSION_ID)", file=sys.stderr)
         return 2
+    name = name or os.environ.get("NUCLEOS_LOOP_NAME") or session
     try:
         loops = nucleos_paths.state_dir() / "loops"
     except nucleos_paths.ProjectNotFound as exc:
         print(f"spec loop: {exc}", file=sys.stderr)
         return 2
-    path = loop_path(loops, session)
+    path = loop_path(loops, name)
     if path.exists():
+        m = re.search(r"^session:\s*(\S+)", path.read_text(encoding="utf-8"), re.MULTILINE)
+        if m and m.group(1) != session:
+            print(f"spec loop '{name}' is owned by another session ({m.group(1)}); "
+                  "pick a different --name", file=sys.stderr)
+            return 2
         print(f"spec loop already open: {path}")
         return 0
     path.parent.mkdir(parents=True, exist_ok=True)
     items = "\n".join(f"- [ ] {i}" for i in argv[1:])
     path.write_text(
-        f"# Spec loop\nspec: {argv[0]}\nstatus: active\n"
+        f"# Spec loop\nspec: {argv[0]}\nsession: {session}\nstatus: active\n"
         "<!-- active | blocked (needs a [!] item) | handoff (context ceiling) | done -->\n\n"
         f"## Items\n{items}\n", encoding="utf-8")
     print(f"spec loop opened: {path}")

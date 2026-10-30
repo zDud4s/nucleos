@@ -169,5 +169,47 @@ class AssemblePrompt(unittest.TestCase):
         self.assertIn("requires `prior_artifacts`", r.stderr)
 
 
+class TreePhases(unittest.TestCase):
+    """The tree_leaf / tree_orchestrate model-routing phases and their cockpits."""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("assemble_prompt_mod", SCRIPT)
+        cls.mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.mod)
+        cls.contract = (BUNDLE / ".nucleos" / "workflow" / "prompt-contract.yaml").read_text(encoding="utf-8")
+
+    def _block(self, phase):
+        lines = self.contract.splitlines()
+        start = next((i for i, l in enumerate(lines) if l == f"  {phase}:"), None)
+        self.assertIsNotNone(start, f"no `{phase}` block in prompt-contract.yaml")
+        out = []
+        for l in lines[start + 1:]:
+            if l.startswith("    "):
+                out.append(l.strip())
+            elif l.strip() and not l.strip().startswith("#"):
+                break
+        return out
+
+    def test_tree_leaf_maps_to_the_wf_leaf_cockpit(self):
+        self.assertEqual(self.mod.PHASE_COCKPIT.get("tree_leaf"), "wf-leaf")
+
+    def test_tree_orchestrate_maps_to_the_wf_tree_orchestrator_cockpit(self):
+        self.assertEqual(self.mod.PHASE_COCKPIT.get("tree_orchestrate"), "wf-tree-orchestrator")
+
+    def test_tree_phases_have_a_skill_mapping(self):
+        self.assertIn("tree_leaf", self.mod.PHASE_SKILL)
+        self.assertIn("tree_orchestrate", self.mod.PHASE_SKILL)
+
+    def test_contract_has_a_block_for_tree_leaf(self):
+        block = self._block("tree_leaf")
+        self.assertTrue(any(l.startswith("allowed:") for l in block), block)
+        self.assertTrue(any(l.startswith("required:") for l in block), block)
+
+    def test_contract_has_a_block_for_tree_orchestrate_like_orchestrate_node(self):
+        self.assertEqual(self._block("tree_orchestrate"), self._block("orchestrate_node"))
+
+
 if __name__ == "__main__":
     unittest.main()

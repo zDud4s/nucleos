@@ -57,6 +57,27 @@ def load_nodes(path):
         root_id = roots[0]
     return root_id, flat
 
+def _load_nodes_from(path):
+    """--nodes-from: a file path, or `-` for the node_tree JSON on stdin."""
+    if path != "-":
+        return load_nodes(path)
+    try:
+        data = sys.stdin.buffer.read().decode("utf-8")
+    except (OSError, ValueError) as exc:
+        raise TreeError(f"cannot read the node_tree JSON from stdin: {exc}")
+    import os
+    import tempfile
+
+    fd, tmp = tempfile.mkstemp(suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(data)
+        return load_nodes(tmp)
+    except TreeError as exc:
+        raise TreeError(str(exc).replace(tmp, "<stdin>"))
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
 def attach_owned(nodes, owned_file):
     """Fill `owned_paths` of nodes that lack it from the controller's --owned file.
 
@@ -212,9 +233,18 @@ def classify(entries, node_id, declared, nodes, subtree, branch_node, recorded=f
     both can be charged for a foreign write.
     """
     by_id = {n["id"]: n for n in nodes}
+    if node_id in subtree:
+        candidates = subtree
+    else:
+        # A correction leaf hung on the root after the branch node closed: the branch's own
+        # leaves are finished, so only root-level leaves compete for the diff.
+        root_ids = {n["id"] for n in nodes if not n.get("parent_id")}
+        candidates = {
+            n["id"] for n in nodes if n.get("parent_id") in root_ids
+        } | {node_id}
     live = [
         by_id[i]
-        for i in subtree
+        for i in candidates
         if by_id[i].get("kind") == "leaf"
         and (
             i == node_id
@@ -347,14 +377,22 @@ def _invalid(manifest, root_id, branch, node_id, text, error, report_path, runni
 def run_record(args):
     """record <node_id> --branch B --nodes FILE [--report-file F] [--owned FILE]."""
     node_id = args.node_id
-    root_id, nodes = load_nodes(args.nodes)
+    nodes_from = getattr(args, "nodes_from", None)
+    source = args.nodes
+    if source is None and nodes_from is None:
+        raise TreeError("record needs --nodes or --nodes-from")
+    if source is None:
+        source = nodes_from
+        if nodes_from == "-":
+            source = "<stdin>"
+    root_id, nodes = load_nodes(args.nodes) if args.nodes is not None else _load_nodes_from(nodes_from)
     attach_owned(nodes, getattr(args, "owned", None))
     by_id = {n["id"]: n for n in nodes}
     if node_id not in by_id:
-        raise TreeError(f"node {node_id} is not in {args.nodes}")
+        raise TreeError(f"node {node_id} is not in {source}")
     tree_id = tree_state.resolve_tree_id(args)
     if tree_id != root_id:
-        raise TreeError(f"tree {tree_id!r} is not the root {root_id!r} of {args.nodes}")
+        raise TreeError(f"tree {tree_id!r} is not the root {root_id!r} of {source}")
 
     manifest = tree_state.load_manifest(root_id)
     branch = tree_state.get_branch(manifest, args.branch)
@@ -362,10 +400,17 @@ def run_record(args):
     if not worktree or not branch_node:
         raise TreeError(f"branch {args.branch} has no worktree or no node_id yet")
     if branch_node not in by_id:
-        raise TreeError(f"the branch node {branch_node} is not in {args.nodes}")
+        raise TreeError(f"the branch node {branch_node} is not in {source}")
     subtree = subtree_ids(nodes, branch_node)
     if node_id not in subtree:
-        raise TreeError(f"node {node_id} is not under the branch node {branch_node}")
+        node = by_id[node_id]
+        correction = (
+            node.get("kind") == "leaf"
+            and node.get("parent_id") == root_id
+            and by_id[branch_node].get("status") != "running"
+        )
+        if not correction:
+            raise TreeError(f"node {node_id} is not under the branch node {branch_node}")
 
     report_path = tree_state.handoff_file(root_id, node_id)
     # A leaf that closed itself (direct launch) must not get a second node_close.
@@ -423,8 +468,14 @@ def add_arguments(parser):
     parser.add_argument("--branch", required=True, help="branch name in the tree manifest")
     parser.add_argument(
         "--nodes",
-        required=True,
+        default=None,
         help="JSON file with the mcp node_tree output for the root (a list or a tree also works)",
+    )
+    parser.add_argument(
+        "--nodes-from",
+        dest="nodes_from",
+        default=None,
+        help="like --nodes, but `-` reads the node_tree JSON from stdin",
     )
     parser.add_argument(
         "--report-file", default=None, help="read the report from this file instead of stdin"
