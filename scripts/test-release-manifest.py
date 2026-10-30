@@ -213,8 +213,10 @@ def releasing_documents_the_identifier_change():
     rest = text[heading.end() :]
     # The section ends at the next heading of the same or a higher level.
     nxt = re.search(rf"^#{{1,{len(heading.group(1))}}}[ \t]+\S", rest, re.M)
-    section = (rest[: nxt.start()] if nxt else rest).lower()
+    # The title line is part of the section: it carries the identifier arrow.
+    section = (heading.group(0) + (rest[: nxt.start()] if nxt else rest)).lower()
     for needle in (
+        "com.pc-multimedia.shell -> com.nucleos.app",
         "com.pc-multimedia.shell",
         "com.nucleos.app",
         "microphone",

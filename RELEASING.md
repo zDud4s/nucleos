@@ -89,18 +89,21 @@ the escape is `NUCLEOS_ALLOW_DIRECT_GIT=1 git push origin vX.Y.Z`.
 macOS minutes bill at ten times while the repository is private, which is why this workflow runs
 only on a tag.
 
-## Identifier change
+## Identifier change (com.pc-multimedia.shell -> com.nucleos.app)
 
-The app identifier changed from `com.nucleos.app` to `com.pc-multimedia.shell`, so every OS sees
-a new app rather than an update of the old one.
+The bundle identifier changed from `com.pc-multimedia.shell` to `com.nucleos.app`, so every OS
+sees a new app rather than an update of the old one. What users see:
 
 - **macOS:** the microphone and accessibility permissions (TCC) are tied to the identifier, so
-  they must be granted again. The keychain entries (stored secrets) and the app data directories
-  kept under `com.nucleos.app` are not migrated automatically.
-- **Linux:** the `.deb` and `.rpm` packages are installed by the system package manager, and the
-  in-app updater does not replace them; a system-package install only shows an update notice.
-  Secrets stored through the Secret Service need `gnome-keyring` (or another Secret Service
-  provider) running.
+  they must be granted again, once; macOS cannot migrate them. The self-signed certificate is
+  unchanged. The keychain entries (stored secrets) are not migrated automatically.
+- **All platforms:** the app data folders (config, WebView profile) are copied once on first
+  launch. The old folders are left in place and may be deleted by hand.
+- **Linux:** the release carries a `.rpm` asset next to the `.deb`; both packages `Recommends`
+  `gnome-keyring`. The `.deb` and `.rpm` are installed by the system package manager, and the
+  in-app updater does not replace them: a system-package install is updated with the package
+  manager, and the app only shows an update notice. Secrets stored through the Secret Service need
+  `gnome-keyring` (or another Secret Service provider) running.
 - **Windows:** the installer treats it as a new app. The NSIS pre-install hook still stops the
   daemon before installing.
 

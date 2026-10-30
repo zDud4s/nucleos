@@ -140,8 +140,15 @@ jobs:
       - name: Install gh and the tools the smoke script needs
         run: |
           if command -v apt-get >/dev/null 2>&1; then
+            # gh is not in the stock Ubuntu 22.04 repositories: use GitHub's official apt repository.
             apt-get update -y
-            apt-get install -y curl git gh ca-certificates
+            apt-get install -y curl git ca-certificates gpg
+            mkdir -p -m 755 /etc/apt/keyrings
+            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /etc/apt/keyrings/githubcli-archive-keyring.gpg
+            chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list
+            apt-get update -y
+            apt-get install -y gh
           else
             dnf install -y curl git gh
           fi
