@@ -328,6 +328,139 @@ describe("SettingsForm", () => {
   });
 });
 
+describe("SettingsForm, history", () => {
+  /** Two real versions, so version 1 has a snapshot the double can bring back. */
+  function twoVersions() {
+    const double = world();
+    double.external("machine", "email", { host: "second.example" });
+    return double;
+  }
+
+  function historyCalls(): unknown[][] {
+    return daemon.apiFetch.mock.calls.filter(([path]) => String(path).endsWith("/history"));
+  }
+
+  it("does not ask for the history until it is opened", async () => {
+    world();
+    open();
+
+    await hostBox();
+    expect(historyCalls()).toEqual([]);
+
+    fireEvent.click(screen.getByRole("button", { name: "History" }));
+
+    expect(await screen.findByRole("list", { name: "Versions of email" })).toBeTruthy();
+    expect(historyCalls().length).toBe(1);
+    expect(screen.getByRole("button", { name: "History" }).getAttribute("aria-expanded")).toBe("true");
+  });
+
+  it("restores as a forward write: the old body becomes a new version", async () => {
+    const double = twoVersions();
+    open();
+
+    expect((await hostBox()).value).toBe("second.example");
+    fireEvent.click(screen.getByRole("button", { name: "History" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Restore version 1" }));
+
+    expect(await screen.findByText(/^restored version 1 and takes effect when the daemon restarts/)).toBeTruthy();
+    expect(double.rollbacks).toEqual([{ scope: "machine", name: "email", target: 1, current: 2 }]);
+    await waitFor(async () => {
+      expect((await hostBox()).value).toBe("a.example");
+    });
+    // The history only grows, and the panel stays open to show it.
+    expect(await screen.findByText("version 3")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Restore version 2" })).toBeTruthy();
+  });
+
+  it("will not restore over a draft", async () => {
+    const double = twoVersions();
+    open();
+
+    fireEvent.change(await hostBox(), { target: { value: "mine.example" } });
+    fireEvent.click(screen.getByRole("button", { name: "History" }));
+
+    const restore = (await screen.findByRole("button", { name: "Restore version 1" })) as HTMLButtonElement;
+    expect(restore.disabled).toBe(true);
+    expect(restore.title).toBe("Save or revert your edit first");
+
+    fireEvent.click(screen.getByRole("button", { name: "Revert" }));
+    await waitFor(() => {
+      expect(restore.disabled).toBe(false);
+    });
+    expect(double.rollbacks).toEqual([]);
+  });
+
+  it("says the emergency stop is why a restore did nothing", async () => {
+    const double = twoVersions();
+    open();
+
+    await hostBox();
+    fireEvent.click(screen.getByRole("button", { name: "History" }));
+    const restore = await screen.findByRole("button", { name: "Restore version 1" });
+    double.failNext = { status: 423, body: { refusal: "kill_switch" } };
+    fireEvent.click(restore);
+
+    expect(await screen.findByText(/emergency stop is engaged/)).toBeTruthy();
+    expect(double.rollbacks).toEqual([]);
+    expect((await hostBox()).value).toBe("second.example");
+  });
+
+  it("on a 409 shows what is stored now and says nothing was restored", async () => {
+    const double = twoVersions();
+    open();
+
+    await hostBox();
+    fireEvent.click(screen.getByRole("button", { name: "History" }));
+    const restore = await screen.findByRole("button", { name: "Restore version 1" });
+    double.external("machine", "email", { host: "third.example" });
+    fireEvent.click(restore);
+
+    expect(await screen.findByText(/nothing was restored/)).toBeTruthy();
+    await waitFor(async () => {
+      expect((await hostBox()).value).toBe("third.example");
+    });
+    expect(double.rollbacks).toEqual([]);
+  });
+
+  /** The 422 the handler sends today: `{refusal: "invalid", detail}`, with nothing naming a field. */
+  it("shows a refused restore that carries only a detail as a note", async () => {
+    const double = twoVersions();
+    open();
+
+    await hostBox();
+    fireEvent.click(screen.getByRole("button", { name: "History" }));
+    const restore = await screen.findByRole("button", { name: "Restore version 1" });
+    double.failNext = { status: 422, body: { refusal: "invalid", detail: "no longer a valid host" } };
+    fireEvent.click(restore);
+
+    expect(await screen.findByText("no longer a valid host")).toBeTruthy();
+    expect((await hostBox()).getAttribute("aria-invalid")).toBeNull();
+    expect(double.rollbacks).toEqual([]);
+  });
+
+  /**
+   * `core/src/http/settings.rs` sends no `field` today, so this cannot happen on the wire yet. It pins what
+   * the form does if a refusal names one: the field belongs to the OLD body, which is not what the form is
+   * drawing, and putting the sentence on the field would accuse text nobody typed.
+   */
+  it("shows a refused restore as a note, never on a field", async () => {
+    const double = twoVersions();
+    open();
+
+    await hostBox();
+    fireEvent.click(screen.getByRole("button", { name: "History" }));
+    const restore = await screen.findByRole("button", { name: "Restore version 1" });
+    double.failNext = {
+      status: 422,
+      body: { refusal: "invalid", field: "/host", detail: "no longer a valid host" },
+    };
+    fireEvent.click(restore);
+
+    expect(await screen.findByText("no longer a valid host")).toBeTruthy();
+    expect((await hostBox()).getAttribute("aria-invalid")).toBeNull();
+  });
+});
+
 describe("takesEffectPhrase", () => {
   it("spells the two tokens and renders anything else as the núcleo wrote it", () => {
     expect(takesEffectPhrase("restart")).toBe("when the daemon restarts");

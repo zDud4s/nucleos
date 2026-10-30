@@ -3,6 +3,7 @@ import { DAEMON_NAME } from "../copy";
 import { ApiRefusal } from "../data/client";
 import {
   classifyWriteFailure,
+  useRollbackSetting,
   useSettingDoc,
   useWriteSetting,
   type SettingDoc,
@@ -10,6 +11,7 @@ import {
 } from "../data/settings";
 import { Button, ErrorNote, Field, RefusalNote, Skeleton } from "../ui";
 import { FieldNode } from "./FieldNode";
+import { SettingHistory } from "./SettingHistory";
 import { hasField, type SchemaNode } from "./schema";
 
 export interface SettingsFormProps {
@@ -23,8 +25,11 @@ export interface SettingsFormProps {
 
 type Mode = "form" | "raw";
 
-/** The last thing a save said. It outlives the editor's remount, which is why the outer part holds it. */
-type Notice = { kind: "saved" } | { kind: "failed"; failure: WriteFailure };
+/** The last thing a save or a restore said. It outlives the editor's remount, which is why the outer part holds it. */
+type Notice =
+  | { kind: "saved" }
+  | { kind: "restored"; target: number }
+  | { kind: "failed"; failure: WriteFailure };
 
 /** Completes "Takes effect ___." The núcleo writes a phrase; the two tokens are tolerated beside it. */
 export function takesEffectPhrase(raw: string): string {
@@ -72,6 +77,25 @@ function failureWords(failure: WriteFailure): string {
 }
 
 /**
+ * A restore's refusal, in words that fit a restore. Both rewrites turn the answer into a plain note: there
+ * was no edit to lose, and a 422's field belongs to the OLD body, which the form is not drawing.
+ */
+function restoreFailure(error: unknown): WriteFailure {
+  const failure = classifyWriteFailure(error);
+  if (failure.kind === "stale") {
+    return { kind: "refused", message: "Someone changed this first. This is what is stored now; nothing was restored." };
+  }
+  if (failure.kind === "invalid") return { kind: "refused", message: failure.message };
+  return failure;
+}
+
+function noticeWords(notice: Notice | null, phrase: string | null): string | null {
+  if (notice === null || notice.kind === "failed") return null;
+  const done = notice.kind === "saved" ? "saved" : `restored version ${notice.target}`;
+  return phrase === null ? done : `${done} and takes effect ${phrase}`;
+}
+
+/**
  * One settings document, drawn from the schema the núcleo served beside it.
  *
  * The outer part owns the query, the mutation, the notice and the mode. The editor below it is keyed on
@@ -86,6 +110,8 @@ function failureWords(failure: WriteFailure): string {
 export function SettingsForm({ scope, name, takesEffect, onDirty }: SettingsFormProps) {
   const doc = useSettingDoc(scope, name);
   const write = useWriteSetting(scope, name);
+  const rollback = useRollbackSetting(scope, name);
+  const [historyOpen, setHistoryOpen] = useState(false);
   const [held, setHeld] = useState<SettingDoc | null>(null);
   const [notice, setNotice] = useState<Notice | null>(null);
   const [mode, setMode] = useState<Mode>("form");
@@ -121,32 +147,60 @@ export function SettingsForm({ scope, name, takesEffect, onDirty }: SettingsForm
     );
   }
 
+  const blockedBecause =
+    held !== null ? "Save or revert your edit first" : write.isPending || rollback.isPending ? "Writing…" : null;
+
   return (
-    <Editor
-      key={shown.version}
-      doc={shown}
-      mode={mode}
-      onMode={setMode}
-      notice={notice}
-      takesEffect={takesEffect}
-      saving={write.isPending}
-      busy={write.isPending || doc.isFetching}
-      onEdit={() => setNotice(null)}
-      onDirtyChange={onDirtyChange}
-      onSave={(body, version) => {
-        setNotice(null);
-        write.mutate(
-          { body, version },
-          {
-            onSuccess: () => {
-              setHeld(null);
-              setNotice({ kind: "saved" });
+    <div className="flex flex-col gap-3">
+      <Editor
+        key={shown.version}
+        doc={shown}
+        mode={mode}
+        onMode={setMode}
+        notice={notice}
+        takesEffect={takesEffect}
+        saving={write.isPending}
+        busy={write.isPending || rollback.isPending || doc.isFetching}
+        onEdit={() => setNotice(null)}
+        onDirtyChange={onDirtyChange}
+        onSave={(body, version) => {
+          setNotice(null);
+          write.mutate(
+            { body, version },
+            {
+              onSuccess: () => {
+                setHeld(null);
+                setNotice({ kind: "saved" });
+              },
+              onError: fail,
             },
-            onError: fail,
-          },
-        );
-      }}
-    />
+          );
+        }}
+      />
+      <div className="sy-setting-controls">
+        <Button aria-expanded={historyOpen} onClick={() => setHistoryOpen((open) => !open)}>
+          History
+        </Button>
+      </div>
+      {historyOpen && (
+        <SettingHistory
+          scope={scope}
+          name={name}
+          current={shown.version}
+          blockedBecause={blockedBecause}
+          onRestore={(target) => {
+            setNotice(null);
+            rollback.mutate(
+              { target, current: shown.version },
+              {
+                onSuccess: () => setNotice({ kind: "restored", target }),
+                onError: (error) => setNotice({ kind: "failed", failure: restoreFailure(error) }),
+              },
+            );
+          }}
+        />
+      )}
+    </div>
   );
 }
 
@@ -291,7 +345,7 @@ function Editor({
         </Button>
         {dirty && !saving && <span className="sy-meta">unsaved changes</span>}
         <span className="sy-meta" role="status">
-          {notice?.kind === "saved" && (phrase === null ? "saved" : `saved and takes effect ${phrase}`)}
+          {noticeWords(notice, phrase)}
         </span>
       </div>
 
