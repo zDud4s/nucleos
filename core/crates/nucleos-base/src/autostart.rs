@@ -76,10 +76,13 @@ fn is_registered(exe_path: &Path) -> bool {
 /// Whether a queried task XML launches `exe_path` AND carries the settings this build registers.
 /// A task from an older build (default 72h limit, no restart-on-failure) names the same exe, so the
 /// exe alone would keep it forever; requiring `PT0S` and `<Count>99</Count>` makes it re-register.
+/// `--headless` is required too: a task whose action runs the exe directly (the pre-conhost format)
+/// opens a console window, so it must not count as registered and is re-registered with `/F`.
 #[cfg(any(windows, test))]
 fn xml_matches_task(xml: &str, exe_path: &Path) -> bool {
     let lower = xml.to_lowercase();
     lower.contains(&xml_escape(&exe_path.to_string_lossy()).to_lowercase())
+        && lower.contains("--headless")
         && lower.contains("pt0s")
         && lower.contains("<count>99</count>")
 }
@@ -132,6 +135,20 @@ fn working_directory_for(exe_path: &Path) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// The console host the task launches the daemon through. `conhost.exe --headless <exe>` runs a
+/// console-subsystem program with no window, so the daemon binary's subsystem stays untouched.
+#[cfg(windows)]
+fn conhost_path() -> String {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    format!(r"{root}\System32\conhost.exe")
+}
+
+/// Test-only stand-in so the task XML is deterministic on every host.
+#[cfg(all(test, not(windows)))]
+fn conhost_path() -> String {
+    r"C:\Windows\System32\conhost.exe".to_string()
+}
+
 #[cfg(any(windows, test))]
 fn task_xml(exe_path: &Path) -> String {
     let working_directory = working_directory_for(exe_path);
@@ -164,10 +181,12 @@ fn task_xml(exe_path: &Path) -> String {
   <Actions Context="Author">
     <Exec>
       <Command>{}</Command>
+      <Arguments>--headless "{}"</Arguments>
       <WorkingDirectory>{}</WorkingDirectory>
     </Exec>
   </Actions>
 </Task>"#,
+        xml_escape(&conhost_path()),
         xml_escape(&exe_path.to_string_lossy()),
         xml_escape(&working_directory.to_string_lossy())
     )
@@ -485,17 +504,39 @@ mod tests {
 
     /// The daemon is a long-lived process: the task must never be killed by the default 72h limit
     /// and must keep restarting after a crash (every minute, 99 times). `<Hidden>true</Hidden>` hides
-    /// the task in the Task Scheduler UI; it does not hide a console window.
+    /// the task in the Task Scheduler UI; the console window is suppressed separately, by launching
+    /// through `conhost.exe --headless`.
     #[test]
     fn task_xml_has_no_time_limit_is_hidden_and_restarts_up_to_99_times() {
         let xml = task_xml(Path::new(
             r"C:\Projects\nucleos\core\target\debug\nucleos-core.exe",
         ));
+        assert!(xml.contains("<RestartOnFailure>"));
         assert!(xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
         assert!(xml.contains("<Hidden>true</Hidden>"));
         assert!(xml.contains(
             "<RestartOnFailure>\n      <Interval>PT1M</Interval>\n      <Count>99</Count>\n    </RestartOnFailure>"
         ));
+    }
+
+    #[test]
+    fn the_task_runs_the_daemon_through_conhost_headless() {
+        let exe = r"C:\Projects\nucleos\core\target\debug\nucleos-core.exe";
+        let xml = task_xml(Path::new(exe));
+        let command = format!("<Command>{}</Command>", conhost_path());
+        assert!(xml.contains(&command));
+        assert!(xml.contains(&format!("<Arguments>--headless \"{exe}\"</Arguments>")));
+        assert!(!xml.contains(&format!("<Command>{exe}</Command>")));
+        #[cfg(not(windows))]
+        assert!(xml.contains(r"<Command>C:\Windows\System32\conhost.exe</Command>"));
+    }
+
+    #[test]
+    fn a_task_registered_before_conhost_headless_is_re_registered() {
+        let exe = Path::new(r"C:\x\nucleos-core.exe");
+        let old = r"<Task><Settings><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><RestartOnFailure><Interval>PT1M</Interval><Count>99</Count></RestartOnFailure></Settings><Actions><Exec><Command>C:\x\nucleos-core.exe</Command><WorkingDirectory>C:\x</WorkingDirectory></Exec></Actions></Task>";
+        assert!(!xml_matches_task(old, exe));
+        assert!(xml_matches_task(&task_xml(exe), exe));
     }
 
     #[test]
@@ -531,8 +572,13 @@ mod tests {
 
         assert!(xml.contains(r"C:\Dev &amp; Ops\nucleos\core\target\debug\nucleos-core.exe"));
         assert!(
-            !xml.contains("Ops\\nucleos\\core\\target\\debug\\nucleos-core.exe</Command>")
-                || xml.contains("&amp;"),
+            xml.contains(
+                r#"<Arguments>--headless "C:\Dev &amp; Ops\nucleos\core\target\debug\nucleos-core.exe"</Arguments>"#
+            ),
+            "the escaped path must sit, quoted, in Arguments"
+        );
+        assert!(
+            !xml.contains("Dev & Ops"),
             "the raw ampersand must not reach the document"
         );
         // One unescaped `&` is the whole failure; there must be none left outside an entity.
