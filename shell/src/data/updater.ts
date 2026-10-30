@@ -19,6 +19,18 @@ export async function updatesEnabled(): Promise<boolean> {
   return isTauri() && (await invoke<boolean>("updates_enabled"));
 }
 
+export type InstallKind = "app-image" | "system-package" | "other";
+
+/** How this build was installed. STUB (RED). */
+export async function installKind(): Promise<InstallKind> {
+  throw new Error("not implemented");
+}
+
+/** Hook over installKind(). STUB (RED). */
+export function useInstallKind(): { data: InstallKind | undefined } {
+  return { data: undefined };
+}
+
 /** The offered update, or null when there is none or updates are disabled here. */
 export async function findUpdate(): Promise<Update | null> {
   if (!(await updatesEnabled())) return null;

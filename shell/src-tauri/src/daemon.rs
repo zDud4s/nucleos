@@ -76,9 +76,63 @@ pub fn updates_enabled() -> bool {
     cfg!(feature = "release-bundle")
 }
 
+/// How this shell was installed, which decides whether it may update itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallKind {
+    AppImage,
+    SystemPackage,
+    Other,
+}
+
+/// Classifies the install. STUB (RED): always `Other`.
+pub fn install_kind_of(_exe: &Path, _appimage_env: bool) -> InstallKind {
+    InstallKind::Other
+}
+
 #[cfg(test)]
 mod tests {
+    use super::InstallKind;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn install_kind_appimage_env_wins_even_under_usr_bin() {
+        assert_eq!(
+            super::install_kind_of(Path::new("/tmp/.mount_x/usr/bin/nucleos-shell"), true),
+            InstallKind::AppImage
+        );
+        assert_eq!(
+            super::install_kind_of(Path::new("/usr/bin/nucleos-shell"), true),
+            InstallKind::AppImage,
+            "APPIMAGE takes priority over /usr/bin"
+        );
+    }
+
+    #[test]
+    fn install_kind_usr_bin_is_a_system_package() {
+        assert_eq!(
+            super::install_kind_of(Path::new("/usr/bin/nucleos-shell"), false),
+            InstallKind::SystemPackage
+        );
+    }
+
+    #[test]
+    fn install_kind_usr_lib_is_a_system_package() {
+        assert_eq!(
+            super::install_kind_of(Path::new("/usr/lib/nucleos/x"), false),
+            InstallKind::SystemPackage
+        );
+    }
+
+    #[test]
+    fn install_kind_other_locations_are_other() {
+        for p in ["/opt/nucleos/nucleos-shell", "C:/apps/nucleos/shell.exe", "/usrx/bin/nucleos-shell"] {
+            assert_eq!(
+                super::install_kind_of(Path::new(p), false),
+                InstallKind::Other,
+                "{p}"
+            );
+        }
+    }
 
     /// The shell starts a daemon only from a release bundle, when nothing answers on the port
     /// and the bundled binary is actually there.
