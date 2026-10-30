@@ -135,6 +135,15 @@ pub mod test_nodes {
             .insert(chat_id.to_owned(), root_id.to_owned());
     }
 
+    static WAITING: LazyLock<Mutex<std::collections::HashSet<String>>> =
+        LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
+    /// Makes the root of `chat_id` report a child waiting on it, so rotation and automatic
+    /// compaction both hold back.
+    pub fn give_waiting_child(chat_id: &str) {
+        WAITING.lock().unwrap().insert(chat_id.to_owned());
+    }
+
     pub(super) struct TestNodes;
 
     #[async_trait]
@@ -142,8 +151,13 @@ pub mod test_nodes {
         async fn active_root_for_chat(&self, chat_id: &str) -> Option<String> {
             ROOTS.lock().unwrap().get(chat_id).cloned()
         }
-        async fn has_waiting_child(&self, _root_id: &str) -> bool {
-            false
+        async fn has_waiting_child(&self, root_id: &str) -> bool {
+            // The test root ids are unique per chat, so a waiting child is keyed by root id too.
+            let roots = ROOTS.lock().unwrap();
+            let waiting = WAITING.lock().unwrap();
+            roots
+                .iter()
+                .any(|(chat, root)| root == root_id && waiting.contains(chat))
         }
         async fn brief_text(&self, _root_id: &str) -> Option<String> {
             Some("TEST-BRIEF".to_owned())
@@ -499,6 +513,10 @@ pub async fn rotate_with_soft(
     context_fill: Option<i64>,
     soft: i64,
 ) -> sqlx::Result<bool> {
+    // With auto-compact on, compaction replaces rotation for this chat.
+    if crate::chats::auto_compact(pool, chat_id).await {
+        return Ok(false);
+    }
     let Some(root_id) = should_rotate(nodes, chat_id, context_fill, soft).await else {
         return Ok(false);
     };
@@ -899,6 +917,43 @@ mod tests {
         let mut n = fake(true);
         n.waiting = true;
         assert_eq!(should_rotate(&n, "c", Some(500), 100).await, None);
+    }
+
+    #[tokio::test]
+    async fn rotate_with_soft_returns_false_when_auto_compact_is_on() {
+        let pool = pool().await;
+        let nodes = fake(true);
+        let on = crate::chats::create(&pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        let off = crate::chats::create(&pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::chats::set_auto_compact(&pool, &on, true)
+            .await
+            .unwrap();
+        for (chat, expect, expected_rows) in [(&on, false, 0), (&off, true, 1)] {
+            let id = run(&pool, chat, "hi", "yo", 0).await;
+            let done = rotate_with_soft(
+                &pool,
+                &nodes,
+                &DeterministicSummarizer,
+                chat,
+                id,
+                Some(999),
+                1,
+            )
+            .await
+            .unwrap();
+            assert_eq!(done, expect, "{chat}");
+            let rows: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM root_rotations WHERE chat_id = ?")
+                    .bind(chat)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(rows, expected_rows, "{chat}");
+        }
     }
 
     #[tokio::test]

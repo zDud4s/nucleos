@@ -7,7 +7,7 @@ use super::*;
 /// Neither the mode nor the root appears here, and neither ever will: both are resolved from the
 /// project's own autopilot state (`resolve_start`), because a caller that could name its own root
 /// would be naming a directory this daemon then creates a worktree in and writes to.
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct CreateJobRequest {
     pub project_id: String,
     pub prompt: String,
