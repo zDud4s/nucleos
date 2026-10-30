@@ -1087,10 +1087,7 @@ mod tests {
         assert_eq!(tallies[0].disagree, 3);
         assert_eq!(tallies[0].stricter, 1, "reject of an allow is stricter");
         assert_eq!(tallies[0].looser, 2, "approve of a deny/pend is looser");
-        assert_eq!(
-            tallies[0].stricter + tallies[0].looser,
-            tallies[0].disagree
-        );
+        assert_eq!(tallies[0].stricter + tallies[0].looser, tallies[0].disagree);
     }
 
     #[tokio::test]
@@ -1169,14 +1166,7 @@ mod tests {
         let pending = insert_shadow(&pool, shadow_run, "governance", "allow", None).await;
         set_created_at(&pool, pending, "2026-07-10T00:00:00Z").await;
         insert_shadow(&pool, worktree_run, "governance", "allow", Some("reject")).await;
-        insert_shadow(
-            &pool,
-            worktree_run,
-            "governance",
-            "deny",
-            Some("approve"),
-        )
-        .await;
+        insert_shadow(&pool, worktree_run, "governance", "deny", Some("approve")).await;
 
         let tallies = scoreboard(&pool, "project-a").await.unwrap();
 
@@ -1192,7 +1182,10 @@ mod tests {
         assert_eq!(w.unreviewed, 0);
         assert_eq!(w.oldest_unreviewed_at, None);
         assert_eq!((w.stricter, w.looser), (1, 1));
-        assert_eq!((w.reviewed_allow, w.reviewed_pend, w.reviewed_deny), (1, 0, 1));
+        assert_eq!(
+            (w.reviewed_allow, w.reviewed_pend, w.reviewed_deny),
+            (1, 0, 1)
+        );
     }
 
     #[tokio::test]
