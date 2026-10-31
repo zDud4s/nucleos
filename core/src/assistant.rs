@@ -2416,7 +2416,10 @@ mod tests {
     async fn an_ordinary_chats_turn_still_runs_nowhere_in_particular() {
         let (state, _dir, runner) = files_root_state().await;
 
-        let id = send_message(&state, "plain-chat", "olá", Origin::Shell)
+        // Its own chat id: `BUSY_CHATS` is process-wide, and a shared literal made this test and
+        // `a_turn_sent_with_nothing_keeps_the_argument_vector` refuse each other under load.
+        let chat = a_chat("plain-chat");
+        let id = send_message(&state, &chat, "olá", Origin::Shell)
             .await
             .unwrap();
         settled_turn(&state.pool, id).await;
@@ -7056,7 +7059,8 @@ mod tests {
         let mut state = test_state().await;
         state.runner = fake.clone();
 
-        let id = send_message(&state, "plain-chat", "arranja o parser", Origin::Shell)
+        let chat = a_chat("plain-chat");
+        let id = send_message(&state, &chat, "arranja o parser", Origin::Shell)
             .await
             .unwrap();
         settled_turn(&state.pool, id).await;
