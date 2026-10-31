@@ -13219,11 +13219,11 @@ mod tests {
         get_json(&state, &format!("/assistant/chats/{b}")).await;
 
         assert!(
-            crate::assistant::chat_is_open(&a),
+            crate::assistant::was_marked_open(&a),
             "the header marks the chat open"
         );
         assert!(
-            !crate::assistant::chat_is_open(&b),
+            !crate::assistant::was_marked_open(&b),
             "a read without the header does not"
         );
     }

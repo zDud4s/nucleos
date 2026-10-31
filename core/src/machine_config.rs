@@ -91,6 +91,7 @@ pub const ROUTER_FILE: &str = "router.yaml";
 pub const DEVTIME_FILE: &str = "devtime.yaml";
 pub const VERIFY_FILE: &str = "verify.yaml";
 pub const KEEP_AWAKE_FILE: &str = "keep_awake.yaml";
+pub const BACKGROUND_FILE: &str = "background.yaml";
 
 /// One of this machine's settings files, with everything a caller needs to act on it safely.
 ///
@@ -192,7 +193,11 @@ fn validate_keep_awake(contents: &str) -> Result<(), String> {
     crate::config::parse_keep_awake_config(contents).map(|_| ())
 }
 
-/// This machine's settings files. Twelve rows, and the count is asserted in the tests for the same
+fn validate_background(contents: &str) -> Result<(), String> {
+    crate::config::parse_background_config(contents).map(|_| ())
+}
+
+/// This machine's settings files. Thirteen rows, and the count is asserted in the tests for the same
 /// reason the project registry asserts two: a row added without reading the header above is a row
 /// that has not answered the membership rule.
 pub static SETTINGS: &[Setting] = &[
@@ -283,6 +288,13 @@ pub static SETTINGS: &[Setting] = &[
         what: "whether this machine is kept from going to sleep on its own while a run is live (`keep_awake_while_working`, on by default); closing the lid or choosing Sleep still obeys the system",
         takes_effect: "when the daemon restarts",
         validate: validate_keep_awake,
+    },
+    Setting {
+        path: BACKGROUND_FILE,
+        area: "background",
+        what: "how many hours a chat's background task may say nothing before its process stops being kept alive for it (`background_silence_hours`, 24 by default); a client polling or not does not change it",
+        takes_effect: "when the daemon restarts",
+        validate: validate_background,
     },
 ];
 
@@ -508,14 +520,14 @@ mod tests {
     /// The membership rule, asserted rather than trusted: every row can say no, and says both of
     /// the sentences the page needs.
     ///
-    /// The count is pinned so a thirteenth row cannot arrive without somebody reading the header. That
+    /// The count is pinned so a fourteenth row cannot arrive without somebody reading the header. That
     /// is the same guard [`crate::ownership`] puts on its own table, and it is here for the same
     /// reason: the dangerous edit to a registry is an addition, not a change.
     #[test]
     fn every_setting_can_refuse_and_says_what_it_changes() {
         assert_eq!(
             SETTINGS.len(),
-            12,
+            13,
             "see the module header before adding a row"
         );
         for setting in SETTINGS {
@@ -537,11 +549,25 @@ mod tests {
         }
     }
 
-    /// The table has the twelve rows the header counts; the pin above names the guard, this one
+    /// The table has the thirteen rows the header counts; the pin above names the guard, this one
     /// names the count.
     #[test]
-    fn the_settings_table_has_twelve_rows() {
-        assert_eq!(SETTINGS.len(), 12);
+    fn the_settings_table_has_thirteen_rows() {
+        assert_eq!(SETTINGS.len(), 13);
+    }
+
+    /// An empty file keeps the day; hours are read; zero is refused.
+    #[test]
+    fn background_silence_defaults_to_a_day_and_refuses_zero() {
+        let parse = crate::config::parse_background_config;
+        assert_eq!(parse("").unwrap().background_silence_hours, 24);
+        assert_eq!(
+            parse("background_silence_hours: 48\n")
+                .unwrap()
+                .background_silence_hours,
+            48
+        );
+        assert!(parse("background_silence_hours: 0\n").is_err());
     }
 
     /// Every production channel manifest has exactly one row, keyed by its `settings_area` and

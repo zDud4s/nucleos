@@ -317,6 +317,12 @@ async fn main() {
         .as_deref()
         .map(config::load_keep_awake_config)
         .unwrap_or_default();
+    let background_config = machine_file(machine_config::BACKGROUND_FILE)
+        .as_deref()
+        .map(config::load_background_config)
+        .unwrap_or_default();
+    // Read once for the run, like the rest: the reaper consults it for every kept process.
+    assistant::set_background_silence(background_config.background_silence_hours);
     let web_config = machine_file(machine_config::WEB_FILE)
         .as_deref()
         .map(config::load_web_config)

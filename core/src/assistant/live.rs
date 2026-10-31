@@ -23,10 +23,27 @@ pub(super) const LIVE_CAP: usize = 5;
 /// blurred cadence (`BLURRED_CADENCE`, `shell/src/app/pacing.ts`), since a visible but unfocused
 /// window polls about every 10 seconds.
 pub(super) const OPEN_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
-/// How long a background task may pin a kept process past its idle window, counted from the later
-/// of the turn's end and the chat's last poll.
-pub(super) const BACKGROUND_PIN_CAP: std::time::Duration =
-    std::time::Duration::from_secs(2 * 60 * 60);
+/// How long a background task may stay silent and still pin a kept process past its idle window: the
+/// default of `background_silence_hours` (`background.yaml`). Counted from the task's last
+/// bookkeeping line, never from a client's poll, so a tower with nobody connected keeps working.
+pub(super) const BACKGROUND_SILENCE_CAP: std::time::Duration =
+    std::time::Duration::from_secs(24 * 60 * 60);
+/// `background_silence_hours` as the daemon read it at startup; unset means [`BACKGROUND_SILENCE_CAP`].
+static BACKGROUND_SILENCE: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+
+/// Sets the silence cap from the setting, once, at startup. A second call is ignored.
+pub fn set_background_silence(hours: u64) {
+    let _ = BACKGROUND_SILENCE.set(std::time::Duration::from_secs(
+        hours.saturating_mul(60 * 60),
+    ));
+}
+
+fn background_silence() -> std::time::Duration {
+    BACKGROUND_SILENCE
+        .get()
+        .copied()
+        .unwrap_or(BACKGROUND_SILENCE_CAP)
+}
 /// The cap `keep_live` enforces. Unbounded under test: `LIVE_CHATS` is one static shared by every
 /// test running in parallel, and a real cap there would evict other tests' processes. `make_room`
 /// is tested directly with `LIVE_CAP`.
@@ -211,6 +228,9 @@ pub(super) struct LiveChat {
     /// Background tasks seen starting in this process and not yet seen ending. Non-empty pins the
     /// process against the reaper (spec 4.2 item 2, before `chat_tasks` exists).
     pub(super) background: HashSet<String>,
+    /// When this process last said something about its background tasks, or when it was created.
+    /// The silence clock of [`worth_keeping`]: no client poll moves it.
+    pub(super) last_task_signal: std::time::Instant,
     /// The between-turns reader that owns this process, by token; 0 for none.
     pub(super) watcher: u64,
     /// The fingerprint of the chat's settings this process was spawned with (K1), compared before a
@@ -256,6 +276,7 @@ impl LiveChat {
             _counted: LiveCount::start(),
             carried: std::collections::VecDeque::new(),
             background: HashSet::new(),
+            last_task_signal: std::time::Instant::now(),
             watcher: 0,
             spawned_with,
             resumed,
@@ -354,6 +375,7 @@ impl LiveChat {
         if !is_task_bookkeeping(line) {
             return;
         }
+        self.last_task_signal = std::time::Instant::now();
         let before = self.background.clone();
         track_background(line, &mut self.background);
         let key = self.process_key();
@@ -749,14 +771,18 @@ pub(super) fn worth_keeping(
     let still_standing = !live.messages.is_closed();
     // A background task that has started and not reported its end is work the process is still
     // doing for the conversation (spec 4.2 item 2; spike 2026-10-05 (c): the CLI answers on its
-    // own when it ends), so such a process is kept past its idle window — but only for
-    // [`BACKGROUND_PIN_CAP`], or a task that never reports its end pins it for good.
+    // own when it ends), so such a process is kept past its idle window — but only while the
+    // process keeps reporting on its tasks: after `background_silence()` without a word, a task that
+    // never reports its end would pin it for good. That clock is the process's own and no poll
+    // moves it, because the work does not stop when nobody is looking.
+    let silent_for = now.saturating_duration_since(live.last_task_signal);
+    let pinned = !live.background.is_empty() && silent_for < background_silence();
     // The idle time is the chat's own, derived from its last turn, and it counts from the later of
-    // that turn's end and the last time the chat was polled by a visible view.
+    // that turn's end and the last time the chat was polled by a visible view: an idle process has
+    // no work, so a poll only moves latency.
     let anchor = seen.map_or(live.idle_since, |s| s.max(live.idle_since));
     let since = now.saturating_duration_since(anchor);
-    still_standing
-        && ((!live.background.is_empty() && since < BACKGROUND_PIN_CAP) || since < live.idle_for)
+    still_standing && (pinned || since < live.idle_for)
 }
 
 /// Whether a stream line is part of an answer: its JSON `type` is `assistant` or `stream_event`.
@@ -1024,11 +1050,12 @@ mod tests {
     /// A background task keeps a process alive past its idle window, but not forever: a task that
     /// never reports its end would otherwise pin a few hundred megabytes for good.
     #[tokio::test]
-    async fn background_tasks_pin_a_process_for_at_most_two_hours() {
-        assert_eq!(BACKGROUND_PIN_CAP, Duration::from_secs(2 * 60 * 60));
+    async fn background_tasks_pin_a_process_for_at_most_a_day_of_silence() {
+        assert_eq!(BACKGROUND_SILENCE_CAP, Duration::from_secs(24 * 60 * 60));
         let mut rig = rig();
         let started = Instant::now();
         rig.live.idle_since = started;
+        rig.live.last_task_signal = started;
         rig.live.idle_for = LIVE_IDLE;
         rig.live.background.insert("task-1".to_owned());
 
@@ -1040,16 +1067,73 @@ mod tests {
             !worth_keeping(
                 &rig.live,
                 None,
-                started + BACKGROUND_PIN_CAP + Duration::from_secs(60)
+                started + BACKGROUND_SILENCE_CAP + Duration::from_secs(60)
             ),
-            "a task running past the cap must stop pinning"
+            "a task silent past the cap must stop pinning"
         );
-        // The cap counts from the later of the turn's end and the last poll, like the idle window.
-        let polled = started + Duration::from_secs(100 * 60);
+    }
+
+    /// Nobody connected is the normal state of a tower: the task still pins past two hours.
+    #[tokio::test]
+    async fn a_background_task_outlives_two_hours_with_nobody_watching() {
+        let mut rig = rig();
+        let started = Instant::now();
+        rig.live.idle_since = started;
+        rig.live.last_task_signal = started;
+        rig.live.idle_for = LIVE_IDLE;
+        rig.live.background.insert("task-1".to_owned());
+
+        assert!(
+            worth_keeping(&rig.live, None, started + Duration::from_secs(3 * 60 * 60)),
+            "three hours without a poll must not retire a process with a task running"
+        );
+    }
+
+    /// A poll counts for the idle window and not for a background task: a silent task past the cap
+    /// gets nothing from a poll, once the idle window has let go of the process too.
+    #[tokio::test]
+    async fn a_poll_does_not_extend_a_silent_background_task() {
+        let mut rig = rig();
+        let started = Instant::now();
+        rig.live.idle_since = started;
+        rig.live.last_task_signal = started;
+        rig.live.idle_for = LIVE_IDLE;
+        rig.live.background.insert("task-1".to_owned());
+
+        let now = started + BACKGROUND_SILENCE_CAP + Duration::from_secs(1);
+        // The last poll is two minutes old: outside the 90-second idle window, so only the task
+        // could still be holding the process.
+        let polled = now - Duration::from_secs(120);
+        assert!(
+            !worth_keeping(&rig.live, Some(polled), now),
+            "a poll must not keep a task pinned past the silence cap"
+        );
+        // Within the cap the same poll changes nothing either way: the task alone pins it.
         assert!(worth_keeping(
             &rig.live,
             Some(polled),
-            started + Duration::from_secs(121 * 60)
+            started + BACKGROUND_SILENCE_CAP - Duration::from_secs(1)
         ));
+    }
+
+    /// Any task line from the process restarts its silence clock.
+    #[tokio::test]
+    async fn a_task_signal_restarts_the_silence_clock() {
+        let mut rig = rig();
+        let before = Instant::now();
+        rig.live.last_task_signal = before;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        rig.live
+            .track(r#"{"type":"system","subtype":"task_progress","task_id":"task-1"}"#);
+        assert!(rig.live.last_task_signal > before);
+
+        let after_task_line = rig.live.last_task_signal;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        rig.live.track(r#"{"type":"assistant"}"#);
+        assert_eq!(
+            rig.live.last_task_signal, after_task_line,
+            "a line that is not about tasks leaves the clock alone"
+        );
     }
 }

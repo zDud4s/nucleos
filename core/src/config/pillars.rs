@@ -353,6 +353,55 @@ pub fn load_keep_awake_config(path: &Path) -> KeepAwakeConfig {
     }
 }
 
+/// `~/.nucleos/background.yaml`: how long a chat's background task may say nothing before its
+/// process stops being kept alive for it.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct BackgroundConfig {
+    /// Hours of silence, 24 by default. Counted from the task's last report, never from a client's
+    /// poll, so work left running overnight is not cut off because nobody was connected.
+    pub background_silence_hours: u64,
+}
+
+impl Default for BackgroundConfig {
+    fn default() -> Self {
+        Self {
+            background_silence_hours: 24,
+        }
+    }
+}
+
+/// `background.yaml`'s grammar. An empty file says nothing, which is the defaults; zero hours is
+/// refused, since it would retire every process with a task running the moment it fell silent.
+pub fn parse_background_config(contents: &str) -> Result<BackgroundConfig, String> {
+    if contents.trim().is_empty() {
+        return Ok(BackgroundConfig::default());
+    }
+    let config =
+        serde_yaml::from_str::<BackgroundConfig>(contents).map_err(|error| error.to_string())?;
+    if config.background_silence_hours == 0 {
+        return Err("background_silence_hours must be at least 1".to_owned());
+    }
+    Ok(config)
+}
+
+pub fn load_background_config(path: &Path) -> BackgroundConfig {
+    if !path.exists() {
+        return BackgroundConfig::default();
+    }
+    match std::fs::read_to_string(path).map(|text| parse_background_config(&text)) {
+        Ok(Ok(config)) => config,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, path = %path.display(), "background config: could not be parsed; defaults apply");
+            BackgroundConfig::default()
+        }
+        Err(error) => {
+            tracing::warn!(%error, path = %path.display(), "background config: could not be read; defaults apply");
+            BackgroundConfig::default()
+        }
+    }
+}
+
 /// `~/.nucleos/web.yaml`. The web pillar's settings, including the one list in this system that decides
 /// what counts as trustworthy.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
