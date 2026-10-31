@@ -26,7 +26,11 @@ pub mod hooks;
 pub mod map;
 pub mod presets;
 pub mod price_refresh;
+// `relay` and `work_nodes` moved up from `nucleos-core` on 2026-10-29: only `assistant` and the daemon
+// read them, so an edit to either no longer rebuilds `nucleos-core`.
+pub mod relay;
 pub mod verify_cli;
+pub mod work_nodes;
 
 /// The channel hub as the rest of the program sees it: everything `nucleos-core` keeps under
 /// `channels` (re-exported, so `crate::channels::registry` and friends keep resolving), plus the
