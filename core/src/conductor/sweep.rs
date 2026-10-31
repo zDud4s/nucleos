@@ -886,6 +886,76 @@ mod tests {
         assert_eq!(summary, None);
     }
 
+    /// An open tree job (no branches) and a `running` work node of it linked to `run_id`, the way
+    /// `tree_job::node_run::launch` links them: `work_nodes.run_id` is the run's decimal id as TEXT.
+    async fn seed_tree_node(state: &AppState, run_id: i64) {
+        let created = Utc::now().to_rfc3339();
+        let mut manifest = Manifest::new("job-1", "feat/tree", "Ship it", "C:/Projects/nucleos", &[]);
+        manifest.state = "open".to_owned();
+        let job = TreeJob {
+            id: "job-1".to_owned(),
+            root_node_id: "job-1-root".to_owned(),
+            project_id: None,
+            feature_branch: Some("feat/tree".to_owned()),
+            goal: "Ship it".to_owned(),
+            state: "open".to_owned(),
+            manifest,
+            contract: None,
+            created_at: created.clone(),
+            updated_at: created,
+        };
+        save(&state.pool, &job).await.unwrap();
+        seed_node(state, "tree-node", "leaf", "running", Some(run_id)).await;
+        sqlx::query("UPDATE work_nodes SET tree_job_id = 'job-1' WHERE id = 'tree-node'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+    }
+
+    /// Feed lines about the node or its run, whatever their kind.
+    async fn lines_about_tree_node(state: &AppState, run_id: i64) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM feed WHERE subject IN (?, ?) OR run_id = ?")
+            .bind(run_key(run_id))
+            .bind(node_key("tree-node"))
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    /// `reconcile_running` only ran at boot, and `tick` skips tree nodes on purpose, so a tree node
+    /// whose run ended while the daemon lived stayed `running` with nobody told.
+    #[tokio::test]
+    async fn the_sweep_reaps_a_tree_node_whose_run_ended() {
+        let state = state().await;
+        let now = Utc::now();
+        let run = seed_finished_run(&state, "completed", now - minutes(5)).await;
+        seed_tree_node(&state, run).await;
+
+        tick(&state, &[], &Limits::default(), now).await.unwrap();
+
+        assert_ne!(node_row(&state, "tree-node").await.0, "running");
+        assert_eq!(lines_about_tree_node(&state, run).await, 1);
+
+        tick(&state, &[], &Limits::default(), Utc::now()).await.unwrap();
+
+        assert_eq!(lines_about_tree_node(&state, run).await, 1);
+    }
+
+    /// Passes already: nothing reaps a node whose run is live. It guards the fix against reaping
+    /// too much.
+    #[tokio::test]
+    async fn the_sweep_leaves_a_tree_node_whose_run_is_alive() {
+        let state = state().await;
+        let run = seed_live_run(&state).await;
+        seed_tree_node(&state, run).await;
+
+        tick(&state, &[], &Limits::default(), Utc::now()).await.unwrap();
+
+        assert_eq!(node_row(&state, "tree-node").await.0, "running");
+        assert_eq!(lines_about_tree_node(&state, run).await, 0);
+    }
+
     // ----- terminal states nobody announced -----
 
     #[tokio::test]
