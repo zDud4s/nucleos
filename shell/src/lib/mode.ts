@@ -14,8 +14,8 @@ import { DAEMON_NAME } from "../copy";
  *
  * What this module still owns is what the words MEAN and when the third setting is offered, and
  * that is why it is still a module rather than three constants inside the control: something that
- * unlocked on different arithmetic from the one the daemon enforces would offer a button that
- * always refuses, and two copies of a sentence about restraint would eventually say two different
+ * judged proof on different arithmetic from the one the daemon uses would warn (or not warn) on
+ * the wrong projects, and two copies of a sentence about restraint would eventually say two different
  * things about it.
  * The third vocabulary is gone too: the map says `active`, the daemon literal, and that word wins.
  */
@@ -35,10 +35,11 @@ export const MODE_MEANING: Record<AutopilotMode, string> = {
 };
 
 /**
- * Why the promote control is locked, in the daemon's own terms.
+ * Why the shadow proof is not enough yet, in the daemon's own terms.
  *
  * `promotable` itself is never recomputed from these numbers: it is `shadow.rs`'s arithmetic,
- * carried on the roster row. This only explains a lock the daemon already decided on.
+ * carried on the roster row. This only explains a verdict the daemon already reached; the control
+ * still lets the person activate anyway, after a warning that says this.
  */
 export function promotionBlocker(project: ProjectSummary, withheld: number): string {
   if (project.classes_total === 0) {

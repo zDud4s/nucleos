@@ -371,8 +371,8 @@ pub async fn scoreboard(pool: &SqlitePool, project_id: &str) -> sqlx::Result<Vec
 /// nothing about the cases that mattered.
 ///
 /// **This is the single source of truth for the rule.** The shell reads the computed
-/// `classes_ready`/`promotable` off the daemon rather than recomputing them, so the button the user
-/// sees and the bar the product enforces can never gate on different numbers.
+/// `classes_ready`/`promotable` off the daemon rather than recomputing them, so the warning the
+/// user sees and the bar the daemon computes can never be judged on different numbers.
 pub const READINESS_MIN_REVIEWED: i64 = 10;
 pub const READINESS_MIN_AGREE_PERCENT: i64 = 95;
 
@@ -411,11 +411,11 @@ pub fn class_ready(reviewed: i64, agree: i64) -> bool {
     reviewed >= READINESS_MIN_REVIEWED && agree * 100 >= READINESS_MIN_AGREE_PERCENT * reviewed
 }
 
-/// A project may leave shadow once it has exercised at least one action class, EVERY exercised
-/// class clears the bar, and at least one of those ready classes contains ONLY decisions where the
-/// classifier WITHHELD (`pending_approval` or `deny`). Classes never exercised don't block (a
-/// project would otherwise wait forever on a `deploy` it never attempts), but zero exercised
-/// classes is NOT promotable — "no evidence" must not read as "all the evidence is good".
+/// A project has earned leaving shadow once it has exercised at least one action class, EVERY
+/// exercised class clears the bar, and at least one of those ready classes contains ONLY decisions
+/// where the classifier WITHHELD (`pending_approval` or `deny`). Classes never exercised don't
+/// count against it (a project would otherwise wait forever on a `deploy` it never attempts), but
+/// zero exercised classes is NOT promotable — "no evidence" must not read as "all the evidence is good".
 ///
 /// The withheld requirement is the part that looks redundant and is not: a corpus made entirely of
 /// `allow` decisions validates the classifier's PERMISSIVENESS — that it lets through what it
