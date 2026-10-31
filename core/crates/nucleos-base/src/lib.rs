@@ -36,6 +36,7 @@ pub mod router_client;
 pub mod search;
 pub mod secrets;
 pub mod storage;
+pub mod supervise;
 pub mod team_notes;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testdb;

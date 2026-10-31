@@ -278,6 +278,27 @@ fn kill_process_group(pid: u32) {
     });
 }
 
+/// Windows only: a job object that kills every process in it when its last handle closes, so that a
+/// supervisor ended by `Stop-Process` or `taskkill /F` takes the child it launched with it.
+///
+/// Unlike `TreeKiller`'s job, this one HAS `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`: dropping it (or the
+/// OS closing the handle when the owner dies) is meant to kill.
+#[cfg(windows)]
+pub struct KillOnCloseJob(windows::Job);
+
+#[cfg(windows)]
+impl KillOnCloseJob {
+    /// `None` when the OS refuses to make the job or to set its limit.
+    pub fn new() -> Option<Self> {
+        windows::Job::create(true).map(Self)
+    }
+
+    /// Puts a live process, and from now on everything it spawns, into the job.
+    pub fn adopt(&self, pid: u32) -> bool {
+        self.0.adopt(pid)
+    }
+}
+
 #[cfg(windows)]
 mod windows {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};

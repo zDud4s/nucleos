@@ -74,8 +74,9 @@ fn is_registered(exe_path: &Path) -> bool {
 }
 
 /// Whether a queried task XML launches `exe_path` AND carries the settings this build registers.
-/// A task from an older build (default 72h limit, no restart-on-failure) names the same exe, so the
-/// exe alone would keep it forever; requiring `PT0S` and `<Count>99</Count>` makes it re-register.
+/// A task from an older build (default 72h limit, or the inert `RestartOnFailure` block, no
+/// `--supervise`) names the same exe, so the exe alone would keep it forever; requiring `PT0S` and
+/// the supervising flag at the end of the action's arguments makes it re-register.
 /// `--headless` is required too: a task whose action runs the exe directly (the pre-conhost format)
 /// opens a console window, so it must not count as registered and is re-registered with `/F`.
 #[cfg(any(windows, test))]
@@ -102,7 +103,7 @@ fn xml_matches_task(xml: &str, exe_path: &Path) -> bool {
         && exe_in_arguments
         && lower.contains("--headless")
         && lower.contains("pt0s")
-        && lower.contains("<count>99</count>")
+        && arguments.ends_with(&format!(" {}", crate::supervise::SUPERVISE_FLAG))
 }
 
 /// PURE: the trimmed text of the first `<tag>…</tag>` in already-lowercased XML.
@@ -199,21 +200,18 @@ fn task_xml(exe_path: &Path) -> String {
     <StartWhenAvailable>true</StartWhenAvailable>
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
     <Hidden>true</Hidden>
-    <RestartOnFailure>
-      <Interval>PT1M</Interval>
-      <Count>99</Count>
-    </RestartOnFailure>
   </Settings>
   <Actions Context="Author">
     <Exec>
       <Command>{}</Command>
-      <Arguments>--headless "{}"</Arguments>
+      <Arguments>--headless "{}" {}</Arguments>
       <WorkingDirectory>{}</WorkingDirectory>
     </Exec>
   </Actions>
 </Task>"#,
         xml_escape(&conhost_path()),
         xml_escape(&exe_path.to_string_lossy()),
+        crate::supervise::SUPERVISE_FLAG,
         xml_escape(&working_directory.to_string_lossy())
     )
 }
@@ -524,45 +522,93 @@ mod tests {
             r"C:\Projects\nucleos\core\target\debug\nucleos-core.exe",
         ));
         assert!(xml.contains(r"C:\Projects\nucleos\core\target\debug\nucleos-core.exe"));
-        assert!(xml.contains("<RestartOnFailure>"));
+        assert!(!xml.contains("<RestartOnFailure>"));
         assert!(xml.contains("<LogonTrigger>"));
         assert!(xml.contains(r"<WorkingDirectory>C:\Projects\nucleos</WorkingDirectory>"));
     }
 
     /// The daemon is a long-lived process: the task must never be killed by the default 72h limit.
-    /// The `RestartOnFailure` block is still written, but measured it restarts nothing here: the
-    /// Task Scheduler ignores a non-zero exit code and `conhost --headless` returns 0. `<Hidden>true</Hidden>` hides
-    /// the task in the Task Scheduler UI; the console window is suppressed separately, by launching
-    /// through `conhost.exe --headless`.
+    /// `<Hidden>true</Hidden>` hides the task in the Task Scheduler UI; the console window is
+    /// suppressed separately, by launching through `conhost.exe --headless`. `RestartOnFailure` is
+    /// gone: measured, it restarts nothing here (the Task Scheduler ignores a non-zero exit code
+    /// and `conhost --headless` returns 0), and `--supervise` does the restarting now, so a block
+    /// that could one day start working would run two restart loops on top of each other.
     #[test]
-    fn task_xml_has_no_time_limit_is_hidden_and_restarts_up_to_99_times() {
+    fn task_xml_has_no_time_limit_is_hidden_and_leaves_restarting_to_the_supervisor() {
         let xml = task_xml(Path::new(
             r"C:\Projects\nucleos\core\target\debug\nucleos-core.exe",
         ));
-        assert!(xml.contains("<RestartOnFailure>"));
         assert!(xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
         assert!(xml.contains("<Hidden>true</Hidden>"));
-        assert!(xml.contains(
-            "<RestartOnFailure>\n      <Interval>PT1M</Interval>\n      <Count>99</Count>\n    </RestartOnFailure>"
-        ));
+        assert!(!xml.contains("RestartOnFailure"));
+        assert!(!xml.contains("<Count>"));
     }
 
     #[test]
-    fn the_task_runs_the_daemon_through_conhost_headless() {
+    fn the_task_runs_the_daemon_through_conhost_headless_in_supervising_mode() {
         let exe = r"C:\Projects\nucleos\core\target\debug\nucleos-core.exe";
         let xml = task_xml(Path::new(exe));
         let command = format!("<Command>{}</Command>", conhost_path());
         assert!(xml.contains(&command));
-        assert!(xml.contains(&format!("<Arguments>--headless \"{exe}\"</Arguments>")));
+        assert!(xml.contains(&format!(
+            "<Arguments>--headless \"{exe}\" --supervise</Arguments>"
+        )));
         assert!(!xml.contains(&format!("<Command>{exe}</Command>")));
         #[cfg(not(windows))]
         assert!(xml.contains(r"<Command>C:\Windows\System32\conhost.exe</Command>"));
     }
 
+    /// The task as the previous build registered it: windowless through conhost, restart block and
+    /// all, but without `--supervise`. It names the right exe and carries every other setting, so
+    /// only the missing flag can make it re-register.
+    #[test]
+    fn a_task_registered_before_the_supervisor_is_re_registered() {
+        let exe = Path::new(r"C:\x\nucleos-core.exe");
+        let current = task_xml(exe);
+        let previous = current
+            .replace(" --supervise", "")
+            .replace(
+                "  </Settings>",
+                "    <RestartOnFailure>\n      <Interval>PT1M</Interval>\n      <Count>99</Count>\n    </RestartOnFailure>\n  </Settings>",
+            );
+        assert_ne!(
+            previous, current,
+            "the fixture must actually change the task"
+        );
+        assert!(!previous.contains("--supervise"));
+        assert!(previous.contains("<Count>99</Count>"));
+        assert!(!xml_matches_task(&previous, exe));
+        assert!(xml_matches_task(&current, exe));
+    }
+
+    /// `--supervise` somewhere else in the document (a description) is not the action's argument.
+    #[test]
+    fn a_task_with_supervise_outside_its_arguments_is_not_registered() {
+        let exe = Path::new(r"C:\x\nucleos-core.exe");
+        let genuine = task_xml(exe);
+        let forged = genuine
+            .replace(" --supervise</Arguments>", "</Arguments>")
+            .replace("</Exec>", "<Description>--supervise</Description></Exec>");
+        assert_ne!(forged, genuine, "the fixture must actually change the task");
+        assert!(forged.contains("--supervise"));
+        assert!(!xml_matches_task(&forged, exe));
+    }
+
+    /// The freshly generated task needs no restart block to count as registered.
+    #[test]
+    fn the_supervising_task_counts_as_registered_without_a_restart_block() {
+        for raw in [r"C:\x\nucleos-core.exe", r"C:\Bob's & Co\nucleos-core.exe"] {
+            let exe = Path::new(raw);
+            let xml = task_xml(exe);
+            assert!(!xml.contains("RestartOnFailure"), "{raw}");
+            assert!(xml_matches_task(&xml, exe), "{raw}");
+        }
+    }
+
     #[test]
     fn a_task_registered_before_conhost_headless_is_re_registered() {
         let exe = Path::new(r"C:\x\nucleos-core.exe");
-        let old = r"<Task><Settings><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><RestartOnFailure><Interval>PT1M</Interval><Count>99</Count></RestartOnFailure></Settings><Actions><Exec><Command>C:\x\nucleos-core.exe</Command><WorkingDirectory>C:\x</WorkingDirectory></Exec></Actions></Task>";
+        let old = r"<Task><Settings><ExecutionTimeLimit>PT0S</ExecutionTimeLimit></Settings><Actions><Exec><Command>C:\x\nucleos-core.exe</Command><WorkingDirectory>C:\x</WorkingDirectory></Exec></Actions></Task>";
         assert!(!xml_matches_task(old, exe));
         assert!(xml_matches_task(&task_xml(exe), exe));
     }
@@ -607,8 +653,11 @@ mod tests {
         let genuine = task_xml(exe);
         let forged = genuine
             .replace(
-                &format!("<Arguments>--headless \"{}\"</Arguments>", exe.display()),
-                "<Arguments>--headless</Arguments>",
+                &format!(
+                    "<Arguments>--headless \"{}\" --supervise</Arguments>",
+                    exe.display()
+                ),
+                "<Arguments>--headless --supervise</Arguments>",
             )
             .replace(
                 "</Exec>",
@@ -654,7 +703,7 @@ mod tests {
         assert!(xml.contains(r"C:\Dev &amp; Ops\nucleos\core\target\debug\nucleos-core.exe"));
         assert!(
             xml.contains(
-                r#"<Arguments>--headless "C:\Dev &amp; Ops\nucleos\core\target\debug\nucleos-core.exe"</Arguments>"#
+                r#"<Arguments>--headless "C:\Dev &amp; Ops\nucleos\core\target\debug\nucleos-core.exe" --supervise</Arguments>"#
             ),
             "the escaped path must sit, quoted, in Arguments"
         );
