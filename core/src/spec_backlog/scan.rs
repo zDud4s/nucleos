@@ -82,10 +82,7 @@ pub async fn scan(
 ) -> Result<ScanReport, ScanError> {
     let mut files = Vec::new();
     if let Some(root) = &roots.project_root {
-        files.push((
-            root.join(".ai").join("specs"),
-            ".ai/specs/".to_owned(),
-        ));
+        files.push((root.join(".ai").join("specs"), ".ai/specs/".to_owned()));
     }
     if let Some(root) = &roots.state_dir {
         files.push((root.join("specs"), "<state_dir>/specs/".to_owned()));

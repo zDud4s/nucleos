@@ -1217,7 +1217,7 @@ mod tests {
             "a dependent does not start after its dependency extraction fails"
         );
 
-        let second = finish_with(
+        finish_with(
             &pool,
             &FinishDeps {
                 launcher: &launcher,
@@ -1230,10 +1230,12 @@ mod tests {
         .unwrap();
 
         assert_eq!(prep.extraction_attempts.load(Ordering::SeqCst), 2);
-        assert!(launcher
-            .requests()
-            .iter()
-            .any(|request| request.spec_id == dependency));
+        assert!(
+            launcher
+                .requests()
+                .iter()
+                .any(|request| request.spec_id == dependency)
+        );
     }
 
     #[tokio::test]
@@ -1267,7 +1269,12 @@ mod tests {
                 .iter()
                 .any(|entry| entry == &format!("extract:{selected}"))
         );
-        assert!(launcher.requests().iter().any(|request| request.spec_id == selected));
+        assert!(
+            launcher
+                .requests()
+                .iter()
+                .any(|request| request.spec_id == selected)
+        );
 
         finish_with(
             &pool,
@@ -1332,7 +1339,10 @@ mod tests {
 
         assert_eq!(launcher.calls.load(Ordering::SeqCst), 1);
         assert!(
-            !log.lock().unwrap().iter().any(|entry| entry == &format!("audit:{id}")),
+            !log.lock()
+                .unwrap()
+                .iter()
+                .any(|entry| entry == &format!("audit:{id}")),
             "a still-running tree is not audited"
         );
         let spec = store::get_spec(&pool, &id).await.unwrap().unwrap();

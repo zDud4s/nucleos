@@ -110,7 +110,9 @@ pub async fn upsert_by_path(
 ) -> Result<Spec, StoreError> {
     let id = spec_id(project_id, path);
     let stamp = now();
-    let mut tx = pool.begin().await?;
+    // IMMEDIATE: this reads before it writes, and a deferred transaction that finds another
+    // connection committed in between fails SQLITE_BUSY at once instead of waiting.
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
 
     let existing: Option<String> = sqlx::query_scalar("SELECT content_sha FROM specs WHERE id = ?")
         .bind(&id)
@@ -988,6 +990,77 @@ mod tests {
 
         // Only this spec's rows were replaced.
         assert_eq!(criteria_texts(&pool, &other.id).await, ["bystander"]);
+    }
+
+    const ROUNDS: usize = 4;
+    const TASKS: usize = 16;
+
+    /// Runs `TASKS` copies of `job` at once, `ROUNDS` times over, and requires every one to be Ok.
+    async fn all_ok_concurrently<F, Fut>(job: F)
+    where
+        F: Fn(usize) -> Fut,
+        Fut: std::future::Future<Output = Result<(), StoreError>> + Send + 'static,
+    {
+        for round in 0..ROUNDS {
+            let handles: Vec<_> = (0..TASKS)
+                .map(|task| tokio::spawn(job(round * TASKS + task)))
+                .collect();
+            for handle in handles {
+                handle.await.unwrap().unwrap();
+            }
+        }
+    }
+
+    // A deferred transaction that reads and then writes answers SQLITE_BUSY at once, with no
+    // busy_timeout wait, once another connection has committed in between.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_upserts_of_one_spec_do_not_lock() {
+        let pool = crate::testdb::fresh_shared_pool().await;
+        seed(&pool, None, PATH).await;
+        all_ok_concurrently(|n| {
+            let pool = pool.clone();
+            async move {
+                upsert_by_path(&pool, None, PATH, "Title", &format!("sha-{n}"))
+                    .await
+                    .map(|_| ())
+            }
+        })
+        .await;
+        pool.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_criteria_replaces_do_not_lock() {
+        let pool = crate::testdb::fresh_shared_pool().await;
+        let id = seed(&pool, None, PATH).await.id;
+        all_ok_concurrently(|n| {
+            let pool = pool.clone();
+            let id = id.clone();
+            async move {
+                replace_criteria(
+                    &pool,
+                    &id,
+                    &format!("sha-{n}"),
+                    &open_items(&["one", "two"]),
+                )
+                .await
+            }
+        })
+        .await;
+        pool.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_extracted_deps_replaces_do_not_lock() {
+        let pool = crate::testdb::fresh_shared_pool().await;
+        let id = seed(&pool, None, PATH).await.id;
+        all_ok_concurrently(|_| {
+            let pool = pool.clone();
+            let id = id.clone();
+            async move { replace_extracted_deps(&pool, &id, &["other".to_owned()]).await }
+        })
+        .await;
+        pool.close().await;
     }
 
     #[tokio::test]
