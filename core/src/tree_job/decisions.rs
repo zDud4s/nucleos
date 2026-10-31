@@ -216,13 +216,26 @@ pub async fn ask_pending(
     node_id: &str,
     question: &str,
 ) -> Result<Decision, DecisionError> {
+    ask_pending_with_id(pool, tree_id, node_id, question, &new_id()).await
+}
+
+/// [`ask_pending`] under a caller-chosen `id`, insert-or-ignore: when a row with this id exists
+/// already (an earlier ask whose id never reached the caller's record), nothing is written, no
+/// feed line is added, and the returned decision carries the id with this call's fields.
+pub(super) async fn ask_pending_with_id(
+    pool: &SqlitePool,
+    tree_id: &str,
+    node_id: &str,
+    question: &str,
+    id: &str,
+) -> Result<Decision, DecisionError> {
     let Some(job) = store::load(pool, tree_id).await? else {
         return Err(DecisionError::NoBranch(format!(
             "tree job {tree_id} not found"
         )));
     };
     let decision = Decision {
-        id: new_id(),
+        id: id.to_owned(),
         tree_id: Some(tree_id.to_owned()),
         node_id: Some(node_id.to_owned()),
         question: question.to_owned(),
@@ -238,8 +251,8 @@ pub async fn ask_pending(
 
     // Nothing below may ask the pool for a connection while `tx` holds one.
     let mut tx = pool.begin().await?;
-    sqlx::query(
-        "INSERT INTO decisions (id, tree_id, node_id, question, answer, origin, at, status)
+    let inserted = sqlx::query(
+        "INSERT OR IGNORE INTO decisions (id, tree_id, node_id, question, answer, origin, at, status)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&decision.id)
@@ -252,6 +265,9 @@ pub async fn ask_pending(
     .bind(&decision.status)
     .execute(&mut *tx)
     .await?;
+    if inserted.rows_affected() == 0 {
+        return Ok(decision);
+    }
     crate::feed::append_on(
         &mut tx,
         job.project_id.as_deref(),

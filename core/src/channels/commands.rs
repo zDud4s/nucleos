@@ -398,10 +398,16 @@ async fn apply_decision(
     text: &str,
 ) -> sqlx::Result<String> {
     if id.starts_with("sq-") {
+        // A blank answer settles the question with nothing: refuse it, write nothing.
+        if text.trim().is_empty() {
+            return Ok(strings::render(&Text::NotSent {
+                refusal: "the answer is empty".to_owned(),
+            }));
+        }
         let said = match crate::spec_backlog::answer(&state.pool, id, text, at.channel).await {
             Ok(answered) => {
-                if let Some(spec_id) = answered.reopened {
-                    crate::spec_backlog::relaunch_answered(state.clone(), spec_id);
+                if answered.reopened.is_some() {
+                    crate::spec_backlog::relaunch_answered(state.clone());
                 }
                 Text::DecisionApplied {
                     question: answered.question,

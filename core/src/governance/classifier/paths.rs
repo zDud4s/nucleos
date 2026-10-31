@@ -34,7 +34,7 @@ use super::*;
 ///
 /// Without a `cwd` there is no boundary to be inside of, so the answer is no — the same reading
 /// `writes_outside_cwd` was corrected to.
-pub(super) fn lands_inside_the_workspace(
+pub fn lands_inside_the_workspace(
     segment: &str,
     cwd: Option<&Path>,
     shell: crate::command_reader::Shell,
@@ -315,7 +315,7 @@ pub(super) fn fold_for_containment(path: &str) -> String {
     path.to_owned()
 }
 
-pub(super) fn is_absolute_path(path: &str) -> bool {
+pub fn is_absolute_path(path: &str) -> bool {
     path.starts_with('/')
         || path
             .as_bytes()

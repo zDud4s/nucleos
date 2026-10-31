@@ -352,7 +352,7 @@ pub(super) fn shapes_output_only(command: &str) -> bool {
 /// as an OR, so the entry let `cargo fmt --check -- --emit files` through whatever the guard here
 /// said, and the test pinning that refusal went red the first time it ran. One place decides
 /// `cargo fmt` now.
-pub(super) fn checks_formatting_without_writing(command: &str) -> bool {
+pub fn checks_formatting_without_writing(command: &str) -> bool {
     let words = flag_words(command);
     let mut tokens = words.iter().map(String::as_str);
     tokens.next().map(program_name) == Some("cargo")

@@ -298,19 +298,8 @@ async fn remember_pending_start(
     {
         return;
     }
-    let question = format!(
-        "Branch {name} (layer {}) waits for disk space and starts by itself once there is room.",
-        pending.layer
-    );
-    let asked = match super::decisions::ask_pending(&state.pool, job_id, pending.caller, &question)
-        .await
-    {
-        Ok(asked) => asked,
-        Err(error) => {
-            tracing::warn!(%error, job = job_id, branch = name, "could not ask about a pending start");
-            return;
-        }
-    };
+    // The record goes first, without a decision id: a crash after it leaves a record that the next
+    // driver pass heals (`heal_pending_decision`), never a decision no record knows about.
     let record = json!({
         "caller": pending.caller,
         "goal": pending.goal,
@@ -318,7 +307,6 @@ async fn remember_pending_start(
         "paths": pending.paths,
         "layer": pending.layer,
         "base": pending.base,
-        "decision_id": asked.id,
     });
     let slot = job
         .manifest
@@ -334,7 +322,108 @@ async fn remember_pending_start(
     job.updated_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
     if let Err(error) = store::update(&state.pool, &job).await {
         tracing::warn!(%error, job = job_id, branch = name, "could not record a pending start");
+        return;
     }
+    // Then the ask, then the id into the record. Both failures are healed by the next pass.
+    let asked = match ask_for_pending(&state.pool, job_id, name, pending.caller, pending.layer)
+        .await
+    {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::warn!(%error, job = job_id, branch = name, "could not ask about a pending start");
+            return;
+        }
+    };
+    if set_decision_id(&mut job, name, &asked)
+        && let Err(error) = store::update(&state.pool, &job).await
+    {
+        tracing::warn!(%error, job = job_id, branch = name, "could not store a pending start's decision id");
+    }
+}
+
+/// The id of the decision that tells the owner a pending start waits: fixed by job and branch name,
+/// so an ask whose id never reached the record is found again, not made twice.
+pub(super) fn pending_decision_id(job_id: &str, name: &str) -> String {
+    format!("pending-{job_id}-{name}")
+}
+
+/// Opens (insert-or-ignore) the decision of a pending start and returns its id.
+async fn ask_for_pending(
+    pool: &sqlx::SqlitePool,
+    job_id: &str,
+    name: &str,
+    caller: &str,
+    layer: &str,
+) -> Result<String, String> {
+    let question = format!(
+        "Branch {name} (layer {layer}) waits for disk space and starts by itself once there is room."
+    );
+    super::decisions::ask_pending_with_id(
+        pool,
+        job_id,
+        caller,
+        &question,
+        &pending_decision_id(job_id, name),
+    )
+    .await
+    .map(|asked| asked.id)
+    .map_err(|e| e.to_string())
+}
+
+/// Writes `id` as the `decision_id` of the pending record of `name`. False when there is no record.
+fn set_decision_id(job: &mut store::TreeJob, name: &str, id: &str) -> bool {
+    let record = job
+        .manifest
+        .extra
+        .get_mut("pending_starts")
+        .and_then(|held| held.get_mut(name))
+        .and_then(Value::as_object_mut);
+    match record {
+        Some(record) => {
+            record.insert("decision_id".to_owned(), json!(id));
+            job.updated_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
+            true
+        }
+        None => false,
+    }
+}
+
+/// A pending record with no `decision_id` (a crash between the record and the ask, or the ask and
+/// the id) asks now, once, and stores the id. Under the job's lock, from a fresh read; the caller
+/// must not hold it. A record that is gone or already has an id is left alone.
+pub(super) async fn heal_pending_decision(
+    state: &AppState,
+    job_id: &str,
+    name: &str,
+) -> Result<(), String> {
+    let lock = job_lock(job_id);
+    let _guard = lock.lock().await;
+    let Some(mut job) = store::load(&state.pool, job_id)
+        .await
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(());
+    };
+    let Some(record) = job
+        .manifest
+        .extra
+        .get("pending_starts")
+        .and_then(|held| held.get(name))
+    else {
+        return Ok(());
+    };
+    if record["decision_id"].as_str().is_some() {
+        return Ok(());
+    }
+    let caller = record["caller"].as_str().unwrap_or_default().to_owned();
+    let layer = record["layer"].as_str().unwrap_or(DEFAULT_LAYER).to_owned();
+    let id = ask_for_pending(&state.pool, job_id, name, &caller, &layer).await?;
+    if set_decision_id(&mut job, name, &id) {
+        store::update(&state.pool, &job)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// Replays the stored start of a pending branch through `/branch_start`, with the body it was
@@ -422,6 +511,28 @@ async fn post_branch_start(
         return Err(refuse(
             StatusCode::CONFLICT,
             format!("tree job {id} is finished and takes no new branch"),
+        ));
+    }
+    // A docs branch has no worktree and its write guard is the classifier hook, so a root without
+    // that hook takes no docs branch: nothing else would enforce the guard.
+    let docs = layer == "docs"
+        || job
+            .manifest
+            .branches
+            .get(&name)
+            .is_some_and(|branch| branch.layer == "docs");
+    if docs
+        && !crate::governance::autopilot::classifier_hook_is_wired(FsPath::new(
+            &job.manifest.project_root,
+        ))
+    {
+        return Err(refuse(
+            StatusCode::CONFLICT,
+            format!(
+                "branch {name} is a docs branch: it runs in the main checkout and its guard is the \
+                 classifier hook, and the classifier hook is not wired in {}",
+                job.manifest.project_root
+            ),
         ));
     }
 
@@ -608,6 +719,9 @@ mod tests {
             let dir = path.join(".nucleos/workflow");
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("speed.yaml"), "tree:\n  floor_gb: 0\n").unwrap();
+            // A docs branch runs in this root with no worktree, and its write guard is the
+            // classifier hook, so a launch needs the root wired (the rule under test below).
+            crate::governance::autopilot::wire_classifier_hook(&path).unwrap();
             Repo {
                 _container: container,
                 path,
@@ -683,6 +797,46 @@ mod tests {
             .unwrap();
         let branch = &job.manifest.branches["notes"];
         assert_eq!(branch.node_id.as_deref(), response["node_id"].as_str());
+    }
+
+    /// A docs branch works in the main checkout with no worktree, and its write guard lives in the
+    /// PreToolUse classifier hook. Nothing else guarantees that hook is there, so a root without it
+    /// takes no docs branch: the guard might never fire.
+    #[tokio::test]
+    async fn a_docs_branch_is_refused_when_the_classifier_hook_is_not_wired() {
+        let (state, app, caller, repo) = tree().await;
+        // Un-wire the root: a settings file that registers nothing.
+        std::fs::write(repo.path.join(".claude/settings.json"), "{}").unwrap();
+        assert!(!crate::governance::autopilot::classifier_hook_is_wired(
+            &repo.path
+        ));
+        let nodes = count(&state, "work_nodes").await;
+        let runs = count(&state, "runs").await;
+
+        let (status, response) = post(&app, &uri(), body(&caller)).await;
+
+        assert!(!status.is_success(), "{status:?} {response:?}");
+        assert!(
+            response.to_string().contains("classifier hook"),
+            "the refusal names the missing hook: {response:?}"
+        );
+        assert_eq!(count(&state, "runs").await, runs, "no run is launched");
+        assert_eq!(
+            count(&state, "work_nodes").await,
+            nodes,
+            "no node is opened"
+        );
+        let job = crate::tree_job::store::load(&state.pool, TREE)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            job.manifest
+                .branches
+                .get("notes")
+                .is_none_or(|branch| branch.state != "building"),
+            "the branch is not running"
+        );
     }
 
     #[tokio::test]

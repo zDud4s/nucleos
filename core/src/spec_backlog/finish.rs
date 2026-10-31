@@ -123,34 +123,10 @@ pub struct FinishReport {
     pub refused: Vec<String>,
     /// Not launched because a dependency ended `needs_owner`, refused or blocked.
     pub blocked: Vec<String>,
-    /// Still queued because the disk was below the floor; the caller retries them later.
+    /// Still queued because the disk was below the floor; the finish intent stays, and the sweeper
+    /// runs another pass later.
     pub deferred: Vec<String>,
     pub cycles: Vec<Cycle>,
-}
-
-impl FinishReport {
-    /// Folds the report of a later pass over some of the same specs into this one.
-    pub fn absorb(&mut self, other: FinishReport) {
-        self.trees.extend(other.trees);
-        self.done.extend(other.done);
-        self.needs_owner.extend(other.needs_owner);
-        self.skipped.extend(other.skipped);
-        self.refused.extend(other.refused);
-        self.blocked.extend(other.blocked);
-        self.deferred.extend(other.deferred);
-        self.cycles.extend(other.cycles);
-        for list in [
-            &mut self.done,
-            &mut self.needs_owner,
-            &mut self.skipped,
-            &mut self.refused,
-            &mut self.blocked,
-            &mut self.deferred,
-        ] {
-            list.sort();
-            list.dedup();
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -200,7 +176,8 @@ pub fn derived_branch(spec_path: &str) -> String {
 
 pub use super::daemon::{
     ProjectPaths, audit_one, extract_one, finish, no_tools_run_request, project_id_for_root,
-    record_extraction_run, resolve_project, resume_finishes,
+    record_extraction_run, resolve_project, resume_finishes, run_sweep_loop, settle_intent,
+    sweep_finishes,
 };
 
 /// The runs that extracted the spec, oldest first.
@@ -300,7 +277,9 @@ fn compatible(owned: &[String], running: &[(String, Vec<String>)]) -> bool {
             .all(|(_, other)| other.is_empty() || sets_overlap(owned, other).is_none())
 }
 
-/// The tree an `in_progress` spec already has, which a restart adopts instead of replacing.
+/// The tree an `in_progress` spec already has, which a restart adopts instead of replacing. One with
+/// no tree id has none to adopt: `drive_spec` records the id before the launch creates the tree, so
+/// a crash that left the id null left no tree behind, and round 1 runs as for any other spec.
 fn adoptable_tree(spec: &Spec) -> Option<String> {
     if spec.status == SpecStatus::InProgress {
         spec.tree_id.clone()

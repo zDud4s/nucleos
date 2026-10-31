@@ -37,28 +37,11 @@ pub async fn answer(
     })
 }
 
-/// Starts the same one-spec retry used by the finish route after an owner answer reopens a spec.
-pub fn relaunch_answered(state: AppState, spec_id: String) {
-    tokio::spawn(async move {
-        let project_id = match store::get_spec(&state.pool, &spec_id).await {
-            Ok(Some(spec)) => spec.project_id,
-            Ok(None) => None,
-            Err(error) => {
-                tracing::warn!(%error, %spec_id, "could not read reopened spec");
-                None
-            }
-        };
-        let Some(project_id) = project_id else {
-            return;
-        };
-        let Some(claim) = finish::claim_project(&project_id) else {
-            return;
-        };
-        let _claim = claim;
-        if let Err(error) = finish::finish(&state, finish::FinishScope::One { spec_id }).await {
-            tracing::warn!(%error, "spec retry after owner answer failed");
-        }
-    });
+/// Wakes a sweep after an owner answer reopens a spec. The answer already wrote the project's
+/// finish intent in its own transaction, so a busy claim loses nothing: the sweep skips that project
+/// and the periodic sweep takes it up once the claim is free.
+pub fn relaunch_answered(state: AppState) {
+    tokio::spawn(async move { finish::sweep_finishes(&state).await });
 }
 
 #[cfg(test)]

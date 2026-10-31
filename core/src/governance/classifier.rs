@@ -26,6 +26,7 @@ pub use self::judge_guard::*;
 pub use self::paths::*;
 pub use self::shell_shape::*;
 use self::write_guards::*;
+pub use self::write_guards::{path_has_suffix, split_first_token};
 
 pub const CLASSIFIER_VERSION: u32 = 23;
 

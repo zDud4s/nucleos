@@ -592,16 +592,36 @@ pub async fn answer_question(
             "question {question_id}"
         )));
     }
-    let reopened = sqlx::query(
-        "UPDATE specs SET status = 'discovered', status_reason = NULL, updated_at = ? \
-         WHERE id = ? AND status = 'needs_owner'",
+    // The spec waits until its last open question is answered: one answer among several settles
+    // nothing yet.
+    let others_open: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM spec_questions WHERE spec_id = ? AND status = 'open'",
     )
-    .bind(now())
     .bind(&spec_id)
-    .execute(&mut *tx)
-    .await?
-    .rows_affected()
-        == 1;
+    .fetch_one(&mut *tx)
+    .await?;
+    let reopened = others_open == 0
+        && sqlx::query(
+            "UPDATE specs SET status = 'discovered', status_reason = NULL, updated_at = ? \
+             WHERE id = ? AND status = 'needs_owner'",
+        )
+        .bind(now())
+        .bind(&spec_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            == 1;
+    if reopened {
+        // Same transaction as the flip: a crash cannot leave a reopened spec nobody will finish.
+        let project_id: Option<String> =
+            sqlx::query_scalar("SELECT project_id FROM specs WHERE id = ?")
+                .bind(&spec_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if let Some(project_id) = project_id {
+            upsert_finish_intent(&mut *tx, &project_id, &now()).await?;
+        }
+    }
     tx.commit().await?;
     Ok((
         Question {
@@ -615,6 +635,64 @@ pub async fn answer_question(
         },
         reopened,
     ))
+}
+
+async fn upsert_finish_intent(
+    conn: &mut sqlx::SqliteConnection,
+    project_id: &str,
+    created_at: &str,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "INSERT INTO spec_finish_intents (project_id, created_at) VALUES (?, ?) \
+         ON CONFLICT (project_id) DO UPDATE SET created_at = excluded.created_at",
+    )
+    .bind(project_id)
+    .bind(created_at)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// Records that `project_id` has finishing to do. Re-writing bumps `created_at`, which is how a
+/// request that arrives during a pass is told from the one the pass served.
+pub async fn write_finish_intent(pool: &SqlitePool, project_id: &str) -> Result<(), StoreError> {
+    write_finish_intent_at(pool, project_id, &now()).await
+}
+
+/// `write_finish_intent` with an explicit RFC3339 `created_at`.
+pub async fn write_finish_intent_at(
+    pool: &SqlitePool,
+    project_id: &str,
+    created_at: &str,
+) -> Result<(), StoreError> {
+    let mut conn = pool.acquire().await?;
+    upsert_finish_intent(&mut conn, project_id, created_at).await
+}
+
+/// Every pending finish intent as `(project_id, created_at)`, ordered by project.
+pub async fn finish_intents(pool: &SqlitePool) -> Result<Vec<(String, String)>, StoreError> {
+    Ok(
+        sqlx::query_as(
+            "SELECT project_id, created_at FROM spec_finish_intents ORDER BY project_id",
+        )
+        .fetch_all(pool)
+        .await?,
+    )
+}
+
+/// Deletes the intent of `project_id`, but only while its `created_at` is still `created_at`: one
+/// re-written since is a newer request and stays.
+pub async fn delete_finish_intent(
+    pool: &SqlitePool,
+    project_id: &str,
+    created_at: &str,
+) -> Result<(), StoreError> {
+    sqlx::query("DELETE FROM spec_finish_intents WHERE project_id = ? AND created_at = ?")
+        .bind(project_id)
+        .bind(created_at)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// Lists this audit's answered owner questions, oldest first.
@@ -1373,7 +1451,11 @@ mod tests {
         assert_eq!(after.status, SpecStatus::NeedsOwner);
         let questions = list_questions(&pool, &spec.id).await.unwrap();
         assert_eq!(
-            questions.iter().find(|question| question.id == still_open).unwrap().status,
+            questions
+                .iter()
+                .find(|question| question.id == still_open)
+                .unwrap()
+                .status,
             "open"
         );
     }

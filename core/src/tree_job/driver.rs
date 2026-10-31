@@ -51,6 +51,8 @@ const GATE_WAIT: Duration = Duration::from_secs(900);
 const FIX_CAP: i64 = 2;
 /// Merge requests of one branch that the conflict resolver is given before the owner is asked.
 const CONFLICT_ATTEMPTS: i64 = 2;
+/// How long a conflict may wait for a resolver run before the owner is asked instead.
+const RESOLVER_GRACE: Duration = Duration::from_secs(15 * 60);
 /// Longest tail of the gate's findings that goes into a relaunch prompt.
 const FINDINGS_MAX: usize = 3000;
 
@@ -224,24 +226,33 @@ async fn retry_pending_start(
         let admission = super::http::current_admission(&job.manifest, layer).await?;
         if !admission.admit {
             if admission.disk_only {
+                // A record a crash left without its decision asks now, once.
+                if record["decision_id"].as_str().is_none() {
+                    super::branch_start::heal_pending_decision(state, &job.id, name).await?;
+                }
                 return Ok(());
             }
             return drop_pending_start(pool, &job.id, name).await;
         }
     }
     super::branch_start::start_pending(state, &job.id, name, record).await?;
-    drop_pending_start(pool, &job.id, name).await?;
 
-    if let Some(decision) = record["decision_id"].as_str() {
-        let text = format!("disk freed: branch {name} admitted automatically");
-        match decisions::answer(pool, decision, &text, "driver").await {
-            // The owner answered first: their answer stays.
-            Ok(_) | Err(decisions::DecisionError::AlreadyDecided(_)) => {}
-            Err(error) => {
-                tracing::warn!(job = %job.id, decision, %error, "could not answer the pending start's decision");
-            }
+    // Start, then answer, then drop the record: a crash between any two repeats safely. A record
+    // with no id may still have a decision (a crash between the ask and the id): the id is fixed.
+    let fallback = super::branch_start::pending_decision_id(&job.id, name);
+    let decision = record["decision_id"].as_str().unwrap_or(&fallback);
+    let text = format!("disk freed: branch {name} admitted automatically");
+    match decisions::answer(pool, decision, &text, "driver").await {
+        // The owner answered first: their answer stays. No row: nothing was ever asked.
+        Ok(_)
+        | Err(
+            decisions::DecisionError::AlreadyDecided(_) | decisions::DecisionError::NotFound(_),
+        ) => {}
+        Err(error) => {
+            tracing::warn!(job = %job.id, decision, %error, "could not answer the pending start's decision");
         }
     }
+    drop_pending_start(pool, &job.id, name).await?;
     let line = format!(
         "{}: branch {name} admitted automatically, the disk is freed",
         job.goal
@@ -730,6 +741,80 @@ fn conflict_attempts(job: &TreeJob, name: &str) -> i64 {
         .unwrap_or(0)
 }
 
+/// Stamps `conflict_since` (RFC 3339) on a branch whose conflict is left to the resolver, keeping it
+/// across passes for the same merge request (`conflict_request_id`) and renewing it for a new one.
+/// Returns `(stamped, overdue)`: whether a stamp was written, and whether the conflict has waited
+/// past [`RESOLVER_GRACE`].
+fn note_unclaimed_conflict(job: &mut TreeJob, name: &str) -> (bool, bool) {
+    let Some(branch) = job.manifest.branches.get_mut(name) else {
+        return (false, false);
+    };
+    let request = branch.extra.get("conflict_request_id").cloned();
+    let since = branch
+        .extra
+        .get("conflict_since")
+        .and_then(Value::as_str)
+        .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok());
+    let same = branch.extra.get("conflict_since_request") == request.as_ref();
+    if let Some(since) = since
+        && same
+    {
+        let late = (Utc::now() - since.with_timezone(&Utc))
+            .to_std()
+            .is_ok_and(|waited| waited > RESOLVER_GRACE);
+        return (false, late);
+    }
+    branch
+        .extra
+        .insert("conflict_since".to_owned(), Value::from(now()));
+    match request {
+        Some(request) => branch
+            .extra
+            .insert("conflict_since_request".to_owned(), request),
+        None => branch.extra.remove("conflict_since_request"),
+    };
+    (true, false)
+}
+
+/// A conflict left to the resolver that no resolver run picked up within [`RESOLVER_GRACE`] (quota
+/// pause, kill switch, resolver loop down) is claimed, so a late resolver never spends on it, and
+/// parked on a question for the owner. Inside the grace it only keeps the stamp.
+async fn park_if_unclaimed(
+    pool: &SqlitePool,
+    job: &mut TreeJob,
+    name: &str,
+    node: Option<&str>,
+    reason: &str,
+    parks: &mut Vec<Park>,
+) -> Result<(), String> {
+    let (stamped, overdue) = note_unclaimed_conflict(job, name);
+    if !overdue {
+        if stamped {
+            persist(pool, job).await?;
+        }
+        return Ok(());
+    }
+    if let Some(branch) = job.manifest.branches.get_mut(name) {
+        branch.extra.remove("conflict_since");
+        branch.extra.remove("conflict_since_request");
+    }
+    let settled = settle_merge(pool, job, name, Duration::ZERO, true)
+        .await
+        .map_err(|e| e.to_string())?;
+    if matches!(settled, MergeSettlement::NotMerged { .. })
+        && let Some(node) = node
+    {
+        parks.push((
+            node.to_owned(),
+            format!(
+                "The merge of branch {name} conflicts and no conflict resolver picked it up within {} minutes: {reason}",
+                RESOLVER_GRACE.as_secs() / 60
+            ),
+        ));
+    }
+    Ok(())
+}
+
 async fn merge(
     state: &AppState,
     job: &mut TreeJob,
@@ -787,6 +872,9 @@ async fn merge(
                     {
                         tracing::warn!(job = %job.id, %error, "could not announce a conflict");
                     }
+                }
+                if !resolution_failed {
+                    park_if_unclaimed(pool, job, name, node.as_deref(), &reason, parks).await?;
                 }
                 if resolution_failed
                     && attempts >= CONFLICT_ATTEMPTS

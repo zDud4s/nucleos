@@ -123,15 +123,17 @@ pub(super) async fn wind_down_decision(
     )
 }
 
-/// Restricts a docs branch to the paths it declared when the tree was opened. This is before the
-/// classifier so a refusal is immediate rather than an approval a tree run cannot answer.
+/// Restricts a docs branch to declared writes and shell actions that alter its checkout. This is
+/// before the classifier so a refusal is immediate rather than an approval a tree run cannot answer.
 pub(super) async fn docs_write_decision(
     state: &AppState,
     payload: &PreToolUsePayload,
     run_id: i64,
     cwd: Option<&Path>,
 ) -> Option<Json<Decision>> {
-    if !crate::governance::classifier::WRITE_TOOLS.contains(&payload.tool_name.as_str()) {
+    let is_write = crate::governance::classifier::WRITE_TOOLS.contains(&payload.tool_name.as_str());
+    let is_shell = matches!(payload.tool_name.as_str(), "Bash" | "PowerShell");
+    if !is_write && !is_shell {
         return None;
     }
 
@@ -176,6 +178,14 @@ pub(super) async fn docs_write_decision(
         return Some(docs_write_deny(&[]));
     };
 
+    if is_shell {
+        let command = payload.tool_input.get("command").and_then(Value::as_str)?;
+        if docs_shell_changes_checkout(command, cwd, &payload.tool_name) {
+            return Some(docs_shell_deny());
+        }
+        return None;
+    }
+
     let paths: Vec<Option<String>> = ["file_path", "notebook_path"]
         .iter()
         .filter_map(|key| payload.tool_input.get(*key).and_then(Value::as_str))
@@ -192,6 +202,72 @@ pub(super) async fn docs_write_decision(
             })
         });
     (!allowed).then(|| docs_write_deny(&docs_branch.paths))
+}
+
+fn docs_shell_deny() -> Json<Decision> {
+    Json(Decision {
+        decision: "deny".to_owned(),
+        reason: "docs branches may not change the main checkout through the shell".to_owned(),
+    })
+}
+
+fn docs_shell_changes_checkout(command: &str, cwd: Option<&Path>, tool_name: &str) -> bool {
+    let shell = crate::governance::classifier::shell_for(tool_name);
+    crate::command_reader::segments(command, shell)
+        .into_iter()
+        .any(|segment| docs_segment_changes_checkout(segment, cwd, shell))
+}
+
+fn docs_segment_changes_checkout(
+    segment: &str,
+    cwd: Option<&Path>,
+    shell: crate::command_reader::Shell,
+) -> bool {
+    let inner = docs_heavy_wrapper_inner(segment).unwrap_or(segment);
+    docs_git_changes_index_or_history(inner)
+        || (crate::governance::classifier::lands_inside_the_workspace(inner, cwd, shell)
+            && !crate::governance::classifier::checks_formatting_without_writing(inner))
+}
+
+/// This guard only refuses. It may therefore inspect a mutable in-checkout `heavy.py` wrapper,
+/// unlike the general classifier, which cannot trust it when deciding to allow a command.
+fn docs_heavy_wrapper_inner(segment: &str) -> Option<&str> {
+    let (program, rest) = crate::governance::classifier::split_first_token(segment)?;
+    let program = std::path::Path::new(&program)
+        .file_name()?
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    if !(program.starts_with("python") || program == "py") {
+        return None;
+    }
+    let (script, rest) = crate::governance::classifier::split_first_token(rest)?;
+    if !crate::governance::classifier::path_has_suffix(
+        &script.replace('\\', "/"),
+        "scripts/heavy.py",
+    ) {
+        return None;
+    }
+    let (_, inner) = rest.split_once("--")?;
+    (!inner.trim().is_empty()).then_some(inner.trim())
+}
+
+fn docs_git_changes_index_or_history(segment: &str) -> bool {
+    let words = crate::governance::classifier::shell_words(segment);
+    if !words
+        .first()
+        .is_some_and(|word| word.eq_ignore_ascii_case("git"))
+    {
+        return false;
+    }
+    let mut words = words.into_iter().skip(1);
+    while let Some(word) = words.next() {
+        if word == "-C" || word == "-c" {
+            let _ = words.next();
+        } else if !word.starts_with('-') {
+            return matches!(word.as_str(), "add" | "commit");
+        }
+    }
+    false
 }
 
 fn docs_write_deny(paths: &[String]) -> Json<Decision> {
@@ -215,11 +291,18 @@ fn docs_relative_path(path: &str, cwd: Option<&Path>) -> Option<String> {
     let cwd = cwd?;
     let path = path.replace('\\', "/");
     let cwd = cwd.to_string_lossy().replace('\\', "/");
+    let absolute = crate::governance::classifier::is_absolute_path(&path);
     let path = docs_clean_path(&path)?;
     let cwd = docs_clean_path(&cwd)?;
-    if path.as_bytes().get(1).is_some_and(|byte| *byte == b':') || path.starts_with('/') {
+    if absolute {
         let prefix = format!("{}/", cwd.trim_end_matches('/'));
-        path.strip_prefix(&prefix).map(str::to_owned)
+        if cfg!(windows) {
+            path.to_ascii_lowercase()
+                .strip_prefix(&prefix.to_ascii_lowercase())
+                .map(str::to_owned)
+        } else {
+            path.strip_prefix(&prefix).map(str::to_owned)
+        }
     } else {
         Some(path)
     }

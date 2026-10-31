@@ -24,9 +24,10 @@ const RUN_POLL: Duration = Duration::from_secs(1);
 const RUN_CEILING: Duration = Duration::from_secs(30 * 60);
 const TREE_POLL: Duration = Duration::from_secs(5);
 const TREE_CEILING: Duration = Duration::from_secs(24 * 60 * 60);
-/// How long a spec held back for disk waits before it is tried again, and for how long in all.
-const DISK_RETRY: Duration = Duration::from_secs(60);
-const DISK_WAIT_CEILING: Duration = Duration::from_secs(24 * 60 * 60);
+/// How often the sweeper looks for finish intents to run.
+const SWEEP_EVERY: Duration = Duration::from_secs(60);
+/// How long an intent may keep coming back with specs held for disk before it is given up.
+const INTENT_CEILING_HOURS: i64 = 24;
 
 /// Remembers that `run_id` extracted `spec_id`'s criteria. A repeat changes nothing.
 pub async fn record_extraction_run(
@@ -458,21 +459,9 @@ pub async fn audit_one(state: &AppState, spec_id: &str) -> Result<AuditReport, S
         .await
 }
 
-/// Finishes the backlog. A spec held back for want of disk is tried again after `DISK_RETRY`, on
-/// its own, until `DISK_WAIT_CEILING`; it is never failed and never put to the owner for it.
+/// One finish pass. A spec held back for want of disk is reported in `deferred`, never failed and
+/// never put to the owner: the caller keeps its finish intent, and the sweeper runs another pass.
 pub async fn finish(state: &AppState, scope: FinishScope) -> Result<FinishReport, FinishError> {
-    let mut report = finish_pass(state, scope).await?;
-    let give_up = tokio::time::Instant::now() + DISK_WAIT_CEILING;
-    while !report.deferred.is_empty() && tokio::time::Instant::now() < give_up {
-        tokio::time::sleep(DISK_RETRY).await;
-        for spec_id in std::mem::take(&mut report.deferred) {
-            report.absorb(finish_pass(state, FinishScope::One { spec_id }).await?);
-        }
-    }
-    Ok(report)
-}
-
-async fn finish_pass(state: &AppState, scope: FinishScope) -> Result<FinishReport, FinishError> {
     let project_id = match &scope {
         FinishScope::All { project_id } => project_id.clone(),
         FinishScope::One { spec_id } => {
@@ -552,19 +541,21 @@ async fn owned_paths_by_spec(pool: &SqlitePool, project_id: &str) -> BTreeMap<St
     owned
 }
 
-/// The projects with an `in_progress` spec that has a tree: a restart cut their finish off.
+/// The projects with an `in_progress` spec: a restart cut their finish off. A spec with no tree id
+/// is included: a crash between its status write and its tree id write left it half-recorded, and
+/// the finish runs its round again (no tree exists yet, as the id is recorded before the launch).
 async fn resume_candidates(pool: &SqlitePool) -> Result<Vec<String>, StoreError> {
     Ok(sqlx::query_scalar(
         "SELECT DISTINCT project_id FROM specs WHERE status = 'in_progress' \
-         AND tree_id IS NOT NULL AND project_id IS NOT NULL ORDER BY project_id",
+         AND project_id IS NOT NULL ORDER BY project_id",
     )
     .fetch_all(pool)
     .await?)
 }
 
-/// Takes up again, once per boot, the finish of each project a restart interrupted: the claim keeps
-/// it to one per project, and each runs in its own task so boot does not wait on a tree. The
-/// finish adopts the trees its specs already have instead of starting others.
+/// Writes, once per boot, a finish intent for each project a restart interrupted. It starts
+/// nothing: the sweep that follows runs the intents, and the finish adopts the trees its specs
+/// already have instead of starting others. An intent already there keeps its age.
 pub async fn resume_finishes(state: &AppState) {
     let projects = match resume_candidates(&state.pool).await {
         Ok(projects) => projects,
@@ -573,22 +564,126 @@ pub async fn resume_finishes(state: &AppState) {
             return;
         }
     };
-    for project_id in projects {
+    let pending: Vec<String> = match store::finish_intents(&state.pool).await {
+        Ok(intents) => intents
+            .into_iter()
+            .map(|(project_id, _)| project_id)
+            .collect(),
+        Err(error) => {
+            tracing::warn!(%error, "could not read the spec finish intents");
+            return;
+        }
+    };
+    for project_id in projects.iter().filter(|id| !pending.contains(id)) {
+        if let Err(error) = store::write_finish_intent(&state.pool, project_id).await {
+            tracing::warn!(%error, %project_id, "could not record a spec finish to resume");
+        }
+    }
+}
+
+/// Settles a finish intent from the pass that served it. A pass with nothing deferred, or one that
+/// failed (the feed says so), deletes it; a pass that held specs for disk keeps it for the next
+/// sweep, until it is `INTENT_CEILING_HOURS` old, when it is announced once and dropped. Only the
+/// intent as it was when the pass began is deleted: one re-written since is a newer request.
+pub async fn settle_intent(
+    pool: &SqlitePool,
+    project_id: &str,
+    created_at: &str,
+    result: &Result<FinishReport, FinishError>,
+) {
+    let settled = match result {
+        Ok(report) if report.deferred.is_empty() => true,
+        Ok(report) => {
+            let age = chrono::DateTime::parse_from_rfc3339(created_at)
+                .map(|at| chrono::Utc::now() - at.with_timezone(&chrono::Utc))
+                .unwrap_or_else(|_| chrono::Duration::zero());
+            if age > chrono::Duration::hours(INTENT_CEILING_HOURS) {
+                // A line in the feed, never a decision: answering cannot make the disk bigger.
+                super::finish::announce_failure(
+                    pool,
+                    project_id,
+                    &format!(
+                        "the disk has stayed short for {INTENT_CEILING_HOURS} hours; {} spec(s) \
+                         could not start for it ({}). Free some disk and ask for the finish again",
+                        report.deferred.len(),
+                        report.deferred.join(", ")
+                    ),
+                )
+                .await;
+                true
+            } else {
+                false
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, %project_id, "the spec finish failed");
+            super::finish::announce_failure(pool, project_id, &error.to_string()).await;
+            true
+        }
+    };
+    if settled && let Err(error) = store::delete_finish_intent(pool, project_id, created_at).await {
+        tracing::warn!(%error, %project_id, "could not delete a spec finish intent");
+    }
+}
+
+/// Runs one pass for each project with a finish intent and no finish under way, then settles the
+/// intent from the pass. A claimed project is skipped with its intent untouched. Returns when every
+/// pass it started has ended; passes of different projects run together.
+async fn sweep_with<P, Fut>(state: &AppState, pass: P)
+where
+    P: Fn(AppState, String) -> Fut + Clone + Send + 'static,
+    Fut: std::future::Future<Output = Result<FinishReport, FinishError>> + Send + 'static,
+{
+    let intents = match store::finish_intents(&state.pool).await {
+        Ok(intents) => intents,
+        Err(error) => {
+            tracing::warn!(%error, "could not read the spec finish intents");
+            return;
+        }
+    };
+    let mut passes = tokio::task::JoinSet::new();
+    for (project_id, created_at) in intents {
         let Some(claim) = super::finish::claim_project(&project_id) else {
             continue;
         };
         let state = state.clone();
-        tokio::spawn(async move {
-            // Held until the finish ends.
+        let pass = pass.clone();
+        passes.spawn(async move {
+            // Held until the pass is settled, then free for an owner request to take.
             let _claim = claim;
-            let scope = FinishScope::All {
-                project_id: Some(project_id.clone()),
-            };
-            if let Err(error) = finish(&state, scope).await {
-                tracing::warn!(%error, %project_id, "the resumed spec finish failed");
-                super::finish::announce_failure(&state.pool, &project_id, &error.to_string()).await;
-            }
+            let result = pass(state.clone(), project_id.clone()).await;
+            settle_intent(&state.pool, &project_id, &created_at, &result).await;
         });
+    }
+    while let Some(ended) = passes.join_next().await {
+        if let Err(error) = ended {
+            tracing::warn!(%error, "a spec finish pass panicked");
+        }
+    }
+}
+
+/// One sweep over the finish intents: a whole-project pass for each.
+pub async fn sweep_finishes(state: &AppState) {
+    sweep_with(state, |state, project_id| async move {
+        finish(
+            &state,
+            FinishScope::All {
+                project_id: Some(project_id),
+            },
+        )
+        .await
+    })
+    .await;
+}
+
+/// Sweeps the finish intents every `SWEEP_EVERY`, the first time one period after it starts.
+pub async fn run_sweep_loop(state: AppState) {
+    let mut ticker =
+        tokio::time::interval_at(tokio::time::Instant::now() + SWEEP_EVERY, SWEEP_EVERY);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        sweep_finishes(&state).await;
     }
 }
 
@@ -775,11 +870,13 @@ mod tests {
         assert_eq!(intent_projects(&state).await, vec!["proj-ans-a".to_owned()]);
 
         // An answer that reopens nothing, and an answer refused, leave no intent behind.
-        let (_, reopened) = store::answer_question(pool, &other, "that")
-            .await
-            .unwrap();
+        let (_, reopened) = store::answer_question(pool, &other, "that").await.unwrap();
         assert!(!reopened);
-        assert!(store::answer_question(pool, &question, "again").await.is_err());
+        assert!(
+            store::answer_question(pool, &question, "again")
+                .await
+                .is_err()
+        );
         assert_eq!(
             intent_projects(&state).await,
             vec!["proj-ans-a".to_owned()],
@@ -814,8 +911,14 @@ mod tests {
             vec!["sweep-one-a".to_owned(), "sweep-one-b".to_owned()],
             "one pass per project, no more"
         );
-        assert!(intents(&state).await.is_empty(), "a finished pass deletes its intent");
-        assert!(claim_project("sweep-one-a").is_some(), "the claim is released");
+        assert!(
+            intents(&state).await.is_empty(),
+            "a finished pass deletes its intent"
+        );
+        assert!(
+            claim_project("sweep-one-a").is_some(),
+            "the claim is released"
+        );
         assert!(claim_project("sweep-one-b").is_some());
         assert!(feed_lines(&state, "sweep-one-a").await.is_empty());
 
@@ -860,12 +963,18 @@ mod tests {
             vec![("sweep-busy".to_owned(), busy_stamp)],
             "the busy project's intent is kept untouched"
         );
-        assert!(feed_lines(&state, "sweep-busy").await.is_empty(), "nothing is announced");
+        assert!(
+            feed_lines(&state, "sweep-busy").await.is_empty(),
+            "nothing is announced"
+        );
 
         // Once the claim is free, the next sweep runs it.
         drop(claim);
         sweep_with(&state, pass).await;
-        assert_eq!(logged(&ran), vec!["sweep-busy".to_owned(), "sweep-free".to_owned()]);
+        assert_eq!(
+            logged(&ran),
+            vec!["sweep-busy".to_owned(), "sweep-free".to_owned()]
+        );
         assert!(intents(&state).await.is_empty());
     }
 
@@ -903,12 +1012,18 @@ mod tests {
             claim_project("sweep-deferred").is_some(),
             "the claim is free, so an owner request can run meanwhile"
         );
-        assert!(feed_lines(&state, "sweep-deferred").await.is_empty(), "inside the ceiling nothing is announced");
+        assert!(
+            feed_lines(&state, "sweep-deferred").await.is_empty(),
+            "inside the ceiling nothing is announced"
+        );
 
         // The next sweep retries it.
         sweep_with(&state, pass).await;
         assert_eq!(passes.load(Ordering::SeqCst), 2);
-        assert_eq!(intent_projects(&state).await, vec!["sweep-deferred".to_owned()]);
+        assert_eq!(
+            intent_projects(&state).await,
+            vec!["sweep-deferred".to_owned()]
+        );
     }
 
     #[tokio::test]
@@ -939,7 +1054,11 @@ mod tests {
 
         assert_eq!(passes.load(Ordering::SeqCst), 1);
         let left = intents(&state).await;
-        assert_eq!(left.len(), 1, "the request that arrived during the pass is not lost");
+        assert_eq!(
+            left.len(),
+            1,
+            "the request that arrived during the pass is not lost"
+        );
         assert_eq!(left[0].0, "sweep-rewrite");
         assert_ne!(left[0].1, first_stamp, "re-writing bumped created_at");
 
@@ -984,12 +1103,20 @@ mod tests {
         );
         let lines = feed_lines(&state, "sweep-stale").await;
         assert_eq!(lines.len(), 1, "announced once: {lines:?}");
-        assert!(lines[0].contains("disk"), "the line says the disk stayed short: {:?}", lines[0]);
+        assert!(
+            lines[0].contains("disk"),
+            "the line says the disk stayed short: {:?}",
+            lines[0]
+        );
         assert!(feed_lines(&state, "sweep-young").await.is_empty());
 
         // Later sweeps never revisit it or announce again.
         sweep_with(&state, pass).await;
-        assert_eq!(passes.load(Ordering::SeqCst), 3, "only the young intent ran again");
+        assert_eq!(
+            passes.load(Ordering::SeqCst),
+            3,
+            "only the young intent ran again"
+        );
         assert_eq!(feed_lines(&state, "sweep-stale").await.len(), 1);
         let owner_decisions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM decisions")
             .fetch_one(&state.pool)

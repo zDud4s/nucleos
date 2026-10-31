@@ -1023,23 +1023,26 @@ async fn main() {
     // `getUpdates` and Telegram answers the loser with a 409.
     // Starts again the tree nodes that boot recovery left without a run. Once per boot, off the
     // startup path: each start creates a run.
-    if let Some(resumed) = resumed_trees {
-        let relaunch_state = state.clone();
-        tokio::spawn(async move {
-            let relaunched = tree_job::open::relaunch_resumed(&relaunch_state, &resumed).await;
-            tracing::info!(
-                started = relaunched.started.len(),
-                skipped = relaunched.skipped.len(),
-                "relaunched tree nodes"
-            );
-        });
-    }
-    // Takes up again the spec finishes the restart cut off, after tree recovery: each adopts the
-    // trees its specs already have. Off the startup path, since a finish waits on its trees.
+    // Then takes up again the spec finishes the restart cut off, after tree recovery so that each
+    // adopts the trees its specs already have: the restart writes an intent per project and one
+    // sweep runs them. Off the startup path, since a finish waits on its trees.
     tokio::spawn({
         let state = state.clone();
-        async move { spec_backlog::finish::resume_finishes(&state).await }
+        async move {
+            if let Some(resumed) = resumed_trees {
+                let relaunched = tree_job::open::relaunch_resumed(&state, &resumed).await;
+                tracing::info!(
+                    started = relaunched.started.len(),
+                    skipped = relaunched.skipped.len(),
+                    "relaunched tree nodes"
+                );
+            }
+            spec_backlog::finish::resume_finishes(&state).await;
+            spec_backlog::finish::sweep_finishes(&state).await;
+        }
     });
+    // Retries the finish intents a pass left (disk short) or a busy claim skipped.
+    tokio::spawn(spec_backlog::finish::run_sweep_loop(state.clone()));
     tokio::spawn(execution::scheduler::run_scheduler(state.clone()));
     tokio::spawn({
         let state = state.clone();

@@ -212,7 +212,7 @@ pub(super) fn writes_outside_cwd(tool_input: &Value, cwd: Option<&Path>) -> bool
 
 /// PURE: splits the first whitespace-delimited token (quotes respected) off `raw`, returning the
 /// token's unquoted text and the raw remainder with its leading whitespace trimmed.
-pub(super) fn split_first_token(raw: &str) -> Option<(String, &str)> {
+pub fn split_first_token(raw: &str) -> Option<(String, &str)> {
     let raw = raw.trim_start();
     if raw.is_empty() {
         return None;
@@ -320,7 +320,7 @@ pub(super) fn main_checkout_of(cwd: &Path) -> Option<String> {
     (!main.is_empty()).then(|| normalize_path(main, None))
 }
 
-pub(super) fn path_has_suffix(path: &str, suffix: &str) -> bool {
+pub fn path_has_suffix(path: &str, suffix: &str) -> bool {
     path == suffix || path.ends_with(&format!("/{suffix}"))
 }
 

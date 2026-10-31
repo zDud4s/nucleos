@@ -37,13 +37,16 @@ fn owned_glob_segments_match(glob: &[&str], path: &[&str]) -> bool {
 }
 
 fn owned_glob_segment_matches(glob: &str, path: &str) -> bool {
-    let mut pieces = glob.split('*');
-    let first = pieces.next().unwrap_or_default();
+    let pieces: Vec<&str> = glob.split('*').collect();
+    let first = pieces.first().copied().unwrap_or_default();
     if !path.starts_with(first) {
         return false;
     }
     let mut remainder = &path[first.len()..];
-    for piece in pieces {
+    for (index, piece) in pieces.iter().enumerate().skip(1) {
+        if index + 1 == pieces.len() {
+            return remainder.ends_with(piece);
+        }
         if piece.is_empty() {
             continue;
         }
@@ -52,7 +55,7 @@ fn owned_glob_segment_matches(glob: &str, path: &str) -> bool {
         };
         remainder = &remainder[index + piece.len()..];
     }
-    glob.ends_with('*') || remainder.is_empty()
+    remainder.is_empty()
 }
 
 /// True when `path` names a file below one of [`DOCS_DIRS`], relative to the repository root.
@@ -121,11 +124,14 @@ mod tests {
     #[test]
     fn docs_glob_anchors_the_last_piece_of_a_segment() {
         assert!(owned_glob_matches(".ai/specs/*.md", ".ai/specs/design.md"));
-        assert!(!owned_glob_matches(
+        assert!(owned_glob_matches(
             ".ai/specs/*.md",
             ".ai/specs/design.md.md"
         ));
-        assert!(!owned_glob_matches(".ai/specs/*.md", ".ai/specs/design.mdx"));
+        assert!(!owned_glob_matches(
+            ".ai/specs/*.md",
+            ".ai/specs/design.mdx"
+        ));
     }
 
     #[test]

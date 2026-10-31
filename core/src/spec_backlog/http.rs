@@ -257,6 +257,13 @@ async fn post_finish(State(state): State<AppState>, Json(request): Json<FinishRe
     if let Err(error) = finish::resolve_project(&state, &project_id).await {
         return refuse(StatusCode::UNPROCESSABLE_ENTITY, error);
     }
+    // The intent is written before the claim is tried: a request refused with a 409 is not lost, the
+    // sweeper runs it once the live pass ends.
+    let requested_at = chrono::Utc::now().to_rfc3339();
+    if let Err(error) = store::write_finish_intent_at(&state.pool, &project_id, &requested_at).await
+    {
+        return failed("could not record the finish", error);
+    }
     let Some(claim) = finish::claim_project(&project_id) else {
         return refuse(
             StatusCode::CONFLICT,
@@ -265,21 +272,10 @@ async fn post_finish(State(state): State<AppState>, Json(request): Json<FinishRe
     };
     tokio::spawn(async move {
         let _claim = claim;
-        if let Err(error) = finish::finish(&state, scope).await {
-            match &error {
-                finish::FinishError::Store(error) => {
-                    tracing::warn!(%error, "backlog finish store failed")
-                }
-                finish::FinishError::Config(error) => {
-                    tracing::warn!(%error, "backlog finish configuration failed")
-                }
-                finish::FinishError::Scan(error) => {
-                    tracing::warn!(%error, "backlog finish scan failed")
-                }
-            }
-            // The owner is not watching this task: the feed is where a failed finish shows.
-            finish::announce_failure(&state.pool, &project_id, &error.to_string()).await;
-        }
+        let result = finish::finish(&state, scope).await;
+        // The owner is not watching this task: a failed finish shows in the feed, and a pass that
+        // held specs for disk leaves its intent for the sweeper.
+        finish::settle_intent(&state.pool, &project_id, &requested_at, &result).await;
     });
     (StatusCode::ACCEPTED, Json(json!({ "accepted": true })))
 }
@@ -303,10 +299,13 @@ async fn post_decision(
     Json(request): Json<DecisionRequest>,
 ) -> Answer {
     if id.starts_with("sq-") {
+        if request.answer.trim().is_empty() {
+            return refuse(StatusCode::BAD_REQUEST, "the answer is empty");
+        }
         return match crate::spec_backlog::answer(&state.pool, &id, &request.answer, "shell").await {
             Ok(answered) => {
-                if let Some(spec_id) = answered.reopened {
-                    crate::spec_backlog::relaunch_answered(state, spec_id);
+                if answered.reopened.is_some() {
+                    crate::spec_backlog::relaunch_answered(state);
                 }
                 (
                     StatusCode::OK,
