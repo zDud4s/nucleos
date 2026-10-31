@@ -1272,6 +1272,30 @@ pub(super) async fn pretooluse_decision_from(
         });
     }
 
+    // A tree run's park is never answered (no timeout, and `reconcile_running` reads the parked
+    // run as live), so it is spelled as a refusal the agent can act on. Same position and shape
+    // as the two conversions above: it only ever converts a `pending_approval`.
+    if classification.decision.decision == "pending_approval"
+        && is_in_flight
+        && node_context::is_tree_run(&state, run_id).await
+    {
+        tracing::info!(
+            run_id,
+            tool_name = %payload.tool_name,
+            action_class = classification.action_class,
+            "pretooluse-decision: refused rather than parked — a tree run has nobody to ask"
+        );
+        record_refused_action(&state, &payload, &payload.tool_name, &classification.reason).await;
+        return Json(Decision {
+            decision: "deny".to_owned(),
+            reason: format!(
+                "{} {}",
+                classification.reason,
+                node_context::TREE_RUN_CANNOT_WAIT_FOR_APPROVAL
+            ),
+        });
+    }
+
     // Spec B E3, D10: after the branches above that already turn a park into a refusal
     // (`unrecognized-tool`, a job node's park, `dont_ask`), so only a real park is asked about;
     // after spec A's judge, so what reaches here is what it left alone. In observe the question is

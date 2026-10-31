@@ -26,7 +26,8 @@ prompt, layer?, base?, node_id}: `name` is a short branch name (letters, digits,
 `goal` and `prompt` describe the part and the task of the agent that will work on it, `owned_paths` \
 lists the paths that part may write, `layer` and `base` are optional (`base` names a branch that \
 must merge first), and `node_id` is your own Node ID. Each call creates the branch, its worktree \
-and its agent, and starts it. Opening the same branch twice is safe.
+and its agent, and starts it. Opening the same branch twice is safe. Each started part must pass \
+the gate on its own, so a part that needs another part's code must name that branch as `base`.
 
 You cannot wait for your branches, and you never merge, land or push anything: the daemon gates \
 and merges each branch when its agent reports, then lands the job. When every part is opened, \

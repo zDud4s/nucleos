@@ -40,6 +40,31 @@ async fn node_verdict(
     }
 }
 
+/// The sentence a tree run gets instead of a park nobody would ever answer.
+pub(super) const TREE_RUN_CANNOT_WAIT_FOR_APPROVAL: &str = "this run belongs to an autonomous tree job, so it cannot wait for an approval nobody will \
+     answer, and nothing is waiting on one. Write files inside your worktree with the Write tool, \
+     not with shell redirects. If the action is truly needed, close the node as blocked and give \
+     the reason.";
+
+/// Whether the run works for a node of a tree job (a branch node bound to the job, or the job's
+/// root). Such a run is refused rather than parked: nothing answers a tree run's park, and
+/// `reconcile_running` reads it as live, so the tree would hang holding a slot. Fails closed: an
+/// error or a missing row answers `false` and the run parks as before.
+pub(super) async fn is_tree_run(state: &AppState, run_id: i64) -> bool {
+    let answer: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM work_nodes n
+         WHERE n.run_id = ?
+           AND (n.tree_job_id IS NOT NULL
+                OR EXISTS (SELECT 1 FROM tree_jobs t WHERE t.root_node_id = n.id))
+         LIMIT 1",
+    )
+    .bind(run_id.to_string())
+    .fetch_optional(&state.pool)
+    .await
+    .unwrap_or(None);
+    answer.is_some()
+}
+
 /// What a node run in its warn band is told, so it splits before the hard limit refuses every
 /// other tool. `None` for a run without a node or below the warn band.
 pub(super) async fn warn_hint(state: &AppState, run_id: i64) -> Option<String> {
