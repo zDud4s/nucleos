@@ -1,8 +1,466 @@
-//! Tests of the Antigravity CLI backend (plan Node 2, tests 17 to 29).
+//! The Antigravity CLI (`agy`) backend: binary resolution, the argument vector, long-prompt staging
+//! and `AgyCliRunner`.
 //!
-//! RED: `agy_program`, `build_args`, `Options`, `Refusal`, `stage_prompt` and `AgyCliRunner` do not
-//! exist yet, so this module fails to compile. Every run-level test goes through a fake binary
-//! chosen by `NUCLEOS_AGY_BIN`; the real `agy` is never started.
+//! `agy -p` runs one prompt and prints a single JSON object. Anything the CLI cannot honour is
+//! refused by name before it is started, exactly as `CodexCliRunner` does, and a reply that does not
+//! carry an exact `SUCCESS` status fails closed. `--dangerously-skip-permissions` is never emitted:
+//! `Permission::Bypass` is refused, not translated. The tests below drive a fake binary chosen by
+//! `NUCLEOS_AGY_BIN`; the real `agy` is never started by them.
+
+use super::*;
+use std::ffi::{OsStr, OsString};
+use std::path::Path;
+
+/// Prompts up to this many bytes travel as the `-p` argument. Longer ones are staged in a file so
+/// the Windows argument limit (about 32k characters) is never approached.
+pub const INLINE_PROMPT_LIMIT: usize = 8000;
+
+/// The file name a long prompt is staged under, inside the run's stage directory.
+pub const STAGED_PROMPT_FILE: &str = "prompt.md";
+
+/// The effort levels `--effort` accepts.
+const VALID_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
+/// How much of a malformed stdout a failure message echoes.
+const ECHO_LIMIT: usize = 500;
+
+/// A control the agy engine cannot honour. Its text names the control and always ends with the
+/// sentence the engine contract fixes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal(String);
+
+impl Refusal {
+    fn control(control: &str) -> Self {
+        Self(format!(
+            "agy cannot honour {control}: the agy engine does not support it"
+        ))
+    }
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refusal {}
+
+/// What `build_args` needs beyond the request.
+#[derive(Debug, Clone)]
+pub struct Options {
+    /// The model id; it may carry the catalogue's `agy/` prefix, which the CLI does not know.
+    pub model: String,
+    /// The runner's configured effort; a request's own effort wins.
+    pub effort: Option<String>,
+    /// Where a long prompt is staged.
+    pub stage_dir: PathBuf,
+}
+
+/// PURE (filesystem reads only): the agy program given the three lookups. `env_bin` is
+/// `NUCLEOS_AGY_BIN` and is taken as given; then `agy.exe`/`agy` along `path_var`; then
+/// `<local_app_data>/agy/bin/agy.exe`.
+pub fn agy_program_from(
+    env_bin: Option<OsString>,
+    path_var: Option<OsString>,
+    local_app_data: Option<OsString>,
+) -> Option<PathBuf> {
+    if let Some(configured) = env_bin {
+        return Some(PathBuf::from(configured));
+    }
+    if let Some(path_var) = path_var.as_deref().map(OsStr::to_owned) {
+        let on_path = std::env::split_paths(&path_var).find_map(|directory| {
+            ["agy.exe", "agy"]
+                .into_iter()
+                .map(|name| directory.join(name))
+                .find(|candidate| candidate.is_file())
+        });
+        if on_path.is_some() {
+            return on_path;
+        }
+    }
+    let installed = PathBuf::from(local_app_data?)
+        .join("agy")
+        .join("bin")
+        .join("agy.exe");
+    installed.is_file().then_some(installed)
+}
+
+/// The program that launches agy: `NUCLEOS_AGY_BIN`, else `PATH`, else `%LOCALAPPDATA%\agy\bin`.
+/// `None` when agy is not installed. Resolves only; nothing is run.
+pub fn agy_program() -> Option<PathBuf> {
+    agy_program_from(
+        std::env::var_os("NUCLEOS_AGY_BIN"),
+        std::env::var_os("PATH"),
+        std::env::var_os("LOCALAPPDATA"),
+    )
+}
+
+/// Writes the prompt to `<stage_dir>/STAGED_PROMPT_FILE` when it is longer than
+/// `INLINE_PROMPT_LIMIT`; returns the file, or `None` when the prompt goes inline (nothing written).
+pub fn stage_prompt(request: &RunRequest, stage_dir: &Path) -> std::io::Result<Option<PathBuf>> {
+    if request.prompt.len() <= INLINE_PROMPT_LIMIT {
+        return Ok(None);
+    }
+    std::fs::create_dir_all(stage_dir)?;
+    let file = stage_dir.join(STAGED_PROMPT_FILE);
+    std::fs::write(&file, &request.prompt)?;
+    Ok(Some(file))
+}
+
+/// The argument vector for one run, or the control agy cannot honour. Pure: it writes no file.
+pub fn build_args(request: &RunRequest, options: &Options) -> Result<Vec<String>, Refusal> {
+    // `Bypass` is how a run stands the CLI's permission barrier down; agy has no counterpart and
+    // the skip-permissions flag is never emitted for it.
+    if request.permission == Permission::Bypass {
+        return Err(Refusal::control("Permission::Bypass"));
+    }
+    // Each of these would be accepted and dropped otherwise, which is the outcome a control must
+    // never have.
+    for (asked, control) in [
+        (!request.fallback_model.is_empty(), "fallback_model"),
+        (request.max_budget_usd.is_some(), "max_budget_usd"),
+        (!request.agents.is_empty(), "agents"),
+        (
+            request.append_system_prompt.is_some(),
+            "append_system_prompt",
+        ),
+        (!request.denied_tools.is_empty(), "denied_tools"),
+        (request.mcp_config.is_some(), "mcp_config"),
+        (!request.mcp_servers.is_empty(), "mcp_servers"),
+        (request.classifier_governs_tools, "classifier_governs_tools"),
+        (!request.images.is_empty(), "images"),
+        // agy has no flag that restricts its tools, so a restricted policy would only be claimed.
+        (
+            request.tool_policy != ToolPolicy::Unrestricted,
+            "a restricted tool policy",
+        ),
+    ] {
+        if asked {
+            return Err(Refusal::control(control));
+        }
+    }
+
+    let model = options.model.strip_prefix("agy/").unwrap_or(&options.model);
+    let effort = request.effort.as_ref().or(options.effort.as_ref());
+    if let Some(effort) = effort
+        && !VALID_EFFORTS.contains(&effort.as_str())
+    {
+        return Err(Refusal(format!(
+            "agy effort {effort:?} is not one of {}",
+            VALID_EFFORTS.join(", ")
+        )));
+    }
+
+    let mut args = Vec::new();
+    let mut add_dirs: Vec<String> = Vec::new();
+    args.push("-p".to_string());
+    if request.prompt.len() <= INLINE_PROMPT_LIMIT {
+        args.push(request.prompt.clone());
+    } else {
+        let file = options.stage_dir.join(STAGED_PROMPT_FILE);
+        args.push(format!(
+            "Read the file {} and follow it exactly; it is your complete task.",
+            file.display()
+        ));
+        add_dirs.push(options.stage_dir.display().to_string());
+    }
+    args.extend(["--output-format".to_string(), "json".to_string()]);
+    args.extend(["--model".to_string(), model.to_string()]);
+    if let Some(effort) = effort {
+        args.extend(["--effort".to_string(), effort.clone()]);
+    }
+    match request.permission {
+        Permission::Plan => args.extend(["--mode".to_string(), "plan".to_string()]),
+        Permission::AcceptEdits => args.extend(["--mode".to_string(), "accept-edits".to_string()]),
+        Permission::Default | Permission::Bypass => {}
+    }
+    if let Some(conversation) = &request.resume_session_id {
+        args.extend(["--conversation".to_string(), conversation.clone()]);
+    }
+    if let Some(deadline) = request.progress_timeout {
+        // Whole seconds, rounded up and never zero: zero would read as "no limit" or "now".
+        let secs = deadline.as_secs() + u64::from(deadline.subsec_nanos() > 0);
+        args.extend(["--print-timeout".to_string(), secs.max(1).to_string()]);
+    }
+    add_dirs.extend(request.add_dirs.iter().map(|dir| dir.display().to_string()));
+    for dir in add_dirs {
+        args.extend(["--add-dir".to_string(), dir]);
+    }
+    Ok(args)
+}
+
+/// The first `ECHO_LIMIT` bytes of `text`, cut on a character boundary.
+fn first_bytes(text: &str) -> &str {
+    let mut end = text.len().min(ECHO_LIMIT);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// What a successful agy reply carries.
+struct AgyReply {
+    response: String,
+    conversation_id: Option<String>,
+    num_turns: Option<i64>,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    cache_read_tokens: Option<i64>,
+}
+
+/// Parses agy's one-shot JSON. `Err` is the failure text: a status other than exactly `SUCCESS`, or
+/// a body that is not the expected object, with the first bytes of what was printed.
+fn parse_reply(stdout: &str) -> Result<AgyReply, String> {
+    let malformed = || {
+        format!(
+            "agy printed no usable reply; first bytes of stdout: {}",
+            first_bytes(stdout)
+        )
+    };
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).map_err(|_| malformed())?;
+    let status = value
+        .get("status")
+        .and_then(|status| status.as_str())
+        .ok_or_else(malformed)?;
+    if status != "SUCCESS" {
+        return Err(format!("agy returned status {status}"));
+    }
+    let response = value
+        .get("response")
+        .and_then(|response| response.as_str())
+        .ok_or_else(malformed)?
+        .to_string();
+    let usage = value.get("usage");
+    let count = |name: &str| usage.and_then(|u| u.get(name)).and_then(|n| n.as_i64());
+    let output = match (count("output_tokens"), count("thinking_tokens")) {
+        (Some(output), Some(thinking)) => Some(output + thinking),
+        (output, thinking) => output.or(thinking),
+    };
+    Ok(AgyReply {
+        response,
+        conversation_id: value
+            .get("conversation_id")
+            .and_then(|id| id.as_str())
+            .map(str::to_string),
+        num_turns: value.get("num_turns").and_then(|turns| turns.as_i64()),
+        input_tokens: count("input_tokens"),
+        output_tokens: output,
+        cache_read_tokens: count("cache_read_tokens"),
+    })
+}
+
+/// The Antigravity CLI backend. Chat-only for now: agents, teams and council refuse the engine.
+pub struct AgyCliRunner {
+    pub model: String,
+    pub effort: Option<String>,
+}
+
+/// Removes a run's stage directory when the run ends, however it ends.
+struct StageDir(PathBuf);
+
+impl Drop for StageDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Appends `text` to `stderr` on its own line.
+fn note(stderr: &mut String, text: String) {
+    if !stderr.is_empty() && !stderr.ends_with('\n') {
+        stderr.push('\n');
+    }
+    stderr.push_str(&text);
+}
+
+#[async_trait]
+impl CommandRunner for AgyCliRunner {
+    async fn run_prompt(
+        &self,
+        request: RunRequest,
+        session_tx: UnboundedSender<String>,
+        transcript: std::sync::Arc<std::sync::Mutex<String>>,
+    ) -> std::io::Result<RunOutcome> {
+        let stage = StageDir(std::env::temp_dir().join(format!(
+            "nucleos-agy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        )));
+        let options = Options {
+            model: request.model.clone().unwrap_or_else(|| self.model.clone()),
+            effort: self.effort.clone(),
+            stage_dir: stage.0.clone(),
+        };
+        // Built before anything is spawned, so a refusal is the `Err` that means the CLI never ran.
+        let args = build_args(&request, &options).map_err(std::io::Error::other)?;
+        stage_prompt(&request, &stage.0)?;
+
+        let agy_bin = agy_program().unwrap_or_else(|| PathBuf::from("agy"));
+        let mut cmd = Command::new(&agy_bin);
+        cmd.args(args);
+        for (k, v) in &request.env {
+            cmd.env(k, v);
+        }
+        if let Some(dir) = &request.cwd {
+            cmd.current_dir(dir);
+        }
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        cmd.kill_on_drop(true);
+        crate::process_tree::spawn_in_own_group(&mut cmd);
+
+        // The ONLY `?` from here on: past the spawn a failure is a failed `RunOutcome`.
+        let mut child = cmd.spawn()?;
+        // Declared after the child so it drops first; see `TreeKiller`.
+        let mut tree_killer = child.id().map(TreeKiller::new);
+
+        let stdout = child.stdout.take().expect("stdout piped above");
+        let stderr = child.stderr.take().expect("stderr piped above");
+        let stderr_task = tokio::spawn(async move {
+            let mut buf = String::new();
+            let mut reader = BufReader::new(stderr);
+            let _ = reader.read_to_string(&mut buf).await;
+            buf
+        });
+
+        let mut lines = BufReader::new(stdout).lines();
+        let mut stdout_acc = String::new();
+        let mut post_launch_error: Option<std::io::Error> = None;
+        let mut progress_timeout_elapsed: Option<Duration> = None;
+        loop {
+            let next_line = match request.progress_timeout {
+                Some(deadline) => match tokio::time::timeout(deadline, lines.next_line()).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        progress_timeout_elapsed = Some(deadline);
+                        break;
+                    }
+                },
+                None => lines.next_line().await,
+            };
+            match next_line {
+                Ok(Some(line)) => {
+                    stdout_acc.push_str(&line);
+                    stdout_acc.push('\n');
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    post_launch_error = Some(error);
+                    break;
+                }
+            }
+        }
+
+        if progress_timeout_elapsed.is_some() || post_launch_error.is_some() {
+            // The whole tree first, so ending the supervisor cannot orphan its tools.
+            drop(tree_killer.take());
+            let _ = child.start_kill();
+        }
+        let status = match child.wait().await {
+            Ok(status) => Some(status),
+            Err(error) => {
+                post_launch_error.get_or_insert(error);
+                None
+            }
+        };
+        if let Some(killer) = tree_killer.as_mut() {
+            killer.disarm();
+        }
+
+        let mut stderr_str = stderr_task.await.unwrap_or_default();
+        let mut exit_code = status.and_then(|status| status.code()).unwrap_or(-1);
+        let mut reply = None;
+        if let Some(deadline) = progress_timeout_elapsed {
+            note(
+                &mut stderr_str,
+                format!("nucleos: run went silent for {deadline:?}; progress deadline expired\n"),
+            );
+            exit_code = PROGRESS_TIMEOUT_EXIT_CODE;
+        } else if let Some(error) = &post_launch_error {
+            note(
+                &mut stderr_str,
+                format!("nucleos: stream failed after launch: {error}\n"),
+            );
+            exit_code = -1;
+        } else if exit_code != 0 {
+            note(
+                &mut stderr_str,
+                format!(
+                    "agy exited with code {exit_code}; first bytes of stdout: {}\n",
+                    first_bytes(&stdout_acc)
+                ),
+            );
+        } else {
+            match parse_reply(&stdout_acc) {
+                Err(why) => {
+                    note(&mut stderr_str, format!("{why}\n"));
+                    exit_code = 1;
+                }
+                Ok(parsed) => {
+                    if let (Some(turns), Some(ceiling)) = (parsed.num_turns, request.max_turns)
+                        && over_turn_ceiling(turns, Some(ceiling))
+                    {
+                        note(
+                            &mut stderr_str,
+                            format!(
+                                "nucleos: stopped after {turns} turns; this run's ceiling was {ceiling}\n"
+                            ),
+                        );
+                        exit_code = TURN_CEILING_EXIT_CODE;
+                    }
+                    reply = Some(parsed);
+                }
+            }
+        }
+
+        // One synthesised `result` line, so `extract_reply` reads this runner like every other.
+        let mut out = stdout_acc;
+        let mut session_id = request
+            .session_id
+            .clone()
+            .or_else(|| request.resume_session_id.clone());
+        let (mut input_tokens, mut output_tokens, mut cache_read_tokens, mut num_turns) =
+            (None, None, None, None);
+        if let Some(parsed) = reply {
+            if let Some(id) = &parsed.conversation_id {
+                let _ = session_tx.send(id.clone());
+                session_id = Some(id.clone());
+            }
+            let line = serde_json::json!({"type": "result", "result": parsed.response}).to_string();
+            if exit_code == 0 {
+                if let Ok(mut shared) = transcript.lock() {
+                    shared.push_str(&line);
+                    shared.push('\n');
+                }
+                out = format!("{line}\n");
+            }
+            input_tokens = parsed.input_tokens;
+            output_tokens = parsed.output_tokens;
+            cache_read_tokens = parsed.cache_read_tokens;
+            num_turns = parsed.num_turns;
+        }
+
+        Ok(RunOutcome {
+            exit_code,
+            stdout: out,
+            stderr: stderr_str,
+            session_id,
+            // agy reports no price: unknown, not free.
+            cost_usd: None,
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_creation_tokens: None,
+            num_turns,
+            compacted: false,
+            model_requested: false,
+        })
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
