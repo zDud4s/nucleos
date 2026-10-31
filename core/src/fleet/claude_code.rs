@@ -735,7 +735,54 @@ fn root_sighting(id: &str, root: &RootCache, state: NodeState) -> Sighting {
     }
 }
 
+/// What the last pass knows about one root session, in the vocabulary of the liveness classifier.
+#[derive(Clone, Debug)]
+pub struct RootObservation {
+    pub session_id: String,
+    /// The pid the registry entry names; `None` once Claude Code deleted the entry.
+    pub pid: Option<u32>,
+    pub observation: crate::conductor::liveness::Observation,
+}
+
 impl ClaudeCode {
+    /// One observation per root session, from the cache of the last `discover`; reads no file.
+    /// Roots owned by a daemon run are left out (the daemon watches those itself), and so are
+    /// children: the sweep watches roots.
+    pub fn observations(&self) -> Vec<RootObservation> {
+        use crate::conductor::liveness::{Observation, SubjectStatus};
+        let st = self.inner.lock();
+        let mut out: Vec<RootObservation> = st
+            .roots
+            .iter()
+            .filter(|(_, root)| root.run.is_none())
+            .map(|(id, root)| {
+                let file = root.registry.as_ref();
+                let status = file.and_then(|(f, _)| match f.status.as_deref() {
+                    Some("busy") => Some(SubjectStatus::Busy),
+                    Some("waiting") => Some(SubjectStatus::Waiting),
+                    _ => None,
+                });
+                RootObservation {
+                    session_id: id.clone(),
+                    pid: file.map(|(f, _)| f.pid),
+                    observation: Observation {
+                        process_alive: file.map(|(_, alive)| *alive),
+                        status,
+                        status_since: file.and_then(|(f, _)| f.updated_at),
+                        started_at: root.started_at,
+                        last_transcript_write: root
+                            .transcript
+                            .as_ref()
+                            .and_then(|_| root.last_activity),
+                        ..Default::default()
+                    },
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+        out
+    }
+
     /// The runs that name a Claude session and are live or inside the retention window. Runs are
     /// the only way to find a root launched in print mode, which has no `sessions/*.json` entry
     /// (spec §4).

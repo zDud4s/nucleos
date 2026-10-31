@@ -1,6 +1,7 @@
 //! The PreToolUse decision: `pretooluse_decision` and the one function that walks every rule in order.
 
 use super::*;
+use crate::conductor::context::{Fill, allowed_for_node, handoff_path};
 
 mod web_builtin;
 
@@ -22,10 +23,62 @@ pub async fn pretooluse_decision(
     } else {
         None
     };
+    // A node run in its warn band is told to split, on an allow only: a refusal already says why.
+    let additional_context = if decision.decision == "allow" {
+        match node_verdict(&state, run_id).await {
+            Some(v) if v.fill == Fill::Warn => Some(
+                "Your context is filling up. Finish the step in hand, then write your handoff and \
+                 close the node (node_close), or split the rest into child nodes, before the \
+                 hard limit refuses every other tool."
+                    .to_owned(),
+            ),
+            _ => None,
+        }
+    } else {
+        None
+    };
     Json(PreToolUseAnswer {
         decision,
         updated_input,
+        additional_context,
     })
+}
+
+/// The context verdict of the node a run works for, `None` for a run without a node and when the
+/// verdict cannot be read (fail open: a read error must not stop a run, and the next call asks
+/// again). The limits come from the run's own `speed.yaml`; the model-window cap is not applied
+/// because the hook does not know the run's model.
+async fn node_verdict(
+    state: &AppState,
+    run_id: i64,
+) -> Option<crate::conductor::context::NodeRunVerdict> {
+    use crate::conductor::context::verdict_for_run;
+    let verdict = match verdict_for_run(&state.pool, run_id, None, None).await {
+        Ok(Some(verdict)) => verdict,
+        Ok(None) => return None,
+        Err(error) => {
+            tracing::warn!(run_id, %error, "pretooluse-decision: could not read the node's context verdict");
+            return None;
+        }
+    };
+    let cwd: Option<String> = sqlx::query_scalar("SELECT cwd FROM runs WHERE id = ?")
+        .bind(run_id)
+        .fetch_optional(&state.pool)
+        .await
+        .ok()
+        .flatten()
+        .flatten();
+    let yaml = cwd
+        .and_then(|cwd| {
+            std::fs::read_to_string(Path::new(&cwd).join(".nucleos/workflow/speed.yaml")).ok()
+        });
+    let Some(yaml) = yaml else {
+        return Some(verdict);
+    };
+    match verdict_for_run(&state.pool, run_id, Some(&yaml), None).await {
+        Ok(Some(with_limits)) => Some(with_limits),
+        _ => Some(verdict),
+    }
 }
 
 /// The replacement input that routes a recognized test/check/build command of an in-flight run
@@ -342,6 +395,42 @@ pub(super) async fn pretooluse_decision_from(
     // `propose_action`'s own grading exists precisely so this door shuts.
     if mode == crate::team::TEAM_MODE {
         return team_decision(&state, &payload).await;
+    }
+
+    // The forced split (spec §4.2). A run behind a work node whose context reached its wrap limit
+    // may do nothing but wind the node down: `allowed_for_node` names what is left (closing or
+    // updating the node, writing its own handoff, and opening a child for an orchestrator). It
+    // answers here, before the classifier, so a refusal never terminates the run or mints a
+    // proposal, and the allowed calls do not depend on the run's mode. A run with no node, or a fill
+    // not yet measured, is not touched.
+    if let Some(node) = node_verdict(&state, run_id).await
+        && matches!(node.fill, Fill::Wrap | Fill::Block)
+    {
+        let own_handoff = state
+            .machine_config_root
+            .as_deref()
+            .zip(node.project_id.as_deref())
+            .and_then(|(root, project)| crate::project::state::dir(root, project))
+            .map(|dir| handoff_path(&dir, &node.root_id, &node.node_id));
+        return if allowed_for_node(
+            &payload.tool_name,
+            &payload.tool_input,
+            &node.kind,
+            own_handoff.as_deref(),
+        ) {
+            Json(Decision {
+                decision: "allow".to_owned(),
+                reason: "a node over its context limit may still wind itself down".to_owned(),
+            })
+        } else {
+            Json(Decision {
+                decision: "deny".to_owned(),
+                reason: "this node's context is full: write your handoff and close the node \
+                         (node_close), or open child nodes if you orchestrate; nothing else is \
+                         allowed"
+                    .to_owned(),
+            })
+        };
     }
 
     // A job's node may call its box's base tools (a finding, verification, `request_tool`,

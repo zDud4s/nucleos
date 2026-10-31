@@ -1,8 +1,11 @@
 //! Context-fill limits per node kind and the verdict they give on a run's fill.
 //!
-//! Pure: nothing here reads a file or the database. `limits` holds the defaults and
-//! `limits_from_speed_yaml` overlays the `nodes:` mapping of a `speed.yaml` the caller has
-//! already read. The caller enforces the verdict.
+//! The limit calculations are pure; the run lookup at the bottom reads the database so the hook
+//! can apply them to the node that owns a run.
+
+use std::path::{Path, PathBuf};
+
+use sqlx::SqlitePool;
 
 /// How full a node's context is, from least to most severe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,6 +26,19 @@ pub struct ContextLimits {
 
 /// The default of `nodes.ceiling` in `speed.yaml`.
 const DEFAULT_BLOCK: i64 = 200_000;
+
+/// Leave enough room for the model's compaction and the hook's own instructions.
+pub const MODEL_BLOCK_MARGIN: i64 = 100_000;
+
+/// The context verdict joined to the node that owns the run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeRunVerdict {
+    pub fill: Fill,
+    pub node_id: String,
+    pub root_id: String,
+    pub kind: String,
+    pub project_id: Option<String>,
+}
 
 /// Whether `kind` gets the orchestrator numbers. Everything else gets the leaf numbers, so an
 /// unknown kind takes the stricter ones.
@@ -91,6 +107,69 @@ pub fn limits_from_speed_yaml(text: &str, kind: &str) -> ContextLimits {
         warn: read(warn_key, defaults.warn),
         wrap: read(wrap_key, defaults.wrap),
         block: read("ceiling", defaults.block),
+    }
+}
+
+/// Turns a model window into the highest safe block threshold.
+pub fn block_cap(window: Option<i64>) -> Option<i64> {
+    window.and_then(|window| window.checked_sub(MODEL_BLOCK_MARGIN))
+        .filter(|cap| *cap > 0)
+}
+
+/// Looks up the node attached to `run_id` and classifies the run's recorded fill.
+pub async fn verdict_for_run(
+    pool: &SqlitePool,
+    run_id: i64,
+    speed_yaml: Option<&str>,
+    cap: Option<i64>,
+) -> sqlx::Result<Option<NodeRunVerdict>> {
+    let row: Option<(Option<i64>, String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT r.context_fill, n.id, n.root_id, n.kind, n.project_id
+         FROM runs r JOIN work_nodes n ON n.run_id = CAST(r.id AS TEXT)
+         WHERE r.id = ?",
+    )
+    .bind(run_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some((fill, node_id, root_id, kind, project_id)) = row else {
+        return Ok(None);
+    };
+
+    let mut limits = speed_yaml.map_or_else(|| limits(&kind), |yaml| limits_from_speed_yaml(yaml, &kind));
+    if let Some(cap) = cap.filter(|cap| *cap < limits.block) {
+        limits.block = cap;
+    }
+    Ok(Some(NodeRunVerdict {
+        fill: verdict_against(&limits, fill),
+        node_id,
+        root_id,
+        kind,
+        project_id,
+    }))
+}
+
+/// The only file a node at its context limit may write.
+pub fn handoff_path(state_dir: &Path, root_id: &str, node_id: &str) -> PathBuf {
+    state_dir.join("nodes").join(root_id).join(format!("{node_id}.md"))
+}
+
+/// Enforces the narrow tool set allowed while a node wraps its context.
+pub fn allowed_for_node(
+    tool: &str,
+    input: &serde_json::Value,
+    kind: &str,
+    handoff: Option<&Path>,
+) -> bool {
+    match tool {
+        "mcp__nucleos__node_update" | "mcp__nucleos__node_close" => true,
+        "mcp__nucleos__node_open" => is_orchestrator(kind),
+        "Write" => handoff.is_some_and(|handoff| {
+            input
+                .get("file_path")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|path| Path::new(path) == handoff)
+        }),
+        _ => false,
     }
 }
 

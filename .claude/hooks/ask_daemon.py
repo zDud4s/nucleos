@@ -1699,6 +1699,8 @@ def main() -> None:
         deny("daemon returned a non-object decision body - failing closed")
 
     rewrite = decision.get("updated_input")
+    # Read before an `asking` answer replaces `decision`: context rides on this first answer only.
+    context = decision.get("additional_context")
     verdict = decision.get("decision")
     if verdict == "asking":
         decision = wait_for_answer(daemon_url, token, run_id)
@@ -1708,7 +1710,7 @@ def main() -> None:
     if verdict != "allow":
         deny(f"daemon returned an unrecognized decision {verdict!r} - failing closed")
     admit_heavy(daemon_url, token, run_id, payload)
-    approve(decision.get("reason", "autopilot: allowed"), rewrite)
+    approve(decision.get("reason", "autopilot: allowed"), rewrite, context)
 
 
 def wait_for_answer(daemon_url, token, run_id):

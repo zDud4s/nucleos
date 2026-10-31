@@ -2,10 +2,11 @@
 
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
 use serde::Deserialize;
+use serde_json::{Value, json};
 
 use crate::state::AppState;
 
@@ -18,9 +19,60 @@ struct FeedRequest {
     reason: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ResumeRequest {
+    session_id: String,
+    cwd: Option<String>,
+}
+
 /// Routes supplied to the daemon's protected router.
 pub fn routes() -> Router<AppState> {
-    Router::new().route("/conductor/feed", post(post_feed))
+    Router::new()
+        .route("/conductor/feed", post(post_feed))
+        .route("/conductor/resume", post(post_resume))
+        .route("/conductor/liveness", get(get_liveness))
+}
+
+async fn post_resume(
+    State(state): State<AppState>,
+    Json(request): Json<ResumeRequest>,
+) -> Result<Json<Value>, StatusCode> {
+    crate::conductor::resume::resume(&state, &request.session_id, request.cwd.as_deref())
+        .await
+        .map(|resumed| Json(json!({ "chat_id": resumed.chat_id })))
+        .map_err(|error| match error {
+            crate::conductor::resume::ResumeError::UnknownSession => StatusCode::CONFLICT,
+            crate::conductor::resume::ResumeError::NotRooted(_) => StatusCode::CONFLICT,
+            crate::conductor::resume::ResumeError::NotWired => StatusCode::SERVICE_UNAVAILABLE,
+            crate::conductor::resume::ResumeError::Refused(reason) => {
+                tracing::warn!(%reason, "conductor resume refused");
+                StatusCode::CONFLICT
+            }
+        })
+}
+
+async fn get_liveness(State(state): State<AppState>) -> Result<Json<Vec<Value>>, StatusCode> {
+    let rows: Vec<(i64, String, String, String)> = sqlx::query_as(
+        "SELECT id, kind, summary, subject FROM feed \
+         WHERE kind IN ('session_silent', 'session_blocked_on_prompt', 'session_stalled', 'session_dead') \
+         ORDER BY id",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|error| {
+        tracing::warn!(%error, "could not list liveness episodes");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|(id, kind, summary, subject)| json!({
+                "id": id,
+                "kind": kind,
+                "summary": summary,
+                "subject": subject,
+            }))
+            .collect(),
+    ))
 }
 
 /// Records a hook's observe-only refusal without making the hook wait for routing.

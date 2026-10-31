@@ -1,4 +1,233 @@
-//! stub: liveness sweep
+//! Periodic liveness observations and their one-shot feed reports.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::{LazyLock, Mutex};
+
+use chrono::{DateTime, Duration, Utc};
+
+use crate::conductor::liveness::{classify, Limits, Observation, SubjectStatus, Veredicto};
+use crate::execution::runs::{finalize_termination, run_timeout_for_mode};
+use crate::feed::Subject;
+use crate::state::AppState;
+
+pub const SPAWN_GRACE_SECS: i64 = 60;
+pub const TERMINAL_LOOKBACK_HOURS: i64 = 24;
+
+/// A source which can be warned, and daemon runs which can also be stopped.
+#[derive(Debug, Clone)]
+pub struct Observed {
+    pub kind: SubjectKind,
+    pub project_id: Option<String>,
+    pub observation: Observation,
+}
+
+#[derive(Debug, Clone)]
+pub enum SubjectKind {
+    External { session_id: String },
+    DaemonRun { run_id: i64, node_id: Option<String> },
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SweepReport {
+    pub reported: Vec<(String, String)>,
+    pub cancelled: Vec<i64>,
+    pub marked_nodes: Vec<String>,
+}
+
+/// The tail buffer has no mtime. This process-local map gives unchanged tails a stable clock.
+static TAIL_CLOCKS: LazyLock<Mutex<HashMap<(i64, usize), (String, DateTime<Utc>)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub async fn tick(
+    state: &AppState,
+    observed: &[Observed],
+    limits: &Limits,
+    now: DateTime<Utc>,
+) -> sqlx::Result<SweepReport> {
+    let mut report = SweepReport::default();
+    for observed in observed {
+        let verdict = classify(&observed.observation, limits, now);
+        let Some(kind) = feed_kind(verdict) else { continue };
+        let (subject, run_id, node_id, daemon) = match &observed.kind {
+            SubjectKind::External { session_id } => (format!("session:{session_id}"), None, None, false),
+            SubjectKind::DaemonRun { run_id, node_id } => (
+                Subject::Run(*run_id).key(),
+                Some(*run_id),
+                node_id.clone(),
+                true,
+            ),
+        };
+        let episode = observed
+            .observation
+            .started_at
+            .iter()
+            .chain(observed.observation.last_transcript_write.iter())
+            .cloned()
+            .max();
+        if insert_feed(state, kind, &subject, run_id, &summary(kind), now, episode).await? {
+            report.reported.push((kind.to_owned(), subject));
+        }
+        if daemon && matches!(verdict, Veredicto::SilentSinceStart | Veredicto::Stalled | Veredicto::Dead) {
+            let run_id = run_id.expect("daemon runs have ids");
+            if matches!(verdict, Veredicto::Dead) {
+                sqlx::query("UPDATE runs SET status = 'cancelled', completed_at = ? WHERE id = ? AND status = 'running'")
+                    .bind(now.to_rfc3339()).bind(run_id).execute(&state.pool).await?;
+            } else {
+                finalize_termination(state, run_id, "cancelled").await;
+            }
+            report.cancelled.push(run_id);
+            if let Some(node_id) = node_id {
+                let tree_job: Option<Option<String>> = sqlx::query_scalar("SELECT tree_job_id FROM work_nodes WHERE id = ?")
+                    .bind(&node_id).fetch_optional(&state.pool).await?;
+                if tree_job.flatten().is_none() {
+                    sqlx::query("UPDATE work_nodes SET status = 'failed', summary = ?, closed_at = ?, updated_at = ? WHERE id = ? AND status = 'running'")
+                        .bind(format!("Liveness sweep: {}", kind.replace("session_", "")))
+                        .bind(now.to_rfc3339()).bind(now.to_rfc3339()).bind(&node_id)
+                        .execute(&state.pool).await?;
+                    report.marked_nodes.push(node_id);
+                }
+            }
+        }
+    }
+    terminal_feed(state, now, &mut report).await?;
+    Ok(report)
+}
+
+fn feed_kind(verdict: Veredicto) -> Option<&'static str> {
+    match verdict {
+        Veredicto::SilentSinceStart => Some("session_silent"),
+        Veredicto::BlockedOnPrompt => Some("session_blocked_on_prompt"),
+        Veredicto::Stalled => Some("session_stalled"),
+        Veredicto::Dead => Some("session_dead"),
+        Veredicto::Healthy | Veredicto::Waiting(_) => None,
+    }
+}
+
+fn summary(kind: &str) -> String {
+    format!("{kind}; use POST /conductor/resume to continue or inspect the run.")
+}
+
+async fn insert_feed(
+    state: &AppState,
+    kind: &str,
+    subject: &str,
+    run_id: Option<i64>,
+    summary: &str,
+    now: DateTime<Utc>,
+    episode: Option<DateTime<Utc>>,
+) -> sqlx::Result<bool> {
+    let exists: Option<String> = sqlx::query_scalar("SELECT created_at FROM feed WHERE kind = ? AND subject = ? ORDER BY id DESC LIMIT 1")
+        .bind(kind).bind(subject).fetch_optional(&state.pool).await?;
+    if let Some(created_at) = exists {
+        let new_episode = episode.is_some_and(|anchor| parse_time(&created_at).is_some_and(|created| anchor > created));
+        if !new_episode { return Ok(false); }
+    }
+    sqlx::query("INSERT INTO feed (kind, summary, run_id, subject, created_at) VALUES (?, ?, ?, ?, ?)")
+        .bind(kind).bind(summary).bind(run_id).bind(subject).bind(now.to_rfc3339())
+        .execute(&state.pool).await?;
+    Ok(true)
+}
+
+async fn terminal_feed(state: &AppState, now: DateTime<Utc>, report: &mut SweepReport) -> sqlx::Result<()> {
+    let since = now - Duration::hours(TERMINAL_LOOKBACK_HOURS);
+    let runs: Vec<i64> = sqlx::query_scalar("SELECT id FROM runs WHERE status = 'timed_out' AND completed_at >= ?")
+        .bind(since.to_rfc3339()).fetch_all(&state.pool).await?;
+    for id in runs {
+        let subject = Subject::Run(id).key();
+        if insert_feed(state, "run_timed_out", &subject, Some(id), "Run timed out.", now, None).await? {
+            report.reported.push(("run_timed_out".to_owned(), subject));
+        }
+    }
+    let nodes: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, status FROM work_nodes WHERE kind != 'root' AND status IN ('done', 'failed', 'handoff') AND closed_at >= ? \
+         AND COALESCE(summary, '') NOT LIKE 'Liveness sweep:%'",
+    ).bind(since.to_rfc3339()).fetch_all(&state.pool).await?;
+    for (id, status) in nodes {
+        if report.marked_nodes.contains(&id) {
+            continue;
+        }
+        let kind = format!("node_{status}");
+        let subject = format!("node:{id}");
+        if insert_feed(state, &kind, &subject, None, &format!("Node {status}."), now, None).await? {
+            report.reported.push((kind, subject));
+        }
+    }
+    Ok(())
+}
+
+pub async fn daemon_observations(state: &AppState) -> sqlx::Result<Vec<Observed>> {
+    let now = Utc::now();
+    let runs: Vec<(i64, String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT id, status, mode, created_at, project_id FROM runs WHERE status = 'running'",
+    ).fetch_all(&state.pool).await?;
+    let mut out = Vec::new();
+    for (id, status, mode, created_at, project_id) in runs {
+        let started_at = parse_time(&created_at);
+        let node_id: Option<String> = sqlx::query_scalar("SELECT id FROM work_nodes WHERE run_id = CAST(? AS TEXT) LIMIT 1")
+            .bind(id).fetch_optional(&state.pool).await?;
+        let running_children: i64 = match &node_id {
+            Some(node) => sqlx::query_scalar("SELECT COUNT(*) FROM work_nodes WHERE parent_id = ? AND status = 'running'")
+                .bind(node).fetch_one(&state.pool).await?,
+            None => 0,
+        };
+        let alive = state.run_handles.lock().unwrap().contains_key(&id);
+        let process_alive = if alive { Some(true) } else if started_at.is_some_and(|start| now - start <= Duration::seconds(SPAWN_GRACE_SECS)) { None } else { Some(false) };
+        let tail = state.run_tails.lock().unwrap().get(&id).cloned();
+        let (last_transcript_write, tool_in_flight_until) = tail.as_ref().map_or((None, None), |tail| {
+            let text = tail.lock().unwrap().clone();
+            let written = tail_clock(id, std::sync::Arc::as_ptr(tail) as usize, text.clone(), now);
+            (if text.is_empty() { None } else { Some(written) }, open_tool_deadline(&text, started_at, state, &mode))
+        });
+        out.push(Observed {
+            kind: SubjectKind::DaemonRun { run_id: id, node_id },
+            project_id,
+            observation: Observation {
+                process_alive,
+                status: (status == "running").then_some(SubjectStatus::Busy),
+                started_at,
+                last_transcript_write,
+                tool_in_flight_until,
+                running_children,
+                ..Default::default()
+            },
+        });
+    }
+    Ok(out)
+}
+
+fn parse_time(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value).ok().map(|time| time.with_timezone(&Utc))
+}
+
+fn tail_clock(id: i64, pointer: usize, text: String, now: DateTime<Utc>) -> DateTime<Utc> {
+    let mut clocks = TAIL_CLOCKS.lock().unwrap();
+    let key = (id, pointer);
+    match clocks.get_mut(&key) {
+        Some((old, time)) if *old == text => *time,
+        Some((old, time)) => { *old = text; *time = now; now }
+        None => { clocks.insert(key, (text, now)); now }
+    }
+}
+
+fn open_tool_deadline(
+    tail: &str,
+    started_at: Option<DateTime<Utc>>,
+    state: &AppState,
+    mode: &str,
+) -> Option<DateTime<Utc>> {
+    let mut open = HashSet::new();
+    for line in tail.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        for block in value.pointer("/message/content").and_then(serde_json::Value::as_array).into_iter().flatten() {
+            match block.get("type").and_then(serde_json::Value::as_str) {
+                Some("tool_use") => { if let Some(id) = block.get("id").and_then(serde_json::Value::as_str) { open.insert(id.to_owned()); } }
+                Some("tool_result") => { if let Some(id) = block.get("tool_use_id").and_then(serde_json::Value::as_str) { open.remove(id); } }
+                _ => {}
+            }
+        }
+    }
+    (!open.is_empty()).then(|| started_at.unwrap_or_else(Utc::now) + Duration::from_std(run_timeout_for_mode(state.run_timeout, mode)).unwrap_or_default())
+}
 
 #[cfg(test)]
 mod tests {

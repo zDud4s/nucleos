@@ -54,6 +54,9 @@ pub struct PreToolUseAnswer {
     pub decision: Decision,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_input: Option<Value>,
+    /// Text the hook forwards as `hookSpecificOutput.additionalContext`, on an allow only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub additional_context: Option<String>,
 }
 
 /// Spec B: what the hook already read about the run, as the resolver's request needs it. A struct

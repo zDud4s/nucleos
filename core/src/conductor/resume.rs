@@ -1,4 +1,103 @@
-//! stub: run resume after a stop
+//! Resume an editor session through the daemon-owned, headless turn path.
+
+use std::time::Duration;
+
+use crate::assistant_types::{turns, Origin, Sent, NOT_WIRED, TURN_IN_PROGRESS};
+use crate::chats::{self, Brain, PermissionMode};
+use crate::governance::autopilot::classifier_hook_is_wired;
+use crate::sessions::IdeSession;
+use crate::state::{AppState, ROOTED_CHAT_PROGRESS_TIMEOUT_MULTIPLIER, ROOTED_CHAT_RUN_TIMEOUT_MULTIPLIER};
+
+pub const RESUME_PROMPT: &str = "Continue the session from its current state.";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resumed {
+    pub chat_id: String,
+    pub sent: Sent,
+    pub silence: Duration,
+    pub ceiling: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeError {
+    UnknownSession,
+    NotRooted(String),
+    NotWired,
+    Refused(String),
+}
+
+/// Resumes a known session, or adopts an external session only when its rooted directory is given.
+pub async fn resume(
+    state: &AppState,
+    session_id: &str,
+    cwd: Option<&str>,
+) -> Result<Resumed, ResumeError> {
+    let known: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT chat_id, cwd FROM chats WHERE ide_session_id = ?
+         UNION
+         SELECT c.chat_id, c.cwd FROM chats c
+         JOIN assistant_sessions s ON s.chat_id = c.chat_id
+         WHERE s.session_id = ?
+         LIMIT 1",
+    )
+    .bind(session_id)
+    .bind(session_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|error| ResumeError::Refused(error.to_string()))?;
+
+    let (chat_id, rooted) = match known {
+        Some((chat_id, Some(rooted))) => (chat_id, rooted),
+        Some((_chat_id, None)) => return Err(ResumeError::NotRooted(session_id.to_owned())),
+        None => {
+            let Some(cwd) = cwd else {
+                return Err(ResumeError::UnknownSession);
+            };
+            if !classifier_hook_is_wired(std::path::Path::new(cwd)) {
+                return Err(ResumeError::NotRooted(cwd.to_owned()));
+            }
+            let session = IdeSession {
+                session_id: session_id.to_owned(),
+                cwd: cwd.to_owned(),
+                title: None,
+                last_activity: chrono::Utc::now().to_rfc3339(),
+            };
+            let chat_id = chats::create_on(
+                &state.pool,
+                Brain::Cloud,
+                Some(&session),
+                PermissionMode::Manual,
+            )
+                .await
+                .map_err(|error| ResumeError::Refused(error.to_string()))?;
+            (chat_id, cwd.to_owned())
+        }
+    };
+    if !classifier_hook_is_wired(std::path::Path::new(&rooted)) {
+        return Err(ResumeError::NotRooted(rooted));
+    }
+    let Some(turns) = turns(state) else {
+        return Err(ResumeError::NotWired);
+    };
+    let sent = turns
+        .send_or_queue(state, &chat_id, RESUME_PROMPT, &[], Origin::Shell)
+        .await
+        .map_err(|error| {
+            if error == NOT_WIRED {
+                ResumeError::NotWired
+            } else if error == TURN_IN_PROGRESS {
+                ResumeError::Refused(TURN_IN_PROGRESS.to_owned())
+            } else {
+                ResumeError::Refused(error)
+            }
+        })?;
+    Ok(Resumed {
+        chat_id,
+        sent,
+        silence: state.progress_timeout * ROOTED_CHAT_PROGRESS_TIMEOUT_MULTIPLIER,
+        ceiling: state.run_timeout * ROOTED_CHAT_RUN_TIMEOUT_MULTIPLIER,
+    })
+}
 
 #[cfg(test)]
 mod tests {

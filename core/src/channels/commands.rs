@@ -397,9 +397,10 @@ async fn apply_decision(
     id: &str,
     text: &str,
 ) -> sqlx::Result<String> {
-    let said = match decisions::answer(&state.pool, id, text, at.channel).await {
-        Ok(decided) => Text::DecisionApplied {
-            question: decided.question,
+    // Not `decisions::answer` alone: an answer that resumes a branch also starts its node again.
+    let said = match crate::tree_job::open::answer_and_relaunch(state, id, text, at.channel).await {
+        Ok(answered) => Text::DecisionApplied {
+            question: answered.decision.question,
             answer: text.to_string(),
         },
         Err(DecisionError::NotFound(_)) => Text::DecisionUnknown { id: id.to_string() },

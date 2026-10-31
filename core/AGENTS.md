@@ -306,8 +306,8 @@ the contract, not a snapshot.
 | `tree_job/close.rs` | Stub, not implemented yet (wave 6): validating a tree node's close through `report` and `checklist` before `work_nodes::close`. |
 | `tree_job/landing.rs` | Stub, not implemented yet (wave 6): gates, merge and land of a tree, with the reviewer's findings kept as data in the manifest. |
 | `tree_job/http.rs` | Stub, not implemented yet (wave 6): the local `/trees` routes. |
-| `tree_job/open.rs` | Stub, not implemented yet (R-OPEN): opening a branch (worktree, git branch, target dir), binding it to a node, and relaunching from a stored launch. |
-| `tree_job/decisions.rs` | Stub, not implemented yet (wave 7): parking a branch on a decision for the owner, resuming it on the answer, and the single list of decisions. |
+| `tree_job/open.rs` | Opening a branch: `open_branch` (worktree on `tree/<id>/<name>`, links, target dir name, admission; a docs branch only changes state), `bind_branch` (node to branch, `building`), `routes()` (`POST /trees/{id}/branches/{name}/open` and `/bind`, merged in `http.rs` beside `tree_job::http::routes()`, never inside it), the stored launches (`tree_launches`, migration 0266) and the two relaunches built on them: `relaunch_resumed` at boot and `answer_and_relaunch` for every entry point that answers a decision. |
+| `tree_job/decisions.rs` | Parking a branch on a decision for the owner (`park`), resuming it on the answer (`answer`, which only moves state: call `open::answer_and_relaunch` to also start the node again), and the single list of decisions. Both hold the job lock. |
 | `conductor/mod.rs` | Conductor: session liveness, context limits, depth guards and resume. Module root; declares the submodules. |
 | `conductor/liveness.rs` | Stub, not implemented yet: session liveness classification. |
 | `conductor/context.rs` | Stub, not implemented yet: context-fill limits and verdicts. |
