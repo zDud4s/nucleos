@@ -209,7 +209,7 @@ pub async fn run(data_dir: &Path, port: u16, call: Invocation) -> Outcome {
             EXIT_DAEMON_LIVE,
             format!(
                 "settings: a daemon answers on 127.0.0.1:{port}; it would not see this write. \
-                 Stop it first (Ctrl+C its terminal, or `schtasks /End /TN \"NucleOS Daemon\"`) and run this again.\n"
+                 Stop it first (Ctrl+C its terminal, or `Stop-Process -Id <pid>`) and run this again.\n"
             ),
         );
     }
@@ -549,6 +549,31 @@ mod tests {
             !daemon_answers_on(port, PROBE_WAIT).await,
             "a released port is not a daemon"
         );
+    }
+
+    #[tokio::test]
+    async fn the_live_daemon_refusal_says_how_to_stop_it_without_schtasks_end() {
+        // The task runs under `conhost --headless`, so `schtasks /End` only kills the conhost and the daemon
+        // stays alive; `scripts/run-daemon.ps1` already tells the user to `Stop-Process -Id <pid>`.
+        let dir = seeded_dir().await;
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+
+        let refused = run(dir.path(), port, reset_machine_verify()).await;
+        assert_eq!(refused.code, EXIT_DAEMON_LIVE);
+        assert!(
+            !refused.stderr.contains("schtasks /End"),
+            "schtasks /End leaves the daemon alive: {}",
+            refused.stderr
+        );
+        assert!(
+            refused.stderr.contains("Stop-Process"),
+            "it names Stop-Process: {}",
+            refused.stderr
+        );
+        drop(listener);
     }
 
     #[tokio::test]

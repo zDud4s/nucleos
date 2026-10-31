@@ -738,6 +738,7 @@ const REMOTE_DENIED_SEGMENTS: &[&str] = &[
     "nodes",
     "pricing",
     "remote",
+    "routes",
     "sidecars",
     "system",
     "tasks",
@@ -2548,6 +2549,16 @@ mod tests {
                 "{segment} must stay hard-denied"
             );
         }
+    }
+
+    /// `route_index/mod.rs` opens with `#[cfg(test)] mod tests;`, which makes the guard test above cut
+    /// the file before `/routes/search`, so the segment is pinned here instead.
+    #[test]
+    fn the_routes_segment_is_explicitly_denied_to_remote_devices() {
+        assert!(
+            REMOTE_DENIED_SEGMENTS.contains(&"routes"),
+            "`routes` must be hard-denied to remote devices"
+        );
     }
 
     #[tokio::test]

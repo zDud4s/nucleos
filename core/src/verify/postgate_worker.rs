@@ -1300,27 +1300,36 @@ mod tests {
 
     const GATE_ON: &str = "gate_command: \"git --version\"\ngate_after_land: true\n";
 
+    /// One `fixture` per test: the rules gate's hold outlives the `Fixture` on this thread, so a
+    /// second `fixture` would ask for the env lock with the gate in hand and deadlock.
+    async fn assert_a_switched_off_tick_does_nothing(rules: Option<&str>) {
+        let f = fixture(rules).await;
+
+        let passes = tick(&f.ex).await;
+
+        assert!(
+            passes.is_empty(),
+            "no pass for a project that is switched off"
+        );
+        assert_eq!(count(&f.pool, "postgate_state").await, 0);
+        assert_eq!(count(&f.pool, "verify_requests").await, 0);
+        assert_eq!(count(&f.pool, "verify_runs").await, 0);
+        assert!(
+            !verify_postgate::postgate_worktree(&f.root).exists(),
+            "no postgate directory is created"
+        );
+    }
+
+    /// The switch absent from a rules file that exists: the default every project has today.
     #[tokio::test]
     async fn with_gate_after_land_off_the_tick_reads_the_rules_and_nothing_else() {
-        // The switch absent from a rules file that exists, and then no rules file at all: the
-        // default every project has today.
-        for rules in [Some("gate_command: \"git --version\"\n"), None] {
-            let f = fixture(rules).await;
+        assert_a_switched_off_tick_does_nothing(Some("gate_command: \"git --version\"\n")).await;
+    }
 
-            let passes = tick(&f.ex).await;
-
-            assert!(
-                passes.is_empty(),
-                "no pass for a project that is switched off"
-            );
-            assert_eq!(count(&f.pool, "postgate_state").await, 0);
-            assert_eq!(count(&f.pool, "verify_requests").await, 0);
-            assert_eq!(count(&f.pool, "verify_runs").await, 0);
-            assert!(
-                !verify_postgate::postgate_worktree(&f.root).exists(),
-                "no postgate directory is created"
-            );
-        }
+    /// No rules file at all: the same default.
+    #[tokio::test]
+    async fn with_no_rules_at_all_the_tick_reads_the_rules_and_nothing_else() {
+        assert_a_switched_off_tick_does_nothing(None).await;
     }
 
     #[tokio::test]

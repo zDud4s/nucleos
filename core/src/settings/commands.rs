@@ -33,6 +33,10 @@ const FIELDS: &[(&str, &[Seg])] = &[
         &[Seg::Key("schedules"), Seg::Each, Seg::Key("command")],
     ),
     (
+        "autopilot",
+        &[Seg::Key("schedules"), Seg::Each, Seg::Key("cwd")],
+    ),
+    (
         "workflow_pins",
         &[
             Seg::Key("workflows"),
@@ -243,6 +247,16 @@ mod tests {
         );
         assert_eq!(pinned.len(), 1);
         assert_eq!(pinned[".workflows[w].path"], json!("other/bundle"));
+    }
+
+    #[test]
+    fn a_schedule_cwd_is_a_command_field() {
+        let found = command_fields(
+            "autopilot",
+            &json!({ "schedules": [{ "name": "r1", "command": "c", "cwd": "tools" }, { "name": "r2", "cwd": null }] }),
+        );
+        assert_eq!(found[".schedules[r1].cwd"], json!("tools"));
+        assert!(!found.contains_key(".schedules[r2].cwd"));
     }
 
     #[test]
