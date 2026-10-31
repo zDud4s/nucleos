@@ -350,6 +350,8 @@ pub(super) const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     ("task_done", ToolEffect::WritesOwn),
     ("task_list", ToolEffect::ReadsOwn),
     ("task_release", ToolEffect::WritesOwn),
+    // `Acts`: it adds a branch, makes its worktree and starts a paid run in it.
+    ("tree_branch_start", ToolEffect::Acts),
     ("tree_launch", ToolEffect::Acts),
     ("tree_status", ToolEffect::ReadsOwn),
     ("triage_email", ToolEffect::Acts),

@@ -1,11 +1,366 @@
-//! Tree-job branch start: HTTP routes for starting a branch (scaffold, no routes yet).
+//! `POST /trees/{id}/branch_start`: the whole start of one branch in a single call, for the
+//! `tree_branch_start` tool. Five steps, each idempotent, so that a call repeated after a crash (or
+//! after a client timeout) finishes the steps the first one did not reach and makes nothing twice:
+//! add the branch, open it (worktree), open a work node under the caller, bind the two, launch the
+//! agent under the key `branch-<name>`.
+//!
+//! **Locks.** `open_branch` and `bind_branch` take `http::job_lock` themselves and the lock is not
+//! reentrant, so this handler holds it only around the lookup-or-open of the node, which touches no
+//! manifest, and never around a step that takes it.
+//!
+//! **Who reaches it.** Like every `/trees*` route it is in no `auth.rs` table: the control token and
+//! an Admin API key only.
 
+use std::path::Path as FsPath;
+
+use axum::Json;
 use axum::Router;
+use axum::body::Body;
+use axum::extract::rejection::JsonRejection;
+use axum::extract::{Path, State};
+use axum::http::{Request, StatusCode};
+use axum::routing::post;
+use serde::Deserialize;
+use serde_json::{Value, json};
+use tower::ServiceExt;
 
+use super::http::{job_lock, refuse};
+use super::model::JOB_TERMINAL_STATE;
+use super::node_run::{self, NodeRunError};
+use super::open::{self, OpenError};
+use super::store::{self, StoreError, launch_recovering};
+use crate::execution::runs::CreateRunError;
 use crate::state::AppState;
+use crate::work_nodes::{self, NodeError, NodeLimits, OpenArgs};
+
+/// The layer of a branch started without one (`root.rs` makes the first branch a `code` one).
+const DEFAULT_LAYER: &str = "code";
+const LAUNCH_MODE: &str = "shadow";
+
+type Refusal = (StatusCode, Json<Value>);
 
 pub fn routes() -> Router<AppState> {
-    Router::new()
+    Router::new().route("/trees/{id}/branch_start", post(post_branch_start))
+}
+
+#[derive(Debug, Deserialize)]
+struct StartBody {
+    name: Option<String>,
+    goal: Option<String>,
+    owned_paths: Option<Vec<String>>,
+    prompt: Option<String>,
+    layer: Option<String>,
+    base: Option<String>,
+    node_id: Option<String>,
+}
+
+fn required(field: &str, value: Option<String>) -> Result<String, Refusal> {
+    value
+        .filter(|text| !text.trim().is_empty())
+        .ok_or_else(|| refuse(StatusCode::BAD_REQUEST, format!("{field} is required")))
+}
+
+/// The rule of `open.rs`'s `valid_name`, checked before the first step so that a name the open step
+/// would refuse never leaves a queued branch behind.
+fn valid_name(value: &str) -> bool {
+    value.chars().next().is_some_and(|first| first.is_ascii_alphanumeric())
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        && !value.contains("..")
+        && !value.ends_with('.')
+        && !value.ends_with(".lock")
+}
+
+fn db_refusal(error: sqlx::Error) -> Refusal {
+    tracing::warn!(%error, "tree branch start storage failed");
+    refuse(StatusCode::INTERNAL_SERVER_ERROR, format!("database error: {error}"))
+}
+
+fn store_refusal(error: StoreError) -> Refusal {
+    let status = match &error {
+        StoreError::NotFound(_) => StatusCode::NOT_FOUND,
+        _ => {
+            tracing::warn!(%error, "tree branch start storage failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    };
+    refuse(status, error.to_string())
+}
+
+fn node_refusal(error: NodeError) -> Refusal {
+    refuse(error.status_code(), error.to_string())
+}
+
+/// The statuses of `open.rs`'s own routes; an admission refusal keeps its reasons.
+fn open_refusal(error: OpenError) -> Refusal {
+    let status = match &error {
+        OpenError::JobNotFound(_) | OpenError::BranchNotFound(_) | OpenError::NodeNotFound(_) => {
+            StatusCode::NOT_FOUND
+        }
+        OpenError::BadName(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        OpenError::Git(_) | OpenError::Link(_) | OpenError::Store(_) | OpenError::Db(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+        _ => StatusCode::CONFLICT,
+    };
+    if let OpenError::NotAdmitted(reasons) = &error {
+        return (
+            status,
+            Json(json!({ "error": error.to_string(), "reasons": reasons })),
+        );
+    }
+    if status == StatusCode::INTERNAL_SERVER_ERROR {
+        tracing::warn!(%error, "tree branch start failed");
+    }
+    refuse(status, error.to_string())
+}
+
+/// The statuses `http.rs` gives a failed launch.
+fn run_refusal(error: NodeRunError) -> Refusal {
+    let status = match &error {
+        NodeRunError::NodeNotFound(_) => StatusCode::NOT_FOUND,
+        NodeRunError::Unresolved { .. } => StatusCode::CONFLICT,
+        NodeRunError::Create(CreateRunError::Invalid(_)) => StatusCode::UNPROCESSABLE_ENTITY,
+        NodeRunError::Create(CreateRunError::Busy | CreateRunError::NoRoomOnDisk(_)) => {
+            StatusCode::CONFLICT
+        }
+        _ => {
+            tracing::warn!(%error, "tree branch start launch failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    };
+    refuse(status, error.to_string())
+}
+
+/// Posts `body` to `uri` on `router`, in this process and with no authentication layer: the
+/// handlers it reaches are the ones their own routes run, and this route is already behind the
+/// token check. A success answers its JSON; any other status answers as it came, reasons included.
+async fn call(
+    router: Router<AppState>,
+    state: &AppState,
+    uri: String,
+    body: Value,
+) -> Result<Value, Refusal> {
+    let request = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("Content-Type", "application/json")
+        .body(Body::from(body.to_string()))
+        .map_err(|error| refuse(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let Ok(response) = router.with_state(state.clone()).oneshot(request).await;
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .map_err(|error| refuse(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    if status.is_success() {
+        Ok(value)
+    } else {
+        Err((status, Json(value)))
+    }
+}
+
+/// The node already made for branch `name` under `caller`, else a new `leaf` for it. The job lock
+/// makes the lookup and the insert one step; nothing in `work_nodes::open` takes that lock.
+async fn find_or_open_node(
+    state: &AppState,
+    job_id: &str,
+    project_root: &str,
+    caller: &str,
+    name: &str,
+    goal: &str,
+    paths: &[String],
+) -> Result<(String, bool), Refusal> {
+    let lock = job_lock(job_id);
+    let _guard = lock.lock().await;
+    let found: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM work_nodes WHERE parent_id = ? AND kind = 'leaf' AND title = ?
+         ORDER BY created_at, id LIMIT 1",
+    )
+    .bind(caller)
+    .bind(name)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(db_refusal)?;
+    if let Some(found) = found {
+        return Ok((found, true));
+    }
+    let limits = NodeLimits::load(Some(FsPath::new(project_root)));
+    let opened = work_nodes::open(
+        &state.pool,
+        None,
+        &limits,
+        &OpenArgs {
+            parent_id: Some(caller.to_owned()),
+            kind: "leaf".to_owned(),
+            title: name.to_owned(),
+            goal: goal.to_owned(),
+            owned_paths: paths.to_vec(),
+            ..OpenArgs::default()
+        },
+    )
+    .await
+    .map_err(node_refusal)?;
+    Ok((opened.id, false))
+}
+
+/// Whether the launch `(node, key)` already holds a run id.
+async fn launch_recorded(state: &AppState, node: &str, key: &str) -> Result<bool, Refusal> {
+    let stored: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT result FROM tree_transitions WHERE node_id = ? AND transition = ? AND key = ?",
+    )
+    .bind(node)
+    .bind(node_run::LAUNCH)
+    .bind(key)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(db_refusal)?;
+    Ok(stored.flatten().is_some_and(|result| !result.is_empty()))
+}
+
+/// `POST /trees/{id}/branch_start`. Checked first: the names, then the job, the caller (404 when it
+/// is not a node of this tree) and a finished job (409). Then the five steps; a refusal at any of
+/// them answers as that step does and leaves the earlier ones in place for the replay. `replayed` is
+/// true only when every step found its work already done.
+async fn post_branch_start(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    body: Result<Json<StartBody>, JsonRejection>,
+) -> Result<Json<Value>, Refusal> {
+    let Json(body) =
+        body.map_err(|rejection| refuse(StatusCode::BAD_REQUEST, rejection.body_text()))?;
+    let name = required("name", body.name)?;
+    let goal = required("goal", body.goal)?;
+    let prompt = required("prompt", body.prompt)?;
+    let caller = required("node_id", body.node_id)?;
+    let paths = body
+        .owned_paths
+        .ok_or_else(|| refuse(StatusCode::BAD_REQUEST, "owned_paths is required"))?;
+    let layer = body
+        .layer
+        .filter(|layer| !layer.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_LAYER.to_owned());
+    let base = body.base.filter(|base| !base.trim().is_empty());
+    for (what, value) in [("tree id", &id), ("branch name", &name)] {
+        if !valid_name(value) {
+            return Err(refuse(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("{what} {value:?} must be letters, digits, '.', '_' or '-'"),
+            ));
+        }
+    }
+
+    let job = store::load(&state.pool, &id)
+        .await
+        .map_err(store_refusal)?
+        .ok_or_else(|| refuse(StatusCode::NOT_FOUND, format!("tree job {id} not found")))?;
+    let not_in_tree = || {
+        refuse(
+            StatusCode::NOT_FOUND,
+            format!("node {caller} is not a node of tree job {id}"),
+        )
+    };
+    let caller_node = match work_nodes::get(&state.pool, &caller).await {
+        Ok(node) => node,
+        Err(NodeError::NotFound) => return Err(not_in_tree()),
+        Err(error) => return Err(node_refusal(error)),
+    };
+    if caller_node.root_id != job.root_node_id {
+        return Err(not_in_tree());
+    }
+    if job.state == JOB_TERMINAL_STATE {
+        return Err(refuse(
+            StatusCode::CONFLICT,
+            format!("tree job {id} is finished and takes no new branch"),
+        ));
+    }
+
+    // 1. The branch, through the route that adds one: its replay, overlap and admission checks
+    // are the ones a direct call gets, and nothing is stored when it refuses.
+    let added = call(
+        super::http::routes(),
+        &state,
+        format!("/trees/{id}/branches"),
+        json!({ "name": name, "paths": paths, "layer": layer, "base": base }),
+    )
+    .await?;
+    let mut replayed = added["replayed"].as_bool().unwrap_or(false);
+
+    // 2. The worktree. A branch past `queued` was opened by an earlier call.
+    let job = store::load(&state.pool, &id)
+        .await
+        .map_err(store_refusal)?
+        .ok_or_else(|| refuse(StatusCode::NOT_FOUND, format!("tree job {id} not found")))?;
+    let branch = job
+        .manifest
+        .branches
+        .get(&name)
+        .cloned()
+        .ok_or_else(|| refuse(StatusCode::NOT_FOUND, format!("branch {name} not found")))?;
+    let worktree = if branch.state == "queued" {
+        let opened = call(
+            open::routes(),
+            &state,
+            format!("/trees/{id}/branches/{name}/open"),
+            json!({}),
+        )
+        .await?;
+        replayed &= opened["replayed"].as_bool().unwrap_or(false);
+        opened["worktree"].as_str().map(str::to_owned)
+    } else {
+        branch.worktree.clone()
+    };
+    // A docs branch has no worktree of its own: its agent works in the project root.
+    let worktree = worktree.unwrap_or_else(|| job.manifest.project_root.clone());
+
+    // 3. The node: the one the branch is bound to, else the one an earlier call made, else a new one.
+    let node_id = match &branch.node_id {
+        Some(bound) => bound.clone(),
+        None => {
+            let (node_id, found) = find_or_open_node(
+                &state,
+                &id,
+                &job.manifest.project_root,
+                &caller,
+                &name,
+                &goal,
+                &paths,
+            )
+            .await?;
+            replayed &= found;
+            node_id
+        }
+    };
+
+    // 4. The binding. It takes the job lock itself.
+    let bound = open::bind_branch(&state.pool, &id, &name, &node_id)
+        .await
+        .map_err(open_refusal)?;
+    replayed &= bound.replayed;
+
+    // 5. The agent, once per branch name.
+    let key = format!("branch-{name}");
+    replayed &= launch_recorded(&state, &node_id, &key).await?;
+    let run_id = launch_recovering(
+        &state,
+        &node_id,
+        &key,
+        prompt,
+        job.project_id.clone(),
+        Some(worktree.clone()),
+        LAUNCH_MODE,
+    )
+    .await
+    .map_err(run_refusal)?;
+
+    Ok(Json(json!({
+        "branch": name,
+        "node_id": node_id,
+        "run_id": run_id,
+        "worktree": worktree,
+        "replayed": replayed,
+    })))
 }
 
 #[cfg(test)]

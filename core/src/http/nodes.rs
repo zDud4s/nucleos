@@ -231,15 +231,26 @@ async fn post_close(
     State(state): State<AppState>,
     Path(id): Path<String>,
     body: Result<Json<CloseBody>, JsonRejection>,
-) -> Result<Json<work_nodes::Node>, Refusal> {
+) -> Result<Json<Value>, Refusal> {
     let Json(body) = body.map_err(bad_body)?;
     let tree_job = crate::tree_job::close::tree_job_of(&state.pool, &id)
         .await
         .map_err(|error| refuse(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     if tree_job.is_some() {
         let closed = close_tree_node(&state, &id, body).await?;
+        // A report on a node that may not close yet is recorded and the node stays running: it is
+        // not a close, so there is no feed line, and the agent is told its work is done.
+        if closed.closed_at.is_none() {
+            let mut value = node_value(&closed)?;
+            value["recorded"] = json!(true);
+            value["message"] = json!(
+                "Your report is recorded. This node closes later, when the daemon has merged \
+                 your work. Stop now: do not call node_close again or do any further work."
+            );
+            return Ok(Json(value));
+        }
         announce_close(&state.pool, &closed).await;
-        return Ok(Json(closed));
+        return Ok(Json(node_value(&closed)?));
     }
     let args = CloseArgs {
         status: required("status", body.status)?,
@@ -252,7 +263,12 @@ async fn post_close(
         .await
         .map_err(refused)?;
     announce_close(&state.pool, &closed).await;
-    Ok(Json(closed))
+    Ok(Json(node_value(&closed)?))
+}
+
+fn node_value(node: &work_nodes::Node) -> Result<Value, Refusal> {
+    serde_json::to_value(node)
+        .map_err(|error| refuse(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
 }
 
 /// The tree-node half of `post_close`. The handoff lands in the node's project state directory

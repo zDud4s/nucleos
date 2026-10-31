@@ -875,7 +875,7 @@ async fn note_skipped(pool: &SqlitePool, relaunched: &mut Relaunched, node: &str
     relaunched.skipped.push((node.to_owned(), reason));
 }
 
-async fn run_is_live(pool: &SqlitePool, run_id: &str) -> Result<bool, sqlx::Error> {
+pub(super) async fn run_is_live(pool: &SqlitePool, run_id: &str) -> Result<bool, sqlx::Error> {
     let Ok(run_number) = run_id.parse::<i64>() else {
         return Ok(false);
     };
@@ -1008,25 +1008,40 @@ pub async fn relaunch_resumed(state: &AppState, resumed: &store::Resumed) -> Rel
                 continue;
             }
             let key = format!("resume-{run_id}");
-            match latest_launch(pool, &node).await {
-                Ok(Some(launch)) => {
-                    match start_again(state, &launch, &key, launch.prompt.clone()).await {
-                        Ok(new_run) => {
-                            handled.insert(node.clone());
-                            relaunched.started.push((node, new_run));
-                        }
-                        Err(reason) => note_skipped(pool, &mut relaunched, &node, reason).await,
-                    }
+            match relaunch_node(state, &node, &run_id, &key, None).await {
+                Ok(new_run) => {
+                    handled.insert(node.clone());
+                    relaunched.started.push((node, new_run));
                 }
-                Ok(None) => {
-                    let reason = format!("run {run_id} is gone and no launch was stored");
-                    note_skipped(pool, &mut relaunched, &node, reason).await;
-                }
-                Err(error) => note_skipped(pool, &mut relaunched, &node, error.to_string()).await,
+                Err(reason) => note_skipped(pool, &mut relaunched, &node, reason).await,
             }
         }
     }
     relaunched
+}
+
+/// Starts `node_id` again from its latest stored launch under `key`: the stored prompt, with
+/// `prompt_suffix` appended when given, and the stored project, cwd and mode. `dead_run` only names
+/// the run that ended, for the error when no launch was ever stored. The key replays, so a second
+/// call with the same key starts nothing new.
+pub(super) async fn relaunch_node(
+    state: &AppState,
+    node_id: &str,
+    dead_run: &str,
+    key: &str,
+    prompt_suffix: Option<&str>,
+) -> Result<i64, String> {
+    match latest_launch(&state.pool, node_id).await {
+        Ok(Some(launch)) => {
+            let prompt = match prompt_suffix {
+                Some(suffix) => format!("{}{suffix}", launch.prompt),
+                None => launch.prompt.clone(),
+            };
+            start_again(state, &launch, key, prompt).await
+        }
+        Ok(None) => Err(format!("run {dead_run} is gone and no launch was stored")),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 // ----- answer and relaunch -----

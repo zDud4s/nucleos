@@ -3148,6 +3148,13 @@ pub const ROUTES: &[RouteEntry] = &[
     },
     RouteEntry {
         method: "POST",
+        path: "/trees/{id}/branch_start",
+        purpose: "Post branch start.",
+        body: Body::Shapeless("StartBody"),
+        handler: "post_branch_start",
+    },
+    RouteEntry {
+        method: "POST",
         path: "/trees/{id}/branches",
         purpose: "Post branch.",
         body: Body::Shapeless("BranchBody"),

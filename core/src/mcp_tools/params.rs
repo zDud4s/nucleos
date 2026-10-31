@@ -26,6 +26,26 @@ pub(super) struct TreeIdParams {
     pub(super) id: String,
 }
 
+/// The body of `POST /trees/{id}/branch_start`, with the job id lifted out into the path.
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub(super) struct TreeBranchStartParams {
+    /// The tree job the branch belongs to.
+    pub(super) id: String,
+    /// The branch's name: letters, digits, `.`, `_` and `-`. Starting the same name again replays.
+    pub(super) name: String,
+    pub(super) goal: String,
+    /// The paths the branch may write, as globs.
+    pub(super) owned_paths: Vec<String>,
+    /// What the branch's agent is told to do.
+    pub(super) prompt: String,
+    /// The branch's layer; absent is `code`. `docs` takes only docs paths and builds nothing.
+    pub(super) layer: Option<String>,
+    /// A branch of this tree this one is based on; it opens once that one is merged.
+    pub(super) base: Option<String>,
+    /// Your own work node: the new branch's node becomes its child.
+    pub(super) node_id: String,
+}
+
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 pub(super) struct SpecFinishParams {
     /// The spec to finish. Absent leaves the choice to the daemon.

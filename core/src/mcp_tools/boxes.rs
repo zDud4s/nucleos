@@ -212,8 +212,9 @@ pub const TASK_TOOL_NAMES: [&str; 4] = ["task_list", "task_claim", "task_release
 /// Accepted residual: node ids are not fenced to the worktree; they are the owner's own bookkeeping
 /// rows and run nothing. The task tools ride with `verify` here as in every box (`TASK_TOOL_NAMES`).
 ///
-/// The only `Acts` tools here are `create_job` and `create_run`, and the person at this session is
-/// who asks for them. No tool here is `ReadsUntrusted` in `TOOL_EFFECTS`, but one call can be: by
+/// The only `Acts` tools here are `create_job`, `create_run` and `tree_branch_start`, and the person
+/// at this session is who asks for them. `tree_branch_start` starts a branch run of a tree job the
+/// caller's node belongs to; the daemon refuses a node that is not in that tree. No tool here is `ReadsUntrusted` in `TOOL_EFFECTS`, but one call can be: by
 /// content, `get_run` on a triage run returns a model's answer over a stranger's mail (see
 /// `effect_of_call`). Nothing marks an interactive session for that read, so the taint rule could
 /// not bar a later `create_run` here; `call_tool` refuses that call instead, through
@@ -236,6 +237,7 @@ pub const WORKTREE_BOX_TOOLS: &[&str] = &[
     "task_done",
     "task_list",
     "task_release",
+    "tree_branch_start",
     "tree_launch",
     "tree_status",
     "verify",

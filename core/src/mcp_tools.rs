@@ -1096,6 +1096,7 @@ mod tests {
                 "task_done",
                 "task_list",
                 "task_release",
+                "tree_branch_start",
                 "tree_launch",
                 "tree_status",
                 "triage_email",
@@ -2794,6 +2795,7 @@ mod tests {
                 "task_done",
                 "task_list",
                 "task_release",
+                "tree_branch_start",
                 "tree_launch",
                 "tree_status",
                 "verify",
@@ -3016,8 +3018,14 @@ mod tests {
                 "{name} is missing from TOOL_EFFECTS"
             );
             let effect = tool_effect(name);
-            let launch_act = ["create_job", "create_run", "spec_finish", "tree_launch"]
-                .contains(&name);
+            let launch_act = [
+                "create_job",
+                "create_run",
+                "spec_finish",
+                "tree_branch_start",
+                "tree_launch",
+            ]
+            .contains(&name);
             assert!(
                 effect != ToolEffect::ReadsUntrusted && (effect != ToolEffect::Acts || launch_act),
                 "{name} is graded {effect:?} and must not be served in a worktree box"
@@ -3047,6 +3055,7 @@ mod tests {
                 "task_done",
                 "task_list",
                 "task_release",
+                "tree_branch_start",
                 "tree_launch",
                 "tree_status",
                 "verify",

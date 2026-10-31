@@ -3,12 +3,13 @@
 use std::collections::{HashMap, HashSet};
 
 /// Each outcome a node can report, with the status that outcome requires.
-pub const OUTCOME_STATUS: [(&str, &str); 5] = [
+pub const OUTCOME_STATUS: [(&str, &str); 6] = [
     ("done", "done"),
     ("split", "done"),
     ("contract_request", "blocked"),
     ("blocked", "blocked"),
     ("failed", "failed"),
+    ("handoff", "handoff"),
 ];
 
 /// The longest accepted summary, in characters.

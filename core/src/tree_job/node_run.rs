@@ -145,7 +145,8 @@ pub async fn apply(
 /// in `LIVE_RUN_STATUSES`, or its row is gone), naming the run in the summary. Returns the ids.
 ///
 /// Spared: nodes with no `run_id`, nodes outside a tree job, and the top branch node of a branch
-/// that may not close yet (see `branch_node_may_close`) while its job is not finished, and every
+/// that may not close yet (see `branch_node_may_close`) and the root of the job, both while the job
+/// is not finished (they stay `running` after reporting, until the driver closes them), and every
 /// node of a job whose manifest cannot be read (named in the feed, once per job).
 pub async fn reconcile_running(pool: &SqlitePool) -> Result<Vec<String>, NodeRunError> {
     let candidates: Vec<(String, String, String)> = sqlx::query_as(
@@ -192,9 +193,10 @@ pub async fn reconcile_running(pool: &SqlitePool) -> Result<Vec<String>, NodeRun
         }
         if let Some(Some(job)) = jobs.get(&job_id)
             && job.state != JOB_TERMINAL_STATE
-            && job.manifest.branches.values().any(|branch| {
-                branch.node_id.as_deref() == Some(id.as_str()) && !branch_node_may_close(branch)
-            })
+            && (job.root_node_id == id
+                || job.manifest.branches.values().any(|branch| {
+                    branch.node_id.as_deref() == Some(id.as_str()) && !branch_node_may_close(branch)
+                }))
         {
             continue;
         }

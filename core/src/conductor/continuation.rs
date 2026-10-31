@@ -58,7 +58,7 @@ fn node_error(error: NodeError) -> ContinuationError {
 /// `text` with the sentence naming `handoff` at its end. On a chain the sentence of the previous
 /// link is taken out first, so neither a goal nor a prompt grows and the original text stays first;
 /// whatever a relaunch wrote after that sentence stays too.
-fn with_handoff(text: &str, handoff: &str) -> String {
+pub(crate) fn with_handoff(text: &str, handoff: &str) -> String {
     let kept = match text.rfind(HANDOFF_MARK) {
         Some(at) => {
             let sentence = &text[at + HANDOFF_MARK.len()..];

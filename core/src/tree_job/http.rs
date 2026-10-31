@@ -33,6 +33,8 @@ use crate::tree_job::store::{self, StoreError, TreeJob, launch_recovering};
 use crate::work_nodes::{self, NodeError, NodeLimits, OpenArgs};
 
 const DOCS_LAYER: &str = "docs";
+/// The feed kind of the line that says a new job's root run did not start.
+const ROOT_START_FAILED_KIND: &str = "work_tree_root_start_failed";
 /// The states of a branch that hold a slot and grow on disk (`OPEN_STATES` in `tree_resources.py`).
 /// `queued` and `parked` are not among them.
 const LIVE_STATES: [&str; 7] = [
@@ -290,7 +292,12 @@ struct TreeBody {
     project_id: Option<String>,
     contract: Option<String>,
     dirty_owner_files: Option<Vec<String>>,
+    /// `hold` (default) or `integration`: whether the driver may land the job into master.
+    land: Option<String>,
 }
+
+/// The values of `land`, the first one being the default (no tree moves master unless asked).
+const LAND_MODES: [&str; 2] = ["hold", "integration"];
 
 fn summary(job: &TreeJob, replayed: bool) -> Value {
     json!({
@@ -325,9 +332,19 @@ async fn post_tree(
     // A job without a project would answer 422 at every node close, so it is refused here, where
     // the owner can still fix it.
     let project_id = required("project_id", body.project_id)?;
+    let land = match body.land.as_deref().map(str::trim) {
+        None | Some("") => LAND_MODES[0].to_owned(),
+        Some(mode) if LAND_MODES.contains(&mode) => mode.to_owned(),
+        Some(mode) => {
+            return Err(refuse(
+                StatusCode::BAD_REQUEST,
+                format!("land must be one of {LAND_MODES:?}, not {mode:?}"),
+            ));
+        }
+    };
 
     let lock = job_lock(&id);
-    let _guard = lock.lock().await;
+    let guard = lock.lock().await;
     if let Some(job) = store::load(&state.pool, &id).await.map_err(store_refusal)? {
         return Ok(Json(summary(&job, true)));
     }
@@ -347,12 +364,14 @@ async fn post_tree(
     .map_err(node_refusal)?;
     let dirty = body.dirty_owner_files.unwrap_or_default();
     let created = now();
+    let mut manifest = Manifest::new(&id, &feature_branch, &goal, &project_root, &dirty);
+    manifest.extra.insert("landing".to_owned(), json!(land));
     let job = TreeJob {
         id: id.clone(),
         root_node_id: opened.id.clone(),
         project_id: Some(project_id),
         feature_branch: Some(feature_branch.clone()),
-        manifest: Manifest::new(&id, &feature_branch, &goal, &project_root, &dirty),
+        manifest,
         goal,
         state: "open".to_owned(),
         contract: body.contract,
@@ -366,6 +385,16 @@ async fn post_tree(
         .execute(&state.pool)
         .await
         .map_err(db_refusal)?;
+    // `start` takes the job lock in `open_branch` and `bind_branch`, and the mutex is not reentrant.
+    drop(guard);
+    // A root that cannot start never fails the request: the job exists and stays open, and the feed
+    // says why.
+    if let Err(reason) = crate::tree_job::root::start(&state, &job).await {
+        tracing::warn!(job = %job.id, %reason, "tree job root run did not start");
+        let line = format!("tree job {} is open but its root run did not start: {reason}", job.id);
+        let _ = crate::feed::append(&state.pool, None, ROOT_START_FAILED_KIND, &line, None, None)
+            .await;
+    }
     Ok(Json(summary(&job, false)))
 }
 

@@ -1,8 +1,223 @@
-//! Tree-job node wrap-up: closes a finished node run and records its outcome (scaffold stub).
+//! Tree-job node wrap-up: ends a node run that already reported, and starts a branch node again
+//! when its run ended with a `handoff` report or died without one.
+//!
+//! The driver owns every other outcome: a node whose run is gone after a `done`, `blocked` or
+//! `failed` report is left alone here.
 
+use crate::conductor::continuation::with_handoff;
+use crate::execution::runs::finalize_termination;
 use crate::state::AppState;
 
-pub async fn tick(_state: &AppState) {}
+use super::decisions;
+use super::engine::branch_node_may_close;
+use super::model::JOB_TERMINAL_STATE;
+use super::open::{latest_launch, relaunch_node, run_is_live};
+use super::store;
+
+/// Nodes one tick acts on, oldest first; nodes it leaves alone do not count.
+const MAX_NODES_PER_TICK: usize = 20;
+/// Key prefix and cap of the relaunches that follow a `handoff` report.
+const WRAP_PREFIX: &str = "wrap-";
+const WRAP_CAP: i64 = 3;
+/// Key prefix and cap of the relaunches that follow a run that died without a report.
+const DIED_PREFIX: &str = "died-";
+const DIED_CAP: i64 = 2;
+/// The feed kind the sweep writes when a handoff chain stops (`conductor::sweep`).
+const CONTINUATION_STOPPED: &str = "node_continuation_stopped";
+const PARKED: &str = "parked";
+
+type NodeRow = (String, String, Option<String>, Option<String>);
+
+/// One pass over the running nodes of unfinished jobs. A failure on one node is logged and never
+/// stops the others. Safe to call again at any time: every relaunch is keyed by the run it follows.
+pub async fn tick(state: &AppState) {
+    let rows: Result<Vec<NodeRow>, _> = sqlx::query_as(
+        "SELECT n.id, n.tree_job_id, n.run_id, n.handoff_path \
+         FROM work_nodes n JOIN tree_jobs j ON j.id = n.tree_job_id \
+         WHERE n.status = 'running' AND j.state <> ? \
+         ORDER BY n.created_at, n.id",
+    )
+    .bind(JOB_TERMINAL_STATE)
+    .fetch_all(&state.pool)
+    .await;
+    let rows = match rows {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(%error, "tree wrap-up could not list the running nodes");
+            return;
+        }
+    };
+    let mut handled = 0;
+    for (node_id, job_id, run_id, handoff) in rows {
+        if handled >= MAX_NODES_PER_TICK {
+            break;
+        }
+        match wrap_node(state, &node_id, &job_id, run_id, handoff).await {
+            Ok(false) => {}
+            Ok(true) => handled += 1,
+            Err(error) => {
+                handled += 1;
+                tracing::warn!(node = %node_id, %error, "tree wrap-up failed for the node");
+            }
+        }
+    }
+}
+
+/// Wraps one node up. `Ok(true)` when it acted (ended a run, relaunched, or stopped the chain).
+async fn wrap_node(
+    state: &AppState,
+    node_id: &str,
+    job_id: &str,
+    run_id: Option<String>,
+    handoff: Option<String>,
+) -> Result<bool, String> {
+    let pool = &state.pool;
+    let Some(job) = store::load(pool, job_id).await.map_err(|e| e.to_string())? else {
+        return Ok(false);
+    };
+    if job.state == JOB_TERMINAL_STATE {
+        return Ok(false);
+    }
+    let branch = job
+        .manifest
+        .branches
+        .values()
+        .find(|branch| branch.node_id.as_deref() == Some(node_id));
+    match branch {
+        // Only an answer starts a parked branch again; a merged or dropped one is the driver's.
+        Some(branch) if branch.state == PARKED || branch_node_may_close(branch) => {
+            return Ok(false);
+        }
+        Some(_) => {}
+        // A leaf child fails through `reconcile_running`; only the root is wrapped without a branch.
+        None if job.root_node_id != node_id => return Ok(false),
+        None => {}
+    }
+    let has_branch = branch.is_some();
+
+    let waiting: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM decisions WHERE node_id = ? AND status = ?")
+            .bind(node_id)
+            .bind(decisions::STATUS_OPEN)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    if waiting > 0 {
+        return Ok(false);
+    }
+
+    let Some(run_id) = run_id else {
+        // A root whose start failed after its launch was stored: start it again under that key.
+        if has_branch {
+            return Ok(false);
+        }
+        let stored = latest_launch(pool, node_id).await.map_err(|e| e.to_string())?;
+        if stored.is_none() {
+            return Ok(false);
+        }
+        relaunch_node(state, node_id, "none", &format!("root-{node_id}"), None).await?;
+        return Ok(true);
+    };
+
+    let live = run_is_live(pool, &run_id).await.map_err(|e| e.to_string())?;
+    let report: Option<String> = sqlx::query_scalar(
+        "SELECT result FROM tree_transitions WHERE node_id = ? AND transition = 'report' AND key = ?",
+    )
+    .bind(node_id)
+    .bind(&run_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    match (live, report.as_deref()) {
+        (true, Some("handoff" | "done" | "blocked" | "failed")) => {
+            // It reported, so it has nothing left to do; its process may still be running.
+            let Ok(number) = run_id.parse::<i64>() else {
+                return Ok(false);
+            };
+            finalize_termination(state, number, "cancelled").await;
+            Ok(true)
+        }
+        (true, _) => Ok(false),
+        (false, Some("handoff")) => {
+            let suffix = handoff.as_deref().map(|path| with_handoff("", path));
+            relaunch_or_stop(
+                state, &job.id, node_id, has_branch, &run_id, WRAP_PREFIX, WRAP_CAP, suffix,
+            )
+            .await
+        }
+        (false, Some(_)) => Ok(false),
+        (false, None) => {
+            relaunch_or_stop(
+                state, &job.id, node_id, has_branch, &run_id, DIED_PREFIX, DIED_CAP, None,
+            )
+            .await
+        }
+    }
+}
+
+/// Starts the node again under `<prefix><dead run>`, unless `cap` links with that prefix already
+/// exist: then it writes the stop line once and parks the branch.
+#[allow(clippy::too_many_arguments)]
+async fn relaunch_or_stop(
+    state: &AppState,
+    job_id: &str,
+    node_id: &str,
+    has_branch: bool,
+    dead_run: &str,
+    prefix: &str,
+    cap: i64,
+    suffix: Option<String>,
+) -> Result<bool, String> {
+    let pool = &state.pool;
+    let key = format!("{prefix}{dead_run}");
+    // The key being replayed is not a prior link.
+    let prior: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM tree_transitions \
+         WHERE node_id = ? AND transition = 'launch' AND key LIKE ? AND key <> ?",
+    )
+    .bind(node_id)
+    .bind(format!("{prefix}%"))
+    .bind(&key)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    if prior < cap {
+        relaunch_node(state, node_id, dead_run, &key, suffix.as_deref()).await?;
+        return Ok(true);
+    }
+
+    let subject = format!("node:{node_id}");
+    let seen: Option<i64> =
+        sqlx::query_scalar("SELECT id FROM feed WHERE kind = ? AND subject = ? LIMIT 1")
+            .bind(CONTINUATION_STOPPED)
+            .bind(&subject)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    if seen.is_none() {
+        sqlx::query(
+            "INSERT INTO feed (kind, summary, run_id, subject, created_at) VALUES (?, ?, NULL, ?, ?)",
+        )
+        .bind(CONTINUATION_STOPPED)
+        .bind("Node ended too many times in a row: its chain stopped.")
+        .bind(&subject)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    if has_branch {
+        // `park` takes the job's lock itself, so none is held here.
+        let question = format!(
+            "Node {node_id} ended {cap} times in a row without finishing; how should the branch go on?"
+        );
+        decisions::park(pool, job_id, node_id, &question)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(true)
+}
 
 #[cfg(test)]
 mod tests {

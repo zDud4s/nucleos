@@ -734,6 +734,47 @@ impl NucleosTools {
         )
     }
 
+    #[tool(
+        description = "Start one branch of a tree job in one call: adds the branch `name`, makes its \
+                       worktree, opens a work node for it as a child of your `node_id` and starts \
+                       its agent with `prompt`. `owned_paths` are the globs it may write; `layer` \
+                       (default `code`) and `base` are optional. Calling it again with the same \
+                       `name` repeats nothing and finishes any step an earlier call did not reach. \
+                       Refused when the job is finished, `node_id` is not a node of this tree, or \
+                       the branch is not admitted for disk or slots. Returns {branch, node_id, \
+                       run_id, worktree, replayed}."
+    )]
+    pub(super) async fn tree_branch_start(
+        &self,
+        Parameters(TreeBranchStartParams {
+            id,
+            name,
+            goal,
+            owned_paths,
+            prompt,
+            layer,
+            base,
+            node_id,
+        }): Parameters<TreeBranchStartParams>,
+    ) -> String {
+        json_result(
+            self.client
+                .tree_branch_start(
+                    &id,
+                    &serde_json::json!({
+                        "name": name,
+                        "goal": goal,
+                        "owned_paths": owned_paths,
+                        "prompt": prompt,
+                        "layer": layer,
+                        "base": base,
+                        "node_id": node_id,
+                    }),
+                )
+                .await,
+        )
+    }
+
     #[tool(description = "Read one tree job by the id it was launched with: its state, root node \
                        and progress.")]
     pub(super) async fn tree_status(

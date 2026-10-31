@@ -12,7 +12,9 @@ use sqlx::SqlitePool;
 
 use super::checklist::may_close;
 use super::engine::branch_node_may_close;
-use super::report::{parse_report, render_handoff, report_problems};
+use super::model::JOB_TERMINAL_STATE;
+use super::node_run::{self, NodeRunError};
+use super::report::{Report, parse_report, render_handoff, report_problems};
 use super::store::{self, StoreError};
 use crate::work_nodes::{self, CloseArgs, Node, NodeError, NodeLimits};
 
@@ -178,9 +180,12 @@ fn table_id(trimmed: &str) -> Option<String> {
 /// report, into `<state_dir>/nodes/<root>/<node>.md` (the node's own ids, never the report's),
 /// and close the node.
 ///
-/// A top branch node stays refused until its branch is `merged` or `dropped` (a docs branch: `done`
-/// or `dropped`), whatever the report's status. That includes a `blocked` report: a blocked branch
-/// parks through the transition route, not by closing its node.
+/// A top branch node whose branch is not `merged` or `dropped` (a docs branch: `done` or `dropped`),
+/// and the root of a job that is not finished, do not close on a report. A valid `done`, `blocked`,
+/// `failed` or `handoff` report is recorded instead: the handoff file is written, `handoff_path` is
+/// set, the `report` transition is stored under the node's run id, and the node stays `running`
+/// for the driver to close later. A `contract_request` or `split` report on a top branch node is
+/// still refused (409); a node with no run cannot record and is refused too.
 pub async fn close_node(
     pool: &SqlitePool,
     state_dir: &Path,
@@ -204,20 +209,17 @@ pub async fn close_node(
         .await?
         .ok_or_else(|| StoreError::NotFound(job_id.clone()))?;
 
-    if let Some(branch) = job
+    // The top node of a branch that may not close yet, or the root of an unfinished job, does not
+    // close on a report: it records it and stays running (see below).
+    let held_branch = job
         .manifest
         .branches
         .values()
-        .find(|branch| branch.node_id.as_deref() == Some(node_id))
-        && !branch_node_may_close(branch)
-    {
-        return Err(NodeError::Conflict(format!(
-            "node {node_id} is the top node of branch {}, which is {}; it closes only once the \
-             branch is merged or dropped",
-            branch.name, branch.state
-        ))
-        .into());
-    }
+        .find(|branch| {
+            branch.node_id.as_deref() == Some(node_id) && !branch_node_may_close(branch)
+        });
+    let holds = held_branch.is_some()
+        || (job.root_node_id == node.id && job.state != JOB_TERMINAL_STATE);
 
     let parsed = parse_report(report);
     let known = job.contract.as_deref().map(contract_ids);
@@ -243,6 +245,25 @@ pub async fn close_node(
         return Err(CloseError::Invalid(problems));
     }
 
+    let records = holds
+        && matches!(
+            parsed.outcome.as_str(),
+            "done" | "blocked" | "failed" | "handoff"
+        );
+    if let Some(branch) = held_branch
+        && !records
+    {
+        return Err(NodeError::Conflict(format!(
+            "node {node_id} is the top node of branch {}, which is {}; it closes only once the \
+             branch is merged or dropped, and a {} report cannot be recorded meanwhile",
+            branch.name, branch.state, parsed.outcome
+        ))
+        .into());
+    }
+    if records {
+        return record_report(pool, state_dir, &node, &parsed).await;
+    }
+
     let dir = state_dir.join("nodes").join(&node.root_id);
     tokio::fs::create_dir_all(&dir).await?;
     let file = dir.join(format!("{}.md", node.id));
@@ -253,6 +274,60 @@ pub async fn close_node(
         handoff_path: file.to_string_lossy().into_owned(),
     };
     Ok(work_nodes::close(pool, &node.id, limits, &args).await?)
+}
+
+/// Records a valid report on a node that may not close yet, and leaves the node `running`.
+///
+/// The record is the `report` transition keyed by the node's run id, with the report's status as
+/// result; the only column written is `handoff_path`. A node with no run has nothing to key the
+/// record on, so it is refused (409). A second report for the same run is answered with the stored
+/// row, and neither the file nor the first result changes.
+async fn record_report(
+    pool: &SqlitePool,
+    state_dir: &Path,
+    node: &Node,
+    parsed: &Report,
+) -> Result<Node, CloseError> {
+    let Some(run_id) = node.run_id.as_deref() else {
+        return Err(NodeError::Conflict(format!(
+            "node {} has no run, so its report cannot be recorded",
+            node.id
+        ))
+        .into());
+    };
+    let recorded: Option<String> = sqlx::query_scalar(
+        "SELECT result FROM tree_transitions WHERE node_id = ? AND transition = 'report' AND key = ?",
+    )
+    .bind(&node.id)
+    .bind(run_id)
+    .fetch_optional(pool)
+    .await?;
+    if recorded.is_some() {
+        return Ok(work_nodes::get(pool, &node.id).await?);
+    }
+
+    let dir = state_dir.join("nodes").join(&node.root_id);
+    tokio::fs::create_dir_all(&dir).await?;
+    let file = dir.join(format!("{}.md", node.id));
+    tokio::fs::write(&file, render_handoff(parsed)).await?;
+    sqlx::query("UPDATE work_nodes SET handoff_path = ? WHERE id = ?")
+        .bind(file.to_string_lossy().into_owned())
+        .bind(&node.id)
+        .execute(pool)
+        .await?;
+    node_run::apply(pool, &node.id, "report", run_id, &parsed.status)
+        .await
+        .map_err(report_error)?;
+    Ok(work_nodes::get(pool, &node.id).await?)
+}
+
+/// `node_run::apply` only fails on the database or, never here, on the store.
+fn report_error(error: NodeRunError) -> CloseError {
+    match error {
+        NodeRunError::Db(error) => CloseError::Db(error),
+        NodeRunError::Store(error) => CloseError::Store(error),
+        other => CloseError::Node(NodeError::Conflict(other.to_string())),
+    }
 }
 
 #[cfg(test)]
