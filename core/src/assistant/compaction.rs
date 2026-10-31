@@ -128,7 +128,8 @@ const AUTO_BACKOFF_TURNS: i64 = 3;
 /// Files an automatic compaction after a completed turn when the guards allow it. Never fails.
 ///
 /// Reads the guards cheapest first and stops at the first that settles the question. `run_id` is
-/// the turn that just ended and `fill` its measured context fill.
+/// the turn that just ended and `fill` its context fill: measured on the CLI path, estimated on the
+/// local one.
 pub(super) async fn maybe_auto_compact(
     state: &AppState,
     chat_id: &str,
@@ -152,6 +153,10 @@ pub(super) async fn maybe_auto_compact(
         return;
     }
     let is_compaction = is_compaction(pool, run_id).await;
+    // A `pending` row whose run already ended (a daemon restart cut the compaction) would trip the
+    // guard below for good, and `start_as` would never get to settle it. A live compaction's run is
+    // still `running`, so this leaves it alone.
+    settle_stale(pool, chat_id).await;
     let pending = compactions::has_pending(pool, chat_id)
         .await
         .unwrap_or_else(|error| {
@@ -1153,6 +1158,118 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows, 0);
+    }
+
+    async fn compaction_rows(pool: &SqlitePool, chat: &str, auto: Option<i64>) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM chat_compactions WHERE chat_id = ? AND (? IS NULL OR auto = ?)",
+        )
+        .bind(chat)
+        .bind(auto)
+        .bind(auto)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// A state whose summarising engine answers, and a chat with auto-compact on and one exchange.
+    async fn auto_chat(on: bool) -> (crate::state::AppState, String, i64) {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let mut state = crate::channels::testkit::state().await;
+        state.runner = fake.clone();
+        let c = chat(&state.pool).await;
+        chats::set_auto_compact(&state.pool, &c, on).await.unwrap();
+        let run = exchange(&state.pool, &c, "q", "a").await;
+        *fake.canned.lock().unwrap() = Some(answer("HANDOFF"));
+        (state, c, run)
+    }
+
+    #[tokio::test]
+    async fn a_local_turn_over_soft_with_auto_compact_on_files_an_automatic_compaction() {
+        let (state, c, run) = auto_chat(true).await;
+
+        super::super::turn::after_local_turn(
+            &state,
+            &c,
+            run,
+            Some(super::super::rotation::DEFAULT_SOFT_FILL + 1),
+        )
+        .await;
+
+        assert_eq!(compaction_rows(&state.pool, &c, Some(1)).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_local_turn_with_auto_compact_off_files_no_compaction() {
+        let (state, c, run) = auto_chat(false).await;
+
+        super::super::turn::after_local_turn(
+            &state,
+            &c,
+            run,
+            Some(super::super::rotation::DEFAULT_SOFT_FILL + 1),
+        )
+        .await;
+
+        assert_eq!(compaction_rows(&state.pool, &c, None).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_local_compaction_turn_triggers_no_further_compaction() {
+        let (state, c, _) = auto_chat(true).await;
+        let compact_run = compaction(&state.pool, &c, "HANDOFF").await;
+        // In production the turn's own settle has already left `pending` when `after_local_turn`
+        // runs; settle here too, so only the `is_compaction` guard can stop a further compaction.
+        settle(&state.pool, compact_run).await;
+        assert!(
+            !compactions::has_pending(&state.pool, &c).await.unwrap(),
+            "the row must be settled before the call"
+        );
+        let before = compaction_rows(&state.pool, &c, None).await;
+
+        super::super::turn::after_local_turn(
+            &state,
+            &c,
+            compact_run,
+            Some(super::super::rotation::DEFAULT_SOFT_FILL + 1),
+        )
+        .await;
+
+        assert_eq!(compaction_rows(&state.pool, &c, None).await, before);
+    }
+
+    #[tokio::test]
+    async fn a_pending_row_of_an_ended_run_does_not_block_the_automatic_compaction() {
+        let (state, c, run) = auto_chat(true).await;
+        // A compaction cut by a daemon restart: its run is `completed`, its row still `pending`.
+        let stale = compaction(&state.pool, &c, "HANDOFF").await;
+        assert!(compactions::has_pending(&state.pool, &c).await.unwrap());
+
+        super::super::turn::after_local_turn(
+            &state,
+            &c,
+            run,
+            Some(super::super::rotation::DEFAULT_SOFT_FILL + 1),
+        )
+        .await;
+
+        assert_eq!(compaction_rows(&state.pool, &c, Some(1)).await, 1);
+        let stale_status: String =
+            sqlx::query_scalar("SELECT status FROM chat_compactions WHERE run_id = ?")
+                .bind(stale)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_ne!(stale_status, "pending");
+    }
+
+    #[tokio::test]
+    async fn a_local_turn_without_a_measured_fill_never_compacts() {
+        let (state, c, run) = auto_chat(true).await;
+
+        super::super::turn::after_local_turn(&state, &c, run, None).await;
+
+        assert_eq!(compaction_rows(&state.pool, &c, None).await, 0);
     }
 
     #[test]
