@@ -454,3 +454,230 @@ mod row_tests {
         assert_eq!(runner_id_in(TABLE, "extra-cli"), "claude");
     }
 }
+
+/// Shared fixtures for the tests that need agy's opt-in on or off, or a stand-in `agy` binary.
+///
+/// RED (plan Node 2, leaf D). The gate is turned on by publishing the real `AgyDoc` through the same
+/// settings snapshot the document is read from; there is no test-only registration path (E3).
+/// Lock order, for every test that uses both: the stand-in binary first (it takes
+/// `worktree::test_env_lock`), then the gate (it takes the settings serial lock).
+#[cfg(test)]
+pub(crate) mod agy_test_support {
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+
+    use super::agy_setting::AgyDoc;
+    use crate::execution::runner::{
+        CommandRunner, Permission, RunOutcome, RunRequest, ToolPolicy,
+    };
+    use crate::settings::testing::{self as settings_testing, Installed};
+    use crate::settings::{Scope, Settings, Snapshot};
+
+    /// Publishes a machine-scope `AgyDoc` and keeps it installed until the guard drops. `true` writes
+    /// the document the endpoint would store after an acknowledged enable; `false` is a stored `off`.
+    pub(crate) fn agy_gate(enabled: bool) -> Installed {
+        let document = AgyDoc {
+            enabled,
+            acknowledged_warning_version: enabled.then_some(super::agy::WARNING_VERSION),
+        };
+        let snapshot = Snapshot::default().with_document(&Scope::Machine, document);
+        settings_testing::install(Settings::from_snapshot(snapshot))
+    }
+
+    /// A stand-in `agy`, found through `NUCLEOS_AGY_BIN`: records its argv to `args.txt`, prints the
+    /// one-shot success JSON for `reply`. The real `agy` is never called.
+    pub(crate) struct FakeAgyBin {
+        dir: tempfile::TempDir,
+        previous: Option<OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl FakeAgyBin {
+        pub(crate) fn success(reply: &str) -> Self {
+            let lock = crate::execution::worktree::test_env_lock();
+            let dir = tempfile::tempdir().unwrap();
+            let body = serde_json::json!({
+                "conversation_id": "conv-fake",
+                "status": "SUCCESS",
+                "response": reply,
+                "duration_seconds": 0.5,
+                "num_turns": 1,
+                "usage": {
+                    "input_tokens": 5,
+                    "output_tokens": 7,
+                    "thinking_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "total_tokens": 12
+                }
+            })
+            .to_string();
+            std::fs::write(dir.path().join("out.json"), body).unwrap();
+            let program = write_script(dir.path());
+            let previous = std::env::var_os("NUCLEOS_AGY_BIN");
+            unsafe { std::env::set_var("NUCLEOS_AGY_BIN", &program) };
+            Self {
+                dir,
+                previous,
+                _lock: lock,
+            }
+        }
+
+        /// Whether the binary was launched at all (it writes `args.txt` first thing).
+        pub(crate) fn was_launched(&self) -> bool {
+            self.dir.path().join("args.txt").exists()
+        }
+    }
+
+    impl Drop for FakeAgyBin {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var("NUCLEOS_AGY_BIN", value),
+                    None => std::env::remove_var("NUCLEOS_AGY_BIN"),
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn write_script(dir: &Path) -> PathBuf {
+        let path = dir.join("agy.cmd");
+        let script =
+            "@echo off\r\necho %*> \"%~dp0args.txt\"\r\ntype \"%~dp0out.json\"\r\nexit /b 0\r\n";
+        std::fs::write(&path, script).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn write_script(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("agy.sh");
+        let script = "#!/bin/sh\nd=$(dirname \"$0\")\nprintf '%s\\n' \"$@\" > \"$d/args.txt\"\ncat \"$d/out.json\"\nexit 0\n";
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// A request with every control at its neutral value, as a chat turn would send it.
+    pub(crate) fn chat_request(prompt: &str) -> RunRequest {
+        RunRequest {
+            prompt: prompt.to_string(),
+            env: Vec::new(),
+            cwd: None,
+            permission: Permission::Default,
+            resume_session_id: None,
+            mcp_config: None,
+            mcp_job: None,
+            mcp_team_run: None,
+            tool_policy: ToolPolicy::McpOnly,
+            progress_timeout: None,
+            max_turns: None,
+            session_id: None,
+            fork_session: false,
+            include_partial_messages: false,
+            images: Vec::new(),
+            steerable: false,
+            classifier_governs_tools: false,
+            mcp_servers: Vec::new(),
+            model: None,
+            effort: None,
+            fallback_model: Vec::new(),
+            add_dirs: Vec::new(),
+            max_budget_usd: None,
+            agents: Vec::new(),
+            append_system_prompt: None,
+            denied_tools: Vec::new(),
+            session_name: None,
+            context_window: None,
+            messages: None,
+            request_tx: None,
+            allowed_mcp_tools: None,
+            background_tasks: false,
+        }
+    }
+
+    /// One run through `runner`, with a minute's ceiling so a wedged stand-in fails the test.
+    pub(crate) async fn run_once(
+        runner: &dyn CommandRunner,
+        prompt: &str,
+    ) -> std::io::Result<RunOutcome> {
+        let (session_tx, _session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let transcript = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            runner.run_prompt(chat_request(prompt), session_tx, transcript),
+        )
+        .await
+        .expect("the run finished within a minute")
+    }
+}
+
+/// `runner_for_primary` and `RefusingRunner` (plan Node 2, test 32). They live here, not in
+/// `main.rs`, so they are unit-testable in the lib: the plan's `--bin nucleos-core` filter does not
+/// apply; the command is `cargo test -p nucleos-core --lib engines::primary_tests`.
+#[cfg(test)]
+mod primary_tests {
+    use super::agy_test_support::{FakeAgyBin, agy_gate, run_once};
+    use super::*;
+    use crate::execution::runner::extract_reply;
+
+    #[tokio::test]
+    async fn primary_runner_agy_gate_on_builds_agy_runner() {
+        let fake = FakeAgyBin::success("answered by the fake agy");
+        let _gate = agy_gate(true);
+
+        let runner = runner_for_primary(Some("agy"), &ModelsConfig::default());
+
+        // Not Claude and not Codex: neither of their markers is set.
+        assert!(!runner.honours_max_budget());
+        assert!(runner.codex_pins().is_none());
+        let outcome = run_once(runner.as_ref(), "hello")
+            .await
+            .expect("the agy runner spawned the stand-in");
+        assert_eq!(outcome.exit_code, 0, "{}", outcome.stderr);
+        assert_eq!(
+            extract_reply(&outcome.stdout).as_deref(),
+            Some("answered by the fake agy")
+        );
+        assert!(fake.was_launched());
+    }
+
+    #[tokio::test]
+    async fn primary_runner_agy_gate_off_builds_refusing_runner_naming_agy() {
+        // The binary is present and would work: the setting alone decides.
+        let fake = FakeAgyBin::success("must never be asked");
+        let _gate = agy_gate(false);
+
+        let runner = runner_for_primary(Some("agy"), &ModelsConfig::default());
+
+        // Never Claude: the Claude CLI's marker is absent.
+        assert!(!runner.honours_max_budget());
+        let error = run_once(runner.as_ref(), "hello")
+            .await
+            .expect_err("a refusing runner fails every run");
+        assert!(
+            error
+                .to_string()
+                .contains("primary_runner is agy, but the agy engine is disabled in settings"),
+            "{error}"
+        );
+        assert!(!fake.was_launched(), "the refusal never reaches the binary");
+    }
+
+    #[test]
+    fn primary_runner_unknown_still_warns_and_uses_claude() {
+        let _gate = agy_gate(false);
+        let models = ModelsConfig::default();
+
+        // An unknown name keeps today's warn + Claude; so do an absent name and `claude` itself.
+        for name in [Some("gemini"), Some("claude"), None] {
+            let runner = runner_for_primary(name, &models);
+            assert!(runner.honours_max_budget(), "{name:?} is the Claude CLI");
+            assert!(runner.codex_pins().is_none(), "{name:?}");
+        }
+        // Codex is still Codex.
+        let codex = runner_for_primary(Some("codex"), &models);
+        assert!(codex.codex_pins().is_some());
+        assert!(!codex.honours_max_budget());
+    }
+}

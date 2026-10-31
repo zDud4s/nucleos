@@ -1835,3 +1835,52 @@ mod tests {
         assert_eq!(utility_default("ollama", &known), None);
     }
 }
+
+/// The agy rows of the catalogue (plan Node 2, tests 30 and 31). RED: `agy_models` does not exist
+/// yet, and `runner_by_id` still sends `agy/claude-...` to Claude.
+#[cfg(test)]
+mod agy_tests {
+    use super::*;
+    use crate::engines::agy_test_support::agy_gate;
+
+    #[test]
+    fn runner_by_id_routes_agy_prefix_before_claude() {
+        // The agy prefix rule runs first: an agy-hosted Claude model is answered by agy.
+        assert_eq!(runner_by_id("agy/claude-sonnet-4-6"), Some(crate::engines::AGY));
+        assert_eq!(runner_by_id("agy/claude-opus-4-6-thinking"), Some("agy"));
+        assert_eq!(runner_by_id("agy/gemini-3.8-flash-high"), Some("agy"));
+        assert_eq!(runner_by_id("AGY/gpt-oss-120b-medium"), Some("agy"));
+        // The bare ids keep their engines, and a bare Gemini id says nothing about a runner.
+        assert_eq!(runner_by_id("claude-sonnet-4-6"), Some(crate::engines::CLAUDE));
+        assert_eq!(runner_by_id("gpt-5.5"), Some(crate::engines::CODEX));
+        assert_eq!(runner_by_id("gemini-3.8-flash-high"), None);
+    }
+
+    #[test]
+    fn agy_models_listed_only_when_gate_on() {
+        {
+            let _off = agy_gate(false);
+            assert!(agy_models().is_empty(), "off means absent");
+        }
+        let _on = agy_gate(true);
+        let models = agy_models();
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "agy/gemini-3.8-flash-high",
+                "agy/gemini-3.8-flash-medium",
+                "agy/gemini-3.8-flash-low",
+                "agy/claude-sonnet-4-6",
+                "agy/claude-opus-4-6-thinking",
+                "agy/gpt-oss-120b-medium",
+            ]
+        );
+        for model in &models {
+            assert_eq!(model.runner, "agy", "{}", model.id);
+            assert_eq!(model.provider, "agy", "{}", model.id);
+            // The picker row carries the runner, so the chat path routes it to agy.
+            assert_eq!(as_choice(model).runner.as_deref(), Some("agy"));
+        }
+    }
+}

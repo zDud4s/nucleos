@@ -1422,3 +1422,54 @@ mod snapshot_tests {
         assert_eq!(models_config_now(), ModelsConfig::default());
     }
 }
+
+/// What the chat menu and the router's allowed models offer of agy (plan Node 2, test 36). RED:
+/// `catalogue_scoped` does not add the agy rows yet, and `RunnerKind::Agy` does not exist.
+#[cfg(test)]
+mod agy_catalogue_tests {
+    use super::*;
+    use crate::engines::agy_test_support::agy_gate;
+    use crate::models::route_advice::{RouterConfig, RunnerKind, allowed_models};
+
+    const AGY_MODEL: &str = "agy/gemini-3.8-flash-high";
+
+    fn agy_ids(choices: &[AssistantChoice]) -> Vec<&str> {
+        choices
+            .iter()
+            .filter(|choice| choice.runner.as_deref() == Some("agy"))
+            .map(|choice| choice.id.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn router_allowed_models_includes_agy_choices_when_on() {
+        let _gate = agy_gate(true);
+        let config = ModelsConfig::default();
+
+        // The chat path offers every runner's models, agy's included, as cloud rows of the agy runner.
+        let chat = config.catalogue_for_chat(&[]);
+        assert!(agy_ids(&chat).contains(&AGY_MODEL), "{chat:?}");
+        assert!(chat.iter().all(|c| c.id != AGY_MODEL || c.brain == "cloud"));
+        // An agent-scoped menu follows the active runner (Claude here), so agy stays out of it.
+        assert!(agy_ids(&config.catalogue()).is_empty());
+
+        // The router picks among the same rows: `allowed_models` for agy lists them.
+        let routed = ModelsConfig {
+            assistant_choices: chat,
+            ..ModelsConfig::default()
+        };
+        let allowed = allowed_models(&routed, &RouterConfig::off(), RunnerKind::Agy);
+        assert!(allowed.iter().any(|id| id == AGY_MODEL), "{allowed:?}");
+        // Claude's allowed list does not pick up agy's rows.
+        let claude = allowed_models(&routed, &RouterConfig::off(), RunnerKind::Claude);
+        assert!(claude.iter().all(|id| !id.starts_with("agy/")), "{claude:?}");
+    }
+
+    #[test]
+    fn the_chat_menu_has_no_agy_rows_when_the_gate_is_off() {
+        let _gate = agy_gate(false);
+        let chat = ModelsConfig::default().catalogue_for_chat(&[]);
+        assert!(agy_ids(&chat).is_empty(), "{chat:?}");
+        assert!(chat.iter().all(|c| !c.id.starts_with("agy/")), "{chat:?}");
+    }
+}

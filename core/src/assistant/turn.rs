@@ -1838,3 +1838,89 @@ mod tests {
         );
     }
 }
+
+/// A chat bound to agy (plan Node 2, tests 34 and 35). RED: `answering_cli` still returns a bare
+/// `&'static str`, so it can neither refuse nor name `EngineDisabled`.
+///
+/// GREEN contract these tests hold: `answering_cli(&ModelsConfig, Option<&str>) ->
+/// Result<&'static str, EngineDisabled>`, and `EngineDisabled` is a unit-like error implementing
+/// `Debug` and `Display`.
+#[cfg(test)]
+mod agy_chat_tests {
+    use super::*;
+    use crate::assistants::{Assistants, ConfiguredAssistants};
+    use crate::config::{AssistantChoice, ModelsConfig};
+    use crate::engines::agy_test_support::{FakeAgyBin, agy_gate, run_once};
+    use crate::execution::runner::extract_reply;
+
+    const AGY_MODEL: &str = "agy/gemini-3.8-flash-high";
+
+    #[test]
+    fn chat_bound_to_agy_with_flag_off_is_refused_not_answered_by_claude() {
+        let _gate = agy_gate(false);
+        let config = ModelsConfig::default();
+
+        // Bound by the model id's agy/ prefix.
+        let refused = answering_cli(&config, Some(AGY_MODEL));
+        assert!(matches!(refused, Err(EngineDisabled)), "{refused:?}");
+        assert_eq!(
+            EngineDisabled.to_string(),
+            "this chat uses the agy engine, which is disabled in settings"
+        );
+
+        // Bound by a stored runner on the catalogue row, whatever the model id looks like.
+        let stored = ModelsConfig {
+            assistant_choices: vec![AssistantChoice {
+                id: "some-model".to_string(),
+                label: "Some model".to_string(),
+                brain: "cloud".to_string(),
+                efforts: Vec::new(),
+                runner: Some("agy".to_string()),
+                tools: None,
+                installed: None,
+            }],
+            ..ModelsConfig::default()
+        };
+        let refused = answering_cli(&stored, Some("some-model"));
+        assert!(matches!(refused, Err(EngineDisabled)), "{refused:?}");
+
+        // Nothing else changed: Claude and Codex models are still answered by their own engines.
+        assert!(matches!(answering_cli(&config, Some("claude-opus-4-6")), Ok("claude")));
+        assert!(matches!(answering_cli(&config, Some("gpt-5.5")), Ok("codex")));
+        assert!(matches!(answering_cli(&config, None), Ok("claude")));
+    }
+
+    #[tokio::test]
+    async fn chat_on_agy_model_is_answered_by_the_fake_agy_runner() {
+        // Lock order: the stand-in binary (env lock) first, then the gate.
+        let fake = FakeAgyBin::success("pong from the fake agy");
+        let _gate = agy_gate(true);
+        let config = ModelsConfig::default();
+
+        let cli = answering_cli(&config, Some(AGY_MODEL));
+        assert!(matches!(cli, Ok("agy")), "{cli:?}");
+
+        let assistants = ConfiguredAssistants::new(
+            None,
+            None,
+            None,
+            "http://127.0.0.1:8791".to_string(),
+            "token".to_string(),
+            crate::testdb::fresh_pool().await,
+            crate::execution::runner::OLLAMA_BASE_URL.to_string(),
+        );
+        let runner = assistants
+            .cli_runner("agy", Some(AGY_MODEL))
+            .expect("an enabled agy row has a runner");
+        let outcome = run_once(runner.as_ref(), "ping")
+            .await
+            .expect("the agy runner spawned the stand-in");
+
+        assert_eq!(outcome.exit_code, 0, "{}", outcome.stderr);
+        assert_eq!(
+            extract_reply(&outcome.stdout).as_deref(),
+            Some("pong from the fake agy")
+        );
+        assert!(fake.was_launched());
+    }
+}
