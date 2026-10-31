@@ -119,6 +119,16 @@ mod tests {
     }
 
     #[test]
+    fn docs_glob_anchors_the_last_piece_of_a_segment() {
+        assert!(owned_glob_matches(".ai/specs/*.md", ".ai/specs/design.md"));
+        assert!(!owned_glob_matches(
+            ".ai/specs/*.md",
+            ".ai/specs/design.md.md"
+        ));
+        assert!(!owned_glob_matches(".ai/specs/*.md", ".ai/specs/design.mdx"));
+    }
+
+    #[test]
     fn docs_path_allows_a_file_under_each_of_the_four_directories() {
         for path in [
             ".ai/specs/design.md",

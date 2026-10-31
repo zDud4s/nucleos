@@ -1860,6 +1860,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn docs_run_absolute_unix_path_inside_declared_paths_is_allowed() {
+        let state = test_state().await;
+        let run_id = seed_tree_branch_run(&state, "docs", &[".ai/notes/**"]).await;
+        sqlx::query("UPDATE runs SET cwd = '/repo' WHERE id = ?")
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let decision = decide(
+            &state,
+            run_id,
+            "Write",
+            write_input(Path::new("/repo/.ai/notes/design.md")),
+        )
+        .await;
+
+        assert_allowed(&decision, "an absolute Unix path under the declared docs path");
+    }
+
+    #[tokio::test]
+    async fn docs_run_path_differing_only_in_case_follows_the_platform() {
+        let state = test_state().await;
+        let run_id = seed_tree_branch_run(&state, "docs", &[".ai/notes/**"]).await;
+
+        let decision = decide(
+            &state,
+            run_id,
+            "Write",
+            write_input(Path::new(r"C:\WORK\REPO\.ai\notes\design.md")),
+        )
+        .await;
+
+        assert_eq!(
+            decision.decision,
+            if cfg!(windows) { "allow" } else { "deny" },
+            "Windows paths are case-insensitive, while Unix paths are case-sensitive: {:?}",
+            decision.reason
+        );
+    }
+
+    #[tokio::test]
     async fn docs_run_write_outside_declared_paths_is_denied_not_parked() {
         let state = test_state().await;
         let run_id = seed_tree_branch_run(&state, "docs", &[".ai/notes/**"]).await;
@@ -1909,6 +1951,116 @@ mod tests {
         .await;
 
         assert_allowed(&decision, "a code branch write");
+    }
+
+    /// The docs guard's refusal of a shell command from a docs node. It must be a `deny` that names
+    /// the docs branch, leave the run running and mint no approval. Without the guard the command
+    /// reaches the classifier, and a refusal from there (a tree run's converted park) names no docs
+    /// branch, so this helper fails on it.
+    async fn assert_docs_run_refuses_shell(state: &AppState, command: &str, what: &str) {
+        let run_id = seed_tree_branch_run(state, "docs", &[".ai/notes/**"]).await;
+        let decision = decide(state, run_id, "Bash", json!({"command": command})).await;
+        assert_eq!(decision.decision, "deny", "{what}: got {:?}", decision.reason);
+        assert!(
+            decision.reason.contains("docs"),
+            "{what}: the docs guard must refuse it at once and name the docs branch, got {:?}",
+            decision.reason
+        );
+        let (status, approvals) = run_status_and_action_approvals(state, run_id).await;
+        assert_eq!(status, "running", "{what}: the refusal must not park the run");
+        assert_eq!(approvals, 0, "{what}: the refusal must not mint an approval");
+    }
+
+    /// A docs output is local and never committed, so a docs run may not commit. Fails today: the
+    /// classifier allows `git commit` (`vcs-local`) and nothing in the docs path intervenes.
+    #[tokio::test]
+    async fn docs_run_git_commit_is_denied_not_parked() {
+        let state = test_state().await;
+        assert_docs_run_refuses_shell(&state, "git commit -m x", "git commit").await;
+    }
+
+    /// Fails today: `git add` is `vcs-local` and the classifier allows it.
+    #[tokio::test]
+    async fn docs_run_git_add_is_denied() {
+        let state = test_state().await;
+        assert_docs_run_refuses_shell(&state, "git add .", "git add .").await;
+    }
+
+    /// Fails today: `cd sub && git commit` is allowed segment by segment, and `git -C sub commit`
+    /// is not a recognised form, so it is refused for the wrong reason (no docs branch named).
+    #[tokio::test]
+    async fn docs_run_wrapped_git_commit_is_denied() {
+        let state = test_state().await;
+        assert_docs_run_refuses_shell(
+            &state,
+            "cd sub && git commit -m x",
+            "cd sub && git commit",
+        )
+        .await;
+        assert_docs_run_refuses_shell(&state, "git -C sub commit -m x", "git -C sub commit").await;
+    }
+
+    /// Fails today: a writing `cargo fmt` is allowed where it lands, and it lands in the checkout.
+    /// The `heavy.py` form is not unwrapped here (its script resolves inside the fixture's cwd), so
+    /// it is refused as a plain interpreter for the wrong reason (no docs branch named).
+    #[tokio::test]
+    async fn docs_run_cargo_fmt_is_denied() {
+        let state = test_state().await;
+        assert_docs_run_refuses_shell(&state, "cargo fmt", "cargo fmt").await;
+        assert_docs_run_refuses_shell(
+            &state,
+            "python scripts/heavy.py -- cargo fmt",
+            "heavy.py cargo fmt",
+        )
+        .await;
+    }
+
+    /// Regression guard: a read-only `cargo fmt --check` writes nothing, and the docs guard must
+    /// leave it to the classifier, which allows it. Passes today.
+    #[tokio::test]
+    async fn docs_run_cargo_fmt_check_is_allowed() {
+        let state = test_state().await;
+        let run_id = seed_tree_branch_run(&state, "docs", &[".ai/notes/**"]).await;
+
+        let decision = decide(
+            &state,
+            run_id,
+            "Bash",
+            json!({"command": "cargo fmt --check"}),
+        )
+        .await;
+
+        assert_allowed(&decision, "a read-only cargo fmt");
+    }
+
+    /// Regression guard: a plain read in a docs run is not touched by the docs guard. The
+    /// classifier allows `git status` as `read-local`. Passes today.
+    #[tokio::test]
+    async fn docs_run_plain_read_is_allowed() {
+        let state = test_state().await;
+        let run_id = seed_tree_branch_run(&state, "docs", &[".ai/notes/**"]).await;
+
+        let decision = decide(&state, run_id, "Bash", json!({"command": "git status"})).await;
+
+        assert_allowed(&decision, "a plain git status in a docs run");
+    }
+
+    /// Regression guard: the docs guard applies to docs nodes only, so a code branch run may still
+    /// commit. The classifier allows `git commit` as `vcs-local`. Passes today.
+    #[tokio::test]
+    async fn code_branch_run_may_still_commit() {
+        let state = test_state().await;
+        let run_id = seed_tree_branch_run(&state, "core", &["core/src/**"]).await;
+
+        let decision = decide(
+            &state,
+            run_id,
+            "Bash",
+            json!({"command": "git commit -m x"}),
+        )
+        .await;
+
+        assert_allowed(&decision, "a code branch commit");
     }
 
     /// Pins that ordinary `worktree` runs are unchanged. Passes today.

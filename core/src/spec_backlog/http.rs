@@ -488,6 +488,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn post_decision_refuses_a_blank_answer_with_400() {
+        let state = state().await;
+        seed_question(&state, "sq-http-blank", "open").await;
+
+        let (status, _) = request(
+            &app(&state),
+            "POST",
+            "/decisions/sq-http-blank",
+            json!({"answer": " \n\t "}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (stored, answer): (String, Option<String>) =
+            sqlx::query_as("SELECT status, answer FROM spec_questions WHERE id = 'sq-http-blank'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, "open");
+        assert_eq!(answer, None);
+    }
+
+    #[tokio::test]
     async fn post_decision_refuses_an_answered_question_with_409() {
         let state = state().await;
         seed_question(&state, "sq-http-2", "open").await;

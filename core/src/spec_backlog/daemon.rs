@@ -641,6 +641,411 @@ mod tests {
         assert_eq!(projects, vec!["proj-a".to_owned(), "proj-b".to_owned()]);
     }
 
+    #[tokio::test]
+    async fn resume_candidates_includes_a_spec_with_no_tree_id() {
+        let pool = crate::testdb::fresh_pool().await;
+        // A crash between the status write and the tree id write left this one half-recorded.
+        let spec = store::upsert_by_path(
+            &pool,
+            Some("proj-null-tree"),
+            ".ai/specs/2026-01-01-null-tree.md",
+            "null-tree",
+            "sha-1",
+        )
+        .await
+        .unwrap();
+        store::set_status(&pool, &spec.id, SpecStatus::InProgress, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            store::get_spec(&pool, &spec.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .tree_id,
+            None
+        );
+
+        let projects = resume_candidates(&pool).await.unwrap();
+
+        assert_eq!(projects, vec!["proj-null-tree".to_owned()]);
+    }
+
+    // ---- Fix C: durable finish intents and the sweeper ---------------------------------------------
+    //
+    // Assumed seams (the implementer follows these exactly):
+    //   store::write_finish_intent(pool, project_id) -> Result<(), StoreError>
+    //       upsert; created_at = now, so re-writing bumps it.
+    //   store::write_finish_intent_at(pool, project_id, created_at: &str) -> Result<(), StoreError>
+    //       the same upsert with an explicit RFC3339 created_at.
+    //   store::finish_intents(pool) -> Result<Vec<(String, String)>, StoreError>
+    //       (project_id, created_at), ordered by project_id.
+    //   async fn sweep_with<P, Fut>(state: &AppState, pass: P)
+    //       where P: Fn(AppState, String) -> Fut + Clone + Send + 'static,
+    //             Fut: Future<Output = Result<FinishReport, FinishError>> + Send + 'static
+    //       Claims each intent's unclaimed project, runs `pass(state.clone(), project_id)` for it,
+    //       settles the intent from the result, releases the claim, and returns only when every pass
+    //       it started has ended. `sweep_finishes(state)` is `sweep_with` over `finish` of
+    //       `FinishScope::All`, run in a spawned task by its callers.
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::spec_backlog::finish::{FinishError, FinishReport, claim_project};
+
+    async fn sweep_state() -> AppState {
+        crate::execution::runs::testkit::test_state_with_runner(
+            Some(Duration::from_secs(5)),
+            Duration::from_secs(600),
+        )
+        .await
+        .0
+    }
+
+    async fn intents(state: &AppState) -> Vec<(String, String)> {
+        store::finish_intents(&state.pool).await.unwrap()
+    }
+
+    async fn intent_projects(state: &AppState) -> Vec<String> {
+        intents(state).await.into_iter().map(|(p, _)| p).collect()
+    }
+
+    async fn feed_lines(state: &AppState, subject: &str) -> Vec<String> {
+        sqlx::query_scalar("SELECT summary FROM feed WHERE subject = ? ORDER BY rowid")
+            .bind(subject)
+            .fetch_all(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    fn hours_ago(hours: i64) -> String {
+        (chrono::Utc::now() - chrono::Duration::hours(hours)).to_rfc3339()
+    }
+
+    /// Projects each pass was run for, in the order the passes started.
+    type PassLog = Arc<std::sync::Mutex<Vec<String>>>;
+
+    fn logged(log: &PassLog) -> Vec<String> {
+        let mut ran = log.lock().unwrap().clone();
+        ran.sort();
+        ran
+    }
+
+    #[tokio::test]
+    async fn an_answer_writes_its_intent_in_the_same_transaction() {
+        let state = sweep_state().await;
+        let pool = &state.pool;
+        let waiting = store::upsert_by_path(
+            pool,
+            Some("proj-ans-a"),
+            ".ai/specs/2026-01-01-ans-a.md",
+            "ans-a",
+            "sha-1",
+        )
+        .await
+        .unwrap();
+        store::set_status(pool, &waiting.id, SpecStatus::NeedsOwner, Some("asked"))
+            .await
+            .unwrap();
+        let question = store::add_question(pool, &waiting.id, "which way?")
+            .await
+            .unwrap();
+        // A spec that is not waiting on the owner: its answer reopens nothing.
+        let running = store::upsert_by_path(
+            pool,
+            Some("proj-ans-b"),
+            ".ai/specs/2026-01-01-ans-b.md",
+            "ans-b",
+            "sha-1",
+        )
+        .await
+        .unwrap();
+        store::set_status(pool, &running.id, SpecStatus::InProgress, None)
+            .await
+            .unwrap();
+        let other = store::add_question(pool, &running.id, "and this?")
+            .await
+            .unwrap();
+        assert!(intents(&state).await.is_empty());
+
+        let (_, reopened) = store::answer_question(pool, &question, "this way")
+            .await
+            .unwrap();
+        assert!(reopened);
+        assert_eq!(intent_projects(&state).await, vec!["proj-ans-a".to_owned()]);
+
+        // An answer that reopens nothing, and an answer refused, leave no intent behind.
+        let (_, reopened) = store::answer_question(pool, &other, "that")
+            .await
+            .unwrap();
+        assert!(!reopened);
+        assert!(store::answer_question(pool, &question, "again").await.is_err());
+        assert_eq!(
+            intent_projects(&state).await,
+            vec!["proj-ans-a".to_owned()],
+            "exactly the reopening answer wrote an intent"
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_runs_one_pass_per_project_and_deletes_a_finished_intent() {
+        let state = sweep_state().await;
+        for project in ["sweep-one-a", "sweep-one-b"] {
+            store::write_finish_intent(&state.pool, project)
+                .await
+                .unwrap();
+        }
+        let ran = PassLog::default();
+        let pass = {
+            let ran = ran.clone();
+            move |_state: AppState, project: String| {
+                let ran = ran.clone();
+                async move {
+                    ran.lock().unwrap().push(project);
+                    Ok::<_, FinishError>(FinishReport::default())
+                }
+            }
+        };
+
+        sweep_with(&state, pass.clone()).await;
+
+        assert_eq!(
+            logged(&ran),
+            vec!["sweep-one-a".to_owned(), "sweep-one-b".to_owned()],
+            "one pass per project, no more"
+        );
+        assert!(intents(&state).await.is_empty(), "a finished pass deletes its intent");
+        assert!(claim_project("sweep-one-a").is_some(), "the claim is released");
+        assert!(claim_project("sweep-one-b").is_some());
+        assert!(feed_lines(&state, "sweep-one-a").await.is_empty());
+
+        // Nothing left: a second sweep runs no pass.
+        sweep_with(&state, pass).await;
+        assert_eq!(ran.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn sweep_skips_a_claimed_project_and_keeps_its_intent() {
+        let state = sweep_state().await;
+        store::write_finish_intent_at(&state.pool, "sweep-busy", &hours_ago(1))
+            .await
+            .unwrap();
+        store::write_finish_intent(&state.pool, "sweep-free")
+            .await
+            .unwrap();
+        let busy_stamp = intents(&state)
+            .await
+            .into_iter()
+            .find(|(project, _)| project == "sweep-busy")
+            .map(|(_, stamp)| stamp)
+            .unwrap();
+        let ran = PassLog::default();
+        let pass = {
+            let ran = ran.clone();
+            move |_state: AppState, project: String| {
+                let ran = ran.clone();
+                async move {
+                    ran.lock().unwrap().push(project);
+                    Ok::<_, FinishError>(FinishReport::default())
+                }
+            }
+        };
+        let claim = claim_project("sweep-busy").expect("nothing else holds the claim");
+
+        sweep_with(&state, pass.clone()).await;
+
+        assert_eq!(logged(&ran), vec!["sweep-free".to_owned()]);
+        assert_eq!(
+            intents(&state).await,
+            vec![("sweep-busy".to_owned(), busy_stamp)],
+            "the busy project's intent is kept untouched"
+        );
+        assert!(feed_lines(&state, "sweep-busy").await.is_empty(), "nothing is announced");
+
+        // Once the claim is free, the next sweep runs it.
+        drop(claim);
+        sweep_with(&state, pass).await;
+        assert_eq!(logged(&ran), vec!["sweep-busy".to_owned(), "sweep-free".to_owned()]);
+        assert!(intents(&state).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_deferred_pass_keeps_the_intent_and_releases_the_claim() {
+        let state = sweep_state().await;
+        store::write_finish_intent_at(&state.pool, "sweep-deferred", &hours_ago(1))
+            .await
+            .unwrap();
+        let stamp = intents(&state).await[0].1.clone();
+        let passes = Arc::new(AtomicUsize::new(0));
+        let pass = {
+            let passes = passes.clone();
+            move |_state: AppState, _project: String| {
+                let passes = passes.clone();
+                async move {
+                    passes.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, FinishError>(FinishReport {
+                        deferred: vec!["spec-short-of-disk".to_owned()],
+                        ..Default::default()
+                    })
+                }
+            }
+        };
+
+        sweep_with(&state, pass.clone()).await;
+
+        assert_eq!(passes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            intents(&state).await,
+            vec![("sweep-deferred".to_owned(), stamp)],
+            "the intent is kept, with its original created_at"
+        );
+        assert!(
+            claim_project("sweep-deferred").is_some(),
+            "the claim is free, so an owner request can run meanwhile"
+        );
+        assert!(feed_lines(&state, "sweep-deferred").await.is_empty(), "inside the ceiling nothing is announced");
+
+        // The next sweep retries it.
+        sweep_with(&state, pass).await;
+        assert_eq!(passes.load(Ordering::SeqCst), 2);
+        assert_eq!(intent_projects(&state).await, vec!["sweep-deferred".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn an_intent_rewritten_during_a_pass_survives_it() {
+        let state = sweep_state().await;
+        store::write_finish_intent_at(&state.pool, "sweep-rewrite", &hours_ago(1))
+            .await
+            .unwrap();
+        let first_stamp = intents(&state).await[0].1.clone();
+        let passes = Arc::new(AtomicUsize::new(0));
+        let pass = {
+            let passes = passes.clone();
+            move |state: AppState, project: String| {
+                let passes = passes.clone();
+                async move {
+                    // The first pass is still running when an owner request arrives.
+                    if passes.fetch_add(1, Ordering::SeqCst) == 0 {
+                        store::write_finish_intent(&state.pool, &project)
+                            .await
+                            .unwrap();
+                    }
+                    Ok::<_, FinishError>(FinishReport::default())
+                }
+            }
+        };
+
+        sweep_with(&state, pass.clone()).await;
+
+        assert_eq!(passes.load(Ordering::SeqCst), 1);
+        let left = intents(&state).await;
+        assert_eq!(left.len(), 1, "the request that arrived during the pass is not lost");
+        assert_eq!(left[0].0, "sweep-rewrite");
+        assert_ne!(left[0].1, first_stamp, "re-writing bumped created_at");
+
+        // It gets its own pass, and that one deletes it.
+        sweep_with(&state, pass).await;
+        assert_eq!(passes.load(Ordering::SeqCst), 2);
+        assert!(intents(&state).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_intent_past_the_ceiling_is_announced_once_and_deleted() {
+        let state = sweep_state().await;
+        store::write_finish_intent_at(&state.pool, "sweep-stale", &hours_ago(25))
+            .await
+            .unwrap();
+        // Inside the ceiling the same deferral just waits.
+        store::write_finish_intent_at(&state.pool, "sweep-young", &hours_ago(23))
+            .await
+            .unwrap();
+        let passes = Arc::new(AtomicUsize::new(0));
+        let pass = {
+            let passes = passes.clone();
+            move |_state: AppState, _project: String| {
+                let passes = passes.clone();
+                async move {
+                    passes.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, FinishError>(FinishReport {
+                        deferred: vec!["spec-short-of-disk".to_owned()],
+                        ..Default::default()
+                    })
+                }
+            }
+        };
+
+        sweep_with(&state, pass.clone()).await;
+
+        assert_eq!(passes.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            intent_projects(&state).await,
+            vec!["sweep-young".to_owned()],
+            "only the stale intent is deleted"
+        );
+        let lines = feed_lines(&state, "sweep-stale").await;
+        assert_eq!(lines.len(), 1, "announced once: {lines:?}");
+        assert!(lines[0].contains("disk"), "the line says the disk stayed short: {:?}", lines[0]);
+        assert!(feed_lines(&state, "sweep-young").await.is_empty());
+
+        // Later sweeps never revisit it or announce again.
+        sweep_with(&state, pass).await;
+        assert_eq!(passes.load(Ordering::SeqCst), 3, "only the young intent ran again");
+        assert_eq!(feed_lines(&state, "sweep-stale").await.len(), 1);
+        let owner_decisions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM decisions")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(owner_decisions, 0, "never a new owner decision");
+    }
+
+    #[tokio::test]
+    async fn a_failed_pass_deletes_its_intent_and_announces_the_failure() {
+        let state = sweep_state().await;
+        store::write_finish_intent(&state.pool, "sweep-failing")
+            .await
+            .unwrap();
+        let pass = |_state: AppState, _project: String| async {
+            Err::<FinishReport, _>(FinishError::Config("no root".to_owned()))
+        };
+
+        sweep_with(&state, pass).await;
+
+        assert!(intents(&state).await.is_empty());
+        let lines = feed_lines(&state, "sweep-failing").await;
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("no root"));
+        assert!(claim_project("sweep-failing").is_some());
+    }
+
+    #[tokio::test]
+    async fn boot_writes_an_intent_for_each_project_with_a_spec_in_progress() {
+        // Assumes `resume_finishes(state: &AppState)` keeps its signature but only writes the
+        // intents (it no longer spawns a finish): `main.rs` sweeps right after it.
+        let state = sweep_state().await;
+        let spec = store::upsert_by_path(
+            &state.pool,
+            Some("proj-boot-intent"),
+            ".ai/specs/2026-01-01-boot-intent.md",
+            "boot-intent",
+            "sha-1",
+        )
+        .await
+        .unwrap();
+        store::set_status(&state.pool, &spec.id, SpecStatus::InProgress, None)
+            .await
+            .unwrap();
+        store::set_tree_id(&state.pool, &spec.id, "tree-boot-intent")
+            .await
+            .unwrap();
+
+        resume_finishes(&state).await;
+
+        assert_eq!(
+            intent_projects(&state).await,
+            vec!["proj-boot-intent".to_owned()]
+        );
+    }
+
     #[test]
     fn finish_config_takes_its_limit_from_speed_tree_cap() {
         let source = include_str!("daemon.rs");

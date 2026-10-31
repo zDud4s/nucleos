@@ -1610,6 +1610,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn decide_refuses_a_blank_answer() {
+        let state = crate::channels::testkit::state().await;
+        seed_owner(&state, "telegram").await;
+        sqlx::query(
+            "INSERT INTO specs (id, path, title, content_sha, created_at, updated_at) \
+             VALUES ('spec-blank', 'C:/spec.md', 'Spec', 'sha', ?, ?)",
+        )
+        .bind(SEEDED_AT)
+        .bind(SEEDED_AT)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO spec_questions (id, spec_id, question, status, created_at) \
+             VALUES ('sq-chan-blank', 'spec-blank', ?, 'open', ?)",
+        )
+        .bind(QUESTION)
+        .bind(SEEDED_AT)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        run_as(
+            &state,
+            "telegram",
+            "u1",
+            "c1",
+            explicit("sq-chan-blank", " \n\t "),
+        )
+        .await;
+
+        let (status, answer): (String, Option<String>) =
+            sqlx::query_as("SELECT status, answer FROM spec_questions WHERE id = 'sq-chan-blank'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "open");
+        assert_eq!(answer, None);
+        let reply = the_one_answer(&state).await;
+        assert!(reply.to_ascii_lowercase().contains("empty"), "{reply}");
+    }
+
+    #[tokio::test]
     async fn execute_explicit_answer_with_two_open_decisions_applies_only_the_named_one() {
         let state = crate::channels::testkit::state().await;
         seed_owner(&state, "telegram").await;

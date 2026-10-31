@@ -1950,6 +1950,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn in_progress_with_no_tree_id_runs_the_round_after_a_restart() {
+        // A crash between the status write and the tree id write left this half-recorded spec.
+        let pool = crate::testdb::fresh_pool().await;
+        let id = add_spec(&pool, "no-tree-id", SpecStatus::Extracted).await;
+        store::set_status(&pool, &id, SpecStatus::InProgress, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            store::get_spec(&pool, &id).await.unwrap().unwrap().tree_id,
+            None
+        );
+        let log = Log::default();
+        let launcher = FakeLauncher::new(&log);
+        let prep = FakePreparer::new(&pool, &log, &[&id]);
+
+        let report = finish_with(
+            &pool,
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &prep,
+            },
+            &cfg(),
+            scope_all(),
+        )
+        .await
+        .unwrap();
+
+        let requests = launcher.requests();
+        assert_eq!(requests.len(), 1, "the round runs, one tree");
+        assert_eq!(requests[0].round, 1);
+        assert!(
+            launcher.waited_tree_ids().is_empty(),
+            "there is no tree to wait on"
+        );
+        assert_eq!(report.needs_owner.len(), 0, "the owner is not told");
+        assert_eq!(report.done, vec![id.clone()]);
+        assert_eq!(report.trees, vec![requests[0].id.clone()]);
+        let spec = store::get_spec(&pool, &id).await.unwrap().unwrap();
+        assert_eq!(
+            spec.tree_id.as_deref(),
+            Some(requests[0].id.as_str()),
+            "the tree id is recorded"
+        );
+    }
+
+    #[tokio::test]
     async fn restart_audits_a_completed_adopted_tree() {
         let pool = crate::testdb::fresh_pool().await;
         let id = add_spec(&pool, "adopt-complete", SpecStatus::Extracted).await;

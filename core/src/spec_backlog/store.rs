@@ -1357,6 +1357,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn answer_keeps_the_spec_waiting_while_another_question_is_open() {
+        let pool = crate::testdb::fresh_pool().await;
+        let spec = seed(&pool, None, PATH).await;
+        let answered = add_question(&pool, &spec.id, "Which port?").await.unwrap();
+        let still_open = add_question(&pool, &spec.id, "Which host?").await.unwrap();
+        set_status(&pool, &spec.id, SpecStatus::NeedsOwner, Some("asked"))
+            .await
+            .unwrap();
+
+        let (_, reopened) = answer_question(&pool, &answered, "8080").await.unwrap();
+
+        assert!(!reopened);
+        let after = get_spec(&pool, &spec.id).await.unwrap().unwrap();
+        assert_eq!(after.status, SpecStatus::NeedsOwner);
+        let questions = list_questions(&pool, &spec.id).await.unwrap();
+        assert_eq!(
+            questions.iter().find(|question| question.id == still_open).unwrap().status,
+            "open"
+        );
+    }
+
+    /// Regression guard: resolving the final open question makes the spec runnable again.
+    #[tokio::test]
+    async fn answering_the_last_open_question_reopens_the_spec() {
+        let pool = crate::testdb::fresh_pool().await;
+        let spec = seed(&pool, None, PATH).await;
+        let question = add_question(&pool, &spec.id, "Which port?").await.unwrap();
+        set_status(&pool, &spec.id, SpecStatus::NeedsOwner, Some("asked"))
+            .await
+            .unwrap();
+
+        let (_, reopened) = answer_question(&pool, &question, "8080").await.unwrap();
+
+        assert!(reopened);
+        let after = get_spec(&pool, &spec.id).await.unwrap().unwrap();
+        assert_eq!(after.status, SpecStatus::Discovered);
+    }
+
+    #[tokio::test]
     async fn list_owner_decisions_merges_spec_questions_and_decisions_when_table_exists() {
         let pool = crate::testdb::fresh_pool().await;
         recreate_decisions(&pool).await;

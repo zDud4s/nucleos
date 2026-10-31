@@ -2570,6 +2570,126 @@ mod tests {
         assert_eq!(origin.as_deref(), Some("owner"));
     }
 
+    // ---- pending start crash windows ---------------------------------------------------------------
+
+    /// What a crash right after the manifest record leaves: the record is stored, no decision was
+    /// asked, and the record carries no `decision_id`.
+    async fn job_with_a_record_but_no_decision(fx: &Fixture, job: &str) {
+        let decision = job_with_a_pending_start(fx, job).await;
+        sqlx::query("DELETE FROM decisions WHERE id = ?")
+            .bind(&decision)
+            .execute(&fx.state.pool)
+            .await
+            .unwrap();
+        let mut stored = fx.job(job).await;
+        stored
+            .manifest
+            .extra
+            .get_mut("pending_starts")
+            .and_then(Value::as_object_mut)
+            .and_then(|pending| pending.get_mut(PENDING_NAME))
+            .and_then(Value::as_object_mut)
+            .expect("the record is there")
+            .remove("decision_id");
+        store::update(&fx.state.pool, &stored).await.unwrap();
+    }
+
+    fn recorded_decision(job: &TreeJob) -> Option<String> {
+        pending_starts(job)[PENDING_NAME]["decision_id"]
+            .as_str()
+            .map(str::to_owned)
+    }
+
+    #[tokio::test]
+    async fn a_pending_record_with_no_decision_asks_once_on_the_next_pass() {
+        const JOB: &str = "drv-pending-nodecision";
+        let fx = Fixture::new().await;
+        job_with_a_record_but_no_decision(&fx, JOB).await;
+        let gate = FakeGate::answering(vec![]);
+        let decisions_before = count_of(&fx, "decisions").await;
+        assert_eq!(recorded_decision(&fx.job(JOB).await), None);
+
+        // The disk is still short: the pass heals the record by asking, exactly once.
+        fx.tick(JOB, &gate).await;
+        let healed = recorded_decision(&fx.job(JOB).await)
+            .expect("the pass stored the id of the decision it asked");
+        assert_eq!(count_of(&fx, "decisions").await, decisions_before + 1);
+        assert_eq!(decision_row(&fx, &healed).await.0, decisions::STATUS_OPEN);
+
+        fx.tick(JOB, &gate).await;
+        fx.tick(JOB, &gate).await;
+        assert_eq!(
+            count_of(&fx, "decisions").await,
+            decisions_before + 1,
+            "later passes ask nothing more"
+        );
+        assert_eq!(
+            recorded_decision(&fx.job(JOB).await),
+            Some(healed.clone()),
+            "the id stays"
+        );
+        assert_eq!(fx.open_questions(JOB, &root_node_of(JOB)).await.len(), 1);
+
+        // Once the disk frees, the healed decision is the one answered.
+        set_layer_cost(&fx, JOB, PENDING_LAYER, FREED_GB).await;
+        fx.tick(JOB, &gate).await;
+        let stored = fx.job(JOB).await;
+        assert!(pending_starts(&stored).get(PENDING_NAME).is_none());
+        assert!(stored.manifest.branches.contains_key(PENDING_NAME));
+        let (status, _, origin) = decision_row(&fx, &healed).await;
+        assert_eq!(status, decisions::STATUS_ANSWERED);
+        assert_eq!(origin.as_deref(), Some("driver"));
+        assert_eq!(count_of(&fx, "decisions").await, decisions_before + 1);
+    }
+
+    #[tokio::test]
+    async fn a_replay_interrupted_before_the_answer_finishes_on_the_next_pass() {
+        const JOB: &str = "drv-pending-halfreplay";
+        let fx = Fixture::new().await;
+        let decision = job_with_a_pending_start(&fx, JOB).await;
+        let gate = FakeGate::answering(vec![]);
+        set_layer_cost(&fx, JOB, PENDING_LAYER, FREED_GB).await;
+        // The crash: the branch was started, but neither the answer nor the record's drop happened.
+        let stored = fx.job(JOB).await;
+        let record = pending_starts(&stored)[PENDING_NAME].clone();
+        crate::tree_job::branch_start::start_pending(&fx.state, JOB, PENDING_NAME, &record)
+            .await
+            .unwrap();
+        assert_eq!(decision_row(&fx, &decision).await.0, decisions::STATUS_OPEN);
+        assert!(
+            pending_starts(&fx.job(JOB).await)
+                .get(PENDING_NAME)
+                .is_some()
+        );
+
+        fx.tick(JOB, &gate).await;
+        fx.tick(JOB, &gate).await;
+
+        let stored = fx.job(JOB).await;
+        assert!(
+            pending_starts(&stored).get(PENDING_NAME).is_none(),
+            "the record is dropped"
+        );
+        let node = stored.manifest.branches[PENDING_NAME]
+            .node_id
+            .clone()
+            .expect("the branch is bound to a node");
+        assert_eq!(
+            fx.launches(&node, "branch-late").await,
+            1,
+            "the branch is not started a second time"
+        );
+        let (status, _, origin) = decision_row(&fx, &decision).await;
+        assert_eq!(status, decisions::STATUS_ANSWERED);
+        assert_eq!(origin.as_deref(), Some("driver"));
+        let announced: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM feed WHERE kind = 'work_tree_pending'")
+                .fetch_one(&fx.state.pool)
+                .await
+                .unwrap();
+        assert_eq!(announced, 1, "admitted is announced once");
+    }
+
     // ---- gap 4: a conflict is the resolver's before it is the owner's ------------------------------
 
     const CLASH_JOB: &str = "drv-clash";
@@ -2754,5 +2874,111 @@ mod tests {
             [Some("tree-merge".to_owned())],
             "the request is claimed so the resolver never spends on it"
         );
+    }
+
+    // ---- a conflict nobody claims ------------------------------------------------------------------
+
+    /// The `conflict_since` the driver stored on `api`, as the string it wrote.
+    async fn conflict_since(fx: &Fixture) -> Option<String> {
+        fx.branch(CLASH_JOB, "api")
+            .await
+            .extra
+            .get("conflict_since")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    }
+
+    /// Rewrites `conflict_since` on `api` to `minutes` ago, as if the resolver never came.
+    async fn age_the_conflict(fx: &Fixture, minutes: i64) {
+        let mut stored = fx.job(CLASH_JOB).await;
+        let since = (chrono::Utc::now() - chrono::Duration::minutes(minutes)).to_rfc3339();
+        stored
+            .manifest
+            .branches
+            .get_mut("api")
+            .expect("the branch is in the manifest")
+            .extra
+            .insert("conflict_since".to_owned(), json!(since));
+        store::update(&fx.state.pool, &stored).await.unwrap();
+    }
+
+    /// The conflict is escalated and left to the resolver, which never claims it.
+    async fn conflict_left_unclaimed(fx: &Fixture, gate: &FakeGate) {
+        fx.tick(CLASH_JOB, gate).await;
+        fx.drain().await;
+        fx.tick(CLASH_JOB, gate).await;
+        assert_eq!(fx.branch(CLASH_JOB, "api").await.state, "green");
+    }
+
+    #[tokio::test]
+    async fn a_conflict_no_resolver_picks_up_parks_once_after_the_grace() {
+        let fx = Fixture::new().await;
+        conflicting_job(&fx).await;
+        let gate = FakeGate::answering(vec![]);
+        conflict_left_unclaimed(&fx, &gate).await;
+        let since = conflict_since(&fx)
+            .await
+            .expect("leaving the conflict to the resolver stamps conflict_since");
+        chrono::DateTime::parse_from_rfc3339(&since).expect("conflict_since is RFC3339");
+        fx.tick(CLASH_JOB, &gate).await;
+        assert_eq!(
+            conflict_since(&fx).await,
+            Some(since),
+            "the stamp is kept across passes for the same merge request"
+        );
+        assert!(fx.open_questions(CLASH_JOB, CLASH_NODE).await.is_empty());
+
+        // Nobody picked the request up for longer than the grace (quota pause, loop down).
+        age_the_conflict(&fx, 16).await;
+        fx.tick(CLASH_JOB, &gate).await;
+        fx.tick(CLASH_JOB, &gate).await;
+        fx.tick(CLASH_JOB, &gate).await;
+
+        assert_eq!(fx.branch(CLASH_JOB, "api").await.state, "parked");
+        let questions = fx.open_questions(CLASH_JOB, CLASH_NODE).await;
+        assert_eq!(questions.len(), 1, "the owner is asked once: {questions:?}");
+        assert!(
+            questions[0].to_lowercase().contains("resolver"),
+            "the reason says the resolver never picked it up: {:?}",
+            questions[0]
+        );
+        let settled: Vec<Option<String>> =
+            sqlx::query_scalar("SELECT settled_reason FROM vcs_requests")
+                .fetch_all(&fx.state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            settled,
+            [Some("tree-merge".to_owned())],
+            "the request is claimed so a late resolver never spends on it"
+        );
+        assert_eq!(fx.requests().await, 1, "no further attempt was queued");
+    }
+
+    #[tokio::test]
+    async fn a_conflict_inside_the_grace_stays_with_the_resolver() {
+        let fx = Fixture::new().await;
+        conflicting_job(&fx).await;
+        let gate = FakeGate::answering(vec![]);
+        conflict_left_unclaimed(&fx, &gate).await;
+
+        age_the_conflict(&fx, 14).await;
+        let aged = conflict_since(&fx).await;
+        fx.tick(CLASH_JOB, &gate).await;
+        fx.tick(CLASH_JOB, &gate).await;
+        fx.tick(CLASH_JOB, &gate).await;
+
+        let branch = fx.branch(CLASH_JOB, "api").await;
+        assert_eq!(branch.state, "green", "the branch still waits");
+        assert!(fx.open_questions(CLASH_JOB, CLASH_NODE).await.is_empty());
+        assert_eq!(count_of(&fx, "decisions").await, 0, "nobody was asked");
+        assert_eq!(conflict_since(&fx).await, aged, "the stamp is not reset");
+        let settled: Vec<Option<String>> =
+            sqlx::query_scalar("SELECT settled_reason FROM vcs_requests")
+                .fetch_all(&fx.state.pool)
+                .await
+                .unwrap();
+        assert_eq!(settled, [None], "the resolver may still claim the request");
+        assert_eq!(fx.requests().await, 1);
     }
 }
