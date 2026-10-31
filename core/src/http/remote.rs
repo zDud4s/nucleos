@@ -198,19 +198,31 @@ struct SetupView {
     enabled: bool,
     public_origin: String,
     tailscale: crate::remote::setup::TailscaleView,
+    /// Tailscale publishes the gateway on 443.
     serving: bool,
+    /// Port 443 is open to the public internet (Funnel). Setup refuses to turn on while it is.
+    funnel: bool,
+    /// Port 443 already serves something that is not the gateway; setup leaves it alone.
+    port_taken: bool,
 }
 
 async fn setup_view(root: &std::path::Path) -> SetupView {
+    use crate::remote::setup::{self, ServePort};
     let config = crate::remote::RemoteConfig::load(&root.join(crate::remote::REMOTE_FILE));
-    let cli = crate::remote::setup::locate_cli();
-    let tailscale = crate::remote::setup::probe(cli.as_deref()).await;
-    let serving = tailscale.installed && crate::remote::setup::is_serving(cli.as_deref()).await;
+    let cli = setup::locate_cli();
+    let tailscale = setup::probe(cli.as_deref()).await;
+    let reading = if tailscale.installed {
+        setup::serve_reading(cli.as_deref()).await
+    } else {
+        None
+    };
     SetupView {
         enabled: config.enabled && config.validate().is_ok(),
         public_origin: config.public_origin,
         tailscale,
-        serving,
+        serving: reading.is_some_and(|r| r.port == ServePort::Ours),
+        funnel: reading.is_some_and(|r| r.funnel),
+        port_taken: reading.is_some_and(|r| r.port == ServePort::Foreign),
     }
 }
 
@@ -250,6 +262,42 @@ struct SetupBody {
     public_origin: Option<String>,
 }
 
+/// A refusal for a setup step that failed before or while changing something.
+fn setup_error(error: crate::remote::setup::SetupError) -> (StatusCode, Json<serde_json::Value>) {
+    use crate::remote::setup::SetupError;
+    match error {
+        SetupError::InvalidOrigin(why) => {
+            super::common::refusal_with_detail(StatusCode::BAD_REQUEST, "invalid_origin", why)
+        }
+        SetupError::PageMissing => refusal(StatusCode::CONFLICT, "remote_page_missing"),
+        SetupError::ConfigUnreadable(why) => {
+            super::common::refusal_with_detail(StatusCode::CONFLICT, "config_unreadable", why)
+        }
+        other => storage_failure(other),
+    }
+}
+
+/// A refusal for a Tailscale Serve step. `serve_needs_approval` carries the link in `detail`.
+fn serve_refusal(error: crate::remote::setup::ServeError) -> (StatusCode, Json<serde_json::Value>) {
+    use crate::remote::setup::ServeError;
+    match error {
+        ServeError::Taken => refusal(StatusCode::CONFLICT, "serve_port_taken"),
+        ServeError::Funnel => refusal(StatusCode::CONFLICT, "funnel_enabled"),
+        ServeError::Failed(failure) => match failure.approval_url {
+            Some(url) => super::common::refusal_with_detail(
+                StatusCode::CONFLICT,
+                "serve_needs_approval",
+                url,
+            ),
+            None => super::common::refusal_with_detail(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "serve_failed",
+                failure.why,
+            ),
+        },
+    }
+}
+
 /// `POST /remote/setup { public_origin? }`: writes `remote.yaml`, starts the gateway and, with no
 /// origin given, publishes it on the tailnet (never with Funnel).
 async fn post_setup(
@@ -257,7 +305,7 @@ async fn post_setup(
     Extension(scope): Extension<Scope>,
     Json(body): Json<SetupBody>,
 ) -> impl IntoResponse {
-    use crate::remote::setup::{self, SetupError, TailscaleCall};
+    use crate::remote::setup;
     if let Err(denied) = require_control(&scope) {
         return denied.into_response();
     }
@@ -265,11 +313,37 @@ async fn post_setup(
         (Ok(root), Ok(dir)) => (root, dir),
         (Err(refused), _) | (_, Err(refused)) => return refused.into_response(),
     };
+    turn_on(
+        &state,
+        &root,
+        &exe_dir,
+        body.public_origin.as_deref(),
+        setup::gateway_allowed(),
+        setup::locate_cli(),
+    )
+    .await
+}
 
-    let cli = setup::locate_cli();
-    let own_origin = body
-        .public_origin
-        .as_deref()
+/// The turn-on step with its surroundings passed in (`primary`: this daemon may run the gateway;
+/// `cli`: where Tailscale is), so a test needs no real Tailscale and no real gateway.
+async fn turn_on(
+    state: &AppState,
+    root: &std::path::Path,
+    exe_dir: &std::path::Path,
+    own_origin: Option<&str>,
+    primary: bool,
+    cli: Option<PathBuf>,
+) -> axum::response::Response {
+    use crate::remote::setup::{self, TailscaleCall};
+    // Before anything is published or written: a daemon that may not run the gateway would answer
+    // "on" with nothing behind it.
+    if !primary {
+        return refusal(StatusCode::CONFLICT, "not_primary").into_response();
+    }
+    // One turn-on or turn-off at a time: they share the file, the key and the Tailscale port.
+    let _one_at_a_time = setup::lock_setup().await;
+
+    let own_origin = own_origin
         .map(str::trim)
         .filter(|origin| !origin.is_empty());
     let via_tailscale = own_origin.is_none();
@@ -285,39 +359,25 @@ async fn post_setup(
     };
 
     // Everything that can be refused is refused before anything is published or written.
-    let config = match setup::plan(&root, &origin, &exe_dir) {
+    let config = match setup::plan(root, &origin, exe_dir) {
         Ok(config) => config,
-        Err(SetupError::InvalidOrigin(why)) => {
-            return super::common::refusal_with_detail(
-                StatusCode::BAD_REQUEST,
-                "invalid_origin",
-                why,
-            )
-            .into_response();
-        }
-        Err(SetupError::PageMissing) => {
-            return refusal(StatusCode::CONFLICT, "remote_page_missing").into_response();
-        }
-        Err(error) => return storage_failure(error).into_response(),
+        Err(error) => return setup_error(error).into_response(),
     };
+    let mut published_here = false;
     if via_tailscale {
         let Some(cli) = cli.as_deref() else {
             return refusal(StatusCode::CONFLICT, "tailscale_not_ready").into_response();
         };
-        if let Err(why) = setup::run(cli, TailscaleCall::ServeOn).await {
-            return super::common::refusal_with_detail(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "serve_failed",
-                why,
-            )
-            .into_response();
+        match setup::serve_on(cli).await {
+            Ok(turned_on) => published_here = turned_on,
+            Err(error) => return serve_refusal(error).into_response(),
         }
     }
     if let Err(error) = setup::commit(
         &state.pool,
-        &root,
+        root,
         &config,
-        &exe_dir,
+        exe_dir,
         &crate::daemon_client::daemon_url(),
         |env| {
             setup::launch_gateway(env);
@@ -325,9 +385,18 @@ async fn post_setup(
     )
     .await
     {
-        return storage_failure(error).into_response();
+        // Serve was published by this call and nothing is behind it now: take it back, but never a
+        // publication that was already there.
+        if published_here {
+            if let Some(cli) = cli.as_deref() {
+                if let Err(failure) = setup::run(cli, TailscaleCall::ServeOff).await {
+                    tracing::warn!(why = %failure.why, "could not roll back publishing the gateway on Tailscale");
+                }
+            }
+        }
+        return setup_error(error).into_response();
     }
-    Json(setup_view(&root).await).into_response()
+    Json(setup_view(root).await).into_response()
 }
 
 /// `DELETE /remote/setup`: switches remote access off, stops the gateway and stops publishing it.
@@ -335,7 +404,7 @@ async fn delete_setup(
     State(state): State<AppState>,
     Extension(scope): Extension<Scope>,
 ) -> impl IntoResponse {
-    use crate::remote::setup::{self, TailscaleCall};
+    use crate::remote::setup;
     if let Err(denied) = require_control(&scope) {
         return denied.into_response();
     }
@@ -343,17 +412,15 @@ async fn delete_setup(
         Ok(root) => root,
         Err(refused) => return refused.into_response(),
     };
+    let _one_at_a_time = setup::lock_setup().await;
     if let Err(error) = setup::disable(&state.pool, &root, setup::stop_gateway).await {
-        return storage_failure(error).into_response();
+        return setup_error(error).into_response();
     }
     // Best effort: the gateway is already off, so a Tailscale that will not answer changes nothing
-    // about who can get in.
-    let cli = setup::locate_cli();
-    if let Some(cli) = cli.as_deref() {
-        if setup::is_serving(Some(cli)).await {
-            if let Err(why) = setup::run(cli, TailscaleCall::ServeOff).await {
-                tracing::warn!(%why, "could not stop publishing the gateway on Tailscale");
-            }
+    // about who can get in. Only a publication that points at the gateway is stopped.
+    if let Some(cli) = setup::locate_cli() {
+        if let Err(failure) = setup::serve_off(&cli).await {
+            tracing::warn!(why = %failure.why, "could not stop publishing the gateway on Tailscale");
         }
     }
     Json(setup_view(&root).await).into_response()
@@ -636,12 +703,170 @@ mod tests {
         let app = router(state);
         for method in ["GET", "POST", "DELETE"] {
             let body = (method == "POST").then(|| serde_json::json!({}));
-            let (status, _) = send(&app, method, "/remote/setup", &key, Some(&session), body).await;
+            // The session is valid, so a 401 would mean something else broke; the middleware's
+            // deny list answers 403 with no body. The handler's own lock also answers 403 but
+            // names itself `control_only`, so seeing that name means the deny list let it through.
+            let (status, text) = send(
+                &app,
+                method,
+                "/remote/setup",
+                &key,
+                Some(&session),
+                body.clone(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method}: {text}");
             assert!(
-                status == StatusCode::FORBIDDEN || status == StatusCode::UNAUTHORIZED,
-                "{method}: {status}"
+                !text.contains("control_only"),
+                "{method}: reached the handler"
             );
+            // The gateway's own key without a device is not an owner either.
+            let (status, text) = send(&app, method, "/remote/setup", &key, None, body).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} (key only): {text}");
+            assert!(!text.contains("control_only"), "{method} (key only)");
         }
+        // And the deny list itself, level by level.
+        for level in [Level::Admin, Level::RunCreating, Level::ReadOnly] {
+            for method in [
+                axum::http::Method::GET,
+                axum::http::Method::POST,
+                axum::http::Method::DELETE,
+            ] {
+                assert!(
+                    !crate::auth::remote_device_permits(level, &method, "/remote/setup"),
+                    "{level:?} {method}"
+                );
+            }
+        }
+    }
+
+    async fn body_of(response: axum::response::Response) -> (StatusCode, serde_json::Value) {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, json(&String::from_utf8_lossy(&bytes)))
+    }
+
+    fn page_in(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir.join("dist-remote")).unwrap();
+        std::fs::write(dir.join("dist-remote").join("index.html"), "<html></html>").unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_daemon_that_may_not_run_the_gateway_refuses_before_writing_anything() {
+        let state = test_state().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, exe_dir) = (tmp.path().join("home"), tmp.path().join("app"));
+        page_in(&exe_dir);
+
+        let response = turn_on(
+            &state,
+            &root,
+            &exe_dir,
+            Some("https://box.example.com"),
+            false,
+            None,
+        )
+        .await;
+        let (status, body) = body_of(response).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["refusal"], "not_primary");
+        assert!(!root.join(crate::remote::REMOTE_FILE).exists());
+        assert!(!crate::remote::is_armed(&state.pool).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn turning_on_with_no_tailscale_is_refused_and_writes_nothing() {
+        let state = test_state().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, exe_dir) = (tmp.path().join("home"), tmp.path().join("app"));
+        page_in(&exe_dir);
+
+        let response = turn_on(&state, &root, &exe_dir, None, true, None).await;
+        let (status, body) = body_of(response).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["refusal"], "tailscale_not_ready");
+        assert!(!root.join(crate::remote::REMOTE_FILE).exists());
+        assert!(!crate::remote::is_armed(&state.pool).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_malformed_remote_yaml_is_refused_on_and_off_and_left_alone() {
+        let mut state = test_state().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, exe_dir) = (tmp.path().join("home"), tmp.path().join("app"));
+        page_in(&exe_dir);
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join(crate::remote::REMOTE_FILE);
+        let broken = "enabled: [oops\npublic_origin: \"https://mine.example.com\"\n";
+        std::fs::write(&file, broken).unwrap();
+
+        let response = turn_on(
+            &state,
+            &root,
+            &exe_dir,
+            Some("https://box.example.com"),
+            true,
+            None,
+        )
+        .await;
+        let (status, body) = body_of(response).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["refusal"], "config_unreadable");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), broken);
+        assert!(!crate::remote::is_armed(&state.pool).await.unwrap());
+
+        state.machine_config_root = Some(root.clone());
+        let response = delete_setup(State(state.clone()), Extension(Scope::Control))
+            .await
+            .into_response();
+        let (status, body) = body_of(response).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["refusal"], "config_unreadable");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), broken);
+    }
+
+    #[test]
+    fn each_serve_failure_has_its_own_refusal() {
+        use crate::remote::setup::{CliFailure, ServeError};
+        let status_and_name = |error| {
+            let (status, Json(body)) = serve_refusal(error);
+            (status, body)
+        };
+
+        let (status, body) = status_and_name(ServeError::Taken);
+        assert_eq!(
+            (status, body["refusal"].as_str()),
+            (StatusCode::CONFLICT, Some("serve_port_taken"))
+        );
+
+        let (status, body) = status_and_name(ServeError::Funnel);
+        assert_eq!(
+            (status, body["refusal"].as_str()),
+            (StatusCode::CONFLICT, Some("funnel_enabled"))
+        );
+
+        // A link the person has to open: its own code, the link as the detail.
+        let (status, body) = status_and_name(ServeError::Failed(CliFailure {
+            why: "tailscale did not answer in time".to_string(),
+            approval_url: Some("https://login.tailscale.com/f/serve?node=n1".to_string()),
+        }));
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["refusal"], "serve_needs_approval");
+        assert_eq!(
+            body["detail"],
+            "https://login.tailscale.com/f/serve?node=n1"
+        );
+
+        // No link: the plain failure keeps what the CLI said.
+        let (status, body) = status_and_name(ServeError::Failed(CliFailure {
+            why: "boom".to_string(),
+            approval_url: None,
+        }));
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["refusal"], "serve_failed");
+        assert_eq!(body["detail"], "boom");
     }
 
     #[tokio::test]

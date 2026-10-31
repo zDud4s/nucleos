@@ -84,6 +84,10 @@ export interface RemoteSetup {
   public_origin: string;
   tailscale: TailscaleState;
   serving: boolean;
+  /** Port 443 is open to the public internet (Funnel): setup will not turn on while it is. */
+  funnel: boolean;
+  /** Port 443 already serves something that is not the gateway: setup leaves it alone. */
+  port_taken: boolean;
 }
 
 const SETUP_KEY = ["remote", "setup"] as const;

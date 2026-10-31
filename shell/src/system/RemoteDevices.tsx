@@ -170,6 +170,14 @@ function SetupWizard({ setup }: { setup: RemoteSetup }) {
   const ts = setup.tailscale;
   const ready = ts.installed && ts.signed_in && ts.https_ok && ts.dns_name !== null;
 
+  // Funnel is the public internet: said whether or not remote access is on, and never offered.
+  const exposed = setup.funnel && (
+    <ErrorNote>
+      Tailscale Funnel has this machine&apos;s HTTPS port open to the public internet. NucleOS does not
+      turn Funnel on and will not turn remote access on while it is. Turn Funnel off in Tailscale.
+    </ErrorNote>
+  );
+
   if (setup.enabled) {
     return (
       <div className="sy-note">
@@ -177,6 +185,7 @@ function SetupWizard({ setup }: { setup: RemoteSetup }) {
           Remote access is on at <strong>{setup.public_origin}</strong>.
           {setup.serving ? " Tailscale is publishing it." : ""}
         </p>
+        {exposed}
         <Button
           variant="ghost"
           disabled={disable.isPending}
@@ -213,12 +222,20 @@ function SetupWizard({ setup }: { setup: RemoteSetup }) {
           </Button>
         </>
       )}
+      {exposed}
+      {setup.port_taken && !setup.funnel && (
+        <p>
+          Tailscale is already serving something else on this machine&apos;s HTTPS port. NucleOS
+          leaves it alone, so it cannot publish the page there. Free that port, or use an address you
+          already have.
+        </p>
+      )}
       {ready && (
         <>
           <p>Ready: {ts.dns_name}. Remote access is published on your tailnet only, never the public internet.</p>
           <Button
             variant="ghost"
-            disabled={enable.isPending}
+            disabled={enable.isPending || setup.funnel || setup.port_taken}
             onClick={() => enable.mutate(null)}
           >
             Turn on remote access
@@ -253,6 +270,22 @@ function SetupWizard({ setup }: { setup: RemoteSetup }) {
 
 function EnableError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) {
+    // The tailnet never enabled Serve: Tailscale printed a page to approve it on. The link comes
+    // from the CLI's own output, and only an https one is ever opened.
+    if (error.code === "serve_needs_approval" && error.detail.startsWith("https://")) {
+      const approval = error.detail;
+      return (
+        <>
+          <ErrorNote>
+            Tailscale needs you to approve Serve for your tailnet first. Open the page, approve it,
+            then press Turn on remote access again.
+          </ErrorNote>
+          <Button variant="ghost" onClick={() => void openUrl(approval)}>
+            Open the Tailscale approval page
+          </Button>
+        </>
+      );
+    }
     return (
       <RefusalNote
         refusal={error}
@@ -261,6 +294,15 @@ function EnableError({ error }: { error: unknown }) {
           tailscale_not_ready: "Tailscale is not ready: sign in and enable HTTPS certificates.",
           remote_page_missing: "This installation has no remote page to serve.",
           serve_failed: "Tailscale refused to publish the page.",
+          serve_needs_approval: "Tailscale needs you to approve Serve for your tailnet first.",
+          serve_port_taken:
+            "Tailscale is already serving something else on this machine's HTTPS port. NucleOS leaves it alone: free that port, or use an address you already have.",
+          funnel_enabled:
+            "Tailscale Funnel has this machine open to the public internet. NucleOS will not turn remote access on while it is: turn Funnel off in Tailscale, then try again.",
+          not_primary:
+            "Another NucleOS on this machine runs the remote gateway. Turn remote access on there.",
+          config_unreadable:
+            "The remote access settings file cannot be read, so NucleOS did not touch it. Fix or remove remote.yaml in the settings folder, then try again.",
           no_machine_config: "This daemon has no settings folder to write to.",
         }}
       />

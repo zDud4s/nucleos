@@ -3,6 +3,8 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { QueryClientProvider } from "@tanstack/react-query";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+const opener = vi.hoisted(() => ({ openUrl: vi.fn() }));
+vi.mock("@tauri-apps/plugin-opener", () => opener);
 const daemon = vi.hoisted(() => ({ apiFetch: vi.fn(), apiText: vi.fn(), probeHealth: vi.fn() }));
 vi.mock("../data/client", async (original) => ({
   ...(await original<typeof import("../data/client")>()),
@@ -113,6 +115,8 @@ describe("RemoteDevices", () => {
       enabled: false,
       public_origin: "",
       serving: false,
+      funnel: false,
+      port_taken: false,
       ...over,
       tailscale: {
         installed: true,
@@ -174,5 +178,54 @@ describe("RemoteDevices", () => {
     expect((field as HTMLInputElement).value).toBe("ABCDE-FGHJK");
     const qr = screen.getByRole("img", { name: "QR code for https://mybox.tail1234.ts.net" });
     expect(qr.querySelector("path")?.getAttribute("d")?.length ?? 0).toBeGreaterThan(100);
+  });
+
+  it("shows_the_tailscale_approval_link_and_lets_the_person_retry", async () => {
+    const link = "https://login.tailscale.com/f/serve?node=n123";
+    let attempts = 0;
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === "/remote/setup" && init?.method === "POST") {
+        attempts += 1;
+        throw new ApiRefusal(409, "serve_needs_approval", link);
+      }
+      if (path === "/remote/setup") return setupOf({});
+      if (path === "/remote/devices") return [];
+      throw new Error(`unexpected ${path}`);
+    });
+    renderPanel();
+    fireEvent.click(await screen.findByRole("button", { name: "Turn on remote access" }));
+    expect(await screen.findByText(/needs you to approve Serve/)).toBeDefined();
+    fireEvent.click(screen.getByRole("button", { name: "Open the Tailscale approval page" }));
+    await waitFor(() => {
+      expect(opener.openUrl).toHaveBeenCalledWith(link);
+    });
+    // The same button is still there to retry once it is approved.
+    fireEvent.click(screen.getByRole("button", { name: "Turn on remote access" }));
+    await waitFor(() => {
+      expect(attempts).toBe(2);
+    });
+  });
+
+  it("refuses_to_offer_turning_on_while_the_port_is_public_or_taken", async () => {
+    daemon.apiFetch.mockImplementation(async (path: string) => {
+      if (path === "/remote/setup") return setupOf({ funnel: true });
+      if (path === "/remote/devices") return [];
+      throw new Error(`unexpected ${path}`);
+    });
+    const { unmount } = renderPanel();
+    expect(await screen.findByText(/open to the public internet/)).toBeDefined();
+    const button = screen.getByRole("button", { name: "Turn on remote access" });
+    expect((button as HTMLButtonElement).disabled).toBe(true);
+    unmount();
+
+    daemon.apiFetch.mockImplementation(async (path: string) => {
+      if (path === "/remote/setup") return setupOf({ port_taken: true });
+      if (path === "/remote/devices") return [];
+      throw new Error(`unexpected ${path}`);
+    });
+    renderPanel();
+    expect(await screen.findByText(/already serving something else/)).toBeDefined();
+    const taken = screen.getByRole("button", { name: "Turn on remote access" });
+    expect((taken as HTMLButtonElement).disabled).toBe(true);
   });
 });

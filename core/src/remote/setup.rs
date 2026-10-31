@@ -12,8 +12,8 @@
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -91,18 +91,128 @@ pub fn parse_status(json: &str) -> TailscaleView {
     view
 }
 
-/// PURE: whether `tailscale serve status --json` shows the gateway being published.
-pub fn parse_serving(json: &str) -> bool {
-    fn mentions(value: &serde_json::Value, needle: &str) -> bool {
-        match value {
-            serde_json::Value::String(text) => text.contains(needle),
-            serde_json::Value::Array(items) => items.iter().any(|item| mentions(item, needle)),
-            serde_json::Value::Object(map) => map.values().any(|item| mentions(item, needle)),
-            _ => false,
+/// What is published on HTTPS port 443 of this machine's tailnet name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServePort {
+    /// Nothing.
+    Free,
+    /// Only the gateway: every handler proxies to [`crate::sidecar::REMOTE_ADDR`].
+    Ours,
+    /// Something else (another proxy, a file path, a text, a TCP forward). Not ours to replace.
+    Foreign,
+}
+
+/// What `tailscale serve status --json` says, reduced to what setup decides on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServeReading {
+    pub port: ServePort,
+    /// `AllowFunnel` is true for this host's :443, i.e. it is open to the whole internet.
+    pub funnel: bool,
+}
+
+/// PURE: reads `tailscale serve status --json` (Tailscale's `ipn.ServeConfig`): top-level `TCP` keyed
+/// by port, `Web` keyed by `host:443` with `Handlers` keyed by path, `AllowFunnel` keyed by
+/// `host:443`. Nothing configured prints `{}` or nothing at all.
+pub fn parse_serve(json: &str) -> Result<ServeReading, String> {
+    let text = if json.trim().is_empty() { "{}" } else { json };
+    let value: serde_json::Value = serde_json::from_str(text).map_err(|error| error.to_string())?;
+    if !value.is_object() {
+        return Err("tailscale serve status is not a JSON object".to_string());
+    }
+    let on_443 = |key: &str| key.rsplit_once(':').is_some_and(|(_, port)| port == "443");
+    let gateway = format!("http://{}", crate::sidecar::REMOTE_ADDR);
+
+    let mut sites = 0usize;
+    let mut all_ours = true;
+    if let Some(web) = value["Web"].as_object() {
+        for (_, site) in web.iter().filter(|(key, _)| on_443(key.as_str())) {
+            sites += 1;
+            let ours = site["Handlers"].as_object().is_some_and(|handlers| {
+                !handlers.is_empty()
+                    && handlers.values().all(|handler| {
+                        handler["Proxy"]
+                            .as_str()
+                            .is_some_and(|proxy| proxy.trim().trim_end_matches('/') == gateway)
+                    })
+            });
+            all_ours &= ours;
         }
     }
-    serde_json::from_str::<serde_json::Value>(json)
-        .is_ok_and(|value| mentions(&value, crate::sidecar::REMOTE_ADDR))
+    // A TCP entry on 443 with no web site behind it is a raw forward or a leftover: not ours either.
+    let port = match (sites, value["TCP"]["443"].is_null()) {
+        (0, true) => ServePort::Free,
+        (0, false) => ServePort::Foreign,
+        _ if all_ours => ServePort::Ours,
+        _ => ServePort::Foreign,
+    };
+    let funnel = value["AllowFunnel"].as_object().is_some_and(|hosts| {
+        hosts
+            .iter()
+            .any(|(key, on)| on_443(key.as_str()) && on.as_bool() == Some(true))
+    });
+    Ok(ServeReading { port, funnel })
+}
+
+/// PURE: whether `tailscale serve status --json` shows the gateway being published.
+pub fn parse_serving(json: &str) -> bool {
+    parse_serve(json).is_ok_and(|reading| reading.port == ServePort::Ours)
+}
+
+/// Why a `serve` call could not turn the gateway on, or could not be allowed to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServeError {
+    /// 443 already serves something that is not the gateway; it is left alone.
+    Taken,
+    /// 443 is open to the public internet (Funnel). Not what the owner agreed to; setup never
+    /// turns it on, off or around.
+    Funnel,
+    /// The CLI failed, timed out, or printed a page the person has to approve first.
+    Failed(CliFailure),
+}
+
+/// PURE: whether it is safe to publish the gateway. `Ok(true)`: it already is (nothing to do).
+pub fn serve_gate(reading: &ServeReading) -> Result<bool, ServeError> {
+    if reading.funnel {
+        return Err(ServeError::Funnel);
+    }
+    match reading.port {
+        ServePort::Foreign => Err(ServeError::Taken),
+        ServePort::Ours => Ok(true),
+        ServePort::Free => Ok(false),
+    }
+}
+
+/// PURE: the first `https://` link in CLI output, which is where `tailscale serve` sends a person
+/// whose tailnet never enabled Serve. Whitespace, quotes and trailing punctuation end it.
+pub fn approval_url(text: &str) -> Option<String> {
+    let rest = &text[text.find("https://")?..];
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c.is_control() || matches!(c, '"' | '\'' | '<' | '>'))
+        .unwrap_or(rest.len());
+    let url = rest[..end].trim_end_matches(['.', ',', ';', ')']);
+    (url.len() > "https://".len() && url.len() <= 512).then(|| url.to_string())
+}
+
+/// A failed CLI call: what to tell the person, and the approval link if the CLI printed one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliFailure {
+    pub why: String,
+    pub approval_url: Option<String>,
+}
+
+/// PURE: a failure that keeps whatever link the CLI had printed on either stream.
+fn failure(why: impl Into<String>, stdout: &str, stderr: &str) -> CliFailure {
+    CliFailure {
+        why: why.into(),
+        approval_url: approval_url(&format!("{stdout}\n{stderr}")),
+    }
+}
+
+fn plain_failure(why: impl Into<String>) -> CliFailure {
+    CliFailure {
+        why: why.into(),
+        approval_url: None,
+    }
 }
 
 /// PURE: the places the Tailscale CLI lives on `os` (`std::env::consts::OS`), most likely first.
@@ -179,26 +289,103 @@ pub fn locate_cli() -> Option<PathBuf> {
     )
 }
 
-/// Runs one fixed Tailscale call and returns its output. `Err` carries what the CLI said.
-pub async fn run(cli: &Path, call: TailscaleCall) -> Result<String, String> {
+/// The most a CLI call's output is kept at, per stream.
+const CLI_OUTPUT_MAX: usize = 64 * 1024;
+
+/// Copies a child's pipe into `into` as it arrives, so a call that is abandoned on the timeout still
+/// leaves what it had printed (`output()` would drop it with the future).
+fn capture<R>(pipe: Option<R>, into: Arc<Mutex<Vec<u8>>>) -> tokio::task::JoinHandle<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let Some(mut pipe) = pipe else {
+            return;
+        };
+        let mut chunk = [0u8; 4096];
+        loop {
+            match tokio::io::AsyncReadExt::read(&mut pipe, &mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    let mut kept = into.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if kept.len() < CLI_OUTPUT_MAX {
+                        kept.extend_from_slice(&chunk[..read]);
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// Runs one fixed Tailscale call and returns its output. `Err` carries what the CLI said, and the
+/// link it asked the person to open, if it printed one (also when it was abandoned on the timeout).
+pub async fn run(cli: &Path, call: TailscaleCall) -> Result<String, CliFailure> {
     let mut command = tokio::process::Command::new(cli);
     command
         .args(call.args())
         .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     #[cfg(windows)]
     command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: no console flashes over the app.
-    let output = tokio::time::timeout(CLI_TIMEOUT, command.output())
-        .await
-        .map_err(|_| "tailscale did not answer in time".to_string())?
-        .map_err(|error| format!("could not run tailscale: {error}"))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let mut child = command
+        .spawn()
+        .map_err(|error| plain_failure(format!("could not run tailscale: {error}")))?;
+    let out = Arc::new(Mutex::new(Vec::new()));
+    let err = Arc::new(Mutex::new(Vec::new()));
+    let readers = [
+        capture(child.stdout.take(), out.clone()),
+        capture(child.stderr.take(), err.clone()),
+    ];
+    let waited = tokio::time::timeout(CLI_TIMEOUT, child.wait()).await;
+    if waited.is_err() {
+        let _ = child.start_kill();
+    }
+    // The pipes close when the child exits or is killed; a grandchild holding one open must not
+    // hold this call.
+    for reader in readers {
+        let _ = tokio::time::timeout(Duration::from_secs(2), reader).await;
+    }
+    let text = |buffer: &Arc<Mutex<Vec<u8>>>| {
+        let bytes = buffer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    let (stdout, stderr) = (text(&out), text(&err));
+    let status = match waited {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => {
+            return Err(failure(
+                format!("could not wait for tailscale: {error}"),
+                &stdout,
+                &stderr,
+            ));
+        }
+        Err(_) => {
+            return Err(failure(
+                "tailscale did not answer in time",
+                &stdout,
+                &stderr,
+            ));
+        }
+    };
     // `status` prints its JSON even when Tailscale is stopped or logged out and exits non-zero.
-    if output.status.success() || (call == TailscaleCall::Status && !stdout.trim().is_empty()) {
+    if status.success() || (call == TailscaleCall::Status && !stdout.trim().is_empty()) {
         return Ok(stdout);
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    Err(stderr.trim().to_string())
+    let said = if stderr.trim().is_empty() {
+        stdout.trim()
+    } else {
+        stderr.trim()
+    };
+    let why = if said.is_empty() {
+        format!("tailscale exited with {status}")
+    } else {
+        said.to_string()
+    };
+    Err(failure(why, &stdout, &stderr))
 }
 
 /// What Tailscale says about this machine. No CLI is reported as `installed: false`, not an error.
@@ -215,14 +402,47 @@ pub async fn probe(cli: Option<&Path>) -> TailscaleView {
     }
 }
 
+/// What `tailscale serve` is publishing on 443, or why that could not be read.
+pub async fn read_serve(cli: &Path) -> Result<ServeReading, CliFailure> {
+    let json = run(cli, TailscaleCall::ServeStatus).await?;
+    parse_serve(&json)
+        .map_err(|why| plain_failure(format!("could not read tailscale serve status: {why}")))
+}
+
+/// [`read_serve`] for display: no CLI or an unreadable answer is `None`.
+pub async fn serve_reading(cli: Option<&Path>) -> Option<ServeReading> {
+    read_serve(cli?).await.ok()
+}
+
 /// Whether the gateway is being published right now.
 pub async fn is_serving(cli: Option<&Path>) -> bool {
-    let Some(cli) = cli else {
-        return false;
-    };
-    run(cli, TailscaleCall::ServeStatus)
+    serve_reading(cli)
         .await
-        .is_ok_and(|json| parse_serving(&json))
+        .is_some_and(|reading| reading.port == ServePort::Ours)
+}
+
+/// Publishes the gateway on the tailnet, unless that would touch something that is not ours.
+/// `Ok(true)` when this call turned it on (and so is the one to roll it back), `Ok(false)` when it
+/// was already published. The port is checked first: `serve --https=443` acts on the whole port.
+pub async fn serve_on(cli: &Path) -> Result<bool, ServeError> {
+    let reading = read_serve(cli).await.map_err(ServeError::Failed)?;
+    if serve_gate(&reading)? {
+        return Ok(false);
+    }
+    run(cli, TailscaleCall::ServeOn)
+        .await
+        .map_err(ServeError::Failed)?;
+    Ok(true)
+}
+
+/// Stops publishing, but only when 443 points at our gateway. `Ok(false)`: it did not, so nothing
+/// was touched.
+pub async fn serve_off(cli: &Path) -> Result<bool, CliFailure> {
+    if read_serve(cli).await?.port != ServePort::Ours {
+        return Ok(false);
+    }
+    run(cli, TailscaleCall::ServeOff).await?;
+    Ok(true)
 }
 
 /// `https://<dns name>`, the origin a browser on the tailnet sees.
@@ -273,35 +493,69 @@ pub fn allow_gateway() {
     GATEWAY_ALLOWED.store(true, Ordering::SeqCst);
 }
 
-/// Starts the gateway supervisor, replacing a running one so a changed origin takes effect.
+/// Whether this process may run the gateway, i.e. [`allow_gateway`] was called. Ask before changing
+/// anything: a refused launch after a write would leave "on" with no gateway behind it.
+pub fn gateway_allowed() -> bool {
+    GATEWAY_ALLOWED.load(Ordering::SeqCst)
+}
+
+/// How long a killed gateway gets to release 127.0.0.1:8797. On Windows the port can stay bound a
+/// moment after the process is gone, and a replacement that binds early dies and backs off.
+const PORT_RELEASE: Duration = Duration::from_millis(300);
+
+/// Stops a gateway supervisor and waits until it is really gone: aborting alone only schedules the
+/// drop that kills the child (`kill_on_drop`). The registry row goes too, since the aborted
+/// supervisor can no longer write `down` itself.
+async fn retire(old: tokio::task::JoinHandle<()>) {
+    old.abort();
+    let _ = old.await;
+    crate::sidecar::forget(crate::sidecar::REMOTE);
+    tokio::time::sleep(PORT_RELEASE).await;
+}
+
+/// Starts the gateway supervisor, replacing a running one so a changed origin takes effect. The new
+/// supervisor first waits for the old one to be gone, so two children never race for the port.
 /// Returns whether one was started. Must be called inside the tokio runtime.
 pub fn launch_gateway(env: Vec<(String, String)>) -> bool {
-    if !GATEWAY_ALLOWED.load(Ordering::SeqCst) {
+    if !gateway_allowed() {
         return false;
     }
     let mut slot = GATEWAY
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(old) = slot.take() {
-        // Dropping the supervisor drops its child, which is spawned with `kill_on_drop`.
-        old.abort();
-    }
-    *slot = Some(tokio::spawn(crate::sidecar::supervise(
-        crate::sidecar::REMOTE.to_string(),
-        crate::sidecar::binary(crate::sidecar::REMOTE),
-        env,
-    )));
+    let old = slot.take();
+    *slot = Some(tokio::spawn(async move {
+        if let Some(old) = old {
+            retire(old).await;
+        }
+        crate::sidecar::supervise(
+            crate::sidecar::REMOTE.to_string(),
+            crate::sidecar::binary(crate::sidecar::REMOTE),
+            env,
+        )
+        .await;
+    }));
     true
 }
 
-/// Stops the gateway this process started, if it did.
-pub fn stop_gateway() {
-    let mut slot = GATEWAY
+/// Stops the gateway this process started, if it did, and returns once its child is gone.
+pub async fn stop_gateway() {
+    let old = GATEWAY
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(old) = slot.take() {
-        old.abort();
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some(old) = old {
+        retire(old).await;
     }
+}
+
+/// One setup operation at a time (turn on, turn off): they share `remote.yaml`, its staging file,
+/// the gateway key and the Tailscale port, and two interleaved ones could leave any of them torn.
+static SETUP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Held by the caller for the whole of a turn-on or turn-off.
+pub async fn lock_setup() -> tokio::sync::MutexGuard<'static, ()> {
+    SETUP_LOCK.lock().await
 }
 
 /* ----------------------------------------------------------------- setup -- */
@@ -314,6 +568,9 @@ pub enum SetupError {
     PageMissing,
     /// `remote.yaml` could not be written.
     Write(String),
+    /// `remote.yaml` exists but cannot be read or parsed. Writing over it would throw away the
+    /// owner's settings, so nothing is done until they fix or remove it.
+    ConfigUnreadable(String),
     Storage(sqlx::Error),
 }
 
@@ -322,6 +579,7 @@ impl std::fmt::Display for SetupError {
         match self {
             Self::InvalidOrigin(why) => write!(f, "invalid_origin: {why}"),
             Self::PageMissing => f.write_str("remote_page_missing"),
+            Self::ConfigUnreadable(why) => write!(f, "config_unreadable: {why}"),
             Self::Write(why) => write!(f, "could not write {REMOTE_FILE}: {why}"),
             Self::Storage(error) => write!(f, "storage: {error}"),
         }
@@ -351,10 +609,31 @@ fn write_config(root: &Path, config: &RemoteConfig) -> Result<(), SetupError> {
     })
 }
 
+/// The file as it is: absent or only comments is the defaults; a file that exists and does not parse
+/// is an error. [`RemoteConfig::load`] answers the defaults for that too, which is right for a
+/// daemon starting up (fail closed) and wrong for a writer: it would overwrite the file.
+pub fn load_strict(path: &Path) -> Result<RemoteConfig, SetupError> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RemoteConfig::default());
+        }
+        Err(error) => return Err(SetupError::ConfigUnreadable(error.to_string())),
+    };
+    if text.lines().all(|line| {
+        let line = line.trim();
+        line.is_empty() || line.starts_with('#')
+    }) {
+        return Ok(RemoteConfig::default());
+    }
+    RemoteConfig::parse(&text).map_err(SetupError::ConfigUnreadable)
+}
+
 /// Checks everything that can be checked without changing anything: the origin and the page.
-/// Keeps the owner's other settings (`dist_dir`, `stream_max_seconds`) from an existing file.
+/// Keeps the owner's other settings (`dist_dir`, `stream_max_seconds`) from an existing file, and
+/// refuses one it cannot read rather than replace it.
 pub fn plan(root: &Path, origin: &str, exe_dir: &Path) -> Result<RemoteConfig, SetupError> {
-    let mut config = RemoteConfig::load(&root.join(REMOTE_FILE));
+    let mut config = load_strict(&root.join(REMOTE_FILE))?;
     config.enabled = true;
     // The gateway compares bytes, so the origin is written the way a browser writes it.
     config.public_origin = origin.trim().trim_end_matches('/').to_ascii_lowercase();
@@ -405,16 +684,19 @@ pub async fn enable(
 
 /// Turns remote access off: the file says so, the gateway's key is deleted, `stop` runs.
 /// The origin stays in the file, so turning it back on needs no typing.
-pub async fn disable(
+pub async fn disable<Stopped>(
     pool: &SqlitePool,
     root: &Path,
-    stop: impl FnOnce(),
-) -> Result<(), SetupError> {
-    let mut config = RemoteConfig::load(&root.join(REMOTE_FILE));
+    stop: impl FnOnce() -> Stopped,
+) -> Result<(), SetupError>
+where
+    Stopped: std::future::Future<Output = ()>,
+{
+    let mut config = load_strict(&root.join(REMOTE_FILE))?;
     config.enabled = false;
     write_config(root, &config)?;
     super::disarm(pool).await?;
-    stop();
+    stop().await;
     Ok(())
 }
 
@@ -644,7 +926,9 @@ mod tests {
 
         // Turning it off keeps the origin, drops the key and stops the gateway.
         let mut stopped = false;
-        disable(&pool, &root, || stopped = true).await.unwrap();
+        disable(&pool, &root, || async { stopped = true })
+            .await
+            .unwrap();
         assert!(stopped);
         assert!(!super::super::is_armed(&pool).await.unwrap());
         let off = RemoteConfig::load(&root.join(REMOTE_FILE));
@@ -653,6 +937,208 @@ mod tests {
 
         // Nothing is left half-written.
         assert!(!root.join(format!("{REMOTE_FILE}.tmp")).exists());
+    }
+
+    /// What `tailscale serve status --json` printed here with the gateway published.
+    const SERVE_OURS: &str = r#"{
+        "TCP": { "443": { "HTTPS": true } },
+        "Web": { "mybox.tail1234.ts.net:443": { "Handlers": { "/": { "Proxy": "http://127.0.0.1:8797" } } } }
+    }"#;
+
+    #[test]
+    fn serve_status_tells_ours_from_foreign_and_free() {
+        let ours = parse_serve(SERVE_OURS).unwrap();
+        assert_eq!(
+            ours,
+            ServeReading {
+                port: ServePort::Ours,
+                funnel: false
+            }
+        );
+        assert!(parse_serving(SERVE_OURS));
+
+        // Nothing configured: `{}`, or no output at all.
+        for empty in ["{}", "", "  \n"] {
+            assert_eq!(
+                parse_serve(empty).unwrap().port,
+                ServePort::Free,
+                "{empty:?}"
+            );
+        }
+
+        // Another proxy, a different port, a path, a text, a second path next to ours.
+        for foreign in [
+            r#"{"TCP":{"443":{"HTTPS":true}},"Web":{"x.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:3000"}}}}}"#,
+            r#"{"TCP":{"443":{"HTTPS":true}},"Web":{"x.ts.net:443":{"Handlers":{"/":{"Path":"/srv/www"}}}}}"#,
+            r#"{"TCP":{"443":{"HTTPS":true}},"Web":{"x.ts.net:443":{"Handlers":{"/":{"Text":"hi"}}}}}"#,
+            r#"{"TCP":{"443":{"HTTPS":true}},"Web":{"x.ts.net:443":{"Handlers":{
+                "/":{"Proxy":"http://127.0.0.1:8797"},"/other":{"Proxy":"http://127.0.0.1:3000"}}}}}"#,
+            r#"{"TCP":{"443":{"TCPForward":"127.0.0.1:22"}}}"#,
+            r#"{"TCP":{"443":{"HTTPS":true}},"Web":{"x.ts.net:443":{"Handlers":{}}}}"#,
+        ] {
+            assert_eq!(
+                parse_serve(foreign).unwrap().port,
+                ServePort::Foreign,
+                "{foreign}"
+            );
+            assert!(!parse_serving(foreign), "{foreign}");
+        }
+
+        // Another port is not our business: only 443 is acted on.
+        let other_port = r#"{"TCP":{"8443":{"HTTPS":true}},"Web":{"x.ts.net:8443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:3000"}}}}}"#;
+        assert_eq!(parse_serve(other_port).unwrap().port, ServePort::Free);
+
+        assert!(parse_serve("not json").is_err());
+        assert!(parse_serve("[1]").is_err());
+    }
+
+    #[test]
+    fn serve_status_reports_a_publicly_exposed_port() {
+        let funnel = r#"{
+            "TCP": { "443": { "HTTPS": true } },
+            "Web": { "mybox.tail1234.ts.net:443": { "Handlers": { "/": { "Proxy": "http://127.0.0.1:8797" } } } },
+            "AllowFunnel": { "mybox.tail1234.ts.net:443": true }
+        }"#;
+        let reading = parse_serve(funnel).unwrap();
+        assert_eq!(reading.port, ServePort::Ours);
+        assert!(reading.funnel);
+        assert_eq!(serve_gate(&reading), Err(ServeError::Funnel));
+
+        // Explicitly false, or another port, is not exposed.
+        let off = SERVE_OURS.replace(
+            "\"Web\"",
+            r#""AllowFunnel": {"mybox.tail1234.ts.net:443": false, "x:8443": true}, "Web""#,
+        );
+        assert!(!parse_serve(&off).unwrap().funnel);
+    }
+
+    #[test]
+    fn serve_is_only_turned_on_over_a_free_port_or_our_own() {
+        let reading = |port, funnel| ServeReading { port, funnel };
+        assert_eq!(serve_gate(&reading(ServePort::Free, false)), Ok(false));
+        assert_eq!(serve_gate(&reading(ServePort::Ours, false)), Ok(true));
+        assert_eq!(
+            serve_gate(&reading(ServePort::Foreign, false)),
+            Err(ServeError::Taken)
+        );
+        // Funnel wins over everything else.
+        assert_eq!(
+            serve_gate(&reading(ServePort::Free, true)),
+            Err(ServeError::Funnel)
+        );
+        assert_eq!(
+            serve_gate(&reading(ServePort::Foreign, true)),
+            Err(ServeError::Funnel)
+        );
+    }
+
+    #[test]
+    fn an_approval_link_is_pulled_out_of_cli_output() {
+        let printed = "\nServe is not enabled on your tailnet.\nTo enable, visit:\n\n         https://login.tailscale.com/f/serve?node=n123abc\n\n";
+        assert_eq!(
+            approval_url(printed).as_deref(),
+            Some("https://login.tailscale.com/f/serve?node=n123abc")
+        );
+        assert_eq!(
+            approval_url("go to (https://example.com/x), then retry.").as_deref(),
+            Some("https://example.com/x")
+        );
+        assert_eq!(approval_url("no link here, http://insecure.example"), None);
+        assert_eq!(approval_url("https://"), None);
+        assert_eq!(approval_url(""), None);
+
+        // Either stream can carry it, and a failure keeps it.
+        let from_stdout = failure("did not answer", printed, "");
+        assert_eq!(
+            from_stdout.approval_url.as_deref(),
+            Some("https://login.tailscale.com/f/serve?node=n123abc")
+        );
+        let from_stderr = failure("exit 1", "", printed);
+        assert_eq!(from_stderr.approval_url, from_stdout.approval_url);
+        assert_eq!(failure("exit 1", "", "boom").approval_url, None);
+    }
+
+    #[test]
+    fn a_malformed_remote_yaml_is_refused_not_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("home");
+        let exe_dir = tmp.path().join("app");
+        page(&exe_dir.join("dist-remote"));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join(REMOTE_FILE);
+
+        let broken = "enabled: [oops\npublic_origin: \"https://mine.example.com\"\n";
+        std::fs::write(&file, broken).unwrap();
+        let result = plan(&root, "https://mybox.tail1234.ts.net", &exe_dir);
+        assert!(
+            matches!(result, Err(SetupError::ConfigUnreadable(_))),
+            "{result:?}"
+        );
+        assert!(matches!(
+            load_strict(&file),
+            Err(SetupError::ConfigUnreadable(_))
+        ));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), broken);
+
+        // Absent, empty and comment-only files are the defaults, not errors.
+        std::fs::write(&file, "# only a note\n\n").unwrap();
+        assert!(!load_strict(&file).unwrap().enabled);
+        std::fs::remove_file(&file).unwrap();
+        assert!(!load_strict(&file).unwrap().enabled);
+    }
+
+    #[tokio::test]
+    async fn turning_off_refuses_a_malformed_remote_yaml_and_leaves_it() {
+        let pool = crate::testdb::fresh_pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(REMOTE_FILE), "enabled: [oops").unwrap();
+        let mut stopped = false;
+        let result = disable(&pool, tmp.path(), || async { stopped = true }).await;
+        assert!(
+            matches!(result, Err(SetupError::ConfigUnreadable(_))),
+            "{result:?}"
+        );
+        assert!(!stopped);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(REMOTE_FILE)).unwrap(),
+            "enabled: [oops"
+        );
+    }
+
+    #[tokio::test]
+    async fn setup_operations_are_serialized() {
+        let first = lock_setup().await;
+        assert!(SETUP_LOCK.try_lock().is_err(), "a second operation got in");
+        drop(first);
+        assert!(SETUP_LOCK.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn stopping_the_gateway_waits_for_it_and_clears_its_row() {
+        allow_gateway();
+        assert!(gateway_allowed());
+        assert!(launch_gateway(Vec::new()));
+        // The supervisor records a row as soon as it first tries to spawn (running, or down when
+        // the binary is not built).
+        let mut seen = false;
+        for _ in 0..40 {
+            if crate::sidecar::liveness_of(crate::sidecar::REMOTE).is_some() {
+                seen = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(seen, "the supervisor never recorded the gateway");
+
+        stop_gateway().await;
+        assert_eq!(crate::sidecar::liveness_of(crate::sidecar::REMOTE), None);
+        assert!(GATEWAY.lock().unwrap().is_none());
+
+        // A relaunch over a running one retires the old supervisor before the new one starts.
+        assert!(launch_gateway(Vec::new()));
+        assert!(launch_gateway(Vec::new()));
+        stop_gateway().await;
+        assert_eq!(crate::sidecar::liveness_of(crate::sidecar::REMOTE), None);
     }
 
     #[tokio::test]

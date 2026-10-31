@@ -31,8 +31,26 @@ Windows, the app bundle, Homebrew or `/usr/local/bin` on macOS, `/usr/bin`, `/us
 `/usr/local/bin` or `/snap/bin` on Linux, then `PATH`. **Funnel is never used**: it would publish the
 page to the public internet, and the app has no way to run it.
 
-**Turn off remote access** stops the gateway, removes its credential and stops publishing. The address
-stays in the file, so turning it on again needs no typing.
+**Tailscale asks you to approve Serve.** On a tailnet that never used Serve, Tailscale waits for you to
+approve it on its website. The panel then shows **Open the Tailscale approval page**. Open it, approve,
+come back and press **Turn on remote access** again. Nothing was changed on your machine in between.
+
+**Something already uses the HTTPS port.** If Tailscale already serves something else on this
+machine's HTTPS port (443), the panel says so and **Turn on remote access** stays off: NucleOS never
+replaces what it did not publish, and **Turn off remote access** never stops it either. Free the port
+in Tailscale, or type an address you already have instead.
+
+**Funnel is on.** If Tailscale Funnel has that port open to the public internet, the panel says so and
+refuses to turn remote access on while it is. NucleOS does not turn Funnel on or off. Turn it off in
+Tailscale, then try again.
+
+**Turn off remote access** stops the gateway, removes its credential and stops publishing, but only
+when Tailscale is publishing the gateway. The address stays in the file, so turning it on again needs
+no typing. If `remote.yaml` exists and cannot be read, both buttons leave it alone and say so: fix or
+remove the file first.
+
+Only one NucleOS on a machine runs the gateway. Another one asked to turn remote access on says so and
+changes nothing.
 
 ## Pair a device
 
@@ -95,4 +113,9 @@ bash scripts/build-sidecars.sh
 | 401 `session_invalid` | Session expired or revoked. Pair again. |
 | 502 `daemon_unreachable` | The daemon is down or restarting. |
 | 409 `remote_disabled` when creating a code | Remote access is off. Turn it on in the panel. |
-| "Tailscale refused to publish the page" | HTTPS certificates are off in the admin console, or Tailscale needs you to approve it. |
+| "Tailscale refused to publish the page" | HTTPS certificates are off in the admin console. |
+| "Tailscale needs you to approve Serve" | Open the approval page the panel offers, approve, press the button again. |
+| "already serving something else" (`serve_port_taken`) | Free port 443 in Tailscale or use your own HTTPS address. |
+| "Funnel has this machine open" (`funnel_enabled`) | Turn Funnel off in Tailscale. NucleOS never turns it on. |
+| `config_unreadable` | `remote.yaml` does not parse. Fix or remove it; NucleOS did not change it. |
+| `not_primary` | Another NucleOS on this machine runs the gateway. Use that one. |
