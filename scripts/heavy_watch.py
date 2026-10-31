@@ -349,7 +349,7 @@ def _past_runs(rec: dict, field: str) -> tuple[list[dict], str]:
     when there are at least two, else the last ones anywhere."""
     key = heavy._log_argv([str(a) for a in (rec.get("argv") or [])])
     rows = [r for r in history() if r.get("argv") == key
-            and r.get("exit") != heavy.EXIT_QUEUE_TIMEOUT
+            and r.get("exit") not in (heavy.EXIT_QUEUE_TIMEOUT, heavy.EXIT_STALLED)
             and isinstance(r.get(field), (int, float)) and r[field] > 0]
     wt = heavy._real(rec.get("worktree") or "")
     here = [r for r in rows if heavy._real(r.get("worktree") or "") == wt][-5:]
@@ -379,8 +379,8 @@ def cpu_progress(rec: dict, used: float | None, field: str) -> str | None:
 def estimate(rec: dict) -> str:
     """How long the same command took before: median and spread of the last runs in the
     same worktree when there are at least two (an incremental build there is the closest
-    match), else of the last runs anywhere. Runs that never started (exit 75) are left out.
-    The spread is shown because it is wide: a full rebuild and an incremental one share an
+    match), else of the last runs anywhere. Runs that never started (exit 75) or were killed as
+    stuck (exit 76) are left out. The spread is shown because it is wide: a full rebuild and an incremental one share an
     argv."""
     runs, where = _past_runs(rec, "run_s")
     vals = sorted(float(r["run_s"]) for r in runs)
