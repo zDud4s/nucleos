@@ -518,4 +518,99 @@ mod tests {
             Some(project_file)
         );
     }
+
+    #[tokio::test]
+    async fn a_deleted_spec_is_set_aside_and_says_why() {
+        let pool = crate::testdb::fresh_pool().await;
+        let project = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let file = write_file(&project_specs(project.path()), "gone.md", b"# Gone\n");
+        let roots = roots_at(project.path(), state.path());
+        scan(&pool, PROJECT, &roots).await.unwrap();
+        let id = spec_id(PROJECT, ".ai/specs/gone.md");
+
+        fs::remove_file(file).unwrap();
+        scan(&pool, PROJECT, &roots).await.unwrap();
+
+        let spec = stored(&pool, &id).await;
+        assert_eq!(spec.status, SpecStatus::Abandoned);
+        assert!(spec.status_reason.as_deref().unwrap_or_default().contains(&spec.path));
+        assert_eq!(get_spec(&pool, &id).await.unwrap(), Some(spec));
+    }
+
+    #[tokio::test]
+    async fn a_spec_that_comes_back_is_discovered_again() {
+        let pool = crate::testdb::fresh_pool().await;
+        let project = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let bytes = b"# Back\n";
+        let file = write_file(&project_specs(project.path()), "back.md", bytes);
+        let roots = roots_at(project.path(), state.path());
+        scan(&pool, PROJECT, &roots).await.unwrap();
+        let id = spec_id(PROJECT, ".ai/specs/back.md");
+
+        fs::remove_file(&file).unwrap();
+        scan(&pool, PROJECT, &roots).await.unwrap();
+        fs::write(&file, bytes).unwrap();
+        scan(&pool, PROJECT, &roots).await.unwrap();
+
+        assert_eq!(stored(&pool, &id).await.status, SpecStatus::Discovered);
+    }
+
+    #[tokio::test]
+    async fn a_finished_spec_whose_file_is_gone_stays_done() {
+        let pool = crate::testdb::fresh_pool().await;
+        let project = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let file = write_file(&project_specs(project.path()), "done.md", b"# Done\n");
+        let roots = roots_at(project.path(), state.path());
+        scan(&pool, PROJECT, &roots).await.unwrap();
+        let id = spec_id(PROJECT, ".ai/specs/done.md");
+        sqlx::query("UPDATE specs SET status = 'done' WHERE id = ?")
+            .bind(&id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        fs::remove_file(file).unwrap();
+        scan(&pool, PROJECT, &roots).await.unwrap();
+
+        assert_eq!(stored(&pool, &id).await.status, SpecStatus::Done);
+    }
+
+    #[tokio::test]
+    async fn a_scan_without_a_state_dir_leaves_state_dir_specs_alone() {
+        let pool = crate::testdb::fresh_pool().await;
+        let project = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        write_file(&project_specs(project.path()), "project.md", b"# Project\n");
+        write_file(&state_specs(state.path()), "state.md", b"# State\n");
+        let roots = roots_at(project.path(), state.path());
+        scan(&pool, PROJECT, &roots).await.unwrap();
+        let state_id = spec_id(PROJECT, "<state_dir>/specs/state.md");
+        let project_id = spec_id(PROJECT, ".ai/specs/project.md");
+        mark_extracted(&pool, &state_id).await;
+        mark_extracted(&pool, &project_id).await;
+
+        scan(&pool, PROJECT, &ScanRoots { project_root: Some(project.path().to_path_buf()), state_dir: None }).await.unwrap();
+        assert_eq!(stored(&pool, &state_id).await.status, SpecStatus::Extracted);
+        scan(&pool, PROJECT, &ScanRoots { project_root: None, state_dir: Some(state.path().to_path_buf()) }).await.unwrap();
+        assert_eq!(stored(&pool, &project_id).await.status, SpecStatus::Extracted);
+    }
+
+    #[tokio::test]
+    async fn a_missing_spec_of_another_project_is_left_alone() {
+        let pool = crate::testdb::fresh_pool().await;
+        let project_a = tempfile::tempdir().unwrap();
+        let project_b = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        write_file(&project_specs(project_b.path()), "other.md", b"# Other\n");
+        scan(&pool, Some("project-b"), &roots_at(project_b.path(), state.path())).await.unwrap();
+        let other = spec_id(Some("project-b"), ".ai/specs/other.md");
+        mark_extracted(&pool, &other).await;
+
+        scan(&pool, Some("project-a"), &roots_at(project_a.path(), state.path())).await.unwrap();
+
+        assert_eq!(stored(&pool, &other).await.status, SpecStatus::Extracted);
+    }
 }

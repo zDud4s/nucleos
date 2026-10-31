@@ -3131,6 +3131,17 @@ mod tests {
     }
 
     #[test]
+    fn spec_finish_can_name_its_project() {
+        let schema = rmcp::schemars::schema_for!(SpecFinishParams);
+        let schema = serde_json::to_value(schema).unwrap();
+        let properties = schema["properties"].as_object().expect("properties");
+
+        for field in ["spec_id", "project_id", "project_root"] {
+            assert!(properties.contains_key(field), "missing {field}: {schema}");
+        }
+    }
+
+    #[test]
     fn wait_advice_is_reads_own() {
         assert_eq!(tool_effect("wait_advice"), ToolEffect::ReadsOwn);
     }

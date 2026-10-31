@@ -891,6 +891,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_audit_overtaken_by_an_edit_does_not_mark_the_spec_done() {
+        struct EditingReviewer {
+            pool: SqlitePool,
+            id: String,
+        }
+
+        #[async_trait::async_trait]
+        impl ReviewerRunner for EditingReviewer {
+            async fn review(
+                &self,
+                _spec: &Spec,
+                criteria: &[Criterion],
+            ) -> Result<ReviewerAnswer, String> {
+                store::upsert_by_path(&self.pool, None, SPEC_PATH, "Title", NEW_SHA)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(ReviewerAnswer {
+                    run: ReviewerRun { run_id: "review-1".to_owned(), lineage_root_id: None },
+                    reviews: criteria.iter().map(|criterion| met(criterion.ordinal, GOOD)).collect(),
+                })
+            }
+        }
+
+        let fx = Fixture::new(&["one", "two"]).await;
+        let reviewer = EditingReviewer { pool: fx.pool.clone(), id: fx.id.clone() };
+        let verify = FakeVerify::new(VerifyState::Green);
+
+        let result = audit(
+            &fx.pool, &reviewer.id, fx.worktree.path(), &SpecLineage::default(), &reviewer, &verify,
+        ).await;
+
+        assert!(matches!(result, Err(AuditError::StaleCriteria)), "{result:?}");
+        let spec = fx.spec().await;
+        assert_eq!(spec.status, SpecStatus::Discovered);
+        assert_eq!(spec.content_sha, NEW_SHA);
+        assert!(fx.criteria().await.iter().all(|criterion| criterion.status == CriterionStatus::Stale));
+        assert!(fx.criteria().await.iter().all(|criterion| criterion.status != CriterionStatus::Met));
+    }
+
+    #[tokio::test]
     async fn reviewer_failure_changes_nothing() {
         let fx = Fixture::new(&["the widget renders"]).await;
         let before = fx.state().await;

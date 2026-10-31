@@ -358,6 +358,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn re_extraction_drops_dependencies_it_no_longer_names() {
+        let pool = crate::testdb::fresh_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (a, _) = register(&pool, dir.path(), "a.md", SMALL_SPEC).await;
+        let (b, _) = register(&pool, dir.path(), "b.md", "# B\n").await;
+        let (c, _) = register(&pool, dir.path(), "c.md", "# C\n").await;
+        let names_b = fenced(json!({
+            "kind": "spec", "criteria": [criterion("first")],
+            "depends_on": [".ai/specs/b.md"], "questions": []
+        }));
+        let runner = FakeRunner::answering(&[names_b, spec_answer(&["second"])]);
+
+        extract(&pool, &roots_at(dir.path()), &a.id, &runner).await.unwrap();
+        store::add_dep(&pool, &a.id, &c.id, DepSource::Owner).await.unwrap();
+        extract(&pool, &roots_at(dir.path()), &a.id, &runner).await.unwrap();
+
+        assert_eq!(
+            list_deps(&pool, &a.id).await.unwrap(),
+            vec![Dep { spec_id: a.id, depends_on: c.id.clone(), source: DepSource::Owner }]
+        );
+        assert_ne!(b.id, c.id);
+    }
+
+    #[tokio::test]
     async fn retries_once_with_the_error_then_needs_owner() {
         let pool = crate::testdb::fresh_pool().await;
         let dir = tempfile::tempdir().unwrap();

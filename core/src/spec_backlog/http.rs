@@ -164,7 +164,7 @@ mod tests {
         let app = app(&state);
 
         let (status, _) = request(&app, "POST", "/specs/scan", json!({})).await;
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         let (status, specs) = request(&app, "GET", "/specs", Value::Null).await;
 
         assert_eq!(status, StatusCode::OK);
@@ -184,8 +184,7 @@ mod tests {
 
         let (status, _) = request(&app(&state), "POST", "/specs/spec-1/extract", json!({})).await;
 
-        // Extraction is asynchronous; this route must not wait for its run.
-        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]
@@ -205,5 +204,129 @@ mod tests {
         assert!(decisions.as_array().unwrap().iter().any(|decision| {
             decision["id"] == "question-1" && decision["question"] == "Which budget?"
         }));
+    }
+
+    #[tokio::test]
+    async fn scan_reads_the_projects_real_specs() {
+        let state = state().await;
+        let root = tempfile::tempdir().unwrap();
+        let specs = root.path().join(".ai/specs");
+        std::fs::create_dir_all(&specs).unwrap();
+        std::fs::write(specs.join("a.md"), "# A\n").unwrap();
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode, project_root) VALUES (?, 'off', ?)")
+            .bind("scan-real-project")
+            .bind(root.path().to_string_lossy().to_string())
+            .execute(&state.pool).await.unwrap();
+        let app = app(&state);
+
+        let (status, body) = request(&app, "POST", "/specs/scan", json!({"project_id": "scan-real-project"})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({"new": 1, "changed": 0, "unchanged": 0}));
+        let (status, specs) = request(&app, "GET", "/specs", Value::Null).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(specs.as_array().unwrap().iter().any(|spec| spec["path"] == ".ai/specs/a.md"));
+    }
+
+    #[tokio::test]
+    async fn scan_of_a_project_without_a_root_is_refused() {
+        let state = state().await;
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('scan-no-root', 'off', NULL)")
+            .execute(&state.pool).await.unwrap();
+        let (status, body) = request(&app(&state), "POST", "/specs/scan", json!({"project_id": "scan-no-root"})).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(!body["error"].as_str().unwrap_or_default().is_empty());
+    }
+
+    #[tokio::test]
+    async fn finish_without_a_project_is_refused() {
+        let state = state().await;
+        let (status, body) = request(&app(&state), "POST", "/backlog/finish", json!({})).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(!body["error"].as_str().unwrap_or_default().is_empty());
+    }
+
+    #[tokio::test]
+    async fn finish_refuses_what_it_cannot_do() {
+        let state = state().await;
+        let app = app(&state);
+        let (status, _) = request(&app, "POST", "/backlog/finish", json!({"spec_id": "nope"})).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let (status, _) = request(&app, "POST", "/backlog/finish", json!({"project_id": "no-root"})).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn a_second_finish_for_a_project_is_refused_while_one_runs() {
+        let state = state().await;
+        let root = tempfile::tempdir().unwrap();
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode, project_root) VALUES (?, 'off', ?)")
+            .bind("finish-claim-project")
+            .bind(root.path().to_string_lossy().to_string())
+            .execute(&state.pool).await.unwrap();
+        let claim = crate::spec_backlog::finish::claim_project("finish-claim-project").expect("first claim");
+        let (status, _) = request(&app(&state), "POST", "/backlog/finish", json!({"project_id": "finish-claim-project"})).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        drop(claim);
+        let (status, _) = request(&app(&state), "POST", "/backlog/finish", json!({"project_id": "finish-claim-project"})).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn finish_finds_the_project_by_its_root() {
+        let state = state().await;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().to_string_lossy().to_string();
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('finish-root-project', 'off', ?)")
+            .bind(&path).execute(&state.pool).await.unwrap();
+        let app = app(&state);
+        for root in [path.replace('\\', "/"), path.replace('/', "\\")] {
+            let (status, _) = request(&app, "POST", "/backlog/finish", json!({"project_root": root})).await;
+            assert_eq!(status, StatusCode::ACCEPTED);
+        }
+        let (status, _) = request(&app, "POST", "/backlog/finish", json!({"project_root": "C:/nowhere"})).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn extract_and_audit_answer_for_what_they_can_do() {
+        let state = state().await;
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('rootless-spec-project', 'off', NULL)")
+            .execute(&state.pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO specs (id, project_id, path, title, content_sha, created_at, updated_at) \
+             VALUES ('rootless-spec', 'rootless-spec-project', '.ai/specs/a.md', 'A', 'sha', 'now', 'now')",
+        ).execute(&state.pool).await.unwrap();
+        let app = app(&state);
+        for route in ["/specs/nope/extract", "/specs/nope/audit"] {
+            let (status, _) = request(&app, "POST", route, json!({})).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{route}");
+        }
+        for route in ["/specs/rootless-spec/extract", "/specs/rootless-spec/audit"] {
+            let (status, _) = request(&app, "POST", route, json!({})).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{route}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_owner_can_add_a_dependency() {
+        let state = state().await;
+        sqlx::query("INSERT INTO specs (id, path, title, content_sha, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)")
+            .bind("dep-a").bind(".ai/specs/a.md").bind("A").bind("a").bind("now").bind("now")
+            .execute(&state.pool).await.unwrap();
+        sqlx::query("INSERT INTO specs (id, path, title, content_sha, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)")
+            .bind("dep-b").bind(".ai/specs/b.md").bind("B").bind("b").bind("now").bind("now")
+            .execute(&state.pool).await.unwrap();
+        let app = app(&state);
+        let (status, _) = request(&app, "POST", "/specs/dep-a/deps", json!({"depends_on": "dep-b"})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(crate::spec_backlog::store::list_deps(&state.pool, "dep-a").await.unwrap()[0].source, crate::spec_backlog::model::DepSource::Owner);
+        for (route, body, expected) in [
+            ("/specs/nope/deps", json!({"depends_on": "dep-b"}), StatusCode::NOT_FOUND),
+            ("/specs/dep-a/deps", json!({"depends_on": "nope"}), StatusCode::UNPROCESSABLE_ENTITY),
+            ("/specs/dep-a/deps", json!({"depends_on": "dep-a"}), StatusCode::UNPROCESSABLE_ENTITY),
+        ] {
+            let (status, _) = request(&app, "POST", route, body).await;
+            assert_eq!(status, expected, "{route}");
+        }
     }
 }

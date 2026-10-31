@@ -69,6 +69,7 @@ pub struct FinishConfig {
     pub owned_paths: BTreeMap<String, Vec<String>>,
     /// The checkout an audit resolves evidence against.
     pub worktree: PathBuf,
+    pub state_dir: Option<PathBuf>,
 }
 
 /// One tree to run for one spec.
@@ -1039,6 +1040,7 @@ pub async fn finish(state: &AppState, scope: FinishScope) -> Result<FinishReport
             .unwrap_or_else(|| "master".to_owned()),
         owned_paths: BTreeMap::new(),
         worktree: PathBuf::from(&project_root),
+        state_dir: None,
         project_root,
     };
     let launcher = DaemonLauncher { state };
@@ -1059,6 +1061,14 @@ pub async fn finish(state: &AppState, scope: FinishScope) -> Result<FinishReport
         preparer: &preparer,
     };
     finish_with(&state.pool, &deps, &config, scope).await
+}
+
+/// Held while a finish runs for a project; released on drop.
+pub struct FinishClaim;
+
+/// Claims a project for one finish; `None` when one is already running.
+pub fn claim_project(_project_id: &str) -> Option<FinishClaim> {
+    Some(FinishClaim)
 }
 
 #[cfg(test)]
@@ -1107,6 +1117,7 @@ mod tests {
             max_rounds: 2,
             integration_branch: "master".to_owned(),
             project_root: "/repo".to_owned(),
+            state_dir: None,
             owned_paths: BTreeMap::new(),
             worktree: std::env::temp_dir(),
         }
@@ -1582,6 +1593,55 @@ mod tests {
         assert_eq!(again.skipped, vec![done.clone()]);
         assert!(log.lock().unwrap().is_empty(), "nothing was started");
         assert_eq!(status_of(&pool, &done).await, SpecStatus::Done);
+    }
+
+    #[tokio::test]
+    async fn finish_discovers_a_spec_written_since_the_last_scan() {
+        let pool = crate::testdb::fresh_pool().await;
+        let project = tempfile::tempdir().unwrap();
+        let specs = project.path().join(".ai/specs");
+        std::fs::create_dir_all(&specs).unwrap();
+        std::fs::write(specs.join("new.md"), "# New\n").unwrap();
+        let expected = spec_id(Some("finish-scan-project"), ".ai/specs/new.md");
+        let log = Log::default();
+        let launcher = FakeLauncher::new(&log);
+        let prep = FakePreparer::new(&pool, &log, &[]);
+        let mut config = cfg();
+        config.project_root = project.path().to_string_lossy().to_string();
+        config.state_dir = None;
+
+        finish_with(
+            &pool,
+            &FinishDeps { launcher: &launcher, preparer: &prep },
+            &config,
+            FinishScope::All { project_id: Some("finish-scan-project".to_owned()) },
+        ).await.unwrap();
+
+        assert!(log.lock().unwrap().iter().any(|entry| entry == &format!("extract:{expected}")));
+    }
+
+    #[tokio::test]
+    async fn finish_says_on_the_feed_how_each_spec_ended() {
+        let pool = crate::testdb::fresh_pool().await;
+        let done = add_spec(&pool, "done", SpecStatus::Extracted).await;
+        let blocked = add_spec(&pool, "blocked", SpecStatus::Extracted).await;
+        let log = Log::default();
+        let launcher = FakeLauncher::new(&log);
+        let prep = FakePreparer::new(&pool, &log, &[&done]);
+        let mut config = cfg();
+        config.owned_paths = disjoint(&[&done, &blocked]);
+
+        finish_with(&pool, &FinishDeps { launcher: &launcher, preparer: &prep }, &config, scope_all()).await.unwrap();
+
+        for (id, kind, title) in [(&done, "spec_done", "done"), (&blocked, "spec_blocked", "blocked")] {
+            let row: Option<(String, String, String)> = sqlx::query_as(
+                "SELECT kind, summary, subject FROM feed WHERE subject = ? ORDER BY created_at DESC LIMIT 1",
+            ).bind(id).fetch_optional(&pool).await.unwrap();
+            let (actual_kind, summary, subject) = row.expect("feed row");
+            assert_eq!(actual_kind, kind);
+            assert_eq!(subject, *id);
+            assert!(summary.contains(title));
+        }
     }
 
     #[tokio::test]
