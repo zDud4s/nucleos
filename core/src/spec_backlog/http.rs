@@ -257,10 +257,13 @@ async fn post_finish(State(state): State<AppState>, Json(request): Json<FinishRe
     if let Err(error) = finish::resolve_project(&state, &project_id).await {
         return refuse(StatusCode::UNPROCESSABLE_ENTITY, error);
     }
-    // The intent is written before the claim is tried: a request refused with a 409 is not lost, the
-    // sweeper runs it once the live pass ends.
+    // A whole-project request writes its intent before the claim is tried: a request refused with a
+    // 409 is not lost, the sweeper runs it once the live pass ends. A pass for one spec writes none
+    // up front; it leaves one behind only if it defers something.
     let requested_at = chrono::Utc::now().to_rfc3339();
-    if let Err(error) = store::write_finish_intent_at(&state.pool, &project_id, &requested_at).await
+    if matches!(scope, finish::FinishScope::All { .. })
+        && let Err(error) =
+            store::write_finish_intent_at(&state.pool, &project_id, &requested_at).await
     {
         return failed("could not record the finish", error);
     }
@@ -272,10 +275,10 @@ async fn post_finish(State(state): State<AppState>, Json(request): Json<FinishRe
     };
     tokio::spawn(async move {
         let _claim = claim;
-        let result = finish::finish(&state, scope).await;
+        let result = finish::finish(&state, scope.clone()).await;
         // The owner is not watching this task: a failed finish shows in the feed, and a pass that
         // held specs for disk leaves its intent for the sweeper.
-        finish::settle_intent(&state.pool, &project_id, &requested_at, &result).await;
+        finish::settle_intent(&state.pool, &project_id, &requested_at, &scope, &result).await;
     });
     (StatusCode::ACCEPTED, Json(json!({ "accepted": true })))
 }

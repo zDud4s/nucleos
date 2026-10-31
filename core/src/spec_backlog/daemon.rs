@@ -585,14 +585,26 @@ pub async fn resume_finishes(state: &AppState) {
 /// failed (the feed says so), deletes it; a pass that held specs for disk keeps it for the next
 /// sweep, until it is `INTENT_CEILING_HOURS` old, when it is announced once and dropped. Only the
 /// intent as it was when the pass began is deleted: one re-written since is a newer request.
+///
+/// The intent is the project's, not one spec's. A pass for one spec never deletes it: it only
+/// writes one (keeping the age of any that stands) when it deferred something, so a spec held back
+/// for disk is not forgotten. Only a whole-project pass settles an intent away.
 pub async fn settle_intent(
     pool: &SqlitePool,
     project_id: &str,
     created_at: &str,
+    scope: &FinishScope,
     result: &Result<FinishReport, FinishError>,
 ) {
+    let whole_project = matches!(scope, FinishScope::All { .. });
     let settled = match result {
-        Ok(report) if report.deferred.is_empty() => true,
+        Ok(report) if report.deferred.is_empty() => whole_project,
+        Ok(_) if !whole_project => {
+            if let Err(error) = store::ensure_finish_intent(pool, project_id, created_at).await {
+                tracing::warn!(%error, %project_id, "could not keep a spec finish intent");
+            }
+            false
+        }
         Ok(report) => {
             let age = chrono::DateTime::parse_from_rfc3339(created_at)
                 .map(|at| chrono::Utc::now() - at.with_timezone(&chrono::Utc))
@@ -618,7 +630,7 @@ pub async fn settle_intent(
         Err(error) => {
             tracing::warn!(%error, %project_id, "the spec finish failed");
             super::finish::announce_failure(pool, project_id, &error.to_string()).await;
-            true
+            whole_project
         }
     };
     if settled && let Err(error) = store::delete_finish_intent(pool, project_id, created_at).await {
@@ -652,7 +664,11 @@ where
             // Held until the pass is settled, then free for an owner request to take.
             let _claim = claim;
             let result = pass(state.clone(), project_id.clone()).await;
-            settle_intent(&state.pool, &project_id, &created_at, &result).await;
+            // The sweep always runs a whole-project pass.
+            let scope = FinishScope::All {
+                project_id: Some(project_id.clone()),
+            };
+            settle_intent(&state.pool, &project_id, &created_at, &scope, &result).await;
         });
     }
     while let Some(ended) = passes.join_next().await {
@@ -1003,7 +1019,10 @@ mod tests {
         )
         .await;
 
-        assert_eq!(intent_projects(&state).await, vec!["one-deferred".to_owned()]);
+        assert_eq!(
+            intent_projects(&state).await,
+            vec!["one-deferred".to_owned()]
+        );
     }
 
     #[tokio::test]

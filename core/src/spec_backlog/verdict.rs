@@ -153,6 +153,7 @@ mod tests {
             status: SpecStatus::InProgress,
             status_reason: None,
             tree_id: Some("tree-1".to_owned()),
+            tree_launched: false,
             last_audited_sha: None,
             created_at: "2026-10-30T10:00:00+00:00".to_owned(),
             updated_at: "2026-10-30T10:00:00+00:00".to_owned(),

@@ -213,9 +213,22 @@ fn docs_shell_deny() -> Json<Decision> {
 
 fn docs_shell_changes_checkout(command: &str, cwd: Option<&Path>, tool_name: &str) -> bool {
     let shell = crate::governance::classifier::shell_for(tool_name);
-    crate::command_reader::segments(command, shell)
-        .into_iter()
-        .any(|segment| docs_segment_changes_checkout(segment, cwd, shell))
+    match shell {
+        crate::command_reader::Shell::Posix => match crate::command_reader::parse(command, shell) {
+            crate::command_reader::Parsed::Commands(commands) => commands
+                .iter()
+                .any(|command| docs_segment_changes_checkout(&command.text, cwd, shell)),
+            crate::command_reader::Parsed::Unreadable(_) => true,
+        },
+        crate::command_reader::Shell::PowerShell => {
+            match crate::command_reader::read(command, shell) {
+                crate::command_reader::Reading::Sequence(segments) => segments
+                    .into_iter()
+                    .any(|segment| docs_segment_changes_checkout(segment, cwd, shell)),
+                crate::command_reader::Reading::Unreadable(_) => true,
+            }
+        }
+    }
 }
 
 fn docs_segment_changes_checkout(
@@ -225,8 +238,17 @@ fn docs_segment_changes_checkout(
 ) -> bool {
     let inner = docs_heavy_wrapper_inner(segment).unwrap_or(segment);
     docs_git_changes_index_or_history(inner)
-        || (crate::governance::classifier::lands_inside_the_workspace(inner, cwd, shell)
+        || (!docs_workspace_navigation_or_creation(inner)
+            && crate::governance::classifier::lands_inside_the_workspace(inner, cwd, shell)
             && !crate::governance::classifier::checks_formatting_without_writing(inner))
+}
+
+fn docs_workspace_navigation_or_creation(segment: &str) -> bool {
+    crate::governance::classifier::split_first_token(segment).is_some_and(|(program, _)| {
+        ["cd", "chdir", "set-location", "mkdir", "md"]
+            .iter()
+            .any(|name| program.eq_ignore_ascii_case(name))
+    })
 }
 
 /// This guard only refuses. It may therefore inspect a mutable in-checkout `heavy.py` wrapper,
@@ -247,8 +269,7 @@ fn docs_heavy_wrapper_inner(segment: &str) -> Option<&str> {
     ) {
         return None;
     }
-    let (_, inner) = rest.split_once("--")?;
-    (!inner.trim().is_empty()).then_some(inner.trim())
+    crate::governance::classifier::heavy_wrapper_arguments(rest)
 }
 
 fn docs_git_changes_index_or_history(segment: &str) -> bool {
@@ -261,10 +282,13 @@ fn docs_git_changes_index_or_history(segment: &str) -> bool {
     }
     let mut words = words.into_iter().skip(1);
     while let Some(word) = words.next() {
-        if word == "-C" || word == "-c" {
+        if ["-C", "-c", "--git-dir", "--work-tree", "--namespace"]
+            .iter()
+            .any(|option| word.eq_ignore_ascii_case(option))
+        {
             let _ = words.next();
         } else if !word.starts_with('-') {
-            return matches!(word.as_str(), "add" | "commit");
+            return word.eq_ignore_ascii_case("add") || word.eq_ignore_ascii_case("commit");
         }
     }
     false
@@ -295,17 +319,21 @@ fn docs_relative_path(path: &str, cwd: Option<&Path>) -> Option<String> {
     let path = docs_clean_path(&path)?;
     let cwd = docs_clean_path(&cwd)?;
     if absolute {
-        let prefix = format!("{}/", cwd.trim_end_matches('/'));
-        if cfg!(windows) {
-            path.to_ascii_lowercase()
-                .strip_prefix(&prefix.to_ascii_lowercase())
-                .map(str::to_owned)
-        } else {
-            path.strip_prefix(&prefix).map(str::to_owned)
-        }
+        strip_root_prefix(&path, &cwd, cfg!(windows)).map(str::to_owned)
     } else {
         Some(path)
     }
+}
+
+fn strip_root_prefix<'a>(path: &'a str, root: &str, case_insensitive: bool) -> Option<&'a str> {
+    let prefix = format!("{}/", root.trim_end_matches('/'));
+    let candidate = path.get(..prefix.len())?;
+    let matches = if case_insensitive {
+        candidate.eq_ignore_ascii_case(&prefix)
+    } else {
+        candidate == prefix
+    };
+    matches.then(|| &path[prefix.len()..])
 }
 
 fn docs_clean_path(path: &str) -> Option<String> {

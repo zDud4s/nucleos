@@ -299,8 +299,11 @@ async fn remember_pending_start(
         return;
     }
     // The record goes first, without a decision id: a crash after it leaves a record that the next
-    // driver pass heals (`heal_pending_decision`), never a decision no record knows about.
+    // driver pass heals (`heal_pending_decision`), never a decision no record knows about. It
+    // carries the generation, so a replay after a crash computes the same decision id.
+    let generation = current_generation(&job.manifest.extra);
     let record = json!({
+        "generation": generation,
         "caller": pending.caller,
         "goal": pending.goal,
         "prompt": pending.prompt,
@@ -325,8 +328,15 @@ async fn remember_pending_start(
         return;
     }
     // Then the ask, then the id into the record. Both failures are healed by the next pass.
-    let asked = match ask_for_pending(&state.pool, job_id, name, pending.caller, pending.layer)
-        .await
+    let asked = match ask_for_pending(
+        &state.pool,
+        job_id,
+        name,
+        generation,
+        pending.caller,
+        pending.layer,
+    )
+    .await
     {
         Ok(id) => id,
         Err(error) => {
@@ -341,10 +351,23 @@ async fn remember_pending_start(
     }
 }
 
-/// The id of the decision that tells the owner a pending start waits: fixed by job and branch name,
-/// so an ask whose id never reached the record is found again, not made twice.
-pub(super) fn pending_decision_id(job_id: &str, name: &str) -> String {
-    format!("pending-{job_id}-{name}")
+/// `manifest.extra` key counting how many pending records of a branch were consumed, plus one: the
+/// generation the next record is written under.
+pub(super) const GENERATION_KEY: &str = "pending_start_generation";
+
+/// The generation a pending record written now gets: the manifest's counter, 1 when it has none.
+pub(super) fn current_generation(extra: &std::collections::BTreeMap<String, Value>) -> u64 {
+    extra
+        .get(GENERATION_KEY)
+        .and_then(Value::as_u64)
+        .unwrap_or(1)
+}
+
+/// The id of the decision that tells the owner a pending start waits: fixed by job, branch name and
+/// generation, so an ask whose id never reached the record is found again, not made twice, while a
+/// later refusal of the same branch (a new generation) is a new question.
+pub(super) fn pending_decision_id(job_id: &str, name: &str, generation: u64) -> String {
+    format!("pending-{job_id}-{name}-{generation}")
 }
 
 /// Opens (insert-or-ignore) the decision of a pending start and returns its id.
@@ -352,6 +375,7 @@ async fn ask_for_pending(
     pool: &sqlx::SqlitePool,
     job_id: &str,
     name: &str,
+    generation: u64,
     caller: &str,
     layer: &str,
 ) -> Result<String, String> {
@@ -363,7 +387,7 @@ async fn ask_for_pending(
         job_id,
         caller,
         &question,
-        &pending_decision_id(job_id, name),
+        &pending_decision_id(job_id, name, generation),
     )
     .await
     .map(|asked| asked.id)
@@ -417,7 +441,9 @@ pub(super) async fn heal_pending_decision(
     }
     let caller = record["caller"].as_str().unwrap_or_default().to_owned();
     let layer = record["layer"].as_str().unwrap_or(DEFAULT_LAYER).to_owned();
-    let id = ask_for_pending(&state.pool, job_id, name, &caller, &layer).await?;
+    // The record's own generation; one written before generations existed is generation 1.
+    let generation = record["generation"].as_u64().unwrap_or(1);
+    let id = ask_for_pending(&state.pool, job_id, name, generation, &caller, &layer).await?;
     if set_decision_id(&mut job, name, &id) {
         store::update(&state.pool, &job)
             .await

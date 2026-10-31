@@ -332,6 +332,7 @@ mod tests {
             status: SpecStatus::Extracted,
             status_reason: None,
             tree_id: None,
+            tree_launched: false,
             last_audited_sha: None,
             created_at: "2026-10-31T00:00:00+00:00".to_owned(),
             updated_at: "2026-10-31T00:00:00+00:00".to_owned(),

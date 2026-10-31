@@ -2052,8 +2052,12 @@ mod tests {
     #[tokio::test]
     async fn docs_run_for_loop_git_add_is_denied() {
         let state = test_state().await;
-        assert_docs_run_refuses_shell(&state, "for f in a; do git add $f; done", "for-loop git add")
-            .await;
+        assert_docs_run_refuses_shell(
+            &state,
+            "for f in a; do git add $f; done",
+            "for-loop git add",
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -2070,18 +2074,23 @@ mod tests {
     #[tokio::test]
     async fn docs_run_command_substitution_git_add_is_denied() {
         let state = test_state().await;
-        assert_docs_run_refuses_shell(&state, "echo \"$(git add .)\"", "command substitution git add")
-            .await;
+        assert_docs_run_refuses_shell(
+            &state,
+            "echo \"$(git add .)\"",
+            "command substitution git add",
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn docs_run_unreadable_shell_command_is_denied() {
         let state = test_state().await;
-        assert_docs_run_refuses_shell(&state, "echo \"unterminated", "unreadable shell command").await;
+        assert_docs_run_refuses_shell(&state, "echo \"unterminated", "unreadable shell command")
+            .await;
     }
 
     #[tokio::test]
-    async fn docs_run_powershell_quoted_semicolon_search_is_allowed() {
+    async fn docs_run_powershell_quoted_semicolon_fails_closed() {
         let state = test_state().await;
         let run_id = seed_tree_branch_run(&state, "docs", &[".ai/notes/**"]).await;
 
@@ -2093,7 +2102,10 @@ mod tests {
         )
         .await;
 
-        assert_allowed(&decision, "a PowerShell search with a quoted semicolon");
+        // The PowerShell reader splits inside quotes on purpose (`blind_walk`), so this reads as a
+        // `git add`. A rare false refusal is the safe side for a run in the main checkout.
+        assert_eq!(decision.decision, "deny");
+        assert!(decision.reason.contains("docs"), "{}", decision.reason);
     }
 
     #[tokio::test]
@@ -2184,7 +2196,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn docs_run_heavy_wrapper_options_cargo_fmt_check_is_allowed() {
+    async fn docs_run_heavy_wrapper_options_cargo_fmt_check_passes_the_docs_guard() {
         let state = test_state().await;
         let run_id = seed_tree_branch_run(&state, "docs", &[".ai/notes/**"]).await;
 
@@ -2196,7 +2208,13 @@ mod tests {
         )
         .await;
 
-        assert_allowed(&decision, "a read-only heavy.py cargo fmt check");
+        // The docs guard lets a read-only check through. The classifier then decides on its own:
+        // it does not unwrap a broker that lives inside the checkout.
+        assert!(
+            !decision.reason.contains("docs branches"),
+            "the docs guard must not refuse a read-only check: {}",
+            decision.reason
+        );
     }
 
     #[tokio::test]

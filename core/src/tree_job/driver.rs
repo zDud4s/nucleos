@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use chrono::{SecondsFormat, Utc};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sqlx::SqlitePool;
 
 use super::decisions;
@@ -239,7 +239,8 @@ async fn retry_pending_start(
 
     // Start, then answer, then drop the record: a crash between any two repeats safely. A record
     // with no id may still have a decision (a crash between the ask and the id): the id is fixed.
-    let fallback = super::branch_start::pending_decision_id(&job.id, name);
+    let generation = record["generation"].as_u64().unwrap_or(1);
+    let fallback = super::branch_start::pending_decision_id(&job.id, name, generation);
     let decision = record["decision_id"].as_str().unwrap_or(&fallback);
     let text = format!("disk freed: branch {name} admitted automatically");
     match decisions::answer(pool, decision, &text, "driver").await {
@@ -293,6 +294,12 @@ async fn drop_pending_start(pool: &SqlitePool, job_id: &str, name: &str) -> Resu
     if pending.is_empty() {
         job.manifest.extra.remove("pending_starts");
     }
+    // The record is consumed: the next refusal of a branch is a new question. Same write as the
+    // drop, so a crash cannot leave one without the other.
+    let next = super::branch_start::current_generation(&job.manifest.extra) + 1;
+    job.manifest
+        .extra
+        .insert(super::branch_start::GENERATION_KEY.to_owned(), json!(next));
     persist(pool, &mut job).await
 }
 
@@ -2822,10 +2829,16 @@ mod tests {
             decisions_of(&fx, JOB).await,
             vec![(first_id.clone(), decisions::STATUS_OPEN.to_owned())]
         );
-        assert_eq!(recorded_decision(&fx.job(JOB).await), Some(first_id.clone()));
+        assert_eq!(
+            recorded_decision(&fx.job(JOB).await),
+            Some(first_id.clone())
+        );
 
         admit_and_end_the_branch(&fx, JOB, &gate).await;
-        assert_eq!(decision_row(&fx, &first_id).await.0, decisions::STATUS_ANSWERED);
+        assert_eq!(
+            decision_row(&fx, &first_id).await.0,
+            decisions::STATUS_ANSWERED
+        );
 
         refuse_the_start(&fx, JOB).await;
 
@@ -2888,7 +2901,10 @@ mod tests {
         admit_and_end_the_branch(&fx, JOB, &gate).await;
         refuse_the_start(&fx, JOB).await;
         let second_id = crate::tree_job::branch_start::pending_decision_id(JOB, PENDING_NAME, 2);
-        assert_eq!(recorded_decision(&fx.job(JOB).await), Some(second_id.clone()));
+        assert_eq!(
+            recorded_decision(&fx.job(JOB).await),
+            Some(second_id.clone())
+        );
 
         // The crash between the record and the ask: no decision, and the record has no id.
         sqlx::query("DELETE FROM decisions WHERE id = ?")
@@ -2915,8 +2931,15 @@ mod tests {
             Some(second_id.clone()),
             "the heal asks under the record's generation"
         );
-        assert_eq!(decision_row(&fx, &second_id).await.0, decisions::STATUS_OPEN);
-        assert_eq!(decisions_of(&fx, JOB).await.len(), 2, "one answered, one open");
+        assert_eq!(
+            decision_row(&fx, &second_id).await.0,
+            decisions::STATUS_OPEN
+        );
+        assert_eq!(
+            decisions_of(&fx, JOB).await.len(),
+            2,
+            "one answered, one open"
+        );
     }
 
     #[tokio::test]

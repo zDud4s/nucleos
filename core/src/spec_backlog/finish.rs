@@ -434,9 +434,18 @@ async fn drive_spec(
     let mut last: Option<String> = None;
     let mut adopted = adoptable_tree(&spec);
     for round in 1..=config.max_rounds {
-        let (tree_id, launched) = if let Some(tree_id) = adopted.take() {
+        // The id recorded before a launch that was never accepted: it is launched as it is.
+        let mut relaunch: Option<String> = None;
+        let waited = if let Some(tree_id) = adopted.take() {
             // A tree the spec already has: never a replacement beside it, even if it is gone.
             match launcher.wait_tree(&tree_id).await {
+                // No tree and no accepted launch: a crash fell between recording the id and
+                // creating the tree. Nothing vanished, so the same id is launched again (the
+                // launcher replays an id it already has instead of making a second tree).
+                Err(_) if !spec.tree_launched => {
+                    relaunch = Some(tree_id);
+                    None
+                }
                 Err(reason) => {
                     mark_needs_owner(
                         pool,
@@ -449,12 +458,17 @@ async fn drive_spec(
                         finished: false,
                     });
                 }
-                waited => (tree_id, waited),
+                waited => Some((tree_id, waited)),
             }
+        } else {
+            None
+        };
+        let (tree_id, launched) = if let Some(waited) = waited {
+            waited
         } else {
             let request = TreeRequest {
                 // A new id per round, or the second launch would replay the first tree.
-                id: format!("spec-{short}-r{round}-{nonce}"),
+                id: relaunch.unwrap_or_else(|| format!("spec-{short}-r{round}-{nonce}")),
                 spec_id: spec.id.clone(),
                 goal: goal_for(pool, &spec, round, last.as_deref()).await?,
                 feature_branch: branch.clone(),
@@ -466,6 +480,10 @@ async fn drive_spec(
             store::set_tree_id(pool, &spec.id, &request.id).await?;
             trees.push(request.id.clone());
             let launched = launcher.run_tree(&request).await;
+            if launched.is_ok() {
+                // The launcher took the tree: from here a missing tree really vanished.
+                store::set_tree_launched(pool, &spec.id).await?;
+            }
             (request.id, launched)
         };
         match launched {
@@ -2033,6 +2051,8 @@ mod tests {
             .await
             .unwrap();
         store::set_tree_id(&pool, &id, adopted).await.unwrap();
+        // The tree really was launched: only then does a missing tree go to the owner.
+        store::set_tree_launched(&pool, &id).await.unwrap();
         let log = Log::default();
         let launcher = FakeLauncher::new(&log);
         launcher.wait_result(adopted, Err("tree does not exist".to_owned()));
@@ -2769,6 +2789,7 @@ mod tests {
             status: SpecStatus::Extracted,
             status_reason: None,
             tree_id: None,
+            tree_launched: false,
             last_audited_sha: None,
             created_at: String::new(),
             updated_at: String::new(),

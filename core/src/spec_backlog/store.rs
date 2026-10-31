@@ -62,6 +62,7 @@ struct SpecRow {
     status: String,
     status_reason: Option<String>,
     tree_id: Option<String>,
+    tree_launched: bool,
     last_audited_sha: Option<String>,
     created_at: String,
     updated_at: String,
@@ -81,6 +82,7 @@ impl SpecRow {
             content_sha: self.content_sha,
             status_reason: self.status_reason,
             tree_id: self.tree_id,
+            tree_launched: self.tree_launched,
             last_audited_sha: self.last_audited_sha,
             created_at: self.created_at,
             updated_at: self.updated_at,
@@ -89,7 +91,8 @@ impl SpecRow {
 }
 
 const SELECT_SPEC: &str = "SELECT id, project_id, path, title, content_sha, kind, status, \
-     status_reason, tree_id, last_audited_sha, created_at, updated_at FROM specs WHERE id = ?";
+     status_reason, tree_id, tree_launched, last_audited_sha, created_at, updated_at \
+     FROM specs WHERE id = ?";
 
 pub async fn get_spec(pool: &SqlitePool, id: &str) -> Result<Option<Spec>, StoreError> {
     let row: Option<SpecRow> = sqlx::query_as(SELECT_SPEC)
@@ -361,13 +364,28 @@ pub async fn set_status(
 }
 
 /// Records the tree that is working on the spec (the latest one, when a second round replaces it).
+/// The new id is not launched yet: `tree_launched` goes back to 0 in the same statement.
 pub async fn set_tree_id(
     pool: &SqlitePool,
     spec_id: &str,
     tree_id: &str,
 ) -> Result<(), StoreError> {
-    let result = sqlx::query("UPDATE specs SET tree_id = ?, updated_at = ? WHERE id = ?")
-        .bind(tree_id)
+    let result =
+        sqlx::query("UPDATE specs SET tree_id = ?, tree_launched = 0, updated_at = ? WHERE id = ?")
+            .bind(tree_id)
+            .bind(now())
+            .bind(spec_id)
+            .execute(pool)
+            .await?;
+    if result.rows_affected() == 0 {
+        return Err(StoreError::NotFound(format!("spec {spec_id}")));
+    }
+    Ok(())
+}
+
+/// Records that the launcher accepted the tree named by the spec's `tree_id`.
+pub async fn set_tree_launched(pool: &SqlitePool, spec_id: &str) -> Result<(), StoreError> {
+    let result = sqlx::query("UPDATE specs SET tree_launched = 1, updated_at = ? WHERE id = ?")
         .bind(now())
         .bind(spec_id)
         .execute(pool)
@@ -385,7 +403,8 @@ pub async fn list_specs_by_project(
 ) -> Result<Vec<Spec>, StoreError> {
     let rows: Vec<SpecRow> = sqlx::query_as(
         "SELECT id, project_id, path, title, content_sha, kind, status, status_reason, tree_id, \
-         last_audited_sha, created_at, updated_at FROM specs WHERE project_id IS ? ORDER BY path",
+         tree_launched, last_audited_sha, created_at, updated_at FROM specs \
+         WHERE project_id IS ? ORDER BY path",
     )
     .bind(project_id)
     .fetch_all(pool)
@@ -397,7 +416,7 @@ pub async fn list_specs_by_project(
 pub async fn list_all_specs(pool: &SqlitePool) -> Result<Vec<Spec>, StoreError> {
     let rows: Vec<SpecRow> = sqlx::query_as(
         "SELECT id, project_id, path, title, content_sha, kind, status, status_reason, tree_id, \
-         last_audited_sha, created_at, updated_at FROM specs ORDER BY path",
+         tree_launched, last_audited_sha, created_at, updated_at FROM specs ORDER BY path",
     )
     .fetch_all(pool)
     .await?;
@@ -619,7 +638,7 @@ pub async fn answer_question(
                 .fetch_one(&mut *tx)
                 .await?;
         if let Some(project_id) = project_id {
-            upsert_finish_intent(&mut *tx, &project_id, &now()).await?;
+            upsert_finish_intent(&mut tx, &project_id, &now()).await?;
         }
     }
     tx.commit().await?;
@@ -667,6 +686,20 @@ pub async fn write_finish_intent_at(
 ) -> Result<(), StoreError> {
     let mut conn = pool.acquire().await?;
     upsert_finish_intent(&mut conn, project_id, created_at).await
+}
+
+/// Records an intent for `project_id` unless one stands: an existing intent keeps its `created_at`.
+pub async fn ensure_finish_intent(
+    pool: &SqlitePool,
+    project_id: &str,
+    created_at: &str,
+) -> Result<(), StoreError> {
+    sqlx::query("INSERT OR IGNORE INTO spec_finish_intents (project_id, created_at) VALUES (?, ?)")
+        .bind(project_id)
+        .bind(created_at)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// Every pending finish intent as `(project_id, created_at)`, ordered by project.

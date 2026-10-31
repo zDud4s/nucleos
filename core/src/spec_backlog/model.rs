@@ -114,6 +114,9 @@ pub struct Spec {
     pub status: SpecStatus,
     pub status_reason: Option<String>,
     pub tree_id: Option<String>,
+    /// True once the launcher accepted the tree named by `tree_id`; recording a new id clears it.
+    #[serde(default)]
+    pub tree_launched: bool,
     pub last_audited_sha: Option<String>,
     pub created_at: String,
     pub updated_at: String,
