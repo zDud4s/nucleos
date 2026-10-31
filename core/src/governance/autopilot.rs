@@ -934,7 +934,7 @@ pub async fn rewire_wired_projects(pool: &sqlx::SqlitePool) -> sqlx::Result<usiz
         let mut rewired = 0;
         for root in roots {
             let dir = Path::new(&root);
-            if !classifier_hook_is_wired(dir) {
+            if !classifier_hook_is_wired(dir) || !classifier_hook_timeout_is_short(dir) {
                 continue;
             }
             match wire_classifier_hook(dir) {
@@ -947,6 +947,17 @@ pub async fn rewire_wired_projects(pool: &sqlx::SqlitePool) -> sqlx::Result<usiz
     .await
     .unwrap_or(0);
     Ok(rewired)
+}
+
+/// Whether `dir` was wired before the current hook timeout, so it needs wiring again. A settings
+/// file this cannot read counts as no: `wire_hook` would refuse it anyway. Asking first is what
+/// keeps a current folder untouched: rewriting the script while a hook of another conversation is
+/// reading it would break that hook, and a project tracking these files would show a diff.
+pub fn classifier_hook_timeout_is_short(dir: &Path) -> bool {
+    std::fs::read_to_string(dir.join(".claude").join("settings.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .is_some_and(|settings| hook_timeout::gate_timeout_is_short(&settings))
 }
 
 /// The tools whose calls the classifier has to see for the barrier to mean anything.

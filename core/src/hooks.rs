@@ -2586,26 +2586,63 @@ mod tests {
         assert!(asks_for(&chat_id).is_empty());
     }
 
-    /// A question stands as long as its hook's connection does, however long that is: the CLI holds
-    /// the call, and a person may answer hours later from another machine. Nothing ages it out.
+    /// A question a hook waits on stands as long as that hook's connection does, however long: the
+    /// CLI holds the call, and a person may answer hours later from another machine. Nothing ages
+    /// it out, not even a long time past the grace a question nobody waits on gets.
     #[tokio::test]
-    async fn a_question_stands_past_the_old_lifetime() {
+    async fn a_question_a_hook_waits_on_stands_past_the_grace() {
         let state = test_state().await;
         let root = tempfile::TempDir::new().unwrap();
         let (chat_id, run_id) = rooted_conversation(&state, &root).await;
 
         let id = ask_about(&chat_id, run_id, "Bash", Some("npm publish".to_owned()));
+        let waiting =
+            tokio::spawn(async move { wait_for_run(run_id, Duration::from_secs(30)).await });
+        // The hook has started waiting once the receiver has been taken out of the table.
+        for _ in 0..200 {
+            let taken = super::asks::ASKS
+                .lock()
+                .unwrap()
+                .get(&id)
+                .is_some_and(|pending| pending.heard.is_none());
+            if taken {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         // Another run asking, which is what used to sweep the old ones out.
         let _other = ask_about(&chat_id, run_id + 1, "Bash", None);
+        super::asks::backdate_ask(&id, ASK_WAIT_GRACE * 1000);
 
-        let waiting = asks_for(&chat_id);
-        assert!(waiting.iter().any(|ask| ask.id == id));
+        assert!(asks_for(&chat_id).iter().any(|ask| ask.id == id));
         assert!(ask_is_open(&id));
         assert!(run_is_parked(run_id));
         assert!(chat_has_open_ask(&chat_id));
+        assert!(answer_ask(&id, true));
+        assert_eq!(waiting.await.unwrap(), Some(true));
         forget_asks_for_chat(&chat_id);
         assert!(!chat_has_open_ask(&chat_id));
         assert!(!run_is_parked(run_id));
+    }
+
+    /// A question whose hook never came to wait is a ghost once the grace has passed: its CLI may
+    /// live on, so neither the hook's connection nor the process ending would ever clear it, and it
+    /// would pin the process and sit in the window for good.
+    #[tokio::test]
+    async fn a_question_no_hook_waits_on_goes_after_the_grace() {
+        let state = test_state().await;
+        let root = tempfile::TempDir::new().unwrap();
+        let (chat_id, run_id) = rooted_conversation(&state, &root).await;
+
+        let id = ask_about(&chat_id, run_id, "Bash", Some("npm publish".to_owned()));
+        assert!(ask_is_open(&id), "a fresh question stands within the grace");
+        super::asks::backdate_ask(&id, ASK_WAIT_GRACE + Duration::from_secs(1));
+
+        assert!(asks_for(&chat_id).is_empty());
+        assert!(!chat_has_open_ask(&chat_id));
+        assert!(!ask_is_open(&id));
+        assert!(!run_is_parked(run_id));
+        assert!(!answer_ask(&id, true), "an expired question took an answer");
     }
 
     /// The hook outwaits the daemon, so the daemon gives the answer, and the CLI's timeout outwaits

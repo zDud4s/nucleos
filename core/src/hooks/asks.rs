@@ -6,10 +6,22 @@
 /// call open for as long as the settings entry's `timeout` says (`HOOK_TIMEOUT_SECONDS`, thirty
 /// days), so a question can stand for as long as the CLI lives and be answered hours later from
 /// another machine. The hook's own wait (`ask_daemon.py`) outlasts this by half an hour, and the
-/// CLI's timeout outlasts that, so the daemon, not the CLI cutting the hook off, gives the answer. A hook the CLI cuts does not block the tool, it falls through to the ordinary
-/// permission flow.
+/// CLI's timeout outlasts that, so the daemon, not the CLI cutting the hook off, gives the answer.
+/// A hook the CLI cuts does not block the tool, it falls through to the ordinary permission flow.
+///
+/// It bounds a question a hook is waiting on. A question no hook ever started waiting on is bounded
+/// by `ASK_WAIT_GRACE` instead.
 pub const ASK_WINDOW: std::time::Duration =
     std::time::Duration::from_secs(30 * 24 * 60 * 60 - 60 * 60);
+
+/// How long a question may stand before a hook has started waiting on it.
+///
+/// The gate call registers the question and the hook comes back to `/hooks/ask-wait` a moment later.
+/// A hook that died in between leaves a question nobody will ever collect, while its CLI lives on,
+/// so neither the hook's connection (`TakeDown`) nor the process's end (`LiveChat` drop) takes it
+/// down. Past this grace such a question is a ghost and goes; one a hook waits on never expires
+/// here, because its connection ends it.
+pub const ASK_WAIT_GRACE: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// One tool call a conversation is waiting to be allowed.
 ///
@@ -58,6 +70,27 @@ pub(super) struct Pending {
     pub(super) answer: Option<tokio::sync::oneshot::Sender<bool>>,
     /// Handed to the hook call that waits, and taken for the same reason.
     pub(super) heard: Option<tokio::sync::oneshot::Receiver<bool>>,
+    /// When it was asked, so a question no hook came to wait on can expire (`ASK_WAIT_GRACE`).
+    pub(super) asked_at: std::time::Instant,
+}
+
+/// Takes down every question whose hook never started waiting (`heard` still there) within
+/// `ASK_WAIT_GRACE`. Called wherever the map is read or written to decide something, which is
+/// exactly where a ghost would otherwise be seen, kept alive by `chat_has_open_ask`, or answered.
+fn forget_ghosts(asks: &mut std::collections::HashMap<String, Pending>) {
+    asks.retain(|_, pending| {
+        !(pending.heard.is_some() && pending.asked_at.elapsed() >= ASK_WAIT_GRACE)
+    });
+}
+
+/// Makes a question look `by` older than it is, so a test can cross the grace without sleeping.
+#[cfg(test)]
+pub(super) fn backdate_ask(id: &str, by: std::time::Duration) {
+    let mut asks = ASKS.lock().unwrap();
+    let pending = asks.get_mut(id).expect("the question to age is standing");
+    pending.asked_at = std::time::Instant::now()
+        .checked_sub(by)
+        .expect("the clock has run long enough to age a question");
 }
 
 pub(super) static ASKS: std::sync::LazyLock<
@@ -90,6 +123,7 @@ fn register_ask(
     let id = crate::auth::generate_uuid_v4();
     let (answer, heard) = tokio::sync::oneshot::channel();
     let mut asks = ASKS.lock().unwrap();
+    forget_ghosts(&mut asks);
     // **One question per run, the newest.** A run has one tool call in flight (see `wait_for_run`),
     // so an older question of the same run is a ghost: its hook died between asking and waiting.
     // Left standing, the judge could still answer it `true`, and `wait_for_run` — which finds a
@@ -108,6 +142,7 @@ fn register_ask(
             call,
             answer: Some(answer),
             heard: Some(heard),
+            asked_at: std::time::Instant::now(),
         },
     );
     id
@@ -115,29 +150,30 @@ fn register_ask(
 
 /// Whether this question is still standing, answered or not yet.
 pub fn ask_is_open(id: &str) -> bool {
-    ASKS.lock().unwrap().contains_key(id)
+    let mut asks = ASKS.lock().unwrap();
+    forget_ghosts(&mut asks);
+    asks.contains_key(id)
 }
 
 /// Whether this run has a tool call parked on a question.
 pub fn run_is_parked(run_id: i64) -> bool {
-    ASKS.lock()
-        .unwrap()
-        .values()
-        .any(|pending| pending.ask.run_id == run_id)
+    let mut asks = ASKS.lock().unwrap();
+    forget_ghosts(&mut asks);
+    asks.values().any(|pending| pending.ask.run_id == run_id)
 }
 
 /// Whether anything of this conversation is waiting on a person, which is work for the process
 /// that holds the CLI: reaping it would cut the hook's call and let the tool fall through.
 pub fn chat_has_open_ask(chat_id: &str) -> bool {
-    ASKS.lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .values()
-        .any(|pending| pending.ask.chat_id == chat_id)
+    let mut asks = ASKS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    forget_ghosts(&mut asks);
+    asks.values().any(|pending| pending.ask.chat_id == chat_id)
 }
 
 /// Takes down every question of a conversation whose process is gone. The hook's connection
-/// (`TakeDown`) is the other way a question ends; this is for a CLI that died with its hook
-/// between the two calls, which nothing else would ever clear.
+/// (`TakeDown`) ends a question being waited on, and `ASK_WAIT_GRACE` one whose hook never arrived
+/// while its process lives; this is for a CLI that died with its hook, which nothing else would
+/// ever clear.
 pub fn forget_asks_for_chat(chat_id: &str) {
     ASKS.lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -146,7 +182,8 @@ pub fn forget_asks_for_chat(chat_id: &str) {
 
 /// What this conversation is waiting to be allowed, which is nearly always nothing or one thing.
 pub fn asks_for(chat_id: &str) -> Vec<Ask> {
-    let asks = ASKS.lock().unwrap();
+    let mut asks = ASKS.lock().unwrap();
+    forget_ghosts(&mut asks);
     asks.values()
         .filter(|pending| pending.ask.chat_id == chat_id)
         .map(|pending| pending.ask.clone())
@@ -158,9 +195,9 @@ pub fn asks_for(chat_id: &str) -> Vec<Ask> {
 /// Only those still unanswered (`answer` not yet taken) and only those that kept their call, so a
 /// question somebody just answered, or one opened without a call, is never handed back.
 pub(super) fn open_calls(chat_id: &str) -> Vec<(String, i64, String, AskedCall)> {
-    ASKS.lock()
-        .unwrap()
-        .values()
+    let mut asks = ASKS.lock().unwrap();
+    forget_ghosts(&mut asks);
+    asks.values()
         .filter(|pending| pending.ask.chat_id == chat_id && pending.answer.is_some())
         .filter_map(|pending| {
             let call = pending.call.clone()?;
@@ -177,11 +214,11 @@ pub(super) fn open_calls(chat_id: &str) -> Vec<(String, i64, String, AskedCall)>
 /// Answers one question. `false` when there was nothing to answer, which is a race a person loses
 /// harmlessly: the turn moved on, or somebody answered a moment sooner.
 pub fn answer_ask(id: &str, allow: bool) -> bool {
-    let answer = ASKS
-        .lock()
-        .unwrap()
-        .get_mut(id)
-        .and_then(|pending| pending.answer.take());
+    let answer = {
+        let mut asks = ASKS.lock().unwrap();
+        forget_ghosts(&mut asks);
+        asks.get_mut(id).and_then(|pending| pending.answer.take())
+    };
     match answer {
         Some(answer) => answer.send(allow).is_ok(),
         None => false,
@@ -202,6 +239,7 @@ pub fn answer_ask(id: &str, allow: bool) -> bool {
 pub async fn wait_for_run(run_id: i64, window: std::time::Duration) -> Option<bool> {
     let (id, heard) = {
         let mut asks = ASKS.lock().unwrap();
+        forget_ghosts(&mut asks);
         let (id, pending) = asks
             .iter_mut()
             .find(|(_, pending)| pending.ask.run_id == run_id)?;
