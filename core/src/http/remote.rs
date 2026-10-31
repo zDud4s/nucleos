@@ -824,7 +824,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_malformed_remote_yaml_is_refused_on_and_off_and_left_alone() {
-        let mut state = test_state().await;
+        let state = test_state().await;
         let tmp = tempfile::tempdir().unwrap();
         let (root, exe_dir) = (tmp.path().join("home"), tmp.path().join("app"));
         page_in(&exe_dir);
@@ -848,11 +848,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&file).unwrap(), broken);
         assert!(!crate::remote::is_armed(&state.pool).await.unwrap());
 
-        state.machine_config_root = Some(root.clone());
-        let response = delete_setup(State(state.clone()), Extension(Scope::Control))
-            .await
-            .into_response();
-        let (status, body) = body_of(response).await;
+        let (status, body) = body_of(turn_off(&state, &root, true, None).await).await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["refusal"], "config_unreadable");
         assert_eq!(std::fs::read_to_string(&file).unwrap(), broken);
