@@ -2424,6 +2424,36 @@ mod tests {
         }
     }
 
+    /// The per-conversation compaction switch sits under `assistant`, so it is classified by the
+    /// segment lists and needs no entry of its own: only an Admin device reaches it, and no scoped
+    /// API token (read-only or run-creating) has it in a table. Pinned because a future table entry
+    /// would quietly open a chat write to keys minted for reading.
+    #[test]
+    fn the_auto_compact_switch_is_an_admin_only_chat_write() {
+        let route = "/assistant/chats/{chat_id}/auto-compact";
+        for level in [ApiTokenLevel::ReadOnly, ApiTokenLevel::RunCreating] {
+            assert!(
+                !grants(&Scope::ApiToken(level), &Method::PUT, route, Target::Route),
+                "{level:?} token"
+            );
+            assert!(
+                !remote_device_permits(level, &Method::PUT, route),
+                "{level:?} device"
+            );
+        }
+        assert!(grants(
+            &Scope::ApiToken(ApiTokenLevel::Admin),
+            &Method::PUT,
+            route,
+            Target::Route
+        ));
+        assert!(remote_device_permits(
+            ApiTokenLevel::Admin,
+            &Method::PUT,
+            route
+        ));
+    }
+
     /// Owner decision: a remote device with the Admin role may read and edit `/settings`; the lower
     /// roles may not, reads included (a settings document holds shortcuts, accounts and gate
     /// commands). Every route the settings router registers is covered.

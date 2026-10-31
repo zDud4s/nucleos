@@ -293,7 +293,29 @@ async fn write_document(
     .await
     .map_err(refused)?;
     reload_channels_after(&state, &scope, doc.name);
+    void_stale_after(&state, &scope, doc.name).await;
     Ok(Json(json!({ "version": version })))
+}
+
+/// A published `devtime` document changes the thresholds the pending shadow rows were decided under:
+/// those rows are voided at once, from the snapshot the store has already swapped (the ingest loop reads
+/// the same `actions` from the next cycle). Rows the owner already judged are left alone. A failure is
+/// logged and never fails the write, which is already committed; the startup sweep catches up on the
+/// next start.
+async fn void_stale_after(state: &AppState, scope: &Scope, name: &str) {
+    if !matches!(scope, Scope::Machine) || name != "devtime" {
+        return;
+    }
+    let config = store::get_opt::<crate::config::DevtimeConfig>(&Scope::Machine).unwrap_or_default();
+    match crate::devtime::store::void_stale_thresholds(&state.pool, &config.actions).await {
+        Ok(voided) if voided > 0 => {
+            tracing::info!(voided, "voided the pending devtime actions after a thresholds change");
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(%error, "voiding the pending devtime actions after a thresholds change failed");
+        }
+    }
 }
 
 /// A published `channels/<id>` document applies at once: the hub re-reads its configuration from the snapshot,
@@ -351,8 +373,12 @@ async fn rollback_document(
     .await
     .map_err(refused)?;
     reload_channels_after(&state, &scope, doc.name);
+    void_stale_after(&state, &scope, doc.name).await;
     Ok(Json(json!({ "version": version })))
 }
+
+#[cfg(test)]
+mod devtime_void_tests;
 
 #[cfg(test)]
 mod tests {
