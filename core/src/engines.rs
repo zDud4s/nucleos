@@ -15,12 +15,17 @@ use crate::config::{ModelsConfig, SeatKind};
 use crate::execution::runner::CommandRunner;
 use crate::models::model_catalog::Discovered;
 
+pub mod agy;
 mod agy_setting;
 
 /// Engine ids, named once so the enums that mirror the table can match on them.
 pub const CLAUDE: &str = "claude";
 pub const CODEX: &str = "codex";
 pub const LOCAL: &str = "local";
+pub const AGY: &str = "agy";
+
+/// The refusal for agy at every launch site of agents, teams and council.
+pub const AGY_REFUSAL: &str = "the agy engine is not available for agents, teams or council";
 
 /// How an engine is reached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +45,8 @@ pub struct EngineDescription {
     pub transport: Transport,
     /// Whether the engine is usable on this machine (nothing is run).
     pub installed: fn() -> bool,
+    /// Whether the row is switched on; a row that is off is absent from every derived list.
+    pub gate: fn() -> bool,
     /// The cheap model a background one-shot asks this engine for, among the models known now.
     pub utility_default: fn(&[Discovered]) -> Option<String>,
     /// The runner this engine launches, built from the models file; `None` when it has no CLI runner.
@@ -90,6 +97,11 @@ fn codex_row_runner(models: &ModelsConfig) -> Option<Arc<dyn CommandRunner>> {
     Some(codex_runner(models))
 }
 
+/// The gate of the engines that are always on.
+fn always() -> bool {
+    true
+}
+
 fn local_runner(_models: &ModelsConfig) -> Option<Arc<dyn CommandRunner>> {
     None
 }
@@ -106,6 +118,7 @@ pub const TABLE: &[EngineDescription] = &[
         seat_kind: SeatKind::Cloud,
         transport: Transport::Cli,
         installed: claude_installed,
+        gate: always,
         utility_default: crate::models::model_catalog::claude_utility_default,
         runner: claude_row_runner,
     },
@@ -115,6 +128,7 @@ pub const TABLE: &[EngineDescription] = &[
         seat_kind: SeatKind::Cloud,
         transport: Transport::Cli,
         installed: codex_installed,
+        gate: always,
         utility_default: crate::models::model_catalog::codex_utility_default,
         runner: codex_row_runner,
     },
@@ -124,10 +138,31 @@ pub const TABLE: &[EngineDescription] = &[
         seat_kind: SeatKind::Local,
         transport: Transport::Http,
         installed: local_installed,
+        gate: always,
         utility_default: local_utility_default,
         runner: local_runner,
     },
+    EngineDescription {
+        id: AGY,
+        display_name: "Antigravity",
+        seat_kind: SeatKind::Cloud,
+        transport: Transport::Cli,
+        installed: agy::installed,
+        gate: agy::enabled,
+        utility_default: local_utility_default,
+        runner: agy::runner,
+    },
 ];
+
+/// The rows whose gate is open, in table order.
+pub fn enabled_in(table: &[EngineDescription]) -> Vec<&EngineDescription> {
+    table.iter().filter(|row| (row.gate)()).collect()
+}
+
+/// The production rows that are switched on: what every derived list reads.
+pub fn enabled_table() -> Vec<&'static EngineDescription> {
+    enabled_in(TABLE)
+}
 
 /// The row with this id.
 pub fn find_in<'a>(table: &'a [EngineDescription], id: &str) -> Option<&'a EngineDescription> {
@@ -137,11 +172,6 @@ pub fn find_in<'a>(table: &'a [EngineDescription], id: &str) -> Option<&'a Engin
 /// The row with this id when it is a CLI runner.
 pub fn cli_row_in<'a>(table: &'a [EngineDescription], id: &str) -> Option<&'a EngineDescription> {
     find_in(table, id).filter(|row| row.transport == Transport::Cli)
-}
-
-/// `(id, seat kind)` per row, in table order.
-pub fn seat_kinds_in(table: &[EngineDescription]) -> Vec<(&'static str, SeatKind)> {
-    table.iter().map(|row| (row.id, row.seat_kind)).collect()
 }
 
 /// The ids of the rows reached through `transport`.

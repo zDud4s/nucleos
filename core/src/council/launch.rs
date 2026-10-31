@@ -125,6 +125,12 @@ pub(super) async fn resolve_seat(
             "{who} names the agent `{agent_id}`, which declares no engine — a package agent              cannot take a council seat"
         )));
     };
+    if engine == crate::engines::AGY {
+        return Err(StartError::Invalid(format!(
+            "{who} names the agent `{agent_id}`: {}",
+            crate::engines::AGY_REFUSAL
+        )));
+    }
     let kind = crate::config::seat_kind_for_engine(engine).ok_or_else(|| {
         StartError::Invalid(format!(
             "{who} names the agent `{agent_id}`, whose engine `{engine}` is not one a seat can run"

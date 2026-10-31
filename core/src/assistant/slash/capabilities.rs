@@ -15,6 +15,7 @@ pub enum ChatEngine {
     Codex,
     Local,
     OpenRouter,
+    Agy,
 }
 
 impl ChatEngine {
@@ -24,6 +25,7 @@ impl ChatEngine {
             Self::Claude => crate::engines::CLAUDE,
             Self::Codex => crate::engines::CODEX,
             Self::Local => crate::engines::LOCAL,
+            Self::Agy => crate::engines::AGY,
             // Not an engine row: OpenRouter is a hosted brain, not a launchable engine.
             Self::OpenRouter => "openrouter",
         }
@@ -33,7 +35,28 @@ impl ChatEngine {
     fn of_cli(cli: &str) -> Self {
         match crate::engines::runner_id_in(crate::engines::TABLE, cli) {
             crate::engines::CODEX => Self::Codex,
+            crate::engines::AGY => Self::Agy,
             _ => Self::Claude,
+        }
+    }
+
+    /// The chat engine a stored engine id names, among the rows that are switched on. An id the
+    /// table does not list (agy with its setting off included) is `None`: the caller refuses it,
+    /// it never becomes Claude.
+    pub fn from_stored(id: &str) -> Option<Self> {
+        let enabled: Vec<crate::engines::EngineDescription> = crate::engines::enabled_table()
+            .into_iter()
+            .cloned()
+            .collect();
+        let id = crate::engines::chat_ids_in(&enabled)
+            .into_iter()
+            .find(|row| *row == id)?;
+        match id {
+            crate::engines::CLAUDE => Some(Self::Claude),
+            crate::engines::CODEX => Some(Self::Codex),
+            crate::engines::LOCAL => Some(Self::Local),
+            crate::engines::AGY => Some(Self::Agy),
+            _ => None,
         }
     }
 }
@@ -81,6 +104,9 @@ pub fn support(engine: ChatEngine, capability: Capability) -> Support {
         (DeniedTools | Agents, Claude) => Yes,
         (TurnBudget, Claude) => Yes,
         (TurnBudget, Local | OpenRouter) => Warn,
+        // Agy takes `--effort` and `--add-dir` and refuses every other control.
+        (Effort | ExtraDirs, Agy) => Yes,
+        (DeniedTools | TurnBudget | Agents | RegistryMcp, Agy) => No,
         _ => No,
     }
 }

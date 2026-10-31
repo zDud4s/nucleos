@@ -27,6 +27,7 @@ pub enum Engine {
     Claude,
     Codex,
     Local,
+    Agy,
 }
 
 impl Engine {
@@ -35,6 +36,7 @@ impl Engine {
             Self::Claude => crate::engines::CLAUDE,
             Self::Codex => crate::engines::CODEX,
             Self::Local => crate::engines::LOCAL,
+            Self::Agy => crate::engines::AGY,
         }
     }
 }
@@ -44,6 +46,7 @@ impl From<RunnerKind> for Engine {
         match kind {
             RunnerKind::Claude => Self::Claude,
             RunnerKind::Codex => Self::Codex,
+            RunnerKind::Agy => Self::Agy,
         }
     }
 }
@@ -163,15 +166,27 @@ pub fn translate(engine: Engine, caps: &[Capability]) -> Result<EngineTools, Uns
                 }
             }
         }
+        // Agents cannot run agy in this delivery: every capability is refused by name.
+        Engine::Agy => {
+            if let Some(&capability) = caps.first() {
+                return Err(Unsupported { engine, capability });
+            }
+        }
     }
     Ok(tools)
 }
 
 /// The CLI runners that translate `caps` without error.
 pub fn translatable_runners(caps: &[Capability]) -> Vec<RunnerKind> {
-    crate::engines::ids_with_transport_in(crate::engines::TABLE, crate::engines::Transport::Cli)
+    let enabled: Vec<crate::engines::EngineDescription> = crate::engines::enabled_table()
+        .into_iter()
+        .cloned()
+        .collect();
+    crate::engines::ids_with_transport_in(&enabled, crate::engines::Transport::Cli)
         .into_iter()
         .filter_map(RunnerKind::parse)
+        // An empty capability list translates for agy, but agents never run on it.
+        .filter(|&kind| kind != RunnerKind::Agy)
         .filter(|&kind| translate(kind.into(), caps).is_ok())
         .collect()
 }

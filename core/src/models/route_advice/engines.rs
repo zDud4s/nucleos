@@ -120,7 +120,11 @@ pub fn front(
 
 /// Which engines' CLIs are installed on this machine, by resolving their programs (nothing is run).
 pub fn installed_engines() -> Vec<RunnerKind> {
-    crate::engines::installed_in(crate::engines::TABLE)
+    let enabled: Vec<crate::engines::EngineDescription> = crate::engines::enabled_table()
+        .into_iter()
+        .cloned()
+        .collect();
+    crate::engines::installed_in(&enabled)
         .into_iter()
         .filter_map(RunnerKind::parse)
         .collect()
@@ -150,7 +154,12 @@ pub fn front_with(
     // What the router may route to: only what `config.runners` names, never widened.
     let mut alternates: Vec<Available> = Vec::new();
     for name in &config.runners {
-        let Some(kind) = RunnerKind::parse(name) else {
+        // A runner whose row is switched off (agy without its opt-in) is as good as unknown.
+        let Some(kind) = RunnerKind::parse(name).filter(|kind| {
+            crate::engines::enabled_table()
+                .iter()
+                .any(|row| row.id == kind.as_str())
+        }) else {
             tracing::warn!(%name, "router config names a runner this daemon cannot launch; ignoring it");
             continue;
         };

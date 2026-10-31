@@ -136,12 +136,20 @@ fn plan_launch(
                 LaunchError::NoRunner(format!("{label} is pinned to unknown engine `{other}`"))
             })?,
         };
+        if engine == Engine::Agy {
+            return Err(LaunchError::NoRunner(format!(
+                "{label}: {}",
+                crate::engines::AGY_REFUSAL
+            )));
+        }
         let tools = capabilities::translate(engine, caps)
             .map_err(|why| LaunchError::Unsupported(label.to_owned(), why))?;
         let runners = match engine {
             Engine::Claude => vec![RunnerKind::Claude],
             Engine::Codex => vec![RunnerKind::Codex],
             Engine::Local => Vec::new(),
+            // Refused above; no runner is ever listed for agy.
+            Engine::Agy => Vec::new(),
         };
         return Ok(Plan {
             runners,

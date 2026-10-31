@@ -113,6 +113,7 @@ impl Surface {
 pub enum RunnerKind {
     Claude,
     Codex,
+    Agy,
 }
 
 impl RunnerKind {
@@ -120,6 +121,7 @@ impl RunnerKind {
         match self {
             Self::Claude => crate::engines::CLAUDE,
             Self::Codex => crate::engines::CODEX,
+            Self::Agy => crate::engines::AGY,
         }
     }
 
@@ -128,6 +130,7 @@ impl RunnerKind {
         match crate::engines::cli_row_in(crate::engines::TABLE, value)?.id {
             crate::engines::CLAUDE => Some(Self::Claude),
             crate::engines::CODEX => Some(Self::Codex),
+            crate::engines::AGY => Some(Self::Agy),
             _ => None,
         }
     }
@@ -401,6 +404,8 @@ impl Router {
             let fits = match alternate.kind {
                 RunnerKind::Claude => true,
                 RunnerKind::Codex => codex_can_take(shape),
+                // Agy cannot run an agent node in this delivery: never offered as an alternate.
+                RunnerKind::Agy => false,
             };
             if fits && !kinds.contains(&alternate.kind) {
                 kinds.push(alternate.kind);
@@ -978,6 +983,8 @@ fn default_model(models: &crate::config::ModelsConfig, kind: RunnerKind) -> Stri
     match kind {
         RunnerKind::Claude => models.claude_model.clone(),
         RunnerKind::Codex => models.codex_model.clone(),
+        // Agy is never a routed runner here, so no model file names a default for it.
+        RunnerKind::Agy => String::new(),
     }
 }
 

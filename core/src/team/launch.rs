@@ -530,10 +530,19 @@ pub(super) async fn spawn_agent(
         .map(|(_, model)| model.clone())
         .filter(|model| !model.is_empty())
         .or_else(|| agent.model.clone());
-    let pin_kind = launch
+    let pin_kind = match launch
         .pin
         .as_ref()
-        .and_then(|(engine, _)| runner_kind_of(*engine));
+        .map(|(engine, _)| runner_kind_of(*engine))
+        .transpose()
+    {
+        Ok(kind) => kind.flatten(),
+        Err(why) => {
+            fail_run(&pool, run_id, &why).await;
+            stop_if_the_run_ended(state, &run.id, run_id).await;
+            return;
+        }
+    };
     let runners = launch.runners.clone();
     // Only a package agent has an output shape its answer is held to; a user agent's is free.
     let shape = agent.is_package().then_some(launch.output);
@@ -742,16 +751,17 @@ pub(super) async fn spawn_agent(
     stop_if_the_run_ended(state, &run.id, run_id).await;
 }
 
-/// The runner kind a CLI engine launches on; the local engine has none.
+/// The runner kind a CLI engine launches on; the local engine has none and agy is refused.
 fn runner_kind_of(
     engine: crate::agents::capabilities::Engine,
-) -> Option<crate::models::route_advice::RunnerKind> {
+) -> Result<Option<crate::models::route_advice::RunnerKind>, String> {
     use crate::agents::capabilities::Engine;
     use crate::models::route_advice::RunnerKind;
     match engine {
-        Engine::Claude => Some(RunnerKind::Claude),
-        Engine::Codex => Some(RunnerKind::Codex),
-        Engine::Local => None,
+        Engine::Claude => Ok(Some(RunnerKind::Claude)),
+        Engine::Codex => Ok(Some(RunnerKind::Codex)),
+        Engine::Local => Ok(None),
+        Engine::Agy => Err(crate::engines::AGY_REFUSAL.to_owned()),
     }
 }
 
