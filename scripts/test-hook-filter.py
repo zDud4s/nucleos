@@ -1643,6 +1643,37 @@ def claimed_land_override_cases():
     return results
 
 
+def stop_timer_cases():
+    """core/hooks/stop_timer.py: exit 2 wakes the session, so only the bundle's own 2 may get out."""
+    script = os.path.join(ROOT, "core", "hooks", "stop_timer.py")
+
+    def run(project, exit_code=None, raises=False):
+        with tempfile.TemporaryDirectory() as tmp:
+            scripts = os.path.join(tmp, "bundle", "scripts")
+            os.makedirs(scripts)
+            workflow = os.path.join(tmp, ".nucleos", "workflow")
+            os.makedirs(workflow)
+            if project:
+                with open(os.path.join(workflow, "project.json"), "w", encoding="utf-8") as f:
+                    json.dump({"bundle_dir": os.path.join(tmp, "bundle")}, f)
+            if exit_code is not None or raises:
+                with open(os.path.join(scripts, "spec_loop_timer.py"), "w", encoding="utf-8") as f:
+                    f.write("raise ValueError('x')\n" if raises else f"import sys\nsys.exit({exit_code})\n")
+            env = {**os.environ, "CLAUDE_PROJECT_DIR": tmp}
+            return subprocess.run([sys.executable, script], env=env, input=b"{}", capture_output=True).returncode
+
+    cases = [
+        ("no project.json", run(False, exit_code=2), 0),
+        ("a bundle older than the timer", run(True), 0),
+        ("the timer wakes", run(True, exit_code=2), 2),
+        ("the timer is quiet", run(True, exit_code=0), 0),
+        ("the timer exits with some other error", run(True, exit_code=1), 0),
+        ("the timer raises", run(True, raises=True), 0),
+    ]
+    return [(f"stop_timer, {label}", None if got == want else f"exit {got}, wanted {want}")
+            for label, got, want in cases]
+
+
 def main() -> int:
     failures = 0
     for command, want in CASES:
@@ -1686,6 +1717,7 @@ def main() -> int:
         + claims_tool_call_cases()
         + claims_prompt_cases()
         + claimed_land_override_cases()
+        + stop_timer_cases()
     ):
         total += 1
         if failure:

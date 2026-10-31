@@ -745,6 +745,37 @@ fn session_start_entry() -> serde_json::Value {
     })
 }
 
+/// The background half of `Stop`: runs the pinned bundle's timer, which wakes a session parked on
+/// background work before its prompt cache expires. Its own script and not `ask_daemon.py`: it sleeps
+/// for most of an hour, and `asyncRewake` turns its exit 2 into a wake-up instead of a refused stop.
+const STOP_TIMER_SCRIPT: &str = ".claude/hooks/stop_timer.py";
+const STOP_TIMER_SOURCE: &str = include_str!("../../hooks/stop_timer.py");
+
+/// Enforced by Claude Code on an `asyncRewake` hook, so it has to outlast the longest window the
+/// timer sleeps (55 minutes, `spec_loop_timer.py`).
+const STOP_TIMER_TIMEOUT_SECONDS: u64 = 3500;
+
+/// Adds the timer to the `Stop` list `wire_event` has already made, once. Beside the entry for
+/// `ask_daemon.py`, and judged by its own script path: `wire_event`'s dedupe looks for the other one.
+fn wire_stop_timer(hooks: &mut serde_json::Map<String, serde_json::Value>) {
+    let Some(list) = hooks.get_mut("Stop").and_then(|stop| stop.as_array_mut()) else {
+        return;
+    };
+    let already = list.iter().any(|existing| {
+        serde_json::to_string(existing).is_ok_and(|text| text.contains(STOP_TIMER_SCRIPT))
+    });
+    if !already {
+        list.push(serde_json::json!({
+            "hooks": [{
+                "type": "command",
+                "command": format!("{HOOK_INTERPRETER} \"${{CLAUDE_PROJECT_DIR}}/{STOP_TIMER_SCRIPT}\""),
+                "asyncRewake": true,
+                "timeout": STOP_TIMER_TIMEOUT_SECONDS
+            }]
+        }));
+    }
+}
+
 /// The auto-compact window written into a project's `env` when it names none: the root soft
 /// threshold (120k tokens). The CLI clamps it to 100k-1M.
 pub const AUTO_COMPACT_WINDOW_DEFAULT: &str = "120000";
@@ -884,6 +915,7 @@ fn wire_hook(dir: &Path, overwrite_script: bool) -> Result<(), String> {
     }
     wire_event(hooks, SESSION_START_EVENT, session_start_entry())
         .map_err(|error| format!("{}: {error}", settings_path.display()))?;
+    wire_stop_timer(hooks);
     set_auto_compact_window(
         object,
         &auto_compact_window(std::env::var("NUCLEOS_AUTO_COMPACT_WINDOW").ok().as_deref()),
@@ -899,6 +931,10 @@ fn wire_hook(dir: &Path, overwrite_script: bool) -> Result<(), String> {
         std::fs::write(&script_path, HOOK_SOURCE)
             .map_err(|error| format!("could not write the hook script: {error}"))?;
     }
+    // Before the settings that name it: Python exits 2 on a script it cannot open, and on this
+    // entry exit 2 wakes the session, whose next stop would run it again.
+    std::fs::write(claude.join("hooks").join("stop_timer.py"), STOP_TIMER_SOURCE)
+        .map_err(|error| format!("could not write the stop timer: {error}"))?;
     std::fs::write(
         &settings_path,
         format!(
@@ -3383,6 +3419,31 @@ pub mod tests {
         }
     }
 
+    #[test]
+    fn wiring_adds_the_stop_timer_once_and_writes_its_script() {
+        let root = TempDir::new().unwrap();
+        wire_classifier_hook(root.path()).unwrap();
+        wire_classifier_hook(root.path()).unwrap();
+
+        let settings = wired_settings(&root);
+        let stop = settings["hooks"]["Stop"].as_array().unwrap();
+        let timers: Vec<_> = stop
+            .iter()
+            .filter(|entry| serde_json::to_string(entry).unwrap().contains(STOP_TIMER_SCRIPT))
+            .collect();
+        assert_eq!(timers.len(), 1, "{stop:?}");
+        assert_eq!(timers[0]["hooks"][0]["asyncRewake"], true);
+        assert_eq!(timers[0]["hooks"][0]["timeout"], STOP_TIMER_TIMEOUT_SECONDS);
+        assert_eq!(
+            fs::read_to_string(root.path().join(STOP_TIMER_SCRIPT)).unwrap(),
+            STOP_TIMER_SOURCE
+        );
+        assert!(
+            serde_json::to_string(&stop[0]).unwrap().contains(HOOK_SCRIPT),
+            "the forwarding entry stays first: {stop:?}"
+        );
+    }
+
     fn wired_settings(root: &TempDir) -> serde_json::Value {
         serde_json::from_str(
             &fs::read_to_string(root.path().join(".claude/settings.json")).unwrap(),
@@ -3458,7 +3519,7 @@ pub mod tests {
         )
         .unwrap();
         let stop = settings["hooks"]["Stop"].as_array().unwrap();
-        assert_eq!(stop.len(), 2, "{stop:?}");
+        assert_eq!(stop.len(), 3, "their hook, ours and the timer: {stop:?}");
         assert!(
             serde_json::to_string(&stop[0])
                 .unwrap()
