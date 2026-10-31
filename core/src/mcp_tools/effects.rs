@@ -517,3 +517,13 @@ pub(super) async fn effect_of_call_via_daemon(
         _ => effect,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tree_branch_start_is_an_acting_tool() {
+        assert!(TOOL_EFFECTS.contains(&("tree_branch_start", ToolEffect::Acts)));
+    }
+}

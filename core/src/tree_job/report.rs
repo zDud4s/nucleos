@@ -704,7 +704,7 @@ none
     }
 
     #[test]
-    fn outcome_status_maps_the_five_outcomes_and_report_problems_enforces_it() {
+    fn outcome_status_maps_the_six_outcomes_and_report_problems_enforces_it() {
         assert_eq!(
             OUTCOME_STATUS.to_vec(),
             vec![
@@ -713,6 +713,7 @@ none
                 ("contract_request", "blocked"),
                 ("blocked", "blocked"),
                 ("failed", "failed"),
+                ("handoff", "handoff"),
             ]
         );
 
@@ -732,5 +733,34 @@ none
             report.status = "wrong".into();
             assert_single_problem(&report, "does not match Outcome");
         }
+    }
+
+    /// A node that ran out of room reports `handoff` so the daemon can relaunch it with a wrap
+    /// prompt; the status it carries is `handoff`, the value `work_nodes` already knows.
+    #[test]
+    fn handoff_is_an_accepted_outcome_with_status_handoff() {
+        assert!(
+            OUTCOME_STATUS.contains(&("handoff", "handoff")),
+            "got {OUTCOME_STATUS:?}"
+        );
+
+        let report = filled_with(|r| {
+            r.outcome = "handoff".into();
+            r.status = "handoff".into();
+        });
+        assert_eq!(problems(&report), Vec::<String>::new());
+
+        // The pairing is enforced like any other: `done` does not go with `handoff`.
+        let mismatched = filled_with(|r| r.outcome = "handoff".into());
+        assert_single_problem(&mismatched, "does not match Outcome");
+        assert!(
+            problems(&mismatched)[0].contains("expected 'handoff'"),
+            "got {:?}",
+            problems(&mismatched)
+        );
+
+        // And the outcome list the agent is shown names it.
+        let unknown = filled_with(|r| r.outcome = "shipped".into());
+        assert!(problems(&unknown)[0].contains("handoff"), "got {:?}", problems(&unknown));
     }
 }

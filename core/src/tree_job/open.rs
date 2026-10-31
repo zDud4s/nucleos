@@ -2925,7 +2925,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_key_of_that_relaunch_is_derived_from_the_dead_run() {
+    async fn relaunch_resumed_still_uses_the_resume_key() {
         let state = live_agent_state().await;
         let pool = &state.pool;
         seed_dead_branch_node(&state, "building").await;

@@ -478,3 +478,13 @@ pub fn client_for_box(
         _ => Err(error),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_worktree_box_serves_tree_branch_start() {
+        assert!(WORKTREE_BOX_TOOLS.contains(&"tree_branch_start"));
+    }
+}

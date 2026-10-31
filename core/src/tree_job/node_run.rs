@@ -700,6 +700,27 @@ mod tests {
         assert_eq!(node_row(&pool, "branch-node").await, before);
     }
 
+    /// The root has no branch, yet it too may sit with a dead run while its job is unfinished: the
+    /// driver relaunches it. `seed_job` names the root node `<job>-root`. Once the job is finished
+    /// the exemption is over, and the leaf proves it belongs to the root alone.
+    #[tokio::test]
+    async fn reconcile_running_spares_the_root_of_an_unfinished_job() {
+        let pool = crate::testdb::fresh_pool().await;
+        seed_run(&pool, DEAD_RUN, "interrupted").await;
+        seed_job(&pool, JOB, "open", &[]).await;
+        seed_job(&pool, "job-2", JOB_TERMINAL_STATE, &[]).await;
+        seed_node(&pool, "job-1-root", "running", Some(JOB), Some(DEAD_RUN)).await;
+        seed_node(&pool, "job-2-root", "running", Some("job-2"), Some(DEAD_RUN)).await;
+        seed_node(&pool, "leaf", "running", Some(JOB), Some(DEAD_RUN)).await;
+        let before = node_row(&pool, "job-1-root").await;
+
+        assert_eq!(reconciled(&pool).await, ["job-2-root", "leaf"]);
+
+        assert_eq!(node_row(&pool, "job-1-root").await, before);
+        assert_failed_naming_run(&pool, "job-2-root", DEAD_RUN).await;
+        assert_failed_naming_run(&pool, "leaf", DEAD_RUN).await;
+    }
+
     /// The other side of the parent's reading of R3: once the branch is `merged` or `dropped` the
     /// exemption is over, and a dead run fails the node as it would any other.
     #[tokio::test]

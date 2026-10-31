@@ -375,6 +375,37 @@ mod tests {
             );
         }
 
+        /// Asserts the report was recorded and not closed: the node is still `running` with only its
+        /// handoff path set, the file is the handoff of `report`, and the one transition row is
+        /// `report` / `run_id` / `result`.
+        async fn assert_recorded(
+            &self,
+            node: &Node,
+            returned: &Node,
+            report: &str,
+            run_id: &str,
+            result: &str,
+        ) {
+            let row = work_nodes::get(&self.pool, &node.id).await.unwrap();
+            assert_eq!(&row, returned, "the returned node is the stored row");
+            assert_eq!(row.status, "running");
+            assert_eq!(row.summary, None);
+            assert_eq!(row.closed_at, None);
+            let file = self.handoff(node);
+            assert_eq!(
+                row.handoff_path.as_deref().map(Path::new),
+                Some(file.as_path())
+            );
+            assert_eq!(
+                std::fs::read_to_string(&file).unwrap(),
+                render_handoff(&parse_report(report))
+            );
+            assert_eq!(
+                transitions(&self.pool, &node.id).await,
+                [("report".to_owned(), run_id.to_owned(), result.to_owned())]
+            );
+        }
+
         /// Replaces the job's branches, through the store as the engine would.
         async fn set_branches(&self, branches: Vec<Branch>) {
             let mut job = store::load(&self.pool, JOB).await.unwrap().unwrap();
@@ -425,6 +456,27 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
+    }
+
+    /// Gives the node the run a report is recorded under; the fixture's nodes have none.
+    async fn set_run(pool: &SqlitePool, node_id: &str, run_id: &str) {
+        sqlx::query("UPDATE work_nodes SET run_id = ? WHERE id = ?")
+            .bind(run_id)
+            .bind(node_id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// Every keyed transition of the node, as (transition, key, result), ordered by key.
+    async fn transitions(pool: &SqlitePool, node_id: &str) -> Vec<(String, String, String)> {
+        sqlx::query_as(
+            "SELECT transition, key, result FROM tree_transitions WHERE node_id = ? ORDER BY key",
+        )
+        .bind(node_id)
+        .fetch_all(pool)
+        .await
+        .unwrap()
     }
 
     /// A report that `report_problems` accepts for any outcome, given a well-formed `contract_used`.
@@ -779,39 +831,115 @@ mod tests {
 
     // --- Behaviour 6: the top branch node (R3) ------------------------------------------------
 
-    /// Executor's reading, flagged for review: R3 says the top node "só fecha quando o ramo fica
-    /// `merged`", with no exception, so a `blocked` or `failed` report from it is refused like a
-    /// `done` one. Such a node reports its trouble some other way than by closing.
+    /// R3 still holds, but a top node that has finished its work must be able to say so: a
+    /// `done`, `blocked`, `failed` or `handoff` report is recorded as the node's result for its run
+    /// and the node stays `running`, so the driver can see the work is finished while the branch
+    /// is still ahead of its merge. The node closes later, when the branch is merged or dropped.
     #[tokio::test]
-    async fn a_top_branch_node_on_a_building_branch_is_refused_whatever_the_report_says() {
-        let fx = Fixture::new(None).await;
-        let top = &fx.leaf;
-        fx.set_branches(vec![branch("api", "backend", "building", &top.id)])
-            .await;
+    async fn a_branch_top_node_reporting_done_is_recorded_and_stays_running() {
+        for outcome in ["done", "blocked", "failed"] {
+            let fx = Fixture::new(None).await;
+            let top = &fx.leaf;
+            fx.set_branches(vec![branch("api", "backend", "building", &top.id)])
+                .await;
+            set_run(&fx.pool, &top.id, "7").await;
+            let report = outcome_report(top, outcome);
 
-        for outcome in ["done", "blocked", "failed", "contract_request"] {
-            let message = conflict(fx.send(top, &outcome_report(top, outcome), None).await);
+            let recorded = fx.send(top, &report, None).await.unwrap();
 
-            assert!(message.contains("building"), "{outcome}: {message:?}");
-            fx.assert_untouched(top).await;
+            assert_eq!(recorded.status, "running", "{outcome}");
+            fx.assert_recorded(top, &recorded, &report, "7", outcome).await;
         }
     }
 
     #[tokio::test]
-    async fn a_top_branch_node_is_refused_in_every_state_short_of_merged_or_dropped() {
+    async fn a_branch_top_node_reporting_handoff_writes_the_handoff_file_and_records_the_run() {
         let fx = Fixture::new(None).await;
         let top = &fx.leaf;
+        fx.set_branches(vec![branch("api", "backend", "building", &top.id)])
+            .await;
+        set_run(&fx.pool, &top.id, "12").await;
+        let report = outcome_report(top, "handoff");
+        assert!(report.contains("Status: handoff\n"), "got {report:?}");
 
+        let recorded = fx.send(top, &report, None).await.unwrap();
+
+        fx.assert_recorded(top, &recorded, &report, "12", "handoff").await;
+        let written = std::fs::read_to_string(fx.handoff(top)).unwrap();
+        assert!(written.contains("Status: handoff\n"), "got {written:?}");
+    }
+
+    /// The same run reporting twice (a retried call) changes nothing: the first result stands and
+    /// the second call is answered, not refused.
+    #[tokio::test]
+    async fn a_second_report_for_the_same_run_is_a_replay() {
+        let fx = Fixture::new(None).await;
+        let top = &fx.leaf;
+        fx.set_branches(vec![branch("api", "backend", "building", &top.id)])
+            .await;
+        set_run(&fx.pool, &top.id, "7").await;
+        let first = done_report(top);
+        let recorded = fx.send(top, &first, None).await.unwrap();
+        fx.assert_recorded(top, &recorded, &first, "7", "done").await;
+
+        // Valid on its own and different from the first, so a second record would show.
+        let second = outcome_report(top, "blocked");
+        fx.send(top, &second, None).await.unwrap();
+
+        assert_eq!(
+            transitions(&fx.pool, &top.id).await,
+            [("report".to_owned(), "7".to_owned(), "done".to_owned())]
+        );
+        let row = work_nodes::get(&fx.pool, &top.id).await.unwrap();
+        assert_eq!(row.status, "running");
+        assert_eq!(row.closed_at, None);
+    }
+
+    /// Recording is not a way round the checks: a broken report is returned to the agent as before,
+    /// and a report that is not about the node's own work (a contract request, a split) is still
+    /// a 409 while the branch is at work. Neither leaves a trace.
+    #[tokio::test]
+    async fn a_branch_top_node_still_refuses_an_invalid_report() {
+        let fx = Fixture::new(None).await;
+        let top = &fx.leaf;
+        fx.set_branches(vec![branch("api", "backend", "building", &top.id)])
+            .await;
+        set_run(&fx.pool, &top.id, "7").await;
+        let broken = report_for(&top.id, &top.root_id, "shipped", "a1", "");
+        let expected = report_problems(&parse_report(&broken), REPORT_MAX_LINES, None);
+        assert_eq!(expected.len(), 3, "the sample has three defects: {expected:?}");
+
+        let problems = invalid(fx.send(top, &broken, None).await);
+
+        assert_eq!(problems, expected);
+        fx.assert_untouched(top).await;
+        assert!(transitions(&fx.pool, &top.id).await.is_empty());
+
+        for outcome in ["contract_request", "split"] {
+            let message = conflict(fx.send(top, &outcome_report(top, outcome), None).await);
+
+            assert!(message.contains("building"), "{outcome}: {message:?}");
+            fx.assert_untouched(top).await;
+            assert!(transitions(&fx.pool, &top.id).await.is_empty(), "{outcome}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_top_branch_node_records_its_report_in_every_state_short_of_merged_or_dropped() {
         for state in BRANCH_STATES {
             if matches!(state, "merged" | "dropped") {
                 continue;
             }
+            let fx = Fixture::new(None).await;
+            let top = &fx.leaf;
             fx.set_branches(vec![branch("api", "backend", state, &top.id)])
                 .await;
+            set_run(&fx.pool, &top.id, "7").await;
+            let report = done_report(top);
 
-            conflict(fx.send(top, &done_report(top), None).await);
+            let recorded = fx.send(top, &report, None).await.unwrap();
 
-            fx.assert_untouched(top).await;
+            fx.assert_recorded(top, &recorded, &report, "7", "done").await;
         }
     }
 
@@ -821,10 +949,12 @@ mod tests {
             let fx = Fixture::new(None).await;
             let top = &fx.leaf;
             let report = done_report(top);
+            set_run(&fx.pool, &top.id, "7").await;
 
             fx.set_branches(vec![branch("api", "backend", "building", &top.id)])
                 .await;
-            conflict(fx.send(top, &report, None).await);
+            let recorded = fx.send(top, &report, None).await.unwrap();
+            fx.assert_recorded(top, &recorded, &report, "7", "done").await;
 
             fx.set_branches(vec![branch("api", "backend", state, &top.id)])
                 .await;
@@ -835,16 +965,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_docs_branch_top_node_closes_on_done_or_dropped_and_not_before() {
+    async fn a_docs_branch_top_node_closes_on_done_or_dropped_and_records_before() {
         for state in ["done", "dropped"] {
             let fx = Fixture::new(None).await;
             let top = &fx.leaf;
             let report = done_report(top);
+            set_run(&fx.pool, &top.id, "7").await;
 
             fx.set_branches(vec![branch("spec", "docs", "building", &top.id)])
                 .await;
-            conflict(fx.send(top, &report, None).await);
-            fx.assert_untouched(top).await;
+            let recorded = fx.send(top, &report, None).await.unwrap();
+            fx.assert_recorded(top, &recorded, &report, "7", "done").await;
 
             fx.set_branches(vec![branch("spec", "docs", state, &top.id)])
                 .await;
@@ -854,25 +985,31 @@ mod tests {
         }
     }
 
+    /// Only the top node of a branch at work and the root of an unfinished job record instead of
+    /// closing; a node under the top closes normally. The root is the last to finish, so its
+    /// report waits for the job as the top node's waits for the branch.
     #[tokio::test]
-    async fn other_nodes_of_the_job_close_normally_while_the_branch_is_building() {
+    async fn other_nodes_close_normally_while_the_branch_is_building_and_the_root_records() {
         let fx = Fixture::new(None).await;
         let top = &fx.leaf;
         let under_top = fx.child_of(&top.id).await;
         fx.set_branches(vec![branch("api", "backend", "building", &top.id)])
             .await;
+        set_run(&fx.pool, &top.id, "7").await;
+        set_run(&fx.pool, &fx.root.id, "3").await;
 
         let report = done_report(&under_top);
         let closed = fx.send(&under_top, &report, None).await.unwrap();
         fx.assert_closed(&under_top, &closed, &report).await;
 
         let root_report = done_report(&fx.root);
-        let closed = fx.send(&fx.root, &root_report, None).await.unwrap();
-        fx.assert_closed(&fx.root, &closed, &root_report).await;
+        let recorded = fx.send(&fx.root, &root_report, None).await.unwrap();
+        fx.assert_recorded(&fx.root, &recorded, &root_report, "3", "done").await;
 
-        // Closing those changed nothing for the top node itself.
-        conflict(fx.send(top, &done_report(top), None).await);
-        fx.assert_untouched(top).await;
+        // Neither changed anything for the top node itself, which records its own.
+        let top_report = done_report(top);
+        let recorded = fx.send(top, &top_report, None).await.unwrap();
+        fx.assert_recorded(top, &recorded, &top_report, "7", "done").await;
     }
 
     // --- Behaviour 7: tree nodes and plain nodes ----------------------------------------------

@@ -55,6 +55,7 @@ pub fn routes() -> Router<AppState> {
         .route("/trees/{id}", get(get_tree))
         .route("/trees/{id}/branches", post(post_branch))
         .route("/trees/{id}/nodes/{node}/transition", post(post_transition))
+        .merge(super::branch_start::routes())
 }
 
 type Refusal = (StatusCode, Json<Value>);
@@ -657,6 +658,7 @@ mod tests {
 
     use super::{branch_admission, overlap_outside_base_chain, routes};
     use crate::execution::admission::AdmissionBook;
+    use crate::execution::git_exec::testkit::{initialize_repo, space_free_tempdir};
     use crate::state::AppState;
     use crate::tree_job::budget::{Admission, check_admission};
     use crate::tree_job::model::{Branch, Manifest};
@@ -1482,6 +1484,183 @@ mod tests {
 
         assert_error(&response, StatusCode::BAD_REQUEST);
         assert_eq!(job_rows(&state.pool).await, 0);
+    }
+
+    // ----- POST /trees: the root run and the landing mode -----
+
+    /// A temp git repository with one commit on `master` and a zero disk floor, so that the root
+    /// worktree is admitted whatever the disk holds. The layout `open.rs`'s `Checkout` has.
+    struct Repo {
+        _container: tempfile::TempDir,
+        path: std::path::PathBuf,
+    }
+
+    impl Repo {
+        fn new() -> Repo {
+            let container = space_free_tempdir("tree-post-");
+            let path = container.path().join("repo");
+            initialize_repo(&path);
+            let repo = Repo {
+                _container: container,
+                path,
+            };
+            // `initialize_repo` takes the machine's `init.defaultBranch`.
+            repo.git(&["branch", "-M", "master"]);
+            let dir = repo.path.join(".nucleos/workflow");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("speed.yaml"), "tree:\n  floor_gb: 0\n").unwrap();
+            repo
+        }
+
+        fn root(&self) -> String {
+            self.path.to_string_lossy().replace('\\', "/")
+        }
+
+        fn git(&self, args: &[&str]) -> String {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&self.path)
+                .args(args)
+                .output()
+                .expect("git should start");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        }
+
+        fn has_ref(&self, branch: &str) -> bool {
+            !self
+                .git(&["for-each-ref", &format!("refs/heads/{branch}")])
+                .is_empty()
+        }
+    }
+
+    fn repo_tree_body(id: &str, repo: &Repo) -> Value {
+        let mut body = tree_body(id);
+        body["project_root"] = json!(repo.root());
+        body
+    }
+
+    /// The run id a launch stored under `key` for `node`, which is what makes the launch replay-safe.
+    async fn stored_launch_result(pool: &SqlitePool, node: &str, key: &str) -> Option<String> {
+        let stored: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT result FROM tree_transitions WHERE node_id = ? AND key = ?",
+        )
+        .bind(node)
+        .bind(key)
+        .fetch_optional(pool)
+        .await
+        .unwrap();
+        stored.flatten()
+    }
+
+    async fn feed_lines_naming(pool: &SqlitePool, word: &str) -> Vec<String> {
+        sqlx::query_scalar("SELECT summary FROM feed WHERE summary LIKE ?")
+            .bind(format!("%{word}%"))
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn post_tree_opens_the_root_worktree_binds_the_root_node_and_starts_one_run() {
+        let state = test_state().await;
+        let repo = Repo::new();
+
+        let response = post(&app(&state), "/trees", repo_tree_body(JOB, &repo)).await;
+
+        assert_first_call(&response);
+        let job = loaded(&state.pool, JOB).await;
+        let root_branch = job.manifest.branches.get("root").expect("a root branch");
+        assert_eq!(root_branch.node_id.as_deref(), Some(job.root_node_id.as_str()));
+        assert!(
+            repo.path.join(".claude/worktrees/job-1-root").is_dir(),
+            "the root worktree is missing"
+        );
+        assert!(repo.has_ref("tree/job-1/root"), "the root git branch is missing");
+        assert_eq!(run_rows(&state.pool).await, 1);
+        let run_id = node_run_id(&state.pool, &job.root_node_id)
+            .await
+            .expect("the root node links its run");
+        assert_eq!(
+            stored_launch_result(&state.pool, &job.root_node_id, "root-job-1")
+                .await
+                .as_deref(),
+            Some(run_id.as_str()),
+            "the launch is stored under the key root-<tree id>"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_tree_replay_starts_no_second_run() {
+        let state = test_state().await;
+        let app = app(&state);
+        let repo = Repo::new();
+        let first = post(&app, "/trees", repo_tree_body(JOB, &repo)).await;
+        assert_first_call(&first);
+        let run = node_run_id(&state.pool, first.1["root_node_id"].as_str().unwrap()).await;
+
+        let replay = post(&app, "/trees", repo_tree_body(JOB, &repo)).await;
+
+        assert_replayed(&replay);
+        assert_eq!(run_rows(&state.pool).await, 1);
+        assert_eq!(node_run_id(&state.pool, replay.1["root_node_id"].as_str().unwrap()).await, run);
+        assert_eq!(repo.git(&["worktree", "list", "--porcelain"]).matches("worktree ").count(), 2);
+    }
+
+    /// No git repository at `project_root`: the worktree cannot be made, so no run starts, but the
+    /// job exists and says why in the feed.
+    #[tokio::test]
+    async fn post_tree_start_failure_keeps_the_job_open_and_leaves_a_feed_line() {
+        let state = test_state().await;
+
+        let response = post(&app(&state), "/trees", tree_body(JOB)).await;
+
+        assert_first_call(&response);
+        let job = loaded(&state.pool, JOB).await;
+        assert_eq!(job.state, "open");
+        assert_eq!(run_rows(&state.pool).await, 0);
+        assert_eq!(node_run_id(&state.pool, &job.root_node_id).await, None);
+        assert!(
+            !feed_lines_naming(&state.pool, JOB).await.is_empty(),
+            "the failed start left no feed line naming the job"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_tree_with_land_hold_stores_the_landing_mode() {
+        let state = test_state().await;
+        let app = app(&state);
+        let mut hold = tree_body(JOB);
+        hold["land"] = json!("hold");
+        let mut integration = tree_body(OTHER_JOB);
+        integration["land"] = json!("integration");
+
+        assert_first_call(&post(&app, "/trees", hold).await);
+        assert_first_call(&post(&app, "/trees", integration).await);
+        assert_first_call(&post(&app, "/trees", tree_body("job-3")).await);
+
+        let landing = |job: TreeJob| job.manifest.extra.get("landing").cloned();
+        assert_eq!(landing(loaded(&state.pool, JOB).await), Some(json!("hold")));
+        assert_eq!(landing(loaded(&state.pool, OTHER_JOB).await), Some(json!("integration")));
+        // Decision D1: no tree moves master unless its body says so.
+        assert_eq!(landing(loaded(&state.pool, "job-3").await), Some(json!("hold")));
+    }
+
+    #[tokio::test]
+    async fn post_tree_refuses_an_unknown_land_value() {
+        let state = test_state().await;
+        let mut body = tree_body(JOB);
+        body["land"] = json!("master");
+
+        let response = post(&app(&state), "/trees", body).await;
+
+        assert_error_naming(&response, StatusCode::BAD_REQUEST, "land");
+        assert_eq!(job_rows(&state.pool).await, 0);
+        assert_eq!(node_rows(&state.pool).await, 0);
     }
 
     // ----- GET /trees/{id} -----
