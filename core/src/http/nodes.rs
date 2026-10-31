@@ -187,15 +187,21 @@ async fn post_node(
     };
     depth::check_child(&chain, &guard_args, tree_total, &TreeLimits::default())
         .map_err(|refusal| refuse(StatusCode::CONFLICT, depth_refusal_message(refusal)))?;
-    if let Some(root_id) = root_id
-        && let Permit::No { reason } = budget::permits_next_node(&state.pool, &root_id).await
+    if let Some(root_id) = root_id.as_deref()
+        && let Permit::No { reason } = budget::permits_next_node(&state.pool, root_id).await
     {
         return Err(refuse(StatusCode::CONFLICT, reason));
     }
-    work_nodes::open(&state.pool, None, &limits, &args)
+    let opened = work_nodes::open(&state.pool, None, &limits, &args)
         .await
-        .map(Json)
-        .map_err(refused)
+        .map_err(refused)?;
+    if let Some(root_id) = root_id.as_deref()
+        && let Err(error) =
+            budget::report_soft_threshold(&state.pool, root_id, chrono::Utc::now()).await
+    {
+        tracing::warn!(%error, root_id, "could not report the tree's soft budget threshold");
+    }
+    Ok(Json(opened))
 }
 
 /// `PATCH /nodes/{id}`: `{status?, decision?, context_peak?}`; only what is sent changes.

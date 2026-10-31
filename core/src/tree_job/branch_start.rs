@@ -21,6 +21,7 @@ use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
 use axum::http::{Request, StatusCode};
 use axum::routing::post;
+use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -32,6 +33,7 @@ use super::open::{self, OpenError};
 use super::store::{self, StoreError, launch_recovering};
 use crate::execution::runs::CreateRunError;
 use crate::state::AppState;
+use crate::tree_cost::budget::{self, Permit};
 use crate::work_nodes::{self, NodeError, NodeLimits, OpenArgs};
 
 /// The layer of a branch started without one (`root.rs` makes the first branch a `code` one).
@@ -170,11 +172,47 @@ async fn call(
     }
 }
 
+/// The node already made for branch `name` under `caller`, if any.
+async fn existing_node(
+    state: &AppState,
+    caller: &str,
+    name: &str,
+) -> Result<Option<String>, Refusal> {
+    sqlx::query_scalar(
+        "SELECT id FROM work_nodes WHERE parent_id = ? AND kind = 'leaf' AND title = ?
+         ORDER BY created_at, id LIMIT 1",
+    )
+    .bind(caller)
+    .bind(name)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(db_refusal)
+}
+
+/// 409 when the tree's budget does not permit one more node.
+async fn check_tree_budget(state: &AppState, root_id: &str) -> Result<(), Refusal> {
+    match budget::permits_next_node(&state.pool, root_id).await {
+        Permit::Yes => Ok(()),
+        Permit::No { reason } => Err(refuse(StatusCode::CONFLICT, reason)),
+    }
+}
+
+/// Writes the tree's soft-threshold feed line when it is newly crossed; a failure is logged, never
+/// the request's.
+async fn report_soft(state: &AppState, root_id: &str) {
+    if let Err(error) = budget::report_soft_threshold(&state.pool, root_id, Utc::now()).await {
+        tracing::warn!(%error, root_id, "could not report the tree's soft budget threshold");
+    }
+}
+
 /// The node already made for branch `name` under `caller`, else a new `leaf` for it. The job lock
-/// makes the lookup and the insert one step; nothing in `work_nodes::open` takes that lock.
+/// makes the lookup and the insert one step; nothing in `work_nodes::open` takes that lock. A new
+/// node is opened only while the tree's budget permits one; finding one costs nothing.
+#[allow(clippy::too_many_arguments)]
 async fn find_or_open_node(
     state: &AppState,
     job_id: &str,
+    root_id: &str,
     project_root: &str,
     caller: &str,
     name: &str,
@@ -183,18 +221,10 @@ async fn find_or_open_node(
 ) -> Result<(String, bool), Refusal> {
     let lock = job_lock(job_id);
     let _guard = lock.lock().await;
-    let found: Option<String> = sqlx::query_scalar(
-        "SELECT id FROM work_nodes WHERE parent_id = ? AND kind = 'leaf' AND title = ?
-         ORDER BY created_at, id LIMIT 1",
-    )
-    .bind(caller)
-    .bind(name)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(db_refusal)?;
-    if let Some(found) = found {
+    if let Some(found) = existing_node(state, caller, name).await? {
         return Ok((found, true));
     }
+    check_tree_budget(state, root_id).await?;
     let limits = NodeLimits::load(Some(FsPath::new(project_root)));
     let opened = work_nodes::open(
         &state.pool,
@@ -211,6 +241,7 @@ async fn find_or_open_node(
     )
     .await
     .map_err(node_refusal)?;
+    report_soft(state, root_id).await;
     Ok((opened.id, false))
 }
 
@@ -285,6 +316,18 @@ async fn post_branch_start(
         ));
     }
 
+    // A branch with no node yet will need a new one at step 3. Refuse now when the budget does not
+    // permit it, so that a refused call has not added a branch or opened a worktree the driver could
+    // pick up. Step 3 checks again under the job lock.
+    let already_bound = job
+        .manifest
+        .branches
+        .get(&name)
+        .is_some_and(|branch| branch.node_id.is_some());
+    if !already_bound && existing_node(&state, &caller, &name).await?.is_none() {
+        check_tree_budget(&state, &job.root_node_id).await?;
+    }
+
     // 1. The branch, through the route that adds one: its replay, overlap and admission checks
     // are the ones a direct call gets, and nothing is stored when it refuses.
     let added = call(
@@ -330,6 +373,7 @@ async fn post_branch_start(
             let (node_id, found) = find_or_open_node(
                 &state,
                 &id,
+                &job.root_node_id,
                 &job.manifest.project_root,
                 &caller,
                 &name,

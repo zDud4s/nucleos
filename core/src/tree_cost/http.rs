@@ -70,6 +70,10 @@ async fn put_budget(
     Path(id): Path<String>,
     Json(request): Json<BudgetRequest>,
 ) -> Result<Json<Value>, StatusCode> {
+    // A limit of zero or less would refuse every node from the start; it is a mistake, not a ceiling.
+    if !request.limit_usd.is_finite() || request.limit_usd <= 0.0 {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
     let id = resolve_root_id(&state.pool, &id).await?;
     let now = Utc::now().to_rfc3339();
     sqlx::query(
