@@ -159,7 +159,9 @@ pub struct ActionStateRow {
 }
 
 /// Records a decision. The unique key `(action, rule_id, subject_key, COALESCE(session_id, ''),
-/// action_version, mode)` makes a second insert a no-op: returns true when a row was written.
+/// action_version, mode)` makes a second insert a no-op, with one exception: a row that was voided
+/// (its thresholds changed) is overwritten in place by the new decision, so the key is decided again.
+/// Returns true when a row was written or replaced.
 pub async fn insert_decision(pool: &SqlitePool, row: &ShadowRow) -> sqlx::Result<bool> {
     let params = if row.params.is_empty() {
         "{}"
@@ -174,7 +176,22 @@ pub async fn insert_decision(pool: &SqlitePool, row: &ShadowRow) -> sqlx::Result
          outcome, outcome_finding_key, outcome_cost_ms, outcome_verified, proposal_id, \
          human_verdict, human_verdict_at, resolved_at) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-         ?, ?, ?) ON CONFLICT DO NOTHING",
+         ?, ?, ?) \
+         ON CONFLICT(action, rule_id, subject_key, COALESCE(session_id, ''), action_version, mode) \
+         DO UPDATE SET project_id = excluded.project_id, decision = excluded.decision, \
+         suppress_reason = excluded.suppress_reason, template_id = excluded.template_id, \
+         params = excluded.params, basis_precision = excluded.basis_precision, \
+         basis_cases = excluded.basis_cases, basis_recent_count = excluded.basis_recent_count, \
+         basis_recent_cost_ms = excluded.basis_recent_cost_ms, \
+         expected_saving_ms = excluded.expected_saving_ms, rule_version = excluded.rule_version, \
+         thresholds_hash = excluded.thresholds_hash, rules_version = excluded.rules_version, \
+         decided_at = excluded.decided_at, window_end_at = excluded.window_end_at, \
+         outcome_state = excluded.outcome_state, outcome = excluded.outcome, \
+         outcome_finding_key = excluded.outcome_finding_key, \
+         outcome_cost_ms = excluded.outcome_cost_ms, outcome_verified = excluded.outcome_verified, \
+         proposal_id = excluded.proposal_id, human_verdict = excluded.human_verdict, \
+         human_verdict_at = excluded.human_verdict_at, resolved_at = excluded.resolved_at \
+         WHERE devtime_shadow.outcome_state = 'void'",
     )
     .bind(&row.action)
     .bind(&row.rule_id)
@@ -266,6 +283,39 @@ pub async fn void_stale(pool: &SqlitePool, rule_id: &str, rule_version: i64) -> 
     .execute(pool)
     .await?;
     Ok(res.rows_affected())
+}
+
+/// Voids every `pending` row decided under thresholds other than `cfg`'s: for each `(action, rule)`
+/// pair with pending rows, the rows whose `thresholds_hash` differs from the one `cfg` gives it.
+/// Resolved, expired and already void rows are never touched, nor is a row the owner already judged
+/// (`human_verdict` set), which stays pending and listed. Idempotent. Returns the rows changed.
+pub async fn void_stale_thresholds(
+    pool: &SqlitePool,
+    cfg: &crate::config::DevtimeActionsConfig,
+) -> sqlx::Result<u64> {
+    let pairs: Vec<(String, String)> = sqlx::query_as(
+        "SELECT DISTINCT action, rule_id FROM devtime_shadow WHERE outcome_state = 'pending'",
+    )
+    .fetch_all(pool)
+    .await?;
+    let now = super::now();
+    let mut changed = 0;
+    for (action, rule_id) in pairs {
+        let current = thresholds_hash(cfg, &action, &rule_id);
+        let res = sqlx::query(
+            "UPDATE devtime_shadow SET outcome_state = 'void', resolved_at = ? \
+             WHERE action = ? AND rule_id = ? AND outcome_state = 'pending' AND thresholds_hash <> ? \
+             AND human_verdict IS NULL",
+        )
+        .bind(&now)
+        .bind(&action)
+        .bind(&rule_id)
+        .bind(current)
+        .execute(pool)
+        .await?;
+        changed += res.rows_affected();
+    }
+    Ok(changed)
 }
 
 /// The non-void rows of one (action, rule, mode) stamped with any of `action_versions`, oldest first.
@@ -677,6 +727,199 @@ mod tests {
         assert_eq!(resolved_after.outcome.as_deref(), Some("hit"));
         assert_eq!(resolved_after.rule_version, 2);
         assert_eq!(*resolved_after, resolved_before);
+    }
+
+    /// A pending row of `(action, rule)` stamped with the hash `cfg` gives that pair.
+    fn hashed(
+        action: &str,
+        rule: &str,
+        subject: &str,
+        cfg: &crate::config::DevtimeActionsConfig,
+    ) -> ShadowRow {
+        ShadowRow {
+            action: action.into(),
+            rule_id: rule.into(),
+            subject_key: subject.into(),
+            thresholds_hash: thresholds_hash(cfg, action, rule),
+            ..sample()
+        }
+    }
+
+    #[tokio::test]
+    async fn void_stale_thresholds_voids_only_pending_rows_under_another_hash() {
+        let pool = pool().await;
+        let old = crate::config::DevtimeActionsConfig::default();
+        let mut new = old.clone();
+        new.propose_min_sessions = 5;
+        for row in [
+            hashed("propose", "F1", "stale", &old),
+            hashed("propose", "F1", "fresh", &new),
+            hashed("inject", "D3", "other-action", &old),
+            hashed("propose", "F1", "resolved", &old),
+        ] {
+            assert!(insert_decision(&pool, &row).await.unwrap());
+        }
+        sqlx::query(
+            "UPDATE devtime_shadow SET outcome_state = 'resolved' WHERE subject_key = 'resolved'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // `inject` hashes did not move; only the stale `propose` row goes.
+        assert_eq!(void_stale_thresholds(&pool, &new).await.unwrap(), 1);
+
+        let state = |rows: &[ShadowRow], subject: &str| {
+            rows.iter()
+                .find(|r| r.subject_key == subject)
+                .map(|r| (r.outcome_state.clone(), r.resolved_at.is_some()))
+                .unwrap()
+        };
+        let rows = all_rows(&pool).await;
+        assert_eq!(state(&rows, "stale"), ("void".into(), true));
+        assert_eq!(state(&rows, "fresh"), ("pending".into(), false));
+        assert_eq!(state(&rows, "other-action"), ("pending".into(), false));
+        assert_eq!(state(&rows, "resolved"), ("resolved".into(), false));
+
+        // Idempotent: the same configuration finds nothing more, which is what the startup sweep relies on.
+        assert_eq!(void_stale_thresholds(&pool, &new).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn void_stale_thresholds_leaves_everything_under_an_unchanged_configuration() {
+        let pool = pool().await;
+        let cfg = crate::config::DevtimeActionsConfig::default();
+        for row in [
+            hashed("propose", "F1", "a", &cfg),
+            hashed("inject", "D3", "b", &cfg),
+        ] {
+            assert!(insert_decision(&pool, &row).await.unwrap());
+        }
+
+        assert_eq!(void_stale_thresholds(&pool, &cfg).await.unwrap(), 0);
+        assert!(
+            all_rows(&pool)
+                .await
+                .iter()
+                .all(|r| r.outcome_state == "pending")
+        );
+    }
+
+    fn tuned(base: &crate::config::DevtimeActionsConfig) -> crate::config::DevtimeActionsConfig {
+        let mut cfg = base.clone();
+        cfg.propose_min_sessions = 5;
+        cfg
+    }
+
+    #[tokio::test]
+    async fn insert_decision_reuses_the_key_of_a_voided_row() {
+        let pool = pool().await;
+        let old = crate::config::DevtimeActionsConfig::default();
+        let new = tuned(&old);
+        assert!(
+            insert_decision(&pool, &hashed("propose", "F1", "k1", &old))
+                .await
+                .unwrap()
+        );
+        assert_eq!(void_stale_thresholds(&pool, &new).await.unwrap(), 1);
+
+        let fresh = ShadowRow {
+            decision: "fire".into(),
+            suppress_reason: None,
+            ..hashed("propose", "F1", "k1", &new)
+        };
+        assert!(
+            insert_decision(&pool, &fresh).await.unwrap(),
+            "a voided key is free again"
+        );
+        let rows = all_rows(&pool).await;
+        assert_eq!(rows.len(), 1, "the voided row is reused, not duplicated");
+        assert_eq!(rows[0].outcome_state, "pending");
+        assert_eq!(
+            rows[0].thresholds_hash,
+            thresholds_hash(&new, "propose", "F1")
+        );
+        assert_eq!(rows[0].decision, "fire");
+        assert_eq!(rows[0].suppress_reason, None);
+        assert_eq!(rows[0].resolved_at, None, "the void stamp is cleared");
+    }
+
+    #[tokio::test]
+    async fn insert_decision_keeps_ignoring_a_key_held_by_a_non_void_row() {
+        for state in ["pending", "resolved", "expired"] {
+            let pool = pool().await;
+            let old = crate::config::DevtimeActionsConfig::default();
+            let new = tuned(&old);
+            assert!(
+                insert_decision(&pool, &hashed("propose", "F1", "k1", &old))
+                    .await
+                    .unwrap()
+            );
+            sqlx::query("UPDATE devtime_shadow SET outcome_state = ?")
+                .bind(state)
+                .execute(&pool)
+                .await
+                .unwrap();
+            let before = all_rows(&pool).await;
+
+            let again = ShadowRow {
+                decision: "fire".into(),
+                suppress_reason: None,
+                ..hashed("propose", "F1", "k1", &new)
+            };
+            assert!(
+                !insert_decision(&pool, &again).await.unwrap(),
+                "a {state} row keeps its key"
+            );
+            assert_eq!(all_rows(&pool).await, before, "a {state} row is untouched");
+        }
+    }
+
+    #[tokio::test]
+    async fn void_stale_thresholds_leaves_a_judged_row_pending_and_listed() {
+        use crate::analytics::devtime::{ShadowQuery, shadow_list};
+        let pool = pool().await;
+        let old = crate::config::DevtimeActionsConfig::default();
+        let new = tuned(&old);
+        let fire = |subject: &str, verdict: Option<&str>| ShadowRow {
+            decision: "fire".into(),
+            suppress_reason: None,
+            human_verdict: verdict.map(Into::into),
+            human_verdict_at: verdict.map(|_| "2026-10-05T11:00:00.000Z".into()),
+            ..hashed("propose", "F1", subject, &old)
+        };
+        for row in [fire("judged", Some("useful")), fire("unjudged", None)] {
+            assert!(insert_decision(&pool, &row).await.unwrap());
+        }
+
+        assert_eq!(
+            void_stale_thresholds(&pool, &new).await.unwrap(),
+            1,
+            "only the row nobody judged goes"
+        );
+        let rows = all_rows(&pool).await;
+        let state = |subject: &str| {
+            rows.iter()
+                .find(|r| r.subject_key == subject)
+                .map(|r| r.outcome_state.clone())
+                .unwrap()
+        };
+        assert_eq!(state("judged"), "pending");
+        assert_eq!(state("unjudged"), "void");
+
+        let page = shadow_list(
+            &pool,
+            &ShadowQuery {
+                action: None,
+                rule_id: None,
+                limit: 10,
+                cursor: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(page.items.len(), 1, "the judged row is still listed");
+        assert_eq!(page.items[0].human_verdict.as_deref(), Some("useful"));
     }
 
     #[tokio::test]

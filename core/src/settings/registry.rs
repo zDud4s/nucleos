@@ -159,7 +159,10 @@ static DOCUMENTS: LazyLock<Vec<DocType>> = LazyLock::new(|| {
             files::VERIFY_FILE,
             "on the next command for switching admission off and for its weights; everything else, including switching it on from off, when the daemon restarts",
         ),
-        of::<DevtimeConfig>(files::DEVTIME_FILE, "when the daemon restarts"),
+        of::<DevtimeConfig>(
+            files::DEVTIME_FILE,
+            "when the daemon restarts — except that on a save or a reset the actions.* settings apply from the next ingest cycle, and the pending actions decided under other actions.* thresholds are voided at once (those the owner marked stay)",
+        ),
         of::<AutopilotRules>(
             crate::project::state::AUTOPILOT_FILE,
             "at the next tick of the autopilot for that project",
