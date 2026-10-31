@@ -2,23 +2,14 @@
 
 /// How long a tool call waits for somebody to answer for it.
 ///
-/// Forty-five seconds, and the number is not a preference. The CLI holds the hook call open while
-/// this waits and kills it at its own ceiling — sixty seconds unless the settings entry says
-/// otherwise, and the entries already written into people's projects do not. Raising that would
-/// help only the projects wired after the change and leave every existing one being cut off
-/// mid-question, so the window is chosen to fit the ceiling that is actually out there.
-///
-/// Long enough for somebody looking at the window to read a command and decide; short enough that
-/// stepping away costs one refused tool call rather than a conversation that hangs.
-pub const ASK_WINDOW: std::time::Duration = std::time::Duration::from_secs(45);
-
-/// How long a question may stand before it is taken to be about nothing.
-///
-/// The hook asks in two calls — one that registers the question, one that waits on it — and the CLI
-/// cuts each off at sixty seconds (see `ASK_WINDOW`). A question older than both together has no
-/// hook left that could collect its answer: the hook died in between, and nothing else would ever
-/// take the question down. Without this it would sit in the window, and in the map, for good.
-pub const ASK_LIFETIME: std::time::Duration = std::time::Duration::from_secs(120);
+/// Thirty days less an hour, and the number is a ceiling, not a preference. The CLI holds the hook
+/// call open for as long as the settings entry's `timeout` says (`HOOK_TIMEOUT_SECONDS`, thirty
+/// days), so a question can stand for as long as the CLI lives and be answered hours later from
+/// another machine. The hook's own wait (`ask_daemon.py`) outlasts this by half an hour, and the
+/// CLI's timeout outlasts that, so the daemon, not the CLI cutting the hook off, gives the answer. A hook the CLI cuts does not block the tool, it falls through to the ordinary
+/// permission flow.
+pub const ASK_WINDOW: std::time::Duration =
+    std::time::Duration::from_secs(30 * 24 * 60 * 60 - 60 * 60);
 
 /// One tool call a conversation is waiting to be allowed.
 ///
@@ -46,7 +37,7 @@ pub struct Ask {
 /// the wire, and its `detail` is deliberately one argument for the reason given there; this carries
 /// the WHOLE input (a `Write`'s content included) and so must never be serialised. It exists so that
 /// moving the permission selector can re-run the same ladder over a question already standing,
-/// instead of leaving it open until the 45-second window refuses it.
+/// instead of leaving it open until the window refuses it.
 #[derive(Clone, Debug)]
 pub struct AskedCall {
     pub tool_input: serde_json::Value,
@@ -67,14 +58,6 @@ pub(super) struct Pending {
     pub(super) answer: Option<tokio::sync::oneshot::Sender<bool>>,
     /// Handed to the hook call that waits, and taken for the same reason.
     pub(super) heard: Option<tokio::sync::oneshot::Receiver<bool>>,
-    /// When it was asked, so a question whose hook died can expire (`ASK_LIFETIME`).
-    pub(super) asked_at: std::time::Instant,
-}
-
-/// Takes down every question older than `ASK_LIFETIME`. Called wherever the map is written or
-/// shown, which is exactly where a ghost would otherwise be seen or grow the map.
-fn forget_expired(asks: &mut std::collections::HashMap<String, Pending>) {
-    asks.retain(|_, pending| pending.asked_at.elapsed() < ASK_LIFETIME);
 }
 
 pub(super) static ASKS: std::sync::LazyLock<
@@ -107,7 +90,6 @@ fn register_ask(
     let id = crate::auth::generate_uuid_v4();
     let (answer, heard) = tokio::sync::oneshot::channel();
     let mut asks = ASKS.lock().unwrap();
-    forget_expired(&mut asks);
     // **One question per run, the newest.** A run has one tool call in flight (see `wait_for_run`),
     // so an older question of the same run is a ghost: its hook died between asking and waiting.
     // Left standing, the judge could still answer it `true`, and `wait_for_run` — which finds a
@@ -126,16 +108,45 @@ fn register_ask(
             call,
             answer: Some(answer),
             heard: Some(heard),
-            asked_at: std::time::Instant::now(),
         },
     );
     id
 }
 
+/// Whether this question is still standing, answered or not yet.
+pub fn ask_is_open(id: &str) -> bool {
+    ASKS.lock().unwrap().contains_key(id)
+}
+
+/// Whether this run has a tool call parked on a question.
+pub fn run_is_parked(run_id: i64) -> bool {
+    ASKS.lock()
+        .unwrap()
+        .values()
+        .any(|pending| pending.ask.run_id == run_id)
+}
+
+/// Whether anything of this conversation is waiting on a person, which is work for the process
+/// that holds the CLI: reaping it would cut the hook's call and let the tool fall through.
+pub fn chat_has_open_ask(chat_id: &str) -> bool {
+    ASKS.lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .values()
+        .any(|pending| pending.ask.chat_id == chat_id)
+}
+
+/// Takes down every question of a conversation whose process is gone. The hook's connection
+/// (`TakeDown`) is the other way a question ends; this is for a CLI that died with its hook
+/// between the two calls, which nothing else would ever clear.
+pub fn forget_asks_for_chat(chat_id: &str) {
+    ASKS.lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .retain(|_, pending| pending.ask.chat_id != chat_id);
+}
+
 /// What this conversation is waiting to be allowed, which is nearly always nothing or one thing.
 pub fn asks_for(chat_id: &str) -> Vec<Ask> {
-    let mut asks = ASKS.lock().unwrap();
-    forget_expired(&mut asks);
+    let asks = ASKS.lock().unwrap();
     asks.values()
         .filter(|pending| pending.ask.chat_id == chat_id)
         .map(|pending| pending.ask.clone())

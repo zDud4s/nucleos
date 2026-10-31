@@ -298,6 +298,9 @@ impl Drop for LiveChat {
         }
         let ended = relock(&PROCESS_BARRIERS).remove(&self.process_key());
         if let Some(ended) = ended {
+            // A question this process's hook put to a person cannot be answered once the CLI is
+            // gone, and nothing else would take it down.
+            crate::hooks::forget_asks_for_chat(&ended.chat_id);
             stop_tasks_of(ended);
         }
     }
@@ -662,8 +665,9 @@ pub(super) fn idle_after_spontaneous(
 
 /// Takes processes out of `kept` until `alive` fits under `cap`, chats nobody has open first and
 /// least recently used within each group, and returns them for the caller to drop. Never one with a
-/// background task, nor one whose `carried` still holds an answer no turn has claimed yet (evicting
-/// it would lose that answer). The one being kept goes only when nothing else can (spec 4.2 item 3:
+/// background task, nor one with a question standing for a person (`chat_has_open_ask`: evicting it
+/// would cut the hook's call and let the tool through), nor one whose `carried` still holds an
+/// answer no turn has claimed yet (evicting it would lose that answer). The one being kept goes only when nothing else can (spec 4.2 item 3:
 /// when every other is busy, the new one is not kept).
 pub(super) fn make_room(
     kept: &mut HashMap<String, LiveChat>,
@@ -678,15 +682,20 @@ pub(super) fn make_room(
         let oldest = kept
             .iter()
             .filter(|(id, live)| {
-                id.as_str() != keeping && live.background.is_empty() && live.carried.is_empty()
+                id.as_str() != keeping
+                    && live.background.is_empty()
+                    && live.carried.is_empty()
+                    && !crate::hooks::chat_has_open_ask(id)
             })
             .min_by_key(|(id, live)| (open.contains(id.as_str()), live.idle_since))
             .map(|(id, _)| id.clone());
         let victim = match oldest {
             Some(id) => id,
-            None if kept
-                .get(keeping)
-                .is_some_and(|live| live.background.is_empty() && live.carried.is_empty()) =>
+            None if kept.get(keeping).is_some_and(|live| {
+                live.background.is_empty()
+                    && live.carried.is_empty()
+                    && !crate::hooks::chat_has_open_ask(keeping)
+            }) =>
             {
                 keeping.to_owned()
             }
@@ -789,12 +798,18 @@ pub(super) fn worth_keeping(
     // moves it, because the work does not stop when nobody is looking.
     let silent_for = now.saturating_duration_since(live.last_task_signal);
     let pinned = !live.background.is_empty() && silent_for < background_silence();
+    // A question put to a person is work with no cap: it stands as long as the CLI lives, and
+    // reaping the process would cut the hook's call and let the tool fall through to the CLI's own
+    // permission flow. The barrier is what says which conversation this process belongs to.
+    let asking = relock(&PROCESS_BARRIERS)
+        .get(&live.process_key())
+        .is_some_and(|barrier| crate::hooks::chat_has_open_ask(&barrier.chat_id));
     // The idle time is the chat's own, derived from its last turn, and it counts from the later of
     // that turn's end and the last time the chat was polled by a visible view: an idle process has
     // no work, so a poll only moves latency.
     let anchor = seen.map_or(live.idle_since, |s| s.max(live.idle_since));
     let since = now.saturating_duration_since(anchor);
-    still_standing && (pinned || since < live.idle_for)
+    still_standing && (pinned || asking || since < live.idle_for)
 }
 
 /// Whether a stream line is part of an answer: its JSON `type` is `assistant` or `stream_event`.
@@ -1126,6 +1141,84 @@ mod tests {
             Some(polled),
             started + BACKGROUND_SILENCE_CAP - Duration::from_secs(1)
         ));
+    }
+
+    /// Registers the barrier that says which conversation a test process belongs to.
+    fn belong_to(live: &LiveChat, chat_id: &str) {
+        relock(&PROCESS_BARRIERS).insert(
+            live.process_key(),
+            ProcessBarrier {
+                mode: "auto",
+                served: Vec::new(),
+                chat_id: chat_id.to_owned(),
+                pool: None,
+            },
+        );
+    }
+
+    /// A question stands as long as the CLI lives, so a process holding one is not reaped however
+    /// long it has idled, and its silence is no reason either.
+    #[tokio::test]
+    async fn a_process_with_an_open_question_is_not_reaped() {
+        let mut rig = rig();
+        let chat_id = format!("asking-{}", crate::auth::generate_uuid_v4());
+        belong_to(&rig.live, &chat_id);
+        let started = Instant::now();
+        rig.live.idle_since = started;
+        rig.live.idle_for = LIVE_IDLE;
+        let much_later = started + Duration::from_secs(10 * 24 * 60 * 60);
+
+        assert!(!worth_keeping(&rig.live, None, much_later));
+        let id = crate::hooks::ask_about(&chat_id, 9_100_001, "Bash", None);
+        assert!(
+            worth_keeping(&rig.live, None, much_later),
+            "a process with a question standing was reaped"
+        );
+        crate::hooks::forget_asks_for_chat(&chat_id);
+        assert!(!crate::hooks::ask_is_open(&id));
+        assert!(!worth_keeping(&rig.live, None, much_later));
+    }
+
+    /// Room is made from processes that are not asking anybody anything, even when that leaves the
+    /// kept one to go.
+    #[tokio::test]
+    async fn make_room_never_evicts_a_process_with_an_open_question() {
+        let asking = format!("asking-{}", crate::auth::generate_uuid_v4());
+        let idle = format!("idle-{}", crate::auth::generate_uuid_v4());
+        let mut kept = HashMap::new();
+        kept.insert(asking.clone(), rig().live);
+        kept.insert(idle.clone(), rig().live);
+        // The asking one is the least recently used, which is what would make it the victim.
+        kept.get_mut(&asking).unwrap().idle_since = Instant::now() - Duration::from_secs(600);
+        crate::hooks::ask_about(&asking, 9_100_002, "Bash", None);
+
+        let evicted = make_room(&mut kept, 2, "new", 1, &HashSet::new());
+
+        assert_eq!(evicted.len(), 1);
+        assert!(kept.contains_key(&asking), "the asking process was evicted");
+        assert!(!kept.contains_key(&idle));
+        crate::hooks::forget_asks_for_chat(&asking);
+
+        // And when every other process is asking, the cap yields rather than cutting a question.
+        crate::hooks::ask_about(&asking, 9_100_003, "Bash", None);
+        let none = make_room(&mut kept, 2, "new", 1, &HashSet::new());
+        assert!(none.is_empty());
+        crate::hooks::forget_asks_for_chat(&asking);
+    }
+
+    /// The CLI going away takes its questions with it: nobody is left to answer them for.
+    #[tokio::test]
+    async fn dropping_a_kept_process_takes_its_questions_down() {
+        let rig = rig();
+        let chat_id = format!("asking-{}", crate::auth::generate_uuid_v4());
+        belong_to(&rig.live, &chat_id);
+        let id = crate::hooks::ask_about(&chat_id, 9_100_004, "Bash", None);
+        assert!(crate::hooks::ask_is_open(&id));
+
+        drop(rig.live);
+
+        assert!(!crate::hooks::ask_is_open(&id));
+        assert!(!crate::hooks::chat_has_open_ask(&chat_id));
     }
 
     /// A finish the CLI delivers only as a `user` notice still lets the process go, and a notice

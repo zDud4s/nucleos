@@ -658,10 +658,13 @@ pub async fn project_roster(pool: &SqlitePool) -> sqlx::Result<Vec<ProjectSummar
 /// slashes because it is compared against a JSON command string, where that is the spelling.
 pub const HOOK_SCRIPT: &str = ".claude/hooks/ask_daemon.py";
 
-/// The timeout, in seconds, written onto the tool-event hook entries. A shell command can wait for
-/// admission inside the hook (`admit_heavy`), far longer than the CLI's default; the script's own
-/// budget (`ADMIT_HOOK_BUDGET_SECONDS`, 3300) stays below this.
-pub const HOOK_TIMEOUT_SECONDS: u64 = 3600;
+/// The timeout, in seconds, written onto the tool-event hook entries: thirty days. A shell command
+/// can wait for admission inside the hook (`admit_heavy`), far longer than the CLI's default, and a
+/// question put to a person (`wait_for_answer`) can stand for as long as the CLI lives. The script's
+/// own waits stay below this: the admission budget (`ADMIT_HOOK_BUDGET_SECONDS`, 3300) and the ask
+/// window plus half an hour. A hook the CLI cuts by timeout does not block the tool, so the hook
+/// must end first and give the answer itself.
+pub const HOOK_TIMEOUT_SECONDS: u64 = 2_592_000;
 
 /// This daemon's classifier hook, carried inside the binary so it can be installed anywhere.
 ///
@@ -912,6 +915,38 @@ fn wire_hook(dir: &Path, overwrite_script: bool) -> Result<(), String> {
     .map_err(|error| format!("could not write {}: {error}", settings_path.display()))?;
 
     Ok(())
+}
+
+/// Brings every project this daemon has wired up to the current hook: the script and the timeouts.
+///
+/// Run at boot. A project wired before a change keeps its old script and its old `timeout` until
+/// something rewrites them, and a project nobody opens again would keep a hook the CLI cuts off at
+/// an hour while the daemon waits a month. Only projects `classifier_hook_is_wired` already
+/// recognises are touched, so a project that never had the hook, or switched hooks off, gains
+/// nothing. Returns how many were rewritten; one that cannot be is logged and skipped.
+pub async fn rewire_wired_projects(pool: &sqlx::SqlitePool) -> sqlx::Result<usize> {
+    let roots = sqlx::query_scalar::<_, String>(
+        "SELECT project_root FROM autopilot_state WHERE project_root IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+    let rewired = tokio::task::spawn_blocking(move || {
+        let mut rewired = 0;
+        for root in roots {
+            let dir = Path::new(&root);
+            if !classifier_hook_is_wired(dir) {
+                continue;
+            }
+            match wire_classifier_hook(dir) {
+                Ok(()) => rewired += 1,
+                Err(error) => tracing::warn!("could not rewire the hook in {root}: {error}"),
+            }
+        }
+        rewired
+    })
+    .await
+    .unwrap_or(0);
+    Ok(rewired)
 }
 
 /// The tools whose calls the classifier has to see for the barrier to mean anything.
@@ -2029,6 +2064,49 @@ pub mod tests {
 
         assert!(command.starts_with(expected_prefix), "{command}");
         assert!(command.ends_with(&format!("/{HOOK_SCRIPT}\"")), "{command}");
+    }
+
+    /// A project wired by an older daemon is brought up at boot: its entry is raised from the old
+    /// hour to the new timeout and its script is replaced. One that never had the hook gains none.
+    #[tokio::test]
+    async fn rewiring_at_boot_raises_an_old_project_and_its_script() {
+        let pool = test_pool().await;
+        let old = TempDir::new().unwrap();
+        let bare = TempDir::new().unwrap();
+        wire_classifier_hook(old.path()).unwrap();
+        let settings_path = old.path().join(".claude/settings.json");
+        let mut settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        for event in ["PreToolUse", "PostToolUse", "PostToolUseFailure"] {
+            settings["hooks"][event][0]["hooks"][0]["timeout"] = serde_json::json!(3600);
+        }
+        fs::write(&settings_path, settings.to_string()).unwrap();
+        let script = old.path().join(".claude/hooks/ask_daemon.py");
+        fs::write(&script, "# an older script").unwrap();
+        for (id, root) in [("old", old.path()), ("bare", bare.path())] {
+            sqlx::query(
+                "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES (?, 'active', ?)",
+            )
+            .bind(id)
+            .bind(root.to_str().unwrap())
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(rewire_wired_projects(&pool).await.unwrap(), 1);
+
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        for event in ["PreToolUse", "PostToolUse", "PostToolUseFailure"] {
+            assert_eq!(
+                settings["hooks"][event][0]["hooks"][0]["timeout"].as_u64(),
+                Some(HOOK_TIMEOUT_SECONDS),
+                "{event}"
+            );
+        }
+        assert_eq!(fs::read_to_string(&script).unwrap(), HOOK_SOURCE);
+        assert!(!bare.path().join(".claude").exists());
     }
 
     #[test]

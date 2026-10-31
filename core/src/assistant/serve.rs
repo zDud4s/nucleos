@@ -74,11 +74,15 @@ pub(super) async fn serve_turn_briefed(
 ) -> Result<std::io::Result<crate::execution::runner::RunOutcome>, tokio::time::error::Elapsed> {
     if !may_live {
         request.progress_timeout = deadlines.silence;
-        return tokio::time::timeout(
+        let served = tokio::time::timeout(
             deadlines.ceiling,
             runner.run_prompt(request, session_tx, std::sync::Arc::clone(transcript)),
         )
         .await;
+        // The process this turn spawned ends with it, and so does any question its hook was
+        // holding: with no `LiveChat` to drop, nothing else would take it down.
+        crate::hooks::forget_asks_for_chat(chat_id);
+        return served;
     }
 
     if let Some(mut live) = take_live(chat_id) {

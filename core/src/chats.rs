@@ -70,7 +70,7 @@ impl Brain {
 /// `dont_ask` is the sixth and it is ours, not the CLI's. It allows precisely what `auto` allows
 /// — the same classifier, the same rules, the same project policy — and REFUSES everything `auto`
 /// would have stopped to ask about, instead of asking. It is a conversation that asks nobody, for
-/// a turn nobody is watching: the question `auto` would have raised waits 45 seconds for an answer
+/// a turn nobody is watching: the question `auto` would have raised waits for an answer
 /// that is not coming, and this rung spends nothing on it. A refusal here costs one tool call and
 /// nothing else — the turn goes on.
 ///

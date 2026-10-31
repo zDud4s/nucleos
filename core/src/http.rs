@@ -13754,7 +13754,7 @@ mod tests {
     ///
     /// The turn that asked is still running and its hook is blocked on the question, so a person who
     /// widens the rung to `accept_edits` has just said yes to a `Write` they are looking at. Without
-    /// the re-read the ask sits there until `ASK_WINDOW` runs out and refuses the call the person
+    /// the re-read the ask sits there until `ASK_WINDOW` runs out (or the CLI goes) and refuses the call the person
     /// had already permitted, which reads as the new rung not having taken.
     ///
     /// The call is parked under `manual`, where a `Write` asks, and the PATCH moves it to a rung that

@@ -4148,8 +4148,8 @@ function ChangedRefusal({ error }: { error: unknown }) {
  * There was nowhere else. It is their window and they are looking at it, and the honest reply to
  * somebody who is watching is a question.
  *
- * Urgent on purpose. A turn is held while this stands and the daemon refuses on its own after about
- * forty-five seconds, because the CLI will not hold a hook call longer than that — so this is drawn
+ * Urgent on purpose. A turn is held while this stands and the question stands as long as the CLI lives
+ * (it can be answered hours later from another device) — so this is drawn
  * where the next thing would have appeared rather than tucked away somewhere tidy.
  *
  * **On `auto` a question can now answer itself, and it is drawn anyway.** A local judge races the

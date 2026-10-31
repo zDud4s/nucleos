@@ -927,8 +927,8 @@
 }
 
 /* A tool call this conversation is being held on. Drawn where the next thing would have
-   appeared, and not tucked away: a turn is stopped while this stands, and the daemon refuses on its
-   own in about forty-five seconds. */
+   appeared, and not tucked away: a turn is stopped while this stands, and the question stands for as
+   long as the CLI lives. */
 .chats-asking {
   display: flex;
   flex-direction: column;

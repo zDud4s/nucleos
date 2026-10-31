@@ -134,6 +134,11 @@ async fn main() {
     tracing::info!("nucleos-core database ready at {}", db_path.display());
 
     startup::reconcile_after_restart(&pool).await;
+    // Projects wired by an older daemon keep its hook script and its timeout until rewritten.
+    match governance::autopilot::rewire_wired_projects(&pool).await {
+        Ok(count) => tracing::info!("rewired the classifier hook in {count} project(s)"),
+        Err(error) => tracing::warn!("could not rewire the wired projects: {error}"),
+    }
     startup::install_agents(&pool, is_primary).await;
 
     // Before anything can launch a Claude run, so the first run's credential is already watched.

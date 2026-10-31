@@ -109,9 +109,13 @@ DEFAULT_DAEMON_URL = "http://127.0.0.1:8791"
 # most 25 seconds, so this is what decides a poll that went quiet, not the daemon.
 ADMIT_POLL_TIMEOUT_SECONDS = 40
 # The total time `admit_heavy` may spend waiting. Kept below `autopilot::HOOK_TIMEOUT_SECONDS`
-# (3600, the timeout written onto the tool-event hook entries), so the hook returns and lets the
+# (the timeout written onto the tool-event hook entries), so the hook returns and lets the
 # command run before the CLI would kill it.
 ADMIT_HOOK_BUDGET_SECONDS = 3300
+# How long `wait_for_answer` waits on the daemon: `hooks::ASK_WINDOW` (thirty days less an hour)
+# plus half an hour, so the daemon decides a question nobody answered. Under the settings entry's
+# timeout (`autopilot::HOOK_TIMEOUT_SECONDS`, thirty days). A literal, so a test can read it.
+ASK_WAIT_TIMEOUT_SECONDS = 2_590_200
 
 
 def governed_git_verb(command: str) -> str:
@@ -1311,10 +1315,12 @@ def wait_for_answer(daemon_url, token, run_id):
     case that earned it. A daemon that is simply down still fails at the first call,
     in five seconds, exactly as before.
 
-    Fifty seconds against the daemon's own forty-five, so the daemon is what decides
-    a question nobody answered rather than this timing out first and saying something
-    less useful. Every failure here is a refusal: a tool call that cannot be allowed
-    must never be allowed by default.
+    The wait is as long as the CLI lives: the daemon holds a question for its ask window
+    and this waits half an hour longer, so the daemon is what decides a question nobody
+    answered rather than this timing out first and saying something less useful. The settings
+    entry's own timeout is longer still, because a hook the CLI cuts by timeout does not
+    block the tool -- it falls through to the normal permission flow. Every failure here is
+    a refusal: a tool call that cannot be allowed must never be allowed by default.
     """
     body = json.dumps({"run_id": run_id}).encode()
     request = urllib.request.Request(
@@ -1327,7 +1333,7 @@ def wait_for_answer(daemon_url, token, run_id):
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=50) as response:
+        with urllib.request.urlopen(request, timeout=ASK_WAIT_TIMEOUT_SECONDS) as response:
             answered = json.loads(response.read())
     except Exception as exc:
         deny(f"nobody could be asked about this ({exc}) - failing closed")

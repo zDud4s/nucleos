@@ -1909,8 +1909,8 @@ export function useSeedChatWorkflow(chatId: string) {
 /**
  * Say whether a held tool call may go ahead.
  *
- * There is a turn waiting on this answer, and a window of about forty-five
- * seconds before the daemon refuses on its own — so the transcript is
+ * There is a turn waiting on this answer, which stands as long as its CLI lives
+ * and is refused by the daemon only when that window closes — so the transcript is
  * invalidated at once rather than on the next poll, and a 404 (the question
  * timed out, or the turn moved on) is not worth showing: the refetch that
  * follows says so by the question no longer being there.
