@@ -912,6 +912,9 @@ async fn main() {
     // The remote gateway. Armed <=> `remote.yaml` enables it AND validates; every other outcome
     // deletes the gateway's key, so a half-configured or switched-off install authenticates nothing.
     // Only the key minted for `Service::Remote` reaches the child — never the control token.
+    if sidecars_wanted {
+        remote::setup::allow_gateway();
+    }
     let remote_valid = match remote_config.validate() {
         Ok(()) => true,
         Err(error) => {
@@ -922,27 +925,21 @@ async fn main() {
     if remote_config.enabled && remote_valid {
         match auth::mint_service_token(&state.pool, auth::Service::Remote).await {
             Ok(remote_key) => {
-                let dist_dir = match &remote_config.dist_dir {
-                    Some(dir) => dir.clone(),
-                    None => std::env::current_exe()
-                        .ok()
-                        .and_then(|exe| exe.parent().map(|dir| dir.join("dist-remote")))
-                        .map(|dir| dir.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "dist-remote".to_string()),
-                };
+                let dist_dir = std::env::current_exe()
+                    .ok()
+                    .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+                    .map(|dir| remote::setup::resolve_dist_dir(&remote_config, &dir))
+                    .unwrap_or_else(|| "dist-remote".into())
+                    .to_string_lossy()
+                    .into_owned();
                 let env = sidecar::remote_env(
                     &daemon_client::daemon_url(),
                     &remote_key,
                     &remote_config,
                     &dist_dir,
                 );
-                if sidecars_wanted {
-                    tokio::spawn(sidecar::supervise(
-                        sidecar::REMOTE.to_string(),
-                        sidecar::binary(sidecar::REMOTE),
-                        env,
-                    ));
-                }
+                // Tracked, so the setup wizard can replace or stop it later.
+                remote::setup::launch_gateway(env);
                 tracing::info!(origin = %remote_config.public_origin, "remote gateway supervised");
             }
             Err(error) => {

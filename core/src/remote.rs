@@ -20,6 +20,8 @@ use sqlx::SqlitePool;
 
 use crate::auth::ApiTokenLevel;
 
+pub mod setup;
+
 /// How long a pairing code can be exchanged.
 pub const PAIRING_TTL: Duration = Duration::seconds(300);
 /// Wrong guesses that burn every open code.
@@ -387,14 +389,15 @@ pub async fn disarm(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
-/// `~/.nucleos/remote.yaml`. Ships off.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// `~/.nucleos/remote.yaml`. Ships off. Written by the setup wizard (`setup::enable`), or by hand.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RemoteConfig {
     pub enabled: bool,
     /// `https://host[:port]` the browser sees; required when enabled.
     pub public_origin: String,
-    /// Built shell for the gateway; `None` means `<dir of daemon exe>/dist-remote`.
+    /// Built shell for the gateway; `None` means the installed layout (`setup::resolve_dist_dir`).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub dist_dir: Option<String>,
     /// Gateway cap on streams of unknown length, 10..=900.
     pub stream_max_seconds: u32,

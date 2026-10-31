@@ -27,6 +27,15 @@ pub(super) fn routes() -> Router<AppState> {
         )
         .route("/remote/devices", get(list_devices))
         .route("/remote/devices/{id}", delete(delete_device))
+        // The setup wizard. Control token only, checked in each handler (`require_control`) as well
+        // as by the device deny list, so a later "owner device" level does not open it.
+        .route(
+            "/remote/setup",
+            get(get_setup)
+                .post(post_setup)
+                .delete(delete_setup)
+                .layer(DefaultBodyLimit::max(PAIR_BODY_LIMIT)),
+        )
 }
 
 fn storage_failure(error: impl std::fmt::Display) -> (StatusCode, Json<serde_json::Value>) {
@@ -167,6 +176,187 @@ async fn delete_device(State(state): State<AppState>, Path(id): Path<i64>) -> im
         Ok(false) => refusal(StatusCode::NOT_FOUND, "unknown_device").into_response(),
         Err(error) => storage_failure(error).into_response(),
     }
+}
+
+/// Only the control token: not an API key of any level, not a run, not a paired device. The same
+/// lock as `/system/autostart` (`admin.rs`), so a device level added later cannot reach this route.
+fn require_control(scope: &Scope) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if *scope == Scope::Control {
+        Ok(())
+    } else {
+        tracing::warn!(
+            ?scope,
+            "refused a caller other than the control token on /remote/setup"
+        );
+        Err(refusal(StatusCode::FORBIDDEN, "control_only"))
+    }
+}
+
+/// `GET /remote/setup` and what the other two verbs answer with.
+#[derive(Serialize)]
+struct SetupView {
+    enabled: bool,
+    public_origin: String,
+    tailscale: crate::remote::setup::TailscaleView,
+    serving: bool,
+}
+
+async fn setup_view(root: &std::path::Path) -> SetupView {
+    let config = crate::remote::RemoteConfig::load(&root.join(crate::remote::REMOTE_FILE));
+    let cli = crate::remote::setup::locate_cli();
+    let tailscale = crate::remote::setup::probe(cli.as_deref()).await;
+    let serving = tailscale.installed && crate::remote::setup::is_serving(cli.as_deref()).await;
+    SetupView {
+        enabled: config.enabled && config.validate().is_ok(),
+        public_origin: config.public_origin,
+        tailscale,
+        serving,
+    }
+}
+
+fn machine_root(state: &AppState) -> Result<PathBuf, (StatusCode, Json<serde_json::Value>)> {
+    state
+        .machine_config_root
+        .clone()
+        .ok_or_else(|| refusal(StatusCode::CONFLICT, "no_machine_config"))
+}
+
+fn exe_dir() -> Result<PathBuf, (StatusCode, Json<serde_json::Value>)> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+        .ok_or_else(|| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))
+}
+
+/// `GET /remote/setup`: whether remote access is on, and what Tailscale says about this machine.
+async fn get_setup(
+    State(state): State<AppState>,
+    Extension(scope): Extension<Scope>,
+) -> impl IntoResponse {
+    if let Err(denied) = require_control(&scope) {
+        return denied.into_response();
+    }
+    match machine_root(&state) {
+        Ok(root) => Json(setup_view(&root).await).into_response(),
+        Err(refused) => refused.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct SetupBody {
+    /// The owner's own `https://` origin. Absent: use this machine's Tailscale name and publish the
+    /// gateway there with `tailscale serve`.
+    #[serde(default)]
+    public_origin: Option<String>,
+}
+
+/// `POST /remote/setup { public_origin? }`: writes `remote.yaml`, starts the gateway and, with no
+/// origin given, publishes it on the tailnet (never with Funnel).
+async fn post_setup(
+    State(state): State<AppState>,
+    Extension(scope): Extension<Scope>,
+    Json(body): Json<SetupBody>,
+) -> impl IntoResponse {
+    use crate::remote::setup::{self, SetupError, TailscaleCall};
+    if let Err(denied) = require_control(&scope) {
+        return denied.into_response();
+    }
+    let (root, exe_dir) = match (machine_root(&state), exe_dir()) {
+        (Ok(root), Ok(dir)) => (root, dir),
+        (Err(refused), _) | (_, Err(refused)) => return refused.into_response(),
+    };
+
+    let cli = setup::locate_cli();
+    let own_origin = body
+        .public_origin
+        .as_deref()
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty());
+    let via_tailscale = own_origin.is_none();
+    let origin = match own_origin {
+        Some(origin) => origin.to_string(),
+        None => {
+            let tailscale = setup::probe(cli.as_deref()).await;
+            match (tailscale.dns_name, tailscale.signed_in, tailscale.https_ok) {
+                (Some(name), true, true) => setup::origin_from_dns(&name),
+                _ => return refusal(StatusCode::CONFLICT, "tailscale_not_ready").into_response(),
+            }
+        }
+    };
+
+    // Everything that can be refused is refused before anything is published or written.
+    let config = match setup::plan(&root, &origin, &exe_dir) {
+        Ok(config) => config,
+        Err(SetupError::InvalidOrigin(why)) => {
+            return super::common::refusal_with_detail(
+                StatusCode::BAD_REQUEST,
+                "invalid_origin",
+                why,
+            )
+            .into_response();
+        }
+        Err(SetupError::PageMissing) => {
+            return refusal(StatusCode::CONFLICT, "remote_page_missing").into_response();
+        }
+        Err(error) => return storage_failure(error).into_response(),
+    };
+    if via_tailscale {
+        let Some(cli) = cli.as_deref() else {
+            return refusal(StatusCode::CONFLICT, "tailscale_not_ready").into_response();
+        };
+        if let Err(why) = setup::run(cli, TailscaleCall::ServeOn).await {
+            return super::common::refusal_with_detail(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "serve_failed",
+                why,
+            )
+            .into_response();
+        }
+    }
+    if let Err(error) = setup::commit(
+        &state.pool,
+        &root,
+        &config,
+        &exe_dir,
+        &crate::daemon_client::daemon_url(),
+        |env| {
+            setup::launch_gateway(env);
+        },
+    )
+    .await
+    {
+        return storage_failure(error).into_response();
+    }
+    Json(setup_view(&root).await).into_response()
+}
+
+/// `DELETE /remote/setup`: switches remote access off, stops the gateway and stops publishing it.
+async fn delete_setup(
+    State(state): State<AppState>,
+    Extension(scope): Extension<Scope>,
+) -> impl IntoResponse {
+    use crate::remote::setup::{self, TailscaleCall};
+    if let Err(denied) = require_control(&scope) {
+        return denied.into_response();
+    }
+    let root = match machine_root(&state) {
+        Ok(root) => root,
+        Err(refused) => return refused.into_response(),
+    };
+    if let Err(error) = setup::disable(&state.pool, &root, setup::stop_gateway).await {
+        return storage_failure(error).into_response();
+    }
+    // Best effort: the gateway is already off, so a Tailscale that will not answer changes nothing
+    // about who can get in.
+    let cli = setup::locate_cli();
+    if let Some(cli) = cli.as_deref() {
+        if setup::is_serving(Some(cli)).await {
+            if let Err(why) = setup::run(cli, TailscaleCall::ServeOff).await {
+                tracing::warn!(%why, "could not stop publishing the gateway on Tailscale");
+            }
+        }
+    }
+    Json(setup_view(&root).await).into_response()
 }
 
 #[cfg(test)]
@@ -403,6 +593,55 @@ mod tests {
         assert!(!text.contains(&session));
         assert!(!text.contains(&crate::remote::hash_secret(&session)));
         assert!(!text.contains("session_hash"));
+    }
+
+    /// The route is refused to a device by the deny list AND by the handler itself; this checks both
+    /// locks, the second being the one that stays shut if a later device level reaches `remote`.
+    #[tokio::test]
+    async fn a_remote_device_cannot_change_setup() {
+        use crate::auth::ApiTokenLevel as Level;
+        let state = test_state().await;
+        for scope in [
+            Scope::ApiToken(Level::Admin),
+            Scope::ApiToken(Level::RunCreating),
+            Scope::ApiToken(Level::ReadOnly),
+            Scope::Run(7),
+        ] {
+            let read = get_setup(State(state.clone()), Extension(scope.clone()))
+                .await
+                .into_response();
+            assert_eq!(read.status(), StatusCode::FORBIDDEN, "{scope:?}");
+            let write = post_setup(
+                State(state.clone()),
+                Extension(scope.clone()),
+                Json(SetupBody {
+                    public_origin: Some("https://box.example.com".to_string()),
+                }),
+            )
+            .await
+            .into_response();
+            assert_eq!(write.status(), StatusCode::FORBIDDEN, "{scope:?}");
+            let off = delete_setup(State(state.clone()), Extension(scope.clone()))
+                .await
+                .into_response();
+            assert_eq!(off.status(), StatusCode::FORBIDDEN, "{scope:?}");
+        }
+        assert!(require_control(&Scope::Control).is_ok());
+
+        // Through the real token check, a paired admin device gets nowhere either.
+        let key = mint_service_token(&state.pool, Service::Remote)
+            .await
+            .unwrap();
+        let (session, _) = pair(&state).await;
+        let app = router(state);
+        for method in ["GET", "POST", "DELETE"] {
+            let body = (method == "POST").then(|| serde_json::json!({}));
+            let (status, _) = send(&app, method, "/remote/setup", &key, Some(&session), body).await;
+            assert!(
+                status == StatusCode::FORBIDDEN || status == StatusCode::UNAUTHORIZED,
+                "{method}: {status}"
+            );
+        }
     }
 
     #[tokio::test]

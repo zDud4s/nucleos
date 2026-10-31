@@ -9,6 +9,7 @@ nobody has watched it work there.
 | Start when you log in | Tested on Windows only | Written, not tested on a Mac | Written, not tested on Linux |
 | Keep running without a login (Settings, System, Tokens) | Not yet measured; see below | Not available, see below | Not yet measured; see below |
 | Do not sleep while work runs (`keep_awake_while_working`, on by default) | Implemented (`SetThreadExecutionState`); not yet watched on a real machine | Written (`caffeinate -i`), not tested on a Mac | Written (`systemd-inhibit --what=idle`), not tested on Linux |
+| Use it from another device (Settings, System, Remote devices) | Wizard written; not yet tried end to end on a clean install | Written, not tested on a Mac; Tailscale CLI path from the app bundle | Written, not tested on Linux; Tailscale CLI path from the usual locations |
 
 ## Keep running without a login
 

@@ -1,12 +1,18 @@
 import { useState } from "react";
 import { isApiRefusal } from "../data/client";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   useCreatePairingCode,
+  useDisableRemote,
+  useEnableRemote,
   useRemoteDevices,
+  useRemoteSetup,
   useRevokeDevice,
   type PairingCode,
   type RemoteDevice,
+  type RemoteSetup,
 } from "../data/remote";
+import { QrCode } from "./QrCode";
 import type { ApiTokenLevel } from "../data/system";
 import { DAEMON_NAME } from "../copy";
 import {
@@ -48,6 +54,7 @@ export function RemoteDevices() {
   const [name, setName] = useState("");
   const [level, setLevel] = useState<ApiTokenLevel>("admin");
   const [created, setCreated] = useState<PairingCode | null>(null);
+  const setup = useRemoteSetup();
 
   function handleCreate() {
     const trimmed = name.trim();
@@ -68,6 +75,7 @@ export function RemoteDevices() {
       <p className="sy-note">
         Pair a browser on another device. Create a code here, then enter it on that device.
       </p>
+      {setup.data !== undefined && <SetupWizard setup={setup.data} />}
 
       {created !== null && (
         <>
@@ -77,9 +85,16 @@ export function RemoteDevices() {
             onDismiss={() => setCreated(null)}
           />
           <p className="sy-note">
-            Valid 5 minutes, single use. On the device, open https://&lt;this machine&gt;.ts.net in
-            the browser and enter this code.
+            Valid 5 minutes, single use. On the device, open{" "}
+            {setup.data?.public_origin ? setup.data.public_origin : "this machine's remote address"}{" "}
+            in the browser and enter this code.
           </p>
+          {setup.data?.enabled === true && setup.data.public_origin !== "" && (
+            <QrCode
+              value={setup.data.public_origin}
+              label={`QR code for ${setup.data.public_origin}`}
+            />
+          )}
         </>
       )}
 
@@ -141,13 +156,126 @@ export function RemoteDevices() {
   );
 }
 
+const TAILSCALE_DOWNLOAD = "https://tailscale.com/download";
+const TAILSCALE_ADMIN_DNS = "https://login.tailscale.com/admin/dns";
+
+/**
+ * Turns remote access on without a terminal: Tailscale when it is there and ready, or an HTTPS
+ * address the owner already has. It says only what it can see, so it never claims a platform.
+ */
+function SetupWizard({ setup }: { setup: RemoteSetup }) {
+  const enable = useEnableRemote();
+  const disable = useDisableRemote();
+  const [own, setOwn] = useState("");
+  const ts = setup.tailscale;
+  const ready = ts.installed && ts.signed_in && ts.https_ok && ts.dns_name !== null;
+
+  if (setup.enabled) {
+    return (
+      <div className="sy-note">
+        <p>
+          Remote access is on at <strong>{setup.public_origin}</strong>.
+          {setup.serving ? " Tailscale is publishing it." : ""}
+        </p>
+        <Button
+          variant="ghost"
+          disabled={disable.isPending}
+          onClick={() => disable.mutate()}
+        >
+          Turn off remote access
+        </Button>
+        {disable.isError && <ErrorNote>remote access was not turned off</ErrorNote>}
+      </div>
+    );
+  }
+
+  return (
+    <div className="sy-note">
+      {!ts.installed && (
+        <>
+          <p>Tailscale is not installed on this machine.</p>
+          <Button variant="ghost" onClick={() => void openUrl(TAILSCALE_DOWNLOAD)}>
+            Install Tailscale
+          </Button>
+        </>
+      )}
+      {ts.installed && !ts.signed_in && (
+        <p>Tailscale is installed but not signed in. Open Tailscale, sign in, then reopen this page.</p>
+      )}
+      {ts.installed && ts.signed_in && !ts.https_ok && (
+        <>
+          <p>
+            Your tailnet has HTTPS certificates switched off. Turn on MagicDNS and HTTPS
+            certificates in the Tailscale admin console, then come back.
+          </p>
+          <Button variant="ghost" onClick={() => void openUrl(TAILSCALE_ADMIN_DNS)}>
+            Open the Tailscale admin console
+          </Button>
+        </>
+      )}
+      {ready && (
+        <>
+          <p>Ready: {ts.dns_name}. Remote access is published on your tailnet only, never the public internet.</p>
+          <Button
+            variant="ghost"
+            disabled={enable.isPending}
+            onClick={() => enable.mutate(null)}
+          >
+            Turn on remote access
+          </Button>
+        </>
+      )}
+      <form
+        className="sy-mint-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (!enable.isPending && own.trim() !== "") enable.mutate(own.trim());
+        }}
+      >
+        <div className="sy-mint-name">
+          <Field label="Or an HTTPS address you already have">
+            <input
+              type="text"
+              placeholder="https://nucleos.example.com"
+              value={own}
+              onChange={(event) => setOwn(event.target.value)}
+            />
+          </Field>
+        </div>
+        <Button type="submit" variant="ghost" disabled={enable.isPending || own.trim() === ""}>
+          Use this address
+        </Button>
+      </form>
+      {enable.isError && <EnableError error={enable.error} />}
+    </div>
+  );
+}
+
+function EnableError({ error }: { error: unknown }) {
+  if (isApiRefusal(error)) {
+    return (
+      <RefusalNote
+        refusal={error}
+        sentences={{
+          invalid_origin: "That address cannot be used: it must be https://host with no path.",
+          tailscale_not_ready: "Tailscale is not ready: sign in and enable HTTPS certificates.",
+          remote_page_missing: "This installation has no remote page to serve.",
+          serve_failed: "Tailscale refused to publish the page.",
+          no_machine_config: "This daemon has no settings folder to write to.",
+        }}
+      />
+    );
+  }
+  return <ErrorNote>remote access was not turned on: the {DAEMON_NAME} is not responding</ErrorNote>;
+}
+
 function CreateError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) {
     return (
       <RefusalNote
         refusal={error}
         sentences={{
-          remote_disabled: "Remote access is switched off in ~/.nucleos/remote.yaml",
+          remote_disabled: "Remote access is switched off. Turn it on above, then create the code.",
           invalid_device_name: "a device name is 1–64 printable characters",
         }}
       />

@@ -69,3 +69,56 @@ export function useRevokeDevice() {
     },
   });
 }
+
+/** What `GET /remote/setup` says about Tailscale on the host. */
+export interface TailscaleState {
+  installed: boolean;
+  signed_in: boolean;
+  dns_name: string | null;
+  https_ok: boolean;
+}
+
+/** `GET /remote/setup`: control token only, so the host's own shell reads it and a device never does. */
+export interface RemoteSetup {
+  enabled: boolean;
+  public_origin: string;
+  tailscale: TailscaleState;
+  serving: boolean;
+}
+
+const SETUP_KEY = ["remote", "setup"] as const;
+
+export function useRemoteSetup() {
+  return useQuery({
+    queryKey: SETUP_KEY,
+    queryFn: () => apiFetch<RemoteSetup>("/remote/setup"),
+  });
+}
+
+/** `POST /remote/setup`: no origin means "this machine's Tailscale name". */
+export function useEnableRemote() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (publicOrigin: string | null) =>
+      apiFetch<RemoteSetup>("/remote/setup", {
+        method: "POST",
+        body: JSON.stringify(publicOrigin === null ? {} : { public_origin: publicOrigin }),
+      }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: SETUP_KEY });
+    },
+  });
+}
+
+/** `DELETE /remote/setup`. */
+export function useDisableRemote() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () => apiFetch<RemoteSetup>("/remote/setup", { method: "DELETE" }),
+    retry: false,
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: SETUP_KEY });
+    },
+  });
+}

@@ -12,7 +12,7 @@ vi.mock("../data/client", async (original) => ({
 import { RemoteDevices } from "./RemoteDevices";
 import { createAppQueryClient } from "../app/queryClient";
 import { ApiRefusal } from "../data/client";
-import type { RemoteDevice } from "../data/remote";
+import type { RemoteDevice, RemoteSetup } from "../data/remote";
 
 /** Past `ConfirmButton`'s dwell, so the second press is a decision and not a double-click. */
 async function pastTheDwell(): Promise<void> {
@@ -103,7 +103,76 @@ describe("RemoteDevices", () => {
     fireEvent.change(await screen.findByLabelText("Device name"), { target: { value: "Phone" } });
     fireEvent.click(screen.getByRole("button", { name: "Create code" }));
     expect(
-      await screen.findByText("Remote access is switched off in ~/.nucleos/remote.yaml"),
+      await screen.findByText(/Remote access is switched off\. Turn it on above/),
     ).toBeDefined();
+  });
+  function setupOf(
+    over: Partial<Omit<RemoteSetup, "tailscale">> & { tailscale?: Partial<RemoteSetup["tailscale"]> },
+  ): RemoteSetup {
+    return {
+      enabled: false,
+      public_origin: "",
+      serving: false,
+      ...over,
+      tailscale: {
+        installed: true,
+        signed_in: true,
+        dns_name: "mybox.tail1234.ts.net",
+        https_ok: true,
+        ...over.tailscale,
+      },
+    };
+  }
+
+  it("the_wizard_points_at_the_admin_console_when_https_is_off", async () => {
+    daemon.apiFetch.mockImplementation(async (path: string) => {
+      if (path === "/remote/setup") return setupOf({ tailscale: { https_ok: false } });
+      if (path === "/remote/devices") return [];
+      throw new Error(`unexpected ${path}`);
+    });
+    renderPanel();
+    expect(await screen.findByText(/HTTPS\s+certificates switched off/)).toBeDefined();
+    expect(screen.getByRole("button", { name: "Open the Tailscale admin console" })).toBeDefined();
+    // Nothing to turn on yet, and no platform is named as a prerequisite.
+    expect(screen.queryByRole("button", { name: "Turn on remote access" })).toBeNull();
+    expect(document.body.textContent ?? "").not.toMatch(/Windows 11/);
+  });
+
+  it("the_wizard_shows_a_code_and_qr_when_ready", async () => {
+    let setup = setupOf({});
+    const posts: unknown[] = [];
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === "/remote/setup" && init?.method === "POST") {
+        posts.push(JSON.parse(String(init.body)));
+        setup = setupOf({
+          enabled: true,
+          public_origin: "https://mybox.tail1234.ts.net",
+          serving: true,
+        });
+        return setup;
+      }
+      if (path === "/remote/setup") return setup;
+      if (path === "/remote/devices") return [];
+      if (path === "/remote/pairing-codes") {
+        return {
+          code: "ABCDE-FGHJK",
+          access_level: "admin",
+          device_name: "Phone",
+          expires_at: "2026-10-29T09:05:00Z",
+        };
+      }
+      throw new Error(`unexpected ${path}`);
+    });
+    renderPanel();
+    fireEvent.click(await screen.findByRole("button", { name: "Turn on remote access" }));
+    await screen.findByText(/Remote access is on at/);
+    expect(posts).toEqual([{}]);
+
+    fireEvent.change(screen.getByLabelText("Device name"), { target: { value: "Phone" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create code" }));
+    const field = await screen.findByLabelText("the pairing code for Phone");
+    expect((field as HTMLInputElement).value).toBe("ABCDE-FGHJK");
+    const qr = screen.getByRole("img", { name: "QR code for https://mybox.tail1234.ts.net" });
+    expect(qr.querySelector("path")?.getAttribute("d")?.length ?? 0).toBeGreaterThan(100);
   });
 });
