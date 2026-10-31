@@ -1717,4 +1717,63 @@ mod tests {
         assert_eq!(status, "running");
         assert!(state.run_handles.lock().unwrap().contains_key(&run_id));
     }
+
+    /// A command that writes a file by redirection: unrecognized by the classifier, so a
+    /// `worktree` run is parked for it (`redirects_a_file`).
+    const REDIRECTING_COMMAND: &str = "cat > .nucleos-report.md <<'EOF'\nx\nEOF";
+
+    async fn run_status_and_action_approvals(state: &AppState, run_id: i64) -> (String, i64) {
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        let approvals: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM proposals WHERE kind = 'action-approval'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        (status, approvals)
+    }
+
+    /// Nothing ever answers a tree run's park: no timeout, and `reconcile_running` reads it as
+    /// live, so the tree would hang holding a slot. It must be a refusal the agent can act on.
+    #[tokio::test]
+    async fn a_tree_runs_unapproved_action_is_refused_not_parked() {
+        let state = test_state().await;
+        let (run_id, node_id, _) = seed_node_run(&state, "worktree", "leaf", Some(1_000)).await;
+        sqlx::query("UPDATE work_nodes SET tree_job_id = 'tree-job-1' WHERE id = ?")
+            .bind(&node_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let decision = decide(&state, run_id, "Bash", json!({"command": REDIRECTING_COMMAND})).await;
+
+        assert_eq!(decision.decision, "deny", "got {:?}", decision.reason);
+        assert!(
+            decision.reason.contains("approval") && decision.reason.contains("Write"),
+            "the reason must say the run cannot wait for approval and point at the Write tool, got {:?}",
+            decision.reason
+        );
+        let (status, approvals) = run_status_and_action_approvals(&state, run_id).await;
+        assert_ne!(status, "awaiting_approval");
+        assert_eq!(status, "running");
+        assert_eq!(approvals, 0);
+        assert!(state.run_handles.lock().unwrap().contains_key(&run_id));
+    }
+
+    /// Pins that ordinary `worktree` runs are unchanged. Passes today.
+    #[tokio::test]
+    async fn a_run_bound_to_no_tree_node_still_parks() {
+        let state = test_state().await;
+        let run_id = seed_run(&state, "worktree", Some(1_000)).await;
+
+        let decision = decide(&state, run_id, "Bash", json!({"command": REDIRECTING_COMMAND})).await;
+
+        assert_eq!(decision.decision, "pending_approval", "got {:?}", decision.reason);
+        let (status, approvals) = run_status_and_action_approvals(&state, run_id).await;
+        assert_eq!(status, "awaiting_approval");
+        assert_eq!(approvals, 1);
+    }
 }
