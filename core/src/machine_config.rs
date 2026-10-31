@@ -508,7 +508,7 @@ mod tests {
     /// The membership rule, asserted rather than trusted: every row can say no, and says both of
     /// the sentences the page needs.
     ///
-    /// The count is pinned so a twelfth row cannot arrive without somebody reading the header. That
+    /// The count is pinned so a thirteenth row cannot arrive without somebody reading the header. That
     /// is the same guard [`crate::ownership`] puts on its own table, and it is here for the same
     /// reason: the dangerous edit to a registry is an addition, not a change.
     #[test]

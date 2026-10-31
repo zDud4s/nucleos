@@ -22,6 +22,11 @@ pub trait Inhibitor: Send {
     fn acquire(&mut self) -> Result<(), String>;
     /// Lets go. Never fails: there is nothing a caller could do about it.
     fn release(&mut self);
+    /// Whether a hold taken earlier is still in force. `false` means it ended on its own (the
+    /// helper process exited) and the caller should re-acquire. Defaults to "yes".
+    fn is_alive(&mut self) -> bool {
+        true
+    }
 }
 
 /// The policy around an [`Inhibitor`]: on only when enabled, edge-triggered, quiet after a failure.
@@ -56,6 +61,11 @@ impl KeepAwake {
     /// every tick: only a change of answer reaches the OS. With the setting off it never holds.
     pub fn hold_awake_while(&mut self, has_work: bool) {
         let want = self.enabled && has_work;
+        if want && self.held && !self.inhibitor.is_alive() {
+            // The hold vanished under us: forget it and fall through to take it again.
+            self.held = false;
+            self.warn_once("the inhibitor exited on its own");
+        }
         if want == self.held {
             return;
         }
@@ -66,13 +76,15 @@ impl KeepAwake {
         }
         match self.inhibitor.acquire() {
             Ok(()) => self.held = true,
-            Err(reason) => {
-                // Not held, so the next tick tries again; only the warning is once.
-                if !self.warned {
-                    self.warned = true;
-                    tracing::warn!(%reason, "keep-awake: could not hold the machine awake; it may sleep with work running");
-                }
-            }
+            // Not held, so the next tick tries again; only the warning is once.
+            Err(reason) => self.warn_once(&reason),
+        }
+    }
+
+    fn warn_once(&mut self, reason: &str) {
+        if !self.warned {
+            self.warned = true;
+            tracing::warn!(%reason, "keep-awake: could not hold the machine awake; it may sleep with work running");
         }
     }
 }
@@ -152,23 +164,43 @@ mod platform {
 
     use super::Inhibitor;
 
+    /// `caffeinate -w <pid>` exits by itself when that process does, so a crashed daemon cannot
+    /// leave the machine held until reboot.
     #[cfg(target_os = "macos")]
-    fn command() -> Command {
+    fn args(daemon_pid: u32) -> Vec<String> {
+        vec!["-i".to_string(), "-w".to_string(), daemon_pid.to_string()]
+    }
+
+    #[cfg(target_os = "macos")]
+    fn command(daemon_pid: u32) -> Command {
         let mut command = Command::new("caffeinate");
-        command.arg("-i");
+        command.args(args(daemon_pid));
         command
     }
 
+    /// The inhibition lasts as long as the wrapped shell loop, which ends once the daemon pid is
+    /// gone. The pid travels as `$1` so it is never parsed as shell text.
     #[cfg(not(target_os = "macos"))]
-    fn command() -> Command {
-        let mut command = Command::new("systemd-inhibit");
-        command.args([
+    fn args(daemon_pid: u32) -> Vec<String> {
+        [
             "--what=idle",
             "--who=NucleOS",
             "--why=A run is in progress",
-            "sleep",
-            "infinity",
-        ]);
+            "sh",
+            "-c",
+            "while kill -0 \"$1\" 2>/dev/null; do sleep 5; done",
+            "sh",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .chain([daemon_pid.to_string()])
+        .collect()
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn command(daemon_pid: u32) -> Command {
+        let mut command = Command::new("systemd-inhibit");
+        command.args(args(daemon_pid));
         command
     }
 
@@ -183,7 +215,7 @@ mod platform {
             if self.child.is_some() {
                 return Ok(());
             }
-            let child = command()
+            let child = command(std::process::id())
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -191,6 +223,20 @@ mod platform {
                 .map_err(|error| error.to_string())?;
             self.child = Some(child);
             Ok(())
+        }
+
+        fn is_alive(&mut self) -> bool {
+            let Some(child) = self.child.as_mut() else {
+                return true;
+            };
+            match child.try_wait() {
+                Ok(None) => true,
+                // Exited on its own (or cannot be asked): drop it so the next acquire respawns.
+                _ => {
+                    self.child = None;
+                    false
+                }
+            }
         }
 
         fn release(&mut self) {
@@ -204,6 +250,24 @@ mod platform {
     impl Drop for SystemInhibitor {
         fn drop(&mut self) {
             self.release();
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn the_inhibitor_dies_with_the_daemon() {
+            let args = args(4242);
+            #[cfg(target_os = "macos")]
+            assert_eq!(args, ["-i", "-w", "4242"]);
+            #[cfg(not(target_os = "macos"))]
+            {
+                assert!(args.iter().any(|arg| arg.contains("kill -0 \"$1\"")));
+                assert_eq!(args.last().map(String::as_str), Some("4242"));
+                assert!(!args.iter().any(|arg| arg == "infinity"));
+            }
         }
     }
 }
@@ -220,6 +284,7 @@ mod tests {
     struct Fake {
         calls: Arc<Mutex<Vec<&'static str>>>,
         fail: bool,
+        alive: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl Inhibitor for Fake {
@@ -235,15 +300,44 @@ mod tests {
         fn release(&mut self) {
             self.calls.lock().unwrap().push("release");
         }
+
+        fn is_alive(&mut self) -> bool {
+            self.alive.load(std::sync::atomic::Ordering::SeqCst)
+        }
     }
 
     fn keep_awake(enabled: bool, fail: bool) -> (KeepAwake, Arc<Mutex<Vec<&'static str>>>) {
+        let (awake, calls, _) = keep_awake_with_life(enabled, fail);
+        (awake, calls)
+    }
+
+    fn keep_awake_with_life(
+        enabled: bool,
+        fail: bool,
+    ) -> (
+        KeepAwake,
+        Arc<Mutex<Vec<&'static str>>>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
         let calls = Arc::new(Mutex::new(Vec::new()));
+        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let fake = Fake {
             calls: calls.clone(),
             fail,
+            alive: alive.clone(),
         };
-        (KeepAwake::new(enabled, Box::new(fake)), calls)
+        (KeepAwake::new(enabled, Box::new(fake)), calls, alive)
+    }
+
+    #[test]
+    fn a_hold_that_ended_on_its_own_is_taken_again() {
+        let (mut awake, calls, alive) = keep_awake_with_life(true, false);
+        awake.hold_awake_while(true);
+        alive.store(false, std::sync::atomic::Ordering::SeqCst);
+        awake.hold_awake_while(true);
+        assert!(awake.warned, "the loss is warned about once");
+        assert!(awake.is_held(), "and the hold is re-acquired");
+        assert_eq!(*calls.lock().unwrap(), vec!["acquire", "acquire"]);
     }
 
     #[test]

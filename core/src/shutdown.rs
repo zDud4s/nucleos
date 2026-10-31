@@ -110,15 +110,45 @@ pub async fn live_runs(pool: &SqlitePool) -> sqlx::Result<i64> {
 /// How often the keep-awake loop re-reads whether a run is live.
 const KEEP_AWAKE_POLL: Duration = Duration::from_secs(30);
 
+/// How many failed counts in a row the loop rides out before it lets the hold go. One hiccup must
+/// not drop a hold that work depends on, but a database that stays broken must not keep the machine
+/// awake forever.
+const KEEP_AWAKE_MAX_FAILED_COUNTS: u32 = 5;
+
+/// One tick of the keep-awake loop: the answer for `hold_awake_while`, or `None` for "no change".
+/// `failures` is the run of consecutive failed counts, owned by the caller.
+fn keep_awake_step(count: Result<i64, ()>, failures: &mut u32) -> Option<bool> {
+    match count {
+        Ok(live) => {
+            *failures = 0;
+            Some(live > 0)
+        }
+        Err(()) => {
+            *failures = failures.saturating_add(1);
+            (*failures >= KEEP_AWAKE_MAX_FAILED_COUNTS).then_some(false)
+        }
+    }
+}
+
 /// Keeps the machine from idle-sleeping while [`live_runs`] is above zero. A failed count counts as
-/// "no change": a database hiccup must not let go of a hold that work still depends on.
+/// "no change" until [`KEEP_AWAKE_MAX_FAILED_COUNTS`] of them in a row, then the hold is released
+/// (with a warning) and the next good count resumes normally.
 pub async fn run_keep_awake_loop(pool: SqlitePool, enabled: bool) {
     let mut awake = crate::keep_awake::KeepAwake::system(enabled);
     let mut ticker = tokio::time::interval(KEEP_AWAKE_POLL);
+    let mut failures = 0u32;
     loop {
         ticker.tick().await;
-        if let Ok(live) = live_runs(&pool).await {
-            awake.hold_awake_while(live > 0);
+        let count = live_runs(&pool).await.map_err(|_| ());
+        let was_failing = failures >= KEEP_AWAKE_MAX_FAILED_COUNTS;
+        if let Some(has_work) = keep_awake_step(count, &mut failures) {
+            if !has_work && failures >= KEEP_AWAKE_MAX_FAILED_COUNTS && !was_failing {
+                tracing::warn!(
+                    failures,
+                    "keep-awake: the run count keeps failing; letting the machine sleep"
+                );
+            }
+            awake.hold_awake_while(has_work);
         }
     }
 }
@@ -239,6 +269,18 @@ mod tests {
     use axum::routing::post;
     use std::sync::Arc;
     use tower::ServiceExt;
+
+    #[test]
+    fn a_stuck_database_lets_the_hold_go() {
+        let mut failures = 0;
+        assert_eq!(keep_awake_step(Ok(2), &mut failures), Some(true));
+        for _ in 1..KEEP_AWAKE_MAX_FAILED_COUNTS {
+            assert_eq!(keep_awake_step(Err(()), &mut failures), None, "ridden out");
+        }
+        assert_eq!(keep_awake_step(Err(()), &mut failures), Some(false));
+        assert_eq!(keep_awake_step(Ok(1), &mut failures), Some(true), "resumes");
+        assert_eq!(failures, 0);
+    }
 
     /// Reopens the door when a test ends, even by a failed assertion.
     struct Reopen;
