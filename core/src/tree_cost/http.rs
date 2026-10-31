@@ -176,6 +176,85 @@ mod tests {
         assert_eq!(cost["budget"]["limit_usd"], 12.5);
     }
 
+    /// Links job `job` to root node `root` and gives the root one costed run of `cost` USD.
+    async fn seed_job_with_spend(state: &AppState, job: &str, root: &str, cost: f64) {
+        sqlx::query(
+            "INSERT INTO tree_jobs (id, root_node_id, goal, state, manifest, created_at, updated_at) \
+             VALUES (?, ?, 'g', 'open', '{}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(job)
+        .bind(root)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO runs (id, prompt, status, mode, cost_usd, created_at) \
+             VALUES (902, 'costed run', 'completed', 'shadow', ?, '2026-10-30T00:00:00Z')",
+        )
+        .bind(cost)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO work_nodes (id, root_id, depth, kind, title, goal, status, run_id, created_at, updated_at) \
+             VALUES (?, ?, 0, 'root', 'title', 'goal', 'done', '902', \
+                     '2026-10-30T00:00:00Z', '2026-10-30T00:00:00Z')",
+        )
+        .bind(root)
+        .bind(root)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_budget_set_by_job_id_applies_to_the_trees_root() {
+        let state = state().await;
+        let app = app(&state);
+        seed_job_with_spend(&state, "proof-slugify-3", "root-uuid-1", 2.5).await;
+
+        let (status, saved) = request(
+            &app,
+            "PUT",
+            "/trees/proof-slugify-3/budget",
+            json!({ "limit_usd": 7.0 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{saved:?}");
+
+        let (status, by_root) =
+            request(&app, "GET", "/trees/root-uuid-1/cost", Value::Null).await;
+        assert_eq!(status, StatusCode::OK, "{by_root:?}");
+        assert_eq!(by_root["budget"]["limit_usd"], 7.0, "{by_root:?}");
+
+        let (status, by_job) =
+            request(&app, "GET", "/trees/proof-slugify-3/cost", Value::Null).await;
+        assert_eq!(status, StatusCode::OK, "{by_job:?}");
+        assert_eq!(by_job["budget"]["limit_usd"], 7.0, "{by_job:?}");
+        assert_eq!(by_job["spent_usd"], 2.5, "{by_job:?}");
+    }
+
+    #[tokio::test]
+    async fn a_budget_set_by_root_id_still_applies() {
+        let state = state().await;
+        let app = app(&state);
+        seed_job_with_spend(&state, "proof-slugify-3", "root-uuid-1", 2.5).await;
+
+        let (status, saved) = request(
+            &app,
+            "PUT",
+            "/trees/root-uuid-1/budget",
+            json!({ "limit_usd": 9.0 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{saved:?}");
+
+        let (status, cost) = request(&app, "GET", "/trees/root-uuid-1/cost", Value::Null).await;
+        assert_eq!(status, StatusCode::OK, "{cost:?}");
+        assert_eq!(cost["budget"]["limit_usd"], 9.0, "{cost:?}");
+        assert_eq!(cost["spent_usd"], 2.5, "{cost:?}");
+    }
+
     #[tokio::test]
     async fn cache_report_route_with_no_data() {
         let state = state().await;

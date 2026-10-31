@@ -1185,4 +1185,17 @@ mod tests {
         assert!(prompt.to_lowercase().contains("handoff"), "{prompt}");
         assert!(prompt.contains("Implement the parser."), "{prompt}");
     }
+
+    /// RED: `node_prompt` must take the tree job's id as a second argument,
+    /// `node_prompt(node_id, tree_job_id, task)`; today it has two parameters, so this fails to
+    /// compile. The branch routes key on the job id, not on the node uuid.
+    #[test]
+    fn a_node_prompt_names_its_tree_job_id() {
+        let prompt = node_prompt("node-abc-123", "proof-slugify-3", "Implement the parser.");
+
+        assert!(prompt.contains("proof-slugify-3"), "{prompt}");
+        assert!(prompt.contains("tree_branch_start"), "{prompt}");
+        assert!(prompt.contains("node-abc-123"), "{prompt}");
+        assert!(prompt.contains("Implement the parser."), "{prompt}");
+    }
 }

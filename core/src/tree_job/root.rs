@@ -433,6 +433,35 @@ mod tests {
         );
     }
 
+    /// The root agent must be told the tree job's id (not only its root node uuid), or it passes the
+    /// node uuid as `id` to `tree_branch_start` and the door answers 403.
+    #[test]
+    fn the_root_prompt_names_its_tree_job_id() {
+        let job = super::TreeJob {
+            id: "proof-slugify-3".to_owned(),
+            root_node_id: "9f1c2d3e-root-node-uuid".to_owned(),
+            project_id: None,
+            feature_branch: Some("feat/tree".to_owned()),
+            goal: GOAL.to_owned(),
+            state: "open".to_owned(),
+            manifest: crate::tree_job::model::Manifest::new(
+                "proof-slugify-3",
+                "feat/tree",
+                GOAL,
+                "C:/Projects/nucleos",
+                &[],
+            ),
+            contract: None,
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+            updated_at: "2026-01-01T00:00:00Z".to_owned(),
+        };
+
+        let prompt = super::root_prompt(&job);
+
+        assert!(prompt.contains("proof-slugify-3"), "{prompt}");
+        assert!(prompt.contains("tree_branch_start"), "{prompt}");
+    }
+
     /// The prompt of the only run `POST /trees` started. It goes through the route, so that the test
     /// names no signature GREEN may still choose.
     #[tokio::test]
