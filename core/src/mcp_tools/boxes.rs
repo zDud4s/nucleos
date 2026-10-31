@@ -230,12 +230,17 @@ pub const WORKTREE_BOX_TOOLS: &[&str] = &[
     "node_tree",
     "node_update",
     "record",
+    "spec_backlog",
+    "spec_finish",
     "task_claim",
     "task_done",
     "task_list",
     "task_release",
+    "tree_launch",
+    "tree_status",
     "verify",
     "verify_status",
+    "wait_advice",
 ];
 
 /// What a team agent's box serves by default: today's `TEAM_TOOLS` plus the door that asks for more

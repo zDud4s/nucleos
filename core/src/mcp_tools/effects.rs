@@ -337,6 +337,12 @@ pub(super) const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     ("shadow_scoreboard", ToolEffect::ReadsOwn),
     // `ReadsOwn`: it asks this machine's own model adviser, on loopback, and files nothing. What it
     // sends is the director's own description of a candidate; what it answers is a model name.
+    // The backlog list and a tree job's status are rows in this machine's own database, and the
+    // wait advice is the daemon's own tally of its own cache waits: nobody else's words in any of
+    // them. `Acts` for the two that start or end something: `tree_launch` opens a root node that a
+    // paid run follows, and `spec_finish` closes a spec out of the backlog.
+    ("spec_backlog", ToolEffect::ReadsOwn),
+    ("spec_finish", ToolEffect::Acts),
     ("suggest_model", ToolEffect::ReadsOwn),
     // `WritesOwn`: a row in this machine's own claim table, keyed to the caller; nothing leaves the
     // machine and nothing is acted on. A claim is advisory until the land gate reads it.
@@ -344,6 +350,8 @@ pub(super) const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     ("task_done", ToolEffect::WritesOwn),
     ("task_list", ToolEffect::ReadsOwn),
     ("task_release", ToolEffect::WritesOwn),
+    ("tree_launch", ToolEffect::Acts),
+    ("tree_status", ToolEffect::ReadsOwn),
     ("triage_email", ToolEffect::Acts),
     ("vcs_request", ToolEffect::Acts),
     ("vcs_ticket", ToolEffect::ReadsOwn),
@@ -351,6 +359,7 @@ pub(super) const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     // ticket and cache rows; nothing leaves the machine. `verify_status` only reads that ticket.
     ("verify", ToolEffect::WritesOwn),
     ("verify_status", ToolEffect::ReadsOwn),
+    ("wait_advice", ToolEffect::ReadsOwn),
     ("web_read", ToolEffect::ReadsUntrusted),
     ("web_search", ToolEffect::ReadsUntrusted),
 ];

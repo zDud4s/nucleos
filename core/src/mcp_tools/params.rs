@@ -8,6 +8,30 @@ pub(super) struct RunParams {
     pub(super) prompt: String,
 }
 
+/// The body of `POST /trees`, field for field (`TreeBody` in `tree_job/http.rs`).
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub(super) struct TreeLaunchParams {
+    /// Your own id for the job; launching it again replays the stored one.
+    pub(super) id: String,
+    pub(super) goal: String,
+    pub(super) feature_branch: String,
+    pub(super) project_root: String,
+    pub(super) project_id: Option<String>,
+    pub(super) contract: Option<String>,
+    pub(super) dirty_owner_files: Option<Vec<String>>,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub(super) struct TreeIdParams {
+    pub(super) id: String,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub(super) struct SpecFinishParams {
+    /// The spec to finish. Absent leaves the choice to the daemon.
+    pub(super) spec_id: Option<String>,
+}
+
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 pub(super) struct JobParams {
     pub(super) project_id: String,

@@ -696,4 +696,79 @@ impl NucleosTools {
     ) -> String {
         json_result(self.client.browser_agent(&task, url.as_deref()).await)
     }
+
+    // The tree and backlog tools. Each is one daemon route and nothing else: the daemon owns every
+    // rule (admission, branch checks, who may finish a spec), so a refusal comes back as its text.
+
+    #[tool(
+        description = "Launch a tree job: opens a root work node for `goal` on `feature_branch` in \
+                       `project_root` and stores the job. `id` is yours to choose and makes the call \
+                       repeatable: launching the same id again answers with the stored job and \
+                       opens nothing. `project_id`, `contract` and `dirty_owner_files` are \
+                       optional. Returns {id, root_node_id, state, replayed}."
+    )]
+    pub(super) async fn tree_launch(
+        &self,
+        Parameters(TreeLaunchParams {
+            id,
+            goal,
+            feature_branch,
+            project_root,
+            project_id,
+            contract,
+            dirty_owner_files,
+        }): Parameters<TreeLaunchParams>,
+    ) -> String {
+        json_result(
+            self.client
+                .tree_launch(&serde_json::json!({
+                    "id": id,
+                    "goal": goal,
+                    "feature_branch": feature_branch,
+                    "project_root": project_root,
+                    "project_id": project_id,
+                    "contract": contract,
+                    "dirty_owner_files": dirty_owner_files,
+                }))
+                .await,
+        )
+    }
+
+    #[tool(description = "Read one tree job by the id it was launched with: its state, root node \
+                       and progress.")]
+    pub(super) async fn tree_status(
+        &self,
+        Parameters(TreeIdParams { id }): Parameters<TreeIdParams>,
+    ) -> String {
+        json_result(self.client.tree_status(&id).await)
+    }
+
+    #[tool(description = "List the spec backlog: the specs waiting to be built, with their state.")]
+    pub(super) async fn spec_backlog(&self) -> String {
+        json_result(self.client.spec_backlog().await)
+    }
+
+    #[tool(
+        description = "Mark a spec finished in the backlog. `spec_id` names the spec; absent, the \
+                       daemon decides which one is meant. The daemon refuses the call when the \
+                       caller may not finish specs."
+    )]
+    pub(super) async fn spec_finish(
+        &self,
+        Parameters(SpecFinishParams { spec_id }): Parameters<SpecFinishParams>,
+    ) -> String {
+        json_result(
+            self.client
+                .spec_finish(&serde_json::json!({ "spec_id": spec_id }))
+                .await,
+        )
+    }
+
+    #[tool(
+        description = "Advice on how long a pause between turns is worth, from the daemon's own \
+                       measurement of cache waits. Read it before deciding to sleep or to wait."
+    )]
+    pub(super) async fn wait_advice(&self) -> String {
+        json_result(self.client.wait_advice().await)
+    }
 }
