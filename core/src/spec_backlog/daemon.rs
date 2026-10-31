@@ -782,6 +782,39 @@ mod tests {
         assert_eq!(projects, vec!["proj-null-tree".to_owned()]);
     }
 
+    #[tokio::test]
+    async fn the_launch_is_recorded_while_the_tree_still_runs() {
+        let pool = crate::testdb::fresh_pool().await;
+        let spec = store::upsert_by_path(
+            &pool,
+            Some("launch-recorded"),
+            ".ai/specs/2026-01-01-launch-recorded.md",
+            "launch-recorded",
+            "sha-1",
+        )
+        .await
+        .unwrap();
+        let request = TreeRequest {
+            id: "tree-launch-recorded".to_owned(),
+            spec_id: spec.id.clone(),
+            goal: "Keep running".to_owned(),
+            feature_branch: "feat/launch-recorded".to_owned(),
+            project_root: "C:/repo".to_owned(),
+            project_id: Some("launch-recorded".to_owned()),
+            round: 1,
+        };
+
+        accepted(&pool, &request).await.unwrap();
+
+        assert!(
+            store::get_spec(&pool, &spec.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .tree_launched
+        );
+    }
+
     // ---- Fix C: durable finish intents and the sweeper ---------------------------------------------
     //
     // Assumed seams (the implementer follows these exactly):

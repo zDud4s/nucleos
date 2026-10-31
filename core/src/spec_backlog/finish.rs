@@ -1200,6 +1200,94 @@ mod tests {
         }
     }
 
+    struct AuditPathPreparer {
+        pool: SqlitePool,
+        calls: Mutex<Vec<&'static str>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SpecPreparer for AuditPathPreparer {
+        async fn extract(&self, spec_id: &str) -> Result<(), String> {
+            store::set_extraction_result(
+                &self.pool,
+                spec_id,
+                SpecKind::Spec,
+                SpecStatus::Extracted,
+                None,
+            )
+            .await
+            .map_err(|error| error.to_string())
+        }
+
+        async fn audit_before_tree(
+            &self,
+            _spec_id: &str,
+            _lineage: &SpecLineage,
+        ) -> Result<AuditReport, String> {
+            self.calls.lock().unwrap().push("before");
+            Ok(AuditReport {
+                reviewer_run_id: "reviewer-before".to_owned(),
+                verify: VerifyState::Red,
+                verdict: Verdict::NotDone(vec![NotDoneReason::VerifyNotGreen]),
+                status: SpecStatus::Audited,
+            })
+        }
+
+        async fn audit(
+            &self,
+            _spec_id: &str,
+            _lineage: &SpecLineage,
+        ) -> Result<AuditReport, String> {
+            self.calls.lock().unwrap().push("after");
+            Ok(AuditReport {
+                reviewer_run_id: "reviewer-after".to_owned(),
+                verify: VerifyState::Green,
+                verdict: Verdict::Done,
+                status: SpecStatus::Done,
+            })
+        }
+    }
+
+    struct UnavailableAuditPreparer {
+        pool: SqlitePool,
+    }
+
+    #[async_trait::async_trait]
+    impl SpecPreparer for UnavailableAuditPreparer {
+        async fn extract(&self, spec_id: &str) -> Result<(), String> {
+            store::set_extraction_result(
+                &self.pool,
+                spec_id,
+                SpecKind::Spec,
+                SpecStatus::Extracted,
+                None,
+            )
+            .await
+            .map_err(|error| error.to_string())
+        }
+
+        async fn audit_before_tree(
+            &self,
+            _spec_id: &str,
+            _lineage: &SpecLineage,
+        ) -> Result<AuditReport, String> {
+            Err("reviewer unavailable".to_owned())
+        }
+
+        async fn audit(
+            &self,
+            _spec_id: &str,
+            _lineage: &SpecLineage,
+        ) -> Result<AuditReport, String> {
+            Ok(AuditReport {
+                reviewer_run_id: "reviewer-after".to_owned(),
+                verify: VerifyState::Green,
+                verdict: Verdict::Done,
+                status: SpecStatus::Done,
+            })
+        }
+    }
+
     fn scope_all() -> FinishScope {
         FinishScope::All { project_id: None }
     }
@@ -1252,6 +1340,67 @@ mod tests {
         let spec = store::get_spec(&pool, &id).await.unwrap().unwrap();
         assert_eq!(spec.status, SpecStatus::NeedsOwner);
         assert!(spec.status_reason.unwrap_or_default().contains("doubt"));
+    }
+
+    #[tokio::test]
+    async fn prepare_audits_with_no_owner_questions() {
+        let pool = crate::testdb::fresh_pool().await;
+        let id = add_spec(&pool, "pre-tree-audit", SpecStatus::Discovered).await;
+        let log = Log::default();
+        let launcher = FakeLauncher::new(&log);
+        let preparer = AuditPathPreparer {
+            pool: pool.clone(),
+            calls: Mutex::new(Vec::new()),
+        };
+
+        finish_with(
+            &pool,
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &preparer,
+            },
+            &cfg(),
+            scope_all(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(launcher.requests().len(), 1);
+        assert_eq!(*preparer.calls.lock().unwrap(), vec!["before", "after"]);
+        assert_eq!(id, launcher.requests()[0].spec_id);
+    }
+
+    #[tokio::test]
+    async fn an_audit_that_cannot_run_leaves_a_feed_line() {
+        let pool = crate::testdb::fresh_pool().await;
+        let id = add_spec(&pool, "audit-unavailable", SpecStatus::Discovered).await;
+        let log = Log::default();
+        let launcher = FakeLauncher::new(&log);
+        let preparer = UnavailableAuditPreparer { pool: pool.clone() };
+
+        finish_with(
+            &pool,
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &preparer,
+            },
+            &cfg(),
+            scope_all(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(launcher.requests().len(), 1);
+        let feed: Vec<String> = sqlx::query_scalar(
+            "SELECT summary FROM feed WHERE kind = 'spec_audit_unavailable' ORDER BY rowid",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(feed.len(), 1, "{feed:?}");
+        assert!(feed[0].contains("reviewer unavailable"), "{feed:?}");
+        assert!(feed[0].contains("2026-01-01-audit-unavailable"), "{feed:?}");
+        assert_eq!(id, launcher.requests()[0].spec_id);
     }
 
     #[tokio::test]

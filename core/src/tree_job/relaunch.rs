@@ -511,6 +511,24 @@ mod tests {
     const ROOT: &str = "relaunch-root";
     const CREATED: &str = "2026-10-31T00:00:00+00:00";
 
+    #[tokio::test]
+    async fn successor_key_first_proposal_wins() {
+        let pool = crate::testdb::fresh_pool().await;
+
+        assert_eq!(
+            successor_key(&pool, NODE, "55", "resume-55").await.unwrap(),
+            "resume-55"
+        );
+        assert_eq!(
+            successor_key(&pool, NODE, "55", "died-55").await.unwrap(),
+            "resume-55"
+        );
+        assert_eq!(
+            successor_key(&pool, NODE, "56", "died-56").await.unwrap(),
+            "died-56"
+        );
+    }
+
     /// An owner's answer decides, so the tree budget does not stop it. This passes today (the answer
     /// relaunch has no budget check) and is here so that a budget check added to the automatic
     /// relaunches cannot reach `answer_and_relaunch`.

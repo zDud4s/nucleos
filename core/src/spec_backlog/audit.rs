@@ -464,6 +464,22 @@ mod tests {
             .await
         }
 
+        async fn run_before_tree(
+            &self,
+            reviewer: &FakeReviewer,
+            verify: &FakeVerify,
+        ) -> Result<AuditReport, AuditError> {
+            audit_before_tree(
+                &self.pool,
+                &self.id,
+                self.worktree.path(),
+                &SpecLineage::default(),
+                reviewer,
+                verify,
+            )
+            .await
+        }
+
         async fn spec(&self) -> Spec {
             store::get_spec(&self.pool, &self.id)
                 .await
@@ -553,6 +569,39 @@ mod tests {
         assert_eq!(spec.status, SpecStatus::Audited);
         assert!(has_reason_text(&spec), "{:?}", spec.status_reason);
         assert_eq!(spec.last_audited_sha.as_deref(), Some(SHA));
+        assert!(fx.has_open_question_about(text).await);
+    }
+
+    #[tokio::test]
+    async fn audit_before_tree_raises_no_question_for_a_doubt() {
+        let fx = Fixture::new(&["the widget renders"]).await;
+        let reviewer = FakeReviewer::answering(
+            "review-1",
+            None,
+            vec![review(1, CriterionStatus::Doubt, Some(GOOD))],
+        );
+        let verify = FakeVerify::new(VerifyState::Green);
+
+        fx.run_before_tree(&reviewer, &verify).await.unwrap();
+
+        assert_eq!(fx.criteria().await[0].status, CriterionStatus::Doubt);
+        assert!(fx.questions().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn audit_after_a_tree_still_raises_the_question_for_a_doubt() {
+        let text = "the widget renders";
+        let fx = Fixture::new(&[text]).await;
+        let reviewer = FakeReviewer::answering(
+            "review-1",
+            None,
+            vec![review(1, CriterionStatus::Doubt, Some(GOOD))],
+        );
+        let verify = FakeVerify::new(VerifyState::Green);
+
+        fx.run(&reviewer, &verify).await.unwrap();
+
+        assert_eq!(fx.questions().await.len(), 1);
         assert!(fx.has_open_question_about(text).await);
     }
 

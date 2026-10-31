@@ -793,6 +793,50 @@ mod tests {
 
     // ---- the boot race -----------------------------------------------------------------------------
 
+    #[tokio::test]
+    async fn a_sweep_racing_a_boot_relaunch_shares_its_key() {
+        let state = state().await;
+        seed_node(&state, Some("building"), "open", NODE, Some(55)).await;
+        seed_run(&state, 55, "interrupted").await;
+        seed_launch(&state, NODE).await;
+
+        let key = super::super::relaunch::successor_key(&state.pool, NODE, "55", "resume-55")
+            .await
+            .unwrap();
+        node_run::apply(&state.pool, NODE, "launch", &key, "56")
+            .await
+            .unwrap();
+        wrap_node(&state, NODE, JOB, Some("55".to_owned()), None)
+            .await
+            .unwrap();
+
+        assert_eq!(launches(&state, NODE, "died-55").await, 0);
+        assert_eq!(all_launches(&state, NODE).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_boot_relaunch_racing_a_sweep_shares_its_key() {
+        let state = state().await;
+        seed_node(&state, Some("building"), "open", NODE, Some(56)).await;
+        seed_run(&state, 56, "interrupted").await;
+        seed_launch(&state, NODE).await;
+
+        let key = super::super::relaunch::successor_key(&state.pool, NODE, "56", "died-56")
+            .await
+            .unwrap();
+        node_run::apply(&state.pool, NODE, "launch", &key, "57")
+            .await
+            .unwrap();
+        let boot = crate::tree_job::store::Resumed {
+            jobs: vec![JOB.to_owned()],
+            ..Default::default()
+        };
+        open::relaunch_resumed(&state, &boot).await;
+
+        assert_eq!(launches(&state, NODE, "resume-56").await, 0);
+        assert_eq!(all_launches(&state, NODE).await, 1);
+    }
+
     /// The first sweep tick fires as `relaunch_resumed` is spawned, so both see a spared node whose
     /// run is dead and neither takes a lock (keys `died-<run>` and `resume-<run>` differ). `tick`
     /// lists its rows once and then acts on that snapshot, so a node `relaunch_resumed` started in
