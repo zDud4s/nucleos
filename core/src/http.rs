@@ -41,6 +41,7 @@ mod chats;
 mod commands;
 mod common;
 mod email;
+mod engines;
 mod files;
 mod fleet;
 mod git_ops;

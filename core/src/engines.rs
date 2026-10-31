@@ -15,6 +15,8 @@ use crate::config::{ModelsConfig, SeatKind};
 use crate::execution::runner::CommandRunner;
 use crate::models::model_catalog::Discovered;
 
+mod agy_setting;
+
 /// Engine ids, named once so the enums that mirror the table can match on them.
 pub const CLAUDE: &str = "claude";
 pub const CODEX: &str = "codex";
