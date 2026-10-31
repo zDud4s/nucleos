@@ -1877,7 +1877,10 @@ mod tests {
         )
         .await;
 
-        assert_allowed(&decision, "an absolute Unix path under the declared docs path");
+        assert_allowed(
+            &decision,
+            "an absolute Unix path under the declared docs path",
+        );
     }
 
     #[tokio::test]
@@ -1960,15 +1963,25 @@ mod tests {
     async fn assert_docs_run_refuses_shell(state: &AppState, command: &str, what: &str) {
         let run_id = seed_tree_branch_run(state, "docs", &[".ai/notes/**"]).await;
         let decision = decide(state, run_id, "Bash", json!({"command": command})).await;
-        assert_eq!(decision.decision, "deny", "{what}: got {:?}", decision.reason);
+        assert_eq!(
+            decision.decision, "deny",
+            "{what}: got {:?}",
+            decision.reason
+        );
         assert!(
             decision.reason.contains("docs"),
             "{what}: the docs guard must refuse it at once and name the docs branch, got {:?}",
             decision.reason
         );
         let (status, approvals) = run_status_and_action_approvals(state, run_id).await;
-        assert_eq!(status, "running", "{what}: the refusal must not park the run");
-        assert_eq!(approvals, 0, "{what}: the refusal must not mint an approval");
+        assert_eq!(
+            status, "running",
+            "{what}: the refusal must not park the run"
+        );
+        assert_eq!(
+            approvals, 0,
+            "{what}: the refusal must not mint an approval"
+        );
     }
 
     /// A docs output is local and never committed, so a docs run may not commit. Fails today: the
@@ -1991,12 +2004,8 @@ mod tests {
     #[tokio::test]
     async fn docs_run_wrapped_git_commit_is_denied() {
         let state = test_state().await;
-        assert_docs_run_refuses_shell(
-            &state,
-            "cd sub && git commit -m x",
-            "cd sub && git commit",
-        )
-        .await;
+        assert_docs_run_refuses_shell(&state, "cd sub && git commit -m x", "cd sub && git commit")
+            .await;
         assert_docs_run_refuses_shell(&state, "git -C sub commit -m x", "git -C sub commit").await;
     }
 
