@@ -607,6 +607,122 @@ mod tests {
         assert_eq!(after, before);
     }
 
+    /// Sets the tree's budget row, keyed on its root node id, as `PUT /trees/{id}/budget` does.
+    async fn set_tree_budget(state: &AppState, root_id: &str, limit: f64, soft_pct: f64) {
+        sqlx::query(
+            "INSERT INTO tree_budgets (tree_id, limit_usd, soft_pct, created_at, updated_at) \
+             VALUES (?, ?, ?, '2026-10-30T10:00:00+00:00', '2026-10-30T10:00:00+00:00') \
+             ON CONFLICT(tree_id) DO UPDATE SET limit_usd = excluded.limit_usd, \
+             soft_pct = excluded.soft_pct",
+        )
+        .bind(root_id)
+        .bind(limit)
+        .bind(soft_pct)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+
+    /// Records `cost` USD of measured spending against the tree, as the ledger counts it: a
+    /// finished node of the tree with a completed run.
+    async fn record_tree_spend(state: &AppState, root_id: &str, node_id: &str, cost: f64) {
+        let run_id = sqlx::query(
+            "INSERT INTO runs (prompt, status, cost_usd, created_at, completed_at) \
+             VALUES ('p', 'completed', ?, '2026-10-30T10:00:00+00:00', '2026-10-30T10:00:00+00:00')",
+        )
+        .bind(cost)
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        sqlx::query(
+            "INSERT INTO work_nodes (id, root_id, depth, kind, title, goal, status, run_id, created_at, updated_at) \
+             VALUES (?, ?, 0, 'leaf', 't', 'g', 'done', ?, '2026-10-30T10:00:00+00:00', '2026-10-30T10:00:00+00:00')",
+        )
+        .bind(node_id)
+        .bind(root_id)
+        .bind(run_id.to_string())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+
+    /// A reserve of zero, so that only the spend against the limit decides the permit.
+    async fn zero_reserve(state: &AppState) {
+        sqlx::query("UPDATE autopilot_global SET budget_per_run_reserve_usd = 0")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn branch_start_is_refused_when_the_tree_budget_is_spent() {
+        let (state, app, caller, _repo) = tree().await;
+        zero_reserve(&state).await;
+        // A limit already reached: nothing spent yet is still `spent >= limit`.
+        set_tree_budget(&state, &caller, 0.0, 80.0).await;
+        let nodes = count(&state, "work_nodes").await;
+
+        let refused = post(&app, &uri(), body(&caller)).await;
+
+        assert_eq!(refused.0, StatusCode::CONFLICT, "{:?}", refused.1);
+        assert_eq!(count(&state, "work_nodes").await, nodes);
+    }
+
+    #[tokio::test]
+    async fn branch_start_replay_of_an_existing_node_survives_a_spent_budget() {
+        let (state, app, caller, _repo) = tree().await;
+        zero_reserve(&state).await;
+        let first = post(&app, &uri(), body(&caller)).await;
+        assert_eq!(first.0, StatusCode::OK, "{:?}", first.1);
+        let nodes = count(&state, "work_nodes").await;
+
+        set_tree_budget(&state, &caller, 0.0, 80.0).await;
+        let second = post(&app, &uri(), body(&caller)).await;
+
+        assert_eq!(second.0, StatusCode::OK, "{:?}", second.1);
+        assert_eq!(second.1["node_id"], first.1["node_id"]);
+        assert_eq!(second.1["replayed"], true);
+        assert_eq!(count(&state, "work_nodes").await, nodes);
+    }
+
+    #[tokio::test]
+    async fn branch_start_writes_the_soft_budget_line_once() {
+        let (state, app, caller, _repo) = tree().await;
+        zero_reserve(&state).await;
+        // The soft threshold is 1 USD of a 1000 USD limit; 5 USD is over it and far under the limit.
+        set_tree_budget(&state, &caller, 1000.0, 0.1).await;
+        record_tree_spend(&state, &caller, "spent-node", 5.0).await;
+        let lines = |state: AppState| async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM feed WHERE kind = 'tree_budget_soft' AND subject = ?",
+            )
+            .bind(format!("tree:{}", caller_of(&state).await))
+            .fetch_one(&state.pool)
+            .await
+            .unwrap()
+        };
+        assert_eq!(lines(state.clone()).await, 0);
+
+        let first = post(&app, &uri(), body(&caller)).await;
+        assert_eq!(first.0, StatusCode::OK, "{:?}", first.1);
+        assert_eq!(lines(state.clone()).await, 1);
+
+        // A replay opens no node, and writes no second line.
+        let second = post(&app, &uri(), body(&caller)).await;
+        assert_eq!(second.0, StatusCode::OK, "{:?}", second.1);
+        assert_eq!(lines(state.clone()).await, 1);
+    }
+
+    /// The root node id of the test tree.
+    async fn caller_of(state: &AppState) -> String {
+        sqlx::query_scalar("SELECT root_node_id FROM tree_jobs WHERE id = ?")
+            .bind(TREE)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap()
+    }
+
     /// The permission and directory of the launch the runner saw last, once there is one.
     async fn seen_launch(
         runner: &crate::execution::runner::FakeCommandRunner,

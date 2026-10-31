@@ -253,6 +253,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_budget_of_zero_or_less_is_refused() {
+        let state = state().await;
+        let app = app(&state);
+
+        for limit in [0.0, -1.0] {
+            let (status, refused) = request(
+                &app,
+                "PUT",
+                "/trees/tree-1/budget",
+                json!({ "limit_usd": limit }),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "limit {limit}: {refused:?}"
+            );
+        }
+
+        let stored: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM tree_budgets WHERE tree_id = 'tree-1'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, 0);
+    }
+
+    #[tokio::test]
     async fn a_budget_set_by_root_id_still_applies() {
         let state = state().await;
         let app = app(&state);
