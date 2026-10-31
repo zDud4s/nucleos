@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 #[cfg(not(target_os = "macos"))]
 use std::process::Command;
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 const TASK_NAME: &str = "NucleOS Daemon";
 
 /// PURE: an AppImage runs from a temporary mount, so registering that path would leave a dead
@@ -19,10 +19,239 @@ pub fn ensure_registered(exe_path: &Path) -> std::io::Result<()> {
         tracing::warn!("running from an AppImage: autostart is not registered");
         return Ok(());
     }
+    reconcile(exe_path)
+}
+
+#[cfg(windows)]
+fn reconcile(exe_path: &Path) -> std::io::Result<()> {
+    match registration_plan(task_state(exe_path)) {
+        Registration::Keep => Ok(()),
+        Registration::CreateAtLogin => register(exe_path),
+        Registration::RepointExe => repoint(exe_path),
+    }
+}
+
+#[cfg(not(windows))]
+fn reconcile(exe_path: &Path) -> std::io::Result<()> {
     if is_registered(exe_path) {
         return Ok(());
     }
     register(exe_path)
+}
+
+/// When the daemon starts on its own. Never stored by NucleOS: the registered task (Windows) or the
+/// user's linger flag (Linux) is the single source of truth, so a hand edit is never contradicted by
+/// a second copy kept here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Mode {
+    /// Starts when the owner logs in. The default.
+    AtLogin,
+    /// Starts with the machine, before any login.
+    AtBoot,
+}
+
+/// What this platform can do for [`Mode::AtBoot`], and what the settings page should say about it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Capability {
+    pub at_boot: bool,
+    /// Whether switching to [`Mode::AtBoot`] needs the account's password, given once and never kept.
+    pub needs_password: bool,
+    /// Why `at_boot` is false, in words for the owner.
+    pub why_not: Option<String>,
+}
+
+#[allow(dead_code)] // each build constructs only its own platform
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Platform {
+    Windows,
+    Macos,
+    Linux,
+}
+
+impl Platform {
+    fn current() -> Self {
+        if cfg!(windows) {
+            Self::Windows
+        } else if cfg!(target_os = "macos") {
+            Self::Macos
+        } else {
+            Self::Linux
+        }
+    }
+}
+
+/// PURE: what each platform can do. `has_user_systemd` only matters on Linux, where linger is a
+/// property of the systemd user manager.
+fn capability_for(platform: Platform, has_user_systemd: bool) -> Capability {
+    match platform {
+        Platform::Windows => Capability {
+            at_boot: true,
+            needs_password: true,
+            why_not: None,
+        },
+        Platform::Macos => Capability {
+            at_boot: false,
+            needs_password: false,
+            why_not: Some(
+                "macOS only starts a LaunchAgent at login, and a LaunchDaemon cannot reach the \
+                 Keychain this app keeps its credentials in. To keep the machine usable without \
+                 someone at the keyboard, turn on automatic login in the system settings."
+                    .to_owned(),
+            ),
+        },
+        Platform::Linux if has_user_systemd => Capability {
+            at_boot: true,
+            needs_password: false,
+            why_not: None,
+        },
+        Platform::Linux => Capability {
+            at_boot: false,
+            needs_password: false,
+            why_not: Some(
+                "This session has no systemd user manager, which is what keeps a user's services \
+                 running without a login."
+                    .to_owned(),
+            ),
+        },
+    }
+}
+
+pub fn capability() -> Capability {
+    let platform = Platform::current();
+    capability_for(
+        platform,
+        platform == Platform::Linux && user_systemd_present(),
+    )
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn user_systemd_present() -> bool {
+    has_user_systemd()
+}
+
+#[cfg(not(all(unix, not(target_os = "macos"))))]
+fn user_systemd_present() -> bool {
+    false
+}
+
+/// Why [`set_mode`] did not change anything.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SetModeError {
+    /// This platform cannot do what was asked; the text says why.
+    Unsupported(String),
+    /// [`Mode::AtBoot`] needs the account's password here and none (or an empty one) came.
+    PasswordRequired,
+    /// The system tool refused. The text is its own words, with the password removed.
+    Failed(String),
+}
+
+impl std::fmt::Display for SetModeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsupported(why) => f.write_str(why),
+            Self::PasswordRequired => f.write_str("the account's password is required"),
+            Self::Failed(why) => f.write_str(why),
+        }
+    }
+}
+
+/// What the registered task looks like, as far as re-registering cares.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TaskState {
+    runs_this_exe: bool,
+    at_boot: bool,
+}
+
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+enum Registration {
+    Keep,
+    CreateAtLogin,
+    RepointExe,
+}
+
+/// PURE: what `ensure_registered` does about the task it found.
+///
+/// A new registration used to overwrite the task with the login one, which would silently undo
+/// [`Mode::AtBoot`] on the next start. A boot task cannot be recreated here, because that needs
+/// the password NucleOS never keeps, so one that points at a moved executable only has its command
+/// changed and keeps its trigger and its credentials.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn registration_plan(task: Option<TaskState>) -> Registration {
+    match task {
+        Some(TaskState {
+            runs_this_exe: true,
+            ..
+        }) => Registration::Keep,
+        Some(TaskState { at_boot: true, .. }) => Registration::RepointExe,
+        _ => Registration::CreateAtLogin,
+    }
+}
+
+/// PURE: whether a task's XML has a boot trigger.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn xml_is_at_boot(xml: &str) -> bool {
+    xml.contains("<BootTrigger>")
+}
+
+/// PURE: `schtasks` arguments that replace only the command of the existing task.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn repoint_args(exe_path: &Path) -> Vec<String> {
+    vec![
+        "/Change".to_owned(),
+        "/TN".to_owned(),
+        TASK_NAME.to_owned(),
+        "/TR".to_owned(),
+        format!("\"{}\"", exe_path.to_string_lossy()),
+    ]
+}
+
+/// PURE: `schtasks` arguments that create the boot task. The password is the one argument that
+/// must never be logged or kept; the caller passes the returned vector straight to the process.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn at_boot_create_args(xml_path: &Path, user: &str, password: &str) -> Vec<String> {
+    vec![
+        "/Create".to_owned(),
+        "/TN".to_owned(),
+        TASK_NAME.to_owned(),
+        "/XML".to_owned(),
+        xml_path.to_string_lossy().into_owned(),
+        "/RU".to_owned(),
+        user.to_owned(),
+        "/RP".to_owned(),
+        password.to_owned(),
+        "/F".to_owned(),
+    ]
+}
+
+/// PURE: a tool's complaint with the password taken out of it, for the response and the log.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn scrub(message: &str, password: &str) -> String {
+    if password.is_empty() {
+        return message.trim().to_owned();
+    }
+    message.replace(password, "***").trim().to_owned()
+}
+
+/// PURE: the mode a `loginctl show-user -p Linger` answer describes.
+#[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
+fn mode_from_linger(output: &str) -> Mode {
+    if output.lines().any(|line| line.trim() == "Linger=yes") {
+        Mode::AtBoot
+    } else {
+        Mode::AtLogin
+    }
+}
+
+/// PURE: the one `loginctl` verb that makes `mode` true.
+#[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
+fn linger_verb(mode: Mode) -> &'static str {
+    match mode {
+        Mode::AtBoot => "enable-linger",
+        Mode::AtLogin => "disable-linger",
+    }
 }
 
 /// PURE: escapes a value for an XML text node.
@@ -41,7 +270,32 @@ fn xml_escape(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-/// Whether the registered task, if any, is one that actually launches THIS executable.
+/// The registered task's XML, if there is one.
+#[cfg(windows)]
+fn query_task_xml() -> Option<String> {
+    let output = Command::new("schtasks")
+        .args(["/Query", "/TN", TASK_NAME, "/XML", "ONE"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    // schtasks emits UTF-16LE here; comparing bytes would never match. Lossy is fine — a path that
+    // does not survive the round trip is not one we would match anyway.
+    Some(
+        output
+            .stdout
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>()
+            .iter()
+            .map(|unit| char::from_u32(u32::from(*unit)).unwrap_or('\u{fffd}'))
+            .collect(),
+    )
+}
+
+/// Whether the registered task, if any, is one that actually launches THIS executable, and its
+/// trigger.
 ///
 /// The name alone was the whole check, and the name is not a fact about the task: anything already
 /// called "NucleOS Daemon" satisfied it forever, whatever it ran. The benign version of that is an
@@ -49,29 +303,81 @@ fn xml_escape(value: &str) -> String {
 /// nothing looked. The unpleasant version is a same-user process pre-creating that name and owning
 /// a logon-persistence slot this daemon would then refuse to correct.
 #[cfg(windows)]
-fn is_registered(exe_path: &Path) -> bool {
-    let Ok(output) = Command::new("schtasks")
-        .args(["/Query", "/TN", TASK_NAME, "/XML", "ONE"])
-        .output()
-    else {
-        return false;
-    };
-    if !output.status.success() {
-        return false;
-    }
-    // schtasks emits UTF-16LE here; comparing bytes would never match. Lossy is fine — a path that
-    // does not survive the round trip is not one we would match anyway.
-    let xml: String = output
-        .stdout
-        .chunks_exact(2)
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-        .collect::<Vec<_>>()
-        .iter()
-        .map(|unit| char::from_u32(u32::from(*unit)).unwrap_or('\u{fffd}'))
-        .collect();
+fn task_state(exe_path: &Path) -> Option<TaskState> {
+    let xml = query_task_xml()?;
+    Some(TaskState {
+        runs_this_exe: xml
+            .to_lowercase()
+            .contains(&xml_escape(&exe_path.to_string_lossy()).to_lowercase()),
+        at_boot: xml_is_at_boot(&xml),
+    })
+}
 
-    xml.to_lowercase()
-        .contains(&xml_escape(&exe_path.to_string_lossy()).to_lowercase())
+/// The mode the machine is in now.
+#[cfg(windows)]
+pub fn current_mode() -> Mode {
+    match query_task_xml() {
+        Some(xml) if xml_is_at_boot(&xml) => Mode::AtBoot,
+        _ => Mode::AtLogin,
+    }
+}
+
+#[cfg(windows)]
+fn windows_user() -> std::io::Result<String> {
+    let name = std::env::var("USERNAME")
+        .map_err(|_| std::io::Error::other("no USERNAME to run the task as"))?;
+    Ok(match std::env::var("USERDOMAIN") {
+        Ok(domain) if !domain.is_empty() => format!("{domain}\\{name}"),
+        _ => name,
+    })
+}
+
+/// Switches the mode. The password, when the platform wants one, goes to the system tool once and
+/// is neither stored nor logged.
+#[cfg(windows)]
+pub fn set_mode(mode: Mode, password: Option<&str>, exe_path: &Path) -> Result<(), SetModeError> {
+    match mode {
+        Mode::AtLogin => {
+            register(exe_path).map_err(|error| SetModeError::Failed(error.to_string()))
+        }
+        Mode::AtBoot => {
+            let password = password
+                .filter(|password| !password.is_empty())
+                .ok_or(SetModeError::PasswordRequired)?;
+            let failed =
+                |error: std::io::Error| SetModeError::Failed(scrub(&error.to_string(), password));
+            let user = windows_user().map_err(failed)?;
+            let xml_path = std::env::temp_dir().join("nucleos-daemon-task.xml");
+            write_utf16_xml(&xml_path, &at_boot_task_xml(exe_path, &user)).map_err(failed)?;
+            let output = Command::new("schtasks")
+                .args(at_boot_create_args(&xml_path, &user, password))
+                .stdin(std::process::Stdio::null())
+                .output();
+            let _ = std::fs::remove_file(&xml_path);
+            let output = output.map_err(failed)?;
+            if output.status.success() {
+                return Ok(());
+            }
+            let said = format!(
+                "{} {}",
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            );
+            Err(SetModeError::Failed(scrub(&said, password)))
+        }
+    }
+}
+
+#[cfg(windows)]
+fn repoint(exe_path: &Path) -> std::io::Result<()> {
+    let status = Command::new("schtasks")
+        .args(repoint_args(exe_path))
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other("schtasks /change failed"))
+    }
 }
 
 #[cfg(windows)]
@@ -124,18 +430,40 @@ fn working_directory_for(exe_path: &Path) -> PathBuf {
 
 #[cfg(any(windows, test))]
 fn task_xml(exe_path: &Path) -> String {
+    task_document(
+        exe_path,
+        "<LogonTrigger>\n      <Enabled>true</Enabled>\n    </LogonTrigger>",
+        "<LogonType>InteractiveToken</LogonType>",
+    )
+}
+
+/// PURE: the boot task. `LogonType` `Password` is what lets it run with nobody logged in; `S4U` is
+/// out because that logon has no access to the Credential Manager, where the daemon keeps its
+/// token. The password is not an input here: it reaches `schtasks` as an argument and nowhere else.
+#[cfg(any(windows, test))]
+fn at_boot_task_xml(exe_path: &Path, user: &str) -> String {
+    task_document(
+        exe_path,
+        "<BootTrigger>\n      <Enabled>true</Enabled>\n    </BootTrigger>",
+        &format!(
+            "<UserId>{}</UserId>\n      <LogonType>Password</LogonType>",
+            xml_escape(user)
+        ),
+    )
+}
+
+#[cfg(any(windows, test))]
+fn task_document(exe_path: &Path, trigger: &str, logon: &str) -> String {
     let working_directory = working_directory_for(exe_path);
     format!(
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <Triggers>
-    <LogonTrigger>
-      <Enabled>true</Enabled>
-    </LogonTrigger>
+    {trigger}
   </Triggers>
   <Principals>
     <Principal id="Author">
-      <LogonType>InteractiveToken</LogonType>
+      {logon}
       <RunLevel>LeastPrivilege</RunLevel>
     </Principal>
   </Principals>
@@ -455,6 +783,64 @@ fn systemctl_user(args: &[&str]) -> std::io::Result<()> {
     }
 }
 
+/// macOS has no boot mode: a LaunchAgent needs a login. See [`capability_for`].
+#[cfg(target_os = "macos")]
+pub fn current_mode() -> Mode {
+    Mode::AtLogin
+}
+
+#[cfg(target_os = "macos")]
+pub fn set_mode(mode: Mode, _password: Option<&str>, _exe_path: &Path) -> Result<(), SetModeError> {
+    match mode {
+        Mode::AtLogin => Ok(()),
+        Mode::AtBoot => Err(SetModeError::Unsupported(
+            capability_for(Platform::Macos, false)
+                .why_not
+                .unwrap_or_default(),
+        )),
+    }
+}
+
+/// Linux: linger is what keeps the user's systemd manager, and so the unit, alive without a login.
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn current_mode() -> Mode {
+    let Some(user) = std::env::var("USER").ok().filter(|user| !user.is_empty()) else {
+        return Mode::AtLogin;
+    };
+    Command::new("loginctl")
+        .args(["show-user", &user, "--property=Linger"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map(|output| mode_from_linger(&String::from_utf8_lossy(&output.stdout)))
+        .unwrap_or(Mode::AtLogin)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn set_mode(mode: Mode, _password: Option<&str>, exe_path: &Path) -> Result<(), SetModeError> {
+    let capability = capability();
+    if mode == Mode::AtBoot && !capability.at_boot {
+        return Err(SetModeError::Unsupported(
+            capability.why_not.unwrap_or_default(),
+        ));
+    }
+    if mode == Mode::AtBoot {
+        // Linger starts a unit that exists; make sure there is one.
+        ensure_registered(exe_path).map_err(|error| SetModeError::Failed(error.to_string()))?;
+    }
+    let output = Command::new("loginctl")
+        .arg(linger_verb(mode))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|error| SetModeError::Failed(format!("loginctl: {error}")))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(SetModeError::Failed(
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,10 +936,11 @@ mod tests {
     fn ensure_registered_creates_a_real_task() {
         let exe = std::env::current_exe().unwrap();
         ensure_registered(&exe).unwrap();
-        assert!(is_registered(&exe));
+        let runs = |path: &Path| task_state(path).is_some_and(|state| state.runs_this_exe);
+        assert!(runs(&exe));
         // A task registered for a DIFFERENT executable must not satisfy the check, which is the
         // whole reason it reads the command rather than the name.
-        assert!(!is_registered(Path::new(r"C:\nowhere\other.exe")));
+        assert!(!runs(Path::new(r"C:\nowhere\other.exe")));
         // best-effort cleanup; leaving a stray dev-created task behind is a known limitation, not
         // a correctness issue for this test
         let _ = Command::new("schtasks")
@@ -770,6 +1157,121 @@ mod tests {
                 "{exe}"
             );
         }
+    }
+
+    /// Registering again at every start used to overwrite the task with the login one. A boot task
+    /// that points at a moved executable only has its command changed; it is never recreated, which
+    /// would need the password nobody keeps.
+    #[test]
+    fn reregistering_keeps_at_boot_mode() {
+        let moved_boot_task = Some(TaskState {
+            runs_this_exe: false,
+            at_boot: true,
+        });
+        assert_eq!(registration_plan(moved_boot_task), Registration::RepointExe);
+        let args = repoint_args(Path::new(r"C:\new place\nucleos-core.exe"));
+        assert_eq!(args[0], "/Change");
+        assert_eq!(args.last().unwrap(), r#""C:\new place\nucleos-core.exe""#);
+        assert!(
+            !args
+                .iter()
+                .any(|arg| matches!(arg.as_str(), "/XML" | "/Create" | "/RP" | "/F")),
+            "{args:?}"
+        );
+
+        let current_boot_task = Some(TaskState {
+            runs_this_exe: true,
+            at_boot: true,
+        });
+        assert_eq!(registration_plan(current_boot_task), Registration::Keep);
+        let moved_login_task = Some(TaskState {
+            runs_this_exe: false,
+            at_boot: false,
+        });
+        assert_eq!(
+            registration_plan(moved_login_task),
+            Registration::CreateAtLogin
+        );
+        assert_eq!(registration_plan(None), Registration::CreateAtLogin);
+    }
+
+    #[test]
+    fn at_boot_xml_uses_a_boot_trigger() {
+        let xml = at_boot_task_xml(Path::new(r"C:\Apps\nucleos-core.exe"), r"DESKTOP\Dev & Ops");
+        assert!(xml.contains("<BootTrigger>"), "{xml}");
+        assert!(!xml.contains("<LogonTrigger>"), "{xml}");
+        assert!(xml.contains("<LogonType>Password</LogonType>"), "{xml}");
+        assert!(!xml.contains("S4U"), "{xml}");
+        assert!(
+            xml.contains(r"<UserId>DESKTOP\Dev &amp; Ops</UserId>"),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(r"<Command>C:\Apps\nucleos-core.exe</Command>"),
+            "{xml}"
+        );
+        assert!(xml_is_at_boot(&xml));
+        // And the login task stays what it was.
+        let login = task_xml(Path::new(r"C:\Apps\nucleos-core.exe"));
+        assert!(login.contains("<LogonTrigger>") && !xml_is_at_boot(&login));
+    }
+
+    #[test]
+    fn the_password_never_reaches_the_task_xml_or_the_logs() {
+        let password = "hunter2-correct-horse";
+        let exe = Path::new(r"C:\Apps\nucleos-core.exe");
+        // The document has no password input, so none can be in it.
+        assert!(!at_boot_task_xml(exe, r"PC\me").contains(password));
+
+        // The password has to reach schtasks, as exactly one argument.
+        let args = at_boot_create_args(Path::new(r"C:\t\task.xml"), r"PC\me", password);
+        let at = args.iter().position(|arg| arg == "/RP").unwrap();
+        assert_eq!(args[at + 1], password);
+        assert_eq!(args.iter().filter(|arg| arg.contains(password)).count(), 1);
+
+        // Whatever the tool says back is scrubbed before it can be shown or logged.
+        let said = format!("ERROR: Invalid credentials for user. Password {password} rejected.");
+        let shown = SetModeError::Failed(scrub(&said, password)).to_string();
+        assert!(!shown.contains(password), "{shown}");
+        assert!(shown.contains("Invalid credentials"), "{shown}");
+        // An empty password must not turn the scrub into "insert *** between every letter".
+        assert_eq!(scrub("abc", ""), "abc");
+    }
+
+    #[test]
+    fn each_platform_reports_its_capability() {
+        let windows = capability_for(Platform::Windows, false);
+        assert_eq!(
+            windows,
+            Capability {
+                at_boot: true,
+                needs_password: true,
+                why_not: None
+            }
+        );
+
+        let mac = capability_for(Platform::Macos, true);
+        assert!(!mac.at_boot && !mac.needs_password);
+        let why = mac.why_not.unwrap();
+        assert!(
+            why.contains("LaunchAgent") && why.contains("Keychain"),
+            "{why}"
+        );
+        assert!(why.contains("automatic login"), "{why}");
+
+        let linux = capability_for(Platform::Linux, true);
+        assert!(linux.at_boot && !linux.needs_password && linux.why_not.is_none());
+        let bare = capability_for(Platform::Linux, false);
+        assert!(!bare.at_boot && bare.why_not.is_some());
+    }
+
+    #[test]
+    fn linger_decides_the_linux_mode() {
+        assert_eq!(mode_from_linger("Linger=yes\n"), Mode::AtBoot);
+        assert_eq!(mode_from_linger("Linger=no\n"), Mode::AtLogin);
+        assert_eq!(mode_from_linger(""), Mode::AtLogin);
+        assert_eq!(linger_verb(Mode::AtBoot), "enable-linger");
+        assert_eq!(linger_verb(Mode::AtLogin), "disable-linger");
     }
 
     #[test]
