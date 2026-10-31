@@ -144,8 +144,9 @@ export function describeProject(p: ProjectSummary, refused = false): string {
  * What a card says about the way to the third setting, and whether that way is open.
  *
  * Every card answers. An acting project has passed the gate, so its card says how to stop it
- * instead; an earned one says so; any other is locked, explained in the daemon's own terms through
- * `promotionBlocker`. An absent withheld count reads as zero — the direction that keeps it locked.
+ * instead; an earned one says so; any other is not earned yet, explained in the daemon's own terms
+ * through `promotionBlocker` (the third segment still works and warns first). An absent withheld
+ * count reads as zero — the direction that keeps it unproven.
  */
 export function gateFor(p: ProjectSummary): { text: string; open: boolean } {
   if (p.mode === "active") return { text: PROMOTION_ACTING, open: true };
