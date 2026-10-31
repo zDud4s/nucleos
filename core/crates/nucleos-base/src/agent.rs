@@ -597,6 +597,22 @@ mod tests {
         ));
     }
 
+    /// The engine list and its refusal sentence name the same engines, agy included. The row lives
+    /// in the core's engine table; this crate keeps its own list, so the sentence is the contract.
+    #[test]
+    fn agent_validate_message_lists_agy() {
+        assert!(ENGINES.contains(&"agy"));
+        let mut asked = request("analyst");
+        asked.engine = Some("gemini".to_owned());
+        assert_eq!(
+            validate_request(&asked),
+            Err("engine must be claude, codex, local or agy")
+        );
+        // Declaring agy passes this crate's validation; the launch surfaces refuse it by name.
+        asked.engine = Some("agy".to_owned());
+        assert_eq!(validate_request(&asked), Ok(()));
+    }
+
     #[tokio::test]
     async fn create_list_get_update_and_delete_round_trip() {
         let pool = pool().await;

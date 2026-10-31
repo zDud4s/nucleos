@@ -2460,6 +2460,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn installed_engines_excludes_agy_when_gate_off() {
+        // The setting is off by default, so agy is absent even when its binary is on PATH.
+        assert!(!crate::engines::agy::enabled());
+        assert!(!installed_engines().contains(&RunnerKind::Agy));
+    }
+
+    #[test]
+    fn front_with_ignores_agy_runner_name_when_off() {
+        let mut config = config(Mode::Shadow, DEFAULT_URL);
+        config.runners = vec!["agy".to_owned()];
+        let runner = front_with(
+            Arc::new(Probe),
+            &crate::config::ModelsConfig::default(),
+            config,
+            &[RunnerKind::Claude],
+        );
+        let router = runner.router().expect("routing is on");
+        assert!(
+            router.alternates.is_empty(),
+            "a runner name the daemon cannot launch is ignored"
+        );
+        // No engine is held for a pin either: it is refused with the existing sentence.
+        assert!(
+            runner
+                .engines()
+                .is_none_or(|engines| engines.available(RunnerKind::Agy).is_none())
+        );
+    }
+
     #[tokio::test]
     async fn a_codex_pin_without_a_router_launches_codex_instead_of_being_refused() {
         let runner = engines_only_runner();

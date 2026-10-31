@@ -949,3 +949,25 @@ async fn team_and_director(
         .flatten();
     Ok(director.map(|director| (team, director)))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agents::capabilities::Engine;
+    use crate::models::route_advice::RunnerKind;
+
+    /// A team seat reaches its runner through `runner_kind_of`. For agy it must refuse by name
+    /// rather than answer `None` (the local engine's arm) or fall into a Claude arm.
+    #[test]
+    fn team_launch_refuses_agy_by_name() {
+        let error = runner_kind_of(Engine::Agy).expect_err("a team cannot run agy");
+        assert!(
+            error.contains("the agy engine is not available for agents, teams or council"),
+            "{error}"
+        );
+        // The engines a team can run keep their kinds.
+        assert_eq!(runner_kind_of(Engine::Claude), Ok(Some(RunnerKind::Claude)));
+        assert_eq!(runner_kind_of(Engine::Codex), Ok(Some(RunnerKind::Codex)));
+        assert_eq!(runner_kind_of(Engine::Local), Ok(None));
+    }
+}

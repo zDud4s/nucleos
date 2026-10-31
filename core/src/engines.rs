@@ -193,7 +193,15 @@ mod tests {
         None
     }
 
-    /// The fourth engine of the "one description plus tests" proof. It lives only in this module
+    fn gate_open() -> bool {
+        true
+    }
+
+    fn gate_shut() -> bool {
+        false
+    }
+
+    /// The extra engine of the "one description plus tests" proof. It lives only in this module
     /// and reaches the lookups as part of a table argument; no production registration path.
     const EXTRA: EngineDescription = EngineDescription {
         id: "extra",
@@ -201,6 +209,7 @@ mod tests {
         seat_kind: SeatKind::Cloud,
         transport: Transport::Http,
         installed: always_installed,
+        gate: gate_open,
         utility_default: no_utility_default,
         runner: no_runner,
     };
@@ -212,22 +221,36 @@ mod tests {
     }
 
     #[test]
-    fn table_lists_claude_codex_local_with_expected_fields() {
+    fn table_lists_claude_codex_local_agy_with_expected_fields() {
+        assert_eq!(TABLE.len(), 4);
         let ids: Vec<&str> = TABLE.iter().map(|row| row.id).collect();
-        assert_eq!(ids, ["claude", "codex", "local"]);
+        assert_eq!(ids, ["claude", "codex", "local", "agy"]);
+        assert_eq!(AGY, "agy");
 
         let row = |id: &str| find_in(TABLE, id).expect("row present");
         assert_eq!(row("claude").display_name, "Claude");
         assert_eq!(row("codex").display_name, "Codex");
         assert_eq!(row("local").display_name, "Local");
+        assert!(!row("agy").display_name.is_empty());
 
         assert_eq!(row("claude").seat_kind, SeatKind::Cloud);
         assert_eq!(row("codex").seat_kind, SeatKind::Cloud);
         assert_eq!(row("local").seat_kind, SeatKind::Local);
+        // The config guard demands a seat kind for every row; agy is a cloud engine.
+        assert_eq!(row("agy").seat_kind, SeatKind::Cloud);
 
         assert_eq!(row("claude").transport, Transport::Cli);
         assert_eq!(row("codex").transport, Transport::Cli);
         assert_eq!(row("local").transport, Transport::Http);
+        assert_eq!(row("agy").transport, Transport::Cli);
+
+        // The three original engines are always on; agy answers to its opt-in setting, which is
+        // off by default.
+        assert!((row("claude").gate)());
+        assert!((row("codex").gate)());
+        assert!((row("local").gate)());
+        assert_eq!((row("agy").gate)(), agy::enabled());
+        assert!(!(row("agy").gate)());
 
         // Utility defaults keep their legacy values: Claude's alias, no cheap tier for Local.
         assert_eq!(
@@ -245,24 +268,21 @@ mod tests {
 
     #[test]
     fn derived_lists_follow_the_table() {
-        // Seat kinds: byte-identical to the legacy `ENGINE_SEAT_KINDS`.
+        // Seat kinds: `ENGINE_SEAT_KINDS` is the derived list and the only consumer.
         assert_eq!(
-            seat_kinds_in(TABLE),
+            crate::config::ENGINE_SEAT_KINDS.to_vec(),
             vec![
                 ("claude", SeatKind::Cloud),
                 ("codex", SeatKind::Cloud),
                 ("local", SeatKind::Local),
+                ("agy", SeatKind::Cloud),
             ]
-        );
-        assert_eq!(
-            seat_kinds_in(TABLE),
-            crate::config::ENGINE_SEAT_KINDS.to_vec()
         );
 
         // CLI runners (what `translatable_runners` iterates) are the CLI-transport rows.
         assert_eq!(
             ids_with_transport_in(TABLE, Transport::Cli),
-            ["claude", "codex"]
+            ["claude", "codex", "agy"]
         );
 
         // Installed engines: only rows whose probe says so, in table order.
@@ -270,11 +290,11 @@ mod tests {
         assert!(
             installed
                 .iter()
-                .all(|id| ["claude", "codex", "local"].contains(id))
+                .all(|id| ["claude", "codex", "local", "agy"].contains(id))
         );
 
         // Chat engines a conversation can name.
-        assert_eq!(chat_ids_in(TABLE), ["claude", "codex", "local"]);
+        assert_eq!(chat_ids_in(TABLE), ["claude", "codex", "local", "agy"]);
     }
 
     #[test]
@@ -311,8 +331,8 @@ mod tests {
         assert!(find_in(rows, "extra").is_some());
         assert!(find_in(TABLE, "extra").is_none());
         assert_eq!(
-            seat_kinds_in(rows).last(),
-            Some(&("extra", SeatKind::Cloud))
+            find_in(rows, "extra").map(|row| row.seat_kind),
+            Some(SeatKind::Cloud)
         );
         assert!(installed_in(rows).contains(&"extra"));
         assert!(chat_ids_in(rows).contains(&"extra"));
@@ -321,7 +341,47 @@ mod tests {
         assert!(ids_with_transport_in(rows, Transport::Http).contains(&"extra"));
         assert_eq!(runner_id_in(rows, "extra"), "claude");
         // The production table is untouched by the test row.
-        assert_eq!(TABLE.len(), 3);
+        assert_eq!(TABLE.len(), 4);
+    }
+
+    #[test]
+    fn gate_false_row_is_absent_from_every_derived_list() {
+        let mut rows: Vec<EngineDescription> = TABLE.to_vec();
+        rows.push(EngineDescription {
+            id: "gated",
+            display_name: "Gated",
+            seat_kind: SeatKind::Cloud,
+            transport: Transport::Cli,
+            installed: always_installed,
+            gate: gate_shut,
+            utility_default: no_utility_default,
+            runner: no_runner,
+        });
+        // The lookups still take the table (E3); the gate decides which rows reach them.
+        let enabled: Vec<EngineDescription> = enabled_in(&rows).into_iter().cloned().collect();
+        let enabled = enabled.as_slice();
+        assert!(find_in(enabled, "claude").is_some());
+        assert!(find_in(enabled, "gated").is_none());
+        assert!(!installed_in(enabled).contains(&"gated"));
+        assert!(!chat_ids_in(enabled).contains(&"gated"));
+        assert!(!ids_with_transport_in(enabled, Transport::Cli).contains(&"gated"));
+        assert_eq!(runner_id_in(enabled, "gated"), "claude");
+        // Without the gate the same row would have shown up everywhere.
+        assert!(installed_in(&rows).contains(&"gated"));
+
+        // The production table with agy's setting off (the default) loses agy and nothing else.
+        let ids: Vec<&str> = enabled_table().iter().map(|row| row.id).collect();
+        assert_eq!(ids, ["claude", "codex", "local"]);
+    }
+
+    #[test]
+    fn runner_id_in_keeps_agy_when_asked_even_if_disabled() {
+        // The single exception to "unknown collapses to claude": a stored `agy` is named, so the
+        // caller can refuse it, even while the gate is shut and agy is absent from the lists.
+        assert!(!agy::enabled());
+        assert_eq!(runner_id_in(TABLE, "agy"), "agy");
+        assert_eq!(runner_id_in(TABLE, "gemini"), "claude");
+        assert_eq!(runner_id_in(TABLE, "local"), "claude");
     }
 }
 
@@ -356,6 +416,7 @@ mod row_tests {
             seat_kind: SeatKind::Cloud,
             transport,
             installed,
+            gate: probe_true,
             utility_default: no_utility_default,
             runner: no_runner,
         }
@@ -385,7 +446,7 @@ mod row_tests {
         assert!(cli_row_in(rows, "extra-cli").is_some());
         assert_eq!(
             ids_with_transport_in(rows, Transport::Cli),
-            ["claude", "codex", "extra-cli"]
+            ["claude", "codex", "agy", "extra-cli"]
         );
         // The production table does not know the row: it collapses to claude.
         assert_eq!(runner_id_in(TABLE, "extra-cli"), "claude");

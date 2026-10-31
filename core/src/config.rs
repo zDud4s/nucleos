@@ -1853,6 +1853,26 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
             );
         }
         assert_eq!(seat_kind_for_engine("gemini"), None);
+        // The new row is covered in both lists: the hand-written one and the derived one.
+        assert!(crate::agent::ENGINES.contains(&"agy"));
+        assert_eq!(seat_kind_for_engine("agy"), Some(SeatKind::Cloud));
+    }
+
+    /// The guard's own check, over a list it is given: a table row missing from the hand-written
+    /// `nucleos_base::agent::ENGINES` must fail loudly, naming the row. (GREEN extracts the check
+    /// the test above runs inline into `engines_missing_from(list)`.)
+    #[test]
+    fn engines_list_missing_a_row_fails_the_guard() {
+        let complete: Vec<&str> = ENGINE_SEAT_KINDS.iter().map(|(id, _)| *id).collect();
+        assert!(engines_missing_from(&complete).is_empty());
+        assert_eq!(
+            engines_missing_from(&["claude", "codex", "local"]),
+            vec!["agy"]
+        );
+        assert_eq!(
+            engines_missing_from(&[]),
+            vec!["claude", "codex", "local", "agy"]
+        );
     }
 
     #[test]

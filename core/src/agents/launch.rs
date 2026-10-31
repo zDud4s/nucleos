@@ -381,6 +381,22 @@ mod tests {
     }
 
     #[test]
+    fn agent_launch_refuses_agy_by_name() {
+        // Pinned by the caller or by the agent row: the pin is where an engine name enters.
+        let pin = Some(("agy".to_owned(), "agy/gemini-3.8-flash-high".to_owned()));
+        let error = plan_launch("coder@1.0.0", &[McpNucleos], pin, None, &[]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("the agy engine is not available for agents, teams or council"),
+            "{error}"
+        );
+        // Not pinned: agy is never one of the runners a launch may narrow to, gate or no gate.
+        let plan = plan_launch("a", &[McpNucleos], None, None, &[]).unwrap();
+        assert!(!plan.runners.contains(&RunnerKind::Agy));
+    }
+
+    #[test]
     fn without_a_router_only_translation_narrows() {
         let plan = plan_launch("a", &[FsRead], None, None, &[Claude]).unwrap();
         assert_eq!(plan.runners, vec![Claude, Codex]);

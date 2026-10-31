@@ -305,5 +305,52 @@ mod tests {
     fn engine_from_runner_kind() {
         assert_eq!(Engine::from(RunnerKind::Claude), Engine::Claude);
         assert_eq!(Engine::from(RunnerKind::Codex), Engine::Codex);
+        assert_eq!(Engine::from(RunnerKind::Agy), Engine::Agy);
+    }
+
+    #[test]
+    fn engine_and_runner_kind_strings_agree_with_the_table() {
+        assert_eq!(Engine::Agy.as_str(), crate::engines::AGY);
+        assert_eq!(RunnerKind::Agy.as_str(), crate::engines::AGY);
+        assert_eq!(RunnerKind::parse("agy"), Some(RunnerKind::Agy));
+        // Every CLI row of the table round-trips through both vocabularies.
+        for id in crate::engines::ids_with_transport_in(
+            crate::engines::TABLE,
+            crate::engines::Transport::Cli,
+        ) {
+            let kind = RunnerKind::parse(id).unwrap_or_else(|| panic!("no RunnerKind for `{id}`"));
+            assert_eq!(kind.as_str(), id);
+            assert_eq!(Engine::from(kind).as_str(), id);
+        }
+        // The local model is not a CLI runner.
+        assert_eq!(RunnerKind::parse("local"), None);
+    }
+
+    #[test]
+    fn translate_agy_refuses_unsupported_capabilities_by_name() {
+        // Agents cannot run agy in this delivery: every capability is refused, by engine and name.
+        for &capability in Capability::ALL {
+            let err = translate(Engine::Agy, &[capability]).unwrap_err();
+            assert_eq!(
+                err,
+                Unsupported {
+                    engine: Engine::Agy,
+                    capability
+                }
+            );
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "the agy engine does not support the capability `{}`",
+                    capability.as_str()
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn translatable_runners_leave_agy_out_while_its_gate_is_off() {
+        assert!(!translatable_runners(&[]).contains(&RunnerKind::Agy));
+        assert!(!translatable_runners(&[McpNucleos]).contains(&RunnerKind::Agy));
     }
 }

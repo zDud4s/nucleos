@@ -106,20 +106,22 @@ mod tests {
 
     #[test]
     fn slash_b_capabilities_table_matches_spec() {
-        // Columns: claude, codex, local, openrouter. Spec section 6.
+        // Columns: claude, codex, local, openrouter, agy. Spec section 6; agy has `--effort` and
+        // `--add-dir` and refuses every other control by name.
         let table = [
-            (Effort, [Yes, Yes, No, No]),
-            (ExtraDirs, [Yes, Yes, No, No]),
-            (DeniedTools, [Yes, No, No, No]),
-            (TurnBudget, [Yes, No, Warn, Warn]),
-            (Agents, [Yes, No, No, No]),
-            (RegistryMcp, [Yes, Yes, No, No]),
+            (Effort, [Yes, Yes, No, No, Yes]),
+            (ExtraDirs, [Yes, Yes, No, No, Yes]),
+            (DeniedTools, [Yes, No, No, No, No]),
+            (TurnBudget, [Yes, No, Warn, Warn, No]),
+            (Agents, [Yes, No, No, No, No]),
+            (RegistryMcp, [Yes, Yes, No, No, No]),
         ];
         let engines = [
             ChatEngine::Claude,
             ChatEngine::Codex,
             ChatEngine::Local,
             ChatEngine::OpenRouter,
+            ChatEngine::Agy,
         ];
         for (capability, expected) in table {
             for (engine, want) in engines.into_iter().zip(expected) {
@@ -149,6 +151,28 @@ mod tests {
         );
         assert!(require(ChatEngine::Codex, TurnBudget, "set a budget").is_err());
         assert!(require(ChatEngine::Codex, DeniedTools, "deny a tool").is_err());
+    }
+
+    #[test]
+    fn chat_engine_of_cli_maps_agy_not_claude() {
+        assert_eq!(ChatEngine::of_cli("agy"), ChatEngine::Agy);
+        assert_eq!(ChatEngine::of_cli("codex"), ChatEngine::Codex);
+        assert_eq!(ChatEngine::of_cli("claude"), ChatEngine::Claude);
+        // An unknown string still collapses to claude.
+        assert_eq!(ChatEngine::of_cli("gemini"), ChatEngine::Claude);
+        assert_eq!(ChatEngine::Agy.as_str(), crate::engines::AGY);
+    }
+
+    #[test]
+    fn chat_engine_from_stored_uses_chat_ids() {
+        assert_eq!(ChatEngine::from_stored("claude"), Some(ChatEngine::Claude));
+        assert_eq!(ChatEngine::from_stored("codex"), Some(ChatEngine::Codex));
+        assert_eq!(ChatEngine::from_stored("local"), Some(ChatEngine::Local));
+        assert_eq!(ChatEngine::from_stored("gemini"), None);
+        assert_eq!(ChatEngine::from_stored(""), None);
+        // agy's setting is off by default, so a stored agy is not an engine a chat can name: the
+        // caller refuses it, it does not become Claude.
+        assert_eq!(ChatEngine::from_stored("agy"), None);
     }
 
     fn codex_choice() -> AssistantChoice {
