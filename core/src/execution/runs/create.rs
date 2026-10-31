@@ -1163,9 +1163,53 @@ async fn create_run_with_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
+
     use crate::execution::runs::tests::{
         WorktreeRootEnv, init_contained_repo, space_free_tempdir, test_state_with_runner,
     };
+
+    fn git(repo: &std::path::Path, args: &[&str]) {
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .status()
+                .expect("git should start")
+                .success(),
+            "git {args:?}"
+        );
+    }
+
+    async fn escalated_resolution_request(state: &AppState, project_root: &str) -> i64 {
+        let repo = crate::execution::vcs::ResolvedRepo::synthetic("proj", project_root, "proj");
+        let request = crate::execution::vcs::submit(
+            &state.pool,
+            &repo,
+            &crate::execution::vcs::Op::Merge {
+                source: "source".into(),
+                target: "master".into(),
+            },
+            crate::execution::vcs::Origin::Shell,
+        )
+        .await
+        .expect("admit the merge");
+        sqlx::query("UPDATE vcs_requests SET status = 'escalated' WHERE id = ?")
+            .bind(request)
+            .execute(&state.pool)
+            .await
+            .expect("escalate the merge");
+        request
+    }
+
+    fn resolution(request_id: i64) -> Resolution {
+        Resolution {
+            request_id,
+            source: "source".into(),
+            target: "master".into(),
+        }
+    }
 
     /// A node's stage is whatever the workflow graph's node id is, not one of three literals: the
     /// run row records it verbatim.
@@ -1244,5 +1288,88 @@ mod tests {
                 .unwrap();
         assert_eq!(stage, "triage");
         assert_eq!(node_job_id, job_id);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_tree_merge_settled_conflict_is_not_claimed_for_resolution() {
+        let _env_lock = crate::execution::worktree::test_env_lock();
+        let wt_root = space_free_tempdir("nucleos-create-tree-merge-wt-");
+        let _env = WorktreeRootEnv::set(wt_root.path());
+        let (_repo_container, repo) = init_contained_repo("nucleos-create-tree-merge-");
+        git(&repo, &["checkout", "-q", "-b", "source"]);
+        git(&repo, &["checkout", "-q", "master"]);
+        let (state, _runner) =
+            test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+        let project_root = repo.to_string_lossy().into_owned();
+        let request = escalated_resolution_request(&state, &project_root).await;
+        sqlx::query("UPDATE vcs_requests SET settled_reason = 'tree-merge' WHERE id = ?")
+            .bind(request)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let result = create_resolution_run(
+            &state,
+            "resolve the conflict".into(),
+            "proj".into(),
+            project_root,
+            resolution(request),
+        )
+        .await;
+
+        assert!(matches!(result, Err(CreateRunError::Invalid(_))), "{result:?}");
+        let claimed: Option<i64> =
+            sqlx::query_scalar("SELECT resolution_run_id FROM vcs_requests WHERE id = ?")
+                .bind(request)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(claimed, None, "a tree merge keeps the resolver claim empty");
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn another_settlement_reason_does_not_block_a_resolution_claim() {
+        let _env_lock = crate::execution::worktree::test_env_lock();
+        let wt_root = space_free_tempdir("nucleos-create-other-settlement-wt-");
+        let _env = WorktreeRootEnv::set(wt_root.path());
+        let (_repo_container, repo) = init_contained_repo("nucleos-create-other-settlement-");
+        std::fs::write(repo.join("conflict.txt"), "base\n").unwrap();
+        git(&repo, &["add", "conflict.txt"]);
+        git(&repo, &["commit", "-qm", "base"]);
+        git(&repo, &["checkout", "-q", "-b", "source"]);
+        std::fs::write(repo.join("conflict.txt"), "source\n").unwrap();
+        git(&repo, &["commit", "-am", "source"]);
+        git(&repo, &["checkout", "-q", "master"]);
+        std::fs::write(repo.join("conflict.txt"), "master\n").unwrap();
+        git(&repo, &["commit", "-am", "master"]);
+        let (state, _runner) =
+            test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+        let project_root = repo.to_string_lossy().into_owned();
+        let request = escalated_resolution_request(&state, &project_root).await;
+        sqlx::query("UPDATE vcs_requests SET settled_reason = 'dismissed' WHERE id = ?")
+            .bind(request)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let run = create_resolution_run(
+            &state,
+            "resolve the conflict".into(),
+            "proj".into(),
+            project_root,
+            resolution(request),
+        )
+        .await
+        .expect("a non-tree settlement does not spend the resolution claim");
+
+        let claimed: Option<i64> =
+            sqlx::query_scalar("SELECT resolution_run_id FROM vcs_requests WHERE id = ?")
+                .bind(request)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(claimed, Some(run));
     }
 }

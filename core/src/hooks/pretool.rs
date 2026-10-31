@@ -1999,6 +1999,29 @@ mod tests {
         assert_docs_run_refuses_shell(&state, "git add .", "git add .").await;
     }
 
+    #[tokio::test]
+    async fn docs_run_other_spellings_of_a_checkout_write_are_refused() {
+        let state = test_state().await;
+
+        for command in [
+            "git.exe add .",
+            "env git add .",
+            "command git add .",
+            "git --config-env user.name=X add .",
+            "git -c alias.a=add a .",
+            "git checkout .",
+            "git restore .",
+            "git rm ./f",
+            "cp a ./b",
+            "touch ./f",
+        ] {
+            let run_id = seed_tree_branch_run(&state, "docs", &[".ai/notes/**"]).await;
+            let decision = decide(&state, run_id, "Bash", json!({"command": command})).await;
+
+            assert_eq!(decision.decision, "deny", "{command}: got {:?}", decision.reason);
+        }
+    }
+
     /// Fails today: `cd sub && git commit` is allowed segment by segment, and `git -C sub commit`
     /// is not a recognised form, so it is refused for the wrong reason (no docs branch named).
     #[tokio::test]

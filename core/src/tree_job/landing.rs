@@ -2130,6 +2130,69 @@ mod tests {
             .unwrap()
     }
 
+    #[tokio::test]
+    async fn settle_unclaimed_yields_to_a_resolver_that_claimed_first() {
+        let _lock = test_env_lock();
+        let (_container, repo) = repo_with_a_conflicting_tree_branch("nucleos-landing-yield-");
+        let h = harness(&repo).await;
+        let mut job = saved_job(
+            &h.pool,
+            manifest_for_repo(&repo, vec![branch_at("api", "green")]),
+        )
+        .await;
+        submit_merge(&h.pool, &h.resolved, &mut job, "api", Origin::Daemon)
+            .await
+            .unwrap();
+        let request_id = job.manifest.branches["api"].extra["merge_request_id"]
+            .as_i64()
+            .unwrap();
+        drain(&h.pool).await;
+        sqlx::query("UPDATE vcs_requests SET resolution_run_id = 1 WHERE id = ?")
+            .bind(request_id)
+            .execute(&h.pool)
+            .await
+            .unwrap();
+
+        let settled = settle_unclaimed(&h.pool, request_id, "the merge conflicted".to_owned())
+            .await
+            .unwrap();
+
+        assert!(matches!(settled, RequestEnd::Pending), "{settled:?}");
+        let (_, settled_at, _) = request_row(&h.pool, request_id).await;
+        assert_eq!(settled_at, None, "the resolver still owns the conflict");
+    }
+
+    #[tokio::test]
+    async fn settle_unclaimed_claims_a_free_conflict() {
+        let _lock = test_env_lock();
+        let (_container, repo) = repo_with_a_conflicting_tree_branch("nucleos-landing-free-");
+        let h = harness(&repo).await;
+        let mut job = saved_job(
+            &h.pool,
+            manifest_for_repo(&repo, vec![branch_at("api", "green")]),
+        )
+        .await;
+        submit_merge(&h.pool, &h.resolved, &mut job, "api", Origin::Daemon)
+            .await
+            .unwrap();
+        let request_id = job.manifest.branches["api"].extra["merge_request_id"]
+            .as_i64()
+            .unwrap();
+        drain(&h.pool).await;
+
+        let settled = settle_unclaimed(&h.pool, request_id, "the merge conflicted".to_owned())
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(settled, RequestEnd::Failed { escalated: true, .. }),
+            "{settled:?}"
+        );
+        let (_, settled_at, settled_reason) = request_row(&h.pool, request_id).await;
+        assert!(settled_at.is_some(), "the free conflict was claimed");
+        assert_eq!(settled_reason.as_deref(), Some("tree-merge"));
+    }
+
     /// Gap 4. With `claim_conflict = false` the escalated row stays the resolver's to pick up, the
     /// branch keeps its request id, and the attempt is counted in `branch.extra`.
     #[tokio::test]
