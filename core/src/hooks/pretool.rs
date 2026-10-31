@@ -2042,6 +2042,180 @@ mod tests {
         assert_allowed(&decision, "a read-only cargo fmt");
     }
 
+    #[tokio::test]
+    async fn docs_run_environment_wrapped_git_commit_is_denied() {
+        let state = test_state().await;
+        assert_docs_run_refuses_shell(&state, "FOO=1 git commit -m x", "environment git commit")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn docs_run_for_loop_git_add_is_denied() {
+        let state = test_state().await;
+        assert_docs_run_refuses_shell(&state, "for f in a; do git add $f; done", "for-loop git add")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn docs_run_if_git_commit_is_denied() {
+        let state = test_state().await;
+        assert_docs_run_refuses_shell(
+            &state,
+            "if true; then git commit -m x; fi",
+            "conditional git commit",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn docs_run_command_substitution_git_add_is_denied() {
+        let state = test_state().await;
+        assert_docs_run_refuses_shell(&state, "echo \"$(git add .)\"", "command substitution git add")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn docs_run_unreadable_shell_command_is_denied() {
+        let state = test_state().await;
+        assert_docs_run_refuses_shell(&state, "echo \"unterminated", "unreadable shell command").await;
+    }
+
+    #[tokio::test]
+    async fn docs_run_powershell_quoted_semicolon_search_is_allowed() {
+        let state = test_state().await;
+        let run_id = seed_tree_branch_run(&state, "docs", &[".ai/notes/**"]).await;
+
+        let decision = decide(
+            &state,
+            run_id,
+            "PowerShell",
+            json!({"command": "rg \"a; git add b\""}),
+        )
+        .await;
+
+        assert_allowed(&decision, "a PowerShell search with a quoted semicolon");
+    }
+
+    #[tokio::test]
+    async fn docs_run_cd_then_git_status_is_allowed() {
+        let state = test_state().await;
+        let run_id = seed_tree_branch_run(&state, "docs", &[".ai/notes/**"]).await;
+
+        let decision = decide(
+            &state,
+            run_id,
+            "Bash",
+            json!({"command": "cd sub && git status"}),
+        )
+        .await;
+
+        assert_allowed(&decision, "a directory change followed by git status");
+    }
+
+    #[tokio::test]
+    async fn docs_run_mkdir_in_declared_docs_area_is_allowed() {
+        let state = test_state().await;
+        let run_id = seed_tree_branch_run(&state, "docs", &[".ai/notes/**"]).await;
+
+        let decision = decide(
+            &state,
+            run_id,
+            "Bash",
+            json!({"command": "mkdir -p .ai/notes/x"}),
+        )
+        .await;
+
+        assert_allowed(&decision, "a docs directory creation");
+    }
+
+    #[tokio::test]
+    async fn docs_run_powershell_set_location_is_allowed() {
+        let state = test_state().await;
+        let run_id = seed_tree_branch_run(&state, "docs", &[".ai/notes/**"]).await;
+
+        let decision = decide(
+            &state,
+            run_id,
+            "PowerShell",
+            json!({"command": "Set-Location x"}),
+        )
+        .await;
+
+        assert_allowed(&decision, "a PowerShell directory change");
+    }
+
+    #[tokio::test]
+    async fn docs_run_cd_then_git_commit_is_denied_by_docs_guard() {
+        let state = test_state().await;
+        assert_docs_run_refuses_shell(
+            &state,
+            "cd sub && git commit -m x",
+            "directory change followed by git commit",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn docs_run_cargo_fmt_is_still_denied() {
+        let state = test_state().await;
+        assert_docs_run_refuses_shell(&state, "cargo fmt", "cargo fmt").await;
+    }
+
+    #[tokio::test]
+    async fn docs_run_heavy_wrapper_options_cargo_fmt_is_denied() {
+        let state = test_state().await;
+        assert_docs_run_refuses_shell(
+            &state,
+            "python scripts/heavy.py --prio 1 -- cargo fmt",
+            "heavy.py options cargo fmt",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn docs_run_heavy_wrapper_without_separator_cargo_fmt_is_denied() {
+        let state = test_state().await;
+        assert_docs_run_refuses_shell(
+            &state,
+            "python scripts/heavy.py cargo fmt",
+            "heavy.py cargo fmt without separator",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn docs_run_heavy_wrapper_options_cargo_fmt_check_is_allowed() {
+        let state = test_state().await;
+        let run_id = seed_tree_branch_run(&state, "docs", &[".ai/notes/**"]).await;
+
+        let decision = decide(
+            &state,
+            run_id,
+            "Bash",
+            json!({"command": "python scripts/heavy.py --prio 1 -- cargo fmt --check"}),
+        )
+        .await;
+
+        assert_allowed(&decision, "a read-only heavy.py cargo fmt check");
+    }
+
+    #[tokio::test]
+    async fn docs_run_git_work_tree_option_commit_is_denied() {
+        let state = test_state().await;
+        assert_docs_run_refuses_shell(
+            &state,
+            "git --work-tree . commit -m x",
+            "git commit with work-tree option",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn docs_run_uppercase_git_commit_is_denied() {
+        let state = test_state().await;
+        assert_docs_run_refuses_shell(&state, "git COMMIT -m x", "uppercase git commit").await;
+    }
+
     /// Regression guard: a plain read in a docs run is not touched by the docs guard. The
     /// classifier allows `git status` as `read-local`. Passes today.
     #[tokio::test]

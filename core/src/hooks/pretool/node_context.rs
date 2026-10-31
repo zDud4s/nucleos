@@ -319,3 +319,20 @@ fn docs_clean_path(path: &str) -> Option<String> {
     }
     (!parts.is_empty()).then(|| parts.join("/"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn docs_run_case_insensitive_absolute_path_preserves_declared_file_case() {
+        let path = "C:/PROJ/.ai/specs/README.md";
+        let relative = strip_root_prefix(path, "c:/proj", true).expect("path below root");
+
+        assert_eq!(relative, ".ai/specs/README.md");
+        assert!(crate::tree_job::docs_paths::owned_glob_matches(
+            ".ai/specs/README.md",
+            relative,
+        ));
+    }
+}

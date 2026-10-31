@@ -704,6 +704,101 @@ mod tests {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
+    /// Waits until the pass the route spawned has ended: its claim is back, and so is free here.
+    async fn wait_for_the_pass(project_id: &str) {
+        for _ in 0..200 {
+            if crate::spec_backlog::finish::claim_project(project_id).is_some() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("the finish pass of {project_id} did not end");
+    }
+
+    async fn seed_rooted_project(state: &AppState, project_id: &str) -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES (?, 'off', ?)",
+        )
+        .bind(project_id)
+        .bind(root.path().to_string_lossy().to_string())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        root
+    }
+
+    // Fix H: a pass for one spec neither writes nor deletes the project-wide intent.
+    #[tokio::test]
+    async fn a_one_spec_finish_leaves_a_project_intent_as_it_was() {
+        use crate::spec_backlog::model::SpecStatus;
+        use crate::spec_backlog::store;
+
+        let state = state().await;
+        let project = "finish-one-keeps-intent";
+        let _root = seed_rooted_project(&state, project).await;
+        // The intent stands for another spec that was held back for disk.
+        let created_at = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+        store::write_finish_intent_at(&state.pool, project, &created_at)
+            .await
+            .unwrap();
+        let spec = store::upsert_by_path(
+            &state.pool,
+            Some(project),
+            ".ai/specs/2026-01-01-one.md",
+            "one",
+            "sha-1",
+        )
+        .await
+        .unwrap();
+        store::set_status(&state.pool, &spec.id, SpecStatus::Done, None)
+            .await
+            .unwrap();
+
+        let (status, _) = request(
+            &app(&state),
+            "POST",
+            "/backlog/finish",
+            json!({"spec_id": spec.id}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        wait_for_the_pass(project).await;
+
+        assert_eq!(
+            store::finish_intents(&state.pool).await.unwrap(),
+            vec![(project.to_owned(), created_at)],
+            "the pass of one spec found nothing deferred, and must not touch the project's intent"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_whole_project_finish_with_nothing_deferred_deletes_the_intent() {
+        use crate::spec_backlog::store;
+
+        let state = state().await;
+        let project = "finish-all-drops-intent";
+        let _root = seed_rooted_project(&state, project).await;
+        store::write_finish_intent(&state.pool, project)
+            .await
+            .unwrap();
+
+        let (status, _) = request(
+            &app(&state),
+            "POST",
+            "/backlog/finish",
+            json!({"project_id": project}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        wait_for_the_pass(project).await;
+
+        assert!(
+            store::finish_intents(&state.pool).await.unwrap().is_empty(),
+            "only a whole-project pass settles the intent away"
+        );
+    }
+
     #[tokio::test]
     async fn extract_and_audit_answer_for_what_they_can_do() {
         let state = state().await;

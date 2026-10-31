@@ -2072,6 +2072,173 @@ mod tests {
         );
     }
 
+    // ---- Fix I: "launched" is durable ---------------------------------------------------------------
+    //
+    // Assumed seams: `store::set_tree_launched(pool, spec_id)` sets the new `tree_launched` column to
+    // 1 and `Spec.tree_launched: bool` reads it; `store::set_tree_id` resets it to 0 in the same
+    // statement.
+
+    /// An `in_progress` spec with a recorded tree id; `launched` is the durable flag.
+    async fn spec_with_recorded_tree(
+        pool: &SqlitePool,
+        name: &str,
+        tree_id: &str,
+        launched: bool,
+    ) -> String {
+        let id = add_spec(pool, name, SpecStatus::Extracted).await;
+        store::set_status(pool, &id, SpecStatus::InProgress, None)
+            .await
+            .unwrap();
+        store::set_tree_id(pool, &id, tree_id).await.unwrap();
+        if launched {
+            store::set_tree_launched(pool, &id).await.unwrap();
+        }
+        id
+    }
+
+    #[tokio::test]
+    async fn a_recorded_tree_id_never_launched_and_with_no_tree_is_launched_with_the_same_id() {
+        let pool = crate::testdb::fresh_pool().await;
+        let recorded = "tree-recorded-not-launched";
+        let id = spec_with_recorded_tree(&pool, "never-launched", recorded, false).await;
+        let log = Log::default();
+        let launcher = FakeLauncher::new(&log);
+        launcher.wait_result(recorded, Err("tree does not exist".to_owned()));
+        let prep = FakePreparer::new(&pool, &log, &[&id]);
+
+        let report = finish_with(
+            &pool,
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &prep,
+            },
+            &cfg(),
+            scope_all(),
+        )
+        .await
+        .unwrap();
+
+        let requests = launcher.requests();
+        assert_eq!(requests.len(), 1, "the tree is launched once");
+        assert_eq!(requests[0].id, recorded, "with the id that was recorded");
+        assert_eq!(requests[0].round, 1);
+        assert!(
+            report.needs_owner.is_empty(),
+            "nothing vanished, so the owner is not asked"
+        );
+        assert_eq!(report.done, vec![id]);
+    }
+
+    #[tokio::test]
+    async fn a_recorded_tree_id_already_launched_and_with_no_tree_goes_to_the_owner() {
+        let pool = crate::testdb::fresh_pool().await;
+        let recorded = "tree-recorded-launched";
+        let id = spec_with_recorded_tree(&pool, "vanished", recorded, true).await;
+        let log = Log::default();
+        let launcher = FakeLauncher::new(&log);
+        launcher.wait_result(recorded, Err("tree does not exist".to_owned()));
+        let prep = FakePreparer::new(&pool, &log, &[]);
+
+        let report = finish_with(
+            &pool,
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &prep,
+            },
+            &cfg(),
+            scope_all(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            launcher.requests().is_empty(),
+            "a tree that really vanished is never replaced"
+        );
+        assert_eq!(report.needs_owner, vec![id.clone()]);
+        assert_eq!(status_of(&pool, &id).await, SpecStatus::NeedsOwner);
+    }
+
+    #[tokio::test]
+    async fn a_recorded_tree_id_never_launched_but_with_a_live_tree_waits_on_it() {
+        // A crash between the launch being accepted and the flag being written.
+        let pool = crate::testdb::fresh_pool().await;
+        let recorded = "tree-recorded-live";
+        let id = spec_with_recorded_tree(&pool, "live-unflagged", recorded, false).await;
+        let log = Log::default();
+        let launcher = FakeLauncher::new(&log);
+        let prep = FakePreparer::new(&pool, &log, &[&id]);
+
+        let report = finish_with(
+            &pool,
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &prep,
+            },
+            &cfg(),
+            scope_all(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(launcher.waited_tree_ids(), vec![recorded]);
+        assert!(
+            launcher.requests().is_empty(),
+            "no second tree beside the live one"
+        );
+        assert!(report.needs_owner.is_empty());
+        assert_eq!(report.done, vec![id]);
+    }
+
+    #[tokio::test]
+    async fn a_launch_the_launcher_accepted_leaves_the_tree_flagged_launched() {
+        let pool = crate::testdb::fresh_pool().await;
+        let id = add_spec(&pool, "flagged", SpecStatus::Extracted).await;
+        let log = Log::default();
+        let launcher = FakeLauncher::new(&log);
+        let prep = FakePreparer::new(&pool, &log, &[&id]);
+
+        finish_with(
+            &pool,
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &prep,
+            },
+            &cfg(),
+            scope_all(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(launcher.requests().len(), 1);
+        let spec = store::get_spec(&pool, &id).await.unwrap().unwrap();
+        assert!(spec.tree_launched, "the launch is durable once accepted");
+    }
+
+    #[tokio::test]
+    async fn recording_a_new_tree_id_resets_the_launched_flag() {
+        let pool = crate::testdb::fresh_pool().await;
+        let id = spec_with_recorded_tree(&pool, "reset", "tree-first", true).await;
+        assert!(
+            store::get_spec(&pool, &id)
+                .await
+                .unwrap()
+                .unwrap()
+                .tree_launched
+        );
+
+        store::set_tree_id(&pool, &id, "tree-second").await.unwrap();
+
+        assert!(
+            !store::get_spec(&pool, &id)
+                .await
+                .unwrap()
+                .unwrap()
+                .tree_launched,
+            "a new id is not launched until run_tree accepts it"
+        );
+    }
+
     #[tokio::test]
     async fn runs_independent_specs_in_parallel_up_to_the_budget() {
         let pool = crate::testdb::fresh_pool().await;

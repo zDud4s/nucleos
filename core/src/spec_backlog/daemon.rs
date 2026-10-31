@@ -978,6 +978,96 @@ mod tests {
         assert!(intents(&state).await.is_empty());
     }
 
+    // Fix H seam, assumed: `settle_intent(pool, project_id, created_at, &scope, &result)` takes the
+    // scope of the pass. A `FinishScope::One` pass writes no intent before it starts; afterwards a
+    // deferral writes the project intent if none exists (an existing one keeps its age), and nothing
+    // deferred leaves any intent alone. Only a `FinishScope::All` pass deletes one.
+    #[tokio::test]
+    async fn a_one_spec_pass_that_deferred_writes_the_project_intent() {
+        let state = sweep_state().await;
+        assert!(intents(&state).await.is_empty());
+        let scope = FinishScope::One {
+            spec_id: "spec-held".to_owned(),
+        };
+        let deferred = Ok::<_, FinishError>(FinishReport {
+            deferred: vec!["spec-held".to_owned()],
+            ..Default::default()
+        });
+
+        settle_intent(
+            &state.pool,
+            "one-deferred",
+            &hours_ago(0),
+            &scope,
+            &deferred,
+        )
+        .await;
+
+        assert_eq!(intent_projects(&state).await, vec!["one-deferred".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn a_one_spec_pass_that_deferred_keeps_the_age_of_an_existing_intent() {
+        let state = sweep_state().await;
+        store::write_finish_intent_at(&state.pool, "one-aged", &hours_ago(3))
+            .await
+            .unwrap();
+        let stamp = intents(&state).await[0].1.clone();
+        let scope = FinishScope::One {
+            spec_id: "spec-held".to_owned(),
+        };
+        let deferred = Ok::<_, FinishError>(FinishReport {
+            deferred: vec!["spec-held".to_owned()],
+            ..Default::default()
+        });
+
+        settle_intent(&state.pool, "one-aged", &hours_ago(0), &scope, &deferred).await;
+
+        assert_eq!(intents(&state).await, vec![("one-aged".to_owned(), stamp)]);
+    }
+
+    #[tokio::test]
+    async fn a_one_spec_pass_with_nothing_deferred_leaves_an_intent_alone() {
+        let state = sweep_state().await;
+        store::write_finish_intent_at(&state.pool, "one-clean", &hours_ago(1))
+            .await
+            .unwrap();
+        let stamp = intents(&state).await[0].1.clone();
+        let scope = FinishScope::One {
+            spec_id: "spec-fine".to_owned(),
+        };
+        let clean = Ok::<_, FinishError>(FinishReport::default());
+
+        // Both the stamp the intent has and a stamp it never had must leave it standing.
+        settle_intent(&state.pool, "one-clean", &stamp, &scope, &clean).await;
+        settle_intent(&state.pool, "one-clean", &hours_ago(0), &scope, &clean).await;
+
+        assert_eq!(intents(&state).await, vec![("one-clean".to_owned(), stamp)]);
+    }
+
+    #[tokio::test]
+    async fn a_whole_project_pass_with_nothing_deferred_deletes_the_intent() {
+        let state = sweep_state().await;
+        store::write_finish_intent_at(&state.pool, "all-clean", &hours_ago(1))
+            .await
+            .unwrap();
+        let stamp = intents(&state).await[0].1.clone();
+        let scope = FinishScope::All {
+            project_id: Some("all-clean".to_owned()),
+        };
+
+        settle_intent(
+            &state.pool,
+            "all-clean",
+            &stamp,
+            &scope,
+            &Ok::<_, FinishError>(FinishReport::default()),
+        )
+        .await;
+
+        assert!(intents(&state).await.is_empty());
+    }
+
     #[tokio::test]
     async fn a_deferred_pass_keeps_the_intent_and_releases_the_claim() {
         let state = sweep_state().await;

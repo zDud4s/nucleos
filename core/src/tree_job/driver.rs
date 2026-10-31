@@ -2730,6 +2730,195 @@ mod tests {
         assert_eq!(count_of(&fx, "decisions").await, decisions_before + 1);
     }
 
+    // ---- Fix J: a second disk refusal of the same branch is asked about again -----------------------
+    //
+    // The refusals below go through the real route (`start_pending` posts `/branch_start`), so the
+    // record, the ask and the id are written by the production code. Assumed seams:
+    // `pending_decision_id(job_id, name, generation)` and the manifest key
+    // `pending_start_generation`, which starts at 1 and grows when the replay drops a record.
+
+    /// A job with no branch whose `PENDING_LAYER` the disk refuses, and no pending record yet.
+    async fn job_the_disk_refuses(fx: &Fixture, job: &str) {
+        fx.seed_job(job, Vec::new(), None).await;
+        let workflow = fx.repo.join(".nucleos").join("workflow");
+        std::fs::create_dir_all(&workflow).unwrap();
+        std::fs::write(
+            workflow.join("speed.yaml"),
+            "tree:\n  base_branch: master\n  floor_gb: 0\n",
+        )
+        .unwrap();
+        set_layer_cost(fx, job, PENDING_LAYER, SHORT_GB).await;
+    }
+
+    /// The start body of `PENDING_NAME`, as a pending record stores it.
+    fn pending_body(job: &str) -> Value {
+        json!({
+            "caller": root_node_of(job),
+            "goal": "Do the work",
+            "prompt": "Do not run.",
+            "paths": ["late/**"],
+            "layer": PENDING_LAYER,
+            "base": null,
+        })
+    }
+
+    /// Posts the start of `PENDING_NAME`; the disk refuses it, which records and asks.
+    async fn refuse_the_start(fx: &Fixture, job: &str) {
+        let refused = crate::tree_job::branch_start::start_pending(
+            &fx.state,
+            job,
+            PENDING_NAME,
+            &pending_body(job),
+        )
+        .await;
+        assert!(refused.is_err(), "the disk refuses the start: {refused:?}");
+    }
+
+    async fn decisions_of(fx: &Fixture, job: &str) -> Vec<(String, String)> {
+        sqlx::query_as("SELECT id, status FROM decisions WHERE tree_id = ? ORDER BY id")
+            .bind(job)
+            .fetch_all(&fx.state.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn feed_lines_naming(fx: &Fixture, text: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM feed WHERE summary LIKE ?")
+            .bind(format!("%{text}%"))
+            .fetch_one(&fx.state.pool)
+            .await
+            .unwrap()
+    }
+
+    /// Frees the disk, lets the driver admit the pending start, then ends the branch so that the
+    /// same name can be refused again.
+    async fn admit_and_end_the_branch(fx: &Fixture, job: &str, gate: &FakeGate) {
+        set_layer_cost(fx, job, PENDING_LAYER, FREED_GB).await;
+        fx.tick(job, gate).await;
+        let mut stored = fx.job(job).await;
+        assert!(
+            stored.manifest.branches.contains_key(PENDING_NAME),
+            "the branch was admitted"
+        );
+        assert!(pending_starts(&stored).get(PENDING_NAME).is_none());
+        stored.manifest.branches.remove(PENDING_NAME);
+        store::update(&fx.state.pool, &stored).await.unwrap();
+        set_layer_cost(fx, job, PENDING_LAYER, SHORT_GB).await;
+    }
+
+    #[tokio::test]
+    async fn a_second_disk_refusal_after_an_admission_asks_the_owner_again() {
+        const JOB: &str = "drv-pending-second";
+        let fx = Fixture::new().await;
+        job_the_disk_refuses(&fx, JOB).await;
+        let gate = FakeGate::answering(vec![]);
+        let first_id = crate::tree_job::branch_start::pending_decision_id(JOB, PENDING_NAME, 1);
+        let second_id = crate::tree_job::branch_start::pending_decision_id(JOB, PENDING_NAME, 2);
+        assert_eq!(first_id, format!("pending-{JOB}-{PENDING_NAME}-1"));
+        assert_ne!(first_id, second_id);
+
+        refuse_the_start(&fx, JOB).await;
+        assert_eq!(
+            decisions_of(&fx, JOB).await,
+            vec![(first_id.clone(), decisions::STATUS_OPEN.to_owned())]
+        );
+        assert_eq!(recorded_decision(&fx.job(JOB).await), Some(first_id.clone()));
+
+        admit_and_end_the_branch(&fx, JOB, &gate).await;
+        assert_eq!(decision_row(&fx, &first_id).await.0, decisions::STATUS_ANSWERED);
+
+        refuse_the_start(&fx, JOB).await;
+
+        let mut expected = vec![
+            (first_id.clone(), decisions::STATUS_ANSWERED.to_owned()),
+            (second_id.clone(), decisions::STATUS_OPEN.to_owned()),
+        ];
+        expected.sort();
+        assert_eq!(
+            decisions_of(&fx, JOB).await,
+            expected,
+            "two distinct decisions, the second one open"
+        );
+        assert_eq!(
+            feed_lines_naming(&fx, &second_id).await,
+            1,
+            "the owner is told in the feed"
+        );
+        assert_eq!(
+            recorded_decision(&fx.job(JOB).await),
+            Some(second_id),
+            "the new record names the new decision"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repeated_refusal_while_the_start_is_pending_asks_nothing_more() {
+        const JOB: &str = "drv-pending-repeat";
+        let fx = Fixture::new().await;
+        job_the_disk_refuses(&fx, JOB).await;
+        let gate = FakeGate::answering(vec![]);
+
+        refuse_the_start(&fx, JOB).await;
+        admit_and_end_the_branch(&fx, JOB, &gate).await;
+        refuse_the_start(&fx, JOB).await;
+        let decisions_before = decisions_of(&fx, JOB).await;
+        let record_before = pending_starts(&fx.job(JOB).await);
+        let feed_before = count_of(&fx, "feed").await;
+
+        refuse_the_start(&fx, JOB).await;
+        fx.tick(JOB, &gate).await;
+        refuse_the_start(&fx, JOB).await;
+
+        assert_eq!(decisions_of(&fx, JOB).await, decisions_before);
+        assert_eq!(
+            pending_starts(&fx.job(JOB).await),
+            record_before,
+            "the record keeps its generation"
+        );
+        assert_eq!(count_of(&fx, "feed").await, feed_before);
+    }
+
+    #[tokio::test]
+    async fn the_heal_of_a_record_with_no_decision_asks_with_the_records_generation() {
+        const JOB: &str = "drv-pending-heal-generation";
+        let fx = Fixture::new().await;
+        job_the_disk_refuses(&fx, JOB).await;
+        let gate = FakeGate::answering(vec![]);
+        refuse_the_start(&fx, JOB).await;
+        admit_and_end_the_branch(&fx, JOB, &gate).await;
+        refuse_the_start(&fx, JOB).await;
+        let second_id = crate::tree_job::branch_start::pending_decision_id(JOB, PENDING_NAME, 2);
+        assert_eq!(recorded_decision(&fx.job(JOB).await), Some(second_id.clone()));
+
+        // The crash between the record and the ask: no decision, and the record has no id.
+        sqlx::query("DELETE FROM decisions WHERE id = ?")
+            .bind(&second_id)
+            .execute(&fx.state.pool)
+            .await
+            .unwrap();
+        let mut stored = fx.job(JOB).await;
+        stored
+            .manifest
+            .extra
+            .get_mut("pending_starts")
+            .and_then(Value::as_object_mut)
+            .and_then(|pending| pending.get_mut(PENDING_NAME))
+            .and_then(Value::as_object_mut)
+            .expect("the record is there")
+            .remove("decision_id");
+        store::update(&fx.state.pool, &stored).await.unwrap();
+
+        fx.tick(JOB, &gate).await;
+
+        assert_eq!(
+            recorded_decision(&fx.job(JOB).await),
+            Some(second_id.clone()),
+            "the heal asks under the record's generation"
+        );
+        assert_eq!(decision_row(&fx, &second_id).await.0, decisions::STATUS_OPEN);
+        assert_eq!(decisions_of(&fx, JOB).await.len(), 2, "one answered, one open");
+    }
+
     #[tokio::test]
     async fn a_replay_interrupted_before_the_answer_finishes_on_the_next_pass() {
         const JOB: &str = "drv-pending-halfreplay";
