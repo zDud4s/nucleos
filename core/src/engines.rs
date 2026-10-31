@@ -143,7 +143,10 @@ pub fn seat_kinds_in(table: &[EngineDescription]) -> Vec<(&'static str, SeatKind
 }
 
 /// The ids of the rows reached through `transport`.
-pub fn ids_with_transport_in(table: &[EngineDescription], transport: Transport) -> Vec<&'static str> {
+pub fn ids_with_transport_in(
+    table: &[EngineDescription],
+    transport: Transport,
+) -> Vec<&'static str> {
     table
         .iter()
         .filter(|row| row.transport == transport)
@@ -227,7 +230,10 @@ mod tests {
         assert_eq!(row("local").transport, Transport::Http);
 
         // Utility defaults keep their legacy values: Claude's alias, no cheap tier for Local.
-        assert_eq!((row("claude").utility_default)(&[]), Some("haiku".to_owned()));
+        assert_eq!(
+            (row("claude").utility_default)(&[]),
+            Some("haiku".to_owned())
+        );
         assert_eq!((row("local").utility_default)(&[]), None);
 
         // Runner constructors: the two CLIs build one, the local model has no CLI runner.
@@ -254,11 +260,18 @@ mod tests {
         );
 
         // CLI runners (what `translatable_runners` iterates) are the CLI-transport rows.
-        assert_eq!(ids_with_transport_in(TABLE, Transport::Cli), ["claude", "codex"]);
+        assert_eq!(
+            ids_with_transport_in(TABLE, Transport::Cli),
+            ["claude", "codex"]
+        );
 
         // Installed engines: only rows whose probe says so, in table order.
         let installed = installed_in(TABLE);
-        assert!(installed.iter().all(|id| ["claude", "codex", "local"].contains(id)));
+        assert!(
+            installed
+                .iter()
+                .all(|id| ["claude", "codex", "local"].contains(id))
+        );
 
         // Chat engines a conversation can name.
         assert_eq!(chat_ids_in(TABLE), ["claude", "codex", "local"]);
@@ -309,5 +322,72 @@ mod tests {
         assert_eq!(runner_id_in(rows, "extra"), "claude");
         // The production table is untouched by the test row.
         assert_eq!(TABLE.len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod row_tests {
+    use super::*;
+    use crate::config::{ModelsConfig, SeatKind};
+    use crate::execution::runner::CommandRunner;
+    use crate::models::model_catalog::Discovered;
+    use std::sync::Arc;
+
+    fn probe_true() -> bool {
+        true
+    }
+
+    fn probe_false() -> bool {
+        false
+    }
+
+    fn no_utility_default(_known: &[Discovered]) -> Option<String> {
+        None
+    }
+
+    fn no_runner(_models: &ModelsConfig) -> Option<Arc<dyn CommandRunner>> {
+        None
+    }
+
+    fn row(id: &'static str, transport: Transport, installed: fn() -> bool) -> EngineDescription {
+        EngineDescription {
+            id,
+            display_name: "Row",
+            seat_kind: SeatKind::Cloud,
+            transport,
+            installed,
+            utility_default: no_utility_default,
+            runner: no_runner,
+        }
+    }
+
+    #[test]
+    fn installed_in_keeps_table_order_and_drops_a_false_probe() {
+        let rows = vec![
+            row("first", Transport::Cli, probe_true),
+            row("second", Transport::Cli, probe_false),
+            row("third", Transport::Cli, probe_true),
+        ];
+        assert_eq!(installed_in(&rows), ["first", "third"]);
+        // The row is dropped by its probe alone: the transport lookup still lists it.
+        assert_eq!(
+            ids_with_transport_in(&rows, Transport::Cli),
+            ["first", "second", "third"]
+        );
+    }
+
+    #[test]
+    fn a_fourth_cli_row_resolves_through_the_runner_lookups() {
+        let mut rows: Vec<EngineDescription> = TABLE.to_vec();
+        rows.push(row("extra-cli", Transport::Cli, probe_true));
+        let rows = rows.as_slice();
+        assert_eq!(runner_id_in(rows, "extra-cli"), "extra-cli");
+        assert!(cli_row_in(rows, "extra-cli").is_some());
+        assert_eq!(
+            ids_with_transport_in(rows, Transport::Cli),
+            ["claude", "codex", "extra-cli"]
+        );
+        // The production table does not know the row: it collapses to claude.
+        assert_eq!(runner_id_in(TABLE, "extra-cli"), "claude");
     }
 }
