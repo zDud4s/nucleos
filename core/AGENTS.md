@@ -24,11 +24,13 @@ the contract, not a snapshot.
 |---|---|
 | `main.rs` | The binary of the `nucleos-daemon` package (exe `nucleos-core`). Startup orchestration ONLY: logging → autostart → storage → reconcile orphaned runs/stranded approvals/orphaned worktrees → secrets/token → model config → `AppState` → HTTP router → sidecar + scheduler + repo-poller + worktree-GC + devtime-ingestion background tasks → serve. No business logic. |
 | `shutdown.rs` | Draining the daemon before an update replaces it: an in-memory `draining` flag (never persisted), the live-run count the updater waits on (`GET /system/update-readiness`), the wait that calls `stop` only after two quiet reads in a row and reopens the door instead of interrupting anything when it times out, and the middleware that answers 503 to the routes that start a run without a slot. Slot-taking work is refused one layer down (`concurrency::NoRoom::Draining`). Judges nothing about WHAT to run; the routes themselves (`/system/*`) live in `http/admin.rs`. |
+| `supervisor.rs` | The `--supervise` loop the Windows logon task runs: spawns the daemon as a child, asks the supervise policy after each exit, sleeps and relaunches. |
 | `cli.rs` | Binary-only, beside `main.rs`: the command-line subcommands that run instead of the daemon (`--print-token`, `--land`, `--verify`, `--pressao`, the `--set-*` secret prompts, `--mcp-tools`, `--workflow-sync`, `--workflow-package`, `--filter-run`) and their argument helpers. `run_subcommand` checks the flags in the order `main` always did. |
 | `startup.rs` | Binary-only, beside `main.rs`: the daemon's one-off start work — seeding the workflow library, the file-to-database migrations (machine settings, project state, onboarding) and `reconcile_after_restart`, the orphan and interrupted-work reconciliation run once the database is open. |
 | `crates/nucleos-base/src/logging.rs` | `tracing` subscriber (rotating daily file + stdout), initialized first to catch a failed startup. |
 | `crates/nucleos-base/src/autostart.rs` | Self-registers OS autostart at login, independent of the shell: a Windows Scheduled Task (`LogonTrigger`, action `conhost --headless <exe> --supervise`; `core/src/supervisor.rs` relaunches the daemon after a failure, because the Task Scheduler's `RestartOnFailure` was measured inert), a macOS LaunchAgent, or on Linux a systemd user unit or an XDG autostart entry (one Linux backend at a time). Registering never starts a second daemon. Non-fatal on failure. |
 | `crates/nucleos-base/src/storage.rs` | SQLite pool + WAL + `sqlx::migrate!`. Knows the storage *mechanism* only — never a table's meaning. |
+| `crates/nucleos-base/src/supervise.rs` | Pure decisions of `--supervise`: which daemon exit is a failure, how long to pause, when to give up. |
 | `crates/nucleos-base/src/backup.rs` | Backup files: takes a consistent snapshot, verifies one, and stages a restore for the next startup to apply. |
 | `auth.rs` | Local token generation + the bearer-token middleware on protected routes. |
 | `agents.rs` | Agent packages: the versioned, file-based source of the factory agents (spec agentes-agnosticos §3); module root, each submodule has exactly one owner. |
@@ -167,6 +169,7 @@ the contract, not a snapshot.
 | `http/repo.rs` | Reading a project's tree (`/projects/{id}/ls`, `/cat`, `/grep`, `/log`, `/diff`…). |
 | `http/run_queue.rs` | Runs, the vcs queue, worktrees and the feed (`/runs/*`, `/vcs/*`, `/worktrees`, `/feed`). |
 | `http/settings.rs` | Settings documents over HTTP (`/settings*`): index, read, history, PUT with optimistic versioning, rollback. |
+| `http/settings/devtime_void_tests.rs` | Tests that a write or rollback of the `devtime` document voids the pending shadow rows decided under the old thresholds (`thresholds_hash`) and nothing else. |
 | `http/tasks.rs` | The HTTP face of `task_claims`: `/tasks/*` per worktree (tools and runs), `/projects/{id}/tasks*` for the owner only (hooks and the shell). A project off the roster is "claims unavailable", never a server error. |
 | `http/team.rs` | Council and teams (`/council/*`, `/teams/*`, `/team-*`). |
 | `http/themes.rs` | Themes (`/themes/*`, owner-only, spec `2026-10-22-segundo-cerebro-abstrato` section 6): list, detail with the members resolved, accept, refuse, rename, merge, add and exclude a member. One of the three files allowed to name the theme tables. |
