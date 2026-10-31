@@ -2086,6 +2086,38 @@ mod tests {
         assert_eq!(fx.job(JOB).await.state, "open", "the job is not finished");
     }
 
+    /// Guard: this passes today because the second park failure is only logged. It ensures that a
+    /// root which tops a branch still asks once and never starts a paid run.
+    #[tokio::test]
+    async fn a_blocked_root_that_tops_a_branch_parks_once_across_ticks() {
+        const JOB: &str = "drv-root-branch-blocked-once";
+        let fx = Fixture::new().await;
+        let root = root_node_of(JOB);
+        fx.seed_job(
+            JOB,
+            vec![code_branch("root", "building", Some(&root))],
+            Some("integration"),
+        )
+        .await;
+        fx.run_ended(&root, Some("blocked")).await;
+        let gate = FakeGate::answering(vec![]);
+
+        for _ in 0..3 {
+            fx.tick(JOB, &gate).await;
+        }
+
+        assert_eq!(fx.branch(JOB, "root").await.state, "parked");
+        assert_eq!(fx.open_questions(JOB, &root).await.len(), 1);
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM decisions")
+            .fetch_one(&fx.state.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1, "repeated ticks asked nothing more");
+        fx.assert_not_landing(JOB).await;
+        assert_eq!(fx.job(JOB).await.state, "open", "the job is not finished");
+        assert!(gate.calls().is_empty(), "a blocked root is not gated");
+    }
+
     #[tokio::test]
     async fn an_answered_blocked_branch_is_not_parked_again_while_its_new_run_lives() {
         const JOB: &str = "drv-blocked-answered";

@@ -481,7 +481,9 @@ mod tests {
         seed_node(pool, ROOT, "root", None, 0).await;
         let mut manifest = Manifest::new(TREE, "feat/tree", "Ship it", "C:/Projects/nucleos", &[]);
         for &(name, state, node_id) in branches {
-            seed_node(pool, node_id, "orchestrator", Some(ROOT), 1).await;
+            if node_id != ROOT {
+                seed_node(pool, node_id, "orchestrator", Some(ROOT), 1).await;
+            }
             let mut branch = Branch::new(name, &[format!("core/src/{name}.rs")], "core", None);
             branch.state = state.to_owned();
             branch.node_id = Some(node_id.to_owned());
@@ -773,6 +775,60 @@ mod tests {
             assert_eq!(feed_rows(&pool).await, 0, "{state}");
             assert_eq!(job(&pool).await, before, "{state}");
         }
+    }
+
+    #[tokio::test]
+    async fn park_or_ask_on_an_already_parked_branch_answers_none() {
+        let pool = crate::testdb::fresh_pool().await;
+        seed_tree(&pool, &[("root", "building", ROOT)]).await;
+
+        let first = park_or_ask(&pool, TREE, ROOT, QUESTION)
+            .await
+            .unwrap()
+            .expect("the first question parks the root branch");
+        let second = park_or_ask(&pool, TREE, ROOT, QUESTION).await.unwrap();
+
+        assert_eq!(second, None);
+        assert_eq!(decision_rows(&pool).await, 1);
+        assert_eq!(feed_rows(&pool).await, 1, "the second call adds no feed line");
+        let record = branch_of(&pool, "root")
+            .await
+            .park
+            .expect("the root branch keeps its park record");
+        assert_eq!(record["decision_id"].as_str(), Some(first.id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn park_or_ask_on_a_parked_ordinary_branch_answers_none() {
+        let pool = crate::testdb::fresh_pool().await;
+        seed_one_branch(&pool, "building").await;
+
+        let first = park_or_ask(&pool, TREE, NODE, QUESTION)
+            .await
+            .unwrap()
+            .expect("the first question parks the branch");
+        let second = park_or_ask(&pool, TREE, NODE, QUESTION).await.unwrap();
+
+        assert_eq!(second, None);
+        assert_eq!(decision_rows(&pool).await, 1);
+        assert_eq!(feed_rows(&pool).await, 1, "the second call adds no feed line");
+        let record = branch_of(&pool, BRANCH)
+            .await
+            .park
+            .expect("the branch keeps its park record");
+        assert_eq!(record["decision_id"].as_str(), Some(first.id.as_str()));
+    }
+
+    /// Guard: passes today. `park_or_ask` becomes idempotent, but `park` remains strict.
+    #[tokio::test]
+    async fn park_still_refuses_a_double_park() {
+        let pool = crate::testdb::fresh_pool().await;
+        seed_one_branch(&pool, "building").await;
+
+        park(&pool, TREE, NODE, QUESTION).await.unwrap();
+        let error = park(&pool, TREE, NODE, QUESTION).await.unwrap_err();
+
+        assert!(matches!(error, DecisionError::Engine(_)), "{error:?}");
     }
 
     // ----- answer -----
