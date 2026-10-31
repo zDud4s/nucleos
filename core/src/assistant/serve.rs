@@ -52,6 +52,43 @@ pub(super) async fn serve_turn(
 pub(super) type LateBriefing =
     std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>;
 
+/// `timeout(ceiling, work)` that does not count the seconds a question stands open for the chat.
+///
+/// A tool-approval question may wait days for a person; the time it is parked is not the turn's
+/// time. The budget is spent at most a second at a time, only on steps where `chat_has_open_ask` is
+/// false, and running out yields the same `Elapsed` a `timeout` would.
+pub(super) async fn within_ceiling<F: std::future::Future>(
+    chat_id: &str,
+    ceiling: std::time::Duration,
+    work: F,
+) -> Result<F::Output, tokio::time::error::Elapsed> {
+    const TICK: std::time::Duration = std::time::Duration::from_secs(1);
+    let mut spent = std::time::Duration::ZERO;
+    tokio::pin!(work);
+    loop {
+        let step = TICK.min(ceiling.saturating_sub(spent));
+        tokio::select! {
+            biased;
+            out = &mut work => return Ok(out),
+            _ = tokio::time::sleep(step) => {
+                if !crate::hooks::chat_has_open_ask(chat_id) {
+                    spent += step;
+                }
+                if spent >= ceiling {
+                    // An `Elapsed` cannot be built by hand; a zero timeout on a future that never
+                    // finishes is the way to get one.
+                    return tokio::time::timeout(
+                        std::time::Duration::ZERO,
+                        std::future::pending::<()>(),
+                    )
+                    .await
+                    .map(|()| unreachable!("a pending future never completes"));
+                }
+            }
+        }
+    }
+}
+
 /// Serves one turn (see `serve_turn`), for a turn that may have skipped its briefing on the strength
 /// of a kept process.
 ///
@@ -74,7 +111,8 @@ pub(super) async fn serve_turn_briefed(
 ) -> Result<std::io::Result<crate::execution::runner::RunOutcome>, tokio::time::error::Elapsed> {
     if !may_live {
         request.progress_timeout = deadlines.silence;
-        let served = tokio::time::timeout(
+        let served = within_ceiling(
+            chat_id,
             deadlines.ceiling,
             runner.run_prompt(request, session_tx, std::sync::Arc::clone(transcript)),
         )
@@ -127,7 +165,8 @@ pub(super) async fn serve_turn_briefed(
             if let Some(request_tx) = request.request_tx.take() {
                 let _ = request_tx.send(());
             }
-            let served = tokio::time::timeout(
+            let served = within_ceiling(
+                chat_id,
                 deadlines.ceiling,
                 live.turn(
                     &request.prompt,
@@ -404,7 +443,8 @@ pub(super) async fn start_live_chat(
 
     // Open while the opening turn is gathered, exactly as in `serve_turn`.
     let steer = SteerGuard::open(chat_id, &live.messages);
-    let served = tokio::time::timeout(
+    let served = within_ceiling(
+        chat_id,
         deadlines.ceiling,
         live.opening(transcript, deadlines.silence),
     )

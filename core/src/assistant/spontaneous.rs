@@ -398,7 +398,8 @@ pub(super) async fn start_spontaneous_turn(
         // Open while the answer is gathered, so Stop reaches this turn softly and a line a person
         // sends lands in it, exactly as in a person's own turn.
         let steer = SteerGuard::open(&chat, &live.messages);
-        let served = tokio::time::timeout(
+        let served = within_ceiling(
+            &chat,
             deadlines.ceiling,
             live.gather(&transcript, deadlines.silence),
         )

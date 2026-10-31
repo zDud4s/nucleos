@@ -207,6 +207,39 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    /// A turn parked on a question for far longer than its ceiling is still waiting, not timed out.
+    #[tokio::test(start_paused = true)]
+    async fn a_turn_parked_on_a_question_does_not_spend_its_ceiling() {
+        let chat_id = a_chat("parked");
+        let id = crate::hooks::ask_about(&chat_id, 9_200_001, "Bash", None);
+
+        let served = within_ceiling(
+            &chat_id,
+            Duration::from_secs(5),
+            tokio::time::sleep(Duration::from_secs(60)),
+        )
+        .await;
+
+        assert!(served.is_ok(), "a parked turn must outlive its ceiling");
+        assert!(crate::hooks::ask_is_open(&id));
+        crate::hooks::forget_asks_for_chat(&chat_id);
+    }
+
+    /// With no question standing the ceiling is the ceiling it always was.
+    #[tokio::test(start_paused = true)]
+    async fn a_turn_not_parked_still_hits_its_ceiling() {
+        let chat_id = a_chat("unparked");
+
+        let served = within_ceiling(
+            &chat_id,
+            Duration::from_secs(5),
+            tokio::time::sleep(Duration::from_secs(60)),
+        )
+        .await;
+
+        assert!(served.is_err());
+    }
+
     /// A chat id no other test in this process is using.
     ///
     /// `ChatSlot::acquire` is process-global, while these tests run in parallel. Reusing an id in
