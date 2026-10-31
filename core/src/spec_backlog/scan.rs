@@ -593,6 +593,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_missing_specs_directory_abandons_nothing() {
+        let pool = crate::testdb::fresh_pool().await;
+        let project = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        write_file(&project_specs(project.path()), "a.md", b"# A\n");
+        let roots = roots_at(project.path(), state.path());
+        scan(&pool, PROJECT, &roots).await.unwrap();
+        let id = spec_id(PROJECT, ".ai/specs/a.md");
+        mark_extracted(&pool, &id).await;
+
+        fs::remove_dir_all(project_specs(project.path())).unwrap();
+        scan(&pool, PROJECT, &roots).await.unwrap();
+
+        let spec = stored(&pool, &id).await;
+        assert_eq!(spec.status, SpecStatus::Extracted);
+        assert_ne!(spec.status, SpecStatus::Abandoned);
+    }
+
+    #[tokio::test]
+    async fn an_empty_specs_directory_still_means_the_spec_is_gone() {
+        let pool = crate::testdb::fresh_pool().await;
+        let project = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let file = write_file(&project_specs(project.path()), "a.md", b"# A\n");
+        let roots = roots_at(project.path(), state.path());
+        scan(&pool, PROJECT, &roots).await.unwrap();
+        let id = spec_id(PROJECT, ".ai/specs/a.md");
+
+        fs::remove_file(file).unwrap();
+        scan(&pool, PROJECT, &roots).await.unwrap();
+
+        assert_eq!(stored(&pool, &id).await.status, SpecStatus::Abandoned);
+    }
+
+    #[tokio::test]
     async fn a_spec_that_comes_back_is_discovered_again() {
         let pool = crate::testdb::fresh_pool().await;
         let project = tempfile::tempdir().unwrap();

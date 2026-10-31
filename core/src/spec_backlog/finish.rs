@@ -72,6 +72,7 @@ pub struct TreeRequest {
 pub struct TreeOutcome {
     pub run_ids: Vec<String>,
     pub lineage_roots: Vec<String>,
+    pub still_running: bool,
 }
 
 /// Runs a tree to its end.
@@ -855,6 +856,7 @@ mod tests {
             Ok(TreeOutcome {
                 run_ids: vec![format!("run-{}-r{}", request.spec_id, request.round)],
                 lineage_roots: vec![format!("root-{}", request.id)],
+                ..Default::default()
             })
         }
     }
@@ -866,6 +868,8 @@ mod tests {
         /// Specs whose audit ends Done; every other audit ends Audited.
         passes: Vec<String>,
         lineages: Mutex<Vec<(String, SpecLineage)>>,
+        fail_first_extractions: AtomicUsize,
+        extraction_attempts: AtomicUsize,
     }
 
     impl FakePreparer {
@@ -875,7 +879,13 @@ mod tests {
                 log: log.clone(),
                 passes: passes.iter().map(|id| (*id).clone()).collect(),
                 lineages: Mutex::new(Vec::new()),
+                fail_first_extractions: AtomicUsize::new(0),
+                extraction_attempts: AtomicUsize::new(0),
             }
+        }
+
+        fn fail_first_extraction(&self) {
+            self.fail_first_extractions.store(1, Ordering::SeqCst);
         }
     }
 
@@ -883,6 +893,10 @@ mod tests {
     impl SpecPreparer for FakePreparer {
         async fn extract(&self, spec_id: &str) -> Result<(), String> {
             self.log.lock().unwrap().push(format!("extract:{spec_id}"));
+            let attempt = self.extraction_attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt < self.fail_first_extractions.load(Ordering::SeqCst) {
+                return Err("temporary extraction error".to_owned());
+            }
             let item = NewCriterion {
                 text: "it works".to_owned(),
                 kind: CriterionKind::Behavior,
@@ -1128,6 +1142,177 @@ mod tests {
         assert!(
             !log.iter().any(|e| *e == format!("extract:{ready}")),
             "an already extracted spec is not extracted again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_extraction_is_tried_again_by_the_next_finish() {
+        let pool = crate::testdb::fresh_pool().await;
+        let dependency = add_spec(&pool, "dependency", SpecStatus::Discovered).await;
+        let dependent = add_spec(&pool, "dependent", SpecStatus::Extracted).await;
+        store::add_dep(&pool, &dependent, &dependency, DepSource::Owner)
+            .await
+            .unwrap();
+        let log = Log::default();
+        let launcher = FakeLauncher::new(&log);
+        let prep = FakePreparer::new(&pool, &log, &[]);
+        prep.fail_first_extraction();
+        let mut config = cfg();
+        config.owned_paths = disjoint(&[&dependency, &dependent]);
+
+        let first = finish_with(
+            &pool,
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &prep,
+            },
+            &config,
+            scope_all(),
+        )
+        .await
+        .unwrap();
+
+        assert!(first.trees.is_empty());
+        assert!(first.needs_owner.contains(&dependency));
+        let failed = store::get_spec(&pool, &dependency).await.unwrap().unwrap();
+        assert_eq!(failed.status, SpecStatus::Discovered);
+        assert!(
+            failed
+                .status_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("temporary extraction error")
+        );
+        assert!(
+            launcher.requests().is_empty(),
+            "a dependent does not start after its dependency extraction fails"
+        );
+
+        let second = finish_with(
+            &pool,
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &prep,
+            },
+            &config,
+            scope_all(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(prep.extraction_attempts.load(Ordering::SeqCst), 2);
+        assert!(launcher
+            .requests()
+            .iter()
+            .any(|request| request.spec_id == dependency));
+    }
+
+    #[tokio::test]
+    async fn a_spec_named_by_the_owner_leaves_needs_owner() {
+        let pool = crate::testdb::fresh_pool().await;
+        let selected = add_spec(&pool, "selected", SpecStatus::NeedsOwner).await;
+        let all_scope = add_spec(&pool, "all-scope", SpecStatus::NeedsOwner).await;
+        let log = Log::default();
+        let launcher = FakeLauncher::new(&log);
+        let prep = FakePreparer::new(&pool, &log, &[]);
+        let mut config = cfg();
+        config.owned_paths = disjoint(&[&selected, &all_scope]);
+
+        finish_with(
+            &pool,
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &prep,
+            },
+            &config,
+            FinishScope::One {
+                spec_id: selected.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .any(|entry| entry == &format!("extract:{selected}"))
+        );
+        assert!(launcher.requests().iter().any(|request| request.spec_id == selected));
+
+        finish_with(
+            &pool,
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &prep,
+            },
+            &config,
+            scope_all(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(status_of(&pool, &all_scope).await, SpecStatus::NeedsOwner);
+        assert!(
+            !log.lock()
+                .unwrap()
+                .iter()
+                .any(|entry| entry == &format!("extract:{all_scope}"))
+        );
+    }
+
+    struct StillRunningLauncher {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl TreeLauncher for StillRunningLauncher {
+        async fn run_tree(&self, _request: &TreeRequest) -> Result<TreeOutcome, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(TreeOutcome {
+                still_running: true,
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tree_still_running_is_not_followed_by_another() {
+        let pool = crate::testdb::fresh_pool().await;
+        let id = add_spec(&pool, "running", SpecStatus::Extracted).await;
+        let log = Log::default();
+        let launcher = StillRunningLauncher {
+            calls: AtomicUsize::new(0),
+        };
+        let prep = FakePreparer::new(&pool, &log, &[]);
+        let mut config = cfg();
+        config.max_rounds = 2;
+        config.owned_paths = disjoint(&[&id]);
+
+        let report = finish_with(
+            &pool,
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &prep,
+            },
+            &config,
+            scope_all(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(launcher.calls.load(Ordering::SeqCst), 1);
+        assert!(
+            !log.lock().unwrap().iter().any(|entry| entry == &format!("audit:{id}")),
+            "a still-running tree is not audited"
+        );
+        let spec = store::get_spec(&pool, &id).await.unwrap().unwrap();
+        assert_eq!(spec.status, SpecStatus::NeedsOwner);
+        assert!(
+            spec.status_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains(&report.trees[0])
         );
     }
 
@@ -1496,6 +1681,7 @@ mod tests {
         let outcome = TreeOutcome {
             run_ids: vec!["tree-run".to_owned()],
             lineage_roots: vec!["tree-root".to_owned()],
+            ..Default::default()
         };
         let lineage = lineage_for(&pool, &id, &[outcome]).await.unwrap();
         for expected in ["ex-1", "ex-2", "tree-run"] {
