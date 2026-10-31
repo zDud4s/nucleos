@@ -1,6 +1,6 @@
 //! Keyed, replay-safe node transitions, reconciliation of false `running` nodes, and agent launch.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use sqlx::SqlitePool;
@@ -130,7 +130,8 @@ pub async fn apply(
 /// in `LIVE_RUN_STATUSES`, or its row is gone), naming the run in the summary. Returns the ids.
 ///
 /// Spared: nodes with no `run_id`, nodes outside a tree job, and the top branch node of a branch
-/// that may not close yet (see `branch_node_may_close`) while its job is not finished.
+/// that may not close yet (see `branch_node_may_close`) while its job is not finished, and every
+/// node of a job whose manifest cannot be read (named in the feed, once per job).
 pub async fn reconcile_running(pool: &SqlitePool) -> Result<Vec<String>, NodeRunError> {
     let candidates: Vec<(String, String, String)> = sqlx::query_as(
         "SELECT id, tree_job_id, run_id FROM work_nodes
@@ -140,6 +141,7 @@ pub async fn reconcile_running(pool: &SqlitePool) -> Result<Vec<String>, NodeRun
     .await?;
 
     let mut jobs: HashMap<String, Option<TreeJob>> = HashMap::new();
+    let mut corrupt: HashSet<String> = HashSet::new();
     let mut marked = Vec::new();
     for (id, job_id, run_id) in candidates {
         let Ok(run_number) = run_id.parse::<i64>() else {
@@ -155,9 +157,23 @@ pub async fn reconcile_running(pool: &SqlitePool) -> Result<Vec<String>, NodeRun
         {
             continue;
         }
+        if corrupt.contains(&job_id) {
+            continue;
+        }
         if !jobs.contains_key(&job_id) {
-            let loaded = store::load(pool, &job_id).await?;
-            jobs.insert(job_id.clone(), loaded);
+            match store::load(pool, &job_id).await {
+                Ok(loaded) => {
+                    jobs.insert(job_id.clone(), loaded);
+                }
+                Err(error @ StoreError::Manifest(_)) => {
+                    // Whether the node may be failed depends on a manifest nobody can read, so it
+                    // is left as it is, and the owner is told once per job.
+                    store::note_corrupt(pool, &job_id, &error).await;
+                    corrupt.insert(job_id);
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
         if let Some(Some(job)) = jobs.get(&job_id)
             && job.state != JOB_TERMINAL_STATE
@@ -806,5 +822,137 @@ mod tests {
 
         assert!(launched.is_err());
         assert_eq!(run_rows(&state.pool).await, 0);
+    }
+
+    // ----- the tools a node's run is launched with -----
+
+    /// Like `launch_state`, but keeps the fake runner so the launch shape it saw can be read.
+    async fn launch_state_with_runner() -> (
+        AppState,
+        std::sync::Arc<crate::execution::runner::FakeCommandRunner>,
+    ) {
+        let (state, runner) = crate::execution::runs::testkit::test_state_with_runner(
+            Some(Duration::from_secs(5)),
+            Duration::from_secs(600),
+        )
+        .await;
+        runner.canned.lock().unwrap().as_mut().unwrap().session_id = None;
+        (state, runner)
+    }
+
+    /// The MCP config path, job id and allowed tools the runner was handed, once it was handed any.
+    async fn seen_launch(
+        runner: &crate::execution::runner::FakeCommandRunner,
+    ) -> (
+        Option<std::path::PathBuf>,
+        Option<i64>,
+        Option<Vec<String>>,
+    ) {
+        for _ in 0..200 {
+            if let Some(seen) = runner.last_job_mcp.lock().unwrap().clone() {
+                return seen;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the runner never received a launch");
+    }
+
+    #[tokio::test]
+    async fn a_node_run_gets_the_worktree_box_for_its_cwd() {
+        let (state, runner) = launch_state_with_runner().await;
+        seed_node(&state.pool, "node-1", "running", Some(JOB), None).await;
+        let cwd = crate::execution::git_exec::testkit::space_free_tempdir("nucleos-node-box-");
+        let cwd_text = cwd.path().to_string_lossy().into_owned();
+
+        launch(
+            &state,
+            "node-1",
+            "key-1",
+            "do it".to_owned(),
+            None,
+            Some(cwd_text),
+            "shadow",
+        )
+        .await
+        .unwrap();
+
+        let (config, ..) = seen_launch(&runner).await;
+        let config = config.expect("a node run is launched with --mcp-config");
+        let launched_cwd = runner
+            .last_cwd
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the run has a cwd");
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config).expect("the config file is on disk"))
+                .unwrap();
+        assert_eq!(
+            written["mcpServers"]["nucleos"]["args"],
+            serde_json::json!([
+                "--mcp-tools",
+                "--box",
+                "worktree",
+                "--worktree",
+                launched_cwd.to_string_lossy()
+            ]),
+            "the box is the worktree box, bound to the run's own cwd"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_node_runs_tool_policy_allows_the_node_tools() {
+        let (state, runner) = launch_state_with_runner().await;
+        seed_node(&state.pool, "node-1", "running", Some(JOB), None).await;
+        let cwd = crate::execution::git_exec::testkit::space_free_tempdir("nucleos-node-tools-");
+
+        launch(
+            &state,
+            "node-1",
+            "key-1",
+            "do it".to_owned(),
+            None,
+            Some(cwd.path().to_string_lossy().into_owned()),
+            "shadow",
+        )
+        .await
+        .unwrap();
+
+        let (_, _, allowed) = seen_launch(&runner).await;
+        let allowed = allowed.expect("a node run narrows --allowedTools to a list");
+        for tool in ["node_open", "node_close", "node_update", "node_tree", "node_active"] {
+            assert!(
+                allowed.iter().any(|name| name == tool),
+                "{tool} is not allowed: {allowed:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_plain_run_gets_no_worktree_box() {
+        let (state, runner) = launch_state_with_runner().await;
+
+        crate::execution::runs::create_run_inner(
+            &state,
+            "do it".to_owned(),
+            None,
+            None,
+            "shadow",
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(seen_launch(&runner).await, (None, None, None));
+    }
+
+    #[test]
+    fn a_node_prompt_names_its_node_id_and_tells_it_to_close() {
+        let prompt = node_prompt("node-abc-123", "Implement the parser.");
+
+        assert!(prompt.contains("node-abc-123"), "{prompt}");
+        assert!(prompt.contains("node_close"), "{prompt}");
+        assert!(prompt.to_lowercase().contains("handoff"), "{prompt}");
+        assert!(prompt.contains("Implement the parser."), "{prompt}");
     }
 }

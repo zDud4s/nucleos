@@ -147,19 +147,42 @@ pub async fn update(pool: &SqlitePool, job: &TreeJob) -> Result<(), StoreError> 
     Ok(())
 }
 
+/// The feed kind of the line that names a job whose manifest cannot be read.
+pub(super) const CORRUPT_FEED_KIND: &str = "work_tree_corrupt";
+
+/// Says in the feed that job `id` is skipped for an unreadable manifest. A failed write is ignored:
+/// the skip is the point, and the line only tells the owner.
+pub(super) async fn note_corrupt(pool: &SqlitePool, id: &str, error: &StoreError) {
+    let summary = format!("tree job {id} is skipped: its stored manifest cannot be read ({error})");
+    tracing::warn!(job = id, %error, "tree job manifest is corrupt");
+    let _ = crate::feed::append(pool, None, CORRUPT_FEED_KIND, &summary, None, None).await;
+}
+
 /// Every job that is not over, oldest first. Parked jobs are included, so that boot can resume
 /// them; the branch list `TERMINAL_STATES` does not apply to a job.
+///
+/// A job whose manifest cannot be read is left out and named in the feed: one bad row must not stop
+/// a list, and so a boot, for every other job. `load` of that very job still answers the error.
 pub async fn list_non_terminal(pool: &SqlitePool) -> Result<Vec<TreeJob>, StoreError> {
     let rows: Vec<JobRow> =
         sqlx::query_as(select_jobs!("WHERE state != ? ORDER BY created_at, id"))
             .bind(JOB_TERMINAL_STATE)
             .fetch_all(pool)
             .await?;
-    rows.into_iter().map(JobRow::into_job).collect()
+    let mut jobs = Vec::with_capacity(rows.len());
+    for row in rows {
+        let id = row.id.clone();
+        match row.into_job() {
+            Ok(job) => jobs.push(job),
+            Err(error @ StoreError::Manifest(_)) => note_corrupt(pool, &id, &error).await,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(jobs)
 }
 
-/// What a boot pass found and repaired. It relaunches nothing: no prompt is persisted, so the
-/// caller only learns what is free to relaunch.
+/// What a boot pass found and repaired. It relaunches nothing itself: `open::relaunch_resumed`
+/// takes this and starts again the agents whose runs were lost.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Resumed {
     /// Ids of the jobs that are not finished, oldest first (parked ones included).
@@ -174,8 +197,8 @@ pub struct Resumed {
 /// `launch`: it deletes every empty launch reservation of an unfinished job, which is only safe
 /// while no call can still be creating a run. Job rows are never written.
 ///
-/// A corrupt manifest makes `list_non_terminal` (and `reconcile_running`) fail whole, so one bad
-/// row stops the pass for every job; this keeps the `?` behaviour of both.
+/// A job with a corrupt manifest is skipped by `list_non_terminal` and `reconcile_running` alike
+/// (each names it in the feed), so one bad row does not stop the pass for every other job.
 pub async fn resume_all(pool: &SqlitePool) -> Result<Resumed, StoreError> {
     let jobs: Vec<String> = list_non_terminal(pool)
         .await?
@@ -248,6 +271,20 @@ pub async fn launch_recovering(
     cwd: Option<String>,
     mode: &str,
 ) -> Result<i64, super::node_run::NodeRunError> {
+    // Stored before the run is created: a crash between the two would otherwise leave a key with
+    // nothing to start it again from. The first write per key stays, as the launch itself does.
+    super::open::save_launch(
+        &state.pool,
+        &super::open::StoredLaunch {
+            node_id: node_id.to_owned(),
+            key: key.to_owned(),
+            prompt: prompt.clone(),
+            project_id: project_id.clone(),
+            cwd: cwd.clone(),
+            mode: mode.to_owned(),
+        },
+    )
+    .await?;
     let outcome =
         super::node_run::launch(state, node_id, key, prompt, project_id, cwd, mode).await;
     if let Err(super::node_run::NodeRunError::Create(_)) = &outcome {

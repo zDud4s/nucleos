@@ -20,6 +20,8 @@ use serde_json::{Value, json};
 use std::path::Path as FsPath;
 
 use super::*;
+use crate::conductor::depth::{self, AncestorView, ChildArgs, DepthRefusal, TreeLimits};
+use crate::tree_cost::budget::{self, Permit};
 use crate::work_nodes::{self, CloseArgs, NodeError, NodeLimits, OpenArgs, UpdateArgs, View};
 
 pub(super) fn routes() -> Router<AppState> {
@@ -88,6 +90,45 @@ fn required(field: &str, value: Option<String>) -> Result<String, Refusal> {
     value.ok_or_else(|| refuse(StatusCode::BAD_REQUEST, format!("{field} is required")))
 }
 
+fn depth_refusal_message(refusal: DepthRefusal) -> &'static str {
+    match refusal {
+        DepthRefusal::SameScopeAsParent => "child has the same scope as its parent",
+        DepthRefusal::SingleChildChain => {
+            "child has the same scope as its parent and would only extend the chain"
+        }
+        DepthRefusal::RepeatedGoal => "child repeats the goal of an ancestor (repeated goal)",
+        DepthRefusal::TreeNodeCeiling => "tree has reached its node ceiling",
+    }
+}
+
+/// Builds the root-first ancestor chain required by the structural opening guard.
+async fn ancestor_chain(
+    pool: &sqlx::SqlitePool,
+    mut node: work_nodes::Node,
+) -> Result<Vec<AncestorView>, NodeError> {
+    let mut chain = Vec::new();
+    loop {
+        let open_children: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM work_nodes \
+             WHERE parent_id = ? AND status IN ('planned', 'running')",
+        )
+        .bind(&node.id)
+        .fetch_one(pool)
+        .await?;
+        chain.push(AncestorView {
+            owned_paths: node.owned_paths.clone(),
+            goal: node.goal.clone(),
+            open_children,
+        });
+        let Some(parent_id) = node.parent_id else {
+            break;
+        };
+        node = work_nodes::get(pool, &parent_id).await?;
+    }
+    chain.reverse();
+    Ok(chain)
+}
+
 /// `POST /nodes`: opens a root (no `parent_id`) or a child under a running node.
 ///
 /// The project is best effort: a root opened by the owner has none (the body names no worktree),
@@ -109,16 +150,47 @@ async fn post_node(
         chat_id: present(body.chat_id),
         run_id: None,
     };
-    let parent_project = match args.parent_id.as_deref() {
+    let parent = match args.parent_id.as_deref() {
         // A missing parent is refused by `open` itself, with the same 404.
         Some(parent_id) => match work_nodes::get(&state.pool, parent_id).await {
-            Ok(parent) => parent.project_id,
+            Ok(parent) => Some(parent),
             Err(NodeError::NotFound) => None,
             Err(error) => return Err(refused(error)),
         },
         None => None,
     };
-    let limits = limits_for(&state, parent_project.as_deref()).await;
+    let limits = limits_for(
+        &state,
+        parent.as_ref().and_then(|node| node.project_id.as_deref()),
+    )
+    .await;
+    let (chain, root_id) = match parent {
+        Some(parent) => {
+            let root_id = parent.root_id.clone();
+            let chain = ancestor_chain(&state.pool, parent).await.map_err(refused)?;
+            (chain, Some(root_id))
+        }
+        None => (Vec::new(), None),
+    };
+    let tree_total = match root_id.as_deref() {
+        Some(root_id) => sqlx::query_scalar("SELECT COUNT(*) FROM work_nodes WHERE root_id = ?")
+            .bind(root_id)
+            .fetch_one(&state.pool)
+            .await
+            .map_err(|error| refused(NodeError::Db(error)))?,
+        None => 0,
+    };
+    let guard_args = ChildArgs {
+        owned_paths: args.owned_paths.clone(),
+        goal: args.goal.clone(),
+    };
+    depth::check_child(&chain, &guard_args, tree_total, &TreeLimits::default())
+        .map_err(|refusal| refuse(StatusCode::CONFLICT, depth_refusal_message(refusal)))?;
+    if let Some(root_id) = root_id {
+        if let Permit::No { reason } = budget::permits_next_node(&state.pool, &root_id).await {
+            return Err(refuse(StatusCode::CONFLICT, reason));
+        }
+    }
     work_nodes::open(&state.pool, None, &limits, &args)
         .await
         .map(Json)

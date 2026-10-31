@@ -2,6 +2,1150 @@
 //! binding to a work node, and the recovery that starts a node's agent again from its stored launch
 //! after a boot or an answered decision.
 
+//!
+//! **Where the pieces meet.** `open_branch` and `bind_branch` are the two moves of a branch before
+//! its node works (spec R8). Both hold the job's lock (`http::job_lock`) from the read of the
+//! manifest to its write, as every writer of a manifest does. `save_launch` keeps what each
+//! `launch` was asked to start, so that `relaunch_resumed` (boot) and `answer_and_relaunch` (an
+//! answered decision) have a prompt to start the agent from again.
+//!
+//! **Routes.** `routes()` is merged by `crate::http` beside `tree_job::http::routes()`, not inside
+//! it: an `axum` router panics when two merged routers hold the same path.
+
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+
+use axum::Json;
+use axum::Router;
+use axum::body::Bytes;
+use axum::extract::{Path as UrlPath, State};
+use axum::http::StatusCode;
+use axum::routing::post;
+use serde::Deserialize;
+use serde_json::{Value, json};
+use sqlx::SqlitePool;
+
+use super::decisions::{self, DecisionError};
+use super::engine::{apply_transition, branch_node_may_close};
+use super::http::{self, admission_book, branch_admission, live_sizes_gb, refuse, tree_limits};
+use super::model::{Branch, JOB_TERMINAL_STATE};
+use super::store::{self, StoreError, TreeJob};
+use crate::execution::concurrency::LIVE_RUN_STATUSES;
+use crate::state::AppState;
+
+/// Where a project's tree worktrees live, relative to its root.
+pub const WORKTREES_DIR: &str = ".claude/worktrees";
+const DOCS_LAYER: &str = "docs";
+const PARKED: &str = "parked";
+const BYTES_PER_GB: f64 = 1_073_741_824.0;
+const RELAUNCH_SKIPPED_KIND: &str = "work_tree_relaunch_skipped";
+
+// ----- names and paths -----
+
+/// `<root>/.claude/worktrees/<tree>-<branch>`.
+pub fn worktree_path(root: &Path, tree_id: &str, branch: &str) -> PathBuf {
+    root.join(WORKTREES_DIR).join(format!("{tree_id}-{branch}"))
+}
+
+/// `<dev home>/cargo-target/<tree>-<branch>`: one cargo target dir per branch, off the project.
+pub fn target_dir(dev_home: &Path, tree_id: &str, branch: &str) -> PathBuf {
+    dev_home.join("cargo-target").join(format!("{tree_id}-{branch}"))
+}
+
+/// The git branch a tree branch works on.
+pub fn git_branch_name(tree_id: &str, branch: &str) -> String {
+    format!("tree/{tree_id}/{branch}")
+}
+
+/// Where this machine's dev-only state lives: `NUCLEOS_DEV_HOME`, else `<system drive>\nucleos-dev`
+/// on Windows, else `$XDG_DATA_HOME/nucleos-dev` or `~/.local/share/nucleos-dev`. It only names the
+/// directory: nothing here creates it, the cargo target dirs under it are made by cargo.
+pub fn dev_home() -> PathBuf {
+    if let Some(home) = std::env::var_os("NUCLEOS_DEV_HOME").filter(|home| !home.is_empty()) {
+        return PathBuf::from(home);
+    }
+    if cfg!(windows) {
+        let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_owned());
+        return PathBuf::from(format!("{drive}\\")).join("nucleos-dev");
+    }
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .filter(|base| !base.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("share"))
+        })
+        .unwrap_or_else(|| PathBuf::from(".local/share"));
+    base.join("nucleos-dev")
+}
+
+/// `check_id` of `tree_state.py`, tightened for git: letters, digits, `.`, `_` and `-`, starting
+/// with a letter or digit, and no `..`, trailing `.` or `.lock`, which a git ref refuses.
+fn valid_name(value: &str) -> bool {
+    value.chars().next().is_some_and(|first| first.is_ascii_alphanumeric())
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        && !value.contains("..")
+        && !value.ends_with('.')
+        && !value.ends_with(".lock")
+}
+
+fn check_name(value: &str, what: &str) -> Result<(), OpenError> {
+    if valid_name(value) {
+        Ok(())
+    } else {
+        Err(OpenError::BadName(format!(
+            "{what} {value:?} must be letters, digits, '.', '_' or '-'"
+        )))
+    }
+}
+
+/// A path as the manifest keeps it: forward slashes, as `project_root` is.
+fn path_text(path: &Path) -> String {
+    let text = path.to_string_lossy().into_owned();
+    if cfg!(windows) { text.replace('\\', "/") } else { text }
+}
+
+fn now() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+// ----- types -----
+
+/// What `open_branch` needs from outside the manifest.
+#[derive(Debug, Clone)]
+pub struct OpenConfig {
+    pub dev_home: PathBuf,
+    /// The integration branch: the feature branch is made from it, and may not be it.
+    pub base_branch: String,
+    /// Untracked paths of the project root that a worktree gets a link to.
+    pub links: Vec<String>,
+    pub free_disk_gb: f64,
+    pub floor_gb: f64,
+    pub max_live_branches: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Opened {
+    pub branch: String,
+    pub state: String,
+    pub worktree: Option<String>,
+    pub git_branch: Option<String>,
+    pub target_dir: Option<String>,
+    pub skipped_links: Vec<String>,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Bound {
+    pub branch: String,
+    pub node_id: String,
+    pub state: String,
+    pub replayed: bool,
+}
+
+#[derive(Debug)]
+pub enum OpenError {
+    JobNotFound(String),
+    BranchNotFound(String),
+    JobFinished(String),
+    BadName(String),
+    /// The branch is not in the state this move needs (`queued` to open, `open` to bind).
+    NotQueued { branch: String, state: String },
+    BaseNotMerged { branch: String, base: String },
+    NotAdmitted(Vec<String>),
+    OverIntegration(String),
+    WorktreeExists(PathBuf),
+    Git(String),
+    Link(String),
+    NodeNotFound(String),
+    AlreadyBound { branch: String, node_id: String },
+    NodeTaken { node_id: String, branch: String },
+    ForeignNode { node_id: String },
+    Engine(String),
+    Store(StoreError),
+    Db(sqlx::Error),
+}
+
+impl fmt::Display for OpenError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OpenError::JobNotFound(id) => write!(f, "tree job {id} not found"),
+            OpenError::BranchNotFound(name) => write!(f, "branch {name} not found"),
+            OpenError::JobFinished(id) => write!(f, "tree job {id} is finished"),
+            OpenError::BadName(reason) => write!(f, "{reason}"),
+            OpenError::NotQueued { branch, state } => {
+                write!(f, "branch {branch} is {state}, which this move does not take")
+            }
+            OpenError::BaseNotMerged { branch, base } => {
+                write!(f, "branch {branch} is based on {base}, which is not merged yet")
+            }
+            OpenError::NotAdmitted(reasons) => {
+                write!(f, "the branch is not admitted: {}", reasons.join("; "))
+            }
+            OpenError::OverIntegration(branch) => write!(
+                f,
+                "the feature branch {branch} is the integration branch; work needs a branch of its own"
+            ),
+            OpenError::WorktreeExists(path) => write!(f, "{} already exists", path.display()),
+            OpenError::Git(reason) => write!(f, "{reason}"),
+            OpenError::Link(reason) => write!(f, "could not link: {reason}"),
+            OpenError::NodeNotFound(id) => write!(f, "work node {id} not found"),
+            OpenError::AlreadyBound { branch, node_id } => {
+                write!(f, "branch {branch} is already bound to node {node_id}")
+            }
+            OpenError::NodeTaken { node_id, branch } => {
+                write!(f, "node {node_id} is already the node of branch {branch}")
+            }
+            OpenError::ForeignNode { node_id } => {
+                write!(f, "node {node_id} belongs to another tree job")
+            }
+            OpenError::Engine(reason) => write!(f, "{reason}"),
+            OpenError::Store(error) => write!(f, "{error}"),
+            OpenError::Db(error) => write!(f, "database error: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for OpenError {}
+
+impl From<StoreError> for OpenError {
+    fn from(error: StoreError) -> Self {
+        OpenError::Store(error)
+    }
+}
+
+impl From<sqlx::Error> for OpenError {
+    fn from(error: sqlx::Error) -> Self {
+        OpenError::Db(error)
+    }
+}
+
+// ----- git and links -----
+
+/// Runs `git -C <root> <args>` and answers its trimmed stdout, or its stderr as the error.
+async fn git(root: &str, args: &[&str]) -> Result<String, String> {
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map_err(|error| format!("git {}: {error}", args.join(" ")))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    } else {
+        Err(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+/// Removes a link without following it: a junction or a directory symlink goes with `remove_dir`
+/// (Windows), a symlink with `remove_file`. The directory it points at is never touched.
+fn unlink(link: &Path) -> std::io::Result<()> {
+    std::fs::remove_dir(link).or_else(|_| std::fs::remove_file(link))
+}
+
+/// A junction on Windows (it needs no privilege), a symlink elsewhere. An existing path at `link`
+/// is an error: a tracked directory of the worktree must not be shadowed.
+fn make_link(source: &Path, link: &Path) -> Result<(), String> {
+    if link.symlink_metadata().is_ok() {
+        return Err(format!("{} already exists in the worktree", link.display()));
+    }
+    if let Some(parent) = link.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("{}: {error}", parent.display()))?;
+    }
+    #[cfg(windows)]
+    {
+        let output = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link.to_string_lossy().replace('/', "\\"))
+            .arg(source.to_string_lossy().replace('/', "\\"))
+            .output()
+            .map_err(|error| format!("mklink: {error}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "mklink {} failed: {}",
+                link.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        std::os::unix::fs::symlink(source, link)
+            .map_err(|error| format!("{}: {error}", link.display()))
+    }
+}
+
+/// A link name must stay inside the project: relative, with no `..`.
+fn safe_relative(link: &str) -> bool {
+    let path = Path::new(link);
+    !link.is_empty()
+        && path.is_relative()
+        && !path.has_root()
+        && path
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+}
+
+/// Undoes a half-made open: links first (without following them), then the worktree, its branch
+/// and a feature branch this very call made. Every step is best effort.
+async fn roll_back(
+    root: &str,
+    worktree: &Path,
+    links: &[PathBuf],
+    git_branch: &str,
+    worktree_added: bool,
+    created_feature: Option<&str>,
+) {
+    for link in links {
+        if let Err(error) = unlink(link) {
+            tracing::warn!(link = %link.display(), %error, "open rollback: link not removed");
+        }
+    }
+    if worktree_added {
+        let worktree = path_text(worktree);
+        for args in [
+            vec!["worktree", "remove", "--force", worktree.as_str()],
+            vec!["branch", "-D", git_branch],
+        ] {
+            if let Err(error) = git(root, &args).await {
+                tracing::warn!(%error, "open rollback step failed");
+            }
+        }
+    }
+    if let Some(feature) = created_feature
+        && let Err(error) = git(root, &["branch", "-D", feature]).await
+    {
+        tracing::warn!(%error, "open rollback: feature branch not removed");
+    }
+}
+
+// ----- open -----
+
+fn opened_from(branch: &Branch, replayed: bool, skipped_links: Vec<String>) -> Opened {
+    Opened {
+        branch: branch.name.clone(),
+        state: branch.state.clone(),
+        worktree: branch.worktree.clone(),
+        git_branch: branch.git_branch.clone(),
+        target_dir: branch.target_dir.clone(),
+        skipped_links,
+        replayed,
+    }
+}
+
+async fn write_job(pool: &SqlitePool, job: &mut TreeJob) -> Result<(), OpenError> {
+    job.updated_at = now();
+    store::update(pool, job).await?;
+    Ok(())
+}
+
+/// Opens `branch_name` of tree job `tree_id`: for a code branch a git worktree on its own git
+/// branch, the links the project asks for and a target dir name; for a docs branch only the state.
+/// Idempotent: an open branch answers what it has with `replayed`. On any failure the branch stays
+/// `queued` and what the call made is undone.
+pub async fn open_branch(
+    pool: &SqlitePool,
+    tree_id: &str,
+    branch_name: &str,
+    config: &OpenConfig,
+) -> Result<Opened, OpenError> {
+    check_name(tree_id, "tree id")?;
+    check_name(branch_name, "branch name")?;
+    let lock = http::job_lock(tree_id);
+    let _guard = lock.lock().await;
+
+    let mut job = store::load(pool, tree_id)
+        .await?
+        .ok_or_else(|| OpenError::JobNotFound(tree_id.to_owned()))?;
+    if job.state == JOB_TERMINAL_STATE {
+        return Err(OpenError::JobFinished(tree_id.to_owned()));
+    }
+    let branch = job
+        .manifest
+        .branches
+        .get(branch_name)
+        .cloned()
+        .ok_or_else(|| OpenError::BranchNotFound(branch_name.to_owned()))?;
+    if branch.state == "open" {
+        return Ok(opened_from(&branch, true, Vec::new()));
+    }
+    if branch.state != "queued" {
+        return Err(OpenError::NotQueued {
+            branch: branch_name.to_owned(),
+            state: branch.state,
+        });
+    }
+    if let Some(base) = &branch.base
+        && job
+            .manifest
+            .branches
+            .get(base)
+            .is_some_and(|base_branch| base_branch.state != "merged")
+    {
+        return Err(OpenError::BaseNotMerged {
+            branch: branch_name.to_owned(),
+            base: base.clone(),
+        });
+    }
+
+    if branch.layer == DOCS_LAYER {
+        let docs = job.manifest.branches.get_mut(branch_name).expect("branch was read");
+        apply_transition(docs, "open").map_err(|error| OpenError::Engine(error.to_string()))?;
+        let opened = opened_from(docs, false, Vec::new());
+        write_job(pool, &mut job).await?;
+        return Ok(opened);
+    }
+
+    let feature = job
+        .feature_branch
+        .clone()
+        .unwrap_or_else(|| job.manifest.feature_branch.clone());
+    if feature == config.base_branch {
+        return Err(OpenError::OverIntegration(feature));
+    }
+    let sizes = live_sizes_gb(&job.manifest).await;
+    let book = admission_book();
+    let admission = branch_admission(
+        &book,
+        &job.manifest,
+        &branch.layer,
+        config.free_disk_gb,
+        config.floor_gb,
+        config.max_live_branches,
+        &sizes,
+    );
+    if !admission.admit {
+        return Err(OpenError::NotAdmitted(admission.reasons));
+    }
+
+    let root_text = job.manifest.project_root.clone();
+    let root = PathBuf::from(&root_text);
+    let worktree = worktree_path(&root, tree_id, branch_name);
+    if worktree.symlink_metadata().is_ok() {
+        return Err(OpenError::WorktreeExists(worktree));
+    }
+    let git_branch = git_branch_name(tree_id, branch_name);
+
+    // The feature branch is made from the integration branch when it does not exist yet.
+    let feature_ref = format!("refs/heads/{feature}");
+    let created_feature = if git(&root_text, &["rev-parse", "--verify", "--quiet", &feature_ref])
+        .await
+        .is_ok()
+    {
+        None
+    } else {
+        git(&root_text, &["branch", &feature, &config.base_branch])
+            .await
+            .map_err(OpenError::Git)?;
+        Some(feature.as_str())
+    };
+    let added = git(
+        &root_text,
+        &["worktree", "add", "-b", &git_branch, &path_text(&worktree), &feature],
+    )
+    .await;
+    if let Err(error) = added {
+        roll_back(&root_text, &worktree, &[], &git_branch, false, created_feature).await;
+        return Err(OpenError::Git(error));
+    }
+
+    let mut made = Vec::new();
+    let mut skipped_links = Vec::new();
+    for name in &config.links {
+        let source = root.join(name);
+        if !safe_relative(name) || !source.exists() {
+            skipped_links.push(name.clone());
+            continue;
+        }
+        let link = worktree.join(name);
+        let (from, to) = (source, link.clone());
+        let linked = tokio::task::spawn_blocking(move || make_link(&from, &to))
+            .await
+            .unwrap_or_else(|error| Err(format!("link task failed: {error}")));
+        match linked {
+            Ok(()) => made.push(link),
+            Err(reason) => {
+                roll_back(&root_text, &worktree, &made, &git_branch, true, created_feature).await;
+                return Err(OpenError::Link(reason));
+            }
+        }
+    }
+
+    let target = path_text(&target_dir(&config.dev_home, tree_id, branch_name));
+    let code = job.manifest.branches.get_mut(branch_name).expect("branch was read");
+    if let Err(error) = apply_transition(code, "open") {
+        roll_back(&root_text, &worktree, &made, &git_branch, true, created_feature).await;
+        return Err(OpenError::Engine(error.to_string()));
+    }
+    code.worktree = Some(path_text(&worktree));
+    code.git_branch = Some(git_branch.clone());
+    code.target_dir = Some(target);
+    let opened = opened_from(code, false, skipped_links);
+    if let Err(error) = write_job(pool, &mut job).await {
+        roll_back(&root_text, &worktree, &made, &git_branch, true, created_feature).await;
+        return Err(error);
+    }
+    Ok(opened)
+}
+
+// ----- bind -----
+
+/// Binds node `node_id` to `branch_name` and moves the branch to `building`. Idempotent for the
+/// same node; a branch bound to another node, or a node bound to another branch, is refused.
+pub async fn bind_branch(
+    pool: &SqlitePool,
+    tree_id: &str,
+    branch_name: &str,
+    node_id: &str,
+) -> Result<Bound, OpenError> {
+    let lock = http::job_lock(tree_id);
+    let _guard = lock.lock().await;
+
+    let mut job = store::load(pool, tree_id)
+        .await?
+        .ok_or_else(|| OpenError::JobNotFound(tree_id.to_owned()))?;
+    if job.state == JOB_TERMINAL_STATE {
+        return Err(OpenError::JobFinished(tree_id.to_owned()));
+    }
+    let branch = job
+        .manifest
+        .branches
+        .get(branch_name)
+        .cloned()
+        .ok_or_else(|| OpenError::BranchNotFound(branch_name.to_owned()))?;
+    if let Some(bound) = &branch.node_id {
+        if bound == node_id {
+            return Ok(Bound {
+                branch: branch_name.to_owned(),
+                node_id: node_id.to_owned(),
+                state: branch.state,
+                replayed: true,
+            });
+        }
+        return Err(OpenError::AlreadyBound {
+            branch: branch_name.to_owned(),
+            node_id: bound.clone(),
+        });
+    }
+    let bindable = if branch.layer == DOCS_LAYER {
+        matches!(branch.state.as_str(), "queued" | "open")
+    } else {
+        branch.state == "open"
+    };
+    if !bindable {
+        return Err(OpenError::NotQueued {
+            branch: branch_name.to_owned(),
+            state: branch.state,
+        });
+    }
+
+    let row: Option<(String, Option<String>)> =
+        sqlx::query_as("SELECT root_id, tree_job_id FROM work_nodes WHERE id = ?")
+            .bind(node_id)
+            .fetch_optional(pool)
+            .await?;
+    let Some((root_id, linked_job)) = row else {
+        return Err(OpenError::NodeNotFound(node_id.to_owned()));
+    };
+    let other_root: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM tree_jobs WHERE root_node_id = ? AND id != ?",
+    )
+    .bind(&root_id)
+    .bind(tree_id)
+    .fetch_optional(pool)
+    .await?;
+    if other_root.is_some() || linked_job.as_deref().is_some_and(|linked| linked != tree_id) {
+        return Err(OpenError::ForeignNode {
+            node_id: node_id.to_owned(),
+        });
+    }
+    if let Some(other) = job
+        .manifest
+        .branches
+        .values()
+        .find(|other| other.node_id.as_deref() == Some(node_id))
+    {
+        return Err(OpenError::NodeTaken {
+            node_id: node_id.to_owned(),
+            branch: other.name.clone(),
+        });
+    }
+
+    sqlx::query("UPDATE work_nodes SET tree_job_id = ? WHERE id = ? AND tree_job_id IS NULL")
+        .bind(tree_id)
+        .bind(node_id)
+        .execute(pool)
+        .await?;
+    let bound = job.manifest.branches.get_mut(branch_name).expect("branch was read");
+    apply_transition(bound, "building").map_err(|error| OpenError::Engine(error.to_string()))?;
+    bound.node_id = Some(node_id.to_owned());
+    let state = bound.state.clone();
+    write_job(pool, &mut job).await?;
+    Ok(Bound {
+        branch: branch_name.to_owned(),
+        node_id: node_id.to_owned(),
+        state,
+        replayed: false,
+    })
+}
+
+// ----- routes -----
+
+type Refusal = (StatusCode, Json<Value>);
+
+pub fn routes() -> Router<AppState> {
+    Router::new()
+        .route("/trees/{id}/branches/{name}/open", post(post_open))
+        .route("/trees/{id}/branches/{name}/bind", post(post_bind))
+}
+
+fn refusal(error: OpenError) -> Refusal {
+    let status = match &error {
+        OpenError::JobNotFound(_) | OpenError::BranchNotFound(_) | OpenError::NodeNotFound(_) => {
+            StatusCode::NOT_FOUND
+        }
+        OpenError::BadName(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        OpenError::Git(_) | OpenError::Link(_) | OpenError::Store(_) | OpenError::Db(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+        _ => StatusCode::CONFLICT,
+    };
+    if let OpenError::NotAdmitted(reasons) = &error {
+        return (
+            status,
+            Json(json!({ "error": error.to_string(), "reasons": reasons })),
+        );
+    }
+    if status == StatusCode::INTERNAL_SERVER_ERROR {
+        tracing::warn!(%error, "tree branch move failed");
+    }
+    refuse(status, error.to_string())
+}
+
+/// `tree:` of the project's `speed.yaml`: the integration branch and the links. The integration
+/// branch defaults to the branch the main checkout is on, then to `master`. The `tree:` block of the
+/// project's own `project.yaml` lives in the state dir, outside the root, and is not read here.
+async fn project_tree_config(root: &str) -> (String, Vec<String>) {
+    let doc = std::fs::read_to_string(Path::new(root).join(".nucleos/workflow/speed.yaml"))
+        .ok()
+        .and_then(|text| serde_yaml::from_str::<serde_yaml::Value>(&text).ok());
+    let tree = doc.as_ref().and_then(|doc| doc.get("tree"));
+    let links = tree
+        .and_then(|tree| tree.get("links"))
+        .and_then(serde_yaml::Value::as_sequence)
+        .map(|links| {
+            links
+                .iter()
+                .filter_map(|link| link.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    let configured = tree
+        .and_then(|tree| tree.get("base_branch"))
+        .and_then(serde_yaml::Value::as_str)
+        .map(str::to_owned);
+    let base = match configured {
+        Some(base) => base,
+        None => git(root, &["symbolic-ref", "--short", "HEAD"])
+            .await
+            .ok()
+            .filter(|branch| !branch.is_empty())
+            .unwrap_or_else(|| "master".to_owned()),
+    };
+    (base, links)
+}
+
+/// Puts the project's pinned workflow in the new worktree: `nucleos-core --workflow-sync <tree>`.
+/// The answer is for the caller to read; a failure never fails the open. A test build does not
+/// start a process: its executable is the test harness, not the daemon.
+async fn workflow_sync(worktree: &str) -> String {
+    if cfg!(test) {
+        return "skipped: test build".to_owned();
+    }
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(error) => return format!("failed: {error}"),
+    };
+    let output = tokio::process::Command::new(exe)
+        .arg("--workflow-sync")
+        .arg(worktree)
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await;
+    match output {
+        Ok(output) if output.status.success() => "synced".to_owned(),
+        Ok(output) => format!(
+            "failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Err(error) => format!("failed: {error}"),
+    }
+}
+
+async fn post_open(
+    State(state): State<AppState>,
+    UrlPath((id, name)): UrlPath<(String, String)>,
+    body: Bytes,
+) -> Result<Json<Value>, Refusal> {
+    // The body is optional; when there is one it must be JSON, and nothing in it is read.
+    if !body.iter().all(u8::is_ascii_whitespace)
+        && let Err(error) = serde_json::from_slice::<Value>(&body)
+    {
+        return Err(refuse(StatusCode::BAD_REQUEST, error.to_string()));
+    }
+    check_name(&id, "tree id").map_err(refusal)?;
+    check_name(&name, "branch name").map_err(refusal)?;
+    let job = store::load(&state.pool, &id)
+        .await
+        .map_err(|error| refusal(error.into()))?
+        .ok_or_else(|| refusal(OpenError::JobNotFound(id.clone())))?;
+    let root = job.manifest.project_root.clone();
+    let (floor_gb, max_live_branches) = tree_limits(&root);
+    let free_disk_gb = crate::health::available_space(Path::new(&root))
+        .map(|bytes| bytes as f64 / BYTES_PER_GB)
+        .unwrap_or(0.0);
+    let (base_branch, links) = project_tree_config(&root).await;
+    let config = OpenConfig {
+        dev_home: dev_home(),
+        base_branch,
+        links,
+        free_disk_gb,
+        floor_gb,
+        max_live_branches,
+    };
+
+    let opened = open_branch(&state.pool, &id, &name, &config)
+        .await
+        .map_err(refusal)?;
+    let sync = match (&opened.worktree, opened.replayed) {
+        (Some(worktree), false) => workflow_sync(worktree).await,
+        (_, true) => "skipped: already open".to_owned(),
+        (None, false) => "skipped: no worktree".to_owned(),
+    };
+    let env = match &opened.target_dir {
+        Some(target) => json!({ "CARGO_TARGET_DIR": target }),
+        None => json!({}),
+    };
+    Ok(Json(json!({
+        "branch": opened.branch,
+        "state": opened.state,
+        "worktree": opened.worktree,
+        "git_branch": opened.git_branch,
+        "target_dir": opened.target_dir,
+        "env": env,
+        "skipped_links": opened.skipped_links,
+        "workflow_sync": sync,
+        "replayed": opened.replayed,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct BindBody {
+    node_id: Option<String>,
+}
+
+async fn post_bind(
+    State(state): State<AppState>,
+    UrlPath((id, name)): UrlPath<(String, String)>,
+    body: Bytes,
+) -> Result<Json<Value>, Refusal> {
+    let body: BindBody = serde_json::from_slice(&body)
+        .map_err(|error| refuse(StatusCode::BAD_REQUEST, error.to_string()))?;
+    let node_id = body
+        .node_id
+        .filter(|node| !node.trim().is_empty())
+        .ok_or_else(|| refuse(StatusCode::BAD_REQUEST, "node_id is required"))?;
+    let bound = bind_branch(&state.pool, &id, &name, &node_id)
+        .await
+        .map_err(refusal)?;
+    Ok(Json(json!({
+        "name": bound.branch,
+        "node_id": bound.node_id,
+        "state": bound.state,
+        "replayed": bound.replayed,
+    })))
+}
+
+// ----- stored launches -----
+
+/// What a `launch` was asked to start, as `create_run_inner` was given it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredLaunch {
+    pub node_id: String,
+    pub key: String,
+    pub prompt: String,
+    pub project_id: Option<String>,
+    pub cwd: Option<String>,
+    pub mode: String,
+}
+
+type LaunchRow = (String, String, String, Option<String>, Option<String>, String);
+
+fn launch_from(row: LaunchRow) -> StoredLaunch {
+    let (node_id, key, prompt, project_id, cwd, mode) = row;
+    StoredLaunch {
+        node_id,
+        key,
+        prompt,
+        project_id,
+        cwd,
+        mode,
+    }
+}
+
+const LAUNCH_COLUMNS: &str = "SELECT node_id, key, prompt, project_id, cwd, mode FROM tree_launches";
+
+/// Stores a launch. The first write per `(node, key)` stays, as the launch itself runs once per key.
+pub async fn save_launch(pool: &SqlitePool, launch: &StoredLaunch) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO tree_launches (node_id, key, prompt, project_id, cwd, mode, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (node_id, key) DO NOTHING",
+    )
+    .bind(&launch.node_id)
+    .bind(&launch.key)
+    .bind(&launch.prompt)
+    .bind(&launch.project_id)
+    .bind(&launch.cwd)
+    .bind(&launch.mode)
+    .bind(now())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn stored_launch(
+    pool: &SqlitePool,
+    node_id: &str,
+    key: &str,
+) -> Result<Option<StoredLaunch>, sqlx::Error> {
+    let row: Option<LaunchRow> =
+        sqlx::query_as(sqlx::AssertSqlSafe(format!("{LAUNCH_COLUMNS} WHERE node_id = ? AND key = ?")))
+            .bind(node_id)
+            .bind(key)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(launch_from))
+}
+
+/// The launch written last for `node_id`: `seq` orders the writes, not the key or a clock.
+pub async fn latest_launch(
+    pool: &SqlitePool,
+    node_id: &str,
+) -> Result<Option<StoredLaunch>, sqlx::Error> {
+    let row: Option<LaunchRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "{LAUNCH_COLUMNS} WHERE node_id = ? ORDER BY seq DESC LIMIT 1"
+    )))
+    .bind(node_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(launch_from))
+}
+
+// ----- relaunch -----
+
+/// What one relaunch pass did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Relaunched {
+    /// `(node id, run id)` of every node whose agent was started (or found started) by the pass.
+    pub started: Vec<(String, i64)>,
+    /// `(node id, reason)` of every node that needed a relaunch and did not get one.
+    pub skipped: Vec<(String, String)>,
+}
+
+async fn note_skipped(pool: &SqlitePool, relaunched: &mut Relaunched, node: &str, reason: String) {
+    let summary = format!("node {node} was not started again: {reason}");
+    tracing::warn!(node, %reason, "relaunch skipped");
+    let _ = crate::feed::append(pool, None, RELAUNCH_SKIPPED_KIND, &summary, None, None).await;
+    relaunched.skipped.push((node.to_owned(), reason));
+}
+
+async fn run_is_live(pool: &SqlitePool, run_id: &str) -> Result<bool, sqlx::Error> {
+    let Ok(run_number) = run_id.parse::<i64>() else {
+        return Ok(false);
+    };
+    let status: Option<String> = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+        .bind(run_number)
+        .fetch_optional(pool)
+        .await?;
+    Ok(status.is_some_and(|status| LIVE_RUN_STATUSES.contains(&status.as_str())))
+}
+
+async fn start_again(
+    state: &AppState,
+    launch: &StoredLaunch,
+    key: &str,
+    prompt: String,
+) -> Result<i64, String> {
+    store::launch_recovering(
+        state,
+        &launch.node_id,
+        key,
+        prompt,
+        launch.project_id.clone(),
+        launch.cwd.clone(),
+        &launch.mode,
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
+async fn cached_job<'a>(
+    pool: &SqlitePool,
+    jobs: &'a mut HashMap<String, Option<TreeJob>>,
+    id: &str,
+) -> Option<&'a TreeJob> {
+    if !jobs.contains_key(id) {
+        let loaded = store::load(pool, id).await.ok().flatten();
+        jobs.insert(id.to_owned(), loaded);
+    }
+    jobs.get(id).and_then(Option::as_ref)
+}
+
+/// Whether the branch behind `node_id` is parked: only an answer starts such a node again.
+async fn branch_is_parked(
+    pool: &SqlitePool,
+    jobs: &mut HashMap<String, Option<TreeJob>>,
+    node_id: &str,
+) -> bool {
+    let linked: Result<Option<Option<String>>, _> =
+        sqlx::query_scalar("SELECT tree_job_id FROM work_nodes WHERE id = ?")
+            .bind(node_id)
+            .fetch_optional(pool)
+            .await;
+    let Ok(Some(Some(job_id))) = linked else {
+        return false;
+    };
+    cached_job(pool, jobs, &job_id).await.is_some_and(|job| {
+        job.manifest
+            .branches
+            .values()
+            .any(|branch| branch.node_id.as_deref() == Some(node_id) && branch.state == PARKED)
+    })
+}
+
+/// Starts again the agents that boot recovery left without a run, once per pass:
+///
+/// - every launch whose empty reservation `resume_all` cleared, from its stored prompt and under
+///   its own key (a launch that was never stored, or whose branch is parked, is skipped);
+/// - every running node of a branch of an unfinished job that `reconcile_running` spared and whose
+///   run is no longer live, from its latest launch, under the key `resume-<dead run id>`.
+///
+/// A failure of one node goes in `skipped` and the feed and stops no other. Call it once per boot
+/// where an `AppState` exists. A second pass over the same `Resumed` starts nothing new while the
+/// runs of the first are live: the keys replay, and a spared node with a live run is left alone. A
+/// run that died between two passes is a new dead run with a new key, and gets a second start.
+pub async fn relaunch_resumed(state: &AppState, resumed: &store::Resumed) -> Relaunched {
+    let pool = &state.pool;
+    let mut relaunched = Relaunched::default();
+    let mut jobs: HashMap<String, Option<TreeJob>> = HashMap::new();
+    let mut handled: HashSet<String> = HashSet::new();
+
+    for (node, key) in &resumed.cleared_launches {
+        if branch_is_parked(pool, &mut jobs, node).await {
+            relaunched
+                .skipped
+                .push((node.clone(), "its branch is parked; only an answer starts it".to_owned()));
+            continue;
+        }
+        match stored_launch(pool, node, key).await {
+            Ok(Some(launch)) => {
+                match start_again(state, &launch, key, launch.prompt.clone()).await {
+                    Ok(run_id) => {
+                        handled.insert(node.clone());
+                        relaunched.started.push((node.clone(), run_id));
+                    }
+                    Err(reason) => note_skipped(pool, &mut relaunched, node, reason).await,
+                }
+            }
+            Ok(None) => {
+                let reason = format!("no prompt was stored for launch {key}");
+                note_skipped(pool, &mut relaunched, node, reason).await;
+            }
+            Err(error) => note_skipped(pool, &mut relaunched, node, error.to_string()).await,
+        }
+    }
+
+    for job_id in &resumed.jobs {
+        let nodes: Vec<String> = match cached_job(pool, &mut jobs, job_id).await {
+            Some(job) => job
+                .manifest
+                .branches
+                .values()
+                .filter(|branch| branch.state != PARKED && !branch_node_may_close(branch))
+                .filter_map(|branch| branch.node_id.clone())
+                .collect(),
+            None => continue,
+        };
+        for node in nodes {
+            if handled.contains(&node) || resumed.failed_nodes.contains(&node) {
+                continue;
+            }
+            let row: Result<Option<(String, Option<String>)>, _> =
+                sqlx::query_as("SELECT status, run_id FROM work_nodes WHERE id = ?")
+                    .bind(&node)
+                    .fetch_optional(pool)
+                    .await;
+            let Ok(Some((status, Some(run_id)))) = row else {
+                continue;
+            };
+            if status != "running" || run_is_live(pool, &run_id).await.unwrap_or(true) {
+                continue;
+            }
+            let key = format!("resume-{run_id}");
+            match latest_launch(pool, &node).await {
+                Ok(Some(launch)) => {
+                    match start_again(state, &launch, &key, launch.prompt.clone()).await {
+                        Ok(new_run) => {
+                            handled.insert(node.clone());
+                            relaunched.started.push((node, new_run));
+                        }
+                        Err(reason) => note_skipped(pool, &mut relaunched, &node, reason).await,
+                    }
+                }
+                Ok(None) => {
+                    let reason = format!("run {run_id} is gone and no launch was stored");
+                    note_skipped(pool, &mut relaunched, &node, reason).await;
+                }
+                Err(error) => note_skipped(pool, &mut relaunched, &node, error.to_string()).await,
+            }
+        }
+    }
+    relaunched
+}
+
+// ----- answer and relaunch -----
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Answered {
+    pub decision: decisions::Decision,
+    /// The run started for the node of the resumed branch, if one was.
+    pub relaunched: Option<i64>,
+}
+
+const DECISION_COLUMNS: &str =
+    "SELECT id, tree_id, node_id, question, answer, origin, at, status FROM decisions";
+
+/// The node of the branch that waits on this still-open decision, read before `answer` moves it:
+/// `answer` returns only the decision, and afterwards the park record is gone.
+async fn node_waiting_on(pool: &SqlitePool, decision_id: &str) -> Option<String> {
+    let decision: decisions::Decision =
+        sqlx::query_as(sqlx::AssertSqlSafe(format!("{DECISION_COLUMNS} WHERE id = ?")))
+            .bind(decision_id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten()?;
+    let (tree_id, node_id) = (decision.tree_id?, decision.node_id?);
+    let job = store::load(pool, &tree_id).await.ok().flatten()?;
+    let waits = job.manifest.branches.values().any(|branch| {
+        branch.node_id.as_deref() == Some(node_id.as_str())
+            && branch.state == PARKED
+            && branch
+                .park
+                .as_ref()
+                .and_then(|record| record.get("decision_id"))
+                .and_then(Value::as_str)
+                == Some(decision_id)
+    });
+    waits.then_some(node_id)
+}
+
+/// Answers a decision and, when that put a parked branch back to work and its node has no live
+/// run, starts the node's agent again from its latest stored launch plus the answer, under the key
+/// `decision-<id>`. The answer is kept whatever the relaunch does; a relaunch that cannot happen
+/// is a feed line, not an error. Every entry point that answers a decision calls this.
+pub async fn answer_and_relaunch(
+    state: &AppState,
+    decision_id: &str,
+    text: &str,
+    origin: &str,
+) -> Result<Answered, DecisionError> {
+    let pool = &state.pool;
+    let waiting = node_waiting_on(pool, decision_id).await;
+    let decision = decisions::answer(pool, decision_id, text, origin).await?;
+    let Some(node) = waiting else {
+        return Ok(Answered {
+            decision,
+            relaunched: None,
+        });
+    };
+    let relaunched = relaunch_after_answer(state, &decision, &node, text).await;
+    Ok(Answered {
+        decision,
+        relaunched,
+    })
+}
+
+async fn relaunch_after_answer(
+    state: &AppState,
+    decision: &decisions::Decision,
+    node: &str,
+    text: &str,
+) -> Option<i64> {
+    let pool = &state.pool;
+    let mut skipped = Relaunched::default();
+    let run: Result<Option<Option<String>>, _> =
+        sqlx::query_scalar("SELECT run_id FROM work_nodes WHERE id = ?")
+            .bind(node)
+            .fetch_optional(pool)
+            .await;
+    match run {
+        Ok(Some(Some(run_id))) => match run_is_live(pool, &run_id).await {
+            Ok(false) => {}
+            Ok(true) => return None,
+            Err(error) => {
+                note_skipped(pool, &mut skipped, node, error.to_string()).await;
+                return None;
+            }
+        },
+        Ok(_) => {}
+        Err(error) => {
+            note_skipped(pool, &mut skipped, node, error.to_string()).await;
+            return None;
+        }
+    }
+    let launch = match latest_launch(pool, node).await {
+        Ok(Some(launch)) => launch,
+        Ok(None) => {
+            let reason = "no launch was stored to start it from".to_owned();
+            note_skipped(pool, &mut skipped, node, reason).await;
+            return None;
+        }
+        Err(error) => {
+            note_skipped(pool, &mut skipped, node, error.to_string()).await;
+            return None;
+        }
+    };
+    let prompt = format!(
+        "{}\n\nYou asked the owner: {}\nThe owner answered: {text}",
+        launch.prompt, decision.question
+    );
+    let key = format!("decision-{}", decision.id);
+    match start_again(state, &launch, &key, prompt).await {
+        Ok(run_id) => Some(run_id),
+        Err(reason) => {
+            note_skipped(pool, &mut skipped, node, reason).await;
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};

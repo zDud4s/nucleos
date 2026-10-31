@@ -56,8 +56,8 @@ macro_rules! select_nodes {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct NodeLimits {
-    /// The deepest `depth` a node may have (the root is 0).
-    pub max_depth: i64,
+    /// The optional deepest `depth` a node may have (the root is 0).
+    pub max_depth: Option<i64>,
     /// The most `planned`/`running` children one node may have at a time.
     pub max_width: i64,
     /// The longest `summary` accepted on close, in characters.
@@ -67,7 +67,7 @@ pub struct NodeLimits {
 impl Default for NodeLimits {
     fn default() -> Self {
         Self {
-            max_depth: 3,
+            max_depth: None,
             max_width: 6,
             summary_max: 1500,
         }
@@ -95,7 +95,7 @@ impl NodeLimits {
                 .and_then(serde_yaml::Value::as_u64)
         };
         if let Some(value) = pick("max_depth").and_then(|v| i64::try_from(v).ok()) {
-            limits.max_depth = value;
+            limits.max_depth = Some(value);
         }
         if let Some(value) = pick("max_width").and_then(|v| i64::try_from(v).ok()) {
             limits.max_width = value;
@@ -512,10 +512,11 @@ pub async fn open(
                     )));
                 }
                 let depth = parent.depth + 1;
-                if depth > limits.max_depth {
+                if let Some(max_depth) = limits.max_depth
+                    && depth > max_depth
+                {
                     return Err(NodeError::Conflict(format!(
-                        "depth {depth} exceeds the limit of {}",
-                        limits.max_depth
+                        "depth {depth} exceeds the limit of {max_depth}"
                     )));
                 }
                 let siblings: Vec<NodeRow> = sqlx::query_as(select_nodes!(

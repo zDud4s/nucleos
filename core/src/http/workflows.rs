@@ -1149,30 +1149,51 @@ pub(super) async fn post_workflow_sync(
     let checkout = tokio::fs::canonicalize(&asked)
         .await
         .map_err(|_| refusal(StatusCode::NOT_FOUND, "no_such_path"))?;
-    let deadline = std::time::Instant::now() + DETECT_GIT_BUDGET;
-    let key = crate::execution::git_exec::repo_key(&checkout, deadline)
-        .await
-        .map_err(|detail| {
-            refusal_with_detail(StatusCode::UNPROCESSABLE_ENTITY, "not_a_checkout", detail)
-        })?;
-
-    let rows: Vec<(String, Option<String>)> =
-        sqlx::query_as("SELECT project_id, project_root FROM autopilot_state")
-            .fetch_all(&state.pool)
+    let mut matches = loop {
+        if crate::governance::autopilot::kill_switch_engaged(&state.pool)
+            .await
+            .unwrap_or(true)
+        {
+            return Err(refusal(StatusCode::LOCKED, "kill_switch"));
+        }
+        let deadline = std::time::Instant::now() + DETECT_GIT_BUDGET;
+        let key = crate::execution::git_exec::repo_key(&checkout, deadline)
+            .await
+            .map_err(|detail| {
+                refusal_with_detail(StatusCode::UNPROCESSABLE_ENTITY, "not_a_checkout", detail)
+            })?;
+        // Read before the roster, never after it. A repair writes the root and only then drops the
+        // lease, so a lease seen gone here means the roster read below has the new root. Read
+        // afterwards, a repair landing between the two looked like no repair at all, and the rows
+        // it had just replaced became a `no_project`.
+        let lease = super::projects::live_repair_wait(&state.pool)
             .await
             .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?;
-    let mut matches = Vec::new();
-    for (project_id, root) in rows {
-        let Some(root) = root else { continue };
-        let root = std::path::PathBuf::from(root);
-        if crate::execution::git_exec::repo_key(&root, deadline)
-            .await
-            .as_ref()
-            == Ok(&key)
-        {
-            matches.push((project_id, root));
+        let rows: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT project_id, project_root FROM autopilot_state")
+                .fetch_all(&state.pool)
+                .await
+                .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?;
+        let mut matches = Vec::new();
+        for (project_id, root) in rows {
+            let Some(root) = root else { continue };
+            let root = std::path::PathBuf::from(root);
+            if crate::execution::git_exec::repo_key(&root, deadline)
+                .await
+                .as_ref()
+                == Ok(&key)
+            {
+                matches.push((project_id, root));
+            }
         }
-    }
+        if !matches.is_empty() {
+            break matches;
+        }
+        let Some(remaining) = lease else {
+            break matches;
+        };
+        tokio::time::sleep(remaining.min(std::time::Duration::from_millis(50))).await;
+    };
     if matches.is_empty() {
         return Err(refusal(StatusCode::NOT_FOUND, "no_project"));
     }

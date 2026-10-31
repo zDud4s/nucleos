@@ -367,6 +367,45 @@ pub(super) async fn create_run_with(
     state: &AppState,
     run: NewRun<'_>,
 ) -> Result<i64, CreateRunError> {
+    create_run_with_policy(state, run, None).await
+}
+
+/// Starts a standalone run that launches with no tools at all (`ToolPolicy::None`), whatever its
+/// mode would otherwise grant, and never steerable.
+///
+/// A new function beside `create_run_inner` rather than a parameter on it: every existing caller
+/// goes on getting the policy its mode implies. The policy lands in the same `tool_policy` that
+/// `spawn_run` turns into the CLI's own deny list, so the restriction is the CLI's refusal and not
+/// a hook's cooperation, and a handoff successor inherits it from the same value.
+pub async fn create_no_tools_run(
+    state: &AppState,
+    prompt: String,
+    project_id: Option<String>,
+    cwd: Option<String>,
+) -> Result<i64, CreateRunError> {
+    create_run_with_policy(
+        state,
+        NewRun {
+            prompt,
+            project_id,
+            cwd,
+            mode: "real",
+            steerable: false,
+            provisioning: None,
+            permission_mode: None,
+        },
+        Some(crate::execution::runner::ToolPolicy::None),
+    )
+    .await
+}
+
+/// `create_run_with` with the tool policy optionally fixed by the caller instead of derived from
+/// the mode.
+async fn create_run_with_policy(
+    state: &AppState,
+    run: NewRun<'_>,
+    policy_override: Option<crate::execution::runner::ToolPolicy>,
+) -> Result<i64, CreateRunError> {
     let NewRun {
         prompt,
         project_id,
@@ -484,7 +523,7 @@ pub(super) async fn create_run_with(
     let plan_only = mode == "shadow";
     // Derived here for the same reason `plan_only` is: the mode is what the caller asked for, and
     // `spawn_run` must not learn to read modes.
-    let tool_policy = tool_policy_for_mode(mode);
+    let tool_policy = policy_override.unwrap_or_else(|| tool_policy_for_mode(mode));
     let mut spawn_cwd = cwd.clone().map(std::path::PathBuf::from);
     let mut completion_feed = plan_only.then(|| {
         (

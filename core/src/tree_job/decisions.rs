@@ -1,7 +1,9 @@
 //! Decisions a tree job asks its owner for: parking a branch on a question, and resuming it from
 //! the answer. Each one is a row of `decisions` (migration 0263).
 //!
-//! `answer` only moves state: relaunching the node of a resumed branch is not done here.
+//! `answer` only moves state: relaunching the node of a resumed branch is `open::answer_and_relaunch`,
+//! which every entry point that answers a decision calls. Both `park` and `answer` hold the job's
+//! lock (`http::job_lock`) while they read and write its manifest.
 //!
 //! `park` writes its own `work_tree_parked` line. `announce_close` in `http/nodes.rs` writes one
 //! for every node that closes `blocked`, so a caller of `park` must not also close that branch's
@@ -140,6 +142,9 @@ pub async fn park(
     node_id: &str,
     question: &str,
 ) -> Result<Decision, DecisionError> {
+    // The manifest is read and written whole, so a handler that changes it holds the job's lock.
+    let lock = super::http::job_lock(tree_id);
+    let _guard = lock.lock().await;
     let Some(mut job) = store::load(pool, tree_id).await? else {
         return Err(DecisionError::NoBranch(format!(
             "tree job {tree_id} not found"
@@ -214,6 +219,13 @@ pub async fn answer(
     if decision.status != STATUS_OPEN {
         return Err(DecisionError::AlreadyDecided(decision_id.to_owned()));
     }
+    // Held from here to the commit: `resumed_manifest` reads the manifest the commit writes back,
+    // and a transition or a `park` landing in between would be lost.
+    let lock = decision.tree_id.as_deref().map(super::http::job_lock);
+    let _guard = match &lock {
+        Some(lock) => Some(lock.lock().await),
+        None => None,
+    };
     let resumed = resumed_manifest(pool, &decision).await?;
     let at = now();
 

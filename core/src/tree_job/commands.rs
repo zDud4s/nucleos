@@ -31,6 +31,18 @@ const WORKSPACE_PACKAGES: &[(&str, &str)] = &[
     ("nucleos-daemon", "core/crates/nucleos-daemon"),
 ];
 
+/// Every go module of the repository, by its directory (where its `go.mod` lies). Written by hand
+/// for the same reason as `WORKSPACE_PACKAGES`: a module added or moved parks until it is listed.
+const GO_MODULES: &[&str] = &[
+    "sidecars/browser",
+    "sidecars/echo",
+    "sidecars/email",
+    "sidecars/quota",
+    "sidecars/remote",
+    "sidecars/telegram",
+    "sidecars/web",
+];
+
 /// The flags one parser accepts: `switches` stand alone, `valued` take `name value` or `name=value`.
 struct Flags {
     switches: &'static [&'static str],
@@ -187,7 +199,7 @@ fn allowed_argv(cmd: &str, branch_paths: &[String]) -> Result<Vec<String>, Strin
     };
     let scopes: Vec<Scope> = match (*program, *subcommand) {
         ("cargo", "test" | "check" | "clippy") => cargo_scopes(subcommand, args)?,
-        ("go", "test") => go_scopes(args)?.into_iter().map(Scope::Path).collect(),
+        ("go", "test") => go_scopes(args)?,
         _ => return Err(off_the_list()),
     };
     if scopes.is_empty() {
@@ -279,16 +291,29 @@ fn manifest_dir(raw: &str) -> Result<String, String> {
 }
 
 /// The directories one `go test` reaches: `-C` itself and each package, resolved against it.
-fn go_scopes(args: &[&str]) -> Result<Vec<String>, String> {
+///
+/// Under `-C <module>`, a `/...` package is a package of that module, so a glob inside the package
+/// holds it (see `Scope::Package`) and `-C` itself reaches nothing more. Anywhere else every
+/// directory is a `Scope::Path`, which only a glob around it holds.
+fn go_scopes(args: &[&str]) -> Result<Vec<Scope>, String> {
     let (base, rest) = split_go_dir(args)?;
     let parsed = parse_flags("go test", rest, &GO_TEST_FLAGS)?;
     let base = base.map(clean_path).transpose()?;
-    let mut scopes = parsed
-        .positional
-        .iter()
-        .map(|pattern| go_package_dir(pattern, base.as_deref()))
-        .collect::<Result<Vec<_>, _>>()?;
-    scopes.extend(base);
+    let in_module = base
+        .as_deref()
+        .is_some_and(|dir| GO_MODULES.iter().any(|module| *module == dir));
+    let mut scopes = Vec::with_capacity(parsed.positional.len() + 1);
+    for pattern in &parsed.positional {
+        let (dir, recursive) = go_package_dir(pattern, base.as_deref())?;
+        scopes.push(if in_module && recursive {
+            Scope::Package(dir)
+        } else {
+            Scope::Path(dir)
+        });
+    }
+    if !in_module || scopes.is_empty() {
+        scopes.extend(base.map(Scope::Path));
+    }
     Ok(scopes)
 }
 
@@ -313,19 +338,23 @@ fn split_go_dir<'a, 'b>(args: &'b [&'a str]) -> Result<(Option<&'a str>, &'b [&'
 /// The directory a go package argument names. Only the `./` form is a directory: go reads a bare
 /// `sidecars/email` as an import path. `...` is a wildcard anywhere in a pattern, so
 /// `./sidecars/email...` also matches `sidecars/emailx`, and only a final `/...` stays in the
-/// directory.
-fn go_package_dir(pattern: &str, base: Option<&str>) -> Result<String, String> {
+/// directory. Answers the directory and whether the pattern covers everything below it.
+fn go_package_dir(pattern: &str, base: Option<&str>) -> Result<(String, bool), String> {
     if pattern != "." && !pattern.starts_with("./") {
         return Err(format!("the go package {pattern:?} does not start with `./`"));
     }
-    let dir = pattern.strip_suffix("/...").unwrap_or(pattern);
+    let (dir, recursive) = match pattern.strip_suffix("/...") {
+        Some(dir) => (dir, true),
+        None => (pattern, false),
+    };
     if dir.contains("...") {
         return Err(format!("the go package {pattern:?} has a partial `...`"));
     }
-    match base {
+    let cleaned = match base {
         Some(base) => clean_path(&format!("{base}/{dir}")),
         None => clean_path(dir),
-    }
+    }?;
+    Ok((cleaned, recursive))
 }
 
 /// A path relative to the project root, in `normalise_glob` form, so `..`, an absolute path and

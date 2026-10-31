@@ -59,7 +59,7 @@ pub fn routes() -> Router<AppState> {
 
 type Refusal = (StatusCode, Json<Value>);
 
-fn refuse(status: StatusCode, message: impl Into<String>) -> Refusal {
+pub(super) fn refuse(status: StatusCode, message: impl Into<String>) -> Refusal {
     (status, Json(json!({ "error": message.into() })))
 }
 
@@ -111,7 +111,7 @@ fn run_refusal(error: NodeRunError) -> Refusal {
 
 /// One lock per job: a manifest is loaded and written whole, so two handlers that change the same
 /// job must not interleave.
-fn job_lock(id: &str) -> Arc<tokio::sync::Mutex<()>> {
+pub(super) fn job_lock(id: &str) -> Arc<tokio::sync::Mutex<()>> {
     static LOCKS: OnceLock<StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
         OnceLock::new();
     let mut locks = LOCKS
@@ -209,7 +209,7 @@ pub fn overlap_outside_base_chain(
 }
 
 /// `tree.floor_gb` and `tree.max_live_branches` of the project's `speed.yaml`, else the defaults.
-fn tree_limits(project_root: &str) -> (f64, usize) {
+pub(super) fn tree_limits(project_root: &str) -> (f64, usize) {
     let doc = std::fs::read_to_string(
         FsPath::new(project_root).join(".nucleos/workflow/speed.yaml"),
     )
@@ -251,7 +251,7 @@ fn dir_size_bytes(root: &FsPath) -> u64 {
 
 /// The measured size in GB of each live code branch's target directory. A branch with none, or one
 /// that cannot be read, has no entry and counts as 0.
-async fn live_sizes_gb(manifest: &Manifest) -> BTreeMap<String, f64> {
+pub(super) async fn live_sizes_gb(manifest: &Manifest) -> BTreeMap<String, f64> {
     let targets: Vec<(String, String)> = live_code_branches(manifest)
         .filter_map(|branch| Some((branch.name.clone(), branch.target_dir.clone()?)))
         .collect();
@@ -268,7 +268,7 @@ async fn live_sizes_gb(manifest: &Manifest) -> BTreeMap<String, f64> {
     .unwrap_or_default()
 }
 
-fn admission_book() -> Arc<AdmissionBook> {
+pub(super) fn admission_book() -> Arc<AdmissionBook> {
     installed().unwrap_or_else(|| {
         Arc::new(AdmissionBook::new(
             default_capacity(),
@@ -321,6 +321,9 @@ async fn post_tree(
     let goal = required("goal", body.goal)?;
     let feature_branch = required("feature_branch", body.feature_branch)?;
     let project_root = required("project_root", body.project_root)?;
+    // A job without a project would answer 422 at every node close, so it is refused here, where
+    // the owner can still fix it.
+    let project_id = required("project_id", body.project_id)?;
 
     let lock = job_lock(&id);
     let _guard = lock.lock().await;
@@ -330,7 +333,7 @@ async fn post_tree(
 
     let opened = work_nodes::open(
         &state.pool,
-        body.project_id.as_deref(),
+        Some(project_id.as_str()),
         &NodeLimits::default(),
         &OpenArgs {
             kind: "root".to_owned(),
@@ -346,7 +349,7 @@ async fn post_tree(
     let job = TreeJob {
         id: id.clone(),
         root_node_id: opened.id.clone(),
-        project_id: body.project_id,
+        project_id: Some(project_id),
         feature_branch: Some(feature_branch.clone()),
         manifest: Manifest::new(&id, &feature_branch, &goal, &project_root, &dirty),
         goal,
@@ -891,6 +894,7 @@ mod tests {
             "goal": "Ship it",
             "feature_branch": "feat/tree",
             "project_root": project_root(),
+            "project_id": "project-0",
         })
     }
 
@@ -1413,7 +1417,6 @@ mod tests {
     async fn post_trees_reads_null_optional_fields_as_absent() {
         let state = test_state().await;
         let mut body = tree_body(JOB);
-        body["project_id"] = Value::Null;
         body["contract"] = Value::Null;
         body["dirty_owner_files"] = Value::Null;
 
@@ -1421,7 +1424,6 @@ mod tests {
 
         assert_first_call(&response);
         let job = loaded(&state.pool, JOB).await;
-        assert_eq!(job.project_id, None);
         assert_eq!(job.contract, None);
         assert!(job.manifest.dirty_owner_files.is_empty());
     }
