@@ -196,6 +196,12 @@ pub(super) fn review_prompt(
              `doubt`; never assume what you were not shown.\n",
         );
     }
+    prompt.push_str(
+        "\nThe daemon runs the project's test suite separately, so judge only what the files \
+         show. For a criterion that also asks that tests pass, answer from the static part: \
+         the test exists, with its file:line as evidence. Never answer `doubt` merely because \
+         a test run is not visible to you.\n",
+    );
     prompt.push_str("\nCriteria:\n");
     for criterion in criteria {
         prompt.push_str(&format!("{}. {}", criterion.ordinal, criterion.text));

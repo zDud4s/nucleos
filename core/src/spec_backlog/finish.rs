@@ -22,10 +22,10 @@ use sqlx::SqlitePool;
 
 use super::audit::{AuditReport, SpecLineage};
 use super::deps::{Cycle, topological_order};
-use super::model::{Spec, SpecKind, SpecStatus};
+use super::model::{CriterionStatus, Spec, SpecKind, SpecStatus};
 use super::scan::ScanRoots;
 use super::store::{self, StoreError};
-use super::verdict::Verdict;
+use super::verdict::{NotDoneReason, Verdict, VerifyState};
 use crate::work_nodes::sets_overlap;
 
 /// Which specs to finish.
@@ -362,6 +362,31 @@ async fn goal_for(
     Ok(goal)
 }
 
+/// How many criteria are in doubt when doubt is all that keeps the spec from done.
+///
+/// Another tree cannot settle a doubt, so a round is only worth paying for when a criterion is
+/// unmet (or still unreviewed) or verify is red. `None` means another round is warranted.
+fn only_doubts_left(report: &AuditReport) -> Option<usize> {
+    if report.verify == VerifyState::Red {
+        return None;
+    }
+    let Verdict::NotDone(reasons) = &report.verdict else {
+        return None;
+    };
+    let mut doubts = 0;
+    for reason in reasons {
+        match reason {
+            NotDoneReason::VerifyNotGreen => {}
+            NotDoneReason::Unresolved {
+                status: CriterionStatus::Doubt,
+                ..
+            } => doubts += 1,
+            _ => return None,
+        }
+    }
+    (doubts > 0).then_some(doubts)
+}
+
 /// One spec, start to end: up to `max_rounds` trees, each followed by an audit.
 async fn drive_spec(
     pool: &SqlitePool,
@@ -418,6 +443,21 @@ async fn drive_spec(
                 });
             }
             Ok(report) => {
+                if let Some(doubts) = only_doubts_left(&report) {
+                    mark_needs_owner(
+                        pool,
+                        &spec.id,
+                        &format!(
+                            "{doubts} criteria are in doubt and the suite is not red; \
+                             the owner has to settle them"
+                        ),
+                    )
+                    .await?;
+                    return Ok(SpecRun {
+                        trees,
+                        finished: false,
+                    });
+                }
                 last = Some(format!(
                     "round {round}: the audit says {:?}",
                     report.verdict
@@ -1034,10 +1074,12 @@ mod tests {
                 text: format!("criterion {}", index + 1),
                 kind: CriterionKind::Behavior,
                 verify_hint: None,
-                status: status.clone(),
+                status: *status,
             })
             .collect();
-        store::replace_criteria(pool, id, SHA, &items).await.unwrap();
+        store::replace_criteria(pool, id, SHA, &items)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
