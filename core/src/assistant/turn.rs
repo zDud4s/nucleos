@@ -1470,9 +1470,11 @@ mod tests {
         .await
         .unwrap();
 
-        prewarm_open_chat(&state, chat);
         let mut warmed = false;
+        // As a transcript's poll does: another test's warm-up holds the one global `WARMING` flag
+        // for a moment, and a call that finds it set does nothing.
         for _ in 0..500 {
+            prewarm_open_chat(&state, chat);
             warmed = *fake.calls.lock().unwrap() == 1 && has_kept_process(chat);
             if warmed {
                 break;
