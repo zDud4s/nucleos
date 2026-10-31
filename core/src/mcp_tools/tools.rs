@@ -735,7 +735,8 @@ impl NucleosTools {
     }
 
     #[tool(
-        description = "Start one branch of a tree job in one call: adds the branch `name`, makes its \
+        description = "Start one branch of a tree job in one call. `id` is the tree JOB id named in \
+                       your prompt, not a node id (a node id is refused). Adds the branch `name`, makes its \
                        worktree, opens a work node for it as a child of your `node_id` and starts \
                        its agent with `prompt`. `owned_paths` are the globs it may write; `layer` \
                        (default `code`) and `base` are optional. Calling it again with the same \

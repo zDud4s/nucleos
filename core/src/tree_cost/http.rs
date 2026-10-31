@@ -26,10 +26,26 @@ pub fn routes() -> Router<AppState> {
         )
 }
 
+/// Budgets, spending and refusal key on the tree's root node id, but callers also know the tree
+/// job id: a job id maps to its root node id, anything else is taken as a root id already.
+async fn resolve_root_id(pool: &sqlx::SqlitePool, id: &str) -> Result<String, StatusCode> {
+    let root: Option<String> =
+        sqlx::query_scalar("SELECT root_node_id FROM tree_jobs WHERE id = ?")
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "could not resolve tree id");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    Ok(root.filter(|root| !root.is_empty()).unwrap_or_else(|| id.to_owned()))
+}
+
 async fn get_cost(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
+    let id = resolve_root_id(&state.pool, &id).await?;
     let spend = crate::tree_cost::budget::tree_spend(&state.pool, &id, Utc::now())
         .await
         .map_err(|error| {
@@ -52,6 +68,7 @@ async fn put_budget(
     Path(id): Path<String>,
     Json(request): Json<BudgetRequest>,
 ) -> Result<Json<Value>, StatusCode> {
+    let id = resolve_root_id(&state.pool, &id).await?;
     let now = Utc::now().to_rfc3339();
     sqlx::query(
         "INSERT INTO tree_budgets (tree_id, limit_usd, soft_pct, created_at, updated_at) \

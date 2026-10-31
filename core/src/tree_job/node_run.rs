@@ -21,12 +21,20 @@ const NODE_PROMPT_HEADER: &str = "You are the agent for NucleOS tree node ";
 ///
 /// A relaunch receives the already stored prompt, so the marker must make this a no-op after the
 /// first launch rather than accumulating a second copy of the instructions.
-pub(super) fn node_prompt(node_id: &str, task: &str) -> String {
+pub(super) fn node_prompt(node_id: &str, tree_job_id: &str, task: &str) -> String {
     if task.starts_with(NODE_PROMPT_HEADER) {
         return task.to_owned();
     }
+    // A node outside any tree job has no id to name.
+    let job_line = if tree_job_id.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Its tree job id is {tree_job_id}: when you call tree_branch_start, pass `id` = {tree_job_id} (the tree job id, not a node id) and `node_id` = {node_id}."
+        )
+    };
     format!(
-        "{NODE_PROMPT_HEADER}{node_id}. If the work is too large for this node, split it with the tree_branch_start tool (a node run cannot open children with node_open). Finish by writing a handoff file and calling node_close. Write the handoff file as `.nucleos-report.md` in your worktree (your current directory; the daemon keeps it out of git, so do not commit it) and pass its absolute path as handoff_path.\n\n{task}"
+        "{NODE_PROMPT_HEADER}{node_id}.{job_line} If the work is too large for this node, split it with the tree_branch_start tool (a node run cannot open children with node_open). Finish by writing a handoff file and calling node_close. Write the handoff file as `.nucleos-report.md` in your worktree (your current directory; the daemon keeps it out of git, so do not commit it) and pass its absolute path as handoff_path.\n\n{task}"
     )
 }
 
@@ -311,7 +319,15 @@ pub async fn launch(
     // A node normally inherits its worktree cwd. Keep legacy cwd-less shadow launches unchanged:
     // without a worktree there is neither a box nor a handoff location for the node protocol.
     let prompt = match cwd.as_ref() {
-        Some(_) => node_prompt(node_id, &prompt),
+        Some(_) => {
+            let tree_job_id: Option<String> =
+                sqlx::query_scalar("SELECT tree_job_id FROM work_nodes WHERE id = ?")
+                    .bind(node_id)
+                    .fetch_optional(pool)
+                    .await?
+                    .flatten();
+            node_prompt(node_id, tree_job_id.as_deref().unwrap_or(""), &prompt)
+        }
         None => prompt,
     };
     // A "worktree" launch with a cwd is a tree run: the cwd is the tree's own worktree, so it is
@@ -1178,7 +1194,7 @@ mod tests {
 
     #[test]
     fn a_node_prompt_names_its_node_id_and_tells_it_to_close() {
-        let prompt = node_prompt("node-abc-123", "Implement the parser.");
+        let prompt = node_prompt("node-abc-123", "job-1", "Implement the parser.");
 
         assert!(prompt.contains("node-abc-123"), "{prompt}");
         assert!(prompt.contains("node_close"), "{prompt}");
