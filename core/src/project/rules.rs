@@ -232,7 +232,8 @@ mod tests {
     #[test]
     fn a_reader_that_goes_on_to_publish_takes_the_exclusive_hold() {
         testing::hold_shared();
-        assert_eq!(autopilot("alpha").unwrap(), AutopilotRules::default());
+        // No premise on the value: the shared hold does not exclude tests installing settings under SERIAL alone.
+        let _ = autopilot("alpha");
 
         testing::publish_rules("alpha", "gate_command: cargo test\n");
 
@@ -251,6 +252,14 @@ mod tests {
         let _second = testing::Home::new();
 
         assert_eq!(autopilot("alpha").unwrap(), AutopilotRules::default());
+    }
+
+    #[test]
+    #[should_panic(expected = "lock-order violation")]
+    fn taking_the_env_lock_while_holding_the_rules_gate_panics() {
+        testing::hold_shared();
+
+        let _lock = crate::execution::worktree::test_env_lock();
     }
 }
 
@@ -290,6 +299,12 @@ pub mod testing {
                 ));
             }
         });
+    }
+
+    /// Whether this thread holds the gate, shared or exclusive. The hold outlives `Home` and the fixtures that took
+    /// it, so once true this stays true until the test thread ends.
+    pub fn holds_the_gate() -> bool {
+        HELD.with(|held| held.borrow().is_some())
     }
 
     /// "This test says what the rules are." Idempotent. A shared hold is dropped before the write lock is awaited.
