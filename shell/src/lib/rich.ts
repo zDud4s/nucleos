@@ -281,10 +281,13 @@ export function lines(text: string): Line[] {
  * Whether a `*` or `_` can open or close emphasis where it stands.
  *
  * CommonMark's flanking rule, cut to what matters here: an opener has something other than a space
- * after it, a closer has something other than a space before it, and `_` additionally refuses to
- * work between two word characters. That last clause is the whole reason this function exists —
- * without it `budget_usd` and `year_start … year_end` become italics, and those are not prose, they
- * are the names this app is full of.
+ * after it, a closer has something other than a space before it, and a single mark additionally
+ * refuses to work between two word characters. That last clause is the whole reason this function
+ * exists — without it `budget_usd` and `year_start … year_end` become italics, and those are not
+ * prose, they are the names this app is full of.
+ *
+ * A mark touching a path separator, or a dot on its way into a file name, is refused for the same
+ * reason: a glob and `pkg/_private_/y` are paths.
  */
 function flanks(
   text: string,
@@ -296,12 +299,27 @@ function flanks(
   const after = at + run < text.length ? text[at + run] : "";
   const side = opening ? after : before;
   if (side === "" || /\s/.test(side)) return false;
+  if (/[/\\]/.test(before) || /[/\\]/.test(after)) return false;
+  if (opening && before === ".") return false;
+  if (!opening && after === "." && /\w/.test(text[at + run + 1] ?? "")) return false;
   // A word on both sides means this is part of a name, not a delimiter.
-  if (text[at] === "_" && /\w/.test(before) && /\w/.test(after)) return false;
+  if (run === 1 && /\w/.test(before) && /\w/.test(after)) return false;
   return true;
 }
 
-/** A link at `at`, or null. The scheme is checked here and nowhere else — see the `link` span. */
+/**
+ * A scheme has two letters at least, which leaves a drive (`C:/x`), and is not followed by a digit,
+ * which leaves a line number (`a.rs:42`).
+ */
+const SCHEME = /^[a-z][a-z0-9+.-]+:(?!\d)/i;
+
+/**
+ * A link at `at`, or null. The scheme is checked here and nowhere else — see the `link` span.
+ *
+ * A link to a file comes back as its words alone: the window cannot open one, and what an agent
+ * means by `[sessions.rs:42](core/src/sessions.rs#L42)` is the name. A target that does not read as
+ * a file stays out of this, because `handlers[i](arg)` is a call.
+ */
 function linkAt(text: string, at: number): { span: Span; end: number } | null {
   if (text[at] !== "[") return null;
   const close = text.indexOf("]", at + 1);
@@ -314,7 +332,13 @@ function linkAt(text: string, at: number): { span: Span; end: number } | null {
   // Only the schemes the window can actually hand to the OS. Anything else — `javascript:`,
   // `data:`, `file:`, a bare word — stays the characters somebody typed, which is both safe and
   // honest: the reader sees the URL rather than a control that would do nothing, or worse.
-  if (!/^(?:https?|mailto):/i.test(href)) return null;
+  if (!/^(?:https?|mailto):/i.test(href)) {
+    if (SCHEME.test(href) || /\s/.test(href) || !/[/\\.#]/.test(href)) return null;
+    const code = /^`([^`]+)`$/.exec(label);
+    const span: Span =
+      code !== null ? { kind: "code", text: code[1] } : { kind: "plain", text: label };
+    return { span, end: end + 1 };
+  }
   return { span: { kind: "link", text: label, href }, end: end + 1 };
 }
 
@@ -357,8 +381,12 @@ export function spans(text: string): Span[] {
     if (ch === "[") {
       const link = linkAt(text, at);
       if (link !== null) {
-        keep();
-        out.push(link.span);
+        if (link.span.kind === "plain") {
+          plain += link.span.text;
+        } else {
+          keep();
+          out.push(link.span);
+        }
         at = link.end;
         continue;
       }

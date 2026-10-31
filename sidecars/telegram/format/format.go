@@ -10,16 +10,16 @@ import (
 )
 
 var (
-	headingPattern     = regexp.MustCompile(`^#{1,6}\s+(.*)$`)
-	bulletPattern      = regexp.MustCompile(`^\s*[-*+]\s+(.*)$`)
-	orderedPattern     = regexp.MustCompile(`^\s*(\d+\.)\s+(.*)$`)
-	codePattern        = regexp.MustCompile("`([^`\\n]*)`")
-	boldStarPattern    = regexp.MustCompile(`\*\*(.+?)\*\*`)
-	boldUnderPattern   = regexp.MustCompile(`__(.+?)__`)
-	italicStarPattern  = regexp.MustCompile(`(^|[^*])\*([^*\s](?:[^*]*[^*\s])?)\*`)
-	italicUnderPattern = regexp.MustCompile(`_(.+?)_`)
-	linkPattern        = regexp.MustCompile(`\[(.+?)\]\((https?://[^)\s]+)\)`)
-	tagPattern         = regexp.MustCompile(`(?s)<[^>]*>`)
+	headingPattern   = regexp.MustCompile(`^#{1,6}\s+(.*)$`)
+	bulletPattern    = regexp.MustCompile(`^\s*[-*+]\s+(.*)$`)
+	orderedPattern   = regexp.MustCompile(`^\s*(\d+\.)\s+(.*)$`)
+	codePattern      = regexp.MustCompile("`([^`\\n]*)`")
+	linkPattern      = regexp.MustCompile(`\[(.+?)\]\((https?://[^)\s]+)\)`)
+	localLinkPattern = regexp.MustCompile(`\[([^\]\n]+)\]\(([^)\s]+)\)`)
+	// A scheme has two letters at least, which leaves a drive (`C:/x`), and is not followed by a
+	// digit, which leaves a line number (`a.rs:42`).
+	schemePattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9+.-]+:[^0-9]`)
+	tagPattern    = regexp.MustCompile(`(?s)<[^>]*>`)
 	// A tag left open at the very end of the text — what a cut mid-tag leaves behind.
 	truncatedTagPattern = regexp.MustCompile(`(?s)<[^>]*$`)
 )
@@ -272,6 +272,15 @@ func inline(text string) string {
 		parts := linkPattern.FindStringSubmatch(link)
 		return hold(`<a href="` + escapeHTML(parts[2]) + `">` + emphasize(escapeHTML(parts[1])) + `</a>`)
 	})
+	// A link to a file opens nothing in Telegram, so what is left of it is its words. Held for the
+	// same reason as the others: the label is usually a file name.
+	protected = localLinkPattern.ReplaceAllStringFunc(protected, func(link string) string {
+		parts := localLinkPattern.FindStringSubmatch(link)
+		if !isLocalTarget(parts[2]) {
+			return link
+		}
+		return hold(escapeHTML(parts[1]))
+	})
 
 	converted := emphasize(escapeHTML(protected))
 
@@ -283,11 +292,107 @@ func inline(text string) string {
 	return converted
 }
 
+// isLocalTarget says whether a link's target reads as a file. A scheme does not, and neither does a
+// bare word: `handlers[i](arg)` is a call.
+func isLocalTarget(target string) bool {
+	return !schemePattern.MatchString(target) && strings.ContainsAny(target, `/\.#`)
+}
+
 func emphasize(escaped string) string {
-	converted := boldStarPattern.ReplaceAllString(escaped, "<b>$1</b>")
-	converted = boldUnderPattern.ReplaceAllString(converted, "<b>$1</b>")
-	converted = italicStarPattern.ReplaceAllString(converted, "$1<i>$2</i>")
-	return italicUnderPattern.ReplaceAllString(converted, "<i>$1</i>")
+	converted := delimit(escaped, "**", "b")
+	converted = delimit(converted, "__", "b")
+	converted = delimit(converted, "*", "i")
+	return delimit(converted, "_", "i")
+}
+
+// delimit wraps in tag each span that mark opens and closes. A run of the mark's character longer or
+// shorter than the mark is not this mark, and a mark that cannot open or close stays the characters
+// it is.
+func delimit(text, mark, tag string) string {
+	var b strings.Builder
+	for i := 0; i < len(text); {
+		if text[i] != mark[0] {
+			b.WriteByte(text[i])
+			i++
+			continue
+		}
+		run := markRun(text, i)
+		if run == len(mark) && canOpen(text, i, mark) {
+			if end := closingMark(text, i+run, mark); end > i+run {
+				b.WriteString("<" + tag + ">" + text[i+run:end] + "</" + tag + ">")
+				i = end + run
+				continue
+			}
+		}
+		b.WriteString(text[i : i+run])
+		i += run
+	}
+	return b.String()
+}
+
+func markRun(text string, at int) int {
+	end := at
+	for end < len(text) && text[end] == text[at] {
+		end++
+	}
+	return end - at
+}
+
+func closingMark(text string, from int, mark string) int {
+	for i := from; i < len(text); {
+		if text[i] != mark[0] {
+			i++
+			continue
+		}
+		run := markRun(text, i)
+		if run == len(mark) && canClose(text, i, mark) {
+			return i
+		}
+		i += run
+	}
+	return -1
+}
+
+// canOpen and canClose are CommonMark's flanking rule, plus what keeps a path whole: a mark touching
+// a separator, or a dot on its way into a file name, is part of the path (`core/**/x`, `__init__.py`).
+// Only `**` may sit against a word: `snake_case` and `2*3*4` are names and arithmetic.
+func canOpen(text string, at int, mark string) bool {
+	after, size := utf8.DecodeRuneInString(text[at+len(mark):])
+	if size == 0 || unicode.IsSpace(after) || isSeparator(after) {
+		return false
+	}
+	if at == 0 {
+		return true
+	}
+	before, _ := utf8.DecodeLastRuneInString(text[:at])
+	return !isSeparator(before) && before != '.' && (mark == "**" || !isWord(before))
+}
+
+func canClose(text string, at int, mark string) bool {
+	before, _ := utf8.DecodeLastRuneInString(text[:at])
+	if unicode.IsSpace(before) || isSeparator(before) {
+		return false
+	}
+	rest := text[at+len(mark):]
+	after, size := utf8.DecodeRuneInString(rest)
+	if size == 0 {
+		return true
+	}
+	if after == '.' {
+		next, nextSize := utf8.DecodeRuneInString(rest[size:])
+		if nextSize > 0 && isWord(next) {
+			return false
+		}
+	}
+	return !isSeparator(after) && (mark == "**" || !isWord(after))
+}
+
+func isSeparator(r rune) bool {
+	return r == '/' || r == '\\'
+}
+
+func isWord(r rune) bool {
+	return r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r)
 }
 
 // escapeHTML escapes for BOTH contexts this package emits: element text and the one attribute value

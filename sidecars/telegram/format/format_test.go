@@ -275,3 +275,65 @@ func TestChunkLeavesShortSpansAlone(t *testing.T) {
 		assertBalanced(t, i, c)
 	}
 }
+
+// A path is the most common thing an agent writes, and the emphasis patterns used to read its
+// underscores and stars as markup: the characters vanished and the middle of the path turned italic.
+func TestPathsAndNamesAreNotEmphasis(t *testing.T) {
+	for _, in := range []string{
+		"core/src/task_claims/sessions.rs e core/src/run_stop/job_decide.rs",
+		`C:\Projects\nucleos\core\src\task_claims\my_file_name.rs agora`,
+		"scripts/test_release_manifest.py",
+		"budget_usd e turn_budget_usd",
+		"__init__.py",
+		"pkg/__init__.py e pkg/__main__.py",
+		"pkg/_private_/mod.rs",
+		"core/**/foo/**/bar.rs",
+		"core/*/foo_*.rs",
+		"2*3*4",
+	} {
+		if got := ToHTML(in); got != in {
+			t.Errorf("ToHTML(%q) = %q, want it unchanged", in, got)
+		}
+	}
+}
+
+func TestEmphasisStillReadsAsEmphasis(t *testing.T) {
+	for _, c := range []struct{ in, want string }{
+		{"**bold** and *it* and _it_ and __bold__", "<b>bold</b> and <i>it</i> and <i>it</i> and <b>bold</b>"},
+		{"(*it*), _it_. **bold**!", "(<i>it</i>), <i>it</i>. <b>bold</b>!"},
+		{"_with snake_case inside_", "<i>with snake_case inside</i>"},
+		{"**a_b.rs** ok", "<b>a_b.rs</b> ok"},
+		{"2 * 3 * 4", "2 * 3 * 4"},
+		{"um * sozinho e **sem fecho", "um * sozinho e **sem fecho"},
+	} {
+		if got := ToHTML(c.in); got != c.want {
+			t.Errorf("ToHTML(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// A link to a file cannot open anything in Telegram, so it shows its words and not its brackets.
+func TestLinkToAFileShowsItsLabel(t *testing.T) {
+	for _, c := range []struct{ in, want string }{
+		{"Ver [sessions.rs:42](core/src/task_claims/sessions.rs#L42) aqui", "Ver sessions.rs:42 aqui"},
+		{"[run_stop.rs](core/src/execution/run_stop.rs) e [AGENTS.md](AGENTS.md)", "run_stop.rs e AGENTS.md"},
+		{"[w](C:/Projects/nucleos/a_b.rs)", "w"},
+		{"[`a_b.rs`](core/a_b.rs)", "<code>a_b.rs</code>"},
+		{"a [b] c [d](e/f)", "a [b] c d"},
+	} {
+		if got := ToHTML(c.in); got != c.want {
+			t.Errorf("ToHTML(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+	// What is not a path stays the characters it was: a scheme, and an indexed call.
+	for _, in := range []string{
+		"[carrega](javascript:alert)",
+		"[carrega](file:///C:/Windows)",
+		"handlers[i](arg)",
+		"[sem endereco]()",
+	} {
+		if got := ToHTML(in); got != in {
+			t.Errorf("ToHTML(%q) = %q, want it unchanged", in, got)
+		}
+	}
+}
