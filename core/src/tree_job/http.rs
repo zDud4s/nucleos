@@ -1212,6 +1212,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_root_branch_is_charged_no_growth() {
+        let manifest = manifest_of(
+            "tree-1",
+            vec![branch("root", "building", CORE, &[], None)],
+            &[(CORE, SEED_GB)],
+        );
+
+        let admission = admit(&manifest, 29.0, &[]);
+
+        assert_admitted(&admission);
+    }
+
+    #[test]
+    fn a_live_branch_beside_the_root_is_still_charged_growth() {
+        let manifest = manifest_of(
+            "tree-1",
+            vec![
+                branch("root", "building", CORE, &[], None),
+                branch("api", "building", CORE, &[], None),
+            ],
+            &[(CORE, SEED_GB)],
+        );
+
+        let admission = admit(&manifest, 29.0, &[]);
+
+        assert_refused_naming(&admission, "disk");
+    }
+
     // ----- branch_admission: cap, book, docs -----
 
     fn live_branches(count: usize, state: &str, layer: &str) -> Vec<Branch> {
@@ -1239,6 +1268,27 @@ mod tests {
     #[test]
     fn admission_takes_the_cap_it_is_given() {
         let manifest = manifest_of("tree-1", live_branches(1, "building", CORE), &[]);
+
+        let admission = branch_admission(
+            &book(8),
+            &manifest,
+            CORE,
+            PLENTY_GB,
+            FLOOR_GB,
+            1,
+            &BTreeMap::new(),
+        );
+
+        assert_refused_naming(&admission, "max_live_branches");
+    }
+
+    #[test]
+    fn the_root_branch_still_counts_against_the_cap() {
+        let manifest = manifest_of(
+            "tree-1",
+            vec![branch("root", "building", CORE, &[], None)],
+            &[(CORE, SEED_GB)],
+        );
 
         let admission = branch_admission(
             &book(8),
