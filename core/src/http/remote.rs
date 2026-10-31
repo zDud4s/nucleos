@@ -412,18 +412,34 @@ async fn delete_setup(
         Ok(root) => root,
         Err(refused) => return refused.into_response(),
     };
+    turn_off(&state, &root, setup::gateway_allowed(), setup::locate_cli()).await
+}
+
+/// The turn-off step with its surroundings passed in, like `turn_on`.
+async fn turn_off(
+    state: &AppState,
+    root: &std::path::Path,
+    primary: bool,
+    cli: Option<PathBuf>,
+) -> axum::response::Response {
+    use crate::remote::setup;
+    // A daemon that does not run the gateway would disarm the key and unpublish the port of the one
+    // that does, and leave that one's gateway running.
+    if !primary {
+        return refusal(StatusCode::CONFLICT, "not_primary").into_response();
+    }
     let _one_at_a_time = setup::lock_setup().await;
-    if let Err(error) = setup::disable(&state.pool, &root, setup::stop_gateway).await {
+    if let Err(error) = setup::disable(&state.pool, root, setup::stop_gateway).await {
         return setup_error(error).into_response();
     }
     // Best effort: the gateway is already off, so a Tailscale that will not answer changes nothing
     // about who can get in. Only a publication that points at the gateway is stopped.
-    if let Some(cli) = setup::locate_cli() {
+    if let Some(cli) = cli {
         if let Err(failure) = setup::serve_off(&cli).await {
             tracing::warn!(why = %failure.why, "could not stop publishing the gateway on Tailscale");
         }
     }
-    Json(setup_view(&root).await).into_response()
+    Json(setup_view(root).await).into_response()
 }
 
 #[cfg(test)]
@@ -774,6 +790,21 @@ mod tests {
         assert_eq!(body["refusal"], "not_primary");
         assert!(!root.join(crate::remote::REMOTE_FILE).exists());
         assert!(!crate::remote::is_armed(&state.pool).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_daemon_that_may_not_run_the_gateway_cannot_turn_it_off() {
+        let state = test_state().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("home");
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join(crate::remote::REMOTE_FILE);
+        std::fs::write(&file, "enabled: true\n").unwrap();
+
+        let (status, body) = body_of(turn_off(&state, &root, false, None).await).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["refusal"], "not_primary");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "enabled: true\n");
     }
 
     #[tokio::test]

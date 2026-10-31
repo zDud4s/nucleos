@@ -182,15 +182,34 @@ pub fn serve_gate(reading: &ServeReading) -> Result<bool, ServeError> {
     }
 }
 
-/// PURE: the first `https://` link in CLI output, which is where `tailscale serve` sends a person
-/// whose tailnet never enabled Serve. Whitespace, quotes and trailing punctuation end it.
+/// PURE: the first Tailscale `https://` link in CLI output, which is where `tailscale serve` sends a
+/// person whose tailnet never enabled Serve. Whitespace, quotes and trailing punctuation end it.
+/// Any other link is not an approval page, and the app must not offer to open it as one.
 pub fn approval_url(text: &str) -> Option<String> {
-    let rest = &text[text.find("https://")?..];
-    let end = rest
-        .find(|c: char| c.is_whitespace() || c.is_control() || matches!(c, '"' | '\'' | '<' | '>'))
-        .unwrap_or(rest.len());
-    let url = rest[..end].trim_end_matches(['.', ',', ';', ')']);
-    (url.len() > "https://".len() && url.len() <= 512).then(|| url.to_string())
+    text.match_indices("https://").find_map(|(start, _)| {
+        let rest = &text[start..];
+        let end = rest
+            .find(|c: char| {
+                c.is_whitespace() || c.is_control() || matches!(c, '"' | '\'' | '<' | '>')
+            })
+            .unwrap_or(rest.len());
+        let url = rest[..end].trim_end_matches(['.', ',', ';', ')']);
+        (url.len() <= 512 && is_tailscale_link(url)).then(|| url.to_string())
+    })
+}
+
+/// PURE: the host of this `https://` link is Tailscale's. Only plain host characters count: with a
+/// userinfo, a port or a backslash in the authority, a browser may not read the host we read.
+fn is_tailscale_link(url: &str) -> bool {
+    let after_scheme = url.strip_prefix("https://").unwrap_or_default();
+    let host = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    host.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.'))
+        && (host == "tailscale.com" || host.ends_with(".tailscale.com"))
 }
 
 /// A failed CLI call: what to tell the person, and the approval link if the CLI printed one.
@@ -1040,8 +1059,26 @@ mod tests {
             Some("https://login.tailscale.com/f/serve?node=n123abc")
         );
         assert_eq!(
-            approval_url("go to (https://example.com/x), then retry.").as_deref(),
-            Some("https://example.com/x")
+            approval_url("go to (https://login.tailscale.com/x), then retry.").as_deref(),
+            Some("https://login.tailscale.com/x")
+        );
+        // A docs link before it is skipped, and no other host is ever offered as an approval.
+        assert_eq!(
+            approval_url("see https://example.com/help or https://login.tailscale.com/y")
+                .as_deref(),
+            Some("https://login.tailscale.com/y")
+        );
+        assert_eq!(approval_url("see https://example.com/x"), None);
+        assert_eq!(approval_url("https://tailscale.com.evil.example/x"), None);
+        assert_eq!(
+            approval_url("https://login.tailscale.com@evil.example/x"),
+            None
+        );
+        assert_eq!(approval_url("https://eviltailscale.com/x"), None);
+        assert_eq!(approval_url("https://evil.example\\.tailscale.com/x"), None);
+        assert_eq!(
+            approval_url("https://evil.example:x@login.tailscale.com/"),
+            None
         );
         assert_eq!(approval_url("no link here, http://insecure.example"), None);
         assert_eq!(approval_url("https://"), None);
