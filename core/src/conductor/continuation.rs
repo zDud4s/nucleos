@@ -1,6 +1,24 @@
 //! Continuation of work nodes that closed because their context was exhausted.
 
+use std::path::Path;
+
+use sqlx::SqlitePool;
+
+use crate::conductor::depth::{self, AncestorView, ChildArgs, TreeLimits};
 use crate::state::AppState;
+use crate::tree_cost::budget::{self, Permit};
+use crate::tree_job::close::tree_job_of;
+use crate::tree_job::model::JOB_TERMINAL_STATE;
+use crate::tree_job::node_run::NodeRunError;
+use crate::tree_job::open::{StoredLaunch, latest_launch};
+use crate::tree_job::store;
+use crate::work_nodes::{self, Node, NodeError, NodeLimits, OpenArgs, OpenLinks};
+
+/// How many continuations one chain may hold. The original node does not count.
+const MAX_CONTINUATIONS: usize = 3;
+
+/// The sentence that names the handoff file, in a goal and in a prompt.
+const HANDOFF_MARK: &str = "\n\nContinue from the handoff at ";
 
 /// The sibling created to carry on a handed-off node.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,14 +32,310 @@ pub struct Continuation {
 pub enum ContinuationError {
     NotHandoff,
     TooManyContinuations,
+    /// The node's tree job is finished, or the node tops a branch: such a node closes only once its
+    /// branch is merged or dropped, so nothing is left to carry on.
+    WorkOver,
+    /// The tree's budget refuses another node.
+    Budget(String),
+    /// A guard refused the sibling, or the node cannot have one. Nothing was opened.
+    Refused(String),
+    /// The sibling exists and its run could not be started. Calling again retries the launch.
+    Launch(String),
+    Db(String),
+}
+
+fn db_error(error: impl std::fmt::Display) -> ContinuationError {
+    ContinuationError::Db(error.to_string())
+}
+
+fn node_error(error: NodeError) -> ContinuationError {
+    match error {
+        NodeError::Db(error) => db_error(error),
+        refusal => ContinuationError::Refused(refusal.to_string()),
+    }
+}
+
+/// `text` with the sentence naming `handoff` at its end. On a chain the sentence of the previous
+/// link is taken out first, so neither a goal nor a prompt grows and the original text stays first;
+/// whatever a relaunch wrote after that sentence stays too.
+fn with_handoff(text: &str, handoff: &str) -> String {
+    let kept = match text.rfind(HANDOFF_MARK) {
+        Some(at) => {
+            let sentence = &text[at + HANDOFF_MARK.len()..];
+            let after = sentence.find('\n').map_or("", |end| &sentence[end..]);
+            format!("{}{after}", &text[..at])
+        }
+        None => text.to_owned(),
+    };
+    format!("{}{HANDOFF_MARK}{handoff}.", kept.trim_end())
+}
+
+/// Handed-off tree nodes the sweep has to ask about: those with no continuation, and those whose
+/// continuation still has no run because its launch failed. Nodes of a finished job are left out,
+/// and so are nodes whose parent closed, since a closed parent takes no new child.
+pub(crate) async fn awaiting_continuation(pool: &SqlitePool) -> sqlx::Result<Vec<String>> {
+    sqlx::query_scalar(
+        "SELECT n.id FROM work_nodes n
+         JOIN tree_jobs j ON j.id = n.tree_job_id
+         JOIN work_nodes p ON p.id = n.parent_id
+         LEFT JOIN work_nodes c ON c.continues_node_id = n.id
+         WHERE n.status = 'handoff' AND j.state != ?
+           AND p.status NOT IN ('done', 'failed', 'handoff', 'blocked')
+           AND (c.id IS NULL OR (c.run_id IS NULL AND c.status = 'running'))
+         ORDER BY n.created_at, n.id",
+    )
+    .bind(JOB_TERMINAL_STATE)
+    .fetch_all(pool)
+    .await
+}
+
+/// How many continuations stand behind `node_id`, counted no further than the cap.
+async fn continuations_behind(pool: &SqlitePool, node_id: &str) -> sqlx::Result<usize> {
+    let mut count = 0;
+    let mut current = node_id.to_owned();
+    while count < MAX_CONTINUATIONS {
+        let previous: Option<Option<String>> =
+            sqlx::query_scalar("SELECT continues_node_id FROM work_nodes WHERE id = ?")
+                .bind(&current)
+                .fetch_optional(pool)
+                .await?;
+        let Some(Some(previous)) = previous else {
+            break;
+        };
+        current = previous;
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// `(id, run_id)` of the continuation of `node_id`, if it has one.
+async fn existing_continuation(
+    pool: &SqlitePool,
+    node_id: &str,
+) -> sqlx::Result<Option<(String, Option<String>)>> {
+    sqlx::query_as("SELECT id, run_id FROM work_nodes WHERE continues_node_id = ?")
+        .bind(node_id)
+        .fetch_optional(pool)
+        .await
+}
+
+async fn check_work_remains(
+    pool: &SqlitePool,
+    job_id: &str,
+    node_id: &str,
+) -> Result<(), ContinuationError> {
+    let job = store::load(pool, job_id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| ContinuationError::Refused(format!("tree job {job_id} not found")))?;
+    let tops_a_branch = job
+        .manifest
+        .branches
+        .values()
+        .any(|branch| branch.node_id.as_deref() == Some(node_id));
+    if job.state == JOB_TERMINAL_STATE || tops_a_branch {
+        return Err(ContinuationError::WorkOver);
+    }
+    Ok(())
+}
+
+/// The limits of the node's project, read as `/nodes` reads them.
+async fn limits_for(pool: &SqlitePool, project_id: Option<&str>) -> NodeLimits {
+    let Some(project_id) = project_id else {
+        return NodeLimits::load(None);
+    };
+    match crate::inspect::project_root(pool, project_id).await {
+        Ok(Some(root)) => NodeLimits::load(Some(Path::new(&root))),
+        Ok(None) => NodeLimits::load(None),
+        Err(error) => {
+            tracing::warn!(project = project_id, %error, "could not read the project root");
+            NodeLimits::load(None)
+        }
+    }
+}
+
+/// The guards of `POST /nodes` that `work_nodes::open` does not apply itself.
+///
+/// The child is presented with no paths, because the scope half of `check_child` asks whether a
+/// child divides its parent, and this one divides nothing by design: it takes over a scope that was
+/// admitted when the source opened, which may be the parent's whole scope. `open` still checks that
+/// scope against the parent's and against the running siblings. So `open_children`, which only the
+/// scope half reads, is not counted.
+async fn check_guards(
+    pool: &SqlitePool,
+    source: &Node,
+    parent: &Node,
+    goal: &str,
+) -> Result<(), ContinuationError> {
+    let mut chain = Vec::new();
+    let mut ancestor = Some(parent.clone());
+    while let Some(node) = ancestor {
+        chain.push(AncestorView {
+            owned_paths: node.owned_paths,
+            goal: node.goal,
+            open_children: 0,
+        });
+        ancestor = match node.parent_id {
+            Some(parent_id) => Some(work_nodes::get(pool, &parent_id).await.map_err(node_error)?),
+            None => None,
+        };
+    }
+    chain.reverse();
+    let tree_total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_nodes WHERE root_id = ?")
+        .bind(&source.root_id)
+        .fetch_one(pool)
+        .await
+        .map_err(db_error)?;
+    let child = ChildArgs {
+        owned_paths: Vec::new(),
+        goal: goal.to_owned(),
+    };
+    depth::check_child(&chain, &child, tree_total, &TreeLimits::default())
+        .map_err(|refusal| ContinuationError::Refused(format!("{refusal:?}")))?;
+    if let Permit::No { reason } = budget::permits_next_node(pool, &source.root_id).await {
+        return Err(ContinuationError::Budget(reason));
+    }
+    Ok(())
+}
+
+/// Opens the sibling, or finds the one a concurrent call opened first.
+async fn open_sibling(
+    pool: &SqlitePool,
+    source: &Node,
+    handoff: &str,
+    tree_job: Option<&str>,
+) -> Result<String, ContinuationError> {
+    let Some(parent_id) = source.parent_id.as_deref() else {
+        return Err(ContinuationError::Refused(format!(
+            "node {} has no parent to open a sibling under",
+            source.id
+        )));
+    };
+    let parent = work_nodes::get(pool, parent_id).await.map_err(node_error)?;
+    let goal = with_handoff(&source.goal, handoff);
+    check_guards(pool, source, &parent, &goal).await?;
+    let args = OpenArgs {
+        parent_id: Some(parent.id.clone()),
+        kind: source.kind.clone(),
+        title: source.title.clone(),
+        goal,
+        owned_paths: source.owned_paths.clone(),
+        budget_tokens: source.budget_tokens,
+        task_id: source.task_id.clone(),
+        ..OpenArgs::default()
+    };
+    let links = OpenLinks {
+        tree_job_id: tree_job,
+        continues_node_id: Some(&source.id),
+    };
+    let limits = limits_for(pool, source.project_id.as_deref()).await;
+    match work_nodes::open_linked(pool, source.project_id.as_deref(), &limits, &args, links).await {
+        Ok(opened) => Ok(opened.id),
+        Err(NodeError::Db(error))
+            if error
+                .as_database_error()
+                .is_some_and(|database_error| database_error.is_unique_violation()) =>
+        {
+            let winner = existing_continuation(pool, &source.id).await.map_err(db_error)?;
+            winner.map(|(id, _)| id).ok_or_else(|| db_error(error))
+        }
+        Err(error) => Err(node_error(error)),
+    }
 }
 
 /// Opens and, for daemon-owned tree nodes, launches the next node in a handoff chain.
+///
+/// Idempotent: the unique index on `continues_node_id` allows one sibling per node, and every later
+/// call returns it. A node with a tree job needs a stored launch, the only place its prompt and cwd
+/// are kept; without one it is refused before anything opens, since a sibling no agent can ever be
+/// started for would hold its parent's slot as `running` for good.
+///
+/// A launch that fails leaves the sibling in place and answers `Launch`. Calling again retries it
+/// under the same key `continue-<source id>`, because `launch_recovering` gives the key back when
+/// the run could not be created. A key left reserved means another call is creating the run, or a
+/// crash that boot recovery clears and relaunches, so it answers the sibling with `run_id: None`.
 pub async fn continue_node(
-    _state: &AppState,
-    _node_id: &str,
+    state: &AppState,
+    node_id: &str,
 ) -> Result<Continuation, ContinuationError> {
-    todo!("D-CONT implementation belongs to the GREEN phase")
+    let pool = &state.pool;
+    let source = work_nodes::get(pool, node_id).await.map_err(node_error)?;
+    if source.status != "handoff" {
+        return Err(ContinuationError::NotHandoff);
+    }
+    let tree_job = tree_job_of(pool, node_id).await.map_err(db_error)?;
+    let existing = existing_continuation(pool, node_id).await.map_err(db_error)?;
+    if let Some((sibling, run_id)) = &existing
+        && (run_id.is_some() || tree_job.is_none())
+    {
+        return Ok(Continuation {
+            node_id: sibling.clone(),
+            run_id: run_id.as_deref().and_then(|run_id| run_id.parse().ok()),
+        });
+    }
+
+    if existing.is_none()
+        && continuations_behind(pool, node_id).await.map_err(db_error)? >= MAX_CONTINUATIONS
+    {
+        return Err(ContinuationError::TooManyContinuations);
+    }
+    let Some(handoff) = source.handoff_path.as_deref() else {
+        return Err(ContinuationError::Refused(format!(
+            "node {node_id} closed as handoff without naming a handoff file"
+        )));
+    };
+    let launch = match tree_job.as_deref() {
+        Some(job_id) => {
+            check_work_remains(pool, job_id, node_id).await?;
+            let stored = latest_launch(pool, node_id).await.map_err(db_error)?;
+            Some(stored.ok_or_else(|| {
+                ContinuationError::Refused(format!("no launch was stored for node {node_id}"))
+            })?)
+        }
+        None => None,
+    };
+
+    let sibling = match existing {
+        Some((sibling, _)) => sibling,
+        None => open_sibling(pool, &source, handoff, tree_job.as_deref()).await?,
+    };
+    let Some(launch) = launch else {
+        return Ok(Continuation {
+            node_id: sibling,
+            run_id: None,
+        });
+    };
+    let run_id = launch_sibling(state, &sibling, node_id, handoff, launch).await?;
+    Ok(Continuation {
+        node_id: sibling,
+        run_id,
+    })
+}
+
+/// `launch_recovering` rather than plain `node_run::launch`: it wraps that call, gives the key back
+/// on a failed create, and stores the launch, which is what the next link of the chain starts from.
+async fn launch_sibling(
+    state: &AppState,
+    sibling: &str,
+    source_id: &str,
+    handoff: &str,
+    launch: StoredLaunch,
+) -> Result<Option<i64>, ContinuationError> {
+    let launched = store::launch_recovering(
+        state,
+        sibling,
+        &format!("continue-{source_id}"),
+        with_handoff(&launch.prompt, handoff),
+        launch.project_id,
+        launch.cwd,
+        &launch.mode,
+    )
+    .await;
+    match launched {
+        Ok(run_id) => Ok(Some(run_id)),
+        Err(NodeRunError::Unresolved { .. }) => Ok(None),
+        Err(error) => Err(ContinuationError::Launch(error.to_string())),
+    }
 }
 
 #[cfg(test)]
@@ -31,6 +345,9 @@ mod tests {
     use super::*;
     use crate::conductor::liveness::Limits;
     use crate::conductor::sweep;
+    use crate::tree_job::model::Manifest;
+    use crate::tree_job::open::save_launch;
+    use crate::tree_job::store::{TreeJob, save};
 
     async fn state() -> AppState {
         crate::channels::testkit::state().await
@@ -119,8 +436,7 @@ mod tests {
     }
 
     /// `work_nodes` has no brief column, so the continuation's `goal` is where the handoff file has
-    /// to be named. This conflicts with the exact-equality assertion on `goal` in
-    /// `handoff_node_gets_a_continuation_with_same_scope`, which GREEN must reconcile.
+    /// to be named.
     #[tokio::test]
     async fn continuation_brief_names_the_handoff_file() {
         let state = state().await;
@@ -215,16 +531,122 @@ mod tests {
             .unwrap();
     }
 
+    /// An open tree job with no branches, as `sweep`'s `seed_tree_node` seeds it.
+    async fn seed_job(state: &AppState) {
+        let created = Utc::now().to_rfc3339();
+        let mut manifest = Manifest::new("job-1", "feat/tree", "Ship it", "C:/Projects/nucleos", &[]);
+        manifest.state = "open".to_owned();
+        let job = TreeJob {
+            id: "job-1".to_owned(),
+            root_node_id: "job-1-root".to_owned(),
+            project_id: None,
+            feature_branch: Some("feat/tree".to_owned()),
+            goal: "Ship it".to_owned(),
+            state: "open".to_owned(),
+            manifest,
+            contract: None,
+            created_at: created.clone(),
+            updated_at: created,
+        };
+        save(&state.pool, &job).await.unwrap();
+    }
+
+    async fn seed_tree_handoff(state: &AppState, id: &str) {
+        seed_node(
+            state,
+            id,
+            Some("root"),
+            "root",
+            1,
+            "handoff",
+            Some("job-1"),
+            Some("C:/state/nodes/root/handoff.md"),
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn the_sweep_continues_a_handoff_node_once() {
-        let state = state().await;
+        let (state, runner) = crate::execution::runs::testkit::test_state_with_runner(
+            Some(std::time::Duration::from_secs(5)),
+            std::time::Duration::from_secs(600),
+        )
+        .await;
+        runner.canned.lock().unwrap().as_mut().unwrap().session_id = None;
+        seed_job(&state).await;
         seed_node(&state, "root", None, "root", 0, "running", None, None).await;
-        seed_handoff(&state, "handoff", "root", "root").await;
+        seed_tree_handoff(&state, "handoff").await;
+        save_launch(
+            &state.pool,
+            &StoredLaunch {
+                node_id: "handoff".to_owned(),
+                key: "key-1".to_owned(),
+                prompt: "do it".to_owned(),
+                project_id: None,
+                cwd: None,
+                mode: "shadow".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
         let now = Utc::now();
 
         sweep::tick(&state, &[], &Limits::default(), now).await.unwrap();
         sweep::tick(&state, &[], &Limits::default(), now).await.unwrap();
 
         assert_eq!(children(&state, "root").await, 2);
+        let run_id: Option<String> = sqlx::query_scalar(
+            "SELECT run_id FROM work_nodes WHERE continues_node_id = 'handoff'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert!(run_id.is_some(), "the sibling has no run");
+        let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(runs, 1);
+    }
+
+    #[tokio::test]
+    async fn the_sweep_never_continues_a_node_with_no_tree_job() {
+        let state = state().await;
+        seed_node(&state, "root", None, "root", 0, "running", None, None).await;
+        seed_handoff(&state, "handoff", "root", "root").await;
+
+        sweep::tick(&state, &[], &Limits::default(), Utc::now()).await.unwrap();
+
+        assert_eq!(children(&state, "root").await, 1);
+    }
+
+    #[tokio::test]
+    async fn the_sweep_says_once_that_a_chain_stopped() {
+        let state = state().await;
+        seed_job(&state).await;
+        seed_node(&state, "root", None, "root", 0, "running", None, None).await;
+        seed_tree_handoff(&state, "link-0").await;
+        for (link, previous) in [("link-1", "link-0"), ("link-2", "link-1"), ("link-3", "link-2")] {
+            seed_tree_handoff(&state, link).await;
+            sqlx::query("UPDATE work_nodes SET continues_node_id = ? WHERE id = ?")
+                .bind(previous)
+                .bind(link)
+                .execute(&state.pool)
+                .await
+                .unwrap();
+        }
+        let now = Utc::now();
+
+        sweep::tick(&state, &[], &Limits::default(), now).await.unwrap();
+        sweep::tick(&state, &[], &Limits::default(), now).await.unwrap();
+
+        let lines: Vec<String> = sqlx::query_scalar(
+            "SELECT subject FROM feed WHERE kind = 'node_continuation_stopped'",
+        )
+        .fetch_all(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(lines, ["node:link-3"]);
+        assert_eq!(children(&state, "root").await, 4);
     }
 }

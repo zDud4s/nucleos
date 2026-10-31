@@ -470,6 +470,26 @@ pub async fn open(
     limits: &NodeLimits,
     args: &OpenArgs,
 ) -> Result<Opened, NodeError> {
+    open_linked(pool, project_id, limits, args, OpenLinks::default()).await
+}
+
+/// Columns no caller of the `/nodes` shape may set, written by the same insert as the node so that a
+/// continuation is never visible without its link.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OpenLinks<'a> {
+    pub tree_job_id: Option<&'a str>,
+    pub continues_node_id: Option<&'a str>,
+}
+
+/// [`open`], with its limits and guards, for a node that also carries `links`. A second continuation
+/// of one node comes back as the unique violation of `work_nodes_continues`, inside `NodeError::Db`.
+pub async fn open_linked(
+    pool: &SqlitePool,
+    project_id: Option<&str>,
+    limits: &NodeLimits,
+    args: &OpenArgs,
+    links: OpenLinks<'_>,
+) -> Result<Opened, NodeError> {
     let title = args.title.trim();
     let goal = args.goal.trim();
     if title.is_empty() {
@@ -556,8 +576,9 @@ pub async fn open(
     sqlx::query(
         "INSERT INTO work_nodes \
          (id, project_id, root_id, parent_id, depth, kind, title, goal, status, owned_paths, \
-          budget_tokens, run_id, session_id, chat_id, task_id, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?)",
+          budget_tokens, run_id, session_id, chat_id, task_id, tree_job_id, continues_node_id, \
+          created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&project)
@@ -573,6 +594,8 @@ pub async fn open(
     .bind(&args.session_id)
     .bind(&args.chat_id)
     .bind(&task_id)
+    .bind(links.tree_job_id)
+    .bind(links.continues_node_id)
     .bind(&now)
     .bind(&now)
     .execute(pool)

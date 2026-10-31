@@ -5,6 +5,7 @@ use std::sync::{LazyLock, Mutex};
 
 use chrono::{DateTime, Duration, Utc};
 
+use crate::conductor::continuation::{awaiting_continuation, continue_node, ContinuationError};
 use crate::conductor::liveness::{classify, Limits, Observation, SubjectStatus, Veredicto};
 use crate::execution::runs::{finalize_termination, run_timeout_for_mode};
 use crate::feed::Subject;
@@ -12,6 +13,7 @@ use crate::state::AppState;
 
 pub const SPAWN_GRACE_SECS: i64 = 60;
 pub const TERMINAL_LOOKBACK_HOURS: i64 = 24;
+const CONTINUATION_STOPPED: &str = "node_continuation_stopped";
 
 /// A source which can be warned, and daemon runs which can also be stopped.
 #[derive(Debug, Clone)]
@@ -89,8 +91,44 @@ pub async fn tick(
             }
         }
     }
+    // Before `terminal_feed`, so a node reaped here has its failure announced in this same tick.
+    if let Err(error) = crate::tree_job::node_run::reconcile_running(&state.pool).await {
+        tracing::warn!(%error, "could not reconcile the running tree nodes");
+    }
+    continue_handoffs(state, now, &mut report).await?;
     terminal_feed(state, now, &mut report).await?;
     Ok(report)
+}
+
+/// Continues every handed-off tree node that needs it. A node without a tree job belongs to an
+/// external session and is never picked up here. A refusal stops that node for this tick only: the
+/// next tick asks again, which is also how a failed launch is retried.
+async fn continue_handoffs(
+    state: &AppState,
+    now: DateTime<Utc>,
+    report: &mut SweepReport,
+) -> sqlx::Result<()> {
+    for node_id in awaiting_continuation(&state.pool).await? {
+        match continue_node(state, &node_id).await {
+            Ok(_) | Err(ContinuationError::WorkOver) => {}
+            Err(ContinuationError::TooManyContinuations) => {
+                let subject = format!("node:{node_id}");
+                let summary = "Node handed off too many times in a row: its chain stopped.";
+                let inserted =
+                    insert_feed(state, CONTINUATION_STOPPED, &subject, None, summary, now, None)
+                        .await?;
+                if inserted {
+                    report
+                        .reported
+                        .push((CONTINUATION_STOPPED.to_owned(), subject));
+                }
+            }
+            Err(error) => {
+                tracing::warn!(node = %node_id, ?error, "could not continue the handed-off node");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn feed_kind(verdict: Veredicto) -> Option<&'static str> {
