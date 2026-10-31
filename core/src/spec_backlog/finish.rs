@@ -67,11 +67,13 @@ pub struct TreeRequest {
     pub round: u32,
 }
 
-/// What a closed tree leaves for the audit: the runs it made and their lineage roots.
+/// What a tree leaves for the audit, unless it is still live: the runs it made and their lineage
+/// roots.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TreeOutcome {
     pub run_ids: Vec<String>,
     pub lineage_roots: Vec<String>,
+    /// True when the launcher reached its deadline while the tree was still live.
     pub still_running: bool,
 }
 
@@ -302,7 +304,13 @@ async fn prepare(
     spec: &Spec,
 ) -> Result<Prepared, FinishError> {
     if let Err(reason) = preparer.extract(&spec.id).await {
-        mark_needs_owner(pool, &spec.id, &format!("extraction failed: {reason}")).await?;
+        store::set_status(
+            pool,
+            &spec.id,
+            SpecStatus::Discovered,
+            Some(&format!("extraction failed: {reason}")),
+        )
+        .await?;
         return Ok(Prepared::NeedsOwner);
     }
     let Some(extracted) = store::get_spec(pool, &spec.id).await? else {
@@ -383,6 +391,18 @@ async fn drive_spec(
         store::set_tree_id(pool, &spec.id, &request.id).await?;
         trees.push(request.id.clone());
         match launcher.run_tree(&request).await {
+            Ok(outcome) if outcome.still_running => {
+                mark_needs_owner(
+                    pool,
+                    &spec.id,
+                    &format!("tree {} is still live", request.id),
+                )
+                .await?;
+                return Ok(SpecRun {
+                    trees,
+                    finished: false,
+                });
+            }
             Ok(outcome) => outcomes.push(outcome),
             Err(reason) => {
                 last = Some(format!("round {round}: the tree failed: {reason}"));
@@ -465,6 +485,15 @@ pub async fn finish_with<'a>(
     // 1. Sort what is in scope: done ones are left alone, the rest is prepared.
     let mut runnable: Vec<Spec> = Vec::new();
     for spec in load_scope(pool, &scope).await? {
+        let spec = if let FinishScope::One { spec_id } = &scope
+            && spec.id == *spec_id
+            && spec.status == SpecStatus::NeedsOwner
+        {
+            store::set_status(pool, &spec.id, SpecStatus::Discovered, None).await?;
+            store::get_spec(pool, &spec.id).await?.unwrap_or(spec)
+        } else {
+            spec
+        };
         if spec.status == SpecStatus::Done {
             done_ids.insert(spec.id.clone());
             report.skipped.push(spec.id);
@@ -714,7 +743,7 @@ async fn post_feed(pool: &SqlitePool, kind: &str, summary: &str, subject: &str) 
     .execute(pool)
     .await;
     if let Err(error) = result {
-        tracing::warn!(%error, kind, subject, "could not write a spec feed line");
+        tracing::warn!(%error, kind, "could not write a spec feed line");
     }
 }
 

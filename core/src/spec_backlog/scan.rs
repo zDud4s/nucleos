@@ -85,25 +85,19 @@ pub async fn scan(
         files.push((
             root.join(".ai").join("specs"),
             ".ai/specs/".to_owned(),
-            root,
         ));
     }
     if let Some(root) = &roots.state_dir {
-        files.push((root.join("specs"), "<state_dir>/specs/".to_owned(), root));
+        files.push((root.join("specs"), "<state_dir>/specs/".to_owned()));
     }
     let mut discovered = Vec::new();
-    // Prefixes whose directory was read (or is empty under an existing root): only specs under
-    // these can be told to be gone.
+    // Prefixes whose directory was read, including empty directories: only specs under these can
+    // be told to be gone.
     let mut read_prefixes: Vec<String> = Vec::new();
-    for (directory, prefix, root) in files {
+    for (directory, prefix) in files {
         let entries = match fs::read_dir(directory) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if root.exists() {
-                    read_prefixes.push(prefix);
-                }
-                continue;
-            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error.into()),
         };
         read_prefixes.push(prefix.clone());

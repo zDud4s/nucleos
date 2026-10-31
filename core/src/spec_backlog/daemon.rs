@@ -320,7 +320,10 @@ impl TreeLauncher for DaemonLauncher<'_> {
                 break;
             }
             if tokio::time::Instant::now() >= deadline {
-                return Err(format!("tree {} did not finish in time", request.id));
+                return Ok(TreeOutcome {
+                    still_running: true,
+                    ..Default::default()
+                });
             }
             tokio::time::sleep(TREE_POLL).await;
         }
