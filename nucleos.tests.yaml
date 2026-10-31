@@ -6,7 +6,7 @@ tests:
   groups:
     core:
       # .nucleos/flows.yaml: the declared flows map::flows checks against core/.
-      paths: [core/, Cargo.toml, Cargo.lock, rust-toolchain.toml, .config/, .nucleos/flows.yaml, sidecars/lib/channelkit/contract/**]
+      paths: [core/, Cargo.toml, Cargo.lock, rust-toolchain.toml, .config/, .nucleos/flows.yaml, sidecars/lib/channelkit/contract/**, scripts/route_index_gate.py]
       check: cargo clippy -p nucleos-base -p nucleos-core -p nucleos-app -p nucleos-daemon --all-targets -- -D warnings
       command: bash scripts/gates.sh core
       # An iteration run whose changes all sit in one module below: the same nextest invocation as
@@ -97,11 +97,17 @@ tests:
     - scripts/doctor.sh
     - scripts/leave-nothing-behind.mjs
     - scripts/update-shell.ps1
+    # Writes (or checks) the route table in core/src/route_index/generated*; run by hand, no gate
+    # calls it. The table it writes is covered by the core group's route_index tests.
+    - scripts/route_index_gate.py
     # Deletes regenerable build output on the owner's machine; run by hand.
     - scripts/free-disk.ps1
     # Serve the preview live for an agent-driven dev-browser window; run by hand.
     - scripts/live-preview.mjs
     - scripts/live-preview-agent.js
+    # Smoke-tests an installed Linux .deb/.rpm inside a clean container; only the release workflow
+    # runs it, on real release assets.
+    - scripts/smoke-bundle.sh
     - docs/
     - design/
     - .githooks/

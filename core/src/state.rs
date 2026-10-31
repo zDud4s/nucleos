@@ -414,15 +414,14 @@ pub struct AppState {
     /// else, where the alternative would be a process-global environment variable two tests would
     /// race on, or a test writing into a real home directory.
     ///
-    /// `None` means this machine has no home directory: every route under `/config/machine` refuses
-    /// rather than guessing at a root. It is also what the test state carries, so the hundreds of
-    /// tests that never touch these routes need no directory to exist.
+    /// `None` means this machine has no home directory: a route that needs a project's state
+    /// directory refuses (`no_machine_root`) rather than guessing at a root. It is also what the
+    /// test state carries, so the hundreds of tests that never touch these routes need no directory
+    /// to exist.
     pub machine_config_root: Option<std::path::PathBuf>,
-    /// What each settings file looked like when the daemon read them at startup: the answer to
-    /// "did it start on this file, or on defaults because the file did not parse". Computed once in
-    /// `main.rs` beside the loaders and never refreshed, so `GET /config/machine` can set it against
-    /// the file as it is now. Empty in the test state, which reads as "nothing was wrong".
-    pub startup_config: Arc<Vec<crate::machine_config::FileCheck>>,
+    /// Kept so struct literals elsewhere keep compiling; removed with the remote branch's next touch
+    /// of this file.
+    pub startup_config: (),
     /// Where this machine's credentials live.
     ///
     /// A trait object for the reason `runner` and `assistants` are: there is no fake backend for

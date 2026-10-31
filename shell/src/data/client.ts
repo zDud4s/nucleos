@@ -155,20 +155,20 @@ async function refusalFrom(res: Response): Promise<ApiRefusal> {
       // The daemon named it. Its name wins over anything we could derive.
       //
       // A `detail` beside the name wins as the sentence, and that pair is not
-      // decoration: `POST /projects/{id}/write` refuses invalid YAML with
-      // `{refusal:"invalid", detail:"...line 3, column 5"}`, and an editor that
-      // showed only "invalid" would send somebody to a text editor to find out
-      // where — which is the surface that editor exists to replace. Without a
+      // decoration: a route that refuses a document with
+      // `{refusal:"invalid", detail:"...line 3, column 5"}` has already located the
+      // problem, and a page that showed only "invalid" would send somebody off to
+      // find out where. Without a
       // detail the name is still the sentence, which is what every route that
       // sends only a name has always got.
       const detail = typeof body.detail === "string" && body.detail !== "" ? body.detail : body.refusal;
       return new ApiRefusal(res.status, body.refusal, detail, body);
     }
     const prose = [body.error, body.message, body.reason].find((v) => typeof v === "string" && v !== "");
-    if (typeof prose === "string") return new ApiRefusal(res.status, fallback, prose);
+    if (typeof prose === "string") return new ApiRefusal(res.status, fallback, prose, body);
   }
 
-  return new ApiRefusal(res.status, fallback, trimmed);
+  return new ApiRefusal(res.status, fallback, trimmed, parsed);
 }
 
 /**

@@ -318,6 +318,62 @@ class SpecLoop(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("- [ ] b", (self.state / "loops" / "s9.md").read_text(encoding="utf-8"))
 
+    def run_start(self, session, *args, name_env=None):
+        env = {**os.environ, "CLAUDE_CODE_SESSION_ID": session, "NUCLEOS_PROJECT_ROOT": str(self.root)}
+        env.pop("NUCLEOS_LOOP_NAME", None)
+        if name_env is not None:
+            env["NUCLEOS_LOOP_NAME"] = name_env
+        return subprocess.run([sys.executable, str(HERE / "spec_loop.py"), "start", *args],
+                              capture_output=True, text=True, env=env)
+
+    def test_start_name_flag_replaces_the_session_id_in_the_file_name(self):
+        r = self.run_start("s9", "--name", "branch-a", "x.md", "a")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("- [ ] a", (self.state / "loops" / "branch-a.md").read_text(encoding="utf-8"))
+        self.assertFalse((self.state / "loops" / "s9.md").exists())
+
+    def test_start_name_env_replaces_the_session_id_in_the_file_name(self):
+        r = self.run_start("s9", "x.md", "a", name_env="branch-b")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue((self.state / "loops" / "branch-b.md").exists())
+        self.assertFalse((self.state / "loops" / "s9.md").exists())
+
+    def test_start_name_flag_wins_over_the_env(self):
+        r = self.run_start("s9", "--name", "from-flag", "x.md", "a", name_env="from-env")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue((self.state / "loops" / "from-flag.md").exists())
+        self.assertFalse((self.state / "loops" / "from-env.md").exists())
+
+    def test_start_name_does_not_leak_into_the_spec_and_items(self):
+        r = self.run_start("s9", "--name", "n", "x.md", "a", "b")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        text = (self.state / "loops" / "n.md").read_text(encoding="utf-8")
+        self.assertIn("spec: x.md", text)
+        self.assertNotIn("--name", text)
+        self.assertIn("- [ ] b", text)
+
+    def test_start_refuses_a_named_loop_owned_by_another_session(self):
+        first = self.run_start("s1", "--name", "shared", "x.md", "a")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        before = (self.state / "loops" / "shared.md").read_text(encoding="utf-8")
+        r = self.run_start("s2", "--name", "shared", "y.md", "other")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("shared", r.stdout + r.stderr)
+        self.assertEqual((self.state / "loops" / "shared.md").read_text(encoding="utf-8"), before)
+
+    def test_start_by_the_owning_session_again_is_still_a_no_op(self):
+        self.run_start("s1", "--name", "shared", "x.md", "a")
+        r = self.run_start("s1", "--name", "shared", "x.md", "a")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("already open", r.stdout)
+
+    def test_hooks_still_look_loops_up_by_session_id_only(self):
+        # A named loop is not found by a session whose id differs from the name.
+        (self.state / "loops" / "n.md").write_text(
+            "# Spec loop\nspec: x.md\nstatus: active\n\n## Items\n- [ ] a\n", encoding="utf-8")
+        self.assertIsNone(self.stop(session="s1"))
+        self.assertIsNone(sl.prompt_context({"session_id": "s1", "cwd": str(self.root), "prompt": "hi"}))
+
     def test_hook_cli_fails_open_on_garbage(self):
         r = subprocess.run([sys.executable, str(HERE / "spec_loop.py"), "--stop-hook"],
                            input="not json", capture_output=True, text=True)

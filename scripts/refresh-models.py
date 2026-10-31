@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Write the models each agent CLI currently offers into `~/.nucleos/nucleos-models.yaml`.
+"""Write the models each agent CLI currently offers into the daemon's models document.
 
-The daemon's model picker is built from `assistant_choices` in that file, and it has to be written
-by somebody: neither CLI can enumerate its own models on demand, so a list left to be maintained by
+The document is read and written through `GET`/`PUT /settings/machine/models`. The daemon's model
+picker is built from its `assistant_choices`, and that list has to be written by somebody: neither
+CLI can enumerate its own models on demand, so a list left to be maintained by
 hand goes stale silently — a menu offering a model that no longer exists produces a turn that dies
 at spawn, days later, for a reason nobody connects to the menu.
 
@@ -23,10 +24,10 @@ Each half reads a source its own vendor publishes, and neither needs a key:
           makes a menu of them — "supports tools, 100k+ of context, not free" still leaves 322 — so
           WHICH hosted models the picker offers stays a person's choice, written here by hand. What
           a person cannot do is re-read 423 entries to notice that one of theirs stopped existing.
-          So the file is its own allowlist: every `brain: openrouter` row already in it is looked
-          up, its label refreshed from the catalogue's own name, and an id that is GONE is reported
-          along with the surviving ids nearest to it. Adding a hosted model is writing its id and
-          running this — the rest fills itself in.
+          So the document is its own allowlist: every `brain: openrouter` row already in it is
+          looked up, its label refreshed from the catalogue's own name, and an id that is GONE is
+          reported along with the surviving ids nearest to it. Adding a hosted model is writing its
+          id and running this — the rest fills itself in.
 
 Sources considered and rejected for the Claude half, so nobody re-treads them: `~/.claude` holds no
 catalogue; `stats-cache.json` is models USED and goes stale; the CLI binary contains every model it
@@ -42,32 +43,39 @@ Usage:
                                      [--legacy]
 
 Prices are NOT this script's: the daemon refreshes `prices_as_of` and `model_prices` in the same
-file itself (`core/src/price_refresh`) — on startup when they are older than a week, daily, when an
-unknown model appears, and from "Refresh prices" on the Devtime page. This script leaves those two
-keys exactly as it finds them; `--only prices` is kept only as a no-op that says so.
+document itself (`core/src/price_refresh`) — on startup when they are older than a week, daily, when
+an unknown model appears, and from "Refresh prices" on the Devtime page. This script sends those two
+keys back exactly as it read them; `--only prices` is kept only as a no-op that says so.
 
-Exit status is 1 when any half could not be refreshed OR when a hosted id no longer exists, so a
-scheduled run reports the stale menu rather than only printing about it.
+The daemon is reached on `127.0.0.1:<NUCLEOS_PORT or 8791>` with the token `nucleos-core
+--print-token` prints, or `NUCLEOS_TOKEN` when it is set. A write that lost a race to another writer
+(409) reads the document again and retries once; a second one is a failed run.
 
-The daemon re-reads the file per request, so nothing needs restarting for a refresh to take.
+Exit status is 1 when the daemon cannot be reached or refuses, when any half could not be refreshed,
+OR when a hosted id no longer exists, so a scheduled run reports the stale menu rather than only
+printing about it.
 """
 
 from __future__ import annotations
 
 import argparse
+import functools
+import http.client
+import importlib.util
 import json
+import os
 import pathlib
 import difflib
 import re
+import shutil
+import subprocess
 import sys
 import urllib.error
 import urllib.request
 
-# This machine's settings folder, the one the daemon reads (`machine_config::root` in the núcleo).
-# Not the repository's `.ai/`, where the file used to live: the daemon copies an old one from there
-# once, at startup, and never reads it again.
-CONFIG = pathlib.Path.home() / ".nucleos" / "nucleos-models.yaml"
-CONFIG_DISPLAY = "~/.nucleos/nucleos-models.yaml"
+MODELS_PATH = "/settings/machine/models"
+DEFAULT_PORT = "8791"  # daemon_client::DEFAULT_PORT
+ROOT = pathlib.Path(__file__).resolve().parent.parent
 CODEX_CACHE = pathlib.Path.home() / ".codex" / "models_cache.json"
 
 DOCS = "https://platform.claude.com/docs/en"
@@ -90,7 +98,7 @@ HOSTED_SUFFIX = " (OpenRouter)"
 # Weakest to strongest, which is the order `efforts` is documented in and the order the picker
 # draws. OpenRouter serves seven words, listed strongest-first and per model: the daemon's own
 # `config::EFFORT_LEVELS` plus `minimal` and `none`. Those two are fine to write when the time
-# comes — `is_effort_level` checks the UNION of what this file declares, not that constant.
+# comes — `is_effort_level` checks the UNION of what the document declares, not that constant.
 EFFORT_LADDER = ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
 
 # Where the hosted wire stands, and the ONE line to change when it moves.
@@ -107,42 +115,144 @@ HOSTED_TAKES_EFFORT = False
 # otherwise be picked up as a model with a dial — and put on a menu nobody here can select from.
 INVITE_ONLY = ("mythos",)
 
-# What the daemon ships when the file names nothing (`config.rs::default_assistant_choices`).
+# What the daemon ships when the document names nothing (`config.rs::default_assistant_choices`).
 #
-# Used only to keep the Claude half from VANISHING when the docs cannot be reached and the file
+# Used only to keep the Claude half from VANISHING when the docs cannot be reached and the document
 # names none — writing a Claude-less list to a daemon running Claude would shrink its menu to one
 # entry. Copied and not invented: these are aliases, so they do not go stale the way a pinned
 # version does, and the script says out loud when it falls back to them.
 SHIPPED_CLAUDE = ["opus", "sonnet", "fable"]
 
-# The block this script owns. Everything else in the file is somebody's, and is preserved verbatim —
-# including `prices_as_of` and `model_prices`, which the daemon refreshes itself
-# (`core/src/price_refresh`); this script never reads, writes or re-banners them.
+# The one field this script owns. Everything else in the document is somebody's, and goes back as
+# it was read — including `prices_as_of` and `model_prices`, which the daemon refreshes itself
+# (`core/src/price_refresh`).
 KEY = "assistant_choices"
-
-BANNER = """# ─────────────────────────────────────────────────────────────
-# Escrito por `scripts/refresh-models.py`. Editável à mão — o script substitui apenas este bloco e
-# deixa o resto do ficheiro intacto — mas uma edição manual é desfeita na próxima passagem dele.
-#
-# `id` é o que vai para `--model`, textualmente. `efforts` são os níveis QUE AQUELE MODELO aceita,
-# do mais fraco para o mais forte; vazio quer dizer que não tem mostrador. `runner` diz qual CLI o
-# corre, e o daemon mostra só os do CLI com que foi arrancado — por isso as duas listas podem viver
-# aqui lado a lado.
-#
-# As linhas `brain: openrouter` são as alojadas, e a escolha de QUAIS é de quem escreve o ficheiro:
-# o catálogo do OpenRouter serve mais de quatrocentos modelos e nenhum filtro faz um menu deles. O
-# script não as inventa — verifica-as. Confirma que o `id` ainda existe (e grita, com os ids vivos
-# mais parecidos, quando deixou de existir) e refaz o `label` a partir do nome do próprio catálogo.
-# Para acrescentar um modelo alojado basta a linha com o `id`; o resto preenche-se na próxima
-# passagem. Sem `runner` de propósito: chegam-se por HTTP, não são lançados por CLI nenhum, e por
-# isso não são filtradas pelo `active_runner()` — aparecem no menu seja qual for a CLI que corre.
-# `efforts` fica como está: o `openrouter.rs::exchange` manda `model`, `messages` e `tools` e mais
-# nada, portanto um mostrador escrito aqui rodava sem chegar ao fio.
-# ─────────────────────────────────────────────────────────────"""
 
 
 def fail(message: str) -> None:
     print(f"error: {message}", file=sys.stderr)
+
+
+# --------------------------------------------------------------------------- daemon --
+
+
+def daemon_url() -> str:
+    return f"http://127.0.0.1:{os.environ.get('NUCLEOS_PORT') or DEFAULT_PORT}"
+
+
+def printed_token(binary: str) -> str | None:
+    try:
+        printed = subprocess.run(
+            [binary, "--print-token"], capture_output=True, text=True, timeout=20
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return (printed.stdout.strip() or None) if printed.returncode == 0 else None
+
+
+@functools.lru_cache(maxsize=1)
+def daemon_token() -> str | None:
+    """`NUCLEOS_TOKEN`, or what `nucleos-core --print-token` prints. `None`, having said so.
+
+    A binary on PATH comes first; a checkout has none there, and finding one in cargo's target dirs
+    is `ask_daemon.py`'s job already. Cached because a run makes up to four requests and each lookup
+    spawns a process.
+    """
+    override = os.environ.get("NUCLEOS_TOKEN")
+    if override:
+        return override
+    on_path = shutil.which("nucleos-core")
+    token = printed_token(on_path) if on_path else None
+    if not token:
+        hook_path = ROOT / "core" / "hooks" / "ask_daemon.py"
+        spec = importlib.util.spec_from_file_location("ask_daemon", hook_path)
+        hook = importlib.util.module_from_spec(spec)
+        try:
+            spec.loader.exec_module(hook)
+        except OSError:
+            pass
+        else:
+            token, _ = hook.read_control_token(str(ROOT))
+    if not token:
+        fail("could not read the daemon token — set NUCLEOS_TOKEN")
+    return token
+
+
+def decoded(raw: bytes) -> object:
+    """An answer's JSON, or `None` when it is not JSON: the status still has to reach the caller."""
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return None
+
+
+def daemon_request(method: str, path: str, body: object = None) -> tuple[int, object] | None:
+    """One request, as `(status, payload)` for ANY status. `None` when nothing answered.
+
+    `None` is the contract `fetch` has, except that the caller is the one to say so: `main` knows
+    which step of the round trip it was on.
+    """
+    token = daemon_token()
+    request = urllib.request.Request(
+        f"{daemon_url()}{path}",
+        method=method,
+        data=None if body is None else json.dumps(body).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            **({"Authorization": f"Bearer {token}"} if token else {}),
+        },
+    )
+    # No proxy: a loopback request sent to one would report a live daemon as refusing or absent.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        try:
+            with opener.open(request, timeout=30) as response:
+                return response.status, decoded(response.read())
+        except urllib.error.HTTPError as answer:
+            with answer:
+                return answer.code, decoded(answer.read())
+    except (urllib.error.URLError, OSError, http.client.HTTPException):
+        return None
+
+
+def say_no_answer(method: str) -> None:
+    fail(
+        f"the daemon at {daemon_url()} did not answer {method} {MODELS_PATH} — is it running? "
+        "scripts/run-daemon.ps1 starts it from a checkout"
+    )
+
+
+def say_refused(method: str, status: int, payload: object) -> None:
+    """A status with no case of its own: named, with whatever reason the daemon gave for it."""
+    why = payload if isinstance(payload, dict) else {}
+    reason = ": ".join(str(why[key]) for key in ("refusal", "detail") if why.get(key))
+    fail(f"the daemon answered {status} to {method} {MODELS_PATH}" + (f" ({reason})" if reason else ""))
+
+
+def read_document() -> tuple[dict, int] | None:
+    """The stored document as `(body, version)`. `None`, having said why, on anything else."""
+    answer = daemon_request("GET", MODELS_PATH, None)
+    if answer is None:
+        say_no_answer("GET")
+        return None
+    status, payload = answer
+    if status != 200:
+        say_refused("GET", status, payload)
+        return None
+    fields = payload if isinstance(payload, dict) else {}
+    # A document with no shipped default reads as a null body at version 0.
+    body = fields.get("body") or {}
+    version = fields.get("version")
+    if not isinstance(body, dict) or not isinstance(version, int):
+        fail(f"the daemon's answer to GET {MODELS_PATH} has no document in it")
+        return None
+    return body, version
+
+
+def kept_rows(body: dict) -> list[dict]:
+    """The rows already in the document, so a half that could not refresh survives."""
+    choices = body.get(KEY)
+    return choices if isinstance(choices, list) else []
 
 
 # --------------------------------------------------------------------------- claude --
@@ -368,7 +478,7 @@ def openrouter_efforts(entry: dict) -> list[str]:
     `reasoning: null` is a model that does not reason, `reasoning: {"mandatory": false}` with no
     levels is one that reasons and publishes no vocabulary (`anthropic/claude-sonnet-4.5` is one
     today), and `supported_efforts` is the vocabulary itself — strongest-first, which is the
-    opposite of this file's contract.
+    opposite of the row's contract.
 
     Filtered THROUGH the ladder rather than sorted by it: a word this repo has never seen has no
     place on a slider, and putting it at a guessed magnitude is worse than leaving it off.
@@ -440,10 +550,10 @@ def worth_offering(entry: dict) -> bool:
 
 
 def suggest(entries: list[dict], already: set[str]) -> list[dict]:
-    """PURE: the shortlist worth offering, minus what the file already has, as rows in its shape.
+    """PURE: the shortlist worth offering, minus what the document already has, as rows in its shape.
 
-    Rows and not prose, so what is printed is what gets pasted — `render_row` writes them in the
-    file's own format, and a suggestion that has to be retyped is a suggestion with a typo in it.
+    Rows and not prose, so what is printed is what gets pasted — `render_row` writes each as the
+    JSON the document holds, and a suggestion that has to be retyped is a suggestion with a typo in it.
     """
     return [
         {
@@ -476,8 +586,8 @@ def refresh_hosted(rows: list[dict], served: dict[str, dict]) -> tuple[list[dict
     """PURE: each hand-written hosted row against the live catalogue.
 
     Returns the rows to write and the problems to shout about. A row whose id is GONE is KEPT, and
-    that is the load-bearing decision: `~/.nucleos/nucleos-models.yaml` is in no repository, so a row this
-    script quietly deleted would leave no diff, no history and nothing at all to notice — the exact
+    that is the load-bearing decision: the models document is in no repository, so a row this
+    script quietly deleted would leave no diff and nothing at all to notice — the exact
     silent staleness the script exists to prevent, committed by the script itself. Dropping a
     person's configuration is also not a refresher's call to make. It says so instead, and `main`
     turns any problem into a non-zero exit.
@@ -515,8 +625,8 @@ def surviving(kept: list[dict], runner: str) -> list[dict]:
         if (choice.get("runner") or "claude") == runner
         # ...but only among the CLOUD rows, which are the only ones the CLI halves refresh. A
         # `brain: openrouter` row carries no runner (it is reached over HTTP, not spawned as
-        # either CLI), so without this it would be bucketed as `claude` and re-emitted by
-        # `render` with a `runner:` it never had.
+        # either CLI), so without this it would be bucketed as `claude` and written back beside
+        # the Claude rows, in the wrong half of the menu.
         and choice.get("brain", "cloud") == "cloud"
     ]
 
@@ -531,145 +641,32 @@ def other_rows(kept: list[dict]) -> list[dict]:
 
     Empty today. It is the door for a `brain` this script has never heard of: carrying an unknown
     row through untouched costs nothing, and dropping one would delete configuration on every run
-    for the crime of being newer than this file.
+    for the crime of being newer than this script.
     """
     return [choice for choice in kept if choice.get("brain", "cloud") not in ("cloud", "openrouter")]
 
 
-def existing_choices(text: str) -> list[dict]:
-    """The `assistant_choices` already in the file, so a half that could not refresh survives."""
-    import yaml
-
-    try:
-        loaded = yaml.safe_load(text) or {}
-    except yaml.YAMLError:
-        return []
-    choices = loaded.get(KEY)
-    return choices if isinstance(choices, list) else []
-
-
 def render_row(choice: dict) -> str:
-    """One model, flow-style, because that is what a person scanning this file wants.
+    """One model as one line of JSON: what `--suggest` and `--dry-run` print.
 
-    Its own function so `--suggest` can print a line that is byte-identical to the one a refresh
-    would write. A suggestion somebody has to retype is a suggestion with a typo in it.
+    The document's own shape, so a suggestion can be pasted in as it stands. A suggestion somebody
+    has to retype is a suggestion with a typo in it.
     """
-    efforts = ", ".join(choice.get("efforts") or [])
-    # OMITTED rather than written empty when there is none: a hosted row has no runner, and
-    # `runner: None` — which is what an f-string makes of Python's `None` — is read back by YAML
-    # as the STRING "None", a runner the daemon does not know. `config.rs` falls unknown names
-    # to `claude`, so the row would then be filtered off the menu by `active_runner()` on any
-    # machine running Codex, for a value nobody wrote.
-    runner = f", runner: {choice['runner']}" if choice.get("runner") else ""
-    return (
-        f"  - {{ id: {json.dumps(choice['id'])}, label: {json.dumps(choice['label'])}, "
-        f"brain: {choice['brain']}{runner}, efforts: [{efforts}] }}"
-    )
+    row = {"id": choice["id"], "label": choice["label"], "brain": choice["brain"]}
+    # OMITTED rather than written null when there is none: only a row some CLI spawns has a runner
+    # to name, and a hosted row is reached over HTTP.
+    if choice.get("runner"):
+        row["runner"] = choice["runner"]
+    row["efforts"] = choice.get("efforts") or []
+    return json.dumps(row)
 
 
-def render(choices: list[dict]) -> str:
-    """The whole block: the banner this script owns, the key, and one line per model."""
-    return "\n".join([BANNER, f"{KEY}:", *(render_row(choice) for choice in choices)])
+def refreshed_rows(kept: list[dict], args: argparse.Namespace) -> tuple[list[dict], bool]:
+    """The new `assistant_choices`, built on the rows just read, and whether any half complained.
 
-
-def splice(text: str, key: str, block: str) -> str:
-    """Replace the `key` block, or append it. Everything else is left untouched.
-
-    Called for `KEY` only; the neighbouring `prices_as_of` / `model_prices` blocks (and the banner
-    comments above them) belong to the daemon and come through byte for byte.
-
-    A surgical text edit and not a load-and-dump: this file is mostly prose, in Portuguese,
-    explaining what each key costs — and `yaml.dump` would return it with every comment gone. The
-    banner above the block is taken with it, so a rewrite does not stack banners.
+    Takes `kept` so that a retry after a 409 is built on the rows of the second read: a half that
+    could not refresh, and every hosted row, come from there.
     """
-    lines = text.splitlines()
-    start = next((i for i, line in enumerate(lines) if line.startswith(f"{key}:")), None)
-    if start is None:
-        trimmed = "\n".join(lines).rstrip()
-        return f"{trimmed}\n\n{block}\n"
-
-    # Back up over the banner this script wrote last time, and over the blank line above it.
-    head = start
-    while head > 0 and (lines[head - 1].startswith("#") or lines[head - 1].strip() == ""):
-        head -= 1
-
-    # Forward to the next column-zero line, key OR comment: the rows of this block are indented, and a
-    # comment in column zero is the banner of the NEXT key, which is not ours to take with us.
-    tail = start + 1
-    while tail < len(lines) and not re.match(r"^[A-Za-z_#]", lines[tail]):
-        tail += 1
-
-    before = "\n".join(lines[:head]).rstrip()
-    after = "\n".join(lines[tail:]).lstrip("\n")
-    parts = [part for part in (before, block, after) if part]
-    return "\n\n".join(parts).rstrip() + "\n"
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dry-run", action="store_true", help="print the block, write nothing")
-    parser.add_argument(
-        "--only",
-        choices=["claude", "codex", "openrouter", "prices"],
-        help="refresh one half and leave the others exactly as they are. `prices` is accepted for "
-        "old invocations and does nothing: the daemon refreshes prices itself",
-    )
-    parser.add_argument(
-        "--legacy",
-        action="store_true",
-        help="also include the models Anthropic files under 'Legacy' — still available, and older",
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=0,
-        metavar="N",
-        help="keep at most N models per CLI, strongest first (0 = all). Useful with --legacy, "
-        "which is a long menu; the trim is printed rather than done silently",
-    )
-    parser.add_argument(
-        "--suggest",
-        nargs="?",
-        const=DEFAULT_CATEGORY,
-        metavar="CATEGORY",
-        help="print the hosted models OpenRouter shortlists for a category (default: "
-        f"{DEFAULT_CATEGORY}) as lines ready to paste, and write NOTHING. Which hosted models "
-        "the picker offers stays a person's choice; this only narrows what that choice is made "
-        "from, since the full catalogue is 400+ models and no filter makes a menu of it",
-    )
-    args = parser.parse_args()
-
-    if args.only == "prices":
-        print("prices are refreshed by the daemon now — use Refresh prices on the Devtime page")
-        return 0
-
-    if not CONFIG.exists():
-        fail(
-            f"{CONFIG_DISPLAY} is not there — write it from the app's System page, or start the "
-            "daemon once from the checkout whose .ai/nucleos-models.yaml it should copy"
-        )
-        return 1
-    text = CONFIG.read_text(encoding="utf-8")
-    kept = existing_choices(text)
-
-    if args.suggest:
-        entries = openrouter_category(args.suggest)
-        if entries is None:
-            return 1
-        rows = suggest(entries, {choice.get("id") for choice in kept})
-        offered = len([entry for entry in entries if worth_offering(entry)])
-        print(
-            f"openrouter: {len(entries)} shortlisted for '{args.suggest}', {offered} worth "
-            f"offering, {len(rows)} not already in the file"
-        )
-        if not rows:
-            print("nothing to add — the file already has every one of them")
-            return 0
-        print("\nPaste any of these among the `brain: openrouter` rows:\n")
-        for row in rows:
-            print(render_row(row))
-        return 0
-
     refreshed: list[dict] = []
     complained = False
 
@@ -685,7 +682,7 @@ def main() -> int:
         if found is None:
             complained = True
             survivors = surviving(kept, runner)
-            # A half that could not be refreshed keeps what the file already had. When the file had
+            # A half that could not be refreshed keeps what the document already had. When it had
             # nothing, the daemon's own shipped list stands in — otherwise this script would turn
             # "could not reach the API" into "this daemon offers one model", which is a worse lie
             # than the stale list it was run to prevent.
@@ -746,20 +743,106 @@ def main() -> int:
         print(f"kept {len(unknown)} row(s) of a kind this script does not refresh")
     refreshed += unknown
 
-    if not refreshed:
-        fail("nothing to write — no half could be read and the file names none")
-        return 1
+    return refreshed, complained
 
-    block = render(refreshed)
-    if args.dry_run:
-        print()
-        print(block)
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dry-run", action="store_true", help="print the rows, write nothing")
+    parser.add_argument(
+        "--only",
+        choices=["claude", "codex", "openrouter", "prices"],
+        help="refresh one half and leave the others exactly as they are. `prices` is accepted for "
+        "old invocations and does nothing: the daemon refreshes prices itself",
+    )
+    parser.add_argument(
+        "--legacy",
+        action="store_true",
+        help="also include the models Anthropic files under 'Legacy' — still available, and older",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        metavar="N",
+        help="keep at most N models per CLI, strongest first (0 = all). Useful with --legacy, "
+        "which is a long menu; the trim is printed rather than done silently",
+    )
+    parser.add_argument(
+        "--suggest",
+        nargs="?",
+        const=DEFAULT_CATEGORY,
+        metavar="CATEGORY",
+        help="print the hosted models OpenRouter shortlists for a category (default: "
+        f"{DEFAULT_CATEGORY}) as JSON lines, and write NOTHING. Which hosted models "
+        "the picker offers stays a person's choice; this only narrows what that choice is made "
+        "from, since the full catalogue is 400+ models and no filter makes a menu of it",
+    )
+    args = parser.parse_args()
+
+    if args.only == "prices":
+        print("prices are refreshed by the daemon now — use Refresh prices on the Devtime page")
+        return 0
+
+    if args.suggest:
+        document = read_document()
+        if document is None:
+            return 1
+        kept = kept_rows(document[0])
+        entries = openrouter_category(args.suggest)
+        if entries is None:
+            return 1
+        rows = suggest(entries, {choice.get("id") for choice in kept})
+        offered = len([entry for entry in entries if worth_offering(entry)])
+        print(
+            f"openrouter: {len(entries)} shortlisted for '{args.suggest}', {offered} worth "
+            f"offering, {len(rows)} not already in the document"
+        )
+        if not rows:
+            print("nothing to add — the document already has every one of them")
+            return 0
+        print(f"\nAdd any of these to `{KEY}` in the models document:\n")
+        for row in rows:
+            print(render_row(row))
+        return 0
+
+    # One retry, and only for a 409: somebody else wrote between the read and the write, so the
+    # whole round is redone on what they wrote. A second 409 is not a third try, because a writer
+    # that keeps winning is something a person should hear about.
+    for retry_left in (True, False):
+        document = read_document()
+        if document is None:
+            return 1
+        body, version = document
+
+        refreshed, complained = refreshed_rows(kept_rows(body), args)
+        if not refreshed:
+            fail("nothing to write — no half could be read and the document names none")
+            return 1
+
+        if args.dry_run:
+            print()
+            for choice in refreshed:
+                print(render_row(choice))
+            return 1 if complained else 0
+
+        answer = daemon_request("PUT", MODELS_PATH, {"body": {**body, KEY: refreshed}, "version": version})
+        if answer is None:
+            say_no_answer("PUT")
+            return 1
+        status, payload = answer
+        if status == 409 and retry_left:
+            print(f"the document changed at version {version} while this ran — reading it again")
+            continue
+        if status != 200:
+            say_refused("PUT", status, payload)
+            return 1
+
+        saved = payload.get("version") if isinstance(payload, dict) else "unknown"
+        print(f"\nsaved {len(refreshed)} choice(s) to the models document at version {saved}")
         return 1 if complained else 0
 
-    CONFIG.write_text(splice(text, KEY, block), encoding="utf-8", newline="\n")
-    print(f"\nwrote {len(refreshed)} choice(s) to {CONFIG_DISPLAY}")
-    print("the daemon re-reads this file per request — nothing needs restarting")
-    return 1 if complained else 0
+    return 1
 
 
 if __name__ == "__main__":

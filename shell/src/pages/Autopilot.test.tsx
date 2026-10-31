@@ -73,6 +73,13 @@ function tally(overrides: Partial<ClassTally> = {}): ClassTally {
     reviewed: 11,
     agree: 11,
     disagree: 0,
+    stricter: 0,
+    looser: 0,
+    unreviewed: 0,
+    reviewed_allow: 0,
+    reviewed_pend: 0,
+    reviewed_deny: 0,
+    oldest_unreviewed_at: null,
     ...overrides,
   };
 }
@@ -940,6 +947,215 @@ describe("Autopilot - the scoreboard is read-only and says what it is not", () =
     expect(screen.getByText(/the count that decides it is not the count below/)).toBeDefined();
     // The authority stays the daemon's own figure.
     expect(screen.getByText("1/2 classes ready")).toBeDefined();
+  });
+});
+
+/* ------------------------------------------------------- the review quality -- */
+
+describe("Autopilot - the scoreboard reports review quality", () => {
+  it("the scoreboard shows stricter, looser, unreviewed, the oldest unreviewed age and the review rate by severity", async () => {
+    const world = cockpitWorld({
+      projects: [project({ project_id: "alpha", mode: "shadow" })],
+      scoreboard: [
+        tally({
+          action_class: "vcs-local",
+          total: 20,
+          would_allow: 8,
+          would_pend: 4,
+          would_deny: 0,
+          reviewed: 7,
+          agree: 5,
+          disagree: 2,
+          stricter: 2,
+          looser: 0,
+          unreviewed: 13,
+          reviewed_allow: 6,
+          reviewed_pend: 1,
+          reviewed_deny: 0,
+          oldest_unreviewed_at: "2026-10-20T10:00:00Z",
+        }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    const table = await screen.findByRole("table", { name: "Shadow evidence" });
+    expect(within(table).getByRole("columnheader", { name: "stricter" })).toBeDefined();
+    expect(within(table).getByRole("columnheader", { name: "looser" })).toBeDefined();
+    expect(within(table).getByRole("columnheader", { name: "unreviewed" })).toBeDefined();
+    expect(within(table).getByRole("columnheader", { name: /oldest/i })).toBeDefined();
+    const row = within(table).getByRole("rowheader", { name: "vcs-local" }).closest("tr")!;
+    // reviewed_allow / would_allow = 6/8 and reviewed_pend / would_pend = 1/4; would_deny is 0, so
+    // that rate is a dash rather than a division by zero.
+    expect(within(row).getByText("75%", { selector: ".ap-rate" })).toBeDefined();
+    expect(within(row).getByText("25%", { selector: ".ap-rate" })).toBeDefined();
+    expect(within(row).getByText("—", { selector: ".ap-rate-none" })).toBeDefined();
+    expect(within(row).queryByText(/NaN|Infinity/)).toBeNull();
+  });
+
+  it("a mixed class notes withheld decisions that were never reviewed", async () => {
+    const world = cockpitWorld({
+      projects: [project({ project_id: "alpha", mode: "shadow" })],
+      scoreboard: [
+        tally({
+          action_class: "vcs-local",
+          total: 13,
+          would_allow: 10,
+          would_pend: 3,
+          reviewed: 10,
+          agree: 10,
+          unreviewed: 3,
+          reviewed_allow: 10,
+          reviewed_pend: 0,
+          reviewed_deny: 0,
+        }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    expect(
+      await screen.findByText("vcs-local: 3 withheld decisions, none reviewed: this blocks promotion until one is"),
+    ).toBeDefined();
+  });
+
+  it("the unreviewed-withheld note does not claim to block promotion on enforced decisions", async () => {
+    const world = cockpitWorld({
+      projects: [project({ project_id: "alpha", mode: "shadow" })],
+      scoreboard: [
+        tally({
+          mode: "worktree",
+          action_class: "vcs-local",
+          total: 13,
+          would_allow: 10,
+          would_pend: 3,
+          reviewed: 10,
+          agree: 10,
+          unreviewed: 3,
+          reviewed_allow: 10,
+          reviewed_pend: 0,
+          reviewed_deny: 0,
+        }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    expect(await screen.findByText("vcs-local: 3 withheld decisions, none reviewed")).toBeDefined();
+    expect(screen.queryByText(/blocks promotion/)).toBeNull();
+  });
+
+  it("a shadow class with withheld decisions and none reviewed does not say ready", async () => {
+    const world = cockpitWorld({
+      projects: [project({ project_id: "alpha", mode: "shadow" })],
+      scoreboard: [
+        tally({
+          action_class: "vcs-local",
+          total: 13,
+          would_allow: 10,
+          would_pend: 3,
+          reviewed: 10,
+          agree: 10,
+          unreviewed: 3,
+          reviewed_allow: 10,
+          reviewed_pend: 0,
+          reviewed_deny: 0,
+        }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    const table = await screen.findByRole("table", { name: "Shadow evidence" });
+    const row = within(table).getByRole("rowheader", { name: "vcs-local" }).closest("tr")!;
+    expect(within(row).queryByText("ready", { selector: ".ap-agree-verdict" })).toBeNull();
+    expect(within(row).getByText("withheld not reviewed", { selector: ".ap-agree-verdict" })).toBeDefined();
+  });
+
+  it("the unreviewed-withheld note keeps its facts but not the promotion claim when the project is active", async () => {
+    const world = cockpitWorld({
+      projects: [project({ project_id: "alpha", mode: "active" })],
+      scoreboard: [
+        tally({
+          action_class: "vcs-local",
+          total: 13,
+          would_allow: 10,
+          would_pend: 3,
+          reviewed: 10,
+          agree: 10,
+          unreviewed: 3,
+          reviewed_allow: 10,
+          reviewed_pend: 0,
+          reviewed_deny: 0,
+        }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    expect(await screen.findByText("vcs-local: 3 withheld decisions, none reviewed")).toBeDefined();
+    expect(screen.queryByText(/blocks promotion/)).toBeNull();
+  });
+
+  it("the unreviewed-withheld note is absent when a pending one was reviewed or nothing was withheld", async () => {
+    const world = cockpitWorld({
+      projects: [project({ project_id: "alpha", mode: "shadow" })],
+      scoreboard: [
+        tally({
+          action_class: "vcs-local",
+          total: 13,
+          would_allow: 10,
+          would_pend: 3,
+          reviewed: 11,
+          agree: 11,
+          unreviewed: 2,
+          reviewed_allow: 10,
+          reviewed_pend: 1,
+        }),
+        tally({ action_class: "read-local", total: 12, would_allow: 12, would_pend: 0, would_deny: 0 }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    await screen.findByRole("table", { name: "Shadow evidence" });
+    expect(screen.queryByText(/none reviewed/)).toBeNull();
+    expect(screen.queryByText(/withheld decisions/)).toBeNull();
+  });
+
+  it("the review-quality wording never says released and labels shadow verdicts as hypothetical", async () => {
+    const world = cockpitWorld({
+      projects: [project({ project_id: "alpha", mode: "shadow" })],
+      scoreboard: [
+        tally({
+          action_class: "vcs-local",
+          total: 13,
+          would_allow: 10,
+          would_pend: 3,
+          reviewed: 10,
+          agree: 10,
+          unreviewed: 3,
+          reviewed_allow: 10,
+          oldest_unreviewed_at: "2026-10-20T10:00:00Z",
+        }),
+      ],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    await renderCockpit();
+
+    // Scoped to the scoreboard panel: elsewhere the page legitimately says a brake is "released".
+    const table = await screen.findByRole("table", { name: "Shadow evidence" });
+    const panel = within(table.closest("section")!);
+    expect(panel.queryByText(/released|libertaste/i)).toBeNull();
+    // In shadow nothing was withheld or released: the verdicts are what the classifier would do.
+    expect(panel.getAllByText(/hypothetical/i).length).toBeGreaterThan(0);
   });
 });
 

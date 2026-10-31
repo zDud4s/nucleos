@@ -26,6 +26,19 @@ pub(super) fn routes() -> Router<AppState> {
             "/analytics/devtime/prices/refresh",
             post(post_devtime_prices_refresh),
         )
+        .route("/analytics/devtime/actions", get(get_devtime_actions))
+        .route(
+            "/analytics/devtime/actions/shadow",
+            get(get_devtime_actions_shadow),
+        )
+        .route(
+            "/analytics/devtime/actions/shadow/{id}/verdict",
+            post(post_devtime_shadow_verdict),
+        )
+        .route(
+            "/analytics/devtime/actions/{action}/{rule}/promote",
+            post(post_devtime_action_promote),
+        )
         .route("/projects/{id}/analytics/devtime", get(get_project_devtime))
         .route(
             "/projects/{id}/analytics/devtime/findings",
@@ -148,7 +161,7 @@ async fn devtime(
     // Re-read per request, so a price refresh (or a hand edit of the file) needs no restart
     // (spec §4.4).
     let models = crate::config::models_config_now();
-    let (rules, _) = devtime_rules(state);
+    let (rules, _) = devtime_rules();
     let mut overview = crate::analytics::devtime::devtime_overview(
         &state.pool,
         &models,
@@ -229,7 +242,7 @@ async fn devtime_findings(
             .await
             .map_err(IntoResponse::into_response)?;
     }
-    let (rules, source) = devtime_rules(state);
+    let (rules, source) = devtime_rules();
     let query = crate::analytics::devtime::FindingsQuery {
         rule_id: params.rule_id.as_deref(),
         order,
@@ -250,24 +263,18 @@ async fn devtime_findings(
     .map_err(|error| failed(error, "devtime findings").into_response())
 }
 
-/// The precision thresholds from `~/.nucleos/devtime.yaml` — the file `main.rs` loads at startup,
-/// from the same root — and where they came from. Read per request through the stat cache, so an
-/// edit applies without a restart and an invalid one keeps the last good thresholds, labelled.
-/// (Ingestion still runs on the startup copy.) Not an `AppState` field: that struct has ~70
-/// literal constructors, and only these routes need it. No root (every test state) is the defaults.
-fn devtime_rules(
-    state: &AppState,
-) -> (
+/// The precision thresholds from the `devtime` document, and where they came from. Read per request
+/// from the settings snapshot, so a write through the settings door applies without a restart.
+/// (Ingestion still runs on the startup copy.) With no document, or one that cannot be read, the
+/// defaults, labelled as such so the page can say so.
+fn devtime_rules() -> (
     crate::config::DevtimeRulesConfig,
     crate::config::ThresholdsSource,
 ) {
-    match state.machine_config_root.as_deref() {
-        Some(root) => {
-            let (config, source) =
-                crate::config::devtime_config_now(&root.join(crate::machine_config::DEVTIME_FILE));
-            (config.rules, source)
-        }
-        None => Default::default(),
+    match crate::settings::get_opt::<crate::config::DevtimeConfig>(&crate::settings::Scope::Machine)
+    {
+        Some(doc) => (doc.rules.clone(), crate::config::ThresholdsSource::File),
+        None => (Default::default(), crate::config::ThresholdsSource::Default),
     }
 }
 
@@ -312,7 +319,7 @@ pub(super) async fn post_devtime_mark(
 ) -> Result<Json<crate::analytics::devtime::MarkOutcome>, Response> {
     use crate::devtime::precision::MarkError;
     let window = window_of(&query, chrono::Utc::now()).map_err(IntoResponse::into_response)?;
-    let (rules, _) = devtime_rules(&state);
+    let (rules, _) = devtime_rules();
     let verdict = body.verdict.as_str();
     let cause = body.cause.as_deref();
     crate::analytics::devtime::mark_finding(&state.pool, &rules, window, &key, verdict, cause)
@@ -325,4 +332,196 @@ pub(super) async fn post_devtime_mark(
             // Generic, no SQL echoed (spec §6.8).
             MarkError::Db(error) => failed(error, "devtime mark").into_response(),
         })
+}
+
+/* ------------------------------------------------------ devtime actions -- */
+
+/// Every parameter read as text, so a bad value is this module's 400, not the extractor's. There is
+/// no `days` here: the shadow list and the promotion report are not windowed by the page's range.
+#[derive(Debug, Deserialize)]
+pub(super) struct ShadowParams {
+    action: Option<String>,
+    rule: Option<String>,
+    limit: Option<String>,
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct ShadowVerdictBody {
+    verdict: String,
+}
+
+/// The whole devtime config (actions block included), read like [`devtime_rules`]: from the
+/// settings snapshot, the defaults when no document is stored.
+fn devtime_full_config() -> crate::config::DevtimeConfig {
+    (*crate::settings::get::<crate::config::DevtimeConfig>(&crate::settings::Scope::Machine))
+        .clone()
+}
+
+fn action_refusal(error: crate::analytics::devtime::ActionError) -> Response {
+    use crate::analytics::devtime::ActionError;
+    match error {
+        ActionError::BadAction => refuse(StatusCode::BAD_REQUEST, "bad_action"),
+        ActionError::BadVerdict => refuse(StatusCode::BAD_REQUEST, "bad_verdict"),
+        ActionError::UnknownRule => refuse(StatusCode::NOT_FOUND, "unknown_rule"),
+        ActionError::UnknownShadow => refuse(StatusCode::NOT_FOUND, "unknown_shadow"),
+        ActionError::NotReady => refuse(StatusCode::CONFLICT, "not_ready"),
+        // Generic, no SQL echoed (spec §6.8).
+        ActionError::Db(error) => failed(error, "devtime actions").into_response(),
+    }
+}
+
+/// `{ "pairs": [...] }`: every configured `(action, rule)` pair with its mode and promotion report
+/// (contract: the module docs of `analytics/devtime/actions.rs`). 200 with a zeroed report for a
+/// pair without rows.
+pub(super) async fn get_devtime_actions(
+    State(state): State<AppState>,
+) -> Result<Json<crate::analytics::devtime::ActionPairs>, Response> {
+    let cfg = devtime_full_config();
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    crate::analytics::devtime::action_pairs(&state.pool, &cfg, now_ms)
+        .await
+        .map(Json)
+        .map_err(|error| failed(error, "devtime actions").into_response())
+}
+
+/// `{ items, next_cursor }`: what the system would have said, closed fields only. Refusals
+/// `bad_action`, `bad_limit` (1..=200, default 50) and `bad_cursor` as `{"error": code}`, 400.
+pub(super) async fn get_devtime_actions_shadow(
+    State(state): State<AppState>,
+    Query(params): Query<ShadowParams>,
+) -> Result<Json<crate::analytics::devtime::ShadowPage>, Response> {
+    let limit = match params.limit.as_deref() {
+        None => DEFAULT_FINDINGS,
+        Some(raw) => match raw.parse::<i64>() {
+            Ok(n) if (1..=MAX_FINDINGS).contains(&n) => n,
+            _ => return Err(refuse(StatusCode::BAD_REQUEST, "bad_limit")),
+        },
+    };
+    let cursor = match params.cursor.as_deref() {
+        None => None,
+        Some(raw) => Some(
+            crate::analytics::devtime::decode_shadow_cursor(raw)
+                .ok_or_else(|| refuse(StatusCode::BAD_REQUEST, "bad_cursor"))?,
+        ),
+    };
+    let query = crate::analytics::devtime::ShadowQuery {
+        action: params.action.as_deref(),
+        rule_id: params.rule.as_deref(),
+        limit,
+        cursor,
+    };
+    crate::analytics::devtime::shadow_list(&state.pool, &query)
+        .await
+        .map(Json)
+        .map_err(action_refusal)
+}
+
+/// The owner's `useful` / `noise` mark on one shadow decision; answers the updated item. 400
+/// `bad_verdict`, 404 `unknown_shadow`.
+pub(super) async fn post_devtime_shadow_verdict(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<ShadowVerdictBody>,
+) -> Result<Json<crate::analytics::devtime::ShadowItem>, Response> {
+    crate::analytics::devtime::mark_shadow(&state.pool, id, &body.verdict)
+        .await
+        .map(Json)
+        .map_err(action_refusal)
+}
+
+/// D2, manual: promotes a pair to `live` as `owner`. 400 `bad_action`, 404 `unknown_rule`, 409
+/// `not_ready` (nothing written); answers the pair.
+pub(super) async fn post_devtime_action_promote(
+    State(state): State<AppState>,
+    Path((action, rule)): Path<(String, String)>,
+) -> Result<Json<crate::analytics::devtime::ActionPair>, Response> {
+    let cfg = devtime_full_config();
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    crate::analytics::devtime::promote_pair(&state.pool, &cfg, &action, &rule, now_ms)
+        .await
+        .map(Json)
+        .map_err(action_refusal)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::devtime_rules;
+    use crate::config::{DevtimeThresholdsConfig, ThresholdsSource};
+    use crate::project::rules::testing::Home;
+    use crate::settings::{self, Scope};
+    use serde_json::json;
+
+    /// What the `devtime` document stores; the default and the stale file both say something else.
+    const STORED_BURST: u32 = 17;
+    const STALE_FILE_BURST: u32 = 8;
+
+    /// Stores the `devtime` document. `Home::new()` comes first in each test: it owns the global
+    /// snapshot.
+    async fn store_the_document() {
+        let state = super::super::tests::test_state().await;
+        settings::put(
+            &state.pool,
+            &Scope::Machine,
+            "devtime",
+            &json!({"rules": {"thresholds": {"d3_search_burst": STORED_BURST}}}),
+            "test",
+            None,
+        )
+        .await
+        .expect("devtime is a registered document");
+    }
+
+    /// As the importer leaves the machine: `devtime.yaml` is gone (renamed to
+    /// `devtime.yaml.imported`) and the document is the configuration.
+    #[tokio::test]
+    async fn devtime_rules_read_the_document_with_no_file_on_disk() {
+        let _home = Home::new();
+        store_the_document().await;
+        assert_ne!(
+            DevtimeThresholdsConfig::default().d3_search_burst,
+            STORED_BURST
+        );
+
+        let (rules, source) = devtime_rules();
+
+        assert_eq!(rules.thresholds.d3_search_burst, STORED_BURST);
+        assert_ne!(
+            source,
+            ThresholdsSource::Default,
+            "the page must not label a stored document as the defaults"
+        );
+    }
+
+    /// A file the importer did not rename (or one written after it ran) says nothing once there is a
+    /// document: the file parses, so only reading the document gives the stored value.
+    #[tokio::test]
+    async fn devtime_rules_ignore_a_stale_file_when_there_is_a_document() {
+        let home = Home::new();
+        store_the_document().await;
+        std::fs::write(
+            home.path().join(crate::machine_config::DEVTIME_FILE),
+            format!("rules:\n  thresholds:\n    d3_search_burst: {STALE_FILE_BURST}\n"),
+        )
+        .unwrap();
+
+        let (rules, _) = devtime_rules();
+
+        assert_eq!(rules.thresholds.d3_search_burst, STORED_BURST);
+    }
+
+    /// `ThresholdsSource`'s own default is `File`, which the page shows no note for: no document has
+    /// to be labelled by name, or the "Using default thresholds" note never appears.
+    #[test]
+    fn devtime_rules_with_no_document_are_labelled_the_defaults() {
+        let _home = Home::new();
+
+        let (rules, source) = devtime_rules();
+
+        assert_eq!(
+            rules.thresholds.d3_search_burst,
+            DevtimeThresholdsConfig::default().d3_search_burst
+        );
+        assert_eq!(source, ThresholdsSource::Default);
+    }
 }

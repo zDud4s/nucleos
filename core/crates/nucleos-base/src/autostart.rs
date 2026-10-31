@@ -70,8 +70,47 @@ fn is_registered(exe_path: &Path) -> bool {
         .map(|unit| char::from_u32(u32::from(*unit)).unwrap_or('\u{fffd}'))
         .collect();
 
-    xml.to_lowercase()
-        .contains(&xml_escape(&exe_path.to_string_lossy()).to_lowercase())
+    xml_matches_task(&xml, exe_path)
+}
+
+/// Whether a queried task XML launches `exe_path` AND carries the settings this build registers.
+/// A task from an older build (default 72h limit, no restart-on-failure) names the same exe, so the
+/// exe alone would keep it forever; requiring `PT0S` and `<Count>99</Count>` makes it re-register.
+/// `--headless` is required too: a task whose action runs the exe directly (the pre-conhost format)
+/// opens a console window, so it must not count as registered and is re-registered with `/F`.
+#[cfg(any(windows, test))]
+fn xml_matches_task(xml: &str, exe_path: &Path) -> bool {
+    let lower = xml.to_lowercase();
+    // The action must be the conhost launcher and the exe must sit in its arguments; the exe path
+    // appearing anywhere else in the document (a description, a forged action) proves nothing.
+    // If `SystemRoot` differs at the next start, the task simply re-registers.
+    let (Some(command), Some(arguments)) = (
+        element_text(&lower, "command"),
+        element_text(&lower, "arguments"),
+    ) else {
+        return false;
+    };
+    let escaped_conhost = xml_escape(&conhost_path()).to_lowercase();
+    let command_is_conhost = command == escaped_conhost
+        || command == escaped_conhost.replace("&apos;", "'")
+        || command == conhost_path().to_lowercase();
+    // `schtasks /Query` may echo an apostrophe either escaped or literal.
+    let escaped_exe = xml_escape(&exe_path.to_string_lossy()).to_lowercase();
+    let exe_in_arguments =
+        arguments.contains(&escaped_exe) || arguments.contains(&escaped_exe.replace("&apos;", "'"));
+    command_is_conhost
+        && exe_in_arguments
+        && lower.contains("--headless")
+        && lower.contains("pt0s")
+        && lower.contains("<count>99</count>")
+}
+
+/// PURE: the trimmed text of the first `<tag>…</tag>` in already-lowercased XML.
+#[cfg(any(windows, test))]
+fn element_text<'a>(lower_xml: &'a str, tag: &str) -> Option<&'a str> {
+    let start = lower_xml.find(&format!("<{tag}>"))? + tag.len() + 2;
+    let end = start + lower_xml[start..].find(&format!("</{tag}>"))?;
+    Some(lower_xml[start..end].trim())
 }
 
 #[cfg(windows)]
@@ -122,6 +161,20 @@ fn working_directory_for(exe_path: &Path) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// The console host the task launches the daemon through. `conhost.exe --headless <exe>` runs a
+/// console-subsystem program with no window, so the daemon binary's subsystem stays untouched.
+#[cfg(windows)]
+fn conhost_path() -> String {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    format!(r"{root}\System32\conhost.exe")
+}
+
+/// Test-only stand-in so the task XML is deterministic on every host.
+#[cfg(all(test, not(windows)))]
+fn conhost_path() -> String {
+    r"C:\Windows\System32\conhost.exe".to_string()
+}
+
 #[cfg(any(windows, test))]
 fn task_xml(exe_path: &Path) -> String {
     let working_directory = working_directory_for(exe_path);
@@ -144,18 +197,22 @@ fn task_xml(exe_path: &Path) -> String {
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
     <StartWhenAvailable>true</StartWhenAvailable>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Hidden>true</Hidden>
     <RestartOnFailure>
       <Interval>PT1M</Interval>
-      <Count>3</Count>
+      <Count>99</Count>
     </RestartOnFailure>
   </Settings>
   <Actions Context="Author">
     <Exec>
       <Command>{}</Command>
+      <Arguments>--headless "{}"</Arguments>
       <WorkingDirectory>{}</WorkingDirectory>
     </Exec>
   </Actions>
 </Task>"#,
+        xml_escape(&conhost_path()),
         xml_escape(&exe_path.to_string_lossy()),
         xml_escape(&working_directory.to_string_lossy())
     )
@@ -232,8 +289,9 @@ fn launch_agent_plist(exe: &str, workdir: &str) -> String {
     )
 }
 
-/// PURE: the systemd user unit. The start limit mirrors the Windows task's `RestartOnFailure`
-/// (three restarts, one minute apart).
+/// PURE: the systemd user unit. Unlike the Windows task, whose `RestartOnFailure` was measured to
+/// restart nothing on a non-zero exit, this unit really restarts on failure (`Restart=on-failure`,
+/// three restarts at most, one minute apart).
 #[cfg(any(all(unix, not(target_os = "macos")), test))]
 fn systemd_unit(exe: &str, workdir: &str) -> String {
     format!(
@@ -471,6 +529,110 @@ mod tests {
         assert!(xml.contains(r"<WorkingDirectory>C:\Projects\nucleos</WorkingDirectory>"));
     }
 
+    /// The daemon is a long-lived process: the task must never be killed by the default 72h limit.
+    /// The `RestartOnFailure` block is still written, but measured it restarts nothing here: the
+    /// Task Scheduler ignores a non-zero exit code and `conhost --headless` returns 0. `<Hidden>true</Hidden>` hides
+    /// the task in the Task Scheduler UI; the console window is suppressed separately, by launching
+    /// through `conhost.exe --headless`.
+    #[test]
+    fn task_xml_has_no_time_limit_is_hidden_and_restarts_up_to_99_times() {
+        let xml = task_xml(Path::new(
+            r"C:\Projects\nucleos\core\target\debug\nucleos-core.exe",
+        ));
+        assert!(xml.contains("<RestartOnFailure>"));
+        assert!(xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
+        assert!(xml.contains("<Hidden>true</Hidden>"));
+        assert!(xml.contains(
+            "<RestartOnFailure>\n      <Interval>PT1M</Interval>\n      <Count>99</Count>\n    </RestartOnFailure>"
+        ));
+    }
+
+    #[test]
+    fn the_task_runs_the_daemon_through_conhost_headless() {
+        let exe = r"C:\Projects\nucleos\core\target\debug\nucleos-core.exe";
+        let xml = task_xml(Path::new(exe));
+        let command = format!("<Command>{}</Command>", conhost_path());
+        assert!(xml.contains(&command));
+        assert!(xml.contains(&format!("<Arguments>--headless \"{exe}\"</Arguments>")));
+        assert!(!xml.contains(&format!("<Command>{exe}</Command>")));
+        #[cfg(not(windows))]
+        assert!(xml.contains(r"<Command>C:\Windows\System32\conhost.exe</Command>"));
+    }
+
+    #[test]
+    fn a_task_registered_before_conhost_headless_is_re_registered() {
+        let exe = Path::new(r"C:\x\nucleos-core.exe");
+        let old = r"<Task><Settings><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><RestartOnFailure><Interval>PT1M</Interval><Count>99</Count></RestartOnFailure></Settings><Actions><Exec><Command>C:\x\nucleos-core.exe</Command><WorkingDirectory>C:\x</WorkingDirectory></Exec></Actions></Task>";
+        assert!(!xml_matches_task(old, exe));
+        assert!(xml_matches_task(&task_xml(exe), exe));
+    }
+
+    #[test]
+    fn an_old_task_without_the_current_settings_is_not_registered() {
+        let exe = Path::new(r"C:\x\nucleos-core.exe");
+        let current = task_xml(exe);
+        assert!(xml_matches_task(&current, exe));
+        let old = r"<Task><Exec><Command>C:\x\nucleos-core.exe</Command></Exec></Task>";
+        assert!(!xml_matches_task(old, exe));
+        assert!(!xml_matches_task(
+            &current,
+            Path::new(r"C:\other\nucleos-core.exe")
+        ));
+    }
+
+    /// RED for the `<Command>` check: the exe path and `--headless` appearing anywhere in the XML
+    /// is not enough, the action must be the conhost launcher.
+    #[test]
+    fn a_task_whose_command_is_not_conhost_is_not_registered() {
+        let exe = Path::new(r"C:\x\nucleos-core.exe");
+        let genuine = task_xml(exe);
+        let forged = genuine.replace(
+            &format!("<Command>{}</Command>", conhost_path()),
+            r"<Command>C:\Windows\System32\cmd.exe</Command>",
+        );
+        assert_ne!(
+            forged, genuine,
+            "the fixture must actually change the command"
+        );
+        assert!(forged.contains("--headless"));
+        assert!(forged.contains(r"C:\x\nucleos-core.exe"));
+        assert!(!xml_matches_task(&forged, exe));
+    }
+
+    /// RED for the `<Arguments>` check: conhost is the command, but the exe path sits in another
+    /// element (here a `<Description>`), so the task would not launch this exe.
+    #[test]
+    fn a_task_with_conhost_but_the_exe_outside_arguments_is_not_registered() {
+        let exe = Path::new(r"C:\x\nucleos-core.exe");
+        let genuine = task_xml(exe);
+        let forged = genuine
+            .replace(
+                &format!("<Arguments>--headless \"{}\"</Arguments>", exe.display()),
+                "<Arguments>--headless</Arguments>",
+            )
+            .replace(
+                "</Exec>",
+                r"<Description>C:\x\nucleos-core.exe</Description></Exec>",
+            );
+        assert_ne!(
+            forged, genuine,
+            "the fixture must actually change the arguments"
+        );
+        assert!(forged.contains(&format!("<Command>{}</Command>", conhost_path())));
+        assert!(forged.contains(r"C:\x\nucleos-core.exe"));
+        assert!(!xml_matches_task(&forged, exe));
+    }
+
+    /// Must pass today and after the fix: the XML this build generates counts as registered, also
+    /// with an apostrophe in the path (`task_xml` writes `&apos;`, as `schtasks /Query` echoes it).
+    #[test]
+    fn the_generated_task_xml_counts_as_registered_even_with_escapes() {
+        for raw in [r"C:\x\nucleos-core.exe", r"C:\Bob's & Co\nucleos-core.exe"] {
+            let exe = Path::new(raw);
+            assert!(xml_matches_task(&task_xml(exe), exe), "{raw}");
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn the_working_directory_is_four_levels_above_a_posix_exe() {
@@ -491,8 +653,13 @@ mod tests {
 
         assert!(xml.contains(r"C:\Dev &amp; Ops\nucleos\core\target\debug\nucleos-core.exe"));
         assert!(
-            !xml.contains("Ops\\nucleos\\core\\target\\debug\\nucleos-core.exe</Command>")
-                || xml.contains("&amp;"),
+            xml.contains(
+                r#"<Arguments>--headless "C:\Dev &amp; Ops\nucleos\core\target\debug\nucleos-core.exe"</Arguments>"#
+            ),
+            "the escaped path must sit, quoted, in Arguments"
+        );
+        assert!(
+            !xml.contains("Dev & Ops"),
             "the raw ampersand must not reach the document"
         );
         // One unescaped `&` is the whole failure; there must be none left outside an entity.

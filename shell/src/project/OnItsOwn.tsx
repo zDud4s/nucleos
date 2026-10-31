@@ -56,11 +56,9 @@ import "../pages/projects.css";
  * needs no prop threading.
  *
  * **It writes, and says so.** Two of the panels below change the núcleo's database: the judge and
- * the ceiling. Neither changes a file — the project's `autopilot.yaml`, which lives in
- * `~/.nucleos/projects/<id>/` and not in the project, is edited as raw text in the workspace
- * (`project/OwnedFiles.tsx`), because a form here would re-serialise the YAML and delete the
- * comments somebody left in it. This component links to that editor rather than growing a second
- * one.
+ * the ceiling. Neither changes the project's `autopilot` settings document, which is edited in the
+ * workspace's "Autopilot rules" panel (`project/AutopilotRules.tsx`). This component links to that
+ * editor rather than growing a second one.
  *
  * **It says when it was read.** The rules are read on open and on window focus, not on a timer
  * (`data/projects.ts` says why), so the time of the read is on the page with a way to ask again —

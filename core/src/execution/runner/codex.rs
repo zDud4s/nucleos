@@ -1,10 +1,16 @@
 //! The Codex CLI backend: its arguments, MCP overrides, staged images, usage and `CodexCliRunner`.
+//!
+//! `usage` here is the session's running total, good for costs and analytics but NOT for context
+//! occupancy; that comes from the rollout file (see `rollout`).
 
 use super::*;
 use std::path::Path;
 
 mod mcp;
+mod rollout;
+
 pub use self::mcp::*;
+pub use self::rollout::*;
 
 /// What `run_prompt` prepared before building argv: MCP overrides, staged image paths and the
 /// sandbox the runner pins.

@@ -25,7 +25,7 @@ use crate::verify::runs::{self as verify_runs, Claimed, Request, State, Submitte
 use crate::verify_sched::{self, Candidate};
 use crate::warm;
 
-/// A project's warm-state ceiling when its `autopilot.yaml` sets none.
+/// A project's warm-state ceiling when its stored rules set none.
 pub const DEFAULT_PROJECT_DISK_CAP_GB: u64 = 30;
 /// Cadence while a unit is in flight (or a warm dir is being removed).
 const POLL: Duration = Duration::from_millis(500);
@@ -480,9 +480,10 @@ async fn run_unit(executor: Arc<Executor>, claimed: Claimed, mut reservation: Re
     drop(reservation);
 }
 
-/// The caps the sweep enforces: the machine's, and each project's from its `autopilot.yaml`. The
-/// projects are read under `warm_home`, their caps under `machine_root`.
-fn sweep_caps(warm_home: &Path, machine_root: &Path, config: &VerifyConfig) -> warm::Caps {
+/// The caps the sweep enforces: the machine's, and each project's from its stored rules (the
+/// settings snapshot). The projects are enumerated under `warm_home`; `_machine_root` is kept in the
+/// signature but no longer read, since the caps are not files any more.
+fn sweep_caps(warm_home: &Path, _machine_root: &Path, config: &VerifyConfig) -> warm::Caps {
     let mut project_bytes = HashMap::new();
     if let Ok(entries) = std::fs::read_dir(warm_home.join("warm")) {
         for entry in entries.flatten() {
@@ -492,7 +493,7 @@ fn sweep_caps(warm_home: &Path, machine_root: &Path, config: &VerifyConfig) -> w
             let Some(project) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
-            let cap = crate::config::load_schedule_rules(Some(machine_root), &project)
+            let cap = crate::project::rules::autopilot(&project)
                 .ok()
                 .and_then(|rules| rules.verify_disk_cap_gb)
                 .unwrap_or(DEFAULT_PROJECT_DISK_CAP_GB);
@@ -602,6 +603,40 @@ mod tests {
 
     async fn test_pool() -> SqlitePool {
         crate::testdb::fresh_pool().await
+    }
+
+    /// A project's disk cap comes from its stored rules, not from a file under the machine root; an
+    /// unreadable document or none at all falls back to the default cap. The stand-in home holds only
+    /// the warm directories: no `autopilot.yaml` is written anywhere.
+    #[test]
+    fn the_sweep_reads_each_projects_cap_from_its_stored_rules() {
+        use crate::project::rules::testing::{Home, publish_rules, publish_unreadable};
+        let home = Home::new();
+        for project in ["alpha", "beta", "gamma"] {
+            std::fs::create_dir_all(home.path().join("warm").join(project)).unwrap();
+        }
+        publish_rules(
+            "alpha",
+            "verify_disk_cap_gb: 7
+",
+        );
+        publish_unreadable("beta", "autopilot", "unknown field");
+
+        let caps = sweep_caps(home.path(), home.path(), &VerifyConfig::default());
+
+        assert_eq!(
+            caps.project_bytes["alpha"],
+            7 * GIB,
+            "the stored cap is read"
+        );
+        assert_eq!(
+            caps.project_bytes["beta"],
+            DEFAULT_PROJECT_DISK_CAP_GB * GIB
+        );
+        assert_eq!(
+            caps.project_bytes["gamma"],
+            DEFAULT_PROJECT_DISK_CAP_GB * GIB
+        );
     }
 
     fn strings(items: &[&str]) -> Vec<String> {

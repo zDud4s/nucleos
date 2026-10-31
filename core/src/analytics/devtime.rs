@@ -30,6 +30,12 @@ pub use turn_efficiency::{
 };
 mod agent_effectiveness;
 pub use agent_effectiveness::{AgentOutcomes, AgentTypeRow, AgentVerification, Agents};
+mod actions;
+pub use actions::{
+    ActionError, ActionPair, ActionPairs, ShadowCursor, ShadowItem, ShadowPage, ShadowQuery,
+    action_pairs, decode_shadow_cursor, encode_shadow_cursor, mark_shadow, promote_pair,
+    shadow_list,
+};
 
 /// The span kinds that are active time on the `main` lane (spec §6.3).
 pub const ACTIVE_KINDS: [&str; 5] = [
@@ -692,7 +698,7 @@ fn tokens_block(window: Window, reads: &Reads, models: &ModelsConfig) -> Devtime
         cost_estimated: true,
         prices_as_of: models.prices_as_of.clone(),
         unpriced_models: unpriced,
-        dropped_prices: models.price_warnings.clone(),
+        dropped_prices: models.model_prices.dropped.clone(),
         previous: PreviousTokens {
             cost_usd: total_cost(&before, |row| row.cost_usd),
             cache_hit_ratio: hit_ratio(&before),
@@ -1353,12 +1359,12 @@ mod tests {
             .await
             .tokens;
         assert!(tokens.dropped_prices.is_empty());
-        models.price_warnings =
+        models.model_prices.dropped =
             vec!["claude-haiku-5-5: input is not a finite, non-negative number".into()];
         let tokens = overview_priced(&pool, Scope::Global, 7, &models)
             .await
             .tokens;
-        assert_eq!(tokens.dropped_prices, models.price_warnings);
+        assert_eq!(tokens.dropped_prices, models.model_prices.dropped);
     }
 
     #[tokio::test]

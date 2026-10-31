@@ -350,7 +350,6 @@ pub(super) fn session_git_reason(
 /// Spec A: the one call this hook puts to the judge, built once from what the hook already holds.
 /// Owned, because an observation outlives the request that started it.
 pub(super) fn judge_asked(
-    state: &AppState,
     run_id: i64,
     shadow_decision_id: Option<i64>,
     project_id: Option<&str>,
@@ -362,7 +361,6 @@ pub(super) fn judge_asked(
         run_id,
         shadow_decision_id,
         project_id: project_id.map(str::to_owned),
-        machine_root: state.machine_config_root.clone(),
         tool_name: payload.tool_name.clone(),
         tool_input: payload.tool_input.clone(),
         cwd: cwd.to_owned(),

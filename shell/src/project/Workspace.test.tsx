@@ -19,6 +19,8 @@ import {
   type DaemonState,
 } from "../test/harness";
 import { ApiRefusal } from "../data/client";
+import type { SchemaNode } from "../settings/schema";
+import { settingsDouble, type SeedDoc } from "../test/settings-double";
 import type { ProjectReadings } from "../data/project-readings";
 import { openInVscode } from "../lib/vscode";
 import { ModeState } from "./ModeState";
@@ -280,7 +282,7 @@ describe("the project workspace", () => {
       "Branches",
       "Workflow",
       "Commands",
-      "Files the app owns",
+      "Autopilot rules",
       "Test map",
     ]);
   });
@@ -390,7 +392,7 @@ describe("the project workspace", () => {
       "Branches",
       "Workflow",
       "Commands",
-      "Files the app owns",
+      "Autopilot rules",
       "Test map",
     ]);
   });
@@ -696,122 +698,145 @@ describe("the project workspace", () => {
   });
 });
 
-/* ------------------------------------------------------- the write boundary -- */
+/* ------------------------------------------------------ the autopilot rules -- */
 
-describe("what the app may author", () => {
-  /** A project with a rules file already in it. */
-  function ownedState(overrides: Partial<DaemonState> = {}): DaemonState {
+describe("the autopilot rules", () => {
+  const RULES_SCHEMA: SchemaNode = {
+    type: "object",
+    properties: { gate_command: { type: "string" } },
+  };
+
+  /** A project whose `autopilot` document holds a gate command, at a version worth checking. */
+  function rulesState(doc: Partial<SeedDoc> = {}): DaemonState {
     return daemonState({
       projects: [project({ project_id: "nucleos", mode: "shadow", project_root: "C:/p" })],
-      text: { diff: "", cat: "gate_command: cargo test\n" },
-      ...overrides,
+      settings: settingsDouble([
+        {
+          scope: "project:nucleos",
+          name: "autopilot",
+          schema: RULES_SCHEMA,
+          body: { gate_command: "cargo test" },
+          version: 3,
+          takes_effect: "at the next tick",
+          ...doc,
+        },
+      ]),
     });
   }
 
-  /**
-   * The fence is the daemon's, and the page draws what it is told.
-   *
-   * A client carrying its own copy would offer an editor for a file the daemon refuses, or hide
-   * one for a file it would accept — and neither mistake announces itself. So the empty answer has
-   * to produce no editor at all, which is what proves the list is doing the deciding.
-   */
-  it("offers an editor for exactly the files the núcleo says it authors", async () => {
-    const nothing = await openState(ownedState({ ownership: [] }));
-    const empty = within(await screen.findByRole("region", { name: "Files the app owns" }));
-    expect(await empty.findByText("none")).toBeTruthy();
-    expect(screen.queryByRole("button", { name: "edit" })).toBeNull();
+  async function gateBox(): Promise<HTMLInputElement> {
+    const panel = within(await screen.findByRole("region", { name: "Autopilot rules" }));
+    return (await panel.findByLabelText("Gate command")) as HTMLInputElement;
+  }
 
-    nothing.unmount();
+  function save() {
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+  }
 
-    await openState(ownedState());
-    expect(await screen.findByText("~/.nucleos/projects/alpha/autopilot.yaml")).toBeTruthy();
-    expect(screen.getByRole("button", { name: "edit" })).toBeTruthy();
+  it("draws the rules from the project's document, and says when they start mattering", async () => {
+    await openState(rulesState());
+
+    expect((await gateBox()).value).toBe("cargo test");
+    expect(screen.getByText("Takes effect at the next tick.")).toBeTruthy();
   });
 
-  /**
-   * What is SENT, not what the component believed it sent. The path comes from the claim rather
-   * than from anything typed here, which is the same rule the daemon follows on its side.
-   */
-  it("sends the text that was typed, to the path the núcleo named", async () => {
-    const state = ownedState();
+  /** What is SENT, not what the component believed it sent: the document, at the version read. */
+  it("writes the rules to the project's document with the version it read", async () => {
+    const state = rulesState();
     await openState(state);
 
-    fireEvent.click(await screen.findByRole("button", { name: "edit" }));
-    const box = await screen.findByLabelText("~/.nucleos/projects/alpha/autopilot.yaml");
-    fireEvent.change(box, { target: { value: "gate_command: cargo clippy\n" } });
-    fireEvent.click(screen.getByRole("button", { name: "save" }));
+    fireEvent.change(await gateBox(), { target: { value: "cargo clippy" } });
+    save();
 
-    await waitFor(() => expect(state.writes.length).toBe(1));
-    expect(state.writes[0]).toEqual({
-      path: "autopilot.yaml",
-      contents: "gate_command: cargo clippy\n",
+    await waitFor(() => expect(state.settings.writes.length).toBe(1));
+    expect(state.settings.writes[0]).toEqual({
+      scope: "project:nucleos",
+      name: "autopilot",
+      body: { gate_command: "cargo clippy" },
+      version: 3,
     });
   });
 
-  /**
-   * A refused save keeps the text in front of the person who wrote it, and says where the file
-   * broke.
-   *
-   * Both halves matter and they fail differently. Dropping the draft makes a rejected edit an edit
-   * LOST — the worst possible answer to "that YAML is invalid". And showing only the word "invalid"
-   * sends somebody to a text editor to find the broken line, which is the surface this editor
-   * exists to replace; the daemon already located it, so the sentence is free.
-   */
-  it("keeps a refused edit on the screen and says where the file broke", async () => {
-    const state = ownedState({
-      writeRefusal: {
-        status: 422,
-        code: "invalid",
-        detail: "unknown field `gate_commmand` at line 1 column 1",
-      },
-    });
+  /** The two routes this replaces are gone from the daemon, so asking one would be a 404 in production. */
+  it("asks nothing of the retired file routes, reading or saving", async () => {
+    // Clear, not reset: `daemon` is shared across this file, and `openState` sets the implementations after.
+    daemon.apiFetch.mockClear();
+    daemon.apiText.mockClear();
+    const state = rulesState();
     await openState(state);
 
-    fireEvent.click(await screen.findByRole("button", { name: "edit" }));
-    const box = await screen.findByLabelText("~/.nucleos/projects/alpha/autopilot.yaml");
-    fireEvent.change(box, { target: { value: "gate_commmand: cargo test\n" } });
-    fireEvent.click(screen.getByRole("button", { name: "save" }));
+    fireEvent.change(await gateBox(), { target: { value: "cargo clippy" } });
+    save();
+    await waitFor(() => expect(state.settings.writes.length).toBe(1));
 
-    expect(await screen.findByText(/gate_commmand/)).toBeTruthy();
-    expect((box as HTMLTextAreaElement).value).toBe("gate_commmand: cargo test\n");
+    const asked = [...daemon.apiFetch.mock.calls, ...daemon.apiText.mock.calls].map(([path]) =>
+      String(path),
+    );
+    expect(asked.filter((path) => /\/projects\/[^/]+\/(write|owned|ownership)\b/.test(path))).toEqual([]);
   });
 
   /**
-   * The emergency stop holds this write too, and the sentence says the one thing that keeps that
-   * from being a trap: the file is still ordinary text in an editor one click away.
+   * A refused save keeps the text in front of the person who wrote it, and says why in the núcleo's
+   * sentence. Dropping the draft would make a rejected edit an edit lost. No `field` here: the core
+   * sends `{refusal, detail}` and never a field today, so the sentence has to stand on its own.
    */
-  it("says the stop is why a save was refused, and where the file is still editable", async () => {
-    const state = ownedState({
-      writeRefusal: { status: 423, code: "kill_switch", detail: "kill_switch" },
-    });
+  it("keeps a refused edit on the screen, with the núcleo's words", async () => {
+    await openState(
+      rulesState({
+        validate: () => ({ message: "the gate command may not be empty" }),
+      }),
+    );
+
+    const box = await gateBox();
+    fireEvent.change(box, { target: { value: "   " } });
+    save();
+
+    expect(await screen.findByText(/the gate command may not be empty/)).toBeTruthy();
+    expect(box.value).toBe("   ");
+  });
+
+  it("says the stop is why a save was refused", async () => {
+    const state = rulesState();
     await openState(state);
 
-    fireEvent.click(await screen.findByRole("button", { name: "edit" }));
-    fireEvent.change(await screen.findByLabelText("~/.nucleos/projects/alpha/autopilot.yaml"), {
-      target: { value: "gate_command: x\n" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "save" }));
+    fireEvent.change(await gateBox(), { target: { value: "x" } });
+    state.settings.failNext = { status: 423, body: { refusal: "kill_switch" } };
+    save();
 
     expect(await screen.findByText(/emergency stop is engaged/)).toBeTruthy();
-    expect(screen.getByText(/still editable in an editor/)).toBeTruthy();
+    expect(state.settings.writes).toEqual([]);
   });
 
   /**
-   * A file that is not there yet is a state, not an error. A project nobody has scheduled anything
-   * in has no rules file, which is the ordinary case — and saving is how it gets one.
+   * A project nobody gave rules has a document that was never written. That is the ordinary case, a
+   * state and not an error, and saving is how it gets one.
    */
-  it("says a rules file is absent rather than showing an empty one", async () => {
-    await openState(ownedState({ text: { diff: "", cat: null } }));
+  it("says rules were never written, and the first save writes against version 0", async () => {
+    const state = rulesState({ body: undefined, version: 0 });
+    await openState(state);
 
-    fireEvent.click(await screen.findByRole("button", { name: "edit" }));
-    expect(await screen.findByText(/no such file yet/)).toBeTruthy();
-    expect(
-      (
-        (await screen.findByLabelText(
-          "~/.nucleos/projects/alpha/autopilot.yaml",
-        )) as HTMLTextAreaElement
-      ).value,
-    ).toBe("");
+    expect(await screen.findByText("Never written: these are the defaults.")).toBeTruthy();
+    fireEvent.change(await gateBox(), { target: { value: "npm test" } });
+    save();
+
+    await waitFor(() => expect(state.settings.writes.length).toBe(1));
+    expect(state.settings.writes[0].version).toBe(0);
+  });
+
+  it("offers no form for a document the index does not list, and does not ask for it", async () => {
+    // Clear, not reset: the tests above did ask for the document, on this same shared `daemon`.
+    daemon.apiFetch.mockClear();
+    daemon.apiText.mockClear();
+    const state = daemonState({
+      projects: [project({ project_id: "nucleos", mode: "shadow", project_root: "C:/p" })],
+    });
+    await openState(state);
+
+    const panel = within(await screen.findByRole("region", { name: "Autopilot rules" }));
+    expect(await panel.findByText(/has no autopilot document/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Save" })).toBeNull();
+    const asked = daemon.apiFetch.mock.calls.map(([path]) => String(path));
+    expect(asked.filter((path) => path.includes("/settings/"))).toEqual([]);
   });
 });
 
@@ -904,6 +929,13 @@ describe("the settings this app authors", () => {
           reviewed: 18,
           agree: 12,
           disagree: 6,
+          stricter: 4,
+          looser: 2,
+          unreviewed: 28,
+          reviewed_allow: 15,
+          reviewed_pend: 2,
+          reviewed_deny: 1,
+          oldest_unreviewed_at: null,
         },
       ],
     });
@@ -1312,7 +1344,6 @@ describe("what this project can be asked to do", () => {
    */
   it("keeps a refused declaration on the screen and names the part that was wrong", async () => {
     const state = withCommands([]);
-    state.writeRefusal = null;
     await openState(state);
 
     // The fake accepts declarations, so the refusal is arranged by making the route answer one.

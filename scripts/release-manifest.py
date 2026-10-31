@@ -26,12 +26,13 @@ from pathlib import Path
 # Names are Tauri's own, as tauri-action uploads them; the macOS tarball has no version in it.
 ASSETS = {
     "windows-x64": [("-setup.exe", True, True)],
-    "linux-x64": [(".AppImage", True, True), (".deb", True, False)],
+    "linux-x64": [(".AppImage", True, True), (".deb", True, False), (".rpm", True, False)],
     "macos-arm64": [(".app.tar.gz", False, True), (".dmg", True, False)],
 }
 UPDATER_FEED = "latest.json"
 SUMS = "SHA256SUMS"
-NAME_VERSION = re.compile(r"_(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)_")
+# deb/AppImage/exe use `_<ver>_`; the rpm uses `NucleOS-<ver>-<release>.<arch>.rpm`.
+NAME_VERSION = re.compile(r"_(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)_|-(\d+\.\d+\.\d+)-\d+\.")
 
 
 def check_platform(files, platform, version):
@@ -47,8 +48,8 @@ def check_platform(files, platform, version):
         name = hits[0]
         if versioned:
             m = NAME_VERSION.search(name)
-            if not m or m.group(1) != version:
-                problems.append(f"{platform}: {name} does not carry version {version} (found {m.group(1) if m else 'none'})")
+            if not m or (m.group(1) or m.group(2)) != version:
+                problems.append(f"{platform}: {name} does not carry version {version} (found {(m.group(1) or m.group(2)) if m else 'none'})")
         if signed and name + ".sig" not in files:
             problems.append(f"{platform}: {name} has no {name}.sig (the updater signature)")
     return problems

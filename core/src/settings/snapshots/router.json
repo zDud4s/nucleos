@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "mode": {
+      "default": "off",
+      "description": "`off`, `shadow` or `apply`.",
+      "type": "string"
+    },
+    "models": {
+      "additionalProperties": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "default": {},
+      "type": "object"
+    },
+    "runners": {
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "surfaces": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "default": {},
+      "description": "Surface name (`runs`, `team`, `council`, `recruit`) to mode.",
+      "type": "object"
+    },
+    "timeout_ms": {
+      "default": 2500,
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "url": {
+      "default": "http://127.0.0.1:18733",
+      "type": "string"
+    }
+  },
+  "title": "RouterDoc",
+  "type": "object"
+}

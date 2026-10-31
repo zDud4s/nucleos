@@ -76,8 +76,7 @@ pub(super) async fn observe_verification(
         (Some(map), _) | (None, MapState::Valid(map)) => map,
         (None, _) => return false,
     };
-    let machine_root = state.machine_config_root.as_deref();
-    let (gate, guard) = match crate::config::load_schedule_rules(machine_root, project_id) {
+    let (gate, guard) = match crate::project::rules::autopilot(project_id) {
         Ok(rules) => (rules.gate_command, rules.verify_guard),
         Err(error) => {
             tracing::warn!(

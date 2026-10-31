@@ -116,8 +116,8 @@ pub(super) const HOME_SPELLINGS: &[&str] =
 ///   would otherwise ask.
 /// - **Each settings file by name, however it is rooted** — an absolute `C:/Users/me/.nucleos/...`
 ///   included, which on a run with a workspace is already refused as `outside-workspace` and on
-///   one without is otherwise only `no-workspace`. Derived from [`crate::machine_config::SETTINGS`]
-///   so a tenth file cannot be added there and forgotten here.
+///   one without is otherwise only `no-workspace`. Derived from [`crate::settings::documents`]
+///   so another document cannot be added there and forgotten here.
 ///
 /// The old `.ai/<file>` copies are not guarded any more: the startup migration that copied them
 /// into `~/.nucleos/` is gone, so the daemon never reads one again and a write there decides
@@ -139,11 +139,29 @@ pub(super) fn names_machine_settings(raw: &str) -> bool {
             .is_some_and(|rest| path_has_prefix(&normalize_path(rest, None), ".nucleos"))
     });
     let normalized = normalize_path(&folded, None);
+    // `<file>.yaml.imported` is the file it came from: ask the same question of the original name.
+    let imported_origin = normalized
+        .strip_suffix(IMPORTED_SUFFIX)
+        .filter(|origin| origin.ends_with(".yaml"));
     under_home_settings
-        || crate::machine_config::SETTINGS
-            .iter()
-            .any(|setting| path_has_suffix(&normalized, &format!(".nucleos/{}", setting.path)))
-        || names_project_state(&normalized)
+        || names_settings_file(&normalized)
+        || imported_origin.is_some_and(names_settings_file)
+}
+
+/// What the importer renames a consumed settings file to, next to where it found it
+/// (`<name>.yaml` -> `<name>.yaml.imported`). Guarded like the original: the import only runs when a
+/// document is absent, but `--settings-reset` re-opens that door, so a hand-edited one is a way in.
+/// Only the `.nucleos/` copies are kept; the old `.ai/` ones are not read by anything.
+pub(super) const IMPORTED_SUFFIX: &str = ".imported";
+
+/// PURE: whether an already-normalised, case-folded path is one of the machine documents by file
+/// name under `.nucleos/`, or one project's state file. Derived from the settings registry, so a
+/// document added there cannot be forgotten here.
+fn names_settings_file(normalized: &str) -> bool {
+    crate::settings::documents().iter().any(|document| {
+        document.kind == crate::settings::Kind::Machine
+            && path_has_suffix(normalized, &format!(".nucleos/{}", document.origin_file))
+    }) || names_project_state(normalized)
 }
 
 /// PURE: whether an already-normalised, case-folded path is one project's state file — under
@@ -451,4 +469,225 @@ pub(super) fn delete_targets<'a>(program: &str, arguments: &'a [String]) -> Vec<
             (!is_option).then_some(argument.as_str())
         })
         .collect()
+}
+
+// ---- the NucleOS database and the files that replace it ---------------------------------------
+
+/// Where the daemon keeps its SQLite database - `<data dir>/nucleos.db` - written as lowercase
+/// path-segment runs that identify the data directory by how the OS and the shell spell it. Matched
+/// ANYWHERE in a path, and only when a sibling name follows (see [`is_nucleos_data_sibling`]).
+///
+/// Each run is what `directories` builds for `ProjectDirs::from("dev", "nucleos", "NucleOS")`:
+///
+/// - Windows: `<LocalAppData>\<organization>\<application>\data`. The run is only the tail, so
+///   `%LOCALAPPDATA%`, `$env:LOCALAPPDATA`, `~/AppData/Local` and a literal `C:\Users\<anyone>\...`
+///   all reach it, and so does the tail a `Join-Path` leaves in one word.
+/// - Linux: `$XDG_DATA_HOME` when absolute, else `~/.local/share`, then the application name.
+///   A custom absolute `XDG_DATA_HOME` is caught by the resolved directory.
+/// - macOS: `~/Library/Application Support/<qualifier>.<organization>.<application>`; the second
+///   form is the shell-escaped `Application\ Support`, whose `\` has become a `/`. The last,
+///   one-segment run is for that escaped form AFTER `shell_words` has split it: the second word
+///   starts `Support/dev.nucleos.NucleOS/nucleos.db`, so no run beginning at `library` can match it.
+///   `dev.nucleos.nucleos` is called nothing else, and a sibling must still follow.
+const NUCLEOS_DATA_ROOTS: &[&[&str]] = &[
+    &["nucleos", "nucleos", "data"],
+    &[".local", "share", "nucleos"],
+    &["$xdg_data_home", "nucleos"],
+    &["${xdg_data_home}", "nucleos"],
+    &["library", "application support", "dev.nucleos.nucleos"],
+    &["library", "application", "support", "dev.nucleos.nucleos"],
+    &["dev.nucleos.nucleos"],
+];
+
+pub(super) const NUCLEOS_DATA_CLASS: &str = "nucleos-data";
+pub(super) const NUCLEOS_DATA_REASON: &str =
+    "the NucleOS database and the files that replace it are the daemon's own and are denied";
+pub(super) const NUCLEOS_SETTINGS_CLI_REASON: &str = "the daemon's settings command line edits the configuration database directly and is denied to an agent";
+
+/// PURE: the names inside the data directory that are the database or replace it at start-up:
+/// `backups` (a restore reads from it), everything beginning `nucleos.` (the database, its
+/// `-wal`/`-shm`/`-journal`, and the restore markers, which `backup.rs` builds with
+/// `with_extension` and so spells `nucleos.pending-restore` and so on), and the bare spellings the
+/// design spec uses. `logs/` and the directory itself are deliberately not here.
+fn is_nucleos_data_sibling(name: &str) -> bool {
+    name == "backups"
+        || name.starts_with("nucleos.")
+        || matches!(
+            name,
+            ".pending-restore" | ".pending-restore-safety" | ".restore-new"
+        )
+}
+
+/// PURE: a path as comparable segments - lowercased, `\` as `/`, `.`/`..` collapsed, a leading
+/// `file:` scheme (a SQLite URI) and a `\\?\` prefix dropped.
+fn nucleos_data_segments(raw: &str) -> Vec<String> {
+    let folded = fold_for_match(&raw.replace('\\', "/"));
+    let without_scheme = folded.strip_prefix("file:").unwrap_or(&folded);
+    let mut segments: Vec<String> = normalize_path(without_scheme, None)
+        .split('/')
+        .map(|segment| segment.trim().to_owned())
+        .collect();
+    if segments.first().is_some_and(|segment| segment == "?") {
+        segments.remove(0);
+    }
+    segments
+}
+
+/// PURE: whether `raw` names the NucleOS database, one of its `-wal`/`-shm` files, `backups/`, or a
+/// restore marker, in the data directory this machine uses (`data_dirs`) or in any spelling of it
+/// ([`NUCLEOS_DATA_ROOTS`]).
+///
+/// **Anchored, never basename-only.** `nucleos.db` alone, `core/testdata/nucleos.db` and a test's
+/// temp directory match nothing; a root has to precede the name. `data_dirs` are absolute and
+/// matched from the START of the path, so a relative override can never turn an ordinary relative
+/// path into a hit. They are a parameter so a test does not depend on the machine it runs on.
+///
+/// Known residuals, seen and not fixed (the kernel-level containment is the sandbox spec's job): a
+/// path built through a variable, a glob, `cd <data dir>` followed by a relative `nucleos.db`, a
+/// Windows 8.3 short name, a link into the directory, and a `Join-Path` split across several words.
+pub(super) fn names_nucleos_data_in(raw: &str, data_dirs: &[std::path::PathBuf]) -> bool {
+    let segments = nucleos_data_segments(raw);
+    let spelled = NUCLEOS_DATA_ROOTS.iter().any(|root| {
+        segments.windows(root.len() + 1).any(|window| {
+            (0..root.len()).all(|at| window[at] == root[at])
+                && is_nucleos_data_sibling(&window[root.len()])
+        })
+    });
+    spelled
+        || data_dirs.iter().any(|dir| {
+            let dir = dir.to_string_lossy();
+            if !is_absolute_path(&dir.replace('\\', "/")) {
+                return false;
+            }
+            let wanted = nucleos_data_segments(&dir);
+            segments.len() > wanted.len()
+                && segments[..wanted.len()] == wanted[..]
+                && is_nucleos_data_sibling(&segments[wanted.len()])
+        })
+}
+
+/// The directories this daemon's database can live in: what THIS process resolves
+/// ([`crate::data_dir::data_dir`]) and the platform default ([`crate::data_dir::default_data_dir`]),
+/// deduplicated. A resolver that fails contributes nothing; the static spellings still apply. The
+/// environment is read each call and is the only reason this is not pure.
+fn nucleos_data_dirs() -> Vec<std::path::PathBuf> {
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    for dir in [
+        crate::data_dir::data_dir(),
+        crate::data_dir::default_data_dir(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs
+}
+
+/// PURE: the paths hiding in one shell word, split on the glue a shell puts between a path and the
+/// rest (`>file`, `2>file`, `--db=file`, `(file)`, `a,b`, `$(...)/file`).
+fn nucleos_data_pieces(word: &str) -> impl Iterator<Item = &str> {
+    word.split(|character: char| {
+        matches!(
+            character,
+            '<' | '>' | '&' | '|' | ';' | '(' | ')' | '`' | '=' | ','
+        )
+    })
+    .filter(|piece| !piece.is_empty())
+}
+
+/// PURE: whether any word of a shell line names the NucleOS database or a sibling that replaces it.
+/// The WHOLE line is scanned, not a segment: a refusal must not depend on where in a line it appears.
+pub(super) fn line_names_nucleos_data_in(command: &str, data_dirs: &[std::path::PathBuf]) -> bool {
+    shell_words(command)
+        .iter()
+        .any(|word| nucleos_data_pieces(word).any(|piece| names_nucleos_data_in(piece, data_dirs)))
+}
+
+pub(super) fn line_names_nucleos_data(command: &str) -> bool {
+    line_names_nucleos_data_in(command, &nucleos_data_dirs())
+}
+
+/// Whether a write tool's target is the NucleOS database or a sibling. Both the raw spelling and
+/// the one resolved against the run's workspace are asked: the first is what a home- or
+/// variable-rooted path looks like, the second what a `..` out of the workspace looks like.
+pub(super) fn writes_nucleos_data(tool_input: &Value, cwd: Option<&Path>) -> bool {
+    let Some(file_path) = written_path(tool_input) else {
+        return false;
+    };
+    let dirs = nucleos_data_dirs();
+    names_nucleos_data_in(file_path, &dirs)
+        || names_nucleos_data_in(&normalize_path(file_path, cwd), &dirs)
+}
+
+/// PURE: whether a path-or-glob names the database, for a tool that LOOKS INSIDE a directory.
+///
+/// `Grep` and `Glob` take a directory or a pattern, so the data directory itself, or
+/// `<data dir>/**`, searches the database without spelling a sibling name. This asks one more
+/// question: the literal directory part of the argument (before the first glob metacharacter, cut
+/// back to a separator) with `nucleos.db` appended - would that file be refused? `logs/` is still
+/// allowed, because `logs/nucleos.db` has no root followed by a sibling.
+///
+/// Known residual: the PARENT of the data directory, and a basename-only pattern, search the
+/// database without naming it.
+fn names_nucleos_data_under(argument: &str, data_dirs: &[std::path::PathBuf]) -> bool {
+    let directory = match argument.find(['*', '?', '[', '{']) {
+        None => argument,
+        Some(at) => argument[..at]
+            .rfind(['/', '\\'])
+            .map_or("", |sep| &argument[..sep]),
+    };
+    names_nucleos_data_in(argument, data_dirs)
+        || names_nucleos_data_in(
+            &format!("{}/nucleos.db", directory.trim_end_matches(['/', '\\'])),
+            data_dirs,
+        )
+}
+
+/// Whether a READ tool's target is the database or a sibling: `Read.file_path`, `Grep.path` and
+/// `Grep.glob`, `Glob.path` and `Glob.pattern`. `Grep.pattern` is a regex over file contents and is
+/// never looked at. `Read` takes a file and is asked with the plain matcher; `Grep` and `Glob` look
+/// inside a directory and are asked with [`names_nucleos_data_under`]. The MCP `project_cat` /
+/// `project_grep` never reach `classify`, so nothing is added for them.
+pub(super) fn reads_nucleos_data(tool_name: &str, tool_input: &Value, cwd: Option<&Path>) -> bool {
+    let keys: &[&str] = match tool_name {
+        "Read" => &["file_path"],
+        "Grep" => &["path", "glob"],
+        "Glob" => &["path", "pattern"],
+        _ => return false,
+    };
+    let dirs = nucleos_data_dirs();
+    let asks = |argument: &str| {
+        if tool_name == "Read" {
+            names_nucleos_data_in(argument, &dirs)
+        } else {
+            names_nucleos_data_under(argument, &dirs)
+        }
+    };
+    keys.iter()
+        .filter_map(|key| tool_input.get(*key).and_then(Value::as_str))
+        .any(|argument| asks(argument) || asks(&normalize_path(argument, cwd)))
+}
+
+/// PURE: whether a shell line runs the daemon's own settings command line: a word whose last path
+/// component is `nucleos-core` or `nucleos-core.exe` (bare, through a path, quoted, after `cd x &&`,
+/// behind `FOO=1`, or as cargo's `-p nucleos-core`), and a word that is exactly `--settings-reset`
+/// or `--settings-rollback` (or either followed by `=value`). Both halves are required. A deliberate
+/// over-deny: `grep nucleos-core --settings-reset` matches too.
+pub(super) fn line_runs_settings_cli(command: &str) -> bool {
+    use crate::settings_cli::{RESET_FLAG, ROLLBACK_FLAG};
+    let words = shell_words(command);
+    let pieces = || words.iter().flat_map(|word| nucleos_data_pieces(word));
+    let is_daemon_binary = |piece: &str| {
+        let name = piece
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(piece)
+            .to_ascii_lowercase();
+        name.strip_suffix(".exe").unwrap_or(&name) == "nucleos-core"
+    };
+    pieces().any(is_daemon_binary)
+        && pieces().any(|piece| piece == RESET_FLAG || piece == ROLLBACK_FLAG)
 }

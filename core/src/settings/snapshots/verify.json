@@ -1,0 +1,116 @@
+{
+  "$defs": {
+    "AdmissionConfig": {
+      "additionalProperties": false,
+      "description": "`verify.yaml`'s `admission:` block: the bound on heavy commands launched at once.",
+      "properties": {
+        "capacity": {
+          "default": null,
+          "description": "Weight units that may be held at once. Absent means half the physical cores, at least one.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "enabled": {
+          "default": true,
+          "description": "Off means every heavy command is admitted at once.",
+          "type": "boolean"
+        },
+        "full_suite_weight": {
+          "default": 2,
+          "description": "The weight of an unfiltered full test suite.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "grant_ttl_seconds": {
+          "default": 7200,
+          "description": "A grant nobody released is reclaimed after this long.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "heavy_weight": {
+          "default": 1,
+          "description": "The weight of an ordinary heavy command (build, check, a filtered test).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_wait_seconds": {
+          "default": 900,
+          "description": "How long a waiting command is held before it is let through without a grant.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "The verification executor's machine settings, `~/.nucleos/verify.yaml`.",
+  "properties": {
+    "admission": {
+      "$ref": "#/$defs/AdmissionConfig",
+      "default": {
+        "capacity": null,
+        "enabled": true,
+        "full_suite_weight": 2,
+        "grant_ttl_seconds": 7200,
+        "heavy_weight": 1,
+        "max_wait_seconds": 900
+      },
+      "description": "The admission book bounding how many heavy commands runs launch at once."
+    },
+    "aging_seconds": {
+      "default": 300,
+      "description": "A queued request that has waited this long moves up one priority level.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "broker_prefix": {
+      "default": [],
+      "description": "The argv prefixed to every unit when it runs (a machine's broker). Empty means none.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "cache_days": {
+      "default": 7,
+      "description": "Days a green unit stays reusable by the cache (spec §5.3).",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "capacity": {
+      "default": 4,
+      "description": "Weight units that may run at once across the whole machine.",
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "disk_cap_gb": {
+      "default": 60,
+      "description": "The ceiling, in GB, on the whole machine's warm state.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "unit_timeout_seconds": {
+      "default": 1800,
+      "description": "The wall clock one unit may take before it is killed.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "title": "VerifyConfig",
+  "type": "object"
+}

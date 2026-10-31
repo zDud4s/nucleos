@@ -52,11 +52,8 @@ pub(super) fn routes() -> Router<AppState> {
             "/projects/{id}/judge",
             post(post_project_judge).delete(delete_project_judge),
         )
-        // The write boundary, read and exercised. They sit together because the second is
-        // unintelligible without the first: `POST /write` refuses everything the table does not
-        // name, so a client that cannot read the table can only discover the fence by hitting it.
+        // The write boundary, read. Served, so a client never has to guess where the fence is.
         .route("/projects/{id}/ownership", get(get_project_ownership))
-        .route("/projects/{id}/owned", get(get_project_owned))
 }
 
 /// How far back a reading looks. Absent is the default window, not zero days.
@@ -144,6 +141,12 @@ pub(super) async fn delete_project(
     match crate::project_exit::remove(&state.pool, &id, query.forget_history).await {
         Ok(crate::project_exit::Removed::Done { forgotten }) => {
             tracing::info!(project_id = %id, forgotten, "a project left the roster");
+            if query.forget_history {
+                // Forgetting deleted the project's settings rows; the snapshot still holds them.
+                if let Err(error) = crate::settings::load(&state.pool).await {
+                    tracing::warn!(project_id = %id, %error, "reloading the settings after a forget failed");
+                }
+            }
             Ok(StatusCode::NO_CONTENT)
         }
         Ok(crate::project_exit::Removed::NotRegistered) => Err((
@@ -449,7 +452,7 @@ pub(super) async fn get_project_tests_map(
 /// tomorrow there is a workflow called `core`.
 #[derive(serde::Serialize)]
 pub(super) struct ClaimView {
-    /// The row's identity: what `POST /write` and `GET /owned` are sent back. Relative to `home`.
+    /// The row's identity. Relative to `home`.
     pub(super) path: String,
     /// `state` for a file in `~/.nucleos/projects/<id>/`, `project` for one in the project's folder.
     pub(super) home: &'static str,
@@ -469,8 +472,8 @@ pub(super) struct ClaimView {
 /// only thing that decides is `ownership.rs`, and the page draws what it is told.
 ///
 /// The root is resolved even though the table does not depend on it. A fence drawn for a project
-/// the daemon has no folder for is a fence around nothing, and the write route answers 404 on the
-/// same call — so this fails in the same place rather than showing an editor that cannot save.
+/// the daemon has no folder for is a fence around nothing, so this answers 404 rather than an empty
+/// list that would read as a project with nothing fenced.
 pub(super) async fn get_project_ownership(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -493,57 +496,6 @@ pub(super) async fn get_project_ownership(
             })
             .collect(),
     ))
-}
-
-/// The text of one file this app declares itself the author of, from wherever the registry says it
-/// lives.
-///
-/// **Its own route because `cat` cannot serve it any more.** `cat` reads inside the project's
-/// folder, and the núcleo's own two files moved out of it, to `~/.nucleos/projects/<id>/`. The page
-/// asks for a claim by its identity and this answers from the claim's home — so neither the page nor
-/// the caller ever names a directory.
-///
-/// 404 with `absent` for a claimed file that does not exist yet: that is the ordinary state of a
-/// project nobody has given rules, and the editor offers to create it. 403 `not_ours` for anything
-/// the table does not name, exactly as the write route refuses it.
-///
-/// In no table in `auth.rs`, and so Admin's by default-deny: the rules file carries `gate_command`
-/// and `GET /projects/{id}/rules`, which serves the same facts, has always been Admin's. When the
-/// file lived in the project a read-only key could `cat` it; the move is where that stops, and it is
-/// the right place for it to stop.
-pub(super) async fn get_project_owned(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Query(query): Query<ReadQuery>,
-) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
-    let root = resolve_project_root(&state, &id)
-        .await
-        .map_err(|status| refusal(status, "no_project_root"))?;
-    let claims = claims_for_project(&state, &id, root.clone())
-        .await
-        .map_err(|status| refusal(status, "internal"))?;
-    let rel = query.path.unwrap_or_default();
-    let crate::ownership::Owner::Declared(claim) = crate::ownership::owner_of(&claims, &rel) else {
-        return Err(refusal(StatusCode::FORBIDDEN, "not_ours"));
-    };
-    let home = claim_home(&state, &id, &root, claim)?;
-    let path = claim.path.clone().into_owned();
-    tokio::task::spawn_blocking(move || {
-        let target = inspect::safe_join(&home, &path)
-            .map_err(|error| refusal(inspect_status(error), "unreadable"))?;
-        match std::fs::read_to_string(&target) {
-            Ok(text) => Ok(text),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Err(refusal(StatusCode::NOT_FOUND, "absent"))
-            }
-            Err(error) => {
-                tracing::warn!(%error, "reading a claimed file failed");
-                Err(refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))
-            }
-        }
-    })
-    .await
-    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
 }
 
 /* ------------------------------------------------------------- onboarding -- */
@@ -623,8 +575,8 @@ pub(super) async fn onboarding_view(
     let project_id = id.to_string();
     tokio::task::spawn_blocking(move || {
         let found = crate::detect::inspect_folder(&root);
-        // An unreadable rules file has no gate this can name; the POST refuses it by name.
-        let configured_gate = crate::config::load_schedule_rules(Some(&machine_root), &project_id)
+        // Stored rules that cannot be read have no gate this can name; the POST refuses them by name.
+        let configured_gate = crate::project::rules::autopilot(&project_id)
             .ok()
             .and_then(|rules| rules.gate_command);
         OnboardingView {
@@ -665,17 +617,17 @@ pub(super) async fn get_project_onboarding(
 /// The one thing activation now asks of a project besides the classifier hook (`autopilot.rs`),
 /// and the act is `onboarding::onboard`'s: check the gate, detect the harnesses, install the hook
 /// with the same `wire_classifier_hook` every other door uses, store the gate as `gate_command` in
-/// the project's `autopilot.yaml` — where the gate already lives — and write the marker last.
+/// the project's `autopilot` settings document — where the gate already lives — and write the marker last.
 ///
-/// **In no table in `auth.rs`, so Admin's by default-deny**, for `POST /projects/{id}/write`'s
-/// reason and a second one: it sets what *green* means, and it writes an executable hook into a
+/// **In no table in `auth.rs`, so Admin's by default-deny**, like `PUT /settings/{scope}/{name}`
+/// and for two reasons: it sets what *green* means, and it writes an executable hook into a
 /// folder. The folder may be named in the body, which the two session doors that wire the hook
 /// refuse to allow; here it is allowed because a project being brought in has no folder on record
 /// yet, and naming one is what `GET /projects/detect` already lets this same key do.
 ///
-/// **Kill-switch checked first, like `POST /write` and `POST /config/machine`.** Onboarding writes
-/// `gate_command` into the project's `autopilot.yaml` and installs an executable classifier hook —
-/// the same shape of governance write those two routes already refuse the stop for — so a stop
+/// **Kill-switch checked first, like `PUT /settings/{scope}/{name}`.** Onboarding writes
+/// `gate_command` into the project's `autopilot` settings document and installs an executable classifier hook —
+/// the same shape of governance write that route already refuses the stop for — so a stop
 /// engaged here must refuse before either lands. The shell's new-project wizard used to lean on
 /// this route succeeding while the stop was engaged, because registering a project runs onboarding
 /// as its first step; it now catches this refusal there, registers the project anyway, and leaves
@@ -720,19 +672,16 @@ pub(super) async fn post_project_onboard(
         .map(|command| command.trim().to_string())
         .filter(|command| !command.is_empty());
 
-    let (project_id, project_root, confirmed) = (id.clone(), root.clone(), gate.clone());
     let now = chrono::Utc::now().to_rfc3339();
-    tokio::task::spawn_blocking(move || {
-        crate::onboarding::onboard(
-            &machine_root,
-            &project_id,
-            &project_root,
-            confirmed.as_deref(),
-            &now,
-        )
-    })
+    crate::onboarding::onboard(
+        &state.pool,
+        &machine_root,
+        &id,
+        &root,
+        gate.as_deref(),
+        &now,
+    )
     .await
-    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
     .map_err(|error| match error {
         crate::onboarding::OnboardError::BadId => {
             refusal(StatusCode::UNPROCESSABLE_ENTITY, "bad_project_id")
@@ -762,9 +711,10 @@ pub(super) async fn post_project_onboard(
             root.display()
         ),
     };
-    // After the act, and loudly on failure, for `post_project_write`'s reason. Spelled as a literal
-    // and not as `onboarding::FEED_KIND`, because the shell's completeness test reads feed kinds out
-    // of this source; the test below holds the two equal.
+    // After the act, and loudly on failure: a line about an act that then failed claims something
+    // that did not happen, and a lost line is recoverable from the log. Spelled as a literal and not
+    // as `onboarding::FEED_KIND`, because the shell's completeness test reads feed kinds out of this
+    // source; the test below holds the two equal.
     if let Err(error) = feed::append(
         &state.pool,
         Some(&id),
@@ -801,27 +751,21 @@ async fn pin_default_workflow(
     machine_root: PathBuf,
     library: PathBuf,
 ) {
-    let (project_id, project_root) = (id.to_string(), root.to_path_buf());
-    let pinned = tokio::task::spawn_blocking(move || {
+    let pinned = async {
         let Some(bundle) =
-            crate::onboarding::pin_default_workflow(&machine_root, &library, &project_id)?
+            crate::onboarding::pin_default_workflow(&state.pool, &machine_root, &library, id)
+                .await?
         else {
             return Ok(None);
         };
-        let state_dir = crate::project::state::dir(&machine_root, &project_id)
-            .ok_or_else(|| format!("`{project_id}` cannot name a state directory"))?;
-        let placed = super::workflows::materialize_after_pin(
-            &project_root,
-            &state_dir.join(crate::project::state::PINS_FILE),
-            &library,
-            &state_dir.join(crate::project::state::MATERIALIZED_FILE),
-            &bundle.name,
-        );
+        let state_dir = crate::project::state::dir(&machine_root, id)
+            .ok_or_else(|| format!("`{id}` cannot name a state directory"))?;
+        let placed =
+            super::workflows::materialize_after_pin(root, id, &state_dir, &library, &bundle.name)
+                .await;
         Ok::<_, String>(Some((bundle, placed)))
-    })
-    .await
-    .map_err(|error| error.to_string())
-    .and_then(|result| result);
+    }
+    .await;
     match pinned {
         Ok(Some((bundle, placed))) => {
             super::workflows::workflow_feed(

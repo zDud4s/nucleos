@@ -1063,16 +1063,22 @@ pub fn source_of(
     Ok(bundle)
 }
 
-/// Materialize every workflow `pins_file` pins — or only `only`, when given — into `checkout`.
+/// Materialize every workflow the project's stored `workflow_pins` document pins — or only `only`, when
+/// given — into `checkout`.
+///
+/// `state_dir` is the project's state directory (`~/.nucleos/projects/<id>/`), where the pointer's
+/// bookkeeping lives; its last segment is the project id, which `place_project_pointer` relies on. A
+/// stored-but-unreadable document stops the sync with an error rather than reading as "no pins".
 pub fn sync(
     checkout: &Path,
-    pins_file: &Path,
+    project_id: &str,
+    state_dir: &Path,
     library_root: &Path,
     record_path: &Path,
     only: Option<&str>,
     mode: Mode,
 ) -> Result<Vec<PinOutcome>, String> {
-    let pins = workflows::read_pins(pins_file)?;
+    let pins = crate::project::rules::pins(project_id).map_err(|error| error.to_string())?;
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
     // The bundle that put `.nucleos/workflow/` here, and its outcome's index, for the pointer.
@@ -1110,7 +1116,6 @@ pub fn sync(
     }
     if mode == Mode::Apply
         && let Some((index, bundle_dir)) = workflow_owner
-        && let Some(state_dir) = pins_file.parent()
         && let Err(error) = place_project_pointer(checkout, state_dir, &bundle_dir)
     {
         // The pin's files are in place, and without the pointer none of them can find the
@@ -1142,7 +1147,7 @@ pub const STATE_SUBDIRS: &[&str] = &["plans", "specs", "loops"];
 /// Write [`PROJECT_POINTER`] into `checkout`, make the state directory's subdirectories, and keep
 /// `.nucleos/` out of the repository's status.
 ///
-/// `state_dir` is the project's (`~/.nucleos/projects/<id>/`, the parent of its pins file), so
+/// `state_dir` is the project's (`~/.nucleos/projects/<id>/`), so
 /// the id is its last segment — the one spelling `project::state::dir` built it from. The pointer
 /// is rewritten only when it would change, so an unchanged sync touches nothing.
 ///
@@ -1232,15 +1237,23 @@ pub async fn into_worktree(
     let Some(state_dir) = crate::project::state::dir(machine_root, project_id) else {
         return;
     };
-    let pins_file = state_dir.join(crate::project::state::PINS_FILE);
-    if !pins_file.is_file() {
+    if !crate::project::rules::is_stored(project_id, "workflow_pins") {
         return;
     }
     let record = worktree_record(&state_dir, worktree);
     let checkout = worktree.to_path_buf();
     let library = library_root.to_path_buf();
+    let id = project_id.to_string();
     let synced = tokio::task::spawn_blocking(move || {
-        sync(&checkout, &pins_file, &library, &record, None, Mode::Apply)
+        sync(
+            &checkout,
+            &id,
+            &state_dir,
+            &library,
+            &record,
+            None,
+            Mode::Apply,
+        )
     })
     .await
     .map_err(|error| error.to_string())
@@ -1503,14 +1516,13 @@ mod tests {
 
     #[tokio::test]
     async fn f5_a_missing_workflow_is_fail_soft_and_writes_a_feed_line() {
+        let _home = crate::project::rules::testing::Home::new();
         let pool = crate::testdb::fresh_pool().await;
         let temp = tempfile::tempdir().unwrap();
         let worktree = temp.path().join("worktree");
         std::fs::create_dir_all(&worktree).unwrap();
-        crate::project::state::write_for_test(
-            temp.path(),
+        crate::project::rules::testing::publish_pins(
             "project",
-            crate::project::state::PINS_FILE,
             "workflows:\n  - name: dev\n    version: 1.0\n    hash: sha256:missing\n    origin: test\n",
         );
 
@@ -1619,10 +1631,8 @@ mod tests {
             crate::execution::git_exec::INTEGRATION_PREFIX
         ));
         std::fs::create_dir_all(&tree).unwrap();
-        crate::project::state::write_for_test(
-            temp.path(),
+        crate::project::rules::testing::publish_pins(
             "project",
-            crate::project::state::PINS_FILE,
             "workflows:\n  - name: dev\n    version: 1.0\n    hash: sha256:missing\n    origin: test\n",
         );
 
@@ -1652,10 +1662,8 @@ mod tests {
             crate::verify::postgate::POSTGATE_PREFIX
         ));
         std::fs::create_dir_all(&tree).unwrap();
-        crate::project::state::write_for_test(
-            temp.path(),
+        crate::project::rules::testing::publish_pins(
             "project",
-            crate::project::state::PINS_FILE,
             "workflows:\n  - name: dev\n    version: 1.0\n    hash: sha256:missing\n    origin: test\n",
         );
 
@@ -1693,17 +1701,20 @@ mod tests {
     /// A bundle that owns `.nucleos/workflow/` is told, beside its files, which project it is in
     /// and where it lives; the project's state gets its task-instance folders; and `.nucleos/`
     /// stays out of the repository's status.
-    #[test]
-    fn a_workflow_dir_owner_gets_the_project_pointer_and_its_state_dirs() {
+    #[tokio::test]
+    async fn a_workflow_dir_owner_gets_the_project_pointer_and_its_state_dirs() {
+        let _home = crate::project::rules::testing::Home::new();
+        let pool = crate::testdb::fresh_pool().await;
         let (temp, checkout, _) = setup(
             &[(".nucleos/workflow/workflow.md", "rules")],
             &[".nucleos/workflow/"],
         );
         let state = temp.path().join("home").join("projects").join("alpha");
-        let pins = state.join(crate::project::state::PINS_FILE);
         let record = state.join(crate::project::state::MATERIALIZED_FILE);
         let library = temp.path().join("lib");
-        workflows::install(&pins, &bundle(temp.path(), "1.0")).unwrap();
+        workflows::install(&pool, "alpha", &bundle(temp.path(), "1.0"))
+            .await
+            .unwrap();
         let repo = std::process::Command::new("git")
             .args(["init", "--quiet"])
             .current_dir(&checkout)
@@ -1711,10 +1722,28 @@ mod tests {
             .is_ok_and(|status| status.success());
 
         // A plan writes nothing, the pointer included.
-        sync(&checkout, &pins, &library, &record, None, Mode::Preview).unwrap();
+        sync(
+            &checkout,
+            "alpha",
+            &state,
+            &library,
+            &record,
+            None,
+            Mode::Preview,
+        )
+        .unwrap();
         assert!(!checkout.join(PROJECT_POINTER).exists());
 
-        let outcomes = sync(&checkout, &pins, &library, &record, None, Mode::Apply).unwrap();
+        let outcomes = sync(
+            &checkout,
+            "alpha",
+            &state,
+            &library,
+            &record,
+            None,
+            Mode::Apply,
+        )
+        .unwrap();
         assert_eq!(outcomes[0].error, None);
         let pointer: serde_json::Value =
             serde_json::from_str(&read(&checkout.join(PROJECT_POINTER))).unwrap();
@@ -1737,7 +1766,16 @@ mod tests {
                 .files
                 .contains_key(PROJECT_POINTER)
         );
-        let outcomes = sync(&checkout, &pins, &library, &record, None, Mode::Apply).unwrap();
+        let outcomes = sync(
+            &checkout,
+            "alpha",
+            &state,
+            &library,
+            &record,
+            None,
+            Mode::Apply,
+        )
+        .unwrap();
         assert!(outcomes[0].report.as_ref().unwrap().conflicts.is_empty());
         assert_eq!(outcomes[0].error, None);
 
@@ -1754,17 +1792,21 @@ mod tests {
 
     /// Only a bundle that owns the workflow directory gets a pointer: one placing other files has
     /// nothing that would read it.
-    #[test]
-    fn a_bundle_not_owning_the_workflow_dir_gets_no_pointer() {
+    #[tokio::test]
+    async fn a_bundle_not_owning_the_workflow_dir_gets_no_pointer() {
+        let _home = crate::project::rules::testing::Home::new();
+        let pool = crate::testdb::fresh_pool().await;
         let (temp, checkout, _) = setup(&[("a.md", "one")], &["a.md"]);
         let state = temp.path().join("home").join("projects").join("alpha");
-        let pins = state.join(crate::project::state::PINS_FILE);
         let record = state.join(crate::project::state::MATERIALIZED_FILE);
-        workflows::install(&pins, &bundle(temp.path(), "1.0")).unwrap();
+        workflows::install(&pool, "alpha", &bundle(temp.path(), "1.0"))
+            .await
+            .unwrap();
 
         let outcomes = sync(
             &checkout,
-            &pins,
+            "alpha",
+            &state,
             &temp.path().join("lib"),
             &record,
             None,
@@ -1779,22 +1821,41 @@ mod tests {
 
     /// The pins decide what is synced: a drifted bundle is not, an ejected one comes from the
     /// project's copy, an adopted one is the project's own folder and needs nothing.
-    #[test]
-    fn syncing_follows_the_pins_and_refuses_bytes_nobody_pinned() {
+    #[tokio::test]
+    async fn syncing_follows_the_pins_and_refuses_bytes_nobody_pinned() {
+        let _home = crate::project::rules::testing::Home::new();
+        let pool = crate::testdb::fresh_pool().await;
         let (temp, checkout, record) = setup(&[("a.md", "one")], &["a.md"]);
-        let pins = temp
-            .path()
-            .join("state")
-            .join(crate::project::state::PINS_FILE);
+        let state = temp.path().join("state").join("follows-project");
         let library = temp.path().join("lib");
-        workflows::install(&pins, &bundle(temp.path(), "1.0")).unwrap();
+        workflows::install(&pool, "follows-project", &bundle(temp.path(), "1.0"))
+            .await
+            .unwrap();
 
-        let outcomes = sync(&checkout, &pins, &library, &record, None, Mode::Apply).unwrap();
+        let outcomes = sync(
+            &checkout,
+            "follows-project",
+            &state,
+            &library,
+            &record,
+            None,
+            Mode::Apply,
+        )
+        .unwrap();
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].report.as_ref().unwrap().written.len(), 1);
 
         std::fs::write(library.join("dev/1.0/a.md"), "tampered").unwrap();
-        let outcomes = sync(&checkout, &pins, &library, &record, None, Mode::Apply).unwrap();
+        let outcomes = sync(
+            &checkout,
+            "follows-project",
+            &state,
+            &library,
+            &record,
+            None,
+            Mode::Apply,
+        )
+        .unwrap();
         assert!(
             outcomes[0]
                 .skipped
@@ -1808,7 +1869,8 @@ mod tests {
         assert!(
             sync(
                 &checkout,
-                &pins,
+                "follows-project",
+                &state,
                 &library,
                 &record,
                 Some("nope"),
@@ -1816,6 +1878,106 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// RED (4.2): the NEW signature `sync(checkout, project_id, state_dir, library_root, record_path, only, mode)`.
+    /// The pins come from the store, the pointer goes under the `state_dir` argument.
+    #[tokio::test]
+    async fn sync_reads_pins_from_the_store_and_places_the_pointer_under_the_state_dir() {
+        let _home = crate::project::rules::testing::Home::new();
+        let pool = crate::testdb::fresh_pool().await;
+        let project_id = "sync-store-project";
+        let (temp, checkout, _) = setup(
+            &[(".nucleos/workflow/workflow.md", "rules")],
+            &[".nucleos/workflow/"],
+        );
+        let state = temp.path().join("home").join("projects").join(project_id);
+        let record = state.join(crate::project::state::MATERIALIZED_FILE);
+        let library = temp.path().join("lib");
+        workflows::install(&pool, project_id, &bundle(temp.path(), "1.0"))
+            .await
+            .unwrap();
+
+        let outcomes = sync(
+            &checkout,
+            project_id,
+            &state,
+            &library,
+            &record,
+            None,
+            Mode::Apply,
+        )
+        .unwrap();
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].error, None);
+        assert!(checkout.join(".nucleos/workflow/workflow.md").is_file());
+        let pointer: serde_json::Value =
+            serde_json::from_str(&read(&checkout.join(PROJECT_POINTER))).unwrap();
+        assert_eq!(pointer["id"], project_id);
+        assert_eq!(
+            Path::new(pointer["state_dir"].as_str().unwrap()),
+            std::path::absolute(&state).unwrap()
+        );
+    }
+
+    /// RED (4.2): a project with no stored `workflow_pins` has nothing pinned, so a sync places nothing.
+    #[test]
+    fn sync_is_a_no_op_when_no_pins_document_is_stored() {
+        let _home = crate::project::rules::testing::Home::new();
+        let project_id = "sync-empty-project";
+        let (temp, checkout, _) = setup(&[("a.md", "one")], &["a.md"]);
+        let state = temp.path().join("home").join("projects").join(project_id);
+        let record = state.join(crate::project::state::MATERIALIZED_FILE);
+        assert!(!crate::project::rules::is_stored(
+            project_id,
+            "workflow_pins"
+        ));
+
+        let outcomes = sync(
+            &checkout,
+            project_id,
+            &state,
+            &temp.path().join("lib"),
+            &record,
+            None,
+            Mode::Apply,
+        )
+        .unwrap();
+
+        assert!(outcomes.is_empty());
+        assert!(!checkout.join("a.md").exists());
+        assert!(!checkout.join(PROJECT_POINTER).exists());
+        assert!(!record.exists());
+    }
+
+    /// RED (4.2): a stored-but-unreadable pins document stops the sync with an error; it is never read as "no pins".
+    #[test]
+    fn an_unreadable_pins_document_refuses_instead_of_defaulting() {
+        let _home = crate::project::rules::testing::Home::new();
+        let project_id = "sync-unreadable-project";
+        crate::project::rules::testing::publish_unreadable(
+            project_id,
+            "workflow_pins",
+            "not a pins document",
+        );
+        let (temp, checkout, _) = setup(&[("a.md", "one")], &["a.md"]);
+        let state = temp.path().join("home").join("projects").join(project_id);
+        let record = state.join(crate::project::state::MATERIALIZED_FILE);
+
+        let refusal = sync(
+            &checkout,
+            project_id,
+            &state,
+            &temp.path().join("lib"),
+            &record,
+            None,
+            Mode::Apply,
+        )
+        .unwrap_err();
+
+        assert!(refusal.contains("workflow_pins"), "{refusal}");
+        assert!(!checkout.join("a.md").exists());
     }
 
     /* ------------------------------------------------------- managed block -- */

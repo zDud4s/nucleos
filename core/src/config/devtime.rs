@@ -5,7 +5,7 @@ use super::*;
 /// The devtime ingestion's settings.
 ///
 /// Derives `PartialEq` and not `Eq`, because the amber rate is an `f64`.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DevtimeConfig {
     pub enabled: bool,
@@ -21,6 +21,8 @@ pub struct DevtimeConfig {
     pub parse_failure_min_lines: u64,
     /// The rule engine's vocabularies and thresholds (sub-project 2).
     pub rules: DevtimeRulesConfig,
+    /// The automatic actions' thresholds (phase 2, shadow mode first).
+    pub actions: DevtimeActionsConfig,
 }
 
 impl Default for DevtimeConfig {
@@ -33,6 +35,7 @@ impl Default for DevtimeConfig {
             parse_failure_amber_rate: 0.02,
             parse_failure_min_lines: 200,
             rules: DevtimeRulesConfig::default(),
+            actions: DevtimeActionsConfig::default(),
         }
     }
 }
@@ -60,7 +63,7 @@ pub(super) fn owned(items: &[&str]) -> Vec<String> {
 /// The rule engine's whole configuration: every threshold, program list and vocabulary a rule reads.
 /// Rule code holds no such literal (spec §3.5), so a partial file at any nesting level is valid and
 /// every field has the default the spec states.
-#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DevtimeRulesConfig {
     pub enabled: bool,
@@ -95,7 +98,7 @@ impl Default for DevtimeRulesConfig {
 
 /// Which programs count as a test, a build, a lint, a mutation, a sleep, a commit or a revert, and
 /// which tool names are shell, edit, read or search tools.
-#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DevtimeCommandsConfig {
     pub test: Vec<String>,
@@ -178,7 +181,7 @@ impl Default for DevtimeCommandsConfig {
 }
 
 /// One project's extra test, build and lint programs.
-#[derive(Debug, Clone, Default, Deserialize, serde::Serialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DevtimeProjectCommands {
     pub test: Vec<String>,
@@ -187,7 +190,7 @@ pub struct DevtimeProjectCommands {
 }
 
 /// Case-insensitive globs (`*` only) over a subagent's `agentType`. The reviewer list is tried first.
-#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DevtimeRolesConfig {
     pub reviewer: Vec<String>,
@@ -204,7 +207,7 @@ impl Default for DevtimeRolesConfig {
 }
 
 /// The words the parser and the rules match in memory. Only the derived flag or token is ever stored.
-#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DevtimeVocabConfig {
     /// A prompt that opens with one of these counts as a correction of the previous answer.
@@ -263,7 +266,7 @@ impl Default for DevtimeVocabConfig {
 }
 
 /// Every numeric threshold a rule compares against.
-#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DevtimeThresholdsConfig {
     /// D3: a Grep/Glob streak without an edit.
@@ -306,7 +309,7 @@ impl Default for DevtimeThresholdsConfig {
 }
 
 /// What counts as an external path, and which file extensions are code.
-#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DevtimePathsConfig {
     /// Globs, case-insensitive, with `\` read as `/`.
@@ -327,7 +330,7 @@ impl Default for DevtimePathsConfig {
 }
 
 /// How a rule's precision is judged (spec §7).
-#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DevtimePrecisionConfig {
     /// A rule below this precision is flagged out of phase 2.
@@ -355,7 +358,7 @@ impl Default for DevtimePrecisionConfig {
 }
 
 /// When a slow turn that no rule explains is worth listing.
-#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DevtimeUnexplainedConfig {
     pub median_multiple: f64,
@@ -382,7 +385,7 @@ impl Default for DevtimeUnexplainedConfig {
 }
 
 /// Where the optional adapter sources live. Empty means absent.
-#[derive(Debug, Clone, Default, Deserialize, serde::Serialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DevtimeAdaptersConfig {
     pub permission_log: String,
@@ -392,6 +395,7 @@ pub struct DevtimeAdaptersConfig {
 /// What the grammar alone cannot say: a signature for a class the parser does not have, a fraction
 /// outside [0, 1], or a count that must be at least one. A file that fails this is refused whole.
 pub fn validate_devtime(config: &DevtimeConfig) -> Result<(), String> {
+    validate_actions(&config.actions)?;
     let rules = &config.rules;
     for class in rules.vocab.error_signatures.keys() {
         if !RULES_ERROR_CLASSES.contains(&class.as_str()) {
@@ -487,23 +491,28 @@ pub fn load_devtime_config(path: &Path) -> DevtimeConfig {
     }
 }
 
-/// Where the thresholds a findings request ran under came from. Reported to the page so a typo in
-/// `devtime.yaml` is visible there instead of silently showing the default precision thresholds.
+/// Where the thresholds a findings request ran under came from. Reported to the page, which shows no
+/// note for `File` and one line for either of the others, so the default precision thresholds are
+/// never shown as if they were the stored ones.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ThresholdsSource {
-    /// The file parsed and applies.
+    /// The stored `devtime` document applies. Named after the file that document replaced, because
+    /// `file` is the value the shell reads.
     #[default]
     File,
-    /// The file is currently invalid; the last version that parsed applies.
+    /// A file that turned invalid, its last version that parsed applying. Only the test-only file
+    /// cache below answers this now: the daemon reads the document, and a write that does not
+    /// validate is refused rather than stored. The shell still has a line for it.
     LastGood,
-    /// No file, or an invalid one and no good version ever seen.
+    /// No document is stored, or the stored one cannot be read: the defaults apply.
     Default,
 }
 
 /// One file's cache slot: the (length, mtime) of the last stat that was read, the last config that
 /// parsed, and whether that read was a refusal (so an unchanged bad file is not re-read, or
 /// re-logged, on every request).
+#[cfg(test)]
 pub(super) struct DevtimeCacheEntry {
     len: u64,
     modified: Option<std::time::SystemTime>,
@@ -511,25 +520,22 @@ pub(super) struct DevtimeCacheEntry {
     invalid: bool,
 }
 
+#[cfg(test)]
 pub(super) type DevtimeCache =
     std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, DevtimeCacheEntry>>;
 
 /// A config and where it came from.
-pub type ResolvedDevtime = (DevtimeConfig, ThresholdsSource);
+#[cfg(test)]
+pub(super) type ResolvedDevtime = (DevtimeConfig, ThresholdsSource);
 
 /// The devtime config at `path`, re-read only when the file's length or modification time moved.
 ///
-/// Findings and mark requests call this per request; `load_devtime_config` is the startup read.
+/// Test-only: the daemon reads the `devtime` document (`http/analytics.rs`), and keeping this out of
+/// production means code still reaching for the file does not compile.
+///
 /// An invalid edit keeps the last version that parsed (defaults only if none ever did) and is
-/// logged once per file change, not once per request. A vanished file is the defaults, as for the
-/// schedule rules: deleting the file is how an owner reverts to the defaults, so the old content
-/// must not outlive it.
-pub fn devtime_config_now(path: &Path) -> ResolvedDevtime {
-    static CACHE: std::sync::OnceLock<DevtimeCache> = std::sync::OnceLock::new();
-    cached_devtime_config(path, CACHE.get_or_init(Default::default))
-}
-
-/// The stat-checked read behind [`devtime_config_now`], apart from the static so a test can drive it.
+/// logged once per file change, not once per request. A vanished file is the defaults.
+#[cfg(test)]
 pub(super) fn cached_devtime_config(path: &Path, cache: &DevtimeCache) -> ResolvedDevtime {
     let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
     let Ok(meta) = std::fs::metadata(path) else {
@@ -584,11 +590,177 @@ pub(super) fn cached_devtime_config(path: &Path, cache: &DevtimeCache) -> Resolv
 
 /// What a cache slot answers while its file is unchanged. `None` only for a slot that has nothing
 /// to answer with, which cannot be a hit.
+#[cfg(test)]
 fn devtime_answer(entry: &DevtimeCacheEntry) -> Option<ResolvedDevtime> {
     match (&entry.last_good, entry.invalid) {
         (Some(config), false) => Some((config.clone(), ThresholdsSource::File)),
         (Some(config), true) => Some((config.clone(), ThresholdsSource::LastGood)),
         (None, true) => Some((DevtimeConfig::default(), ThresholdsSource::Default)),
         (None, false) => None,
+    }
+}
+
+/// The per-action floor on the shadow hit rate (spec 4.1).
+#[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct DevtimeHitRateMin {
+    pub inject: f64,
+    pub propose: f64,
+}
+
+impl Default for DevtimeHitRateMin {
+    fn default() -> Self {
+        Self {
+            inject: 0.6,
+            propose: 0.5,
+        }
+    }
+}
+
+/// The automatic actions' thresholds (actions design spec, sections 4 and 6). A partial or absent
+/// block is valid: every field has the spec default.
+#[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct DevtimeActionsConfig {
+    /// Global switch: false puts every pair in `off`.
+    pub enabled: bool,
+    pub precision_wilson_lower: f64,
+    pub effect_min_resolved: u32,
+    pub effect_min_sessions: u32,
+    pub effect_min_days: u32,
+    pub shadow_hit_rate_min: DevtimeHitRateMin,
+    pub min_mean_hit_cost_ms: u64,
+    pub inject_window_days: u32,
+    pub inject_min_count: u32,
+    pub inject_min_cost_ms: u64,
+    pub inject_max_per_session: u32,
+    pub inject_cooldown_days: u32,
+    pub propose_min_sessions: u32,
+    pub propose_min_cost_ms: u64,
+    pub propose_window_days: u32,
+    pub propose_max_open: u32,
+    pub human_min_marks: u32,
+    pub holdout_fraction: f64,
+    pub rollback_window: u32,
+    pub reentry_days: u32,
+    /// Action to the rule ids that start in shadow.
+    pub pairs: BTreeMap<String, Vec<String>>,
+}
+
+impl Default for DevtimeActionsConfig {
+    fn default() -> Self {
+        let mut pairs = BTreeMap::new();
+        pairs.insert("inject".to_string(), owned(&["D3", "D6"]));
+        pairs.insert("propose".to_string(), owned(&["F1", "F2"]));
+        Self {
+            enabled: true,
+            precision_wilson_lower: 0.6,
+            effect_min_resolved: 30,
+            effect_min_sessions: 10,
+            effect_min_days: 14,
+            shadow_hit_rate_min: DevtimeHitRateMin::default(),
+            min_mean_hit_cost_ms: 30_000,
+            inject_window_days: 14,
+            inject_min_count: 3,
+            inject_min_cost_ms: 120_000,
+            inject_max_per_session: 3,
+            inject_cooldown_days: 3,
+            propose_min_sessions: 3,
+            propose_min_cost_ms: 600_000,
+            propose_window_days: 14,
+            propose_max_open: 5,
+            human_min_marks: 5,
+            holdout_fraction: 0.10,
+            rollback_window: 30,
+            reentry_days: 14,
+            pairs,
+        }
+    }
+}
+
+/// Refuses a fraction outside [0, 1] and an injection cap of zero.
+fn validate_actions(actions: &DevtimeActionsConfig) -> Result<(), String> {
+    let fractions = [
+        ("actions.holdout_fraction", actions.holdout_fraction),
+        (
+            "actions.precision_wilson_lower",
+            actions.precision_wilson_lower,
+        ),
+        (
+            "actions.shadow_hit_rate_min.inject",
+            actions.shadow_hit_rate_min.inject,
+        ),
+        (
+            "actions.shadow_hit_rate_min.propose",
+            actions.shadow_hit_rate_min.propose,
+        ),
+    ];
+    for (name, value) in fractions {
+        if !(0.0..=1.0).contains(&value) {
+            return Err(format!("{name} must be within [0, 1], got {value}"));
+        }
+    }
+    if actions.inject_max_per_session == 0 {
+        return Err("actions.inject_max_per_session must be at least 1".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod actions_tests {
+    use super::*;
+
+    #[test]
+    fn missing_actions_block_gives_the_spec_defaults() {
+        let config = parse_devtime_config("enabled: true\n").expect("parses");
+        let a = config.actions;
+        assert!(a.enabled);
+        assert_eq!(a.precision_wilson_lower, 0.6);
+        assert_eq!(a.effect_min_resolved, 30);
+        assert_eq!(a.effect_min_sessions, 10);
+        assert_eq!(a.effect_min_days, 14);
+        assert_eq!(a.shadow_hit_rate_min.inject, 0.6);
+        assert_eq!(a.shadow_hit_rate_min.propose, 0.5);
+        assert_eq!(a.min_mean_hit_cost_ms, 30_000);
+        assert_eq!(a.inject_window_days, 14);
+        assert_eq!(a.inject_min_count, 3);
+        assert_eq!(a.inject_min_cost_ms, 120_000);
+        assert_eq!(a.inject_max_per_session, 3);
+        assert_eq!(a.inject_cooldown_days, 3);
+        assert_eq!(a.propose_min_sessions, 3);
+        assert_eq!(a.propose_min_cost_ms, 600_000);
+        assert_eq!(a.propose_window_days, 14);
+        assert_eq!(a.propose_max_open, 5);
+        assert_eq!(a.human_min_marks, 5);
+        assert_eq!(a.holdout_fraction, 0.10);
+        assert_eq!(a.rollback_window, 30);
+        assert_eq!(a.reentry_days, 14);
+        assert_eq!(a.pairs["inject"], vec!["D3", "D6"]);
+        assert_eq!(a.pairs["propose"], vec!["F1", "F2"]);
+    }
+
+    #[test]
+    fn partial_actions_block_keeps_the_other_defaults() {
+        let config =
+            parse_devtime_config("actions:\n  inject_max_per_session: 2\n").expect("parses");
+        assert_eq!(config.actions.inject_max_per_session, 2);
+        assert_eq!(config.actions.inject_cooldown_days, 3);
+    }
+
+    #[test]
+    fn unknown_actions_key_is_refused() {
+        assert!(parse_devtime_config("actions:\n  bogus_key: 1\n").is_err());
+    }
+
+    #[test]
+    fn holdout_fraction_outside_unit_interval_is_refused() {
+        assert!(parse_devtime_config("actions:\n  holdout_fraction: 1.5\n").is_err());
+        assert!(parse_devtime_config("actions:\n  holdout_fraction: -0.1\n").is_err());
+        assert!(parse_devtime_config("actions:\n  holdout_fraction: 0.25\n").is_ok());
+    }
+
+    #[test]
+    fn zero_inject_max_per_session_is_refused() {
+        assert!(parse_devtime_config("actions:\n  inject_max_per_session: 0\n").is_err());
     }
 }

@@ -11,6 +11,7 @@
  */
 export async function invoke<T>(command: string): Promise<T> {
   if (command === "get_daemon_token") return "preview" as T;
+  if (command === "install_kind") return "other" as T;
   throw new Error(`the preview has no answer for invoke("${command}")`);
 }
 

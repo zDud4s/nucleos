@@ -173,8 +173,8 @@ pub(super) fn machine_config_root(
 /// none.
 ///
 /// Two refusals, and they are different facts: `no_machine_root` is this machine having no home
-/// directory — the same name `/config/machine` refuses with — and `bad_project_id` is an id that
-/// cannot name a directory without meaning another one (`project::state::valid_id`).
+/// directory, and `bad_project_id` is an id that cannot name a directory without meaning another
+/// one (`project::state::valid_id`).
 pub(super) fn project_state_dir(
     state: &AppState,
     id: &str,
@@ -184,26 +184,9 @@ pub(super) fn project_state_dir(
         .ok_or_else(|| refusal(StatusCode::UNPROCESSABLE_ENTITY, "bad_project_id"))
 }
 
-/// Where a claimed file actually is, for the read route and the write route alike.
-///
-/// A state row is joined onto the state directory, a project row onto the project root — and in
-/// both cases it is the REGISTRY's string that is joined, never the caller's, for the reason
-/// `post_project_write` gives.
-pub(super) fn claim_home(
-    state: &AppState,
-    id: &str,
-    root: &std::path::Path,
-    claim: &crate::ownership::Claim,
-) -> Result<PathBuf, (StatusCode, Json<serde_json::Value>)> {
-    match claim.home {
-        crate::ownership::Home::State => project_state_dir(state, id),
-        crate::ownership::Home::Project => Ok(root.to_path_buf()),
-    }
-}
-
 /// The fence in force in one project, read off the disk on the thread pool.
 ///
-/// `spawn_blocking`, because assembling it opens the pins file and walks whatever bundles are
+/// `spawn_blocking`, because assembling it reads the stored pins and walks whatever bundles are
 /// installed. Small work, but filesystem work, and the runtime this daemon shares with every
 /// sidecar and every run is not the place to do it inline.
 ///
@@ -211,7 +194,7 @@ pub(super) fn claim_home(
 /// núcleo's own rows still stand, so the write boundary never disappears because a path lookup came
 /// back empty.
 ///
-/// The same is true of a project with no state directory: no pins file means nothing is installed,
+/// The same is true of a project with no stored pins: no `workflow_pins` document means nothing is installed,
 /// and the fence is the núcleo's rows alone.
 pub(super) async fn claims_for_project(
     state: &AppState,
@@ -219,27 +202,16 @@ pub(super) async fn claims_for_project(
     root: PathBuf,
 ) -> Result<Vec<crate::ownership::Claim>, StatusCode> {
     let library = state.workflow_library.clone();
-    let pins = crate::project::state::file(
-        state.machine_config_root.as_deref(),
-        id,
-        crate::project::state::PINS_FILE,
-    );
+    let project_id = id.to_string();
     tokio::task::spawn_blocking(move || match library {
-        Some(library) => crate::ownership::claims_for(&root, pins.as_deref(), &library),
+        Some(library) => crate::ownership::claims_for(&root, &project_id, &library),
         None => crate::ownership::CLAIMS.to_vec(),
     })
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-#[derive(Deserialize)]
-pub(super) struct WriteRequest {
-    /// A claim's identity, forward slashes. Only ever compared — never joined; see below.
-    pub(super) path: String,
-    pub(super) contents: String,
-}
-
-/// A refusal with its reason beside its name — the shape `POST /write` uses for `invalid`.
+/// A refusal with its reason beside its name — the shape a refusal with a reason uses.
 pub(super) fn refusal_with_detail(
     status: StatusCode,
     name: &'static str,
@@ -401,17 +373,13 @@ pub(super) fn chars(text: &str) -> Vec<char> {
     text.chars().collect()
 }
 
-/// The pinned model names as they are on disk right now.
+/// The `models` document from the settings snapshot, per request, so a choice written through the
+/// settings door is live without a restart (the snapshot is swapped on each committed write, and
+/// is not held on `AppState`, which every caller of this depends on).
 ///
-/// Re-read per request rather than held on `AppState`, which every caller of this depends on: a
-/// pinned choice travels as `--model` on the turn itself, so a name added to the file is one this
-/// daemon can already run — and a catalogue cached at startup would spend a whole daemon lifetime
-/// refusing it. The daemon's price refresh (`crate::price_refresh`) and `scripts/refresh-models.py`
-/// both rewrite this file, and nothing should have to be restarted for that to take.
-///
-/// An unreadable or missing file answers with the built-in defaults rather than an error, matching
-/// what startup does: a picker that fails closed leaves somebody unable to change a model because
-/// of a typo in a key that has nothing to do with models.
+/// Unreadable or absent answers the defaults, matching what startup does: a picker that fails
+/// closed leaves somebody unable to change a model because of a typo in a key that has nothing to
+/// do with models.
 pub(super) fn models_config() -> crate::config::ModelsConfig {
     crate::config::models_config_now()
 }

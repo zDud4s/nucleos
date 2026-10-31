@@ -1407,6 +1407,15 @@ where
 
 #[cfg(any(test, feature = "testkit"))]
 pub fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    // The lock order is this lock first, then the rules gate. The gate hold lasts until the thread
+    // ends, so a thread that holds it and waits here can deadlock against one that holds this lock
+    // and waits for the gate. Fail at the violation rather than hang on the unlucky schedule.
+    if crate::project::rules::testing::holds_the_gate() {
+        panic!(
+            "lock-order violation: this thread holds the rules gate and asks for the env lock, \
+             which can deadlock; take the env lock first or use one fixture per test"
+        );
+    }
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
         .lock()

@@ -18,11 +18,19 @@ import type {
 import type { CalendarConfigView, EventOccurrence } from "../data/calendar";
 import type { ChannelNotifyPolicy, FeedEntry, FeedSeen, FeedTimeline, NotifyPolicy, PendingNotification } from "../data/feed";
 import type { ChannelIdentities, ChannelsReadout, PairingCode, PairingStatus } from "../data/channels";
-import type { MachineConfig, MachineSecret } from "../data/machine-config";
+import type { MachineSecret } from "../data/secrets";
 import type { Branches } from "../data/project-git";
 import type { ProjectReadings } from "../data/project-readings";
 import type { AnalyticsDays, AnalyticsReport, QuotaHistory } from "../data/analytics";
-import type { DevtimeDay, DevtimeOverview, ModelTokens } from "../data/devtime";
+import type {
+  ActionPairs,
+  DevtimeDay,
+  DevtimeOverview,
+  ModelTokens,
+  PromotionReport,
+  ShadowItem,
+  ShadowPage,
+} from "../data/devtime";
 import type { PipelineReport } from "../data/analytics-pipeline";
 import type {
   ApiTokenSummary,
@@ -442,6 +450,50 @@ export function previewQuotaHistory(rawDays: string | null): QuotaHistory {
         })),
       },
     ],
+  };
+}
+
+/** `GET /analytics/devtime/actions`: one pair short of promotion (human review missing), one live. */
+export function previewActionPairs(): ActionPairs {
+  const report: PromotionReport = {
+    action_eligible: true, wilson_lower: 0.71, n_resolved: 14, n_sessions: 7, days_covered: 10, sample_ok: true,
+    hit_rate: 0.82, mean_hit_cost_ms: 4200, shadow_approved: true, avoidable_now: 0.1, avoidable_prev: 0.18,
+    regression_ok: true, human_marks: 2, human_rate: 0.5, human_ok: false, ready: false,
+    median_hit_cost_ms: 3800, suppress_rate: 0.12, ignored: 1,
+  };
+  return {
+    pairs: [
+      { action: "inject", rule_id: "A1", mode: "shadow", since: null, changed_by: null, report },
+      {
+        action: "propose", rule_id: "B2", mode: "live", since: "2026-10-20T09:00:00Z", changed_by: "owner",
+        report: { ...report, human_marks: 6, human_rate: 0.9, human_ok: true, ready: true },
+      },
+    ],
+  };
+}
+
+/** `GET /analytics/devtime/actions/shadow`: a fire with an outcome, a fire awaiting one, and a suppression. */
+export function previewShadowPage(action: string | null, rule: string | null): ShadowPage {
+  const items: ShadowItem[] = [
+    {
+      id: 3, action: "inject", rule_id: "A1", project_id: "alpha", decision: "fire", suppress_reason: null,
+      template_id: "tpl_reread", params: { file: "src/main.rs", limit: 3 }, decided_at: "2026-10-29T10:00:00Z",
+      outcome_state: "resolved", outcome: "hit", human_verdict: "useful",
+    },
+    {
+      id: 2, action: "inject", rule_id: "A1", project_id: "alpha", decision: "fire", suppress_reason: null,
+      template_id: "tpl_reread", params: {}, decided_at: "2026-10-29T08:30:00Z",
+      outcome_state: "pending", outcome: null, human_verdict: null,
+    },
+    {
+      id: 1, action: "inject", rule_id: "A1", project_id: "beta", decision: "suppress", suppress_reason: "budget",
+      template_id: "tpl_reread", params: {}, decided_at: "2026-10-28T16:00:00Z",
+      outcome_state: "none", outcome: null, human_verdict: null,
+    },
+  ];
+  return {
+    items: items.filter((entry) => (action === null || entry.action === action) && (rule === null || entry.rule_id === rule)),
+    next_cursor: null,
   };
 }
 
@@ -1720,27 +1772,29 @@ export const VCS_REQUESTS: VcsRequestSummary[] = [
  * "Nothing recorded in shadow yet" beside a roster row claiming 5 of 5 classes clearing the
  * bar — the contradiction reached a screen for the first time when round 8 made alpha
  * promotable. The bar is `READINESS_MIN_REVIEWED` reviews at `READINESS_MIN_AGREE_PERCENT`
- * agreement, per class; `ClassTally` carries no "withheld" field, so a class the classifier
- * held back is one with `would_allow: 0` and the total sitting in `would_pend`/`would_deny`.
+ * agreement, per class; `ClassTally` carries no single "withheld" field, so a class the classifier
+ * held back is one with `would_allow: 0` and the total sitting in `would_pend`/`would_deny`;
+ * the review-quality fields (stricter/looser/unreviewed/reviewed_*) say how far a human got.
  */
 export const SCOREBOARD: Record<string, ClassTally[]> = {
   alpha: [
-    { mode: "shadow", action_class: "read-local", total: 46, would_allow: 46, would_pend: 0, would_deny: 0, reviewed: 18, agree: 18, disagree: 0 },
-    { mode: "shadow", action_class: "confined-to-workspace", total: 31, would_allow: 31, would_pend: 0, would_deny: 0, reviewed: 14, agree: 14, disagree: 0 },
-    { mode: "shadow", action_class: "vcs-local", total: 12, would_allow: 12, would_pend: 0, would_deny: 0, reviewed: 11, agree: 11, disagree: 0 },
+    { mode: "shadow", action_class: "read-local", total: 46, would_allow: 46, would_pend: 0, would_deny: 0, reviewed: 18, agree: 18, disagree: 0, stricter: 0, looser: 0, unreviewed: 28, reviewed_allow: 18, reviewed_pend: 0, reviewed_deny: 0, oldest_unreviewed_at: "2026-10-27T09:14:00Z" },
+    { mode: "shadow", action_class: "confined-to-workspace", total: 31, would_allow: 31, would_pend: 0, would_deny: 0, reviewed: 14, agree: 14, disagree: 0, stricter: 0, looser: 0, unreviewed: 17, reviewed_allow: 14, reviewed_pend: 0, reviewed_deny: 0, oldest_unreviewed_at: "2026-10-28T16:02:00Z" },
+    { mode: "shadow", action_class: "vcs-local", total: 12, would_allow: 12, would_pend: 0, would_deny: 0, reviewed: 11, agree: 11, disagree: 0, stricter: 0, looser: 0, unreviewed: 1, reviewed_allow: 11, reviewed_pend: 0, reviewed_deny: 0, oldest_unreviewed_at: "2026-10-29T08:30:00Z" },
     // The two the classifier withheld — the other half of the bar, and the reason alpha's
     // row carries `withheld_classes_ready: 2`.
-    { mode: "shadow", action_class: "unrecognized", total: 22, would_allow: 0, would_pend: 22, would_deny: 0, reviewed: 20, agree: 19, disagree: 1 },
-    { mode: "shadow", action_class: "push-merge-deploy", total: 15, would_allow: 0, would_pend: 15, would_deny: 0, reviewed: 12, agree: 12, disagree: 0 },
+    { mode: "shadow", action_class: "unrecognized", total: 22, would_allow: 0, would_pend: 22, would_deny: 0, reviewed: 20, agree: 19, disagree: 1, stricter: 0, looser: 1, unreviewed: 2, reviewed_allow: 0, reviewed_pend: 20, reviewed_deny: 0, oldest_unreviewed_at: "2026-10-29T11:45:00Z" },
+    { mode: "shadow", action_class: "push-merge-deploy", total: 15, would_allow: 0, would_pend: 15, would_deny: 0, reviewed: 12, agree: 12, disagree: 0, stricter: 0, looser: 0, unreviewed: 3, reviewed_allow: 0, reviewed_pend: 12, reviewed_deny: 0, oldest_unreviewed_at: "2026-10-29T13:20:00Z" },
   ],
   delta: [
-    { mode: "shadow", action_class: "read-local", total: 30, would_allow: 30, would_pend: 0, would_deny: 0, reviewed: 12, agree: 12, disagree: 0 },
-    { mode: "shadow", action_class: "confined-to-workspace", total: 18, would_allow: 18, would_pend: 0, would_deny: 0, reviewed: 10, agree: 10, disagree: 0 },
+    { mode: "shadow", action_class: "read-local", total: 30, would_allow: 30, would_pend: 0, would_deny: 0, reviewed: 12, agree: 12, disagree: 0, stricter: 0, looser: 0, unreviewed: 18, reviewed_allow: 12, reviewed_pend: 0, reviewed_deny: 0, oldest_unreviewed_at: "2026-10-26T10:00:00Z" },
+    { mode: "shadow", action_class: "confined-to-workspace", total: 18, would_allow: 18, would_pend: 0, would_deny: 0, reviewed: 10, agree: 10, disagree: 0, stricter: 0, looser: 0, unreviewed: 8, reviewed_allow: 10, reviewed_pend: 0, reviewed_deny: 0, oldest_unreviewed_at: "2026-10-27T12:10:00Z" },
+    // Mixed class below: 2 withheld (would_pend) decisions, none of them reviewed yet.
     // Short on evidence, not on agreement — the panel has to be able to show both ways of
     // failing the bar, or "still short" reads as one thing.
-    { mode: "shadow", action_class: "vcs-local", total: 9, would_allow: 9, would_pend: 0, would_deny: 0, reviewed: 4, agree: 4, disagree: 0 },
-    { mode: "shadow", action_class: "unrecognized", total: 11, would_allow: 0, would_pend: 11, would_deny: 0, reviewed: 10, agree: 8, disagree: 2 },
-    { mode: "shadow", action_class: "destructive", total: 6, would_allow: 0, would_pend: 0, would_deny: 6, reviewed: 3, agree: 3, disagree: 0 },
+    { mode: "shadow", action_class: "vcs-local", total: 9, would_allow: 7, would_pend: 2, would_deny: 0, reviewed: 4, agree: 4, disagree: 0, stricter: 0, looser: 0, unreviewed: 5, reviewed_allow: 4, reviewed_pend: 0, reviewed_deny: 0, oldest_unreviewed_at: "2026-10-25T07:40:00Z" },
+    { mode: "shadow", action_class: "unrecognized", total: 11, would_allow: 0, would_pend: 11, would_deny: 0, reviewed: 10, agree: 8, disagree: 2, stricter: 0, looser: 2, unreviewed: 1, reviewed_allow: 0, reviewed_pend: 10, reviewed_deny: 0, oldest_unreviewed_at: "2026-10-29T15:05:00Z" },
+    { mode: "shadow", action_class: "destructive", total: 6, would_allow: 0, would_pend: 0, would_deny: 6, reviewed: 3, agree: 3, disagree: 0, stricter: 0, looser: 0, unreviewed: 3, reviewed_allow: 0, reviewed_pend: 0, reviewed_deny: 3, oldest_unreviewed_at: "2026-10-28T09:00:00Z" },
   ],
 };
 
@@ -3311,7 +3365,26 @@ const MACHINE_AREAS: [area: string, what: string, contents: string | null][] = [
   ["models", "Which model each phase uses.", null],
 ];
 
-const MACHINE_CONFIG: MachineConfig = {
+/** What the `/config/machine` fixture answers. It goes with the fixture, when `answerSettings` replaces it. */
+export interface PreviewMachineConfig {
+  root: string;
+  root_display: string;
+  settings: {
+    path: string;
+    display: string;
+    area: string;
+    what: string;
+    takes_effect: string;
+    exists: boolean;
+    valid: boolean;
+    problem: string | null;
+    at_startup: { valid: boolean; problem: string | null };
+    contents: string | null;
+    resolved: string;
+  }[];
+}
+
+const MACHINE_CONFIG: PreviewMachineConfig = {
   root: "C:/Users/owner/.nucleos",
   root_display: "~/.nucleos",
   settings: MACHINE_AREAS.map(([area, what, contents]) => ({
@@ -4202,6 +4275,8 @@ export function answer(path: string, init?: RequestInit): unknown {
   if (projectPipeline !== null) {
     return previewPipeline(decodeURIComponent(projectPipeline[1]), analyticsDaysParam);
   }
+  if (route === "/analytics/devtime/actions") return previewActionPairs();
+  if (route === "/analytics/devtime/actions/shadow") return previewShadowPage(query.get("action"), query.get("rule"));
   if (route === "/analytics/devtime") return previewDevtime(null, analyticsDaysParam);
   const projectDevtime = /^\/projects\/([^/]+)\/analytics\/devtime$/.exec(route);
   if (projectDevtime !== null) {

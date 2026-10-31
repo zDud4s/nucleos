@@ -20,6 +20,9 @@ runtime: process liveness (pid + creation time), the directory mutex, running th
 inside a Windows Job object (so a hard-killed broker takes its child with it),
 `NUCLEOS_HEAVY=0`, and fail-open. A bug in the broker must run the command, never block it;
 a busy mutex is contention, not a bug, and is answered with exit 75.
+Exit 76: the command's process tree used no CPU for NUCLEOS_HEAVY_STALL_SECS (default 600, 0 = off),
+so it deadlocked or waited on something and was killed: do not re-run it blindly, read the thread
+dump named on stderr.
 
 Standard library only. Never `os.kill(pid, 0)` on Windows: CPython maps it to
 TerminateProcess.
@@ -36,6 +39,7 @@ import signal
 import subprocess
 import sys
 import statistics
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -67,6 +71,13 @@ BIG_MEM_MB = float("inf")
 AGENT_WAIT_MAX_S = 540.0
 CALLER_WAIT_MAX_S = 3600.0
 EXIT_QUEUE_TIMEOUT = 75
+EXIT_STALLED = 76
+DEFAULT_STALL_S = 600.0
+# The stall watcher's thread dump: this machine's gdb goes first (NUCLEOS_HEAVY_GDB overrides it),
+# deepest processes first, because the stuck one is a test binary under cargo, never cargo.
+GDB_FIXED_PATH = r"C:\Projects\mingw64\bin\gdb.exe"
+GDB_DEFAULT_TIMEOUT_S = 120.0
+GDB_MAX_PROCESSES = 6
 
 SUBCOMMANDS = ("status", "report", "hold-worktree", "warm", "idle", "gc")
 SWEEP_EVERY_S = 3600.0
@@ -438,6 +449,145 @@ def job_cpu_seconds(job) -> float | None:
     return (info.TotalUserTime + info.TotalKernelTime) / 1e7  # 100 ns units
 
 
+def _tree_pids(root: int, edges) -> list[int]:
+    """`root` and its descendants out of (pid, parent pid) pairs, parents before children."""
+    kids: dict[int, list[int]] = {}
+    for pid, ppid in edges:
+        kids.setdefault(ppid, []).append(pid)
+    tree, seen = [root], {root}
+    for pid in tree:  # grows while it is walked; `seen` survives a cycle from a reused pid
+        for kid in kids.get(pid, ()):
+            if kid not in seen:
+                seen.add(kid)
+                tree.append(kid)
+    return tree
+
+
+def _ps_seconds(text: str) -> float:
+    """A `ps` TIME column in seconds: `[DD-]HH:MM:SS`, or `M:SS.ss` on macOS."""
+    days, _, clock = text.strip().rpartition("-")
+    secs = 0.0
+    for part in clock.split(":"):
+        secs = secs * 60 + float(part)
+    return secs + (int(days) * 86400 if days else 0)
+
+
+def _posix_process_rows() -> dict[int, tuple[int, float]]:
+    """pid -> (parent pid, CPU seconds) of every process, from /proc or else from `ps`."""
+    rows: dict[int, tuple[int, float]] = {}
+    if os.path.exists("/proc/self/stat"):
+        tick = os.sysconf("SC_CLK_TCK")
+        for name in os.listdir("/proc"):
+            if not name.isdigit():
+                continue
+            try:
+                with open(f"/proc/{name}/stat", "rb") as f:
+                    # After the `(comm)`, which may hold anything: state, ppid, ... utime, stime.
+                    fields = f.read().rpartition(b")")[2].split()
+                rows[int(name)] = (int(fields[1]), (int(fields[11]) + int(fields[12])) / tick)
+            except (OSError, IndexError, ValueError):
+                continue
+        return rows
+    out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,time="], stdin=subprocess.DEVNULL,
+                         capture_output=True, text=True, timeout=10, check=True).stdout
+    for line in out.splitlines():
+        try:
+            pid, ppid, cpu = line.split()
+            rows[int(pid)] = (int(ppid), _ps_seconds(cpu))
+        except ValueError:
+            continue
+    return rows
+
+
+def _win_process_edges() -> list[tuple[int, int]]:
+    """(pid, parent pid) of every process on the machine, from a Toolhelp32 snapshot. Console
+    hosts are left out: they are nobody's work, and there is nothing to learn from dumping one."""
+    import ctypes
+    from ctypes import wintypes
+
+    class ENTRY(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", ctypes.c_wchar * 260),
+        ]
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    for step in (k32.Process32FirstW, k32.Process32NextW):
+        step.argtypes = [wintypes.HANDLE, ctypes.POINTER(ENTRY)]
+        step.restype = wintypes.BOOL
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    TH32CS_SNAPPROCESS = 0x2
+    snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if not snap or snap == wintypes.HANDLE(-1).value:
+        raise OSError("no process snapshot")
+    edges = []
+    try:
+        entry = ENTRY()
+        entry.dwSize = ctypes.sizeof(ENTRY)
+        ok = k32.Process32FirstW(snap, ctypes.byref(entry))
+        while ok:
+            if entry.szExeFile.lower() != "conhost.exe":
+                edges.append((int(entry.th32ProcessID), int(entry.th32ParentProcessID)))
+            ok = k32.Process32NextW(snap, ctypes.byref(entry))
+    finally:
+        k32.CloseHandle(snap)
+    return edges
+
+
+def _win_cpu_seconds(pids) -> float:
+    """User + kernel CPU of the processes in `pids` that can still be opened."""
+    import ctypes
+    from ctypes import wintypes
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+    k32.GetProcessTimes.restype = wintypes.BOOL
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    total = 0
+    for pid in pids:
+        handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            continue
+        try:
+            c, e, k, u = (wintypes.FILETIME() for _ in range(4))
+            if k32.GetProcessTimes(handle, ctypes.byref(c), ctypes.byref(e),
+                                   ctypes.byref(k), ctypes.byref(u)):
+                for t in (k, u):
+                    total += (t.dwHighDateTime << 32) | t.dwLowDateTime
+        finally:
+            k32.CloseHandle(handle)
+    return total / 1e7  # 100 ns units
+
+
+def _tree_cpu_seconds(root: int) -> float | None:
+    """CPU of the processes alive now under `root`, for a child with no job to ask. It falls when
+    one of them exits, so only a change means anything. None when it cannot be read, which the
+    caller must not take for a stall."""
+    try:
+        if os.name == "nt":
+            return _win_cpu_seconds(_tree_pids(root, _win_process_edges()))
+        rows = _posix_process_rows()
+        tree = _tree_pids(root, [(pid, row[0]) for pid, row in rows.items()])
+        return sum(rows[pid][1] for pid in tree if pid in rows)
+    except Exception:
+        return None
+
+
 # ----------------------------------------------------------------------------- queue
 
 
@@ -447,6 +597,16 @@ def _env_float(name: str, default: float) -> float:
         return v if v > 0 else default
     except ValueError:
         return default
+
+
+def stall_secs() -> float:
+    """How long a child's tree may use no CPU before it counts as stuck; 0 turns the watcher off.
+    Not `_env_float`, which reads "0" as unset."""
+    try:
+        v = float(os.environ.get("NUCLEOS_HEAVY_STALL_SECS", ""))
+    except ValueError:
+        return DEFAULT_STALL_S
+    return v if v >= 0 else DEFAULT_STALL_S  # a NaN fails this too
 
 
 def capacity() -> int:
@@ -1373,6 +1533,147 @@ def _watch_yield(proc, job, in_job: bool, stats: dict, yield_check, stop,
             return
 
 
+def _cargo_still_building(prog: dict) -> bool:
+    """True until cargo leaves its build phase: it queues for a file lock (another command is doing
+    the work, and that one has its own watcher) or its bar has units left. Under sccache rustc runs
+    in the sccache server, outside the child's tree, so a long legitimate compile shows no CPU here.
+    The price is accepted: a compile that is really stuck is not caught.
+
+    A sign that the command moved on outranks both: `step` survives a lock that was granted with
+    nothing to build, so a test binary hung after it would be spared. So does a finished bar:
+    `cargo run` prints a `Running` header that sets no `binary`, and nextest lists its binaries
+    before `Starting`, and a hang in either must count."""
+    if any(prog.get(k) for k in ("binary", "runner")):
+        return False
+    if str(prog.get("step") or "").startswith("Blocking waiting for file lock"):
+        return True
+    total = prog.get("units_total")
+    return bool(total) and prog.get("units_done", 0) < total
+
+
+def _gdb_path() -> str | None:
+    """The gdb to dump threads with: NUCLEOS_HEAVY_GDB ("0" = no dump), the fixed path, PATH."""
+    raw = os.environ.get("NUCLEOS_HEAVY_GDB")
+    if raw == "0":
+        return None
+    if raw:
+        return raw
+    if os.name == "nt" and os.path.isfile(GDB_FIXED_PATH):
+        return GDB_FIXED_PATH
+    return shutil.which("gdb")
+
+
+def _stall_dump_file(pid: int) -> Path | None:
+    """An empty file for the dump, in the dev home's scratch dir or else the temp dir."""
+    name = f"heavy-stall-{time.strftime('%Y%m%d-%H%M%S')}-{pid}.txt"
+    for base in (_dev_home() / "scratch", Path(tempfile.gettempdir())):
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+            path = base / name
+            path.touch()
+            return path
+        except OSError:
+            continue
+    return None
+
+
+def _dump_threads(gdb: str, root: int, path: Path) -> bool:
+    """Append what the deepest processes under `root` are blocked on to `path`, all within
+    NUCLEOS_HEAVY_GDB_TIMEOUT_SECS; True if some gdb finished cleanly. gdb's output goes only to
+    the file: on the broker's own pipes, a grandchild of gdb that outlives it would hold them
+    open, and the broker's caller would wait for that grandchild."""
+    budget = _env_float("NUCLEOS_HEAVY_GDB_TIMEOUT_SECS", GDB_DEFAULT_TIMEOUT_S)
+    deadline = time.monotonic() + budget
+    try:
+        edges = (_win_process_edges() if os.name == "nt"
+                 else [(pid, row[0]) for pid, row in _posix_process_rows().items()])
+        tree = _tree_pids(root, edges)
+    except Exception:
+        tree = [root]
+    posix = os.name != "nt"
+    kw = {"start_new_session": True} if posix else {"creationflags": 0x08000000}  # CREATE_NO_WINDOW
+    done = False
+    with open(path, "ab") as sink:
+        for pid in reversed(tree[-GDB_MAX_PROCESSES:]):
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            sink.write(f"=== pid {pid} (child {root})\n".encode())
+            sink.flush()
+            dump = subprocess.Popen(
+                [gdb, "--batch", "-nx", "-p", str(pid), "-ex", "set pagination off",
+                 "-ex", "info threads", "-ex", "thread apply all bt 22"],
+                stdin=subprocess.DEVNULL, stdout=sink, stderr=subprocess.STDOUT, **kw)
+            try:
+                if dump.wait(timeout=left) == 0:
+                    done = True
+            except subprocess.TimeoutExpired:
+                terminate_tree(None, dump, group=posix)
+                try:
+                    dump.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                sink.write(f"=== gdb expired after {budget:g}s\n".encode())
+                break
+    return done
+
+
+def _report_stall(proc, idle_s: float, limit: float) -> None:
+    """Say on stderr that the child is stuck, then try the dump. Never raises, and takes at most
+    the dump's time limit: neither may stand between a stuck command and its death."""
+    def say(text: str) -> None:
+        try:
+            sys.stderr.write(f"heavy: {text}\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+
+    try:
+        gdb = _gdb_path()
+        path = _stall_dump_file(proc.pid) if gdb else None
+        dump = f"thread dump: {path}" if path else "no thread dump"
+        say(f"STUCK: no CPU for {idle_s:.0f}s in the process tree of pid {proc.pid} (limit "
+            f"{limit:g}s). The command is stuck, it did not fail a test; {dump}. Killing it, "
+            f"exit {EXIT_STALLED}: do not re-run it blindly")
+        if gdb and path and not _dump_threads(gdb, proc.pid, path):
+            say(f"the thread dump did not complete, see {path}")
+    except Exception as exc:
+        say(f"the thread dump failed: {exc!r}")
+
+
+def _watch_stall(proc, job, in_job: bool, stats: dict, limit: float, stop,
+                 group: bool = False) -> None:
+    """Kill the child (stats["stalled"]) once its tree's CPU has not changed for `limit` seconds.
+    "Changed", not "grew": the sum over a tree with no job falls when a process exits. A reading
+    that fails, cargo still in its build phase and a machine that slept all restart the clock."""
+    interval = max(0.2, min(5.0, limit / 4))
+    last_cpu = None
+    since = tick = time.monotonic()
+    while not stop.wait(interval):
+        if proc.poll() is not None or stats.get("preempted"):
+            return
+        try:
+            cpu = job_cpu_seconds(job) if in_job else _tree_cpu_seconds(proc.pid)
+        except Exception:
+            cpu = None
+        now = time.monotonic()
+        slept = now - tick > interval + 60
+        tick = now
+        if (cpu is None or cpu != last_cpu or slept
+                or _cargo_still_building(stats.get("progress") or {})):
+            last_cpu, since = cpu, now
+            continue
+        if now - since < limit:
+            continue
+        # Set before the dump: a gdb that dies attached can take the child with it, and that exit
+        # must still read as a stall.
+        stats["stalled"] = True
+        _report_stall(proc, now - since, limit)
+        if proc.poll() is None:
+            terminate_tree(job if in_job else None, proc, group=group)
+        return
+
+
 def _watch_phase(stats: dict, cb, stop: threading.Event) -> None:
     """Call `cb` once, as soon as the output has shown a `Running ...`/`Doc-tests` header or
     nextest's `Starting N tests across M binaries` line (printed once the build is over): the
@@ -1398,7 +1699,9 @@ def run_child(argv: list[str], env: dict | None, job, low: bool = False,
     below-normal CPU priority (Windows) with no console window of its own. With `progress`,
     that file holds, while it runs, the CPU its tree has used and what the output says about
     units and tests; a cargo child is asked to draw its bar into the pipe for that. With
-    `yield_check`, the child is stopped (stats["preempted"]) as soon as it returns True."""
+    `yield_check`, the child is stopped (stats["preempted"]) as soon as it returns True. On every
+    path, a child whose tree stops using CPU is killed and the exit is EXIT_STALLED (see
+    _watch_stall): the exit comes from here because the killed tree's own says nothing."""
     stats = _new_stats()
     # CreateProcess finds only `.exe` without an extension, so `npm`/`npx` (`.cmd` shims)
     # failed with WinError 2: resolve argv[0] through PATH and PATHEXT the way a shell would.
@@ -1419,9 +1722,11 @@ def run_child(argv: list[str], env: dict | None, job, low: bool = False,
     flags = 0
     if low and os.name == "nt":
         flags = 0x00004000 | 0x08000000  # BELOW_NORMAL_PRIORITY_CLASS | CREATE_NO_WINDOW
-    # A child that may be preempted gets its own process group on POSIX, so killing it takes
-    # its compiler children too and not the broker (which already runs in its own session).
-    own_group = yield_check is not None and os.name != "nt"
+    # A child that may be killed (preempted or stuck) gets its own process group on POSIX, so
+    # killing it takes its compiler children too and not the broker (which already runs in its
+    # own session).
+    limit = stall_secs()
+    own_group = (yield_check is not None or limit > 0) and os.name != "nt"
     popen_kw = {"start_new_session": True} if own_group else {}
     proc = subprocess.Popen(
         argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=flags,
@@ -1442,6 +1747,12 @@ def run_child(argv: list[str], env: dict | None, job, low: bool = False,
         threading.Thread(target=_watch_yield,
                          args=(proc, job, in_job, stats, yield_check, stop, own_group),
                          daemon=True).start()
+    stall_watch = None
+    if limit > 0:
+        stall_watch = threading.Thread(target=_watch_stall,
+                                       args=(proc, job, in_job, stats, limit, stop, own_group),
+                                       daemon=True)
+        stall_watch.start()
     if progress is not None:
         writer = threading.Thread(target=_write_progress, args=(progress, stats, stop, cpu),
                                   daemon=True)
@@ -1453,13 +1764,26 @@ def run_child(argv: list[str], env: dict | None, job, low: bool = False,
         phase.start()
     for t in threads:
         t.start()
-    code = proc.wait()
+    try:
+        code = proc.wait()
+    except BaseException:
+        # In its own session the child no longer gets the terminal's Ctrl-C with the broker.
+        if own_group:
+            terminate_tree(None, proc, group=True)
+        raise
     if code == 0 and stats.get("preempted"):
         # It finished on its own between the watcher's poll and the kill: nothing was stopped.
         stats.pop("preempted", None)
     for t in threads:
         t.join(timeout=10)
     stop.set()
+    if stall_watch is not None:
+        stall_watch.join(timeout=5)
+    if stats.get("stalled"):
+        if code == 0:
+            stats.pop("stalled", None)  # as with `preempted`: it finished before the kill
+        else:
+            code = EXIT_STALLED
     if writer is not None:
         writer.join(timeout=5)
     if phase is not None:
@@ -2147,7 +2471,7 @@ def _holder_estimate(directory: Path, holder: dict) -> float | None:
                 continue
             if not isinstance(row, dict) or row.get("argv") != want:
                 continue
-            if row.get("exit") in (75, None) or row.get("preempted"):
+            if row.get("exit") in (EXIT_QUEUE_TIMEOUT, EXIT_STALLED, None) or row.get("preempted"):
                 continue
             try:
                 run_s = float(row.get("run_s") or 0)
@@ -2709,7 +3033,8 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
     except BaseException:
         _release_all(directory, lock_hash, holding, lease)
         raise
-    preempted = bool(stats.get("preempted"))
+    stalled = bool(stats.get("stalled"))
+    preempted = bool(stats.get("preempted")) and not stalled
     if preempted:
         code = EXIT_QUEUE_TIMEOUT  # a stopped warm: its exit is ours, not the killed tree's
     row.update({
@@ -2735,6 +3060,11 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
             row["pred_cores"], row["pred_mem_mb"] = alt[1], alt[2]
     except Exception:
         pass
+    if stalled:
+        row["stalled"] = True
+        # Ten idle minutes say nothing about what the command costs: with no class, the row stays
+        # out of costs.json and light.json, as an exit 75 does.
+        row.pop("cls", None)
     # Register and log BEFORE releasing: the lock's next owner reads the registry the moment
     # it holds the lock, and must see what this run just built.
     if fp is not None:
