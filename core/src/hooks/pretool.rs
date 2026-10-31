@@ -1407,6 +1407,10 @@ pub(super) async fn pretooluse_decision_from(
 mod tests {
     use super::*;
     use crate::conductor::context::handoff_path;
+    use crate::tree_job::{
+        model::{Branch, Manifest},
+        store::{self, TreeJob},
+    };
     use serde_json::json;
 
     /// `limits("leaf")`: warn 80k, wrap 100k. `limits("orchestrator")`: wrap 125k. Block is 200k.
@@ -1480,6 +1484,53 @@ mod tests {
         .await
         .unwrap();
         (run_id, node_id, root_id)
+    }
+
+    /// A tree branch whose node is bound to a running `worktree` run. It does not launch an
+    /// agent; the run is the test fixture's inert row.
+    async fn seed_tree_branch_run(
+        state: &AppState,
+        layer: &str,
+        owned_paths: &[&str],
+    ) -> i64 {
+        let (run_id, node_id, root_id) =
+            seed_node_run(state, "worktree", "leaf", Some(1_000)).await;
+        let tree_id = format!("tree-{run_id}");
+        let paths: Vec<String> = owned_paths.iter().map(|path| (*path).to_owned()).collect();
+        let mut manifest = Manifest::new(
+            &tree_id,
+            "feature/docs",
+            "Write docs",
+            r"C:\work\repo",
+            &[],
+        );
+        let mut branch = Branch::new("docs", &paths, layer, None);
+        branch.node_id = Some(node_id.clone());
+        manifest.branches.insert("docs".to_owned(), branch);
+        store::save(
+            &state.pool,
+            &TreeJob {
+                id: tree_id.clone(),
+                root_node_id: root_id,
+                project_id: Some(PROJECT.to_owned()),
+                feature_branch: Some("feature/docs".to_owned()),
+                goal: "Write docs".to_owned(),
+                state: "open".to_owned(),
+                manifest,
+                contract: None,
+                created_at: "2026-10-30T00:00:00Z".to_owned(),
+                updated_at: "2026-10-30T00:00:00Z".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE work_nodes SET tree_job_id = ? WHERE id = ?")
+            .bind(tree_id)
+            .bind(node_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        run_id
     }
 
     fn payload(run_id: i64, tool: &str, input: Value) -> PreToolUsePayload {
@@ -1791,6 +1842,75 @@ mod tests {
         assert_eq!(status, "running");
         assert_eq!(approvals, 0);
         assert!(state.run_handles.lock().unwrap().contains_key(&run_id));
+    }
+
+    /// Regression guard: a docs branch may write a declared file in an allowed docs directory.
+    #[tokio::test]
+    async fn docs_run_write_inside_declared_paths_is_allowed() {
+        let state = test_state().await;
+        let run_id = seed_tree_branch_run(&state, "docs", &[".ai/notes/**"]).await;
+
+        let decision = decide(
+            &state,
+            run_id,
+            "Write",
+            write_input(Path::new(r"C:\work\repo\.ai\notes\design.md")),
+        )
+        .await;
+
+        assert_allowed(&decision, "a declared docs write");
+    }
+
+    #[tokio::test]
+    async fn docs_run_write_outside_declared_paths_is_denied_not_parked() {
+        let state = test_state().await;
+        let run_id = seed_tree_branch_run(&state, "docs", &[".ai/notes/**"]).await;
+
+        let decision = decide(
+            &state,
+            run_id,
+            "Write",
+            write_input(Path::new(r"C:\work\repo\.ai\specs\design.md")),
+        )
+        .await;
+
+        assert_eq!(decision.decision, "deny", "got {:?}", decision.reason);
+        let (status, approvals) = run_status_and_action_approvals(&state, run_id).await;
+        assert_eq!(status, "running");
+        assert_eq!(approvals, 0);
+    }
+
+    #[tokio::test]
+    async fn docs_run_write_to_an_allowed_dir_but_undeclared_file_is_denied() {
+        let state = test_state().await;
+        let run_id = seed_tree_branch_run(&state, "docs", &[".ai/notes/declared.md"]).await;
+
+        let decision = decide(
+            &state,
+            run_id,
+            "Write",
+            write_input(Path::new(r"C:\work\repo\.ai\notes\undeclared.md")),
+        )
+        .await;
+
+        assert_eq!(decision.decision, "deny", "got {:?}", decision.reason);
+    }
+
+    /// Regression guard: the docs-only write restriction must not change code branches.
+    #[tokio::test]
+    async fn code_branch_run_is_not_affected_by_the_docs_rule() {
+        let state = test_state().await;
+        let run_id = seed_tree_branch_run(&state, "core", &["core/src/**"]).await;
+
+        let decision = decide(
+            &state,
+            run_id,
+            "Write",
+            write_input(Path::new(r"C:\work\repo\core\src\lib.rs")),
+        )
+        .await;
+
+        assert_allowed(&decision, "a code branch write");
     }
 
     /// Pins that ordinary `worktree` runs are unchanged. Passes today.

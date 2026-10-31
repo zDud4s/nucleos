@@ -856,6 +856,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn answered_doubt_remains_unfinished_without_reasking() {
+        let fx = Fixture::new(&["the widget renders"]).await;
+        let first = FakeReviewer::answering(
+            "review-1",
+            None,
+            vec![review(1, CriterionStatus::Doubt, None)],
+        );
+        let second = FakeReviewer::answering(
+            "review-2",
+            None,
+            vec![review(1, CriterionStatus::Doubt, None)],
+        );
+        let verify = FakeVerify::new(VerifyState::Green);
+
+        fx.run(&first, &verify).await.unwrap();
+        let question = fx.questions().await.into_iter().next().unwrap();
+        store::answer_question(&fx.pool, &question.id, "Use the default port")
+            .await
+            .unwrap();
+        let report = fx.run(&second, &verify).await.unwrap();
+
+        // The reviewer still doubts, so the spec is not finished, but the owner is not asked again
+        // and the answered row is kept as it was.
+        assert_ne!(report.status, SpecStatus::Done);
+        assert_ne!(fx.spec().await.status, SpecStatus::Done);
+        let questions = fx.questions().await;
+        assert_eq!(questions.len(), 1, "{questions:?}");
+        assert_eq!(questions[0].id, question.id);
+        assert_eq!(questions[0].status, "answered");
+        assert_eq!(questions[0].answer.as_deref(), Some("Use the default port"));
+        assert!(!fx.has_open_question_about("the widget renders").await);
+    }
+
+    #[tokio::test]
     async fn audit_writes_nothing_to_the_checkout() {
         let fx = Fixture::new(&["the widget renders"]).await;
         let root = fx.worktree.path();

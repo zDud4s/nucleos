@@ -1189,6 +1189,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn answer_question_refuses_closed_or_answered_and_keeps_original() {
+        let pool = crate::testdb::fresh_pool().await;
+        let spec = seed(&pool, None, PATH).await;
+        let answered = add_question(&pool, &spec.id, "Which port?").await.unwrap();
+        let closed = add_question(&pool, &spec.id, "Which host?").await.unwrap();
+        exec(
+            &pool,
+            "UPDATE spec_questions SET status = 'closed' WHERE id = ?",
+            &[closed.as_str()],
+        )
+        .await;
+
+        answer_question(&pool, &answered, "8080").await.unwrap();
+        let again = answer_question(&pool, &answered, "9090").await;
+        assert!(
+            matches!(again, Err(StoreError::AlreadyDecided(..))),
+            "{again:?}"
+        );
+        let late = answer_question(&pool, &closed, "localhost").await;
+        assert!(
+            matches!(late, Err(StoreError::AlreadyDecided(..))),
+            "{late:?}"
+        );
+        // An id that was never asked stays distinct from one already decided.
+        let unknown = answer_question(&pool, "sq-nope", "x").await;
+        assert!(
+            matches!(unknown, Err(StoreError::NotFound(..))),
+            "{unknown:?}"
+        );
+
+        let questions = list_questions(&pool, &spec.id).await.unwrap();
+        let kept = questions.iter().find(|q| q.id == answered).unwrap();
+        assert_eq!(kept.status, "answered");
+        assert_eq!(kept.answer.as_deref(), Some("8080"));
+        let untouched = questions.iter().find(|q| q.id == closed).unwrap();
+        assert_eq!(untouched.status, "closed");
+        assert_eq!(untouched.answer, None);
+        assert_eq!(untouched.answered_at, None);
+    }
+
+    #[tokio::test]
+    async fn settle_questions_preserves_answered_matching_doubt() {
+        const PREFIX: &str = "Owner decision needed for criterion: ";
+        let pool = crate::testdb::fresh_pool().await;
+        let spec = seed(&pool, None, PATH).await;
+        let kept_text = format!("{PREFIX}the widget renders");
+        let surplus_text = format!("{PREFIX}the widget scrolls");
+        let kept = add_question(&pool, &spec.id, &kept_text).await.unwrap();
+        let surplus = add_question(&pool, &spec.id, &surplus_text).await.unwrap();
+        answer_question(&pool, &kept, "Yes, it renders").await.unwrap();
+
+        settle_questions(&pool, &spec.id, PREFIX, std::slice::from_ref(&kept_text))
+            .await
+            .unwrap();
+
+        // The answered doubt is neither asked again nor rewritten; the surplus open one is closed.
+        let questions = list_questions(&pool, &spec.id).await.unwrap();
+        assert_eq!(questions.len(), 2, "{questions:?}");
+        let answered = questions.iter().find(|q| q.id == kept).unwrap();
+        assert_eq!(answered.status, "answered");
+        assert_eq!(answered.answer.as_deref(), Some("Yes, it renders"));
+        let closed = questions.iter().find(|q| q.id == surplus).unwrap();
+        assert_eq!(closed.status, "closed");
+        assert!(questions.iter().all(|q| q.status != "open"), "{questions:?}");
+    }
+
+    #[tokio::test]
+    async fn answer_flips_a_waiting_spec_to_discovered() {
+        let pool = crate::testdb::fresh_pool().await;
+        let waiting = seed(&pool, None, PATH).await;
+        let working = seed(&pool, None, OTHER_PATH).await;
+        let asked = add_question(&pool, &waiting.id, "Which port?").await.unwrap();
+        let other = add_question(&pool, &working.id, "Which host?").await.unwrap();
+        set_status(&pool, &waiting.id, SpecStatus::NeedsOwner, Some("asked"))
+            .await
+            .unwrap();
+        set_status(&pool, &working.id, SpecStatus::Queued, None)
+            .await
+            .unwrap();
+
+        answer_question(&pool, &asked, "8080").await.unwrap();
+        answer_question(&pool, &other, "localhost").await.unwrap();
+
+        let after = get_spec(&pool, &waiting.id).await.unwrap().unwrap();
+        assert_eq!(after.status, SpecStatus::Discovered);
+        // A spec that was not waiting on the owner keeps its status.
+        let untouched = get_spec(&pool, &working.id).await.unwrap().unwrap();
+        assert_eq!(untouched.status, SpecStatus::Queued);
+    }
+
+    #[tokio::test]
     async fn list_owner_decisions_merges_spec_questions_and_decisions_when_table_exists() {
         let pool = crate::testdb::fresh_pool().await;
         recreate_decisions(&pool).await;

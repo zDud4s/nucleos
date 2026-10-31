@@ -234,6 +234,7 @@ mod tests {
             admit: true,
             cost_gb: SEED_COST_GB,
             reasons: Vec::new(),
+            disk_only: false,
         };
         assert_eq!(admission, expected);
     }
@@ -300,6 +301,7 @@ mod tests {
             admit: true,
             cost_gb: 0.0,
             reasons: Vec::new(),
+            disk_only: false,
         };
         assert_eq!(admission, expected);
     }
@@ -313,6 +315,31 @@ mod tests {
         assert!(!admission.admit);
         assert!(names_slots(&admission));
         assert!(names_disk(&admission));
+    }
+
+    #[test]
+    fn admission_marks_disk_only_refusals() {
+        // Disk alone: the only refusal a freed disk can undo.
+        let disk_alone = check_admission(&free_book(2), &manifest(), LAYER, 10.0, FLOOR_GB);
+        assert!(!disk_alone.admit);
+        assert!(disk_alone.disk_only);
+
+        // Slots alone: not disk-only.
+        let slots_alone = check_admission(&full_book(2), &manifest(), LAYER, PLENTY_GB, FLOOR_GB);
+        assert!(!slots_alone.admit);
+        assert!(!slots_alone.disk_only);
+
+        // Slots and disk together: a freed disk would not be enough.
+        let both = check_admission(&full_book(2), &manifest(), LAYER, 10.0, FLOOR_GB);
+        assert!(!both.admit);
+        assert!(!both.disk_only);
+
+        // An admission is never disk-only, docs included.
+        let admitted = check_admission(&free_book(2), &manifest(), LAYER, PLENTY_GB, FLOOR_GB);
+        assert!(admitted.admit);
+        assert!(!admitted.disk_only);
+        let docs = check_admission(&full_book(2), &manifest(), "docs", 1.0, FLOOR_GB);
+        assert!(!docs.disk_only);
     }
 
     #[test]

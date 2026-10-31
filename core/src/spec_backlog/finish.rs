@@ -889,6 +889,9 @@ mod tests {
     struct FakeLauncher {
         log: Log,
         requests: Mutex<Vec<TreeRequest>>,
+        waited_tree_ids: Mutex<Vec<String>>,
+        wait_outcomes: Mutex<BTreeMap<String, Result<TreeOutcome, String>>>,
+        free_disk_bytes: AtomicUsize,
         in_flight: AtomicUsize,
         max_in_flight: AtomicUsize,
         delay: Duration,
@@ -899,6 +902,9 @@ mod tests {
             Self {
                 log: log.clone(),
                 requests: Mutex::new(Vec::new()),
+                waited_tree_ids: Mutex::new(Vec::new()),
+                wait_outcomes: Mutex::new(BTreeMap::new()),
+                free_disk_bytes: AtomicUsize::new(usize::MAX),
                 in_flight: AtomicUsize::new(0),
                 max_in_flight: AtomicUsize::new(0),
                 delay: Duration::from_millis(40),
@@ -907,6 +913,21 @@ mod tests {
 
         fn requests(&self) -> Vec<TreeRequest> {
             self.requests.lock().unwrap().clone()
+        }
+
+        fn wait_result(&self, tree_id: &str, result: Result<TreeOutcome, String>) {
+            self.wait_outcomes
+                .lock()
+                .unwrap()
+                .insert(tree_id.to_owned(), result);
+        }
+
+        fn waited_tree_ids(&self) -> Vec<String> {
+            self.waited_tree_ids.lock().unwrap().clone()
+        }
+
+        fn set_free_disk_bytes(&self, bytes: usize) {
+            self.free_disk_bytes.store(bytes, Ordering::SeqCst);
         }
     }
 
@@ -927,6 +948,25 @@ mod tests {
                 lineage_roots: vec![format!("root-{}", request.id)],
                 ..Default::default()
             })
+        }
+
+        async fn wait_tree(&self, tree_id: &str) -> Result<TreeOutcome, String> {
+            self.waited_tree_ids.lock().unwrap().push(tree_id.to_owned());
+            self.wait_outcomes
+                .lock()
+                .unwrap()
+                .remove(tree_id)
+                .unwrap_or_else(|| {
+                    Ok(TreeOutcome {
+                        run_ids: vec![format!("run-{tree_id}")],
+                        lineage_roots: vec![format!("root-{tree_id}")],
+                        ..Default::default()
+                    })
+                })
+        }
+
+        fn free_disk_bytes(&self) -> u64 {
+            self.free_disk_bytes.load(Ordering::SeqCst) as u64
         }
     }
 
@@ -1298,6 +1338,166 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn review_and_note_dependencies_are_satisfied() {
+        let pool = crate::testdb::fresh_pool().await;
+        let review = add_spec(&pool, "review-dependency", SpecStatus::Extracted).await;
+        let note = add_spec(&pool, "note-dependency", SpecStatus::Extracted).await;
+        let dependent = add_spec(&pool, "depends-on-non-specs", SpecStatus::Extracted).await;
+        store::set_extraction_result(&pool, &review, SpecKind::Review, SpecStatus::Extracted, None)
+            .await
+            .unwrap();
+        store::set_extraction_result(&pool, &note, SpecKind::Note, SpecStatus::Extracted, None)
+            .await
+            .unwrap();
+        store::add_dep(&pool, &dependent, &review, DepSource::Owner)
+            .await
+            .unwrap();
+        store::add_dep(&pool, &dependent, &note, DepSource::Owner)
+            .await
+            .unwrap();
+        let log = Log::default();
+        let launcher = FakeLauncher::new(&log);
+        let prep = FakePreparer::new(&pool, &log, &[&dependent]);
+
+        let report = finish_with(
+            &pool,
+            &FinishDeps { launcher: &launcher, preparer: &prep },
+            &cfg(),
+            scope_all(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(launcher.requests().len(), 1);
+        assert_eq!(report.needs_owner.len(), 0, "satisfied non-spec dependencies need no owner");
+        assert_eq!(report.done, vec![dependent]);
+    }
+
+    #[tokio::test]
+    async fn abandoned_dependency_marks_dependent_needs_owner_once() {
+        let pool = crate::testdb::fresh_pool().await;
+        let dependency = add_spec(&pool, "abandoned-dependency", SpecStatus::Abandoned).await;
+        let dependent = add_spec(&pool, "abandoned-dependent", SpecStatus::Extracted).await;
+        store::add_dep(&pool, &dependent, &dependency, DepSource::Owner)
+            .await
+            .unwrap();
+        let log = Log::default();
+        let launcher = FakeLauncher::new(&log);
+        let prep = FakePreparer::new(&pool, &log, &[]);
+
+        let report = finish_with(
+            &pool,
+            &FinishDeps { launcher: &launcher, preparer: &prep },
+            &cfg(),
+            scope_all(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(launcher.requests().len(), 0);
+        assert_eq!(report.needs_owner, vec![dependent.clone()], "the owner is told once");
+        let reason = store::get_spec(&pool, &dependent)
+            .await
+            .unwrap()
+            .unwrap()
+            .status_reason
+            .unwrap_or_default();
+        assert!(reason.contains(&dependency), "the reason names the dependency");
+        assert!(reason.contains("abandoned"), "the reason states that it is abandoned");
+    }
+
+    #[tokio::test]
+    async fn missing_dependency_marks_dependent_needs_owner_once() {
+        let pool = crate::testdb::fresh_pool().await;
+        let dependent = add_spec(&pool, "missing-dependent", SpecStatus::Extracted).await;
+        let missing = "missing-dependency";
+        store::add_dep(&pool, &dependent, missing, DepSource::Owner)
+            .await
+            .unwrap();
+        let log = Log::default();
+        let launcher = FakeLauncher::new(&log);
+        let prep = FakePreparer::new(&pool, &log, &[]);
+
+        let report = finish_with(
+            &pool,
+            &FinishDeps { launcher: &launcher, preparer: &prep },
+            &cfg(),
+            scope_all(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(launcher.requests().len(), 0);
+        assert_eq!(report.needs_owner, vec![dependent.clone()], "the owner is told once");
+        let reason = store::get_spec(&pool, &dependent)
+            .await
+            .unwrap()
+            .unwrap()
+            .status_reason
+            .unwrap_or_default();
+        assert!(reason.contains(missing), "the reason names the dependency");
+        assert!(reason.contains("does not exist"), "the reason states that it is missing");
+    }
+
+    #[tokio::test]
+    async fn invalid_dependency_propagates_to_its_dependents() {
+        let pool = crate::testdb::fresh_pool().await;
+        let abandoned = add_spec(&pool, "invalid-root", SpecStatus::Abandoned).await;
+        let dependent = add_spec(&pool, "invalid-dependent", SpecStatus::Extracted).await;
+        let downstream = add_spec(&pool, "invalid-downstream", SpecStatus::Extracted).await;
+        store::add_dep(&pool, &dependent, &abandoned, DepSource::Owner)
+            .await
+            .unwrap();
+        store::add_dep(&pool, &downstream, &dependent, DepSource::Owner)
+            .await
+            .unwrap();
+        let log = Log::default();
+        let launcher = FakeLauncher::new(&log);
+        let prep = FakePreparer::new(&pool, &log, &[]);
+
+        let report = finish_with(
+            &pool,
+            &FinishDeps { launcher: &launcher, preparer: &prep },
+            &cfg(),
+            scope_all(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(launcher.requests().len(), 0);
+        assert_eq!(report.needs_owner, vec![dependent.clone()], "only the invalid dependency is announced");
+        assert_eq!(status_of(&pool, &dependent).await, SpecStatus::NeedsOwner);
+        assert_eq!(status_of(&pool, &downstream).await, SpecStatus::Blocked);
+        assert!(report.blocked.contains(&downstream));
+    }
+
+    #[tokio::test]
+    async fn done_dependency_behavior_is_unchanged() {
+        let pool = crate::testdb::fresh_pool().await;
+        let dependency = add_spec(&pool, "done-dependency", SpecStatus::Done).await;
+        let dependent = add_spec(&pool, "done-dependent", SpecStatus::Extracted).await;
+        store::add_dep(&pool, &dependent, &dependency, DepSource::Owner)
+            .await
+            .unwrap();
+        let log = Log::default();
+        let launcher = FakeLauncher::new(&log);
+        let prep = FakePreparer::new(&pool, &log, &[&dependent]);
+
+        let report = finish_with(
+            &pool,
+            &FinishDeps { launcher: &launcher, preparer: &prep },
+            &cfg(),
+            scope_all(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(launcher.requests().len(), 1);
+        assert_eq!(report.needs_owner.len(), 0);
+        assert_eq!(report.done, vec![dependent]);
+    }
+
+    #[tokio::test]
     async fn skips_specs_already_done() {
         let pool = crate::testdb::fresh_pool().await;
         let done = add_spec(&pool, "finished", SpecStatus::Done).await;
@@ -1560,6 +1760,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restart_adopts_a_live_tree_without_creating_a_second_tree() {
+        let pool = crate::testdb::fresh_pool().await;
+        let id = add_spec(&pool, "adopt-live", SpecStatus::Extracted).await;
+        let adopted = "tree-adopt-live";
+        store::set_status(&pool, &id, SpecStatus::InProgress, None)
+            .await
+            .unwrap();
+        store::set_tree_id(&pool, &id, adopted).await.unwrap();
+        let log = Log::default();
+        let launcher = FakeLauncher::new(&log);
+        let prep = FakePreparer::new(&pool, &log, &[&id]);
+
+        let report = finish_with(
+            &pool,
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &prep,
+            },
+            &cfg(),
+            scope_all(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(launcher.requests().len(), 0, "no replacement tree is created");
+        assert_eq!(launcher.waited_tree_ids(), vec![adopted]);
+        assert_eq!(report.needs_owner.len(), 0, "the owner is not told about a live tree");
+        assert_eq!(report.done, vec![id]);
+    }
+
+    #[tokio::test]
+    async fn restart_audits_a_completed_adopted_tree() {
+        let pool = crate::testdb::fresh_pool().await;
+        let id = add_spec(&pool, "adopt-complete", SpecStatus::Extracted).await;
+        let adopted = "tree-adopt-complete";
+        store::set_status(&pool, &id, SpecStatus::InProgress, None)
+            .await
+            .unwrap();
+        store::set_tree_id(&pool, &id, adopted).await.unwrap();
+        let log = Log::default();
+        let launcher = FakeLauncher::new(&log);
+        launcher.wait_result(
+            adopted,
+            Ok(TreeOutcome {
+                run_ids: vec!["adopted-run".to_owned()],
+                lineage_roots: vec!["adopted-root".to_owned()],
+                ..Default::default()
+            }),
+        );
+        let prep = FakePreparer::new(&pool, &log, &[&id]);
+
+        let report = finish_with(
+            &pool,
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &prep,
+            },
+            &cfg(),
+            scope_all(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(launcher.requests().len(), 0, "the completed tree is adopted, not replaced");
+        assert_eq!(launcher.waited_tree_ids(), vec![adopted]);
+        assert_eq!(report.needs_owner.len(), 0, "the owner is not told twice");
+        let lineages = prep.lineages.lock().unwrap();
+        assert!(lineages[0].1.run_ids.contains(&"adopted-run".to_owned()));
+        assert!(lineages[0].1.lineage_roots.contains(&"adopted-root".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn missing_adopted_tree_marks_spec_needs_owner() {
+        let pool = crate::testdb::fresh_pool().await;
+        let id = add_spec(&pool, "adopt-missing", SpecStatus::Extracted).await;
+        let adopted = "tree-adopt-missing";
+        store::set_status(&pool, &id, SpecStatus::InProgress, None)
+            .await
+            .unwrap();
+        store::set_tree_id(&pool, &id, adopted).await.unwrap();
+        let log = Log::default();
+        let launcher = FakeLauncher::new(&log);
+        launcher.wait_result(adopted, Err("tree does not exist".to_owned()));
+        let prep = FakePreparer::new(&pool, &log, &[]);
+
+        let report = finish_with(
+            &pool,
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &prep,
+            },
+            &cfg(),
+            scope_all(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(launcher.requests().len(), 0, "a missing adopted tree is never replaced");
+        assert_eq!(report.needs_owner, vec![id.clone()], "the owner is told once");
+        let spec = store::get_spec(&pool, &id).await.unwrap().unwrap();
+        let reason = spec.status_reason.unwrap_or_default();
+        assert!(reason.contains(adopted), "the reason names the missing tree");
+        assert!(reason.contains("does not exist"), "the reason states the missing-tree fact");
+    }
+
+    #[tokio::test]
     async fn runs_independent_specs_in_parallel_up_to_the_budget() {
         let pool = crate::testdb::fresh_pool().await;
         let ids = [
@@ -1597,7 +1903,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn serialises_specs_with_overlapping_paths() {
+    async fn unknown_scope_specs_run_in_parallel() {
         let pool = crate::testdb::fresh_pool().await;
         let a = add_spec(&pool, "alpha", SpecStatus::Extracted).await;
         let b = add_spec(&pool, "beta", SpecStatus::Extracted).await;
@@ -1630,9 +1936,112 @@ mod tests {
         assert_eq!(launcher.requests().len(), 3);
         assert_eq!(
             launcher.max_in_flight.load(Ordering::SeqCst),
-            1,
-            "overlapping and unknown scopes never run together"
+            2,
+            "an unknown scope may run beside a declared scope; only declared overlap serialises"
         );
+    }
+
+    #[tokio::test]
+    async fn declared_overlap_still_runs_one_after_another() {
+        let pool = crate::testdb::fresh_pool().await;
+        let a = add_spec(&pool, "declared-alpha", SpecStatus::Extracted).await;
+        let b = add_spec(&pool, "declared-beta", SpecStatus::Extracted).await;
+        let log = Log::default();
+        let launcher = FakeLauncher::new(&log);
+        let prep = FakePreparer::new(&pool, &log, &[&a, &b]);
+        let mut config = cfg();
+        config.max_parallel = 2;
+        config
+            .owned_paths
+            .insert(a.clone(), vec!["core/src/shared/".to_owned()]);
+        config
+            .owned_paths
+            .insert(b.clone(), vec!["core/src/shared/mod.rs".to_owned()]);
+
+        let report = finish_with(
+            &pool,
+            &FinishDeps { launcher: &launcher, preparer: &prep },
+            &config,
+            scope_all(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(launcher.requests().len(), 2);
+        assert_eq!(launcher.max_in_flight.load(Ordering::SeqCst), 1);
+        assert_eq!(report.needs_owner.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn dependent_spec_starts_after_parallel_prerequisites_finish() {
+        let pool = crate::testdb::fresh_pool().await;
+        let first = add_spec(&pool, "parallel-first", SpecStatus::Extracted).await;
+        let second = add_spec(&pool, "parallel-second", SpecStatus::Extracted).await;
+        let dependent = add_spec(&pool, "parallel-dependent", SpecStatus::Extracted).await;
+        store::add_dep(&pool, &dependent, &first, DepSource::Owner)
+            .await
+            .unwrap();
+        store::add_dep(&pool, &dependent, &second, DepSource::Owner)
+            .await
+            .unwrap();
+        let log = Log::default();
+        let launcher = FakeLauncher::new(&log);
+        let prep = FakePreparer::new(&pool, &log, &[&first, &second, &dependent]);
+        let mut config = cfg();
+        config.max_parallel = 2;
+
+        let report = finish_with(
+            &pool,
+            &FinishDeps { launcher: &launcher, preparer: &prep },
+            &config,
+            scope_all(),
+        )
+        .await
+        .unwrap();
+
+        let requests = launcher.requests();
+        let dependent_position = requests
+            .iter()
+            .position(|request| request.spec_id == dependent)
+            .expect("dependent tree");
+        assert_eq!(requests.len(), 3);
+        assert_eq!(launcher.max_in_flight.load(Ordering::SeqCst), 2);
+        assert!(
+            requests[..dependent_position]
+                .iter()
+                .any(|request| request.spec_id == first)
+                && requests[..dependent_position]
+                    .iter()
+                    .any(|request| request.spec_id == second),
+            "both prerequisites launch before their dependent"
+        );
+        assert_eq!(report.needs_owner.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn disk_below_floor_defers_the_next_spec_tree_without_failing_it() {
+        let pool = crate::testdb::fresh_pool().await;
+        let id = add_spec(&pool, "disk-deferred", SpecStatus::Extracted).await;
+        let log = Log::default();
+        let launcher = FakeLauncher::new(&log);
+        launcher.set_free_disk_bytes(99);
+        let prep = FakePreparer::new(&pool, &log, &[&id]);
+        let mut config = cfg();
+        config.min_free_disk_bytes = 100;
+
+        let report = finish_with(
+            &pool,
+            &FinishDeps { launcher: &launcher, preparer: &prep },
+            &config,
+            scope_all(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(launcher.requests().len(), 0, "the next tree waits for disk space");
+        assert_eq!(report.needs_owner.len(), 0, "low disk is not an owner question");
+        assert_eq!(report.blocked.len(), 0, "low disk does not fail the queued spec");
+        assert_eq!(status_of(&pool, &id).await, SpecStatus::Extracted);
     }
 
     #[tokio::test]

@@ -301,7 +301,7 @@ impl ReviewerRunner for NoToolsReviewer<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spec_backlog::model::{CriterionKind, SpecKind, SpecStatus};
+    use crate::spec_backlog::model::{CriterionKind, Question, SpecKind, SpecStatus};
 
     fn spec() -> Spec {
         Spec {
@@ -343,7 +343,7 @@ mod tests {
             cut: false,
         };
 
-        let prompt = review_prompt(&spec(), &criteria, &material);
+        let prompt = review_prompt(&spec(), &criteria, &material, &[]);
 
         assert!(prompt.contains("answer `met`"), "{prompt}");
         assert!(
@@ -351,5 +351,54 @@ mod tests {
             "{prompt}"
         );
         assert!(prompt.contains("doubt"), "{prompt}");
+    }
+
+    #[test]
+    fn prompt_shows_owner_answer_but_requires_met_evidence() {
+        let criterion = |ordinal: i64, text: &str| Criterion {
+            id: ordinal,
+            spec_id: "spec-1".to_owned(),
+            ordinal,
+            text: text.to_owned(),
+            kind: CriterionKind::Behavior,
+            verify_hint: None,
+            status: CriterionStatus::Doubt,
+            evidence: None,
+            reviewer_run_id: None,
+            spec_sha: "sha-1".to_owned(),
+            checked_at: None,
+        };
+        let criteria = [
+            criterion(1, "The widget renders"),
+            criterion(2, "The widget scrolls"),
+        ];
+        let material = ReviewMaterial {
+            files: Vec::new(),
+            cut: false,
+        };
+        // An answered doubt, as `store::answered_audit_questions` returns it for the first
+        // criterion only.
+        let answers = [Question {
+            id: "sq-1".to_owned(),
+            spec_id: "spec-1".to_owned(),
+            question: "Owner decision needed for criterion: The widget renders".to_owned(),
+            answer: Some("Rendering is done by render_widget in src/ui.rs".to_owned()),
+            status: "answered".to_owned(),
+            created_at: "2026-10-31T00:00:00+00:00".to_owned(),
+            answered_at: Some("2026-10-31T01:00:00+00:00".to_owned()),
+        }];
+
+        let prompt = review_prompt(&spec(), &criteria, &material, &answers);
+
+        let first = prompt.find("1. The widget renders").expect(&prompt);
+        let second = prompt.find("2. The widget scrolls").expect(&prompt);
+        let shown = prompt
+            .find("Owner answer: Rendering is done by render_widget in src/ui.rs")
+            .expect(&prompt);
+        // The answer sits under its own criterion and nowhere else.
+        assert!(first < shown && shown < second, "{prompt}");
+        assert_eq!(prompt.matches("Owner answer:").count(), 1, "{prompt}");
+        // It is context only: `met` still needs a file and line.
+        assert!(prompt.contains("`met` needs evidence naming a file and line"), "{prompt}");
     }
 }

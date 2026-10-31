@@ -45,6 +45,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn docs_glob_matches_declared_paths_and_rejects_traversal() {
+        assert!(owned_glob_matches(".ai/notes/**", ".ai/notes/design.md"));
+        assert!(owned_glob_matches(
+            ".ai/notes/**",
+            ".ai/notes/nested/design.md"
+        ));
+        assert!(owned_glob_matches(".ai/specs/*.md", ".ai/specs/design.md"));
+        assert!(!owned_glob_matches(".ai/specs/*.md", ".ai/specs/nested/design.md"));
+        assert!(!owned_glob_matches(
+            ".ai/notes/**",
+            ".ai/notes/../specs/design.md"
+        ));
+        assert!(!owned_glob_matches(".ai/notes/**", "../.ai/notes/design.md"));
+    }
+
+    #[test]
     fn docs_path_allows_a_file_under_each_of_the_four_directories() {
         for path in [
             ".ai/specs/design.md",

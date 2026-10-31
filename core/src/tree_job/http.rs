@@ -2182,6 +2182,130 @@ mod tests {
         assert!(loaded(&state.pool, JOB).await.manifest.branches.is_empty());
     }
 
+    fn branch_start_uri(job: &str) -> String {
+        format!("/trees/{job}/branch_start")
+    }
+
+    fn branch_start_body(name: &str, layer: &str) -> Value {
+        json!({
+            "name": name,
+            "goal": "Do the work",
+            "prompt": "Do not run.",
+            "owned_paths": [CODE_PATH],
+            "layer": layer,
+            "node_id": format!("{JOB}-root"),
+        })
+    }
+
+    async fn table_rows(pool: &SqlitePool, table: &str) -> i64 {
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Gap 3. A start the disk alone refuses is remembered and asked about once, without parking
+    /// the caller; the agent still gets its 409.
+    #[tokio::test]
+    async fn branch_start_refused_for_disk_alone_records_a_pending_start_and_asks_once() {
+        let state = test_state().await;
+        seed_job(
+            &state.pool,
+            JOB,
+            "open",
+            Vec::new(),
+            &[(HUGE_LAYER, HUGE_GB)],
+        )
+        .await;
+        let app = app(&state);
+        let decisions_before = table_rows(&state.pool, "decisions").await;
+
+        let first = post(
+            &app,
+            &branch_start_uri(JOB),
+            branch_start_body("big", HUGE_LAYER),
+        )
+        .await;
+        assert_error(&first, StatusCode::CONFLICT);
+
+        // The pending start is stored under the manifest, with the body to replay.
+        let job = loaded(&state.pool, JOB).await;
+        assert!(job.manifest.branches.is_empty(), "no branch is added");
+        let record = &job.manifest.extra["pending_starts"]["big"];
+        assert_eq!(record["caller"], json!(format!("{JOB}-root")), "{record}");
+        assert_eq!(record["layer"], json!(HUGE_LAYER), "{record}");
+        assert_eq!(record["goal"], json!("Do the work"), "{record}");
+        assert_eq!(record["prompt"], json!("Do not run."), "{record}");
+        assert_eq!(record["paths"], json!([CODE_PATH]), "{record}");
+
+        // One open decision on this tree and one feed line; nobody is parked.
+        assert_eq!(
+            table_rows(&state.pool, "decisions").await,
+            decisions_before + 1
+        );
+        let open: Vec<(String, String)> = sqlx::query_as(
+            "SELECT tree_id, status FROM decisions WHERE tree_id IS NOT NULL",
+        )
+        .fetch_all(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(open, vec![(JOB.to_owned(), "open".to_owned())]);
+        let lines: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM feed WHERE kind = 'work_tree_parked'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(lines, 1);
+        assert!(job.manifest.branches.values().all(|b| b.state != "parked"));
+
+        // The same refusal again keeps one record and asks no second time.
+        let again = post(
+            &app,
+            &branch_start_uri(JOB),
+            branch_start_body("big", HUGE_LAYER),
+        )
+        .await;
+        assert_error(&again, StatusCode::CONFLICT);
+        let job = loaded(&state.pool, JOB).await;
+        assert_eq!(
+            job.manifest.extra["pending_starts"].as_object().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            table_rows(&state.pool, "decisions").await,
+            decisions_before + 1
+        );
+    }
+
+    /// A refusal that is not the disk's alone stays exactly as it is today: nothing is stored.
+    #[tokio::test]
+    async fn branch_start_refused_for_the_cap_records_nothing() {
+        let state = test_state().await;
+        seed_job(
+            &state.pool,
+            JOB,
+            "open",
+            live_branches(CAP, "building", FREE_LAYER),
+            &[(FREE_LAYER, 0.0)],
+        )
+        .await;
+        let decisions_before = table_rows(&state.pool, "decisions").await;
+        let feed_before = table_rows(&state.pool, "feed").await;
+
+        let response = post(
+            &app(&state),
+            &branch_start_uri(JOB),
+            branch_start_body("api", FREE_LAYER),
+        )
+        .await;
+
+        assert_error(&response, StatusCode::CONFLICT);
+        let job = loaded(&state.pool, JOB).await;
+        assert!(!job.manifest.extra.contains_key("pending_starts"));
+        assert_eq!(table_rows(&state.pool, "decisions").await, decisions_before);
+        assert_eq!(table_rows(&state.pool, "feed").await, feed_before);
+    }
+
     /// Four live branches at no cost: the default cap refuses whatever the disk holds.
     #[tokio::test]
     async fn post_branch_not_admitted_at_the_cap_is_409_with_reasons() {

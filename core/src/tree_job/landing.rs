@@ -1794,7 +1794,7 @@ mod tests {
         assert_eq!(request_count(&h.pool).await, 1);
 
         drain(&h.pool).await;
-        let settled = settle_merge(&h.pool, &mut job, "api", SETTLE_WAIT)
+        let settled = settle_merge(&h.pool, &mut job, "api", SETTLE_WAIT, true)
             .await
             .unwrap();
 
@@ -1856,7 +1856,7 @@ mod tests {
             .await
             .unwrap();
         drain(&h.pool).await;
-        let settled = settle_merge(&h.pool, &mut job, "api", SETTLE_WAIT)
+        let settled = settle_merge(&h.pool, &mut job, "api", SETTLE_WAIT, true)
             .await
             .unwrap();
 
@@ -1922,7 +1922,7 @@ mod tests {
 
         // As boot would: the job comes back from the store and nothing else is remembered.
         let mut resumed = stored(&h.pool, "job-1").await;
-        let settled = settle_merge(&h.pool, &mut resumed, "api", SETTLE_WAIT)
+        let settled = settle_merge(&h.pool, &mut resumed, "api", SETTLE_WAIT, true)
             .await
             .unwrap();
 
@@ -1941,7 +1941,7 @@ mod tests {
             .unwrap();
         let before = job.manifest.clone();
 
-        let settled = settle_merge(&pool, &mut job, "api", Duration::ZERO)
+        let settled = settle_merge(&pool, &mut job, "api", Duration::ZERO, true)
             .await
             .unwrap();
 
@@ -1956,7 +1956,7 @@ mod tests {
         let mut job = saved_job(&pool, manifest_with(vec![branch_at("api", "green")])).await;
         let before = job.manifest.clone();
 
-        let result = settle_merge(&pool, &mut job, "api", Duration::ZERO).await;
+        let result = settle_merge(&pool, &mut job, "api", Duration::ZERO, true).await;
 
         assert!(
             matches!(result, Err(LandingError::Refused(_))),
@@ -1981,7 +1981,7 @@ mod tests {
             .await
             .unwrap();
         drain(&h.pool).await;
-        let settled = settle_merge(&h.pool, &mut job, "api", SETTLE_WAIT)
+        let settled = settle_merge(&h.pool, &mut job, "api", SETTLE_WAIT, true)
             .await
             .unwrap();
 
@@ -2031,7 +2031,7 @@ mod tests {
             .await
             .unwrap();
         drain(&h.pool).await;
-        settle_merge(&h.pool, &mut job, "api", SETTLE_WAIT)
+        settle_merge(&h.pool, &mut job, "api", SETTLE_WAIT, true)
             .await
             .unwrap();
         assert_eq!(job.manifest.branches["api"].state, "green");
@@ -2046,6 +2046,96 @@ mod tests {
         );
         assert_ne!(first, second);
         assert_eq!(request_count(&h.pool).await, 2);
+    }
+
+    /// `(status, settled_at, settled_reason)` of one `vcs_requests` row.
+    async fn request_row(pool: &SqlitePool, id: i64) -> (String, Option<String>, Option<String>) {
+        sqlx::query_as("SELECT status, settled_at, settled_reason FROM vcs_requests WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Gap 4. With `claim_conflict = false` the escalated row stays the resolver's to pick up, the
+    /// branch keeps its request id, and the attempt is counted in `branch.extra`.
+    #[tokio::test]
+    async fn settle_merge_with_claim_false_leaves_the_escalated_row_unclaimed_and_keeps_the_request()
+     {
+        let _lock = test_env_lock();
+        let (_container, repo) = repo_with_a_conflicting_tree_branch("nucleos-landing-unclaimed-");
+        let h = harness(&repo).await;
+        let mut job = saved_job(
+            &h.pool,
+            manifest_for_repo(&repo, vec![branch_at("api", "green")]),
+        )
+        .await;
+        submit_merge(&h.pool, &h.resolved, &mut job, "api", Origin::Daemon)
+            .await
+            .unwrap();
+        let request_id = job.manifest.branches["api"].extra["merge_request_id"].clone();
+        drain(&h.pool).await;
+
+        let settled = settle_merge(&h.pool, &mut job, "api", SETTLE_WAIT, false)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(settled, MergeSettlement::Conflicted { .. }),
+            "{settled:?}"
+        );
+        let branch = &job.manifest.branches["api"];
+        assert_eq!(branch.state, "green");
+        assert_eq!(branch.extra["merge_request_id"], request_id);
+        assert_eq!(branch.extra["conflict_attempts"], json!(1));
+        assert!(!branch.extra.contains_key("merge_sha"));
+        let (status, settled_at, settled_reason) =
+            request_row(&h.pool, request_id.as_i64().unwrap()).await;
+        assert_eq!(status, "escalated");
+        assert_eq!(settled_at, None, "the resolver may still claim the row");
+        assert_eq!(settled_reason, None);
+        assert_eq!(
+            stored(&h.pool, "job-1").await.manifest,
+            job.manifest,
+            "the attempt was persisted"
+        );
+    }
+
+    /// Regression, not RED: the claiming form keeps today's behaviour and passes today once the
+    /// extra argument compiles. The row is marked `tree-merge` and the request id is dropped.
+    #[tokio::test]
+    async fn settle_merge_with_claim_true_marks_tree_merge() {
+        let _lock = test_env_lock();
+        let (_container, repo) = repo_with_a_conflicting_tree_branch("nucleos-landing-claimed-");
+        let h = harness(&repo).await;
+        let mut job = saved_job(
+            &h.pool,
+            manifest_for_repo(&repo, vec![branch_at("api", "green")]),
+        )
+        .await;
+        submit_merge(&h.pool, &h.resolved, &mut job, "api", Origin::Daemon)
+            .await
+            .unwrap();
+        let request_id = job.manifest.branches["api"].extra["merge_request_id"]
+            .as_i64()
+            .unwrap();
+        drain(&h.pool).await;
+
+        let settled = settle_merge(&h.pool, &mut job, "api", SETTLE_WAIT, true)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(settled, MergeSettlement::NotMerged { .. }),
+            "{settled:?}"
+        );
+        let (status, settled_at, settled_reason) = request_row(&h.pool, request_id).await;
+        assert_eq!(status, "escalated");
+        assert!(settled_at.is_some());
+        assert_eq!(settled_reason.as_deref(), Some("tree-merge"));
+        let branch = &job.manifest.branches["api"];
+        assert!(!branch.extra.contains_key("merge_request_id"));
+        assert!(branch.extra.contains_key("merge_failure"));
     }
 
     // ---- land: the decision --------------------------------------------------------------------

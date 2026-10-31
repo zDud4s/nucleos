@@ -1536,6 +1536,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn decide_answers_an_sq_question() {
+        let state = crate::channels::testkit::state().await;
+        seed_owner(&state, "telegram").await;
+        // A spec that is not waiting on the owner, so answering reopens nothing and starts no run.
+        sqlx::query(
+            "INSERT INTO specs (id, path, title, content_sha, created_at, updated_at) \
+             VALUES ('spec-1', 'C:/spec.md', 'Spec', 'sha', ?, ?)",
+        )
+        .bind(SEEDED_AT)
+        .bind(SEEDED_AT)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO spec_questions (id, spec_id, question, status, created_at) \
+             VALUES ('sq-chan-1', 'spec-1', ?, 'open', ?)",
+        )
+        .bind(QUESTION)
+        .bind(SEEDED_AT)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        run_as(&state, "telegram", "u1", "c1", explicit("sq-chan-1", "sqlite")).await;
+
+        let (status, answer): (String, Option<String>) =
+            sqlx::query_as("SELECT status, answer FROM spec_questions WHERE id = 'sq-chan-1'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "answered");
+        assert_eq!(answer.as_deref(), Some("sqlite"));
+        let reply = the_one_answer(&state).await;
+        assert!(reply.contains(QUESTION), "{reply}");
+    }
+
+    #[tokio::test]
     async fn execute_explicit_answer_with_two_open_decisions_applies_only_the_named_one() {
         let state = crate::channels::testkit::state().await;
         seed_owner(&state, "telegram").await;

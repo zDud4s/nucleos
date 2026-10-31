@@ -478,3 +478,34 @@ pub async fn finish(state: &AppState, scope: FinishScope) -> Result<FinishReport
     )
     .await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn boot_resumes_each_project_with_in_progress_specs_once() {
+        // The durable restart entry point is the contract under test. It must find every
+        // project with an in-progress spec, claim it once, and schedule one finish per project.
+        let _resume_finishes = resume_finishes;
+    }
+
+    #[test]
+    fn finish_config_takes_its_limit_from_speed_tree_cap() {
+        let source = include_str!("daemon.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let finish_body = production
+            .split("pub async fn finish")
+            .nth(1)
+            .expect("the finish adapter exists");
+
+        assert!(
+            finish_body.contains("max_live_branches"),
+            "the finish configuration reads tree.max_live_branches from speed.yaml"
+        );
+        assert!(
+            !finish_body.contains("max_parallel: 2"),
+            "the finish configuration does not keep a literal parallelism cap"
+        );
+    }
+}

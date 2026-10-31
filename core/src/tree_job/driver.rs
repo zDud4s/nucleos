@@ -2215,4 +2215,347 @@ mod tests {
         assert_eq!(asked.len(), 1, "the owner is told once: {asked:?}");
         assert!(asked[0].to_lowercase().contains("budget"), "{:?}", asked[0]);
     }
+
+    // ---- gap 3: a start refused for disk alone is retried by the driver ---------------------------
+
+    /// A layer no real disk can hold, and the same layer measured at no cost.
+    const SHORT_GB: f64 = 1e12;
+    const FREED_GB: f64 = 0.0;
+    const PENDING_LAYER: &str = "backend";
+    const PENDING_NAME: &str = "late";
+
+    async fn set_layer_cost(fx: &Fixture, job: &str, layer: &str, gb: f64) {
+        let mut stored = fx.job(job).await;
+        stored.manifest.costs_gb.insert(layer.to_owned(), json!(gb));
+        store::update(&fx.state.pool, &stored).await.unwrap();
+    }
+
+    /// A job with no branch, a pending start of `PENDING_NAME` that the disk refused, and the one
+    /// open decision `post_branch_start` would have opened for it. Returns the decision's id.
+    async fn job_with_a_pending_start(fx: &Fixture, job: &str) -> String {
+        fx.seed_job(job, Vec::new(), None).await;
+        let caller = root_node_of(job);
+        let asked = decisions::ask_pending(
+            &fx.state.pool,
+            job,
+            &caller,
+            "branch late waits for disk space",
+        )
+        .await
+        .unwrap();
+        let mut stored = fx.job(job).await;
+        stored.manifest.costs_gb.insert(PENDING_LAYER.to_owned(), json!(SHORT_GB));
+        stored.manifest.extra.insert(
+            "pending_starts".to_owned(),
+            json!({ PENDING_NAME: {
+                "caller": caller,
+                "goal": "Do the work",
+                "prompt": "Do not run.",
+                "paths": ["late/**"],
+                "layer": PENDING_LAYER,
+                "base": null,
+                "decision_id": asked.id,
+            }}),
+        );
+        store::update(&fx.state.pool, &stored).await.unwrap();
+        asked.id
+    }
+
+    fn pending_starts(job: &TreeJob) -> Value {
+        job.manifest
+            .extra
+            .get("pending_starts")
+            .cloned()
+            .unwrap_or_else(|| json!({}))
+    }
+
+    async fn decision_row(fx: &Fixture, id: &str) -> (String, Option<String>, Option<String>) {
+        sqlx::query_as("SELECT status, answer, origin FROM decisions WHERE id = ?")
+            .bind(id)
+            .fetch_one(&fx.state.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn count_of(fx: &Fixture, table: &str) -> i64 {
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+            .fetch_one(&fx.state.pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_pending_start_is_admitted_when_disk_frees_and_its_decision_is_answered() {
+        const JOB: &str = "drv-pending-admit";
+        let fx = Fixture::new().await;
+        let decision = job_with_a_pending_start(&fx, JOB).await;
+        let gate = FakeGate::answering(vec![]);
+
+        fx.tick(JOB, &gate).await;
+        assert!(fx.job(JOB).await.manifest.branches.is_empty());
+
+        set_layer_cost(&fx, JOB, PENDING_LAYER, FREED_GB).await;
+        fx.tick(JOB, &gate).await;
+
+        let stored = fx.job(JOB).await;
+        assert!(
+            pending_starts(&stored).get(PENDING_NAME).is_none(),
+            "the pending record is removed: {:?}",
+            pending_starts(&stored)
+        );
+        let branch = stored
+            .manifest
+            .branches
+            .get(PENDING_NAME)
+            .expect("the branch was started from the stored body");
+        let node = branch.node_id.clone().expect("the branch is bound to a node");
+        assert_eq!(fx.launches(&node, "branch-late").await, 1);
+        let (status, answer, origin) = decision_row(&fx, &decision).await;
+        assert_eq!(status, decisions::STATUS_ANSWERED);
+        assert_eq!(origin.as_deref(), Some("driver"));
+        assert!(
+            answer.as_deref().unwrap_or_default().contains("disk freed"),
+            "{answer:?}"
+        );
+        assert!(fx.open_questions(JOB, &root_node_of(JOB)).await.is_empty());
+        assert_ne!(fx.branch(JOB, "late").await.state, "parked");
+    }
+
+    #[tokio::test]
+    async fn a_pending_start_stays_while_the_disk_is_still_short_and_asks_no_second_time() {
+        const JOB: &str = "drv-pending-short";
+        let fx = Fixture::new().await;
+        let decision = job_with_a_pending_start(&fx, JOB).await;
+        let gate = FakeGate::answering(vec![]);
+        let decisions_before = count_of(&fx, "decisions").await;
+        let feed_before = count_of(&fx, "feed").await;
+        let before = pending_starts(&fx.job(JOB).await);
+
+        fx.tick(JOB, &gate).await;
+        fx.tick(JOB, &gate).await;
+        fx.tick(JOB, &gate).await;
+
+        let stored = fx.job(JOB).await;
+        assert_eq!(pending_starts(&stored), before, "the record is untouched");
+        assert!(stored.manifest.branches.is_empty(), "no branch was started");
+        assert_eq!(count_of(&fx, "decisions").await, decisions_before);
+        assert_eq!(count_of(&fx, "feed").await, feed_before, "nothing is announced");
+        assert_eq!(decision_row(&fx, &decision).await.0, decisions::STATUS_OPEN);
+    }
+
+    #[tokio::test]
+    async fn an_owner_answer_before_the_disk_frees_does_not_break_the_retry() {
+        const JOB: &str = "drv-pending-owner";
+        let fx = Fixture::new().await;
+        let decision = job_with_a_pending_start(&fx, JOB).await;
+        let gate = FakeGate::answering(vec![]);
+        decisions::answer(&fx.state.pool, &decision, "I will free some space", "owner")
+            .await
+            .unwrap();
+
+        fx.tick(JOB, &gate).await;
+        assert!(
+            pending_starts(&fx.job(JOB).await)
+                .get(PENDING_NAME)
+                .is_some(),
+            "the retry waits for the disk, not for the owner"
+        );
+
+        set_layer_cost(&fx, JOB, PENDING_LAYER, FREED_GB).await;
+        fx.tick(JOB, &gate).await;
+
+        let stored = fx.job(JOB).await;
+        assert!(pending_starts(&stored).get(PENDING_NAME).is_none());
+        assert!(stored.manifest.branches.contains_key(PENDING_NAME));
+        let (status, answer, origin) = decision_row(&fx, &decision).await;
+        assert_eq!(status, decisions::STATUS_ANSWERED);
+        assert_eq!(
+            answer.as_deref(),
+            Some("I will free some space"),
+            "the owner's answer stays"
+        );
+        assert_eq!(origin.as_deref(), Some("owner"));
+    }
+
+    // ---- gap 4: a conflict is the resolver's before it is the owner's ------------------------------
+
+    const CLASH_JOB: &str = "drv-clash";
+    const CLASH_NODE: &str = "api-node";
+
+    /// `tree/api` and `feat/tree` each change `feature.txt`, so merging one into the other conflicts.
+    fn make_api_conflict(repo: &Path) {
+        assert!(git_in(repo, &["checkout", "-q", "tree/api"]));
+        commit_file(repo, "feature.txt", "theirs\n", "theirs");
+        assert!(git_in(repo, &["checkout", "-q", "feat/tree"]));
+        commit_file(repo, "feature.txt", "ours\n", "ours");
+    }
+
+    /// A job with one green branch `api` whose merge conflicts, behind a node that reported `done`.
+    async fn conflicting_job(fx: &Fixture) {
+        make_api_conflict(&fx.repo);
+        fx.seed_job(
+            CLASH_JOB,
+            vec![code_branch("api", "green", Some(CLASH_NODE))],
+            None,
+        )
+        .await;
+        fx.add_node(CLASH_JOB, CLASH_NODE, "orchestrator").await;
+        fx.run_ended(CLASH_NODE, Some("done")).await;
+    }
+
+    /// Runs the queue once, with or without a request waiting.
+    async fn run_queue(fx: &Fixture) {
+        drain_once(&fx.state.pool, &fx.key, &GitExecutor::default()).await;
+    }
+
+    /// The resolver claimed the newest escalated request and its run ended without landing.
+    async fn resolution_ends_without_landing(fx: &Fixture) {
+        let run = fx.next_run.get() + 1;
+        fx.next_run.set(run);
+        sqlx::query("INSERT INTO runs (id, prompt, status, created_at) VALUES (?, 'resolve', 'interrupted', ?)")
+            .bind(run)
+            .bind(STAMP)
+            .execute(&fx.state.pool)
+            .await
+            .unwrap();
+        let claimed = sqlx::query(
+            "UPDATE vcs_requests SET resolution_run_id = ?
+              WHERE id = (SELECT MAX(id) FROM vcs_requests)
+                AND status = 'escalated' AND resolution_run_id IS NULL",
+        )
+        .bind(run)
+        .execute(&fx.state.pool)
+        .await
+        .unwrap();
+        assert_eq!(claimed.rows_affected(), 1, "an escalated request was waiting");
+    }
+
+    async fn conflict_attempts(fx: &Fixture) -> Option<i64> {
+        fx.branch(CLASH_JOB, "api")
+            .await
+            .extra
+            .get("conflict_attempts")
+            .and_then(Value::as_i64)
+    }
+
+    #[tokio::test]
+    async fn a_conflicting_green_branch_is_left_to_the_resolver_and_not_parked() {
+        let fx = Fixture::new().await;
+        conflicting_job(&fx).await;
+        let gate = FakeGate::answering(vec![]);
+
+        fx.tick(CLASH_JOB, &gate).await;
+        fx.drain().await;
+        fx.tick(CLASH_JOB, &gate).await;
+        fx.tick(CLASH_JOB, &gate).await;
+
+        let branch = fx.branch(CLASH_JOB, "api").await;
+        assert_eq!(branch.state, "green", "the branch waits, it is not parked");
+        let request = branch.extra["merge_request_id"]
+            .as_i64()
+            .expect("the request stays on the branch for the resolver");
+        assert_eq!(conflict_attempts(&fx).await, Some(1));
+        assert!(fx.open_questions(CLASH_JOB, CLASH_NODE).await.is_empty());
+        let row: (String, Option<String>) =
+            sqlx::query_as("SELECT status, settled_at FROM vcs_requests WHERE id = ?")
+                .bind(request)
+                .fetch_one(&fx.state.pool)
+                .await
+                .unwrap();
+        assert_eq!(row.0, "escalated");
+        assert_eq!(row.1, None, "the resolver may still claim the request");
+        assert_eq!(fx.requests().await, 1, "nothing is resubmitted meanwhile");
+    }
+
+    #[tokio::test]
+    async fn a_second_failed_resolution_parks_once() {
+        let fx = Fixture::new().await;
+        conflicting_job(&fx).await;
+        let gate = FakeGate::answering(vec![]);
+
+        // Attempt 1: the queue escalates, the resolver fails.
+        fx.tick(CLASH_JOB, &gate).await;
+        fx.drain().await;
+        fx.tick(CLASH_JOB, &gate).await;
+        assert_eq!(conflict_attempts(&fx).await, Some(1));
+        resolution_ends_without_landing(&fx).await;
+        // The driver drops the dead request and resubmits (in this pass or the next).
+        fx.tick(CLASH_JOB, &gate).await;
+        fx.tick(CLASH_JOB, &gate).await;
+        assert!(fx.open_questions(CLASH_JOB, CLASH_NODE).await.is_empty());
+
+        // Attempt 2: the queue escalates again, the resolver fails again.
+        run_queue(&fx).await;
+        fx.tick(CLASH_JOB, &gate).await;
+        assert_eq!(conflict_attempts(&fx).await, Some(2));
+        assert!(fx.open_questions(CLASH_JOB, CLASH_NODE).await.is_empty());
+        resolution_ends_without_landing(&fx).await;
+
+        // At the limit the conflict is claimed and the owner is asked, once.
+        fx.tick(CLASH_JOB, &gate).await;
+        fx.tick(CLASH_JOB, &gate).await;
+        fx.tick(CLASH_JOB, &gate).await;
+
+        assert_eq!(fx.branch(CLASH_JOB, "api").await.state, "parked");
+        assert_eq!(fx.open_questions(CLASH_JOB, CLASH_NODE).await.len(), 1);
+        assert_eq!(fx.requests().await, 2, "no third attempt was queued");
+    }
+
+    #[tokio::test]
+    async fn a_resolution_that_lands_merges_the_branch_with_no_park() {
+        let fx = Fixture::new().await;
+        conflicting_job(&fx).await;
+        let gate = FakeGate::answering(vec![]);
+        fx.tick(CLASH_JOB, &gate).await;
+        fx.drain().await;
+        fx.tick(CLASH_JOB, &gate).await;
+        assert_eq!(fx.branch(CLASH_JOB, "api").await.state, "green");
+
+        // The resolver landed the same merge as a later request.
+        let sha = sha_of(&fx.repo, "feat/tree");
+        sqlx::query(
+            "INSERT INTO vcs_requests (op, args, project_id, project_root, origin, status,
+                                       result_sha, created_at)
+             SELECT op, args, project_id, project_root, origin, 'succeeded', ?, created_at
+               FROM vcs_requests ORDER BY id LIMIT 1",
+        )
+        .bind(&sha)
+        .execute(&fx.state.pool)
+        .await
+        .unwrap();
+        fx.tick(CLASH_JOB, &gate).await;
+
+        let branch = fx.branch(CLASH_JOB, "api").await;
+        assert_eq!(branch.state, "merged");
+        assert_eq!(branch.extra["merge_sha"], json!(sha));
+        assert!(!branch.extra.contains_key("merge_request_id"));
+        assert!(fx.open_questions(CLASH_JOB, CLASH_NODE).await.is_empty());
+        assert_eq!(count_of(&fx, "decisions").await, 0, "nobody was asked");
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_tree_budget_parks_the_conflict_without_a_resolver() {
+        let fx = Fixture::new().await;
+        conflicting_job(&fx).await;
+        fx.exhaust_budget(CLASH_JOB, CLASH_NODE, 1.0, 5.0).await;
+        let gate = FakeGate::answering(vec![]);
+
+        fx.tick(CLASH_JOB, &gate).await;
+        fx.drain().await;
+        fx.tick(CLASH_JOB, &gate).await;
+        fx.tick(CLASH_JOB, &gate).await;
+
+        assert_eq!(fx.branch(CLASH_JOB, "api").await.state, "parked");
+        assert_eq!(fx.open_questions(CLASH_JOB, CLASH_NODE).await.len(), 1);
+        let settled: Vec<Option<String>> =
+            sqlx::query_scalar("SELECT settled_reason FROM vcs_requests")
+                .fetch_all(&fx.state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            settled,
+            [Some("tree-merge".to_owned())],
+            "the request is claimed so the resolver never spends on it"
+        );
+    }
 }

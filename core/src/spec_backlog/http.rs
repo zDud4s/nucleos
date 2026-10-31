@@ -383,6 +383,95 @@ mod tests {
         }));
     }
 
+    /// A spec that is not waiting on the owner, so answering never reopens it and no run starts.
+    async fn seed_question(state: &AppState, id: &str, status: &str) {
+        sqlx::query(
+            "INSERT OR IGNORE INTO specs (id, path, title, content_sha, created_at, updated_at) \
+             VALUES ('spec-1', 'C:/spec.md', 'Spec', 'sha', '2026-10-30T00:00:00Z', '2026-10-30T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO spec_questions (id, spec_id, question, status, created_at) \
+             VALUES (?, 'spec-1', 'Which budget?', ?, '2026-10-30T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(status)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn post_decision_answers_an_sq_question() {
+        let state = state().await;
+        seed_question(&state, "sq-http-1", "open").await;
+
+        let (status, _) = request(
+            &app(&state),
+            "POST",
+            "/decisions/sq-http-1",
+            json!({"answer": "ten dollars"}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let (stored, answer): (String, Option<String>) =
+            sqlx::query_as("SELECT status, answer FROM spec_questions WHERE id = 'sq-http-1'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, "answered");
+        assert_eq!(answer.as_deref(), Some("ten dollars"));
+    }
+
+    #[tokio::test]
+    async fn post_decision_refuses_an_answered_question_with_409() {
+        let state = state().await;
+        seed_question(&state, "sq-http-2", "open").await;
+        let app = app(&state);
+        let (status, _) = request(
+            &app,
+            "POST",
+            "/decisions/sq-http-2",
+            json!({"answer": "first"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _) = request(
+            &app,
+            "POST",
+            "/decisions/sq-http-2",
+            json!({"answer": "second"}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        let answer: Option<String> =
+            sqlx::query_scalar("SELECT answer FROM spec_questions WHERE id = 'sq-http-2'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(answer.as_deref(), Some("first"));
+    }
+
+    #[tokio::test]
+    async fn post_decision_unknown_id_is_404() {
+        let state = state().await;
+
+        let (status, _) = request(
+            &app(&state),
+            "POST",
+            "/decisions/sq-nope",
+            json!({"answer": "anything"}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
     #[tokio::test]
     async fn scan_reads_the_projects_real_specs() {
         let state = state().await;
