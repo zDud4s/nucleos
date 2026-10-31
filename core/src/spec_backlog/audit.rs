@@ -779,6 +779,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_repeated_doubt_asks_the_owner_once() {
+        let text = "the widget renders";
+        let fx = Fixture::new(&[text]).await;
+        let first = FakeReviewer::answering(
+            "review-1",
+            None,
+            vec![review(1, CriterionStatus::Doubt, None)],
+        );
+        let second = FakeReviewer::answering(
+            "review-2",
+            None,
+            vec![review(1, CriterionStatus::Doubt, None)],
+        );
+        let verify = FakeVerify::new(VerifyState::Green);
+
+        fx.run(&first, &verify).await.unwrap();
+        fx.run(&second, &verify).await.unwrap();
+
+        let open: Vec<_> = fx
+            .questions()
+            .await
+            .into_iter()
+            .filter(|question| question.status == "open")
+            .collect();
+        assert_eq!(open.len(), 1);
+        assert!(open[0].question.contains(text));
+    }
+
+    #[tokio::test]
+    async fn a_doubt_met_later_closes_its_question() {
+        let fx = Fixture::new(&["the widget renders"]).await;
+        let doubt = FakeReviewer::answering(
+            "review-1",
+            None,
+            vec![review(1, CriterionStatus::Doubt, None)],
+        );
+        let met_later = FakeReviewer::answering("review-2", None, vec![met(1, GOOD)]);
+        let verify = FakeVerify::new(VerifyState::Green);
+
+        fx.run(&doubt, &verify).await.unwrap();
+        fx.run(&met_later, &verify).await.unwrap();
+
+        assert!(
+            fx.questions()
+                .await
+                .iter()
+                .all(|question| question.status != "open")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_answered_question_stays_answered_after_a_later_audit() {
+        let fx = Fixture::new(&["the widget renders"]).await;
+        let doubt = FakeReviewer::answering(
+            "review-1",
+            None,
+            vec![review(1, CriterionStatus::Doubt, None)],
+        );
+        let met_later = FakeReviewer::answering("review-2", None, vec![met(1, GOOD)]);
+        let verify = FakeVerify::new(VerifyState::Green);
+
+        fx.run(&doubt, &verify).await.unwrap();
+        let question = fx.questions().await.into_iter().next().unwrap();
+        store::answer_question(&fx.pool, &question.id, "Use the default port")
+            .await
+            .unwrap();
+        fx.run(&met_later, &verify).await.unwrap();
+
+        // This guard passes today: a later audit must not reopen an answered question.
+        let questions = fx.questions().await;
+        assert_eq!(questions.len(), 1);
+        assert_eq!(questions[0].status, "answered");
+        assert_eq!(questions[0].answer.as_deref(), Some("Use the default port"));
+    }
+
+    #[tokio::test]
     async fn audit_writes_nothing_to_the_checkout() {
         let fx = Fixture::new(&["the widget renders"]).await;
         let root = fx.worktree.path();

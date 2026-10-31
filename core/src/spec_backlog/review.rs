@@ -293,3 +293,59 @@ impl ReviewerRunner for NoToolsReviewer<'_> {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec_backlog::model::{CriterionKind, SpecKind, SpecStatus};
+
+    fn spec() -> Spec {
+        Spec {
+            id: "spec-1".to_owned(),
+            project_id: None,
+            path: ".ai/specs/example.md".to_owned(),
+            title: "Example".to_owned(),
+            content_sha: "sha-1".to_owned(),
+            kind: SpecKind::Spec,
+            status: SpecStatus::Extracted,
+            status_reason: None,
+            tree_id: None,
+            last_audited_sha: None,
+            created_at: "2026-10-31T00:00:00+00:00".to_owned(),
+            updated_at: "2026-10-31T00:00:00+00:00".to_owned(),
+        }
+    }
+
+    #[test]
+    fn the_prompt_rests_a_suite_criterion_on_the_daemons_run() {
+        let criteria = [Criterion {
+            id: 1,
+            spec_id: "spec-1".to_owned(),
+            ordinal: 1,
+            text: "The test suite passes".to_owned(),
+            kind: CriterionKind::Test,
+            verify_hint: Some("python -m unittest discover -s tests -t .".to_owned()),
+            status: CriterionStatus::Open,
+            evidence: None,
+            reviewer_run_id: None,
+            spec_sha: "sha-1".to_owned(),
+            checked_at: None,
+        }];
+        let material = ReviewMaterial {
+            files: vec![ReviewFile {
+                path: "tests/test_example.py".to_owned(),
+                text: "1: def test_example():\n".to_owned(),
+            }],
+            cut: false,
+        };
+
+        let prompt = review_prompt(&spec(), &criteria, &material);
+
+        assert!(prompt.contains("answer `met`"), "{prompt}");
+        assert!(
+            prompt.contains("refuses to finish the spec unless its own run is green"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("doubt"), "{prompt}");
+    }
+}
