@@ -770,10 +770,7 @@ impl ClaudeCode {
                         status,
                         status_since: file.and_then(|(f, _)| f.updated_at),
                         started_at: root.started_at,
-                        last_transcript_write: root
-                            .transcript
-                            .as_ref()
-                            .and_then(|_| root.last_activity),
+                        last_transcript_write: root.transcript.as_ref().and(root.last_activity),
                         ..Default::default()
                     },
                 }

@@ -94,7 +94,6 @@ async fn post_finish(
                 finish::FinishError::Config(error) => {
                     tracing::warn!(%error, "backlog finish configuration failed")
                 }
-                other => tracing::warn!(?other, "backlog finish failed"),
             }
         }
     });

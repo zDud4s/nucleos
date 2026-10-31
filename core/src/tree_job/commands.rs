@@ -299,9 +299,7 @@ fn go_scopes(args: &[&str]) -> Result<Vec<Scope>, String> {
     let (base, rest) = split_go_dir(args)?;
     let parsed = parse_flags("go test", rest, &GO_TEST_FLAGS)?;
     let base = base.map(clean_path).transpose()?;
-    let in_module = base
-        .as_deref()
-        .is_some_and(|dir| GO_MODULES.iter().any(|module| *module == dir));
+    let in_module = base.as_deref().is_some_and(|dir| GO_MODULES.contains(&dir));
     let mut scopes = Vec::with_capacity(parsed.positional.len() + 1);
     for pattern in &parsed.positional {
         let (dir, recursive) = go_package_dir(pattern, base.as_deref())?;

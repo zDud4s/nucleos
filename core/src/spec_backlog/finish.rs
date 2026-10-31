@@ -730,17 +730,17 @@ pub(super) async fn run_no_tools(
                 .fetch_optional(&state.pool)
                 .await
                 .map_err(|error| error.to_string())?;
-        if let Some((status, stdout)) = row {
-            if crate::execution::runs::TERMINAL_RUN_STATUSES.contains(&status.as_str()) {
-                if status != "completed" {
-                    return Err(format!("run {id} ended {status}"));
-                }
-                let text = stdout
-                    .as_deref()
-                    .and_then(crate::execution::runner::extract_reply)
-                    .ok_or_else(|| format!("run {id} ended without a final text"))?;
-                return Ok((id.to_string(), text));
+        if let Some((status, stdout)) = row
+            && crate::execution::runs::TERMINAL_RUN_STATUSES.contains(&status.as_str())
+        {
+            if status != "completed" {
+                return Err(format!("run {id} ended {status}"));
             }
+            let text = stdout
+                .as_deref()
+                .and_then(crate::execution::runner::extract_reply)
+                .ok_or_else(|| format!("run {id} ended without a final text"))?;
+            return Ok((id.to_string(), text));
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(format!("run {id} did not end in time"));

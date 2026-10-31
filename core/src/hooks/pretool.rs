@@ -1772,7 +1772,13 @@ mod tests {
             .await
             .unwrap();
 
-        let decision = decide(&state, run_id, "Bash", json!({"command": REDIRECTING_COMMAND})).await;
+        let decision = decide(
+            &state,
+            run_id,
+            "Bash",
+            json!({"command": REDIRECTING_COMMAND}),
+        )
+        .await;
 
         assert_eq!(decision.decision, "deny", "got {:?}", decision.reason);
         assert!(
@@ -1793,9 +1799,19 @@ mod tests {
         let state = test_state().await;
         let run_id = seed_run(&state, "worktree", Some(1_000)).await;
 
-        let decision = decide(&state, run_id, "Bash", json!({"command": REDIRECTING_COMMAND})).await;
+        let decision = decide(
+            &state,
+            run_id,
+            "Bash",
+            json!({"command": REDIRECTING_COMMAND}),
+        )
+        .await;
 
-        assert_eq!(decision.decision, "pending_approval", "got {:?}", decision.reason);
+        assert_eq!(
+            decision.decision, "pending_approval",
+            "got {:?}",
+            decision.reason
+        );
         let (status, approvals) = run_status_and_action_approvals(&state, run_id).await;
         assert_eq!(status, "awaiting_approval");
         assert_eq!(approvals, 1);

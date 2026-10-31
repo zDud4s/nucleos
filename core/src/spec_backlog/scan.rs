@@ -466,8 +466,9 @@ mod tests {
         let pool = crate::testdb::fresh_pool().await;
         let project = tempfile::tempdir().unwrap();
         let state = tempfile::tempdir().unwrap();
-        let bytes: &[u8] = &[0xff, 0xfe, 0x00, 0x80, b'\n'];
-        assert!(std::str::from_utf8(bytes).is_err());
+        let owned: Vec<u8> = vec![0xff, 0xfe, 0x00, 0x80, b'\n'];
+        let bytes: &[u8] = &owned;
+        assert!(String::from_utf8(owned.clone()).is_err());
         write_file(&project_specs(project.path()), "binary-ish.md", bytes);
 
         let report = scan(&pool, PROJECT, &roots_at(project.path(), state.path()))

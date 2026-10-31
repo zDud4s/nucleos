@@ -577,7 +577,7 @@ mod tests {
             .unwrap()
             .unwrap();
         job.manifest.costs_gb.insert("core".to_owned(), json!(1e20));
-        crate::tree_job::store::update(&state.pool, &mut job)
+        crate::tree_job::store::update(&state.pool, &job)
             .await
             .unwrap();
         let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_nodes")

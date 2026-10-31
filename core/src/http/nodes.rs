@@ -187,10 +187,10 @@ async fn post_node(
     };
     depth::check_child(&chain, &guard_args, tree_total, &TreeLimits::default())
         .map_err(|refusal| refuse(StatusCode::CONFLICT, depth_refusal_message(refusal)))?;
-    if let Some(root_id) = root_id {
-        if let Permit::No { reason } = budget::permits_next_node(&state.pool, &root_id).await {
-            return Err(refuse(StatusCode::CONFLICT, reason));
-        }
+    if let Some(root_id) = root_id
+        && let Permit::No { reason } = budget::permits_next_node(&state.pool, &root_id).await
+    {
+        return Err(refuse(StatusCode::CONFLICT, reason));
     }
     work_nodes::open(&state.pool, None, &limits, &args)
         .await

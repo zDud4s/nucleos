@@ -82,7 +82,9 @@ async fn price_unmeasured_runs(
     now: DateTime<Utc>,
 ) -> sqlx::Result<f64> {
     let rate = load_budget_config(pool).await?.time_cost_per_hour_usd;
-    let rows: Vec<(String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+    // (created_at, completed_at, model_watch, model_requested_at)
+    type RunTimesRow = (String, Option<String>, Option<String>, Option<String>);
+    let rows: Vec<RunTimesRow> = sqlx::query_as(
         "SELECT r.created_at, r.completed_at, r.model_watch, r.model_requested_at
          FROM tree_run_ids t
          JOIN runs r ON r.id = t.run_id

@@ -38,7 +38,9 @@ async fn resolve_root_id(pool: &sqlx::SqlitePool, id: &str) -> Result<String, St
                 tracing::warn!(%error, "could not resolve tree id");
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
-    Ok(root.filter(|root| !root.is_empty()).unwrap_or_else(|| id.to_owned()))
+    Ok(root
+        .filter(|root| !root.is_empty())
+        .unwrap_or_else(|| id.to_owned()))
 }
 
 async fn get_cost(
@@ -239,8 +241,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{saved:?}");
 
-        let (status, by_root) =
-            request(&app, "GET", "/trees/root-uuid-1/cost", Value::Null).await;
+        let (status, by_root) = request(&app, "GET", "/trees/root-uuid-1/cost", Value::Null).await;
         assert_eq!(status, StatusCode::OK, "{by_root:?}");
         assert_eq!(by_root["budget"]["limit_usd"], 7.0, "{by_root:?}");
 

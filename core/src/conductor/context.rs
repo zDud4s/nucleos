@@ -124,7 +124,9 @@ pub async fn verdict_for_run(
     speed_yaml: Option<&str>,
     cap: Option<i64>,
 ) -> sqlx::Result<Option<NodeRunVerdict>> {
-    let row: Option<(Option<i64>, String, String, String, Option<String>)> = sqlx::query_as(
+    // (context_fill, node id, root id, kind, project id)
+    type NodeFillRow = (Option<i64>, String, String, String, Option<String>);
+    let row: Option<NodeFillRow> = sqlx::query_as(
         "SELECT r.context_fill, n.id, n.root_id, n.kind, n.project_id
          FROM runs r JOIN work_nodes n ON n.run_id = CAST(r.id AS TEXT)
          WHERE r.id = ?",

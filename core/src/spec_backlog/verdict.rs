@@ -65,11 +65,7 @@ fn inside_tree_lineage(reviewer: &ReviewerRun, facts: &ReviewFacts) -> bool {
         facts.tree_run_ids.iter().any(|run| run == id)
             || facts.tree_lineage_roots.iter().any(|root| root == id)
     };
-    tree_owns(&reviewer.run_id)
-        || reviewer
-            .lineage_root_id
-            .as_deref()
-            .is_some_and(|root| tree_owns(root))
+    tree_owns(&reviewer.run_id) || reviewer.lineage_root_id.as_deref().is_some_and(tree_owns)
 }
 
 /// A spec is done only when verify is green, it has criteria, and every one is met against the

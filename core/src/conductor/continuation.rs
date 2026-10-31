@@ -364,6 +364,7 @@ mod tests {
         crate::channels::testkit::state().await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn seed_node(
         state: &AppState,
         id: &str,

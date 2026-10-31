@@ -43,8 +43,8 @@ pub struct SweepReport {
 }
 
 /// The tail buffer has no mtime. This process-local map gives unchanged tails a stable clock.
-static TAIL_CLOCKS: LazyLock<Mutex<HashMap<(i64, usize), (String, DateTime<Utc>)>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+type TailClocks = HashMap<(i64, usize), (String, DateTime<Utc>)>;
+static TAIL_CLOCKS: LazyLock<Mutex<TailClocks>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub async fn tick(
     state: &AppState,
