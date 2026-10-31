@@ -23,12 +23,11 @@ pub(super) fn raise_short_timeouts(list: &mut [Value]) {
     }
 }
 
-/// Whether these settings' `PreToolUse` gate still carries a timeout from before the current one.
-pub(super) fn gate_timeout_is_short(settings: &Value) -> bool {
-    settings
-        .pointer("/hooks/PreToolUse")
-        .and_then(Value::as_array)
-        .into_iter()
+/// Whether any tool event in these settings still carries a timeout from before the current one.
+pub(super) fn a_timeout_is_short(settings: &Value) -> bool {
+    ["PreToolUse", "PostToolUse", "PostToolUseFailure"]
+        .iter()
+        .filter_map(|event| settings.get("hooks")?.get(event)?.as_array())
         .flatten()
         .filter_map(|entry| entry.get("hooks").and_then(Value::as_array))
         .flatten()

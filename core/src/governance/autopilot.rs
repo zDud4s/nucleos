@@ -934,7 +934,9 @@ pub async fn rewire_wired_projects(pool: &sqlx::SqlitePool) -> sqlx::Result<usiz
         let mut rewired = 0;
         for root in roots {
             let dir = Path::new(&root);
-            if !classifier_hook_is_wired(dir) || !classifier_hook_timeout_is_short(dir) {
+            let behind =
+                classifier_hook_timeout_is_short(dir) || classifier_hook_script_is_stale(dir);
+            if !classifier_hook_is_wired(dir) || !behind {
                 continue;
             }
             match wire_classifier_hook(dir) {
@@ -957,7 +959,14 @@ pub fn classifier_hook_timeout_is_short(dir: &Path) -> bool {
     std::fs::read_to_string(dir.join(".claude").join("settings.json"))
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok())
-        .is_some_and(|settings| hook_timeout::gate_timeout_is_short(&settings))
+        .is_some_and(|settings| hook_timeout::a_timeout_is_short(&settings))
+}
+
+/// Whether the script in `dir` is not the one this daemon ships. Only boot asks this, when no CLI
+/// of this daemon is reading the script; a turn asks only about the timeout, since a worktree may
+/// check out a copy of its own and that would be rewritten on every turn.
+fn classifier_hook_script_is_stale(dir: &Path) -> bool {
+    std::fs::read_to_string(dir.join(HOOK_SCRIPT)).map_or(true, |script| script != HOOK_SOURCE)
 }
 
 /// The tools whose calls the classifier has to see for the barrier to mean anything.
@@ -2118,6 +2127,29 @@ pub mod tests {
         }
         assert_eq!(fs::read_to_string(&script).unwrap(), HOOK_SOURCE);
         assert!(!bare.path().join(".claude").exists());
+    }
+
+    /// A later daemon's script still reaches a project whose timeout is current, and a project with
+    /// nothing behind is not written at all.
+    #[tokio::test]
+    async fn rewiring_at_boot_refreshes_a_stale_script_and_leaves_a_current_project_alone() {
+        let pool = test_pool().await;
+        let root = TempDir::new().unwrap();
+        wire_classifier_hook(root.path()).unwrap();
+        let script = root.path().join(".claude/hooks/ask_daemon.py");
+        fs::write(&script, "# an older script").unwrap();
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('p', 'active', ?)",
+        )
+        .bind(root.path().to_str().unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(rewire_wired_projects(&pool).await.unwrap(), 1);
+        assert_eq!(fs::read_to_string(&script).unwrap(), HOOK_SOURCE);
+
+        assert_eq!(rewire_wired_projects(&pool).await.unwrap(), 0);
     }
 
     #[test]
