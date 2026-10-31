@@ -675,9 +675,8 @@ struct SystemShutdownQuery {
 ///
 /// Answers 202 at once with the readiness it saw; the wait happens in a task. New work is refused
 /// from this moment on (`shutdown.rs`). When the wait ends with no run live the daemon leaves by
-/// the same graceful path as `/daemon/shutdown`, exit code 0 (on Windows nothing relaunches it
-/// either way: Task Scheduler does not restart on a non-zero exit, and `conhost --headless` returns
-/// 0 regardless; see `shutdown.rs`). When it times out the daemon
+/// the same graceful path as `/daemon/shutdown`, exit code 0, which on Windows is also what tells
+/// the `--supervise` loop not to relaunch it; see `shutdown.rs`. When it times out the daemon
 /// carries on and `GET /system/update-readiness` shows `draining: false` and the runs still live.
 /// A second request while one is draining changes nothing.
 async fn post_system_shutdown(

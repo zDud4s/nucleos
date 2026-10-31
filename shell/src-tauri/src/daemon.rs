@@ -18,6 +18,17 @@ pub fn should_spawn(release_bundle: bool, answered: bool, present: bool) -> bool
     release_bundle && !answered && present
 }
 
+/// The arguments the shell gives the bundled daemon. On Windows it runs under `--supervise`, like
+/// the logon task, so a daemon relaunched after an update is restarted if it fails; elsewhere the
+/// daemon is started plain.
+pub fn daemon_args(windows: bool) -> &'static [&'static str] {
+    if windows {
+        &["--supervise"]
+    } else {
+        &[]
+    }
+}
+
 fn answers() -> bool {
     let addr = SocketAddr::from(([127, 0, 0, 1], 8791));
     TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok()
@@ -48,6 +59,7 @@ pub fn ensure_running() {
             return;
         }
         let mut cmd = std::process::Command::new(&exe);
+        cmd.args(daemon_args(cfg!(windows)));
         if let Some(dir) = exe.parent() {
             cmd.current_dir(dir);
         }
@@ -172,6 +184,12 @@ mod tests {
             !super::should_spawn(true, false, false),
             "no binary, nothing to spawn"
         );
+    }
+
+    #[test]
+    fn only_windows_starts_the_daemon_under_the_supervisor() {
+        assert_eq!(super::daemon_args(true), ["--supervise"]);
+        assert!(super::daemon_args(false).is_empty());
     }
 
     #[test]
