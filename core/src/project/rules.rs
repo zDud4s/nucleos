@@ -49,17 +49,27 @@ pub fn pins_versioned(project_id: &str) -> Result<(Pins, i64), DocumentUnreadabl
     Ok((pins, version))
 }
 
-/// Whether the project has a readable stored document called `name`.
+/// Whether the project has a readable stored document called `name`. After a failed load nothing is known, so
+/// it is `false` (and the readers above are `Err`).
 pub fn is_stored(project_id: &str, name: &str) -> bool {
     let snapshot = crate::settings::global().snapshot();
     let scope = Scope::project(project_id);
-    snapshot.entry(&scope, name).is_some() && !snapshot.is_unreadable(&scope, name)
+    snapshot.load_failed().is_none()
+        && snapshot.entry(&scope, name).is_some()
+        && !snapshot.is_unreadable(&scope, name)
 }
 
 pub fn read_from<T: Document + Default + Clone>(
     snapshot: &Snapshot,
     project_id: &str,
 ) -> Result<T, DocumentUnreadable> {
+    // A snapshot whose load failed is incomplete: "nothing stored" there would read as "gate off".
+    if let Some(reason) = snapshot.load_failed() {
+        return Err(DocumentUnreadable {
+            name: T::NAME,
+            reason: format!("the settings could not be loaded: {reason}"),
+        });
+    }
     let scope = Scope::project(project_id);
     if let Some(record) = snapshot.unreadable_for(&scope, T::NAME) {
         return Err(DocumentUnreadable {
@@ -190,6 +200,26 @@ mod tests {
         assert_eq!(pinned.workflows.len(), 1);
         assert_eq!(pinned.workflows[0].name, "lint");
         assert!(is_stored("alpha", "workflow_pins"));
+    }
+
+    /// D2: when `settings::init` fails the snapshot is empty, which reads as "nothing stored" (gate off). It must
+    /// read as unreadable instead, so every caller takes its safe side. (A plain never-initialised handle stays the
+    /// default: `Home::new()` and most tests above depend on that, so the failure has to be recorded by `init`.)
+    #[tokio::test]
+    async fn rules_are_an_error_after_a_failed_settings_init() {
+        let _home = testing::Home::new();
+        let pool = crate::testdb::fresh_pool().await;
+        sqlx::query("DROP TABLE settings")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert!(crate::settings::init(&pool).await.is_err(), "premise");
+
+        assert!(autopilot("alpha").is_err(), "must not answer the default");
+        assert!(pins("alpha").is_err());
+        assert!(pins_versioned("alpha").is_err());
+        assert!(!is_stored("alpha", "autopilot"));
     }
 
     /// Characterisation: `Home` is test support, already implemented, so this one passes before the GREEN.

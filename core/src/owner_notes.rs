@@ -1805,6 +1805,12 @@ use crate::{needle}s;"
             if crate::source_scan::module_path(&path).starts_with("http/") {
                 continue;
             }
+            // The route table parts (`route_index/generated/*.rs`, written by
+            // `scripts/route_index_gate.py`) are route text only: the notes routes' handler names
+            // appear there, and nothing in them reads a note.
+            if crate::source_scan::module_path(&path).starts_with("route_index/generated/") {
+                continue;
+            }
             // The submodules of this module (`owner_notes/embeddings.rs`, ...) are this module,
             // but only under `core/src`: another crate's `owner_notes/` folder is scanned.
             if is_owner_notes_submodule_file(

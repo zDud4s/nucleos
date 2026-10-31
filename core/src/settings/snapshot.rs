@@ -43,9 +43,21 @@ pub struct Unreadable {
 pub struct Snapshot {
     entries: BTreeMap<Scope, BTreeMap<String, Entry>>,
     unreadable: Vec<Unreadable>,
+    /// Why the table could not be loaded, when it could not. Such a snapshot is incomplete, so a reader of a
+    /// safety setting must not take "nothing stored" for "off".
+    load_failed: Option<String>,
 }
 
 impl Snapshot {
+    /// Why the last load of the table failed, if it did; `None` for a snapshot built from a successful load.
+    pub fn load_failed(&self) -> Option<&str> {
+        self.load_failed.as_deref()
+    }
+
+    pub(crate) fn set_load_failed(&mut self, reason: String) {
+        self.load_failed = Some(reason);
+    }
+
     /// The document `T` at `scope`, if one is stored and readable.
     pub fn get_opt<T: Document>(&self, scope: &Scope) -> Option<Arc<T>> {
         let entry = self.entry(scope, T::NAME)?;
@@ -178,6 +190,15 @@ impl Settings {
                 .read()
                 .unwrap_or_else(PoisonError::into_inner),
         )
+    }
+
+    /// Record that a project document was refused at import: unreadable at version 0 (nothing is stored), so
+    /// `rules::*` answer `Err` for it. Takes the write lock, like a write.
+    pub(super) async fn mark_unreadable(&self, record: Unreadable) {
+        let _writes = self.lock_writes().await;
+        let mut next = (*self.snapshot()).clone();
+        next.mark_unreadable(record);
+        self.swap(next);
     }
 
     pub(super) fn swap(&self, snapshot: Snapshot) {

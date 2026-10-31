@@ -103,6 +103,7 @@ pub fn by_id(id: &str) -> Option<&'static Manifest> {
 #[derive(
     Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
 )]
+#[serde(deny_unknown_fields)]
 pub struct ChannelConfig {
     // `pillars` is a private module of `config`; its glob re-export carries the `pub` fn.
     #[serde(
@@ -117,6 +118,7 @@ pub struct ChannelConfig {
     /// Whether a running turn's ack message is edited with the live text (`channels.stream_edits`
     /// in the plan). Absent = on; it only ever applies to a channel that declares `edit`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("default" = true))]
     pub stream_edits: Option<bool>,
 }
 
@@ -887,6 +889,31 @@ mod tests {
         let blank: ChannelConfig = serde_json::from_value(serde_json::json!({"doctrine": ""}))
             .expect("a blank doctrine parses");
         assert_eq!(blank.doctrine, None);
+    }
+
+    /// D5: a PUT with a misspelt key (`strem_edits: false`) must be refused, not stored without it.
+    #[test]
+    fn a_write_with_a_misspelt_field_is_refused() {
+        use crate::settings::decode;
+        let why = decode::prepare::<ChannelConfig>(&serde_json::json!({"strem_edits": false}))
+            .expect_err("a typo in a field name is refused on write");
+        assert!(why.contains("unknown field `strem_edits`"), "{why}");
+        // The correct spelling still passes.
+        assert!(
+            decode::prepare::<ChannelConfig>(&serde_json::json!({"stream_edits": false})).is_ok()
+        );
+    }
+
+    /// D5: the stored-row read stays lenient with the same type: an extra key is dropped, the rest is kept.
+    #[test]
+    fn loading_a_stored_row_with_an_extra_field_still_yields_a_value() {
+        use crate::settings::decode;
+        let erased = decode::load::<ChannelConfig>(r#"{"doctrine": "be brief", "from_newer": 1}"#)
+            .expect("a row with an unknown key stays readable");
+        let config = erased
+            .downcast::<ChannelConfig>()
+            .expect("the document has the expected type");
+        assert_eq!(config.doctrine.as_deref(), Some("be brief"));
     }
 
     #[tokio::test]

@@ -910,6 +910,42 @@ gate_command: git --version
         assert_eq!(sha_of(&repo, "master"), before, "master moved");
     }
 
+    /// D2 end to end: an `autopilot.yaml` with `gate_before_publish: true` and a syntax error is refused by the
+    /// startup import. That must refuse the merge (as unreadable rules do), not skip the gate and publish.
+    #[tokio::test]
+    async fn a_rules_file_the_import_refused_refuses_the_merge_and_publishes_nothing() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-gate-refused-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        let home = crate::project::rules::testing::Home::new();
+        crate::project::state::write_for_test(
+            home.path(),
+            "alpha",
+            "autopilot.yaml",
+            "gate_before_publish: true\ngate_command: [oops\n",
+        );
+        let pool = crate::testdb::fresh_pool().await;
+        let outcome = crate::settings::import::run(
+            &pool,
+            &crate::settings::global(),
+            Some(home.path()),
+            true,
+        )
+        .await;
+        assert!(!outcome.refused.is_empty(), "premise: {outcome:?}");
+        let before = sha_of(&repo, "master");
+
+        match land_ordinarily(&repo).await {
+            Outcome::Failed { reason, .. } => {
+                assert!(reason.contains("could not be read"), "{reason}");
+                assert!(reason.contains("nothing was published"), "{reason}");
+            }
+            other => panic!("a refused rules file must refuse the merge, got {other:?}"),
+        }
+        assert_eq!(sha_of(&repo, "master"), before, "master moved");
+    }
+
     /// The gate is read from the stored rules at the moment of the merge, not from a file: a red gate
     /// that is only stored in the snapshot refuses the merge, and `master` does not move.
     #[tokio::test]
@@ -3564,6 +3600,26 @@ gate_command: git rev-parse --verify nao-existe
             sha_of(&remote, "refs/heads/master"),
             sha_of(&repo, "refs/heads/master")
         );
+    }
+
+    /// Unreadable stored rules must not read as "no post-land gate": the push is refused and the remote
+    /// does not move (it used to fall through to an ungated push).
+    #[tokio::test]
+    async fn a_push_with_unreadable_rules_is_refused_and_the_remote_does_not_move() {
+        let (_container, repo, remote, pool) = gated_push_fixture(GATED_RULES).await;
+        crate::project::rules::testing::publish_unreadable("alpha", "autopilot", "broken rules");
+
+        let outcome = execute_push(&repo, &pool, "master").await;
+
+        match outcome {
+            Outcome::Failed { reason, .. } => {
+                assert!(reason.contains("could not be read"), "{reason}");
+                assert!(reason.contains("nothing was pushed"), "{reason}");
+                assert!(reason.contains("broken rules"), "{reason}");
+            }
+            other => panic!("unreadable rules must refuse the push, got {other:?}"),
+        }
+        assert!(!remote_has(&remote, "master"));
     }
 
     #[tokio::test]

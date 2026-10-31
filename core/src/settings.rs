@@ -9,6 +9,7 @@ use serde_json::Value;
 use sqlx::SqlitePool;
 
 mod checks;
+pub mod commands;
 pub mod decode;
 pub mod import;
 pub mod registry;
@@ -157,8 +158,11 @@ pub async fn rollback(
     name: &str,
     to_version: i64,
     by: &str,
+    expected: Option<i64>,
 ) -> Result<i64, SettingsError> {
-    global().rollback(pool, scope, name, to_version, by).await
+    global()
+        .rollback(pool, scope, name, to_version, by, expected)
+        .await
 }
 
 pub async fn delete(

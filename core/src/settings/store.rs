@@ -137,7 +137,16 @@ impl Settings {
     /// Replace the snapshot with the table's contents.
     pub async fn load(&self, pool: &SqlitePool) -> Result<(), SettingsError> {
         let _writes = self.lock_writes().await;
-        let snapshot = load_all(pool).await?;
+        let snapshot = match load_all(pool).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                // Keep what was loaded before, but say it is incomplete: `rules::*` then refuse to answer the default.
+                let mut failed = (*self.snapshot()).clone();
+                failed.set_load_failed(error.to_string());
+                self.swap(failed);
+                return Err(error);
+            }
+        };
         self.swap(snapshot);
         Ok(())
     }
@@ -194,6 +203,7 @@ impl Settings {
 
     /// Write the body of an earlier version as a NEW version (history is append-only). The body is validated
     /// again under today's rules: a version whose fields this daemon no longer knows is refused, not repaired.
+    /// `expected` is the CURRENT version the caller saw, checked in the commit like `put` does.
     pub async fn rollback(
         &self,
         pool: &SqlitePool,
@@ -201,6 +211,7 @@ impl Settings {
         name: &str,
         to_version: i64,
         by: &str,
+        expected: Option<i64>,
     ) -> Result<i64, SettingsError> {
         let doc = lookup(scope, name)?;
         // Read before taking the write lock: history rows are append-only, so the body of `to_version`
@@ -223,7 +234,7 @@ impl Settings {
             .map_err(|error| SettingsError::Invalid(error.to_string()))?;
         let prepared = (doc.prepare)(&body).map_err(SettingsError::Invalid)?;
         let _writes = self.lock_writes().await;
-        self.commit_locked(pool, scope, doc, Change::Write(prepared), by, None)
+        self.commit_locked(pool, scope, doc, Change::Write(prepared), by, expected)
             .await
     }
 
@@ -905,7 +916,7 @@ mod tests {
             .await
             .unwrap();
         let version = settings
-            .rollback(&pool, &Scope::Machine, "verify", 1, "owner")
+            .rollback(&pool, &Scope::Machine, "verify", 1, "owner", None)
             .await
             .unwrap();
         assert_eq!(version, 3, "a rollback is a write, never a rewind");
@@ -944,19 +955,62 @@ mod tests {
             .await
             .unwrap();
         let missing = settings
-            .rollback(&pool, &Scope::Machine, "verify", 9, "a")
+            .rollback(&pool, &Scope::Machine, "verify", 9, "a", None)
             .await;
         assert!(matches!(missing, Err(SettingsError::NotFound)));
         let deletion = settings
-            .rollback(&pool, &Scope::Machine, "verify", 2, "a")
+            .rollback(&pool, &Scope::Machine, "verify", 2, "a", None)
             .await;
         assert!(
             matches!(deletion, Err(SettingsError::Invalid(why)) if why.contains("is a deletion"))
         );
         let unknown = settings
-            .rollback(&pool, &Scope::Machine, "nope", 1, "a")
+            .rollback(&pool, &Scope::Machine, "nope", 1, "a", None)
             .await;
         assert!(matches!(unknown, Err(SettingsError::UnknownDocument(_))));
+    }
+
+    /// The expected version is checked inside the commit, under the write lock, like `put` and `delete`.
+    #[tokio::test]
+    async fn rollback_with_a_stale_expected_version_is_refused_and_writes_nothing() {
+        let (pool, settings) = fixture().await;
+        for capacity in [2, 3] {
+            settings
+                .put(
+                    &pool,
+                    &Scope::Machine,
+                    "verify",
+                    &json!({"capacity": capacity}),
+                    "a",
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let stale = settings
+            .rollback(&pool, &Scope::Machine, "verify", 1, "owner", Some(1))
+            .await;
+        assert!(matches!(stale, Err(SettingsError::Stale { current: 2 })));
+        assert_eq!(
+            history(&pool, &Scope::Machine, "verify")
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "no new version"
+        );
+        assert_eq!(
+            settings
+                .snapshot()
+                .get::<VerifyConfig>(&Scope::Machine)
+                .capacity,
+            3
+        );
+        let current = settings
+            .rollback(&pool, &Scope::Machine, "verify", 1, "owner", Some(2))
+            .await
+            .unwrap();
+        assert_eq!(current, 3, "the current version lets it through");
     }
 
     #[tokio::test]
@@ -984,7 +1038,7 @@ mod tests {
                 .is_none()
         );
         let version = settings
-            .rollback(&pool, &Scope::Machine, "verify", 1, "a")
+            .rollback(&pool, &Scope::Machine, "verify", 1, "a", None)
             .await
             .unwrap();
         assert_eq!(version, 3);

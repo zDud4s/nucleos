@@ -310,7 +310,7 @@ export function FieldNode(props: FieldNodeProps): ReactElement {
           <label className="flex items-center gap-2">
             <input
               type="checkbox"
-              checked={value === true}
+              checked={value === undefined || value === null ? inner.default === true : value === true}
               aria-invalid={invalid}
               onChange={(event) => { onChange(event.target.checked); }}
             />

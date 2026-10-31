@@ -16,7 +16,7 @@ use serde::Serialize;
 use serde_json::Value;
 use sqlx::SqlitePool;
 
-use super::{DocType, Kind, Scope, Settings, SettingsError};
+use super::{DocType, Kind, Scope, Settings, SettingsError, Unreadable};
 use crate::models::route_advice;
 use crate::models::route_doc::RouterDoc;
 use crate::{config, feed, machine_config, project, workflows};
@@ -68,8 +68,11 @@ pub fn yaml_to_body(name: &str, text: &str) -> Result<Value, String> {
             if text.trim().is_empty() {
                 return to_json(crate::channels::registry::ChannelConfig::default());
             }
-            let config: crate::channels::registry::ChannelConfig =
-                serde_yaml::from_str(text).map_err(|error| error.to_string())?;
+            // The struct denies unknown fields, but a legacy file may carry keys this daemon dropped: read through
+            // the lenient path (as a stored row is) so those keys are removed and the rest kept. A syntax or type
+            // error still refuses the file.
+            let raw: Value = serde_yaml::from_str(text).map_err(|error| error.to_string())?;
+            let config: crate::channels::registry::ChannelConfig = super::decode::tolerant(raw)?;
             to_json(config)
         }
         other => Err(format!("{NO_IMPORTER} `{other}`")),
@@ -116,6 +119,7 @@ async fn feed_line(pool: &SqlitePool, scope: &Scope, summary: &str) {
 
 async fn refuse(
     pool: &SqlitePool,
+    settings: &Settings,
     scope: &Scope,
     ty: &'static DocType,
     why: &str,
@@ -131,6 +135,18 @@ async fn refuse(
         ),
     )
     .await;
+    // A project document is a safety setting (the pre-publish gate, pins): "nothing stored" would read as "gate
+    // off", so mark it unreadable and let `rules::*` answer `Err`. Machine documents keep absent = defaults.
+    if ty.kind == Kind::Project {
+        settings
+            .mark_unreadable(Unreadable {
+                scope: scope.clone(),
+                name: ty.name.to_owned(),
+                version: 0,
+                reason: why.to_owned(),
+            })
+            .await;
+    }
     outcome.refused.push((scope.clone(), ty.name));
 }
 
@@ -155,6 +171,7 @@ async fn import_document(
         Err(error) => {
             refuse(
                 pool,
+                settings,
                 scope,
                 ty,
                 &format!("it could not be read: {error}"),
@@ -167,7 +184,7 @@ async fn import_document(
     let body = match yaml_to_body(ty.name, &text) {
         Ok(body) => body,
         Err(why) => {
-            refuse(pool, scope, ty, &why, outcome).await;
+            refuse(pool, settings, scope, ty, &why, outcome).await;
             return;
         }
     };
@@ -179,11 +196,11 @@ async fn import_document(
         // Somebody else created it between the check above and the write: theirs stands.
         Err(SettingsError::Stale { .. }) => return,
         Err(SettingsError::Invalid(why)) => {
-            refuse(pool, scope, ty, &why, outcome).await;
+            refuse(pool, settings, scope, ty, &why, outcome).await;
             return;
         }
         Err(other) => {
-            refuse(pool, scope, ty, &other.to_string(), outcome).await;
+            refuse(pool, settings, scope, ty, &other.to_string(), outcome).await;
             return;
         }
     }
@@ -816,6 +833,231 @@ mod tests {
                 .get::<crate::config::EmailConfig>(&Scope::Machine)
                 .host,
             "imap.example.com"
+        );
+    }
+
+    /// A project file that is syntactically broken: `gate_before_publish: true` is in it, and the old loader failed
+    /// the whole file, so nothing was published. "Refused" must therefore not read as "absent".
+    const BAD_RULES: &str = "gate_before_publish: true\ngate_command: [oops\n";
+    const BAD_PINS: &str = "workflows: [oops\n";
+
+    /// D2: a refused project document is marked unreadable in the snapshot (not left absent), so that
+    /// `rules::*` answer `Err` for that project; the file stays on disk under its own name.
+    #[tokio::test]
+    async fn a_refused_project_file_is_marked_unreadable_and_not_left_absent() {
+        use crate::config::AutopilotRules;
+        use crate::project::rules::read_from;
+        use crate::workflows::Pins;
+
+        let pool = crate::testdb::fresh_pool().await;
+        let settings = Settings::new();
+        let home = home();
+        let rules =
+            crate::project::state::write_for_test(&home.root, "alpha", "autopilot.yaml", BAD_RULES);
+        crate::project::state::write_for_test(&home.root, "gamma", "workflows.yaml", BAD_PINS);
+        // A neighbour that is fine must come in and stay readable.
+        crate::project::state::write_for_test(&home.root, "beta", "workflows.yaml", PINS);
+
+        let outcome = run(&pool, &settings, Some(&home.root), true).await;
+
+        assert!(
+            outcome
+                .refused
+                .contains(&(Scope::project("alpha"), "autopilot")),
+            "{outcome:?}"
+        );
+        let snapshot = settings.snapshot();
+        let alpha = Scope::project("alpha");
+        assert!(
+            snapshot.entry(&alpha, "autopilot").is_none(),
+            "nothing is stored"
+        );
+        assert!(
+            snapshot.is_unreadable(&alpha, "autopilot"),
+            "the refusal must be recorded, or the readers answer the default (gate off)"
+        );
+        let error = read_from::<AutopilotRules>(&snapshot, "alpha").unwrap_err();
+        assert_eq!(error.name, "autopilot");
+        assert!(!error.reason.is_empty());
+        assert!(
+            read_from::<Pins>(&snapshot, "gamma").is_err(),
+            "the same holds for the other project document"
+        );
+        assert!(read_from::<Pins>(&snapshot, "beta").is_ok());
+        assert!(read_from::<AutopilotRules>(&snapshot, "beta").is_ok());
+        assert!(
+            read_from::<AutopilotRules>(&snapshot, "gamma").is_ok(),
+            "a project's other document is not poisoned"
+        );
+        assert!(rules.exists(), "the original is not renamed");
+        assert!(!imported(&rules).exists());
+        assert_eq!(std::fs::read_to_string(&rules).unwrap(), BAD_RULES);
+    }
+
+    /// D2, restart: nothing is stored, so every start refuses again and marks again.
+    #[tokio::test]
+    async fn every_start_marks_a_refused_project_file_again() {
+        use crate::config::AutopilotRules;
+        use crate::project::rules::read_from;
+
+        let pool = crate::testdb::fresh_pool().await;
+        let home = home();
+        let rules =
+            crate::project::state::write_for_test(&home.root, "alpha", "autopilot.yaml", BAD_RULES);
+        let alpha = Scope::project("alpha");
+
+        let first = Settings::new();
+        run(&pool, &first, Some(&home.root), true).await;
+        assert!(first.snapshot().is_unreadable(&alpha, "autopilot"));
+
+        // A new process: a fresh handle loaded from the same database, which holds nothing for the document.
+        let second = Settings::new();
+        second.load(&pool).await.unwrap();
+        let again = run(&pool, &second, Some(&home.root), true).await;
+        assert!(
+            again.refused.contains(&(alpha.clone(), "autopilot")),
+            "{again:?}"
+        );
+        assert!(
+            read_from::<AutopilotRules>(&second.snapshot(), "alpha").is_err(),
+            "the second start must mark it again"
+        );
+        assert_eq!(std::fs::read_to_string(&rules).unwrap(), BAD_RULES);
+        assert!(!imported(&rules).exists());
+    }
+
+    /// D2, recovery: a valid write through the settings door clears the mark, and the broken file is never read
+    /// again (a document exists), so the project reads well on the next start too.
+    #[tokio::test]
+    async fn a_valid_put_after_a_refusal_makes_the_project_readable_again() {
+        use crate::config::AutopilotRules;
+        use crate::project::rules::read_from;
+
+        let pool = crate::testdb::fresh_pool().await;
+        let settings = Settings::new();
+        let home = home();
+        crate::project::state::write_for_test(&home.root, "alpha", "autopilot.yaml", BAD_RULES);
+        let alpha = Scope::project("alpha");
+        run(&pool, &settings, Some(&home.root), true).await;
+        assert!(
+            read_from::<AutopilotRules>(&settings.snapshot(), "alpha").is_err(),
+            "premise: the refusal made the project unreadable"
+        );
+
+        let body = yaml_to_body("autopilot", RULES).unwrap();
+        settings
+            .put(&pool, &alpha, "autopilot", &body, "owner", None)
+            .await
+            .unwrap();
+
+        let rules = read_from::<AutopilotRules>(&settings.snapshot(), "alpha").unwrap();
+        assert_eq!(rules.gate_command.as_deref(), Some("true"));
+        assert!(!settings.snapshot().is_unreadable(&alpha, "autopilot"));
+
+        let next_start = Settings::new();
+        next_start.load(&pool).await.unwrap();
+        let outcome = run(&pool, &next_start, Some(&home.root), true).await;
+        assert_eq!(
+            outcome,
+            Outcome::default(),
+            "the stored document wins; the file is not read"
+        );
+        assert!(read_from::<AutopilotRules>(&next_start.snapshot(), "alpha").is_ok());
+    }
+
+    /// Machine documents keep their rule (refused = absent = defaults; github stays off): the new mark is for
+    /// project scope only. Characterisation: this passes before the GREEN and guards it.
+    #[tokio::test]
+    async fn a_refused_machine_file_is_not_marked_unreadable() {
+        let pool = crate::testdb::fresh_pool().await;
+        let settings = Settings::new();
+        let home = home();
+        write(&home.root, "email.yaml", "enabled: [oops\n");
+        write(&home.root, "github.yaml", "enabled: [oops\n");
+
+        let outcome = run(&pool, &settings, Some(&home.root), true).await;
+
+        assert_eq!(outcome.refused.len(), 2, "{outcome:?}");
+        assert!(settings.snapshot().unreadable().is_empty());
+        assert!(
+            settings
+                .snapshot()
+                .get_opt::<crate::config::GithubConfig>(&Scope::Machine)
+                .is_none()
+        );
+    }
+
+    /// `ChannelConfig` refuses unknown keys on a PUT (typo guard), but an old `channels/<id>.yaml` was read
+    /// leniently, so a stray key in it must not cost the owner the whole channel configuration: the known fields
+    /// are stored, the unknown key is dropped, and the file is treated like any other successful import.
+    #[tokio::test]
+    async fn channel_yaml_with_an_unknown_key_is_imported_and_the_key_dropped() {
+        use crate::channels::registry::ChannelConfig;
+
+        let pool = crate::testdb::fresh_pool().await;
+        let settings = Settings::new();
+        let home = home();
+        let text =
+            "stream_edits: false\ndoctrine: be brief\nprojects:\n  alpha: \"42\"\nretired_key: 1\n";
+        let path = write(&home.root, "channels/telegram.yaml", text);
+
+        let outcome = run(&pool, &settings, Some(&home.root), true).await;
+
+        assert!(outcome.refused.is_empty(), "{outcome:?}");
+        assert_eq!(
+            outcome.imported,
+            vec![(Scope::Machine, "channels/telegram")]
+        );
+        let snapshot = settings.snapshot();
+        let stored = snapshot
+            .entry_as::<ChannelConfig>(&Scope::Machine, "channels/telegram")
+            .expect("the channel document is stored");
+        assert_eq!(stored.stream_edits, Some(false));
+        assert_eq!(stored.doctrine.as_deref(), Some("be brief"));
+        assert_eq!(stored.projects.get("alpha").map(String::as_str), Some("42"));
+        let body = snapshot
+            .entry(&Scope::Machine, "channels/telegram")
+            .unwrap()
+            .body();
+        assert!(body.get("retired_key").is_none(), "{body}");
+        assert_eq!(
+            snapshot.version(&Scope::Machine, "channels/telegram"),
+            Some(1)
+        );
+        // Treated as the other imported files: renamed, byte for byte, with the migration line.
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_to_string(imported(&path)).unwrap(), text);
+        let lines = feed_lines(&pool, "config_migrated").await;
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("channels/telegram.yaml") && line.contains("imported")),
+            "{lines:?}"
+        );
+    }
+
+    /// The tolerance above is for unknown keys only: a channel file that is not YAML is still refused and kept.
+    #[tokio::test]
+    async fn a_syntactically_invalid_channel_yaml_is_still_refused() {
+        let pool = crate::testdb::fresh_pool().await;
+        let settings = Settings::new();
+        let home = home();
+        let path = write(
+            &home.root,
+            "channels/telegram.yaml",
+            "stream_edits: [oops\n",
+        );
+
+        let outcome = run(&pool, &settings, Some(&home.root), true).await;
+
+        assert_eq!(outcome.refused, vec![(Scope::Machine, "channels/telegram")]);
+        assert!(outcome.imported.is_empty(), "{outcome:?}");
+        assert!(path.exists() && !imported(&path).exists());
+        assert!(
+            settings
+                .snapshot()
+                .entry(&Scope::Machine, "channels/telegram")
+                .is_none()
         );
     }
 

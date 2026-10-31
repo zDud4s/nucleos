@@ -12,9 +12,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::common::{project_is_on_the_roster, refusal_with_detail};
-use crate::auth::Scope as Caller;
+use crate::auth::{RemoteDevice, Scope as Caller};
 use crate::door::refusal;
 use crate::governance::autopilot;
+use crate::settings::commands::command_fields;
 use crate::settings::{self as store, DocType, Kind, Scope, SettingsError, Snapshot};
 use crate::state::AppState;
 
@@ -122,13 +123,28 @@ fn stored_version(snapshot: &Snapshot, scope: &Scope, name: &str) -> Option<i64>
 }
 
 /// `http:<token-id>` is not available: the control token is one shared secret and `auth::Scope` keeps only the
-/// level of an API key, so neither carries an id. The name of the kind of token is what can be said.
-fn written_by(caller: &Caller) -> &'static str {
-    match caller {
+/// level of an API key, so neither carries an id. The name of the kind of token is what can be said, except for a
+/// paired remote device, which `auth.rs` identifies: `remote:<id>`.
+fn written_by(caller: &Caller, device: Option<&RemoteDevice>) -> String {
+    if let Some(device) = device {
+        return format!("remote:{}", device.id);
+    }
+    let kind = match caller {
         Caller::Control => "http:control",
         Caller::ApiToken(_) => "http:api-token",
         _ => "http:other",
+    };
+    kind.to_owned()
+}
+
+/// A paired device is the owner on another machine, but it never changes a command the host will run: `new` is
+/// refused when any command field of `name` differs from `current`. A document that is absent or unreadable has
+/// no commands, so a device may only create it without any.
+fn refuse_command_change(name: &str, current: &Value, new: &Value) -> Result<(), Refused> {
+    if command_fields(name, current) == command_fields(name, new) {
+        return Ok(());
     }
+    Err(refusal(StatusCode::FORBIDDEN, "remote_command_field"))
 }
 
 fn stale(current: i64) -> Refused {
@@ -251,18 +267,27 @@ async fn read_history(
 async fn write_document(
     State(state): State<AppState>,
     Extension(caller): Extension<Caller>,
+    device: Option<Extension<RemoteDevice>>,
     Path((scope, name)): Path<(String, String)>,
     request: Result<Json<WriteRequest>, JsonRejection>,
 ) -> Result<Json<Value>, Refused> {
     let scope = writable_scope(&state, &scope).await?;
     let doc = owned_document(&scope, &name)?;
     let Json(request) = request.map_err(bad_body)?;
+    let device = device.map(|Extension(device)| device);
+    if device.is_some() {
+        let current = store::global()
+            .snapshot()
+            .entry(&scope, doc.name)
+            .map_or(Value::Null, |entry| entry.body());
+        refuse_command_change(doc.name, &current, &request.body)?;
+    }
     let version = store::put(
         &state.pool,
         &scope,
         doc.name,
         &request.body,
-        written_by(&caller),
+        &written_by(&caller, device.as_ref()),
         Some(request.version),
     )
     .await
@@ -287,27 +312,41 @@ fn reload_channels_after(state: &AppState, scope: &Scope, name: &str) {
 
 /// `POST /settings/{scope}/{name}/rollback/{version}`: the body of an earlier version, written as a new one.
 ///
-/// `settings::rollback` takes no expected version, so the check happens here, against the snapshot. A write landing
-/// between this check and the store's commit is not caught; the rollback then wins, and stays in the history.
+/// The current version the client saw goes to the store, which checks it under its write lock: the 409 is the
+/// store's `Stale`. A device is refused first when the target version carries another command than the stored one.
 async fn rollback_document(
     State(state): State<AppState>,
     Extension(caller): Extension<Caller>,
+    device: Option<Extension<RemoteDevice>>,
     Path((scope, name, to_version)): Path<(String, String, i64)>,
     request: Result<Json<RollbackRequest>, JsonRejection>,
 ) -> Result<Json<Value>, Refused> {
     let scope = writable_scope(&state, &scope).await?;
     let doc = owned_document(&scope, &name)?;
     let Json(request) = request.map_err(bad_body)?;
-    let current = stored_version(&store::global().snapshot(), &scope, doc.name).unwrap_or(0);
-    if request.version != current {
-        return Err(stale(current));
+    let device = device.map(|Extension(device)| device);
+    if device.is_some() {
+        let rows = store::history(&state.pool, &scope, doc.name)
+            .await
+            .map_err(refused)?;
+        let target = rows
+            .iter()
+            .find(|row| row.version == to_version)
+            .ok_or_else(|| refused(SettingsError::NotFound))?;
+        let target: Value = serde_json::from_str(&target.body_json).unwrap_or(Value::Null);
+        let current = store::global()
+            .snapshot()
+            .entry(&scope, doc.name)
+            .map_or(Value::Null, |entry| entry.body());
+        refuse_command_change(doc.name, &current, &target)?;
     }
     let version = store::rollback(
         &state.pool,
         &scope,
         doc.name,
         to_version,
-        written_by(&caller),
+        &written_by(&caller, device.as_ref()),
+        Some(request.version),
     )
     .await
     .map_err(refused)?;
@@ -1082,7 +1121,7 @@ mod tests {
             assert_eq!(verify_history(&state).await[0].written_by, "http:control");
 
             let admin = crate::auth::Scope::ApiToken(crate::auth::ApiTokenLevel::Admin);
-            assert_eq!(super::super::written_by(&admin), "http:api-token");
+            assert_eq!(super::super::written_by(&admin, None), "http:api-token");
         }
     }
 
@@ -1316,6 +1355,294 @@ mod tests {
                 assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {answer}");
                 assert_eq!(answer["refusal"], "not_ours", "{uri}");
             }
+        }
+    }
+
+    /// A paired remote device is the owner on another machine, but it never changes a command the host will
+    /// run: the request carries the `RemoteDevice` extension that `auth.rs` inserts after the token check.
+    mod remote {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        use super::*;
+        use crate::auth::{ApiTokenLevel, RemoteDevice, Scope as Caller};
+
+        const DEVICE: i64 = 7;
+
+        /// The settings routes with the extensions the auth layer would have put on a device's request.
+        async fn remote_call(
+            state: &AppState,
+            method: &str,
+            uri: &str,
+            body: Value,
+        ) -> (StatusCode, Value) {
+            let app = super::super::routes()
+                .with_state(state.clone())
+                .layer(axum::Extension(Caller::ApiToken(ApiTokenLevel::Admin)))
+                .layer(axum::Extension(RemoteDevice { id: DEVICE }));
+            let request = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let response = app.oneshot(request).await.unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (
+                status,
+                serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+            )
+        }
+
+        async fn remote_put(
+            state: &AppState,
+            scope: &str,
+            name: &str,
+            body: Value,
+            version: i64,
+        ) -> (StatusCode, Value) {
+            let uri = format!("/settings/{scope}/{name}");
+            let request = json!({ "body": body, "version": version });
+            remote_call(state, "PUT", &uri, request).await
+        }
+
+        async fn remote_rollback(
+            state: &AppState,
+            scope: &str,
+            name: &str,
+            to_version: i64,
+            current: i64,
+        ) -> (StatusCode, Value) {
+            let uri = format!("/settings/{scope}/{name}/rollback/{to_version}");
+            remote_call(state, "POST", &uri, json!({ "version": current })).await
+        }
+
+        async fn seed(state: &AppState, scope: &str, name: &str, body: &Value, expected: i64) {
+            store::put(
+                &state.pool,
+                &scope.parse::<Scope>().unwrap(),
+                name,
+                body,
+                "test",
+                Some(expected),
+            )
+            .await
+            .expect("seed the document");
+        }
+
+        async fn versions(state: &AppState, scope: &str, name: &str) -> Vec<store::HistoryRow> {
+            store::history(&state.pool, &scope.parse::<Scope>().unwrap(), name)
+                .await
+                .unwrap()
+        }
+
+        /// The document is stored as `old`; a device that sends `new` is refused with the named reason and the
+        /// document stays at version 1; the same `new` from the local caller goes through.
+        async fn remote_put_changing_a_command_is_refused(
+            scope: &str,
+            name: &str,
+            old: Value,
+            new: Value,
+        ) {
+            let (_home, state) = fixture().await;
+            seed(&state, scope, name, &old, 0).await;
+
+            let (status, answer) = remote_put(&state, scope, name, new.clone(), 1).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{scope}/{name}: {answer}");
+            assert_eq!(answer["refusal"], "remote_command_field", "{scope}/{name}");
+            let rows = versions(&state, scope, name).await;
+            assert_eq!(rows.len(), 1, "{scope}/{name}: nothing written");
+            assert_eq!(rows[0].written_by, "test");
+
+            let (status, answer) = put_doc(&state, scope, name, new, 1).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "local caller, {scope}/{name}: {answer}"
+            );
+            assert_eq!(answer["version"], 2);
+        }
+
+        #[tokio::test]
+        async fn a_remote_put_changing_the_verify_broker_prefix_is_403() {
+            remote_put_changing_a_command_is_refused(
+                "machine",
+                "verify",
+                json!({ "capacity": 2, "broker_prefix": ["python", "heavy.py"] }),
+                json!({ "capacity": 2, "broker_prefix": ["python", "evil.py"] }),
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn a_remote_put_adding_a_verify_broker_prefix_is_403() {
+            remote_put_changing_a_command_is_refused(
+                "machine",
+                "verify",
+                json!({ "capacity": 2 }),
+                json!({ "capacity": 2, "broker_prefix": ["python", "evil.py"] }),
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn a_remote_put_changing_the_voice_stt_command_is_403() {
+            remote_put_changing_a_command_is_refused(
+                "machine",
+                "voice",
+                json!({ "stt_command": "whisper-cli -m model.bin" }),
+                json!({ "stt_command": "evil.exe" }),
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn a_remote_put_changing_the_autopilot_gate_command_is_403() {
+            let mut old = autopilot_body();
+            old["gate_command"] = json!("cargo test");
+            let mut new = old.clone();
+            new["gate_command"] = json!("cargo test && evil");
+            remote_put_changing_a_command_is_refused("project:p1", "autopilot", old, new).await;
+        }
+
+        #[tokio::test]
+        async fn a_remote_put_changing_the_autopilot_postgate_idle_command_is_403() {
+            let mut old = autopilot_body();
+            old["postgate_idle_command"] = json!("python scripts/heavy.py idle");
+            let mut new = old.clone();
+            new["postgate_idle_command"] = json!("python evil.py");
+            remote_put_changing_a_command_is_refused("project:p1", "autopilot", old, new).await;
+        }
+
+        #[tokio::test]
+        async fn a_remote_put_changing_an_autopilot_schedule_command_is_403() {
+            let mut old = autopilot_body();
+            old["schedules"] = json!([
+                { "name": "r1", "at": "2026-10-22T09:00:00Z", "command": "git --version" }
+            ]);
+            let mut new = old.clone();
+            new["schedules"][0]["command"] = json!("git --help");
+            remote_put_changing_a_command_is_refused("project:p1", "autopilot", old, new).await;
+        }
+
+        #[tokio::test]
+        async fn a_remote_put_changing_a_workflow_pin_node_command_is_403() {
+            let pins = |command: &str| {
+                json!({ "workflows": [{
+                    "name": "alpha",
+                    "version": "1",
+                    "origin": "library:alpha",
+                    "hash": "h",
+                    "nodes": { "build": { "command": command } },
+                }] })
+            };
+            remote_put_changing_a_command_is_refused(
+                "project:p1",
+                "workflow_pins",
+                pins("make"),
+                pins("make evil"),
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn a_remote_put_changing_a_workflow_pin_path_is_403() {
+            let pins = |path: &str| {
+                json!({ "workflows": [{
+                    "name": "alpha",
+                    "version": "1",
+                    "origin": "library:alpha",
+                    "hash": "h",
+                    "path": path,
+                }] })
+            };
+            remote_put_changing_a_command_is_refused(
+                "project:p1",
+                "workflow_pins",
+                pins("bundles/alpha"),
+                pins("bundles/evil"),
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn a_remote_put_that_leaves_every_command_alone_is_200() {
+            let (_home, state) = fixture().await;
+            let body = |capacity: u32| json!({ "capacity": capacity, "broker_prefix": ["python", "heavy.py"] });
+            seed(&state, "machine", "verify", &body(2), 0).await;
+
+            let (status, answer) = remote_put(&state, "machine", "verify", body(9), 1).await;
+            assert_eq!(status, StatusCode::OK, "{answer}");
+            assert_eq!(answer["version"], 2);
+            assert_eq!(verify_capacity(), 9);
+        }
+
+        #[tokio::test]
+        async fn a_remote_rollback_to_a_version_with_another_command_is_403() {
+            let (_home, state) = fixture().await;
+            seed(
+                &state,
+                "machine",
+                "verify",
+                &json!({ "broker_prefix": ["python", "a.py"] }),
+                0,
+            )
+            .await;
+            seed(
+                &state,
+                "machine",
+                "verify",
+                &json!({ "broker_prefix": ["python", "b.py"] }),
+                1,
+            )
+            .await;
+
+            let (status, answer) = remote_rollback(&state, "machine", "verify", 1, 2).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{answer}");
+            assert_eq!(answer["refusal"], "remote_command_field");
+            assert_eq!(versions(&state, "machine", "verify").await.len(), 2);
+            assert_eq!(
+                store::get::<VerifyConfig>(&Scope::Machine).broker_prefix,
+                vec!["python", "b.py"],
+                "the snapshot did not move"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_remote_rollback_that_changes_no_command_is_200() {
+            let (_home, state) = fixture().await;
+            let body = |capacity: u32| json!({ "capacity": capacity, "broker_prefix": ["python", "heavy.py"] });
+            seed(&state, "machine", "verify", &body(2), 0).await;
+            seed(&state, "machine", "verify", &body(3), 1).await;
+
+            let (status, answer) = remote_rollback(&state, "machine", "verify", 1, 2).await;
+            assert_eq!(status, StatusCode::OK, "{answer}");
+            assert_eq!(answer["version"], 3);
+            assert_eq!(verify_capacity(), 2);
+        }
+
+        #[tokio::test]
+        async fn a_remote_write_is_signed_with_the_device_id() {
+            let (_home, state) = fixture().await;
+            let expected = format!("remote:{DEVICE}");
+
+            let (status, answer) =
+                remote_put(&state, "machine", "verify", json!({ "capacity": 5 }), 0).await;
+            assert_eq!(status, StatusCode::OK, "{answer}");
+            assert_eq!(
+                versions(&state, "machine", "verify").await[0].written_by,
+                expected
+            );
+
+            let (status, answer) = remote_rollback(&state, "machine", "verify", 1, 1).await;
+            assert_eq!(status, StatusCode::OK, "{answer}");
+            let rows = versions(&state, "machine", "verify").await;
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].written_by, expected, "the rollback is signed too");
         }
     }
 }

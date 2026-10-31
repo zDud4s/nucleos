@@ -50,10 +50,16 @@ pub fn prepare<T: Document>(body: &Value) -> Result<Prepared, String> {
 /// Decode stored text as `T`, dropping keys `T` does not know. `finish` is NOT applied: a row written under
 /// older rules must stay readable; the next write validates it again.
 pub fn load<T: Document>(text: &str) -> Result<Erased, String> {
-    let mut json: Value = serde_json::from_str(text).map_err(|error| error.to_string())?;
+    let json: Value = serde_json::from_str(text).map_err(|error| error.to_string())?;
+    let typed: T = tolerant(json)?;
+    Ok(Arc::new(typed))
+}
+
+/// Decode `json` as `T`, dropping keys `T` does not know (the lenient read, for any deserializable type).
+pub fn tolerant<T: serde::de::DeserializeOwned>(mut json: Value) -> Result<T, String> {
     for _ in 0..=MAX_STRIPPED_KEYS {
         match serde_json::from_value::<T>(json.clone()) {
-            Ok(typed) => return Ok(Arc::new(typed)),
+            Ok(typed) => return Ok(typed),
             Err(error) => {
                 let message = error.to_string();
                 let Some(key) = unknown_field(&message) else {

@@ -268,7 +268,7 @@ async fn apply(
         None => handle.delete(pool, scope, name, WRITTEN_BY, None).await,
         Some(version) => {
             handle
-                .rollback(pool, scope, name, version, WRITTEN_BY)
+                .rollback(pool, scope, name, version, WRITTEN_BY, None)
                 .await
         }
     }

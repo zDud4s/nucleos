@@ -279,10 +279,10 @@ impl GitExecutor {
     /// otherwise parks (`Outcome::AwaitingGate`) until the gate turns green - the gate's green writes
     /// requeue the row (`vcs::release_awaiting_gate`) and the push then re-resolves and re-decides.
     ///
-    /// Any other push, a project without `gate_after_land`, an executor without a database, and any
-    /// state that cannot be read behave exactly as before: this only ever DELAYS a push on positive
-    /// evidence that the project asked for it, and a failure to find that evidence must not hold a
-    /// push back. The sha is resolved once and decided on, and that same sha is what is pushed.
+    /// Any other push, a project without `gate_after_land`, and an executor without a database behave
+    /// exactly as before. Stored rules that cannot be read refuse the push (nothing leaves), and a
+    /// post-land gate state that cannot be read parks it. The sha is resolved once and decided on, and
+    /// that same sha is what is pushed.
     async fn push_when_gated_green(
         &self,
         request: &crate::execution::vcs::ClaimedRequest,
@@ -294,11 +294,22 @@ impl GitExecutor {
         let Some(pool) = self.pool.as_ref() else {
             return push(project_root, remote, branch, deadline).await;
         };
-        // Fails open like unreadable stored rules: with no `gate_command` no gate will ever run, so
-        // a push parked for it would wait for ever.
-        let gate_after_land = crate::project::rules::autopilot(&request.project_id)
-            .map(|rules| rules.gate_after_land && rules.gate_command.is_some())
-            .unwrap_or(false);
+        // With no `gate_command` no gate will ever run, so a push parked for it would wait for ever: that
+        // case pushes at once. Rules that cannot be read are a different case: whether the project wants
+        // its pushes gated is unknown, so nothing is pushed (the same safe side as the merge gate).
+        let gate_after_land = match crate::project::rules::autopilot(&request.project_id) {
+            Ok(rules) => rules.gate_after_land && rules.gate_command.is_some(),
+            Err(error) => {
+                return Outcome::Failed {
+                    reason: format!(
+                        "the stored rules of this project could not be read, so whether this push \
+                         waits for the post-land gate is unknown and nothing was pushed: {error}"
+                    ),
+                    exit_code: None,
+                    output_tail: String::new(),
+                };
+            }
+        };
         if !gate_after_land {
             return push(project_root, remote, branch, deadline).await;
         }

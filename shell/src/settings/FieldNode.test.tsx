@@ -92,6 +92,18 @@ describe("FieldNode", () => {
     expect(current()).toEqual({ hotkey: "F9", enabled: true });
   });
 
+  it("shows the schema default for a boolean with no value, and one click writes false", () => {
+    const schema: SchemaNode = {
+      type: "object",
+      properties: { stream_edits: { type: ["boolean", "null"], default: true } },
+    };
+    renderWithQuery(<Harness schema={schema} initial={{}} />);
+    const box = screen.getByLabelText("Stream edits") as HTMLInputElement;
+    expect(box.checked).toBe(true);
+    fireEvent.click(box);
+    expect(current()).toEqual({ stream_edits: false });
+  });
+
   it("offers an enum's choices and an empty one while it is optional", () => {
     renderWithQuery(<Harness />);
     const select = screen.getByLabelText("Mode");
