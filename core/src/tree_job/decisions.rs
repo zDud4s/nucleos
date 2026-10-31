@@ -205,6 +205,112 @@ pub async fn park(
     Ok(decision)
 }
 
+/// `manifest.extra` key naming the decision a root without a branch waits on: `{ "decision_id" }`.
+/// `relaunch::node_waiting_on` reads it, so only this decision's answer restarts the root.
+pub(super) const ROOT_PARK_KEY: &str = "root_park";
+
+/// Parks the branch behind `node_id`, or, when `node_id` is the job's root, which tops no branch,
+/// asks the owner on the root itself (see [`ask_root`]). `None` when the root already waits.
+pub(super) async fn park_or_ask(
+    pool: &SqlitePool,
+    tree_id: &str,
+    node_id: &str,
+    question: &str,
+) -> Result<Option<Decision>, DecisionError> {
+    if let Some(job) = store::load(pool, tree_id).await?
+        && job.root_node_id == node_id
+        && !job
+            .manifest
+            .branches
+            .values()
+            .any(|branch| branch.node_id.as_deref() == Some(node_id))
+    {
+        return ask_root(pool, tree_id, node_id, question).await;
+    }
+    park(pool, tree_id, node_id, question).await.map(Some)
+}
+
+/// Opens a decision on the job's root: the row, the `root_park` record and the feed line land
+/// together. No branch moves and the job's state is untouched, so the job stays unfinished and its
+/// landing waits (the root is not `done`). `None`, writing nothing, while the root has an open
+/// decision: a root that stays blocked is asked about once.
+async fn ask_root(
+    pool: &SqlitePool,
+    tree_id: &str,
+    node_id: &str,
+    question: &str,
+) -> Result<Option<Decision>, DecisionError> {
+    let lock = super::http::job_lock(tree_id);
+    let _guard = lock.lock().await;
+    let Some(mut job) = store::load(pool, tree_id).await? else {
+        return Err(DecisionError::NoBranch(format!(
+            "tree job {tree_id} not found"
+        )));
+    };
+    if job.root_node_id != node_id {
+        return Err(DecisionError::NoBranch(format!(
+            "node {node_id} is not the root of tree job {tree_id}"
+        )));
+    }
+    let waiting: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM decisions WHERE node_id = ? AND status = ?")
+            .bind(node_id)
+            .bind(STATUS_OPEN)
+            .fetch_one(pool)
+            .await?;
+    if waiting > 0 {
+        return Ok(None);
+    }
+    let decision = Decision {
+        id: new_id(),
+        tree_id: Some(tree_id.to_owned()),
+        node_id: Some(node_id.to_owned()),
+        question: question.to_owned(),
+        answer: None,
+        origin: Some(ORIGIN_AGENT.to_owned()),
+        at: now(),
+        status: STATUS_OPEN.to_owned(),
+    };
+    job.manifest.extra.insert(
+        ROOT_PARK_KEY.to_owned(),
+        json!({ "decision_id": decision.id }),
+    );
+    let line = format!(
+        "{}: blocked — root, decision {} — precisa de: {question}",
+        job.goal, decision.id
+    );
+    let manifest = serde_json::to_string(&job.manifest).map_err(StoreError::from)?;
+
+    // Nothing below may ask the pool for a connection while `tx` holds one.
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO decisions (id, tree_id, node_id, question, answer, origin, at, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&decision.id)
+    .bind(&decision.tree_id)
+    .bind(&decision.node_id)
+    .bind(&decision.question)
+    .bind(&decision.answer)
+    .bind(&decision.origin)
+    .bind(&decision.at)
+    .bind(&decision.status)
+    .execute(&mut *tx)
+    .await?;
+    write_manifest(&mut tx, tree_id, &manifest, &decision.at).await?;
+    crate::feed::append_on(
+        &mut tx,
+        job.project_id.as_deref(),
+        FEED_KIND,
+        &line,
+        None,
+        None,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Some(decision))
+}
+
 /// Records the answer and, when the branch still waits on this very decision, puts it back in the
 /// state it parked from. The first answer stays: a second one is refused and changes nothing.
 ///

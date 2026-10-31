@@ -35,6 +35,7 @@ use super::landing::{
 };
 use super::model::JOB_TERMINAL_STATE;
 use super::open::{FIX_PREFIX, relaunch_node, run_is_live};
+use super::relaunch::{budget_refusal, refusal_question};
 use super::store::{self, TreeJob};
 use crate::execution::git_exec::OPERATION_TIMEOUT;
 use crate::execution::vcs::{Origin, ResolvedRepo, resolve_repo};
@@ -160,7 +161,7 @@ async fn advance(state: &AppState, job_id: &str, gate: Option<GateFn>) {
         tracing::warn!(job = job_id, %error, "tree driver failed to advance the job");
     }
     for (node, question) in parks {
-        if let Err(error) = decisions::park(&state.pool, job_id, &node, &question).await {
+        if let Err(error) = decisions::park_or_ask(&state.pool, job_id, &node, &question).await {
             tracing::warn!(job = job_id, %node, %error, "tree driver could not park the branch");
         }
     }
@@ -200,7 +201,28 @@ async fn pass(
         }
     }
 
+    root_step(pool, &job, parks).await?;
     landing_step(state, &mut job).await
+}
+
+/// A root whose run is over and reported `blocked` or `failed` has nobody else to ask: the owner is
+/// asked on the root itself. `park_or_ask` asks once while the decision is open, and the job stays
+/// unfinished and unlanded because the root is not `done`.
+async fn root_step(pool: &SqlitePool, job: &TreeJob, parks: &mut Vec<Park>) -> Result<(), String> {
+    let root = &job.root_node_id;
+    // A root with no node row has no run to report; `landing_step` is where that is an error.
+    let Ok(node) = work_nodes::get(pool, root).await else {
+        return Ok(());
+    };
+    if node.closed_at.is_some() {
+        return Ok(());
+    }
+    let report = node_report(pool, root).await?;
+    if let (false, Some(outcome @ ("blocked" | "failed"))) = (report.live, report.result.as_deref())
+    {
+        parks.push((root.clone(), stopped_question(root, None, outcome)));
+    }
+    Ok(())
 }
 
 // ---- branches ----------------------------------------------------------------------------------
@@ -216,7 +238,7 @@ async fn branch_step(
         return Ok(());
     };
     match branch.state.as_str() {
-        "building" | "fixing" | "reviewing" => at_work(state, job, name, gate).await,
+        "building" | "fixing" | "reviewing" => at_work(state, job, name, gate, parks).await,
         "red" => red(state, job, name, parks).await,
         "green" => merge(state, job, name, parks).await,
         _ => Ok(()),
@@ -272,13 +294,16 @@ async fn persist(pool: &SqlitePool, job: &mut TreeJob) -> Result<(), String> {
     store::update(pool, job).await.map_err(|e| e.to_string())
 }
 
-/// A branch at work whose node reported `done` and whose run is over: a docs branch is done, a
-/// `root` branch with no diff is dropped, anything else is gated.
+/// A branch at work whose node's run is over. Reported `done`: a docs branch is done, a `root`
+/// branch with no diff is dropped, anything else is gated. Reported `blocked` or `failed`: the
+/// branch is parked on a question for the owner. The report belongs to the run, so the new run an
+/// answer starts is not parked again by the old report.
 async fn at_work(
     state: &AppState,
     job: &mut TreeJob,
     name: &str,
     gate: Option<&GateFn>,
+    parks: &mut Vec<Park>,
 ) -> Result<(), String> {
     let pool = &state.pool;
     let Some(branch) = job.manifest.branches.get(name) else {
@@ -288,8 +313,16 @@ async fn at_work(
         return Ok(());
     };
     let report = node_report(pool, &node).await?;
-    if report.live || report.result.as_deref() != Some("done") {
+    if report.live {
         return Ok(());
+    }
+    match report.result.as_deref() {
+        Some("done") => {}
+        Some(outcome @ ("blocked" | "failed")) => {
+            parks.push((node.clone(), stopped_question(&node, Some(name), outcome)));
+            return Ok(());
+        }
+        _ => return Ok(()),
     }
 
     if branch.layer == "docs" {
@@ -330,6 +363,15 @@ async fn at_work(
         spawn_gate(state, gate, &job.id, name);
     }
     Ok(())
+}
+
+/// The question for a node whose run ended `blocked` or `failed`; `branch` is `None` for the root.
+fn stopped_question(node: &str, branch: Option<&str>, outcome: &str) -> String {
+    let whose = match branch {
+        Some(branch) => format!("node {node} of branch {branch}"),
+        None => format!("the root node {node}"),
+    };
+    format!("{whose} reported {outcome}; how should it go on?")
 }
 
 /// Whether the branch holds a commit the feature branch does not. A worktree is checkpointed first:
@@ -530,6 +572,11 @@ async fn red(
         return Ok(());
     }
 
+    if let Some(reason) = budget_refusal(pool, &node).await {
+        // A fix run is paid for: past the tree's limit the owner is asked, and the run id stays.
+        parks.push((node.clone(), refusal_question(&node, &reason)));
+        return Ok(());
+    }
     let suffix = format!(
         "\n\nThe gate failed on your branch with these findings:\n{findings}\n\nFix them, then finish the node again."
     );
@@ -1838,8 +1885,12 @@ mod tests {
 
     /// A job with one branch `api` at work behind `api-node`, whose run ended with `outcome`.
     async fn job_whose_branch_reported(fx: &Fixture, job: &str, outcome: &str) {
-        fx.seed_job(job, vec![code_branch("api", "building", Some("api-node"))], None)
-            .await;
+        fx.seed_job(
+            job,
+            vec![code_branch("api", "building", Some("api-node"))],
+            None,
+        )
+        .await;
         fx.add_node(job, "api-node", "orchestrator").await;
         fx.save_launch("api-node").await;
         fx.run_ended("api-node", Some(outcome)).await;
@@ -1856,7 +1907,11 @@ mod tests {
 
         let asked = fx.open_questions(JOB, "api-node").await;
         assert_eq!(asked.len(), 1, "the owner is asked once: {asked:?}");
-        assert!(asked[0].to_lowercase().contains("blocked"), "{:?}", asked[0]);
+        assert!(
+            asked[0].to_lowercase().contains("blocked"),
+            "{:?}",
+            asked[0]
+        );
         assert_eq!(fx.branch(JOB, "api").await.state, "parked");
         assert!(gate.calls().is_empty(), "a blocked branch is not gated");
     }
@@ -1938,7 +1993,11 @@ mod tests {
 
         let asked = fx.open_questions(JOB, &root_node_of(JOB)).await;
         assert_eq!(asked.len(), 1, "the owner is asked once: {asked:?}");
-        assert!(asked[0].to_lowercase().contains("blocked"), "{:?}", asked[0]);
+        assert!(
+            asked[0].to_lowercase().contains("blocked"),
+            "{:?}",
+            asked[0]
+        );
         fx.assert_not_landing(JOB).await;
         assert_eq!(fx.job(JOB).await.state, "open", "the job is not finished");
     }
@@ -1980,6 +2039,36 @@ mod tests {
         assert_eq!(rows, 1, "the old report asked nothing a second time");
     }
 
+    /// The root's question is answered like a branch's: the answer starts the root again, under
+    /// `decision-<id>`, and its new run is not parked again by the old report.
+    #[tokio::test]
+    async fn an_answered_blocked_root_is_relaunched() {
+        const JOB: &str = "drv-root-answered";
+        let fx = Fixture::new().await;
+        fx.seed_job(JOB, vec![merged_branch("api", None)], Some("integration"))
+            .await;
+        let root = root_node_of(JOB);
+        fx.save_launch(&root).await;
+        let dead = fx.run_ended(&root, Some("blocked")).await;
+        let gate = FakeGate::answering(vec![]);
+        fx.tick(JOB, &gate).await;
+        let decision: String = sqlx::query_scalar("SELECT id FROM decisions WHERE node_id = ?")
+            .bind(&root)
+            .fetch_one(&fx.state.pool)
+            .await
+            .unwrap();
+
+        let answered = open::answer_and_relaunch(&fx.state, &decision, "go ahead", "shell")
+            .await
+            .unwrap();
+
+        let new_run = answered.relaunched.expect("the answer relaunched the root");
+        assert_ne!(new_run, dead);
+        assert_eq!(fx.current_run(&root).await, new_run);
+        assert_eq!(fx.launches(&root, &format!("decision-{decision}")).await, 1);
+        assert!(fx.open_questions(JOB, &root).await.is_empty());
+    }
+
     // ---- the tree budget ---------------------------------------------------------------------------
 
     #[tokio::test]
@@ -1999,7 +2088,11 @@ mod tests {
         fx.tick(JOB, &gate).await;
         fx.tick(JOB, &gate).await;
 
-        assert_eq!(fx.launches(NODE, "fix-").await, 0, "no paid run was started");
+        assert_eq!(
+            fx.launches(NODE, "fix-").await,
+            0,
+            "no paid run was started"
+        );
         assert_eq!(fx.current_run(NODE).await, run_before);
         assert_eq!(fx.branch(JOB, "api").await.state, "parked");
         let asked = fx.open_questions(JOB, NODE).await;

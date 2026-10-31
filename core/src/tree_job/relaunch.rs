@@ -16,6 +16,7 @@ use super::open::now;
 use super::store::{self, TreeJob};
 use crate::execution::concurrency::LIVE_RUN_STATUSES;
 use crate::state::AppState;
+use crate::tree_cost::budget::{self, Permit};
 
 const PARKED: &str = "parked";
 /// The feed kind of a node that needed a relaunch and did not get one.
@@ -223,6 +224,29 @@ async fn branch_is_parked(
     })
 }
 
+/// Why the tree budget refuses an automatic relaunch of `node_id`, or `None` when it permits one
+/// (or the node has no tree row). The owner's answer relaunch does not ask: the owner decided.
+pub(super) async fn budget_refusal(pool: &SqlitePool, node_id: &str) -> Option<String> {
+    let root: Option<String> = sqlx::query_scalar("SELECT root_id FROM work_nodes WHERE id = ?")
+        .bind(node_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+    match budget::permits_next_node(pool, &root?).await {
+        Permit::Yes => None,
+        Permit::No { reason } => Some(reason),
+    }
+}
+
+/// The question asked when the budget stopped an automatic relaunch of `node_id`.
+pub(super) fn refusal_question(node_id: &str, reason: &str) -> String {
+    format!(
+        "Node {node_id} was not started again: the tree budget does not permit it ({reason}). \
+         Raise the budget, or say how the node should go on."
+    )
+}
+
 /// Starts again the agents that boot recovery left without a run, once per pass:
 ///
 /// - every launch whose empty reservation `resume_all` cleared, from its stored prompt and under
@@ -292,6 +316,15 @@ pub async fn relaunch_resumed(state: &AppState, resumed: &store::Resumed) -> Rel
             if status != "running" || run_is_live(pool, &run_id).await.unwrap_or(true) {
                 continue;
             }
+            if let Some(reason) = budget_refusal(pool, &node).await {
+                // The boot does not spend past the tree's limit: the owner is asked once.
+                let question = refusal_question(&node, &reason);
+                if let Err(error) = decisions::park_or_ask(pool, job_id, &node, &question).await {
+                    tracing::warn!(%node, %error, "could not park a node over the tree budget");
+                }
+                note_skipped(pool, &mut relaunched, &node, reason).await;
+                continue;
+            }
             let key = format!("{RESUME_PREFIX}{run_id}");
             match relaunch_node(state, &node, &run_id, &key, None).await {
                 Ok(new_run) => {
@@ -359,6 +392,18 @@ async fn node_waiting_on(pool: &SqlitePool, decision_id: &str) -> Option<String>
     .flatten()?;
     let (tree_id, node_id) = (decision.tree_id?, decision.node_id?);
     let job = store::load(pool, &tree_id).await.ok().flatten()?;
+    // A root without a branch waits on the decision its `root_park` record names.
+    let root_waits = job.root_node_id == node_id
+        && job
+            .manifest
+            .extra
+            .get(decisions::ROOT_PARK_KEY)
+            .and_then(|record| record.get("decision_id"))
+            .and_then(Value::as_str)
+            == Some(decision_id);
+    if root_waits {
+        return Some(node_id);
+    }
     let waits = job.manifest.branches.values().any(|branch| {
         branch.node_id.as_deref() == Some(node_id.as_str())
             && branch.state == PARKED
@@ -501,11 +546,13 @@ mod tests {
         )
         .await
         .unwrap();
-        sqlx::query("INSERT INTO runs (id, prompt, status, created_at) VALUES (71, 'p', 'interrupted', ?)")
-            .bind(CREATED)
-            .execute(pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO runs (id, prompt, status, created_at) VALUES (71, 'p', 'interrupted', ?)",
+        )
+        .bind(CREATED)
+        .execute(pool)
+        .await
+        .unwrap();
         sqlx::query(
             "INSERT INTO work_nodes (id, root_id, depth, kind, title, goal, status, run_id, \
                                      tree_job_id, created_at, updated_at) \
@@ -532,7 +579,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let asked = decisions::park(pool, JOB, NODE, "which way?").await.unwrap();
+        let asked = decisions::park(pool, JOB, NODE, "which way?")
+            .await
+            .unwrap();
         // The tree spent five dollars of a one dollar limit.
         sqlx::query(
             "INSERT INTO tree_budgets (tree_id, limit_usd, soft_pct, created_at, updated_at) \
@@ -553,7 +602,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(answered.relaunched.is_some(), "the owner decided: the node starts again");
+        assert!(
+            answered.relaunched.is_some(),
+            "the owner decided: the node starts again"
+        );
         let started: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM tree_transitions \
              WHERE node_id = ? AND transition = 'launch' AND key = ?",
@@ -564,5 +616,109 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(started, 1);
+    }
+
+    /// The boot relaunch is automatic, so the tree budget stops it: the node keeps its dead run and
+    /// the owner is asked, once.
+    #[tokio::test]
+    async fn a_resumed_node_at_boot_is_not_relaunched_past_the_budget() {
+        let (state, _runner) = crate::execution::runs::testkit::test_state_with_runner(
+            Some(Duration::from_secs(60)),
+            Duration::from_secs(600),
+        )
+        .await;
+        let pool = &state.pool;
+        let mut manifest = Manifest::new(JOB, "feat/relaunch", "Resume it", "C:/nowhere", &[]);
+        let mut branch = Branch::new("branch", &["core/src/**".to_owned()], "core", None);
+        branch.state = "building".to_owned();
+        branch.node_id = Some(NODE.to_owned());
+        manifest.branches.insert(branch.name.clone(), branch);
+        store::save(
+            pool,
+            &TreeJob {
+                id: JOB.to_owned(),
+                root_node_id: ROOT.to_owned(),
+                project_id: None,
+                feature_branch: Some("feat/relaunch".to_owned()),
+                goal: "Resume it".to_owned(),
+                state: "open".to_owned(),
+                manifest,
+                contract: None,
+                created_at: CREATED.to_owned(),
+                updated_at: CREATED.to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO runs (id, prompt, status, cost_usd, created_at) \
+             VALUES (72, 'p', 'interrupted', 5.0, ?)",
+        )
+        .bind(CREATED)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO work_nodes (id, root_id, depth, kind, title, goal, status, run_id, \
+                                     tree_job_id, created_at, updated_at) \
+             VALUES (?, ?, 1, 'orchestrator', 'title', 'goal', 'running', '72', ?, ?, ?)",
+        )
+        .bind(NODE)
+        .bind(ROOT)
+        .bind(JOB)
+        .bind(CREATED)
+        .bind(CREATED)
+        .execute(pool)
+        .await
+        .unwrap();
+        save_launch(
+            pool,
+            &StoredLaunch {
+                node_id: NODE.to_owned(),
+                key: "initial".to_owned(),
+                prompt: "original prompt".to_owned(),
+                project_id: None,
+                cwd: None,
+                mode: "shadow".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO tree_budgets (tree_id, limit_usd, soft_pct, created_at, updated_at) \
+             VALUES (?, 1.0, 80.0, ?, ?)",
+        )
+        .bind(ROOT)
+        .bind(CREATED)
+        .bind(CREATED)
+        .execute(pool)
+        .await
+        .unwrap();
+        let resumed = store::Resumed {
+            jobs: vec![JOB.to_owned()],
+            ..Default::default()
+        };
+
+        let relaunched = relaunch_resumed(&state, &resumed).await;
+        relaunch_resumed(&state, &resumed).await;
+
+        assert!(relaunched.started.is_empty(), "{relaunched:?}");
+        let run: String = sqlx::query_scalar("SELECT run_id FROM work_nodes WHERE id = ?")
+            .bind(NODE)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(run, "72", "no new run was started");
+        let asked: Vec<String> =
+            sqlx::query_scalar("SELECT question FROM decisions WHERE node_id = ? AND status = ?")
+                .bind(NODE)
+                .bind(decisions::STATUS_OPEN)
+                .fetch_all(pool)
+                .await
+                .unwrap();
+        assert_eq!(asked.len(), 1, "the owner is told once: {asked:?}");
+        assert!(asked[0].to_lowercase().contains("budget"), "{:?}", asked[0]);
+        let stored = store::load(pool, JOB).await.unwrap().unwrap();
+        assert_eq!(stored.manifest.branches["branch"].state, "parked");
     }
 }

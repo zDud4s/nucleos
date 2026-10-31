@@ -13,6 +13,7 @@ use super::decisions;
 use super::engine::branch_node_may_close;
 use super::model::JOB_TERMINAL_STATE;
 use super::open::{DIED_PREFIX, WRAP_PREFIX, latest_launch, relaunch_node, run_is_live};
+use super::relaunch::{budget_refusal, refusal_question};
 use super::store;
 
 /// Nodes one tick acts on, oldest first; nodes it leaves alone do not count.
@@ -118,6 +119,18 @@ async fn wrap_node(
         return Ok(true);
     };
 
+    // `tick` listed its rows before this pass, and a relaunch that started meanwhile (the boot one,
+    // under another key) has moved the node on: the run it was handed is no longer the node's.
+    let current: Option<Option<String>> =
+        sqlx::query_scalar("SELECT run_id FROM work_nodes WHERE id = ?")
+            .bind(node_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    if current.flatten().as_deref() != Some(run_id.as_str()) {
+        return Ok(false);
+    }
+
     let live = run_is_live(pool, &run_id)
         .await
         .map_err(|e| e.to_string())?;
@@ -198,6 +211,15 @@ async fn relaunch_or_stop(
     .await
     .map_err(|e| e.to_string())?;
     if prior < cap {
+        if let Some(reason) = budget_refusal(pool, node_id).await {
+            // An automatic relaunch spends: past the tree's limit the owner is asked once (the
+            // parked branch, or the root's open decision, ends every later pass at `wrap_node`).
+            let question = refusal_question(node_id, &reason);
+            decisions::park_or_ask(pool, job_id, node_id, &question)
+                .await
+                .map_err(|e| e.to_string())?;
+            return Ok(true);
+        }
         relaunch_node(state, node_id, dead_run, &key, suffix.as_deref()).await?;
         return Ok(true);
     }
@@ -706,18 +728,21 @@ mod tests {
 
     /// The branch's state and the questions of its open decisions.
     async fn parked_and_asked(state: &AppState) -> (String, Vec<String>) {
-        let branch = store::load(&state.pool, JOB).await.unwrap().unwrap().manifest.branches
-            ["branch"]
+        let branch = store::load(&state.pool, JOB)
+            .await
+            .unwrap()
+            .unwrap()
+            .manifest
+            .branches["branch"]
             .state
             .clone();
-        let asked = sqlx::query_scalar(
-            "SELECT question FROM decisions WHERE node_id = ? AND status = ?",
-        )
-        .bind(NODE)
-        .bind(decisions::STATUS_OPEN)
-        .fetch_all(&state.pool)
-        .await
-        .unwrap();
+        let asked =
+            sqlx::query_scalar("SELECT question FROM decisions WHERE node_id = ? AND status = ?")
+                .bind(NODE)
+                .bind(decisions::STATUS_OPEN)
+                .fetch_all(&state.pool)
+                .await
+                .unwrap();
         (branch, asked)
     }
 
@@ -733,7 +758,11 @@ mod tests {
         tick(&state).await;
         tick(&state).await;
 
-        assert_eq!(launches(&state, NODE, "wrap-").await, 0, "no paid run was started");
+        assert_eq!(
+            launches(&state, NODE, "wrap-").await,
+            0,
+            "no paid run was started"
+        );
         let (branch, asked) = parked_and_asked(&state).await;
         assert_eq!(branch, "parked");
         assert_eq!(asked.len(), 1, "the owner is told once: {asked:?}");
@@ -751,7 +780,11 @@ mod tests {
         tick(&state).await;
         tick(&state).await;
 
-        assert_eq!(launches(&state, NODE, "died-").await, 0, "no paid run was started");
+        assert_eq!(
+            launches(&state, NODE, "died-").await,
+            0,
+            "no paid run was started"
+        );
         let (branch, asked) = parked_and_asked(&state).await;
         assert_eq!(branch, "parked");
         assert_eq!(asked.len(), 1, "the owner is told once: {asked:?}");
@@ -778,8 +811,14 @@ mod tests {
         };
         open::relaunch_resumed(&stale, &boot).await;
         let listed_before = Some("53".to_owned());
-        wrap_node(&stale, NODE, JOB, listed_before, None).await.unwrap();
-        assert_eq!(all_launches(&stale, NODE).await, 1, "boot first, then the stale sweep");
+        wrap_node(&stale, NODE, JOB, listed_before, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            all_launches(&stale, NODE).await,
+            1,
+            "boot first, then the stale sweep"
+        );
 
         // The sweep wins, then the boot relaunch looks again: it reads the node afresh.
         let fresh = state().await;
@@ -797,7 +836,11 @@ mod tests {
         .await
         .unwrap();
         open::relaunch_resumed(&fresh, &boot).await;
-        assert_eq!(all_launches(&fresh, NODE).await, 1, "sweep first, then boot");
+        assert_eq!(
+            all_launches(&fresh, NODE).await,
+            1,
+            "sweep first, then boot"
+        );
     }
 
     /// Every `launch` transition of the node, whatever its key.
