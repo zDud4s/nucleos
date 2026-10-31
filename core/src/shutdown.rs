@@ -4,8 +4,10 @@
 //! work down with it. The order is: the shell asks `GET /system/update-readiness`, the user
 //! accepts, `POST /system/shutdown` puts the daemon in **draining**, the daemon waits until no run
 //! is live, and only then does it leave through the same graceful path as `/daemon/shutdown`, with
-//! exit code 0 so the autostart entry (`RestartOnFailure`, `Restart=on-failure`) does not bring it
-//! back under the installer.
+//! exit code 0. On Windows that code is not what keeps the autostart task from bringing the daemon
+//! back: measured, Task Scheduler's `RestartOnFailure` does not react to a non-zero exit code, and
+//! the task runs the daemon through `conhost --headless`, which reports 0 whatever the daemon
+//! returns. (systemd's `Restart=on-failure` does read the code, so there 0 matters.)
 //!
 //! **Draining refuses new work; it never ends work.** A run is never marked `interrupted` here:
 //! when the wait times out the daemon clears the flag and carries on, and says so.
