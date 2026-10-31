@@ -553,7 +553,9 @@ pub(super) fn spawn_run(
                 permission,
                 resume_session_id: resume_session_id.clone(),
                 mcp_config: job_mcp.as_ref().map(|mcp| mcp.path.clone()),
-                mcp_job: job_mcp.as_ref().map(|mcp| mcp.job_id),
+                mcp_job: job_mcp
+                    .as_ref()
+                    .and_then(|mcp| (mcp.job_id != 0).then_some(mcp.job_id)),
                 mcp_team_run: None,
                 tool_policy,
                 progress_timeout: Some(progress_timeout),

@@ -15,6 +15,21 @@ use crate::tree_job::store::{self, StoreError, TreeJob};
 /// The transition name `launch` records its key under.
 pub(super) const LAUNCH: &str = "launch";
 
+const NODE_PROMPT_HEADER: &str = "You are the agent for NucleOS tree node ";
+
+/// Gives a tree node the protocol it needs to split work and report its result.
+///
+/// A relaunch receives the already stored prompt, so the marker must make this a no-op after the
+/// first launch rather than accumulating a second copy of the instructions.
+pub(super) fn node_prompt(node_id: &str, task: &str) -> String {
+    if task.starts_with(NODE_PROMPT_HEADER) {
+        return task.to_owned();
+    }
+    format!(
+        "{NODE_PROMPT_HEADER}{node_id}. If the work is too large for this node, you may open children under it with node_open. Finish by writing a handoff file and calling node_close.\n\n{task}"
+    )
+}
+
 #[derive(Debug)]
 pub enum NodeRunError {
     Db(sqlx::Error),
@@ -243,9 +258,21 @@ pub async fn launch(
             });
     }
 
-    let run_id =
-        crate::execution::runs::create_run_inner(state, prompt, project_id, cwd, mode, false)
-            .await?;
+    // A node normally inherits its worktree cwd. Keep legacy cwd-less shadow launches unchanged:
+    // without a worktree there is neither a box nor a handoff location for the node protocol.
+    let prompt = match cwd.as_ref() {
+        Some(_) => node_prompt(node_id, &prompt),
+        None => prompt,
+    };
+    let run_id = crate::execution::runs::create_run_with_worktree_box(
+        state,
+        prompt,
+        project_id,
+        cwd,
+        mode,
+        false,
+    )
+    .await?;
 
     sqlx::query(
         "UPDATE tree_transitions SET result = ? WHERE node_id = ? AND transition = ? AND key = ?",

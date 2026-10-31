@@ -60,7 +60,34 @@ pub async fn create_run_inner(
     mode: &str,
     steerable: bool,
 ) -> Result<i64, CreateRunError> {
-    create_run_with(
+    create_run_inner_with_mcp_box(state, prompt, project_id, cwd, mode, steerable, false).await
+}
+
+/// Starts a run with a transient worktree MCP box rooted at the directory the CLI will enter.
+///
+/// This is deliberately separate from [`create_run_inner`]: ordinary runs retain their exact MCP
+/// shape, while tree-node launches opt into the node protocol's box.
+pub async fn create_run_with_worktree_box(
+    state: &AppState,
+    prompt: String,
+    project_id: Option<String>,
+    cwd: Option<String>,
+    mode: &str,
+    steerable: bool,
+) -> Result<i64, CreateRunError> {
+    create_run_inner_with_mcp_box(state, prompt, project_id, cwd, mode, steerable, true).await
+}
+
+async fn create_run_inner_with_mcp_box(
+    state: &AppState,
+    prompt: String,
+    project_id: Option<String>,
+    cwd: Option<String>,
+    mode: &str,
+    steerable: bool,
+    worktree_mcp_box: bool,
+) -> Result<i64, CreateRunError> {
+    create_run_with_policy(
         state,
         NewRun {
             prompt,
@@ -71,6 +98,8 @@ pub async fn create_run_inner(
             provisioning: None,
             permission_mode: None,
         },
+        None,
+        worktree_mcp_box,
     )
     .await
 }
@@ -367,7 +396,7 @@ pub(super) async fn create_run_with(
     state: &AppState,
     run: NewRun<'_>,
 ) -> Result<i64, CreateRunError> {
-    create_run_with_policy(state, run, None).await
+    create_run_with_policy(state, run, None, false).await
 }
 
 /// Starts a standalone run that launches with no tools at all (`ToolPolicy::None`), whatever its
@@ -395,6 +424,7 @@ pub async fn create_no_tools_run(
             permission_mode: None,
         },
         Some(crate::execution::runner::ToolPolicy::None),
+        false,
     )
     .await
 }
@@ -405,6 +435,7 @@ async fn create_run_with_policy(
     state: &AppState,
     run: NewRun<'_>,
     policy_override: Option<crate::execution::runner::ToolPolicy>,
+    worktree_mcp_box: bool,
 ) -> Result<i64, CreateRunError> {
     let NewRun {
         prompt,
@@ -1027,6 +1058,20 @@ async fn create_run_with_policy(
     {
         tracing::warn!(run_id = id, %error, "could not record a run's loadout");
     }
+    let job_mcp = if worktree_mcp_box {
+        JobNodeMcp::for_worktree_box(id, spawn_cwd.as_deref())
+    } else {
+        JobNodeMcp::for_run(
+            id,
+            node.as_ref()
+                .map(|node| node.job_id)
+                .or(item.as_ref().map(|item| item.job_id)),
+        )
+        .map(|mcp| match run_tools {
+            Some(run_tools) => mcp.with_loadout(run_tools),
+            None => mcp,
+        })
+    };
     spawn_run(
         state,
         runner,
@@ -1058,16 +1103,7 @@ async fn create_run_with_policy(
         state.runner.model_for_stage(model_stage),
         state.runner.effort_for_stage(model_stage),
         route,
-        JobNodeMcp::for_run(
-            id,
-            node.as_ref()
-                .map(|node| node.job_id)
-                .or(item.as_ref().map(|item| item.job_id)),
-        )
-        .map(|mcp| match run_tools {
-            Some(run_tools) => mcp.with_loadout(run_tools),
-            None => mcp,
-        }),
+        job_mcp,
         max_turns,
     );
 

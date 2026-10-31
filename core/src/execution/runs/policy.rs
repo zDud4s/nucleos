@@ -52,6 +52,7 @@ pub fn run_env(
 
 pub struct JobNodeMcp {
     pub(super) path: std::path::PathBuf,
+    /// Zero represents the worktree-box variant, which has no job behind it.
     pub(super) job_id: i64,
     /// The tool names the CLI is allowed to call on the box's server. Today's fixed list until a
     /// loadout narrows or widens it.
@@ -97,6 +98,39 @@ impl JobNodeMcp {
             path,
             job_id,
             allowed: crate::mcp_tools::JOB_NODE_TOOLS
+                .iter()
+                .map(|tool| (*tool).to_owned())
+                .collect(),
+            add_dirs: Vec::new(),
+        })
+    }
+
+    /// A transient worktree box for a tree node, kept outside the worktree so it cannot become an
+    /// IDE sidecar or modify the checkout.
+    pub fn for_worktree_box(run_id: i64, cwd: Option<&std::path::Path>) -> Option<Self> {
+        let cwd = cwd?;
+        let path = std::env::temp_dir().join(format!(
+            "nucleos-worktree-{}-{run_id}-{}.json",
+            std::process::id(),
+            crate::auth::generate_uuid_v4()
+        ));
+        let written = (|| -> std::io::Result<()> {
+            let exe = std::env::current_exe()?;
+            let config = crate::verify::provision::worktree_mcp_config(
+                &exe.to_string_lossy(),
+                &cwd.to_string_lossy(),
+            );
+            let bytes = serde_json::to_vec(&config).map_err(std::io::Error::other)?;
+            crate::storage::write_atomic(&path, &bytes)
+        })();
+        if let Err(error) = written {
+            tracing::warn!(run_id, cwd = %cwd.display(), %error, "could not write worktree MCP config");
+            return None;
+        }
+        Some(Self {
+            path,
+            job_id: 0,
+            allowed: crate::mcp_tools::WORKTREE_BOX_TOOLS
                 .iter()
                 .map(|tool| (*tool).to_owned())
                 .collect(),
