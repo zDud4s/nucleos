@@ -120,6 +120,10 @@ pub fn evidence_exists(worktree: &Path, evidence: &str) -> bool {
     })
 }
 
+/// The wording that makes a question this audit's own. Questions in any other wording belong to
+/// other code, and the audit leaves them alone.
+const DOUBT_QUESTION_PREFIX: &str = "Owner decision needed for criterion: ";
+
 pub async fn audit(
     pool: &SqlitePool,
     spec_id: &str,
@@ -165,6 +169,7 @@ pub async fn audit(
             run_id: answer.run.run_id,
         });
     }
+    let mut doubts = Vec::new();
     for criterion in &criteria {
         let review = answer
             .reviews
@@ -205,14 +210,10 @@ pub async fn audit(
         .await
         .map_err(stale_or_store)?;
         if status == CriterionStatus::Doubt {
-            store::add_question(
-                pool,
-                spec_id,
-                &format!("Owner decision needed for criterion: {}", criterion.text),
-            )
-            .await?;
+            doubts.push(format!("{DOUBT_QUESTION_PREFIX}{}", criterion.text));
         }
     }
+    store::settle_questions(pool, spec_id, DOUBT_QUESTION_PREFIX, &doubts).await?;
     let reviewed = store::list_criteria(pool, spec_id).await?;
     let verify_state = verify.verify(&spec, &reviewed).await;
     let existing_evidence = reviewed

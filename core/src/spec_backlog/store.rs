@@ -4,6 +4,7 @@
 //! A function that holds a transaction runs every query on it, never on the pool: the test pool has a
 //! single connection.
 
+use std::collections::HashSet;
 use std::fmt;
 
 use chrono::{DateTime, Utc};
@@ -505,6 +506,59 @@ pub async fn add_question(
     Ok(id)
 }
 
+/// Makes `questions` the open questions of a spec among those whose text starts with `prefix`, each
+/// open once. A text already open keeps its row (the oldest, if an earlier audit left copies), a
+/// new one is asked, and any other open row with the prefix becomes `closed`, which takes it off
+/// the owner's list. Answered rows and rows without the prefix are not touched.
+pub async fn settle_questions(
+    pool: &SqlitePool,
+    spec_id: &str,
+    prefix: &str,
+    questions: &[String],
+) -> Result<(), StoreError> {
+    // IMMEDIATE: this reads before it writes, and a deferred transaction that finds another
+    // connection committed in between fails SQLITE_BUSY at once instead of waiting.
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let open: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, question FROM spec_questions WHERE spec_id = ? AND status = 'open' \
+         ORDER BY created_at, id",
+    )
+    .bind(spec_id)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    let mut asked: HashSet<&str> = HashSet::new();
+    for (id, question) in &open {
+        if !question.starts_with(prefix) {
+            continue;
+        }
+        if questions.contains(question) && asked.insert(question.as_str()) {
+            continue;
+        }
+        sqlx::query("UPDATE spec_questions SET status = 'closed' WHERE id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    for question in questions {
+        if !asked.insert(question.as_str()) {
+            continue;
+        }
+        sqlx::query(
+            "INSERT INTO spec_questions (id, spec_id, question, status, created_at) \
+             VALUES (?, ?, ?, 'open', ?)",
+        )
+        .bind(new_question_id())
+        .bind(spec_id)
+        .bind(question)
+        .bind(now())
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 pub async fn answer_question(
     pool: &SqlitePool,
     question_id: &str,
@@ -556,13 +610,14 @@ struct DecisionRow {
     at: String,
 }
 
-/// The owner's single list: every spec question and, when the tree-job `decisions` table exists,
-/// every tree decision, oldest first. The migration's view covers the questions; the union is here
-/// because that view cannot reference a table that may not exist.
+/// The owner's single list: every spec question not closed and, when the tree-job `decisions` table
+/// exists, every tree decision, oldest first. The migration's view covers the questions, closed
+/// ones included, so they are filtered here; the union is here because that view cannot reference
+/// a table that may not exist.
 pub async fn list_owner_decisions(pool: &SqlitePool) -> Result<Vec<OwnerDecision>, StoreError> {
     let questions: Vec<QuestionRow> = sqlx::query_as(
         "SELECT id, subject AS spec_id, question, answer, status, created_at, answered_at \
-         FROM owner_decisions",
+         FROM owner_decisions WHERE status <> 'closed'",
     )
     .fetch_all(pool)
     .await?;

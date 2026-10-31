@@ -200,7 +200,11 @@ pub(super) fn review_prompt(
         "\nThe daemon runs the project's test suite separately, so judge only what the files \
          show. For a criterion that also asks that tests pass, answer from the static part: \
          the test exists, with its file:line as evidence. Never answer `doubt` merely because \
-         a test run is not visible to you.\n",
+         a test run is not visible to you.\n\
+         \nA criterion that only asks for the test suite to pass has no other static part: when \
+         test files are shown, answer `met` with the file:line of a test as evidence. The daemon \
+         refuses to finish the spec unless its own run is green, so this `met` cannot pass a red \
+         suite. Only when no test file is shown does such a criterion stay `doubt`.\n",
     );
     prompt.push_str("\nCriteria:\n");
     for criterion in criteria {
