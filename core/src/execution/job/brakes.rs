@@ -179,10 +179,7 @@ pub(super) async fn brakes(state: &AppState, job: &JobRow, now: DateTime<Utc>) -
     // A rules file that cannot be read leaves the brake ON. That is the direction every other arm
     // of this chain fails in, and the asymmetry is the argument: being wrong this way costs a job
     // that waits, and being wrong the other way starts a node in a worktree somebody is using.
-    let brake_applies = match crate::config::load_schedule_rules(
-        state.machine_config_root.as_deref(),
-        &job.project_id,
-    ) {
+    let brake_applies = match crate::project::rules::autopilot(&job.project_id) {
         Ok(rules) => rules.attention_brake(),
         Err(error) => {
             tracing::warn!(

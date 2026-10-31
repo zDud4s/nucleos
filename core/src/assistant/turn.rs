@@ -113,10 +113,15 @@ pub(super) async fn spawn_local_turn(
 
     let pool = state.pool.clone();
     let run_timeout = state.run_timeout;
+    // Kept for after the turn, as on the CLI path: `spawn_registered` takes the state, and the chat
+    // id lives on the slot, which is dropped before the automatic compaction is considered.
+    let after = state.clone();
+    let chat_id = slot.chat_id.clone();
     crate::execution::runs::spawn_registered(state, id, async move {
-        // Holds the chat for the length of the turn and releases it however this ends, including by
-        // being aborted mid-await — the same guarantee `TurnGuard` gives the CLI path.
-        let _slot = slot;
+        // `slot`, captured by this block, holds the chat for the length of the turn and releases it
+        // however this ends, including by being aborted mid-await — the same guarantee `TurnGuard`
+        // gives the CLI path.
+        //
         // Wrapped for the same reason the CLI path is: the slot is released by this task ending,
         // so a turn that never ends is a chat that answers nothing ever again — every later message
         // refused with 409 until the daemon restarts. The HTTP client has its own per-exchange
@@ -140,6 +145,9 @@ pub(super) async fn spawn_local_turn(
         // fail-closed move left is to refuse the ANSWER: the turn is recorded as failed and its
         // text is dropped rather than stored and handed to the next turn as history.
         let mut unmarked = false;
+        // Set only once the turn's row really reads `completed`: a `/cancel` that got there first
+        // leaves it empty, and a turn that did not complete neither rotates nor compacts.
+        let mut auto_fill: Option<i64> = None;
         if taint.load(std::sync::atomic::Ordering::SeqCst)
             && let Err(error) = crate::execution::runs::mark_untrusted_context(&pool, id).await
         {
@@ -199,7 +207,7 @@ pub(super) async fn spawn_local_turn(
                     // These engines report no usage we read, so the window is estimated.
                     let fill =
                         super::compaction::local_fill_estimate(&history, &prompt, &turn.answer);
-                    sqlx::query(
+                    let completed = sqlx::query(
                         "UPDATE runs SET status = 'completed', exit_code = 0, stdout = ?, cost_usd = 0, context_fill = ?, completed_at = ? WHERE id = ? AND status = 'running'",
                     )
                     .bind(&turn.answer)
@@ -207,7 +215,14 @@ pub(super) async fn spawn_local_turn(
                     .bind(&completed_at)
                     .bind(id)
                     .execute(&pool)
-                    .await
+                    .await;
+                    if completed
+                        .as_ref()
+                        .is_ok_and(|written| written.rows_affected() > 0)
+                    {
+                        auto_fill = Some(fill);
+                    }
+                    completed
                 }
             }
             // Transport failure: Ollama stopped, OpenRouter refused the request, or the model was
@@ -227,6 +242,15 @@ pub(super) async fn spawn_local_turn(
         };
         crate::execution::runs::warn_on_terminal_write_err(&written, id, "completed");
         super::compaction::settle(&pool, id).await;
+
+        // Released before the compaction is considered, which refuses a busy chat: this turn's own
+        // slot would otherwise stop it. In a task of its own for the reason the CLI path gives: a
+        // compaction turn must not start inside this one's registered task.
+        drop(slot);
+        // An unknown fill never fires, so a turn without one needs no task.
+        if auto_fill.is_some() {
+            spawn_after_local_turn(after, chat_id, id, auto_fill);
+        }
     });
 
     Ok(id)
@@ -1015,11 +1039,24 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
                     let claude_fill = o.stdout.lines().fold(None, |fill, line| {
                         crate::execution::runner::context_fill_from_line(line, fill)
                     });
-                    // Codex has no `assistant` usage events; its figure comes from `turn.completed`.
-                    // Only the Claude figure feeds `rotation::rotate` until the auto-compact wiring
-                    // lands, so a Codex chat does not start rotating before the flag exists.
-                    let context_fill = claude_fill
-                        .or_else(|| crate::execution::runner::codex_context_fill(&o.stdout));
+                    // Codex's `turn.completed` carries the session's running total, not the window, so
+                    // its figure is read from the thread's rollout file. That is synchronous fs work,
+                    // hence `spawn_blocking`; it is skipped for any other engine and whenever the
+                    // Claude stream already gave a figure.
+                    let context_fill = match (claude_fill, o.session_id.clone()) {
+                        (None, Some(thread_id)) if cli == "codex" => {
+                            tokio::task::spawn_blocking(move || {
+                                // Without a resolvable home there is nothing to read: an empty path
+                                // would scan the working directory.
+                                let home = codex_home_now()?;
+                                rotation_fill(None, "", Some(&thread_id), &home)
+                            })
+                            .await
+                            .ok()
+                            .flatten()
+                        }
+                        (claude_fill, _) => claude_fill,
+                    };
                     // Taken off the outcome and not re-derived from the transcript beside it: on the
                     // multi-turn path the transcript belongs to a PROCESS that may have served several
                     // answers, and this is a fact about ONE of them. `RunOutcome` is where the
@@ -1099,35 +1136,15 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
                     // a compaction turn: its settle consumes the rotation (`consume_older`).
                     if status == "completed" {
                         auto_fill = context_fill;
-                    }
-                    if status == "completed" && !super::compaction::is_compaction(&pool, id).await {
-                        // Deterministic unless `NUCLEOS_ROOT_ROTATE_LLM` is on; any failure of the
-                        // model falls back to it inside the summarizer.
-                        let one_shot = rotation::RunnerModel {
-                            runner: daemon_runner.as_ref(),
-                            model: utility_model.clone(),
-                        };
-                        let summarizer =
-                            rotation::LlmSummarizer::new(&one_shot, rotation::llm_enabled());
-                        match rotation::rotate(
+                        rotate_after_turn(
                             &pool,
-                            &*rotation::root_nodes(&pool),
-                            &summarizer,
+                            daemon_runner.as_ref(),
+                            utility_model.clone(),
                             &turn.slot.chat_id,
                             id,
-                            claude_fill,
+                            context_fill,
                         )
-                        .await
-                        {
-                            // The kept process still holds the old session; stop it now rather than
-                            // rely on the next turn noticing (it would, through `resume.is_none()`,
-                            // but a spontaneous answer between turns would be spoken down it).
-                            Ok(true) => evict_live(&turn.slot.chat_id),
-                            Ok(false) => {}
-                            Err(error) => {
-                                tracing::warn!(%error, id, "root rotation failed; the session stays");
-                            }
-                        }
+                        .await;
                     }
                 }
                 // `stdout` is left NULL rather than filled with the stream: there is no reply, and a
@@ -1231,6 +1248,113 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
     });
 }
 
+/// The Codex home of this process: `$CODEX_HOME`, else `<user home>/.codex`, in the order
+/// `model_catalog` uses for its own Codex cache.
+fn codex_home_now() -> Option<std::path::PathBuf> {
+    crate::execution::runner::codex_home_dir(
+        std::env::var("CODEX_HOME").ok(),
+        std::env::var("USERPROFILE")
+            .ok()
+            .or_else(|| std::env::var("HOME").ok()),
+    )
+}
+
+/// The context fill of a CLI turn: the Claude figure when there is one, else Codex's. Codex has no
+/// `assistant` usage events, and its `turn.completed` `usage.input_tokens` is the session's running
+/// total rather than the window, so the figure is the thread's last `token_count` in its rollout
+/// under `codex_home`. `_stdout` is not read: the tests pin the four-argument shape, and their
+/// point is exactly that the stream's cumulative figure must not stand in.
+fn rotation_fill(
+    claude: Option<i64>,
+    _stdout: &str,
+    thread_id: Option<&str>,
+    codex_home: &std::path::Path,
+) -> Option<i64> {
+    claude.or_else(|| {
+        thread_id.and_then(|thread_id| {
+            crate::execution::runner::codex_rollout_fill(codex_home, thread_id)
+        })
+    })
+}
+
+/// Rotates the chat after a completed turn when `rotation::rotate` says so. Never fails, and never
+/// rotates on a compaction turn, whose settle consumes the rotation (`consume_older`).
+async fn rotate_after_turn(
+    pool: &SqlitePool,
+    runner: &dyn crate::execution::runner::CommandRunner,
+    utility_model: Option<String>,
+    chat_id: &str,
+    run_id: i64,
+    fill: Option<i64>,
+) {
+    if super::compaction::is_compaction(pool, run_id).await {
+        return;
+    }
+    // Deterministic unless `NUCLEOS_ROOT_ROTATE_LLM` is on; any failure of the model falls back to
+    // it inside the summarizer.
+    let one_shot = rotation::RunnerModel {
+        runner,
+        model: utility_model,
+    };
+    let summarizer = rotation::LlmSummarizer::new(&one_shot, rotation::llm_enabled());
+    match rotation::rotate(
+        pool,
+        &*rotation::root_nodes(pool),
+        &summarizer,
+        chat_id,
+        run_id,
+        fill,
+    )
+    .await
+    {
+        // The kept process still holds the old session; stop it now rather than rely on the next
+        // turn noticing (it would, through `resume.is_none()`, but a spontaneous answer between
+        // turns would be spoken down it).
+        Ok(true) => evict_live(chat_id),
+        Ok(false) => {}
+        Err(error) => {
+            tracing::warn!(%error, run_id, "root rotation failed; the session stays");
+        }
+    }
+}
+
+/// Runs [`after_local_turn`] in a task of its own.
+///
+/// A plain function on purpose, like `spawn_assistant_turn`: a compaction it starts comes back
+/// through `send_message_inner` to `spawn_local_turn`, so spawning that future from inside
+/// `spawn_local_turn`'s own body would make the compiler need that function's future type to prove
+/// its own `Send`, which is a cycle.
+fn spawn_after_local_turn(
+    state: crate::state::AppState,
+    chat_id: String,
+    run_id: i64,
+    fill: Option<i64>,
+) {
+    tokio::spawn(async move {
+        after_local_turn(&state, &chat_id, run_id, fill).await;
+    });
+}
+
+/// What a local/OpenRouter chat turn does once its row is written and its slot released: automatic
+/// compaction on the estimated `fill`. Without a figure it does nothing, because no value is
+/// invented.
+///
+/// It does not rotate. Only the CLI path consumes pending rotations (`take_pending`,
+/// `rotated_prompt`); a local chat resends its own history and has no session to rotate, so a
+/// rotation here would only add a `root_rotations` row and requeue a distillation whose prefix never
+/// reaches the engine.
+pub(super) async fn after_local_turn(
+    state: &crate::state::AppState,
+    chat_id: &str,
+    run_id: i64,
+    fill: Option<i64>,
+) {
+    if fill.is_none() {
+        return;
+    }
+    super::compaction::maybe_auto_compact(state, chat_id, run_id, fill).await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1238,6 +1362,128 @@ mod tests {
     use crate::state::AppState;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    /// A Codex stream whose `turn.completed` reports the SESSION's running total (130k) while the
+    /// window actually holds far less. The thread id is the one `thread.started` announces.
+    const CODEX_STREAM_CUMULATIVE_130K: &str = concat!(
+        r#"{"type":"thread.started","thread_id":"thread-aaa"}"#,
+        "\n",
+        r#"{"type":"turn.completed","usage":{"input_tokens":130000,"cached_input_tokens":120000,"output_tokens":90}}"#,
+        "\n",
+    );
+
+    /// A rollout holding one `token_count` of the real shape: `total_token_usage` is cumulative,
+    /// `last_token_usage` is the latest round (the window).
+    fn write_codex_rollout(home: &std::path::Path, thread_id: &str, last_input: i64) {
+        let dir = home.join("sessions/2026/10/30");
+        std::fs::create_dir_all(&dir).unwrap();
+        let line = format!(
+            r#"{{"timestamp":"2026-10-30T23:13:36.661Z","ordinal":22,"type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":130000,"total_tokens":130090}},"last_token_usage":{{"input_tokens":{last_input},"total_tokens":{}}},"model_context_window":475000}}}}}}"#,
+            last_input + 90
+        );
+        std::fs::write(
+            dir.join(format!("rollout-2026-10-30T23-13-31-{thread_id}.jsonl")),
+            line,
+        )
+        .unwrap();
+    }
+
+    /// What `turn.rs` does with the figure after a completed turn: rotation on the root, then
+    /// automatic compaction. `true` for each that would fire at the 120k soft limit.
+    async fn fires(fill: Option<i64>) -> (bool, bool) {
+        struct OneRoot;
+        #[async_trait::async_trait]
+        impl crate::assistant::rotation::RootNodes for OneRoot {
+            async fn active_root_for_chat(&self, _: &str) -> Option<String> {
+                Some("root-1".into())
+            }
+            async fn has_waiting_child(&self, _: &str) -> bool {
+                false
+            }
+            async fn brief_text(&self, _: &str) -> Option<String> {
+                None
+            }
+        }
+        let rotates = crate::assistant::rotation::should_rotate(&OneRoot, "chat", fill, 120_000)
+            .await
+            .is_some();
+        let compacts = crate::assistant::compaction::should_auto_compact(
+            fill,
+            120_000,
+            None,
+            crate::assistant::compaction::AutoCompactGuards::default(),
+        );
+        (rotates, compacts)
+    }
+
+    #[tokio::test]
+    async fn a_codex_turn_with_a_130k_session_total_but_a_16k_window_neither_rotates_nor_compacts()
+    {
+        let home = tempfile::tempdir().unwrap();
+        write_codex_rollout(home.path(), "thread-aaa", 16_000);
+        let fill = rotation_fill(
+            None,
+            CODEX_STREAM_CUMULATIVE_130K,
+            Some("thread-aaa"),
+            home.path(),
+        );
+        assert_eq!(fill, Some(16_000));
+        assert_eq!(fires(fill).await, (false, false));
+    }
+
+    #[tokio::test]
+    async fn a_codex_turn_whose_rollout_says_130k_rotates_and_compacts() {
+        let home = tempfile::tempdir().unwrap();
+        write_codex_rollout(home.path(), "thread-aaa", 130_000);
+        let fill = rotation_fill(
+            None,
+            CODEX_STREAM_CUMULATIVE_130K,
+            Some("thread-aaa"),
+            home.path(),
+        );
+        assert_eq!(fill, Some(130_000));
+        assert_eq!(fires(fill).await, (true, true));
+    }
+
+    #[tokio::test]
+    async fn a_codex_turn_without_a_rollout_has_no_figure_and_neither_rotates_nor_compacts() {
+        // An empty home: no rollout for the thread. The 130k in `turn.completed` must not stand in.
+        let home = tempfile::tempdir().unwrap();
+        let fill = rotation_fill(
+            None,
+            CODEX_STREAM_CUMULATIVE_130K,
+            Some("thread-aaa"),
+            home.path(),
+        );
+        assert_eq!(fill, None);
+        assert_eq!(fires(fill).await, (false, false));
+        // No thread id at all behaves the same.
+        assert_eq!(
+            rotation_fill(None, CODEX_STREAM_CUMULATIVE_130K, None, home.path()),
+            None
+        );
+    }
+
+    #[test]
+    fn rotation_fill_prefers_claude_over_codex() {
+        let home = tempfile::tempdir().unwrap();
+        write_codex_rollout(home.path(), "thread-aaa", 16_000);
+        assert_eq!(
+            rotation_fill(
+                Some(500),
+                CODEX_STREAM_CUMULATIVE_130K,
+                Some("thread-aaa"),
+                home.path()
+            ),
+            Some(500)
+        );
+    }
+
+    #[test]
+    fn rotation_fill_is_none_when_no_engine_measured_one() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(rotation_fill(None, "plain text", None, home.path()), None);
+    }
 
     async fn test_state(runner: Arc<FakeCommandRunner>) -> AppState {
         AppState {

@@ -14,12 +14,17 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("spec_loop", HERE / "spec_loop.py")
 sl = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(sl)
+sys.modules["spec_loop"] = sl
+timer_spec = importlib.util.spec_from_file_location("spec_loop_timer", HERE / "spec_loop_timer.py")
+timer = importlib.util.module_from_spec(timer_spec)
+timer_spec.loader.exec_module(timer)
 
 REPORT = "## Feito\n- a\n## Falta\nnada\n## Verificação\nx -> 0\n## Próximo passo\nnada\n"
 
@@ -121,6 +126,162 @@ class SpecLoop(unittest.TestCase):
         ]), encoding="utf-8")
         out = sl.stop_decision({"session_id": "s1", "cwd": str(self.root), "transcript_path": str(tr)})
         self.assertIsNone(out)
+
+    def stop_with(self, tasks, message="A aguardar.", pushed=False):
+        return sl.stop_decision({"session_id": "s1", "cwd": str(self.root), "stop_hook_active": pushed,
+                                 "last_assistant_message": message, "background_tasks": tasks})
+
+    @staticmethod
+    def task(task="b1", status="running", kind="shell"):
+        return {"id": task, "type": kind, "status": status, "description": "x"}
+
+    def test_running_background_work_lets_the_stop_go_with_no_report(self):
+        self.write("- [ ] a\n")
+        for kind in ("shell", "subagent", "monitor", "workflow"):
+            self.assertIsNone(self.stop_with([self.task(kind=kind)]), kind)
+        self.assertTrue(self.loop.exists(), "the loop stays open for when the work wakes the session")
+
+    def test_no_running_background_work_pushes(self):
+        self.write("- [ ] a\n")
+        for tasks in ([], [self.task(status="completed")], None, "garbage", ["garbage"]):
+            self.assertEqual(self.stop_with(tasks)["decision"], "block", tasks)
+
+    def test_one_task_still_running_holds_the_push_back(self):
+        self.write("- [ ] a\n")
+        self.assertIsNone(self.stop_with([self.task("a", "completed"), self.task("b")]))
+
+    def test_background_work_does_not_excuse_a_finished_checklist_from_its_report(self):
+        self.write("- [x] a\n")
+        out = self.stop_with([self.task()], message="feito")
+        self.assertIn("Próximo passo", out["reason"])
+
+    def transcript(self, *records):
+        tr = self.root / "t.jsonl"
+        tr.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
+        return str(tr)
+
+    @staticmethod
+    def answered(at, cache_kind="ephemeral_1h_input_tokens", tokens=10, **extra):
+        when = datetime.fromtimestamp(at, timezone.utc).isoformat().replace("+00:00", "Z")
+        usage = {"cache_creation": {cache_kind: tokens}}
+        return {"type": "assistant", "timestamp": when, "message": {"usage": usage}, **extra}
+
+    def timer(self, records, tasks=("b1",), clock=None, on_sleep=None):
+        """Runs the timer on a fake clock that starts at 1000; returns (message, total slept)."""
+        self.timer_at = 1000 if clock is None else clock
+        slept = []
+
+        def sleep(secs):
+            slept.append(secs)
+            self.timer_at += secs
+            if on_sleep:
+                on_sleep()
+        message = timer.wake_message(
+            {"session_id": "s1", "cwd": str(self.root), "transcript_path": self.transcript(*records),
+             "background_tasks": [self.task(t) for t in tasks]},
+            now=lambda: self.timer_at, sleep=sleep)
+        return message, sum(slept)
+
+    def test_timer_wakes_an_idle_session_just_before_the_cache_expires(self):
+        self.write("- [ ] a\n")
+        message, slept = self.timer([self.answered(1000)])
+        self.assertIn("b1", message)
+        self.assertEqual(slept, 55 * 60)
+
+    def test_timer_uses_the_ttl_the_last_write_went_out_with(self):
+        self.write("- [ ] a\n")
+        _, slept = self.timer([self.answered(1000, "ephemeral_5m_input_tokens")])
+        self.assertEqual(slept, 4 * 60)
+
+    def test_timer_looks_past_a_request_that_only_read_the_cache(self):
+        self.write("- [ ] a\n")
+        _, slept = self.timer([self.answered(900, "ephemeral_5m_input_tokens"),
+                               self.answered(1000, tokens=0)])
+        self.assertEqual(slept, 4 * 60)
+
+    def test_timer_measures_from_the_last_request_not_from_its_own_start(self):
+        self.write("- [ ] a\n")
+        _, slept = self.timer([self.answered(1000)], clock=1000 + 50 * 60)
+        self.assertEqual(slept, 5 * 60)
+
+    def test_timer_ignores_a_subagents_records(self):
+        self.write("- [ ] a\n")
+        _, slept = self.timer([self.answered(1000), self.answered(1500, isSidechain=True)])
+        self.assertEqual(slept, 55 * 60)
+
+    def test_timer_bows_out_when_the_session_moves_on(self):
+        self.write("- [ ] a\n")
+        tr = self.root / "t.jsonl"
+
+        def turn():
+            with tr.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(self.answered(1100)) + "\n")
+        message, slept = self.timer([self.answered(1000)], on_sleep=turn)
+        self.assertIsNone(message)
+        self.assertEqual(slept, timer.POLL_SECS)
+
+    def test_timer_stays_quiet_with_nothing_to_wait_for(self):
+        self.write("- [ ] a\n")
+        self.assertEqual(self.timer([self.answered(1000)], tasks=()), (None, 0))
+        self.write("- [x] a\n")
+        self.assertEqual(self.timer([self.answered(1000)]), (None, 0))
+        self.write("- [ ] a\n- [!] b\n", status="blocked")
+        self.assertEqual(self.timer([self.answered(1000)]), (None, 0))
+        self.loop.unlink()
+        self.assertEqual(self.timer([self.answered(1000)]), (None, 0))
+
+    def test_timer_stays_quiet_if_the_loop_closed_while_it_slept(self):
+        self.write("- [ ] a\n")
+        message, _ = self.timer([self.answered(1000)], on_sleep=lambda: self.write("- [x] a\n"))
+        self.assertIsNone(message)
+
+    def test_timer_stops_waking_once_unchanged_tasks_outlast_the_budget(self):
+        self.write("- [ ] a\n")
+        self.assertIsNotNone(self.timer([self.answered(1000)])[0])
+        end = self.timer_at + timer.MAX_WAKE_SECS
+        self.assertIsNotNone(self.timer([self.answered(1000)], clock=end - 1)[0])
+        self.assertEqual(self.timer([self.answered(1000)], clock=end), (None, 0))
+        self.assertIsNotNone(self.timer([self.answered(1000)], tasks=("b2",), clock=end)[0],
+                             "new work resets it")
+
+    def test_timer_budget_is_time_so_a_short_cache_gets_the_same_hours(self):
+        self.write("- [ ] a\n")
+        at = 1000
+        for _ in range(20):
+            message, _ = self.timer([self.answered(at, "ephemeral_5m_input_tokens")], clock=at)
+            self.assertIsNotNone(message)
+            at = self.timer_at
+
+    def test_timer_treats_a_count_left_by_an_older_version_as_a_new_budget(self):
+        self.write("- [ ] a\n")
+        self.timer([self.answered(1000)])
+        state_path = self.loop.with_suffix(".state.json")
+        state = json.loads(state_path.read_text())
+        state["wakes"] = {"tasks": state["wakes"]["tasks"], "count": 6}
+        state_path.write_text(json.dumps(state))
+        self.assertIsNotNone(self.timer([self.answered(1000)], clock=1000 + 100 * 3600)[0])
+
+    def test_a_wake_leaves_the_stop_hooks_state_alone(self):
+        self.write("- [ ] a\n")
+        self.stop(REPORT)
+        self.timer([self.answered(1000)])
+        self.assertIn("last_block", json.loads(self.loop.with_suffix(".state.json").read_text()))
+
+    def test_timer_exits_2_only_with_a_wake_and_stays_silent_otherwise(self):
+        self.write("- [ ] a\n")
+        tr = self.transcript(self.answered(1000))
+        run = lambda tasks: subprocess.run(
+            [sys.executable, str(HERE / "spec_loop_timer.py")], capture_output=True, text=True,
+            input=json.dumps({"session_id": "s1", "cwd": str(self.root), "transcript_path": tr,
+                              "background_tasks": tasks}))
+        idle = run([self.task()])
+        self.assertEqual(idle.returncode, 2, idle.stderr)
+        self.assertIn("prompt cache", idle.stderr)
+        quiet = run([])
+        self.assertEqual((quiet.returncode, quiet.stderr), (0, ""))
+        broken = subprocess.run([sys.executable, str(HERE / "spec_loop_timer.py")],
+                                capture_output=True, input=b"not json")
+        self.assertEqual(broken.returncode, 0)
 
     def test_prompt_hook_nudges_only_spec_prompts_without_a_loop(self):
         ask = lambda p: sl.prompt_context({"session_id": "s1", "cwd": str(self.root), "prompt": p})

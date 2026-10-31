@@ -10,6 +10,10 @@ use crate::judge::JudgeMode;
 use crate::wip::{open_proposals_term, open_shadow_decisions_term};
 
 mod hook_timeout;
+mod refresh;
+mod stop_timer;
+
+pub use refresh::refresh_wired_hooks;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -804,7 +808,7 @@ fn wire_event(
     });
     if !already {
         list.push(entry);
-    } else if !SESSION_EVENTS.contains(&event_name) {
+    } else if !SESSION_EVENTS.contains(&event_name) && event_name != SESSION_START_EVENT {
         hook_timeout::raise_short_timeouts(list);
     }
     Ok(())
@@ -884,6 +888,7 @@ fn wire_hook(dir: &Path, overwrite_script: bool) -> Result<(), String> {
     }
     wire_event(hooks, SESSION_START_EVENT, session_start_entry())
         .map_err(|error| format!("{}: {error}", settings_path.display()))?;
+    stop_timer::wire(hooks);
     set_auto_compact_window(
         object,
         &auto_compact_window(std::env::var("NUCLEOS_AUTO_COMPACT_WINDOW").ok().as_deref()),
@@ -899,14 +904,17 @@ fn wire_hook(dir: &Path, overwrite_script: bool) -> Result<(), String> {
         std::fs::write(&script_path, HOOK_SOURCE)
             .map_err(|error| format!("could not write the hook script: {error}"))?;
     }
-    std::fs::write(
-        &settings_path,
-        format!(
-            "{body}
+    stop_timer::write_script(dir)?;
+    let body = format!(
+        "{body}
 "
-        ),
-    )
-    .map_err(|error| format!("could not write {}: {error}", settings_path.display()))?;
+    );
+    // A running session watches this file, and `refresh_wired_hooks` passes here on every start.
+    if std::fs::read_to_string(&settings_path).ok().as_deref() == Some(body.as_str()) {
+        return Ok(());
+    }
+    std::fs::write(&settings_path, body)
+        .map_err(|error| format!("could not write {}: {error}", settings_path.display()))?;
 
     Ok(())
 }
@@ -1038,10 +1046,9 @@ pub fn main_checkout_of(dir: &Path) -> Option<std::path::PathBuf> {
 /// The workflows a project pins that have files to put in a checkout: every pin but an adopted one,
 /// which is the project's own folder and already where it is read. A project "carries a workflow"
 /// exactly when this is not empty. Unreadable pins are no pins: the offer fails closed.
-fn materializable_pins(machine_root: &Path, project_id: &str) -> Vec<crate::workflows::Pin> {
-    crate::project::state::dir(machine_root, project_id)
-        .map(|state| state.join(crate::project::state::PINS_FILE))
-        .and_then(|pins| crate::workflows::read_pins(&pins).ok())
+fn materializable_pins(project_id: &str) -> Vec<crate::workflows::Pin> {
+    crate::project::rules::pins(project_id)
+        .ok()
         .map(|pins| {
             pins.workflows
                 .into_iter()
@@ -1109,7 +1116,7 @@ pub fn workflow_missing(dir: &Path, roster: &[Rostered], machine_root: Option<&P
     let Some(project_id) = rostered_id(&main, roster) else {
         return false;
     };
-    let pins = materializable_pins(machine_root, project_id);
+    let pins = materializable_pins(project_id);
     if pins.is_empty() {
         return false;
     }
@@ -1160,7 +1167,7 @@ pub async fn seed_workflow(
         let main = main_checkout_of(&dir).ok_or(SeedRefusal::NotAWorktree)?;
         let project_id = rostered_id(&main, &roster).ok_or(SeedRefusal::MainNotRostered)?;
         let machine_root = machine_root.ok_or(SeedRefusal::NoPinnedWorkflow)?;
-        if materializable_pins(&machine_root, project_id).is_empty() {
+        if materializable_pins(project_id).is_empty() {
             return Err(SeedRefusal::NoPinnedWorkflow);
         }
         let state_dir = crate::project::state::dir(&machine_root, project_id)
@@ -1169,7 +1176,8 @@ pub async fn seed_workflow(
             .ok_or_else(|| SeedRefusal::Failed("this daemon has no workflow library".to_owned()))?;
         let outcomes = crate::workflows::materialize::sync(
             &dir,
-            &state_dir.join(crate::project::state::PINS_FILE),
+            project_id,
+            &state_dir,
             &library_root,
             &crate::workflows::materialize::worktree_record(&state_dir, &dir),
             None,
@@ -1311,7 +1319,7 @@ pub mod testkit {
         pub container: TempDir,
         pub main: std::path::PathBuf,
         pub wt: std::path::PathBuf,
-        /// The machine root holding the project's state (`projects/<id>/workflows.yaml`).
+        /// The machine root holding the project's state directory (its pins are in the store).
         pub machine_root: std::path::PathBuf,
         /// The workflow library its pins point into.
         pub library: std::path::PathBuf,
@@ -1338,6 +1346,9 @@ pub mod testkit {
         let machine_root = container.path().join("machine");
         let library = container.path().join("library");
         fs::create_dir_all(&machine_root).unwrap();
+        // The pins live in the settings store now. The hold this takes is the thread's, so it
+        // outlives the guard dropped here; callers that open a pool do so after this returns.
+        drop(crate::project::rules::testing::Home::new());
         if workflow {
             let bundle_dir = library.join("dev").join("1.0");
             fs::create_dir_all(bundle_dir.join(".claude/skills/orchestrate")).unwrap();
@@ -1354,11 +1365,12 @@ pub mod testkit {
             let bundle = crate::workflows::read_bundle(&bundle_dir, "dev", "1.0")
                 .unwrap()
                 .expect("the fixture's bundle has a manifest");
-            let pins = crate::project::state::dir(&machine_root, SEED_PROJECT)
-                .unwrap()
-                .join(crate::project::state::PINS_FILE);
-            fs::create_dir_all(pins.parent().unwrap()).unwrap();
-            crate::workflows::install(&pins, &bundle).expect("pin the fixture's bundle");
+            let mut pins = crate::workflows::Pins::default();
+            crate::workflows::apply_install(&mut pins, &bundle).expect("pin the fixture's bundle");
+            crate::project::rules::testing::publish_pins(
+                SEED_PROJECT,
+                &crate::workflows::render_pins(&pins),
+            );
         }
         let wt = container.path().join("wt");
         let added = std::process::Command::new("git")
@@ -1406,6 +1418,20 @@ pub mod tests {
     }
     use std::fs;
     use tempfile::TempDir;
+
+    /// RED (4.2): the NEW signature `materializable_pins(project_id)` reads the store, not a pins file, and still
+    /// leaves out an adopted pin (the project's own folder).
+    #[test]
+    fn materializable_pins_reads_the_store() {
+        crate::project::rules::testing::publish_pins(
+            "autopilot-pins-project",
+            "workflows:\n  - name: lint\n    version: v1\n    origin: library\n    hash: abc123\n  - name: own\n    version: v1\n    origin: adopted\n    hash: def456\n    path: tools/own\n",
+        );
+        let pins = materializable_pins("autopilot-pins-project");
+        let names: Vec<&str> = pins.iter().map(|pin| pin.name.as_str()).collect();
+        assert_eq!(names, ["lint"]);
+        assert!(materializable_pins("autopilot-unpinned-project").is_empty());
+    }
 
     /// An unseeded linked worktree is the one case "Set up workflow" answers: its project pins a
     /// workflow and none was ever materialized into it. The main checkout itself, a seeded worktree
@@ -3458,7 +3484,7 @@ pub mod tests {
         )
         .unwrap();
         let stop = settings["hooks"]["Stop"].as_array().unwrap();
-        assert_eq!(stop.len(), 2, "{stop:?}");
+        assert_eq!(stop.len(), 3, "their hook, ours and the timer: {stop:?}");
         assert!(
             serde_json::to_string(&stop[0])
                 .unwrap()

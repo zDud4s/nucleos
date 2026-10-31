@@ -66,8 +66,9 @@ pub(super) async fn post_shadow_verdict(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    // Readiness only ever moves when a human reviews a decision, so this is the one place a project
-    // can cross the promotion bar — sample it either side of the verdict to catch the crossing.
+    // Readiness can fall without a review (a new class or a new withheld decision arrives unreviewed),
+    // but it only ever rises on a human verdict, so this is the one place a project can cross the
+    // promotion bar upward — sample it either side of the verdict to catch the crossing.
     let project = shadow::project_of_decision(&state.pool, id)
         .await
         .unwrap_or(None);

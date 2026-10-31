@@ -1,0 +1,109 @@
+{
+  "$defs": {
+    "CouncilConsumers": {
+      "additionalProperties": false,
+      "description": "The internal callers a configured council is allowed to advise.\n\n**Both false by default, and both are advice rather than authority.** A consumer costs minutes\nof paid deliberation in front of something that was going to happen anyway, so neither is\ninherited — and neither decides anything: the job's `review` node still runs and still writes\nits own opinion, and a proposal gets a NOTE on its event log while the human keeps the verdict.\n`.ai/decisions.md` fixed that second half — the arbiter of an ambiguity is the person, and the\ncouncil gates nothing — so a flag here that approved anything would contradict a standing\ndecision rather than extend a feature.",
+      "properties": {
+        "job_review": {
+          "default": false,
+          "description": "Before a job's `review` node starts, put the job's task to the council and leave the\nsynthesis in the job's artifacts directory for the node to read. The job waits while the\ncouncil deliberates.",
+          "type": "boolean"
+        },
+        "proposal_advice": {
+          "default": false,
+          "description": "When a run is stopped for an approval, put the refused action to the council and write the\nsynthesis onto the proposal as a note. Best-effort and out of band: the proposal is created\nand the run is parked exactly as they were, whatever the council does or fails to do.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "SeatKind": {
+      "description": "Where one seat's answer comes from.\n\nTwo variants and no `Auto`. Which machine a question leaves — or does not leave — is the whole\nreason a mixed roster is a feature, and a variant that decided it for the operator would make\nthe roster stop being the statement of that.",
+      "oneOf": [
+        {
+          "const": "cloud",
+          "description": "An agent CLI, through `runner.rs`.",
+          "type": "string"
+        },
+        {
+          "const": "local",
+          "description": "A model on this machine, through `local_agent.rs`.",
+          "type": "string"
+        }
+      ]
+    },
+    "SeatSpec": {
+      "additionalProperties": false,
+      "description": "One seat as a roster DECLARES it: either a model, or an agent of the house catalogue.\n\nSeparate from `CouncilSeat` — the seat that will actually run — because the two are checked at\ndifferent times by different things. The FORM is checked here, at load, and is pure. The\nREFERENCE is checked by `council::start` against a catalogue the owner edits while the daemon\nruns. Collapsing them into one type with everything optional would leave every later reader\nasking which half is set, and one of them would eventually guess.\n\nBoth forms are valid forever. The tempting cleanup — migrate the file, drop `{ kind, ref }` — is\nrefused for a concrete reason: the roster lives at `~/.nucleos/council.yaml`, outside any\ncheckout, so it is one person's configuration on one machine and nothing shipped here can\nrewrite it. A form retired here does not produce an error on the machines still using it;\n`load_council_config` returns `None` on a roster with faults, so it produces a council that\nsilently stops existing at the next daemon start.",
+      "properties": {
+        "agent": {
+          "description": "An `agents` row id. Never resolved here — see `council::resolve_seat`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SeatKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ref": {
+          "description": "Spelled `ref` in the file, because that is what the design and the Python it came from call\nit, and `model_ref` in Rust, because `ref` is a keyword.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-widget": "model-picker"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "`~/.nucleos/council.yaml`. Absent means there is no council — this pillar has no useful default,\nbecause a roster nobody chose is a list of models nobody agreed to pay for.\n\n`deny_unknown_fields`, and here it is load-bearing rather than tidy: `member:` for `members:`\nwould otherwise parse into a council with no seats, which is a council that answers every\nquestion with the chairman's own opinion while looking like it deliberated.",
+  "properties": {
+    "chairman": {
+      "$ref": "#/$defs/SeatSpec"
+    },
+    "consumers": {
+      "$ref": "#/$defs/CouncilConsumers",
+      "default": {
+        "job_review": false,
+        "proposal_advice": false
+      },
+      "description": "Which of the daemon's own decisions get the council's opinion before a person sees them.\n\nAbsent means none of them, which is what every roster written before this field already\nmeant. `#[serde(default)]` on the struct AND on each flag, so `consumers: { job_review:\ntrue }` is a legal half-answer: an operator turning one on should not have to write the\nother down to leave it alone."
+    },
+    "members": {
+      "items": {
+        "$ref": "#/$defs/SeatSpec"
+      },
+      "type": "array"
+    },
+    "rounds": {
+      "default": 1,
+      "description": "1 to `MAX_COUNCIL_ROUNDS`. Each round past the first is a further deliberation round: after\nthe blind ranking every seat is shown the same anonymised peer answers it ranked, plus where\nthe council placed them, and revises its own answer — and the chairman then synthesises the\nrevised ones. A round that changes nothing ends the deliberation early.\n\nA FAULT rather than a clamp when it is anything else, which is the one place this field\nparts company with `timeout_seconds` two lines up. A clock outside its bounds has an obvious\nnearest legal value and costs nothing to guess at; `rounds: 4` does not, because both\ncandidates are defensible and they differ by the price of a whole extra round. So it joins\nthe fault list and the council stays off, which is the branch `load_council_config` took\nover `load_models_config`'s on purpose: the operator is told, and nothing is spent guessing.",
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "timeout_seconds": {
+      "default": 600,
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "chairman",
+    "members"
+  ],
+  "title": "CouncilConfig",
+  "type": "object"
+}

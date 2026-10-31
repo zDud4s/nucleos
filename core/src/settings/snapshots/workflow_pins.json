@@ -1,0 +1,94 @@
+{
+  "$defs": {
+    "NodeOverlay": {
+      "description": "What this project overrides on one node of the origin's graph.\n\n**Rows, not a second graph.** §6.2 says the overlay is painted rather than hidden: the canvas\ndraws the origin's graph and stamps these on top, so a node this project disabled stays in the\npicture, dotted. Fields are all optional because absent means *inherited*, which is a third\nanswer that a `bool` and a default would have collapsed into \"off\".\n\nThis slice does not open the graph, so it never checks that a key here names a node that exists.\nThat is the canvas's question and it is the right place for it: an overlay row for a node a\nnewer bundle removed is information — it is how somebody learns their override stopped applying\n— and refusing to load the pin over it would take the whole workflow away instead.",
+      "properties": {
+        "command": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-widget": "command"
+        },
+        "disabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-widget": "model-picker"
+        },
+        "tool": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "Pin": {
+      "description": "One workflow this project uses, as its `workflows.yaml` records it.",
+      "properties": {
+        "ejected_at": {
+          "description": "When this project took its own copy — and so, when it stopped receiving updates. §6.1's\nsecond named weakness is that an ejected bundle freezes in silence; this is the field that\nlets the page say how long the silence has lasted.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hash": {
+          "description": "What the bundle hashed to when it was pinned. The whole of `drifted` rests on this field.",
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "nodes": {
+          "additionalProperties": {
+            "$ref": "#/$defs/NodeOverlay"
+          },
+          "type": "object"
+        },
+        "origin": {
+          "description": "Where the bundle came from, copied off the manifest at install time. See the module header.",
+          "type": "string"
+        },
+        "path": {
+          "description": "Where this project's own copy is, when it is not where an eject would have put it.\n\n**This is what lets the app recognise a workflow that was already here.** §9's second step\nsays the app must not ask somebody to recreate the harness they already have — this\nrepository's `.ai/` built NucleOS — so adopting it points the pin at the folder that is\nthere and touches nothing inside it. `None` is the ordinary case: an ejected copy lives at\n`.nucleos/workflows/<name>/` and does not need saying.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "version",
+        "origin",
+        "hash"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "workflows": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/Pin"
+      },
+      "type": "array"
+    }
+  },
+  "title": "Pins",
+  "type": "object"
+}

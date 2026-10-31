@@ -42,8 +42,8 @@ pub use item_context::{ItemContext, ItemRef, failed_label, item_context};
 pub const DEFAULT_URL: &str = "http://127.0.0.1:18733";
 /// The ceiling on one route call. A run waits at most this long before launching without advice.
 pub const DEFAULT_TIMEOUT_MS: u64 = 2500;
-const MIN_TIMEOUT_MS: u64 = 100;
-const MAX_TIMEOUT_MS: u64 = 10_000;
+pub(crate) const MIN_TIMEOUT_MS: u64 = 100;
+pub(crate) const MAX_TIMEOUT_MS: u64 = 10_000;
 /// How much of the prompt leaves the daemon as `task`: the head, where the ask is.
 pub const TASK_CHARS: usize = 4000;
 /// How much of the gate's output goes as `gate_output`: the tail, where the failure is. The router
@@ -66,7 +66,7 @@ impl Mode {
         }
     }
 
-    fn parse(value: &str) -> Option<Self> {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
         match value {
             "off" => Some(Self::Off),
             "shadow" => Some(Self::Shadow),
@@ -105,7 +105,7 @@ impl Surface {
         }
     }
 
-    const ALL: [Self; 4] = [Self::Runs, Self::Team, Self::Council, Self::Recruit];
+    pub(crate) const ALL: [Self; 4] = [Self::Runs, Self::Team, Self::Council, Self::Recruit];
 }
 
 /// A CLI the daemon can launch, named as the router names it (`route_api.RUNNERS`).
@@ -220,6 +220,23 @@ pub fn load_config(path: &Path) -> RouterConfig {
     }
 }
 
+/// The stored `router` document as a configuration; `off` when none is stored or the document
+/// names a router off this machine (`RouterDoc::to_config` is the loopback fence).
+pub fn current_config() -> RouterConfig {
+    let Some(doc) =
+        crate::settings::get_opt::<super::route_doc::RouterDoc>(&crate::settings::Scope::Machine)
+    else {
+        return RouterConfig::off();
+    };
+    match doc.to_config() {
+        Ok(config) => config,
+        Err(why) => {
+            tracing::warn!(%why, "stored router document refused; routing is off");
+            RouterConfig::off()
+        }
+    }
+}
+
 /// The pure half of [`load_config`]: the reason a file is refused, or the configuration it names.
 pub fn parse_config(text: &str) -> Result<RouterConfig, String> {
     let raw: RawConfig = serde_yaml::from_str(text).map_err(|error| error.to_string())?;
@@ -229,37 +246,26 @@ pub fn parse_config(text: &str) -> Result<RouterConfig, String> {
             Mode::from_yaml(value).ok_or_else(|| format!("unknown router mode {value:?}"))?
         }
     };
-    let url = raw.url.unwrap_or_else(|| DEFAULT_URL.to_owned());
-    if !is_loopback(&url) {
-        return Err(format!(
-            "router url {url} is not on this machine; only loopback is allowed"
-        ));
-    }
+    // `from_yaml` accepts `false` as `off`; the document carries the canonical word instead.
     let mut surfaces = BTreeMap::new();
     for (name, value) in &raw.surfaces {
-        let surface = Surface::ALL
-            .into_iter()
-            .find(|surface| surface.as_str() == name)
-            .ok_or_else(|| format!("unknown router surface {name}"))?;
-        let mode = Mode::from_yaml(value)
+        let surface_mode = Mode::from_yaml(value)
             .ok_or_else(|| format!("unknown router mode {value:?} for surface {name}"))?;
-        surfaces.insert(surface.as_str(), mode);
+        surfaces.insert(name.clone(), surface_mode.as_str().to_owned());
     }
-    Ok(RouterConfig {
-        mode,
-        url,
-        timeout_ms: raw
-            .timeout_ms
-            .unwrap_or(DEFAULT_TIMEOUT_MS)
-            .clamp(MIN_TIMEOUT_MS, MAX_TIMEOUT_MS),
+    super::route_doc::RouterDoc {
+        mode: mode.as_str().to_owned(),
+        url: raw.url.unwrap_or_else(|| DEFAULT_URL.to_owned()),
+        timeout_ms: raw.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS),
         runners: raw.runners,
         models: raw.models,
         surfaces,
-    })
+    }
+    .to_config()
 }
 
 /// Only `http(s)://` to 127.0.0.1, localhost or ::1.
-fn is_loopback(url: &str) -> bool {
+pub(crate) fn is_loopback(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return false;
     };

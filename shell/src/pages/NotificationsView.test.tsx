@@ -166,7 +166,7 @@ describe("the notifications view", () => {
 
     // `config_written` is claimed by no prefix, so "follows its family" would
     // name something that does not exist for it.
-    const loose = await screen.findByLabelText("project file written");
+    const loose = await screen.findByLabelText("setting written");
     expect(loose.tagName).toBe("INPUT");
     expect((loose as HTMLInputElement).checked).toBe(true);
 

@@ -164,6 +164,7 @@ mod tests {
         AppState,
         std::sync::Arc<crate::execution::runner::FakeCommandRunner>,
     ) {
+        crate::project::rules::testing::hold_shared();
         let runner = std::sync::Arc::new(crate::execution::runner::FakeCommandRunner::default());
         let state = AppState {
             startup_config: Default::default(),
@@ -3920,7 +3921,12 @@ mod tests {
         // The gate, where a job reads it: the project's state directory under a stand-in home
         // that lives in the same container (see `with_home`). Written for both ids these walks use,
         // since the rules are keyed by the project and not by the folder.
+        // The file is still written beside the snapshot: `command_node::resolve_command` has not moved off it.
         for project_id in ["nucleos", "project-a"] {
+            crate::project::rules::testing::publish_rules(
+                project_id,
+                &format!("gate_command: {gate}\nschedules: []\n"),
+            );
             crate::project::state::write_for_test(
                 &container.path().join(WALK_HOME),
                 project_id,
@@ -5487,6 +5493,7 @@ mod tests {
         let (container, repo) = walkable_repo("nucleos-job-workflow-", "git --version");
         let root = tempfile::tempdir().unwrap();
         let _env = WorktreeRootEnv::set(root.path());
+        let _settings = crate::project::rules::testing::Home::new();
         let pool = test_pool().await;
         let mut state = with_home(test_state(pool.clone()).await, &container);
         let library = container.path().join("workflows");
@@ -5497,13 +5504,12 @@ mod tests {
         let bundle = crate::workflows::read_bundle(&bundle_dir, "dev", "1.0")
             .unwrap()
             .unwrap();
-        let pins = crate::project::state::file(
-            state.machine_config_root.as_deref(),
+        let mut pins = crate::workflows::Pins::default();
+        crate::workflows::apply_install(&mut pins, &bundle).unwrap();
+        crate::project::rules::testing::publish_pins(
             "nucleos",
-            crate::project::state::PINS_FILE,
-        )
-        .unwrap();
-        crate::workflows::install(&pins, &bundle).unwrap();
+            &crate::workflows::render_pins(&pins),
+        );
         state.workflow_library = Some(library);
         let project_root = repo.to_string_lossy().into_owned();
 
@@ -7459,12 +7465,7 @@ mod tests {
         let state = test_state(pool.clone()).await;
         let worktree = tempfile::tempdir().unwrap();
         let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
-        crate::project::state::write_for_test(
-            worktree.path(),
-            "project-a",
-            crate::project::state::AUTOPILOT_FILE,
-            "attention_brake: false\n",
-        );
+        crate::project::rules::testing::publish_rules("project-a", "attention_brake: false\n");
         let state = AppState {
             machine_config_root: Some(worktree.path().to_path_buf()),
             ..state
@@ -7508,6 +7509,125 @@ mod tests {
                 .await
                 .unwrap();
         assert_ne!(reason.as_deref(), Some("attention"));
+    }
+
+    /// The owner is at the keyboard for `project-a`: the heartbeat the attention check reads.
+    async fn the_owner_is_present(pool: &sqlx::SqlitePool) {
+        sqlx::query(
+            "INSERT INTO attention_heartbeats (scope, project_id, last_seen_at) VALUES ('project', 'project-a', ?)",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// Rules nobody can read leave the brake ON: being wrong this way costs a job that waits, and
+    /// being wrong the other way starts a node in a worktree somebody is using.
+    /// Characterisation: it passes before the GREEN too (the snapshot holds no readable rules, so
+    /// the default brake applies).
+    #[tokio::test]
+    async fn rules_that_cannot_be_read_leave_the_attention_brake_on() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
+        crate::project::rules::testing::publish_unreadable(
+            "project-a",
+            "autopilot",
+            "unknown field `attention_brak`",
+        );
+        the_owner_is_present(&pool).await;
+
+        let job = load_job(&pool, job_id).await.unwrap();
+
+        assert!(matches!(
+            brakes(&state, &job, Utc::now()).await,
+            Brake::Park {
+                reason: "attention",
+                ..
+            }
+        ));
+    }
+
+    /// The brake is read at every check, not once: a switch published between two checks governs the second.
+    #[tokio::test]
+    async fn the_attention_brake_follows_a_switch_published_between_two_checks() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
+        the_owner_is_present(&pool).await;
+        let job = load_job(&pool, job_id).await.unwrap();
+
+        crate::project::rules::testing::publish_rules("project-a", "attention_brake: false\n");
+        assert!(matches!(brakes(&state, &job, Utc::now()).await, Brake::Go));
+
+        crate::project::rules::testing::publish_rules("project-a", "attention_brake: true\n");
+        assert!(matches!(
+            brakes(&state, &job, Utc::now()).await,
+            Brake::Park {
+                reason: "attention",
+                ..
+            }
+        ));
+    }
+
+    /// A gate configuration nobody can read means the measurement did not happen. It must not be
+    /// recorded as a project with no gate, and it must never be a pass.
+    #[tokio::test]
+    async fn a_gate_configuration_that_cannot_be_read_errors_the_gate() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let worktree = tempfile::tempdir().unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
+        crate::project::rules::testing::publish_unreadable(
+            "project-a",
+            "autopilot",
+            "unknown field `gate_comand`",
+        );
+        sqlx::query("UPDATE jobs SET project_root = ? WHERE id = ?")
+            .bind(worktree.path().to_string_lossy().into_owned())
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_worktree(&pool, job_id, worktree.path()).await;
+        seed_items(&pool, job_id, &["implemented", "implemented"]).await;
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        gate_item(&state, &job, 0, 2).await;
+
+        assert_eq!(item_statuses(&pool, job_id).await[0], "gate_errored");
+    }
+
+    /// The gate command is read at every gate: rules repaired after one errored gate are what the
+    /// next item is measured by.
+    #[tokio::test]
+    async fn a_gate_command_published_after_an_unreadable_one_governs_the_next_item() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let worktree = tempfile::tempdir().unwrap();
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
+        sqlx::query("UPDATE jobs SET project_root = ? WHERE id = ?")
+            .bind(worktree.path().to_string_lossy().into_owned())
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_worktree(&pool, job_id, worktree.path()).await;
+        seed_items(&pool, job_id, &["implemented", "implemented"]).await;
+        let job = load_job(&pool, job_id).await.unwrap();
+
+        crate::project::rules::testing::publish_unreadable(
+            "project-a",
+            "autopilot",
+            "unknown field `gate_comand`",
+        );
+        gate_item(&state, &job, 0, 2).await;
+        assert_eq!(item_statuses(&pool, job_id).await[0], "gate_errored");
+
+        crate::project::rules::testing::publish_rules("project-a", "gate_command: git --version\n");
+        gate_item(&state, &job, 1, 2).await;
+        assert_eq!(item_statuses(&pool, job_id).await[1], "passed");
     }
 
     /// Decision 14, and the reason parked time counts toward it: without that, parking would be a
@@ -9081,10 +9201,8 @@ mod tests {
         let state = test_state(pool.clone()).await;
         let worktree = tempfile::tempdir().unwrap();
         let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
-        crate::project::state::write_for_test(
-            worktree.path(),
+        crate::project::rules::testing::publish_rules(
             "project-a",
-            crate::project::state::AUTOPILOT_FILE,
             "gate_command: definitely-not-a-real-binary\n",
         );
         let state = AppState {
@@ -10879,12 +10997,7 @@ tests:
         assert!(git_ok(root, &["commit", "-q", "-am", "two"]));
 
         let machine = tempfile::tempdir().unwrap();
-        crate::project::state::write_for_test(
-            machine.path(),
-            "project-a",
-            crate::project::state::AUTOPILOT_FILE,
-            rules,
-        );
+        crate::project::rules::testing::publish_rules("project-a", rules);
         let pool = test_pool().await;
         let state = AppState {
             machine_config_root: Some(machine.path().to_path_buf()),

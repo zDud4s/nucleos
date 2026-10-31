@@ -28,11 +28,8 @@ import { OnboardPanel } from "./Onboard";
  * editor is, because it knows the schema — there is no way to set the mode to a fourth value, and
  * no way to write a negative ceiling, because there is nowhere to write one.
  *
- * The other half of layer 1 is a *file*, and it is next door in `OwnedFiles` for a reason worth
- * stating: a form that round-tripped YAML would delete the comment somebody left explaining why a
- * schedule is switched off. "A shell that offered to write it would be a second author of a
- * document git already owns" stays true about the file's SHAPE even where it has stopped being
- * true about the file.
+ * The other half of layer 1 is a settings document, and it is next door in `AutopilotRules`: one
+ * editor for it, drawn from the schema the núcleo serves, and not a second one here.
  *
  * Two of the three things here are settings and the third is evidence. The classes are in this
  * section anyway, because they are what unlocks the third mode — and they are drawn as facts

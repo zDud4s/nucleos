@@ -63,9 +63,10 @@ const PROJECT_SCOPED: &[&str] = &[
     "devtime_findings",
     // The parent of six session-keyed tables; those are written out in `remove`, ahead of the loop.
     "devtime_sessions",
-    // What the automatic actions decided, or would have decided, about the project (migration 0260).
-    // It is derived from the project's dev time, so it goes with it. `devtime_action_state` has no
-    // project: it is the house's switch per (action, rule), and it stays.
+    // What the automatic actions decided, or would have decided, about the project's sessions, and
+    // what the owner said of it (migration 0260): derived from the project's dev time, so it goes with
+    // it. `devtime_action_state` has no `project_id`: the on/shadow/live state is per (action, rule) for
+    // the whole machine, and it stays.
     "devtime_shadow",
     "devtime_turn_stats",
     // Pending distillations are the project's history; a forgotten project must not be distilled later.
@@ -657,6 +658,22 @@ pub async fn remove(
                 .execute(&mut *tx)
                 .await?
                 .rows_affected();
+        }
+
+        // The project's configuration documents (migration 0257): `settings` keys them by the text
+        // scope `project:<id>`, not by a `project_id` column, so the loop below does not see them,
+        // and the schema-honesty test cannot either. Their history goes too, or a re-added project
+        // would pick its version numbers up from a project nobody remembers. The machine documents
+        // (`scope = 'machine'`) are not a project's to forget. The caller reloads the settings
+        // snapshot after this commits.
+        for table in ["settings", "settings_history"] {
+            forgotten += sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DELETE FROM {table} WHERE scope = 'project:' || ?"
+            )))
+            .bind(project_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
         }
 
         // Children first. The deferral above means it would work in any order, and doing it in the
@@ -1989,6 +2006,60 @@ mod tests {
             left, 0,
             "a forgotten project's capture requests outlived it"
         );
+    }
+
+    /// A project's configuration documents and their history are keyed by the text scope
+    /// `project:<id>`, not by a `project_id` column. Forgetting the project takes them; another
+    /// project's and the machine's stay. A plain removal (no forget) keeps them, like its neighbours.
+    #[tokio::test]
+    async fn forgetting_a_project_takes_its_settings_documents_and_leaves_the_machine_alone() {
+        let pool = pool().await;
+        register(&pool, "alpha").await;
+        register(&pool, "bravo").await;
+        for scope in ["machine", "project:alpha", "project:bravo"] {
+            sqlx::query(
+                "INSERT INTO settings (scope, name, body_json, version, updated_at, updated_by)
+                 VALUES (?, 'verify', '{}', 1, 'x', 'test')",
+            )
+            .bind(scope)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO settings_history (scope, name, version, body_json, written_at, written_by)
+                 VALUES (?, 'verify', 1, '{}', 'x', 'test')",
+            )
+            .bind(scope)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        remove(&pool, "alpha", false).await.unwrap();
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM settings").await,
+            3,
+            "removing without forgetting touched settings"
+        );
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM settings_history").await,
+            3,
+            "removing without forgetting touched settings_history"
+        );
+
+        register(&pool, "alpha").await;
+        remove(&pool, "alpha", true).await.unwrap();
+        for sql in [
+            "SELECT scope FROM settings ORDER BY scope",
+            "SELECT scope FROM settings_history ORDER BY scope",
+        ] {
+            let scopes: Vec<String> = sqlx::query_scalar(sql).fetch_all(&pool).await.unwrap();
+            assert_eq!(
+                scopes,
+                ["machine", "project:bravo"],
+                "forgetting alpha must take exactly its own documents: {sql}"
+            );
+        }
     }
 
     /// A task claim is the project's working history: forgetting the project takes its claims, their

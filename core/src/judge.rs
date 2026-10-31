@@ -7,7 +7,7 @@
 //! never approve, which calls it is asked about, and the text it is shown. The client, the rows
 //! and the review queue arrive with the plan's later chunks.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -641,8 +641,6 @@ pub struct Asked {
     /// decision, and the boundary for "the actions before this one".
     pub shadow_decision_id: Option<i64>,
     pub project_id: Option<String>,
-    /// `AppState::machine_config_root`: where the project's `autopilot.yaml` lives (D7).
-    pub machine_root: Option<PathBuf>,
     pub tool_name: String,
     pub tool_input: Value,
     pub cwd: String,
@@ -802,31 +800,24 @@ async fn record(pool: &SqlitePool, row: &VerdictRow) -> sqlx::Result<i64> {
     .map(|result| result.last_insert_rowid())
 }
 
-/// D7: the project's thresholds, read at decision time from its `autopilot.yaml` (in the machine
-/// config root, keyed by project id: `config::load_schedule_rules`). No project or no root means
-/// the defaults, as an absent file does. An UNREADABLE file is an error, and the call falls back
-/// to the classifier: the defaults may be looser than what the project wrote down, and a
-/// tightening that silently stopped applying is the failure D7's warning exists to prevent.
-async fn thresholds_for(
-    machine_root: Option<PathBuf>,
-    project_id: Option<&str>,
-) -> Result<Thresholds, String> {
-    let Some(project_id) = project_id.map(str::to_owned) else {
+/// D7: the project's thresholds, read at decision time from the settings snapshot (its stored
+/// `autopilot` document, `project::rules::autopilot`). No project means the defaults, as an absent
+/// document does. An UNREADABLE document is an error, and the call falls back to the classifier:
+/// the defaults may be looser than what the project wrote down, and a tightening that silently
+/// stopped applying is the failure D7's warning exists to prevent.
+fn thresholds_for(project_id: Option<&str>) -> Result<Thresholds, String> {
+    let Some(project_id) = project_id else {
         return Ok(Thresholds::default());
     };
-    tokio::task::spawn_blocking(move || {
-        crate::config::load_schedule_rules(machine_root.as_deref(), &project_id)
-    })
-    .await
-    .map_err(|error| error.to_string())?
-    .map(|rules| rules.judge_thresholds())
-    .map_err(|error| error.to_string())
+    crate::project::rules::autopilot(project_id)
+        .map(|rules| rules.judge_thresholds())
+        .map_err(|error| error.to_string())
 }
 
 /// Review item G: why this project's thresholds cannot be read, if they cannot - the same read the
 /// hook makes, so the panel says exactly what the hook will do (fall back to the classifier).
-pub async fn rules_problem(machine_root: Option<PathBuf>, project_id: &str) -> Option<String> {
-    thresholds_for(machine_root, Some(project_id)).await.err()
+pub fn rules_problem(project_id: &str) -> Option<String> {
+    thresholds_for(Some(project_id)).err()
 }
 
 /// D9: the state for one call. The task is `runs.prompt` (NOT NULL) or, for a job node, its
@@ -885,13 +876,12 @@ pub async fn state_with_note(
     }))
 }
 
-/// D7/D9: everything the call needs from this machine. An unreadable rules file is an error (the
+/// D7/D9: everything the call needs from this machine. Unreadable stored rules are an error (the
 /// defaults may be looser than what the project wrote down), and so is a database that will not
 /// answer.
 pub async fn prepare(pool: &SqlitePool, asked: &Asked) -> Result<Prepared, String> {
-    let thresholds = thresholds_for(asked.machine_root.clone(), asked.project_id.as_deref())
-        .await
-        .map_err(|error| format!("config: {error}"))?;
+    let thresholds =
+        thresholds_for(asked.project_id.as_deref()).map_err(|error| format!("config: {error}"))?;
     let state = state_for(pool, asked)
         .await
         .map_err(|error| format!("state: {error}"))?;
@@ -1657,11 +1647,13 @@ mod tests {
     use std::time::Instant;
 
     fn asked(run_id: i64, shadow: Option<i64>, command: &str) -> Asked {
+        // These tests read the project's rules through `prepare`: hold the shared side of the rules
+        // gate; the ones that publish take the exclusive side themselves.
+        crate::project::rules::testing::hold_shared();
         Asked {
             run_id,
             shadow_decision_id: shadow,
             project_id: Some("p".to_owned()),
-            machine_root: None,
             tool_name: "Bash".to_owned(),
             tool_input: json!({ "command": command, "description": "Run the tests" }),
             cwd: "C:/work/repo".to_owned(),
@@ -1963,27 +1955,19 @@ mod tests {
         assert_eq!(cost, 0.0);
     }
 
-    /// D7/D10: a project whose `autopilot.yaml` cannot be read is not judged with defaults
-    /// that may be looser than what it wrote down.
+    /// D7/D10: a project whose STORED rules cannot be read is not judged with defaults that may be
+    /// looser than what it wrote down.
     #[tokio::test]
-    async fn an_unreadable_rules_file_falls_back_to_the_classifier() {
+    async fn an_unreadable_rules_document_falls_back_to_the_classifier() {
         let pool = pool().await;
-        let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(root.path().join("projects").join("p")).unwrap();
-        std::fs::write(
-            root.path()
-                .join("projects")
-                .join("p")
-                .join("autopilot.yaml"),
-            "judge:
-  allow: 0.9
-",
-        )
-        .unwrap();
+        crate::project::rules::testing::publish_unreadable(
+            "p",
+            "autopilot",
+            "judge: unknown field `allow`",
+        );
         let run_id = running_run(&pool).await;
         let judge = ScriptedJudge::answering(0.99, 0.99);
-        let mut call = asked(run_id, None, "cargo test --workspace | tee t.log");
-        call.machine_root = Some(root.path().to_path_buf());
+        let call = asked(run_id, None, "cargo test --workspace | tee t.log");
 
         judge_call(
             &pool,
@@ -1993,9 +1977,47 @@ mod tests {
         )
         .await;
 
-        assert_eq!(judge.calls(), 0);
+        assert_eq!(
+            judge.calls(),
+            0,
+            "an unreadable document must not reach the judge"
+        );
         let (.., error, _, _) = verdicts(&pool, 1).await.remove(0);
-        assert!(error.unwrap().starts_with("config:"));
+        let error = error.expect("the verdict row names the config error");
+        assert!(error.starts_with("config:"), "{error}");
+        assert!(error.contains("judge: unknown field `allow`"), "{error}");
+    }
+
+    /// The thresholds are read when the call is decided: a change to the stored rules is seen by the
+    /// very next call, in both directions, and removing them brings the defaults back.
+    #[tokio::test]
+    async fn a_change_in_the_stored_thresholds_is_seen_on_the_next_call() {
+        use crate::project::rules::testing::{clear, publish_rules};
+        let pool = pool().await;
+        let run_id = running_run(&pool).await;
+        let call = asked(run_id, None, "cargo test --workspace | tee t.log");
+
+        publish_rules(
+            "p",
+            "judge:
+  allow_at: 0.97
+",
+        );
+        let strict = prepare(&pool, &call).await.unwrap().thresholds;
+        assert_eq!(strict.allow_at, 0.97, "the stored allow_at is read");
+
+        publish_rules(
+            "p",
+            "judge:
+  allow_at: 0.91
+",
+        );
+        let relaxed = prepare(&pool, &call).await.unwrap().thresholds;
+        assert_eq!(relaxed.allow_at, 0.91, "a republished value is seen");
+
+        clear("p", "autopilot");
+        let defaults = prepare(&pool, &call).await.unwrap().thresholds;
+        assert_eq!(defaults, Thresholds::default());
     }
 
     /// The key never travels in an error: every variant's text is built from a status, a name or

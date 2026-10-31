@@ -236,15 +236,8 @@ export const keys = {
      * whenever the map's own reading fails. It is a table, like the pile above and unlike `map`.
      */
     mapSilenced: (projectId: string) => ["projects", projectId, "map", "silenced"] as const,
-    /** The write boundary. Under the roster prefix, so one write invalidates it with everything else. */
-    ownership: (projectId: string) => ["projects", projectId, "ownership"] as const,
     /** The project's `nucleos.tests.yaml` and the map the daemon proposes. */
     testsMap: (projectId: string) => ["projects", projectId, "tests-map"] as const,
-    /**
-     * The text of one file inside that boundary, read from wherever the daemon keeps it. Under the
-     * same prefix, so the write that changes it invalidates it.
-     */
-    owned: (projectId: string, path: string) => ["projects", projectId, "owned", path] as const,
     /** What this project can be asked to do to itself, and what each of them last said. */
     commands: (projectId: string) => ["projects", projectId, "commands"] as const,
     /**
@@ -273,8 +266,8 @@ export const keys = {
      *
      * Under the project prefix and NOT under `keys.workflows` below, because it is a fact about
      * this project rather than about the machine — and because installing one also changes what
-     * `ownership` answers, which is its neighbour here. The library itself is the machine's and
-     * has its own root.
+     * `GET /projects/{id}/ownership` answers. The library itself is the machine's and has its own
+     * root.
      */
     workflows: (projectId: string) => ["projects", projectId, "workflows"] as const,
     /** One workflow's divergence from its origin, asked for only when somebody opens it. */
@@ -706,18 +699,6 @@ export const keys = {
     notifyPolicyFor: (channel: string) => ["system", "notify-policy", channel] as const,
     notifyKinds: ["system", "notify-kinds"] as const,
     config: (area: string) => ["system", "config", area] as const,
-    /**
-     * This machine's settings files — `GET /config/machine`.
-     *
-     * A sibling of `config` above rather than a child of it, and the difference
-     * is not cosmetic: that one keys the daemon's PARSED view of a pillar — what
-     * it is actually doing, clamps applied — and this one keys the files on
-     * disk. The two disagree exactly when somebody has edited a file and not
-     * restarted, which is the state the settings page exists to show. A write
-     * invalidating this must not also throw away the running readout it is
-     * about to be compared against.
-     */
-    machine: ["system", "machine"] as const,
     /** `GET /config/distiller` — which brain the distiller asks. */
     distiller: ["system", "distiller"] as const,
     /** `GET /config/distiller-sources` — the chat and calendar switches. */
@@ -735,5 +716,13 @@ export const keys = {
     all: ["channels"] as const,
     identities: (channel: string) => ["channels", channel, "identities"] as const,
     pairing: (channel: string) => ["channels", channel, "pairing"] as const,
+  },
+
+  /** Settings documents kept in the núcleo's database — `GET /settings…`. */
+  settings: {
+    all: ["settings"] as const,
+    index: (scope?: string) => ["settings", "index", scope ?? "all"] as const,
+    doc: (scope: string, name: string) => ["settings", "doc", scope, name] as const,
+    history: (scope: string, name: string) => ["settings", "history", scope, name] as const,
   },
 } as const;

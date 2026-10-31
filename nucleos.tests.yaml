@@ -100,11 +100,17 @@ tests:
     - scripts/doctor.sh
     - scripts/leave-nothing-behind.mjs
     - scripts/update-shell.ps1
+    # Writes (or checks) the route table in core/src/route_index/generated*; run by hand, no gate
+    # calls it. The table it writes is covered by the core group's route_index tests.
+    - scripts/route_index_gate.py
     # Deletes regenerable build output on the owner's machine; run by hand.
     - scripts/free-disk.ps1
     # Serve the preview live for an agent-driven dev-browser window; run by hand.
     - scripts/live-preview.mjs
     - scripts/live-preview-agent.js
+    # Smoke-tests an installed Linux .deb/.rpm inside a clean container; only the release workflow
+    # runs it, on real release assets.
+    - scripts/smoke-bundle.sh
     - docs/
     - design/
     - .githooks/

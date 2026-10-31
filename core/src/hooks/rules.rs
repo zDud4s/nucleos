@@ -72,7 +72,6 @@ pub(super) struct RunSnapshot<'a> {
 
 /// Spec B: the block this call is, as the resolver is asked about it.
 pub(super) fn resolve_asked(
-    state: &AppState,
     event: crate::judge::resolve::Event,
     run: &RunSnapshot<'_>,
     payload: &PreToolUsePayload,
@@ -84,7 +83,6 @@ pub(super) fn resolve_asked(
         event,
         event_ref: run.shadow_decision_id,
         project_id: run.project_id.map(str::to_owned),
-        machine_root: state.machine_config_root.clone(),
         subject: crate::judge::resolve::Subject::Call {
             tool_name: payload.tool_name.clone(),
             tool_input: payload.tool_input.clone(),

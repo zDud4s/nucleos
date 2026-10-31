@@ -440,7 +440,7 @@ function Found({
    * write, rather than found out after the project row already exists.
    *
    * Onboarding, inside the register step, is the exception that proves this: it now consults the
-   * same switch, because it is a governance write like the ones `POST /write` already guards. It is
+   * same switch, because it is a governance write like the settings writes it already guards. It is
    * not blocked here, because its refusal does not need to be — `finish`'s register step catches it
    * and skips onboarding rather than the whole step, so the stop still never refuses the project.
    */

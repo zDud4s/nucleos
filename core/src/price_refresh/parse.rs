@@ -1,12 +1,11 @@
 //! The prices half of `scripts/refresh-models.py`, ported line for line and kept pure. The script
-//! no longer writes prices; this is the only writer of the price block now.
+//! no longer writes prices; the refresh this feeds is their only writer now.
 //!
 //! Two bodies come in (Anthropic's pricing page as markdown, OpenRouter's `/api/v1/models` as JSON)
-//! and two YAML blocks go out (`prices_as_of` and `model_prices`), rendered to the byte as the
-//! script rendered its rows, so the first daemon refresh of a file the script last wrote changes
-//! the banner, the date and any price that moved, and nothing else. That is why the odd corners are kept rather than
-//! tidied: Python's float `repr` (`1e-05`, `10.0`), its `round(x, 6)`, its `strip()` and
-//! `splitlines()`. Each of them shows in the rendered text, and each is a diff if it drifts.
+//! and the typed prices go out, for the caller to put in the `models` document. The odd corners of
+//! the port are kept rather than tidied wherever they decide a value or a line a person reads:
+//! Python's `round(x, 6)`, its `strip()` and `splitlines()`, and its float `repr` (`1e-05`, `10.0`)
+//! in the cross-check's warnings.
 //!
 //! What is not ported is the script's I/O: fetching is the caller's, and every complaint the script
 //! prints comes back as a line instead.
@@ -36,7 +35,7 @@ const PRICING_COLUMNS: [&str; 5] = [
     "Output tokens",
 ];
 
-/// The rate fields of a price and of a tier, in the order every rendered row writes them.
+/// The rate fields of a price, in the order [`price_rates`] returns them and a warning names them.
 const PRICE_FIELDS: [&str; 5] = [
     "input",
     "output",
@@ -54,31 +53,13 @@ const OPENROUTER_PRICE_FIELDS: [(&str, &str); 5] = [
     ("input_cache_write_1h", "cache_write_1h"),
 ];
 
-/// The banner above `prices_as_of`. Portuguese because the file has always carried it in
-/// Portuguese, beside the other keys' prose. It names the daemon and when it refreshes, since the
-/// script that used to write this block no longer does. The splice takes the banner above the key
-/// with the block, so a file still carrying the script's banner gets this one on its next refresh.
-pub const PRICE_BANNER: &str = r#"# ─────────────────────────────────────────────────────────────
-# Escrito pelo daemon: preços publicados pelos fornecedores, USD por milhão de tokens, lidos em
-# `prices_as_of`. O daemon atualiza-os ao arrancar e uma vez por dia quando têm mais de 7 dias,
-# quando a página Devtime encontra um modelo sem preço, e no botão "Refresh prices" dessa página;
-# `auto_refresh_prices: false` deixa só o botão. Usa-os só para o custo ESTIMADO do devtime; nunca
-# é a fatura. Um modelo sem preço legível fica com `null`. Um preço por tamanho do prompt (Haiku
-# 5.5, muitos `openai/*`) vai em `tiers`: cada escalão vale a partir de `min_prompt_tokens` tokens
-# de prompt e traz só as tarifas que muda. `fast` é a tarifa do fast mode (as da cache escalam com
-# ela) e `geo_us_mult` o multiplicador de `inference_geo: "us"`; um modelo sem eles deixa esses
-# pedidos sem preço. Um preço por hora do dia não é escrito. Editar à mão é desfeito na próxima
-# passagem.
-# ─────────────────────────────────────────────────────────────"#;
-
-/// The two blocks of `nucleos-models.yaml` a refresh owns, rendered and ready for
-/// [`splice_price_blocks`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PriceBlocks {
-    /// The banner plus `prices_as_of: "<date>"`.
+/// What one clean read of both sources says, ready for the `models` document.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RefreshedPrices {
+    /// The refresh's own date, `YYYY-MM-DD`.
     pub prices_as_of: String,
-    /// `model_prices:` and one flow-style row per model, ids sorted.
-    pub model_prices: String,
+    /// One entry per model, by normalised id.
+    pub model_prices: BTreeMap<String, ModelPrice>,
 }
 
 macro_rules! pattern {
@@ -120,10 +101,6 @@ fn py_strip(text: &str) -> &str {
     text.trim_matches(is_py_space)
 }
 
-fn py_rstrip(text: &str) -> &str {
-    text.trim_end_matches(is_py_space)
-}
-
 /// Python's `str.splitlines()`: every line boundary Python knows (not only `\n`), a `\r\n` pair as
 /// one, and no empty last line for a text that ends in a newline.
 fn py_splitlines(text: &str) -> Vec<&str> {
@@ -161,10 +138,10 @@ fn py_splitlines(text: &str) -> Vec<&str> {
     lines
 }
 
-/// Python's `repr(float)`, which is what the script writes every price with: the shortest digits
+/// Python's `repr(float)`, which is how a warning writes a price: the shortest digits
 /// that read back to the same float, a `.0` on a whole number (`10.0`), and an exponent of at least
 /// two digits once the number leaves `1e-4 <= |x| < 1e16` (`1e-05`, `1e+16`). Rust's `{}` writes
-/// `10` and `0.00001`, and its `{:?}` writes `1e-5`; each would be a diff on every refresh.
+/// `10` and `0.00001`, and its `{:?}` writes `1e-5`.
 fn py_float_repr(value: f64) -> String {
     if value.is_nan() {
         return "nan".to_string();
@@ -281,7 +258,7 @@ fn py_truthy(value: &Value) -> bool {
 
 // ---------------------------------------------------------------------------- rates --
 
-/// A price's or a tier's five rates, in [`PRICE_FIELDS`] order.
+/// A price's five rates, in [`PRICE_FIELDS`] order.
 type Rates = [Option<f64>; 5];
 
 fn price_rates(price: &ModelPrice) -> Rates {
@@ -291,16 +268,6 @@ fn price_rates(price: &ModelPrice) -> Rates {
         price.cache_read,
         price.cache_write,
         price.cache_write_1h,
-    ]
-}
-
-fn tier_rates(tier: &PriceTier) -> Rates {
-    [
-        tier.input,
-        tier.output,
-        tier.cache_read,
-        tier.cache_write,
-        tier.cache_write_1h,
     ]
 }
 
@@ -775,115 +742,12 @@ fn crosscheck(
     (vendor, warnings)
 }
 
-// ------------------------------------------------------------------------ rendering --
-
-fn render_number(value: Option<f64>) -> String {
-    value.map_or_else(|| "null".to_string(), py_float_repr)
-}
-
-/// One tier, flow-style: its threshold, then only the rates it carries (absent = the base rate).
-fn render_tier(tier: &PriceTier) -> String {
-    let mut parts = vec![format!("min_prompt_tokens: {}", tier.min_prompt_tokens)];
-    for (field, rate) in PRICE_FIELDS.iter().zip(tier_rates(tier)) {
-        if let Some(rate) = rate {
-            parts.push(format!("{field}: {}", py_float_repr(rate)));
-        }
-    }
-    format!("{{ {} }}", parts.join(", "))
-}
-
-/// One `model_prices` row: the five rates always (an unreadable one as an explicit `null`), then
-/// `tiers`, `fast` and `geo_us_mult` when the model has them, then `source`.
-fn render_price_row(model_id: &str, price: &ModelPrice) -> String {
-    let mut fields: Vec<String> = PRICE_FIELDS
-        .iter()
-        .zip(price_rates(price))
-        .map(|(field, rate)| format!("{field}: {}", render_number(rate)))
-        .collect();
-    if !price.tiers.is_empty() {
-        let tiers: Vec<String> = price.tiers.iter().map(render_tier).collect();
-        fields.push(format!("tiers: [{}]", tiers.join(", ")));
-    }
-    if let Some(fast) = &price.fast {
-        fields.push(format!(
-            "fast: {{ input: {}, output: {} }}",
-            py_float_repr(fast.input),
-            py_float_repr(fast.output)
-        ));
-    }
-    if let Some(mult) = price.geo_us_mult {
-        fields.push(format!("geo_us_mult: {}", py_float_repr(mult)));
-    }
-    format!(
-        "  {model_id}: {{ {}, source: {} }}",
-        fields.join(", "),
-        price.source.as_deref().unwrap_or("")
-    )
-}
-
-/// The two owned price keys as blocks, ids sorted so a re-run with the same prices is a no-op diff.
-fn render_prices(prices: &BTreeMap<String, ModelPrice>, as_of: &str) -> PriceBlocks {
-    let mut model_prices = vec!["model_prices:".to_string()];
-    model_prices.extend(prices.iter().map(|(id, price)| render_price_row(id, price)));
-    PriceBlocks {
-        prices_as_of: format!("{PRICE_BANNER}\nprices_as_of: \"{as_of}\""),
-        model_prices: model_prices.join("\n"),
-    }
-}
-
-// ------------------------------------------------------------------------- splicing --
-
-/// Replace the `key` block, or append it. Everything else is left untouched.
-///
-/// A surgical text edit and not a load-and-dump: this file is mostly prose, in Portuguese,
-/// explaining what each key costs, and a YAML round trip would return it with every comment gone.
-/// The banner above the block is taken with it, so a rewrite does not stack banners.
-fn splice(text: &str, key: &str, block: &str) -> String {
-    let lines = py_splitlines(text);
-    let opening = format!("{key}:");
-    let Some(start) = lines.iter().position(|line| line.starts_with(&opening)) else {
-        let joined = lines.join("\n");
-        return format!("{}\n\n{block}\n", py_rstrip(&joined));
-    };
-
-    // Back up over the banner written last time, and over the blank line above it.
-    let mut head = start;
-    while head > 0 && (lines[head - 1].starts_with('#') || py_strip(lines[head - 1]).is_empty()) {
-        head -= 1;
-    }
-
-    // Forward to the next column-zero line, key OR comment: the rows of this block are indented, and
-    // a comment in column zero is the banner of the NEXT key (the script's `assistant_choices`
-    // banner, say), which is not ours to take with us.
-    let mut tail = start + 1;
-    while tail < lines.len()
-        && !lines[tail].starts_with(|c: char| c.is_ascii_alphabetic() || c == '_' || c == '#')
-    {
-        tail += 1;
-    }
-
-    let before = lines[..head].join("\n");
-    let after = lines[tail..].join("\n");
-    let parts: Vec<&str> = [py_rstrip(&before), block, after.trim_start_matches('\n')]
-        .into_iter()
-        .filter(|part| !part.is_empty())
-        .collect();
-    format!("{}\n", py_rstrip(&parts.join("\n\n")))
-}
-
-/// `text` with both price blocks replaced (or appended), `prices_as_of` first and `model_prices`
-/// second — the order the script splices them in, which decides where they land in a file that
-/// has neither yet.
-pub fn splice_price_blocks(text: &str, blocks: &PriceBlocks) -> String {
-    let text = splice(text, "prices_as_of", &blocks.prices_as_of);
-    splice(&text, "model_prices", &blocks.model_prices)
-}
-
 /// The script's `refresh_prices`, given the two bodies it would have fetched (`None` for a source
 /// that could not be read) and today's date as `YYYY-MM-DD`.
 ///
-/// The blocks are `None` when either source could not be read or changed shape: the file's price
-/// block is then left exactly as it was, and `prices_as_of` keeps saying how old it is. The lines
+/// The prices are `None` when either source could not be read or changed shape: the document's
+/// prices are then left exactly as they were, and `prices_as_of` keeps saying how old they are. The
+/// lines
 /// are everything the script would have printed about the run, in its order: the cross-check
 /// warnings, the `openai/*` models priced by time of day (left out), then the problems — a model
 /// written without price, a fast or residency table it could not read, a source it could not use.
@@ -892,7 +756,7 @@ pub fn refresh_from_bodies(
     pricing_md: Option<&str>,
     openrouter_json: Option<&str>,
     today: &str,
-) -> (Option<PriceBlocks>, Vec<String>) {
+) -> (Option<RefreshedPrices>, Vec<String>) {
     let mut lines = Vec::new();
     let Some(page) = pricing_md else {
         lines.push(format!("could not read {PRICING_DOC} — prices unchanged"));
@@ -929,7 +793,13 @@ pub fn refresh_from_bodies(
     // A vendor id never collides with an openai id; the vendor wins anyway.
     let mut prices = openai;
     prices.extend(vendor);
-    (Some(render_prices(&prices, today)), lines)
+    (
+        Some(RefreshedPrices {
+            prices_as_of: today.to_string(),
+            model_prices: prices,
+        }),
+        lines,
+    )
 }
 
 #[cfg(test)]
@@ -1400,7 +1270,7 @@ For Claude 4.6 and later models, specifying US-only inference through the `infer
         assert_eq!(million(Value::Null), None);
     }
 
-    // --- prices: rendering and splicing ----------------------------------------------
+    // --- prices: python's text ---------------------------------------------------------
 
     #[test]
     fn floats_are_written_the_way_python_repr_writes_them() {
@@ -1428,116 +1298,11 @@ For Claude 4.6 and later models, specifying US-only inference through the `infer
     }
 
     #[test]
-    fn splice_replaces_model_prices_block_and_leaves_other_keys_intact() {
-        let original = "local_assistant_model: \"qwen\"\n\n# banner\nassistant_choices:\n  - { id: \"opus\" }\n\n\
-                        prices_as_of: \"2026-01-01\"\nmodel_prices:\n  old: { input: 1.0 }\n\nembedding_model: x\n";
-        let prices = BTreeMap::from([(
-            "claude-opus-4-7".to_string(),
-            ModelPrice {
-                source: Some("anthropic".to_string()),
-                ..price(5.0, 25.0, 0.5, 6.25)
-            },
-        )]);
-        let blocks = render_prices(&prices, "2026-10-18");
-        let spliced = splice(original, "model_prices", &blocks.model_prices);
-        let spliced = splice(&spliced, "prices_as_of", &blocks.prices_as_of);
-        assert!(!spliced.contains("old:"));
-        assert!(spliced.contains("prices_as_of: \"2026-10-18\""));
-        assert!(spliced.contains("local_assistant_model: \"qwen\""));
-        assert!(spliced.contains("assistant_choices:"));
-        assert!(spliced.contains("embedding_model: x"));
-        assert_eq!(spliced.matches("model_prices:").count(), 1);
-    }
-
-    #[test]
-    fn a_price_row_is_flow_style_with_explicit_nulls() {
-        let row = render_price_row(
-            "gpt-5.5",
-            &ModelPrice {
-                input: Some(1.25),
-                output: Some(10.0),
-                cache_read: Some(0.125),
-                source: Some("openrouter".to_string()),
-                ..ModelPrice::default()
-            },
-        );
-        assert_eq!(
-            row,
-            "  gpt-5.5: { input: 1.25, output: 10.0, cache_read: 0.125, cache_write: null, \
-             cache_write_1h: null, source: openrouter }"
-        );
-    }
-
-    #[test]
-    fn a_tiered_row_writes_its_tiers_inline_each_with_only_the_rates_it_carries() {
-        let row = render_price_row(
-            "claude-haiku-5-5",
-            &ModelPrice {
-                input: Some(0.1),
-                output: Some(0.5),
-                cache_read: Some(0.01),
-                cache_write: Some(0.125),
-                cache_write_1h: Some(0.2),
-                tiers: vec![PriceTier {
-                    min_prompt_tokens: 100_001,
-                    input: Some(0.5),
-                    output: Some(2.5),
-                    ..PriceTier::default()
-                }],
-                source: Some("anthropic".to_string()),
-                ..ModelPrice::default()
-            },
-        );
-        assert_eq!(
-            row,
-            "  claude-haiku-5-5: { input: 0.1, output: 0.5, cache_read: 0.01, cache_write: 0.125, \
-             cache_write_1h: 0.2, tiers: [{ min_prompt_tokens: 100001, input: 0.5, output: 2.5 }], \
-             source: anthropic }"
-        );
-    }
-
-    #[test]
-    fn a_row_with_fast_and_residency_rates_writes_both_after_its_tiers() {
-        let row = render_price_row(
-            "claude-opus-5-5",
-            &ModelPrice {
-                cache_write_1h: Some(8.0),
-                fast: Some(FastPrice {
-                    input: 8.0,
-                    output: 40.0,
-                }),
-                geo_us_mult: Some(1.1),
-                source: Some("anthropic".to_string()),
-                ..price(4.0, 20.0, 0.2, 5.0)
-            },
-        );
-        assert_eq!(
-            row,
-            "  claude-opus-5-5: { input: 4.0, output: 20.0, cache_read: 0.2, cache_write: 5.0, \
-             cache_write_1h: 8.0, fast: { input: 8.0, output: 40.0 }, geo_us_mult: 1.1, source: anthropic }"
-        );
-    }
-
-    #[test]
     fn lines_split_the_way_python_splitlines_splits_them() {
         assert_eq!(py_splitlines("a\r\nb\rc\n"), ["a", "b", "c"]);
         assert_eq!(py_splitlines("a\n\nb"), ["a", "", "b"]);
         assert_eq!(py_splitlines("a\u{2028}b"), ["a", "b"]);
         assert!(py_splitlines("").is_empty());
-    }
-
-    #[test]
-    fn splice_appends_a_key_the_file_does_not_have_yet() {
-        assert_eq!(splice("a: 1\n\n\n", "b", "b: 2"), "a: 1\n\nb: 2\n");
-    }
-
-    #[test]
-    fn splice_leaves_the_banner_of_the_key_after_it_in_place() {
-        let text = "model_prices:\n  old: {}\n\n# menus banner\nassistant_choices:\n  - x\n";
-        assert_eq!(
-            splice(text, "model_prices", "model_prices:\n  new: {}"),
-            "model_prices:\n  new: {}\n\n# menus banner\nassistant_choices:\n  - x\n"
-        );
     }
 
     // --- prices: the whole refresh ----------------------------------------------------
@@ -1546,130 +1311,76 @@ For Claude 4.6 and later models, specifying US-only inference through the `infer
 
     #[test]
     fn a_clean_read_writes_both_sources_and_does_not_complain() {
-        let (blocks, lines) = refresh_from_bodies(Some(PRICING_MD), Some(GOOD), "2026-10-18");
-        let blocks = blocks.unwrap();
-        assert!(blocks.model_prices.contains("claude-opus-4-7:"));
-        assert!(blocks.model_prices.contains("gpt-5.5:"));
+        let (refreshed, lines) = refresh_from_bodies(Some(PRICING_MD), Some(GOOD), "2026-10-18");
+        let refreshed = refreshed.unwrap();
+        assert!(refreshed.model_prices.contains_key("claude-opus-4-7"));
+        assert!(refreshed.model_prices.contains_key("gpt-5.5"));
         assert!(lines.is_empty(), "{lines:?}");
-        assert!(
-            blocks
-                .prices_as_of
-                .ends_with("\nprices_as_of: \"2026-10-18\"")
-        );
+        assert_eq!(refreshed.prices_as_of, "2026-10-18");
     }
 
     #[test]
     fn a_clean_read_writes_the_fast_and_residency_rates() {
-        let (blocks, _) = refresh_from_bodies(Some(PRICING_MD), Some(GOOD), "2026-10-18");
-        assert!(
-            blocks
-                .unwrap()
-                .model_prices
-                .contains("fast: { input: 10.0, output: 50.0 }, geo_us_mult: 1.1")
+        let (refreshed, _) = refresh_from_bodies(Some(PRICING_MD), Some(GOOD), "2026-10-18");
+        let refreshed = refreshed.unwrap();
+        let opus = &refreshed.model_prices["claude-opus-4-7"];
+        assert_eq!(
+            opus.fast,
+            Some(FastPrice {
+                input: 10.0,
+                output: 50.0
+            })
         );
+        assert_eq!(opus.geo_us_mult, Some(1.1));
     }
 
     #[test]
     fn a_clean_read_writes_the_tiered_model_with_its_tier() {
-        let (blocks, _) = refresh_from_bodies(Some(PRICING_MD), Some(GOOD), "2026-10-18");
-        let model_prices = blocks.unwrap().model_prices;
-        assert!(model_prices.contains("claude-haiku-5-5: { input: 0.1"));
-        assert!(model_prices.contains("min_prompt_tokens: 100001"));
+        let (refreshed, _) = refresh_from_bodies(Some(PRICING_MD), Some(GOOD), "2026-10-18");
+        let refreshed = refreshed.unwrap();
+        let haiku = &refreshed.model_prices["claude-haiku-5-5"];
+        assert_eq!(haiku.input, Some(0.1));
+        assert_eq!(haiku.tiers[0].min_prompt_tokens, 100_001);
     }
 
     #[test]
     fn an_unreadable_price_is_written_without_price_and_complains() {
         let broken = PRICING_MD.replace("| $25 / MTok |", "| ask sales |");
-        let (blocks, lines) = refresh_from_bodies(Some(&broken), Some(GOOD), "2026-10-18");
-        assert!(
-            blocks
-                .unwrap()
-                .model_prices
-                .contains("claude-opus-4-7: { input: null")
-        );
+        let (refreshed, lines) = refresh_from_bodies(Some(&broken), Some(GOOD), "2026-10-18");
+        let refreshed = refreshed.unwrap();
+        assert_eq!(refreshed.model_prices["claude-opus-4-7"].input, None);
         assert!(!lines.is_empty());
     }
 
     #[test]
     fn a_pricing_page_format_change_writes_nothing_and_complains() {
         let renamed = PRICING_MD.replace("Output tokens", "Output");
-        let (blocks, lines) = refresh_from_bodies(Some(&renamed), Some(GOOD), "2026-10-18");
-        assert_eq!(blocks, None);
+        let (refreshed, lines) = refresh_from_bodies(Some(&renamed), Some(GOOD), "2026-10-18");
+        assert_eq!(refreshed, None);
         assert_eq!(lines.len(), 1);
     }
 
     #[test]
     fn an_unreachable_pricing_page_writes_nothing_and_complains() {
-        let (blocks, lines) = refresh_from_bodies(None, Some(GOOD), "2026-10-18");
-        assert_eq!(blocks, None);
+        let (refreshed, lines) = refresh_from_bodies(None, Some(GOOD), "2026-10-18");
+        assert_eq!(refreshed, None);
         assert_eq!(lines.len(), 1);
     }
 
     #[test]
     fn an_unreachable_or_empty_catalogue_writes_nothing_and_complains() {
         for body in [None, Some("not json"), Some(r#"{"data": []}"#)] {
-            let (blocks, lines) = refresh_from_bodies(Some(PRICING_MD), body, "2026-10-18");
-            assert_eq!(blocks, None, "{body:?}");
+            let (refreshed, lines) = refresh_from_bodies(Some(PRICING_MD), body, "2026-10-18");
+            assert_eq!(refreshed, None, "{body:?}");
             assert_eq!(lines.len(), 1, "{body:?}");
         }
     }
 
-    /// The exact text a refresh renders from the bodies below. The rows were first taken from what
-    /// `scripts/refresh-models.py` wrote for the same bodies (its `fetch` swapped for them), pasted
-    /// unchanged; the banner is the daemon's own since the script stopped writing prices, so the
-    /// contract now is this text, byte for byte, and not agreement with the script.
+    /// The prices a refresh reads from the bodies below. The rows were first taken from what
+    /// `scripts/refresh-models.py` wrote for the same bodies (its `fetch` swapped for them).
     const GOLDEN_CATALOGUE: &str = r#"{"data": [{"id": "openai/gpt-5.5", "pricing": {"prompt": "0.00000125", "completion": "0.00001", "input_cache_read": "0.000000125"}}, {"id": "openai/gpt-5.5:batch", "pricing": {"prompt": "0.0000006", "completion": "0.000005"}}, {"id": "openai/gpt-6-tiered", "pricing": {"prompt": "0.000002", "completion": "0.00001", "input_cache_write_1h": "0.000004", "overrides": [{"min_prompt_tokens": 272000, "prompt": "0.000004", "completion": "0.00002", "input_cache_read": "0.0000004"}]}}, {"id": "openai/gpt-night", "pricing": {"prompt": "0.000002", "completion": "0.00001", "overrides": [{"utc_days": [0, 1], "utc_start": "00:00", "utc_end": "06:00", "prompt": "0.000001"}]}}, {"id": "openai/gpt-tiny", "pricing": {"prompt": "0.0000003", "completion": "0.00000000001", "input_cache_read": 0}}, {"id": "anthropic/claude-opus-4.7", "pricing": {"prompt": "0.000005", "completion": "0.000026", "input_cache_read": "0.0000005"}}, {"id": "google/gemini-x", "pricing": {"prompt": "0.000001", "completion": "0.000002"}}]}"#;
-    const GOLDEN_ORIGINAL: &str = "claude_model: opus\ncodex_model: gpt-a\n\n# banner\nassistant_choices:\n  - { id: \"opus\" }\n\n\
-                                   prices_as_of: \"2026-01-01\"\nmodel_prices:\n  old: { input: 1.0 }\n\nembedding_model: x\n";
-    const GOLDEN_SPLICED: &str = r#"claude_model: opus
+    const GOLDEN_PRICES: &str = r#"claude_model: opus
 codex_model: gpt-a
-
-# banner
-assistant_choices:
-  - { id: "opus" }
-
-# ─────────────────────────────────────────────────────────────
-# Escrito pelo daemon: preços publicados pelos fornecedores, USD por milhão de tokens, lidos em
-# `prices_as_of`. O daemon atualiza-os ao arrancar e uma vez por dia quando têm mais de 7 dias,
-# quando a página Devtime encontra um modelo sem preço, e no botão "Refresh prices" dessa página;
-# `auto_refresh_prices: false` deixa só o botão. Usa-os só para o custo ESTIMADO do devtime; nunca
-# é a fatura. Um modelo sem preço legível fica com `null`. Um preço por tamanho do prompt (Haiku
-# 5.5, muitos `openai/*`) vai em `tiers`: cada escalão vale a partir de `min_prompt_tokens` tokens
-# de prompt e traz só as tarifas que muda. `fast` é a tarifa do fast mode (as da cache escalam com
-# ela) e `geo_us_mult` o multiplicador de `inference_geo: "us"`; um modelo sem eles deixa esses
-# pedidos sem preço. Um preço por hora do dia não é escrito. Editar à mão é desfeito na próxima
-# passagem.
-# ─────────────────────────────────────────────────────────────
-prices_as_of: "2026-10-18"
-
-model_prices:
-  claude-haiku-5-5: { input: 0.1, output: 0.5, cache_read: 0.01, cache_write: 0.125, cache_write_1h: 0.2, tiers: [{ min_prompt_tokens: 100001, input: 0.5, output: 2.5, cache_read: 0.05, cache_write: 0.625, cache_write_1h: 1.0 }], geo_us_mult: 1.1, source: anthropic }
-  claude-opus-4-1: { input: 15.0, output: 75.0, cache_read: 1.5, cache_write: 18.75, cache_write_1h: 30.0, source: anthropic }
-  claude-opus-4-7: { input: 5.0, output: 25.0, cache_read: 0.5, cache_write: 6.25, cache_write_1h: 10.0, fast: { input: 10.0, output: 50.0 }, geo_us_mult: 1.1, source: anthropic }
-  claude-sonnet-5: { input: 2.0, output: 10.0, cache_read: 0.2, cache_write: 2.5, cache_write_1h: 4.0, fast: { input: 10.0, output: 50.0 }, geo_us_mult: 1.1, source: anthropic }
-  gpt-5.5: { input: 1.25, output: 10.0, cache_read: 0.125, cache_write: null, cache_write_1h: null, source: openrouter }
-  gpt-6-tiered: { input: 2.0, output: 10.0, cache_read: null, cache_write: null, cache_write_1h: 4.0, tiers: [{ min_prompt_tokens: 272001, input: 4.0, output: 20.0, cache_read: 0.4 }], source: openrouter }
-  gpt-tiny: { input: 0.3, output: 1e-05, cache_read: 0.0, cache_write: null, cache_write_1h: null, source: openrouter }
-
-embedding_model: x
-"#;
-    const GOLDEN_APPENDED: &str = r#"claude_model: opus
-codex_model: gpt-a
-
-# ─────────────────────────────────────────────────────────────
-# Escrito pelo daemon: preços publicados pelos fornecedores, USD por milhão de tokens, lidos em
-# `prices_as_of`. O daemon atualiza-os ao arrancar e uma vez por dia quando têm mais de 7 dias,
-# quando a página Devtime encontra um modelo sem preço, e no botão "Refresh prices" dessa página;
-# `auto_refresh_prices: false` deixa só o botão. Usa-os só para o custo ESTIMADO do devtime; nunca
-# é a fatura. Um modelo sem preço legível fica com `null`. Um preço por tamanho do prompt (Haiku
-# 5.5, muitos `openai/*`) vai em `tiers`: cada escalão vale a partir de `min_prompt_tokens` tokens
-# de prompt e traz só as tarifas que muda. `fast` é a tarifa do fast mode (as da cache escalam com
-# ela) e `geo_us_mult` o multiplicador de `inference_geo: "us"`; um modelo sem eles deixa esses
-# pedidos sem preço. Um preço por hora do dia não é escrito. Editar à mão é desfeito na próxima
-# passagem.
-# ─────────────────────────────────────────────────────────────
-prices_as_of: "2026-10-18"
-
 model_prices:
   claude-haiku-5-5: { input: 0.1, output: 0.5, cache_read: 0.01, cache_write: 0.125, cache_write_1h: 0.2, tiers: [{ min_prompt_tokens: 100001, input: 0.5, output: 2.5, cache_read: 0.05, cache_write: 0.625, cache_write_1h: 1.0 }], geo_us_mult: 1.1, source: anthropic }
   claude-opus-4-1: { input: 15.0, output: 75.0, cache_read: 1.5, cache_write: 18.75, cache_write_1h: 30.0, source: anthropic }
@@ -1681,18 +1392,13 @@ model_prices:
 "#;
 
     #[test]
-    fn the_refresh_renders_exactly_the_banner_date_and_rows_pinned_here() {
-        let (blocks, lines) =
+    fn the_refresh_reads_exactly_the_date_rates_and_lines_pinned_here() {
+        let (refreshed, lines) =
             refresh_from_bodies(Some(PRICING_MD), Some(GOLDEN_CATALOGUE), "2026-10-18");
-        let blocks = blocks.unwrap();
-        assert_eq!(
-            splice_price_blocks(GOLDEN_ORIGINAL, &blocks),
-            GOLDEN_SPLICED
-        );
-        assert_eq!(
-            splice_price_blocks("claude_model: opus\ncodex_model: gpt-a\n", &blocks),
-            GOLDEN_APPENDED
-        );
+        let refreshed = refreshed.unwrap();
+        let pinned = crate::config::parse_models_config(GOLDEN_PRICES).unwrap();
+        assert_eq!(refreshed.prices_as_of, "2026-10-18");
+        assert_eq!(refreshed.model_prices, pinned.model_prices.entries);
         assert_eq!(
             lines,
             [
@@ -1703,27 +1409,27 @@ model_prices:
         );
     }
 
+    /// Through the JSON a document stores: a rate lost or changed on that trip is a wrong cost.
     #[test]
-    fn a_refresh_of_a_file_already_refreshed_is_a_no_op() {
-        let (blocks, _) =
+    fn the_stored_prices_read_back_as_the_prices_they_were_written_from() {
+        let (refreshed, _) =
             refresh_from_bodies(Some(PRICING_MD), Some(GOLDEN_CATALOGUE), "2026-10-18");
-        let blocks = blocks.unwrap();
-        assert_eq!(splice_price_blocks(GOLDEN_SPLICED, &blocks), GOLDEN_SPLICED);
-    }
-
-    #[test]
-    fn the_spliced_file_reads_back_as_the_prices_it_was_rendered_from() {
-        let (blocks, _) =
-            refresh_from_bodies(Some(PRICING_MD), Some(GOLDEN_CATALOGUE), "2026-10-18");
-        let text =
-            splice_price_blocks("claude_model: opus\ncodex_model: gpt-a\n", &blocks.unwrap());
-        let config = crate::config::parse_models_config(&text).expect("the spliced file parses");
+        let refreshed = refreshed.unwrap();
+        let body = serde_json::json!({
+            "claude_model": "opus",
+            "codex_model": "gpt-a",
+            "prices_as_of": refreshed.prices_as_of,
+            "model_prices": refreshed.model_prices,
+        });
+        let config: crate::config::ModelsConfig =
+            serde_json::from_value(body).expect("the stored prices decode");
         assert!(
-            config.price_warnings.is_empty(),
+            config.model_prices.dropped.is_empty(),
             "{:?}",
-            config.price_warnings
+            config.model_prices.dropped
         );
         assert_eq!(config.prices_as_of.as_deref(), Some("2026-10-18"));
+        assert_eq!(config.model_prices.entries, refreshed.model_prices);
         let haiku = &config.model_prices["claude-haiku-5-5"];
         assert_eq!(haiku.input, Some(0.1));
         assert_eq!(

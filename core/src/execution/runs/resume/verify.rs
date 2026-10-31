@@ -137,8 +137,7 @@ pub async fn resume_for_verify(
     let wake = write_verify_wake(&state.pool, &draft).await?;
 
     let daemon_token = mint_run_token(&state.pool, wake).await;
-    let rules =
-        crate::config::load_schedule_rules(state.machine_config_root.as_deref(), &project_id);
+    let rules = crate::project::rules::autopilot(&project_id);
     let max_turns = rules.as_ref().ok().and_then(|rules| rules.max_turns);
     let gate_config = match rules {
         Ok(rules) => {

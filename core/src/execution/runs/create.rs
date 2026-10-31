@@ -625,10 +625,7 @@ async fn create_run_with_policy(
         // measured after it lands on the job's branch, by the gate the merge runs; gating it here as
         // well would spend a second cold build to reach a verdict about a tree nobody merges from,
         // and the two verdicts could disagree — the tree it built in is not the tree the job ships.
-        let rules = crate::config::load_schedule_rules(
-            state.machine_config_root.as_deref(),
-            worktree_project_id,
-        );
+        let rules = crate::project::rules::autopilot(worktree_project_id);
         // Read OUTSIDE the gate's branch below, deliberately. A node and an item are not gated
         // here, but they are still runs of this project's work, and the ceiling is what stops one
         // that will not finish - the case this key exists for is a job item, which reaches this
@@ -639,27 +636,10 @@ async fn create_run_with_policy(
         // reason. A second refusal here would report the same fault as a different one.
         max_turns = rules.as_ref().ok().and_then(|rules| rules.max_turns);
         // A tree run is not gated here either: the tree job runs its own gates per branch.
-        gate_config = match (node.is_some() || item.is_some() || tree.is_some(), rules) {
-            (true, _) => GateConfig::NotConfigured,
-            (false, Ok(rules)) => {
-                let scoped_final = rules.scoped_final();
-                rules
-                    .gate_command
-                    .map_or(GateConfig::NotConfigured, |command| GateConfig::Command {
-                        command,
-                        project_root: project_root.to_string(),
-                        scoped_final,
-                    })
-            }
-            (false, Err(error)) => {
-                tracing::warn!(
-                    project_id = worktree_project_id,
-                    project_root,
-                    %error,
-                    "failed to load worktree gate configuration"
-                );
-                GateConfig::Unreadable(format!("gate configuration is unreadable: {error}"))
-            }
+        gate_config = if node.is_some() || item.is_some() || tree.is_some() {
+            GateConfig::NotConfigured
+        } else {
+            GateConfig::of_project(worktree_project_id, project_root)
         };
         // A job node inherits its job's worktree; only a standalone run provisions one. Skipping
         // both the `create` and the `record` is what lets a sequence of nodes accumulate work on one

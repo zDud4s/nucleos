@@ -224,29 +224,24 @@ fn pinned_graph_dir(
 
 /// PURE (reads files, touches no database): the graph `workflow` resolves to for a project.
 ///
-/// Pins file -> pin named `workflow` -> project copy else library bundle -> `graph::parse` ->
-/// `effective(graph, pin.nodes)`. No pins file, no such pin, or an unavailable source resolves to
+/// Stored pins -> pin named `workflow` -> project copy else library bundle -> `graph::parse` ->
+/// `effective(graph, pin.nodes)`. No stored pins, no such pin, or an unavailable source resolves to
 /// the embedded autopilot, but ONLY for the `autopilot` workflow: asking for any other name that
 /// the project does not pin is a refusal, not a different workflow. A source that is present but
 /// does not parse is always a refusal.
 pub fn resolve_graph_from(
-    machine_root: Option<&Path>,
     library_root: Option<&Path>,
     project_id: &str,
     project_root: &Path,
     workflow: &str,
 ) -> Result<ResolvedGraph, String> {
-    let pins_file = machine_root
-        .and_then(|root| crate::project::state::dir(root, project_id))
-        .map(|dir| dir.join(crate::project::state::PINS_FILE))
-        .filter(|file| file.is_file());
-    let pin = pins_file.and_then(|file| match crate::workflows::read_pins(&file) {
+    let pin = match crate::project::rules::pins(project_id) {
         Ok(pins) => pins.workflows.into_iter().find(|pin| pin.name == workflow),
         Err(error) => {
-            tracing::warn!(project_id, %error, "unreadable workflows.yaml; the job starts unpinned");
+            tracing::warn!(project_id, %error, "unreadable workflow_pins; the job starts unpinned");
             None
         }
-    });
+    };
     let Some(pin) = pin else {
         return if workflow == crate::seed::NAME {
             embedded_graph(&std::collections::BTreeMap::new())
@@ -291,19 +286,12 @@ pub async fn resolve_job_graph(
     project_root: &str,
     workflow: &str,
 ) -> Result<ResolvedGraph, String> {
-    let machine_root = state.machine_config_root.clone();
     let library = state.workflow_library.clone();
     let project_id = project_id.to_string();
     let project_root = PathBuf::from(project_root);
     let workflow = workflow.to_string();
     tokio::task::spawn_blocking(move || {
-        resolve_graph_from(
-            machine_root.as_deref(),
-            library.as_deref(),
-            &project_id,
-            &project_root,
-            &workflow,
-        )
+        resolve_graph_from(library.as_deref(), &project_id, &project_root, &workflow)
     })
     .await
     .map_err(|error| format!("the graph resolution did not finish: {error}"))?

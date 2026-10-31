@@ -66,7 +66,13 @@ pub fn is_pulled(wanted: &str, listed: &[String]) -> bool {
 pub async fn get_embedding_config(State(state): State<AppState>) -> Json<serde_json::Value> {
     let model = match crate::embed::installed() {
         Some(embedder) => embedder.model().to_string(),
-        None => effective(&state.pool, crate::config::DEFAULT_EMBEDDING_MODEL).await,
+        None => {
+            effective(
+                &state.pool,
+                &crate::config::models_config_now().embedding_model,
+            )
+            .await
+        }
     };
     Json(serde_json::json!({ "model": model }))
 }
