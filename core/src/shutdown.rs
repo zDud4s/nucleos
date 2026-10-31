@@ -107,6 +107,22 @@ pub async fn live_runs(pool: &SqlitePool) -> sqlx::Result<i64> {
         .await
 }
 
+/// How often the keep-awake loop re-reads whether a run is live.
+const KEEP_AWAKE_POLL: Duration = Duration::from_secs(30);
+
+/// Keeps the machine from idle-sleeping while [`live_runs`] is above zero. A failed count counts as
+/// "no change": a database hiccup must not let go of a hold that work still depends on.
+pub async fn run_keep_awake_loop(pool: SqlitePool, enabled: bool) {
+    let mut awake = crate::keep_awake::KeepAwake::system(enabled);
+    let mut ticker = tokio::time::interval(KEEP_AWAKE_POLL);
+    loop {
+        ticker.tick().await;
+        if let Ok(live) = live_runs(&pool).await {
+            awake.hold_awake_while(live > 0);
+        }
+    }
+}
+
 /// The answer to `GET /system/update-readiness`: which version this is, and whether it is safe to
 /// stop it now.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

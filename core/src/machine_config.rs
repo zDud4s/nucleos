@@ -90,6 +90,7 @@ pub const COUNCIL_FILE: &str = "council.yaml";
 pub const ROUTER_FILE: &str = "router.yaml";
 pub const DEVTIME_FILE: &str = "devtime.yaml";
 pub const VERIFY_FILE: &str = "verify.yaml";
+pub const KEEP_AWAKE_FILE: &str = "keep_awake.yaml";
 
 /// One of this machine's settings files, with everything a caller needs to act on it safely.
 ///
@@ -187,7 +188,11 @@ fn validate_verify(contents: &str) -> Result<(), String> {
     crate::config::parse_verify_config(contents).map(|_| ())
 }
 
-/// This machine's settings files. Eleven rows, and the count is asserted in the tests for the same
+fn validate_keep_awake(contents: &str) -> Result<(), String> {
+    crate::config::parse_keep_awake_config(contents).map(|_| ())
+}
+
+/// This machine's settings files. Twelve rows, and the count is asserted in the tests for the same
 /// reason the project registry asserts two: a row added without reading the header above is a row
 /// that has not answered the membership rule.
 pub static SETTINGS: &[Setting] = &[
@@ -271,6 +276,13 @@ pub static SETTINGS: &[Setting] = &[
         what: "how many verification units run at once on this machine, how long one may take, how long a waiting request waits before it moves up, the disk its warm state may fill, and the broker command every unit runs behind",
         takes_effect: "when the daemon restarts",
         validate: validate_verify,
+    },
+    Setting {
+        path: KEEP_AWAKE_FILE,
+        area: "keep_awake",
+        what: "whether this machine is kept from going to sleep on its own while a run is live (`keep_awake_while_working`, on by default); closing the lid or choosing Sleep still obeys the system",
+        takes_effect: "when the daemon restarts",
+        validate: validate_keep_awake,
     },
 ];
 
@@ -503,7 +515,7 @@ mod tests {
     fn every_setting_can_refuse_and_says_what_it_changes() {
         assert_eq!(
             SETTINGS.len(),
-            11,
+            12,
             "see the module header before adding a row"
         );
         for setting in SETTINGS {
@@ -525,11 +537,11 @@ mod tests {
         }
     }
 
-    /// The table has the eleven rows the header counts; the pin above names the guard, this one
+    /// The table has the twelve rows the header counts; the pin above names the guard, this one
     /// names the count.
     #[test]
-    fn the_settings_table_has_eleven_rows() {
-        assert_eq!(SETTINGS.len(), 11);
+    fn the_settings_table_has_twelve_rows() {
+        assert_eq!(SETTINGS.len(), 12);
     }
 
     /// Every production channel manifest has exactly one row, keyed by its `settings_area` and

@@ -52,6 +52,7 @@ pub mod health;
 pub use nucleos_base::inspect;
 pub mod integrations;
 pub use nucleos_base::join;
+pub use nucleos_base::keep_awake;
 pub mod judge;
 pub mod knowledge;
 pub mod loadout;

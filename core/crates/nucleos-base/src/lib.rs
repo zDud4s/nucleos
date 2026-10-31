@@ -23,6 +23,7 @@ pub mod gate;
 pub mod handoff;
 pub mod inspect;
 pub mod join;
+pub mod keep_awake;
 pub mod logging;
 pub mod mentions;
 pub mod notes;

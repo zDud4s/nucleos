@@ -313,6 +313,10 @@ async fn main() {
         .as_deref()
         .map(config::load_verify_config)
         .unwrap_or_default();
+    let keep_awake_config = machine_file(machine_config::KEEP_AWAKE_FILE)
+        .as_deref()
+        .map(config::load_keep_awake_config)
+        .unwrap_or_default();
     let web_config = machine_file(machine_config::WEB_FILE)
         .as_deref()
         .map(config::load_web_config)
@@ -1008,6 +1012,11 @@ async fn main() {
     // whole gate timeout, and sharing a loop would stall every scheduled rule in the daemon behind
     // one project's test suite.
     tokio::spawn(execution::job::run_job_loop(state.clone()));
+    // Holds the machine awake while a run is live (setting `keep_awake_while_working`, on by default).
+    tokio::spawn(shutdown::run_keep_awake_loop(
+        state.pool.clone(),
+        keep_awake_config.keep_awake_while_working,
+    ));
     // AFTER `execution::runs::reconcile_orphaned_runs`, which ran near the top of this function and is what
     // marks the abandoned subprocesses `interrupted` — the ordering this depends on, and the same
     // one `execution::job::reconcile_orphaned_jobs` respects. Awaited rather than spawned, so the loop below

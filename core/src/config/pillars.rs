@@ -311,6 +311,48 @@ pub fn load_verify_config(path: &Path) -> VerifyConfig {
     }
 }
 
+/// `~/.nucleos/keep_awake.yaml`: whether the machine is kept from idle-sleeping while a run is live.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct KeepAwakeConfig {
+    /// On by default. Only the automatic idle sleep is held off; closing the lid still obeys the
+    /// system.
+    pub keep_awake_while_working: bool,
+}
+
+impl Default for KeepAwakeConfig {
+    fn default() -> Self {
+        Self {
+            keep_awake_while_working: true,
+        }
+    }
+}
+
+/// `keep_awake.yaml`'s grammar. An empty file says nothing, which is the defaults.
+pub fn parse_keep_awake_config(contents: &str) -> Result<KeepAwakeConfig, String> {
+    if contents.trim().is_empty() {
+        return Ok(KeepAwakeConfig::default());
+    }
+    serde_yaml::from_str::<KeepAwakeConfig>(contents).map_err(|error| error.to_string())
+}
+
+pub fn load_keep_awake_config(path: &Path) -> KeepAwakeConfig {
+    if !path.exists() {
+        return KeepAwakeConfig::default();
+    }
+    match std::fs::read_to_string(path).map(|text| parse_keep_awake_config(&text)) {
+        Ok(Ok(config)) => config,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, path = %path.display(), "keep-awake config: could not be parsed; defaults apply");
+            KeepAwakeConfig::default()
+        }
+        Err(error) => {
+            tracing::warn!(%error, path = %path.display(), "keep-awake config: could not be read; defaults apply");
+            KeepAwakeConfig::default()
+        }
+    }
+}
+
 /// `~/.nucleos/web.yaml`. The web pillar's settings, including the one list in this system that decides
 /// what counts as trustworthy.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
