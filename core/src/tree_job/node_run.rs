@@ -1268,7 +1268,10 @@ mod tests {
 
         assert!(prompt.contains("Root ID: root-9"), "{prompt}");
         assert!(!prompt.contains("node_tree shows"), "{prompt}");
-        assert!(!prompt.contains("read it from your node record"), "{prompt}");
+        assert!(
+            !prompt.contains("read it from your node record"),
+            "{prompt}"
+        );
     }
 
     /// RED: `node_prompt` must spell out the report format the daemon validates on `node_close`.
