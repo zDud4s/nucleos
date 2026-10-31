@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use crate::spec_backlog::model::DepSource;
 use crate::spec_backlog::{finish, scan, store};
 use crate::state::AppState;
+use crate::tree_job::decisions::DecisionError;
 
 #[derive(Debug, Deserialize)]
 struct FinishRequest {
@@ -29,6 +30,11 @@ struct ScanRequest {
 #[derive(Debug, Deserialize)]
 struct DepRequest {
     depends_on: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DecisionRequest {
+    answer: String,
 }
 
 type Answer = (StatusCode, Json<Value>);
@@ -60,6 +66,7 @@ pub fn routes() -> Router<AppState> {
         .route("/backlog", get(get_backlog))
         .route("/backlog/finish", post(post_finish))
         .route("/decisions", get(get_decisions))
+        .route("/decisions/{id}", post(post_decision))
 }
 
 /// Reads the project's real spec directories into the backlog.
@@ -287,6 +294,48 @@ async fn get_decisions(
             tracing::warn!(%error, "could not list owner decisions");
             StatusCode::INTERNAL_SERVER_ERROR
         })
+}
+
+/// Records an owner decision without waiting for any restarted backlog work.
+async fn post_decision(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<DecisionRequest>,
+) -> Answer {
+    if id.starts_with("sq-") {
+        return match crate::spec_backlog::answer(&state.pool, &id, &request.answer, "shell").await {
+            Ok(answered) => {
+                if let Some(spec_id) = answered.reopened {
+                    crate::spec_backlog::relaunch_answered(state, spec_id);
+                }
+                (StatusCode::OK, Json(json!({ "question": answered.question })))
+            }
+            Err(store::StoreError::NotFound(_)) => {
+                refuse(StatusCode::NOT_FOUND, format!("decision {id} not found"))
+            }
+            Err(store::StoreError::AlreadyDecided(_)) => {
+                refuse(StatusCode::CONFLICT, format!("decision {id} is already decided"))
+            }
+            Err(error) => failed("could not answer the decision", error),
+        };
+    }
+    if id.starts_with("d-") {
+        return match crate::tree_job::open::answer_and_relaunch(&state, &id, &request.answer, "shell").await {
+            Ok(answered) => (
+                StatusCode::OK,
+                Json(json!({ "question": answered.decision.question })),
+            ),
+            Err(DecisionError::NotFound(_)) => {
+                refuse(StatusCode::NOT_FOUND, format!("decision {id} not found"))
+            }
+            Err(DecisionError::AlreadyDecided(_)) => {
+                refuse(StatusCode::CONFLICT, format!("decision {id} is already decided"))
+            }
+            Err(DecisionError::Db(error)) => failed("could not answer the decision", error),
+            Err(error) => failed("could not answer the decision", error),
+        };
+    }
+    refuse(StatusCode::NOT_FOUND, format!("decision {id} not found"))
 }
 
 #[cfg(test)]

@@ -205,6 +205,66 @@ pub async fn park(
     Ok(decision)
 }
 
+/// Opens a decision for the owner without parking anyone: the open row and one `work_tree_parked`
+/// feed line land together, and no branch or manifest moves. For a start the disk refused, which
+/// the driver retries by itself: the caller keeps working, and the question only tells the owner
+/// why the branch waits. The caller records the returned id so it asks once. It takes no job lock,
+/// so it may run under one.
+pub async fn ask_pending(
+    pool: &SqlitePool,
+    tree_id: &str,
+    node_id: &str,
+    question: &str,
+) -> Result<Decision, DecisionError> {
+    let Some(job) = store::load(pool, tree_id).await? else {
+        return Err(DecisionError::NoBranch(format!(
+            "tree job {tree_id} not found"
+        )));
+    };
+    let decision = Decision {
+        id: new_id(),
+        tree_id: Some(tree_id.to_owned()),
+        node_id: Some(node_id.to_owned()),
+        question: question.to_owned(),
+        answer: None,
+        origin: Some(ORIGIN_AGENT.to_owned()),
+        at: now(),
+        status: STATUS_OPEN.to_owned(),
+    };
+    let line = format!(
+        "{}: waiting — node {node_id}, decision {} — {question}",
+        job.goal, decision.id
+    );
+
+    // Nothing below may ask the pool for a connection while `tx` holds one.
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO decisions (id, tree_id, node_id, question, answer, origin, at, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&decision.id)
+    .bind(&decision.tree_id)
+    .bind(&decision.node_id)
+    .bind(&decision.question)
+    .bind(&decision.answer)
+    .bind(&decision.origin)
+    .bind(&decision.at)
+    .bind(&decision.status)
+    .execute(&mut *tx)
+    .await?;
+    crate::feed::append_on(
+        &mut tx,
+        job.project_id.as_deref(),
+        FEED_KIND,
+        &line,
+        None,
+        None,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(decision)
+}
+
 /// `manifest.extra` key naming the decision a root without a branch waits on: `{ "decision_id" }`.
 /// `relaunch::node_waiting_on` reads it, so only this decision's answer restarts the root.
 pub(super) const ROOT_PARK_KEY: &str = "root_park";

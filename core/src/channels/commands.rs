@@ -397,6 +397,36 @@ async fn apply_decision(
     id: &str,
     text: &str,
 ) -> sqlx::Result<String> {
+    if id.starts_with("sq-") {
+        let said = match crate::spec_backlog::answer(&state.pool, id, text, at.channel).await {
+            Ok(answered) => {
+                if let Some(spec_id) = answered.reopened {
+                    crate::spec_backlog::relaunch_answered(state.clone(), spec_id);
+                }
+                Text::DecisionApplied {
+                    question: answered.question,
+                    answer: text.to_string(),
+                }
+            }
+            Err(crate::spec_backlog::store::StoreError::NotFound(_)) => {
+                Text::DecisionUnknown { id: id.to_string() }
+            }
+            Err(crate::spec_backlog::store::StoreError::AlreadyDecided(_)) => Text::AlreadyHandled,
+            Err(crate::spec_backlog::store::StoreError::Db(error)) => return Err(error),
+            Err(error) => {
+                tracing::warn!(
+                    channel = at.channel,
+                    decision = id,
+                    %error,
+                    "a spec question did not take its answer"
+                );
+                Text::NotSent {
+                    refusal: format!("decision {id} could not take the answer ({error})"),
+                }
+            }
+        };
+        return Ok(strings::render(&said));
+    }
     // Not `decisions::answer` alone: an answer that resumes a branch also starts its node again.
     let said = match crate::tree_job::open::answer_and_relaunch(state, id, text, at.channel).await {
         Ok(answered) => Text::DecisionApplied {

@@ -357,6 +357,17 @@ pub(super) async fn pretooluse_decision_from(
         return decision;
     }
 
+    if let Some(decision) = node_context::docs_write_decision(
+        &state,
+        &payload,
+        run_id,
+        cwd.as_deref().map(Path::new),
+    )
+    .await
+    {
+        return decision;
+    }
+
     // A job's node may call its box's base tools (a finding, verification, `request_tool`,
     // `read_context`): the `mcp__` tools an unattended run is allowed without a loadout row. Before
     // the classifier, like the branches above, so it never reaches the judge, never parks and writes

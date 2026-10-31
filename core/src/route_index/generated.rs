@@ -1327,6 +1327,13 @@ pub const ROUTES: &[RouteEntry] = &[
         handler: "get_decisions",
     },
     RouteEntry {
+        method: "POST",
+        path: "/decisions/{id}",
+        purpose: "Post decision.",
+        body: Body::Shapeless("DecisionRequest"),
+        handler: "post_decision",
+    },
+    RouteEntry {
         method: "GET",
         path: "/distill/causes",
         purpose: "Where each distilled row came from.",

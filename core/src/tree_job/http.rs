@@ -173,12 +173,14 @@ pub fn branch_admission(
         .sum();
     let live = live_code_branches(manifest).count();
     let mut reasons = Vec::new();
-    if live >= max_live_branches {
+    let capped = live >= max_live_branches;
+    if capped {
         reasons.push(format!(
             "max_live_branches: {live} branches are live, the limit is {max_live_branches}"
         ));
     }
     let checked = check_admission(book, manifest, layer, free_disk_gb - growth_gb, floor_gb);
+    let disk_only = checked.disk_only && !capped;
     reasons.extend(checked.reasons);
     if !reasons.is_empty() && growth_gb > 0.0 {
         reasons.push(format!(
@@ -189,6 +191,7 @@ pub fn branch_admission(
         admit: reasons.is_empty(),
         cost_gb: checked.cost_gb,
         reasons,
+        disk_only,
     }
 }
 
@@ -532,10 +535,12 @@ async fn post_branch(
     );
     if !admission.admit {
         let error = format!("branch not admitted: {}", admission.reasons.join("; "));
-        return Err((
-            StatusCode::CONFLICT,
-            Json(json!({ "error": error, "reasons": admission.reasons })),
-        ));
+        let mut refusal = json!({ "error": error, "reasons": admission.reasons });
+        if admission.disk_only {
+            // `branch_start` reads this to remember the start for the driver to retry.
+            refusal["disk_only"] = json!(true);
+        }
+        return Err((StatusCode::CONFLICT, Json(refusal)));
     }
 
     let branch = Branch::new(&name, &paths, &layer, base.as_deref());
@@ -549,6 +554,30 @@ async fn post_branch(
         "name": name, "state": queued, "layer": layer, "base": base,
         "cost_gb": admission.cost_gb, "replayed": false,
     })))
+}
+
+/// The admission a new branch of `layer` would get from `manifest` right now: the project's disk,
+/// its floor and cap, and the live branches' sizes. The driver asks it before it replays a start
+/// the disk refused. `Err` when the free disk cannot be read.
+pub(super) async fn current_admission(manifest: &Manifest, layer: &str) -> Result<Admission, String> {
+    let (floor_gb, max_live) = tree_limits(&manifest.project_root);
+    let free_disk_gb = if layer == DOCS_LAYER {
+        0.0
+    } else {
+        crate::health::available_space(FsPath::new(&manifest.project_root))
+            .map_err(|error| format!("could not read the free disk space: {error}"))? as f64
+            / BYTES_PER_GB
+    };
+    let sizes = live_sizes_gb(manifest).await;
+    Ok(branch_admission(
+        &admission_book(),
+        manifest,
+        layer,
+        free_disk_gb,
+        floor_gb,
+        max_live,
+        &sizes,
+    ))
 }
 
 // ----- POST /trees/{id}/nodes/{n}/transition -----

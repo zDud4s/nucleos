@@ -19,6 +19,7 @@ use super::model::{
 #[derive(Debug)]
 pub enum StoreError {
     NotFound(String),
+    AlreadyDecided(String),
     /// The write was refused because the spec's content moved since the caller read it.
     Stale(String),
     /// A stored value outside its closed vocabulary.
@@ -30,6 +31,7 @@ impl fmt::Display for StoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             StoreError::NotFound(id) => write!(f, "{id} not found"),
+            StoreError::AlreadyDecided(id) => write!(f, "{id} was already decided"),
             StoreError::Stale(what) => write!(f, "{what} changed since it was read"),
             StoreError::Invalid(what) => write!(f, "invalid stored value: {what}"),
             StoreError::Db(error) => write!(f, "database error: {error}"),
@@ -519,8 +521,9 @@ pub async fn settle_questions(
     // IMMEDIATE: this reads before it writes, and a deferred transaction that finds another
     // connection committed in between fails SQLITE_BUSY at once instead of waiting.
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-    let open: Vec<(String, String)> = sqlx::query_as(
-        "SELECT id, question FROM spec_questions WHERE spec_id = ? AND status = 'open' \
+    let existing: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT id, question, status FROM spec_questions WHERE spec_id = ? \
+         AND status IN ('open', 'answered') \
          ORDER BY created_at, id",
     )
     .bind(spec_id)
@@ -528,17 +531,19 @@ pub async fn settle_questions(
     .await?;
 
     let mut asked: HashSet<&str> = HashSet::new();
-    for (id, question) in &open {
+    for (id, question, status) in &existing {
         if !question.starts_with(prefix) {
             continue;
         }
         if questions.contains(question) && asked.insert(question.as_str()) {
             continue;
         }
-        sqlx::query("UPDATE spec_questions SET status = 'closed' WHERE id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
+        if status == "open" {
+            sqlx::query("UPDATE spec_questions SET status = 'closed' WHERE id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
     }
     for question in questions {
         if !asked.insert(question.as_str()) {
@@ -563,19 +568,81 @@ pub async fn answer_question(
     pool: &SqlitePool,
     question_id: &str,
     answer: &str,
-) -> Result<(), StoreError> {
+) -> Result<(Question, bool), StoreError> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let question: Option<(String, String)> = sqlx::query_as(
+        "SELECT spec_id, question FROM spec_questions WHERE id = ?",
+    )
+    .bind(question_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((spec_id, question)) = question else {
+        return Err(StoreError::NotFound(format!("question {question_id}")));
+    };
     let done = sqlx::query(
-        "UPDATE spec_questions SET answer = ?, status = 'answered', answered_at = ? WHERE id = ?",
+        "UPDATE spec_questions SET answer = ?, status = 'answered', answered_at = ? \
+         WHERE id = ? AND status = 'open'",
     )
     .bind(answer)
     .bind(now())
     .bind(question_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
     if done.rows_affected() == 0 {
-        return Err(StoreError::NotFound(format!("question {question_id}")));
+        return Err(StoreError::AlreadyDecided(format!("question {question_id}")));
     }
-    Ok(())
+    let reopened = sqlx::query(
+        "UPDATE specs SET status = 'discovered', status_reason = NULL, updated_at = ? \
+         WHERE id = ? AND status = 'needs_owner'",
+    )
+    .bind(now())
+    .bind(&spec_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        == 1;
+    tx.commit().await?;
+    Ok((
+        Question {
+            id: question_id.to_owned(),
+            spec_id,
+            question,
+            answer: Some(answer.to_owned()),
+            status: "answered".to_owned(),
+            created_at: String::new(),
+            answered_at: None,
+        },
+        reopened,
+    ))
+}
+
+/// Lists this audit's answered owner questions, oldest first.
+pub async fn answered_audit_questions(
+    pool: &SqlitePool,
+    spec_id: &str,
+    prefix: &str,
+) -> Result<Vec<Question>, StoreError> {
+    let rows: Vec<QuestionRow> = sqlx::query_as(
+        "SELECT id, spec_id, question, answer, status, created_at, answered_at \
+         FROM spec_questions WHERE spec_id = ? AND status = 'answered' AND question LIKE ? \
+         ORDER BY created_at, id",
+    )
+    .bind(spec_id)
+    .bind(format!("{prefix}%"))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| Question {
+            id: row.id,
+            spec_id: row.spec_id,
+            question: row.question,
+            answer: row.answer,
+            status: row.status,
+            created_at: row.created_at,
+            answered_at: row.answered_at,
+        })
+        .collect())
 }
 
 pub async fn list_questions(pool: &SqlitePool, spec_id: &str) -> Result<Vec<Question>, StoreError> {

@@ -1034,6 +1034,12 @@ async fn main() {
             );
         });
     }
+    // Takes up again the spec finishes the restart cut off, after tree recovery: each adopts the
+    // trees its specs already have. Off the startup path, since a finish waits on its trees.
+    tokio::spawn({
+        let state = state.clone();
+        async move { spec_backlog::finish::resume_finishes(&state).await }
+    });
     tokio::spawn(execution::scheduler::run_scheduler(state.clone()));
     tokio::spawn({
         let state = state.clone();

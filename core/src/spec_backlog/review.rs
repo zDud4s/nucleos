@@ -10,7 +10,7 @@ use std::path::Path;
 
 use super::audit::{self, CriterionReview, ReviewerAnswer, ReviewerRunner};
 use super::daemon::{no_tools_run_request, run_no_tools};
-use super::model::{Criterion, CriterionStatus, Spec};
+use super::model::{Criterion, CriterionStatus, Question, Spec};
 use super::verdict::ReviewerRun;
 use crate::state::AppState;
 
@@ -182,6 +182,7 @@ pub(super) fn review_prompt(
     spec: &Spec,
     criteria: &[Criterion],
     material: &ReviewMaterial,
+    answers: &[Question],
 ) -> String {
     let mut prompt = format!(
         "You are an independent reviewer of the spec `{}` ({}). You have no tools and cannot read \
@@ -213,6 +214,14 @@ pub(super) fn review_prompt(
             prompt.push_str(&format!(" (verify: {hint})"));
         }
         prompt.push('\n');
+        let question = format!("Owner decision needed for criterion: {}", criterion.text);
+        if let Some(answer) = answers
+            .iter()
+            .find(|answer| answer.question == question)
+            .and_then(|answer| answer.answer.as_deref())
+        {
+            prompt.push_str(&format!("Owner answer: {answer}\n"));
+        }
     }
     prompt.push_str("\nFiles (changed on the feature branch, or named by a criterion):\n");
     if material.files.is_empty() {
@@ -274,8 +283,17 @@ pub(super) struct NoToolsReviewer<'a> {
 #[async_trait::async_trait]
 impl ReviewerRunner for NoToolsReviewer<'_> {
     async fn review(&self, spec: &Spec, criteria: &[Criterion]) -> Result<ReviewerAnswer, String> {
+        self.review_with_answers(spec, criteria, &[]).await
+    }
+
+    async fn review_with_answers(
+        &self,
+        spec: &Spec,
+        criteria: &[Criterion],
+        answers: &[Question],
+    ) -> Result<ReviewerAnswer, String> {
         let material = gather_material(self.worktree, self.integration_branch, criteria).await;
-        let prompt = review_prompt(spec, criteria, &material);
+        let prompt = review_prompt(spec, criteria, &material, answers);
         let request = no_tools_run_request(&prompt, spec.project_id.as_deref(), Some(self.cwd));
         let (run_id, text) = run_no_tools(self.state, request).await?;
         let reviews = parse_reviews(&text)?;

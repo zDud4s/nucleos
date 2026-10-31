@@ -2,9 +2,11 @@
 //!
 //! The plan, in the order it runs: specs that are still `discovered` are extracted and audited
 //! first (one may already be done); then each remaining spec gets a tree of its own, a dependency
-//! before its dependents, up to `max_parallel` at once and never two together whose owned paths
-//! overlap or are unknown; when a tree closes, the spec is audited, and a spec that is still not
-//! done after `max_rounds` trees becomes `needs_owner`.
+//! before its dependents, up to `max_parallel` at once and never two together whose declared owned
+//! paths overlap (an unknown scope may run beside anything: each tree has its own worktree and
+//! branch, and a clash surfaces at landing); when a tree closes, the spec is audited, and a spec
+//! that is still not done after `max_rounds` trees becomes `needs_owner`. A spec a restart finds
+//! `in_progress` keeps its tree: the first round waits on it instead of starting another.
 //!
 //! In doubt, a spec is unfinished. A spec file is read, never written: this module has no code that
 //! creates, changes or removes a file.
@@ -47,8 +49,11 @@ pub struct FinishConfig {
     pub integration_branch: String,
     pub project_root: String,
     /// Paths each spec writes, by spec id. `Spec` carries no such field, so the caller supplies
-    /// them; a spec without an entry has an unknown scope and runs alone.
+    /// them; a spec without an entry has an unknown scope, which never holds another spec back.
     pub owned_paths: BTreeMap<String, Vec<String>>,
+    /// Free disk the launcher must report before the next spec tree starts; 0 turns the check
+    /// off. Below it the spec stays queued, never failed.
+    pub min_free_disk_bytes: u64,
     /// The checkout an audit resolves evidence against.
     pub worktree: PathBuf,
     pub state_dir: Option<PathBuf>,
@@ -81,6 +86,17 @@ pub struct TreeOutcome {
 #[async_trait::async_trait]
 pub trait TreeLauncher: Send + Sync {
     async fn run_tree(&self, request: &TreeRequest) -> Result<TreeOutcome, String>;
+
+    /// Waits for a tree that already exists (one a restart found under way) and collects what it
+    /// left. An error means the tree cannot be waited on, for instance that it does not exist.
+    async fn wait_tree(&self, tree_id: &str) -> Result<TreeOutcome, String> {
+        Err(format!("this launcher cannot wait on tree {tree_id}"))
+    }
+
+    /// Free bytes on the volume the next tree is built on.
+    fn free_disk_bytes(&self) -> u64 {
+        u64::MAX
+    }
 }
 
 /// Extracts and audits a spec. Both write their result to the store.
@@ -107,7 +123,34 @@ pub struct FinishReport {
     pub refused: Vec<String>,
     /// Not launched because a dependency ended `needs_owner`, refused or blocked.
     pub blocked: Vec<String>,
+    /// Still queued because the disk was below the floor; the caller retries them later.
+    pub deferred: Vec<String>,
     pub cycles: Vec<Cycle>,
+}
+
+impl FinishReport {
+    /// Folds the report of a later pass over some of the same specs into this one.
+    pub fn absorb(&mut self, other: FinishReport) {
+        self.trees.extend(other.trees);
+        self.done.extend(other.done);
+        self.needs_owner.extend(other.needs_owner);
+        self.skipped.extend(other.skipped);
+        self.refused.extend(other.refused);
+        self.blocked.extend(other.blocked);
+        self.deferred.extend(other.deferred);
+        self.cycles.extend(other.cycles);
+        for list in [
+            &mut self.done,
+            &mut self.needs_owner,
+            &mut self.skipped,
+            &mut self.refused,
+            &mut self.blocked,
+            &mut self.deferred,
+        ] {
+            list.sort();
+            list.dedup();
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -157,7 +200,7 @@ pub fn derived_branch(spec_path: &str) -> String {
 
 pub use super::daemon::{
     ProjectPaths, audit_one, extract_one, finish, no_tools_run_request, project_id_for_root,
-    record_extraction_run, resolve_project,
+    record_extraction_run, resolve_project, resume_finishes,
 };
 
 /// The runs that extracted the spec, oldest first.
@@ -247,14 +290,23 @@ async fn next_finished(
     .await
 }
 
-/// A spec may start when nothing runs, or when its paths are known and disjoint from every
-/// running spec's paths.
+/// A spec may start unless its declared paths overlap those of a running spec. An unknown scope
+/// (no paths) is never a reason to wait: every tree works in its own worktree and merges into its
+/// own spec branch, so a clash shows at landing, where the conflict resolver is.
 fn compatible(owned: &[String], running: &[(String, Vec<String>)]) -> bool {
-    running.is_empty()
-        || (!owned.is_empty()
-            && running
-                .iter()
-                .all(|(_, other)| !other.is_empty() && sets_overlap(owned, other).is_none()))
+    owned.is_empty()
+        || running
+            .iter()
+            .all(|(_, other)| other.is_empty() || sets_overlap(owned, other).is_none())
+}
+
+/// The tree an `in_progress` spec already has, which a restart adopts instead of replacing.
+fn adoptable_tree(spec: &Spec) -> Option<String> {
+    if spec.status == SpecStatus::InProgress {
+        spec.tree_id.clone()
+    } else {
+        None
+    }
 }
 
 async fn load_scope(pool: &SqlitePool, scope: &FinishScope) -> Result<Vec<Spec>, StoreError> {
@@ -401,28 +453,45 @@ async fn drive_spec(
     let mut outcomes: Vec<TreeOutcome> = Vec::new();
     let mut trees = Vec::new();
     let mut last: Option<String> = None;
+    let mut adopted = adoptable_tree(&spec);
     for round in 1..=config.max_rounds {
-        let request = TreeRequest {
-            // A new id per round, or the second launch would replay the first tree.
-            id: format!("spec-{short}-r{round}-{nonce}"),
-            spec_id: spec.id.clone(),
-            goal: goal_for(pool, &spec, round, last.as_deref()).await?,
-            feature_branch: branch.clone(),
-            project_root: config.project_root.clone(),
-            project_id: spec.project_id.clone(),
-            round,
+        let (tree_id, launched) = if let Some(tree_id) = adopted.take() {
+            // A tree the spec already has: never a replacement beside it, even if it is gone.
+            match launcher.wait_tree(&tree_id).await {
+                Err(reason) => {
+                    mark_needs_owner(
+                        pool,
+                        &spec.id,
+                        &format!("tree {tree_id} cannot be resumed: {reason}"),
+                    )
+                    .await?;
+                    return Ok(SpecRun {
+                        trees,
+                        finished: false,
+                    });
+                }
+                waited => (tree_id, waited),
+            }
+        } else {
+            let request = TreeRequest {
+                // A new id per round, or the second launch would replay the first tree.
+                id: format!("spec-{short}-r{round}-{nonce}"),
+                spec_id: spec.id.clone(),
+                goal: goal_for(pool, &spec, round, last.as_deref()).await?,
+                feature_branch: branch.clone(),
+                project_root: config.project_root.clone(),
+                project_id: spec.project_id.clone(),
+                round,
+            };
+            store::set_status(pool, &spec.id, SpecStatus::InProgress, None).await?;
+            store::set_tree_id(pool, &spec.id, &request.id).await?;
+            trees.push(request.id.clone());
+            let launched = launcher.run_tree(&request).await;
+            (request.id, launched)
         };
-        store::set_status(pool, &spec.id, SpecStatus::InProgress, None).await?;
-        store::set_tree_id(pool, &spec.id, &request.id).await?;
-        trees.push(request.id.clone());
-        match launcher.run_tree(&request).await {
+        match launched {
             Ok(outcome) if outcome.still_running => {
-                mark_needs_owner(
-                    pool,
-                    &spec.id,
-                    &format!("tree {} is still live", request.id),
-                )
-                .await?;
+                mark_needs_owner(pool, &spec.id, &format!("tree {tree_id} is still live")).await?;
                 return Ok(SpecRun {
                     trees,
                     finished: false,
@@ -545,9 +614,9 @@ pub async fn finish_with<'a>(
             continue;
         }
         match spec.status {
+            // Already with the owner: it blocks its dependents, but is not announced again.
             SpecStatus::NeedsOwner => {
-                stopped.insert(spec.id.clone());
-                report.needs_owner.push(spec.id);
+                stopped.insert(spec.id);
             }
             SpecStatus::Discovered | SpecStatus::Extracting => {
                 match prepare(pool, deps.preparer, &spec).await? {
@@ -608,19 +677,34 @@ pub async fn finish_with<'a>(
         }
     };
 
-    // 4. A dependency outside the plan is satisfied only when it is done.
+    // 4. A dependency outside the plan is satisfied when it is done, or a review or a note (which
+    // are never built). One that is abandoned or does not exist sends the dependent to the owner.
     let planned: BTreeSet<String> = runnable.iter().map(|spec| spec.id.clone()).collect();
-    for (_, target) in &pairs {
+    for (from, target) in &pairs {
         if planned.contains(target) || done_ids.contains(target) || stopped.contains(target) {
             continue;
         }
-        match store::get_spec(pool, target).await? {
-            Some(spec) if spec.status == SpecStatus::Done => {
-                done_ids.insert(target.clone());
+        let invalid = match store::get_spec(pool, target).await? {
+            Some(spec) if spec.status == SpecStatus::Done => None,
+            Some(spec) if matches!(spec.kind, SpecKind::Review | SpecKind::Note) => None,
+            Some(spec) if spec.status == SpecStatus::Abandoned => {
+                Some(format!("dependency {target} is abandoned"))
             }
-            _ => {
+            Some(_) => {
                 stopped.insert(target.clone());
+                continue;
             }
+            None => Some(format!("dependency {target} does not exist")),
+        };
+        let Some(reason) = invalid else {
+            done_ids.insert(target.clone());
+            continue;
+        };
+        // The target is not stopped, only the dependent: whatever waits on it is blocked below.
+        if stopped.insert(from.clone()) {
+            mark_needs_owner(pool, from, &reason).await?;
+            report.needs_owner.push(from.clone());
+            runnable.retain(|spec| spec.id != *from);
         }
     }
 
@@ -649,7 +733,9 @@ pub async fn finish_with<'a>(
     let budget = config.max_parallel.max(1);
     let mut running: Running<'a> = Vec::new();
     let mut running_paths: Vec<(String, Vec<String>)> = Vec::new();
+    let mut disk_short: bool;
     loop {
+        disk_short = false;
         // What waits on something that will not finish is blocked, and so is what waits on that.
         while let Some(index) = queue
             .iter()
@@ -679,6 +765,15 @@ pub async fn finish_with<'a>(
                 .iter()
                 .all(|dep| done_ids.contains(dep));
             if ready && compatible(&queue[index].owned, &running_paths) {
+                // A new tree needs room on the disk; one a restart adopted already has its own.
+                if adoptable_tree(&queue[index].spec).is_none()
+                    && config.min_free_disk_bytes > 0
+                    && deps.launcher.free_disk_bytes() < config.min_free_disk_bytes
+                {
+                    disk_short = true;
+                    index += 1;
+                    continue;
+                }
                 let Waiting { spec, owned, .. } = queue.remove(index);
                 let id = spec.id.clone();
                 running_paths.push((id.clone(), owned));
@@ -706,8 +801,13 @@ pub async fn finish_with<'a>(
             report.needs_owner.push(id);
         }
     }
-    // Nothing runs and these were never ready: they wait on something that is neither done nor
-    // stopped. Unfinished, and said so.
+    // Nothing runs. With the disk short, what is left waits for room (or for what waits for it):
+    // still queued, not failed, and handed back for the caller to retry.
+    if disk_short {
+        report.deferred = queue.drain(..).map(|left| left.spec.id).collect();
+    }
+    // The rest were never ready: they wait on something that is neither done nor stopped.
+    // Unfinished, and said so.
     for left in queue {
         store::set_status(
             pool,
@@ -725,6 +825,7 @@ pub async fn finish_with<'a>(
         &mut report.skipped,
         &mut report.refused,
         &mut report.blocked,
+        &mut report.deferred,
     ] {
         list.sort();
         list.dedup();
@@ -872,6 +973,7 @@ mod tests {
             project_root: "/repo".to_owned(),
             state_dir: None,
             owned_paths: BTreeMap::new(),
+            min_free_disk_bytes: 0,
             worktree: std::env::temp_dir(),
         }
     }
@@ -2443,17 +2545,17 @@ b
             cut: true,
             ..whole.clone()
         };
-        let shown = review_prompt(&sample_spec(), &criteria, &whole);
+        let shown = review_prompt(&sample_spec(), &criteria, &whole, &[]);
         assert!(shown.contains("=== a.rs ===") && shown.contains("1: fn a() {}"));
         assert!(!shown.contains("NOT EVERYTHING IS SHOWN"));
-        let hidden = review_prompt(&sample_spec(), &criteria, &cut);
+        let hidden = review_prompt(&sample_spec(), &criteria, &cut, &[]);
         assert!(hidden.contains("NOT EVERYTHING IS SHOWN") && hidden.contains("doubt"));
     }
 
     #[test]
     fn the_prompt_says_the_suite_is_run_separately() {
         let criteria = [crit(1, "the test suite passes", None)];
-        let prompt = review_prompt(&sample_spec(), &criteria, &ReviewMaterial::default());
+        let prompt = review_prompt(&sample_spec(), &criteria, &ReviewMaterial::default(), &[]);
 
         assert!(prompt.contains("runs the project's test suite separately"));
         assert!(prompt.contains("doubt"));

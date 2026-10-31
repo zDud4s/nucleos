@@ -50,6 +50,8 @@ pub struct Admission {
     pub admit: bool,
     pub cost_gb: f64,
     pub reasons: Vec<String>,
+    /// True when the disk is the only reason of a refusal: the one a freed disk can undo.
+    pub disk_only: bool,
 }
 
 /// Whether a new branch of `layer` may start: the book needs a free slot and the disk must keep
@@ -70,16 +72,19 @@ pub fn check_admission(
             admit: true,
             cost_gb,
             reasons: Vec::new(),
+            disk_only: false,
         };
     }
     let mut reasons = Vec::new();
-    if book.free() == 0 {
+    let no_slot = book.free() == 0;
+    if no_slot {
         reasons.push(format!(
             "no free slot: all {} admission units are held",
             book.capacity()
         ));
     }
-    if free_disk_gb - cost_gb < floor_gb {
+    let short_disk = free_disk_gb - cost_gb < floor_gb;
+    if short_disk {
         reasons.push(format!(
             "disk: {free_disk_gb:.1} GB free minus {cost_gb:.1} GB cost is below the {floor_gb:.1} GB floor"
         ));
@@ -88,6 +93,7 @@ pub fn check_admission(
         admit: reasons.is_empty(),
         cost_gb,
         reasons,
+        disk_only: short_disk && !no_slot,
     }
 }
 

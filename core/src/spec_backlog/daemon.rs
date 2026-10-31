@@ -12,7 +12,7 @@ use super::finish::{
     FinishConfig, FinishDeps, FinishError, FinishReport, FinishScope, SpecPreparer, TreeLauncher,
     TreeOutcome, TreeRequest, derived_branch, finish_with,
 };
-use super::model::{Criterion, Spec};
+use super::model::{Criterion, Spec, SpecStatus};
 use super::review::NoToolsReviewer;
 use super::scan::ScanRoots;
 use super::store::{self, StoreError};
@@ -24,6 +24,9 @@ const RUN_POLL: Duration = Duration::from_secs(1);
 const RUN_CEILING: Duration = Duration::from_secs(30 * 60);
 const TREE_POLL: Duration = Duration::from_secs(5);
 const TREE_CEILING: Duration = Duration::from_secs(24 * 60 * 60);
+/// How long a spec held back for disk waits before it is tried again, and for how long in all.
+const DISK_RETRY: Duration = Duration::from_secs(60);
+const DISK_WAIT_CEILING: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Remembers that `run_id` extracted `spec_id`'s criteria. A repeat changes nothing.
 pub async fn record_extraction_run(
@@ -268,6 +271,45 @@ impl SpecPreparer for DaemonPreparer<'_> {
 
 struct DaemonLauncher<'a> {
     state: &'a AppState,
+    /// The checkout the trees are built beside; its volume is the one the disk floor is read on.
+    project_root: PathBuf,
+}
+
+impl DaemonLauncher<'_> {
+    /// Waits until the tree's durable job is terminal, then collects the runs it made and their
+    /// lineage roots. A tree with no job does not exist; one still live at the ceiling is reported
+    /// as such.
+    async fn wait_for_job(&self, tree_id: &str) -> Result<TreeOutcome, String> {
+        let deadline = tokio::time::Instant::now() + TREE_CEILING;
+        let root_node_id = loop {
+            let job = crate::tree_job::store::load(&self.state.pool, tree_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("tree {tree_id} does not exist"))?;
+            if job.state == crate::tree_job::model::JOB_TERMINAL_STATE {
+                break job.root_node_id;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(TreeOutcome {
+                    still_running: true,
+                    ..Default::default()
+                });
+            }
+            tokio::time::sleep(TREE_POLL).await;
+        };
+        let rows: Vec<(i64, i64)> = sqlx::query_as("SELECT id, COALESCE(lineage_root_id, id) FROM runs WHERE id IN (SELECT CAST(run_id AS INTEGER) FROM work_nodes WHERE root_id = ? AND run_id IS NOT NULL)")
+            .bind(&root_node_id).fetch_all(&self.state.pool).await.map_err(|error| error.to_string())?;
+        let mut outcome = TreeOutcome::default();
+        for (run, root) in rows {
+            outcome.run_ids.push(run.to_string());
+            outcome.lineage_roots.push(root.to_string());
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        outcome
+            .lineage_roots
+            .retain(|root| seen.insert(root.clone()));
+        Ok(outcome)
+    }
 }
 
 #[async_trait::async_trait]
@@ -302,43 +344,16 @@ impl TreeLauncher for DaemonLauncher<'_> {
                 String::from_utf8_lossy(&bytes)
             ));
         }
-        let root_node_id = serde_json::from_slice::<serde_json::Value>(&bytes)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("root_node_id")
-                    .and_then(|id| id.as_str().map(str::to_owned))
-            })
-            .ok_or_else(|| "POST /trees answered without a root node".to_owned())?;
-        let deadline = tokio::time::Instant::now() + TREE_CEILING;
-        loop {
-            let job = crate::tree_job::store::load(&self.state.pool, &request.id)
-                .await
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| format!("tree {} disappeared", request.id))?;
-            if job.state == crate::tree_job::model::JOB_TERMINAL_STATE {
-                break;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Ok(TreeOutcome {
-                    still_running: true,
-                    ..Default::default()
-                });
-            }
-            tokio::time::sleep(TREE_POLL).await;
-        }
-        let rows: Vec<(i64, i64)> = sqlx::query_as("SELECT id, COALESCE(lineage_root_id, id) FROM runs WHERE id IN (SELECT CAST(run_id AS INTEGER) FROM work_nodes WHERE root_id = ? AND run_id IS NOT NULL)")
-            .bind(&root_node_id).fetch_all(&self.state.pool).await.map_err(|error| error.to_string())?;
-        let mut outcome = TreeOutcome::default();
-        for (run, root) in rows {
-            outcome.run_ids.push(run.to_string());
-            outcome.lineage_roots.push(root.to_string());
-        }
-        let mut seen = std::collections::BTreeSet::new();
-        outcome
-            .lineage_roots
-            .retain(|root| seen.insert(root.clone()));
-        Ok(outcome)
+        self.wait_for_job(&request.id).await
+    }
+
+    async fn wait_tree(&self, tree_id: &str) -> Result<TreeOutcome, String> {
+        self.wait_for_job(tree_id).await
+    }
+
+    fn free_disk_bytes(&self) -> u64 {
+        // A volume that cannot be read counts as full: the spec waits, it is not failed.
+        crate::health::available_space(&self.project_root).unwrap_or(0)
     }
 }
 
@@ -443,7 +458,21 @@ pub async fn audit_one(state: &AppState, spec_id: &str) -> Result<AuditReport, S
         .await
 }
 
+/// Finishes the backlog. A spec held back for want of disk is tried again after `DISK_RETRY`, on
+/// its own, until `DISK_WAIT_CEILING`; it is never failed and never put to the owner for it.
 pub async fn finish(state: &AppState, scope: FinishScope) -> Result<FinishReport, FinishError> {
+    let mut report = finish_pass(state, scope).await?;
+    let give_up = tokio::time::Instant::now() + DISK_WAIT_CEILING;
+    while !report.deferred.is_empty() && tokio::time::Instant::now() < give_up {
+        tokio::time::sleep(DISK_RETRY).await;
+        for spec_id in std::mem::take(&mut report.deferred) {
+            report.absorb(finish_pass(state, FinishScope::One { spec_id }).await?);
+        }
+    }
+    Ok(report)
+}
+
+async fn finish_pass(state: &AppState, scope: FinishScope) -> Result<FinishReport, FinishError> {
     let project_id = match &scope {
         FinishScope::All { project_id } => project_id.clone(),
         FinishScope::One { spec_id } => {
@@ -456,16 +485,21 @@ pub async fn finish(state: &AppState, scope: FinishScope) -> Result<FinishReport
     let project_id =
         project_id.ok_or_else(|| FinishError::Config("a project is required".to_owned()))?;
     let paths = resolve_project(state, &project_id).await?;
+    let (tree_cap, min_free_disk_bytes) = tree_speed(&paths.project_root);
     let config = FinishConfig {
-        max_parallel: 2,
+        max_parallel: tree_cap,
         max_rounds: 2,
         integration_branch: paths.integration_branch.clone(),
-        owned_paths: BTreeMap::new(),
+        owned_paths: owned_paths_by_spec(&state.pool, &project_id).await,
+        min_free_disk_bytes,
         worktree: PathBuf::from(&paths.project_root),
         state_dir: paths.state_dir.clone(),
         project_root: paths.project_root.clone(),
     };
-    let launcher = DaemonLauncher { state };
+    let launcher = DaemonLauncher {
+        state,
+        project_root: PathBuf::from(&paths.project_root),
+    };
     let preparer = daemon_preparer(state, &paths);
     finish_with(
         &state.pool,
@@ -479,6 +513,89 @@ pub async fn finish(state: &AppState, scope: FinishScope) -> Result<FinishReport
     .await
 }
 
+/// `tree.max_live_branches` and `tree.floor_gb` (as bytes) of the project's `speed.yaml`: the
+/// limits tree admission applies, else its defaults (4 branches, 15 GB).
+fn tree_speed(project_root: &str) -> (usize, u64) {
+    const BYTES_PER_GB: f64 = 1_073_741_824.0;
+    let doc = std::fs::read_to_string(Path::new(project_root).join(".nucleos/workflow/speed.yaml"))
+        .ok()
+        .and_then(|text| serde_yaml::from_str::<serde_yaml::Value>(&text).ok());
+    let tree = doc.as_ref().and_then(|doc| doc.get("tree"));
+    let cap = tree
+        .and_then(|tree| tree.get("max_live_branches"))
+        .and_then(serde_yaml::Value::as_u64)
+        .and_then(|cap| usize::try_from(cap).ok())
+        .unwrap_or(4);
+    let floor_gb = tree
+        .and_then(|tree| tree.get("floor_gb"))
+        .and_then(serde_yaml::Value::as_f64)
+        .unwrap_or(15.0);
+    (cap, (floor_gb.max(0.0) * BYTES_PER_GB) as u64)
+}
+
+/// The files each unfinished spec's criteria name, by spec id. A spec naming none, or one whose
+/// criteria are not read yet, has an unknown scope. Best effort: a failed read means no paths.
+async fn owned_paths_by_spec(
+    pool: &SqlitePool,
+    project_id: &str,
+) -> BTreeMap<String, Vec<String>> {
+    let specs = store::list_specs_by_project(pool, Some(project_id))
+        .await
+        .unwrap_or_default();
+    let mut owned = BTreeMap::new();
+    for spec in specs.iter().filter(|spec| spec.status != SpecStatus::Done) {
+        let criteria = store::list_criteria(pool, &spec.id)
+            .await
+            .unwrap_or_default();
+        let named = super::review::paths_named_by(&criteria);
+        if !named.is_empty() {
+            owned.insert(spec.id.clone(), named);
+        }
+    }
+    owned
+}
+
+/// The projects with an `in_progress` spec that has a tree: a restart cut their finish off.
+async fn resume_candidates(pool: &SqlitePool) -> Result<Vec<String>, StoreError> {
+    Ok(sqlx::query_scalar(
+        "SELECT DISTINCT project_id FROM specs WHERE status = 'in_progress' \
+         AND tree_id IS NOT NULL AND project_id IS NOT NULL ORDER BY project_id",
+    )
+    .fetch_all(pool)
+    .await?)
+}
+
+/// Takes up again, once per boot, the finish of each project a restart interrupted: the claim keeps
+/// it to one per project, and each runs in its own task so boot does not wait on a tree. The
+/// finish adopts the trees its specs already have instead of starting others.
+pub async fn resume_finishes(state: &AppState) {
+    let projects = match resume_candidates(&state.pool).await {
+        Ok(projects) => projects,
+        Err(error) => {
+            tracing::warn!(%error, "could not look for spec finishes to resume");
+            return;
+        }
+    };
+    for project_id in projects {
+        let Some(claim) = super::finish::claim_project(&project_id) else {
+            continue;
+        };
+        let state = state.clone();
+        tokio::spawn(async move {
+            // Held until the finish ends.
+            let _claim = claim;
+            let scope = FinishScope::All {
+                project_id: Some(project_id.clone()),
+            };
+            if let Err(error) = finish(&state, scope).await {
+                tracing::warn!(%error, %project_id, "the resumed spec finish failed");
+                super::finish::announce_failure(&state.pool, &project_id, &error.to_string())
+                    .await;
+            }
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,6 +605,44 @@ mod tests {
         // The durable restart entry point is the contract under test. It must find every
         // project with an in-progress spec, claim it once, and schedule one finish per project.
         let _resume_finishes = resume_finishes;
+    }
+
+    #[tokio::test]
+    async fn resume_candidates_lists_each_project_with_in_progress_specs_once() {
+        let pool = crate::testdb::fresh_pool().await;
+        // Two projects have an in-progress spec with a tree (one of them two); a third has none.
+        for (project, name) in [
+            ("proj-a", "first"),
+            ("proj-a", "second"),
+            ("proj-b", "only"),
+        ] {
+            let path = format!(".ai/specs/2026-01-01-{name}.md");
+            let spec = store::upsert_by_path(&pool, Some(project), &path, name, "sha-1")
+                .await
+                .unwrap();
+            store::set_status(&pool, &spec.id, SpecStatus::InProgress, None)
+                .await
+                .unwrap();
+            store::set_tree_id(&pool, &spec.id, &format!("tree-{project}-{name}"))
+                .await
+                .unwrap();
+        }
+        let idle = store::upsert_by_path(
+            &pool,
+            Some("proj-c"),
+            ".ai/specs/2026-01-01-idle.md",
+            "idle",
+            "sha-1",
+        )
+        .await
+        .unwrap();
+        store::set_status(&pool, &idle.id, SpecStatus::Extracted, None)
+            .await
+            .unwrap();
+
+        let projects = resume_candidates(&pool).await.unwrap();
+
+        assert_eq!(projects, vec!["proj-a".to_owned(), "proj-b".to_owned()]);
     }
 
     #[test]

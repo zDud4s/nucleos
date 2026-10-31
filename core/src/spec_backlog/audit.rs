@@ -6,7 +6,7 @@ use std::path::{Component, Path};
 
 use sqlx::SqlitePool;
 
-use super::model::{Criterion, CriterionStatus, Spec, SpecKind, SpecStatus};
+use super::model::{Criterion, CriterionStatus, Question, Spec, SpecKind, SpecStatus};
 use super::store::{self, StoreError};
 use super::verdict::{ReviewFacts, ReviewerRun, Verdict, VerifyState, done};
 
@@ -26,6 +26,15 @@ pub struct ReviewerAnswer {
 #[async_trait::async_trait]
 pub trait ReviewerRunner: Send + Sync {
     async fn review(&self, spec: &Spec, criteria: &[Criterion]) -> Result<ReviewerAnswer, String>;
+
+    async fn review_with_answers(
+        &self,
+        spec: &Spec,
+        criteria: &[Criterion],
+        _answers: &[Question],
+    ) -> Result<ReviewerAnswer, String> {
+        self.review(spec, criteria).await
+    }
 }
 
 #[async_trait::async_trait]
@@ -147,8 +156,9 @@ pub async fn audit(
     }) {
         return Err(AuditError::StaleCriteria);
     }
+    let answers = store::answered_audit_questions(pool, spec_id, DOUBT_QUESTION_PREFIX).await?;
     let answer = reviewer
-        .review(&spec, &criteria)
+        .review_with_answers(&spec, &criteria, &answers)
         .await
         .map_err(AuditError::Reviewer)?;
     let mut forbidden: HashSet<&str> = lineage.run_ids.iter().map(String::as_str).collect();

@@ -259,6 +259,120 @@ async fn launch_recorded(state: &AppState, node: &str, key: &str) -> Result<bool
     Ok(stored.flatten().is_some_and(|result| !result.is_empty()))
 }
 
+/// The body of a start the disk refused, as stored under `manifest.extra["pending_starts"]`.
+struct PendingStart<'a> {
+    caller: &'a str,
+    goal: &'a str,
+    prompt: &'a str,
+    paths: &'a [String],
+    layer: &'a str,
+    base: Option<&'a str>,
+}
+
+/// Stores a start the disk alone refused under `manifest.extra["pending_starts"][name]` and asks
+/// the owner once, without parking the caller. Idempotent by name: a name already pending is left
+/// as it is and asks nothing. A failure is logged, never the request's: the agent gets its 409
+/// either way.
+async fn remember_pending_start(
+    state: &AppState,
+    job_id: &str,
+    name: &str,
+    pending: &PendingStart<'_>,
+) {
+    let lock = job_lock(job_id);
+    let _guard = lock.lock().await;
+    let mut job = match store::load(&state.pool, job_id).await {
+        Ok(Some(job)) => job,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(%error, job = job_id, "could not read the job to record a pending start");
+            return;
+        }
+    };
+    if job
+        .manifest
+        .extra
+        .get("pending_starts")
+        .and_then(|held| held.get(name))
+        .is_some()
+    {
+        return;
+    }
+    let question = format!(
+        "Branch {name} (layer {}) waits for disk space and starts by itself once there is room.",
+        pending.layer
+    );
+    let asked = match super::decisions::ask_pending(
+        &state.pool,
+        job_id,
+        pending.caller,
+        &question,
+    )
+    .await
+    {
+        Ok(asked) => asked,
+        Err(error) => {
+            tracing::warn!(%error, job = job_id, branch = name, "could not ask about a pending start");
+            return;
+        }
+    };
+    let record = json!({
+        "caller": pending.caller,
+        "goal": pending.goal,
+        "prompt": pending.prompt,
+        "paths": pending.paths,
+        "layer": pending.layer,
+        "base": pending.base,
+        "decision_id": asked.id,
+    });
+    let slot = job
+        .manifest
+        .extra
+        .entry("pending_starts".to_owned())
+        .or_insert_with(|| json!({}));
+    if !slot.is_object() {
+        *slot = json!({});
+    }
+    if let Some(map) = slot.as_object_mut() {
+        map.insert(name.to_owned(), record);
+    }
+    job.updated_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
+    if let Err(error) = store::update(&state.pool, &job).await {
+        tracing::warn!(%error, job = job_id, branch = name, "could not record a pending start");
+    }
+}
+
+/// Replays the stored start of a pending branch through `/branch_start`, with the body it was
+/// refused with: every step is idempotent and the launch key is `branch-<name>`, so a replay after
+/// a crash makes nothing twice. The caller must not hold the job's lock. `Err` carries the reason.
+pub(super) async fn start_pending(
+    state: &AppState,
+    job_id: &str,
+    name: &str,
+    record: &Value,
+) -> Result<Value, String> {
+    let body = json!({
+        "name": name,
+        "goal": record["goal"],
+        "prompt": record["prompt"],
+        "owned_paths": record["paths"],
+        "layer": record["layer"],
+        "base": record["base"],
+        "node_id": record["caller"],
+    });
+    call(
+        routes(),
+        state,
+        format!("/trees/{job_id}/branch_start"),
+        body,
+    )
+    .await
+    .map_err(|(status, Json(refusal))| {
+        let reason = refusal["error"].as_str().unwrap_or("no reason given");
+        format!("{status}: {reason}")
+    })
+}
+
 /// `POST /trees/{id}/branch_start`. Checked first: the names, then the job, the caller (404 when it
 /// is not a node of this tree) and a finished job (409). Then the five steps; a refusal at any of
 /// them answers as that step does and leaves the earlier ones in place for the replay. `replayed` is
@@ -330,13 +444,34 @@ async fn post_branch_start(
 
     // 1. The branch, through the route that adds one: its replay, overlap and admission checks
     // are the ones a direct call gets, and nothing is stored when it refuses.
-    let added = call(
+    let added = match call(
         super::http::routes(),
         &state,
         format!("/trees/{id}/branches"),
         json!({ "name": name, "paths": paths, "layer": layer, "base": base }),
     )
-    .await?;
+    .await
+    {
+        Ok(added) => added,
+        Err((status, Json(refusal))) => {
+            // The disk alone refused it: the driver retries the start when the disk frees.
+            if status == StatusCode::CONFLICT
+                && refusal["disk_only"] == json!(true)
+                && layer != "docs"
+            {
+                let pending = PendingStart {
+                    caller: &caller,
+                    goal: &goal,
+                    prompt: &prompt,
+                    paths: &paths,
+                    layer: &layer,
+                    base: base.as_deref(),
+                };
+                remember_pending_start(&state, &id, &name, &pending).await;
+            }
+            return Err((status, Json(refusal)));
+        }
+    };
     let mut replayed = added["replayed"].as_bool().unwrap_or(false);
 
     // 2. The worktree. A branch past `queued` was opened by an earlier call.

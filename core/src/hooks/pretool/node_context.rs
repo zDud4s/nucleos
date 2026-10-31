@@ -122,3 +122,119 @@ pub(super) async fn wind_down_decision(
         },
     )
 }
+
+/// Restricts a docs branch to the paths it declared when the tree was opened. This is before the
+/// classifier so a refusal is immediate rather than an approval a tree run cannot answer.
+pub(super) async fn docs_write_decision(
+    state: &AppState,
+    payload: &PreToolUsePayload,
+    run_id: i64,
+    cwd: Option<&Path>,
+) -> Option<Json<Decision>> {
+    if !crate::governance::classifier::WRITE_TOOLS.contains(&payload.tool_name.as_str()) {
+        return None;
+    }
+
+    // The JSON predicate leaves ordinary and code branch runs at one indexed node lookup. Only a
+    // matching docs node pays to deserialize its manifest and inspect its declared paths.
+    let docs_node: Option<(String, String)> = match sqlx::query_as(
+        "SELECT n.id, j.manifest
+         FROM work_nodes n
+         JOIN tree_jobs j ON j.id = n.tree_job_id
+         WHERE n.run_id = ?
+           AND EXISTS (
+               SELECT 1 FROM json_each(j.manifest, '$.branches') b
+               WHERE json_extract(b.value, '$.layer') = 'docs'
+                 AND json_extract(b.value, '$.node_id') = n.id
+           )
+         LIMIT 1",
+    )
+    .bind(run_id.to_string())
+    .fetch_optional(&state.pool)
+    .await
+    {
+        Ok(docs_node) => docs_node,
+        Err(error) => {
+            tracing::warn!(run_id, %error, "pretooluse-decision: could not look up docs node");
+            return Some(docs_write_deny(&[]));
+        }
+    };
+    let Some((node_id, manifest)) = docs_node else {
+        return None;
+    };
+    let manifest: crate::tree_job::model::Manifest = match serde_json::from_str(&manifest) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            tracing::warn!(run_id, %error, "pretooluse-decision: could not read docs manifest");
+            return Some(docs_write_deny(&[]));
+        }
+    };
+    let docs_branch = manifest
+        .branches
+        .values()
+        .find(|branch| {
+            branch.layer == "docs" && branch.node_id.as_deref() == Some(node_id.as_str())
+        });
+    let Some(docs_branch) = docs_branch else {
+        return Some(docs_write_deny(&[]));
+    };
+
+    let paths: Vec<Option<String>> = ["file_path", "notebook_path"]
+        .iter()
+        .filter_map(|key| payload.tool_input.get(*key).and_then(Value::as_str))
+        .map(|path| docs_relative_path(path, cwd))
+        .collect();
+    let allowed = !paths.is_empty() && paths.iter().all(|path| {
+        path.as_deref().is_some_and(|path| {
+            crate::tree_job::docs_paths::is_allowed_docs_path(path)
+                && docs_branch
+                    .paths
+                    .iter()
+                    .any(|glob| crate::tree_job::docs_paths::owned_glob_matches(glob, path))
+        })
+    });
+    (!allowed).then(|| docs_write_deny(&docs_branch.paths))
+}
+
+fn docs_write_deny(paths: &[String]) -> Json<Decision> {
+    let declared = if paths.is_empty() {
+        "the declared docs paths".to_owned()
+    } else {
+        paths.join(", ")
+    };
+    Json(Decision {
+        decision: "deny".to_owned(),
+        reason: format!(
+            "docs branches may write only declared paths ({declared}); close the node blocked if you need another path"
+        ),
+    })
+}
+
+/// Returns a lexical path relative to the checkout root. The docs policy must not resolve a
+/// traversal before checking it, because a spelling that leaves and re-enters the checkout is not
+/// a declared docs path.
+fn docs_relative_path(path: &str, cwd: Option<&Path>) -> Option<String> {
+    let cwd = cwd?;
+    let path = path.replace('\\', "/");
+    let cwd = cwd.to_string_lossy().replace('\\', "/");
+    let path = docs_clean_path(&path)?;
+    let cwd = docs_clean_path(&cwd)?;
+    if path.as_bytes().get(1).is_some_and(|byte| *byte == b':') || path.starts_with('/') {
+        let prefix = format!("{}/", cwd.trim_end_matches('/'));
+        path.strip_prefix(&prefix).map(str::to_owned)
+    } else {
+        Some(path)
+    }
+}
+
+fn docs_clean_path(path: &str) -> Option<String> {
+    let mut parts = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => continue,
+            ".." => return None,
+            _ => parts.push(part),
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
+}

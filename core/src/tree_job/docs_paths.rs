@@ -3,6 +3,55 @@
 /// The only directories under `.ai/` a docs branch may write to.
 const DOCS_DIRS: [&str; 4] = ["specs", "spikes", "plans", "notes"];
 
+/// True when `path` matches an owned docs-path glob. `*` stays within one path segment and `**`
+/// matches zero or more whole segments. Traversal is never a match, even when a glob would
+/// otherwise consume it.
+pub fn owned_glob_matches(glob: &str, path: &str) -> bool {
+    let glob = glob.replace('\\', "/");
+    let path = path.replace('\\', "/");
+    let glob: Vec<&str> = glob.split('/').collect();
+    let path: Vec<&str> = path.split('/').collect();
+    if glob.iter().chain(path.iter()).any(|segment| {
+        segment.is_empty() || matches!(*segment, "." | "..")
+    }) {
+        return false;
+    }
+    owned_glob_segments_match(&glob, &path)
+}
+
+fn owned_glob_segments_match(glob: &[&str], path: &[&str]) -> bool {
+    match glob {
+        [] => path.is_empty(),
+        ["**", rest @ ..] => {
+            owned_glob_segments_match(rest, path)
+                || (!path.is_empty() && owned_glob_segments_match(glob, &path[1..]))
+        }
+        [segment, rest @ ..] => path
+            .first()
+            .is_some_and(|part| owned_glob_segment_matches(segment, part))
+            && owned_glob_segments_match(rest, &path[1..]),
+    }
+}
+
+fn owned_glob_segment_matches(glob: &str, path: &str) -> bool {
+    let mut pieces = glob.split('*');
+    let first = pieces.next().unwrap_or_default();
+    if !path.starts_with(first) {
+        return false;
+    }
+    let mut remainder = &path[first.len()..];
+    for piece in pieces {
+        if piece.is_empty() {
+            continue;
+        }
+        let Some(index) = remainder.find(piece) else {
+            return false;
+        };
+        remainder = &remainder[index + piece.len()..];
+    }
+    glob.ends_with('*') || remainder.is_empty()
+}
+
 /// True when `path` names a file below one of [`DOCS_DIRS`], relative to the repository root.
 ///
 /// The check is purely lexical and fails closed. Backslashes count as separators, the match is

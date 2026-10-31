@@ -14,6 +14,53 @@ pub mod scan;
 pub mod store;
 pub mod verdict;
 
+use sqlx::SqlitePool;
+
+use crate::state::AppState;
+
+pub struct Answered {
+    pub question: String,
+    pub reopened: Option<String>,
+}
+
+/// Records an owner's spec-question answer. Starting any follow-up work belongs to the caller.
+pub async fn answer(
+    pool: &SqlitePool,
+    id: &str,
+    text: &str,
+    _origin: &str,
+) -> Result<Answered, store::StoreError> {
+    let (question, reopened) = store::answer_question(pool, id, text).await?;
+    Ok(Answered {
+        question: question.question,
+        reopened: reopened.then_some(question.spec_id),
+    })
+}
+
+/// Starts the same one-spec retry used by the finish route after an owner answer reopens a spec.
+pub fn relaunch_answered(state: AppState, spec_id: String) {
+    tokio::spawn(async move {
+        let project_id = match store::get_spec(&state.pool, &spec_id).await {
+            Ok(Some(spec)) => spec.project_id,
+            Ok(None) => None,
+            Err(error) => {
+                tracing::warn!(%error, %spec_id, "could not read reopened spec");
+                None
+            }
+        };
+        let Some(project_id) = project_id else {
+            return;
+        };
+        let Some(claim) = finish::claim_project(&project_id) else {
+            return;
+        };
+        let _claim = claim;
+        if let Err(error) = finish::finish(&state, finish::FinishScope::One { spec_id }).await {
+            tracing::warn!(%error, "spec retry after owner answer failed");
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     async fn names(pool: &sqlx::SqlitePool, kind: &str) -> Vec<String> {

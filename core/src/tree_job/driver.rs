@@ -41,6 +41,7 @@ use crate::execution::git_exec::OPERATION_TIMEOUT;
 use crate::execution::vcs::{Origin, ResolvedRepo, resolve_repo};
 use crate::gate::GateOutcome;
 use crate::state::AppState;
+use crate::tree_cost::budget::{self as tree_budget, Permit};
 use crate::verify::{ScopeVerdict, gate_job_scope};
 use crate::work_nodes::{self, CLOSE_STATUSES, CloseArgs, NodeLimits};
 
@@ -48,6 +49,8 @@ use crate::work_nodes::{self, CLOSE_STATUSES, CloseArgs, NodeLimits};
 const GATE_WAIT: Duration = Duration::from_secs(900);
 /// Cap of the relaunches that follow a red gate (key prefix `FIX_PREFIX`).
 const FIX_CAP: i64 = 2;
+/// Merge requests of one branch that the conflict resolver is given before the owner is asked.
+const CONFLICT_ATTEMPTS: i64 = 2;
 /// Longest tail of the gate's findings that goes into a relaunch prompt.
 const FINDINGS_MAX: usize = 3000;
 
@@ -166,6 +169,114 @@ async fn advance(state: &AppState, job_id: &str, gate: Option<GateFn>) {
             tracing::warn!(job = job_id, %node, %error, "tree driver could not park the branch");
         }
     }
+    // Outside the job's lock: the start goes through the routes that take it.
+    if let Err(error) = retry_pending_starts(state, job_id).await {
+        tracing::warn!(job = job_id, %error, "tree driver could not retry the pending starts");
+    }
+}
+
+// ---- pending starts: a start the disk refused ----------------------------------------------------
+
+/// Replays each start that `branch_start` stored because the disk alone refused it, once the disk
+/// admits the branch. Still short: nothing is written or announced. Refused for another reason now,
+/// or the caller is gone: the record is dropped and the decision stays open for the owner.
+async fn retry_pending_starts(state: &AppState, job_id: &str) -> Result<(), String> {
+    let Some(job) = store::load(&state.pool, job_id).await.map_err(|e| e.to_string())? else {
+        return Ok(());
+    };
+    if job.state == JOB_TERMINAL_STATE {
+        return Ok(());
+    }
+    let Some(pending) = job
+        .manifest
+        .extra
+        .get("pending_starts")
+        .and_then(Value::as_object)
+    else {
+        return Ok(());
+    };
+    for (name, record) in pending {
+        if let Err(error) = retry_pending_start(state, &job, name, record).await {
+            tracing::warn!(job = job_id, branch = %name, %error, "a pending start could not be retried");
+        }
+    }
+    Ok(())
+}
+
+async fn retry_pending_start(
+    state: &AppState,
+    job: &TreeJob,
+    name: &str,
+    record: &Value,
+) -> Result<(), String> {
+    let pool = &state.pool;
+    let caller = record["caller"].as_str().unwrap_or_default();
+    if work_nodes::get(pool, caller).await.is_err() {
+        return drop_pending_start(pool, &job.id, name).await;
+    }
+    // A branch already added by an earlier, half-finished replay needs no admission: the replay
+    // only finishes its remaining steps.
+    if !job.manifest.branches.contains_key(name) {
+        let layer = record["layer"].as_str().unwrap_or("code");
+        let admission = super::http::current_admission(&job.manifest, layer).await?;
+        if !admission.admit {
+            if admission.disk_only {
+                return Ok(());
+            }
+            return drop_pending_start(pool, &job.id, name).await;
+        }
+    }
+    super::branch_start::start_pending(state, &job.id, name, record).await?;
+    drop_pending_start(pool, &job.id, name).await?;
+
+    if let Some(decision) = record["decision_id"].as_str() {
+        let text = format!("disk freed: branch {name} admitted automatically");
+        match decisions::answer(pool, decision, &text, "driver").await {
+            // The owner answered first: their answer stays.
+            Ok(_) | Err(decisions::DecisionError::AlreadyDecided(_)) => {}
+            Err(error) => {
+                tracing::warn!(job = %job.id, decision, %error, "could not answer the pending start's decision");
+            }
+        }
+    }
+    let line = format!("{}: branch {name} admitted automatically, the disk is freed", job.goal);
+    if let Err(error) = crate::feed::append(
+        pool,
+        job.project_id.as_deref(),
+        "work_tree_pending",
+        &line,
+        None,
+        None,
+    )
+    .await
+    {
+        tracing::warn!(job = %job.id, %error, "could not announce an admitted pending start");
+    }
+    Ok(())
+}
+
+/// Removes the pending record of `name` under the job's lock, from a fresh read of the manifest.
+async fn drop_pending_start(pool: &SqlitePool, job_id: &str, name: &str) -> Result<(), String> {
+    let lock = job_lock(job_id);
+    let _guard = lock.lock().await;
+    let Some(mut job) = store::load(pool, job_id).await.map_err(|e| e.to_string())? else {
+        return Ok(());
+    };
+    let Some(pending) = job
+        .manifest
+        .extra
+        .get_mut("pending_starts")
+        .and_then(Value::as_object_mut)
+    else {
+        return Ok(());
+    };
+    if pending.remove(name).is_none() {
+        return Ok(());
+    }
+    if pending.is_empty() {
+        job.manifest.extra.remove("pending_starts");
+    }
+    persist(pool, &mut job).await
 }
 
 async fn pass(
@@ -603,6 +714,16 @@ async fn repo_of(pool: &SqlitePool, job: &TreeJob) -> Result<ResolvedRepo, Strin
     })
 }
 
+/// How many merge requests of the branch the conflict resolver was given so far.
+fn conflict_attempts(job: &TreeJob, name: &str) -> i64 {
+    job.manifest
+        .branches
+        .get(name)
+        .and_then(|branch| branch.extra.get("conflict_attempts"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+}
+
 async fn merge(
     state: &AppState,
     job: &mut TreeJob,
@@ -617,15 +738,63 @@ async fn merge(
     let node = branch.node_id.clone();
 
     if queued {
-        let settled = settle_merge(pool, job, name, Duration::ZERO)
+        let before = conflict_attempts(job, name);
+        // Past the tree's budget no resolution is paid for: the conflict is claimed (so the
+        // resolver never picks it up) and the owner is asked at once.
+        let claim = !matches!(
+            tree_budget::permits_next_node(pool, &job.root_node_id).await,
+            Permit::Yes
+        );
+        let settled = settle_merge(pool, job, name, Duration::ZERO, claim)
             .await
             .map_err(|e| e.to_string())?;
-        if let MergeSettlement::NotMerged { reason } = settled {
-            tracing::warn!(job = %job.id, branch = name, %reason, "the queue did not merge the branch");
-            // Resubmitting a conflicted branch would conflict again: an owner decides.
-            if let Some(node) = node {
-                parks.push((node, format!("The merge of branch {name} failed: {reason}")));
+        match settled {
+            MergeSettlement::NotMerged { reason } => {
+                tracing::warn!(job = %job.id, branch = name, %reason, "the queue did not merge the branch");
+                // Resubmitting a conflicted branch would conflict again: an owner decides.
+                if let Some(node) = node {
+                    parks.push((node, format!("The merge of branch {name} failed: {reason}")));
+                }
             }
+            MergeSettlement::Conflicted {
+                reason,
+                resolution_failed,
+            } => {
+                // The conflict is the resolver's first: it is announced once per attempt and the
+                // owner is asked only when the last attempt's resolution ended without landing.
+                // Otherwise a dead request is dropped and the next pass resubmits it.
+                let attempts = conflict_attempts(job, name);
+                if attempts != before {
+                    let line = format!(
+                        "{}: branch {name} conflicts; resolver attempt {attempts}",
+                        job.goal
+                    );
+                    if let Err(error) = crate::feed::append(
+                        pool,
+                        job.project_id.as_deref(),
+                        "work_tree_conflict",
+                        &line,
+                        None,
+                        None,
+                    )
+                    .await
+                    {
+                        tracing::warn!(job = %job.id, %error, "could not announce a conflict");
+                    }
+                }
+                if resolution_failed
+                    && attempts >= CONFLICT_ATTEMPTS
+                    && let Some(node) = node
+                {
+                    parks.push((
+                        node,
+                        format!(
+                            "The merge of branch {name} conflicts and {attempts} resolution attempts did not land it: {reason}"
+                        ),
+                    ));
+                }
+            }
+            _ => {}
         }
         return Ok(());
     }
@@ -2234,6 +2403,14 @@ mod tests {
     /// open decision `post_branch_start` would have opened for it. Returns the decision's id.
     async fn job_with_a_pending_start(fx: &Fixture, job: &str) -> String {
         fx.seed_job(job, Vec::new(), None).await;
+        // The replay opens the root: name its base branch, and a 0 floor so only the cost refuses.
+        let workflow = fx.repo.join(".nucleos").join("workflow");
+        std::fs::create_dir_all(&workflow).unwrap();
+        std::fs::write(
+            workflow.join("speed.yaml"),
+            "tree:\n  base_branch: master\n  floor_gb: 0\n",
+        )
+        .unwrap();
         let caller = root_node_of(job);
         let asked = decisions::ask_pending(
             &fx.state.pool,

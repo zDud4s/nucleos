@@ -622,6 +622,14 @@ pub enum MergeSettlement {
     NotMerged {
         reason: String,
     },
+    /// The queue escalated the merge and the caller asked not to claim it (`claim_conflict` false).
+    /// While `resolution_failed` is false the request id stays on the branch for the conflict
+    /// resolver. When true a resolution ran and ended without landing: the request id is dropped
+    /// so the branch can resubmit, as for `NotMerged`.
+    Conflicted {
+        reason: String,
+        resolution_failed: bool,
+    },
     /// The queue has not finished (or a resolution is running); nothing changed.
     Pending,
 }
@@ -629,11 +637,16 @@ pub enum MergeSettlement {
 /// Reads the outcome of the branch's queued merge for up to `wait` and records it: a success moves
 /// the branch to `merged` with `merge_sha` and `merged_at`; a failure or conflict keeps it `green`
 /// and records `merge_failure`. Either way the request id is dropped so a new submit queues afresh.
+///
+/// `claim_conflict` false leaves an escalated, unclaimed row to the conflict resolver: the branch
+/// keeps its request id, and `conflict_attempts` counts one attempt per merge request (the request
+/// last counted is `conflict_request_id`, so a repeated pass over the same conflict adds nothing).
 pub async fn settle_merge(
     pool: &SqlitePool,
     job: &mut TreeJob,
     branch: &str,
     wait: Duration,
+    claim_conflict: bool,
 ) -> Result<MergeSettlement, LandingError> {
     let held = branch_of(&job.manifest, branch)?;
     if held.state == "merged"
@@ -647,7 +660,25 @@ pub async fn settle_merge(
         LandingError::Refused(format!("branch {branch} has no merge in the queue"))
     })?;
 
-    let end = settle_request(pool, id, wait, true).await?;
+    let end = settle_request(pool, id, wait, claim_conflict).await?;
+    // Read before `held` borrows the job: whether a resolution run claimed the escalated row.
+    let unresolved = if matches!(
+        end,
+        RequestEnd::Failed {
+            escalated: true,
+            ..
+        }
+    ) && !claim_conflict
+    {
+        let claimed: Option<Option<i64>> =
+            sqlx::query_scalar("SELECT resolution_run_id FROM vcs_requests WHERE id = ?")
+                .bind(id)
+                .fetch_optional(pool)
+                .await?;
+        matches!(claimed, Some(None))
+    } else {
+        false
+    };
     let held = job
         .manifest
         .branches
@@ -655,6 +686,45 @@ pub async fn settle_merge(
         .ok_or_else(|| LandingError::UnknownBranch(branch.to_owned()))?;
     match end {
         RequestEnd::Pending => Ok(MergeSettlement::Pending),
+        RequestEnd::Failed {
+            reason,
+            escalated: true,
+        } if !claim_conflict => {
+            // One attempt per merge request, however many passes see the same conflict.
+            let counted = held.extra.get("conflict_request_id").and_then(Value::as_i64);
+            if counted != Some(id) {
+                let attempts = held
+                    .extra
+                    .get("conflict_attempts")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                held.extra
+                    .insert("conflict_attempts".to_owned(), json!(attempts + 1));
+                held.extra
+                    .insert("conflict_request_id".to_owned(), json!(id));
+                if unresolved {
+                    persist(pool, job).await?;
+                    return Ok(MergeSettlement::Conflicted {
+                        reason,
+                        resolution_failed: false,
+                    });
+                }
+            } else if unresolved {
+                return Ok(MergeSettlement::Conflicted {
+                    reason,
+                    resolution_failed: false,
+                });
+            }
+            // A resolution ran and ended without landing: the request is dead.
+            held.extra
+                .insert("merge_failure".to_owned(), json!(reason.clone()));
+            held.extra.remove("merge_request_id");
+            persist(pool, job).await?;
+            Ok(MergeSettlement::Conflicted {
+                reason,
+                resolution_failed: true,
+            })
+        }
         RequestEnd::Succeeded(sha) => {
             let sha = sha.filter(|sha| !sha.trim().is_empty()).ok_or_else(|| {
                 LandingError::Refused(format!(
