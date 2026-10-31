@@ -11,8 +11,8 @@ use rand::RngExt;
 use sqlx::SqlitePool;
 
 use super::model::{
-    spec_id, Criterion, CriterionKind, CriterionStatus, Dep, DepSource, NewCriterion,
-    OwnerDecision, Question, Spec, SpecKind, SpecStatus,
+    Criterion, CriterionKind, CriterionStatus, Dep, DepSource, NewCriterion, OwnerDecision,
+    Question, Spec, SpecKind, SpecStatus, spec_id,
 };
 
 #[derive(Debug)]
@@ -243,26 +243,48 @@ pub async fn list_criteria(pool: &SqlitePool, spec_id: &str) -> Result<Vec<Crite
 }
 
 /// Lists paths in one registry namespace for extraction dependency validation.
-pub async fn list_paths_by_project(pool: &SqlitePool, project_id: Option<&str>) -> Result<Vec<String>, StoreError> {
-    Ok(sqlx::query_scalar("SELECT path FROM specs WHERE project_id IS ? ORDER BY path")
-        .bind(project_id)
-        .fetch_all(pool)
-        .await?)
+pub async fn list_paths_by_project(
+    pool: &SqlitePool,
+    project_id: Option<&str>,
+) -> Result<Vec<String>, StoreError> {
+    Ok(
+        sqlx::query_scalar("SELECT path FROM specs WHERE project_id IS ? ORDER BY path")
+            .bind(project_id)
+            .fetch_all(pool)
+            .await?,
+    )
 }
 
 pub async fn set_extraction_result(
-    pool: &SqlitePool, spec_id: &str, kind: SpecKind, status: SpecStatus, reason: Option<&str>,
+    pool: &SqlitePool,
+    spec_id: &str,
+    kind: SpecKind,
+    status: SpecStatus,
+    reason: Option<&str>,
 ) -> Result<(), StoreError> {
-    let result = sqlx::query("UPDATE specs SET kind = ?, status = ?, status_reason = ?, updated_at = ? WHERE id = ?")
-        .bind(kind.as_str()).bind(status.as_str()).bind(reason).bind(now()).bind(spec_id)
-        .execute(pool).await?;
-    if result.rows_affected() == 0 { return Err(StoreError::NotFound(format!("spec {spec_id}"))); }
+    let result = sqlx::query(
+        "UPDATE specs SET kind = ?, status = ?, status_reason = ?, updated_at = ? WHERE id = ?",
+    )
+    .bind(kind.as_str())
+    .bind(status.as_str())
+    .bind(reason)
+    .bind(now())
+    .bind(spec_id)
+    .execute(pool)
+    .await?;
+    if result.rows_affected() == 0 {
+        return Err(StoreError::NotFound(format!("spec {spec_id}")));
+    }
     Ok(())
 }
 
 pub async fn set_criterion_review(
-    pool: &SqlitePool, spec_id: &str, ordinal: i64, status: CriterionStatus,
-    evidence: Option<&str>, reviewer_run_id: &str,
+    pool: &SqlitePool,
+    spec_id: &str,
+    ordinal: i64,
+    status: CriterionStatus,
+    evidence: Option<&str>,
+    reviewer_run_id: &str,
 ) -> Result<(), StoreError> {
     sqlx::query("UPDATE spec_criteria SET status = ?, evidence = ?, reviewer_run_id = ?, checked_at = ? WHERE spec_id = ? AND ordinal = ?")
         .bind(status.as_str()).bind(evidence).bind(reviewer_run_id).bind(now()).bind(spec_id).bind(ordinal)
@@ -271,35 +293,63 @@ pub async fn set_criterion_review(
 }
 
 pub async fn set_audit_result(
-    pool: &SqlitePool, spec_id: &str, status: SpecStatus, reason: Option<&str>, sha: &str,
+    pool: &SqlitePool,
+    spec_id: &str,
+    status: SpecStatus,
+    reason: Option<&str>,
+    sha: &str,
 ) -> Result<(), StoreError> {
     let result = sqlx::query("UPDATE specs SET status = ?, status_reason = ?, last_audited_sha = ?, updated_at = ? WHERE id = ?")
         .bind(status.as_str()).bind(reason).bind(sha).bind(now()).bind(spec_id).execute(pool).await?;
-    if result.rows_affected() == 0 { return Err(StoreError::NotFound(format!("spec {spec_id}"))); }
+    if result.rows_affected() == 0 {
+        return Err(StoreError::NotFound(format!("spec {spec_id}")));
+    }
     Ok(())
 }
 
 /// Moves a spec to `status` with the reason, touching nothing else (not `last_audited_sha`).
 pub async fn set_status(
-    pool: &SqlitePool, spec_id: &str, status: SpecStatus, reason: Option<&str>,
+    pool: &SqlitePool,
+    spec_id: &str,
+    status: SpecStatus,
+    reason: Option<&str>,
 ) -> Result<(), StoreError> {
-    let result = sqlx::query("UPDATE specs SET status = ?, status_reason = ?, updated_at = ? WHERE id = ?")
-        .bind(status.as_str()).bind(reason).bind(now()).bind(spec_id).execute(pool).await?;
-    if result.rows_affected() == 0 { return Err(StoreError::NotFound(format!("spec {spec_id}"))); }
+    let result =
+        sqlx::query("UPDATE specs SET status = ?, status_reason = ?, updated_at = ? WHERE id = ?")
+            .bind(status.as_str())
+            .bind(reason)
+            .bind(now())
+            .bind(spec_id)
+            .execute(pool)
+            .await?;
+    if result.rows_affected() == 0 {
+        return Err(StoreError::NotFound(format!("spec {spec_id}")));
+    }
     Ok(())
 }
 
 /// Records the tree that is working on the spec (the latest one, when a second round replaces it).
-pub async fn set_tree_id(pool: &SqlitePool, spec_id: &str, tree_id: &str) -> Result<(), StoreError> {
+pub async fn set_tree_id(
+    pool: &SqlitePool,
+    spec_id: &str,
+    tree_id: &str,
+) -> Result<(), StoreError> {
     let result = sqlx::query("UPDATE specs SET tree_id = ?, updated_at = ? WHERE id = ?")
-        .bind(tree_id).bind(now()).bind(spec_id).execute(pool).await?;
-    if result.rows_affected() == 0 { return Err(StoreError::NotFound(format!("spec {spec_id}"))); }
+        .bind(tree_id)
+        .bind(now())
+        .bind(spec_id)
+        .execute(pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(StoreError::NotFound(format!("spec {spec_id}")));
+    }
     Ok(())
 }
 
 /// Every spec of one registry namespace (`None` is the namespace without a project), by path.
 pub async fn list_specs_by_project(
-    pool: &SqlitePool, project_id: Option<&str>,
+    pool: &SqlitePool,
+    project_id: Option<&str>,
 ) -> Result<Vec<Spec>, StoreError> {
     let rows: Vec<SpecRow> = sqlx::query_as(
         "SELECT id, project_id, path, title, content_sha, kind, status, status_reason, tree_id, \
@@ -468,11 +518,10 @@ pub async fn list_owner_decisions(pool: &SqlitePool) -> Result<Vec<OwnerDecision
     .fetch_one(pool)
     .await?;
     if has_decisions > 0 {
-        let decisions: Vec<DecisionRow> = sqlx::query_as(
-            "SELECT id, tree_id, question, answer, status, at FROM decisions",
-        )
-        .fetch_all(pool)
-        .await?;
+        let decisions: Vec<DecisionRow> =
+            sqlx::query_as("SELECT id, tree_id, question, answer, status, at FROM decisions")
+                .fetch_all(pool)
+                .await?;
         rows.extend(decisions.into_iter().map(|row| OwnerDecision {
             origin: "tree_decision".to_owned(),
             id: row.id,
@@ -502,7 +551,7 @@ pub async fn list_owner_decisions(pool: &SqlitePool) -> Result<Vec<OwnerDecision
 mod tests {
     use super::*;
     use crate::spec_backlog::model::{
-        spec_id, CriterionKind, CriterionStatus, DepSource, NewCriterion, Spec, SpecStatus,
+        CriterionKind, CriterionStatus, DepSource, NewCriterion, Spec, SpecStatus, spec_id,
     };
     use sqlx::SqlitePool;
 
@@ -681,7 +730,12 @@ mod tests {
             let criteria = list_criteria(&pool, &spec.id).await.unwrap();
             assert_eq!(criteria.len(), 2);
             for criterion in &criteria {
-                assert_eq!(criterion.status, CriterionStatus::Stale, "{}", criterion.text);
+                assert_eq!(
+                    criterion.status,
+                    CriterionStatus::Stale,
+                    "{}",
+                    criterion.text
+                );
                 assert_eq!(criterion.spec_sha, "sha-1", "{}", criterion.text);
             }
 
@@ -979,7 +1033,13 @@ mod tests {
         // Interleaved on purpose: neither table first would give this order.
         let order: Vec<(&str, &str, &str)> = rows
             .iter()
-            .map(|row| (row.origin.as_str(), row.id.as_str(), row.created_at.as_str()))
+            .map(|row| {
+                (
+                    row.origin.as_str(),
+                    row.id.as_str(),
+                    row.created_at.as_str(),
+                )
+            })
             .collect();
         assert_eq!(
             order,

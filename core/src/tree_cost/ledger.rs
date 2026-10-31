@@ -84,9 +84,9 @@ async fn price_unmeasured_runs(
     let rate = load_budget_config(pool).await?.time_cost_per_hour_usd;
     let rows: Vec<(String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT r.created_at, r.completed_at, r.model_watch, r.model_requested_at
-         FROM work_nodes n
-         JOIN runs r ON r.id = CAST(n.run_id AS INTEGER)
-         WHERE n.root_id = ? AND r.cost_usd IS NULL",
+         FROM tree_run_ids t
+         JOIN runs r ON r.id = t.run_id
+         WHERE t.root_id = ? AND r.cost_usd IS NULL",
     )
     .bind(root_id)
     .fetch_all(pool)
@@ -114,13 +114,9 @@ async fn judges_usd(pool: &SqlitePool, root_id: &str) -> sqlx::Result<f64> {
     sqlx::query_scalar(
         "SELECT
            (SELECT COALESCE(SUM(cost_usd), 0.0) FROM judge_verdicts
-            WHERE run_id IN (SELECT r.id FROM work_nodes n
-                             JOIN runs r ON r.id = CAST(n.run_id AS INTEGER)
-                             WHERE n.root_id = ?1))
+            WHERE run_id IN (SELECT run_id FROM tree_run_ids WHERE root_id = ?1))
          + (SELECT COALESCE(SUM(cost_usd), 0.0) FROM judge_resolutions
-            WHERE run_id IN (SELECT r.id FROM work_nodes n
-                             JOIN runs r ON r.id = CAST(n.run_id AS INTEGER)
-                             WHERE n.root_id = ?1))",
+            WHERE run_id IN (SELECT run_id FROM tree_run_ids WHERE root_id = ?1))",
     )
     .bind(root_id)
     .fetch_one(pool)
@@ -262,14 +258,8 @@ mod tests {
         let cost = tree_cost(&pool, "root-1", at(NOW)).await.unwrap();
 
         // Priced by the governance rule at the configured rate, not by a local copy of it.
-        let expected = crate::governance::budget::unmeasured_usd(
-            at(STARTED),
-            at(NOW),
-            None,
-            None,
-            true,
-            6.0,
-        );
+        let expected =
+            crate::governance::budget::unmeasured_usd(at(STARTED), at(NOW), None, None, true, 6.0);
         assert!(expected > 0.0);
         assert_eq!(cost.runs, 2);
         assert_eq!(cost.unmeasured_runs, 1);

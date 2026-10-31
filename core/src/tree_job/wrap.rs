@@ -108,7 +108,9 @@ async fn wrap_node(
         if has_branch {
             return Ok(false);
         }
-        let stored = latest_launch(pool, node_id).await.map_err(|e| e.to_string())?;
+        let stored = latest_launch(pool, node_id)
+            .await
+            .map_err(|e| e.to_string())?;
         if stored.is_none() {
             return Ok(false);
         }
@@ -116,7 +118,9 @@ async fn wrap_node(
         return Ok(true);
     };
 
-    let live = run_is_live(pool, &run_id).await.map_err(|e| e.to_string())?;
+    let live = run_is_live(pool, &run_id)
+        .await
+        .map_err(|e| e.to_string())?;
     let report: Option<String> = sqlx::query_scalar(
         "SELECT result FROM tree_transitions WHERE node_id = ? AND transition = 'report' AND key = ?",
     )
@@ -139,14 +143,28 @@ async fn wrap_node(
         (false, Some("handoff")) => {
             let suffix = handoff.as_deref().map(|path| with_handoff("", path));
             relaunch_or_stop(
-                state, &job.id, node_id, has_branch, &run_id, WRAP_PREFIX, WRAP_CAP, suffix,
+                state,
+                &job.id,
+                node_id,
+                has_branch,
+                &run_id,
+                WRAP_PREFIX,
+                WRAP_CAP,
+                suffix,
             )
             .await
         }
         (false, Some(_)) => Ok(false),
         (false, None) => {
             relaunch_or_stop(
-                state, &job.id, node_id, has_branch, &run_id, DIED_PREFIX, DIED_CAP, None,
+                state,
+                &job.id,
+                node_id,
+                has_branch,
+                &run_id,
+                DIED_PREFIX,
+                DIED_CAP,
+                None,
             )
             .await
         }
@@ -280,7 +298,11 @@ mod tests {
         .bind(node_id)
         .bind("wrap-root")
         .bind((branch_state.is_none()) as i64)
-        .bind(if branch_state.is_some() { "orchestrator" } else { "root" })
+        .bind(if branch_state.is_some() {
+            "orchestrator"
+        } else {
+            "root"
+        })
         .bind(run_id.map(|id| id.to_string()))
         .bind(JOB)
         .bind("C:/state/nodes/wrap/handoff.md")
@@ -292,13 +314,15 @@ mod tests {
     }
 
     async fn seed_run(state: &AppState, id: i64, status: &str) {
-        sqlx::query("INSERT INTO runs (id, prompt, status, created_at) VALUES (?, 'original prompt', ?, ?)")
-            .bind(id)
-            .bind(status)
-            .bind(CREATED)
-            .execute(&state.pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO runs (id, prompt, status, created_at) VALUES (?, 'original prompt', ?, ?)",
+        )
+        .bind(id)
+        .bind(status)
+        .bind(CREATED)
+        .execute(&state.pool)
+        .await
+        .unwrap();
     }
 
     async fn seed_launch(state: &AppState, node_id: &str) {
@@ -333,7 +357,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_dead_run_with_a_handoff_report_is_relaunched_under_a_wrap_key_with_the_handoff_sentence() {
+    async fn a_dead_run_with_a_handoff_report_is_relaunched_under_a_wrap_key_with_the_handoff_sentence()
+     {
         let state = state().await;
         seed_node(&state, Some("building"), "open", NODE, Some(41)).await;
         seed_run(&state, 41, "interrupted").await;
@@ -343,10 +368,11 @@ mod tests {
         tick(&state).await;
 
         assert_eq!(launches(&state, NODE, "wrap-41").await, 1);
-        let prompt: String = sqlx::query_scalar("SELECT prompt FROM runs WHERE id <> 41 ORDER BY id DESC LIMIT 1")
-            .fetch_one(&state.pool)
-            .await
-            .unwrap();
+        let prompt: String =
+            sqlx::query_scalar("SELECT prompt FROM runs WHERE id <> 41 ORDER BY id DESC LIMIT 1")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
         assert!(prompt.contains("handoff.md"), "{prompt:?}");
     }
 
@@ -370,9 +396,17 @@ mod tests {
     async fn a_live_run_with_a_handoff_report_is_ended_not_relaunched() {
         let state = state().await;
         seed_node(&state, Some("building"), "open", NODE, None).await;
-        let run_id = node_run::launch(&state, NODE, "live", "original prompt".to_owned(), None, None, "shadow")
-            .await
-            .unwrap();
+        let run_id = node_run::launch(
+            &state,
+            NODE,
+            "live",
+            "original prompt".to_owned(),
+            None,
+            None,
+            "shadow",
+        )
+        .await
+        .unwrap();
         report(&state, NODE, run_id, "handoff").await;
 
         tick(&state).await;
@@ -394,7 +428,9 @@ mod tests {
         seed_launch(&state, NODE).await;
         report(&state, NODE, 43, "handoff").await;
         for key in ["wrap-old-1", "wrap-old-2", "wrap-old-3"] {
-            node_run::apply(&state.pool, NODE, "launch", key, "99").await.unwrap();
+            node_run::apply(&state.pool, NODE, "launch", key, "99")
+                .await
+                .unwrap();
         }
 
         tick(&state).await;
@@ -408,11 +444,13 @@ mod tests {
             .state
             .clone();
         assert_eq!(parked, "parked");
-        let feed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM feed WHERE kind = 'node_continuation_stopped' AND subject = ?")
-            .bind(format!("node:{NODE}"))
-            .fetch_one(&state.pool)
-            .await
-            .unwrap();
+        let feed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM feed WHERE kind = 'node_continuation_stopped' AND subject = ?",
+        )
+        .bind(format!("node:{NODE}"))
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
         assert_eq!(feed, 1);
     }
 
@@ -425,20 +463,30 @@ mod tests {
 
         tick(&state).await;
         assert_eq!(launches(&state, NODE, "died-44").await, 1);
-        let first: i64 = sqlx::query_scalar("SELECT CAST(run_id AS INTEGER) FROM work_nodes WHERE id = ?")
-            .bind(NODE)
-            .fetch_one(&state.pool)
+        let first: i64 =
+            sqlx::query_scalar("SELECT CAST(run_id AS INTEGER) FROM work_nodes WHERE id = ?")
+                .bind(NODE)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        sqlx::query("UPDATE runs SET status = 'interrupted' WHERE id = ?")
+            .bind(first)
+            .execute(&state.pool)
             .await
             .unwrap();
-        sqlx::query("UPDATE runs SET status = 'interrupted' WHERE id = ?").bind(first).execute(&state.pool).await.unwrap();
         tick(&state).await;
         assert_eq!(launches(&state, NODE, "died-").await, 2);
-        let second: i64 = sqlx::query_scalar("SELECT CAST(run_id AS INTEGER) FROM work_nodes WHERE id = ?")
-            .bind(NODE)
-            .fetch_one(&state.pool)
+        let second: i64 =
+            sqlx::query_scalar("SELECT CAST(run_id AS INTEGER) FROM work_nodes WHERE id = ?")
+                .bind(NODE)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        sqlx::query("UPDATE runs SET status = 'interrupted' WHERE id = ?")
+            .bind(second)
+            .execute(&state.pool)
             .await
             .unwrap();
-        sqlx::query("UPDATE runs SET status = 'interrupted' WHERE id = ?").bind(second).execute(&state.pool).await.unwrap();
         tick(&state).await;
 
         let parked = store::load(&state.pool, JOB)
@@ -473,7 +521,14 @@ mod tests {
         assert_eq!(launches(&merged_state, NODE, "wrap-").await, 0);
 
         let finished_state = state().await;
-        seed_node(&finished_state, Some("building"), "finished", NODE, Some(49)).await;
+        seed_node(
+            &finished_state,
+            Some("building"),
+            "finished",
+            NODE,
+            Some(49),
+        )
+        .await;
         seed_run(&finished_state, 49, "interrupted").await;
         seed_launch(&finished_state, NODE).await;
         report(&finished_state, NODE, 49, "handoff").await;
@@ -574,12 +629,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), axum::http::StatusCode::OK);
-        let root = store::load(&state.pool, JOB).await.unwrap().unwrap().root_node_id;
-        let first: i64 = sqlx::query_scalar("SELECT CAST(run_id AS INTEGER) FROM work_nodes WHERE id = ?")
-            .bind(&root)
-            .fetch_one(&state.pool)
+        let root = store::load(&state.pool, JOB)
             .await
-            .expect("the root run is linked to the root node");
+            .unwrap()
+            .unwrap()
+            .root_node_id;
+        let first: i64 =
+            sqlx::query_scalar("SELECT CAST(run_id AS INTEGER) FROM work_nodes WHERE id = ?")
+                .bind(&root)
+                .fetch_one(&state.pool)
+                .await
+                .expect("the root run is linked to the root node");
         for _ in 0..300 {
             if runner.last_permission.lock().unwrap().is_some() {
                 break;
@@ -602,7 +662,11 @@ mod tests {
 
         tick(&state).await;
 
-        assert_eq!(launches(&state, &root, "wrap-").await, 1, "the wrap relaunched the root");
+        assert_eq!(
+            launches(&state, &root, "wrap-").await,
+            1,
+            "the wrap relaunched the root"
+        );
         let mut seen = None;
         for _ in 0..300 {
             seen = *runner.last_permission.lock().unwrap();

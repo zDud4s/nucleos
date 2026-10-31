@@ -341,7 +341,9 @@ fn split_go_dir<'a, 'b>(args: &'b [&'a str]) -> Result<(Option<&'a str>, &'b [&'
 /// directory. Answers the directory and whether the pattern covers everything below it.
 fn go_package_dir(pattern: &str, base: Option<&str>) -> Result<(String, bool), String> {
     if pattern != "." && !pattern.starts_with("./") {
-        return Err(format!("the go package {pattern:?} does not start with `./`"));
+        return Err(format!(
+            "the go package {pattern:?} does not start with `./`"
+        ));
     }
     let (dir, recursive) = match pattern.strip_suffix("/...") {
         Some(dir) => (dir, true),
@@ -1217,7 +1219,10 @@ mod tests {
                     "`needs` must name {bad:?}: {}",
                     parked.needs
                 );
-                assert!(calls.is_empty(), "{commands:?} ran before parking: {calls:?}");
+                assert!(
+                    calls.is_empty(),
+                    "{commands:?} ran before parking: {calls:?}"
+                );
             }
         }
     }
@@ -1361,6 +1366,9 @@ mod tests {
         .await;
 
         assert_eq!(run.exit_code, None);
-        assert!(!run.output.trim().is_empty(), "nothing explains the failure");
+        assert!(
+            !run.output.trim().is_empty(),
+            "nothing explains the failure"
+        );
     }
 }

@@ -36,7 +36,12 @@ mod tests {
         .unwrap();
     }
 
-    async fn insert_run(pool: &sqlx::SqlitePool, cost: Option<f64>, input: i64, output: i64) -> i64 {
+    async fn insert_run(
+        pool: &sqlx::SqlitePool,
+        cost: Option<f64>,
+        input: i64,
+        output: i64,
+    ) -> i64 {
         sqlx::query(
             "INSERT INTO runs (prompt, status, cost_usd, created_at, input_tokens, output_tokens, \
              cache_read_tokens, cache_creation_tokens) \
@@ -60,10 +65,12 @@ mod tests {
         for table in ["tree_budgets", "cache_waits", "wait_policy"] {
             assert!(tables.iter().any(|t| t == table), "missing table {table}");
         }
-        assert!(names(&pool, "view")
-            .await
-            .iter()
-            .any(|v| v == "tree_run_costs"));
+        assert!(
+            names(&pool, "view")
+                .await
+                .iter()
+                .any(|v| v == "tree_run_costs")
+        );
 
         let keep_warm: String =
             sqlx::query_scalar("SELECT value FROM wait_policy WHERE key = 'keep_warm_enabled'")
@@ -71,12 +78,11 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(keep_warm, "false");
-        let rotate: String = sqlx::query_scalar(
-            "SELECT value FROM wait_policy WHERE key = 'rotate_context_tokens'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let rotate: String =
+            sqlx::query_scalar("SELECT value FROM wait_policy WHERE key = 'rotate_context_tokens'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(rotate, "60000");
 
         // A budget with no ceiling keeps the default soft threshold.
@@ -88,12 +94,11 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        let (limit, soft): (Option<f64>, f64) = sqlx::query_as(
-            "SELECT limit_usd, soft_pct FROM tree_budgets WHERE tree_id = 'root-1'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let (limit, soft): (Option<f64>, f64) =
+            sqlx::query_as("SELECT limit_usd, soft_pct FROM tree_budgets WHERE tree_id = 'root-1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!((limit, soft), (None, 80.0));
     }
 

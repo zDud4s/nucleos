@@ -232,11 +232,12 @@ struct NodeReport {
 }
 
 async fn node_report(pool: &SqlitePool, node_id: &str) -> Result<NodeReport, String> {
-    let run: Option<Option<String>> = sqlx::query_scalar("SELECT run_id FROM work_nodes WHERE id = ?")
-        .bind(node_id)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| e.to_string())?;
+    let run: Option<Option<String>> =
+        sqlx::query_scalar("SELECT run_id FROM work_nodes WHERE id = ?")
+            .bind(node_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?;
     let Some(run_id) = run.flatten() else {
         return Ok(NodeReport {
             run_id: None,
@@ -244,7 +245,9 @@ async fn node_report(pool: &SqlitePool, node_id: &str) -> Result<NodeReport, Str
             result: None,
         });
     };
-    let live = run_is_live(pool, &run_id).await.map_err(|e| e.to_string())?;
+    let live = run_is_live(pool, &run_id)
+        .await
+        .map_err(|e| e.to_string())?;
     let result: Option<String> = sqlx::query_scalar(
         "SELECT result FROM tree_transitions WHERE node_id = ? AND transition = 'report' AND key = ?",
     )
@@ -291,7 +294,11 @@ async fn at_work(
 
     if branch.layer == "docs" {
         if branch.state == "building" {
-            let held = job.manifest.branches.get_mut(name).ok_or("branch vanished")?;
+            let held = job
+                .manifest
+                .branches
+                .get_mut(name)
+                .ok_or("branch vanished")?;
             apply_transition(held, "done").map_err(|e| e.to_string())?;
             persist(pool, job).await?;
         }
@@ -301,7 +308,11 @@ async fn at_work(
         let changed = has_diff(job, branch).await;
         match changed {
             Ok(false) => {
-                let held = job.manifest.branches.get_mut(name).ok_or("branch vanished")?;
+                let held = job
+                    .manifest
+                    .branches
+                    .get_mut(name)
+                    .ok_or("branch vanished")?;
                 apply_transition(held, "dropped").map_err(|e| e.to_string())?;
                 held.extra.insert(
                     "drop_reason".to_owned(),
@@ -488,7 +499,11 @@ async fn red(
 
     if report.live {
         // The fix was started and the daemon went down before it wrote `fixing`.
-        let held = job.manifest.branches.get_mut(name).ok_or("branch vanished")?;
+        let held = job
+            .manifest
+            .branches
+            .get_mut(name)
+            .ok_or("branch vanished")?;
         apply_transition(held, "fixing").map_err(|e| e.to_string())?;
         return persist(pool, job).await;
     }
@@ -519,7 +534,11 @@ async fn red(
         "\n\nThe gate failed on your branch with these findings:\n{findings}\n\nFix them, then finish the node again."
     );
     relaunch_node(state, &node, &run, &key, Some(&suffix)).await?;
-    let held = job.manifest.branches.get_mut(name).ok_or("branch vanished")?;
+    let held = job
+        .manifest
+        .branches
+        .get_mut(name)
+        .ok_or("branch vanished")?;
     apply_transition(held, "fixing").map_err(|e| e.to_string())?;
     persist(pool, job).await
 }
@@ -531,9 +550,9 @@ async fn repo_of(pool: &SqlitePool, job: &TreeJob) -> Result<ResolvedRepo, Strin
         .project_id
         .as_deref()
         .ok_or_else(|| format!("tree job {} has no project", job.id))?;
-    resolve_repo(pool, project)
-        .await
-        .map_err(|error| format!("could not resolve the repository of project {project}: {error:?}"))
+    resolve_repo(pool, project).await.map_err(|error| {
+        format!("could not resolve the repository of project {project}: {error:?}")
+    })
 }
 
 async fn merge(
@@ -579,7 +598,9 @@ async fn merge(
 /// Closes the node with the report its latest run left and the handoff file recorded for it, when it
 /// is open, its run is over and both exist. `Ok(false)` when there was nothing to close.
 async fn close_with_report(pool: &SqlitePool, node_id: &str) -> Result<bool, String> {
-    let node = work_nodes::get(pool, node_id).await.map_err(|e| e.to_string())?;
+    let node = work_nodes::get(pool, node_id)
+        .await
+        .map_err(|e| e.to_string())?;
     if node.closed_at.is_some() {
         return Ok(false);
     }
@@ -589,10 +610,7 @@ async fn close_with_report(pool: &SqlitePool, node_id: &str) -> Result<bool, Str
     if node_report(pool, node_id).await?.live || !CLOSE_STATUSES.contains(&report.as_str()) {
         return Ok(false);
     }
-    let Some(handoff) = node
-        .handoff_path
-        .filter(|path| Path::new(path).is_file())
-    else {
+    let Some(handoff) = node.handoff_path.filter(|path| Path::new(path).is_file()) else {
         return Ok(false);
     };
     let args = CloseArgs {
@@ -610,7 +628,9 @@ async fn close_with_report(pool: &SqlitePool, node_id: &str) -> Result<bool, Str
 
 /// The root is done when it is closed as `done`, or its run is over and reported `done`.
 async fn root_is_done(pool: &SqlitePool, root_id: &str) -> Result<bool, String> {
-    let node = work_nodes::get(pool, root_id).await.map_err(|e| e.to_string())?;
+    let node = work_nodes::get(pool, root_id)
+        .await
+        .map_err(|e| e.to_string())?;
     if node.closed_at.is_some() {
         return Ok(node.status == "done");
     }
@@ -620,7 +640,13 @@ async fn root_is_done(pool: &SqlitePool, root_id: &str) -> Result<bool, String> 
 
 async fn landing_step(state: &AppState, job: &mut TreeJob) -> Result<(), String> {
     let pool = &state.pool;
-    if job.manifest.extra.get("land_id").and_then(Value::as_i64).is_some() {
+    if job
+        .manifest
+        .extra
+        .get("land_id")
+        .and_then(Value::as_i64)
+        .is_some()
+    {
         let settled = settle_land(pool, job, Duration::ZERO)
             .await
             .map_err(|e| e.to_string())?;
@@ -644,7 +670,15 @@ async fn landing_step(state: &AppState, job: &mut TreeJob) -> Result<(), String>
         return finish_held(pool, job).await;
     }
     let repo = repo_of(pool, job).await?;
-    match land_job(pool, &repo, job, Instant::now() + OPERATION_TIMEOUT, Origin::Shell).await {
+    match land_job(
+        pool,
+        &repo,
+        job,
+        Instant::now() + OPERATION_TIMEOUT,
+        Origin::Shell,
+    )
+    .await
+    {
         Ok(_) => Ok(()),
         Err(LandingError::LandRefused(reason)) => {
             // `land_job` recorded it as `land_refusal`; the job stays open.
@@ -740,7 +774,10 @@ mod tests {
         commit_file(&repo, "feature.txt", "from the tree\n", "feature");
         for name in ["api", "web", "storage"] {
             let git_branch = format!("tree/{name}");
-            assert!(git_in(&repo, &["checkout", "-q", "-b", git_branch.as_str()]));
+            assert!(git_in(
+                &repo,
+                &["checkout", "-q", "-b", git_branch.as_str()]
+            ));
             commit_file(&repo, &format!("{name}.txt"), "from the branch\n", name);
             assert!(git_in(&repo, &["checkout", "-q", "feat/tree"]));
         }
@@ -903,7 +940,13 @@ mod tests {
         /// Saves the job with its root node (running, no run yet). `landing` is the manifest's
         /// landing mode; `None` leaves it absent.
         async fn seed_job(&self, id: &str, branches: Vec<Branch>, landing: Option<&str>) {
-            let mut manifest = Manifest::new(id, "feat/tree", "Ship it", &self.repo.to_string_lossy(), &[]);
+            let mut manifest = Manifest::new(
+                id,
+                "feat/tree",
+                "Ship it",
+                &self.repo.to_string_lossy(),
+                &[],
+            );
             for branch in branches {
                 manifest.branches.insert(branch.name.clone(), branch);
             }
@@ -962,13 +1005,15 @@ mod tests {
             let run = self.next_run.get() + 1;
             self.next_run.set(run);
             let pool = &self.state.pool;
-            sqlx::query("INSERT INTO runs (id, prompt, status, created_at) VALUES (?, 'seeded', ?, ?)")
-                .bind(run)
-                .bind(status)
-                .bind(STAMP)
-                .execute(pool)
-                .await
-                .unwrap();
+            sqlx::query(
+                "INSERT INTO runs (id, prompt, status, created_at) VALUES (?, 'seeded', ?, ?)",
+            )
+            .bind(run)
+            .bind(status)
+            .bind(STAMP)
+            .execute(pool)
+            .await
+            .unwrap();
             sqlx::query("UPDATE work_nodes SET run_id = ? WHERE id = ?")
                 .bind(run.to_string())
                 .bind(node)
@@ -1160,7 +1205,10 @@ mod tests {
 
         async fn assert_not_landing(&self, job: &str) {
             let stored = self.job(job).await;
-            assert!(!stored.manifest.extra.contains_key("land_id"), "no landing admitted");
+            assert!(
+                !stored.manifest.extra.contains_key("land_id"),
+                "no landing admitted"
+            );
             assert_eq!(stored.state, "open");
             assert_eq!(self.requests().await, 0, "nothing was queued");
         }
@@ -1172,8 +1220,12 @@ mod tests {
     async fn a_green_branch_is_submitted_then_settled_into_the_feature_branch() {
         const JOB: &str = "drv-merge";
         let fx = Fixture::new().await;
-        fx.seed_job(JOB, vec![code_branch("api", "green", Some("api-node"))], None)
-            .await;
+        fx.seed_job(
+            JOB,
+            vec![code_branch("api", "green", Some("api-node"))],
+            None,
+        )
+        .await;
         fx.add_node(JOB, "api-node", "orchestrator").await;
         fx.run_ended("api-node", Some("done")).await;
         let gate = FakeGate::answering(vec![]);
@@ -1208,11 +1260,18 @@ mod tests {
         let sha = merged.extra["merge_sha"].as_str().expect("the merge sha");
         assert_eq!(sha, sha_of(&fx.repo, "feat/tree"));
         assert_eq!(sha_of(&fx.repo, &format!("{sha}^2")), tip);
-        assert_eq!(sha_of(&fx.repo, "master"), master, "only the feature branch moved");
+        assert_eq!(
+            sha_of(&fx.repo, "master"),
+            master,
+            "only the feature branch moved"
+        );
         assert!(!merged.extra.contains_key("merge_request_id"));
         assert_eq!(fx.requests().await, 1, "settling queued nothing");
         let node = fx.node("api-node").await;
-        assert_eq!(node.status, "done", "the merged branch's node is closed with its report");
+        assert_eq!(
+            node.status, "done",
+            "the merged branch's node is closed with its report"
+        );
         assert!(node.closed_at.is_some());
     }
 
@@ -1274,7 +1333,10 @@ mod tests {
             assert_eq!(fx.branch(JOB, "api").await.state, "fixing");
             assert_eq!(fx.launches(NODE, "fix-").await, attempt as i64);
             let prompt = fx.prompt_of(fx.current_run(NODE).await).await;
-            assert!(prompt.contains(finding), "the relaunch carries the findings: {prompt:?}");
+            assert!(
+                prompt.contains(finding),
+                "the relaunch carries the findings: {prompt:?}"
+            );
             fx.relaunched_run_reports_done(NODE).await;
         }
 
@@ -1284,7 +1346,11 @@ mod tests {
         fx.tick(JOB, &gate).await;
 
         assert_eq!(fx.branch(JOB, "api").await.state, "parked");
-        assert_eq!(fx.launches(NODE, "fix-").await, 2, "the cap is two relaunches");
+        assert_eq!(
+            fx.launches(NODE, "fix-").await,
+            2,
+            "the cap is two relaunches"
+        );
         assert_eq!(gate.calls().len(), 3);
         let open: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM decisions WHERE tree_id = ? AND node_id = ? AND status = ?",
@@ -1296,11 +1362,12 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(open, 1, "parking opens one decision");
-        let question: String = sqlx::query_scalar("SELECT question FROM decisions WHERE node_id = ?")
-            .bind(NODE)
-            .fetch_one(&fx.state.pool)
-            .await
-            .unwrap();
+        let question: String =
+            sqlx::query_scalar("SELECT question FROM decisions WHERE node_id = ?")
+                .bind(NODE)
+                .fetch_one(&fx.state.pool)
+                .await
+                .unwrap();
         assert!(question.contains("boom-3"), "{question:?}");
     }
 
@@ -1308,7 +1375,8 @@ mod tests {
     async fn a_repeated_tick_queues_no_second_merge_and_writes_nothing() {
         const JOB: &str = "drv-replay";
         let fx = Fixture::new().await;
-        fx.seed_job(JOB, vec![code_branch("api", "green", None)], None).await;
+        fx.seed_job(JOB, vec![code_branch("api", "green", None)], None)
+            .await;
         let gate = FakeGate::answering(vec![]);
 
         fx.tick(JOB, &gate).await;
@@ -1319,7 +1387,11 @@ mod tests {
         fx.tick(JOB, &gate).await;
         fx.tick(JOB, &gate).await;
 
-        assert_eq!(fx.writes().await, Vec::<String>::new(), "a quiet tick writes nothing");
+        assert_eq!(
+            fx.writes().await,
+            Vec::<String>::new(),
+            "a quiet tick writes nothing"
+        );
         assert_eq!(fx.requests().await, 1, "no second merge was queued");
         assert_eq!(fx.job(JOB).await, before);
         assert!(gate.calls().is_empty());
@@ -1333,8 +1405,12 @@ mod tests {
         dependent.base = Some("storage".to_owned());
         // `api` sorts before `storage`, so a driver that walks the branches in name order meets the
         // dependent first.
-        fx.seed_job(JOB, vec![dependent, code_branch("storage", "green", None)], None)
-            .await;
+        fx.seed_job(
+            JOB,
+            vec![dependent, code_branch("storage", "green", None)],
+            None,
+        )
+        .await;
         let gate = FakeGate::answering(vec![]);
 
         fx.tick(JOB, &gate).await;
@@ -1346,7 +1422,12 @@ mod tests {
             .await
             .unwrap();
         assert!(args.contains("tree/storage"), "{args}");
-        assert!(!fx.branch(JOB, "storage").await.extra.contains_key("merge_sha"));
+        assert!(
+            !fx.branch(JOB, "storage")
+                .await
+                .extra
+                .contains_key("merge_sha")
+        );
         let waiting = fx.branch(JOB, "api").await;
         assert_eq!(waiting.state, "green");
         assert!(!waiting.extra.contains_key("merge_request_id"));
@@ -1356,13 +1437,20 @@ mod tests {
         fx.tick(JOB, &gate).await;
 
         assert_eq!(fx.branch(JOB, "storage").await.state, "merged");
-        assert_eq!(fx.requests().await, 2, "the dependent is queued once its base is merged");
+        assert_eq!(
+            fx.requests().await,
+            2,
+            "the dependent is queued once its base is merged"
+        );
         fx.drain().await;
         fx.tick(JOB, &gate).await;
         fx.tick(JOB, &gate).await;
 
         assert_eq!(fx.branch(JOB, "api").await.state, "merged");
-        assert!(git_in(&fx.repo, &["cat-file", "-e", "feat/tree:storage.txt"]));
+        assert!(git_in(
+            &fx.repo,
+            &["cat-file", "-e", "feat/tree:storage.txt"]
+        ));
         assert!(git_in(&fx.repo, &["cat-file", "-e", "feat/tree:api.txt"]));
     }
 
@@ -1374,7 +1462,10 @@ mod tests {
         let fx = Fixture::new().await;
         fx.seed_job(
             JOB,
-            vec![merged_branch("api", None), code_branch("web", "dropped", None)],
+            vec![
+                merged_branch("api", None),
+                code_branch("web", "dropped", None),
+            ],
             Some("integration"),
         )
         .await;
@@ -1395,7 +1486,14 @@ mod tests {
         fx.tick(JOB, &gate).await;
 
         let landing = fx.job(JOB).await;
-        assert!(landing.manifest.extra.get("land_id").and_then(Value::as_i64).is_some());
+        assert!(
+            landing
+                .manifest
+                .extra
+                .get("land_id")
+                .and_then(Value::as_i64)
+                .is_some()
+        );
         assert_eq!(fx.requests().await, 1);
         assert_eq!(landing.state, "open", "admitted is not landed");
     }
@@ -1408,7 +1506,8 @@ mod tests {
 
         // An absent mode is a hold, and so is the explicit one.
         for (job, landing) in [("drv-held-default", None), ("drv-held-hold", Some("hold"))] {
-            fx.seed_job(job, vec![merged_branch("api", None)], landing).await;
+            fx.seed_job(job, vec![merged_branch("api", None)], landing)
+                .await;
             fx.root_done(job).await;
 
             fx.tick(job, &gate).await;
@@ -1419,7 +1518,10 @@ mod tests {
             assert_eq!(held.manifest.extra["landing"], json!("held"), "{job}");
             assert!(!fx.open_jobs().await.contains(&job.to_owned()), "{job}");
             let root = fx.node(&root_node_of(job)).await;
-            assert_eq!(root.status, "done", "{job}: the root closes with its report");
+            assert_eq!(
+                root.status, "done",
+                "{job}: the root closes with its report"
+            );
             assert!(root.closed_at.is_some());
         }
 
@@ -1448,13 +1550,27 @@ mod tests {
         fx.tick(JOB, &gate).await;
 
         let admitted = fx.job(JOB).await;
-        assert!(admitted.manifest.extra.get("land_id").and_then(Value::as_i64).is_some());
+        assert!(
+            admitted
+                .manifest
+                .extra
+                .get("land_id")
+                .and_then(Value::as_i64)
+                .is_some()
+        );
         assert_eq!(admitted.state, "open", "admitted is not landed");
         assert_eq!(fx.requests().await, 1);
-        assert_eq!(sha_of(&fx.repo, "master"), master, "the queue has not run yet");
+        assert_eq!(
+            sha_of(&fx.repo, "master"),
+            master,
+            "the queue has not run yet"
+        );
         let child = fx.node("api-node").await;
         let root = fx.node(&root_node_of(JOB)).await;
-        assert_eq!((child.status.as_str(), root.status.as_str()), ("done", "done"));
+        assert_eq!(
+            (child.status.as_str(), root.status.as_str()),
+            ("done", "done")
+        );
         assert!(
             child.closed_at.expect("the child closed") <= root.closed_at.expect("the root closed"),
             "children close before the root"
@@ -1511,7 +1627,8 @@ mod tests {
         let gate = FakeGate::answering(vec![]);
 
         // The daemon that ran before queued a merge and went down before it saw the outcome.
-        fx.seed_job(MERGING, vec![code_branch("api", "green", None)], None).await;
+        fx.seed_job(MERGING, vec![code_branch("api", "green", None)], None)
+            .await;
         let mut stale = fx.job(MERGING).await;
         submit_merge(pool, &resolved, &mut stale, "api", Origin::Daemon)
             .await
@@ -1523,25 +1640,42 @@ mod tests {
 
         let merged = fx.branch(MERGING, "api").await;
         assert_eq!(merged.state, "merged", "the stored request id is settled");
-        assert_eq!(merged.extra["merge_sha"], json!(sha_of(&fx.repo, "feat/tree")));
+        assert_eq!(
+            merged.extra["merge_sha"],
+            json!(sha_of(&fx.repo, "feat/tree"))
+        );
         assert_eq!(fx.requests().await, 1, "no second merge was queued");
 
         // And one admitted a landing and went down before it saw that outcome.
         assert!(git_in(&fx.repo, &["checkout", "-q", "master"]));
         let feature = sha_of(&fx.repo, "feat/tree");
-        fx.seed_job(LANDING, vec![merged_branch("api", None)], Some("integration"))
-            .await;
+        fx.seed_job(
+            LANDING,
+            vec![merged_branch("api", None)],
+            Some("integration"),
+        )
+        .await;
         fx.root_done(LANDING).await;
         let mut stale = fx.job(LANDING).await;
-        land_job(pool, &resolved, &mut stale, Instant::now() + OPERATION_TIMEOUT, Origin::Daemon)
-            .await
-            .unwrap();
+        land_job(
+            pool,
+            &resolved,
+            &mut stale,
+            Instant::now() + OPERATION_TIMEOUT,
+            Origin::Daemon,
+        )
+        .await
+        .unwrap();
         fx.drain().await;
         assert_eq!(fx.requests().await, 2);
 
         fx.tick(LANDING, &gate).await;
 
-        assert_eq!(fx.job(LANDING).await.state, "finished", "the stored land id is settled");
+        assert_eq!(
+            fx.job(LANDING).await.state,
+            "finished",
+            "the stored land id is settled"
+        );
         assert_eq!(sha_of(&fx.repo, "master^2"), feature);
         assert_eq!(fx.requests().await, 2, "no second landing was queued");
     }
@@ -1552,8 +1686,12 @@ mod tests {
         let fx = Fixture::new().await;
         // The pool has one connection, so a queue call that needs one while the tick holds it never
         // returns; the timeout turns that into a failure.
-        fx.seed_job(JOB, vec![code_branch("api", "green", None)], Some("integration"))
-            .await;
+        fx.seed_job(
+            JOB,
+            vec![code_branch("api", "green", None)],
+            Some("integration"),
+        )
+        .await;
         fx.root_done(JOB).await;
         let gate = FakeGate::answering(vec![]);
         let limit = Duration::from_secs(20);
@@ -1579,7 +1717,14 @@ mod tests {
 
         assert_eq!(fx.branch(JOB, "api").await.state, "merged");
         let landing = fx.job(JOB).await;
-        assert!(landing.manifest.extra.get("land_id").and_then(Value::as_i64).is_some());
+        assert!(
+            landing
+                .manifest
+                .extra
+                .get("land_id")
+                .and_then(Value::as_i64)
+                .is_some()
+        );
         assert_eq!(fx.requests().await, 2);
     }
 
@@ -1587,8 +1732,12 @@ mod tests {
     async fn a_tick_does_not_wait_for_a_gate_in_progress() {
         const JOB: &str = "drv-slow-gate";
         let fx = Fixture::new().await;
-        fx.seed_job(JOB, vec![code_branch("api", "building", Some("api-node"))], None)
-            .await;
+        fx.seed_job(
+            JOB,
+            vec![code_branch("api", "building", Some("api-node"))],
+            None,
+        )
+        .await;
         fx.add_node(JOB, "api-node", "orchestrator").await;
         fx.run_ended("api-node", Some("done")).await;
         let (gate, release) = FakeGate::held(GateVerdict::Green);
@@ -1600,7 +1749,11 @@ mod tests {
         fx.tick_within(JOB, &gate, short).await;
 
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(gate.calls().len(), 1, "a gate in progress is not started a second time");
+        assert_eq!(
+            gate.calls().len(),
+            1,
+            "a gate in progress is not started a second time"
+        );
         assert_eq!(fx.branch(JOB, "api").await.state, "building");
         assert_eq!(fx.requests().await, 0);
 

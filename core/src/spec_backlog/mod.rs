@@ -8,6 +8,7 @@ pub mod finish;
 pub mod http;
 pub mod model;
 pub mod prompts;
+mod review;
 pub mod scan;
 pub mod store;
 pub mod verdict;
@@ -42,10 +43,12 @@ mod tests {
         ] {
             assert!(indexes.iter().any(|i| i == index), "missing index {index}");
         }
-        assert!(names(&pool, "view")
-            .await
-            .iter()
-            .any(|v| v == "owner_decisions"));
+        assert!(
+            names(&pool, "view")
+                .await
+                .iter()
+                .any(|v| v == "owner_decisions")
+        );
 
         // The view lists a spec question with its origin.
         sqlx::query(

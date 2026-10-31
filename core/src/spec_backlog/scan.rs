@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 
 use super::model::Spec;
-use super::store::{upsert_by_path, StoreError};
+use super::store::{StoreError, upsert_by_path};
 
 pub struct ScanRoots {
     pub project_root: Option<PathBuf>,
@@ -28,33 +28,54 @@ pub enum ScanError {
 }
 
 impl From<std::io::Error> for ScanError {
-    fn from(error: std::io::Error) -> Self { Self::Io(error) }
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
 }
 
 impl From<StoreError> for ScanError {
-    fn from(error: StoreError) -> Self { Self::Store(error) }
+    fn from(error: StoreError) -> Self {
+        Self::Store(error)
+    }
 }
 
 pub fn content_sha(bytes: &[u8]) -> String {
-    Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 pub fn resolve_stored_path(roots: &ScanRoots, stored: &str) -> Option<PathBuf> {
     if let Some(path) = stored.strip_prefix(".ai/specs/") {
-        return roots.project_root.as_ref().map(|root| root.join(".ai").join("specs").join(path));
+        return roots
+            .project_root
+            .as_ref()
+            .map(|root| root.join(".ai").join("specs").join(path));
     }
     stored.strip_prefix("<state_dir>/specs/").and_then(|path| {
-        roots.state_dir.as_ref().map(|root| root.join("specs").join(path))
+        roots
+            .state_dir
+            .as_ref()
+            .map(|root| root.join("specs").join(path))
     })
 }
 
 fn title(bytes: &[u8], fallback: &str) -> String {
-    std::str::from_utf8(bytes).ok().and_then(|text| {
-        text.lines().find_map(|line| line.strip_prefix("# ").map(str::to_owned))
-    }).unwrap_or_else(|| fallback.to_owned())
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .find_map(|line| line.strip_prefix("# ").map(str::to_owned))
+        })
+        .unwrap_or_else(|| fallback.to_owned())
 }
 
-pub async fn scan(pool: &SqlitePool, project_id: Option<&str>, roots: &ScanRoots) -> Result<ScanReport, ScanError> {
+pub async fn scan(
+    pool: &SqlitePool,
+    project_id: Option<&str>,
+    roots: &ScanRoots,
+) -> Result<ScanReport, ScanError> {
     let mut files = Vec::new();
     if let Some(root) = &roots.project_root {
         files.push((root.join(".ai").join("specs"), ".ai/specs/".to_owned()));
@@ -72,19 +93,34 @@ pub async fn scan(pool: &SqlitePool, project_id: Option<&str>, roots: &ScanRoots
         for entry in entries {
             let entry = entry?;
             let path = entry.path();
-            if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("md") { continue; }
+            if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+                continue;
+            }
             let name = entry.file_name().to_string_lossy().into_owned();
             discovered.push((format!("{prefix}{name}"), path, name));
         }
     }
     discovered.sort_by(|left, right| left.0.cmp(&right.0));
-    let mut report = ScanReport { specs: Vec::new(), new: 0, changed: 0, unchanged: 0 };
+    let mut report = ScanReport {
+        specs: Vec::new(),
+        new: 0,
+        changed: 0,
+        unchanged: 0,
+    };
     for (stored_path, path, name) in discovered {
         let bytes = fs::read(&path);
         let bytes = bytes?;
         let sha = content_sha(&bytes);
-        let previous = super::store::get_spec(pool, &super::model::spec_id(project_id, &stored_path)).await?;
-        let spec = upsert_by_path(pool, project_id, &stored_path, &title(&bytes, name.trim_end_matches(".md")), &sha).await?;
+        let previous =
+            super::store::get_spec(pool, &super::model::spec_id(project_id, &stored_path)).await?;
+        let spec = upsert_by_path(
+            pool,
+            project_id,
+            &stored_path,
+            &title(&bytes, name.trim_end_matches(".md")),
+            &sha,
+        )
+        .await?;
         match previous {
             None => report.new += 1,
             Some(old) if old.content_sha == sha => report.unchanged += 1,
@@ -99,7 +135,7 @@ pub async fn scan(pool: &SqlitePool, project_id: Option<&str>, roots: &ScanRoots
 mod tests {
     use super::*;
     use crate::spec_backlog::model::{
-        spec_id, CriterionKind, CriterionStatus, NewCriterion, Spec, SpecKind, SpecStatus,
+        CriterionKind, CriterionStatus, NewCriterion, Spec, SpecKind, SpecStatus, spec_id,
     };
     use crate::spec_backlog::store::{get_spec, list_criteria, replace_criteria};
     use sha2::{Digest, Sha256};
@@ -347,9 +383,14 @@ mod tests {
         let roots = roots_at(project.path(), state.path());
         scan(&pool, PROJECT, &roots).await.unwrap();
         let id = spec_id(PROJECT, ".ai/specs/alpha.md");
-        replace_criteria(&pool, &id, &sha_hex(version_1), &open_items(&["one", "two"]))
-            .await
-            .unwrap();
+        replace_criteria(
+            &pool,
+            &id,
+            &sha_hex(version_1),
+            &open_items(&["one", "two"]),
+        )
+        .await
+        .unwrap();
         mark_extracted(&pool, &id).await;
 
         fs::write(&file, version_2).unwrap();
@@ -363,9 +404,11 @@ mod tests {
         assert_eq!(spec.content_sha, sha_hex(version_2));
         let criteria = list_criteria(&pool, &id).await.unwrap();
         assert_eq!(criteria.len(), 2);
-        assert!(criteria
-            .iter()
-            .all(|criterion| criterion.status == CriterionStatus::Stale));
+        assert!(
+            criteria
+                .iter()
+                .all(|criterion| criterion.status == CriterionStatus::Stale)
+        );
     }
 
     #[tokio::test]
@@ -445,21 +488,33 @@ mod tests {
         let state_file = Path::new("state").join("specs").join("x.md");
 
         let both = roots_at(Path::new("proj"), Path::new("state"));
-        assert_eq!(resolve_stored_path(&both, project_path), Some(project_file.clone()));
-        assert_eq!(resolve_stored_path(&both, state_path), Some(state_file.clone()));
+        assert_eq!(
+            resolve_stored_path(&both, project_path),
+            Some(project_file.clone())
+        );
+        assert_eq!(
+            resolve_stored_path(&both, state_path),
+            Some(state_file.clone())
+        );
 
         let no_project = ScanRoots {
             project_root: None,
             state_dir: Some(PathBuf::from("state")),
         };
         assert_eq!(resolve_stored_path(&no_project, project_path), None);
-        assert_eq!(resolve_stored_path(&no_project, state_path), Some(state_file));
+        assert_eq!(
+            resolve_stored_path(&no_project, state_path),
+            Some(state_file)
+        );
 
         let no_state = ScanRoots {
             project_root: Some(PathBuf::from("proj")),
             state_dir: None,
         };
         assert_eq!(resolve_stored_path(&no_state, state_path), None);
-        assert_eq!(resolve_stored_path(&no_state, project_path), Some(project_file));
+        assert_eq!(
+            resolve_stored_path(&no_state, project_path),
+            Some(project_file)
+        );
     }
 }

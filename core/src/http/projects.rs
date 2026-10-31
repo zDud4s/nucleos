@@ -40,7 +40,10 @@ pub(super) fn routes() -> Router<AppState> {
         // Repairing points an existing daemon project back at its main checkout. It is deliberately
         // outside the scope tables: changing where a project runs is an owner-only operation.
         .route("/projects/{id}/repair", post(post_project_repair))
-        .route("/projects/{id}/repair/begin", post(post_project_repair_begin))
+        .route(
+            "/projects/{id}/repair/begin",
+            post(post_project_repair_begin),
+        )
         .route("/projects/{id}/readings", get(get_project_readings))
         .route("/projects/{id}/tests-map", get(get_project_tests_map))
         // Control/admin only: absent from the `auth.rs` scope tables; the handler re-checks the owner.
@@ -227,12 +230,14 @@ async fn repair_project_exists(
     state: &AppState,
     id: &str,
 ) -> Result<bool, (StatusCode, Json<serde_json::Value>)> {
-    sqlx::query_scalar::<_, i64>("SELECT EXISTS(SELECT 1 FROM autopilot_state WHERE project_id = ?)")
-        .bind(id)
-        .fetch_one(&state.pool)
-        .await
-        .map(|exists| exists != 0)
-        .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))
+    sqlx::query_scalar::<_, i64>(
+        "SELECT EXISTS(SELECT 1 FROM autopilot_state WHERE project_id = ?)",
+    )
+    .bind(id)
+    .fetch_one(&state.pool)
+    .await
+    .map(|exists| exists != 0)
+    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))
 }
 
 /// Points an existing roster entry at the main checkout that now contains it.
@@ -256,7 +261,10 @@ pub(super) async fn post_project_repair(
 
     let named = std::path::PathBuf::from(body.project_root);
     if !named.is_absolute() {
-        return Err(refusal(StatusCode::UNPROCESSABLE_ENTITY, "path_not_absolute"));
+        return Err(refusal(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "path_not_absolute",
+        ));
     }
     let canonical = tokio::fs::canonicalize(&named)
         .await
@@ -281,13 +289,12 @@ pub(super) async fn post_project_repair(
     let project_root = crate::execution::git_exec::without_verbatim_prefix(&canonical)
         .to_string_lossy()
         .into_owned();
-    let previous_root: Option<String> = sqlx::query_scalar(
-        "SELECT project_root FROM autopilot_state WHERE project_id = ?",
-    )
-    .bind(&id)
-    .fetch_one(&state.pool)
-    .await
-    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?;
+    let previous_root: Option<String> =
+        sqlx::query_scalar("SELECT project_root FROM autopilot_state WHERE project_id = ?")
+            .bind(&id)
+            .fetch_one(&state.pool)
+            .await
+            .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?;
     sqlx::query("UPDATE autopilot_state SET project_root = ? WHERE project_id = ?")
         .bind(&project_root)
         .bind(&id)
@@ -329,9 +336,8 @@ pub(super) async fn post_project_repair_begin(
         .lease_secs
         .unwrap_or(DEFAULT_REPAIR_LEASE_SECS)
         .clamp(1, MAX_REPAIR_LEASE_SECS);
-    let expires_at_ms = repair_now_ms().saturating_add(
-        i64::try_from(lease_secs.saturating_mul(1_000)).unwrap_or(i64::MAX),
-    );
+    let expires_at_ms = repair_now_ms()
+        .saturating_add(i64::try_from(lease_secs.saturating_mul(1_000)).unwrap_or(i64::MAX));
     sqlx::query(
         "INSERT INTO project_repair_leases (singleton, expires_at_ms) VALUES (1, ?) \
          ON CONFLICT(singleton) DO UPDATE SET expires_at_ms = excluded.expires_at_ms",
@@ -352,11 +358,10 @@ pub(super) async fn post_project_repair_begin(
 pub(super) async fn live_repair_wait(
     pool: &sqlx::SqlitePool,
 ) -> Result<Option<std::time::Duration>, sqlx::Error> {
-    let expires_at_ms: Option<i64> = sqlx::query_scalar(
-        "SELECT expires_at_ms FROM project_repair_leases WHERE singleton = 1",
-    )
-    .fetch_optional(pool)
-    .await?;
+    let expires_at_ms: Option<i64> =
+        sqlx::query_scalar("SELECT expires_at_ms FROM project_repair_leases WHERE singleton = 1")
+            .fetch_optional(pool)
+            .await?;
     Ok(expires_at_ms.and_then(|expires_at_ms| {
         let remaining_ms = expires_at_ms.saturating_sub(repair_now_ms());
         (remaining_ms > 0).then(|| std::time::Duration::from_millis(remaining_ms as u64))

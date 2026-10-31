@@ -165,11 +165,7 @@ mod tests {
     fn single_child_with_same_scope_is_refused_as_chain() {
         // G2: it would be the parent's only child, on the parent's whole scope:
         // that is a handoff, not a split.
-        let chain = [ancestor(
-            &["src/a.rs", "src/b.rs"],
-            "split the module",
-            0,
-        )];
+        let chain = [ancestor(&["src/a.rs", "src/b.rs"], "split the module", 0)];
         let args = child(&["src/a.rs", "src/b.rs"], "write the parser");
 
         assert_eq!(
@@ -214,11 +210,7 @@ mod tests {
         assert_eq!(limits.max_nodes, 300);
 
         // Scope and goal are both acceptable: only the total can refuse.
-        let chain = [ancestor(
-            &["src/a.rs", "src/b.rs"],
-            "split the module",
-            1,
-        )];
+        let chain = [ancestor(&["src/a.rs", "src/b.rs"], "split the module", 1)];
         let args = child(&["src/a.rs"], "write the parser");
 
         assert_eq!(check_child(&chain, &args, 299, &limits), Ok(()));
@@ -287,11 +279,7 @@ mod tests {
     #[test]
     fn same_scope_ignores_order_and_duplicates() {
         let limits = TreeLimits::default();
-        let chain = [ancestor(
-            &["src/a.rs", "src/b.rs"],
-            "split the module",
-            1,
-        )];
+        let chain = [ancestor(&["src/a.rs", "src/b.rs"], "split the module", 1)];
 
         assert_eq!(
             check_child(

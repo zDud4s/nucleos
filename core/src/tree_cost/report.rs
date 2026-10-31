@@ -328,8 +328,14 @@ mod tests {
 
         let report = cache_report(&pool).await.unwrap();
 
-        assert_eq!(count_of(&report.gap_counts.value, GapBucket::Under5), (20, 0));
-        assert_eq!(count_of(&report.gap_counts.value, GapBucket::Over65), (20, 20));
+        assert_eq!(
+            count_of(&report.gap_counts.value, GapBucket::Under5),
+            (20, 0)
+        );
+        assert_eq!(
+            count_of(&report.gap_counts.value, GapBucket::Over65),
+            (20, 20)
+        );
         assert_eq!(report.effective_ttl_s.value, Some(3900));
     }
 

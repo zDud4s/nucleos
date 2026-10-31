@@ -108,6 +108,28 @@ pub const WRITE_TOOLS: &[&str] = &["Edit", "Write", "NotebookEdit"];
 /// declined delegation.
 const SUBAGENT_TOOLS: &[&str] = &["Agent", "Task"];
 
+/// The daemon's own bookkeeping and verification tools a tree agent calls (`ROOT_PROTOCOL`, the
+/// orchestrate-node skill): the `WORKTREE_BOX_TOOLS` it is served. Exact full names only, so a
+/// longer name that merely starts with one, a nested `mcp__nucleos__x__...` spelling and another
+/// server's `node_close` all stay `unrecognized-tool`.
+///
+/// **Allowed because the door behind each tool is the real gate.** A call lands on a daemon route
+/// that checks the run key's scope (`auth::tree_run_admits` for the tree and node routes), so the
+/// classifier admitting the tool call does not widen what the run may do: a key bound to no node,
+/// or to another tree, takes a 403 from the route. Left unrecognized, an unattended tree run was
+/// refused every one of them and could neither delegate nor close its node.
+const TREE_AGENT_TOOLS: &[&str] = &[
+    "mcp__nucleos__tree_branch_start",
+    "mcp__nucleos__node_open",
+    "mcp__nucleos__node_update",
+    "mcp__nucleos__node_close",
+    "mcp__nucleos__node_tree",
+    "mcp__nucleos__node_active",
+    "mcp__nucleos__record",
+    "mcp__nucleos__verify",
+    "mcp__nucleos__verify_status",
+];
+
 /// Files whose CONTENTS are the policy, matched as a path suffix wherever they sit.
 ///
 /// This machine's settings (`voice.yaml`'s `stt_command`, a string the daemon spawns on a hotkey
@@ -677,6 +699,16 @@ pub fn classify(
             "allow",
             "subagent",
             "starting a subagent is allowed; its own tool calls are classified the same way",
+        );
+    }
+
+    // Its own class, so the scoreboard shows the tree agent's calls to the daemon apart from file
+    // reads and apart from the genuinely unrecognized tools.
+    if TREE_AGENT_TOOLS.contains(&tool_name) {
+        return classification(
+            "allow",
+            "nucleos-tree",
+            "the tree agent's own daemon tools are allowed; the daemon's door scopes each call",
         );
     }
 
@@ -6550,6 +6582,49 @@ mod tests {
             );
         }
         for tool in ["WebFetch", "WebSearch", "mcp__github__create_issue"] {
+            assert_classification(
+                classify(tool, &json!({}), Some(Path::new("C:/work/repo"))),
+                "pending_approval",
+                "unrecognized-tool",
+            );
+        }
+    }
+
+    /// The tools a tree agent calls per `ROOT_PROTOCOL` and the orchestrate-node skill. They are the
+    /// daemon's own bookkeeping and verification doors (`WORKTREE_BOX_TOOLS`), and while they classify
+    /// as `unrecognized-tool` an autonomous tree run is refused every one of them, so a root can
+    /// neither delegate (`tree_branch_start`) nor close (`node_close`).
+    #[test]
+    fn the_tree_agents_nucleos_tools_are_not_unrecognized() {
+        for name in [
+            "tree_branch_start",
+            "node_open",
+            "node_update",
+            "node_close",
+            "node_tree",
+            "node_active",
+            "record",
+            "verify",
+            "verify_status",
+        ] {
+            let tool = format!("mcp__nucleos__{name}");
+            let result = classify(&tool, &json!({}), Some(Path::new("C:/work/repo")));
+            assert_ne!(result.action_class, "unrecognized-tool", "{tool}");
+            assert_eq!(result.decision.decision, "allow", "{tool}");
+        }
+    }
+
+    /// The allowance is for the exact `mcp__nucleos__<name>` spelling of the listed tools: a nucleos
+    /// tool nobody listed, a different server's `node_close`, and a longer name that merely starts
+    /// with a listed one all stay unrecognized.
+    #[test]
+    fn only_the_listed_nucleos_tools_leave_unrecognized() {
+        for tool in [
+            "mcp__nucleos__something_else",
+            "mcp__other__node_close",
+            "mcp__nucleos__node_close_all",
+            "mcp__nucleos__x__node_close",
+        ] {
             assert_classification(
                 classify(tool, &json!({}), Some(Path::new("C:/work/repo"))),
                 "pending_approval",

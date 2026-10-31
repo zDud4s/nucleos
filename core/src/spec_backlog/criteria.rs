@@ -110,7 +110,11 @@ pub fn parse(raw: &str, known_paths: &[String]) -> Result<Extraction, ParseError
         let verify_hint = match item.get("verify_hint") {
             Some(Value::Null) => None,
             Some(Value::String(hint)) => Some(hint.trim().to_string()).filter(|h| !h.is_empty()),
-            _ => return shape(format!("criterion {index} needs `verify_hint` (string or null)")),
+            _ => {
+                return shape(format!(
+                    "criterion {index} needs `verify_hint` (string or null)"
+                ));
+            }
         };
         let ambiguous = match item.get("ambiguous") {
             None | Some(Value::Null) => false,
@@ -165,9 +169,9 @@ pub fn parse(raw: &str, known_paths: &[String]) -> Result<Extraction, ParseError
 
 #[cfg(test)]
 mod tests {
-    use super::{parse, Extraction, ParseError};
+    use super::{Extraction, ParseError, parse};
     use crate::spec_backlog::model::{CriterionKind, CriterionStatus, SpecKind};
-    use crate::spec_backlog::prompts::{extraction_prompt, split_sections, MAX_SPEC_CHARS};
+    use crate::spec_backlog::prompts::{MAX_SPEC_CHARS, extraction_prompt, split_sections};
 
     const KNOWN_DEP: &str = ".ai/specs/known.md";
     const UNKNOWN_DEP: &str = ".ai/specs/ghost.md";
@@ -292,9 +296,11 @@ mod tests {
 
         assert_eq!(extraction.depends_on, vec![KNOWN_DEP.to_string()]);
         assert_eq!(extraction.questions.len(), 2, "{:?}", extraction.questions);
-        assert!(extraction
-            .questions
-            .contains(&"Which branch lands this?".to_string()));
+        assert!(
+            extraction
+                .questions
+                .contains(&"Which branch lands this?".to_string())
+        );
         assert!(
             extraction.questions.iter().any(|q| q.contains(UNKNOWN_DEP)),
             "no question names the unknown path: {:?}",
@@ -410,7 +416,8 @@ mod tests {
         assert_eq!(sections.concat(), with_preamble);
 
         // No preamble: no empty element ahead of the first heading.
-        let without_preamble = format!("## First\n{filler}\n## Second\n{filler}\n## Third\n{filler}\n");
+        let without_preamble =
+            format!("## First\n{filler}\n## Second\n{filler}\n## Third\n{filler}\n");
         let sections = split_sections(&without_preamble);
         assert_eq!(sections.len(), 3);
         assert!(sections.iter().all(|section| section.starts_with("## ")));
@@ -429,7 +436,10 @@ mod tests {
 
         // The limit is inclusive: exactly at it is one element, one char over it splits.
         let head = "## First\nbody\n## Second\n";
-        let at_limit = format!("{head}{}", "y".repeat(MAX_SPEC_CHARS - head.chars().count()));
+        let at_limit = format!(
+            "{head}{}",
+            "y".repeat(MAX_SPEC_CHARS - head.chars().count())
+        );
         assert_eq!(at_limit.chars().count(), MAX_SPEC_CHARS);
         assert_eq!(split_sections(&at_limit), vec![at_limit.clone()]);
 

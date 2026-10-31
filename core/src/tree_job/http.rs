@@ -78,7 +78,10 @@ fn required(field: &str, value: Option<String>) -> Result<String, Refusal> {
 
 fn db_refusal(error: sqlx::Error) -> Refusal {
     tracing::warn!(%error, "tree job storage failed");
-    refuse(StatusCode::INTERNAL_SERVER_ERROR, format!("database error: {error}"))
+    refuse(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("database error: {error}"),
+    )
 }
 
 fn store_refusal(error: StoreError) -> Refusal {
@@ -207,17 +210,17 @@ pub fn overlap_outside_base_chain(
         next = branch.base.as_deref();
     }
     let mut rest = manifest.clone();
-    rest.branches.retain(|name, _| !chain.contains(name.as_str()));
+    rest.branches
+        .retain(|name, _| !chain.contains(name.as_str()));
     overlapping_branch(&rest, paths)
 }
 
 /// `tree.floor_gb` and `tree.max_live_branches` of the project's `speed.yaml`, else the defaults.
 pub(super) fn tree_limits(project_root: &str) -> (f64, usize) {
-    let doc = std::fs::read_to_string(
-        FsPath::new(project_root).join(".nucleos/workflow/speed.yaml"),
-    )
-    .ok()
-    .and_then(|text| serde_yaml::from_str::<serde_yaml::Value>(&text).ok());
+    let doc =
+        std::fs::read_to_string(FsPath::new(project_root).join(".nucleos/workflow/speed.yaml"))
+            .ok()
+            .and_then(|text| serde_yaml::from_str::<serde_yaml::Value>(&text).ok());
     let tree = doc.as_ref().and_then(|doc| doc.get("tree"));
     let floor = tree
         .and_then(|tree| tree.get("floor_gb"))
@@ -264,7 +267,12 @@ pub(super) async fn live_sizes_gb(manifest: &Manifest) -> BTreeMap<String, f64> 
     tokio::task::spawn_blocking(move || {
         targets
             .into_iter()
-            .map(|(name, dir)| (name, dir_size_bytes(FsPath::new(&dir)) as f64 / BYTES_PER_GB))
+            .map(|(name, dir)| {
+                (
+                    name,
+                    dir_size_bytes(FsPath::new(&dir)) as f64 / BYTES_PER_GB,
+                )
+            })
             .collect::<BTreeMap<String, f64>>()
     })
     .await
@@ -378,7 +386,9 @@ async fn post_tree(
         created_at: created.clone(),
         updated_at: created,
     };
-    store::save(&state.pool, &job).await.map_err(store_refusal)?;
+    store::save(&state.pool, &job)
+        .await
+        .map_err(store_refusal)?;
     sqlx::query("UPDATE work_nodes SET tree_job_id = ? WHERE id = ?")
         .bind(&id)
         .bind(&opened.id)
@@ -391,9 +401,12 @@ async fn post_tree(
     // says why.
     if let Err(reason) = crate::tree_job::root::start(&state, &job).await {
         tracing::warn!(job = %job.id, %reason, "tree job root run did not start");
-        let line = format!("tree job {} is open but its root run did not start: {reason}", job.id);
-        let _ = crate::feed::append(&state.pool, None, ROOT_START_FAILED_KIND, &line, None, None)
-            .await;
+        let line = format!(
+            "tree job {} is open but its root run did not start: {reason}",
+            job.id
+        );
+        let _ =
+            crate::feed::append(&state.pool, None, ROOT_START_FAILED_KIND, &line, None, None).await;
     }
     Ok(Json(summary(&job, false)))
 }
@@ -494,13 +507,14 @@ async fn post_branch(
     let free_disk_gb = if layer == DOCS_LAYER {
         0.0
     } else {
-        crate::health::available_space(FsPath::new(&job.manifest.project_root))
-            .map_err(|error| {
+        crate::health::available_space(FsPath::new(&job.manifest.project_root)).map_err(
+            |error| {
                 refuse(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("could not read the free disk space: {error}"),
                 )
-            })? as f64
+            },
+        )? as f64
             / BYTES_PER_GB
     };
     let sizes = live_sizes_gb(&job.manifest).await;
@@ -525,7 +539,9 @@ async fn post_branch(
     let queued = branch.state.clone();
     job.manifest.branches.insert(name.clone(), branch);
     job.updated_at = now();
-    store::update(&state.pool, &job).await.map_err(store_refusal)?;
+    store::update(&state.pool, &job)
+        .await
+        .map_err(store_refusal)?;
     Ok(Json(json!({
         "name": name, "state": queued, "layer": layer, "base": base,
         "cost_gb": admission.cost_gb, "replayed": false,
@@ -620,14 +636,21 @@ async fn post_transition(
     }
 
     let Some(branch) = job.manifest.branches.get_mut(&name) else {
-        return Err(refuse(StatusCode::NOT_FOUND, format!("branch {name} not found")));
+        return Err(refuse(
+            StatusCode::NOT_FOUND,
+            format!("branch {name} not found"),
+        ));
     };
     let from = branch.state.clone();
     apply_transition(branch, &transition)
         .map_err(|error| refuse(StatusCode::CONFLICT, error.to_string()))?;
     if transition == "parked" {
         let mut park = json!({ "prev_state": from });
-        if let Some(reason) = body.reason.as_deref().filter(|reason| !reason.trim().is_empty()) {
+        if let Some(reason) = body
+            .reason
+            .as_deref()
+            .filter(|reason| !reason.trim().is_empty())
+        {
             park["reason"] = json!(reason);
         }
         branch.park = Some(park);
@@ -637,11 +660,15 @@ async fn post_transition(
     // The branch is written before the key is claimed: a crash between the two leaves the key
     // unspent, and a retry is refused as illegal instead of answering a move that never happened.
     job.updated_at = now();
-    store::update(&state.pool, &job).await.map_err(store_refusal)?;
+    store::update(&state.pool, &job)
+        .await
+        .map_err(store_refusal)?;
     let applied = node_run::apply(&state.pool, &node, &transition, &key, &transition)
         .await
         .map_err(run_refusal)?;
-    Ok(Json(json!({ "result": applied.result, "replayed": applied.replayed })))
+    Ok(Json(
+        json!({ "result": applied.result, "replayed": applied.replayed }),
+    ))
 }
 
 /// The `launch` transition. No job lock: it changes no manifest, and the key alone makes it once.
@@ -655,7 +682,12 @@ async fn launch(
     let prompt = body
         .prompt
         .filter(|prompt| !prompt.trim().is_empty())
-        .ok_or_else(|| refuse(StatusCode::UNPROCESSABLE_ENTITY, "prompt is required to launch"))?;
+        .ok_or_else(|| {
+            refuse(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "prompt is required to launch",
+            )
+        })?;
     let project_id = match body.project_id {
         Some(project_id) => Some(project_id),
         None => store::load(&state.pool, id)
@@ -669,7 +701,9 @@ async fn launch(
     let run_id = launch_recovering(state, node, key, prompt, project_id, body.cwd, &mode)
         .await
         .map_err(run_refusal)?;
-    Ok(Json(json!({ "result": run_id.to_string(), "replayed": replayed })))
+    Ok(Json(
+        json!({ "result": run_id.to_string(), "replayed": replayed }),
+    ))
 }
 
 #[cfg(test)]
@@ -969,7 +1003,11 @@ mod tests {
         manifest.project_root = project_root();
         let root_node_id = format!("{id}-root");
         seed_node(pool, &root_node_id, "root", &root_node_id, id).await;
-        for node_id in manifest.branches.values().filter_map(|b| b.node_id.as_ref()) {
+        for node_id in manifest
+            .branches
+            .values()
+            .filter_map(|b| b.node_id.as_ref())
+        {
             seed_node(pool, node_id, "orchestrator", &root_node_id, id).await;
         }
         let job = TreeJob {
@@ -998,7 +1036,9 @@ mod tests {
     }
 
     async fn branch_state(pool: &SqlitePool, job: &str, name: &str) -> String {
-        loaded(pool, job).await.manifest.branches[name].state.clone()
+        loaded(pool, job).await.manifest.branches[name]
+            .state
+            .clone()
     }
 
     async fn job_rows(pool: &SqlitePool) -> i64 {
@@ -1066,7 +1106,10 @@ mod tests {
         let sizes = [("someone-else", SEED_GB)];
 
         assert_admitted(&admit(&manifest, FLOOR_GB + SEED_GB * 2.0, &sizes));
-        assert_refused_naming(&admit(&manifest, FLOOR_GB + SEED_GB * 2.0 - 1.0, &sizes), "disk");
+        assert_refused_naming(
+            &admit(&manifest, FLOOR_GB + SEED_GB * 2.0 - 1.0, &sizes),
+            "disk",
+        );
     }
 
     #[test]
@@ -1141,8 +1184,7 @@ mod tests {
     #[test]
     fn admission_counts_growth_for_every_live_state() {
         for state in LIVE_STATES {
-            let manifest =
-                manifest_of("tree-1", vec![branch("a", state, CORE, &[], None)], &[]);
+            let manifest = manifest_of("tree-1", vec![branch("a", state, CORE, &[], None)], &[]);
 
             let admission = admit(&manifest, FLOOR_GB + SEED_GB, &[]);
 
@@ -1155,8 +1197,7 @@ mod tests {
     #[test]
     fn admission_counts_no_growth_for_a_branch_that_is_not_live() {
         for state in NOT_LIVE_STATES {
-            let manifest =
-                manifest_of("tree-1", vec![branch("a", state, CORE, &[], None)], &[]);
+            let manifest = manifest_of("tree-1", vec![branch("a", state, CORE, &[], None)], &[]);
 
             assert_admitted(&admit(&manifest, FLOOR_GB + SEED_GB, &[]));
         }
@@ -1165,8 +1206,7 @@ mod tests {
     #[test]
     fn admission_counts_no_growth_for_a_docs_branch_in_any_state() {
         for state in ["queued", "building", "done", "dropped"] {
-            let manifest =
-                manifest_of("tree-1", vec![branch("a", state, DOCS, &[], None)], &[]);
+            let manifest = manifest_of("tree-1", vec![branch("a", state, DOCS, &[], None)], &[]);
 
             assert_admitted(&admit(&manifest, FLOOR_GB + SEED_GB, &[]));
         }
@@ -1481,7 +1521,13 @@ mod tests {
         assert_eq!(job_rows(&state.pool).await, 1);
         assert_eq!(node_rows(&state.pool).await, 1);
         // A replay must not rewrite the job from the request body.
-        assert!(loaded(&state.pool, JOB).await.manifest.branches.contains_key("notes"));
+        assert!(
+            loaded(&state.pool, JOB)
+                .await
+                .manifest
+                .branches
+                .contains_key("notes")
+        );
     }
 
     #[tokio::test]
@@ -1575,14 +1621,13 @@ mod tests {
 
     /// The run id a launch stored under `key` for `node`, which is what makes the launch replay-safe.
     async fn stored_launch_result(pool: &SqlitePool, node: &str, key: &str) -> Option<String> {
-        let stored: Option<Option<String>> = sqlx::query_scalar(
-            "SELECT result FROM tree_transitions WHERE node_id = ? AND key = ?",
-        )
-        .bind(node)
-        .bind(key)
-        .fetch_optional(pool)
-        .await
-        .unwrap();
+        let stored: Option<Option<String>> =
+            sqlx::query_scalar("SELECT result FROM tree_transitions WHERE node_id = ? AND key = ?")
+                .bind(node)
+                .bind(key)
+                .fetch_optional(pool)
+                .await
+                .unwrap();
         stored.flatten()
     }
 
@@ -1604,12 +1649,18 @@ mod tests {
         assert_first_call(&response);
         let job = loaded(&state.pool, JOB).await;
         let root_branch = job.manifest.branches.get("root").expect("a root branch");
-        assert_eq!(root_branch.node_id.as_deref(), Some(job.root_node_id.as_str()));
+        assert_eq!(
+            root_branch.node_id.as_deref(),
+            Some(job.root_node_id.as_str())
+        );
         assert!(
             repo.path.join(".claude/worktrees/job-1-root").is_dir(),
             "the root worktree is missing"
         );
-        assert!(repo.has_ref("tree/job-1/root"), "the root git branch is missing");
+        assert!(
+            repo.has_ref("tree/job-1/root"),
+            "the root git branch is missing"
+        );
         assert_eq!(run_rows(&state.pool).await, 1);
         let run_id = node_run_id(&state.pool, &job.root_node_id)
             .await
@@ -1636,8 +1687,16 @@ mod tests {
 
         assert_replayed(&replay);
         assert_eq!(run_rows(&state.pool).await, 1);
-        assert_eq!(node_run_id(&state.pool, replay.1["root_node_id"].as_str().unwrap()).await, run);
-        assert_eq!(repo.git(&["worktree", "list", "--porcelain"]).matches("worktree ").count(), 2);
+        assert_eq!(
+            node_run_id(&state.pool, replay.1["root_node_id"].as_str().unwrap()).await,
+            run
+        );
+        assert_eq!(
+            repo.git(&["worktree", "list", "--porcelain"])
+                .matches("worktree ")
+                .count(),
+            2
+        );
     }
 
     /// No git repository at `project_root`: the worktree cannot be made, so no run starts, but the
@@ -1674,9 +1733,15 @@ mod tests {
 
         let landing = |job: TreeJob| job.manifest.extra.get("landing").cloned();
         assert_eq!(landing(loaded(&state.pool, JOB).await), Some(json!("hold")));
-        assert_eq!(landing(loaded(&state.pool, OTHER_JOB).await), Some(json!("integration")));
+        assert_eq!(
+            landing(loaded(&state.pool, OTHER_JOB).await),
+            Some(json!("integration"))
+        );
         // Decision D1: no tree moves master unless its body says so.
-        assert_eq!(landing(loaded(&state.pool, "job-3").await), Some(json!("hold")));
+        assert_eq!(
+            landing(loaded(&state.pool, "job-3").await),
+            Some(json!("hold"))
+        );
     }
 
     #[tokio::test]
@@ -1707,10 +1772,7 @@ mod tests {
         assert_eq!(body["state"], json!("open"));
         assert_eq!(body["goal"], json!("Ship it"));
         assert_eq!(body["manifest"]["tree_id"], json!(JOB));
-        assert_eq!(
-            body["manifest"]["branches"][BRANCH]["node_id"],
-            json!(NODE)
-        );
+        assert_eq!(body["manifest"]["branches"][BRANCH]["node_id"], json!(NODE));
     }
 
     #[tokio::test]
@@ -1889,7 +1951,13 @@ mod tests {
         .await;
 
         assert_error_naming(&response, StatusCode::CONFLICT, "stranger-z");
-        assert!(!loaded(&state.pool, JOB).await.manifest.branches.contains_key("notes"));
+        assert!(
+            !loaded(&state.pool, JOB)
+                .await
+                .manifest
+                .branches
+                .contains_key("notes")
+        );
     }
 
     #[tokio::test]
@@ -1916,7 +1984,10 @@ mod tests {
 
         assert_first_call(&response);
         let job = loaded(&state.pool, JOB).await;
-        assert_eq!(job.manifest.branches["notes"].base.as_deref(), Some("parent"));
+        assert_eq!(
+            job.manifest.branches["notes"].base.as_deref(),
+            Some("parent")
+        );
     }
 
     #[tokio::test]
@@ -2020,12 +2091,7 @@ mod tests {
         seed_job(&state.pool, JOB, "open", Vec::new(), &[]).await;
 
         for paths in [vec![CODE_PATH], vec![SHARED, CODE_PATH]] {
-            let response = post(
-                &app,
-                &branches_uri(JOB),
-                docs_branch_body("notes", &paths),
-            )
-            .await;
+            let response = post(&app, &branches_uri(JOB), docs_branch_body("notes", &paths)).await;
 
             assert_error_naming(&response, StatusCode::UNPROCESSABLE_ENTITY, CODE_PATH);
         }
@@ -2036,7 +2102,14 @@ mod tests {
     #[tokio::test]
     async fn post_branch_not_admitted_for_disk_is_409_with_reasons() {
         let state = test_state().await;
-        seed_job(&state.pool, JOB, "open", Vec::new(), &[(HUGE_LAYER, HUGE_GB)]).await;
+        seed_job(
+            &state.pool,
+            JOB,
+            "open",
+            Vec::new(),
+            &[(HUGE_LAYER, HUGE_GB)],
+        )
+        .await;
 
         let response = post(
             &app(&state),
@@ -2048,7 +2121,9 @@ mod tests {
         assert_error(&response, StatusCode::CONFLICT);
         let reasons = response.1["reasons"].as_array().expect("a reasons array");
         assert!(
-            reasons.iter().any(|reason| reason.as_str().is_some_and(|text| text.contains("disk"))),
+            reasons
+                .iter()
+                .any(|reason| reason.as_str().is_some_and(|text| text.contains("disk"))),
             "{reasons:?}"
         );
         assert!(loaded(&state.pool, JOB).await.manifest.branches.is_empty());
@@ -2077,9 +2152,9 @@ mod tests {
         assert_error(&response, StatusCode::CONFLICT);
         let reasons = response.1["reasons"].as_array().expect("a reasons array");
         assert!(
-            reasons
-                .iter()
-                .any(|reason| reason.as_str().is_some_and(|text| text.contains("max_live_branches"))),
+            reasons.iter().any(|reason| reason
+                .as_str()
+                .is_some_and(|text| text.contains("max_live_branches"))),
             "{reasons:?}"
         );
     }
@@ -2209,9 +2284,11 @@ mod tests {
         assert_eq!(transition_rows(&state.pool).await, 0);
 
         // Walked to where `merged` is legal, the very key that was refused now succeeds.
-        for (index, step) in ["open", "building", "gating", "green"].into_iter().enumerate() {
-            let (status, body) =
-                move_branch(&app, JOB, NODE, step, &format!("step-{index}")).await;
+        for (index, step) in ["open", "building", "gating", "green"]
+            .into_iter()
+            .enumerate()
+        {
+            let (status, body) = move_branch(&app, JOB, NODE, step, &format!("step-{index}")).await;
             assert_eq!(status, StatusCode::OK, "{step}: {body:?}");
         }
         let (status, body) = move_branch(&app, JOB, NODE, "merged", KEY).await;
@@ -2243,7 +2320,10 @@ mod tests {
     async fn transition_to_done_is_known_and_legal_only_on_a_docs_branch() {
         let state = test_state().await;
         let app = app(&state);
-        let docs = with_node(branch("notes", "building", DOCS, &[SHARED], None), "node-notes");
+        let docs = with_node(
+            branch("notes", "building", DOCS, &[SHARED], None),
+            "node-notes",
+        );
         let code = with_node(branch(BRANCH, "building", CORE, &[CODE_PATH], None), NODE);
         seed_job(&state.pool, JOB, "open", vec![docs, code], &[]).await;
 
@@ -2353,16 +2433,14 @@ mod tests {
         let state = test_state().await;
         seed_one_branch(&state.pool, "building").await;
 
-        let response = post(
-            &app(&state),
-            &transition_uri(JOB, NODE),
-            launch_body(KEY),
-        )
-        .await;
+        let response = post(&app(&state), &transition_uri(JOB, NODE), launch_body(KEY)).await;
 
         let run_id = launched_run(&response);
         assert_eq!(run_rows(&state.pool).await, 1);
-        assert_eq!(node_run_id(&state.pool, NODE).await, Some(run_id.to_string()));
+        assert_eq!(
+            node_run_id(&state.pool, NODE).await,
+            Some(run_id.to_string())
+        );
         let (prompt, mode): (String, String) =
             sqlx::query_as("SELECT prompt, mode FROM runs WHERE id = ?")
                 .bind(run_id)
@@ -2393,8 +2471,7 @@ mod tests {
         let app = app(&state);
         seed_one_branch(&state.pool, "building").await;
 
-        let (status, body) =
-            post(&app, &transition_uri(JOB, NODE), failing_launch_body(KEY)).await;
+        let (status, body) = post(&app, &transition_uri(JOB, NODE), failing_launch_body(KEY)).await;
 
         assert!(
             status.is_client_error() || status.is_server_error(),
@@ -2408,7 +2485,10 @@ mod tests {
 
         let run_id = launched_run(&retried);
         assert_eq!(run_rows(&state.pool).await, 1);
-        assert_eq!(node_run_id(&state.pool, NODE).await, Some(run_id.to_string()));
+        assert_eq!(
+            node_run_id(&state.pool, NODE).await,
+            Some(run_id.to_string())
+        );
 
         let replay = post(&app, &transition_uri(JOB, NODE), launch_body(KEY)).await;
 
@@ -2465,12 +2545,7 @@ mod tests {
         let state = test_state().await;
         seed_one_branch(&state.pool, "building").await;
 
-        let response = post(
-            &app(&state),
-            &transition_uri(JOB, NODE),
-            launch_body(KEY),
-        )
-        .await;
+        let response = post(&app(&state), &transition_uri(JOB, NODE), launch_body(KEY)).await;
 
         launched_run(&response);
         assert_eq!(branch_state(&state.pool, JOB, BRANCH).await, "building");
@@ -2482,25 +2557,11 @@ mod tests {
     async fn launch_route_and_launch_recovering_share_the_key() {
         let state = test_state().await;
         seed_one_branch(&state.pool, "building").await;
-        let routed = launched_run(
-            &post(
-                &app(&state),
-                &transition_uri(JOB, NODE),
-                launch_body(KEY),
-            )
-            .await,
-        );
+        let routed =
+            launched_run(&post(&app(&state), &transition_uri(JOB, NODE), launch_body(KEY)).await);
 
-        let direct: Result<i64, NodeRunError> = launch_recovering(
-            &state,
-            NODE,
-            KEY,
-            "do it".to_owned(),
-            None,
-            None,
-            "shadow",
-        )
-        .await;
+        let direct: Result<i64, NodeRunError> =
+            launch_recovering(&state, NODE, KEY, "do it".to_owned(), None, None, "shadow").await;
 
         assert_eq!(direct.unwrap(), routed);
         assert_eq!(run_rows(&state.pool).await, 1);
@@ -2520,7 +2581,10 @@ mod tests {
         for round in 0..ROUNDS {
             let job = format!("job-{round}");
             let (left_node, right_node) = (format!("left-{round}"), format!("right-{round}"));
-            let left = with_node(branch("left", "queued", CORE, &[CODE_PATH], None), &left_node);
+            let left = with_node(
+                branch("left", "queued", CORE, &[CODE_PATH], None),
+                &left_node,
+            );
             let right = with_node(
                 branch("right", "queued", CORE, &[OTHER_CODE_PATH], None),
                 &right_node,
@@ -2578,8 +2642,16 @@ mod tests {
             seed_job(&state.pool, &job, "open", Vec::new(), &[]).await;
 
             let (first, second) = tokio::join!(
-                spawn_post(&app, branches_uri(&job), docs_branch_body("left", &[SHARED])),
-                spawn_post(&app, branches_uri(&job), docs_branch_body("right", &[SHARED])),
+                spawn_post(
+                    &app,
+                    branches_uri(&job),
+                    docs_branch_body("left", &[SHARED])
+                ),
+                spawn_post(
+                    &app,
+                    branches_uri(&job),
+                    docs_branch_body("right", &[SHARED])
+                ),
             );
 
             let mut statuses = [first.unwrap().0, second.unwrap().0];
@@ -2604,8 +2676,16 @@ mod tests {
             seed_job(&state.pool, &job, "open", Vec::new(), &[]).await;
 
             let (first, second) = tokio::join!(
-                spawn_post(&app, branches_uri(&job), docs_branch_body("left", &[SHARED])),
-                spawn_post(&app, branches_uri(&job), docs_branch_body("right", &[OTHER_DOCS])),
+                spawn_post(
+                    &app,
+                    branches_uri(&job),
+                    docs_branch_body("left", &[SHARED])
+                ),
+                spawn_post(
+                    &app,
+                    branches_uri(&job),
+                    docs_branch_body("right", &[OTHER_DOCS])
+                ),
             );
 
             assert_eq!(first.unwrap().0, StatusCode::OK, "round {round}");

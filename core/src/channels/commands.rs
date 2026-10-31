@@ -307,9 +307,7 @@ pub enum AnswerClass {
 /// Only a bare yes or no is clear, whatever its case and with a closing `.` or `!`. Anything longer
 /// may qualify the answer, so it is asked about rather than applied.
 pub fn classify_answer(text: &str) -> AnswerClass {
-    const CLEAR: [&str; 8] = [
-        "sim", "yes", "ok", "aprovo", "não", "nao", "no", "rejeito",
-    ];
+    const CLEAR: [&str; 8] = ["sim", "yes", "ok", "aprovo", "não", "nao", "no", "rejeito"];
     let sent = text.trim();
     let bare = sent.trim_end_matches(['.', '!']).to_lowercase();
     if CLEAR.contains(&bare.as_str()) {
@@ -345,10 +343,12 @@ pub async fn pending_answer(
 
 /// `open` can only fail on the database, which is all `sqlx::Result` has room for.
 async fn open_decisions(state: &AppState) -> sqlx::Result<Vec<Decision>> {
-    decisions::open(&state.pool).await.map_err(|error| match error {
-        DecisionError::Db(error) => error,
-        other => sqlx::Error::Protocol(other.to_string()),
-    })
+    decisions::open(&state.pool)
+        .await
+        .map_err(|error| match error {
+            DecisionError::Db(error) => error,
+            other => sqlx::Error::Protocol(other.to_string()),
+        })
 }
 
 /// The reply to an answer to a decision, or `None` for a sender `admit` refuses, who gets no reply

@@ -3,7 +3,7 @@
 use std::fmt;
 
 use crate::tree_job::docs_paths::is_docs_terminal_state;
-use crate::tree_job::model::{Branch, Manifest, BRANCH_STATES};
+use crate::tree_job::model::{BRANCH_STATES, Branch, Manifest};
 use crate::work_nodes::sets_overlap;
 
 /// The layer whose branches write only gitignored docs (spec R6).
@@ -152,11 +152,7 @@ pub enum Group {
 
 /// Port of `build_plan` (`tree_plan.py`): splits `items` into a balanced tree of at most
 /// `max_width` children per node and at most `max_depth` levels.
-pub fn group_items(
-    items: usize,
-    max_width: usize,
-    max_depth: usize,
-) -> Result<Group, EngineError> {
+pub fn group_items(items: usize, max_width: usize, max_depth: usize) -> Result<Group, EngineError> {
     if items < 1 {
         return Err(EngineError::InvalidGrouping(format!(
             "items must be at least 1, got {items}"
@@ -184,7 +180,9 @@ fn split_adaptive(start: usize, len: usize, width: usize, max_levels: usize) -> 
     while width.saturating_pow(levels) < len {
         levels += 1;
     }
-    let levels = usize::try_from(levels).unwrap_or(usize::MAX).min(max_levels);
+    let levels = usize::try_from(levels)
+        .unwrap_or(usize::MAX)
+        .min(max_levels);
     split(start, len, width, levels)
 }
 
@@ -211,7 +209,7 @@ mod tests {
     use std::ops::Range;
 
     use super::*;
-    use crate::tree_job::model::{Branch, Manifest, BRANCH_STATES};
+    use crate::tree_job::model::{BRANCH_STATES, Branch, Manifest};
 
     const CODE: &str = "core";
     const DOCS: &str = "docs";
@@ -600,7 +598,12 @@ mod tests {
         assert_eq!(
             group_items(37, 6, 3).unwrap(),
             Group::Children(vec![
-                Group::Children(vec![items(0..5), items(5..10), items(10..15), items(15..19)]),
+                Group::Children(vec![
+                    items(0..5),
+                    items(5..10),
+                    items(10..15),
+                    items(15..19)
+                ]),
                 Group::Children(vec![items(19..25), items(25..31), items(31..37)]),
             ])
         );

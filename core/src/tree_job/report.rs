@@ -82,11 +82,7 @@ pub fn parse_report(text: &str) -> Report {
     };
     let prose = |name: &str| {
         let text = body(name);
-        if is_none(&text) {
-            String::new()
-        } else {
-            text
-        }
+        if is_none(&text) { String::new() } else { text }
     };
 
     let raw = header("Contract used");
@@ -144,7 +140,9 @@ pub fn report_problems(
     match expected_status(outcome) {
         None => {
             let outcomes = quoted_list(OUTCOME_STATUS.iter().map(|&(name, _)| name));
-            problems.push(format!("Outcome must be one of {outcomes}, not '{outcome}'"));
+            problems.push(format!(
+                "Outcome must be one of {outcomes}, not '{outcome}'"
+            ));
         }
         Some(expected) if status != expected => problems.push(format!(
             "Status '{status}' does not match Outcome '{outcome}' (expected '{expected}')"
@@ -179,14 +177,12 @@ pub fn report_problems(
         ));
     }
     if outcome == "contract_request" && report.contract_request.is_empty() {
-        problems.push(
-            "Outcome contract_request needs text under `## Contract request`".to_string(),
-        );
+        problems
+            .push("Outcome contract_request needs text under `## Contract request`".to_string());
     }
     if outcome != "contract_request" && !report.contract_request.is_empty() {
-        problems.push(
-            "`## Contract request` has text but Outcome is not contract_request".to_string(),
-        );
+        problems
+            .push("`## Contract request` has text but Outcome is not contract_request".to_string());
     }
     if matches!(outcome, "blocked" | "failed") && report.blocked_reason.is_empty() {
         problems.push(format!(
@@ -305,11 +301,7 @@ fn bullets(items: &[String]) -> String {
 }
 
 fn or_none(text: &str) -> &str {
-    if text.is_empty() {
-        "none"
-    } else {
-        text
-    }
+    if text.is_empty() { "none" } else { text }
 }
 
 #[cfg(test)]
@@ -542,7 +534,10 @@ None.
         let message = &problems(&report)[0];
         assert!(message.contains("shipped"), "got {message:?}");
         for (outcome, _) in OUTCOME_STATUS.iter().copied() {
-            assert!(message.contains(outcome), "{outcome} missing from {message:?}");
+            assert!(
+                message.contains(outcome),
+                "{outcome} missing from {message:?}"
+            );
         }
     }
 
@@ -579,8 +574,14 @@ None.
                 r.files.clear();
             })
         };
-        assert_single_problem(&split_by("leaf"), "only an orchestrator can split, not a leaf");
-        assert_single_problem(&split_by("review"), "only an orchestrator can split, not a review");
+        assert_single_problem(
+            &split_by("leaf"),
+            "only an orchestrator can split, not a leaf",
+        );
+        assert_single_problem(
+            &split_by("review"),
+            "only an orchestrator can split, not a review",
+        );
 
         for role in ["orchestrator", "review"] {
             let report = filled_with(|r| r.role = role.into());
@@ -762,6 +763,10 @@ none
 
         // And the outcome list the agent is shown names it.
         let unknown = filled_with(|r| r.outcome = "shipped".into());
-        assert!(problems(&unknown)[0].contains("handoff"), "got {:?}", problems(&unknown));
+        assert!(
+            problems(&unknown)[0].contains("handoff"),
+            "got {:?}",
+            problems(&unknown)
+        );
     }
 }

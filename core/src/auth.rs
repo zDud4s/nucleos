@@ -723,6 +723,7 @@ const REMOTE_ADMIN_SEGMENTS: &[&str] = &[
 const REMOTE_DENIED_SEGMENTS: &[&str] = &[
     "admission",
     "api-tokens",
+    "backlog",
     "backup",
     "backups",
     "browser",
@@ -730,14 +731,18 @@ const REMOTE_DENIED_SEGMENTS: &[&str] = &[
     "channels",
     "chats",
     "config",
+    "conductor",
     "context",
+    "cost",
     "daemon",
+    "decisions",
     "hooks",
     "models",
     "nodes",
     "pricing",
     "remote",
     "sidecars",
+    "specs",
     "system",
     "tasks",
     "team-files",
@@ -745,6 +750,7 @@ const REMOTE_DENIED_SEGMENTS: &[&str] = &[
     "team-pressure",
     "team-recruits",
     "team-reports",
+    "trees",
     "v1",
     "verify",
     "webhooks",
@@ -1041,6 +1047,69 @@ async fn loadout_admits(
         }
         _ => false,
     }
+}
+
+/// The id in `{id}` of `/<head>/{id}<tail>`, read off the real request path. `None` when the path
+/// has another shape, or the id is empty or percent-encoded: the door only admits what it can read
+/// back exactly.
+fn tree_route_id<'a>(path: &'a str, head: &str, tail: &str) -> Option<&'a str> {
+    let id = path.strip_prefix(head)?.strip_suffix(tail)?;
+    (!id.is_empty() && !id.contains(['/', '%'])).then_some(id)
+}
+
+/// Whether a run key bound to a tree node may use a tree or node route: the autonomous tree run's
+/// own door. Admits exactly `POST /trees/{id}/branch_start` for the tree its node belongs to, and
+/// `PATCH /nodes/{id}` / `POST /nodes/{id}/close` for the node the run is bound to
+/// (`work_nodes.run_id`, text). Everything else on those families stays refused, including
+/// `POST /trees`, `POST /nodes` and `GET /nodes/active`, and so does every error or a run bound to
+/// no node: the binding is the credential. `grants` stays pure and lists none of these.
+async fn tree_run_admits(
+    pool: &sqlx::SqlitePool,
+    scope: &Scope,
+    method: &Method,
+    matched: &str,
+    path: &str,
+) -> bool {
+    let Scope::Run(run_id) = scope else {
+        return false;
+    };
+    let tree_route = *method == Method::POST && matched == "/trees/{id}/branch_start";
+    let update_route = *method == Method::PATCH && matched == "/nodes/{id}";
+    let close_route = *method == Method::POST && matched == "/nodes/{id}/close";
+    if !(tree_route || update_route || close_route) {
+        return false;
+    }
+    let bound: Result<Vec<(String, String)>, sqlx::Error> =
+        sqlx::query_as("SELECT id, root_id FROM work_nodes WHERE run_id = ?")
+            .bind(run_id.to_string())
+            .fetch_all(pool)
+            .await;
+    let Ok(bound) = bound else {
+        return false;
+    };
+    if tree_route {
+        let Some(tree) = tree_route_id(path, "/trees/", "/branch_start") else {
+            return false;
+        };
+        for (_, root_id) in &bound {
+            let owns: Result<Option<i64>, sqlx::Error> =
+                sqlx::query_scalar("SELECT 1 FROM tree_jobs WHERE id = ? AND root_node_id = ?")
+                    .bind(tree)
+                    .bind(root_id)
+                    .fetch_optional(pool)
+                    .await;
+            if matches!(owns, Ok(Some(_))) {
+                return true;
+            }
+        }
+        return false;
+    }
+    let node = if update_route {
+        tree_route_id(path, "/nodes/", "")
+    } else {
+        tree_route_id(path, "/nodes/", "/close")
+    };
+    node.is_some_and(|node| bound.iter().any(|(id, _)| id == node))
 }
 
 /// The chat turn a browser request was admitted for. `require_token` inserts it as a request
@@ -1458,6 +1527,15 @@ pub async fn require_token(
     {
         allowed = loadout_admits(&state.pool, &scope, req.method(), matched, req.headers()).await;
     }
+    // The tree-run door: an autonomous tree run's key on its own tree's branch_start and on its
+    // own node's update and close, decided by the run's `work_nodes` binding.
+    if !allowed
+        && device.is_none()
+        && let Some(matched) = route.as_deref()
+    {
+        allowed =
+            tree_run_admits(&state.pool, &scope, req.method(), matched, req.uri().path()).await;
+    }
     // The chat-browser door: a chat turn's run key on the session routes, for its own sessions.
     if !allowed
         && matches!(scope, Scope::Run(_))
@@ -1685,6 +1763,14 @@ mod tests {
             .route("/web/search", post(|| async {}))
             .route("/web/read", post(|| async {}))
             .route("/loadout/tool-requests", post(|| async {}))
+            // The tree and node routes, mounted so the tree-run door's refusals are refusals of
+            // routes that exist rather than 404s.
+            .route("/trees", post(|| async {}))
+            .route("/trees/{id}/branch_start", post(|| async {}))
+            .route("/nodes", post(|| async {}))
+            .route("/nodes/active", get(|| async {}))
+            .route("/nodes/{id}", axum::routing::patch(|| async {}))
+            .route("/nodes/{id}/close", post(|| async {}))
             // A stand-in: the door is decided by the run's `run_loadout` row, not by a scope table.
             .route("/context/read", post(|| async {}))
             .route("/team-files/read", post(|| async {}))
@@ -2720,6 +2806,196 @@ mod tests {
             post_status_with_run_header(&app, "/web/read", &token, None).await,
             StatusCode::OK
         );
+    }
+
+    /// A tree job `job` over the root node `root`, written the way the tree route writes it (the
+    /// manifest is a stub: a door must read the `tree_jobs` columns, not parse the manifest).
+    async fn seed_tree(state: &AppState, job: &str, root: &str) {
+        sqlx::query(
+            "INSERT INTO tree_jobs (id, root_node_id, goal, state, manifest, created_at, updated_at)
+             VALUES (?, ?, 'g', 'open', '{}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(job)
+        .bind(root)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        seed_tree_node(state, root, root, Some(job), None).await;
+    }
+
+    /// A node of the tree rooted at `root`, bound to `run` through `work_nodes.run_id` when given.
+    async fn seed_tree_node(
+        state: &AppState,
+        id: &str,
+        root: &str,
+        job: Option<&str>,
+        run: Option<i64>,
+    ) {
+        sqlx::query(
+            "INSERT INTO work_nodes (id, root_id, depth, kind, title, goal, status, run_id,
+                                     tree_job_id, created_at, updated_at)
+             VALUES (?, ?, 0, 'leaf', 't', 'g', 'running', ?, ?,
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(root)
+        .bind(run.map(|run| run.to_string()))
+        .bind(job)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+
+    /// A run key whose run is bound to node `node` of the tree rooted at `root`.
+    async fn tree_run_key(state: &AppState, node: &str, root: &str, job: &str) -> String {
+        let (id, token) = running_run_with_token(state).await;
+        seed_tree_node(state, node, root, Some(job), Some(id)).await;
+        token
+    }
+
+    async fn status_with_json(app: &Router, method: &str, uri: &str, bearer: &str) -> StatusCode {
+        app.clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("Authorization", format!("Bearer {bearer}"))
+                    .header("Content-Type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// An autonomous run in a tree may start child branches of ITS OWN tree: the run key of a run
+    /// bound to a node of tree X is admitted on `/trees/X/branch_start`, and refused (403) on the
+    /// branch_start of another tree. Fails today: `grants` lists no tree route for `Scope::Run`.
+    #[tokio::test]
+    async fn tree_run_key_may_start_branches_of_its_own_tree_only() {
+        let state = test_state("owner-token").await;
+        let app = protected_router(state.clone());
+        seed_tree(&state, "tree-x", "root-x").await;
+        seed_tree(&state, "tree-y", "root-y").await;
+        let key = tree_run_key(&state, "leaf-x", "root-x", "tree-x").await;
+
+        assert_eq!(
+            status_with_json(&app, "POST", "/trees/tree-x/branch_start", &key).await,
+            StatusCode::OK,
+            "its own tree"
+        );
+        assert_eq!(
+            status_with_json(&app, "POST", "/trees/tree-y/branch_start", &key).await,
+            StatusCode::FORBIDDEN,
+            "another tree"
+        );
+        assert_eq!(
+            status_with_json(&app, "POST", "/trees/no-such-tree/branch_start", &key).await,
+            StatusCode::FORBIDDEN,
+            "a tree that does not exist"
+        );
+    }
+
+    /// The root node's own run (the agent that was told to call `tree_branch_start` and
+    /// `node_close`) is bound to the root node, whose `tree_job_id` may be the job itself: it is a
+    /// node of its tree like any other.
+    #[tokio::test]
+    async fn the_root_nodes_run_key_may_start_branches_and_close_the_root() {
+        let state = test_state("owner-token").await;
+        let app = protected_router(state.clone());
+        let (id, key) = running_run_with_token(&state).await;
+        sqlx::query(
+            "INSERT INTO tree_jobs (id, root_node_id, goal, state, manifest, created_at, updated_at)
+             VALUES ('tree-x', 'root-x', 'g', 'open', '{}', '2026-01-01T00:00:00Z',
+                     '2026-01-01T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        seed_tree_node(&state, "root-x", "root-x", None, Some(id)).await;
+
+        assert_eq!(
+            status_with_json(&app, "POST", "/trees/tree-x/branch_start", &key).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status_with_json(&app, "POST", "/nodes/root-x/close", &key).await,
+            StatusCode::OK
+        );
+    }
+
+    /// A tree run closes and updates ITS OWN node, and no node of another tree. Fails today for the
+    /// same reason: no `/nodes*` route is open to `Scope::Run`.
+    #[tokio::test]
+    async fn tree_run_key_may_close_and_update_its_own_node_only() {
+        let state = test_state("owner-token").await;
+        let app = protected_router(state.clone());
+        seed_tree(&state, "tree-x", "root-x").await;
+        seed_tree(&state, "tree-y", "root-y").await;
+        let key = tree_run_key(&state, "leaf-x", "root-x", "tree-x").await;
+
+        assert_eq!(
+            status_with_json(&app, "POST", "/nodes/leaf-x/close", &key).await,
+            StatusCode::OK,
+            "close its own node"
+        );
+        assert_eq!(
+            status_with_json(&app, "PATCH", "/nodes/leaf-x", &key).await,
+            StatusCode::OK,
+            "update its own node"
+        );
+        assert_eq!(
+            status_with_json(&app, "POST", "/nodes/root-y/close", &key).await,
+            StatusCode::FORBIDDEN,
+            "close a node of another tree"
+        );
+        assert_eq!(
+            status_with_json(&app, "PATCH", "/nodes/root-y", &key).await,
+            StatusCode::FORBIDDEN,
+            "update a node of another tree"
+        );
+        assert_eq!(
+            status_with_json(&app, "POST", "/nodes/no-such-node/close", &key).await,
+            StatusCode::FORBIDDEN,
+            "close a node that does not exist"
+        );
+    }
+
+    /// A run bound to no node (an ordinary run, or a node row that points at another run) gets none
+    /// of this: the binding is the credential. Also pins "nothing else": a tree run still cannot
+    /// create a tree, open a node, or list the active ones.
+    #[tokio::test]
+    async fn a_run_key_bound_to_no_node_stays_refused_on_tree_and_node_routes() {
+        let state = test_state("owner-token").await;
+        let app = protected_router(state.clone());
+        seed_tree(&state, "tree-x", "root-x").await;
+        let (_, unbound) = running_run_with_token(&state).await;
+
+        for (method, uri) in [
+            ("POST", "/trees/tree-x/branch_start"),
+            ("POST", "/nodes/root-x/close"),
+            ("PATCH", "/nodes/root-x"),
+        ] {
+            assert_eq!(
+                status_with_json(&app, method, uri, &unbound).await,
+                StatusCode::FORBIDDEN,
+                "{method} {uri} with a run bound to no node"
+            );
+        }
+
+        let bound = tree_run_key(&state, "leaf-x", "root-x", "tree-x").await;
+        for (method, uri) in [
+            ("POST", "/trees"),
+            ("POST", "/nodes"),
+            ("GET", "/nodes/active"),
+        ] {
+            assert_eq!(
+                status_with_json(&app, method, uri, &bound).await,
+                StatusCode::FORBIDDEN,
+                "{method} {uri} stays outside a tree run's reach"
+            );
+        }
     }
 
     /// `read_context` is a loadout door like `request_tool`: a run key reaches it only while the

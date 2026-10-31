@@ -775,8 +775,10 @@ impl NucleosTools {
         )
     }
 
-    #[tool(description = "Read one tree job by the id it was launched with: its state, root node \
-                       and progress.")]
+    #[tool(
+        description = "Read one tree job by the id it was launched with: its state, root node \
+                       and progress."
+    )]
     pub(super) async fn tree_status(
         &self,
         Parameters(TreeIdParams { id }): Parameters<TreeIdParams>,

@@ -20,10 +20,16 @@ pub fn routes() -> Router<AppState> {
         .route("/trees/{id}/cost", get(get_cost))
         .route("/trees/{id}/budget", put(put_budget))
         .route("/cost/cache-report", get(get_cache_report))
-        .route("/cost/wait-advice", get(crate::tree_cost::wait_policy::wait_advice_handler))
+        .route(
+            "/cost/wait-advice",
+            get(crate::tree_cost::wait_policy::wait_advice_handler),
+        )
 }
 
-async fn get_cost(State(state): State<AppState>, Path(id): Path<String>) -> Result<Json<Value>, StatusCode> {
+async fn get_cost(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, StatusCode> {
     let spend = crate::tree_cost::budget::tree_spend(&state.pool, &id, Utc::now())
         .await
         .map_err(|error| {
@@ -84,9 +90,9 @@ async fn get_cache_report(State(state): State<AppState>) -> Result<Json<Value>, 
 mod tests {
     use std::time::Duration;
 
+    use axum::Router;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
-    use axum::Router;
     use serde_json::{Value, json};
     use tower::ServiceExt;
 
@@ -174,7 +180,8 @@ mod tests {
     async fn cache_report_route_with_no_data() {
         let state = state().await;
 
-        let (status, report) = request(&app(&state), "GET", "/cost/cache-report", Value::Null).await;
+        let (status, report) =
+            request(&app(&state), "GET", "/cost/cache-report", Value::Null).await;
 
         assert_eq!(status, StatusCode::OK, "{report:?}");
         assert!(report["effective_ttl"].is_null(), "{report:?}");

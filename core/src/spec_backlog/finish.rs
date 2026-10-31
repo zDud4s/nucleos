@@ -20,15 +20,19 @@ use std::time::Duration;
 use rand::RngExt;
 use sqlx::SqlitePool;
 
-use super::audit::{
-    self, AuditReport, CriterionReview, ReviewerAnswer, ReviewerRunner, SpecLineage, VerifyRunner,
-};
-use super::deps::{topological_order, Cycle};
+use super::audit::{self, AuditReport, SpecLineage, VerifyRunner};
+use super::deps::{Cycle, topological_order};
 use super::extract::{self, ExtractionRunner};
-use super::model::{Criterion, CriterionStatus, Spec, SpecKind, SpecStatus};
+use super::model::{Criterion, Spec, SpecKind, SpecStatus};
+use super::review::NoToolsReviewer;
+#[cfg(test)]
+use super::review::{
+    REVIEW_FILE_CAP, ReviewFile, ReviewMaterial, gather_material, numbered_prefix, paths_named_by,
+    review_prompt,
+};
 use super::scan::ScanRoots;
 use super::store::{self, StoreError};
-use super::verdict::{ReviewerRun, Verdict, VerifyState};
+use super::verdict::{Verdict, VerifyState};
 use crate::execution::runner::ToolPolicy;
 use crate::state::AppState;
 use crate::work_nodes::sets_overlap;
@@ -151,7 +155,13 @@ pub fn derived_branch(spec_path: &str) -> String {
     let stem = file.strip_suffix(".md").unwrap_or(file);
     let clean: String = stem
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     format!("spec/{clean}")
 }
@@ -177,12 +187,17 @@ pub async fn record_extraction_run(
 }
 
 /// The runs that extracted the spec, oldest first.
-pub async fn extraction_run_ids(pool: &SqlitePool, spec_id: &str) -> Result<Vec<String>, StoreError> {
+pub async fn extraction_run_ids(
+    pool: &SqlitePool,
+    spec_id: &str,
+) -> Result<Vec<String>, StoreError> {
     Ok(
-        sqlx::query_scalar("SELECT run_id FROM spec_extraction_runs WHERE spec_id = ? ORDER BY seq")
-            .bind(spec_id)
-            .fetch_all(pool)
-            .await?,
+        sqlx::query_scalar(
+            "SELECT run_id FROM spec_extraction_runs WHERE spec_id = ? ORDER BY seq",
+        )
+        .bind(spec_id)
+        .fetch_all(pool)
+        .await?,
     )
 }
 
@@ -199,7 +214,9 @@ pub async fn lineage_for(
     };
     for outcome in outcomes {
         lineage.run_ids.extend(outcome.run_ids.iter().cloned());
-        lineage.lineage_roots.extend(outcome.lineage_roots.iter().cloned());
+        lineage
+            .lineage_roots
+            .extend(outcome.lineage_roots.iter().cloned());
     }
     dedup_in_order(&mut lineage.run_ids);
     dedup_in_order(&mut lineage.lineage_roots);
@@ -298,7 +315,11 @@ async fn load_scope(pool: &SqlitePool, scope: &FinishScope) -> Result<Vec<Spec>,
     }
 }
 
-async fn mark_needs_owner(pool: &SqlitePool, spec_id: &str, reason: &str) -> Result<(), StoreError> {
+async fn mark_needs_owner(
+    pool: &SqlitePool,
+    spec_id: &str,
+    reason: &str,
+) -> Result<(), StoreError> {
     store::set_status(pool, spec_id, SpecStatus::NeedsOwner, Some(reason)).await
 }
 
@@ -346,7 +367,11 @@ async fn goal_for(
         spec.path, spec.title
     );
     for criterion in &criteria {
-        goal.push_str(&format!("- [{}] {}\n", criterion.status.as_str(), criterion.text));
+        goal.push_str(&format!(
+            "- [{}] {}\n",
+            criterion.status.as_str(),
+            criterion.text
+        ));
     }
     if let (true, Some(reason)) = (round > 1, previous) {
         goal.push_str(&format!(
@@ -395,9 +420,17 @@ async fn drive_spec(
         let lineage = lineage_for(pool, &spec.id, &outcomes).await?;
         match preparer.audit(&spec.id, &lineage).await {
             Ok(report) if report.status == SpecStatus::Done && report.verdict == Verdict::Done => {
-                return Ok(SpecRun { trees, finished: true });
+                return Ok(SpecRun {
+                    trees,
+                    finished: true,
+                });
             }
-            Ok(report) => last = Some(format!("round {round}: the audit says {:?}", report.verdict)),
+            Ok(report) => {
+                last = Some(format!(
+                    "round {round}: the audit says {:?}",
+                    report.verdict
+                ))
+            }
             Err(reason) => last = Some(format!("round {round}: the audit failed: {reason}")),
         }
     }
@@ -414,11 +447,18 @@ async fn drive_spec(
         ),
     )
     .await?;
-    Ok(SpecRun { trees, finished: false })
+    Ok(SpecRun {
+        trees,
+        finished: false,
+    })
 }
 
 fn fresh_nonce() -> String {
-    rand::rng().random::<[u8; 4]>().iter().map(|b| format!("{b:02x}")).collect()
+    rand::rng()
+        .random::<[u8; 4]>()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Finishes the backlog through `deps`. See the module doc for the order of things.
@@ -529,7 +569,9 @@ pub async fn finish_with<'a>(
     // 5. Run them.
     let mut queue: Vec<Waiting> = Vec::new();
     for id in &order {
-        let Some(position) = runnable.iter().position(|spec| spec.id == *id) else { continue };
+        let Some(position) = runnable.iter().position(|spec| spec.id == *id) else {
+            continue;
+        };
         let spec = runnable.swap_remove(position);
         let waits_on = pairs
             .iter()
@@ -537,7 +579,11 @@ pub async fn finish_with<'a>(
             .map(|(_, to)| to.clone())
             .collect();
         queue.push(Waiting {
-            owned: config.owned_paths.get(&spec.id).cloned().unwrap_or_default(),
+            owned: config
+                .owned_paths
+                .get(&spec.id)
+                .cloned()
+                .unwrap_or_default(),
             spec,
             waits_on,
         });
@@ -570,7 +616,10 @@ pub async fn finish_with<'a>(
         }
         let mut index = 0;
         while running.len() < budget && index < queue.len() {
-            let ready = queue[index].waits_on.iter().all(|dep| done_ids.contains(dep));
+            let ready = queue[index]
+                .waits_on
+                .iter()
+                .all(|dep| done_ids.contains(dep));
             if ready && compatible(&queue[index].owned, &running_paths) {
                 let Waiting { spec, owned, .. } = queue.remove(index);
                 let id = spec.id.clone();
@@ -585,7 +634,9 @@ pub async fn finish_with<'a>(
                 index += 1;
             }
         }
-        let Some((id, outcome)) = next_finished(&mut running).await else { break };
+        let Some((id, outcome)) = next_finished(&mut running).await else {
+            break;
+        };
         running_paths.retain(|(running_id, _)| *running_id != id);
         let outcome = outcome?;
         report.trees.extend(outcome.trees);
@@ -655,7 +706,7 @@ pub fn no_tools_run_request(
 
 /// Starts the run through `create_no_tools_run` (the policy lands in the run itself) and waits for
 /// it to end. Returns the run id and its final text.
-async fn run_no_tools(
+pub(super) async fn run_no_tools(
     state: &AppState,
     request: NoToolsRunRequest,
 ) -> Result<(String, String), String> {
@@ -751,235 +802,6 @@ impl VerifyRunner for DaemonVerify {
     }
 }
 
-/// Bytes of one file the reviewer is shown.
-const REVIEW_FILE_CAP: usize = 24 * 1024;
-/// Bytes of all files together.
-const REVIEW_TOTAL_CAP: usize = 160 * 1024;
-/// A file larger than this is not even read.
-const REVIEW_READ_LIMIT: u64 = 4 * 1024 * 1024;
-
-/// One file as the reviewer sees it: numbered lines, so `path:line` evidence is exact.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ReviewFile {
-    path: String,
-    text: String,
-}
-
-/// What the reviewer is given to read, and whether anything was left out.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct ReviewMaterial {
-    files: Vec<ReviewFile>,
-    /// A cap cut something, a file was binary or too large, or the changed-file list could not be
-    /// read: the reviewer may not have seen everything.
-    cut: bool,
-}
-
-/// File-looking tokens (`dir/name.ext`, `name.ext`, with an optional `:line`) in the criteria and
-/// their verify hints, in order, once each. Whether a file exists is decided at read time.
-fn paths_named_by(criteria: &[Criterion]) -> Vec<String> {
-    let mut found: Vec<String> = Vec::new();
-    for criterion in criteria {
-        let hint = criterion.verify_hint.as_deref().unwrap_or("");
-        for token in criterion.text.split_whitespace().chain(hint.split_whitespace()) {
-            let token = token
-                .trim_matches(|c: char| matches!(c, '`' | '\'' | '"' | '(' | ')' | ',' | ';' | '[' | ']' | '<' | '>'))
-                .trim_end_matches(['.', ':']);
-            let token = match token.rsplit_once(':') {
-                Some((path, line)) if !line.is_empty() && line.chars().all(|c| c.is_ascii_digit()) => path,
-                _ => token,
-            };
-            let token = token.replace('\\', "/");
-            let token = token.strip_prefix("./").unwrap_or(&token).to_owned();
-            let name = token.rsplit('/').next().unwrap_or("");
-            let looks_like_file = name.rsplit_once('.').is_some_and(|(stem, ext)| {
-                !stem.is_empty() && (1..=5).contains(&ext.len()) && ext.chars().all(|c| c.is_ascii_alphanumeric())
-            });
-            if looks_like_file && !token.contains("://") && !found.contains(&token) {
-                found.push(token);
-            }
-        }
-    }
-    found
-}
-
-/// `text` as numbered lines, whole lines only, at most `cap` bytes; the flag says a line was left out.
-fn numbered_prefix(text: &str, cap: usize) -> (String, bool) {
-    let mut out = String::new();
-    for (index, line) in text.lines().enumerate() {
-        let row = format!("{}: {line}\n", index + 1);
-        if out.len() + row.len() > cap {
-            return (out, true);
-        }
-        out.push_str(&row);
-    }
-    (out, false)
-}
-
-/// The files the feature branch changed against the integration branch, or `None` when git could
-/// not say.
-async fn changed_files(worktree: &Path, integration: &str) -> Option<Vec<String>> {
-    let output = crate::execution::worktree::git()
-        .arg("-c")
-        .arg("core.quotepath=false")
-        .arg("-C")
-        .arg(worktree)
-        .arg("diff")
-        .arg("--name-only")
-        .arg(format!("{integration}...HEAD"))
-        .output()
-        .await
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(
-        String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(str::to_owned)
-            .collect(),
-    )
-}
-
-/// Reads, within the caps, the files the criteria name and then the files changed on the branch.
-/// Paths that escape the worktree or do not exist are skipped.
-async fn gather_material(worktree: &Path, integration: &str, criteria: &[Criterion]) -> ReviewMaterial {
-    let mut cut = false;
-    let mut wanted = paths_named_by(criteria);
-    match changed_files(worktree, integration).await {
-        Some(changed) => {
-            for path in changed {
-                if !wanted.contains(&path) {
-                    wanted.push(path);
-                }
-            }
-        }
-        None => cut = true,
-    }
-    let mut files = Vec::new();
-    let mut used = 0usize;
-    for path in wanted {
-        let Some(full) = audit::safe_relative_path(worktree, &path) else { continue };
-        let Ok(meta) = tokio::fs::metadata(&full).await else { continue };
-        if !meta.is_file() {
-            continue;
-        }
-        if meta.len() > REVIEW_READ_LIMIT {
-            cut = true;
-            continue;
-        }
-        let Ok(bytes) = tokio::fs::read(&full).await else { continue };
-        if bytes.contains(&0) {
-            cut = true;
-            continue;
-        }
-        let remaining = REVIEW_TOTAL_CAP.saturating_sub(used);
-        if remaining == 0 {
-            cut = true;
-            break;
-        }
-        let (text, file_cut) =
-            numbered_prefix(&String::from_utf8_lossy(&bytes), REVIEW_FILE_CAP.min(remaining));
-        cut |= file_cut;
-        used += text.len();
-        files.push(ReviewFile { path, text });
-    }
-    ReviewMaterial { files, cut }
-}
-
-fn review_prompt(spec: &Spec, criteria: &[Criterion], material: &ReviewMaterial) -> String {
-    let mut prompt = format!(
-        "You are an independent reviewer of the spec `{}` ({}). You have no tools and cannot read \
-         the repository: judge only from the file contents below (lines are numbered), and answer \
-         `doubt` (the unknown answer) for any criterion this material does not prove.\n",
-        spec.path, spec.title
-    );
-    if material.cut {
-        prompt.push_str(
-            "\nNOT EVERYTHING IS SHOWN: a size cap, a binary or oversized file, or an unreadable \
-             change list left material out. For every criterion you cannot see the proof of, answer \
-             `doubt`; never assume what you were not shown.\n",
-        );
-    }
-    prompt.push_str("\nCriteria:\n");
-    for criterion in criteria {
-        prompt.push_str(&format!("{}. {}", criterion.ordinal, criterion.text));
-        if let Some(hint) = &criterion.verify_hint {
-            prompt.push_str(&format!(" (verify: {hint})"));
-        }
-        prompt.push('\n');
-    }
-    prompt.push_str("\nFiles (changed on the feature branch, or named by a criterion):\n");
-    if material.files.is_empty() {
-        prompt.push_str("(none could be shown)\n");
-    }
-    for file in &material.files {
-        prompt.push_str(&format!("\n=== {} ===\n{}", file.path, file.text));
-    }
-    prompt.push_str(
-        "\nAnswer with one JSON array and nothing else, one object per criterion: \
-         {\"ordinal\": <number>, \"status\": \"met\" | \"unmet\" | \"doubt\", \
-         \"evidence\": \"<path>:<line>\" or null}. `met` needs evidence naming a file and line.\n",
-    );
-    prompt
-}
-
-/// Reads the reviewer's JSON array out of its text, tolerating a code fence around it.
-fn parse_reviews(text: &str) -> Result<Vec<CriterionReview>, String> {
-    let (Some(start), Some(end)) = (text.find('['), text.rfind(']')) else {
-        return Err("the reviewer did not answer with a JSON array".to_owned());
-    };
-    if end < start {
-        return Err("the reviewer did not answer with a JSON array".to_owned());
-    }
-    let items: Vec<serde_json::Value> = serde_json::from_str(&text[start..=end])
-        .map_err(|error| format!("the reviewer's answer is not valid JSON: {error}"))?;
-    Ok(items
-        .iter()
-        .filter_map(|item| {
-            let ordinal = item.get("ordinal")?.as_i64()?;
-            let status = item
-                .get("status")
-                .and_then(|status| status.as_str())
-                .and_then(CriterionStatus::parse)
-                .unwrap_or(CriterionStatus::Doubt);
-            let evidence = item.get("evidence").and_then(|e| e.as_str()).map(str::to_owned);
-            Some(CriterionReview { ordinal, status, evidence })
-        })
-        .collect())
-}
-
-/// The independent reviewer: a fresh no-tools run, so it cannot write, and `audit` refuses it if
-/// it turns out to belong to the spec's own lineage.
-struct NoToolsReviewer<'a> {
-    state: &'a AppState,
-    cwd: &'a str,
-    /// The checkout of the spec's feature branch, whose files are embedded in the prompt.
-    worktree: &'a Path,
-    integration_branch: &'a str,
-}
-
-#[async_trait::async_trait]
-impl ReviewerRunner for NoToolsReviewer<'_> {
-    async fn review(&self, spec: &Spec, criteria: &[Criterion]) -> Result<ReviewerAnswer, String> {
-        let material = gather_material(self.worktree, self.integration_branch, criteria).await;
-        let prompt = review_prompt(spec, criteria, &material);
-        let request = no_tools_run_request(&prompt, spec.project_id.as_deref(), Some(self.cwd));
-        let (run_id, text) = run_no_tools(self.state, request).await?;
-        let reviews = parse_reviews(&text)?;
-        let numeric: i64 = run_id.parse().map_err(|_| format!("bad run id {run_id}"))?;
-        let root = sqlx::query_scalar::<_, Option<i64>>("SELECT lineage_root_id FROM runs WHERE id = ?")
-            .bind(numeric)
-            .fetch_optional(&self.state.pool)
-            .await
-            .map_err(|error| error.to_string())?
-            .flatten();
-        let lineage_root_id = Some(root.unwrap_or(numeric).to_string());
-        Ok(ReviewerAnswer { run: ReviewerRun { run_id, lineage_root_id }, reviews })
-    }
-}
-
 /// The checkout an audit reads: a detached worktree of the spec's feature branch under the
 /// project's worktree root, made on first use and moved to the branch tip on later ones. With no
 /// feature branch yet (nothing was built), or when the checkout cannot be made, the project root:
@@ -1024,7 +846,11 @@ async fn audit_worktree(project_root: &Path, spec: &Spec) -> PathBuf {
                 .await
                 .is_ok_and(|output| output.status.success())
     };
-    if ready { path } else { project_root.to_path_buf() }
+    if ready {
+        path
+    } else {
+        project_root.to_path_buf()
+    }
 }
 
 struct DaemonPreparer<'a> {
@@ -1050,7 +876,10 @@ impl SpecPreparer for DaemonPreparer<'_> {
             project_id: spec.project_id.as_deref(),
             cwd: &cwd,
         };
-        let roots = ScanRoots { project_root: Some(self.project_root.clone()), state_dir: self.state_dir.clone() };
+        let roots = ScanRoots {
+            project_root: Some(self.project_root.clone()),
+            state_dir: self.state_dir.clone(),
+        };
         // A spec the agent could not make sense of is stored as `needs_owner` by `extract` itself,
         // which `finish_with` reads back; only a failure to extract at all is an error here.
         extract::extract(&self.state.pool, &roots, spec_id, &runner)
@@ -1077,9 +906,16 @@ impl SpecPreparer for DaemonPreparer<'_> {
             worktree: worktree.clone(),
             caller_id: crate::tree_job::landing::scope_caller_id(spec_id),
         };
-        audit::audit(&self.state.pool, spec_id, &worktree, lineage, &reviewer, &verify)
-            .await
-            .map_err(|error| format!("{error:?}"))
+        audit::audit(
+            &self.state.pool,
+            spec_id,
+            &worktree,
+            lineage,
+            &reviewer,
+            &verify,
+        )
+        .await
+        .map_err(|error| format!("{error:?}"))
     }
 }
 
@@ -1123,11 +959,18 @@ impl TreeLauncher for DaemonLauncher<'_> {
             .await
             .map_err(|error| error.to_string())?;
         if status != StatusCode::OK {
-            return Err(format!("POST /trees answered {status}: {}", String::from_utf8_lossy(&bytes)));
+            return Err(format!(
+                "POST /trees answered {status}: {}",
+                String::from_utf8_lossy(&bytes)
+            ));
         }
         let root_node_id = serde_json::from_slice::<serde_json::Value>(&bytes)
             .ok()
-            .and_then(|value| value.get("root_node_id").and_then(|id| id.as_str().map(str::to_owned)))
+            .and_then(|value| {
+                value
+                    .get("root_node_id")
+                    .and_then(|id| id.as_str().map(str::to_owned))
+            })
             .ok_or_else(|| "POST /trees answered without a root node".to_owned())?;
 
         let deadline = tokio::time::Instant::now() + TREE_CEILING;
@@ -1211,7 +1054,10 @@ pub async fn finish(state: &AppState, scope: FinishScope) -> Result<FinishReport
         integration_branch: config.integration_branch.clone(),
         state_dir,
     };
-    let deps = FinishDeps { launcher: &launcher, preparer: &preparer };
+    let deps = FinishDeps {
+        launcher: &launcher,
+        preparer: &preparer,
+    };
     finish_with(&state.pool, &deps, &config, scope).await
 }
 
@@ -1221,7 +1067,7 @@ mod tests {
     use crate::execution::runner::ToolPolicy;
     use crate::spec_backlog::audit::{AuditReport, SpecLineage};
     use crate::spec_backlog::model::{
-        spec_id, CriterionKind, CriterionStatus, DepSource, NewCriterion, SpecKind, SpecStatus,
+        CriterionKind, CriterionStatus, DepSource, NewCriterion, SpecKind, SpecStatus, spec_id,
     };
     use crate::spec_backlog::store;
     use crate::spec_backlog::verdict::{NotDoneReason, Verdict, VerifyState};
@@ -1240,9 +1086,13 @@ mod tests {
     /// Registers a spec in `status` and returns its id.
     async fn add_spec(pool: &SqlitePool, name: &str, status: SpecStatus) -> String {
         let path = path_of(name);
-        let spec = store::upsert_by_path(pool, None, &path, name, SHA).await.unwrap();
+        let spec = store::upsert_by_path(pool, None, &path, name, SHA)
+            .await
+            .unwrap();
         if status == SpecStatus::Done {
-            store::set_audit_result(pool, &spec.id, SpecStatus::Done, None, SHA).await.unwrap();
+            store::set_audit_result(pool, &spec.id, SpecStatus::Done, None, SHA)
+                .await
+                .unwrap();
         } else if status != SpecStatus::Discovered {
             store::set_extraction_result(pool, &spec.id, SpecKind::Spec, status, None)
                 .await
@@ -1300,7 +1150,10 @@ mod tests {
     impl TreeLauncher for FakeLauncher {
         async fn run_tree(&self, request: &TreeRequest) -> Result<TreeOutcome, String> {
             self.requests.lock().unwrap().push(request.clone());
-            self.log.lock().unwrap().push(format!("tree:{}", request.spec_id));
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("tree:{}", request.spec_id));
             let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_in_flight.fetch_max(now, Ordering::SeqCst);
             tokio::time::sleep(self.delay).await;
@@ -1342,7 +1195,9 @@ mod tests {
                 verify_hint: None,
                 status: CriterionStatus::Open,
             };
-            store::replace_criteria(&self.pool, spec_id, SHA, &[item]).await.unwrap();
+            store::replace_criteria(&self.pool, spec_id, SHA, &[item])
+                .await
+                .unwrap();
             store::set_extraction_result(
                 &self.pool,
                 spec_id,
@@ -1357,15 +1212,26 @@ mod tests {
 
         async fn audit(&self, spec_id: &str, lineage: &SpecLineage) -> Result<AuditReport, String> {
             self.log.lock().unwrap().push(format!("audit:{spec_id}"));
-            self.lineages.lock().unwrap().push((spec_id.to_owned(), lineage.clone()));
+            self.lineages
+                .lock()
+                .unwrap()
+                .push((spec_id.to_owned(), lineage.clone()));
             let done = self.passes.iter().any(|id| id == spec_id);
-            let status = if done { SpecStatus::Done } else { SpecStatus::Audited };
+            let status = if done {
+                SpecStatus::Done
+            } else {
+                SpecStatus::Audited
+            };
             store::set_audit_result(&self.pool, spec_id, status, Some("fake audit"), SHA)
                 .await
                 .unwrap();
             Ok(AuditReport {
                 reviewer_run_id: "reviewer-1".to_owned(),
-                verify: if done { VerifyState::Green } else { VerifyState::Red },
+                verify: if done {
+                    VerifyState::Green
+                } else {
+                    VerifyState::Red
+                },
                 verdict: if done {
                     Verdict::Done
                 } else {
@@ -1398,7 +1264,10 @@ mod tests {
 
         let report = finish_with(
             &pool,
-            &FinishDeps { launcher: &launcher, preparer: &prep },
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &prep,
+            },
             &config,
             scope_all(),
         )
@@ -1424,7 +1293,10 @@ mod tests {
             assert_ne!(request.feature_branch, "master", "never a tree over master");
             assert_eq!(request.project_root, "/repo");
             assert_eq!(request.round, 1);
-            assert!(request.goal.contains(".ai/specs/2026-01-01-"), "goal names the spec file");
+            assert!(
+                request.goal.contains(".ai/specs/2026-01-01-"),
+                "goal names the spec file"
+            );
         }
         assert_eq!(report.trees.len(), 3);
         for id in [&a, &b, &c] {
@@ -1441,8 +1313,12 @@ mod tests {
         let a = add_spec(&pool, "alpha", SpecStatus::Extracted).await;
         let b = add_spec(&pool, "beta", SpecStatus::Extracted).await;
         let c = add_spec(&pool, "gamma", SpecStatus::Extracted).await;
-        store::add_dep(&pool, &a, &b, DepSource::Owner).await.unwrap();
-        store::add_dep(&pool, &b, &c, DepSource::Extracted).await.unwrap();
+        store::add_dep(&pool, &a, &b, DepSource::Owner)
+            .await
+            .unwrap();
+        store::add_dep(&pool, &b, &c, DepSource::Extracted)
+            .await
+            .unwrap();
         let log = Log::default();
         let launcher = FakeLauncher::new(&log);
         let prep = FakePreparer::new(&pool, &log, &[&a, &b, &c]);
@@ -1452,16 +1328,27 @@ mod tests {
 
         finish_with(
             &pool,
-            &FinishDeps { launcher: &launcher, preparer: &prep },
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &prep,
+            },
             &config,
             scope_all(),
         )
         .await
         .unwrap();
 
-        let order: Vec<_> = launcher.requests().iter().map(|r| r.spec_id.clone()).collect();
+        let order: Vec<_> = launcher
+            .requests()
+            .iter()
+            .map(|r| r.spec_id.clone())
+            .collect();
         assert_eq!(order, vec![c, b, a]);
-        assert_eq!(launcher.max_in_flight.load(Ordering::SeqCst), 1, "a chain never overlaps");
+        assert_eq!(
+            launcher.max_in_flight.load(Ordering::SeqCst),
+            1,
+            "a chain never overlaps"
+        );
     }
 
     #[tokio::test]
@@ -1475,18 +1362,28 @@ mod tests {
 
         let report = finish_with(
             &pool,
-            &FinishDeps { launcher: &launcher, preparer: &prep },
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &prep,
+            },
             &cfg(),
             scope_all(),
         )
         .await
         .unwrap();
 
-        let launched: Vec<_> = launcher.requests().iter().map(|r| r.spec_id.clone()).collect();
+        let launched: Vec<_> = launcher
+            .requests()
+            .iter()
+            .map(|r| r.spec_id.clone())
+            .collect();
         assert_eq!(launched, vec![todo]);
         assert_eq!(report.skipped, vec![done.clone()]);
         assert!(
-            !log.lock().unwrap().iter().any(|entry| entry.ends_with(&done)),
+            !log.lock()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.ends_with(&done)),
             "a done spec is neither extracted, audited nor launched"
         );
     }
@@ -1507,7 +1404,10 @@ mod tests {
 
         finish_with(
             &pool,
-            &FinishDeps { launcher: &launcher, preparer: &prep },
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &prep,
+            },
             &config,
             scope_all(),
         )
@@ -1515,7 +1415,10 @@ mod tests {
         .unwrap();
 
         let log = log.lock().unwrap().clone();
-        let first_tree = log.iter().position(|e| e.starts_with("tree:")).expect("trees ran");
+        let first_tree = log
+            .iter()
+            .position(|e| e.starts_with("tree:"))
+            .expect("trees ran");
         for fresh in [&fresh_one, &fresh_two] {
             let extract = log.iter().position(|e| *e == format!("extract:{fresh}"));
             let audit = log.iter().position(|e| *e == format!("audit:{fresh}"));
@@ -1548,7 +1451,10 @@ mod tests {
 
         finish_with(
             &pool,
-            &FinishDeps { launcher: &launcher, preparer: &prep },
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &prep,
+            },
             &config,
             scope_all(),
         )
@@ -1575,12 +1481,19 @@ mod tests {
         let mut config = cfg();
         config.max_parallel = 4;
         // a and b write under the same directory; c has an unknown scope (no entry).
-        config.owned_paths.insert(a.clone(), vec!["core/src/shared/".to_owned()]);
-        config.owned_paths.insert(b.clone(), vec!["core/src/shared/mod.rs".to_owned()]);
+        config
+            .owned_paths
+            .insert(a.clone(), vec!["core/src/shared/".to_owned()]);
+        config
+            .owned_paths
+            .insert(b.clone(), vec!["core/src/shared/mod.rs".to_owned()]);
 
         finish_with(
             &pool,
-            &FinishDeps { launcher: &launcher, preparer: &prep },
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &prep,
+            },
             &config,
             scope_all(),
         )
@@ -1606,7 +1519,10 @@ mod tests {
 
         let report = finish_with(
             &pool,
-            &FinishDeps { launcher: &launcher, preparer: &prep },
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &prep,
+            },
             &cfg(),
             scope_all(),
         )
@@ -1617,7 +1533,10 @@ mod tests {
         assert_eq!(rounds, vec![1, 2], "at most two rounds, never a third tree");
         assert_eq!(status_of(&pool, &stubborn).await, SpecStatus::NeedsOwner);
         let spec = store::get_spec(&pool, &stubborn).await.unwrap().unwrap();
-        assert!(spec.status_reason.is_some_and(|r| !r.is_empty()), "a reason is recorded");
+        assert!(
+            spec.status_reason.is_some_and(|r| !r.is_empty()),
+            "a reason is recorded"
+        );
         assert_eq!(report.needs_owner, vec![stubborn.clone()]);
         assert!(report.done.is_empty());
         // The second round's audit sees the lineage of both trees.
@@ -1636,7 +1555,10 @@ mod tests {
 
         let empty = finish_with(
             &pool,
-            &FinishDeps { launcher: &launcher, preparer: &prep },
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &prep,
+            },
             &cfg(),
             scope_all(),
         )
@@ -1647,7 +1569,10 @@ mod tests {
         let done = add_spec(&pool, "finished", SpecStatus::Done).await;
         let again = finish_with(
             &pool,
-            &FinishDeps { launcher: &launcher, preparer: &prep },
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &prep,
+            },
             &cfg(),
             scope_all(),
         )
@@ -1672,14 +1597,20 @@ mod tests {
 
         let report = finish_with(
             &pool,
-            &FinishDeps { launcher: &launcher, preparer: &prep },
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &prep,
+            },
             &config,
             scope_all(),
         )
         .await
         .unwrap();
 
-        assert!(launcher.requests().is_empty(), "no tree is created over the integration branch");
+        assert!(
+            launcher.requests().is_empty(),
+            "no tree is created over the integration branch"
+        );
         assert_eq!(report.refused, vec![risky.clone()]);
         assert_ne!(status_of(&pool, &risky).await, SpecStatus::Done);
         assert!(derived_branch(&path_of("risky")).starts_with("spec/"));
@@ -1702,21 +1633,40 @@ mod tests {
 
         finish_with(
             &pool,
-            &FinishDeps { launcher: &launcher, preparer: &prep },
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &prep,
+            },
             &config,
             scope_all(),
         )
         .await
         .unwrap();
 
-        assert_eq!(std::fs::read(&file).unwrap(), bytes, "the spec file is byte-identical");
-        assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), before);
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            bytes,
+            "the spec file is byte-identical"
+        );
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().modified().unwrap(),
+            before
+        );
         let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
         assert_eq!(names.len(), 1, "finish creates nothing beside the spec");
         let source = include_str!("finish.rs");
         let production = source.split("#[cfg(test)]").next().unwrap();
-        for needle in ["fs::write", "OpenOptions", "File::create", "remove_file", "rename("] {
-            assert!(!production.contains(needle), "production code must not use {needle}");
+        for needle in [
+            "fs::write",
+            "OpenOptions",
+            "File::create",
+            "remove_file",
+            "rename(",
+        ] {
+            assert!(
+                !production.contains(needle),
+                "production code must not use {needle}"
+            );
         }
     }
 
@@ -1727,9 +1677,19 @@ mod tests {
         assert_eq!(request.prompt, "review this");
         assert_eq!(request.project_id.as_deref(), Some("proj"));
         assert_eq!(request.cwd.as_deref(), Some("/repo"));
-        assert_eq!(request.tool_policy, ToolPolicy::None, "the reviewer has no tools at all");
-        assert!(request.wait_for_final_text, "the adapter waits for the final text");
-        assert!(!request.steerable, "nobody talks to a reviewer after it starts");
+        assert_eq!(
+            request.tool_policy,
+            ToolPolicy::None,
+            "the reviewer has no tools at all"
+        );
+        assert!(
+            request.wait_for_final_text,
+            "the adapter waits for the final text"
+        );
+        assert!(
+            !request.steerable,
+            "nobody talks to a reviewer after it starts"
+        );
     }
 
     #[tokio::test]
@@ -1743,9 +1703,20 @@ mod tests {
         record_extraction_run(&pool, &id, "ex-1").await.unwrap();
         record_extraction_run(&pool, &other, "ex-9").await.unwrap();
 
-        assert_eq!(extraction_run_ids(&pool, &id).await.unwrap(), vec!["ex-1", "ex-2"]);
-        assert_eq!(extraction_run_ids(&pool, &other).await.unwrap(), vec!["ex-9"]);
-        assert!(extraction_run_ids(&pool, "unknown").await.unwrap().is_empty());
+        assert_eq!(
+            extraction_run_ids(&pool, &id).await.unwrap(),
+            vec!["ex-1", "ex-2"]
+        );
+        assert_eq!(
+            extraction_run_ids(&pool, &other).await.unwrap(),
+            vec!["ex-9"]
+        );
+        assert!(
+            extraction_run_ids(&pool, "unknown")
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         // A later audit counts them as part of the spec's own lineage.
         let outcome = TreeOutcome {
@@ -1754,7 +1725,10 @@ mod tests {
         };
         let lineage = lineage_for(&pool, &id, &[outcome]).await.unwrap();
         for expected in ["ex-1", "ex-2", "tree-run"] {
-            assert!(lineage.run_ids.iter().any(|r| r == expected), "missing {expected}");
+            assert!(
+                lineage.run_ids.iter().any(|r| r == expected),
+                "missing {expected}"
+            );
         }
         assert!(!lineage.run_ids.iter().any(|r| r == "ex-9"));
         assert!(lineage.lineage_roots.iter().any(|r| r == "tree-root"));
@@ -1798,33 +1772,65 @@ mod tests {
     fn criteria_name_files_through_text_and_hint() {
         let criteria = [
             crit(1, "`core/src/a.rs:12` rejects an empty id.", None),
-            crit(2, "Docs updated.", Some("see ./docs/b.md and https://x.io/p.html")),
+            crit(
+                2,
+                "Docs updated.",
+                Some("see ./docs/b.md and https://x.io/p.html"),
+            ),
         ];
-        assert_eq!(paths_named_by(&criteria), vec!["core/src/a.rs", "docs/b.md"]);
+        assert_eq!(
+            paths_named_by(&criteria),
+            vec!["core/src/a.rs", "docs/b.md"]
+        );
     }
 
     #[test]
     fn numbered_prefix_cuts_on_a_line_boundary_and_says_so() {
-        assert_eq!(numbered_prefix("a
+        assert_eq!(
+            numbered_prefix(
+                "a
 b
-", 100), ("1: a
+", 100
+            ),
+            (
+                "1: a
 2: b
-".to_owned(), false));
-        assert_eq!(numbered_prefix("a
+"
+                .to_owned(),
+                false
+            )
+        );
+        assert_eq!(
+            numbered_prefix(
+                "a
 b
-", 7), ("1: a
-".to_owned(), true));
+", 7
+            ),
+            (
+                "1: a
+"
+                .to_owned(),
+                true
+            )
+        );
     }
 
     #[test]
     fn a_cut_prompt_tells_the_reviewer_to_doubt_what_it_cannot_see() {
         let criteria = [crit(1, "x", None)];
         let whole = ReviewMaterial {
-            files: vec![ReviewFile { path: "a.rs".to_owned(), text: "1: fn a() {}
-".to_owned() }],
+            files: vec![ReviewFile {
+                path: "a.rs".to_owned(),
+                text: "1: fn a() {}
+"
+                .to_owned(),
+            }],
             cut: false,
         };
-        let cut = ReviewMaterial { cut: true, ..whole.clone() };
+        let cut = ReviewMaterial {
+            cut: true,
+            ..whole.clone()
+        };
         let shown = review_prompt(&sample_spec(), &criteria, &whole);
         assert!(shown.contains("=== a.rs ===") && shown.contains("1: fn a() {}"));
         assert!(!shown.contains("NOT EVERYTHING IS SHOWN"));
@@ -1836,12 +1842,23 @@ b
     async fn material_embeds_named_files_within_the_caps_and_flags_a_cut() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
-        std::fs::write(dir.path().join("src/a.rs"), "one
+        std::fs::write(
+            dir.path().join("src/a.rs"),
+            "one
 two
-").unwrap();
+",
+        )
+        .unwrap();
         let big = "x".repeat(100);
-        std::fs::write(dir.path().join("src/big.rs"), format!("{big}
-").repeat(REVIEW_FILE_CAP)).unwrap();
+        std::fs::write(
+            dir.path().join("src/big.rs"),
+            format!(
+                "{big}
+"
+            )
+            .repeat(REVIEW_FILE_CAP),
+        )
+        .unwrap();
         std::fs::write(dir.path().join("src/bin.dat"), [0u8, 1, 2]).unwrap();
         let criteria = [crit(
             1,
@@ -1852,9 +1869,11 @@ two
         let material = gather_material(dir.path(), "master", &criteria).await;
         let paths: Vec<&str> = material.files.iter().map(|f| f.path.as_str()).collect();
         assert_eq!(paths, vec!["src/a.rs", "src/big.rs"]);
-        assert!(material.files[0].text.starts_with("1: one
+        assert!(material.files[0].text.starts_with(
+            "1: one
 2: two
-"));
+"
+        ));
         assert!(material.files[1].text.len() <= REVIEW_FILE_CAP);
         assert!(material.cut);
     }

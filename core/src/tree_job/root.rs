@@ -104,9 +104,10 @@ async fn add_root_branch(state: &AppState, job_id: &str) -> Result<(), String> {
     if job.manifest.branches.contains_key(ROOT_BRANCH) {
         return Ok(());
     }
-    job.manifest
-        .branches
-        .insert(ROOT_BRANCH.to_owned(), Branch::new(ROOT_BRANCH, &[], "code", None));
+    job.manifest.branches.insert(
+        ROOT_BRANCH.to_owned(),
+        Branch::new(ROOT_BRANCH, &[], "code", None),
+    );
     job.updated_at = chrono::Utc::now().to_rfc3339();
     store::update(&state.pool, &job)
         .await
@@ -220,10 +221,15 @@ mod tests {
     }
 
     /// Creates the tree job through the route, which starts its root run in the root worktree.
-    async fn start_tree(repo: &Path, delay: Option<Duration>) -> (AppState, Arc<FakeCommandRunner>) {
-        let (state, runner) =
-            crate::execution::runs::testkit::test_state_with_runner(delay, Duration::from_secs(600))
-                .await;
+    async fn start_tree(
+        repo: &Path,
+        delay: Option<Duration>,
+    ) -> (AppState, Arc<FakeCommandRunner>) {
+        let (state, runner) = crate::execution::runs::testkit::test_state_with_runner(
+            delay,
+            Duration::from_secs(600),
+        )
+        .await;
         runner.canned.lock().unwrap().as_mut().unwrap().session_id = None;
         let body = json!({
             "id": TREE,
@@ -239,7 +245,11 @@ mod tests {
             .header("Content-Type", "application/json")
             .body(Body::from(body.to_string()))
             .unwrap();
-        let response = routes().with_state(state.clone()).oneshot(request).await.unwrap();
+        let response = routes()
+            .with_state(state.clone())
+            .oneshot(request)
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         (state, runner)
     }
@@ -319,7 +329,10 @@ mod tests {
         assert_eq!(mode, "worktree", "a tree run is an autonomous code run");
         assert_eq!(run_cwd.map(PathBuf::from), Some(worktree));
         let listed = git_text(&repo, &["worktree", "list", "--porcelain"]);
-        let trees = listed.lines().filter(|line| line.starts_with("worktree ")).count();
+        let trees = listed
+            .lines()
+            .filter(|line| line.starts_with("worktree "))
+            .count();
         assert_eq!(
             trees, 2,
             "the project checkout and the root worktree, and no third one: {listed}"
@@ -397,14 +410,22 @@ mod tests {
         std::fs::write(worktree.join("AGENTS.md"), "# managed\n").unwrap();
         let before = git_text(&worktree, &["rev-parse", "HEAD"]);
 
-        let status = git_text(&worktree, &["status", "--porcelain", "--untracked-files=all"]);
-        let sha = crate::execution::worktree::checkpoint(&worktree).await.unwrap();
+        let status = git_text(
+            &worktree,
+            &["status", "--porcelain", "--untracked-files=all"],
+        );
+        let sha = crate::execution::worktree::checkpoint(&worktree)
+            .await
+            .unwrap();
 
         assert!(
             !status.contains("AGENTS.md") && !status.contains(".agents"),
             "workflow files show as changes of the tree: {status:?}"
         );
-        assert_eq!(sha, before, "a checkpoint of workflow files alone commits nothing");
+        assert_eq!(
+            sha, before,
+            "a checkpoint of workflow files alone commits nothing"
+        );
         let tracked = git_text(&worktree, &["ls-files"]);
         assert!(
             !tracked.contains("AGENTS.md") && !tracked.contains(".agents"),
@@ -453,19 +474,30 @@ mod tests {
             .body(Body::from(body.to_string()))
             .unwrap();
 
-        let response = routes().with_state(state.clone()).oneshot(request).await.unwrap();
+        let response = routes()
+            .with_state(state.clone())
+            .oneshot(request)
+            .await
+            .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
         let prompts: Vec<String> = sqlx::query_scalar("SELECT prompt FROM runs")
             .fetch_all(&state.pool)
             .await
             .unwrap();
-        assert_eq!(prompts.len(), 1, "expected exactly one root run: {prompts:?}");
+        assert_eq!(
+            prompts.len(),
+            1,
+            "expected exactly one root run: {prompts:?}"
+        );
         let prompt = &prompts[0];
         assert!(prompt.contains(GOAL), "the goal is missing: {prompt}");
         // The protocol names the tools the root uses and the way it ends.
         for needle in ["tree_branch_start", "node_close", "handoff"] {
-            assert!(prompt.contains(needle), "the protocol lacks {needle:?}: {prompt}");
+            assert!(
+                prompt.contains(needle),
+                "the protocol lacks {needle:?}: {prompt}"
+            );
         }
     }
 }

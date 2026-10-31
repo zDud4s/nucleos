@@ -1054,7 +1054,9 @@ async fn main() {
                             tracing::warn!(%error, "conductor liveness sweep failed");
                         }
                     }
-                    Err(error) => tracing::warn!(%error, "could not collect conductor observations"),
+                    Err(error) => {
+                        tracing::warn!(%error, "could not collect conductor observations")
+                    }
                 }
             }
         }

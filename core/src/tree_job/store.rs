@@ -132,15 +132,14 @@ pub async fn load(pool: &SqlitePool, id: &str) -> Result<Option<TreeJob>, StoreE
 /// does not exist is an error, since otherwise the caller's state would be lost without a word.
 pub async fn update(pool: &SqlitePool, job: &TreeJob) -> Result<(), StoreError> {
     let manifest = serde_json::to_string(&job.manifest)?;
-    let updated = sqlx::query(
-        "UPDATE tree_jobs SET state = ?, manifest = ?, updated_at = ? WHERE id = ?",
-    )
-    .bind(&job.state)
-    .bind(manifest)
-    .bind(&job.updated_at)
-    .bind(&job.id)
-    .execute(pool)
-    .await?;
+    let updated =
+        sqlx::query("UPDATE tree_jobs SET state = ?, manifest = ?, updated_at = ? WHERE id = ?")
+            .bind(&job.state)
+            .bind(manifest)
+            .bind(&job.updated_at)
+            .bind(&job.id)
+            .execute(pool)
+            .await?;
     if updated.rows_affected() == 0 {
         return Err(StoreError::NotFound(job.id.clone()));
     }
@@ -205,13 +204,14 @@ pub async fn resume_all(pool: &SqlitePool) -> Result<Resumed, StoreError> {
         .into_iter()
         .map(|job| job.id)
         .collect();
-    let failed_nodes = super::node_run::reconcile_running(pool)
-        .await
-        .map_err(|error| match error {
-            super::node_run::NodeRunError::Store(error) => error,
-            super::node_run::NodeRunError::Db(error) => StoreError::Db(error),
-            other => StoreError::Db(sqlx::Error::Protocol(other.to_string())),
-        })?;
+    let failed_nodes =
+        super::node_run::reconcile_running(pool)
+            .await
+            .map_err(|error| match error {
+                super::node_run::NodeRunError::Store(error) => error,
+                super::node_run::NodeRunError::Db(error) => StoreError::Db(error),
+                other => StoreError::Db(sqlx::Error::Protocol(other.to_string())),
+            })?;
 
     let spent: Vec<(String, String)> = sqlx::query_as(
         "SELECT t.node_id, t.key FROM tree_transitions t
@@ -285,8 +285,7 @@ pub async fn launch_recovering(
         },
     )
     .await?;
-    let outcome =
-        super::node_run::launch(state, node_id, key, prompt, project_id, cwd, mode).await;
+    let outcome = super::node_run::launch(state, node_id, key, prompt, project_id, cwd, mode).await;
     if let Err(super::node_run::NodeRunError::Create(_)) = &outcome {
         // Best effort: the create error is the answer, and a failed clear only leaves the old
         // behaviour (the key stays spent until the next boot).

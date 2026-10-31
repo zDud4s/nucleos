@@ -176,7 +176,11 @@ async fn check_guards(
             open_children: 0,
         });
         ancestor = match node.parent_id {
-            Some(parent_id) => Some(work_nodes::get(pool, &parent_id).await.map_err(node_error)?),
+            Some(parent_id) => Some(
+                work_nodes::get(pool, &parent_id)
+                    .await
+                    .map_err(node_error)?,
+            ),
             None => None,
         };
     }
@@ -236,7 +240,9 @@ async fn open_sibling(
                 .as_database_error()
                 .is_some_and(|database_error| database_error.is_unique_violation()) =>
         {
-            let winner = existing_continuation(pool, &source.id).await.map_err(db_error)?;
+            let winner = existing_continuation(pool, &source.id)
+                .await
+                .map_err(db_error)?;
             winner.map(|(id, _)| id).ok_or_else(|| db_error(error))
         }
         Err(error) => Err(node_error(error)),
@@ -264,7 +270,9 @@ pub async fn continue_node(
         return Err(ContinuationError::NotHandoff);
     }
     let tree_job = tree_job_of(pool, node_id).await.map_err(db_error)?;
-    let existing = existing_continuation(pool, node_id).await.map_err(db_error)?;
+    let existing = existing_continuation(pool, node_id)
+        .await
+        .map_err(db_error)?;
     if let Some((sibling, run_id)) = &existing
         && (run_id.is_some() || tree_job.is_none())
     {
@@ -275,7 +283,10 @@ pub async fn continue_node(
     }
 
     if existing.is_none()
-        && continuations_behind(pool, node_id).await.map_err(db_error)? >= MAX_CONTINUATIONS
+        && continuations_behind(pool, node_id)
+            .await
+            .map_err(db_error)?
+            >= MAX_CONTINUATIONS
     {
         return Err(ContinuationError::TooManyContinuations);
     }
@@ -401,7 +412,10 @@ mod tests {
         .await;
     }
 
-    async fn sibling(state: &AppState, id: &str) -> (String, String, String, Option<String>, Option<String>) {
+    async fn sibling(
+        state: &AppState,
+        id: &str,
+    ) -> (String, String, String, Option<String>, Option<String>) {
         sqlx::query_as(
             "SELECT parent_id, goal, owned_paths, tree_job_id, run_id FROM work_nodes WHERE id = ?",
         )
@@ -429,7 +443,10 @@ mod tests {
 
         let (parent, goal, paths, tree_job, run_id) = sibling(&state, &continuation.node_id).await;
         assert_eq!(parent, "root");
-        assert!(goal.starts_with("Keep the original goal"), "the goal keeps the original text first: {goal}");
+        assert!(
+            goal.starts_with("Keep the original goal"),
+            "the goal keeps the original text first: {goal}"
+        );
         assert_eq!(paths, r#"["core/src/conductor/**"]"#);
         assert_eq!(tree_job, None);
         assert_eq!(run_id, None);
@@ -477,14 +494,14 @@ mod tests {
             "INSERT INTO tree_budgets (tree_id, limit_usd, soft_pct, created_at, updated_at) \
              VALUES (?, ?, ?, ?, ?)",
         )
-            .bind("root")
-            .bind(0.0)
-            .bind(80.0)
-            .bind(Utc::now().to_rfc3339())
-            .bind(Utc::now().to_rfc3339())
-            .execute(&state.pool)
-            .await
-            .unwrap();
+        .bind("root")
+        .bind(0.0)
+        .bind(80.0)
+        .bind(Utc::now().to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&state.pool)
+        .await
+        .unwrap();
 
         assert!(continue_node(&state, "handoff").await.is_err());
         assert_eq!(children(&state, "root").await, 1);
@@ -534,7 +551,8 @@ mod tests {
     /// An open tree job with no branches, as `sweep`'s `seed_tree_node` seeds it.
     async fn seed_job(state: &AppState) {
         let created = Utc::now().to_rfc3339();
-        let mut manifest = Manifest::new("job-1", "feat/tree", "Ship it", "C:/Projects/nucleos", &[]);
+        let mut manifest =
+            Manifest::new("job-1", "feat/tree", "Ship it", "C:/Projects/nucleos", &[]);
         manifest.state = "open".to_owned();
         let job = TreeJob {
             id: "job-1".to_owned(),
@@ -591,16 +609,19 @@ mod tests {
         .unwrap();
         let now = Utc::now();
 
-        sweep::tick(&state, &[], &Limits::default(), now).await.unwrap();
-        sweep::tick(&state, &[], &Limits::default(), now).await.unwrap();
+        sweep::tick(&state, &[], &Limits::default(), now)
+            .await
+            .unwrap();
+        sweep::tick(&state, &[], &Limits::default(), now)
+            .await
+            .unwrap();
 
         assert_eq!(children(&state, "root").await, 2);
-        let run_id: Option<String> = sqlx::query_scalar(
-            "SELECT run_id FROM work_nodes WHERE continues_node_id = 'handoff'",
-        )
-        .fetch_one(&state.pool)
-        .await
-        .unwrap();
+        let run_id: Option<String> =
+            sqlx::query_scalar("SELECT run_id FROM work_nodes WHERE continues_node_id = 'handoff'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
         assert!(run_id.is_some(), "the sibling has no run");
         let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
             .fetch_one(&state.pool)
@@ -615,7 +636,9 @@ mod tests {
         seed_node(&state, "root", None, "root", 0, "running", None, None).await;
         seed_handoff(&state, "handoff", "root", "root").await;
 
-        sweep::tick(&state, &[], &Limits::default(), Utc::now()).await.unwrap();
+        sweep::tick(&state, &[], &Limits::default(), Utc::now())
+            .await
+            .unwrap();
 
         assert_eq!(children(&state, "root").await, 1);
     }
@@ -626,7 +649,11 @@ mod tests {
         seed_job(&state).await;
         seed_node(&state, "root", None, "root", 0, "running", None, None).await;
         seed_tree_handoff(&state, "link-0").await;
-        for (link, previous) in [("link-1", "link-0"), ("link-2", "link-1"), ("link-3", "link-2")] {
+        for (link, previous) in [
+            ("link-1", "link-0"),
+            ("link-2", "link-1"),
+            ("link-3", "link-2"),
+        ] {
             seed_tree_handoff(&state, link).await;
             sqlx::query("UPDATE work_nodes SET continues_node_id = ? WHERE id = ?")
                 .bind(previous)
@@ -637,15 +664,18 @@ mod tests {
         }
         let now = Utc::now();
 
-        sweep::tick(&state, &[], &Limits::default(), now).await.unwrap();
-        sweep::tick(&state, &[], &Limits::default(), now).await.unwrap();
+        sweep::tick(&state, &[], &Limits::default(), now)
+            .await
+            .unwrap();
+        sweep::tick(&state, &[], &Limits::default(), now)
+            .await
+            .unwrap();
 
-        let lines: Vec<String> = sqlx::query_scalar(
-            "SELECT subject FROM feed WHERE kind = 'node_continuation_stopped'",
-        )
-        .fetch_all(&state.pool)
-        .await
-        .unwrap();
+        let lines: Vec<String> =
+            sqlx::query_scalar("SELECT subject FROM feed WHERE kind = 'node_continuation_stopped'")
+                .fetch_all(&state.pool)
+                .await
+                .unwrap();
         assert_eq!(lines, ["node:link-3"]);
         assert_eq!(children(&state, "root").await, 4);
     }

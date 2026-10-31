@@ -65,7 +65,11 @@ fn chunk_section(section: &str, out: &mut Vec<String>) {
 
 /// The prompt for one section of the spec at `rel_path`. `previous_error` is the rendered
 /// `ParseError` of the last attempt, appended so the agent can correct itself on a retry.
-pub fn extraction_prompt(rel_path: &str, section_text: &str, previous_error: Option<&str>) -> String {
+pub fn extraction_prompt(
+    rel_path: &str,
+    section_text: &str,
+    previous_error: Option<&str>,
+) -> String {
     let mut prompt = format!(
         "You are extracting the acceptance criteria of the spec `{rel_path}`.\n\
          Read the text below and answer with ONE JSON object in a ```json fence, and nothing else \

@@ -75,7 +75,9 @@ mod tests {
 
     #[test]
     fn parse_sorts_both_bullets_and_every_mark_in_document_order() {
-        let c = parse("- [ ] first open\n* [ ] second open\n- [x] lower done\n* [X] upper done\n- [!] dash blocked\n* [!] star blocked\n");
+        let c = parse(
+            "- [ ] first open\n* [ ] second open\n- [x] lower done\n* [X] upper done\n- [!] dash blocked\n* [!] star blocked\n",
+        );
 
         assert_eq!(c.open, ["first open", "second open"]);
         assert_eq!(c.done, ["lower done", "upper done"]);

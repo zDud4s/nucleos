@@ -7,12 +7,13 @@
 //! Every refusal is `{error}` with the status `NodeError::status_code` names. A field sent as
 //! `null` reads exactly as an absent one, because the MCP client sends every field it has.
 //!
-//! **Who reaches them.** No route here is in any `auth.rs` table, so only the control token and an
+//! **Who reaches them.** No route here is in any `auth.rs` table, so the control token and an
 //! Admin API key get in — the same reach as `/hooks/bundle`, whose caller (the hook forwarder in a
 //! person's own Claude Code session) is the main caller here too, alongside the MCP daemon client
-//! of such a session. `Scope::Run` is deliberately left out: it only ever matches literal POST
-//! paths, so it could not reach `PATCH /nodes/{id}` or the `GET` reads anyway, and a half-reachable
-//! tree is worse than none. Letting an autonomous run keep its own tree is a later decision.
+//! of such a session. The one exception is an autonomous tree run: `auth::tree_run_admits` lets a
+//! `Scope::Run` key use `PATCH /nodes/{id}` and `POST /nodes/{id}/close` for the node its run is
+//! bound to (`work_nodes.run_id`) and no other. `POST /nodes`, `GET /nodes/active` and the tree
+//! read stay out of a run key's reach, so a tree run cannot open or list nodes itself.
 
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::routing::patch;
@@ -626,14 +627,8 @@ mod tests {
     async fn open_refused_for_same_scope_child() {
         let app = app().await;
         let root = open_root(&app, "s-same-scope").await;
-        let (status, parent) = open_child(
-            &app,
-            &root,
-            "Parent",
-            "Split the core module",
-            &["core/**"],
-        )
-        .await;
+        let (status, parent) =
+            open_child(&app, &root, "Parent", "Split the core module", &["core/**"]).await;
         assert_eq!(status, StatusCode::OK, "{parent}");
         let parent_id = parent["id"].as_str().unwrap();
         let (status, first) = open_leaf(&app, parent_id, "First", &["core/a/**"]).await;
@@ -687,10 +682,7 @@ mod tests {
 
         let (status, body) = open_leaf(&app, &root, "Blocked", &["core/**"]).await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
-        assert!(
-            body["error"].as_str().unwrap().contains("budget"),
-            "{body}"
-        );
+        assert!(body["error"].as_str().unwrap().contains("budget"), "{body}");
     }
 
     #[tokio::test]
@@ -706,25 +698,13 @@ mod tests {
     async fn open_refused_for_repeated_goal_of_an_ancestor() {
         let app = app().await;
         let root = open_root(&app, "s-repeated-goal").await;
-        let (status, parent) = open_child(
-            &app,
-            &root,
-            "Parent",
-            "Split the core module",
-            &["core/**"],
-        )
-        .await;
+        let (status, parent) =
+            open_child(&app, &root, "Parent", "Split the core module", &["core/**"]).await;
         assert_eq!(status, StatusCode::OK, "{parent}");
         let parent_id = parent["id"].as_str().unwrap();
 
-        let (status, body) = open_child(
-            &app,
-            parent_id,
-            "Repeated",
-            "ship the tree",
-            &["core/a/**"],
-        )
-        .await;
+        let (status, body) =
+            open_child(&app, parent_id, "Repeated", "ship the tree", &["core/a/**"]).await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
         assert!(
             body["error"].as_str().unwrap().contains("repeated goal"),

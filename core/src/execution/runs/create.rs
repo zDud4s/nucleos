@@ -216,12 +216,7 @@ pub async fn create_tree_node_run(
 ) -> Result<i64, CreateRunError> {
     create_run_with_policy(
         state,
-        NewRun::provisioned(
-            prompt,
-            project_id,
-            project_root,
-            Provisioning::Tree(tree),
-        ),
+        NewRun::provisioned(prompt, project_id, project_root, Provisioning::Tree(tree)),
         None,
         true,
     )

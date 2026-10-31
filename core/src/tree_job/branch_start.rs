@@ -9,7 +9,8 @@
 //! manifest, and never around a step that takes it.
 //!
 //! **Who reaches it.** Like every `/trees*` route it is in no `auth.rs` table: the control token and
-//! an Admin API key only.
+//! an Admin API key, plus one door: `auth::tree_run_admits` admits a `Scope::Run` key on this route
+//! for the tree its run's work node belongs to, and for no other tree.
 
 use std::path::Path as FsPath;
 
@@ -65,7 +66,10 @@ fn required(field: &str, value: Option<String>) -> Result<String, Refusal> {
 /// The rule of `open.rs`'s `valid_name`, checked before the first step so that a name the open step
 /// would refuse never leaves a queued branch behind.
 fn valid_name(value: &str) -> bool {
-    value.chars().next().is_some_and(|first| first.is_ascii_alphanumeric())
+    value
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_alphanumeric())
         && value
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
@@ -76,7 +80,10 @@ fn valid_name(value: &str) -> bool {
 
 fn db_refusal(error: sqlx::Error) -> Refusal {
     tracing::warn!(%error, "tree branch start storage failed");
-    refuse(StatusCode::INTERNAL_SERVER_ERROR, format!("database error: {error}"))
+    refuse(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("database error: {error}"),
+    )
 }
 
 fn store_refusal(error: StoreError) -> Refusal {
@@ -370,11 +377,11 @@ mod tests {
     use std::time::Duration;
 
     use axum::{
+        Router,
         body::Body,
         http::{Request, StatusCode},
-        Router,
     };
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use tower::ServiceExt;
 
     use super::*;
@@ -645,7 +652,9 @@ mod tests {
             .expect("the tree route creates its root node")
             .to_owned();
         // The root run launched first; forget it, so that what is read next is the branch's.
-        seen_launch(&runner).await.expect("the root run reached the runner");
+        seen_launch(&runner)
+            .await
+            .expect("the root run reached the runner");
         *runner.last_permission.lock().unwrap() = None;
         *runner.last_cwd.lock().unwrap() = None;
 
@@ -678,7 +687,11 @@ mod tests {
             "the branch run starts in the worktree its branch was opened with"
         );
         let mode: String = sqlx::query_scalar("SELECT mode FROM runs WHERE id = ?")
-            .bind(response["run_id"].as_i64().expect("the answer names the run"))
+            .bind(
+                response["run_id"]
+                    .as_i64()
+                    .expect("the answer names the run"),
+            )
             .fetch_one(&state.pool)
             .await
             .unwrap();

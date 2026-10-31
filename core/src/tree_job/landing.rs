@@ -234,7 +234,9 @@ pub enum GateResult {
     Green,
     Red,
     /// Nothing was measured that could bless or fail the work; the branch stays where it was.
-    Undecided { reason: String },
+    Undecided {
+        reason: String,
+    },
 }
 
 fn tail(text: &str) -> String {
@@ -325,9 +327,10 @@ pub async fn gate_branch(
 ) -> Result<GateResult, LandingError> {
     let held = branch_of(&job.manifest, branch)?;
     gate_refusal(held)?;
-    let worktree = held.worktree.clone().ok_or_else(|| {
-        LandingError::Refused(format!("branch {branch} has no worktree to gate"))
-    })?;
+    let worktree = held
+        .worktree
+        .clone()
+        .ok_or_else(|| LandingError::Refused(format!("branch {branch} has no worktree to gate")))?;
 
     let verdict = gate_job_scope(
         executor,
@@ -415,8 +418,12 @@ pub fn check_may_merge(manifest: &Manifest, branch: &str) -> Result<MergeDecisio
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergeSubmission {
     /// A merge request is in the queue (new, or the one already there).
-    Queued { request_id: i64 },
-    AlreadyMerged { sha: String },
+    Queued {
+        request_id: i64,
+    },
+    AlreadyMerged {
+        sha: String,
+    },
 }
 
 fn stored_request_id(branch: &Branch, key: &str) -> Option<i64> {
@@ -543,12 +550,11 @@ async fn settle_escalated(
     reason: String,
     claim_conflict: bool,
 ) -> Result<RequestEnd, LandingError> {
-    let row: Option<(String, String, Option<i64>)> = sqlx::query_as(
-        "SELECT project_id, args, resolution_run_id FROM vcs_requests WHERE id = ?",
-    )
-    .bind(id)
-    .fetch_optional(pool)
-    .await?;
+    let row: Option<(String, String, Option<i64>)> =
+        sqlx::query_as("SELECT project_id, args, resolution_run_id FROM vcs_requests WHERE id = ?")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
     let Some((project_id, args, resolution_run)) = row else {
         return Ok(RequestEnd::Failed {
             reason,
@@ -578,7 +584,11 @@ async fn settle_escalated(
                 .fetch_optional(pool)
                 .await?;
             if matches!(status.as_deref(), Some("running" | "awaiting_approval")) {
-                tracing::info!(request_id = id, run, "a conflict resolution is still running");
+                tracing::info!(
+                    request_id = id,
+                    run,
+                    "a conflict resolution is still running"
+                );
                 return Ok(RequestEnd::Pending);
             }
         }
@@ -605,9 +615,13 @@ async fn settle_escalated(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergeSettlement {
-    Merged { sha: String },
+    Merged {
+        sha: String,
+    },
     /// The queue did not merge it. The branch stays `green` and may resubmit.
-    NotMerged { reason: String },
+    NotMerged {
+        reason: String,
+    },
     /// The queue has not finished (or a resolution is running); nothing changed.
     Pending,
 }
@@ -743,9 +757,13 @@ pub async fn land_job(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LandSettlement {
     /// The queue landed it; the job is `finished`.
-    Finished { sha: Option<String> },
+    Finished {
+        sha: Option<String>,
+    },
     /// The queue did not land it; the job stays live with `land_failure` recorded.
-    NotLanded { reason: String },
+    NotLanded {
+        reason: String,
+    },
     Pending,
 }
 
@@ -871,7 +889,10 @@ mod tests {
     }
 
     async fn stored(pool: &SqlitePool, id: &str) -> TreeJob {
-        store::load(pool, id).await.unwrap().expect("the job is stored")
+        store::load(pool, id)
+            .await
+            .unwrap()
+            .expect("the job is stored")
     }
 
     async fn listed_ids(pool: &SqlitePool) -> Vec<String> {
@@ -888,7 +909,9 @@ mod tests {
     }
 
     fn reviewed(mut branch: Branch, findings: Value) -> Branch {
-        branch.reviews.push(json!({"at": STAMP, "findings": findings}));
+        branch
+            .reviews
+            .push(json!({"at": STAMP, "findings": findings}));
         branch
     }
 
@@ -910,7 +933,11 @@ mod tests {
     }
 
     fn undecided_verdicts() -> Vec<ScopeVerdict> {
-        vec![errored(), ScopeVerdict::NothingRan, ScopeVerdict::Unavailable]
+        vec![
+            errored(),
+            ScopeVerdict::NothingRan,
+            ScopeVerdict::Unavailable,
+        ]
     }
 
     // ---- fixtures: repositories and the queue --------------------------------------------------
@@ -1178,7 +1205,10 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(matches!(error, LandingError::InvalidFindings(_)), "{error:?}");
+        assert!(
+            matches!(error, LandingError::InvalidFindings(_)),
+            "{error:?}"
+        );
         assert!(error.to_string().contains("f1"), "{error}");
         assert_eq!(manifest, before);
     }
@@ -1463,8 +1493,14 @@ mod tests {
     fn the_scope_caller_id_is_derived_from_the_text_id_and_is_stable() {
         let first = scope_caller_id("5d6616a7-71f0-4414-a717-99d697a4c6d0");
 
-        assert_eq!(first, scope_caller_id("5d6616a7-71f0-4414-a717-99d697a4c6d0"));
-        assert_ne!(first, scope_caller_id("204d71d1-6b8b-4606-8e2b-d612bdbc5e00"));
+        assert_eq!(
+            first,
+            scope_caller_id("5d6616a7-71f0-4414-a717-99d697a4c6d0")
+        );
+        assert_ne!(
+            first,
+            scope_caller_id("204d71d1-6b8b-4606-8e2b-d612bdbc5e00")
+        );
         assert!(first > i64::from(u32::MAX), "{first}");
         assert!(scope_caller_id("") > i64::from(u32::MAX));
         assert!(scope_caller_id("job-1") > i64::from(u32::MAX));
@@ -1572,7 +1608,10 @@ mod tests {
 
             let error = check_may_merge(&manifest, "api").unwrap_err();
 
-            assert!(matches!(error, LandingError::Refused(_)), "{state}: {error:?}");
+            assert!(
+                matches!(error, LandingError::Refused(_)),
+                "{state}: {error:?}"
+            );
             assert!(error.to_string().contains(state), "{state}: {error}");
         }
     }
@@ -1783,7 +1822,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(replay, MergeSubmission::AlreadyMerged { sha });
-        assert_eq!(request_count(&h.pool).await, 1, "the replay enqueued nothing");
+        assert_eq!(
+            request_count(&h.pool).await,
+            1,
+            "the replay enqueued nothing"
+        );
     }
 
     /// The pattern of `merge_item`: an implement node leaves its tree uncommitted, and a merge of
@@ -1796,7 +1839,13 @@ mod tests {
         let worktree = container.path().join("api-tree");
         assert!(git_in(
             &repo,
-            &["worktree", "add", "-q", &worktree.to_string_lossy(), "tree/api"]
+            &[
+                "worktree",
+                "add",
+                "-q",
+                &worktree.to_string_lossy(),
+                "tree/api"
+            ]
         ));
         std::fs::write(worktree.join("wip.txt"), "not committed yet\n").expect("write");
         let mut branch = branch_at("api", "green");
@@ -1909,7 +1958,10 @@ mod tests {
 
         let result = settle_merge(&pool, &mut job, "api", Duration::ZERO).await;
 
-        assert!(matches!(result, Err(LandingError::Refused(_))), "{result:?}");
+        assert!(
+            matches!(result, Err(LandingError::Refused(_))),
+            "{result:?}"
+        );
         assert_eq!(job.manifest, before);
     }
 
@@ -1938,7 +1990,11 @@ mod tests {
         };
         assert!(!reason.trim().is_empty());
 
-        assert_eq!(sha_of(&repo, "feat/tree"), target, "the target did not move");
+        assert_eq!(
+            sha_of(&repo, "feat/tree"),
+            target,
+            "the target did not move"
+        );
         assert_eq!(porcelain(&repo), "", "the target's checkout is clean");
         assert!(
             !repo.join(".git").join("MERGE_HEAD").exists(),
@@ -1984,7 +2040,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(matches!(second, MergeSubmission::Queued { .. }), "{second:?}");
+        assert!(
+            matches!(second, MergeSubmission::Queued { .. }),
+            "{second:?}"
+        );
         assert_ne!(first, second);
         assert_eq!(request_count(&h.pool).await, 2);
     }
@@ -2049,12 +2108,14 @@ mod tests {
             "reviewing",
             "fixing",
         ] {
-            let manifest =
-                manifest_with(vec![branch_at("api", "merged"), branch_at("ui", state)]);
+            let manifest = manifest_with(vec![branch_at("api", "merged"), branch_at("ui", state)]);
 
             let error = check_may_land(&manifest).unwrap_err();
 
-            assert!(matches!(error, LandingError::Refused(_)), "{state}: {error:?}");
+            assert!(
+                matches!(error, LandingError::Refused(_)),
+                "{state}: {error:?}"
+            );
             assert!(error.to_string().contains("ui"), "{state}: {error}");
         }
     }
@@ -2089,7 +2150,10 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(result, Err(LandingError::Refused(_))), "{result:?}");
+        assert!(
+            matches!(result, Err(LandingError::Refused(_))),
+            "{result:?}"
+        );
         assert_eq!(request_count(&pool).await, 0);
         assert!(!job.manifest.extra.contains_key("land_id"));
         assert_eq!(listed_ids(&pool).await, ["job-1"]);
@@ -2297,7 +2361,9 @@ mod tests {
         .unwrap();
         let before = job.clone();
 
-        let settled = settle_land(&h.pool, &mut job, Duration::ZERO).await.unwrap();
+        let settled = settle_land(&h.pool, &mut job, Duration::ZERO)
+            .await
+            .unwrap();
 
         assert_eq!(settled, LandSettlement::Pending);
         assert_eq!(job, before);
@@ -2310,7 +2376,10 @@ mod tests {
 
         let result = settle_land(&pool, &mut job, Duration::ZERO).await;
 
-        assert!(matches!(result, Err(LandingError::Refused(_))), "{result:?}");
+        assert!(
+            matches!(result, Err(LandingError::Refused(_))),
+            "{result:?}"
+        );
         assert_ne!(job.state, JOB_TERMINAL_STATE);
         assert_eq!(listed_ids(&pool).await, ["job-1"]);
     }

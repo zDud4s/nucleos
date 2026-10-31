@@ -112,7 +112,8 @@ pub fn limits_from_speed_yaml(text: &str, kind: &str) -> ContextLimits {
 
 /// Turns a model window into the highest safe block threshold.
 pub fn block_cap(window: Option<i64>) -> Option<i64> {
-    window.and_then(|window| window.checked_sub(MODEL_BLOCK_MARGIN))
+    window
+        .and_then(|window| window.checked_sub(MODEL_BLOCK_MARGIN))
         .filter(|cap| *cap > 0)
 }
 
@@ -135,7 +136,8 @@ pub async fn verdict_for_run(
         return Ok(None);
     };
 
-    let mut limits = speed_yaml.map_or_else(|| limits(&kind), |yaml| limits_from_speed_yaml(yaml, &kind));
+    let mut limits =
+        speed_yaml.map_or_else(|| limits(&kind), |yaml| limits_from_speed_yaml(yaml, &kind));
     if let Some(cap) = cap.filter(|cap| *cap < limits.block) {
         limits.block = cap;
     }
@@ -150,7 +152,10 @@ pub async fn verdict_for_run(
 
 /// The only file a node at its context limit may write.
 pub fn handoff_path(state_dir: &Path, root_id: &str, node_id: &str) -> PathBuf {
-    state_dir.join("nodes").join(root_id).join(format!("{node_id}.md"))
+    state_dir
+        .join("nodes")
+        .join(root_id)
+        .join(format!("{node_id}.md"))
 }
 
 /// Enforces the narrow tool set allowed while a node wraps its context.
@@ -285,8 +290,16 @@ nodes:
         for kind in KINDS {
             let limits = limits(kind);
             assert!(limits.block > limits.wrap, "kind {kind}");
-            assert_eq!(verdict(kind, Some(limits.block - 1)), Fill::Wrap, "kind {kind}");
-            assert_eq!(verdict(kind, Some(limits.block)), Fill::Block, "kind {kind}");
+            assert_eq!(
+                verdict(kind, Some(limits.block - 1)),
+                Fill::Wrap,
+                "kind {kind}"
+            );
+            assert_eq!(
+                verdict(kind, Some(limits.block)),
+                Fill::Block,
+                "kind {kind}"
+            );
         }
     }
 
@@ -330,7 +343,10 @@ nodes:
 
     #[test]
     fn malformed_speed_yaml_gives_defaults() {
-        for yaml in ["nodes: {leaf_warn: 70000", "nodes:\n  leaf_warn: [unclosed\n"] {
+        for yaml in [
+            "nodes: {leaf_warn: 70000",
+            "nodes:\n  leaf_warn: [unclosed\n",
+        ] {
             for kind in KINDS {
                 assert_eq!(
                     limits_from_speed_yaml(yaml, kind),
@@ -565,7 +581,10 @@ nodes:
             serde_json::json!({"path": own.to_str().unwrap()}),
             serde_json::Value::Null,
         ] {
-            assert!(!allowed_for_node("Write", &input, "leaf", handoff), "{input}");
+            assert!(
+                !allowed_for_node("Write", &input, "leaf", handoff),
+                "{input}"
+            );
         }
     }
 
@@ -590,7 +609,12 @@ nodes:
     fn write_without_a_handoff_path_is_denied() {
         let path = handoff_path(state_dir(), "r", "n");
         assert!(!allowed_for_node("Write", &write_to(&path), "leaf", None));
-        assert!(!allowed_for_node("Write", &serde_json::json!({}), "leaf", None));
+        assert!(!allowed_for_node(
+            "Write",
+            &serde_json::json!({}),
+            "leaf",
+            None
+        ));
     }
 
     #[test]

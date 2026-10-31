@@ -211,15 +211,11 @@ pub async fn close_node(
 
     // The top node of a branch that may not close yet, or the root of an unfinished job, does not
     // close on a report: it records it and stays running (see below).
-    let held_branch = job
-        .manifest
-        .branches
-        .values()
-        .find(|branch| {
-            branch.node_id.as_deref() == Some(node_id) && !branch_node_may_close(branch)
-        });
-    let holds = held_branch.is_some()
-        || (job.root_node_id == node.id && job.state != JOB_TERMINAL_STATE);
+    let held_branch = job.manifest.branches.values().find(|branch| {
+        branch.node_id.as_deref() == Some(node_id) && !branch_node_may_close(branch)
+    });
+    let holds =
+        held_branch.is_some() || (job.root_node_id == node.id && job.state != JOB_TERMINAL_STATE);
 
     let parsed = parse_report(report);
     let known = job.contract.as_deref().map(contract_ids);
@@ -605,7 +601,11 @@ mod tests {
 
     fn with_extra_lines(report: &str, extra: usize) -> String {
         let section = "## What was done\n";
-        report.replacen(section, &format!("{section}{}", "- more\n".repeat(extra)), 1)
+        report.replacen(
+            section,
+            &format!("{section}{}", "- more\n".repeat(extra)),
+            1,
+        )
     }
 
     fn branch(name: &str, layer: &str, state: &str, node_id: &str) -> Branch {
@@ -691,7 +691,11 @@ mod tests {
         let fx = Fixture::new(None).await;
         let broken = report_for(&fx.leaf.id, &fx.leaf.root_id, "shipped", "a1", "");
         let expected = report_problems(&parse_report(&broken), REPORT_MAX_LINES, None);
-        assert_eq!(expected.len(), 3, "the sample has three defects: {expected:?}");
+        assert_eq!(
+            expected.len(),
+            3,
+            "the sample has three defects: {expected:?}"
+        );
 
         let problems = invalid(fx.send(&fx.leaf, &broken, None).await);
 
@@ -923,7 +927,8 @@ mod tests {
             let recorded = fx.send(top, &report, None).await.unwrap();
 
             assert_eq!(recorded.status, "running", "{outcome}");
-            fx.assert_recorded(top, &recorded, &report, "7", outcome).await;
+            fx.assert_recorded(top, &recorded, &report, "7", outcome)
+                .await;
         }
     }
 
@@ -939,7 +944,8 @@ mod tests {
 
         let recorded = fx.send(top, &report, None).await.unwrap();
 
-        fx.assert_recorded(top, &recorded, &report, "12", "handoff").await;
+        fx.assert_recorded(top, &recorded, &report, "12", "handoff")
+            .await;
         let written = std::fs::read_to_string(fx.handoff(top)).unwrap();
         assert!(written.contains("Status: handoff\n"), "got {written:?}");
     }
@@ -955,7 +961,8 @@ mod tests {
         set_run(&fx.pool, &top.id, "7").await;
         let first = done_report(top);
         let recorded = fx.send(top, &first, None).await.unwrap();
-        fx.assert_recorded(top, &recorded, &first, "7", "done").await;
+        fx.assert_recorded(top, &recorded, &first, "7", "done")
+            .await;
 
         // Valid on its own and different from the first, so a second record would show.
         let second = outcome_report(top, "blocked");
@@ -982,7 +989,11 @@ mod tests {
         set_run(&fx.pool, &top.id, "7").await;
         let broken = report_for(&top.id, &top.root_id, "shipped", "a1", "");
         let expected = report_problems(&parse_report(&broken), REPORT_MAX_LINES, None);
-        assert_eq!(expected.len(), 3, "the sample has three defects: {expected:?}");
+        assert_eq!(
+            expected.len(),
+            3,
+            "the sample has three defects: {expected:?}"
+        );
 
         let problems = invalid(fx.send(top, &broken, None).await);
 
@@ -1014,7 +1025,8 @@ mod tests {
 
             let recorded = fx.send(top, &report, None).await.unwrap();
 
-            fx.assert_recorded(top, &recorded, &report, "7", "done").await;
+            fx.assert_recorded(top, &recorded, &report, "7", "done")
+                .await;
         }
     }
 
@@ -1029,7 +1041,8 @@ mod tests {
             fx.set_branches(vec![branch("api", "backend", "building", &top.id)])
                 .await;
             let recorded = fx.send(top, &report, None).await.unwrap();
-            fx.assert_recorded(top, &recorded, &report, "7", "done").await;
+            fx.assert_recorded(top, &recorded, &report, "7", "done")
+                .await;
 
             fx.set_branches(vec![branch("api", "backend", state, &top.id)])
                 .await;
@@ -1050,7 +1063,8 @@ mod tests {
             fx.set_branches(vec![branch("spec", "docs", "building", &top.id)])
                 .await;
             let recorded = fx.send(top, &report, None).await.unwrap();
-            fx.assert_recorded(top, &recorded, &report, "7", "done").await;
+            fx.assert_recorded(top, &recorded, &report, "7", "done")
+                .await;
 
             fx.set_branches(vec![branch("spec", "docs", state, &top.id)])
                 .await;
@@ -1079,12 +1093,14 @@ mod tests {
 
         let root_report = done_report(&fx.root);
         let recorded = fx.send(&fx.root, &root_report, None).await.unwrap();
-        fx.assert_recorded(&fx.root, &recorded, &root_report, "3", "done").await;
+        fx.assert_recorded(&fx.root, &recorded, &root_report, "3", "done")
+            .await;
 
         // Neither changed anything for the top node itself, which records its own.
         let top_report = done_report(top);
         let recorded = fx.send(top, &top_report, None).await.unwrap();
-        fx.assert_recorded(top, &recorded, &top_report, "7", "done").await;
+        fx.assert_recorded(top, &recorded, &top_report, "7", "done")
+            .await;
     }
 
     // --- Behaviour 7: tree nodes and plain nodes ----------------------------------------------
@@ -1160,7 +1176,12 @@ mod tests {
             matches!(error, CloseError::Node(NodeError::NotFound)),
             "got {error:?}"
         );
-        let file = fx.dir.path().join("nodes").join(&fx.root.id).join("no-such-node.md");
+        let file = fx
+            .dir
+            .path()
+            .join("nodes")
+            .join(&fx.root.id)
+            .join("no-such-node.md");
         assert!(!file.exists());
     }
 
@@ -1175,12 +1196,21 @@ mod tests {
         let bytes = std::fs::read(&file).unwrap();
 
         // Valid on its own and different from the first, so a write would show.
-        let second = report_for(&fx.leaf.id, &fx.leaf.root_id, "done", "none", "A second story.");
+        let second = report_for(
+            &fx.leaf.id,
+            &fx.leaf.root_id,
+            "done",
+            "none",
+            "A second story.",
+        );
         let message = conflict(fx.send(&fx.leaf, &second, None).await);
 
         assert!(message.contains("already closed"), "got {message:?}");
         assert_eq!(std::fs::read(&file).unwrap(), bytes);
-        assert_eq!(work_nodes::get(&fx.pool, &fx.leaf.id).await.unwrap(), closed);
+        assert_eq!(
+            work_nodes::get(&fx.pool, &fx.leaf.id).await.unwrap(),
+            closed
+        );
     }
 
     // --- Behaviour 10: contract_ids, against `contract_ids` in tree_state.py ------------------

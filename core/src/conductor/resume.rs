@@ -2,11 +2,13 @@
 
 use std::time::Duration;
 
-use crate::assistant_types::{turns, Origin, Sent, NOT_WIRED, TURN_IN_PROGRESS};
+use crate::assistant_types::{NOT_WIRED, Origin, Sent, TURN_IN_PROGRESS, turns};
 use crate::chats::{self, Brain, PermissionMode};
 use crate::governance::autopilot::classifier_hook_is_wired;
 use crate::sessions::IdeSession;
-use crate::state::{AppState, ROOTED_CHAT_PROGRESS_TIMEOUT_MULTIPLIER, ROOTED_CHAT_RUN_TIMEOUT_MULTIPLIER};
+use crate::state::{
+    AppState, ROOTED_CHAT_PROGRESS_TIMEOUT_MULTIPLIER, ROOTED_CHAT_RUN_TIMEOUT_MULTIPLIER,
+};
 
 pub const RESUME_PROMPT: &str = "Continue the session from its current state.";
 
@@ -68,8 +70,8 @@ pub async fn resume(
                 Some(&session),
                 PermissionMode::Manual,
             )
-                .await
-                .map_err(|error| ResumeError::Refused(error.to_string()))?;
+            .await
+            .map_err(|error| ResumeError::Refused(error.to_string()))?;
             (chat_id, cwd.to_owned())
         }
     };
@@ -108,7 +110,7 @@ mod tests {
 
     use super::*;
     use crate::assistant_types::{
-        install_turns, upsert_session, Origin, RecordingTurns, Sent, Turns, TURN_IN_PROGRESS,
+        Origin, RecordingTurns, Sent, TURN_IN_PROGRESS, Turns, install_turns, upsert_session,
     };
     use crate::chats::{self, Brain};
     use crate::execution::runner::Attachment;
@@ -266,7 +268,10 @@ mod tests {
 
         for cwd in [None, Some(path_of(&dir))] {
             let refused = resume(&state, "session-1", cwd).await;
-            assert!(matches!(refused, Err(ResumeError::NotRooted(_))), "{refused:?}");
+            assert!(
+                matches!(refused, Err(ResumeError::NotRooted(_))),
+                "{refused:?}"
+            );
         }
         assert!(recorder.calls().is_empty());
     }
@@ -284,7 +289,10 @@ mod tests {
         assert!(matches!(known, Err(ResumeError::NotRooted(_))), "{known:?}");
 
         let adopted = resume(&state, "external-session", Some(path_of(&dir))).await;
-        assert!(matches!(adopted, Err(ResumeError::NotRooted(_))), "{adopted:?}");
+        assert!(
+            matches!(adopted, Err(ResumeError::NotRooted(_))),
+            "{adopted:?}"
+        );
         assert!(chats_from(&state, "external-session").await.is_empty());
 
         assert!(recorder.calls().is_empty());

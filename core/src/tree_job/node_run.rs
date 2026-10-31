@@ -26,7 +26,7 @@ pub(super) fn node_prompt(node_id: &str, task: &str) -> String {
         return task.to_owned();
     }
     format!(
-        "{NODE_PROMPT_HEADER}{node_id}. If the work is too large for this node, you may open children under it with node_open. Finish by writing a handoff file and calling node_close. Write the handoff file as `.nucleos-report.md` in your worktree (your current directory; the daemon keeps it out of git, so do not commit it) and pass its absolute path as handoff_path.\n\n{task}"
+        "{NODE_PROMPT_HEADER}{node_id}. If the work is too large for this node, split it with the tree_branch_start tool (a node run cannot open children with node_open). Finish by writing a handoff file and calling node_close. Write the handoff file as `.nucleos-report.md` in your worktree (your current directory; the daemon keeps it out of git, so do not commit it) and pass its absolute path as handoff_path.\n\n{task}"
     )
 }
 
@@ -41,7 +41,10 @@ pub enum NodeRunError {
     /// earlier call died (or `create_run_inner` failed) after reserving it. `launch` itself does not
     /// recover such a reservation: `store::launch_recovering` clears a key whose reservation its own
     /// failing call made, and `store::resume_all` clears the rest at boot.
-    Unresolved { node_id: String, key: String },
+    Unresolved {
+        node_id: String,
+        key: String,
+    },
 }
 
 impl fmt::Display for NodeRunError {
@@ -228,14 +231,7 @@ async fn tree_launch_context(
     node_id: &str,
     project_id: &str,
     worktree: &str,
-) -> Result<
-    Option<(
-        String,
-        String,
-        crate::execution::runs::TreeWorktree,
-    )>,
-    NodeRunError,
-> {
+) -> Result<Option<(String, String, crate::execution::runs::TreeWorktree)>, NodeRunError> {
     let tree_job_id: Option<String> =
         sqlx::query_scalar("SELECT tree_job_id FROM work_nodes WHERE id = ?")
             .bind(node_id)
@@ -255,7 +251,12 @@ async fn tree_launch_context(
         .branches
         .values()
         .find(|branch| branch.node_id.as_deref() == Some(node_id))
-        .map(|branch| branch.git_branch.clone().unwrap_or_else(|| branch.name.clone()))
+        .map(|branch| {
+            branch
+                .git_branch
+                .clone()
+                .unwrap_or_else(|| branch.name.clone())
+        })
         .unwrap_or_else(|| node_id.to_owned());
     Ok(Some((
         project_id.to_owned(),
@@ -336,12 +337,7 @@ pub async fn launch(
         }
         None => {
             crate::execution::runs::create_run_with_worktree_box(
-                state,
-                prompt,
-                project_id,
-                cwd,
-                mode,
-                false,
+                state, prompt, project_id, cwd, mode, false,
             )
             .await?
         }
@@ -367,6 +363,12 @@ pub async fn launch(
     .bind(node_id)
     .execute(pool)
     .await?;
+    // The UPDATE above keeps only the current run; the history keeps every run the tree paid for.
+    sqlx::query("INSERT OR IGNORE INTO work_node_runs (node_id, run_id) VALUES (?, ?)")
+        .bind(node_id)
+        .bind(run_id)
+        .execute(pool)
+        .await?;
     Ok(run_id)
 }
 
@@ -516,9 +518,17 @@ mod tests {
     }
 
     async fn launch_shadow(state: &AppState, node_id: &str, key: &str) -> i64 {
-        launch(state, node_id, key, "do it".to_owned(), None, None, "shadow")
-            .await
-            .unwrap()
+        launch(
+            state,
+            node_id,
+            key,
+            "do it".to_owned(),
+            None,
+            None,
+            "shadow",
+        )
+        .await
+        .unwrap()
     }
 
     // ----- apply -----
@@ -646,9 +656,15 @@ mod tests {
     async fn reconcile_fails_a_running_node_whose_run_has_finished() {
         let pool = pool_with_job().await;
         let mut expected = Vec::new();
-        for (offset, status) in ["completed", "failed", "cancelled", "timed_out", "superseded"]
-            .into_iter()
-            .enumerate()
+        for (offset, status) in [
+            "completed",
+            "failed",
+            "cancelled",
+            "timed_out",
+            "superseded",
+        ]
+        .into_iter()
+        .enumerate()
         {
             let run_id = DEAD_RUN + offset as i64;
             let node = format!("node-{status}");
@@ -684,7 +700,14 @@ mod tests {
         seed_run(&pool, DEAD_RUN, "running").await;
         seed_node(&pool, "node-running", "running", Some(JOB), Some(DEAD_RUN)).await;
         seed_run(&pool, DEAD_RUN + 1, "awaiting_approval").await;
-        seed_node(&pool, "node-awaiting", "running", Some(JOB), Some(DEAD_RUN + 1)).await;
+        seed_node(
+            &pool,
+            "node-awaiting",
+            "running",
+            Some(JOB),
+            Some(DEAD_RUN + 1),
+        )
+        .await;
         let before = (
             node_row(&pool, "node-running").await,
             node_row(&pool, "node-awaiting").await,
@@ -783,7 +806,14 @@ mod tests {
         seed_job(&pool, JOB, "open", &[]).await;
         seed_job(&pool, "job-2", JOB_TERMINAL_STATE, &[]).await;
         seed_node(&pool, "job-1-root", "running", Some(JOB), Some(DEAD_RUN)).await;
-        seed_node(&pool, "job-2-root", "running", Some("job-2"), Some(DEAD_RUN)).await;
+        seed_node(
+            &pool,
+            "job-2-root",
+            "running",
+            Some("job-2"),
+            Some(DEAD_RUN),
+        )
+        .await;
         seed_node(&pool, "leaf", "running", Some(JOB), Some(DEAD_RUN)).await;
         let before = node_row(&pool, "job-1-root").await;
 
@@ -926,6 +956,83 @@ mod tests {
         assert_ne!(first_session, second_session);
     }
 
+    /// Prices run `run_id`, so the tree-cost figures have something to add up.
+    async fn price_run(pool: &SqlitePool, run_id: i64, cost: f64) {
+        sqlx::query(
+            "UPDATE runs SET cost_usd = ?, input_tokens = 100, output_tokens = 10 WHERE id = ?",
+        )
+        .bind(cost)
+        .bind(run_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// A node relaunched twice through the real `launch` (a new key each time) overwrites
+    /// `work_nodes.run_id` three times; the tree must still be charged for all three runs. Live
+    /// proof: runs 6, 7, 8 cost 0.12, 0.10, 0.11 and the tree showed 0.11. Fails today: the view
+    /// `tree_run_costs` and `ledger::tree_cost` join only the node's current run, so `runs` is 1 and
+    /// the total 0.11.
+    #[tokio::test]
+    async fn a_node_relaunched_twice_costs_the_tree_all_three_runs() {
+        let state = launch_state().await;
+        seed_node(&state.pool, "node-1", "running", None, None).await;
+        let first = launch_shadow(&state, "node-1", "key-1").await;
+        let second = launch_shadow(&state, "node-1", "key-2").await;
+        let third = launch_shadow(&state, "node-1", "key-3").await;
+        assert_eq!(
+            node_row(&state.pool, "node-1").await.2,
+            Some(third.to_string()),
+            "the node points at the latest run"
+        );
+        for (run, cost) in [(first, 0.12), (second, 0.10), (third, 0.11)] {
+            price_run(&state.pool, run, cost).await;
+        }
+
+        // `seed_node` makes every node its own root.
+        let cost = crate::tree_cost::ledger::tree_cost(&state.pool, "node-1", chrono::Utc::now())
+            .await
+            .unwrap();
+
+        assert_eq!(cost.runs, 3);
+        assert_eq!(cost.unmeasured_runs, 0);
+        assert!((cost.measured_usd - 0.33).abs() < 1e-9, "{cost:?}");
+        assert!((cost.total_usd - 0.33).abs() < 1e-9, "{cost:?}");
+        assert_eq!(cost.input_tokens, 300);
+        assert_eq!(cost.output_tokens, 30);
+    }
+
+    /// A replayed launch (same key) makes no second run, so it adds no second charge; and a run
+    /// counted in one tree is never counted in another, relaunches included. Fails today on
+    /// tree one (1 run costing 0.3 instead of 2 costing 0.8); tree two already holds.
+    #[tokio::test]
+    async fn relaunch_costs_stay_in_their_own_tree() {
+        let state = launch_state().await;
+        seed_node(&state.pool, "node-1", "running", None, None).await;
+        seed_node(&state.pool, "node-2", "running", None, None).await;
+        let one_a = launch_shadow(&state, "node-1", "key-1").await;
+        let one_b = launch_shadow(&state, "node-1", "key-2").await;
+        let one_replay = launch_shadow(&state, "node-1", "key-2").await;
+        let two_a = launch_shadow(&state, "node-2", "key-1").await;
+        assert_eq!(one_replay, one_b);
+        for (run, cost) in [(one_a, 0.5), (one_b, 0.3), (two_a, 4.0)] {
+            price_run(&state.pool, run, cost).await;
+        }
+
+        let now = chrono::Utc::now();
+        let one = crate::tree_cost::ledger::tree_cost(&state.pool, "node-1", now)
+            .await
+            .unwrap();
+        let two = crate::tree_cost::ledger::tree_cost(&state.pool, "node-2", now)
+            .await
+            .unwrap();
+
+        assert_eq!(one.runs, 2);
+        assert!((one.measured_usd - 0.8).abs() < 1e-9, "{one:?}");
+        assert_eq!(two.runs, 1);
+        assert!((two.measured_usd - 4.0).abs() < 1e-9, "{two:?}");
+    }
+
     #[tokio::test]
     async fn launch_of_an_unknown_node_is_an_error_and_leaves_no_run() {
         let state = launch_state().await;
@@ -964,11 +1071,7 @@ mod tests {
     /// The MCP config path, job id and allowed tools the runner was handed, once it was handed any.
     async fn seen_launch(
         runner: &crate::execution::runner::FakeCommandRunner,
-    ) -> (
-        Option<std::path::PathBuf>,
-        Option<i64>,
-        Option<Vec<String>>,
-    ) {
+    ) -> (Option<std::path::PathBuf>, Option<i64>, Option<Vec<String>>) {
         for _ in 0..200 {
             if let Some(seen) = runner.last_job_mcp.lock().unwrap().clone() {
                 return seen;
@@ -1041,7 +1144,13 @@ mod tests {
 
         let (_, _, allowed) = seen_launch(&runner).await;
         let allowed = allowed.expect("a node run narrows --allowedTools to a list");
-        for tool in ["node_open", "node_close", "node_update", "node_tree", "node_active"] {
+        for tool in [
+            "node_open",
+            "node_close",
+            "node_update",
+            "node_tree",
+            "node_active",
+        ] {
             assert!(
                 allowed.iter().any(|name| name == tool),
                 "{tool} is not allowed: {allowed:?}"

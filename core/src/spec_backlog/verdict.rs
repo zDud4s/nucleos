@@ -133,7 +133,7 @@ pub fn done(
 
 #[cfg(test)]
 mod tests {
-    use super::{done, NotDoneReason, ReviewFacts, ReviewerRun, Verdict, VerifyState};
+    use super::{NotDoneReason, ReviewFacts, ReviewerRun, Verdict, VerifyState, done};
     use crate::spec_backlog::model::{
         Criterion, CriterionKind, CriterionStatus, Spec, SpecKind, SpecStatus,
     };

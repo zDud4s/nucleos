@@ -88,8 +88,12 @@ async fn post_finish(
     tokio::spawn(async move {
         if let Err(error) = finish::finish(&state_for_task, scope).await {
             match error {
-                finish::FinishError::Store(error) => tracing::warn!(%error, "backlog finish store failed"),
-                finish::FinishError::Config(error) => tracing::warn!(%error, "backlog finish configuration failed"),
+                finish::FinishError::Store(error) => {
+                    tracing::warn!(%error, "backlog finish store failed")
+                }
+                finish::FinishError::Config(error) => {
+                    tracing::warn!(%error, "backlog finish configuration failed")
+                }
                 other => tracing::warn!(?other, "backlog finish failed"),
             }
         }
@@ -113,9 +117,9 @@ async fn get_decisions(
 mod tests {
     use std::time::Duration;
 
+    use axum::Router;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
-    use axum::Router;
     use serde_json::{Value, json};
     use tower::ServiceExt;
 

@@ -36,11 +36,15 @@ fn in_set_deps(
     specs: &BTreeSet<String>,
     deps: &[(String, String)],
 ) -> BTreeMap<String, BTreeSet<String>> {
-    let mut map: BTreeMap<String, BTreeSet<String>> =
-        specs.iter().map(|id| (id.clone(), BTreeSet::new())).collect();
+    let mut map: BTreeMap<String, BTreeSet<String>> = specs
+        .iter()
+        .map(|id| (id.clone(), BTreeSet::new()))
+        .collect();
     for (spec, depends_on) in deps {
         if specs.contains(spec) && specs.contains(depends_on) {
-            map.entry(spec.clone()).or_default().insert(depends_on.clone());
+            map.entry(spec.clone())
+                .or_default()
+                .insert(depends_on.clone());
         }
     }
     map
@@ -157,7 +161,7 @@ pub fn parallel_groups(
 mod tests {
     // `topological_order` stays qualified as `super::` here: a test of the same name, fixed by the
     // plan, shadows it in this module.
-    use super::{parallel_groups, Cycle, PlannedSpec};
+    use super::{Cycle, PlannedSpec, parallel_groups};
     use crate::work_nodes::sets_overlap;
 
     fn ids(specs: &[&str]) -> Vec<String> {

@@ -325,7 +325,10 @@ mod tests {
         let wait = input(SMALL_CONTEXT, 10_800, 0, None, 2.0);
         let report = report(true, Some(ONE_HOUR_S), Some(0.20));
 
-        assert_eq!(advice(&wait, &keep_warm_on(), &report), WaitAction::KeepWarm);
+        assert_eq!(
+            advice(&wait, &keep_warm_on(), &report),
+            WaitAction::KeepWarm
+        );
     }
 
     #[test]
@@ -422,10 +425,7 @@ mod tests {
         let set = WaitSettings::default();
         let threshold = set.rotate_context_tokens;
         let decide = |context, wait_s| {
-            decide_wait(
-                &input(context, wait_s, ONE_HOUR_S, Some(1.0), 2.0),
-                &set,
-            )
+            decide_wait(&input(context, wait_s, ONE_HOUR_S, Some(1.0), 2.0), &set)
         };
 
         // Context exactly at the threshold, with a wait well over the TTL.
@@ -446,10 +446,22 @@ mod tests {
         };
 
         // Without an input probability, the settings one decides.
-        assert_eq!(decide_wait(&wait(None), &settings_with(0.05)), WaitAction::Park);
-        assert_eq!(decide_wait(&wait(None), &settings_with(0.20)), WaitAction::KeepWarm);
+        assert_eq!(
+            decide_wait(&wait(None), &settings_with(0.05)),
+            WaitAction::Park
+        );
+        assert_eq!(
+            decide_wait(&wait(None), &settings_with(0.20)),
+            WaitAction::KeepWarm
+        );
         // With one, it beats the settings in both directions.
-        assert_eq!(decide_wait(&wait(Some(0.20)), &settings_with(0.05)), WaitAction::KeepWarm);
-        assert_eq!(decide_wait(&wait(Some(0.05)), &settings_with(0.20)), WaitAction::Park);
+        assert_eq!(
+            decide_wait(&wait(Some(0.20)), &settings_with(0.05)),
+            WaitAction::KeepWarm
+        );
+        assert_eq!(
+            decide_wait(&wait(Some(0.05)), &settings_with(0.20)),
+            WaitAction::Park
+        );
     }
 }

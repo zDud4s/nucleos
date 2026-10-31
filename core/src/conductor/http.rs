@@ -65,12 +65,14 @@ async fn get_liveness(State(state): State<AppState>) -> Result<Json<Vec<Value>>,
     })?;
     Ok(Json(
         rows.into_iter()
-            .map(|(id, kind, summary, subject)| json!({
-                "id": id,
-                "kind": kind,
-                "summary": summary,
-                "subject": subject,
-            }))
+            .map(|(id, kind, summary, subject)| {
+                json!({
+                    "id": id,
+                    "kind": kind,
+                    "summary": summary,
+                    "subject": subject,
+                })
+            })
             .collect(),
     ))
 }
@@ -80,13 +82,22 @@ async fn post_feed(
     State(state): State<AppState>,
     Json(request): Json<FeedRequest>,
 ) -> Result<StatusCode, StatusCode> {
-    let session_id = request.session_id.filter(|id| !id.is_empty()).ok_or(StatusCode::BAD_REQUEST)?;
+    let session_id = request
+        .session_id
+        .filter(|id| !id.is_empty())
+        .ok_or(StatusCode::BAD_REQUEST)?;
     let subject = format!("session:{session_id}");
     let summary = format!(
         "{}{}{}",
         request.tool_name.unwrap_or_else(|| "tool".to_owned()),
-        request.reason.map(|reason| format!(": {reason}")).unwrap_or_default(),
-        request.cwd.map(|cwd| format!(" ({cwd})")).unwrap_or_default(),
+        request
+            .reason
+            .map(|reason| format!(": {reason}"))
+            .unwrap_or_default(),
+        request
+            .cwd
+            .map(|cwd| format!(" ({cwd})"))
+            .unwrap_or_default(),
     );
     sqlx::query("INSERT INTO feed (kind, summary, subject, created_at) VALUES (?, ?, ?, ?)")
         .bind(request.kind)
@@ -103,9 +114,9 @@ async fn post_feed(
 mod tests {
     use std::time::Duration;
 
+    use axum::Router;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
-    use axum::Router;
     use serde_json::{Value, json};
     use tower::ServiceExt;
 
@@ -156,7 +167,8 @@ mod tests {
         .await
         .unwrap();
 
-        let (status, episodes) = request(&app(&state), "GET", "/conductor/liveness", Value::Null).await;
+        let (status, episodes) =
+            request(&app(&state), "GET", "/conductor/liveness", Value::Null).await;
 
         assert_eq!(status, StatusCode::OK, "{episodes:?}");
         assert!(episodes.as_array().unwrap().iter().any(|episode| {
@@ -183,12 +195,11 @@ mod tests {
         .await;
 
         assert_eq!(status, StatusCode::ACCEPTED);
-        let row: (String, String) = sqlx::query_as(
-            "SELECT kind, subject FROM feed WHERE subject = 'session:session-1'",
-        )
-        .fetch_one(&state.pool)
-        .await
-        .unwrap();
+        let row: (String, String) =
+            sqlx::query_as("SELECT kind, subject FROM feed WHERE subject = 'session:session-1'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
         assert_eq!(row.0, "conductor_would_deny");
         assert_eq!(row.1, "session:session-1");
     }

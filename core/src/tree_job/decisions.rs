@@ -192,8 +192,15 @@ pub async fn park(
     .execute(&mut *tx)
     .await?;
     write_manifest(&mut tx, tree_id, &manifest, &decision.at).await?;
-    crate::feed::append_on(&mut tx, job.project_id.as_deref(), FEED_KIND, &line, None, None)
-        .await?;
+    crate::feed::append_on(
+        &mut tx,
+        job.project_id.as_deref(),
+        FEED_KIND,
+        &line,
+        None,
+        None,
+    )
+    .await?;
     tx.commit().await?;
     Ok(decision)
 }
@@ -506,7 +513,13 @@ mod tests {
     fn mixed_rows() -> Vec<Decision> {
         vec![
             row("c-open", T3, STATUS_OPEN, None, Some(ORIGIN_AGENT)),
-            row("a-answered", T1, STATUS_ANSWERED, Some("yes"), Some(CHANNEL)),
+            row(
+                "a-answered",
+                T1,
+                STATUS_ANSWERED,
+                Some("yes"),
+                Some(CHANNEL),
+            ),
             row("d-open", T2, STATUS_OPEN, None, Some(ORIGIN_AGENT)),
             row("b-answered", T2, STATUS_ANSWERED, Some("no"), Some("shell")),
         ]
@@ -792,7 +805,10 @@ mod tests {
 
         let listed = list(&pool).await.unwrap();
 
-        assert_eq!(ids(&listed), ["a-answered", "b-answered", "d-open", "c-open"]);
+        assert_eq!(
+            ids(&listed),
+            ["a-answered", "b-answered", "d-open", "c-open"]
+        );
         // Whole rows, so that `origin` and the rest are read back and not only ordered.
         let expected = [
             rows[1].clone(),

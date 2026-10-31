@@ -7,7 +7,7 @@ use sqlx::SqlitePool;
 use super::criteria::parse;
 use super::model::{SpecKind, SpecStatus};
 use super::prompts::{extraction_prompt, split_sections};
-use super::scan::{content_sha, resolve_stored_path, ScanRoots};
+use super::scan::{ScanRoots, content_sha, resolve_stored_path};
 use super::store::{self, StoreError};
 
 #[async_trait::async_trait]
@@ -30,16 +30,32 @@ pub enum ExtractError {
     Runner(String),
 }
 
-impl From<StoreError> for ExtractError { fn from(error: StoreError) -> Self { Self::Store(error) } }
-impl From<std::io::Error> for ExtractError { fn from(error: std::io::Error) -> Self { Self::Io(error) } }
+impl From<StoreError> for ExtractError {
+    fn from(error: StoreError) -> Self {
+        Self::Store(error)
+    }
+}
+impl From<std::io::Error> for ExtractError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
 
 pub async fn extract(
-    pool: &SqlitePool, roots: &ScanRoots, spec_id: &str, runner: &dyn ExtractionRunner,
+    pool: &SqlitePool,
+    roots: &ScanRoots,
+    spec_id: &str,
+    runner: &dyn ExtractionRunner,
 ) -> Result<ExtractOutcome, ExtractError> {
-    let spec = store::get_spec(pool, spec_id).await?.ok_or_else(|| ExtractError::NotFound(spec_id.to_owned()))?;
-    let path = resolve_stored_path(roots, &spec.path).ok_or_else(|| ExtractError::NotFound(spec_id.to_owned()))?;
+    let spec = store::get_spec(pool, spec_id)
+        .await?
+        .ok_or_else(|| ExtractError::NotFound(spec_id.to_owned()))?;
+    let path = resolve_stored_path(roots, &spec.path)
+        .ok_or_else(|| ExtractError::NotFound(spec_id.to_owned()))?;
     let bytes = fs::read(path)?;
-    if content_sha(&bytes) != spec.content_sha { return Err(ExtractError::SpecChanged { spec_id: spec.id }); }
+    if content_sha(&bytes) != spec.content_sha {
+        return Err(ExtractError::SpecChanged { spec_id: spec.id });
+    }
     let text = String::from_utf8_lossy(&bytes);
     let known_paths = store::list_paths_by_project(pool, spec.project_id.as_deref()).await?;
     let mut kind = None;
@@ -47,17 +63,39 @@ pub async fn extract(
     let mut dependencies = Vec::new();
     let mut questions = Vec::new();
     for section in split_sections(&text) {
-        let first = runner.run(extraction_prompt(&spec.path, &section, None)).await.map_err(ExtractError::Runner)?;
+        let first = runner
+            .run(extraction_prompt(&spec.path, &section, None))
+            .await
+            .map_err(ExtractError::Runner)?;
         let extraction = match parse(&first, &known_paths) {
             Ok(value) => value,
             Err(first_error) => {
-                let retry = runner.run(extraction_prompt(&spec.path, &section, Some(&first_error.to_string()))).await.map_err(ExtractError::Runner)?;
+                let retry = runner
+                    .run(extraction_prompt(
+                        &spec.path,
+                        &section,
+                        Some(&first_error.to_string()),
+                    ))
+                    .await
+                    .map_err(ExtractError::Runner)?;
                 match parse(&retry, &known_paths) {
                     Ok(value) => value,
                     Err(error) => {
                         let error = error.to_string();
-                        store::set_extraction_result(pool, &spec.id, spec.kind, SpecStatus::NeedsOwner, Some(&error)).await?;
-                        store::add_question(pool, &spec.id, &format!("Extraction needs owner input: {error}")).await?;
+                        store::set_extraction_result(
+                            pool,
+                            &spec.id,
+                            spec.kind,
+                            SpecStatus::NeedsOwner,
+                            Some(&error),
+                        )
+                        .await?;
+                        store::add_question(
+                            pool,
+                            &spec.id,
+                            &format!("Extraction needs owner input: {error}"),
+                        )
+                        .await?;
                         return Ok(ExtractOutcome::NeedsOwner { error });
                     }
                 }
@@ -72,11 +110,22 @@ pub async fn extract(
     let count = criteria.len();
     store::replace_criteria(pool, &spec.id, &spec.content_sha, &criteria).await?;
     for dependency in dependencies {
-        store::add_dep(pool, &spec.id, &super::model::spec_id(spec.project_id.as_deref(), &dependency), super::model::DepSource::Extracted).await?;
+        store::add_dep(
+            pool,
+            &spec.id,
+            &super::model::spec_id(spec.project_id.as_deref(), &dependency),
+            super::model::DepSource::Extracted,
+        )
+        .await?;
     }
-    for question in questions { store::add_question(pool, &spec.id, &question).await?; }
+    for question in questions {
+        store::add_question(pool, &spec.id, &question).await?;
+    }
     store::set_extraction_result(pool, &spec.id, kind, SpecStatus::Extracted, None).await?;
-    Ok(ExtractOutcome::Stored { kind, criteria: count })
+    Ok(ExtractOutcome::Stored {
+        kind,
+        criteria: count,
+    })
 }
 
 #[cfg(test)]
@@ -84,15 +133,15 @@ mod tests {
     use super::*;
     use crate::spec_backlog::criteria::ParseError;
     use crate::spec_backlog::model::{
-        spec_id, CriterionKind, CriterionStatus, Dep, DepSource, NewCriterion, Spec, SpecKind,
-        SpecStatus,
+        CriterionKind, CriterionStatus, Dep, DepSource, NewCriterion, Spec, SpecKind, SpecStatus,
+        spec_id,
     };
-    use crate::spec_backlog::prompts::{split_sections, MAX_SPEC_CHARS};
-    use crate::spec_backlog::scan::{content_sha, ScanRoots};
+    use crate::spec_backlog::prompts::{MAX_SPEC_CHARS, split_sections};
+    use crate::spec_backlog::scan::{ScanRoots, content_sha};
     use crate::spec_backlog::store::{
         get_spec, list_criteria, list_deps, list_questions, replace_criteria, upsert_by_path,
     };
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use sqlx::SqlitePool;
     use std::collections::VecDeque;
     use std::fs;
@@ -103,7 +152,8 @@ mod tests {
     /// Renders as `ParseError::NoJsonBlock`.
     const NOT_JSON: &str = "I could not read the spec, sorry.";
     /// Renders as `ParseError::NoCriteria`.
-    const NO_CRITERIA: &str = r#"{"kind": "spec", "criteria": [], "depends_on": [], "questions": []}"#;
+    const NO_CRITERIA: &str =
+        r#"{"kind": "spec", "criteria": [], "depends_on": [], "questions": []}"#;
 
     struct FakeRunner {
         answers: Mutex<VecDeque<Result<String, String>>>,
@@ -292,8 +342,14 @@ mod tests {
                 .map(|question| question.question)
                 .collect();
             assert_eq!(questions.len(), 3, "{questions:?}");
-            assert!(questions.iter().any(|q| q == "Which port?"), "{questions:?}");
-            assert!(questions.iter().any(|q| q.contains(ghost_path)), "{questions:?}");
+            assert!(
+                questions.iter().any(|q| q == "Which port?"),
+                "{questions:?}"
+            );
+            assert!(
+                questions.iter().any(|q| q.contains(ghost_path)),
+                "{questions:?}"
+            );
             assert!(
                 questions.iter().any(|q| q.contains(elsewhere_path)),
                 "{questions:?}"
@@ -331,8 +387,14 @@ mod tests {
         let reason = row.status_reason.expect("a status reason");
         assert!(reason.contains(&error), "{reason}");
         let questions = list_questions(&pool, &spec.id).await.unwrap();
-        assert!(questions.iter().any(|q| q.status == "open"), "{questions:?}");
-        assert_eq!(list_criteria(&pool, &spec.id).await.unwrap(), criteria_before);
+        assert!(
+            questions.iter().any(|q| q.status == "open"),
+            "{questions:?}"
+        );
+        assert_eq!(
+            list_criteria(&pool, &spec.id).await.unwrap(),
+            criteria_before
+        );
     }
 
     #[tokio::test]
@@ -367,7 +429,8 @@ mod tests {
     ) {
         let pool = crate::testdb::fresh_pool().await;
         let dir = tempfile::tempdir().unwrap();
-        let (spec, _) = register(&pool, dir.path(), file_name, "# Findings\nNothing to do.\n").await;
+        let (spec, _) =
+            register(&pool, dir.path(), file_name, "# Findings\nNothing to do.\n").await;
         let runner = FakeRunner::answering(&[empty_answer(raw_kind)]);
 
         let outcome = extract(&pool, &roots_at(dir.path()), &spec.id, &runner)
@@ -420,7 +483,10 @@ mod tests {
 
         let criteria = list_criteria(&pool, &spec.id).await.unwrap();
         let statuses: Vec<CriterionStatus> = criteria.iter().map(|c| c.status).collect();
-        assert_eq!(statuses, vec![CriterionStatus::Doubt, CriterionStatus::Open]);
+        assert_eq!(
+            statuses,
+            vec![CriterionStatus::Doubt, CriterionStatus::Open]
+        );
     }
 
     #[tokio::test]
@@ -481,7 +547,10 @@ mod tests {
             other => panic!("expected SpecChanged, got {other:?}"),
         }
         assert!(runner.prompts().is_empty());
-        assert_eq!(list_criteria(&pool, &spec.id).await.unwrap(), criteria_before);
+        assert_eq!(
+            list_criteria(&pool, &spec.id).await.unwrap(),
+            criteria_before
+        );
     }
 
     #[tokio::test]
@@ -527,7 +596,10 @@ mod tests {
             }
         );
         assert_eq!(fs::read(&file).unwrap(), SMALL_SPEC.as_bytes());
-        assert_eq!(fs::metadata(&file).unwrap().modified().unwrap(), modified_before);
+        assert_eq!(
+            fs::metadata(&file).unwrap().modified().unwrap(),
+            modified_before
+        );
 
         fs::set_permissions(&file, original).unwrap();
     }

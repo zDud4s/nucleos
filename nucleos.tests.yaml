@@ -37,6 +37,7 @@ tests:
         # A byte copy of core/hooks/ask_daemon.py, held equal by test-hook-filter.py.
         - .claude/hooks/ask_daemon.py
         - scripts/test-hook-filter.py
+        - scripts/test-conductor-hook.py
         - scripts/test-gates-summary.py
         - scripts/own-cargo-target.sh
         - scripts/test-own-cargo-target.py
@@ -88,6 +89,8 @@ tests:
     # A measuring tool run by hand before and after a refactor; no gate calls it.
     - scripts/code_metrics.py
     - scripts/stage-bundle-bins.sh
+    # Run by hand (or by the release workflow) inside a clean ubuntu/fedora box against downloaded assets.
+    - scripts/smoke-bundle.sh
     - scripts/css-contract.mjs
     - scripts/preview-shots.mjs
     - scripts/preview-shots-all.mjs

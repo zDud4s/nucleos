@@ -329,14 +329,13 @@ mod tests {
         set_reserve(&pool, 0.5).await;
         set_budget(&pool, "root-1", Some(1.0), 50.0).await;
         spend(&pool, "n-done", "root-1", 3.0).await;
-        let live_run = sqlx::query(
-            "INSERT INTO runs (prompt, status, created_at) VALUES ('p', 'running', ?)",
-        )
-        .bind(NOW)
-        .execute(&pool)
-        .await
-        .unwrap()
-        .last_insert_rowid();
+        let live_run =
+            sqlx::query("INSERT INTO runs (prompt, status, created_at) VALUES ('p', 'running', ?)")
+                .bind(NOW)
+                .execute(&pool)
+                .await
+                .unwrap()
+                .last_insert_rowid();
         insert_node(&pool, "n-live", "root-1", "running", live_run).await;
 
         // Every entry point of this module, over the limit: none of them may touch a status.
