@@ -37,7 +37,7 @@ and merges each branch when its agent reports, then lands the job. When every pa
 report and stop.
 
 To report, write your report to a file of your own: a new file inside this worktree, for example \
-`.nucleos-root-report.md`, which you do not commit. Do not use `<state_dir>/nodes/<root>/<id>.md`: \
+`.nucleos-root-report.md`, which the daemon keeps out of git (do not commit it). Do not use `<state_dir>/nodes/<root>/<id>.md`: \
 the daemon writes that file itself and overwrites yours. Then call `node_close` with `handoff_path` \
 set to the absolute path of your file, and with `status` `done` and a one-line `summary`. The \
 daemon reads the report from the file and ignores those two fields, but the tool requires them. \

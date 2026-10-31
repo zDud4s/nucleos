@@ -95,6 +95,9 @@ pub async fn tick(
     if let Err(error) = crate::tree_job::node_run::reconcile_running(&state.pool).await {
         tracing::warn!(%error, "could not reconcile the running tree nodes");
     }
+    // Both ticks log their own failures and return nothing, so neither can fail the sweep.
+    crate::tree_job::wrap::tick(state).await;
+    crate::tree_job::driver::tick(state).await;
     continue_handoffs(state, now, &mut report).await?;
     terminal_feed(state, now, &mut report).await?;
     Ok(report)

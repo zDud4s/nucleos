@@ -1558,15 +1558,25 @@ mod tests {
         fx.root_done(JOB).await;
         let gate = FakeGate::answering(vec![]);
         let limit = Duration::from_secs(20);
-        let idle = || fx.state.pool.size() as usize == fx.state.pool.num_idle();
+        // A dropped connection goes back to the pool on a spawned task, so `num_idle` read right
+        // after the tick is racy: poll for up to a second.
+        let idle = || async {
+            for _ in 0..50 {
+                if fx.state.pool.size() as usize == fx.state.pool.num_idle() {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            false
+        };
 
         fx.tick_within(JOB, &gate, limit).await; // submit the merge
-        assert!(idle(), "the tick released its connection");
+        assert!(idle().await, "the tick released its connection");
         assert_eq!(fx.requests().await, 1);
         fx.drain().await;
         fx.tick_within(JOB, &gate, limit).await; // settle the merge
         fx.tick_within(JOB, &gate, limit).await; // admit the landing
-        assert!(idle(), "the tick released its connection");
+        assert!(idle().await, "the tick released its connection");
 
         assert_eq!(fx.branch(JOB, "api").await.state, "merged");
         let landing = fx.job(JOB).await;

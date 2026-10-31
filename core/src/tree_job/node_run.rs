@@ -26,7 +26,7 @@ pub(super) fn node_prompt(node_id: &str, task: &str) -> String {
         return task.to_owned();
     }
     format!(
-        "{NODE_PROMPT_HEADER}{node_id}. If the work is too large for this node, you may open children under it with node_open. Finish by writing a handoff file and calling node_close.\n\n{task}"
+        "{NODE_PROMPT_HEADER}{node_id}. If the work is too large for this node, you may open children under it with node_open. Finish by writing a handoff file and calling node_close. Write the handoff file as `.nucleos-report.md` in your worktree (your current directory; the daemon keeps it out of git, so do not commit it) and pass its absolute path as handoff_path.\n\n{task}"
     )
 }
 

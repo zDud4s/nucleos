@@ -248,6 +248,33 @@ async fn git(root: &str, args: &[&str]) -> Result<String, String> {
     }
 }
 
+/// The pattern of the report files a tree node writes in its worktree (`.nucleos-report.md`, and the
+/// root's `.nucleos-root-report.md`). A node may only write inside its worktree, so the files cannot
+/// live elsewhere; they are kept out of git instead, or `checkpoint` (`git add -A`) would commit
+/// them and a node with no other work would look like it has a diff.
+const REPORT_EXCLUDE: &str = "/.nucleos-*report.md";
+
+/// Adds [`REPORT_EXCLUDE`] to the repository's `info/exclude`, which every worktree of the
+/// repository shares. A no-op when the line is there already.
+async fn exclude_reports(root: &str) -> Result<(), String> {
+    let reported = git(root, &["rev-parse", "--git-path", "info/exclude"]).await?;
+    // Git answers relative to the directory it ran in when the path is not absolute.
+    let exclude = Path::new(root).join(reported);
+    let mut contents = std::fs::read_to_string(&exclude).unwrap_or_default();
+    if contents.lines().any(|line| line.trim() == REPORT_EXCLUDE) {
+        return Ok(());
+    }
+    if let Some(parent) = exclude.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
+    }
+    if !contents.is_empty() && !contents.ends_with('\n') {
+        contents.push('\n');
+    }
+    contents.push_str(REPORT_EXCLUDE);
+    contents.push('\n');
+    std::fs::write(&exclude, contents).map_err(|error| format!("{}: {error}", exclude.display()))
+}
+
 /// Removes a link without following it: a junction or a directory symlink goes with `remove_dir`
 /// (Windows), a symlink with `remove_file`. The directory it points at is never touched.
 fn unlink(link: &Path) -> std::io::Result<()> {
@@ -460,6 +487,11 @@ pub async fn open_branch(
     .await;
     if let Err(error) = added {
         roll_back(&root_text, &worktree, &[], &git_branch, false, created_feature).await;
+        return Err(OpenError::Git(error));
+    }
+
+    if let Err(error) = exclude_reports(&root_text).await {
+        roll_back(&root_text, &worktree, &[], &git_branch, true, created_feature).await;
         return Err(OpenError::Git(error));
     }
 
@@ -857,6 +889,35 @@ pub async fn latest_launch(
     Ok(row.map(launch_from))
 }
 
+/// Key prefixes of the relaunches that carry a one-off suffix (the wrap, died, fix and resume
+/// relaunches of `wrap`, `driver` and `relaunch_resumed`). Their stored prompts are never a base
+/// for a new suffix, or each relaunch would repeat the sentences of the earlier ones.
+const SUFFIXED_KEY_PREFIXES: [&str; 4] = ["wrap-", "died-", "fix-", "resume-"];
+
+/// The launch a suffix is appended to: the latest one that is not itself a suffixed relaunch, i.e.
+/// the original prompt, or the last answer relaunch (whose prompt carries the owner's answers, which
+/// must survive a later wrap or fix). Falls back to the latest launch when every one is suffixed.
+pub(super) async fn base_launch(
+    pool: &SqlitePool,
+    node_id: &str,
+) -> Result<Option<StoredLaunch>, sqlx::Error> {
+    let rows: Vec<LaunchRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "{LAUNCH_COLUMNS} WHERE node_id = ? ORDER BY seq DESC"
+    )))
+    .bind(node_id)
+    .fetch_all(pool)
+    .await?;
+    let mut launches: Vec<StoredLaunch> = rows.into_iter().map(launch_from).collect();
+    let base = launches
+        .iter()
+        .position(|launch| !SUFFIXED_KEY_PREFIXES.iter().any(|prefix| launch.key.starts_with(prefix)));
+    Ok(match base {
+        Some(index) => Some(launches.swap_remove(index)),
+        None if launches.is_empty() => None,
+        None => Some(launches.swap_remove(0)),
+    })
+}
+
 // ----- relaunch -----
 
 /// What one relaunch pass did.
@@ -1020,10 +1081,11 @@ pub async fn relaunch_resumed(state: &AppState, resumed: &store::Resumed) -> Rel
     relaunched
 }
 
-/// Starts `node_id` again from its latest stored launch under `key`: the stored prompt, with
-/// `prompt_suffix` appended when given, and the stored project, cwd and mode. `dead_run` only names
-/// the run that ended, for the error when no launch was ever stored. The key replays, so a second
-/// call with the same key starts nothing new.
+/// Starts `node_id` again under `key`, with the stored project, cwd and mode. Without a suffix the
+/// prompt is the latest stored launch's, unchanged. With one it is the node's base launch (see
+/// [`base_launch`]) plus `prompt_suffix`, so suffixes of earlier relaunches are not repeated.
+/// `dead_run` only names the run that ended, for the error when no launch was ever stored. The key
+/// replays, so a second call with the same key starts nothing new.
 pub(super) async fn relaunch_node(
     state: &AppState,
     node_id: &str,
@@ -1031,7 +1093,11 @@ pub(super) async fn relaunch_node(
     key: &str,
     prompt_suffix: Option<&str>,
 ) -> Result<i64, String> {
-    match latest_launch(&state.pool, node_id).await {
+    let found = match prompt_suffix {
+        Some(_) => base_launch(&state.pool, node_id).await,
+        None => latest_launch(&state.pool, node_id).await,
+    };
+    match found {
         Ok(Some(launch)) => {
             let prompt = match prompt_suffix {
                 Some(suffix) => format!("{}{suffix}", launch.prompt),
@@ -1135,7 +1201,9 @@ async fn relaunch_after_answer(
             return None;
         }
     }
-    let launch = match latest_launch(pool, node).await {
+    // The base launch, not the latest: a wrap or fix suffix of an earlier relaunch is not carried
+    // into the answer's prompt, while an earlier answer (a `decision-` launch) is.
+    let launch = match base_launch(pool, node).await {
         Ok(Some(launch)) => launch,
         Ok(None) => {
             let reason = "no launch was stored to start it from".to_owned();
