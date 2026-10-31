@@ -186,6 +186,33 @@ pub(super) async fn reconcile_after_restart(pool: &sqlx::SqlitePool) {
     }
 }
 
+/// Gives every rostered project already wired the hooks this build wires. Primary only: a second
+/// daemon may be an older build, and must not write its idea of the hooks over a project's settings.
+/// Never stops the daemon: a project that cannot be refreshed keeps the hooks it has.
+pub(super) async fn refresh_wired_hooks(pool: &sqlx::SqlitePool, is_primary: bool) {
+    if !is_primary {
+        return;
+    }
+    let projects = match governance::autopilot::rostered_projects(pool).await {
+        Ok(projects) => projects,
+        Err(error) => {
+            tracing::warn!(%error, "could not list the projects to refresh their hooks");
+            return;
+        }
+    };
+    let refreshed = tokio::task::spawn_blocking(move || {
+        for (project, root) in &projects {
+            if let Err(error) = governance::autopilot::refresh_wired_hooks(root) {
+                tracing::warn!(%project, %error, "could not refresh the project's hooks");
+            }
+        }
+    })
+    .await;
+    if let Err(error) = refreshed {
+        tracing::warn!(%error, "refreshing the projects' hooks did not finish");
+    }
+}
+
 /// Re-arms the per-ticket watchers of verify wakes a previous daemon left `pending`: the tasks that
 /// were waiting on those tickets died with it. After the verify executor is installed and started,
 /// because the tickets themselves were requeued by `reconcile_after_restart` and finish only then.
