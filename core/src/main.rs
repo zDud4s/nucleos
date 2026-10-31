@@ -234,8 +234,9 @@ async fn main() {
                     "settings import finished"
                 );
             }
-            devtime_readable =
-                !handle.snapshot().is_unreadable(&settings::Scope::Machine, "devtime");
+            devtime_readable = !handle
+                .snapshot()
+                .is_unreadable(&settings::Scope::Machine, "devtime");
             for unreadable in handle.snapshot().unreadable() {
                 tracing::warn!(
                     document = %unreadable.name,
