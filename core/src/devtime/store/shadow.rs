@@ -254,12 +254,12 @@ pub async fn resolve(pool: &SqlitePool, id: i64, outcome: &ShadowOutcome) -> sql
     Ok(res.rows_affected() > 0)
 }
 
-/// Marks `void` every row of `rule_id` stamped with the stale `rule_version`, resolved ones included
-/// (their supporting finding is gone); rows of other versions stay. Returns the rows changed.
+/// Marks `void` only the `pending` rows of `rule_id` stamped with the stale `rule_version`; resolved
+/// (and expired) rows keep counting, and rows of other versions stay. Returns the rows changed.
 pub async fn void_stale(pool: &SqlitePool, rule_id: &str, rule_version: i64) -> sqlx::Result<u64> {
     let res = sqlx::query(
         "UPDATE devtime_shadow SET outcome_state = 'void' \
-         WHERE rule_id = ? AND rule_version = ? AND outcome_state <> 'void'",
+         WHERE rule_id = ? AND rule_version = ? AND outcome_state = 'pending'",
     )
     .bind(rule_id)
     .bind(rule_version)
@@ -633,6 +633,50 @@ mod tests {
             .unwrap();
         assert_eq!(counted.len(), 1);
         assert_eq!(counted[0].rule_version, 3);
+    }
+
+    #[tokio::test]
+    async fn void_stale_voids_pending_and_leaves_resolved_intact() {
+        let pool = pool().await;
+        let pending = sample();
+        let mut to_resolve = sample();
+        to_resolve.session_id = Some("s2".into());
+        for row in [&pending, &to_resolve] {
+            assert!(insert_decision(&pool, row).await.unwrap());
+        }
+        let resolved_id = all_rows(&pool)
+            .await
+            .iter()
+            .find(|r| r.session_id.as_deref() == Some("s2"))
+            .unwrap()
+            .id;
+        let outcome = ShadowOutcome {
+            state: "resolved".into(),
+            outcome: Some("hit".into()),
+            finding_key: Some("fk1".into()),
+            cost_ms: Some(45_000),
+            verified: Some("passed".into()),
+            proposal_id: None,
+            resolved_at: "2026-10-05T12:01:00.000Z".into(),
+        };
+        assert!(resolve(&pool, resolved_id, &outcome).await.unwrap());
+        let resolved_before = all_rows(&pool)
+            .await
+            .into_iter()
+            .find(|r| r.id == resolved_id)
+            .unwrap();
+
+        // Same rule and stale version for both rows: only the pending one is voided.
+        assert_eq!(void_stale(&pool, "D3", 2).await.unwrap(), 1);
+
+        let rows = all_rows(&pool).await;
+        let pending_after = rows.iter().find(|r| r.id != resolved_id).unwrap();
+        assert_eq!(pending_after.outcome_state, "void");
+        let resolved_after = rows.iter().find(|r| r.id == resolved_id).unwrap();
+        assert_eq!(resolved_after.outcome_state, "resolved");
+        assert_eq!(resolved_after.outcome.as_deref(), Some("hit"));
+        assert_eq!(resolved_after.rule_version, 2);
+        assert_eq!(*resolved_after, resolved_before);
     }
 
     #[tokio::test]
