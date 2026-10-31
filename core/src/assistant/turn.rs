@@ -1238,8 +1238,12 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
             });
         }
         // A linked child's answer travels to its parent now that this chat's slot is free. An
-        // unlinked chat costs one read inside `deliver_reply`.
-        if let Some(reply) = linked_reply {
+        // unlinked chat costs one read inside `deliver_reply`. A compaction's handoff is a summary
+        // for this chat's own next turn, not an answer. Read here, last, because `start_as` files
+        // the row after spawning the turn.
+        if let Some(reply) = linked_reply
+            && !super::compaction::is_compaction(&pool, id).await
+        {
             super::linked::deliver_reply(&after, &drained_chat, id, &reply).await;
         }
         // The process this turn kept is read from here on, so a background task's own answer is not
@@ -1653,6 +1657,112 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         evict_live(&mother);
+    }
+
+    /// A mother with a live heartbeat (so a delivery would go through) and a browser-agent child
+    /// linked to her, the child with one answered exchange for a compaction to summarise.
+    async fn linked_pair(state: &AppState) -> (String, String) {
+        crate::attention::record_heartbeat(
+            &state.pool,
+            &crate::attention::AttentionScope::Global,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        let mother = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        let child = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::chats::links::open(&state.pool, &child, Some(&mother), "browser", None)
+            .await
+            .expect("link the child to its mother");
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, chat_id, origin, stdout, created_at)
+             VALUES ('q', 'completed', 'assistant', ?, 'shell', 'a', ?)",
+        )
+        .bind(&child)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        (mother, child)
+    }
+
+    /// Relays the child's turns have sent to anyone, delivered, queued or refused.
+    async fn relays_from(pool: &sqlx::SqlitePool, chat: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM chat_relays WHERE from_chat_id = ?")
+            .bind(chat)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Compacts the linked child (`auto` is whether the daemon started it), waits for the turn to
+    /// end and for anything it would deliver afterwards, and returns the relays the child sent.
+    async fn relays_after_compacting_a_linked_child(auto: bool) -> i64 {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let state = test_state(fake.clone()).await;
+        let (mother, child) = linked_pair(&state).await;
+
+        let run = crate::assistant::compaction::start_as(&state, &child, "/compact", None, auto)
+            .await
+            .unwrap();
+
+        for _ in 0..500 {
+            let status: String =
+                sqlx::query_scalar("SELECT status FROM chat_compactions WHERE run_id = ?")
+                    .bind(run)
+                    .fetch_one(&state.pool)
+                    .await
+                    .unwrap();
+            if status != "pending" && !super::super::is_busy(&child) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // The delivery, when there is one, runs right after the slot is released.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let sent = relays_from(&state.pool, &child).await;
+        evict_live(&child);
+        evict_live(&mother);
+        sent
+    }
+
+    /// The handoff of a compaction is a summary for the chat's own next turn; delivered to the
+    /// mother it would read as the child's answer to her task.
+    #[tokio::test]
+    async fn a_typed_compact_in_a_linked_child_delivers_nothing_to_the_mother() {
+        assert_eq!(relays_after_compacting_a_linked_child(false).await, 0);
+    }
+
+    #[tokio::test]
+    async fn an_automatic_compaction_in_a_linked_child_delivers_nothing_to_the_mother() {
+        assert_eq!(relays_after_compacting_a_linked_child(true).await, 0);
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_turn_in_a_linked_child_still_delivers_to_the_mother() {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let state = test_state(fake.clone()).await;
+        let (mother, child) = linked_pair(&state).await;
+
+        send_message(&state, &child, "go on", Origin::Shell)
+            .await
+            .unwrap();
+
+        let mut sent = 0;
+        for _ in 0..500 {
+            sent = relays_from(&state.pool, &child).await;
+            if sent > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        evict_live(&child);
+        evict_live(&mother);
+        assert_eq!(sent, 1);
     }
 
     /// A declined chat is not re-evaluated on every poll: it is left alone for the TTL, and only it.

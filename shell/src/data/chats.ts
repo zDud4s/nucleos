@@ -122,6 +122,8 @@ export interface ChatSummary {
    * window wide enough to hold what it inherited.
    */
   context_window: number | null;
+  /** Whether the conversation compacts itself past the soft limit. Absent from an older daemon: off. */
+  auto_compact?: boolean;
   created_at: string;
   /** Set only when this conversation continues a session had somewhere else. */
   cwd: string | null;
@@ -780,6 +782,26 @@ export function useSetChatGroup() {
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: keys.chats.all });
     },
+  });
+}
+
+/**
+ * Turn automatic compaction on or off for one conversation.
+ *
+ * `onSuccess` returns the invalidation so the mutation stays pending until the list has landed: the
+ * switch draws the row, and a click before then would send the old value again. `exact`, because
+ * only the list carries this flag and the wait must not hang on anything else under the prefix.
+ */
+export function useSetChatAutoCompact() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (v: { chatId: string; enabled: boolean }) =>
+      apiFetch<void>(`/assistant/chats/${encodeURIComponent(v.chatId)}/auto-compact`, {
+        method: "PUT",
+        body: JSON.stringify({ enabled: v.enabled }),
+      }),
+    retry: false,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: keys.chats.all, exact: true }),
   });
 }
 
