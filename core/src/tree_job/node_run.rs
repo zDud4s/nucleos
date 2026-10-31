@@ -33,8 +33,42 @@ pub(super) fn node_prompt(node_id: &str, tree_job_id: &str, task: &str) -> Strin
             " Its tree job id is {tree_job_id}: when you call tree_branch_start, pass `id` = {tree_job_id} (the tree job id, not a node id) and `node_id` = {node_id}."
         )
     };
+    let report = report_format(node_id);
     format!(
-        "{NODE_PROMPT_HEADER}{node_id}.{job_line} If the work is too large for this node, split it with the tree_branch_start tool (a node run cannot open children with node_open). Finish by writing a handoff file and calling node_close. Write the handoff file as `.nucleos-report.md` in your worktree (your current directory; the daemon keeps it out of git, so do not commit it) and pass its absolute path as handoff_path.\n\n{task}"
+        "{NODE_PROMPT_HEADER}{node_id}.{job_line} If the work is too large for this node, split it with the tree_branch_start tool (a node run cannot open children with node_open). Finish by writing a handoff file and calling node_close. Write the handoff file as `.nucleos-report.md` in your worktree (your current directory; the daemon keeps it out of git, so do not commit it) and pass its absolute path as handoff_path.\n\n{report}\n\n{task}"
+    )
+}
+
+/// The report a node writes to `.nucleos-report.md`: the shape `report::parse_report` reads and
+/// `report::report_problems` checks, with this node's id filled in.
+fn report_format(node_id: &str) -> String {
+    format!(
+        "Write your report to `.nucleos-report.md` in your worktree, in this shape. The daemon checks \
+it, and `node_close` refuses a report that breaks a rule below:\n\n\
+# Node Handoff\n\n\
+Node ID: {node_id}\n\
+Root ID: <the id of the root of your tree; read it from your node record, which node_tree shows>\n\
+Status: <done, blocked, failed or handoff, as the Outcome requires>\n\
+Role: <leaf, orchestrator or review>\n\
+Outcome: <done, split, contract_request, blocked, failed or handoff>\n\
+Contract used: <ids such as A3, E2 from contract.md, separated by commas, or none>\n\n\
+## Summary\n\
+<what you did, in at most 1500 characters>\n\n\
+## What was done\n\
+- <one bullet per change, or none>\n\n\
+## Decisions\n\
+- <or none>\n\n\
+## Files touched\n\
+- <one bullet per file you changed, or none>\n\n\
+## Commands for the root\n\
+- <or none>\n\n\
+## Open items / next step\n\
+<or none>\n\n\
+Status follows Outcome: `done` or `split` takes Status `done`, `contract_request` or `blocked` takes \
+`blocked`, and `failed` and `handoff` take their own names. Only an orchestrator may use `split`. An \
+orchestrator or review node edits no file, so its Files touched is `none`. Add `## Contract request` with \
+the contract you need when Outcome is `contract_request`, and `## Blocked reason` with the cause when \
+Outcome is `blocked` or `failed`. Leave each of these two sections out otherwise."
     )
 }
 
@@ -1213,5 +1247,22 @@ mod tests {
         assert!(prompt.contains("tree_branch_start"), "{prompt}");
         assert!(prompt.contains("node-abc-123"), "{prompt}");
         assert!(prompt.contains("Implement the parser."), "{prompt}");
+    }
+
+    /// RED: `node_prompt` must spell out the report format the daemon validates on `node_close`.
+    /// Each literal below is a header or section the report validator reads (report.rs:19-26,
+    /// 67-70, 101-106, 130-134, 136-151, 161, 171-173); the prompt does not carry them yet.
+    #[test]
+    fn a_node_prompt_gives_the_report_format() {
+        let prompt = node_prompt("node-abc-123", "job-1", "Implement the parser.");
+
+        assert!(prompt.contains("node-abc-123"), "{prompt}");
+        assert!(prompt.contains("Node ID:"), "{prompt}");
+        assert!(prompt.contains("Root ID:"), "{prompt}");
+        assert!(prompt.contains("Status:"), "{prompt}");
+        assert!(prompt.contains("Role:"), "{prompt}");
+        assert!(prompt.contains("Outcome:"), "{prompt}");
+        assert!(prompt.contains("Contract used:"), "{prompt}");
+        assert!(prompt.contains("## Summary"), "{prompt}");
     }
 }
