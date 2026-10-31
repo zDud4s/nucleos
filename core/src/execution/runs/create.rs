@@ -199,6 +199,35 @@ pub async fn create_job_item_run(
     .await
 }
 
+/// Starts one run of a tree job, inside the worktree `tree_job::open` already made for its branch.
+///
+/// A `mode = "worktree"` run like every other autonomous code run, so it is not launched in plan
+/// mode and is governed by the classifier where the project wires one. It is NOT a
+/// [`create_job_node_run`]: that writes `runs.job_id`, which the old job chain would then try to
+/// finalise. `project_root` is the project checkout (where settings are inherited from) and `tree`
+/// the worktree the CLI starts in. The box is the worktree box, so the agent has `node_close` and
+/// `tree_branch_start`.
+pub async fn create_tree_node_run(
+    state: &AppState,
+    prompt: String,
+    project_id: String,
+    project_root: String,
+    tree: TreeWorktree,
+) -> Result<i64, CreateRunError> {
+    create_run_with_policy(
+        state,
+        NewRun::provisioned(
+            prompt,
+            project_id,
+            project_root,
+            Provisioning::Tree(tree),
+        ),
+        None,
+        true,
+    )
+    .await
+}
+
 /// What a run is handed to start from, when it is handed anything at all.
 ///
 /// **An enum and not two `Option`s, because the two are mutually exclusive and the type should say
@@ -224,6 +253,16 @@ pub(super) enum Provisioning {
     /// A correction run: a worktree of its own, born on the `fix/` branch the post-merge gate
     /// prepared. Standalone for the gate and the slot, `Item`-like only for the base.
     Correction(Correction),
+    /// A run of a tree job, inside the worktree its branch already owns. Like `Node` it brings no
+    /// tree, slot or `worktrees` row (the tree job's own bookkeeping owns the checkout), but unlike
+    /// `Node` it carries no job identity, so the old job chain never sees the run.
+    Tree(TreeWorktree),
+}
+
+/// The worktree a tree job's run works in, already made and owned by the tree job.
+pub struct TreeWorktree {
+    pub worktree_path: String,
+    pub branch: String,
 }
 
 /// A correction run about to be given a tree of its own (F3-4, spec 2026-10-05 §6.2 D4).
@@ -253,40 +292,47 @@ impl Provisioning {
     pub(super) fn node(&self) -> Option<&JobNode> {
         match self {
             Self::Node(node) => Some(node.as_ref()),
-            Self::Resolution(_) | Self::Item(_) | Self::Correction(_) => None,
+            Self::Resolution(_) | Self::Item(_) | Self::Correction(_) | Self::Tree(_) => None,
         }
     }
 
     pub(super) fn resolution(&self) -> Option<&Resolution> {
         match self {
             Self::Resolution(resolution) => Some(resolution),
-            Self::Node(_) | Self::Item(_) | Self::Correction(_) => None,
+            Self::Node(_) | Self::Item(_) | Self::Correction(_) | Self::Tree(_) => None,
         }
     }
 
     pub(super) fn item(&self) -> Option<&JobItem> {
         match self {
             Self::Item(item) => Some(item),
-            Self::Node(_) | Self::Resolution(_) | Self::Correction(_) => None,
+            Self::Node(_) | Self::Resolution(_) | Self::Correction(_) | Self::Tree(_) => None,
         }
     }
 
     pub(super) fn correction(&self) -> Option<&Correction> {
         match self {
             Self::Correction(correction) => Some(correction),
-            Self::Node(_) | Self::Resolution(_) | Self::Item(_) => None,
+            Self::Node(_) | Self::Resolution(_) | Self::Item(_) | Self::Tree(_) => None,
+        }
+    }
+
+    pub(super) fn tree(&self) -> Option<&TreeWorktree> {
+        match self {
+            Self::Tree(tree) => Some(tree),
+            Self::Node(_) | Self::Resolution(_) | Self::Item(_) | Self::Correction(_) => None,
         }
     }
 
     /// Whether this provisioning gets a checkout of its own — and therefore a concurrency slot, a
     /// `worktrees` row, and a share of the disk.
     ///
-    /// **The house rule, in one place.** `Node` is the only exception, and it is the exception
-    /// because it gets no tree: it works inside the one its job already owns, and charging it a
-    /// second slot would have a five-item job refuse itself at the second item. Everything else —
-    /// a standalone run, a resolution, an item — brings a tree and pays for it.
+    /// **The house rule, in one place.** `Node` and `Tree` are the exceptions, and they are the
+    /// exceptions because they get no tree: they work inside the one their job already owns, and
+    /// charging them a second slot would have a five-item job refuse itself at the second item.
+    /// Everything else — a standalone run, a resolution, an item — brings a tree and pays for it.
     pub(super) fn owns_a_tree(&self) -> bool {
-        !matches!(self, Self::Node(_))
+        !matches!(self, Self::Node(_) | Self::Tree(_))
     }
 }
 
@@ -450,6 +496,7 @@ async fn create_run_with_policy(
     let resolution = provisioning.as_ref().and_then(Provisioning::resolution);
     let item = provisioning.as_ref().and_then(Provisioning::item);
     let correction = provisioning.as_ref().and_then(Provisioning::correction);
+    let tree = provisioning.as_ref().and_then(Provisioning::tree);
     // The house rule, asked once: everything but a job node brings a checkout of its own, and
     // therefore claims a slot, records a row and is charged disk for it. `None` — a standalone
     // run — brings one too.
@@ -596,7 +643,8 @@ async fn create_run_with_policy(
         // refusing: the gate below already turns that into `Unreadable`, which stops the run with a
         // reason. A second refusal here would report the same fault as a different one.
         max_turns = rules.as_ref().ok().and_then(|rules| rules.max_turns);
-        gate_config = match (node.is_some() || item.is_some(), rules) {
+        // A tree run is not gated here either: the tree job runs its own gates per branch.
+        gate_config = match (node.is_some() || item.is_some() || tree.is_some(), rules) {
             (true, _) => GateConfig::NotConfigured,
             (false, Ok(rules)) => {
                 let scoped_final = rules.scoped_final();
@@ -622,8 +670,8 @@ async fn create_run_with_policy(
         // both the `create` and the `record` is what lets a sequence of nodes accumulate work on one
         // tree — and it is why nothing here writes a `worktrees` row for a node: the job already
         // owns one, and a second row for the same directory would give the GC two owners to reconcile.
-        let info = match &node {
-            Some(node) => crate::execution::worktree::WorktreeInfo {
+        let info = match (&node, tree) {
+            (Some(node), _) => crate::execution::worktree::WorktreeInfo {
                 path: std::path::PathBuf::from(&node.worktree_path),
                 branch: node.branch.clone(),
                 // `None`, and it costs nothing: the base belongs to the tree, the job's own
@@ -632,7 +680,13 @@ async fn create_run_with_policy(
                 // on, which is not where the tree was born.
                 base_sha: None,
             },
-            None => {
+            // The tree job opened this worktree and owns its bookkeeping; same reasoning as a node.
+            (None, Some(tree)) => crate::execution::worktree::WorktreeInfo {
+                path: std::path::PathBuf::from(&tree.worktree_path),
+                branch: tree.branch.clone(),
+                base_sha: None,
+            },
+            (None, None) => {
                 // The tree's name, and with it the slot's owner. An item's is its row's id and
                 // comes back the same on every retry; everything else is named after this run.
                 let owner = match item {
@@ -782,6 +836,7 @@ async fn create_run_with_policy(
             .bind(item.job_id)
             .bind(item.stage.as_str())
             .bind(item.item_id),
+            // A tree run carries no job identity on purpose; see `Provisioning::Tree`.
             (None, None) => {
                 sqlx::query("UPDATE runs SET cwd = ? WHERE id = ?").bind(&worktree_path)
             }

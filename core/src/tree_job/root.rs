@@ -134,7 +134,7 @@ async fn drop_unopened_root_branch(state: &AppState, job_id: &str) {
 }
 
 /// Starts the root run of `job`: the `root` branch, its worktree on `tree/<id>/root`, the root node
-/// bound to it, and one `shadow` run in that worktree under the launch key `root-<id>`. Every step
+/// bound to it, and one `worktree` run in that worktree under the launch key `root-<id>`. Every step
 /// replays, so calling it again after a failure finishes the missing ones and never starts a second
 /// run. It takes the job lock itself (in `open_branch` and `bind_branch`), so the caller must not
 /// hold it. Answers the run id.
@@ -165,7 +165,7 @@ pub async fn start(state: &AppState, job: &TreeJob) -> Result<i64, String> {
         root_prompt(job),
         job.project_id.clone(),
         Some(worktree),
-        "shadow",
+        "worktree",
     )
     .await
     .map_err(|error| error.to_string())
@@ -336,8 +336,11 @@ mod tests {
 
         let mut kinds: Vec<String> = Vec::new();
         for _ in 0..300 {
-            let entries = crate::feed::list_feed(&state.pool, None, 50).await.unwrap();
-            kinds = entries.into_iter().map(|entry| entry.kind).collect();
+            // `list_feed(None)` returns only global rows, and this run's line carries its project.
+            kinds = sqlx::query_scalar("SELECT kind FROM feed")
+                .fetch_all(&state.pool)
+                .await
+                .unwrap();
             if kinds.iter().any(|kind| kind.ends_with("_run_completed")) {
                 break;
             }

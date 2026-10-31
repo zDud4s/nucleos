@@ -35,7 +35,9 @@ use crate::work_nodes::{self, NodeError, NodeLimits, OpenArgs};
 
 /// The layer of a branch started without one (`root.rs` makes the first branch a `code` one).
 const DEFAULT_LAYER: &str = "code";
-const LAUNCH_MODE: &str = "shadow";
+/// A tree branch's agent acts in its own worktree, so it is a worktree run (never `shadow`, which
+/// launches in plan mode).
+const LAUNCH_MODE: &str = "worktree";
 
 type Refusal = (StatusCode, Json<Value>);
 

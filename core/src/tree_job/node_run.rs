@@ -220,6 +220,53 @@ pub async fn reconcile_running(pool: &SqlitePool) -> Result<Vec<String>, NodeRun
     Ok(marked)
 }
 
+/// What `create_tree_node_run` needs for a node that belongs to a tree job: the project id, the
+/// project root (from the job's manifest) and the worktree the node was handed. `None` for a node
+/// with no tree job, which keeps the plain launch. Holds no connection after it returns.
+async fn tree_launch_context(
+    pool: &SqlitePool,
+    node_id: &str,
+    project_id: &str,
+    worktree: &str,
+) -> Result<
+    Option<(
+        String,
+        String,
+        crate::execution::runs::TreeWorktree,
+    )>,
+    NodeRunError,
+> {
+    let tree_job_id: Option<String> =
+        sqlx::query_scalar("SELECT tree_job_id FROM work_nodes WHERE id = ?")
+            .bind(node_id)
+            .fetch_optional(pool)
+            .await?
+            .flatten();
+    let Some(tree_job_id) = tree_job_id else {
+        return Ok(None);
+    };
+    let Some(job) = store::load(pool, &tree_job_id).await? else {
+        return Ok(None);
+    };
+    // The branch only feeds text (the feed line and the info record), so any non-empty name will do
+    // when the node is not bound to a branch yet.
+    let branch = job
+        .manifest
+        .branches
+        .values()
+        .find(|branch| branch.node_id.as_deref() == Some(node_id))
+        .map(|branch| branch.git_branch.clone().unwrap_or_else(|| branch.name.clone()))
+        .unwrap_or_else(|| node_id.to_owned());
+    Ok(Some((
+        project_id.to_owned(),
+        job.manifest.project_root,
+        crate::execution::runs::TreeWorktree {
+            worktree_path: worktree.to_owned(),
+            branch,
+        },
+    )))
+}
+
 /// Starts the agent run behind a node exactly once per `(node_id, key)` and returns its run id.
 ///
 /// Order: the node must exist; the key is reserved with an empty result in `tree_transitions` (no
@@ -266,15 +313,39 @@ pub async fn launch(
         Some(_) => node_prompt(node_id, &prompt),
         None => prompt,
     };
-    let run_id = crate::execution::runs::create_run_with_worktree_box(
-        state,
-        prompt,
-        project_id,
-        cwd,
-        mode,
-        false,
-    )
-    .await?;
+    // A "worktree" launch with a cwd is a tree run: the cwd is the tree's own worktree, so it is
+    // created as such (no second checkout, no gate, the project's classifier hook inherited from
+    // the project root). Any other launch keeps the plain path, including "worktree" with no cwd,
+    // which `create_run_with_policy` refuses as `Invalid`.
+    let tree_run = match (mode, project_id.as_ref(), cwd.as_ref()) {
+        ("worktree", Some(project_id), Some(worktree)) => {
+            tree_launch_context(pool, node_id, project_id, worktree).await?
+        }
+        _ => None,
+    };
+    let run_id = match tree_run {
+        Some((project_id, project_root, tree)) => {
+            crate::execution::runs::create_tree_node_run(
+                state,
+                prompt,
+                project_id,
+                project_root,
+                tree,
+            )
+            .await?
+        }
+        None => {
+            crate::execution::runs::create_run_with_worktree_box(
+                state,
+                prompt,
+                project_id,
+                cwd,
+                mode,
+                false,
+            )
+            .await?
+        }
+    };
 
     sqlx::query(
         "UPDATE tree_transitions SET result = ? WHERE node_id = ? AND transition = ? AND key = ?",

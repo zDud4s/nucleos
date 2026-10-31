@@ -254,14 +254,31 @@ async fn git(root: &str, args: &[&str]) -> Result<String, String> {
 /// them and a node with no other work would look like it has a diff.
 const REPORT_EXCLUDE: &str = "/.nucleos-*report.md";
 
-/// Adds [`REPORT_EXCLUDE`] to the repository's `info/exclude`, which every worktree of the
-/// repository shares. A no-op when the line is there already.
+/// Everything a tree worktree holds that is the daemon's and not the branch's, so `checkpoint`
+/// (`git add -A`) must not commit it: the report files, the agents' workflow files that
+/// `workflow --sync` writes, and the classifier settings a run inherits from the project root.
+/// `info/exclude` only affects UNTRACKED files, so a repository that tracks any of these (this one
+/// tracks `.claude/hooks/ask_daemon.py`) keeps seeing its changes.
+const TREE_EXCLUDES: [&str; 5] = [
+    REPORT_EXCLUDE,
+    "/.agents/",
+    "/AGENTS.md",
+    "/.claude/settings.json",
+    "/.claude/hooks/ask_daemon.py",
+];
+
+/// Adds [`TREE_EXCLUDES`] to the repository's `info/exclude`, which every worktree of the
+/// repository shares. Lines that are there already are not repeated.
 async fn exclude_reports(root: &str) -> Result<(), String> {
     let reported = git(root, &["rev-parse", "--git-path", "info/exclude"]).await?;
     // Git answers relative to the directory it ran in when the path is not absolute.
     let exclude = Path::new(root).join(reported);
     let mut contents = std::fs::read_to_string(&exclude).unwrap_or_default();
-    if contents.lines().any(|line| line.trim() == REPORT_EXCLUDE) {
+    let missing: Vec<&str> = TREE_EXCLUDES
+        .into_iter()
+        .filter(|pattern| !contents.lines().any(|line| line.trim() == *pattern))
+        .collect();
+    if missing.is_empty() {
         return Ok(());
     }
     if let Some(parent) = exclude.parent() {
@@ -270,8 +287,10 @@ async fn exclude_reports(root: &str) -> Result<(), String> {
     if !contents.is_empty() && !contents.ends_with('\n') {
         contents.push('\n');
     }
-    contents.push_str(REPORT_EXCLUDE);
-    contents.push('\n');
+    for pattern in missing {
+        contents.push_str(pattern);
+        contents.push('\n');
+    }
     std::fs::write(&exclude, contents).map_err(|error| format!("{}: {error}", exclude.display()))
 }
 
