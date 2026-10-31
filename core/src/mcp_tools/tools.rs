@@ -793,17 +793,27 @@ impl NucleosTools {
     }
 
     #[tool(
-        description = "Mark a spec finished in the backlog. `spec_id` names the spec; absent, the \
-                       daemon decides which one is meant. The daemon refuses the call when the \
-                       caller may not finish specs."
+        description = "Start the work of finishing specs: extract their criteria, audit them and \
+                       run one tree per spec that is not done. Finishes one spec by `spec_id`, or \
+                       every spec of a project by `project_id` or `project_root` (your cwd's \
+                       project root). The daemon refuses a call that names none of the three, and \
+                       answers at once while the work goes on."
     )]
     pub(super) async fn spec_finish(
         &self,
-        Parameters(SpecFinishParams { spec_id }): Parameters<SpecFinishParams>,
+        Parameters(SpecFinishParams {
+            spec_id,
+            project_id,
+            project_root,
+        }): Parameters<SpecFinishParams>,
     ) -> String {
         json_result(
             self.client
-                .spec_finish(&serde_json::json!({ "spec_id": spec_id }))
+                .spec_finish(&serde_json::json!({
+                    "spec_id": spec_id,
+                    "project_id": project_id,
+                    "project_root": project_root,
+                }))
                 .await,
         )
     }

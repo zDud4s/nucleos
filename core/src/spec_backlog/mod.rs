@@ -2,6 +2,7 @@
 
 pub mod audit;
 pub mod criteria;
+mod daemon;
 pub mod deps;
 pub mod extract;
 pub mod finish;

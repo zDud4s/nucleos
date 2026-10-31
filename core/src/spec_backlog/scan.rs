@@ -6,8 +6,12 @@ use std::path::PathBuf;
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 
-use super::model::Spec;
+use super::model::{Spec, SpecStatus};
 use super::store::{StoreError, upsert_by_path};
+
+/// Start of the reason a scan gives a spec whose file is gone; a spec carrying it is found again
+/// when the file comes back, an owner's own abandon is not.
+pub const GONE_REASON_PREFIX: &str = "spec file is gone: ";
 
 pub struct ScanRoots {
     pub project_root: Option<PathBuf>,
@@ -78,18 +82,31 @@ pub async fn scan(
 ) -> Result<ScanReport, ScanError> {
     let mut files = Vec::new();
     if let Some(root) = &roots.project_root {
-        files.push((root.join(".ai").join("specs"), ".ai/specs/".to_owned()));
+        files.push((
+            root.join(".ai").join("specs"),
+            ".ai/specs/".to_owned(),
+            root,
+        ));
     }
     if let Some(root) = &roots.state_dir {
-        files.push((root.join("specs"), "<state_dir>/specs/".to_owned()));
+        files.push((root.join("specs"), "<state_dir>/specs/".to_owned(), root));
     }
     let mut discovered = Vec::new();
-    for (directory, prefix) in files {
+    // Prefixes whose directory was read (or is empty under an existing root): only specs under
+    // these can be told to be gone.
+    let mut read_prefixes: Vec<String> = Vec::new();
+    for (directory, prefix, root) in files {
         let entries = match fs::read_dir(directory) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if root.exists() {
+                    read_prefixes.push(prefix);
+                }
+                continue;
+            }
             Err(error) => return Err(error.into()),
         };
+        read_prefixes.push(prefix.clone());
         for entry in entries {
             let entry = entry?;
             let path = entry.path();
@@ -107,6 +124,10 @@ pub async fn scan(
         changed: 0,
         unchanged: 0,
     };
+    let found: std::collections::HashSet<String> = discovered
+        .iter()
+        .map(|(stored, _, _)| stored.clone())
+        .collect();
     for (stored_path, path, name) in discovered {
         let bytes = fs::read(&path);
         let bytes = bytes?;
@@ -121,12 +142,40 @@ pub async fn scan(
             &sha,
         )
         .await?;
+        let spec = if spec.status == SpecStatus::Abandoned
+            && spec
+                .status_reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with(GONE_REASON_PREFIX))
+        {
+            super::store::set_status(pool, &spec.id, SpecStatus::Discovered, None).await?;
+            super::store::get_spec(pool, &spec.id)
+                .await?
+                .unwrap_or(spec)
+        } else {
+            spec
+        };
         match previous {
             None => report.new += 1,
             Some(old) if old.content_sha == sha => report.unchanged += 1,
             Some(_) => report.changed += 1,
         }
         report.specs.push(spec);
+    }
+    if !read_prefixes.is_empty() {
+        for spec in super::store::list_specs_by_project(pool, project_id).await? {
+            let read = read_prefixes
+                .iter()
+                .any(|prefix| spec.path.starts_with(prefix.as_str()));
+            if read
+                && !found.contains(&spec.path)
+                && !matches!(spec.status, SpecStatus::Done | SpecStatus::Abandoned)
+            {
+                let reason = format!("{GONE_REASON_PREFIX}{}", spec.path);
+                super::store::set_status(pool, &spec.id, SpecStatus::Abandoned, Some(&reason))
+                    .await?;
+            }
+        }
     }
     Ok(report)
 }
@@ -534,7 +583,12 @@ mod tests {
 
         let spec = stored(&pool, &id).await;
         assert_eq!(spec.status, SpecStatus::Abandoned);
-        assert!(spec.status_reason.as_deref().unwrap_or_default().contains(&spec.path));
+        assert!(
+            spec.status_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains(&spec.path)
+        );
         assert_eq!(get_spec(&pool, &id).await.unwrap(), Some(spec));
     }
 
@@ -592,10 +646,31 @@ mod tests {
         mark_extracted(&pool, &state_id).await;
         mark_extracted(&pool, &project_id).await;
 
-        scan(&pool, PROJECT, &ScanRoots { project_root: Some(project.path().to_path_buf()), state_dir: None }).await.unwrap();
+        scan(
+            &pool,
+            PROJECT,
+            &ScanRoots {
+                project_root: Some(project.path().to_path_buf()),
+                state_dir: None,
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(stored(&pool, &state_id).await.status, SpecStatus::Extracted);
-        scan(&pool, PROJECT, &ScanRoots { project_root: None, state_dir: Some(state.path().to_path_buf()) }).await.unwrap();
-        assert_eq!(stored(&pool, &project_id).await.status, SpecStatus::Extracted);
+        scan(
+            &pool,
+            PROJECT,
+            &ScanRoots {
+                project_root: None,
+                state_dir: Some(state.path().to_path_buf()),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            stored(&pool, &project_id).await.status,
+            SpecStatus::Extracted
+        );
     }
 
     #[tokio::test]
@@ -605,11 +680,23 @@ mod tests {
         let project_b = tempfile::tempdir().unwrap();
         let state = tempfile::tempdir().unwrap();
         write_file(&project_specs(project_b.path()), "other.md", b"# Other\n");
-        scan(&pool, Some("project-b"), &roots_at(project_b.path(), state.path())).await.unwrap();
+        scan(
+            &pool,
+            Some("project-b"),
+            &roots_at(project_b.path(), state.path()),
+        )
+        .await
+        .unwrap();
         let other = spec_id(Some("project-b"), ".ai/specs/other.md");
         mark_extracted(&pool, &other).await;
 
-        scan(&pool, Some("project-a"), &roots_at(project_a.path(), state.path())).await.unwrap();
+        scan(
+            &pool,
+            Some("project-a"),
+            &roots_at(project_a.path(), state.path()),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(stored(&pool, &other).await.status, SpecStatus::Extracted);
     }

@@ -12,39 +12,21 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::{Mutex, PoisonError};
 use std::task::Poll;
-use std::time::Duration;
 
 use rand::RngExt;
 use sqlx::SqlitePool;
 
-use super::audit::{self, AuditReport, SpecLineage, VerifyRunner};
+use super::audit::{AuditReport, SpecLineage};
 use super::deps::{Cycle, topological_order};
-use super::extract::{self, ExtractionRunner};
-use super::model::{Criterion, Spec, SpecKind, SpecStatus};
-use super::review::NoToolsReviewer;
-#[cfg(test)]
-use super::review::{
-    REVIEW_FILE_CAP, ReviewFile, ReviewMaterial, gather_material, numbered_prefix, paths_named_by,
-    review_prompt,
-};
+use super::model::{Spec, SpecKind, SpecStatus};
 use super::scan::ScanRoots;
 use super::store::{self, StoreError};
-use super::verdict::{Verdict, VerifyState};
-use crate::execution::runner::ToolPolicy;
-use crate::state::AppState;
+use super::verdict::Verdict;
 use crate::work_nodes::sets_overlap;
-
-/// Trees at once when nothing says otherwise.
-const DEFAULT_MAX_PARALLEL: usize = 2;
-/// Two trees at most per spec, then the owner decides.
-const DEFAULT_MAX_ROUNDS: u32 = 2;
-const RUN_POLL: Duration = Duration::from_secs(1);
-const RUN_CEILING: Duration = Duration::from_secs(30 * 60);
-const TREE_POLL: Duration = Duration::from_secs(5);
-const TREE_CEILING: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Which specs to finish.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,6 +112,8 @@ pub enum FinishError {
     Store(StoreError),
     /// Something finish needs to start is missing (a project, its root).
     Config(String),
+    /// The scan that discovers the project's specs failed.
+    Scan(String),
 }
 
 impl fmt::Display for FinishError {
@@ -137,6 +121,7 @@ impl fmt::Display for FinishError {
         match self {
             FinishError::Store(error) => write!(f, "{error}"),
             FinishError::Config(what) => write!(f, "cannot finish the backlog: {what}"),
+            FinishError::Scan(what) => write!(f, "cannot scan the specs: {what}"),
         }
     }
 }
@@ -167,25 +152,10 @@ pub fn derived_branch(spec_path: &str) -> String {
     format!("spec/{clean}")
 }
 
-// ----- the storage of extraction runs -----
-
-/// Remembers that `run_id` extracted `spec_id`'s criteria. A repeat changes nothing.
-pub async fn record_extraction_run(
-    pool: &SqlitePool,
-    spec_id: &str,
-    run_id: &str,
-) -> Result<(), StoreError> {
-    sqlx::query(
-        "INSERT INTO spec_extraction_runs (spec_id, run_id, created_at) VALUES (?, ?, ?) \
-         ON CONFLICT (spec_id, run_id) DO NOTHING",
-    )
-    .bind(spec_id)
-    .bind(run_id)
-    .bind(chrono::Utc::now().to_rfc3339())
-    .execute(pool)
-    .await?;
-    Ok(())
-}
+pub use super::daemon::{
+    ProjectPaths, audit_one, extract_one, finish, no_tools_run_request, project_id_for_root,
+    record_extraction_run, resolve_project,
+};
 
 /// The runs that extracted the spec, oldest first.
 pub async fn extraction_run_ids(
@@ -469,6 +439,23 @@ pub async fn finish_with<'a>(
     config: &'a FinishConfig,
     scope: FinishScope,
 ) -> Result<FinishReport, FinishError> {
+    // A spec written since the last scan is part of "everything".
+    let scanned_project = match &scope {
+        FinishScope::All { project_id } => Some(project_id.clone()),
+        FinishScope::One { spec_id } => store::get_spec(pool, spec_id)
+            .await?
+            .map(|spec| spec.project_id),
+    };
+    if let Some(project_id) = scanned_project {
+        let roots = ScanRoots {
+            project_root: Some(PathBuf::from(&config.project_root)),
+            state_dir: config.state_dir.clone(),
+        };
+        super::scan::scan(pool, project_id.as_deref(), &roots)
+            .await
+            .map_err(|error| FinishError::Scan(format!("{error:?}")))?;
+    }
+
     let mut report = FinishReport::default();
     let mut done_ids: BTreeSet<String> = BTreeSet::new();
     // Specs that will not finish in this run; whatever waits on one is blocked.
@@ -672,407 +659,103 @@ pub async fn finish_with<'a>(
         list.sort();
         list.dedup();
     }
+    announce(pool, &report).await;
     Ok(report)
 }
 
-// ----- the production wiring -----
-
-/// A run that starts with no tools and is waited for.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NoToolsRunRequest {
-    pub prompt: String,
-    pub project_id: Option<String>,
-    pub cwd: Option<String>,
-    pub tool_policy: ToolPolicy,
-    pub steerable: bool,
-    pub wait_for_final_text: bool,
-}
-
-/// What the real reviewer and the extraction agent are started with: the CLI's own refusal of
-/// every tool (`ToolPolicy::None`), nobody able to talk to the run, and the final text awaited.
-pub fn no_tools_run_request(
-    prompt: &str,
-    project_id: Option<&str>,
-    cwd: Option<&str>,
-) -> NoToolsRunRequest {
-    NoToolsRunRequest {
-        prompt: prompt.to_owned(),
-        project_id: project_id.map(str::to_owned),
-        cwd: cwd.map(str::to_owned),
-        tool_policy: ToolPolicy::None,
-        steerable: false,
-        wait_for_final_text: true,
+/// Says on the feed how each spec ended in this run; one line per spec, none for a spec that was
+/// already done. A feed that cannot be written to only warns: the finish itself is not undone.
+async fn announce(pool: &SqlitePool, report: &FinishReport) {
+    let ended = report.done.iter().map(|id| (id, "spec_done")).chain(
+        report
+            .needs_owner
+            .iter()
+            .chain(&report.refused)
+            .chain(&report.blocked)
+            .map(|id| (id, "spec_blocked")),
+    );
+    for (id, kind) in ended {
+        let spec = match store::get_spec(pool, id).await {
+            Ok(spec) => spec,
+            Err(error) => {
+                tracing::warn!(%error, spec_id = %id, "could not read a spec to announce it");
+                None
+            }
+        };
+        let title = spec
+            .as_ref()
+            .map_or(id.as_str(), |spec| spec.title.as_str());
+        let summary = if kind == "spec_done" {
+            format!("Spec done: {title}")
+        } else {
+            let reason = if report.refused.contains(id) {
+                "its branch is the integration branch, so no tree was started".to_owned()
+            } else {
+                spec.as_ref()
+                    .and_then(|spec| spec.status_reason.clone())
+                    .unwrap_or_else(|| "it did not finish".to_owned())
+            };
+            format!("Spec not finished: {title} ({reason})")
+        };
+        post_feed(pool, kind, &summary, id).await;
     }
 }
 
-/// Starts the run through `create_no_tools_run` (the policy lands in the run itself) and waits for
-/// it to end. Returns the run id and its final text.
-pub(super) async fn run_no_tools(
-    state: &AppState,
-    request: NoToolsRunRequest,
-) -> Result<(String, String), String> {
-    debug_assert_eq!(request.tool_policy, ToolPolicy::None);
-    let id = crate::execution::runs::create_no_tools_run(
-        state,
-        request.prompt,
-        request.project_id,
-        request.cwd,
+/// One feed line; a failure only warns.
+async fn post_feed(pool: &SqlitePool, kind: &str, summary: &str, subject: &str) {
+    let result = sqlx::query(
+        "INSERT INTO feed (kind, summary, run_id, subject, created_at) VALUES (?, ?, NULL, ?, ?)",
     )
-    .await
-    .map_err(|error| format!("could not start the run: {error:?}"))?;
-    if !request.wait_for_final_text {
-        return Ok((id.to_string(), String::new()));
-    }
-    let deadline = tokio::time::Instant::now() + RUN_CEILING;
-    loop {
-        let row: Option<(String, Option<String>)> =
-            sqlx::query_as("SELECT status, stdout FROM runs WHERE id = ?")
-                .bind(id)
-                .fetch_optional(&state.pool)
-                .await
-                .map_err(|error| error.to_string())?;
-        if let Some((status, stdout)) = row
-            && crate::execution::runs::TERMINAL_RUN_STATUSES.contains(&status.as_str())
-        {
-            if status != "completed" {
-                return Err(format!("run {id} ended {status}"));
-            }
-            let text = stdout
-                .as_deref()
-                .and_then(crate::execution::runner::extract_reply)
-                .ok_or_else(|| format!("run {id} ended without a final text"))?;
-            return Ok((id.to_string(), text));
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(format!("run {id} did not end in time"));
-        }
-        tokio::time::sleep(RUN_POLL).await;
+    .bind(kind)
+    .bind(summary)
+    .bind(subject)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(pool)
+    .await;
+    if let Err(error) = result {
+        tracing::warn!(%error, kind, subject, "could not write a spec feed line");
     }
 }
 
-/// The extraction agent, recording each run it makes against the spec.
-struct RecordingExtractor<'a> {
-    state: &'a AppState,
-    spec_id: &'a str,
-    project_id: Option<&'a str>,
-    cwd: &'a str,
+/// Writes the feed line the owner sees when a finish could not even run.
+pub async fn announce_failure(pool: &SqlitePool, subject: &str, error: &str) {
+    post_feed(pool, "spec_blocked", error, subject).await;
 }
 
-#[async_trait::async_trait]
-impl ExtractionRunner for RecordingExtractor<'_> {
-    async fn run(&self, prompt: String) -> Result<String, String> {
-        let request = no_tools_run_request(&prompt, self.project_id, Some(self.cwd));
-        let (run_id, text) = run_no_tools(self.state, request).await?;
-        record_extraction_run(&self.state.pool, self.spec_id, &run_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        Ok(text)
-    }
-}
-
-/// The daemon's own `verify scope` gate over the audit worktree (the spec's feature branch), the
-/// same call that gates a tree branch. Only a passed ticket is green and only a failed one is red;
-/// no executor, nothing measured, a refused submit or a timeout is unknown, which
-/// `verdict::done` never reads as done.
-struct DaemonVerify {
-    worktree: PathBuf,
-    caller_id: i64,
-}
-
-#[async_trait::async_trait]
-impl VerifyRunner for DaemonVerify {
-    async fn verify(&self, _spec: &Spec, _criteria: &[Criterion]) -> VerifyState {
-        use crate::gate::GateOutcome;
-        use crate::verify::ScopeVerdict;
-
-        let Some(executor) = crate::verify::installed() else {
-            return VerifyState::Unknown;
-        };
-        let verdict = crate::verify::gate_scope(
-            &executor,
-            crate::verify::Caller::Job(self.caller_id),
-            &self.worktree,
-            crate::state::DEFAULT_GATE_TIMEOUT,
-        )
-        .await;
-        match verdict {
-            ScopeVerdict::Measured(GateOutcome::Passed) => VerifyState::Green,
-            ScopeVerdict::Measured(GateOutcome::Failed { .. }) => VerifyState::Red,
-            _ => VerifyState::Unknown,
-        }
-    }
-}
-
-/// The checkout an audit reads: a detached worktree of the spec's feature branch under the
-/// project's worktree root, made on first use and moved to the branch tip on later ones. With no
-/// feature branch yet (nothing was built), or when the checkout cannot be made, the project root:
-/// the spec then shows only what the root already holds, which errs towards unfinished.
-async fn audit_worktree(project_root: &Path, spec: &Spec) -> PathBuf {
-    use crate::execution::worktree as wt;
-
-    let branch = derived_branch(&spec.path);
-    let exists = wt::git()
-        .arg("-C")
-        .arg(project_root)
-        .args(["rev-parse", "--verify", "--quiet"])
-        .arg(format!("refs/heads/{branch}"))
-        .output()
-        .await
-        .is_ok_and(|output| output.status.success());
-    if !exists {
-        return project_root.to_path_buf();
-    }
-    let root = wt::worktree_root(project_root);
-    let short: String = spec.id.chars().take(12).collect();
-    let path = root.join(format!("spec-audit-{short}"));
-    let ready = if path.join(".git").exists() {
-        wt::git()
-            .arg("-C")
-            .arg(&path)
-            .args(["checkout", "--quiet", "--detach"])
-            .arg(&branch)
-            .output()
-            .await
-            .is_ok_and(|output| output.status.success())
-    } else {
-        tokio::fs::create_dir_all(&root).await.is_ok()
-            && wt::hide_root_if_nested(project_root, &root).await.is_ok()
-            && wt::git()
-                .arg("-C")
-                .arg(project_root)
-                .args(["worktree", "add", "--detach"])
-                .arg(&path)
-                .arg(&branch)
-                .output()
-                .await
-                .is_ok_and(|output| output.status.success())
-    };
-    if ready {
-        path
-    } else {
-        project_root.to_path_buf()
-    }
-}
-
-struct DaemonPreparer<'a> {
-    state: &'a AppState,
-    project_root: PathBuf,
-    integration_branch: String,
-    /// `<machine root>/projects/<id>`, where the project's own specs live; `None` when the machine
-    /// has no config root.
-    state_dir: Option<PathBuf>,
-}
-
-#[async_trait::async_trait]
-impl SpecPreparer for DaemonPreparer<'_> {
-    async fn extract(&self, spec_id: &str) -> Result<(), String> {
-        let spec = store::get_spec(&self.state.pool, spec_id)
-            .await
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| format!("spec {spec_id} not found"))?;
-        let cwd = self.project_root.to_string_lossy().into_owned();
-        let runner = RecordingExtractor {
-            state: self.state,
-            spec_id,
-            project_id: spec.project_id.as_deref(),
-            cwd: &cwd,
-        };
-        let roots = ScanRoots {
-            project_root: Some(self.project_root.clone()),
-            state_dir: self.state_dir.clone(),
-        };
-        // A spec the agent could not make sense of is stored as `needs_owner` by `extract` itself,
-        // which `finish_with` reads back; only a failure to extract at all is an error here.
-        extract::extract(&self.state.pool, &roots, spec_id, &runner)
-            .await
-            .map(|_| ())
-            .map_err(|error| format!("{error:?}"))
-    }
-
-    async fn audit(&self, spec_id: &str, lineage: &SpecLineage) -> Result<AuditReport, String> {
-        let cwd = self.project_root.to_string_lossy().into_owned();
-        let spec = store::get_spec(&self.state.pool, spec_id)
-            .await
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| format!("spec {spec_id} not found"))?;
-        // The tree's work is on the spec's feature branch, not in the project root.
-        let worktree = audit_worktree(&self.project_root, &spec).await;
-        let reviewer = NoToolsReviewer {
-            state: self.state,
-            cwd: &cwd,
-            worktree: &worktree,
-            integration_branch: &self.integration_branch,
-        };
-        let verify = DaemonVerify {
-            worktree: worktree.clone(),
-            caller_id: crate::tree_job::landing::scope_caller_id(spec_id),
-        };
-        audit::audit(
-            &self.state.pool,
-            spec_id,
-            &worktree,
-            lineage,
-            &reviewer,
-            &verify,
-        )
-        .await
-        .map_err(|error| format!("{error:?}"))
-    }
-}
-
-/// Starts a tree through the `POST /trees` handler itself (in process, same body), then waits for
-/// the job to reach its terminal state and collects the runs of its nodes.
-struct DaemonLauncher<'a> {
-    state: &'a AppState,
-}
-
-#[async_trait::async_trait]
-impl TreeLauncher for DaemonLauncher<'_> {
-    async fn run_tree(&self, request: &TreeRequest) -> Result<TreeOutcome, String> {
-        use axum::body::Body;
-        use axum::http::{Request, StatusCode};
-        use tower::ServiceExt;
-
-        let project_id = request
-            .project_id
-            .as_deref()
-            .ok_or_else(|| "the spec has no project, and a tree needs one".to_owned())?;
-        let body = serde_json::json!({
-            "id": request.id,
-            "goal": request.goal,
-            "feature_branch": request.feature_branch,
-            "project_root": request.project_root,
-            "project_id": project_id,
-        });
-        let http_request = Request::builder()
-            .method("POST")
-            .uri("/trees")
-            .header("content-type", "application/json")
-            .body(Body::from(body.to_string()))
-            .map_err(|error| error.to_string())?;
-        let response = crate::tree_job::http::routes()
-            .with_state(self.state.clone())
-            .oneshot(http_request)
-            .await
-            .map_err(|error| error.to_string())?;
-        let status = response.status();
-        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
-            .await
-            .map_err(|error| error.to_string())?;
-        if status != StatusCode::OK {
-            return Err(format!(
-                "POST /trees answered {status}: {}",
-                String::from_utf8_lossy(&bytes)
-            ));
-        }
-        let root_node_id = serde_json::from_slice::<serde_json::Value>(&bytes)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("root_node_id")
-                    .and_then(|id| id.as_str().map(str::to_owned))
-            })
-            .ok_or_else(|| "POST /trees answered without a root node".to_owned())?;
-
-        let deadline = tokio::time::Instant::now() + TREE_CEILING;
-        loop {
-            let job = crate::tree_job::store::load(&self.state.pool, &request.id)
-                .await
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| format!("tree {} disappeared", request.id))?;
-            if job.state == crate::tree_job::model::JOB_TERMINAL_STATE {
-                break;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(format!("tree {} did not finish in time", request.id));
-            }
-            tokio::time::sleep(TREE_POLL).await;
-        }
-
-        let rows: Vec<(i64, i64)> = sqlx::query_as(
-            "SELECT id, COALESCE(lineage_root_id, id) FROM runs WHERE id IN \
-             (SELECT CAST(run_id AS INTEGER) FROM work_nodes WHERE root_id = ? AND run_id IS NOT NULL)",
-        )
-        .bind(&root_node_id)
-        .fetch_all(&self.state.pool)
-        .await
-        .map_err(|error| error.to_string())?;
-        let mut outcome = TreeOutcome::default();
-        for (run, root) in rows {
-            outcome.run_ids.push(run.to_string());
-            outcome.lineage_roots.push(root.to_string());
-        }
-        dedup_in_order(&mut outcome.lineage_roots);
-        Ok(outcome)
-    }
-}
-
-/// "Finish everything": reads the project's root and integration branch from the daemon's own
-/// state and runs the plan against the real tree launcher, extraction agent and reviewer.
-pub async fn finish(state: &AppState, scope: FinishScope) -> Result<FinishReport, FinishError> {
-    let project_id = match &scope {
-        FinishScope::All { project_id } => project_id.clone(),
-        FinishScope::One { spec_id } => {
-            store::get_spec(&state.pool, spec_id)
-                .await?
-                .ok_or_else(|| StoreError::NotFound(format!("spec {spec_id}")))?
-                .project_id
-        }
-    };
-    let project_id =
-        project_id.ok_or_else(|| FinishError::Config("a project is required".to_owned()))?;
-    let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT project_root, integration_branch FROM autopilot_state WHERE project_id = ?",
-    )
-    .bind(&project_id)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(StoreError::from)?;
-    let (root, branch) = row.unwrap_or((None, None));
-    let project_root = root
-        .filter(|root| !root.trim().is_empty())
-        .ok_or_else(|| FinishError::Config(format!("project {project_id} has no recorded root")))?;
-    let config = FinishConfig {
-        max_parallel: DEFAULT_MAX_PARALLEL,
-        max_rounds: DEFAULT_MAX_ROUNDS,
-        integration_branch: branch
-            .filter(|branch| !branch.trim().is_empty())
-            .unwrap_or_else(|| "master".to_owned()),
-        owned_paths: BTreeMap::new(),
-        worktree: PathBuf::from(&project_root),
-        state_dir: None,
-        project_root,
-    };
-    let launcher = DaemonLauncher { state };
-    // Specs under `<state_dir>/specs` live in the project's state directory, resolved as the
-    // HTTP routes do: the machine config root plus the project id.
-    let state_dir = state
-        .machine_config_root
-        .as_deref()
-        .and_then(|root| crate::project::state::dir(root, &project_id));
-    let preparer = DaemonPreparer {
-        state,
-        project_root: PathBuf::from(&config.project_root),
-        integration_branch: config.integration_branch.clone(),
-        state_dir,
-    };
-    let deps = FinishDeps {
-        launcher: &launcher,
-        preparer: &preparer,
-    };
-    finish_with(&state.pool, &deps, &config, scope).await
-}
+/// Projects with a finish under way in this process.
+static CLAIMS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
 /// Held while a finish runs for a project; released on drop.
-pub struct FinishClaim;
+#[derive(Debug)]
+pub struct FinishClaim {
+    project_id: String,
+}
+
+impl Drop for FinishClaim {
+    fn drop(&mut self) {
+        // A poisoned lock still holds a valid set: take it and release the claim.
+        CLAIMS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.project_id);
+    }
+}
 
 /// Claims a project for one finish; `None` when one is already running.
-pub fn claim_project(_project_id: &str) -> Option<FinishClaim> {
-    Some(FinishClaim)
+pub fn claim_project(project_id: &str) -> Option<FinishClaim> {
+    let mut claims = CLAIMS.lock().unwrap_or_else(PoisonError::into_inner);
+    claims.insert(project_id.to_owned()).then(|| FinishClaim {
+        project_id: project_id.to_owned(),
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::model::Criterion;
+    use super::super::review::{
+        REVIEW_FILE_CAP, ReviewFile, ReviewMaterial, gather_material, numbered_prefix,
+        paths_named_by, review_prompt,
+    };
     use super::*;
     use crate::execution::runner::ToolPolicy;
     use crate::spec_backlog::audit::{AuditReport, SpecLineage};
@@ -1233,7 +916,12 @@ mod tests {
             } else {
                 SpecStatus::Audited
             };
-            store::set_audit_result(&self.pool, spec_id, status, Some("fake audit"), SHA)
+            let sha = store::get_spec(&self.pool, spec_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .content_sha;
+            store::set_audit_result(&self.pool, spec_id, status, Some("fake audit"), &sha)
                 .await
                 .unwrap();
             Ok(AuditReport {
@@ -1612,12 +1300,24 @@ mod tests {
 
         finish_with(
             &pool,
-            &FinishDeps { launcher: &launcher, preparer: &prep },
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &prep,
+            },
             &config,
-            FinishScope::All { project_id: Some("finish-scan-project".to_owned()) },
-        ).await.unwrap();
+            FinishScope::All {
+                project_id: Some("finish-scan-project".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
 
-        assert!(log.lock().unwrap().iter().any(|entry| entry == &format!("extract:{expected}")));
+        assert!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .any(|entry| entry == &format!("extract:{expected}"))
+        );
     }
 
     #[tokio::test]
@@ -1631,9 +1331,22 @@ mod tests {
         let mut config = cfg();
         config.owned_paths = disjoint(&[&done, &blocked]);
 
-        finish_with(&pool, &FinishDeps { launcher: &launcher, preparer: &prep }, &config, scope_all()).await.unwrap();
+        finish_with(
+            &pool,
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &prep,
+            },
+            &config,
+            scope_all(),
+        )
+        .await
+        .unwrap();
 
-        for (id, kind, title) in [(&done, "spec_done", "done"), (&blocked, "spec_blocked", "blocked")] {
+        for (id, kind, title) in [
+            (&done, "spec_done", "done"),
+            (&blocked, "spec_blocked", "blocked"),
+        ] {
             let row: Option<(String, String, String)> = sqlx::query_as(
                 "SELECT kind, summary, subject FROM feed WHERE subject = ? ORDER BY created_at DESC LIMIT 1",
             ).bind(id).fetch_optional(&pool).await.unwrap();
@@ -1714,19 +1427,20 @@ mod tests {
         );
         let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
         assert_eq!(names.len(), 1, "finish creates nothing beside the spec");
-        let source = include_str!("finish.rs");
-        let production = source.split("#[cfg(test)]").next().unwrap();
-        for needle in [
-            "fs::write",
-            "OpenOptions",
-            "File::create",
-            "remove_file",
-            "rename(",
-        ] {
-            assert!(
-                !production.contains(needle),
-                "production code must not use {needle}"
-            );
+        for source in [include_str!("finish.rs"), include_str!("daemon.rs")] {
+            let production = source.split("#[cfg(test)]").next().unwrap();
+            for needle in [
+                "fs::write",
+                "OpenOptions",
+                "File::create",
+                "remove_file",
+                "rename(",
+            ] {
+                assert!(
+                    !production.contains(needle),
+                    "production code must not use {needle}"
+                );
+            }
         }
     }
 

@@ -323,18 +323,19 @@ the contract, not a snapshot.
 | `conductor/sweep.rs` | Stub, not implemented yet: the liveness sweep. |
 | `conductor/http.rs` | Stub, not implemented yet: the conductor's HTTP routes. |
 | `spec_backlog/mod.rs` | Spec backlog (migration 0264): a registry of spec files, their criteria, dependencies and owner questions. Module root; declares the submodules. |
-| `spec_backlog/model.rs` | Stub, not implemented yet: the spec backlog's types. |
-| `spec_backlog/store.rs` | Stub, not implemented yet: the spec backlog's storage. |
-| `spec_backlog/scan.rs` | Stub, not implemented yet: the scan of spec files. |
-| `spec_backlog/criteria.rs` | Stub, not implemented yet: parsing a spec's criteria. |
-| `spec_backlog/extract.rs` | Stub, not implemented yet: extracting a spec's criteria. |
-| `spec_backlog/prompts.rs` | Stub, not implemented yet: the extraction prompts. |
-| `spec_backlog/deps.rs` | Stub, not implemented yet: the dependencies between specs. |
-| `spec_backlog/audit.rs` | Stub, not implemented yet: the spec audit. |
-| `spec_backlog/verdict.rs` | Stub, not implemented yet: a spec's done verdict. |
-| `spec_backlog/finish.rs` | Stub, not implemented yet: finishing specs. |
+| `spec_backlog/model.rs` | The spec backlog's closed vocabularies, the stable spec id and the registry's row types. |
+| `spec_backlog/store.rs` | The spec backlog's storage: reads and writes over the registry tables and the owner's decisions. |
+| `spec_backlog/scan.rs` | Discovery of spec files, which are read-only inputs to the backlog. |
+| `spec_backlog/criteria.rs` | Validation of what the extraction agent returns: a spec's kind, criteria, dependencies and open questions. |
+| `spec_backlog/extract.rs` | Criteria extraction over registered, immutable spec files. |
+| `spec_backlog/prompts.rs` | The extraction prompts: how a large spec is cut into sections and what the agent is told to return. |
+| `spec_backlog/deps.rs` | Pure dependency planning for specs: a topological order, cycles reported as owner questions, and parallel groups. |
+| `spec_backlog/audit.rs` | Independent review and verification of extracted specs. |
+| `spec_backlog/verdict.rs` | The pure "finished" rule: a spec is done only with a green verify and an independent reviewer's confirmation. |
+| `spec_backlog/finish.rs` | Finishing the backlog: one tree per spec, in dependency order, audited as each tree closes. |
+| `spec_backlog/daemon.rs` | The finish plan's daemon-side wiring: the launcher, preparer, verify and reviewer adapters, and how a project's root is resolved. |
 | `spec_backlog/review.rs` | The independent reviewer of a spec's criteria: the files it is shown under size caps, its prompt, and reading its JSON answer back. |
-| `spec_backlog/http.rs` | Stub, not implemented yet: the spec backlog's HTTP routes. |
+| `spec_backlog/http.rs` | HTTP routes for the spec backlog. |
 | `tree_cost/mod.rs` | Tree cost (migration 0265): per-tree spending, budgets, cache measurement and the wait policy. Module root; declares the submodules and holds the migration's tests. |
 | `tree_cost/ledger.rs` | Stub, not implemented yet: the tree cost ledger. |
 | `tree_cost/budget.rs` | Stub, not implemented yet: tree budgets. |

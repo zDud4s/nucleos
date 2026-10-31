@@ -9,7 +9,7 @@
 use std::path::Path;
 
 use super::audit::{self, CriterionReview, ReviewerAnswer, ReviewerRunner};
-use super::finish::{no_tools_run_request, run_no_tools};
+use super::daemon::{no_tools_run_request, run_no_tools};
 use super::model::{Criterion, CriterionStatus, Spec};
 use super::verdict::ReviewerRun;
 use crate::state::AppState;

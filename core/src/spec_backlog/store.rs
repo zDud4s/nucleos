@@ -18,6 +18,8 @@ use super::model::{
 #[derive(Debug)]
 pub enum StoreError {
     NotFound(String),
+    /// The write was refused because the spec's content moved since the caller read it.
+    Stale(String),
     /// A stored value outside its closed vocabulary.
     Invalid(String),
     Db(sqlx::Error),
@@ -27,6 +29,7 @@ impl fmt::Display for StoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             StoreError::NotFound(id) => write!(f, "{id} not found"),
+            StoreError::Stale(what) => write!(f, "{what} changed since it was read"),
             StoreError::Invalid(what) => write!(f, "invalid stored value: {what}"),
             StoreError::Db(error) => write!(f, "database error: {error}"),
         }
@@ -278,6 +281,8 @@ pub async fn set_extraction_result(
     Ok(())
 }
 
+/// Records one criterion's review. The write only lands on a criterion extracted from the spec's
+/// current content: a spec edited while its reviewer ran is `Stale`, and nothing is overwritten.
 pub async fn set_criterion_review(
     pool: &SqlitePool,
     spec_id: &str,
@@ -286,12 +291,27 @@ pub async fn set_criterion_review(
     evidence: Option<&str>,
     reviewer_run_id: &str,
 ) -> Result<(), StoreError> {
-    sqlx::query("UPDATE spec_criteria SET status = ?, evidence = ?, reviewer_run_id = ?, checked_at = ? WHERE spec_id = ? AND ordinal = ?")
-        .bind(status.as_str()).bind(evidence).bind(reviewer_run_id).bind(now()).bind(spec_id).bind(ordinal)
-        .execute(pool).await?;
+    let result = sqlx::query(
+        "UPDATE spec_criteria SET status = ?, evidence = ?, reviewer_run_id = ?, checked_at = ? \
+         WHERE spec_id = ? AND ordinal = ? \
+         AND spec_sha = (SELECT content_sha FROM specs WHERE id = ?)",
+    )
+    .bind(status.as_str())
+    .bind(evidence)
+    .bind(reviewer_run_id)
+    .bind(now())
+    .bind(spec_id)
+    .bind(ordinal)
+    .bind(spec_id)
+    .execute(pool)
+    .await?;
+    if result.rows_affected() == 0 {
+        return Err(StoreError::Stale(format!("criteria of spec {spec_id}")));
+    }
     Ok(())
 }
 
+/// Records an audit's outcome, only when the spec still has the content `sha` the audit read.
 pub async fn set_audit_result(
     pool: &SqlitePool,
     spec_id: &str,
@@ -299,10 +319,17 @@ pub async fn set_audit_result(
     reason: Option<&str>,
     sha: &str,
 ) -> Result<(), StoreError> {
-    let result = sqlx::query("UPDATE specs SET status = ?, status_reason = ?, last_audited_sha = ?, updated_at = ? WHERE id = ?")
-        .bind(status.as_str()).bind(reason).bind(sha).bind(now()).bind(spec_id).execute(pool).await?;
+    let result = sqlx::query("UPDATE specs SET status = ?, status_reason = ?, last_audited_sha = ?, updated_at = ? WHERE id = ? AND content_sha = ?")
+        .bind(status.as_str()).bind(reason).bind(sha).bind(now()).bind(spec_id).bind(sha).execute(pool).await?;
     if result.rows_affected() == 0 {
-        return Err(StoreError::NotFound(format!("spec {spec_id}")));
+        let exists: Option<String> = sqlx::query_scalar("SELECT id FROM specs WHERE id = ?")
+            .bind(spec_id)
+            .fetch_optional(pool)
+            .await?;
+        return Err(match exists {
+            Some(_) => StoreError::Stale(format!("spec {spec_id}")),
+            None => StoreError::NotFound(format!("spec {spec_id}")),
+        });
     }
     Ok(())
 }
@@ -361,6 +388,17 @@ pub async fn list_specs_by_project(
     rows.into_iter().map(SpecRow::into_spec).collect()
 }
 
+/// Lists every spec, regardless of project ownership.
+pub async fn list_all_specs(pool: &SqlitePool) -> Result<Vec<Spec>, StoreError> {
+    let rows: Vec<SpecRow> = sqlx::query_as(
+        "SELECT id, project_id, path, title, content_sha, kind, status, status_reason, tree_id, \
+         last_audited_sha, created_at, updated_at FROM specs ORDER BY path",
+    )
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter().map(SpecRow::into_spec).collect()
+}
+
 /// Records that `spec_id` depends on `depends_on`. The pair is the key: a repeat, under either
 /// source, changes nothing.
 pub async fn add_dep(
@@ -378,6 +416,34 @@ pub async fn add_dep(
     .bind(source.as_str())
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+/// Replaces the dependencies a spec's extraction named with `depends_on`; the owner's own
+/// dependencies stay. One transaction, so a failure leaves the previous set.
+pub async fn replace_extracted_deps(
+    pool: &SqlitePool,
+    spec_id: &str,
+    depends_on: &[String],
+) -> Result<(), StoreError> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM spec_deps WHERE spec_id = ? AND source = ?")
+        .bind(spec_id)
+        .bind(DepSource::Extracted.as_str())
+        .execute(&mut *tx)
+        .await?;
+    for target in depends_on {
+        sqlx::query(
+            "INSERT INTO spec_deps (spec_id, depends_on, source) VALUES (?, ?, ?) \
+             ON CONFLICT (spec_id, depends_on) DO NOTHING",
+        )
+        .bind(spec_id)
+        .bind(target)
+        .bind(DepSource::Extracted.as_str())
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 

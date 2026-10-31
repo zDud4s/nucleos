@@ -22,6 +22,8 @@ run as daemon runs, not in your session, so closing the laptop or dropping a tun
 stop them. If those tools are not offered in your session, fall back to `Agent` + `orchestrate`
 and say so.
 
+For "finish everything", call `spec_finish` with `project_root` set to the session's project root; the daemon refuses a call that names no spec and no project.
+
 ## Escape
 
 The owner starts a prompt with `manual:` to opt out of the conductor's routing for that one

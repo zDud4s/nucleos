@@ -109,15 +109,11 @@ pub async fn extract(
     let kind = kind.unwrap_or(SpecKind::Unknown);
     let count = criteria.len();
     store::replace_criteria(pool, &spec.id, &spec.content_sha, &criteria).await?;
-    for dependency in dependencies {
-        store::add_dep(
-            pool,
-            &spec.id,
-            &super::model::spec_id(spec.project_id.as_deref(), &dependency),
-            super::model::DepSource::Extracted,
-        )
-        .await?;
-    }
+    let dependencies: Vec<String> = dependencies
+        .iter()
+        .map(|dependency| super::model::spec_id(spec.project_id.as_deref(), dependency))
+        .collect();
+    store::replace_extracted_deps(pool, &spec.id, &dependencies).await?;
     for question in questions {
         store::add_question(pool, &spec.id, &question).await?;
     }
@@ -370,13 +366,23 @@ mod tests {
         }));
         let runner = FakeRunner::answering(&[names_b, spec_answer(&["second"])]);
 
-        extract(&pool, &roots_at(dir.path()), &a.id, &runner).await.unwrap();
-        store::add_dep(&pool, &a.id, &c.id, DepSource::Owner).await.unwrap();
-        extract(&pool, &roots_at(dir.path()), &a.id, &runner).await.unwrap();
+        extract(&pool, &roots_at(dir.path()), &a.id, &runner)
+            .await
+            .unwrap();
+        store::add_dep(&pool, &a.id, &c.id, DepSource::Owner)
+            .await
+            .unwrap();
+        extract(&pool, &roots_at(dir.path()), &a.id, &runner)
+            .await
+            .unwrap();
 
         assert_eq!(
             list_deps(&pool, &a.id).await.unwrap(),
-            vec![Dep { spec_id: a.id, depends_on: c.id.clone(), source: DepSource::Owner }]
+            vec![Dep {
+                spec_id: a.id,
+                depends_on: c.id.clone(),
+                source: DepSource::Owner
+            }]
         );
         assert_ne!(b.id, c.id);
     }

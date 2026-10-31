@@ -2828,8 +2828,22 @@ pub const ROUTES: &[RouteEntry] = &[
         method: "POST",
         path: "/specs/scan",
         purpose: "Post scan.",
-        body: Body::None,
+        body: Body::Shapeless("ScanRequest"),
         handler: "post_scan",
+    },
+    RouteEntry {
+        method: "POST",
+        path: "/specs/{id}/audit",
+        purpose: "Post audit.",
+        body: Body::None,
+        handler: "post_audit",
+    },
+    RouteEntry {
+        method: "POST",
+        path: "/specs/{id}/deps",
+        purpose: "Post deps.",
+        body: Body::Shapeless("DepRequest"),
+        handler: "post_deps",
     },
     RouteEntry {
         method: "POST",

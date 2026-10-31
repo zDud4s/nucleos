@@ -48,8 +48,12 @@ pub(super) struct TreeBranchStartParams {
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 pub(super) struct SpecFinishParams {
-    /// The spec to finish. Absent leaves the choice to the daemon.
+    /// One spec to finish, with whatever it depends on that is not done yet.
     pub(super) spec_id: Option<String>,
+    /// Finish every spec of this project.
+    pub(super) project_id: Option<String>,
+    /// Finish every spec of the project with this root: your session's project root.
+    pub(super) project_root: Option<String>,
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]

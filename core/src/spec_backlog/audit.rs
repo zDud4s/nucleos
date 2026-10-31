@@ -64,6 +64,14 @@ impl From<StoreError> for AuditError {
     }
 }
 
+/// A write refused because the spec moved under the audit is a stale audit, not a store failure.
+fn stale_or_store(error: StoreError) -> AuditError {
+    match error {
+        StoreError::Stale(_) => AuditError::StaleCriteria,
+        other => AuditError::Store(other),
+    }
+}
+
 pub(super) fn safe_relative_path(worktree: &Path, path: &str) -> Option<std::path::PathBuf> {
     let relative = Path::new(path);
     if relative.is_absolute()
@@ -194,7 +202,8 @@ pub async fn audit(
             evidence,
             &answer.run.run_id,
         )
-        .await?;
+        .await
+        .map_err(stale_or_store)?;
         if status == CriterionStatus::Doubt {
             store::add_question(
                 pool,
@@ -225,7 +234,9 @@ pub async fn audit(
         SpecStatus::Audited
     };
     let reason = (status != SpecStatus::Done).then(|| format!("{verdict:?}"));
-    store::set_audit_result(pool, spec_id, status, reason.as_deref(), &spec.content_sha).await?;
+    store::set_audit_result(pool, spec_id, status, reason.as_deref(), &spec.content_sha)
+        .await
+        .map_err(stale_or_store)?;
     Ok(AuditReport {
         reviewer_run_id: answer.run.run_id,
         verify: verify_state,
@@ -908,26 +919,54 @@ mod tests {
                     .await
                     .map_err(|error| error.to_string())?;
                 Ok(ReviewerAnswer {
-                    run: ReviewerRun { run_id: "review-1".to_owned(), lineage_root_id: None },
-                    reviews: criteria.iter().map(|criterion| met(criterion.ordinal, GOOD)).collect(),
+                    run: ReviewerRun {
+                        run_id: "review-1".to_owned(),
+                        lineage_root_id: None,
+                    },
+                    reviews: criteria
+                        .iter()
+                        .map(|criterion| met(criterion.ordinal, GOOD))
+                        .collect(),
                 })
             }
         }
 
         let fx = Fixture::new(&["one", "two"]).await;
-        let reviewer = EditingReviewer { pool: fx.pool.clone(), id: fx.id.clone() };
+        let reviewer = EditingReviewer {
+            pool: fx.pool.clone(),
+            id: fx.id.clone(),
+        };
         let verify = FakeVerify::new(VerifyState::Green);
 
         let result = audit(
-            &fx.pool, &reviewer.id, fx.worktree.path(), &SpecLineage::default(), &reviewer, &verify,
-        ).await;
+            &fx.pool,
+            &reviewer.id,
+            fx.worktree.path(),
+            &SpecLineage::default(),
+            &reviewer,
+            &verify,
+        )
+        .await;
 
-        assert!(matches!(result, Err(AuditError::StaleCriteria)), "{result:?}");
+        assert!(
+            matches!(result, Err(AuditError::StaleCriteria)),
+            "{result:?}"
+        );
         let spec = fx.spec().await;
         assert_eq!(spec.status, SpecStatus::Discovered);
         assert_eq!(spec.content_sha, NEW_SHA);
-        assert!(fx.criteria().await.iter().all(|criterion| criterion.status == CriterionStatus::Stale));
-        assert!(fx.criteria().await.iter().all(|criterion| criterion.status != CriterionStatus::Met));
+        assert!(
+            fx.criteria()
+                .await
+                .iter()
+                .all(|criterion| criterion.status == CriterionStatus::Stale)
+        );
+        assert!(
+            fx.criteria()
+                .await
+                .iter()
+                .all(|criterion| criterion.status != CriterionStatus::Met)
+        );
     }
 
     #[tokio::test]

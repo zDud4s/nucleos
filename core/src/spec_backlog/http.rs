@@ -1,11 +1,16 @@
 //! HTTP routes for the spec backlog.
+//!
+//! A route that starts slow work (a finish, an extraction, an audit) checks what it can before it
+//! answers: a refusal is a 4xx with `{"error": ..}`, and only a request that can run is a 202.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
+use serde_json::{Value, json};
 
+use crate::spec_backlog::model::DepSource;
 use crate::spec_backlog::{finish, scan, store};
 use crate::state::AppState;
 
@@ -13,6 +18,35 @@ use crate::state::AppState;
 struct FinishRequest {
     spec_id: Option<String>,
     project_id: Option<String>,
+    project_root: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScanRequest {
+    project_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DepRequest {
+    depends_on: String,
+}
+
+type Answer = (StatusCode, Json<Value>);
+
+fn refuse(status: StatusCode, error: impl std::fmt::Display) -> Answer {
+    (status, Json(json!({ "error": error.to_string() })))
+}
+
+fn failed(what: &str, error: impl std::fmt::Display) -> Answer {
+    tracing::warn!(%error, "{what}");
+    refuse(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("{what}: {error}"),
+    )
+}
+
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.trim().is_empty())
 }
 
 /// Routes supplied to the daemon's protected router.
@@ -21,32 +55,43 @@ pub fn routes() -> Router<AppState> {
         .route("/specs/scan", post(post_scan))
         .route("/specs", get(get_specs))
         .route("/specs/{id}/extract", post(post_extract))
+        .route("/specs/{id}/audit", post(post_audit))
+        .route("/specs/{id}/deps", post(post_deps))
         .route("/backlog", get(get_backlog))
         .route("/backlog/finish", post(post_finish))
         .route("/decisions", get(get_decisions))
 }
 
-async fn post_scan(State(state): State<AppState>) -> Result<StatusCode, StatusCode> {
-    scan::scan(
-        &state.pool,
-        None,
-        &scan::ScanRoots {
-            project_root: None,
-            state_dir: None,
-        },
-    )
-    .await
-    .map(|_| StatusCode::OK)
-    .map_err(|error| {
-        tracing::warn!(?error, "spec scan failed");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })
+/// Reads the project's real spec directories into the backlog.
+async fn post_scan(State(state): State<AppState>, Json(request): Json<ScanRequest>) -> Answer {
+    let Some(project_id) = non_empty(request.project_id) else {
+        return refuse(StatusCode::UNPROCESSABLE_ENTITY, "project_id is required");
+    };
+    let paths = match finish::resolve_project(&state, &project_id).await {
+        Ok(paths) => paths,
+        Err(error) => return refuse(StatusCode::UNPROCESSABLE_ENTITY, error),
+    };
+    let roots = scan::ScanRoots {
+        project_root: Some(paths.project_root.into()),
+        state_dir: paths.state_dir,
+    };
+    match scan::scan(&state.pool, Some(&project_id), &roots).await {
+        Ok(report) => (
+            StatusCode::OK,
+            Json(json!({
+                "new": report.new,
+                "changed": report.changed,
+                "unchanged": report.unchanged,
+            })),
+        ),
+        Err(error) => failed("spec scan failed", format!("{error:?}")),
+    }
 }
 
 async fn get_specs(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<crate::spec_backlog::model::Spec>>, StatusCode> {
-    store::list_specs_by_project(&state.pool, None)
+    store::list_all_specs(&state.pool)
         .await
         .map(Json)
         .map_err(|error| {
@@ -55,12 +100,94 @@ async fn get_specs(
         })
 }
 
-/// Extraction is deliberately detached: a client only waits for acceptance of the work.
-async fn post_extract(Path(spec_id): Path<String>) -> StatusCode {
+/// What `extract` and `audit` check before they accept: the spec exists, and its project has a
+/// root to read it from.
+async fn check_spec_can_run(state: &AppState, spec_id: &str) -> Result<(), Answer> {
+    let spec = match store::get_spec(&state.pool, spec_id).await {
+        Ok(Some(spec)) => spec,
+        Ok(None) => {
+            return Err(refuse(
+                StatusCode::NOT_FOUND,
+                format!("spec {spec_id} not found"),
+            ));
+        }
+        Err(error) => return Err(failed("could not read the spec", error)),
+    };
+    let Some(project_id) = spec.project_id else {
+        return Err(refuse(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("spec {spec_id} has no project"),
+        ));
+    };
+    finish::resolve_project(state, &project_id)
+        .await
+        .map(|_| ())
+        .map_err(|error| refuse(StatusCode::UNPROCESSABLE_ENTITY, error))
+}
+
+/// Extraction runs a paid agent, so the route only waits for acceptance of the work.
+async fn post_extract(State(state): State<AppState>, Path(spec_id): Path<String>) -> Answer {
+    if let Err(answer) = check_spec_can_run(&state, &spec_id).await {
+        return answer;
+    }
     tokio::spawn(async move {
-        tracing::info!(%spec_id, "spec extraction accepted");
+        if let Err(error) = finish::extract_one(&state, &spec_id).await {
+            tracing::warn!(%error, %spec_id, "spec extraction failed");
+        }
     });
-    StatusCode::ACCEPTED
+    (StatusCode::ACCEPTED, Json(json!({ "accepted": true })))
+}
+
+/// An audit runs a reviewer, so the route only waits for acceptance of the work.
+async fn post_audit(State(state): State<AppState>, Path(spec_id): Path<String>) -> Answer {
+    if let Err(answer) = check_spec_can_run(&state, &spec_id).await {
+        return answer;
+    }
+    tokio::spawn(async move {
+        if let Err(error) = finish::audit_one(&state, &spec_id).await {
+            tracing::warn!(%error, %spec_id, "spec audit failed");
+        }
+    });
+    (StatusCode::ACCEPTED, Json(json!({ "accepted": true })))
+}
+
+/// The owner says that `id` waits on another spec. A cycle is accepted on purpose: `finish` sends
+/// it to the owner as a question.
+async fn post_deps(
+    State(state): State<AppState>,
+    Path(spec_id): Path<String>,
+    Json(request): Json<DepRequest>,
+) -> Answer {
+    match store::get_spec(&state.pool, &spec_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return refuse(StatusCode::NOT_FOUND, format!("spec {spec_id} not found"));
+        }
+        Err(error) => return failed("could not read the spec", error),
+    }
+    if request.depends_on == spec_id {
+        return refuse(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a spec cannot depend on itself",
+        );
+    }
+    match store::get_spec(&state.pool, &request.depends_on).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return refuse(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("spec {} not found", request.depends_on),
+            );
+        }
+        Err(error) => return failed("could not read the spec", error),
+    }
+    match store::add_dep(&state.pool, &spec_id, &request.depends_on, DepSource::Owner).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(json!({ "spec_id": spec_id, "depends_on": request.depends_on })),
+        ),
+        Err(error) => failed("could not record the dependency", error),
+    }
 }
 
 async fn get_backlog(
@@ -69,35 +196,85 @@ async fn get_backlog(
     get_specs(State(state)).await
 }
 
-async fn post_finish(
-    State(state): State<AppState>,
-    Json(request): Json<FinishRequest>,
-) -> StatusCode {
-    let scope = match request.spec_id {
-        Some(spec_id) if !spec_id.trim().is_empty() => finish::FinishScope::One { spec_id },
-        _ => finish::FinishScope::All {
-            project_id: request.project_id,
-        },
+/// Starts a finish when it can run: the scope names a known spec or a project with a root, and no
+/// other finish holds that project. The claim lives as long as the finish does.
+async fn post_finish(State(state): State<AppState>, Json(request): Json<FinishRequest>) -> Answer {
+    let (scope, project_id) = if let Some(spec_id) = non_empty(request.spec_id) {
+        match store::get_spec(&state.pool, &spec_id).await {
+            Ok(Some(spec)) => match spec.project_id {
+                Some(project_id) => (finish::FinishScope::One { spec_id }, project_id),
+                None => {
+                    return refuse(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        format!("spec {spec_id} has no project"),
+                    );
+                }
+            },
+            Ok(None) => {
+                return refuse(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("spec {spec_id} not found"),
+                );
+            }
+            Err(error) => return failed("could not read the spec", error),
+        }
+    } else if let Some(project_id) = non_empty(request.project_id) {
+        (
+            finish::FinishScope::All {
+                project_id: Some(project_id.clone()),
+            },
+            project_id,
+        )
+    } else if let Some(root) = non_empty(request.project_root) {
+        match finish::project_id_for_root(&state.pool, &root).await {
+            Ok(Some(project_id)) => (
+                finish::FinishScope::All {
+                    project_id: Some(project_id.clone()),
+                },
+                project_id,
+            ),
+            Ok(None) => {
+                return refuse(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("no project has the root {root}"),
+                );
+            }
+            Err(error) => return failed("could not look the project up", error),
+        }
+    } else {
+        return refuse(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "name a spec_id, a project_id or a project_root",
+        );
     };
-    if let finish::FinishScope::One { spec_id } = &scope
-        && !matches!(store::get_spec(&state.pool, spec_id).await, Ok(Some(_)))
-    {
-        return StatusCode::ACCEPTED;
+    if let Err(error) = finish::resolve_project(&state, &project_id).await {
+        return refuse(StatusCode::UNPROCESSABLE_ENTITY, error);
     }
-    let state_for_task = state.clone();
+    let Some(claim) = finish::claim_project(&project_id) else {
+        return refuse(
+            StatusCode::CONFLICT,
+            format!("a finish is already running for project {project_id}"),
+        );
+    };
     tokio::spawn(async move {
-        if let Err(error) = finish::finish(&state_for_task, scope).await {
-            match error {
+        let _claim = claim;
+        if let Err(error) = finish::finish(&state, scope).await {
+            match &error {
                 finish::FinishError::Store(error) => {
                     tracing::warn!(%error, "backlog finish store failed")
                 }
                 finish::FinishError::Config(error) => {
                     tracing::warn!(%error, "backlog finish configuration failed")
                 }
+                finish::FinishError::Scan(error) => {
+                    tracing::warn!(%error, "backlog finish scan failed")
+                }
             }
+            // The owner is not watching this task: the feed is where a failed finish shows.
+            finish::announce_failure(&state.pool, &project_id, &error.to_string()).await;
         }
     });
-    StatusCode::ACCEPTED
+    (StatusCode::ACCEPTED, Json(json!({ "accepted": true })))
 }
 
 async fn get_decisions(
@@ -213,18 +390,34 @@ mod tests {
         let specs = root.path().join(".ai/specs");
         std::fs::create_dir_all(&specs).unwrap();
         std::fs::write(specs.join("a.md"), "# A\n").unwrap();
-        sqlx::query("INSERT INTO autopilot_state (project_id, mode, project_root) VALUES (?, 'off', ?)")
-            .bind("scan-real-project")
-            .bind(root.path().to_string_lossy().to_string())
-            .execute(&state.pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES (?, 'off', ?)",
+        )
+        .bind("scan-real-project")
+        .bind(root.path().to_string_lossy().to_string())
+        .execute(&state.pool)
+        .await
+        .unwrap();
         let app = app(&state);
 
-        let (status, body) = request(&app, "POST", "/specs/scan", json!({"project_id": "scan-real-project"})).await;
+        let (status, body) = request(
+            &app,
+            "POST",
+            "/specs/scan",
+            json!({"project_id": "scan-real-project"}),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, json!({"new": 1, "changed": 0, "unchanged": 0}));
         let (status, specs) = request(&app, "GET", "/specs", Value::Null).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(specs.as_array().unwrap().iter().any(|spec| spec["path"] == ".ai/specs/a.md"));
+        assert!(
+            specs
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|spec| spec["path"] == ".ai/specs/a.md")
+        );
     }
 
     #[tokio::test]
@@ -232,7 +425,13 @@ mod tests {
         let state = state().await;
         sqlx::query("INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('scan-no-root', 'off', NULL)")
             .execute(&state.pool).await.unwrap();
-        let (status, body) = request(&app(&state), "POST", "/specs/scan", json!({"project_id": "scan-no-root"})).await;
+        let (status, body) = request(
+            &app(&state),
+            "POST",
+            "/specs/scan",
+            json!({"project_id": "scan-no-root"}),
+        )
+        .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert!(!body["error"].as_str().unwrap_or_default().is_empty());
     }
@@ -249,9 +448,16 @@ mod tests {
     async fn finish_refuses_what_it_cannot_do() {
         let state = state().await;
         let app = app(&state);
-        let (status, _) = request(&app, "POST", "/backlog/finish", json!({"spec_id": "nope"})).await;
+        let (status, _) =
+            request(&app, "POST", "/backlog/finish", json!({"spec_id": "nope"})).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-        let (status, _) = request(&app, "POST", "/backlog/finish", json!({"project_id": "no-root"})).await;
+        let (status, _) = request(
+            &app,
+            "POST",
+            "/backlog/finish",
+            json!({"project_id": "no-root"}),
+        )
+        .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
@@ -259,15 +465,32 @@ mod tests {
     async fn a_second_finish_for_a_project_is_refused_while_one_runs() {
         let state = state().await;
         let root = tempfile::tempdir().unwrap();
-        sqlx::query("INSERT INTO autopilot_state (project_id, mode, project_root) VALUES (?, 'off', ?)")
-            .bind("finish-claim-project")
-            .bind(root.path().to_string_lossy().to_string())
-            .execute(&state.pool).await.unwrap();
-        let claim = crate::spec_backlog::finish::claim_project("finish-claim-project").expect("first claim");
-        let (status, _) = request(&app(&state), "POST", "/backlog/finish", json!({"project_id": "finish-claim-project"})).await;
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES (?, 'off', ?)",
+        )
+        .bind("finish-claim-project")
+        .bind(root.path().to_string_lossy().to_string())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let claim = crate::spec_backlog::finish::claim_project("finish-claim-project")
+            .expect("first claim");
+        let (status, _) = request(
+            &app(&state),
+            "POST",
+            "/backlog/finish",
+            json!({"project_id": "finish-claim-project"}),
+        )
+        .await;
         assert_eq!(status, StatusCode::CONFLICT);
         drop(claim);
-        let (status, _) = request(&app(&state), "POST", "/backlog/finish", json!({"project_id": "finish-claim-project"})).await;
+        let (status, _) = request(
+            &app(&state),
+            "POST",
+            "/backlog/finish",
+            json!({"project_id": "finish-claim-project"}),
+        )
+        .await;
         assert_eq!(status, StatusCode::ACCEPTED);
     }
 
@@ -279,11 +502,33 @@ mod tests {
         sqlx::query("INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('finish-root-project', 'off', ?)")
             .bind(&path).execute(&state.pool).await.unwrap();
         let app = app(&state);
-        for root in [path.replace('\\', "/"), path.replace('/', "\\")] {
-            let (status, _) = request(&app, "POST", "/backlog/finish", json!({"project_root": root})).await;
-            assert_eq!(status, StatusCode::ACCEPTED);
+        for (index, root) in [path.replace('\\', "/"), path.replace('/', "\\")]
+            .into_iter()
+            .enumerate()
+        {
+            let (status, _) = request(
+                &app,
+                "POST",
+                "/backlog/finish",
+                json!({"project_root": root}),
+            )
+            .await;
+            if index == 0 {
+                assert_eq!(status, StatusCode::ACCEPTED);
+            } else {
+                assert!(matches!(
+                    status,
+                    StatusCode::ACCEPTED | StatusCode::CONFLICT
+                ));
+            }
         }
-        let (status, _) = request(&app, "POST", "/backlog/finish", json!({"project_root": "C:/nowhere"})).await;
+        let (status, _) = request(
+            &app,
+            "POST",
+            "/backlog/finish",
+            json!({"project_root": "C:/nowhere"}),
+        )
+        .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
@@ -317,13 +562,37 @@ mod tests {
             .bind("dep-b").bind(".ai/specs/b.md").bind("B").bind("b").bind("now").bind("now")
             .execute(&state.pool).await.unwrap();
         let app = app(&state);
-        let (status, _) = request(&app, "POST", "/specs/dep-a/deps", json!({"depends_on": "dep-b"})).await;
+        let (status, _) = request(
+            &app,
+            "POST",
+            "/specs/dep-a/deps",
+            json!({"depends_on": "dep-b"}),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(crate::spec_backlog::store::list_deps(&state.pool, "dep-a").await.unwrap()[0].source, crate::spec_backlog::model::DepSource::Owner);
+        assert_eq!(
+            crate::spec_backlog::store::list_deps(&state.pool, "dep-a")
+                .await
+                .unwrap()[0]
+                .source,
+            crate::spec_backlog::model::DepSource::Owner
+        );
         for (route, body, expected) in [
-            ("/specs/nope/deps", json!({"depends_on": "dep-b"}), StatusCode::NOT_FOUND),
-            ("/specs/dep-a/deps", json!({"depends_on": "nope"}), StatusCode::UNPROCESSABLE_ENTITY),
-            ("/specs/dep-a/deps", json!({"depends_on": "dep-a"}), StatusCode::UNPROCESSABLE_ENTITY),
+            (
+                "/specs/nope/deps",
+                json!({"depends_on": "dep-b"}),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "/specs/dep-a/deps",
+                json!({"depends_on": "nope"}),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                "/specs/dep-a/deps",
+                json!({"depends_on": "dep-a"}),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
         ] {
             let (status, _) = request(&app, "POST", route, body).await;
             assert_eq!(status, expected, "{route}");
