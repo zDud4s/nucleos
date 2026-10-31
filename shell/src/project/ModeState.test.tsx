@@ -2,7 +2,7 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
@@ -12,6 +12,7 @@ vi.mock("../data/client", async (original) => ({
   ...daemon,
 }));
 
+import { ApiRefusal } from "../data/client";
 import {
   daemonFetch,
   daemonState,
@@ -34,12 +35,15 @@ async function openState(
   state: DaemonState,
   failing: Set<string> = new Set(),
   path = "/projects/nucleos/state",
+  refuse?: (path: string, init?: RequestInit) => Error | undefined,
 ) {
   const answer = daemonFetch(state);
   daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
     for (const prefix of failing) {
       if (path.startsWith(prefix)) throw new Error(`${prefix} is down`);
     }
+    const refusal = refuse?.(path, init);
+    if (refusal !== undefined) throw refusal;
     return answer(path, init);
   });
   daemon.apiText.mockImplementation(daemonText(state));
@@ -103,16 +107,19 @@ describe("the mode switch says which mode is set", () => {
     expect(document.activeElement).toBe(off);
   });
 
-  it("a locked offer stays reachable and is described by why it is locked", async () => {
+  // Changed from "a locked offer stays reachable ... inert": the owner's rule is that activating is
+  // never blocked, so the offer is live and the standing sentence says what is missing.
+  it("an offer without enough shadow proof is live and is described by what is missing", async () => {
     await openState(
       settingsState({ promotable: false, classes_ready: 2, classes_total: 5 }),
       new Set(),
       AUTHORITY,
     );
 
-    const locked = await screen.findByRole("button", { name: "Let it act" });
-    expect(locked.getAttribute("aria-disabled")).toBe("true");
-    const reason = document.getElementById(locked.getAttribute("aria-describedby") ?? "");
+    const offer = await screen.findByRole("button", { name: "Let it act" });
+    expect(offer.getAttribute("aria-disabled")).not.toBe("true");
+    expect((offer as HTMLButtonElement).disabled).toBe(false);
+    const reason = document.getElementById(offer.getAttribute("aria-describedby") ?? "");
     expect(reason?.textContent).toBe("3 of 5 action classes are still short of the bar.");
   });
 
@@ -121,6 +128,171 @@ describe("the mode switch says which mode is set", () => {
     for (const name of ["Mode", "Open-proposal ceiling", "Action classes"]) {
       expect(await screen.findByRole("heading", { level: 3, name })).toBeTruthy();
     }
+  });
+});
+
+/** The POSTs to the mode route that reached the daemon, as their parsed bodies. */
+function modeWrites(): unknown[] {
+  return daemon.apiFetch.mock.calls
+    .filter(([path, init]) => path === "/autopilot/state" && init?.method === "POST")
+    .map(([, init]) => JSON.parse(String((init as RequestInit).body)));
+}
+
+const ACTIVATE = { project_id: "nucleos", mode: "active", project_root: "C:/p" };
+
+/** The warning drawn when the shadow proof is not enough; absent otherwise. */
+const WARNING = { name: "Not enough shadow evidence" };
+
+describe("letting a project act without enough shadow proof (warn, never block)", () => {
+  const SHORT = { promotable: false, classes_ready: 2, classes_total: 5 } as const;
+
+  // `modeWrites` reads the mock's history, which would otherwise carry over from the test before.
+  beforeEach(() => {
+    daemon.apiFetch.mockClear();
+  });
+
+  /** Presses "Let it act" the way the interlock fallback does and confirms, retrying the dwell. */
+  async function confirmProvenOffer() {
+    fireEvent.click(await screen.findByRole("button", { name: "Let it act" }));
+    await waitFor(() => {
+      const armed = screen.queryByRole("button", { name: "Let nucleos act" });
+      if (armed !== null) fireEvent.click(armed);
+      expect(screen.queryByRole("button", { name: "Let nucleos act" })).toBeNull();
+    });
+  }
+
+  it("enables the offer and, on pressing it, warns what is missing with a confirm and a cancel", async () => {
+    await openState(settingsState(SHORT), new Set(), AUTHORITY);
+
+    const offer = await screen.findByRole("button", { name: "Let it act" });
+    expect(offer.getAttribute("aria-disabled")).not.toBe("true");
+    expect(offer.hasAttribute("disabled")).toBe(false);
+
+    fireEvent.click(offer);
+
+    const warning = await screen.findByRole("group", WARNING);
+    // The reason is the one already in the data (`promotionBlocker`), not a second copy of it.
+    expect(warning.textContent).toMatch(/3 of 5 action classes are still short of the bar/);
+    expect(within(warning).getByRole("button", { name: "Activate anyway" })).toBeTruthy();
+    expect(within(warning).getByRole("button", { name: "Cancel" })).toBeTruthy();
+    // Warning only: pressing the offer asks nothing of the daemon yet.
+    expect(modeWrites()).toEqual([]);
+  });
+
+  it("cancel sends no request and closes the warning", async () => {
+    await openState(settingsState(SHORT), new Set(), AUTHORITY);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Let it act" }));
+    const warning = await screen.findByRole("group", WARNING);
+    fireEvent.click(within(warning).getByRole("button", { name: "Cancel" }));
+
+    await waitFor(() => expect(screen.queryByRole("group", WARNING)).toBeNull());
+    expect(modeWrites()).toEqual([]);
+    expect(screen.getByRole("button", { name: "Let it act" })).toBeTruthy();
+  });
+
+  it("confirming sends the mode change to active", async () => {
+    const state = settingsState(SHORT);
+    await openState(state, new Set(), AUTHORITY);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Let it act" }));
+    const warning = await screen.findByRole("group", WARNING);
+    fireEvent.click(within(warning).getByRole("button", { name: "Activate anyway" }));
+
+    await waitFor(() => expect(modeWrites()).toEqual([ACTIVATE]));
+    await waitFor(() => expect(state.projects[0].mode).toBe("active"));
+  });
+
+  it("with enough proof it activates through the interlock, with no warning", async () => {
+    const state = settingsState({
+      promotable: true,
+      classes_ready: 5,
+      classes_total: 5,
+      withheld_classes_ready: 1,
+    });
+    await openState(state, new Set(), AUTHORITY);
+
+    await confirmProvenOffer();
+
+    await waitFor(() => expect(modeWrites()).toEqual([ACTIVATE]));
+    expect(screen.queryByRole("group", WARNING)).toBeNull();
+  });
+
+  // A shell newer than its daemon can meet a row without the verdict: that is not "enough".
+  it("a roster row that does not carry the verdict is unconfirmed proof: it warns", async () => {
+    await openState(
+      settingsState({
+        promotable: undefined as unknown as boolean,
+        classes_ready: 5,
+        classes_total: 5,
+      }),
+      new Set(),
+      AUTHORITY,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "Let it act" }));
+
+    expect(await screen.findByRole("group", WARNING)).toBeTruthy();
+    expect(modeWrites()).toEqual([]);
+  });
+
+  /** A mode POST the daemon refuses unless it carries a folder, as it does for a project in `off`. */
+  const needsFolder = (path: string, init?: RequestInit) => {
+    if (path !== "/autopilot/state" || init?.method !== "POST") return undefined;
+    const body = JSON.parse(String(init.body)) as { project_root?: string };
+    return body.project_root === undefined
+      ? new ApiRefusal(422, "unprocessable", "ProjectRootRequired")
+      : undefined;
+  };
+
+  it("a project without a folder on record can be activated by giving one here", async () => {
+    const state = settingsState({ ...SHORT, mode: "off", project_root: null });
+    await openState(state, new Set(), AUTHORITY, needsFolder);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Let it act" }));
+    fireEvent.click(
+      within(await screen.findByRole("group", WARNING)).getByRole("button", {
+        name: "Activate anyway",
+      }),
+    );
+
+    const field = await screen.findByLabelText("Folder for nucleos");
+    fireEvent.change(field, { target: { value: "C:/work/nucleos" } });
+    fireEvent.click(screen.getByRole("button", { name: "Try again with this folder" }));
+
+    await waitFor(() =>
+      expect(modeWrites().slice(-1)[0]).toEqual({
+        project_id: "nucleos",
+        mode: "active",
+        project_root: "C:/work/nucleos",
+      }),
+    );
+    await waitFor(() => expect(state.projects[0].mode).toBe("active"));
+  });
+
+  it("says so when the daemon cannot be reached, instead of staying silent", async () => {
+    await openState(settingsState(SHORT), new Set(), AUTHORITY, (path, init) =>
+      path === "/autopilot/state" && init?.method === "POST" ? new Error("down") : undefined,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "Let it act" }));
+    fireEvent.click(
+      within(await screen.findByRole("group", WARNING)).getByRole("button", {
+        name: "Activate anyway",
+      }),
+    );
+
+    expect(await screen.findByText(/Could not reach the .*: this project.s setting is unchanged/)).toBeTruthy();
+  });
+
+  // Passes already in RED: with no roster there is no switch, and it must stay that way (a read
+  // that failed is never drawn as proof). Guards the GREEN from "fixing" the loading state.
+  it("a roster that never answered offers nothing to press, so nothing can be sent as proven", async () => {
+    await openState(settingsState(SHORT), new Set(["/projects"]), AUTHORITY);
+
+    await screen.findByText(/gave no reply, so this project.s settings are unknown/);
+    expect(screen.queryByRole("button", { name: "Let it act" })).toBeNull();
+    expect(modeWrites()).toEqual([]);
   });
 });
 

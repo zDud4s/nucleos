@@ -686,7 +686,7 @@
   color: var(--text);
 }
 
-/* Locked: the way to the third setting is not open yet, said a rung quieter. */
+/* Not earned yet: the third setting still works but warns, said a rung quieter. */
 .ap-fan-gate-locked {
   color: var(--text-muted);
 }

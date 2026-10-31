@@ -883,9 +883,10 @@ describe("the settings this app authors", () => {
       AUTHORITY,
     );
     const active = await screen.findByRole("button", { name: "Let it act" });
-    // Focusable and refused rather than natively disabled: the house pattern, so the reason beside
-    // it is reachable by keyboard from the control it explains.
-    expect(active.getAttribute("aria-disabled")).toBe("true");
+    // Changed from "aria-disabled": activating is never blocked (owner's rule). The offer is live
+    // and the standing sentence still says what is missing; pressing it warns (ModeState.test).
+    expect(active.getAttribute("aria-disabled")).not.toBe("true");
+    expect(active.hasAttribute("disabled")).toBe(false);
     expect(screen.getByText(/3 of 5 action classes are still short of the bar/)).toBeTruthy();
 
     locked.unmount();

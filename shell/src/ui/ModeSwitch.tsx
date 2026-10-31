@@ -1,3 +1,5 @@
+import { useId, useRef, useState, type KeyboardEvent } from "react";
+import { Button } from "./Button";
 import { ConfirmButton } from "./ConfirmButton";
 
 /** The three settings, spelled as this control needs them. Structurally `AutopilotMode`. */
@@ -5,8 +7,17 @@ export type SwitchMode = "off" | "shadow" | "active";
 
 export interface ModeSwitchProps {
   value: SwitchMode;
-  /** Whether the third segment has been earned — the daemon's arithmetic, never recomputed. */
-  actAllowed: boolean;
+  /**
+   * Whether the shadow proof for the third segment is enough — the daemon's arithmetic, never
+   * recomputed. Never a lock: a proven offer is the hold interlock, an unproven one is a live
+   * segment that warns first (`shortReason`) and lets the person go ahead anyway.
+   */
+  proven: boolean;
+  /**
+   * Why the proof is not enough, in the daemon's own terms (`promotionBlocker`, `lib/mode.ts`).
+   * Said in the warning an unproven press opens; unused while `proven`.
+   */
+  shortReason: string;
   /**
    * What the armed segment says — short, one line, and it names the project
    * (`promotionConfirmLabel`, `lib/mode.ts`). Required, because a confirmation that does not name
@@ -51,12 +62,10 @@ export interface ModeSwitchProps {
    * instead of native `disabled`.
    *
    * Inert means the pressed segment, all three while `busy`, the pressed "Let it act" once the
-   * project is `active`, and the interlock while `!actAllowed` (which then reaches
-   * `ConfirmButton` as `unavailable`, never as `disabled`). Native `disabled` drops focus to
-   * `<body>` the moment the segment you just pressed becomes the setting, and it takes the
-   * locked interlock out of the tab order together with the `actDescribedBy` sentence that says
-   * why it is locked. Off or absent, the rendered output is exactly what it was before this
-   * existed.
+   * project is `active`. Native `disabled` drops focus to `<body>` the moment the segment you
+   * just pressed becomes the setting, and it takes a busy segment out of the tab order together
+   * with the `actDescribedBy` sentence that describes it. Off or absent, the rendered output is
+   * exactly what it was before this existed.
    */
   focusableWhenInert?: boolean;
   onChoose: (mode: SwitchMode) => void;
@@ -96,11 +105,16 @@ export interface ModeSwitchProps {
  * interlock's live region, and it POINTS at it, through `actDescribedBy`, from the first
  * render — a description that arrives with the arming arrives too late to be heard.
  *
- * The third segment is the one that differs, twice over. It is a `ConfirmButton` while it is
- * still something you could do — letting a project act on its own is the setting here that is
- * hardest to take back — and a plain pressed segment once it IS the setting, because there is then
- * nothing left to confirm. What it never is, is green while locked: see `.ui-button-approve:disabled`
- * in `ui.css`. A control that cannot be pressed does not advertise the consequence of pressing it.
+ * The third segment is the one that differs, three ways. With enough shadow proof it is a
+ * `ConfirmButton` — letting a project act on its own is the setting here that is hardest to take
+ * back. Without it, it is a live plain segment (never green, never locked: the owner's rule is
+ * that nothing blocks activating) whose press opens a warning naming what is missing, with
+ * "Activate anyway" and "Cancel". And it is a plain pressed segment once it IS the setting,
+ * because there is then nothing left to confirm.
+ *
+ * The warning is a disclosure of that segment (`aria-expanded`/`aria-controls`): pressing the
+ * segment again, Cancel, or Escape folds it away and returns the focus to the segment, choosing
+ * another segment closes it, and "Activate anyway" does nothing while a write is in flight.
  *
  * `focusableWhenInert` exists for one caller, the Autopilot carousel: it shows one switch on
  * screen at a time, so the focus on the segment somebody just pressed has to survive the change
@@ -108,7 +122,8 @@ export interface ModeSwitchProps {
  */
 export function ModeSwitch({
   value,
-  actAllowed,
+  proven,
+  shortReason,
   actArmedLabel,
   actConsequence,
   onArmedChange,
@@ -126,14 +141,44 @@ export function ModeSwitch({
       ? { "aria-disabled": inert === true ? ("true" as const) : undefined }
       : { disabled: inert };
   }
+  const [warning, setWarning] = useState(false);
+  // The warning is only ever drawn for an offer that is not proven and not already the setting.
+  // When that stops being true the state is cleared too, not merely hidden, so a project that
+  // becomes unproven again later does not reopen a warning nobody asked for.
+  const eligible = !proven && value !== "active";
+  if (warning && !eligible) setWarning(false);
+  const warningOpen = warning && eligible;
+  const warningId = useId();
+  const consequenceId = useId();
+  const offer = useRef<HTMLButtonElement>(null);
   function choose(mode: SwitchMode, inert: boolean | undefined) {
     if (inert === true) return;
+    // Another segment is a different decision: the warning about the third one goes with it.
+    setWarning(false);
     onChoose(mode);
+  }
+  // Closing the warning unmounts the button that was pressed, which would drop the focus to
+  // `<body>`; it goes back to the segment that opened it instead.
+  function dismiss() {
+    offer.current?.focus();
+    setWarning(false);
+  }
+  function activateAnyway() {
+    // A write is already in flight: a second POST must not leave from here.
+    if (busy === true) return;
+    offer.current?.focus();
+    setWarning(false);
+    onChoose("active");
+  }
+  function onEscape(event: KeyboardEvent<HTMLElement>) {
+    if (event.key !== "Escape" || !warningOpen) return;
+    event.stopPropagation();
+    dismiss();
   }
   const offInert = value === "off" || busy;
   const shadowInert = value === "shadow" || busy;
-  return (
-    <div className="ui-switch" role="group" aria-label="Autopilot mode">
+  const track = (
+    <div className="ui-switch" role="group" aria-label="Autopilot mode" onKeyDown={onEscape}>
       <button
         type="button"
         className="ui-switch-seg"
@@ -156,28 +201,79 @@ export function ModeSwitch({
         <button type="button" className="ui-switch-seg" aria-pressed {...inertness(true)}>
           Let it act
         </button>
-      ) : (
+      ) : proven ? (
         // Wrapped rather than classed: `ConfirmButton` takes no `className`, and it is not this
         // packet's file to change. The wrapper is the segment as far as the track is concerned.
-        //
-        // No `title` on the locked segment: both callers already render the blocker visibly, under
-        // exactly the condition that locks this button (`Autopilot.tsx`'s `Quiet`, `Settings.tsx`'s
-        // paragraph). The tooltip was a third copy of one sentence, and the only copy you had to
-        // hover to read.
         <span className="ui-switch-seg-wrap">
           <ConfirmButton
             label="Let it act"
             confirmLabel={actArmedLabel}
             sayAs={actConsequence}
             variant="approve"
-            disabled={focusable ? undefined : !actAllowed || busy}
-            unavailable={focusable ? !actAllowed || busy === true : undefined}
+            disabled={focusable ? undefined : busy}
+            unavailable={focusable ? busy === true : undefined}
             onArmedChange={onArmedChange}
             describedBy={actDescribedBy}
             onConfirm={() => onChoose("active")}
           />
         </span>
+      ) : (
+        // Not proven: a live segment, not green (nothing here is earned), whose press asks
+        // "are you sure?" through the warning below instead of holding.
+        <button
+          ref={offer}
+          type="button"
+          className="ui-switch-seg"
+          aria-describedby={actDescribedBy}
+          aria-expanded={warningOpen}
+          aria-controls={warningOpen ? warningId : undefined}
+          {...inertness(busy)}
+          onClick={() => {
+            if (busy === true) return;
+            // A second press folds the warning away again.
+            setWarning((open) => !open);
+          }}
+        >
+          Let it act
+        </button>
       )}
     </div>
+  );
+  if (!eligible) return track;
+  const reason = shortReason.trim();
+  const said = `Not enough shadow evidence: ${reason}${/[.!?…]$/.test(reason) ? "" : "."}`;
+  return (
+    <>
+      {track}
+      {/* Mounted before it has anything to say, because a live region that arrives already full
+          is not reliably announced. It says the warning once, when it opens. */}
+      <span role="status" className="sr-only">
+        {warningOpen ? `${said} ${actConsequence}` : ""}
+      </span>
+      {warningOpen ? (
+        <div
+          id={warningId}
+          className="ui-switch-warning"
+          role="group"
+          aria-label="Not enough shadow evidence"
+          onKeyDown={onEscape}
+        >
+          <p className="ui-switch-warning-text">{said}</p>
+          <p className="ui-switch-warning-text" id={consequenceId}>
+            {actConsequence}
+          </p>
+          <div className="ui-switch-warning-actions">
+            <Button
+              aria-describedby={consequenceId}
+              aria-disabled={busy === true ? "true" : undefined}
+              onClick={activateAnyway}
+            >
+              Activate anyway
+            </Button>
+            <Button onClick={dismiss}>Cancel</Button>
+          </div>
+        </div>
+      ) : null}
+    </>
   );
 }
