@@ -1,4 +1,84 @@
-//! stub: tree cost HTTP routes
+//! HTTP routes for tree spending and cache observations.
+
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::routing::{get, put};
+use axum::{Json, Router};
+use chrono::Utc;
+use serde::Deserialize;
+use serde_json::{Value, json};
+
+use crate::state::AppState;
+
+#[derive(Debug, Deserialize)]
+struct BudgetRequest {
+    limit_usd: f64,
+}
+
+pub fn routes() -> Router<AppState> {
+    Router::new()
+        .route("/trees/{id}/cost", get(get_cost))
+        .route("/trees/{id}/budget", put(put_budget))
+        .route("/cost/cache-report", get(get_cache_report))
+        .route("/cost/wait-advice", get(crate::tree_cost::wait_policy::wait_advice_handler))
+}
+
+async fn get_cost(State(state): State<AppState>, Path(id): Path<String>) -> Result<Json<Value>, StatusCode> {
+    let spend = crate::tree_cost::budget::tree_spend(&state.pool, &id, Utc::now())
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "could not read tree cost");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(Json(json!({
+        "spent_usd": spend.total_usd,
+        "budget": {
+            "limit_usd": spend.limit_usd,
+            "soft_pct": spend.soft_pct,
+            "soft_crossed": spend.soft_crossed,
+            "hard_crossed": spend.hard_crossed,
+        },
+    })))
+}
+
+async fn put_budget(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<BudgetRequest>,
+) -> Result<Json<Value>, StatusCode> {
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        "INSERT INTO tree_budgets (tree_id, limit_usd, soft_pct, created_at, updated_at) \
+         VALUES (?, ?, 80.0, ?, ?) \
+         ON CONFLICT(tree_id) DO UPDATE SET limit_usd = excluded.limit_usd, updated_at = excluded.updated_at",
+    )
+    .bind(&id)
+    .bind(request.limit_usd)
+    .bind(&now)
+    .bind(&now)
+    .execute(&state.pool)
+    .await
+    .map_err(|error| {
+        tracing::warn!(%error, "could not save tree budget");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(json!({ "limit_usd": request.limit_usd })))
+}
+
+async fn get_cache_report(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
+    let report = crate::tree_cost::report::cache_report(&state.pool)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "could not build cache report");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(Json(json!({
+        "has_data": report.has_data,
+        "effective_ttl": report.effective_ttl_s.value,
+        "effective_ttl_estimated": report.effective_ttl_s.estimated,
+        "p_resume": report.p_resume,
+    })))
+}
 
 #[cfg(test)]
 mod tests {

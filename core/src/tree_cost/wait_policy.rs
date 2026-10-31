@@ -5,6 +5,14 @@
 //! spec 6.2, not a price comparison between the three actions. The inequality's formula is
 //! normative; the examples beside it in 6.2 are orders of magnitude and disagree with it on `n`.
 
+use axum::extract::State;
+use axum::response::IntoResponse;
+use sqlx::SqlitePool;
+
+use crate::state::AppState;
+
+use super::report::cache_report;
+
 /// One wait to decide on.
 #[derive(Debug, Clone)]
 pub struct WaitInput {
@@ -55,6 +63,124 @@ pub enum WaitAction {
     KeepWarm,
     /// Close with a handoff and resume from a small brief.
     Rotate,
+}
+
+impl WaitAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Park => "park",
+            Self::KeepWarm => "keep_warm",
+            Self::Rotate => "rotate",
+        }
+    }
+}
+
+/// Records a wait decision before the caller parks, keeps warm, or rotates the session.
+pub async fn record(
+    pool: &SqlitePool,
+    session_id: Option<&str>,
+    input: &WaitInput,
+    action: WaitAction,
+) -> sqlx::Result<i64> {
+    Ok(sqlx::query(
+        "INSERT INTO cache_waits \
+         (session_id, context_tokens, expected_wait_s, ttl_s, action, decided_at) \
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(session_id)
+    .bind(input.context_tokens)
+    .bind(input.expected_wait_s)
+    .bind(input.ttl_s)
+    .bind(action.as_str())
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(pool)
+    .await?
+    .last_insert_rowid())
+}
+
+/// Closes a recorded wait after the caller either did or did not return in time.
+pub async fn close(pool: &SqlitePool, id: i64, returned: bool) -> sqlx::Result<()> {
+    sqlx::query("UPDATE cache_waits SET returned = ?, returned_at = ? WHERE id = ?")
+        .bind(if returned { 1_i64 } else { 0_i64 })
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Loads the persisted policy, retaining conservative defaults for absent or unreadable values.
+pub async fn load_settings(pool: &SqlitePool) -> sqlx::Result<WaitSettings> {
+    let rows: Vec<(String, String)> = sqlx::query_as("SELECT key, value FROM wait_policy")
+        .fetch_all(pool)
+        .await?;
+    let mut settings = WaitSettings::default();
+    for (key, value) in rows {
+        match key.as_str() {
+            "rotate_context_tokens" => {
+                if let Ok(parsed) = value.parse() {
+                    settings.rotate_context_tokens = parsed;
+                }
+            }
+            "rotate_min_wait_over_ttl" => {
+                if let Ok(parsed) = value.parse() {
+                    settings.rotate_min_wait_over_ttl = parsed;
+                }
+            }
+            "keep_warm_enabled" => settings.keep_warm_enabled = value == "true",
+            "resume_probability" => {
+                if let Ok(parsed) = value.parse() {
+                    settings.resume_probability = parsed;
+                }
+            }
+            "read_multiplier" => {
+                if let Ok(parsed) = value.parse() {
+                    settings.read_multiplier = parsed;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(settings)
+}
+
+/// Applies the measured cache report to a proposed wait before evaluating the policy.
+pub fn advice(
+    input: &WaitInput,
+    settings: &WaitSettings,
+    report: &super::report::CacheReport,
+) -> WaitAction {
+    if !report.has_data {
+        return WaitAction::Park;
+    }
+    let Some(ttl_s) = report.effective_ttl_s.value else {
+        return WaitAction::Park;
+    };
+    let report_input = WaitInput {
+        ttl_s,
+        resume_probability: input.resume_probability.or(report.p_resume),
+        ..input.clone()
+    };
+    decide_wait(&report_input, settings)
+}
+
+/// `GET /cost/wait-advice` returns the safe action when no wait estimate was supplied.
+pub async fn wait_advice_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let settings = load_settings(&state.pool).await.unwrap_or_default();
+    let report = cache_report(&state.pool).await.ok();
+    let input = WaitInput {
+        context_tokens: 0,
+        expected_wait_s: 0,
+        ttl_s: 0,
+        resume_probability: None,
+        write_multiplier: 1.0,
+        needs_live_session: true,
+    };
+    let action = report
+        .as_ref()
+        .map(|report| advice(&input, &settings, report))
+        .unwrap_or(WaitAction::Park);
+    axum::Json(serde_json::json!({ "action": action.as_str() }))
 }
 
 /// Decides one wait. The first matching rule wins, so Rotate beats a keep-warm that would pass.

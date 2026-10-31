@@ -1,4 +1,127 @@
-//! stub: cache report
+//! Cache report (E-REPORT): reads the persisted cache observations and delegates
+//! the statistical calculations to `measure`.
+
+use chrono::{DateTime, Utc};
+use sqlx::{Row, SqlitePool};
+
+use super::measure::{self, ObservedWait, Turn};
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Figure<T> {
+    pub value: T,
+    pub estimated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CacheReport {
+    pub has_data: bool,
+    pub ttl_distribution: measure::TtlDistribution,
+    pub gap_counts: Figure<Vec<measure::BucketCount>>,
+    pub miss_rates: Figure<Vec<measure::BucketRate>>,
+    pub effective_ttl_s: Figure<Option<i64>>,
+    pub p_resume: Option<f64>,
+}
+
+/// Builds the cache report from chat runs, main-lane devtime messages, and closed waits.
+/// Timestamps are persisted as text, so a malformed row is omitted from the measurements.
+pub async fn cache_report(pool: &SqlitePool) -> sqlx::Result<CacheReport> {
+    let run_rows = sqlx::query("SELECT cache_ttl FROM runs WHERE chat_id IS NOT NULL")
+        .fetch_all(pool)
+        .await?;
+    let ttls: Vec<Option<String>> = run_rows
+        .iter()
+        .map(|row| row.try_get("cache_ttl"))
+        .collect::<sqlx::Result<_>>()?;
+    let ttl_values: Vec<Option<&str>> = ttls.iter().map(Option::as_deref).collect();
+
+    let message_rows = sqlx::query(
+        "SELECT session_id, first_at, last_at, input_tokens, cache_read_tokens, \
+         cache_creation_tokens FROM devtime_messages WHERE lane = 'main'",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut turns = Vec::new();
+    for row in message_rows {
+        let session_id: String = row.try_get("session_id")?;
+        let first_at: String = row.try_get("first_at")?;
+        let last_at: String = row.try_get("last_at")?;
+        let (Ok(first_at), Ok(last_at)) = (
+            DateTime::parse_from_rfc3339(&first_at),
+            DateTime::parse_from_rfc3339(&last_at),
+        ) else {
+            continue;
+        };
+        turns.push(Turn {
+            session_id,
+            first_at: first_at.with_timezone(&Utc),
+            last_at: last_at.with_timezone(&Utc),
+            input_tokens: row.try_get("input_tokens")?,
+            cache_read_tokens: row.try_get("cache_read_tokens")?,
+            cache_creation_tokens: row.try_get("cache_creation_tokens")?,
+        });
+    }
+
+    let wait_rows = sqlx::query(
+        "SELECT expected_wait_s, returned, decided_at, returned_at \
+         FROM cache_waits",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut waits = Vec::new();
+    let mut has_wait_data = false;
+    for row in wait_rows {
+        let expected_s: i64 = row.try_get("expected_wait_s")?;
+        let returned: Option<i64> = row.try_get("returned")?;
+        let decided_at: String = row.try_get("decided_at")?;
+        let returned_at: Option<String> = row.try_get("returned_at")?;
+        let Ok(decided_at) = DateTime::parse_from_rfc3339(&decided_at) else {
+            continue;
+        };
+        let returned_at = match returned_at {
+            Some(returned_at) => match DateTime::parse_from_rfc3339(&returned_at) {
+                Ok(returned_at) => Some(returned_at),
+                Err(_) => continue,
+            },
+            None => None,
+        };
+        has_wait_data = true;
+        let returned_after_s = match returned {
+            Some(0) => None,
+            Some(1) => match returned_at {
+                Some(returned_at) => Some((returned_at - decided_at).num_seconds()),
+                None => continue,
+            },
+            _ => continue,
+        };
+        waits.push(ObservedWait {
+            expected_s,
+            returned_after_s,
+        });
+    }
+
+    let estimated = !turns.is_empty();
+    let gap_counts = measure::gap_buckets(&turns);
+    let miss_rates = measure::miss_rate_by_bucket(&gap_counts);
+    let effective_ttl_s = measure::effective_ttl(&miss_rates);
+
+    Ok(CacheReport {
+        has_data: !ttls.is_empty() || !turns.is_empty() || has_wait_data,
+        ttl_distribution: measure::ttl_distribution(&ttl_values),
+        gap_counts: Figure {
+            value: gap_counts,
+            estimated,
+        },
+        miss_rates: Figure {
+            value: miss_rates,
+            estimated,
+        },
+        effective_ttl_s: Figure {
+            value: effective_ttl_s,
+            estimated,
+        },
+        p_resume: measure::p_resume(&waits),
+    })
+}
 
 #[cfg(test)]
 mod tests {
