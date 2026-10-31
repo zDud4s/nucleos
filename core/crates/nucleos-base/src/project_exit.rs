@@ -115,6 +115,7 @@ const PROJECT_SCOPED: &[&str] = &[
     // house's rows (`project_id` NULL raw, '' daily) never match a project id, so they stay.
     "slot_samples",
     "slot_samples_daily",
+    "spec_finish_intents",
     // The registry of the project's spec files (migration 0264). Only the registry row goes: the
     // files on disk are not touched. Specs with no project (`project_id` NULL) never match a
     // project id, so they stay. `spec_criteria`, `spec_deps` and `spec_questions` have no `project_id`
