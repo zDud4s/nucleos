@@ -372,12 +372,24 @@ impl LiveChat {
     /// `track_background` over this process, remembering which tasks ended and never letting an
     /// ended one back in.
     pub(super) fn track(&mut self, line: &str) {
-        if !is_task_bookkeeping(line) {
+        // The CLI often delivers a finish only as a `user` line carrying `<task-notification>`;
+        // read as the `system` event it stands for, so it leaves `background` the same way.
+        let notices = if !is_task_bookkeeping(line) && line.contains("<task-notification>") {
+            notice_task_lines(&std::collections::VecDeque::from([
+                crate::execution::runner::TurnEvent::Line(line.to_owned()),
+            ]))
+        } else {
+            Vec::new()
+        };
+        if notices.is_empty() && !is_task_bookkeeping(line) {
             return;
         }
         self.last_task_signal = std::time::Instant::now();
         let before = self.background.clone();
         track_background(line, &mut self.background);
+        for notice in &notices {
+            track_background(notice, &mut self.background);
+        }
         let key = self.process_key();
         let Ok(mut ended) = ENDED_TASKS.lock() else {
             return;
@@ -1114,6 +1126,51 @@ mod tests {
             Some(polled),
             started + BACKGROUND_SILENCE_CAP - Duration::from_secs(1)
         ));
+    }
+
+    /// A finish the CLI delivers only as a `user` notice still lets the process go, and a notice
+    /// for another task leaves the rest in place.
+    #[tokio::test]
+    async fn a_finish_seen_only_as_a_user_notice_lets_the_process_go() {
+        let mut rig = rig();
+        rig.live.background.insert("task-1".to_owned());
+        rig.live.background.insert("task-2".to_owned());
+        let notice = |id: &str| {
+            serde_json::json!({"type": "user", "message": {"role": "user", "content":
+                format!("<task-notification><task-id>{id}</task-id><status>completed</status>\
+                         <summary>done</summary></task-notification>")}})
+            .to_string()
+        };
+
+        rig.live.track(&notice("task-2"));
+        assert_eq!(
+            rig.live.background,
+            HashSet::from(["task-1".to_owned()]),
+            "a notice for another task must leave the rest in place"
+        );
+        rig.live.track(&notice("task-1"));
+        assert!(rig.live.background.is_empty());
+
+        // A start line replayed after the finish stays out.
+        rig.live.track(
+            r#"{"type":"system","subtype":"task_started","task_id":"task-1","is_backgrounded":true}"#,
+        );
+        assert!(rig.live.background.is_empty());
+    }
+
+    /// The between-turns reader goes through the same path.
+    #[tokio::test]
+    async fn a_user_notice_read_between_turns_clears_the_background_set() {
+        let mut rig = rig();
+        rig.live.background.insert("task-1".to_owned());
+        let line = serde_json::json!({"type": "user", "message": {"role": "user", "content":
+            "<task-notification><task-id>task-1</task-id><status>completed</status></task-notification>"}})
+        .to_string();
+        rig.events
+            .send(crate::execution::runner::TurnEvent::Line(line))
+            .unwrap();
+        rig.live.drain_idle();
+        assert!(rig.live.background.is_empty());
     }
 
     /// Any task line from the process restarts its silence clock.
