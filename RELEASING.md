@@ -107,6 +107,8 @@ sees a new app rather than an update of the old one. What users see:
 - **Windows:** the installer treats it as a new app. The NSIS pre-install hook still stops the
   daemon before installing.
 
+On Windows the installer does not clean up after the old identifier: that is a decision, not an oversight. The `hooks.nsh` pre-install hook only stops the daemon and does not touch the registry. The old install folder and app data are expected to stay behind. Not verified: the Tauri NSIS template is not on disk here, so how it keys the "Apps & features" entry is unconfirmed, and the `com.pc-multimedia.shell` entry may either stay beside the new one or be replaced by it. To remove the old version, uninstall it from "Apps & features" if it is still listed, then delete any leftover registry key by hand in `regedit` and the old app data folder once the copy to the new one has been checked.
+
 ## Installing a release
 
 The scripts are attached to every release, so the `latest` URLs always match the newest one. Both
