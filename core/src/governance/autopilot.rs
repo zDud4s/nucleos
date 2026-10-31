@@ -10,7 +10,10 @@ use crate::judge::JudgeMode;
 use crate::wip::{open_proposals_term, open_shadow_decisions_term};
 
 mod hook_timeout;
+mod refresh;
 mod stop_timer;
+
+pub use refresh::refresh_wired_hooks;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -805,7 +808,7 @@ fn wire_event(
     });
     if !already {
         list.push(entry);
-    } else if !SESSION_EVENTS.contains(&event_name) {
+    } else if !SESSION_EVENTS.contains(&event_name) && event_name != SESSION_START_EVENT {
         hook_timeout::raise_short_timeouts(list);
     }
     Ok(())
@@ -902,14 +905,16 @@ fn wire_hook(dir: &Path, overwrite_script: bool) -> Result<(), String> {
             .map_err(|error| format!("could not write the hook script: {error}"))?;
     }
     stop_timer::write_script(dir)?;
-    std::fs::write(
-        &settings_path,
-        format!(
-            "{body}
+    let body = format!(
+        "{body}
 "
-        ),
-    )
-    .map_err(|error| format!("could not write {}: {error}", settings_path.display()))?;
+    );
+    // A running session watches this file, and `refresh_wired_hooks` passes here on every start.
+    if std::fs::read_to_string(&settings_path).ok().as_deref() == Some(body.as_str()) {
+        return Ok(());
+    }
+    std::fs::write(&settings_path, body)
+        .map_err(|error| format!("could not write {}: {error}", settings_path.display()))?;
 
     Ok(())
 }

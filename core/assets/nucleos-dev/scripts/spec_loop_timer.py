@@ -28,9 +28,10 @@ import spec_loop
 WINDOW_SECS = {"ephemeral_1h_input_tokens": 55 * 60, "ephemeral_5m_input_tokens": 4 * 60}
 DEFAULT_WINDOW_SECS = 55 * 60
 POLL_SECS = 30
-# Wakes for one unchanged set of tasks. Past this a hung task stops costing a turn per window. The
-# longest real wait measured is 4.4 h.
-MAX_WAKES = 6
+# How long one unchanged set of tasks keeps being woken, from its first wake. Past this a hung task
+# stops costing a turn per window. Time and not a count: the count that fitted the 1 h cache gave
+# the 5 min one only 24 minutes. The longest real wait measured is 4.4 h.
+MAX_WAKE_SECS = 5.5 * 3600
 
 
 def _window(usage: dict) -> int | None:
@@ -89,9 +90,9 @@ def wake_message(payload: dict, now=time.time, sleep=time.sleep) -> str | None:
 
     state_path = path.with_suffix(".state.json")
     wakes = spec_loop._load_state(state_path).get("wakes") or {}
-    count = wakes.get("count", 0) if wakes.get("tasks") == tasks else 0
+    since = wakes.get("since") if wakes.get("tasks") == tasks else None
     start = last_request(transcript)
-    if not start or count >= MAX_WAKES or not still_parked():
+    if not start or (since and now() - since >= MAX_WAKE_SECS) or not still_parked():
         return None
 
     deadline = start[0] + start[1]
@@ -104,7 +105,7 @@ def wake_message(payload: dict, now=time.time, sleep=time.sleep) -> str | None:
         return None
 
     state = spec_loop._load_state(state_path)
-    state["wakes"] = {"tasks": tasks, "count": count + 1}
+    state["wakes"] = {"tasks": tasks, "since": since or now()}
     state_path.write_text(json.dumps(state), encoding="utf-8")
     return ("Spec loop timer: background work is still running and the prompt cache is about to "
             f"expire ({', '.join(tasks)}). This wake-up exists to keep the cache: if the work is "

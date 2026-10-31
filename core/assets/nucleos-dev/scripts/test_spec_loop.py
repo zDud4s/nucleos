@@ -235,12 +235,31 @@ class SpecLoop(unittest.TestCase):
         message, _ = self.timer([self.answered(1000)], on_sleep=lambda: self.write("- [x] a\n"))
         self.assertIsNone(message)
 
-    def test_timer_stops_waking_for_tasks_that_never_change(self):
+    def test_timer_stops_waking_once_unchanged_tasks_outlast_the_budget(self):
         self.write("- [ ] a\n")
-        for _ in range(timer.MAX_WAKES):
-            self.assertIsNotNone(self.timer([self.answered(1000)])[0])
-        self.assertIsNone(self.timer([self.answered(1000)])[0])
-        self.assertIsNotNone(self.timer([self.answered(1000)], tasks=("b2",))[0], "new work resets it")
+        self.assertIsNotNone(self.timer([self.answered(1000)])[0])
+        end = self.timer_at + timer.MAX_WAKE_SECS
+        self.assertIsNotNone(self.timer([self.answered(1000)], clock=end - 1)[0])
+        self.assertEqual(self.timer([self.answered(1000)], clock=end), (None, 0))
+        self.assertIsNotNone(self.timer([self.answered(1000)], tasks=("b2",), clock=end)[0],
+                             "new work resets it")
+
+    def test_timer_budget_is_time_so_a_short_cache_gets_the_same_hours(self):
+        self.write("- [ ] a\n")
+        at = 1000
+        for _ in range(20):
+            message, _ = self.timer([self.answered(at, "ephemeral_5m_input_tokens")], clock=at)
+            self.assertIsNotNone(message)
+            at = self.timer_at
+
+    def test_timer_treats_a_count_left_by_an_older_version_as_a_new_budget(self):
+        self.write("- [ ] a\n")
+        self.timer([self.answered(1000)])
+        state_path = self.loop.with_suffix(".state.json")
+        state = json.loads(state_path.read_text())
+        state["wakes"] = {"tasks": state["wakes"]["tasks"], "count": 6}
+        state_path.write_text(json.dumps(state))
+        self.assertIsNotNone(self.timer([self.answered(1000)], clock=1000 + 100 * 3600)[0])
 
     def test_a_wake_leaves_the_stop_hooks_state_alone(self):
         self.write("- [ ] a\n")
