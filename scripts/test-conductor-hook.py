@@ -248,6 +248,35 @@ def test_agent_tool_allowed():
         deny(fx.verdict("WebFetch", {"url": "http://example.invalid"}), "WebFetch")
 
 
+def test_conductor_tools_are_allowed_when_on():
+    with fixture("on") as fx:
+        material = fx.path(".ai")
+        for tool, tool_input in (
+            ("Agent", {}),
+            ("Read", {"file_path": fx.path(".ai", "plans", "p.md")}),
+            ("Glob", {"pattern": "*.md", "path": material}),
+            ("Grep", {"pattern": "B-DEFAULT", "path": material}),
+            ("ToolSearch", {}),
+            ("TaskOutput", {}),
+            ("BashOutput", {}),
+            ("SendMessage", {}),
+            ("LSP", {}),
+            ("mcp__nucleos__spec_backlog", {}),
+            ("mcp__nucleos__spec_finish", {}),
+            ("mcp__nucleos__tree_launch", {}),
+            ("mcp__nucleos__tree_status", {}),
+            ("mcp__nucleos__wait_advice", {}),
+        ):
+            allow(fx.verdict(tool, tool_input), tool)
+        source = fx.path("core", "src", "lib.rs")
+        for tool, tool_input in (
+            ("NotebookEdit", {"notebook_path": source}),
+            ("Edit", {"file_path": source, "old_string": "a", "new_string": "b"}),
+            ("Write", {"file_path": source, "content": "x"}),
+        ):
+            deny(fx.verdict(tool, tool_input), tool)
+
+
 def test_subagent_payload_with_agent_id_unaffected():
     with fixture("on") as fx:
         source = {"file_path": fx.path("core", "src", "lib.rs")}
@@ -366,6 +395,27 @@ def _prompt(fx, text, session="sess-1", event="UserPromptSubmit"):
     return _need("conductor_prompt")(payload, fx.state)
 
 
+def test_manual_prefix_lets_the_owner_work_by_hand():
+    with fixture("on") as fx:
+        target = fx.path("core", "src", "lib.rs")
+        deny(fx.verdict("Edit", {"file_path": target, "old_string": "a", "new_string": "b"}), "control")
+        _prompt(fx, "manual: fix the typo in lib.rs")
+        allow(
+            fx.verdict("Edit", {"file_path": target, "old_string": "a", "new_string": "b"}),
+            "manual prompt permits owner Edit",
+        )
+
+
+def test_escape_is_only_at_the_start_of_the_prompt():
+    with fixture("on") as fx:
+        target = fx.path("core", "src", "lib.rs")
+        _prompt(fx, "Please use manual: to fix the typo in lib.rs")
+        deny(
+            fx.verdict("Edit", {"file_path": target, "old_string": "a", "new_string": "b"}),
+            "manual: in the middle is not an escape",
+        )
+
+
 def test_manual_prefix_enables_until_next_prompt():
     with fixture("on") as fx:
         source = {"file_path": fx.path("core", "src", "lib.rs")}
@@ -415,6 +465,51 @@ def test_conductor_env_mention_in_command_denied():
 
 
 # --- modes ------------------------------------------------------------------------------------
+
+
+def test_default_mode_is_on_when_probe_confirmed():
+    with fixture("on") as fx:
+        fx.set_mode(None)
+        if _need("PROBE_CONFIRMED") is not True:
+            raise AssertionError("the measured probe must enable conductor mode by default")
+        mode = _need("conductor_mode")(fx.state)
+        if mode != "on":
+            raise AssertionError(f"confirmed probe should default to on, got {mode!r}")
+        deny(
+            fx.verdict(
+                "Edit", {"file_path": fx.path("core", "src", "lib.rs"), "old_string": "a", "new_string": "b"}
+            ),
+            "top-level Edit in the confirmed default mode",
+        )
+
+
+def test_default_mode_observe_when_probe_unconfirmed():
+    with fixture("on") as fx:
+        fx.set_mode(None)
+        _need("PROBE_CONFIRMED")
+        with mock.patch.object(hook, "PROBE_CONFIRMED", False):
+            mode = _need("conductor_mode")(fx.state)
+            if mode != "observe":
+                raise AssertionError(f"unconfirmed probe should default to observe, got {mode!r}")
+            allow(
+                fx.verdict(
+                    "Edit", {"file_path": fx.path("core", "src", "lib.rs"), "old_string": "a", "new_string": "b"}
+                ),
+                "top-level Edit in the unconfirmed default mode",
+            )
+
+
+def test_subagent_is_unaffected_when_on():
+    with fixture("on") as fx:
+        allow(
+            fx.verdict(
+                "Edit",
+                {"file_path": fx.path("core", "src", "lib.rs"), "old_string": "a", "new_string": "b"},
+                agent_id="a1b2",
+                agent_type="wf-leaf",
+            ),
+            "subagent Edit in mode on",
+        )
 
 
 def test_observe_mode_allows_and_reports():
@@ -527,6 +622,7 @@ TESTS = [
     test_mcp_nucleos_tool_allowed,
     test_mcp_nucleos_double_segment_denied,
     test_agent_tool_allowed,
+    test_conductor_tools_are_allowed_when_on,
     test_subagent_payload_with_agent_id_unaffected,
     test_run_with_run_id_env_unaffected,
     test_heavy_py_cargo_allowed,
@@ -536,9 +632,14 @@ TESTS = [
     test_git_push_denied,
     test_edit_of_source_denied,
     test_write_to_state_dir_allowed,
+    test_manual_prefix_lets_the_owner_work_by_hand,
+    test_escape_is_only_at_the_start_of_the_prompt,
     test_manual_prefix_enables_until_next_prompt,
     test_agent_cannot_write_manual_flag,
     test_conductor_env_mention_in_command_denied,
+    test_default_mode_is_on_when_probe_confirmed,
+    test_default_mode_observe_when_probe_unconfirmed,
+    test_subagent_is_unaffected_when_on,
     test_observe_mode_allows_and_reports,
     test_off_mode_allows_everything,
     test_fail_open_on_internal_error,

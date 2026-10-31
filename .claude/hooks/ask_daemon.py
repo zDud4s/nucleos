@@ -998,8 +998,10 @@ def verify_hint(payload: dict, now=None) -> str:
 # does not work source by hand. Local and fail-open: it must not cost latency, must not depend on the
 # daemon, and a broken guard must not take a person's session down.
 #
-# The one constant to flip from "observe" to "on".
-DEFAULT_CONDUCTOR_MODE = "observe"
+# Measured 2026-10-30 with `claude -p` and a probe hook: top-level calls carry no `agent_id`, subagent calls do.
+PROBE_CONFIRMED = True
+# The mode with no conductor.json, derived from the probe; `conductor_mode` re-derives it on each call.
+DEFAULT_CONDUCTOR_MODE = "on" if PROBE_CONFIRMED else "observe"
 CONDUCTOR_MODES = ("on", "observe", "off")
 # A conductor.json that exists but cannot be used is not a reason to refuse, whatever the default.
 CONDUCTOR_UNREADABLE_MODE = "observe"
@@ -1015,7 +1017,9 @@ CONDUCTOR_FEED_KIND = "conductor_would_deny"
 CONDUCTOR_FEED_TIMEOUT_SECONDS = 1
 # The file `agents::prefix::state_dir_for` reads the `state_dir` key of.
 WORKFLOW_POINTER = (".nucleos", "workflow", "project.json")
-CONDUCTOR_TOOLS = ("Agent", "Task", "Skill", "TodoWrite", "AskUserQuestion", "ExitPlanMode", "ToolSearch")
+CONDUCTOR_TOOLS = ("Agent", "Task", "Skill", "TodoWrite", "AskUserQuestion", "ExitPlanMode", "ToolSearch",
+                   "TaskOutput", "BashOutput", "SendMessage", "LSP", "Monitor", "TaskStop",
+                   "TaskCreate", "TaskList", "TaskGet", "TaskUpdate")
 CONDUCTOR_MATERIAL_DIRS = (".ai", ".nucleos")
 CONDUCTOR_METACHARACTERS = (";", "&", "|", "<", ">", "`", "$(", "\n", "\r")
 CONDUCTOR_GIT_READS = ("status", "log", "diff", "show", "rev-parse", "ls-tree", "cat-file")
@@ -1085,7 +1089,7 @@ def conductor_mode(state):
         with open(os.path.join(state_dir, CONDUCTOR_FILE), encoding="utf-8-sig") as handle:
             loaded = json.load(handle)
     except FileNotFoundError:
-        return DEFAULT_CONDUCTOR_MODE
+        return "on" if PROBE_CONFIRMED else "observe"
     except Exception:
         return CONDUCTOR_UNREADABLE_MODE
     mode = loaded.get("mode") if isinstance(loaded, dict) else None
