@@ -210,14 +210,25 @@ pub async fn park(
 pub(super) const ROOT_PARK_KEY: &str = "root_park";
 
 /// Parks the branch behind `node_id`, or, when `node_id` is the job's root, which tops no branch,
-/// asks the owner on the root itself (see [`ask_root`]). `None` when the root already waits.
+/// asks the owner on the root itself (see [`ask_root`]). `None`, writing nothing, when the branch
+/// behind `node_id` is already parked, and when the root already waits.
 pub(super) async fn park_or_ask(
     pool: &SqlitePool,
     tree_id: &str,
     node_id: &str,
     question: &str,
 ) -> Result<Option<Decision>, DecisionError> {
-    if let Some(job) = store::load(pool, tree_id).await?
+    let loaded = store::load(pool, tree_id).await?;
+    if let Some(job) = &loaded
+        && job
+            .manifest
+            .branches
+            .values()
+            .any(|branch| branch.node_id.as_deref() == Some(node_id) && branch.state == PARKED)
+    {
+        return Ok(None);
+    }
+    if let Some(job) = loaded
         && job.root_node_id == node_id
         && !job
             .manifest
@@ -790,7 +801,11 @@ mod tests {
 
         assert_eq!(second, None);
         assert_eq!(decision_rows(&pool).await, 1);
-        assert_eq!(feed_rows(&pool).await, 1, "the second call adds no feed line");
+        assert_eq!(
+            feed_rows(&pool).await,
+            1,
+            "the second call adds no feed line"
+        );
         let record = branch_of(&pool, "root")
             .await
             .park
@@ -811,7 +826,11 @@ mod tests {
 
         assert_eq!(second, None);
         assert_eq!(decision_rows(&pool).await, 1);
-        assert_eq!(feed_rows(&pool).await, 1, "the second call adds no feed line");
+        assert_eq!(
+            feed_rows(&pool).await,
+            1,
+            "the second call adds no feed line"
+        );
         let record = branch_of(&pool, BRANCH)
             .await
             .park
