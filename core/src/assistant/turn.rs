@@ -498,7 +498,9 @@ pub(super) fn chat_run_request(
         cwd,
         permission,
         resume_session_id: resume,
-        mcp_config: Some(mcp_config),
+        // An MCP config only grants, and agy has no flag to take it, so an agy chat answers without
+        // NucleOS tools; the runner keeps refusing a config it cannot honour.
+        mcp_config: (cli != crate::engines::AGY).then_some(mcp_config),
         mcp_job: None,
         mcp_team_run: None,
         // Decided by `tool_policy_for`, which is where the rule is written out. The

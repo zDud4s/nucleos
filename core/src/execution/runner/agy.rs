@@ -129,11 +129,6 @@ pub fn build_args(request: &RunRequest, options: &Options) -> Result<Vec<String>
         (!request.mcp_servers.is_empty(), "mcp_servers"),
         (request.classifier_governs_tools, "classifier_governs_tools"),
         (!request.images.is_empty(), "images"),
-        // agy has no flag that restricts its tools, so a restricted policy would only be claimed.
-        (
-            request.tool_policy != ToolPolicy::Unrestricted,
-            "a restricted tool policy",
-        ),
     ] {
         if asked {
             return Err(Refusal::control(control));
@@ -169,10 +164,20 @@ pub fn build_args(request: &RunRequest, options: &Options) -> Result<Vec<String>
     if let Some(effort) = effort {
         args.extend(["--effort".to_string(), effort.clone()]);
     }
-    match request.permission {
-        Permission::Plan => args.extend(["--mode".to_string(), "plan".to_string()]),
-        Permission::AcceptEdits => args.extend(["--mode".to_string(), "accept-edits".to_string()]),
-        Permission::Default | Permission::Bypass => {}
+    // agy has no tool-restriction flag, so plan mode plus its sandbox is the closest it offers to a
+    // restricted turn. A restricted policy therefore overrides the request's permission mode.
+    match request.tool_policy {
+        ToolPolicy::McpOnly | ToolPolicy::None => {
+            args.extend(["--mode".to_string(), "plan".to_string()]);
+            args.push("--sandbox".to_string());
+        }
+        ToolPolicy::Unrestricted => match request.permission {
+            Permission::Plan => args.extend(["--mode".to_string(), "plan".to_string()]),
+            Permission::AcceptEdits => {
+                args.extend(["--mode".to_string(), "accept-edits".to_string()]);
+            }
+            Permission::Default | Permission::Bypass => {}
+        },
     }
     if let Some(conversation) = &request.resume_session_id {
         args.extend(["--conversation".to_string(), conversation.clone()]);

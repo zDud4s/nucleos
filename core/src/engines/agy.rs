@@ -7,7 +7,7 @@ use crate::config::ModelsConfig;
 use crate::execution::runner::CommandRunner;
 use crate::settings::Scope;
 
-pub(crate) use super::agy_setting::AgyDoc;
+pub use super::agy_setting::AgyDoc;
 
 /// What the owner must accept before the engine is enabled. Shown by `GET /engines/agy`.
 pub const WARNING: &str = "Antigravity CLI use here is not supported by Google on consumer plans. Google's FAQ and Terms do not support running agy this way, and your Google account may be suspended. Enable only if you accept that risk.";
