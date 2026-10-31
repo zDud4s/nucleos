@@ -562,6 +562,16 @@ impl ModelsConfig {
                 },
             );
         }
+        // The agy models belong to the chat menu only (`every_runner`), and only while the opt-in is
+        // on (`agy_models` is empty otherwise). An agent-scoped menu follows the running CLI, which is
+        // never agy, so it keeps them out. A row the file already lists is not added twice.
+        if every_runner {
+            for model in crate::models::model_catalog::agy_models() {
+                if !choices.iter().any(|choice| choice.id == model.id) {
+                    choices.push(crate::models::model_catalog::as_choice(&model));
+                }
+            }
+        }
         // Which server the local route resolves to, asked once for both questions below: whether
         // these rows belong on the menu at all, and whether "is it installed?" is even a question
         // this engine's server can be asked.

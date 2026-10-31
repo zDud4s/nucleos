@@ -106,8 +106,22 @@ fn is_o_series(token: &str) -> bool {
     c.next() == Some('o') && c.next().is_some_and(|d| d.is_ascii_digit())
 }
 
+/// The catalogue prefix of the models the agy CLI hosts, matched case-insensitively.
+const AGY_PREFIX: &str = "agy/";
+
+/// The id without the agy prefix, or `None` when it carries none.
+fn strip_agy_prefix(id: &str) -> Option<&str> {
+    let id = id.trim();
+    let head = id.get(..AGY_PREFIX.len())?;
+    head.eq_ignore_ascii_case(AGY_PREFIX)
+        .then(|| &id[AGY_PREFIX.len()..])
+}
+
 /// The name a person reads for a vendor id. Pure; see the table in the tests.
 pub fn display_name(id: &str) -> String {
+    if let Some(rest) = strip_agy_prefix(id) {
+        return format!("{} (agy)", display_name(rest));
+    }
     let s = normalise(id);
     let tokens: Vec<&str> = s.split('-').filter(|t| !t.is_empty()).collect();
     if tokens.is_empty() {
@@ -162,6 +176,8 @@ pub fn display_name(id: &str) -> String {
 
 /// `(provider, family)` an id belongs to.
 pub fn family_of(id: &str) -> (&'static str, String) {
+    // The family is the hosted model's own; the prefix only says who answers.
+    let id = strip_agy_prefix(id).unwrap_or(id);
     let s = normalise(id);
     let tokens: Vec<&str> = s.split('-').filter(|t| !t.is_empty()).collect();
     match tokens.first().copied() {
@@ -183,6 +199,10 @@ pub fn family_of(id: &str) -> (&'static str, String) {
 pub fn runner_by_id(id: &str) -> Option<&'static str> {
     let s = id.trim().to_lowercase();
     // The id patterns stay here (a table row cannot express them); the answers are the table's ids.
+    // The agy prefix goes first: `agy/claude-sonnet-4-6` is answered by agy, not by Claude.
+    if s.starts_with(AGY_PREFIX) {
+        return Some(crate::engines::AGY);
+    }
     if s.starts_with("claude-") || ALIASES.contains(&s.as_str()) {
         return Some(crate::engines::CLAUDE);
     }
@@ -190,6 +210,38 @@ pub fn runner_by_id(id: &str) -> Option<&'static str> {
         return Some(crate::engines::CODEX);
     }
     None
+}
+
+/// The models the agy CLI hosts, in the order the picker shows them. Empty while the agy opt-in is
+/// off. A static list: agy cannot be asked for its models without running it.
+pub fn agy_models() -> Vec<Discovered> {
+    if !crate::engines::agy::enabled() {
+        return Vec::new();
+    }
+    // The Gemini and gpt-oss ids carry their level in the id itself; only Sonnet takes an effort.
+    const MODELS: [(&str, &[&str]); 6] = [
+        ("gemini-3.8-flash-high", &[]),
+        ("gemini-3.8-flash-medium", &[]),
+        ("gemini-3.8-flash-low", &[]),
+        ("claude-sonnet-4-6", THREE),
+        ("claude-opus-4-6-thinking", &[]),
+        ("gpt-oss-120b-medium", &[]),
+    ];
+    MODELS
+        .iter()
+        .map(|(model, efforts)| {
+            let id = format!("{AGY_PREFIX}{model}");
+            Discovered {
+                label: display_name(&id),
+                family: family_of(&id).1,
+                id,
+                provider: crate::engines::AGY,
+                runner: crate::engines::AGY,
+                efforts: efforts.iter().map(|e| (*e).to_string()).collect(),
+                created: None,
+            }
+        })
+        .collect()
 }
 
 /// The cheap model a background one-shot should ask `runner` for, or `None` when the runner has no

@@ -553,17 +553,17 @@ mod tests {
     #[test]
     fn a_discovered_gpt_model_is_answered_by_codex() {
         let config = turn_config();
-        assert_eq!(answering_cli(&config, Some("gpt-9.9-nova")), "codex");
-        assert_eq!(answering_cli(&config, Some("o9-mini")), "codex");
-        assert_eq!(answering_cli(&config, Some("claude-opus-9-9")), "claude");
+        assert_eq!(answering_cli(&config, Some("gpt-9.9-nova")), Ok("codex"));
+        assert_eq!(answering_cli(&config, Some("o9-mini")), Ok("codex"));
+        assert_eq!(answering_cli(&config, Some("claude-opus-9-9")), Ok("claude"));
         // An id that says nothing keeps the active runner.
         assert_eq!(
             answering_cli(&config, Some("llama3.2:3b")),
-            if config.active_runner() == "codex" {
+            Ok(if config.active_runner() == "codex" {
                 "codex"
             } else {
                 "claude"
-            }
+            })
         );
     }
 
@@ -579,16 +579,18 @@ mod tests {
         };
         let config = turn_config();
 
-        let (runner, cli) = runner_for_turn(&daemon, &assistants, &config, Some("gpt-5.5"));
+        let (runner, cli) =
+            runner_for_turn(&daemon, &assistants, &config, Some("gpt-5.5")).unwrap();
         assert!(Arc::ptr_eq(&runner, &codex));
         assert_eq!(cli, "codex");
-        assert_eq!(answering_cli(&config, Some("gpt-5.5")), "codex");
+        assert_eq!(answering_cli(&config, Some("gpt-5.5")), Ok("codex"));
 
         let without_codex = CliAssistants {
             claude: None,
             codex: None,
         };
-        let (runner, cli) = runner_for_turn(&daemon, &without_codex, &config, Some("gpt-5.5"));
+        let (runner, cli) =
+            runner_for_turn(&daemon, &without_codex, &config, Some("gpt-5.5")).unwrap();
         assert!(Arc::ptr_eq(&runner, &daemon));
         assert_eq!(cli, "codex");
     }
@@ -604,7 +606,7 @@ mod tests {
         let config = turn_config();
 
         for pinned in [None, Some("sonnet"), Some("not-in-the-catalogue")] {
-            let (runner, cli) = runner_for_turn(&daemon, &assistants, &config, pinned);
+            let (runner, cli) = runner_for_turn(&daemon, &assistants, &config, pinned).unwrap();
             assert!(Arc::ptr_eq(&runner, &daemon), "{pinned:?}");
             assert_eq!(cli, "claude", "{pinned:?}");
         }

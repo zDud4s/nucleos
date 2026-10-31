@@ -27,6 +27,7 @@ mod stream;
 mod turns;
 mod wire;
 
+pub use self::agy::{AgyCliRunner, agy_program};
 pub use self::auth_watch::watch_claude_auth;
 pub use self::claude::*;
 pub use self::claude_args::*;

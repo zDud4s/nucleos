@@ -1,7 +1,5 @@
-//! The agy (Antigravity CLI) engine: the opt-in and its warning; `installed` and `runner` are stubs
-//! until the leaves that own them land.
-//!
-//! Leaf C wires `runner` to the CLI runner and Leaf D settles the rest.
+//! The agy (Antigravity CLI) engine: the opt-in, its warning, the install probe and the runner
+//! constructor. Every runner is built only while the opt-in is on.
 
 use std::sync::Arc;
 
@@ -22,12 +20,27 @@ pub fn enabled() -> bool {
     crate::settings::get_opt::<AgyDoc>(&Scope::Machine).is_some_and(|doc| doc.enabled)
 }
 
+/// The model an agy runner uses when nothing pins one.
+pub const DEFAULT_MODEL: &str = "agy/gemini-3.8-flash-high";
+
 /// Whether the agy binary resolves on this machine.
 pub fn installed() -> bool {
-    false
+    crate::execution::runner::agy_program().is_some()
 }
 
-/// The agy runner, built from the models file.
+/// An agy runner for `model` (the catalogue's `agy/` prefix is accepted), or `None` while the
+/// opt-in is off. The one place a real `AgyCliRunner` is built.
+pub fn runner_for(model: Option<&str>) -> Option<Arc<dyn CommandRunner>> {
+    if !enabled() {
+        return None;
+    }
+    Some(Arc::new(crate::execution::runner::AgyCliRunner {
+        model: model.unwrap_or(DEFAULT_MODEL).to_string(),
+        effort: None,
+    }))
+}
+
+/// The agy runner, built from the models file (which has no agy key: the default model applies).
 pub fn runner(_models: &ModelsConfig) -> Option<Arc<dyn CommandRunner>> {
-    None
+    runner_for(None)
 }

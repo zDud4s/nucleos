@@ -70,7 +70,7 @@ fn local_installed() -> bool {
 }
 
 /// The Claude runner, built from the models file as `main.rs` builds the primary.
-pub(crate) fn claude_runner(models: &ModelsConfig) -> Arc<dyn CommandRunner> {
+pub fn claude_runner(models: &ModelsConfig) -> Arc<dyn CommandRunner> {
     Arc::new(crate::execution::runner::ClaudeCliRunner {
         model: models.claude_model.clone(),
         plan_model: models.plan_model.clone(),
@@ -81,7 +81,7 @@ pub(crate) fn claude_runner(models: &ModelsConfig) -> Arc<dyn CommandRunner> {
 }
 
 /// The Codex runner, built from the models file as `main.rs` builds the primary.
-pub(crate) fn codex_runner(models: &ModelsConfig) -> Arc<dyn CommandRunner> {
+pub fn codex_runner(models: &ModelsConfig) -> Arc<dyn CommandRunner> {
     Arc::new(crate::execution::runner::CodexCliRunner {
         model: models.codex_model.clone(),
         sandbox_mode: None,
@@ -203,6 +203,56 @@ pub fn chat_ids_in(table: &[EngineDescription]) -> Vec<&'static str> {
 /// The CLI runner a string names. Unknown, empty or non-CLI ids collapse to claude.
 pub fn runner_id_in(table: &[EngineDescription], id: &str) -> &'static str {
     cli_row_in(table, id).map_or(CLAUDE, |row| row.id)
+}
+
+/// A runner that fails every run with a fixed message. Stands in for an engine the owner asked for
+/// by name but has not enabled, so the daemon never answers with a different engine instead.
+struct RefusingRunner {
+    message: String,
+}
+
+#[async_trait::async_trait]
+impl CommandRunner for RefusingRunner {
+    async fn run_prompt(
+        &self,
+        _request: crate::execution::runner::RunRequest,
+        _session_tx: tokio::sync::mpsc::UnboundedSender<String>,
+        _transcript: Arc<std::sync::Mutex<String>>,
+    ) -> std::io::Result<crate::execution::runner::RunOutcome> {
+        Err(std::io::Error::other(self.message.clone()))
+    }
+}
+
+/// The runner the daemon launches runs with, from `primary_runner` in the models file.
+///
+/// `codex` builds the Codex runner; `agy` builds the agy runner while its opt-in is on and a
+/// refusing runner while it is off, never Claude; an absent or unknown name keeps the Claude CLI
+/// (an unknown one warns, so a typo does not take the daemon down).
+pub fn runner_for_primary(name: Option<&str>, models: &ModelsConfig) -> Arc<dyn CommandRunner> {
+    match name {
+        Some(CODEX) => {
+            tracing::info!(model = %models.codex_model, "codex CLI selected as the run runner");
+            codex_runner(models)
+        }
+        Some(AGY) => match agy::runner(models) {
+            Some(runner) => {
+                tracing::info!("agy CLI selected as the run runner");
+                runner
+            }
+            None => {
+                tracing::warn!("primary_runner is agy, but the agy engine is disabled in settings");
+                Arc::new(RefusingRunner {
+                    message: "primary_runner is agy, but the agy engine is disabled in settings"
+                        .to_string(),
+                })
+            }
+        },
+        Some(other) if other != CLAUDE => {
+            tracing::warn!(%other, "unknown primary_runner — keeping the Claude CLI");
+            claude_runner(models)
+        }
+        _ => claude_runner(models),
+    }
 }
 
 #[cfg(test)]

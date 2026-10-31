@@ -359,9 +359,26 @@ pub fn tool_policy_for(
     }
 }
 
-/// Chooses the CLI that should answer a conversation turn.
-pub fn answering_cli(config: &crate::config::ModelsConfig, pinned: Option<&str>) -> &'static str {
-    pinned
+/// A chat bound to the agy engine while its opt-in is off. The turn is refused rather than handed
+/// to another engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineDisabled;
+
+impl std::fmt::Display for EngineDisabled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("this chat uses the agy engine, which is disabled in settings")
+    }
+}
+
+impl std::error::Error for EngineDisabled {}
+
+/// Chooses the CLI that should answer a conversation turn, or refuses when that CLI is agy and
+/// agy is switched off.
+pub fn answering_cli(
+    config: &crate::config::ModelsConfig,
+    pinned: Option<&str>,
+) -> Result<&'static str, EngineDisabled> {
+    let cli = pinned
         .and_then(|id| {
             config
                 .runner_of(id)
@@ -369,7 +386,11 @@ pub fn answering_cli(config: &crate::config::ModelsConfig, pinned: Option<&str>)
         })
         .unwrap_or_else(|| {
             crate::engines::runner_id_in(crate::engines::TABLE, config.active_runner())
-        })
+        });
+    if cli == crate::engines::AGY && !crate::engines::agy::enabled() {
+        return Err(EngineDisabled);
+    }
+    Ok(cli)
 }
 
 /// Chooses a runner for a turn without replacing the daemon's default unnecessarily.
@@ -378,20 +399,23 @@ pub fn runner_for_turn(
     assistants: &dyn crate::assistants::Assistants,
     config: &crate::config::ModelsConfig,
     pinned: Option<&str>,
-) -> (
-    std::sync::Arc<dyn crate::execution::runner::CommandRunner>,
-    &'static str,
-) {
-    let cli = answering_cli(config, pinned);
+) -> Result<
+    (
+        std::sync::Arc<dyn crate::execution::runner::CommandRunner>,
+        &'static str,
+    ),
+    EngineDisabled,
+> {
+    let cli = answering_cli(config, pinned)?;
     if pinned.is_none() || cli == config.active_runner() {
-        (daemon.clone(), cli)
+        Ok((daemon.clone(), cli))
     } else {
-        (
+        Ok((
             assistants
                 .cli_runner(cli, pinned)
                 .unwrap_or_else(|| daemon.clone()),
             cli,
-        )
+        ))
     }
 }
 
@@ -807,12 +831,32 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
             .await
             .unwrap_or_default();
         let config = crate::config::models_config_now();
-        let (runner, cli) = runner_for_turn(
+        let (runner, cli) = match runner_for_turn(
             &daemon_runner,
             assistants.as_ref(),
             &config,
             answering.model.as_deref(),
-        );
+        ) {
+            Ok(chosen) => chosen,
+            Err(refusal) => {
+                // The chat is bound to an engine that is switched off: fail the turn with the
+                // reason, never answer it with another engine.
+                tracing::warn!(run_id = id, chat_id = %turn.slot.chat_id, %refusal, "refusing the turn");
+                let failed = sqlx::query(
+                    "UPDATE runs SET status = 'failed', stderr = ?, completed_at = ? WHERE id = ? AND status = 'running'",
+                )
+                .bind(refusal.to_string())
+                .bind(chrono::Utc::now().to_rfc3339())
+                .bind(id)
+                .execute(&pool)
+                .await;
+                crate::execution::runs::warn_on_terminal_write_err(&failed, id, "failed");
+                // Ends like any failed turn: the guard goes first, then whatever waited behind it.
+                drop(turn);
+                drain_queued(&after, &drained_chat).await;
+                return;
+            }
+        };
 
         // Which door this turn goes through. Decided once and named, because the two are not
         // interchangeable and the reason is a security one before it is a speed one.

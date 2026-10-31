@@ -446,6 +446,8 @@ impl Assistants for ConfiguredAssistants {
                 )) as std::sync::Arc<dyn crate::execution::runner::CommandRunner>
             }),
             crate::engines::CLAUDE => self.claude_cli.clone(),
+            // Not wired through `with_agent_clis`: agy needs no daemon-held state, only its opt-in.
+            crate::engines::AGY => crate::engines::agy::runner_for(pinned),
             _ => None,
         }
     }

@@ -1159,6 +1159,7 @@ mod tests {
             default_model: match kind {
                 RunnerKind::Claude => "claude-sonnet-5".into(),
                 RunnerKind::Codex => "gpt-5.6-terra".into(),
+                RunnerKind::Agy => "agy/gemini-3.8-flash-high".into(),
             },
             models: globs.iter().map(|glob| (*glob).to_owned()).collect(),
         }

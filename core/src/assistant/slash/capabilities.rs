@@ -90,7 +90,9 @@ pub fn engine_of(config: &ModelsConfig, brain: Brain, model: Option<&str>) -> Ch
     match brain {
         Brain::Local => ChatEngine::Local,
         Brain::OpenRouter => ChatEngine::OpenRouter,
-        Brain::Cloud => ChatEngine::of_cli(crate::assistant::answering_cli(config, model)),
+        // A refusal means the chat is bound to agy while agy is off.
+        Brain::Cloud => crate::assistant::answering_cli(config, model)
+            .map_or(ChatEngine::Agy, ChatEngine::of_cli),
     }
 }
 

@@ -328,15 +328,15 @@ mod tests {
 
     #[test]
     fn there_are_thirteen_documents_with_unique_names() {
-        // 13 fixed documents plus one `channels/<id>` per manifest.
+        // 14 fixed documents plus one `channels/<id>` per manifest.
         let channels = crate::channels::registry::MANIFESTS.len();
         let docs = documents();
-        assert_eq!(docs.len(), 13 + channels);
+        assert_eq!(docs.len(), 14 + channels);
         let names: BTreeSet<_> = docs.iter().map(|doc| doc.name).collect();
-        assert_eq!(names.len(), 13 + channels);
+        assert_eq!(names.len(), 14 + channels);
         assert_eq!(
             docs.iter().filter(|doc| doc.kind == Kind::Machine).count(),
-            11 + channels
+            12 + channels
         );
         let project: Vec<_> = docs
             .iter()

@@ -1840,12 +1840,11 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
                 "the catalogue accepts `{engine}` and no seat can host it"
             );
         }
-        for (engine, _) in ENGINE_SEAT_KINDS {
-            assert!(
-                crate::agent::ENGINES.contains(engine),
-                "`{engine}` translates to a seat and no agent may declare it"
-            );
-        }
+        let missing = engines_missing_from(crate::agent::ENGINES);
+        assert!(
+            missing.is_empty(),
+            "{missing:?} translate to a seat and no agent may declare them"
+        );
         for kind in [SeatKind::Cloud, SeatKind::Local] {
             assert!(
                 ENGINE_SEAT_KINDS.iter().any(|(_, mapped)| *mapped == kind),
