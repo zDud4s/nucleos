@@ -601,7 +601,7 @@ fn devtime_answer(entry: &DevtimeCacheEntry) -> Option<ResolvedDevtime> {
 }
 
 /// The per-action floor on the shadow hit rate (spec 4.1).
-#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DevtimeHitRateMin {
     pub inject: f64,
@@ -619,7 +619,7 @@ impl Default for DevtimeHitRateMin {
 
 /// The automatic actions' thresholds (actions design spec, sections 4 and 6). A partial or absent
 /// block is valid: every field has the spec default.
-#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DevtimeActionsConfig {
     /// Global switch: false puts every pair in `off`.

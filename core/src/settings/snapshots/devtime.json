@@ -1,5 +1,150 @@
 {
   "$defs": {
+    "DevtimeActionsConfig": {
+      "additionalProperties": false,
+      "description": "The automatic actions' thresholds (actions design spec, sections 4 and 6). A partial or absent\nblock is valid: every field has the spec default.",
+      "properties": {
+        "effect_min_days": {
+          "default": 14,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "effect_min_resolved": {
+          "default": 30,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "effect_min_sessions": {
+          "default": 10,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "enabled": {
+          "default": true,
+          "description": "Global switch: false puts every pair in `off`.",
+          "type": "boolean"
+        },
+        "holdout_fraction": {
+          "default": 0.1,
+          "format": "double",
+          "type": "number"
+        },
+        "human_min_marks": {
+          "default": 5,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "inject_cooldown_days": {
+          "default": 3,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "inject_max_per_session": {
+          "default": 3,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "inject_min_cost_ms": {
+          "default": 120000,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "inject_min_count": {
+          "default": 3,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "inject_window_days": {
+          "default": 14,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "min_mean_hit_cost_ms": {
+          "default": 30000,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pairs": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "default": {
+            "inject": [
+              "D3",
+              "D6"
+            ],
+            "propose": [
+              "F1",
+              "F2"
+            ]
+          },
+          "description": "Action to the rule ids that start in shadow.",
+          "type": "object"
+        },
+        "precision_wilson_lower": {
+          "default": 0.6,
+          "format": "double",
+          "type": "number"
+        },
+        "propose_max_open": {
+          "default": 5,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "propose_min_cost_ms": {
+          "default": 600000,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "propose_min_sessions": {
+          "default": 3,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "propose_window_days": {
+          "default": 14,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "reentry_days": {
+          "default": 14,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rollback_window": {
+          "default": 30,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "shadow_hit_rate_min": {
+          "$ref": "#/$defs/DevtimeHitRateMin",
+          "default": {
+            "inject": 0.6,
+            "propose": 0.5
+          }
+        }
+      },
+      "type": "object"
+    },
     "DevtimeAdaptersConfig": {
       "additionalProperties": false,
       "description": "Where the optional adapter sources live. Empty means absent.",
@@ -188,6 +333,23 @@
             "type": "string"
           },
           "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "DevtimeHitRateMin": {
+      "additionalProperties": false,
+      "description": "The per-action floor on the shadow hit rate (spec 4.1).",
+      "properties": {
+        "inject": {
+          "default": 0.6,
+          "format": "double",
+          "type": "number"
+        },
+        "propose": {
+          "default": 0.5,
+          "format": "double",
+          "type": "number"
         }
       },
       "type": "object"
@@ -798,6 +960,45 @@
   "additionalProperties": false,
   "description": "The devtime ingestion's settings.\n\nDerives `PartialEq` and not `Eq`, because the amber rate is an `f64`.",
   "properties": {
+    "actions": {
+      "$ref": "#/$defs/DevtimeActionsConfig",
+      "default": {
+        "effect_min_days": 14,
+        "effect_min_resolved": 30,
+        "effect_min_sessions": 10,
+        "enabled": true,
+        "holdout_fraction": 0.1,
+        "human_min_marks": 5,
+        "inject_cooldown_days": 3,
+        "inject_max_per_session": 3,
+        "inject_min_cost_ms": 120000,
+        "inject_min_count": 3,
+        "inject_window_days": 14,
+        "min_mean_hit_cost_ms": 30000,
+        "pairs": {
+          "inject": [
+            "D3",
+            "D6"
+          ],
+          "propose": [
+            "F1",
+            "F2"
+          ]
+        },
+        "precision_wilson_lower": 0.6,
+        "propose_max_open": 5,
+        "propose_min_cost_ms": 600000,
+        "propose_min_sessions": 3,
+        "propose_window_days": 14,
+        "reentry_days": 14,
+        "rollback_window": 30,
+        "shadow_hit_rate_min": {
+          "inject": 0.6,
+          "propose": 0.5
+        }
+      },
+      "description": "The automatic actions' thresholds (phase 2, shadow mode first)."
+    },
     "cycle_seconds": {
       "default": 60,
       "description": "Seconds between two ingestion cycles.",

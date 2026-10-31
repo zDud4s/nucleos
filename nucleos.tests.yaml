@@ -105,6 +105,9 @@ tests:
     # Serve the preview live for an agent-driven dev-browser window; run by hand.
     - scripts/live-preview.mjs
     - scripts/live-preview-agent.js
+    # Smoke-tests an installed Linux .deb/.rpm inside a clean container; only the release workflow
+    # runs it, on real release assets.
+    - scripts/smoke-bundle.sh
     - docs/
     - design/
     - .githooks/

@@ -141,6 +141,12 @@ pub(super) async fn delete_project(
     match crate::project_exit::remove(&state.pool, &id, query.forget_history).await {
         Ok(crate::project_exit::Removed::Done { forgotten }) => {
             tracing::info!(project_id = %id, forgotten, "a project left the roster");
+            if query.forget_history {
+                // Forgetting deleted the project's settings rows; the snapshot still holds them.
+                if let Err(error) = crate::settings::load(&state.pool).await {
+                    tracing::warn!(project_id = %id, %error, "reloading the settings after a forget failed");
+                }
+            }
             Ok(StatusCode::NO_CONTENT)
         }
         Ok(crate::project_exit::Removed::NotRegistered) => Err((

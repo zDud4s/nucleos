@@ -25954,6 +25954,9 @@ mod tests {
     /// a zeroed report (never a 500) for a pair without decisions.
     #[tokio::test]
     async fn analytics_devtime_actions_lists_every_pair_with_its_state_and_report() {
+        // The route reads the `devtime` document from the settings snapshot: own it, empty, so the
+        // defaults asserted below are the defaults and not another test's stored document.
+        let _home = crate::project::rules::testing::Home::new();
         let state = test_state().await;
         sqlx::query(
             "INSERT INTO devtime_action_state (action, rule_id, mode, since, changed_by)
@@ -26137,6 +26140,8 @@ mod tests {
     /// 30-row fixture, is pinned in `analytics::devtime::actions`).
     #[tokio::test]
     async fn analytics_devtime_actions_promote_maps_refusals_and_writes_nothing_when_not_ready() {
+        // Promotion reads the thresholds from the `devtime` document in the settings snapshot.
+        let _home = crate::project::rules::testing::Home::new();
         let state = test_state().await;
         seed_shadow(&state, "a", "shadow", "fire", 10).await;
         for (uri, status, code) in [
@@ -26180,6 +26185,8 @@ mod tests {
     /// no scope table); no token at all is 401 on all four.
     #[tokio::test]
     async fn analytics_devtime_actions_are_readable_with_a_read_only_key_and_the_posts_are_not() {
+        // The routes read the `devtime` document from the settings snapshot.
+        let _home = crate::project::rules::testing::Home::new();
         let (state, db) = file_test_state().await;
         let id = seed_shadow(&state, "a", "shadow", "fire", 10).await;
         let token = store_api_token_at_level(&state, "reader", ApiTokenLevel::ReadOnly).await;
