@@ -92,6 +92,7 @@ pub async fn advance_job(state: &AppState, job_id: &str) {
 }
 
 /// One step of the driver for one job, with the gate injected so tests can script it.
+#[cfg(test)]
 pub(super) async fn advance_job_with_gate(state: &AppState, job_id: &str, gate: GateFn) {
     advance(state, job_id, Some(gate)).await;
 }
