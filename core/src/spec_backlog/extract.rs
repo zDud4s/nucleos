@@ -1,4 +1,83 @@
-//! stub: criteria extraction
+//! Criteria extraction over registered, immutable spec files.
+
+use std::fs;
+
+use sqlx::SqlitePool;
+
+use super::criteria::parse;
+use super::model::{SpecKind, SpecStatus};
+use super::prompts::{extraction_prompt, split_sections};
+use super::scan::{content_sha, resolve_stored_path, ScanRoots};
+use super::store::{self, StoreError};
+
+#[async_trait::async_trait]
+pub trait ExtractionRunner: Send + Sync {
+    async fn run(&self, prompt: String) -> Result<String, String>;
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ExtractOutcome {
+    Stored { kind: SpecKind, criteria: usize },
+    NeedsOwner { error: String },
+}
+
+#[derive(Debug)]
+pub enum ExtractError {
+    Store(StoreError),
+    Io(std::io::Error),
+    NotFound(String),
+    SpecChanged { spec_id: String },
+    Runner(String),
+}
+
+impl From<StoreError> for ExtractError { fn from(error: StoreError) -> Self { Self::Store(error) } }
+impl From<std::io::Error> for ExtractError { fn from(error: std::io::Error) -> Self { Self::Io(error) } }
+
+pub async fn extract(
+    pool: &SqlitePool, roots: &ScanRoots, spec_id: &str, runner: &dyn ExtractionRunner,
+) -> Result<ExtractOutcome, ExtractError> {
+    let spec = store::get_spec(pool, spec_id).await?.ok_or_else(|| ExtractError::NotFound(spec_id.to_owned()))?;
+    let path = resolve_stored_path(roots, &spec.path).ok_or_else(|| ExtractError::NotFound(spec_id.to_owned()))?;
+    let bytes = fs::read(path)?;
+    if content_sha(&bytes) != spec.content_sha { return Err(ExtractError::SpecChanged { spec_id: spec.id }); }
+    let text = String::from_utf8_lossy(&bytes);
+    let known_paths = store::list_paths_by_project(pool, spec.project_id.as_deref()).await?;
+    let mut kind = None;
+    let mut criteria = Vec::new();
+    let mut dependencies = Vec::new();
+    let mut questions = Vec::new();
+    for section in split_sections(&text) {
+        let first = runner.run(extraction_prompt(&spec.path, &section, None)).await.map_err(ExtractError::Runner)?;
+        let extraction = match parse(&first, &known_paths) {
+            Ok(value) => value,
+            Err(first_error) => {
+                let retry = runner.run(extraction_prompt(&spec.path, &section, Some(&first_error.to_string()))).await.map_err(ExtractError::Runner)?;
+                match parse(&retry, &known_paths) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let error = error.to_string();
+                        store::set_extraction_result(pool, &spec.id, spec.kind, SpecStatus::NeedsOwner, Some(&error)).await?;
+                        store::add_question(pool, &spec.id, &format!("Extraction needs owner input: {error}")).await?;
+                        return Ok(ExtractOutcome::NeedsOwner { error });
+                    }
+                }
+            }
+        };
+        kind.get_or_insert(extraction.kind);
+        criteria.extend(extraction.criteria);
+        dependencies.extend(extraction.depends_on);
+        questions.extend(extraction.questions);
+    }
+    let kind = kind.unwrap_or(SpecKind::Unknown);
+    let count = criteria.len();
+    store::replace_criteria(pool, &spec.id, &spec.content_sha, &criteria).await?;
+    for dependency in dependencies {
+        store::add_dep(pool, &spec.id, &super::model::spec_id(spec.project_id.as_deref(), &dependency), super::model::DepSource::Extracted).await?;
+    }
+    for question in questions { store::add_question(pool, &spec.id, &question).await?; }
+    store::set_extraction_result(pool, &spec.id, kind, SpecStatus::Extracted, None).await?;
+    Ok(ExtractOutcome::Stored { kind, criteria: count })
+}
 
 #[cfg(test)]
 mod tests {

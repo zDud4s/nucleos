@@ -1,4 +1,136 @@
-//! stub: spec audit
+//! Independent review and verification of extracted specs.
+
+use std::collections::HashSet;
+use std::fs;
+use std::path::{Component, Path};
+
+use sqlx::SqlitePool;
+
+use super::model::{Criterion, CriterionStatus, Spec, SpecKind, SpecStatus};
+use super::store::{self, StoreError};
+use super::verdict::{done, ReviewFacts, ReviewerRun, Verdict, VerifyState};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CriterionReview {
+    pub ordinal: i64,
+    pub status: CriterionStatus,
+    pub evidence: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewerAnswer {
+    pub run: ReviewerRun,
+    pub reviews: Vec<CriterionReview>,
+}
+
+#[async_trait::async_trait]
+pub trait ReviewerRunner: Send + Sync {
+    async fn review(&self, spec: &Spec, criteria: &[Criterion]) -> Result<ReviewerAnswer, String>;
+}
+
+#[async_trait::async_trait]
+pub trait VerifyRunner: Send + Sync {
+    async fn verify(&self, spec: &Spec, criteria: &[Criterion]) -> VerifyState;
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SpecLineage {
+    pub run_ids: Vec<String>,
+    pub lineage_roots: Vec<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct AuditReport {
+    pub reviewer_run_id: String,
+    pub verify: VerifyState,
+    pub verdict: Verdict,
+    pub status: SpecStatus,
+}
+
+#[derive(Debug)]
+pub enum AuditError {
+    Store(StoreError),
+    NotFound(String),
+    NotASpec(SpecKind),
+    NoCriteria,
+    StaleCriteria,
+    Reviewer(String),
+    ReviewerNotNew { run_id: String },
+}
+
+impl From<StoreError> for AuditError { fn from(error: StoreError) -> Self { Self::Store(error) } }
+
+pub(super) fn safe_relative_path(worktree: &Path, path: &str) -> Option<std::path::PathBuf> {
+    let relative = Path::new(path);
+    if relative.is_absolute() || path.is_empty() || relative.components().any(|component| !matches!(component, Component::Normal(_))) {
+        return None;
+    }
+    Some(worktree.join(relative))
+}
+
+pub fn evidence_exists(worktree: &Path, evidence: &str) -> bool {
+    let Some((path, target)) = evidence.rsplit_once(':').or_else(|| evidence.rsplit_once('#')) else { return false; };
+    let Some(file) = safe_relative_path(worktree, path) else { return false; };
+    let Ok(contents) = fs::read_to_string(file) else { return false; };
+    if evidence.contains(':') {
+        return target.parse::<usize>().ok().is_some_and(|line| line > 0 && contents.lines().nth(line - 1).is_some());
+    }
+    if target.is_empty() { return false; }
+    contents.lines().any(|line| {
+        let line = line.trim_start();
+        let name = line.strip_prefix("fn ").or_else(|| line.strip_prefix("pub fn "));
+        name.is_some_and(|name| name.strip_prefix(target).is_some_and(|suffix| {
+            suffix.starts_with('(') || suffix.starts_with('<') || suffix.starts_with(' ')
+        }))
+    })
+}
+
+pub async fn audit(
+    pool: &SqlitePool, spec_id: &str, worktree: &Path, lineage: &SpecLineage,
+    reviewer: &dyn ReviewerRunner, verify: &dyn VerifyRunner,
+) -> Result<AuditReport, AuditError> {
+    let spec = store::get_spec(pool, spec_id).await?.ok_or_else(|| AuditError::NotFound(spec_id.to_owned()))?;
+    if matches!(spec.kind, SpecKind::Review | SpecKind::Note) { return Err(AuditError::NotASpec(spec.kind)); }
+    let criteria = store::list_criteria(pool, spec_id).await?;
+    if criteria.is_empty() { return Err(AuditError::NoCriteria); }
+    if criteria.iter().any(|criterion| criterion.status == CriterionStatus::Stale || criterion.spec_sha != spec.content_sha) {
+        return Err(AuditError::StaleCriteria);
+    }
+    let answer = reviewer.review(&spec, &criteria).await.map_err(AuditError::Reviewer)?;
+    let mut forbidden: HashSet<&str> = lineage.run_ids.iter().map(String::as_str).collect();
+    forbidden.extend(lineage.lineage_roots.iter().map(String::as_str));
+    forbidden.extend(criteria.iter().filter_map(|criterion| criterion.reviewer_run_id.as_deref()));
+    if forbidden.contains(answer.run.run_id.as_str()) || answer.run.lineage_root_id.as_deref().is_some_and(|root| forbidden.contains(root)) {
+        return Err(AuditError::ReviewerNotNew { run_id: answer.run.run_id });
+    }
+    for criterion in &criteria {
+        let review = answer.reviews.iter().find(|review| review.ordinal == criterion.ordinal);
+        let (status, evidence) = match review {
+            None => (CriterionStatus::Doubt, None),
+            Some(review) if review.evidence.as_deref().is_some_and(|evidence| !evidence_exists(worktree, evidence)) => (CriterionStatus::Doubt, review.evidence.as_deref()),
+            Some(review) if review.status == CriterionStatus::Met && review.evidence.as_deref().is_some_and(|evidence| evidence_exists(worktree, evidence)) => (CriterionStatus::Met, review.evidence.as_deref()),
+            Some(review) if review.status == CriterionStatus::Unmet => (CriterionStatus::Unmet, review.evidence.as_deref()),
+            Some(review) => (CriterionStatus::Doubt, review.evidence.as_deref()),
+        };
+        store::set_criterion_review(pool, spec_id, criterion.ordinal, status, evidence, &answer.run.run_id).await?;
+        if status == CriterionStatus::Doubt {
+            store::add_question(pool, spec_id, &format!("Owner decision needed for criterion: {}", criterion.text)).await?;
+        }
+    }
+    let reviewed = store::list_criteria(pool, spec_id).await?;
+    let verify_state = verify.verify(&spec, &reviewed).await;
+    let existing_evidence = reviewed.iter().filter_map(|criterion| criterion.evidence.as_deref())
+        .filter(|evidence| evidence_exists(worktree, evidence)).map(str::to_owned).collect();
+    let facts = ReviewFacts {
+        tree_run_ids: lineage.run_ids.clone(), tree_lineage_roots: lineage.lineage_roots.clone(),
+        reviewers: vec![answer.run.clone()], existing_evidence,
+    };
+    let verdict = done(&spec, &reviewed, verify_state, &facts);
+    let status = if verdict == Verdict::Done { SpecStatus::Done } else { SpecStatus::Audited };
+    let reason = (status != SpecStatus::Done).then(|| format!("{verdict:?}"));
+    store::set_audit_result(pool, spec_id, status, reason.as_deref(), &spec.content_sha).await?;
+    Ok(AuditReport { reviewer_run_id: answer.run.run_id, verify: verify_state, verdict, status })
+}
 
 #[cfg(test)]
 mod tests {

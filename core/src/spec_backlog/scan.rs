@@ -1,4 +1,99 @@
-//! stub: spec file scan
+//! Discovery of spec files. Specs are read-only inputs to the backlog.
+
+use std::fs;
+use std::path::PathBuf;
+
+use sha2::{Digest, Sha256};
+use sqlx::SqlitePool;
+
+use super::model::Spec;
+use super::store::{upsert_by_path, StoreError};
+
+pub struct ScanRoots {
+    pub project_root: Option<PathBuf>,
+    pub state_dir: Option<PathBuf>,
+}
+
+pub struct ScanReport {
+    pub specs: Vec<Spec>,
+    pub new: usize,
+    pub changed: usize,
+    pub unchanged: usize,
+}
+
+#[derive(Debug)]
+pub enum ScanError {
+    Io(std::io::Error),
+    Store(StoreError),
+}
+
+impl From<std::io::Error> for ScanError {
+    fn from(error: std::io::Error) -> Self { Self::Io(error) }
+}
+
+impl From<StoreError> for ScanError {
+    fn from(error: StoreError) -> Self { Self::Store(error) }
+}
+
+pub fn content_sha(bytes: &[u8]) -> String {
+    Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+pub fn resolve_stored_path(roots: &ScanRoots, stored: &str) -> Option<PathBuf> {
+    if let Some(path) = stored.strip_prefix(".ai/specs/") {
+        return roots.project_root.as_ref().map(|root| root.join(".ai").join("specs").join(path));
+    }
+    stored.strip_prefix("<state_dir>/specs/").and_then(|path| {
+        roots.state_dir.as_ref().map(|root| root.join("specs").join(path))
+    })
+}
+
+fn title(bytes: &[u8], fallback: &str) -> String {
+    std::str::from_utf8(bytes).ok().and_then(|text| {
+        text.lines().find_map(|line| line.strip_prefix("# ").map(str::to_owned))
+    }).unwrap_or_else(|| fallback.to_owned())
+}
+
+pub async fn scan(pool: &SqlitePool, project_id: Option<&str>, roots: &ScanRoots) -> Result<ScanReport, ScanError> {
+    let mut files = Vec::new();
+    if let Some(root) = &roots.project_root {
+        files.push((root.join(".ai").join("specs"), ".ai/specs/".to_owned()));
+    }
+    if let Some(root) = &roots.state_dir {
+        files.push((root.join("specs"), "<state_dir>/specs/".to_owned()));
+    }
+    let mut discovered = Vec::new();
+    for (directory, prefix) in files {
+        let entries = match fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("md") { continue; }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            discovered.push((format!("{prefix}{name}"), path, name));
+        }
+    }
+    discovered.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut report = ScanReport { specs: Vec::new(), new: 0, changed: 0, unchanged: 0 };
+    for (stored_path, path, name) in discovered {
+        let bytes = fs::read(&path);
+        let bytes = bytes?;
+        let sha = content_sha(&bytes);
+        let previous = super::store::get_spec(pool, &super::model::spec_id(project_id, &stored_path)).await?;
+        let spec = upsert_by_path(pool, project_id, &stored_path, &title(&bytes, name.trim_end_matches(".md")), &sha).await?;
+        match previous {
+            None => report.new += 1,
+            Some(old) if old.content_sha == sha => report.unchanged += 1,
+            Some(_) => report.changed += 1,
+        }
+        report.specs.push(spec);
+    }
+    Ok(report)
+}
 
 #[cfg(test)]
 mod tests {

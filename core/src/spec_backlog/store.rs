@@ -242,6 +242,75 @@ pub async fn list_criteria(pool: &SqlitePool, spec_id: &str) -> Result<Vec<Crite
     rows.into_iter().map(CriterionRow::into_criterion).collect()
 }
 
+/// Lists paths in one registry namespace for extraction dependency validation.
+pub async fn list_paths_by_project(pool: &SqlitePool, project_id: Option<&str>) -> Result<Vec<String>, StoreError> {
+    Ok(sqlx::query_scalar("SELECT path FROM specs WHERE project_id IS ? ORDER BY path")
+        .bind(project_id)
+        .fetch_all(pool)
+        .await?)
+}
+
+pub async fn set_extraction_result(
+    pool: &SqlitePool, spec_id: &str, kind: SpecKind, status: SpecStatus, reason: Option<&str>,
+) -> Result<(), StoreError> {
+    let result = sqlx::query("UPDATE specs SET kind = ?, status = ?, status_reason = ?, updated_at = ? WHERE id = ?")
+        .bind(kind.as_str()).bind(status.as_str()).bind(reason).bind(now()).bind(spec_id)
+        .execute(pool).await?;
+    if result.rows_affected() == 0 { return Err(StoreError::NotFound(format!("spec {spec_id}"))); }
+    Ok(())
+}
+
+pub async fn set_criterion_review(
+    pool: &SqlitePool, spec_id: &str, ordinal: i64, status: CriterionStatus,
+    evidence: Option<&str>, reviewer_run_id: &str,
+) -> Result<(), StoreError> {
+    sqlx::query("UPDATE spec_criteria SET status = ?, evidence = ?, reviewer_run_id = ?, checked_at = ? WHERE spec_id = ? AND ordinal = ?")
+        .bind(status.as_str()).bind(evidence).bind(reviewer_run_id).bind(now()).bind(spec_id).bind(ordinal)
+        .execute(pool).await?;
+    Ok(())
+}
+
+pub async fn set_audit_result(
+    pool: &SqlitePool, spec_id: &str, status: SpecStatus, reason: Option<&str>, sha: &str,
+) -> Result<(), StoreError> {
+    let result = sqlx::query("UPDATE specs SET status = ?, status_reason = ?, last_audited_sha = ?, updated_at = ? WHERE id = ?")
+        .bind(status.as_str()).bind(reason).bind(sha).bind(now()).bind(spec_id).execute(pool).await?;
+    if result.rows_affected() == 0 { return Err(StoreError::NotFound(format!("spec {spec_id}"))); }
+    Ok(())
+}
+
+/// Moves a spec to `status` with the reason, touching nothing else (not `last_audited_sha`).
+pub async fn set_status(
+    pool: &SqlitePool, spec_id: &str, status: SpecStatus, reason: Option<&str>,
+) -> Result<(), StoreError> {
+    let result = sqlx::query("UPDATE specs SET status = ?, status_reason = ?, updated_at = ? WHERE id = ?")
+        .bind(status.as_str()).bind(reason).bind(now()).bind(spec_id).execute(pool).await?;
+    if result.rows_affected() == 0 { return Err(StoreError::NotFound(format!("spec {spec_id}"))); }
+    Ok(())
+}
+
+/// Records the tree that is working on the spec (the latest one, when a second round replaces it).
+pub async fn set_tree_id(pool: &SqlitePool, spec_id: &str, tree_id: &str) -> Result<(), StoreError> {
+    let result = sqlx::query("UPDATE specs SET tree_id = ?, updated_at = ? WHERE id = ?")
+        .bind(tree_id).bind(now()).bind(spec_id).execute(pool).await?;
+    if result.rows_affected() == 0 { return Err(StoreError::NotFound(format!("spec {spec_id}"))); }
+    Ok(())
+}
+
+/// Every spec of one registry namespace (`None` is the namespace without a project), by path.
+pub async fn list_specs_by_project(
+    pool: &SqlitePool, project_id: Option<&str>,
+) -> Result<Vec<Spec>, StoreError> {
+    let rows: Vec<SpecRow> = sqlx::query_as(
+        "SELECT id, project_id, path, title, content_sha, kind, status, status_reason, tree_id, \
+         last_audited_sha, created_at, updated_at FROM specs WHERE project_id IS ? ORDER BY path",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter().map(SpecRow::into_spec).collect()
+}
+
 /// Records that `spec_id` depends on `depends_on`. The pair is the key: a repeat, under either
 /// source, changes nothing.
 pub async fn add_dep(

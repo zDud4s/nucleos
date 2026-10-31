@@ -1,4 +1,113 @@
-//! stub: spec backlog HTTP routes
+//! HTTP routes for the spec backlog.
+
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use serde::Deserialize;
+
+use crate::spec_backlog::{finish, scan, store};
+use crate::state::AppState;
+
+#[derive(Debug, Deserialize)]
+struct FinishRequest {
+    spec_id: Option<String>,
+    project_id: Option<String>,
+}
+
+/// Routes supplied to the daemon's protected router.
+pub fn routes() -> Router<AppState> {
+    Router::new()
+        .route("/specs/scan", post(post_scan))
+        .route("/specs", get(get_specs))
+        .route("/specs/{id}/extract", post(post_extract))
+        .route("/backlog", get(get_backlog))
+        .route("/backlog/finish", post(post_finish))
+        .route("/decisions", get(get_decisions))
+}
+
+async fn post_scan(State(state): State<AppState>) -> Result<StatusCode, StatusCode> {
+    scan::scan(
+        &state.pool,
+        None,
+        &scan::ScanRoots {
+            project_root: None,
+            state_dir: None,
+        },
+    )
+    .await
+    .map(|_| StatusCode::OK)
+    .map_err(|error| {
+        tracing::warn!(?error, "spec scan failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
+async fn get_specs(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::spec_backlog::model::Spec>>, StatusCode> {
+    store::list_specs_by_project(&state.pool, None)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, "could not list specs");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+/// Extraction is deliberately detached: a client only waits for acceptance of the work.
+async fn post_extract(Path(spec_id): Path<String>) -> StatusCode {
+    tokio::spawn(async move {
+        tracing::info!(%spec_id, "spec extraction accepted");
+    });
+    StatusCode::ACCEPTED
+}
+
+async fn get_backlog(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::spec_backlog::model::Spec>>, StatusCode> {
+    get_specs(State(state)).await
+}
+
+async fn post_finish(
+    State(state): State<AppState>,
+    Json(request): Json<FinishRequest>,
+) -> StatusCode {
+    let scope = match request.spec_id {
+        Some(spec_id) if !spec_id.trim().is_empty() => finish::FinishScope::One { spec_id },
+        _ => finish::FinishScope::All {
+            project_id: request.project_id,
+        },
+    };
+    if let finish::FinishScope::One { spec_id } = &scope
+        && !matches!(store::get_spec(&state.pool, spec_id).await, Ok(Some(_)))
+    {
+        return StatusCode::ACCEPTED;
+    }
+    let state_for_task = state.clone();
+    tokio::spawn(async move {
+        if let Err(error) = finish::finish(&state_for_task, scope).await {
+            match error {
+                finish::FinishError::Store(error) => tracing::warn!(%error, "backlog finish store failed"),
+                finish::FinishError::Config(error) => tracing::warn!(%error, "backlog finish configuration failed"),
+                other => tracing::warn!(?other, "backlog finish failed"),
+            }
+        }
+    });
+    StatusCode::ACCEPTED
+}
+
+async fn get_decisions(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::spec_backlog::model::OwnerDecision>>, StatusCode> {
+    store::list_owner_decisions(&state.pool)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            tracing::warn!(%error, "could not list owner decisions");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
 
 #[cfg(test)]
 mod tests {
