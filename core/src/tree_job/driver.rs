@@ -1,42 +1,670 @@
-//! Tree-job driver tick: advances running tree jobs one step per pass (scaffold stub).
+//! Tree-job driver tick: advances every unfinished tree job one step per pass.
+//!
+//! One pass over a job, under the job's lock (`http::job_lock`), in this order:
+//!
+//! 1. each branch, in name order: a branch whose node reported `done` is gated (the gate runs in a
+//!    spawned task, never inside the tick); a `red` branch is fixed by relaunching its node with the
+//!    findings, twice at most, then parked; a `green` branch has its merge queued or settled;
+//! 2. the nodes of merged and dropped branches are closed with their report;
+//! 3. landing: once the root reported `done` and every branch is finished, the root closes (last),
+//!    and the job either finishes held or has its landing queued or settled.
+//!
+//! Every step reads the state it wrote (`merge_request_id`, `land_id`, `merge_sha`), so a pass that
+//! finds nothing to do writes nothing and a restarted daemon picks up where the old one stopped.
+//! Neither a transaction nor a lock on the pool outlives a call: the queue is asked with none held.
+//! `decisions::park` takes the job's lock itself, so parks are collected and made after it is freed.
 
+use std::collections::HashSet;
 use std::future::Future;
+use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::process::Stdio;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::time::{Duration, Instant};
 
+use chrono::{SecondsFormat, Utc};
+use serde_json::Value;
+use sqlx::SqlitePool;
+
+use super::decisions;
+use super::engine::{apply_transition, branch_node_may_close};
+use super::http::job_lock;
+use super::landing::{
+    self, LandingError, MergeSettlement, apply_gate_verdict, check_may_land, check_may_merge,
+    land_job, scope_caller_id, settle_land, settle_merge, submit_merge,
+};
+use super::model::JOB_TERMINAL_STATE;
+use super::open::{relaunch_node, run_is_live};
+use super::store::{self, TreeJob};
+use crate::execution::git_exec::OPERATION_TIMEOUT;
+use crate::execution::vcs::{Origin, ResolvedRepo, resolve_repo};
+use crate::gate::GateOutcome;
 use crate::state::AppState;
+use crate::verify::{ScopeVerdict, gate_job_scope};
+use crate::work_nodes::{self, CLOSE_STATUSES, CloseArgs, NodeLimits};
+
+/// How long the production gate waits for the verify queue.
+const GATE_WAIT: Duration = Duration::from_secs(900);
+/// Key prefix and cap of the relaunches that follow a red gate.
+const FIX_PREFIX: &str = "fix-";
+const FIX_CAP: i64 = 2;
+/// Longest tail of the gate's findings that goes into a relaunch prompt.
+const FINDINGS_MAX: usize = 3000;
 
 /// What a gate measured for one branch. `Err` from a [`GateFn`] means nothing was measured (the
-/// scope gate's undecided outcomes), so the branch stays where it was. GREEN maps the real
-/// `ScopeVerdict` onto this and applies it with `landing::apply_gate_verdict`: `Passed` is `Green`,
-/// `Failed { output }` is `Red` with the output's tail as `summary`, anything else is `Err`.
+/// scope gate's undecided outcomes), so the branch stays where it was. The driver maps it back onto
+/// a `ScopeVerdict` and applies it with `landing::apply_gate_verdict`: `Passed` is `Green`,
+/// `Failed { output }` is `Red` with the output as `summary`, anything else is `Err`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // GREEN wires the production gate; until then only the tests build one.
 pub(super) enum GateVerdict {
     Green,
     Red { summary: String },
 }
 
-#[allow(dead_code)]
 pub(super) type GateFuture = Pin<Box<dyn Future<Output = Result<GateVerdict, String>> + Send>>;
 
 /// Runs the gate of one branch: called with `(job id, branch name)`. The driver spawns the future
 /// and never awaits it inside a tick.
-#[allow(dead_code)]
 pub(super) type GateFn = Arc<dyn Fn(String, String) -> GateFuture + Send + Sync>;
 
-pub async fn tick(_state: &AppState) {}
+/// A branch to park after the job's lock is released: `(node id, question)`.
+type Park = (String, String);
 
-/// Advance one stored tree job. GREEN owns the driver state machine and wires the production gate
-/// (`crate::verify::installed()`) into [`advance_job_with_gate`].
-pub async fn advance_job(_state: &AppState, _job_id: &str) {
-    todo!("RED C1: implement the tree-job driver")
+/// One pass over every unfinished job. A failure on one job is logged and never stops the others.
+pub async fn tick(state: &AppState) {
+    let jobs = match store::list_non_terminal(&state.pool).await {
+        Ok(jobs) => jobs,
+        Err(error) => {
+            tracing::warn!(%error, "tree driver could not list the open jobs");
+            return;
+        }
+    };
+    let gate = production_gate(state);
+    for job in jobs {
+        advance(state, &job.id, gate.clone()).await;
+    }
+}
+
+/// Advance one stored tree job with the production gate (`crate::verify::installed()`). Without a
+/// verify executor nothing is gated, and the rest of the job still moves.
+pub async fn advance_job(state: &AppState, job_id: &str) {
+    advance(state, job_id, production_gate(state)).await;
 }
 
 /// One step of the driver for one job, with the gate injected so tests can script it.
-#[allow(dead_code)]
-pub(super) async fn advance_job_with_gate(_state: &AppState, _job_id: &str, _gate: GateFn) {
-    todo!("RED C1: implement the tree-job driver")
+pub(super) async fn advance_job_with_gate(state: &AppState, job_id: &str, gate: GateFn) {
+    advance(state, job_id, Some(gate)).await;
+}
+
+/// The gate over the verify queue, or `None` (with a warning) while no executor is installed.
+///
+/// It runs `gate_job_scope` itself rather than `landing::gate_branch`: that one persists the whole
+/// job without the job's lock, and the driver records the verdict under it.
+fn production_gate(state: &AppState) -> Option<GateFn> {
+    let Some(executor) = crate::verify::installed() else {
+        tracing::warn!("tree driver has no verify executor installed: branches are not gated");
+        return None;
+    };
+    let pool = state.pool.clone();
+    let gate: GateFn = Arc::new(move |job_id: String, branch: String| -> GateFuture {
+        let executor = executor.clone();
+        let pool = pool.clone();
+        Box::pin(async move {
+            let job = store::load(&pool, &job_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("tree job {job_id} not found"))?;
+            let worktree = job
+                .manifest
+                .branches
+                .get(&branch)
+                .and_then(|held| held.worktree.clone())
+                .ok_or_else(|| format!("branch {branch} has no worktree to gate"))?;
+            let verdict = gate_job_scope(
+                &executor,
+                scope_caller_id(&job_id),
+                Path::new(&worktree),
+                GATE_WAIT,
+            )
+            .await;
+            verdict_of(verdict)
+        })
+    });
+    Some(gate)
+}
+
+fn verdict_of(verdict: ScopeVerdict) -> Result<GateVerdict, String> {
+    match verdict {
+        ScopeVerdict::Measured(GateOutcome::Passed) => Ok(GateVerdict::Green),
+        ScopeVerdict::Measured(GateOutcome::Failed { output, .. }) => {
+            Ok(GateVerdict::Red { summary: output })
+        }
+        ScopeVerdict::Measured(GateOutcome::Errored { reason }) => Err(reason),
+        ScopeVerdict::NothingRan => {
+            Err("no test unit agrees with the branch's diff, so nothing was measured".to_owned())
+        }
+        ScopeVerdict::Unavailable => {
+            Err("the scope gate could not be submitted, so nothing was measured".to_owned())
+        }
+    }
+}
+
+/// Runs one pass over one job, then the parks it asked for. Errors are logged.
+async fn advance(state: &AppState, job_id: &str, gate: Option<GateFn>) {
+    let mut parks: Vec<Park> = Vec::new();
+    let outcome = {
+        let lock = job_lock(job_id);
+        let _guard = lock.lock().await;
+        pass(state, job_id, gate, &mut parks).await
+    };
+    if let Err(error) = outcome {
+        tracing::warn!(job = job_id, %error, "tree driver failed to advance the job");
+    }
+    for (node, question) in parks {
+        if let Err(error) = decisions::park(&state.pool, job_id, &node, &question).await {
+            tracing::warn!(job = job_id, %node, %error, "tree driver could not park the branch");
+        }
+    }
+}
+
+async fn pass(
+    state: &AppState,
+    job_id: &str,
+    gate: Option<GateFn>,
+    parks: &mut Vec<Park>,
+) -> Result<(), String> {
+    let pool = &state.pool;
+    let Some(mut job) = store::load(pool, job_id).await.map_err(|e| e.to_string())? else {
+        return Ok(());
+    };
+    if job.state == JOB_TERMINAL_STATE {
+        return Ok(());
+    }
+
+    let names: Vec<String> = job.manifest.branches.keys().cloned().collect();
+    for name in &names {
+        if let Err(error) = branch_step(state, &mut job, name, gate.as_ref(), parks).await {
+            tracing::warn!(job = job_id, branch = %name, %error, "tree driver failed on a branch");
+        }
+    }
+
+    let closable: Vec<String> = job
+        .manifest
+        .branches
+        .values()
+        .filter(|branch| branch_node_may_close(branch))
+        .filter_map(|branch| branch.node_id.clone())
+        .collect();
+    for node in closable {
+        if let Err(error) = close_with_report(pool, &node).await {
+            tracing::warn!(job = job_id, %node, %error, "tree driver could not close a node");
+        }
+    }
+
+    landing_step(state, &mut job).await
+}
+
+// ---- branches ----------------------------------------------------------------------------------
+
+async fn branch_step(
+    state: &AppState,
+    job: &mut TreeJob,
+    name: &str,
+    gate: Option<&GateFn>,
+    parks: &mut Vec<Park>,
+) -> Result<(), String> {
+    let Some(branch) = job.manifest.branches.get(name) else {
+        return Ok(());
+    };
+    match branch.state.as_str() {
+        "building" | "fixing" | "reviewing" => at_work(state, job, name, gate).await,
+        "red" => red(state, job, name, parks).await,
+        "green" => merge(state, job, name, parks).await,
+        _ => Ok(()),
+    }
+}
+
+/// The report of a node's latest run.
+struct NodeReport {
+    run_id: Option<String>,
+    live: bool,
+    /// The result of the `report` transition keyed by the run, when there is one.
+    result: Option<String>,
+}
+
+async fn node_report(pool: &SqlitePool, node_id: &str) -> Result<NodeReport, String> {
+    let run: Option<Option<String>> = sqlx::query_scalar("SELECT run_id FROM work_nodes WHERE id = ?")
+        .bind(node_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(run_id) = run.flatten() else {
+        return Ok(NodeReport {
+            run_id: None,
+            live: false,
+            result: None,
+        });
+    };
+    let live = run_is_live(pool, &run_id).await.map_err(|e| e.to_string())?;
+    let result: Option<String> = sqlx::query_scalar(
+        "SELECT result FROM tree_transitions WHERE node_id = ? AND transition = 'report' AND key = ?",
+    )
+    .bind(node_id)
+    .bind(&run_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(NodeReport {
+        run_id: Some(run_id),
+        live,
+        result,
+    })
+}
+
+fn now() -> String {
+    Utc::now().to_rfc3339_opts(SecondsFormat::Secs, false)
+}
+
+async fn persist(pool: &SqlitePool, job: &mut TreeJob) -> Result<(), String> {
+    job.updated_at = now();
+    store::update(pool, job).await.map_err(|e| e.to_string())
+}
+
+/// A branch at work whose node reported `done` and whose run is over: a docs branch is done, a
+/// `root` branch with no diff is dropped, anything else is gated.
+async fn at_work(
+    state: &AppState,
+    job: &mut TreeJob,
+    name: &str,
+    gate: Option<&GateFn>,
+) -> Result<(), String> {
+    let pool = &state.pool;
+    let Some(branch) = job.manifest.branches.get(name) else {
+        return Ok(());
+    };
+    let Some(node) = branch.node_id.clone() else {
+        return Ok(());
+    };
+    let report = node_report(pool, &node).await?;
+    if report.live || report.result.as_deref() != Some("done") {
+        return Ok(());
+    }
+
+    if branch.layer == "docs" {
+        if branch.state == "building" {
+            let held = job.manifest.branches.get_mut(name).ok_or("branch vanished")?;
+            apply_transition(held, "done").map_err(|e| e.to_string())?;
+            persist(pool, job).await?;
+        }
+        return Ok(());
+    }
+    if name == "root" {
+        let changed = has_diff(job, branch).await;
+        match changed {
+            Ok(false) => {
+                let held = job.manifest.branches.get_mut(name).ok_or("branch vanished")?;
+                apply_transition(held, "dropped").map_err(|e| e.to_string())?;
+                held.extra.insert(
+                    "drop_reason".to_owned(),
+                    Value::String("the root changed nothing".to_owned()),
+                );
+                return persist(pool, job).await;
+            }
+            Ok(true) => {}
+            Err(error) => {
+                tracing::warn!(job = %job.id, %error, "could not tell whether the root branch changed anything");
+            }
+        }
+    }
+    if let Some(gate) = gate {
+        spawn_gate(state, gate, &job.id, name);
+    }
+    Ok(())
+}
+
+/// Whether the branch holds a commit the feature branch does not. A worktree is checkpointed first:
+/// an implement node leaves its work uncommitted.
+async fn has_diff(job: &TreeJob, branch: &super::model::Branch) -> Result<bool, String> {
+    if let Some(worktree) = &branch.worktree {
+        crate::execution::worktree::checkpoint(Path::new(worktree))
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    let Some(git_branch) = &branch.git_branch else {
+        return Ok(true);
+    };
+    let range = format!("{}..{git_branch}", job.manifest.feature_branch);
+    let counted = git(&job.manifest.project_root, &["rev-list", "--count", &range]).await?;
+    Ok(counted != "0")
+}
+
+/// Runs `git -C <root> <args>` and answers its trimmed stdout, or its stderr as the error.
+async fn git(root: &str, args: &[&str]) -> Result<String, String> {
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map_err(|error| format!("git {}: {error}", args.join(" ")))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    } else {
+        Err(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+// ---- the gate task -----------------------------------------------------------------------------
+
+/// The `(job, branch)` pairs whose gate is running in this process.
+fn gating() -> &'static StdMutex<HashSet<(String, String)>> {
+    static GATING: OnceLock<StdMutex<HashSet<(String, String)>>> = OnceLock::new();
+    GATING.get_or_init(Default::default)
+}
+
+/// Frees the `(job, branch)` pair when the gate task ends, however it ends.
+struct GateGuard((String, String));
+
+impl Drop for GateGuard {
+    fn drop(&mut self) {
+        gating()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.0);
+    }
+}
+
+/// Starts the gate of one branch in a task of its own, unless one is already running for it. The
+/// task records the verdict under the job's lock; the tick does not wait for it.
+fn spawn_gate(state: &AppState, gate: &GateFn, job_id: &str, branch: &str) {
+    let key = (job_id.to_owned(), branch.to_owned());
+    let fresh = gating()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(key.clone());
+    if !fresh {
+        return;
+    }
+    let guard = GateGuard(key);
+    let future = gate(job_id.to_owned(), branch.to_owned());
+    let state = state.clone();
+    let (job_id, branch) = (job_id.to_owned(), branch.to_owned());
+    tokio::spawn(async move {
+        let _guard = guard;
+        let verdict = future.await;
+        record_verdict(&state, &job_id, &branch, verdict).await;
+    });
+}
+
+async fn record_verdict(
+    state: &AppState,
+    job_id: &str,
+    branch: &str,
+    verdict: Result<GateVerdict, String>,
+) {
+    let scope = match verdict {
+        Ok(GateVerdict::Green) => ScopeVerdict::Measured(GateOutcome::Passed),
+        Ok(GateVerdict::Red { summary }) => ScopeVerdict::Measured(GateOutcome::Failed {
+            exit_code: 1,
+            output: summary,
+        }),
+        Err(reason) => {
+            tracing::warn!(job = job_id, branch, %reason, "the gate measured nothing");
+            return;
+        }
+    };
+    let lock = job_lock(job_id);
+    let _guard = lock.lock().await;
+    if let Err(error) = apply_verdict(&state.pool, job_id, branch, &scope).await {
+        tracing::warn!(job = job_id, branch, %error, "could not record the gate verdict");
+    }
+}
+
+async fn apply_verdict(
+    pool: &SqlitePool,
+    job_id: &str,
+    branch: &str,
+    scope: &ScopeVerdict,
+) -> Result<(), String> {
+    let Some(mut job) = store::load(pool, job_id).await.map_err(|e| e.to_string())? else {
+        return Ok(());
+    };
+    let Some(held) = job.manifest.branches.get_mut(branch) else {
+        return Ok(());
+    };
+    // The job may have moved on (parked, dropped) while the gate ran: then the verdict is stale.
+    if !matches!(held.state.as_str(), "building" | "fixing" | "reviewing") {
+        return Ok(());
+    }
+    apply_gate_verdict(held, scope).map_err(|e| e.to_string())?;
+    persist(pool, &mut job).await
+}
+
+// ---- red: fix, then park -----------------------------------------------------------------------
+
+/// The findings of the last red gate of the branch.
+fn last_findings(branch: &super::model::Branch) -> String {
+    let text = branch
+        .gates
+        .iter()
+        .rev()
+        .find(|entry| entry.get("verdict").and_then(Value::as_str) == Some("red"))
+        .and_then(|entry| entry.get("log_tail").and_then(Value::as_str))
+        .unwrap_or("the gate failed without output");
+    if text.len() <= FINDINGS_MAX {
+        return text.to_owned();
+    }
+    let mut start = text.len() - FINDINGS_MAX;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    text[start..].to_owned()
+}
+
+async fn red(
+    state: &AppState,
+    job: &mut TreeJob,
+    name: &str,
+    parks: &mut Vec<Park>,
+) -> Result<(), String> {
+    let pool = &state.pool;
+    let Some(branch) = job.manifest.branches.get(name) else {
+        return Ok(());
+    };
+    let Some(node) = branch.node_id.clone() else {
+        return Ok(());
+    };
+    let findings = last_findings(branch);
+    let report = node_report(pool, &node).await?;
+    let Some(run) = report.run_id else {
+        return Ok(());
+    };
+
+    if report.live {
+        // The fix was started and the daemon went down before it wrote `fixing`.
+        let held = job.manifest.branches.get_mut(name).ok_or("branch vanished")?;
+        apply_transition(held, "fixing").map_err(|e| e.to_string())?;
+        return persist(pool, job).await;
+    }
+
+    let key = format!("{FIX_PREFIX}{run}");
+    // The key being replayed is not a prior link.
+    let prior: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM tree_transitions \
+         WHERE node_id = ? AND transition = 'launch' AND key LIKE ? AND key <> ?",
+    )
+    .bind(&node)
+    .bind(format!("{FIX_PREFIX}%"))
+    .bind(&key)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    if prior >= FIX_CAP {
+        parks.push((
+            node,
+            format!(
+                "The gate of branch {name} failed after {FIX_CAP} automatic fixes; last findings:\n{findings}"
+            ),
+        ));
+        return Ok(());
+    }
+
+    let suffix = format!(
+        "\n\nThe gate failed on your branch with these findings:\n{findings}\n\nFix them, then finish the node again."
+    );
+    relaunch_node(state, &node, &run, &key, Some(&suffix)).await?;
+    let held = job.manifest.branches.get_mut(name).ok_or("branch vanished")?;
+    apply_transition(held, "fixing").map_err(|e| e.to_string())?;
+    persist(pool, job).await
+}
+
+// ---- green: merge ------------------------------------------------------------------------------
+
+async fn repo_of(pool: &SqlitePool, job: &TreeJob) -> Result<ResolvedRepo, String> {
+    let project = job
+        .project_id
+        .as_deref()
+        .ok_or_else(|| format!("tree job {} has no project", job.id))?;
+    resolve_repo(pool, project)
+        .await
+        .map_err(|error| format!("could not resolve the repository of project {project}: {error:?}"))
+}
+
+async fn merge(
+    state: &AppState,
+    job: &mut TreeJob,
+    name: &str,
+    parks: &mut Vec<Park>,
+) -> Result<(), String> {
+    let pool = &state.pool;
+    let Some(branch) = job.manifest.branches.get(name) else {
+        return Ok(());
+    };
+    let queued = branch.extra.contains_key("merge_request_id");
+    let node = branch.node_id.clone();
+
+    if queued {
+        let settled = settle_merge(pool, job, name, Duration::ZERO)
+            .await
+            .map_err(|e| e.to_string())?;
+        if let MergeSettlement::NotMerged { reason } = settled {
+            tracing::warn!(job = %job.id, branch = name, %reason, "the queue did not merge the branch");
+            // Resubmitting a conflicted branch would conflict again: an owner decides.
+            if let Some(node) = node {
+                parks.push((node, format!("The merge of branch {name} failed: {reason}")));
+            }
+        }
+        return Ok(());
+    }
+
+    // Not mergeable yet (its base waits, a finding is open): nothing to do this pass.
+    if check_may_merge(&job.manifest, name).is_err() {
+        return Ok(());
+    }
+    let repo = repo_of(pool, job).await?;
+    submit_merge(pool, &repo, job, name, Origin::Daemon)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// ---- closing nodes -----------------------------------------------------------------------------
+
+/// Closes the node with the report its latest run left and the handoff file recorded for it, when it
+/// is open, its run is over and both exist. `Ok(false)` when there was nothing to close.
+async fn close_with_report(pool: &SqlitePool, node_id: &str) -> Result<bool, String> {
+    let node = work_nodes::get(pool, node_id).await.map_err(|e| e.to_string())?;
+    if node.closed_at.is_some() {
+        return Ok(false);
+    }
+    let Some(report) = (node_report(pool, node_id).await?).result else {
+        return Ok(false);
+    };
+    if node_report(pool, node_id).await?.live || !CLOSE_STATUSES.contains(&report.as_str()) {
+        return Ok(false);
+    }
+    let Some(handoff) = node
+        .handoff_path
+        .filter(|path| Path::new(path).is_file())
+    else {
+        return Ok(false);
+    };
+    let args = CloseArgs {
+        summary: format!("Closed by the tree driver with the node's {report} report."),
+        status: report,
+        handoff_path: handoff,
+    };
+    work_nodes::close(pool, node_id, &NodeLimits::default(), &args)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+// ---- landing -----------------------------------------------------------------------------------
+
+/// The root is done when it is closed as `done`, or its run is over and reported `done`.
+async fn root_is_done(pool: &SqlitePool, root_id: &str) -> Result<bool, String> {
+    let node = work_nodes::get(pool, root_id).await.map_err(|e| e.to_string())?;
+    if node.closed_at.is_some() {
+        return Ok(node.status == "done");
+    }
+    let report = node_report(pool, root_id).await?;
+    Ok(!report.live && report.result.as_deref() == Some("done"))
+}
+
+async fn landing_step(state: &AppState, job: &mut TreeJob) -> Result<(), String> {
+    let pool = &state.pool;
+    if job.manifest.extra.get("land_id").and_then(Value::as_i64).is_some() {
+        let settled = settle_land(pool, job, Duration::ZERO)
+            .await
+            .map_err(|e| e.to_string())?;
+        if let landing::LandSettlement::NotLanded { reason } = settled {
+            tracing::warn!(job = %job.id, %reason, "the queue did not land the job");
+        }
+        return Ok(());
+    }
+    if !root_is_done(pool, &job.root_node_id).await? || check_may_land(&job.manifest).is_err() {
+        return Ok(());
+    }
+
+    // The children closed earlier in the pass, so the root closes last.
+    if let Err(error) = close_with_report(pool, &job.root_node_id).await {
+        tracing::warn!(job = %job.id, %error, "tree driver could not close the root node");
+    }
+
+    let integration =
+        job.manifest.extra.get("landing").and_then(Value::as_str) == Some("integration");
+    if !integration {
+        return finish_held(pool, job).await;
+    }
+    let repo = repo_of(pool, job).await?;
+    match land_job(pool, &repo, job, Instant::now() + OPERATION_TIMEOUT, Origin::Shell).await {
+        Ok(_) => Ok(()),
+        Err(LandingError::LandRefused(reason)) => {
+            // `land_job` recorded it as `land_refusal`; the job stays open.
+            tracing::warn!(job = %job.id, %reason, "the landing was refused");
+            Ok(())
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Ends a job that does not land: `finished`, with `landing = "held"`, the integration branch
+/// untouched. `settle_land` is the only other writer of `finished`.
+pub(super) async fn finish_held(pool: &SqlitePool, job: &mut TreeJob) -> Result<(), String> {
+    job.state = JOB_TERMINAL_STATE.to_owned();
+    job.manifest.state = JOB_TERMINAL_STATE.to_owned();
+    job.manifest
+        .extra
+        .insert("landing".to_owned(), Value::String("held".to_owned()));
+    persist(pool, job).await
 }
 
 #[cfg(test)]

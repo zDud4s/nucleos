@@ -994,6 +994,245 @@ mod tests {
         assert_eq!(lines_about_tree_node(&state, run).await, 0);
     }
 
+    // ----- the wrap-up and the driver, from the same tick -----
+
+    /// A state whose runner answers the relaunches a wrap-up starts, as the `wrap` tests' state does.
+    async fn runner_state() -> AppState {
+        let (state, runner) = crate::execution::runs::testkit::test_state_with_runner(
+            Some(std::time::Duration::from_secs(60)),
+            std::time::Duration::from_secs(600),
+        )
+        .await;
+        runner.canned.lock().unwrap().as_mut().unwrap().session_id = None;
+        state
+    }
+
+    /// One open tree job whose only branch `api` is in `branch_state`, bound to `node_id` if given.
+    async fn seed_branch_job(
+        state: &AppState,
+        job: &str,
+        project_id: Option<&str>,
+        root: &str,
+        branch_state: &str,
+        node_id: Option<&str>,
+    ) {
+        let created = Utc::now().to_rfc3339();
+        let mut manifest = Manifest::new(job, "feat/sweep", "Ship it", root, &[]);
+        manifest.state = "open".to_owned();
+        let mut branch = Branch::new("api", &["api/**".to_owned()], "backend", None);
+        branch.state = branch_state.to_owned();
+        branch.git_branch = Some("tree/api".to_owned());
+        branch.node_id = node_id.map(str::to_owned);
+        manifest.branches.insert(branch.name.clone(), branch);
+        save(
+            &state.pool,
+            &TreeJob {
+                id: job.to_owned(),
+                root_node_id: format!("{job}-root"),
+                project_id: project_id.map(str::to_owned),
+                feature_branch: Some("feat/sweep".to_owned()),
+                goal: "Ship it".to_owned(),
+                state: "open".to_owned(),
+                manifest,
+                contract: None,
+                created_at: created.clone(),
+                updated_at: created,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Binds a seeded node to a tree job, with the handoff file its run left.
+    async fn bind_to_job(state: &AppState, node_id: &str, job: &str) {
+        sqlx::query("UPDATE work_nodes SET tree_job_id = ?, handoff_path = ? WHERE id = ?")
+            .bind(job)
+            .bind(format!("C:/state/nodes/{node_id}/handoff.md"))
+            .bind(node_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+    }
+
+    /// Stores the launch a relaunch starts again from, as the first start of a node stores it.
+    async fn store_first_launch(state: &AppState, node_id: &str) {
+        crate::tree_job::open::save_launch(
+            &state.pool,
+            &crate::tree_job::open::StoredLaunch {
+                node_id: node_id.to_owned(),
+                key: "initial".to_owned(),
+                prompt: "original prompt".to_owned(),
+                project_id: None,
+                cwd: None,
+                mode: "shadow".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    /// The `launch` transitions of a node under exactly `key`.
+    async fn launch_rows(state: &AppState, node_id: &str, key: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tree_transitions WHERE node_id = ? AND transition = 'launch' AND key = ?",
+        )
+        .bind(node_id)
+        .bind(key)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap()
+    }
+
+    fn git_in(dir: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .status()
+            .expect("git should start");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn commit_in(repo: &std::path::Path, file: &str, text: &str, message: &str) {
+        std::fs::write(repo.join(file), text).expect("write");
+        git_in(repo, &["add", "-A"]);
+        git_in(repo, &["commit", "-q", "-m", message]);
+    }
+
+    /// `master`; `feat/sweep` one commit ahead of it; `tree/api` one commit ahead of that. The
+    /// checkout stands on `feat/sweep`, as the driver's fixtures leave it.
+    fn sweep_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+        let container =
+            crate::execution::git_exec::testkit::space_free_tempdir("nucleos-sweep-repo-");
+        let repo = container.path().join("repo");
+        crate::execution::git_exec::testkit::initialize_repo(&repo);
+        git_in(&repo, &["branch", "-M", "master"]);
+        git_in(&repo, &["checkout", "-q", "-b", "feat/sweep"]);
+        commit_in(&repo, "feature.txt", "from the feature\n", "feature");
+        git_in(&repo, &["checkout", "-q", "-b", "tree/api"]);
+        commit_in(&repo, "api.txt", "from the branch\n", "api");
+        git_in(&repo, &["checkout", "-q", "feat/sweep"]);
+        (container, repo)
+    }
+
+    /// A branch node that handed off, whose run then died, is the wrap-up's to start again. No
+    /// other step of the tick launches anything, so the launch row can only come from `wrap::tick`.
+    #[tokio::test]
+    async fn the_sweep_runs_the_wrap_relaunch_for_a_handed_off_branch_node() {
+        let state = runner_state().await;
+        let now = Utc::now();
+        let run = seed_run(&state, "interrupted", now - minutes(5)).await;
+        seed_node(&state, "branch-node", "orchestrator", "running", Some(run)).await;
+        seed_branch_job(
+            &state,
+            "sweep-wrap",
+            None,
+            "C:/Projects/nucleos",
+            "building",
+            Some("branch-node"),
+        )
+        .await;
+        bind_to_job(&state, "branch-node", "sweep-wrap").await;
+        store_first_launch(&state, "branch-node").await;
+        crate::tree_job::node_run::apply(
+            &state.pool,
+            "branch-node",
+            "report",
+            &run.to_string(),
+            "handoff",
+        )
+        .await
+        .unwrap();
+
+        tick(&state, &[], &limits(), now).await.unwrap();
+
+        assert_eq!(
+            launch_rows(&state, "branch-node", &format!("wrap-{run}")).await,
+            1
+        );
+    }
+
+    /// A green branch is merged by the driver, and the sweep has to call it: nothing else in the
+    /// tick queues a merge. The merge request is the branch's `merge_request_id`.
+    #[tokio::test]
+    async fn the_sweep_advances_a_green_branch_through_the_driver() {
+        let state = runner_state().await;
+        let now = Utc::now();
+        let (_container, repo) = sweep_repo();
+        let root = repo.to_string_lossy().into_owned();
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root, integration_branch)
+             VALUES ('alpha', 'active', ?, 'master')",
+        )
+        .bind(root.as_str())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let run = seed_run(&state, "interrupted", now - minutes(5)).await;
+        seed_node(&state, "api-node", "orchestrator", "running", Some(run)).await;
+        seed_branch_job(
+            &state,
+            "sweep-merge",
+            Some("alpha"),
+            &root,
+            "green",
+            Some("api-node"),
+        )
+        .await;
+        bind_to_job(&state, "api-node", "sweep-merge").await;
+        crate::tree_job::node_run::apply(
+            &state.pool,
+            "api-node",
+            "report",
+            &run.to_string(),
+            "done",
+        )
+        .await
+        .unwrap();
+
+        tick(&state, &[], &limits(), now).await.unwrap();
+
+        let job = crate::tree_job::store::load(&state.pool, "sweep-merge")
+            .await
+            .unwrap()
+            .expect("the job is stored");
+        let branch = &job.manifest.branches["api"];
+        assert_eq!(branch.state, "green", "a queued merge is not a merge yet");
+        assert!(
+            branch
+                .extra
+                .get("merge_request_id")
+                .and_then(serde_json::Value::as_i64)
+                .is_some(),
+            "no merge request on the branch: {:?}",
+            branch.extra
+        );
+        let requests: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vcs_requests")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(requests, 1);
+    }
+
+    /// A job whose project has no repository on record cannot be advanced. That must not keep the
+    /// terminal feed from announcing a node that finished in the same tick.
+    #[tokio::test]
+    async fn a_failing_driver_does_not_stop_the_terminal_feed() {
+        let state = state().await;
+        let now = Utc::now();
+        seed_branch_job(&state, "sweep-orphan", Some("ghost"), "C:/nowhere", "green", None).await;
+        seed_closed_node(&state, "n1", "leaf", "done", now - minutes(5)).await;
+
+        tick(&state, &[], &limits(), now).await.unwrap();
+
+        assert_eq!(rows(&state, "node_done", &node_key("n1")).await, 1);
+        let job = crate::tree_job::store::load(&state.pool, "sweep-orphan")
+            .await
+            .unwrap()
+            .expect("the job is stored");
+        assert_eq!(job.manifest.branches["api"].state, "green");
+    }
+
     // ----- terminal states nobody announced -----
 
     #[tokio::test]
