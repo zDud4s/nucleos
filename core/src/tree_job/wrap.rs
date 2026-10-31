@@ -13,7 +13,7 @@ use super::decisions;
 use super::engine::branch_node_may_close;
 use super::model::JOB_TERMINAL_STATE;
 use super::open::{DIED_PREFIX, WRAP_PREFIX, latest_launch, relaunch_node, run_is_live};
-use super::relaunch::{budget_refusal, refusal_question};
+use super::relaunch::{budget_refusal, refusal_question, successor_key};
 use super::store;
 
 /// Nodes one tick acts on, oldest first; nodes it leaves alone do not count.
@@ -220,6 +220,10 @@ async fn relaunch_or_stop(
                 .map_err(|e| e.to_string())?;
             return Ok(true);
         }
+        // The boot relaunch may have claimed this dead run first: its key is then ours too.
+        let key = successor_key(pool, node_id, dead_run, &key)
+            .await
+            .map_err(|e| e.to_string())?;
         relaunch_node(state, node_id, dead_run, &key, suffix.as_deref()).await?;
         return Ok(true);
     }

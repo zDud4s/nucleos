@@ -104,6 +104,16 @@ pub trait TreeLauncher: Send + Sync {
 pub trait SpecPreparer: Send + Sync {
     async fn extract(&self, spec_id: &str) -> Result<(), String>;
     async fn audit(&self, spec_id: &str, lineage: &SpecLineage) -> Result<AuditReport, String>;
+
+    /// `audit`, before any tree exists: a doubt here means the work was not started, so no owner
+    /// question is raised.
+    async fn audit_before_tree(
+        &self,
+        spec_id: &str,
+        lineage: &SpecLineage,
+    ) -> Result<AuditReport, String> {
+        self.audit(spec_id, lineage).await
+    }
 }
 
 pub struct FinishDeps<'a> {
@@ -356,11 +366,22 @@ async fn prepare(
     let lineage = lineage_for(pool, &spec.id, &[]).await?;
     // An audit that cannot run is not a verdict: the spec still gets its tree, and the audit after
     // the tree decides.
-    Ok(match preparer.audit(&spec.id, &lineage).await {
+    Ok(match preparer.audit_before_tree(&spec.id, &lineage).await {
         Ok(report) if report.status == SpecStatus::Done && report.verdict == Verdict::Done => {
             Prepared::Done
         }
-        _ => Prepared::Ready,
+        Ok(_) => Prepared::Ready,
+        Err(reason) => {
+            // Said once in the feed, so a spec that went to its tree unaudited is not silent.
+            let summary = format!(
+                "the audit before the tree could not run for {}: {reason}",
+                extracted.path
+            );
+            tracing::warn!(spec = %spec.id, %reason, "audit before the tree could not run");
+            let _ = crate::feed::append(pool, None, "spec_audit_unavailable", &summary, None, None)
+                .await;
+            Prepared::Ready
+        }
     })
 }
 

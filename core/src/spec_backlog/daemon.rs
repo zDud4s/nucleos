@@ -241,6 +241,26 @@ impl SpecPreparer for DaemonPreparer<'_> {
     }
 
     async fn audit(&self, spec_id: &str, lineage: &SpecLineage) -> Result<AuditReport, String> {
+        self.audit_with(spec_id, lineage, false).await
+    }
+
+    async fn audit_before_tree(
+        &self,
+        spec_id: &str,
+        lineage: &SpecLineage,
+    ) -> Result<AuditReport, String> {
+        self.audit_with(spec_id, lineage, true).await
+    }
+}
+
+impl DaemonPreparer<'_> {
+    /// The audit both entry points share; `before_tree` raises no owner question.
+    async fn audit_with(
+        &self,
+        spec_id: &str,
+        lineage: &SpecLineage,
+        before_tree: bool,
+    ) -> Result<AuditReport, String> {
         let cwd = self.project_root.to_string_lossy().into_owned();
         let spec = store::get_spec(&self.state.pool, spec_id)
             .await
@@ -257,16 +277,13 @@ impl SpecPreparer for DaemonPreparer<'_> {
             worktree: worktree.clone(),
             caller_id: crate::tree_job::landing::scope_caller_id(spec_id),
         };
-        audit::audit(
-            &self.state.pool,
-            spec_id,
-            &worktree,
-            lineage,
-            &reviewer,
-            &verify,
-        )
-        .await
-        .map_err(|error| format!("{error:?}"))
+        let pool = &self.state.pool;
+        let report = if before_tree {
+            audit::audit_before_tree(pool, spec_id, &worktree, lineage, &reviewer, &verify).await
+        } else {
+            audit::audit(pool, spec_id, &worktree, lineage, &reviewer, &verify).await
+        };
+        report.map_err(|error| format!("{error:?}"))
     }
 }
 
@@ -313,6 +330,13 @@ impl DaemonLauncher<'_> {
     }
 }
 
+/// Marks the spec's tree as launched once the daemon has accepted it, before the wait for its end.
+async fn accepted(pool: &SqlitePool, request: &TreeRequest) -> Result<(), String> {
+    store::set_tree_launched(pool, &request.spec_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
 #[async_trait::async_trait]
 impl TreeLauncher for DaemonLauncher<'_> {
     async fn run_tree(&self, request: &TreeRequest) -> Result<TreeOutcome, String> {
@@ -345,6 +369,8 @@ impl TreeLauncher for DaemonLauncher<'_> {
                 String::from_utf8_lossy(&bytes)
             ));
         }
+        // The tree exists from here on: record it now, so a restart mid-tree is not read as "never launched".
+        accepted(&self.state.pool, request).await?;
         self.wait_for_job(&request.id).await
     }
 

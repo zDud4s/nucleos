@@ -160,6 +160,34 @@ async fn note_skipped(pool: &SqlitePool, relaunched: &mut Relaunched, node: &str
     relaunched.skipped.push((node.to_owned(), reason));
 }
 
+/// The launch key of the run that succeeds `dead_run` on `node_id`. The first caller's `proposed` wins, atomically; every
+/// later caller gets it back, so racing paths share one key and `launch` starts one run.
+pub(super) async fn successor_key(
+    pool: &SqlitePool,
+    node_id: &str,
+    dead_run: &str,
+    proposed: &str,
+) -> Result<String, sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO tree_transitions (node_id, transition, key, result, created_at)
+         VALUES (?, 'successor', ?, ?, ?)
+         ON CONFLICT (node_id, transition, key) DO NOTHING",
+    )
+    .bind(node_id)
+    .bind(dead_run)
+    .bind(proposed)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(pool)
+    .await?;
+    sqlx::query_scalar(
+        "SELECT result FROM tree_transitions WHERE node_id = ? AND transition = 'successor' AND key = ?",
+    )
+    .bind(node_id)
+    .bind(dead_run)
+    .fetch_one(pool)
+    .await
+}
+
 pub(super) async fn run_is_live(pool: &SqlitePool, run_id: &str) -> Result<bool, sqlx::Error> {
     let Ok(run_number) = run_id.parse::<i64>() else {
         return Ok(false);
@@ -325,7 +353,15 @@ pub async fn relaunch_resumed(state: &AppState, resumed: &store::Resumed) -> Rel
                 note_skipped(pool, &mut relaunched, &node, reason).await;
                 continue;
             }
-            let key = format!("{RESUME_PREFIX}{run_id}");
+            let proposed = format!("{RESUME_PREFIX}{run_id}");
+            // The sweep may have claimed this dead run first: its key is then ours too.
+            let key = match successor_key(pool, &node, &run_id, &proposed).await {
+                Ok(key) => key,
+                Err(error) => {
+                    note_skipped(pool, &mut relaunched, &node, error.to_string()).await;
+                    continue;
+                }
+            };
             match relaunch_node(state, &node, &run_id, &key, None).await {
                 Ok(new_run) => {
                     handled.insert(node.clone());

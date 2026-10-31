@@ -141,6 +141,31 @@ pub async fn audit(
     reviewer: &dyn ReviewerRunner,
     verify: &dyn VerifyRunner,
 ) -> Result<AuditReport, AuditError> {
+    audit_with(pool, spec_id, worktree, lineage, reviewer, verify, true).await
+}
+
+/// `audit`, before any tree exists: criteria are reviewed and a Done verdict counts, but a doubt here means the
+/// work was not started, so no owner question is raised or settled.
+pub async fn audit_before_tree(
+    pool: &SqlitePool,
+    spec_id: &str,
+    worktree: &Path,
+    lineage: &SpecLineage,
+    reviewer: &dyn ReviewerRunner,
+    verify: &dyn VerifyRunner,
+) -> Result<AuditReport, AuditError> {
+    audit_with(pool, spec_id, worktree, lineage, reviewer, verify, false).await
+}
+
+async fn audit_with(
+    pool: &SqlitePool,
+    spec_id: &str,
+    worktree: &Path,
+    lineage: &SpecLineage,
+    reviewer: &dyn ReviewerRunner,
+    verify: &dyn VerifyRunner,
+    raise_questions: bool,
+) -> Result<AuditReport, AuditError> {
     let spec = store::get_spec(pool, spec_id)
         .await?
         .ok_or_else(|| AuditError::NotFound(spec_id.to_owned()))?;
@@ -223,7 +248,9 @@ pub async fn audit(
             doubts.push(format!("{DOUBT_QUESTION_PREFIX}{}", criterion.text));
         }
     }
-    store::settle_questions(pool, spec_id, DOUBT_QUESTION_PREFIX, &doubts).await?;
+    if raise_questions {
+        store::settle_questions(pool, spec_id, DOUBT_QUESTION_PREFIX, &doubts).await?;
+    }
     let reviewed = store::list_criteria(pool, spec_id).await?;
     let verify_state = verify.verify(&spec, &reviewed).await;
     let existing_evidence = reviewed
