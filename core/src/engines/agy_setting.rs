@@ -119,6 +119,6 @@ mod tests {
         assert!(WARNING.contains("Terms"));
         assert!(WARNING.contains("suspended"));
         assert!(WARNING.contains("not supported"));
-        assert!(WARNING_VERSION >= 1);
+        const { assert!(WARNING_VERSION >= 1) };
     }
 }

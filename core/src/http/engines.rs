@@ -193,6 +193,7 @@ mod tests {
         assert_eq!(stored(&state).await["body"]["enabled"], false);
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn get_engines_agy_returns_warning_text_and_installed() {
         // The probe resolves `NUCLEOS_AGY_BIN` first, as given, so the answer does not depend on the
