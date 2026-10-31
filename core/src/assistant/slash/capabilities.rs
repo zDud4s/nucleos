@@ -21,10 +21,19 @@ impl ChatEngine {
     /// The name the refusal text and the cards use.
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Claude => "claude",
-            Self::Codex => "codex",
-            Self::Local => "local",
+            Self::Claude => crate::engines::CLAUDE,
+            Self::Codex => crate::engines::CODEX,
+            Self::Local => crate::engines::LOCAL,
+            // Not an engine row: OpenRouter is a hosted brain, not a launchable engine.
             Self::OpenRouter => "openrouter",
+        }
+    }
+
+    /// The chat engine of a CLI runner string; unknown strings collapse to claude.
+    fn of_cli(cli: &str) -> Self {
+        match crate::engines::runner_id_in(crate::engines::TABLE, cli) {
+            crate::engines::CODEX => Self::Codex,
+            _ => Self::Claude,
         }
     }
 }
@@ -58,13 +67,7 @@ pub fn engine_of(config: &ModelsConfig, brain: Brain, model: Option<&str>) -> Ch
     match brain {
         Brain::Local => ChatEngine::Local,
         Brain::OpenRouter => ChatEngine::OpenRouter,
-        Brain::Cloud => {
-            if crate::assistant::answering_cli(config, model) == "codex" {
-                ChatEngine::Codex
-            } else {
-                ChatEngine::Claude
-            }
-        }
+        Brain::Cloud => ChatEngine::of_cli(crate::assistant::answering_cli(config, model)),
     }
 }
 

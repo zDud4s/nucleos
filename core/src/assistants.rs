@@ -437,13 +437,15 @@ impl Assistants for ConfiguredAssistants {
         cli: &str,
         pinned: Option<&str>,
     ) -> Option<std::sync::Arc<dyn crate::execution::runner::CommandRunner>> {
-        match cli {
-            "codex" => self.codex_model.as_ref().map(|configured| {
+        // Only CLI rows of the engine table are runners here; `local` and unknown names get none.
+        let row = crate::engines::cli_row_in(crate::engines::TABLE, cli)?;
+        match row.id {
+            crate::engines::CODEX => self.codex_model.as_ref().map(|configured| {
                 std::sync::Arc::new(crate::execution::runner::CodexCliRunner::for_chat(
                     pinned.unwrap_or(configured).to_string(),
                 )) as std::sync::Arc<dyn crate::execution::runner::CommandRunner>
             }),
-            "claude" => self.claude_cli.clone(),
+            crate::engines::CLAUDE => self.claude_cli.clone(),
             _ => None,
         }
     }

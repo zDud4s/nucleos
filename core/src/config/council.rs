@@ -76,11 +76,18 @@ impl SeatKind {
 /// nomenclatures for overlapping facts, and the divergence is deliberate — renaming the council's
 /// columns to match would touch a shipped table to change no behaviour. What is NOT acceptable is
 /// two translations, so there is one, here, walked in both directions by a test.
-pub const ENGINE_SEAT_KINDS: &[(&str, SeatKind)] = &[
-    ("claude", SeatKind::Cloud),
-    ("codex", SeatKind::Cloud),
-    ("local", SeatKind::Local),
-];
+///
+/// Derived from `engines::TABLE` at compile time, so a new engine row appears here by itself.
+pub const ENGINE_SEAT_KINDS: &[(&str, SeatKind)] = &{
+    let table = crate::engines::TABLE;
+    let mut out = [("", SeatKind::Cloud); crate::engines::TABLE.len()];
+    let mut index = 0;
+    while index < table.len() {
+        out[index] = (table[index].id, table[index].seat_kind);
+        index += 1;
+    }
+    out
+};
 
 /// PURE: where an agent of the catalogue would run, or `None` for an engine no seat can host.
 pub fn seat_kind_for_engine(engine: &str) -> Option<SeatKind> {

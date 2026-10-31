@@ -120,35 +120,17 @@ pub fn front(
 
 /// Which engines' CLIs are installed on this machine, by resolving their programs (nothing is run).
 pub fn installed_engines() -> Vec<RunnerKind> {
-    [RunnerKind::Claude, RunnerKind::Codex]
+    crate::engines::installed_in(crate::engines::TABLE)
         .into_iter()
-        .filter(|kind| match kind {
-            RunnerKind::Claude => {
-                let configured =
-                    std::env::var_os("NUCLEOS_CLAUDE_BIN").unwrap_or_else(|| "claude".into());
-                crate::health::resolve_program(&configured).is_some()
-            }
-            RunnerKind::Codex => crate::execution::runner::codex_program().is_some(),
-        })
+        .filter_map(RunnerKind::parse)
         .collect()
 }
 
 /// The runner a kind launches, built from the models file as `main.rs` builds the primary.
 fn engine_runner(models: &crate::config::ModelsConfig, kind: RunnerKind) -> Arc<dyn CommandRunner> {
-    match kind {
-        RunnerKind::Claude => Arc::new(crate::execution::runner::ClaudeCliRunner {
-            model: models.claude_model.clone(),
-            plan_model: models.plan_model.clone(),
-            review_model: models.review_model.clone(),
-            resolve_model: models.resolve_model.clone(),
-            resolve_effort: models.resolve_effort.clone(),
-        }),
-        RunnerKind::Codex => Arc::new(crate::execution::runner::CodexCliRunner {
-            model: models.codex_model.clone(),
-            sandbox_mode: None,
-            web_search: None,
-        }),
-    }
+    crate::engines::find_in(crate::engines::TABLE, kind.as_str())
+        .and_then(|row| (row.runner)(models))
+        .unwrap_or_else(|| crate::engines::claude_runner(models))
 }
 
 /// `front` with the installed engines given, so a test does not depend on this machine's PATH.

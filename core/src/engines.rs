@@ -1,7 +1,174 @@
 //! The engine description table (contract A1): one row per engine, plain data plus lookups.
 //!
-//! RED stage: only the tests exist. The table, `EngineDescription`, `Transport` and the `*_in`
-//! lookups (each takes the table as an argument, contract E3) are still to be written.
+//! `TABLE` lists Claude, Codex and Local. The `*_in` lookups take the table as an argument
+//! (contract E3), so a test can append a fourth row without any production registration path;
+//! production code passes `TABLE`.
+//!
+//! The vocabularies that used to repeat these facts (`capabilities::Engine`, `RunnerKind`,
+//! `ChatEngine`, `ENGINE_SEAT_KINDS`, the runner and utility-default lookups) read from here.
+//! What stays engine-specific (capability walls in `translate`, Codex flags) lives beside its
+//! engine, not in a row.
+
+use std::sync::Arc;
+
+use crate::config::{ModelsConfig, SeatKind};
+use crate::execution::runner::CommandRunner;
+use crate::models::model_catalog::Discovered;
+
+/// Engine ids, named once so the enums that mirror the table can match on them.
+pub const CLAUDE: &str = "claude";
+pub const CODEX: &str = "codex";
+pub const LOCAL: &str = "local";
+
+/// How an engine is reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    /// A CLI process the daemon launches.
+    Cli,
+    /// An HTTP endpoint.
+    Http,
+}
+
+/// One engine: plain data plus the three hooks that differ per engine.
+#[derive(Clone)]
+pub struct EngineDescription {
+    pub id: &'static str,
+    pub display_name: &'static str,
+    pub seat_kind: SeatKind,
+    pub transport: Transport,
+    /// Whether the engine is usable on this machine (nothing is run).
+    pub installed: fn() -> bool,
+    /// The cheap model a background one-shot asks this engine for, among the models known now.
+    pub utility_default: fn(&[Discovered]) -> Option<String>,
+    /// The runner this engine launches, built from the models file; `None` when it has no CLI runner.
+    pub runner: fn(&ModelsConfig) -> Option<Arc<dyn CommandRunner>>,
+}
+
+/// Whether the Claude CLI resolves on this machine.
+fn claude_installed() -> bool {
+    let configured = std::env::var_os("NUCLEOS_CLAUDE_BIN").unwrap_or_else(|| "claude".into());
+    crate::health::resolve_program(&configured).is_some()
+}
+
+/// Whether the Codex CLI resolves on this machine.
+fn codex_installed() -> bool {
+    crate::execution::runner::codex_program().is_some()
+}
+
+/// The local model needs no binary of its own.
+fn local_installed() -> bool {
+    true
+}
+
+/// The Claude runner, built from the models file as `main.rs` builds the primary.
+pub(crate) fn claude_runner(models: &ModelsConfig) -> Arc<dyn CommandRunner> {
+    Arc::new(crate::execution::runner::ClaudeCliRunner {
+        model: models.claude_model.clone(),
+        plan_model: models.plan_model.clone(),
+        review_model: models.review_model.clone(),
+        resolve_model: models.resolve_model.clone(),
+        resolve_effort: models.resolve_effort.clone(),
+    })
+}
+
+/// The Codex runner, built from the models file as `main.rs` builds the primary.
+pub(crate) fn codex_runner(models: &ModelsConfig) -> Arc<dyn CommandRunner> {
+    Arc::new(crate::execution::runner::CodexCliRunner {
+        model: models.codex_model.clone(),
+        sandbox_mode: None,
+        web_search: None,
+    })
+}
+
+fn claude_row_runner(models: &ModelsConfig) -> Option<Arc<dyn CommandRunner>> {
+    Some(claude_runner(models))
+}
+
+fn codex_row_runner(models: &ModelsConfig) -> Option<Arc<dyn CommandRunner>> {
+    Some(codex_runner(models))
+}
+
+fn local_runner(_models: &ModelsConfig) -> Option<Arc<dyn CommandRunner>> {
+    None
+}
+
+fn local_utility_default(_known: &[Discovered]) -> Option<String> {
+    None
+}
+
+/// The production table, in the order every derived list shows.
+pub const TABLE: &[EngineDescription] = &[
+    EngineDescription {
+        id: CLAUDE,
+        display_name: "Claude",
+        seat_kind: SeatKind::Cloud,
+        transport: Transport::Cli,
+        installed: claude_installed,
+        utility_default: crate::models::model_catalog::claude_utility_default,
+        runner: claude_row_runner,
+    },
+    EngineDescription {
+        id: CODEX,
+        display_name: "Codex",
+        seat_kind: SeatKind::Cloud,
+        transport: Transport::Cli,
+        installed: codex_installed,
+        utility_default: crate::models::model_catalog::codex_utility_default,
+        runner: codex_row_runner,
+    },
+    EngineDescription {
+        id: LOCAL,
+        display_name: "Local",
+        seat_kind: SeatKind::Local,
+        transport: Transport::Http,
+        installed: local_installed,
+        utility_default: local_utility_default,
+        runner: local_runner,
+    },
+];
+
+/// The row with this id.
+pub fn find_in<'a>(table: &'a [EngineDescription], id: &str) -> Option<&'a EngineDescription> {
+    table.iter().find(|row| row.id == id)
+}
+
+/// The row with this id when it is a CLI runner.
+pub fn cli_row_in<'a>(table: &'a [EngineDescription], id: &str) -> Option<&'a EngineDescription> {
+    find_in(table, id).filter(|row| row.transport == Transport::Cli)
+}
+
+/// `(id, seat kind)` per row, in table order.
+pub fn seat_kinds_in(table: &[EngineDescription]) -> Vec<(&'static str, SeatKind)> {
+    table.iter().map(|row| (row.id, row.seat_kind)).collect()
+}
+
+/// The ids of the rows reached through `transport`.
+pub fn ids_with_transport_in(table: &[EngineDescription], transport: Transport) -> Vec<&'static str> {
+    table
+        .iter()
+        .filter(|row| row.transport == transport)
+        .map(|row| row.id)
+        .collect()
+}
+
+/// The ids of the rows whose probe says they are usable here.
+pub fn installed_in(table: &[EngineDescription]) -> Vec<&'static str> {
+    table
+        .iter()
+        .filter(|row| (row.installed)())
+        .map(|row| row.id)
+        .collect()
+}
+
+/// The ids a conversation can name as its engine.
+pub fn chat_ids_in(table: &[EngineDescription]) -> Vec<&'static str> {
+    table.iter().map(|row| row.id).collect()
+}
+
+/// The CLI runner a string names. Unknown, empty or non-CLI ids collapse to claude.
+pub fn runner_id_in(table: &[EngineDescription], id: &str) -> &'static str {
+    cli_row_in(table, id).map_or(CLAUDE, |row| row.id)
+}
 
 #[cfg(test)]
 mod tests {
