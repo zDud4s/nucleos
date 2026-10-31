@@ -29,6 +29,7 @@ use crate::tree_job::docs_paths::is_allowed_docs_path;
 use crate::tree_job::engine::{apply_transition, overlapping_branch};
 use crate::tree_job::model::{BRANCH_STATES, Branch, JOB_TERMINAL_STATE, Manifest};
 use crate::tree_job::node_run::{self, NodeRunError};
+use crate::tree_job::root::ROOT_BRANCH;
 use crate::tree_job::store::{self, StoreError, TreeJob, launch_recovering};
 use crate::work_nodes::{self, NodeError, NodeLimits, OpenArgs};
 
@@ -149,7 +150,8 @@ fn live_code_branches(manifest: &Manifest) -> impl Iterator<Item = &Branch> {
 
 /// Decides whether a new branch of `layer` may start. Growth first: every live code branch will
 /// still grow to its layer's cost, so what it has yet to take is subtracted from the free disk
-/// (an absent size counts as 0). Then the cap on live branches, then [`check_admission`].
+/// (an absent size counts as 0). Then the cap on live branches, then [`check_admission`]. The root
+/// branch only plans and delegates, so it is charged no growth, though it still takes a slot.
 pub fn branch_admission(
     book: &AdmissionBook,
     manifest: &Manifest,
@@ -163,6 +165,7 @@ pub fn branch_admission(
         return check_admission(book, manifest, layer, free_disk_gb, floor_gb);
     }
     let growth_gb: f64 = live_code_branches(manifest)
+        .filter(|branch| branch.name != ROOT_BRANCH)
         .map(|branch| {
             let size = live_sizes_gb.get(&branch.name).copied().unwrap_or(0.0);
             (layer_cost_gb(manifest, &branch.layer) - size).max(0.0)

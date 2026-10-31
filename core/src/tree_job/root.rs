@@ -8,7 +8,7 @@ use super::store::{self, TreeJob};
 use crate::state::AppState;
 
 /// The manifest name of the root's branch. The worktree is `<root>/.claude/worktrees/<id>-root`.
-const ROOT_BRANCH: &str = "root";
+pub(super) const ROOT_BRANCH: &str = "root";
 
 /// What the root run is told besides the goal. It must stay true to the tools and to what
 /// `close_node` accepts: the daemon reads the report from the file at `handoff_path` (the MCP tool
