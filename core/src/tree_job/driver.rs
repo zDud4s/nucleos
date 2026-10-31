@@ -1212,6 +1212,44 @@ mod tests {
             assert_eq!(stored.state, "open");
             assert_eq!(self.requests().await, 0, "nothing was queued");
         }
+
+        /// The questions of the open decisions the job asked about `node`.
+        async fn open_questions(&self, job: &str, node: &str) -> Vec<String> {
+            sqlx::query_scalar(
+                "SELECT question FROM decisions WHERE tree_id = ? AND node_id = ? AND status = ?",
+            )
+            .bind(job)
+            .bind(node)
+            .bind(decisions::STATUS_OPEN)
+            .fetch_all(&self.state.pool)
+            .await
+            .unwrap()
+        }
+
+        /// Gives the job's tree a limit of `limit` dollars and charges `spent` dollars to the
+        /// node's current run, so the tree's budget refuses its next node.
+        async fn exhaust_budget(&self, job: &str, node: &str, limit: f64, spent: f64) {
+            sqlx::query(
+                "INSERT INTO tree_budgets (tree_id, limit_usd, soft_pct, created_at, updated_at) \
+                 VALUES (?, ?, 80.0, ?, ?)",
+            )
+            .bind(root_node_of(job))
+            .bind(limit)
+            .bind(STAMP)
+            .bind(STAMP)
+            .execute(&self.state.pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "UPDATE runs SET cost_usd = ? \
+                 WHERE id = (SELECT CAST(run_id AS INTEGER) FROM work_nodes WHERE id = ?)",
+            )
+            .bind(spent)
+            .bind(node)
+            .execute(&self.state.pool)
+            .await
+            .unwrap();
+        }
     }
 
     // ---- the merge path --------------------------------------------------------------------------
@@ -1794,5 +1832,178 @@ mod tests {
         assert_eq!(gate.calls(), vec![(FULL.to_owned(), "root".to_owned())]);
         fx.wait_branch_state(FULL, "root", "green").await;
         assert_ne!(fx.branch(FULL, "root").await.state, "dropped");
+    }
+
+    // ---- a report that is not `done` ---------------------------------------------------------------
+
+    /// A job with one branch `api` at work behind `api-node`, whose run ended with `outcome`.
+    async fn job_whose_branch_reported(fx: &Fixture, job: &str, outcome: &str) {
+        fx.seed_job(job, vec![code_branch("api", "building", Some("api-node"))], None)
+            .await;
+        fx.add_node(job, "api-node", "orchestrator").await;
+        fx.save_launch("api-node").await;
+        fx.run_ended("api-node", Some(outcome)).await;
+    }
+
+    #[tokio::test]
+    async fn a_branch_reporting_blocked_parks_and_asks_the_owner() {
+        const JOB: &str = "drv-blocked";
+        let fx = Fixture::new().await;
+        job_whose_branch_reported(&fx, JOB, "blocked").await;
+        let gate = FakeGate::answering(vec![]);
+
+        fx.tick(JOB, &gate).await;
+
+        let asked = fx.open_questions(JOB, "api-node").await;
+        assert_eq!(asked.len(), 1, "the owner is asked once: {asked:?}");
+        assert!(asked[0].to_lowercase().contains("blocked"), "{:?}", asked[0]);
+        assert_eq!(fx.branch(JOB, "api").await.state, "parked");
+        assert!(gate.calls().is_empty(), "a blocked branch is not gated");
+    }
+
+    #[tokio::test]
+    async fn a_branch_reporting_failed_parks_and_asks_the_owner() {
+        const JOB: &str = "drv-failed";
+        let fx = Fixture::new().await;
+        job_whose_branch_reported(&fx, JOB, "failed").await;
+        let gate = FakeGate::answering(vec![]);
+
+        fx.tick(JOB, &gate).await;
+
+        let asked = fx.open_questions(JOB, "api-node").await;
+        assert_eq!(asked.len(), 1, "the owner is asked once: {asked:?}");
+        assert!(asked[0].to_lowercase().contains("failed"), "{:?}", asked[0]);
+        assert_eq!(fx.branch(JOB, "api").await.state, "parked");
+        assert!(gate.calls().is_empty(), "a failed branch is not gated");
+    }
+
+    #[tokio::test]
+    async fn a_blocked_branch_parks_once_across_ticks() {
+        const JOB: &str = "drv-blocked-once";
+        let fx = Fixture::new().await;
+        job_whose_branch_reported(&fx, JOB, "blocked").await;
+        let gate = FakeGate::answering(vec![]);
+
+        for _ in 0..3 {
+            fx.tick(JOB, &gate).await;
+        }
+
+        // The first tick must have parked it; the later ones must add nothing.
+        assert_eq!(fx.branch(JOB, "api").await.state, "parked");
+        assert_eq!(fx.open_questions(JOB, "api-node").await.len(), 1);
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM decisions")
+            .fetch_one(&fx.state.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1, "repeated ticks asked nothing more");
+    }
+
+    /// Guard: passes today and must keep passing. A run that is still live has not stopped, so its
+    /// report is not yet the node's last word.
+    #[tokio::test]
+    async fn a_blocked_branch_whose_run_is_still_live_does_not_park() {
+        const JOB: &str = "drv-blocked-live";
+        let fx = Fixture::new().await;
+        fx.seed_job(
+            JOB,
+            vec![code_branch("api", "building", Some("api-node"))],
+            None,
+        )
+        .await;
+        fx.add_node(JOB, "api-node", "orchestrator").await;
+        fx.run_with("api-node", "running", Some("blocked")).await;
+        let gate = FakeGate::answering(vec![]);
+
+        fx.tick(JOB, &gate).await;
+        fx.tick(JOB, &gate).await;
+
+        assert_eq!(fx.branch(JOB, "api").await.state, "building");
+        assert!(fx.open_questions(JOB, "api-node").await.is_empty());
+    }
+
+    /// The job's root tops no branch, so there is nothing for `decisions::park` to park: GREEN has
+    /// to give the root another way to ask. What the owner needs is pinned instead: one open
+    /// decision of this job, and the job neither finished nor landing.
+    #[tokio::test]
+    async fn a_root_reporting_blocked_parks_and_asks_the_owner() {
+        const JOB: &str = "drv-root-blocked";
+        let fx = Fixture::new().await;
+        fx.seed_job(JOB, vec![merged_branch("api", None)], Some("integration"))
+            .await;
+        fx.run_ended(&root_node_of(JOB), Some("blocked")).await;
+        let gate = FakeGate::answering(vec![]);
+
+        fx.tick(JOB, &gate).await;
+        fx.tick(JOB, &gate).await;
+
+        let asked = fx.open_questions(JOB, &root_node_of(JOB)).await;
+        assert_eq!(asked.len(), 1, "the owner is asked once: {asked:?}");
+        assert!(asked[0].to_lowercase().contains("blocked"), "{:?}", asked[0]);
+        fx.assert_not_landing(JOB).await;
+        assert_eq!(fx.job(JOB).await.state, "open", "the job is not finished");
+    }
+
+    #[tokio::test]
+    async fn an_answered_blocked_branch_is_not_parked_again_while_its_new_run_lives() {
+        const JOB: &str = "drv-blocked-answered";
+        let fx = Fixture::new().await;
+        job_whose_branch_reported(&fx, JOB, "blocked").await;
+        let gate = FakeGate::answering(vec![]);
+        fx.tick(JOB, &gate).await;
+        let asked = fx.open_questions(JOB, "api-node").await;
+        assert_eq!(asked.len(), 1, "the branch parked on the first tick");
+        let decision: String = sqlx::query_scalar("SELECT id FROM decisions WHERE node_id = ?")
+            .bind("api-node")
+            .fetch_one(&fx.state.pool)
+            .await
+            .unwrap();
+
+        let answered = open::answer_and_relaunch(&fx.state, &decision, "go ahead", "shell")
+            .await
+            .unwrap();
+        let new_run = answered.relaunched.expect("the answer relaunched the node");
+        // The new run is live: it has not reported, and the old `blocked` belongs to the old run.
+        sqlx::query("UPDATE runs SET status = 'running' WHERE id = ?")
+            .bind(new_run)
+            .execute(&fx.state.pool)
+            .await
+            .unwrap();
+        fx.tick(JOB, &gate).await;
+        fx.tick(JOB, &gate).await;
+
+        assert_eq!(fx.branch(JOB, "api").await.state, "building");
+        assert!(fx.open_questions(JOB, "api-node").await.is_empty());
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM decisions")
+            .fetch_one(&fx.state.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1, "the old report asked nothing a second time");
+    }
+
+    // ---- the tree budget ---------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_red_gate_at_the_budget_limit_parks_instead_of_relaunching() {
+        const JOB: &str = "drv-fix-budget";
+        const NODE: &str = "api-node";
+        let fx = Fixture::new().await;
+        fx.seed_job(JOB, vec![code_branch("api", "red", Some(NODE))], None)
+            .await;
+        fx.add_node(JOB, NODE, "orchestrator").await;
+        fx.run_ended(NODE, Some("done")).await;
+        fx.save_launch(NODE).await;
+        fx.exhaust_budget(JOB, NODE, 1.0, 5.0).await;
+        let run_before = fx.current_run(NODE).await;
+        let gate = FakeGate::answering(vec![]);
+
+        fx.tick(JOB, &gate).await;
+        fx.tick(JOB, &gate).await;
+
+        assert_eq!(fx.launches(NODE, "fix-").await, 0, "no paid run was started");
+        assert_eq!(fx.current_run(NODE).await, run_before);
+        assert_eq!(fx.branch(JOB, "api").await.state, "parked");
+        let asked = fx.open_questions(JOB, NODE).await;
+        assert_eq!(asked.len(), 1, "the owner is told once: {asked:?}");
+        assert!(asked[0].to_lowercase().contains("budget"), "{:?}", asked[0]);
     }
 }

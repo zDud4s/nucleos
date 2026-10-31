@@ -239,6 +239,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::tree_job::decisions;
     use crate::tree_job::model::{Branch, Manifest};
     use crate::tree_job::node_run;
     use crate::tree_job::open::{self, StoredLaunch};
@@ -681,5 +682,126 @@ mod tests {
             Permission::Plan,
             "a relaunch that plans only ends again and burns the chain's cap"
         );
+    }
+
+    // ---- the tree budget ---------------------------------------------------------------------------
+
+    /// Gives the tree (root `wrap-root`) a limit of one dollar and charges five to run `run_id`.
+    async fn exhaust_budget(state: &AppState, run_id: i64) {
+        sqlx::query(
+            "INSERT INTO tree_budgets (tree_id, limit_usd, soft_pct, created_at, updated_at) \
+             VALUES ('wrap-root', 1.0, 80.0, ?, ?)",
+        )
+        .bind(CREATED)
+        .bind(CREATED)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE runs SET cost_usd = 5.0 WHERE id = ?")
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+    }
+
+    /// The branch's state and the questions of its open decisions.
+    async fn parked_and_asked(state: &AppState) -> (String, Vec<String>) {
+        let branch = store::load(&state.pool, JOB).await.unwrap().unwrap().manifest.branches
+            ["branch"]
+            .state
+            .clone();
+        let asked = sqlx::query_scalar(
+            "SELECT question FROM decisions WHERE node_id = ? AND status = ?",
+        )
+        .bind(NODE)
+        .bind(decisions::STATUS_OPEN)
+        .fetch_all(&state.pool)
+        .await
+        .unwrap();
+        (branch, asked)
+    }
+
+    #[tokio::test]
+    async fn wrap_does_not_relaunch_a_silent_node_past_the_budget() {
+        let state = state().await;
+        seed_node(&state, Some("building"), "open", NODE, Some(51)).await;
+        seed_run(&state, 51, "interrupted").await;
+        seed_launch(&state, NODE).await;
+        report(&state, NODE, 51, "handoff").await;
+        exhaust_budget(&state, 51).await;
+
+        tick(&state).await;
+        tick(&state).await;
+
+        assert_eq!(launches(&state, NODE, "wrap-").await, 0, "no paid run was started");
+        let (branch, asked) = parked_and_asked(&state).await;
+        assert_eq!(branch, "parked");
+        assert_eq!(asked.len(), 1, "the owner is told once: {asked:?}");
+        assert!(asked[0].to_lowercase().contains("budget"), "{:?}", asked[0]);
+    }
+
+    #[tokio::test]
+    async fn a_dead_node_is_not_relaunched_past_the_budget() {
+        let state = state().await;
+        seed_node(&state, Some("building"), "open", NODE, Some(52)).await;
+        seed_run(&state, 52, "interrupted").await;
+        seed_launch(&state, NODE).await;
+        exhaust_budget(&state, 52).await;
+
+        tick(&state).await;
+        tick(&state).await;
+
+        assert_eq!(launches(&state, NODE, "died-").await, 0, "no paid run was started");
+        let (branch, asked) = parked_and_asked(&state).await;
+        assert_eq!(branch, "parked");
+        assert_eq!(asked.len(), 1, "the owner is told once: {asked:?}");
+        assert!(asked[0].to_lowercase().contains("budget"), "{:?}", asked[0]);
+    }
+
+    // ---- the boot race -----------------------------------------------------------------------------
+
+    /// The first sweep tick fires as `relaunch_resumed` is spawned, so both see a spared node whose
+    /// run is dead and neither takes a lock (keys `died-<run>` and `resume-<run>` differ). `tick`
+    /// lists its rows once and then acts on that snapshot, so a node `relaunch_resumed` started in
+    /// between is relaunched a second time: its fresh run is orphaned, still live and paid for.
+    /// The race is replayed deterministically by handing `wrap_node` the run id it listed before.
+    #[tokio::test]
+    async fn a_dead_node_at_boot_is_relaunched_once() {
+        // The boot relaunch wins, then a sweep that listed the node earlier acts on the old run.
+        let stale = state().await;
+        seed_node(&stale, Some("building"), "open", NODE, Some(53)).await;
+        seed_run(&stale, 53, "interrupted").await;
+        seed_launch(&stale, NODE).await;
+        let boot = crate::tree_job::store::Resumed {
+            jobs: vec![JOB.to_owned()],
+            ..Default::default()
+        };
+        open::relaunch_resumed(&stale, &boot).await;
+        let listed_before = Some("53".to_owned());
+        wrap_node(&stale, NODE, JOB, listed_before, None).await.unwrap();
+        assert_eq!(all_launches(&stale, NODE).await, 1, "boot first, then the stale sweep");
+
+        // The sweep wins, then the boot relaunch looks again: it reads the node afresh.
+        let fresh = state().await;
+        seed_node(&fresh, Some("building"), "open", NODE, Some(54)).await;
+        seed_run(&fresh, 54, "interrupted").await;
+        seed_launch(&fresh, NODE).await;
+        tick(&fresh).await;
+        // The run the sweep started is live, whatever the stub runner does with it next.
+        sqlx::query(
+            "UPDATE runs SET status = 'running' \
+             WHERE id = (SELECT CAST(run_id AS INTEGER) FROM work_nodes WHERE id = ?)",
+        )
+        .bind(NODE)
+        .execute(&fresh.pool)
+        .await
+        .unwrap();
+        open::relaunch_resumed(&fresh, &boot).await;
+        assert_eq!(all_launches(&fresh, NODE).await, 1, "sweep first, then boot");
+    }
+
+    /// Every `launch` transition of the node, whatever its key.
+    async fn all_launches(state: &AppState, node_id: &str) -> i64 {
+        launches(state, node_id, "").await
     }
 }

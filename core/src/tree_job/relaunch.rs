@@ -453,3 +453,116 @@ async fn relaunch_after_answer(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::tree_job::model::{Branch, Manifest};
+
+    const JOB: &str = "relaunch-job";
+    const NODE: &str = "relaunch-node";
+    const ROOT: &str = "relaunch-root";
+    const CREATED: &str = "2026-10-31T00:00:00+00:00";
+
+    /// An owner's answer decides, so the tree budget does not stop it. This passes today (the answer
+    /// relaunch has no budget check) and is here so that a budget check added to the automatic
+    /// relaunches cannot reach `answer_and_relaunch`.
+    #[tokio::test]
+    async fn an_owners_answer_relaunches_even_past_the_budget() {
+        let (state, runner) = crate::execution::runs::testkit::test_state_with_runner(
+            Some(Duration::from_secs(60)),
+            Duration::from_secs(600),
+        )
+        .await;
+        runner.canned.lock().unwrap().as_mut().unwrap().session_id = None;
+        let pool = &state.pool;
+
+        let mut manifest = Manifest::new(JOB, "feat/relaunch", "Answer it", "C:/nowhere", &[]);
+        let mut branch = Branch::new("branch", &["core/src/**".to_owned()], "core", None);
+        branch.state = "building".to_owned();
+        branch.node_id = Some(NODE.to_owned());
+        manifest.branches.insert(branch.name.clone(), branch);
+        store::save(
+            pool,
+            &TreeJob {
+                id: JOB.to_owned(),
+                root_node_id: ROOT.to_owned(),
+                project_id: None,
+                feature_branch: Some("feat/relaunch".to_owned()),
+                goal: "Answer it".to_owned(),
+                state: "open".to_owned(),
+                manifest,
+                contract: None,
+                created_at: CREATED.to_owned(),
+                updated_at: CREATED.to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO runs (id, prompt, status, created_at) VALUES (71, 'p', 'interrupted', ?)")
+            .bind(CREATED)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO work_nodes (id, root_id, depth, kind, title, goal, status, run_id, \
+                                     tree_job_id, created_at, updated_at) \
+             VALUES (?, ?, 1, 'orchestrator', 'title', 'goal', 'running', '71', ?, ?, ?)",
+        )
+        .bind(NODE)
+        .bind(ROOT)
+        .bind(JOB)
+        .bind(CREATED)
+        .bind(CREATED)
+        .execute(pool)
+        .await
+        .unwrap();
+        save_launch(
+            pool,
+            &StoredLaunch {
+                node_id: NODE.to_owned(),
+                key: "initial".to_owned(),
+                prompt: "original prompt".to_owned(),
+                project_id: None,
+                cwd: None,
+                mode: "shadow".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        let asked = decisions::park(pool, JOB, NODE, "which way?").await.unwrap();
+        // The tree spent five dollars of a one dollar limit.
+        sqlx::query(
+            "INSERT INTO tree_budgets (tree_id, limit_usd, soft_pct, created_at, updated_at) \
+             VALUES (?, 1.0, 80.0, ?, ?)",
+        )
+        .bind(ROOT)
+        .bind(CREATED)
+        .bind(CREATED)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE runs SET cost_usd = 5.0 WHERE id = 71")
+            .execute(pool)
+            .await
+            .unwrap();
+
+        let answered = answer_and_relaunch(&state, &asked.id, "left", "shell")
+            .await
+            .unwrap();
+
+        assert!(answered.relaunched.is_some(), "the owner decided: the node starts again");
+        let started: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tree_transitions \
+             WHERE node_id = ? AND transition = 'launch' AND key = ?",
+        )
+        .bind(NODE)
+        .bind(format!("decision-{}", asked.id))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(started, 1);
+    }
+}
