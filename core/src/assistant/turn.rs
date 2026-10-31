@@ -1894,7 +1894,7 @@ mod agy_chat_tests {
     use super::*;
     use crate::assistants::{Assistants, ConfiguredAssistants};
     use crate::config::{AssistantChoice, ModelsConfig};
-    use crate::engines::agy_test_support::{FakeAgyBin, agy_gate, run_once};
+    use crate::engines::agy_test_support::{FakeAgyBin, agy_gate, run_once, run_request};
     use crate::execution::runner::extract_reply;
 
     const AGY_MODEL: &str = "agy/gemini-3.8-flash-high";
@@ -1966,5 +1966,65 @@ mod agy_chat_tests {
             Some("pong from the fake agy")
         );
         assert!(fake.was_launched());
+    }
+
+    /// The chat request for `cli`, as the real caller builds it for an MCP-only chat turn.
+    fn mcp_only_request(cli: &str) -> crate::execution::runner::RunRequest {
+        chat_run_request(
+            "ping".to_owned(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            crate::execution::runner::Permission::Default,
+            Some("s-1".to_owned()),
+            "s-1".to_owned(),
+            std::env::temp_dir().join("agy-chat-mcp.json"),
+            crate::execution::runner::ToolPolicy::McpOnly,
+            crate::chats::Answering::default(),
+            None,
+            cli,
+            None,
+        )
+    }
+
+    #[test]
+    fn chat_run_request_gives_agy_no_mcp_config_and_keeps_it_for_the_others() {
+        assert!(mcp_only_request("agy").mcp_config.is_none());
+        assert!(mcp_only_request("codex").mcp_config.is_some());
+        assert!(mcp_only_request("claude").mcp_config.is_some());
+    }
+
+    #[tokio::test]
+    async fn real_chat_request_on_agy_reaches_the_runner_in_plan_mode_with_sandbox() {
+        // Lock order: the stand-in binary (env lock) first, then the gate.
+        let fake = FakeAgyBin::success("pong from the fake agy");
+        let _gate = agy_gate(true);
+
+        let assistants = ConfiguredAssistants::new(
+            None,
+            None,
+            None,
+            "http://127.0.0.1:8791".to_string(),
+            "token".to_string(),
+            crate::testdb::fresh_pool().await,
+            crate::execution::runner::OLLAMA_BASE_URL.to_string(),
+        );
+        let runner = assistants
+            .cli_runner("agy", Some(AGY_MODEL))
+            .expect("an enabled agy row has a runner");
+        let request = mcp_only_request("agy");
+        let outcome = run_request(runner.as_ref(), request)
+            .await
+            .expect("the agy runner spawned the stand-in");
+
+        assert_eq!(outcome.exit_code, 0, "{}", outcome.stderr);
+        assert_eq!(
+            extract_reply(&outcome.stdout).as_deref(),
+            Some("pong from the fake agy")
+        );
+        assert!(fake.was_launched());
+        let args = fake.args();
+        assert!(args.contains("--mode plan"), "{args}");
+        assert!(args.contains("--sandbox"), "{args}");
     }
 }

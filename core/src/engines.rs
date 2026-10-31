@@ -541,8 +541,8 @@ mod row_tests {
 /// settings snapshot the document is read from; there is no test-only registration path (E3).
 /// Lock order, for every test that uses both: the stand-in binary first (it takes
 /// `worktree::test_env_lock`), then the gate (it takes the settings serial lock).
-#[cfg(test)]
-pub(crate) mod agy_test_support {
+#[cfg(any(test, feature = "testkit"))]
+pub mod agy_test_support {
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
 
@@ -555,7 +555,7 @@ pub(crate) mod agy_test_support {
 
     /// Publishes a machine-scope `AgyDoc` and keeps it installed until the guard drops. `true` writes
     /// the document the endpoint would store after an acknowledged enable; `false` is a stored `off`.
-    pub(crate) fn agy_gate(enabled: bool) -> Installed {
+    pub fn agy_gate(enabled: bool) -> Installed {
         let document = AgyDoc {
             enabled,
             acknowledged_warning_version: enabled.then_some(super::agy::WARNING_VERSION),
@@ -566,14 +566,14 @@ pub(crate) mod agy_test_support {
 
     /// A stand-in `agy`, found through `NUCLEOS_AGY_BIN`: records its argv to `args.txt`, prints the
     /// one-shot success JSON for `reply`. The real `agy` is never called.
-    pub(crate) struct FakeAgyBin {
+    pub struct FakeAgyBin {
         dir: tempfile::TempDir,
         previous: Option<OsString>,
         _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl FakeAgyBin {
-        pub(crate) fn success(reply: &str) -> Self {
+        pub fn success(reply: &str) -> Self {
             let lock = crate::execution::worktree::test_env_lock();
             let dir = tempfile::tempdir().unwrap();
             let body = serde_json::json!({
@@ -603,8 +603,18 @@ pub(crate) mod agy_test_support {
         }
 
         /// Whether the binary was launched at all (it writes `args.txt` first thing).
-        pub(crate) fn was_launched(&self) -> bool {
+        pub fn was_launched(&self) -> bool {
             self.dir.path().join("args.txt").exists()
+        }
+
+        /// The argv the stand-in recorded, whitespace-normalised to single spaces. The Windows stand-in
+        /// writes one line and the Unix one writes one argument per line; this reads both the same way.
+        pub fn args(&self) -> String {
+            std::fs::read_to_string(self.dir.path().join("args.txt"))
+                .unwrap_or_default()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
         }
     }
 
@@ -639,7 +649,7 @@ pub(crate) mod agy_test_support {
     }
 
     /// A request with every control at its neutral value, as a chat turn would send it.
-    pub(crate) fn chat_request(prompt: &str) -> RunRequest {
+    pub fn chat_request(prompt: &str) -> RunRequest {
         RunRequest {
             prompt: prompt.to_string(),
             env: Vec::new(),
@@ -676,16 +686,24 @@ pub(crate) mod agy_test_support {
         }
     }
 
-    /// One run through `runner`, with a minute's ceiling so a wedged stand-in fails the test.
-    pub(crate) async fn run_once(
+    /// One run of `prompt` as a neutral chat request; see [`run_request`].
+    pub async fn run_once(
         runner: &dyn CommandRunner,
         prompt: &str,
+    ) -> std::io::Result<RunOutcome> {
+        run_request(runner, chat_request(prompt)).await
+    }
+
+    /// One run of `request` through `runner`, with a minute's ceiling so a wedged stand-in fails the test.
+    pub async fn run_request(
+        runner: &dyn CommandRunner,
+        request: RunRequest,
     ) -> std::io::Result<RunOutcome> {
         let (session_tx, _session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let transcript = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         tokio::time::timeout(
             std::time::Duration::from_secs(60),
-            runner.run_prompt(chat_request(prompt), session_tx, transcript),
+            runner.run_prompt(request, session_tx, transcript),
         )
         .await
         .expect("the run finished within a minute")

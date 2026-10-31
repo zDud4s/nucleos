@@ -652,17 +652,28 @@ mod tests {
         let args = build_args(&asked, &options()).unwrap();
         assert!(!has(&args, "--sandbox"), "{args:?}");
 
-        // Any other policy is either refused by name or carries the sandbox; never neither.
+        // A restricted policy always runs in plan mode with the sandbox, whatever the
+        // permission would otherwise map to (accept-edits included).
         for policy in [ToolPolicy::McpOnly, ToolPolicy::None] {
-            asked.tool_policy = policy;
-            match build_args(&asked, &options()) {
-                Ok(args) => assert!(has(&args, "--sandbox"), "{policy:?}: {args:?}"),
-                Err(refusal) => assert!(
-                    refusal.to_string().contains("the agy engine does not support it"),
-                    "{policy:?}: {refusal}"
-                ),
+            for permission in [Permission::Default, Permission::AcceptEdits] {
+                asked.tool_policy = policy;
+                asked.permission = permission;
+                let args = build_args(&asked, &options())
+                    .unwrap_or_else(|refusal| panic!("{policy:?}/{permission:?}: {refusal}"));
+                assert_eq!(
+                    pair(&args, "--mode").as_deref(),
+                    Some("plan"),
+                    "{policy:?}/{permission:?}: {args:?}"
+                );
+                assert!(has(&args, "--sandbox"), "{policy:?}/{permission:?}: {args:?}");
             }
         }
+
+        // Unrestricted carries no sandbox, also with accept-edits.
+        asked.tool_policy = ToolPolicy::Unrestricted;
+        asked.permission = Permission::AcceptEdits;
+        let args = build_args(&asked, &options()).unwrap();
+        assert!(!has(&args, "--sandbox"), "{args:?}");
     }
 
     #[test]
@@ -1000,12 +1011,15 @@ mod tests {
         let outcome = fake.run(request("hi"));
         assert_ne!(outcome.exit_code, 0);
         assert!(outcome.stderr.contains("this is not json"), "{}", outcome.stderr);
+        // The guard holds the test env lock: release it before the next fake takes it.
+        drop(fake);
 
         // Valid JSON with no `response` is no answer either.
         let fake = FakeAgy::new(r#"{"status":"SUCCESS","conversation_id":"c"}"#, 0, false);
         let outcome = fake.run(request("hi"));
         assert_ne!(outcome.exit_code, 0);
         assert!(outcome.stderr.contains("SUCCESS"), "the first bytes are shown: {}", outcome.stderr);
+        drop(fake);
 
         // The echoed bytes are bounded.
         let fake = FakeAgy::new(&"x".repeat(5_000), 0, false);
@@ -1056,6 +1070,8 @@ mod tests {
         let outcome = fake.run(asked);
         assert_ne!(outcome.exit_code, 0, "five turns under a ceiling of two");
         assert!(outcome.stderr.contains("turns"), "{}", outcome.stderr);
+        // The guard holds the test env lock: release it before the next fake takes it.
+        drop(fake);
 
         let fake = FakeAgy::new(&body(1), 0, false);
         let mut asked = request("hi");
