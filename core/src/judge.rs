@@ -1884,12 +1884,14 @@ mod tests {
     async fn a_slow_judge_is_cut_at_the_deadline() {
         let pool = pool().await;
         let run_id = running_run(&pool).await;
+        // Built before the clock starts: the fixture may wait on the rules gate.
+        let call = asked(run_id, None, "cargo test --workspace | tee t.log");
         let started = Instant::now();
 
         judge_call(
             &pool,
             &JudgeRuntime::with(ScriptedJudge::slow(Duration::from_secs(10))),
-            &asked(run_id, None, "cargo test --workspace | tee t.log"),
+            &call,
             JudgeMode::Observe,
         )
         .await;
@@ -1912,12 +1914,13 @@ mod tests {
         let run_id = running_run(&pool).await;
         let judge = ScriptedJudge::answering(0.9, 0.9);
         let held = pool.acquire().await.unwrap();
+        let call = asked(run_id, None, "cargo test --workspace | tee t.log");
         let started = Instant::now();
 
         judge_call(
             &pool,
             &JudgeRuntime::with(judge.clone()),
-            &asked(run_id, None, "cargo test --workspace | tee t.log"),
+            &call,
             JudgeMode::Observe,
         )
         .await;
