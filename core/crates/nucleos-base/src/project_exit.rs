@@ -131,6 +131,7 @@ const PROJECT_SCOPED: &[&str] = &[
     // and `tree_budgets` have no `project_id` and no foreign key, so neither this list nor VIA_PARENT
     // reaches them: they are written out in `remove`, ahead of the loop.
     "tree_jobs",
+    "tree_launches",
     "vcs_requests",
     // What a project's verification asked, cached, did and observed is its history.
     "verification_observations",
