@@ -153,6 +153,10 @@ pub(super) async fn maybe_auto_compact(
         return;
     }
     let is_compaction = is_compaction(pool, run_id).await;
+    // A `pending` row whose run already ended (a daemon restart cut the compaction) would trip the
+    // guard below for good, and `start_as` would never get to settle it. A live compaction's run is
+    // still `running`, so this leaves it alone.
+    settle_stale(pool, chat_id).await;
     let pending = compactions::has_pending(pool, chat_id)
         .await
         .unwrap_or_else(|error| {
@@ -1214,6 +1218,13 @@ mod tests {
     async fn a_local_compaction_turn_triggers_no_further_compaction() {
         let (state, c, _) = auto_chat(true).await;
         let compact_run = compaction(&state.pool, &c, "HANDOFF").await;
+        // In production the turn's own settle has already left `pending` when `after_local_turn`
+        // runs; settle here too, so only the `is_compaction` guard can stop a further compaction.
+        settle(&state.pool, compact_run).await;
+        assert!(
+            !compactions::has_pending(&state.pool, &c).await.unwrap(),
+            "the row must be settled before the call"
+        );
         let before = compaction_rows(&state.pool, &c, None).await;
 
         super::super::turn::after_local_turn(
@@ -1225,6 +1236,31 @@ mod tests {
         .await;
 
         assert_eq!(compaction_rows(&state.pool, &c, None).await, before);
+    }
+
+    #[tokio::test]
+    async fn a_pending_row_of_an_ended_run_does_not_block_the_automatic_compaction() {
+        let (state, c, run) = auto_chat(true).await;
+        // A compaction cut by a daemon restart: its run is `completed`, its row still `pending`.
+        let stale = compaction(&state.pool, &c, "HANDOFF").await;
+        assert!(compactions::has_pending(&state.pool, &c).await.unwrap());
+
+        super::super::turn::after_local_turn(
+            &state,
+            &c,
+            run,
+            Some(super::super::rotation::DEFAULT_SOFT_FILL + 1),
+        )
+        .await;
+
+        assert_eq!(compaction_rows(&state.pool, &c, Some(1)).await, 1);
+        let stale_status: String =
+            sqlx::query_scalar("SELECT status FROM chat_compactions WHERE run_id = ?")
+                .bind(stale)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_ne!(stale_status, "pending");
     }
 
     #[tokio::test]

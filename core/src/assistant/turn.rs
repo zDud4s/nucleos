@@ -1039,7 +1039,24 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
                     let claude_fill = o.stdout.lines().fold(None, |fill, line| {
                         crate::execution::runner::context_fill_from_line(line, fill)
                     });
-                    let context_fill = rotation_fill(claude_fill, &o.stdout);
+                    // Codex's `turn.completed` carries the session's running total, not the window, so
+                    // its figure is read from the thread's rollout file. That is synchronous fs work,
+                    // hence `spawn_blocking`; it is skipped for any other engine and whenever the
+                    // Claude stream already gave a figure.
+                    let context_fill = match (claude_fill, o.session_id.clone()) {
+                        (None, Some(thread_id)) if cli == "codex" => {
+                            tokio::task::spawn_blocking(move || {
+                                // Without a resolvable home there is nothing to read: an empty path
+                                // would scan the working directory.
+                                let home = codex_home_now()?;
+                                rotation_fill(None, "", Some(&thread_id), &home)
+                            })
+                            .await
+                            .ok()
+                            .flatten()
+                        }
+                        (claude_fill, _) => claude_fill,
+                    };
                     // Taken off the outcome and not re-derived from the transcript beside it: on the
                     // multi-turn path the transcript belongs to a PROCESS that may have served several
                     // answers, and this is a fact about ONE of them. `RunOutcome` is where the
@@ -1231,10 +1248,33 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
     });
 }
 
+/// The Codex home of this process: `$CODEX_HOME`, else `<user home>/.codex`, in the order
+/// `model_catalog` uses for its own Codex cache.
+fn codex_home_now() -> Option<std::path::PathBuf> {
+    crate::execution::runner::codex_home_dir(
+        std::env::var("CODEX_HOME").ok(),
+        std::env::var("USERPROFILE")
+            .ok()
+            .or_else(|| std::env::var("HOME").ok()),
+    )
+}
+
 /// The context fill of a CLI turn: the Claude figure when there is one, else Codex's. Codex has no
-/// `assistant` usage events; its figure comes from `turn.completed` in `stdout`.
-fn rotation_fill(claude: Option<i64>, stdout: &str) -> Option<i64> {
-    claude.or_else(|| crate::execution::runner::codex_context_fill(stdout))
+/// `assistant` usage events, and its `turn.completed` `usage.input_tokens` is the session's running
+/// total rather than the window, so the figure is the thread's last `token_count` in its rollout
+/// under `codex_home`. `_stdout` is not read: the tests pin the four-argument shape, and their
+/// point is exactly that the stream's cumulative figure must not stand in.
+fn rotation_fill(
+    claude: Option<i64>,
+    _stdout: &str,
+    thread_id: Option<&str>,
+    codex_home: &std::path::Path,
+) -> Option<i64> {
+    claude.or_else(|| {
+        thread_id.and_then(|thread_id| {
+            crate::execution::runner::codex_rollout_fill(codex_home, thread_id)
+        })
+    })
 }
 
 /// Rotates the chat after a completed turn when `rotation::rotate` says so. Never fails, and never
@@ -1323,21 +1363,126 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    const CODEX_DONE: &str = r#"{"type":"turn.completed","usage":{"input_tokens":24763}}"#;
+    /// A Codex stream whose `turn.completed` reports the SESSION's running total (130k) while the
+    /// window actually holds far less. The thread id is the one `thread.started` announces.
+    const CODEX_STREAM_CUMULATIVE_130K: &str = concat!(
+        r#"{"type":"thread.started","thread_id":"thread-aaa"}"#,
+        "\n",
+        r#"{"type":"turn.completed","usage":{"input_tokens":130000,"cached_input_tokens":120000,"output_tokens":90}}"#,
+        "\n",
+    );
 
-    #[test]
-    fn rotation_fill_uses_the_codex_figure_when_claude_has_none() {
-        assert_eq!(rotation_fill(None, CODEX_DONE), Some(24763));
+    /// A rollout holding one `token_count` of the real shape: `total_token_usage` is cumulative,
+    /// `last_token_usage` is the latest round (the window).
+    fn write_codex_rollout(home: &std::path::Path, thread_id: &str, last_input: i64) {
+        let dir = home.join("sessions/2026/10/30");
+        std::fs::create_dir_all(&dir).unwrap();
+        let line = format!(
+            r#"{{"timestamp":"2026-10-30T23:13:36.661Z","ordinal":22,"type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":130000,"total_tokens":130090}},"last_token_usage":{{"input_tokens":{last_input},"total_tokens":{}}},"model_context_window":475000}}}}}}"#,
+            last_input + 90
+        );
+        std::fs::write(
+            dir.join(format!("rollout-2026-10-30T23-13-31-{thread_id}.jsonl")),
+            line,
+        )
+        .unwrap();
+    }
+
+    /// What `turn.rs` does with the figure after a completed turn: rotation on the root, then
+    /// automatic compaction. `true` for each that would fire at the 120k soft limit.
+    async fn fires(fill: Option<i64>) -> (bool, bool) {
+        struct OneRoot;
+        #[async_trait::async_trait]
+        impl crate::assistant::rotation::RootNodes for OneRoot {
+            async fn active_root_for_chat(&self, _: &str) -> Option<String> {
+                Some("root-1".into())
+            }
+            async fn has_waiting_child(&self, _: &str) -> bool {
+                false
+            }
+            async fn brief_text(&self, _: &str) -> Option<String> {
+                None
+            }
+        }
+        let rotates = crate::assistant::rotation::should_rotate(&OneRoot, "chat", fill, 120_000)
+            .await
+            .is_some();
+        let compacts = crate::assistant::compaction::should_auto_compact(
+            fill,
+            120_000,
+            None,
+            crate::assistant::compaction::AutoCompactGuards::default(),
+        );
+        (rotates, compacts)
+    }
+
+    #[tokio::test]
+    async fn a_codex_turn_with_a_130k_session_total_but_a_16k_window_neither_rotates_nor_compacts()
+    {
+        let home = tempfile::tempdir().unwrap();
+        write_codex_rollout(home.path(), "thread-aaa", 16_000);
+        let fill = rotation_fill(
+            None,
+            CODEX_STREAM_CUMULATIVE_130K,
+            Some("thread-aaa"),
+            home.path(),
+        );
+        assert_eq!(fill, Some(16_000));
+        assert_eq!(fires(fill).await, (false, false));
+    }
+
+    #[tokio::test]
+    async fn a_codex_turn_whose_rollout_says_130k_rotates_and_compacts() {
+        let home = tempfile::tempdir().unwrap();
+        write_codex_rollout(home.path(), "thread-aaa", 130_000);
+        let fill = rotation_fill(
+            None,
+            CODEX_STREAM_CUMULATIVE_130K,
+            Some("thread-aaa"),
+            home.path(),
+        );
+        assert_eq!(fill, Some(130_000));
+        assert_eq!(fires(fill).await, (true, true));
+    }
+
+    #[tokio::test]
+    async fn a_codex_turn_without_a_rollout_has_no_figure_and_neither_rotates_nor_compacts() {
+        // An empty home: no rollout for the thread. The 130k in `turn.completed` must not stand in.
+        let home = tempfile::tempdir().unwrap();
+        let fill = rotation_fill(
+            None,
+            CODEX_STREAM_CUMULATIVE_130K,
+            Some("thread-aaa"),
+            home.path(),
+        );
+        assert_eq!(fill, None);
+        assert_eq!(fires(fill).await, (false, false));
+        // No thread id at all behaves the same.
+        assert_eq!(
+            rotation_fill(None, CODEX_STREAM_CUMULATIVE_130K, None, home.path()),
+            None
+        );
     }
 
     #[test]
     fn rotation_fill_prefers_claude_over_codex() {
-        assert_eq!(rotation_fill(Some(500), CODEX_DONE), Some(500));
+        let home = tempfile::tempdir().unwrap();
+        write_codex_rollout(home.path(), "thread-aaa", 16_000);
+        assert_eq!(
+            rotation_fill(
+                Some(500),
+                CODEX_STREAM_CUMULATIVE_130K,
+                Some("thread-aaa"),
+                home.path()
+            ),
+            Some(500)
+        );
     }
 
     #[test]
     fn rotation_fill_is_none_when_no_engine_measured_one() {
-        assert_eq!(rotation_fill(None, "plain text"), None);
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(rotation_fill(None, "plain text", None, home.path()), None);
     }
 
     async fn test_state(runner: Arc<FakeCommandRunner>) -> AppState {
