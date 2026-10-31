@@ -43,6 +43,7 @@ pub mod detect;
 pub mod distill;
 pub mod door;
 pub mod embed;
+pub mod engines;
 pub mod execution;
 pub use nucleos_base::feed;
 pub mod files;

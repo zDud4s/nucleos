@@ -182,11 +182,12 @@ pub fn family_of(id: &str) -> (&'static str, String) {
 /// The agent CLI that answers an id, or `None` when the id says nothing about it.
 pub fn runner_by_id(id: &str) -> Option<&'static str> {
     let s = id.trim().to_lowercase();
+    // The id patterns stay here (a table row cannot express them); the answers are the table's ids.
     if s.starts_with("claude-") || ALIASES.contains(&s.as_str()) {
-        return Some("claude");
+        return Some(crate::engines::CLAUDE);
     }
     if s.strip_prefix("gpt-").is_some_and(starts_with_digit) || is_o_series(&s) {
-        return Some("codex");
+        return Some(crate::engines::CODEX);
     }
     None
 }
@@ -198,22 +199,27 @@ pub fn runner_by_id(id: &str) -> Option<&'static str> {
 /// alias, so it is the newest known OpenAI id with `mini` in it: by `created` when the vendor said,
 /// else the last one listed.
 pub fn utility_default(runner: &str, known: &[Discovered]) -> Option<String> {
-    match runner {
-        "claude" => Some("haiku".to_owned()),
-        "codex" => {
-            let minis: Vec<&Discovered> = known
-                .iter()
-                .filter(|m| m.provider == "openai" && m.id.to_lowercase().contains("mini"))
-                .collect();
-            let newest = minis
-                .iter()
-                .enumerate()
-                .max_by_key(|(index, m)| (m.created, *index))
-                .map(|(_, m)| *m)?;
-            Some(newest.id.clone())
-        }
-        _ => None,
-    }
+    let row = crate::engines::find_in(crate::engines::TABLE, runner)?;
+    (row.utility_default)(known)
+}
+
+/// Claude's cheap tier: its CLI alias. The engine table's `utility_default` for `claude`.
+pub(crate) fn claude_utility_default(_known: &[Discovered]) -> Option<String> {
+    Some("haiku".to_owned())
+}
+
+/// Codex's cheap tier: the newest known `mini`. The engine table's `utility_default` for `codex`.
+pub(crate) fn codex_utility_default(known: &[Discovered]) -> Option<String> {
+    let minis: Vec<&Discovered> = known
+        .iter()
+        .filter(|m| m.provider == "openai" && m.id.to_lowercase().contains("mini"))
+        .collect();
+    let newest = minis
+        .iter()
+        .enumerate()
+        .max_by_key(|(index, m)| (m.created, *index))
+        .map(|(_, m)| *m)?;
+    Some(newest.id.clone())
 }
 
 /// Effort levels a family takes when no config entry says otherwise.

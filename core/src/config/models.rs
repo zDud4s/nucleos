@@ -452,9 +452,11 @@ impl ModelsConfig {
         self.assistant_choices
             .iter()
             .find(|choice| choice.brain == "cloud" && choice.id == id)
-            .map(|choice| match choice.runner.as_deref() {
-                Some("codex") => "codex",
-                _ => "claude",
+            .map(|choice| {
+                crate::engines::runner_id_in(
+                    crate::engines::TABLE,
+                    choice.runner.as_deref().unwrap_or_default(),
+                )
             })
     }
 
@@ -703,10 +705,10 @@ impl ModelsConfig {
 
     /// Which agent CLI this daemon runs. Unknown names fall to `claude`, exactly as `main.rs` does.
     pub fn active_runner(&self) -> &str {
-        match self.primary_runner.as_deref() {
-            Some("codex") => "codex",
-            _ => "claude",
-        }
+        crate::engines::runner_id_in(
+            crate::engines::TABLE,
+            self.primary_runner.as_deref().unwrap_or_default(),
+        )
     }
 
     /// Every effort level any model on the menu takes, weakest-first, without repeats.

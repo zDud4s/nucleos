@@ -368,11 +368,7 @@ pub fn answering_cli(config: &crate::config::ModelsConfig, pinned: Option<&str>)
                 .or_else(|| crate::models::model_catalog::runner_by_id(id))
         })
         .unwrap_or_else(|| {
-            if config.active_runner() == "codex" {
-                "codex"
-            } else {
-                "claude"
-            }
+            crate::engines::runner_id_in(crate::engines::TABLE, config.active_runner())
         })
 }
 

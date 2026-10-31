@@ -32,9 +32,9 @@ pub enum Engine {
 impl Engine {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Claude => "claude",
-            Self::Codex => "codex",
-            Self::Local => "local",
+            Self::Claude => crate::engines::CLAUDE,
+            Self::Codex => crate::engines::CODEX,
+            Self::Local => crate::engines::LOCAL,
         }
     }
 }
@@ -169,8 +169,9 @@ pub fn translate(engine: Engine, caps: &[Capability]) -> Result<EngineTools, Uns
 
 /// The CLI runners that translate `caps` without error.
 pub fn translatable_runners(caps: &[Capability]) -> Vec<RunnerKind> {
-    [RunnerKind::Claude, RunnerKind::Codex]
+    crate::engines::ids_with_transport_in(crate::engines::TABLE, crate::engines::Transport::Cli)
         .into_iter()
+        .filter_map(RunnerKind::parse)
         .filter(|&kind| translate(kind.into(), caps).is_ok())
         .collect()
 }

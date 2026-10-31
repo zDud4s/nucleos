@@ -118,15 +118,16 @@ pub enum RunnerKind {
 impl RunnerKind {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Claude => "claude",
-            Self::Codex => "codex",
+            Self::Claude => crate::engines::CLAUDE,
+            Self::Codex => crate::engines::CODEX,
         }
     }
 
+    /// The kind of a CLI row of the engine table; `None` for any other id (`local` included).
     pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "claude" => Some(Self::Claude),
-            "codex" => Some(Self::Codex),
+        match crate::engines::cli_row_in(crate::engines::TABLE, value)?.id {
+            crate::engines::CLAUDE => Some(Self::Claude),
+            crate::engines::CODEX => Some(Self::Codex),
             _ => None,
         }
     }
