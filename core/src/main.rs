@@ -1036,15 +1036,11 @@ async fn main() {
         devtime_projects_dir,
     ));
     // The devtime cost's prices, kept fresh by the daemon rather than by somebody remembering
-    // `scripts/refresh-models.py`. Installed for the "refresh prices" button even when the file
-    // turns `auto_refresh_prices` off: the loop reads that per tick, the button ignores it. The
-    // path is still the legacy `nucleos-models.yaml` under the machine root: the refresh has not
-    // moved onto the `models` document yet, so it writes the file the one-time import read.
-    if let Some(models_path) = machine_file(config::MODELS_CONFIG_FILE) {
-        let refresher = Arc::new(price_refresh::Refresher::for_daemon(models_path));
-        price_refresh::install(Arc::clone(&refresher));
-        tokio::spawn(price_refresh::run_refresh_loop(refresher));
-    }
+    // `scripts/refresh-models.py`. Installed for the "refresh prices" button even when the `models`
+    // document turns `auto_refresh_prices` off: the loop reads that per tick, the button ignores it.
+    let refresher = Arc::new(price_refresh::Refresher::for_daemon(state.pool.clone()));
+    price_refresh::install(Arc::clone(&refresher));
+    tokio::spawn(price_refresh::run_refresh_loop(refresher));
     // `POST /verify` submits to it, so the handlers need the very instance the worker drains: it is
     // parked in `verify::install` (an `OnceLock`, because `AppState` is built literally in dozens of
     // places) before the worker starts. The restart above hands interrupted units straight back to it.

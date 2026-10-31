@@ -3513,9 +3513,9 @@ ok: {{ input: 2.0, output: 8.0 }}\n"
                 "{bad}: routing still loads"
             );
             assert!(
-                config.price_warnings.iter().any(|w| w.starts_with("m: ")),
+                config.model_prices.dropped.iter().any(|w| w.starts_with("m: ")),
                 "{bad}: and the drop is recorded, not only logged: {:?}",
-                config.price_warnings
+                config.model_prices.dropped
             );
         }
     }
@@ -3552,12 +3552,12 @@ ok: {{ input: 2.0, output: 8.0 }}\n"
             );
             assert_eq!(config.claude_model, "opus", "{bad}: routing still loads");
             assert_eq!(
-                config.price_warnings.len(),
+                config.model_prices.dropped.len(),
                 1,
                 "{bad}: exactly the one drop is recorded: {:?}",
-                config.price_warnings
+                config.model_prices.dropped
             );
-            assert!(config.price_warnings[0].starts_with("m: "), "{bad}");
+            assert!(config.model_prices.dropped[0].starts_with("m: "), "{bad}");
         }
     }
 
@@ -3569,15 +3569,15 @@ ok: {{ input: 2.0, output: 8.0 }}\n"
         assert!(config.model_prices.is_empty());
         assert_eq!(config.claude_model, "opus");
         assert_eq!(
-            config.price_warnings.len(),
+            config.model_prices.dropped.len(),
             1,
             "{:?}",
-            config.price_warnings
+            config.model_prices.dropped
         );
         // A null block is a file with no prices, which is not a warning.
         let empty =
             parse_models_config("claude_model: opus\ncodex_model: gpt\nmodel_prices: ~\n").unwrap();
-        assert!(empty.model_prices.is_empty() && empty.price_warnings.is_empty());
+        assert!(empty.model_prices.is_empty() && empty.model_prices.dropped.is_empty());
         // Routing keys keep their strict grammar: a wrong type there still refuses the file.
         assert!(parse_models_config("claude_model: [1]\ncodex_model: gpt\n").is_err());
     }
@@ -3598,9 +3598,9 @@ half-tier: { input: 1.0, output: 4.0, tiers: [{ min_prompt_tokens: 10, input: 2.
     fn a_tiered_price_parses_with_its_tiers_fast_rate_and_residency_multiplier() {
         let config = parse_models_config(HAIKU_AND_OPUS).unwrap();
         assert!(
-            config.price_warnings.is_empty(),
+            config.model_prices.dropped.is_empty(),
             "{:?}",
-            config.price_warnings
+            config.model_prices.dropped
         );
         let haiku = config.price_of("claude-haiku-5-5").unwrap();
         assert_eq!(haiku.cache_write_1h, Some(0.2));

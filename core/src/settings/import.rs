@@ -611,6 +611,37 @@ mod tests {
         assert!(imported(&home.root.join("nucleos-models.yaml")).exists());
     }
 
+    /// Prices imported as `null` next to a kept `prices_as_of` would read as "not old" for up to a
+    /// week while nothing could be priced, so they are checked through `price_of`, in the imported
+    /// snapshot and in a fresh load of the table.
+    #[tokio::test]
+    async fn the_prices_of_the_models_file_come_across_and_can_be_read() {
+        let pool = crate::testdb::fresh_pool().await;
+        let settings = Settings::new();
+        let home = home();
+        write(
+            &home.root,
+            "nucleos-models.yaml",
+            "claude_model: opus\ncodex_model: gpt\nprices_as_of: \"2026-10-01\"\n\
+             model_prices:\n  claude-opus-4-7: { input: 5.0, output: 25.0 }\n",
+        );
+
+        let outcome = run(&pool, &settings, Some(&home.root), true).await;
+
+        assert!(outcome.refused.is_empty(), "{outcome:?}");
+        let models = settings
+            .snapshot()
+            .get::<crate::config::ModelsConfig>(&Scope::Machine);
+        assert_eq!(models.prices_as_of.as_deref(), Some("2026-10-01"));
+        assert!(models.price_of("claude-opus-4-7").is_some(), "{models:?}");
+        let next_start = Settings::new();
+        next_start.load(&pool).await.unwrap();
+        let stored = next_start
+            .snapshot()
+            .get::<crate::config::ModelsConfig>(&Scope::Machine);
+        assert!(stored.price_of("claude-opus-4-7").is_some(), "{stored:?}");
+    }
+
     #[tokio::test]
     async fn an_absent_council_file_leaves_no_council() {
         let pool = crate::testdb::fresh_pool().await;

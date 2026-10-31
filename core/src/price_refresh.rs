@@ -1,10 +1,10 @@
-//! The daemon keeps the price block of `nucleos-models.yaml` fresh itself, instead of waiting for
-//! somebody to remember `scripts/refresh-models.py`: an estimated cost read off prices nobody has
-//! refreshed in months is a wrong number shown with a straight face.
+//! The daemon keeps the prices of the `models` settings document fresh itself, instead of waiting
+//! for somebody to remember `scripts/refresh-models.py`: an estimated cost read off prices nobody
+//! has refreshed in months is a wrong number shown with a straight face.
 //!
-//! [`parse`] holds the pure part: two fetched bodies in, the two rendered YAML blocks out, with no
-//! network, no file and no clock, so the exact text it renders can be pinned by a test. This module
-//! is the rest: fetching, writing the file, and deciding when.
+//! [`parse`] holds the pure part: two fetched bodies in, the typed prices out, with no network, no
+//! database and no clock, so what it reads can be pinned by a test. This module is the rest:
+//! fetching, writing the document, and deciding when.
 //!
 //! Three things start a refresh:
 //! - the loop ([`run_refresh_loop`]), shortly after startup and then daily (hourly after a failed
@@ -20,18 +20,22 @@
 pub mod parse;
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::Serialize;
+use sqlx::SqlitePool;
 
-use crate::config::ModelsConfig;
+use crate::config::{ModelsConfig, PriceTable};
+use crate::settings::{self, Scope};
+
+/// The document the prices live in.
+const MODELS_DOCUMENT: &str = "models";
 
 /// Prices older than this many days are refreshed by the loop. A week, because the vendors change
-/// prices with a model launch, not daily, and a daily refresh would be two fetches a day for a file
-/// that almost never moves.
+/// prices with a model launch, not daily, and a daily refresh would be two fetches a day for prices
+/// that almost never move.
 pub const STALE_AFTER_DAYS: i64 = 7;
 
 /// The least time between two automatic refreshes. Without it, a model that never gets a price (a
@@ -39,7 +43,7 @@ pub const STALE_AFTER_DAYS: i64 = 7;
 pub const AUTO_RETRY_HOURS: i64 = 24;
 
 /// How long after startup the loop first looks: long enough that a refresh never competes with the
-/// daemon coming up, short enough that a stale file is fixed in the first minute.
+/// daemon coming up, short enough that stale prices are fixed in the first minute.
 const STARTUP_DELAY: Duration = Duration::from_secs(30);
 
 /// How often the loop looks after that. Staleness is measured in days, so a daily look is enough.
@@ -67,14 +71,14 @@ const USER_AGENT: &str = "nucleos-price-refresh";
 pub struct PriceRefreshStatus {
     /// When the refresh ran, RFC 3339 in UTC.
     pub at: String,
-    /// The price blocks were written, or were already exactly what the vendors publish. `false`
-    /// means the file was left as it was and `problems` says why.
+    /// The prices were written, or were already exactly what the vendors publish. `false` means
+    /// the document was left as it was and `problems` says why.
     pub ok: bool,
-    /// The date the file's prices are now as of: the refresh's own date when `ok`, otherwise the
-    /// file's existing `prices_as_of` (best effort; `None` when it had none or did not parse).
+    /// The date the document's prices are now as of: the refresh's own date when `ok`, otherwise
+    /// the document's existing `prices_as_of` (`None` when it had none or could not be read).
     pub prices_as_of: Option<String>,
     /// Everything worth a person's eye: the parse's warnings and problems (a model written without
-    /// a price, a source it could not read) and any IO failure. Empty on a clean run.
+    /// a price, a source it could not read) and any failure to write. Empty on a clean run.
     pub problems: Vec<String>,
 }
 
@@ -111,7 +115,7 @@ impl Default for PriceSources {
 }
 
 /// One GET; any failure (transport, non-2xx, unreadable body, a body over [`MAX_BODY_BYTES`]) is
-/// `None`, which [`parse::refresh_from_bodies`] turns into "could not read …" and a file left
+/// `None`, which [`parse::refresh_from_bodies`] turns into "could not read …" and a document left
 /// untouched.
 async fn fetch(client: &reqwest::Client, url: &str) -> Option<String> {
     fetch_at_most(client, url, MAX_BODY_BYTES).await
@@ -172,49 +176,39 @@ async fn fetch_at_most(client: &reqwest::Client, url: &str, max_bytes: usize) ->
     Some(String::from_utf8_lossy(&body).into_owned())
 }
 
-/// The models file's text, or the problem line that says why there is none.
-fn read_models_file(path: &Path) -> Result<String, String> {
-    let shown = crate::config::MODELS_CONFIG_DISPLAY_PATH;
-    std::fs::read_to_string(path).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            format!("{shown} does not exist — prices unchanged")
-        } else {
-            format!("could not read {shown} ({error}) — prices unchanged")
-        }
-    })
+/// The `models` document as it is now, or the problem line that says why there is none to refresh.
+fn models_document() -> Result<Arc<ModelsConfig>, String> {
+    let snapshot = settings::global().snapshot();
+    if let Some(unreadable) = snapshot.unreadable_for(&Scope::Machine, MODELS_DOCUMENT) {
+        return Err(format!(
+            "the models document is unreadable ({}) — prices unchanged",
+            unreadable.reason
+        ));
+    }
+    snapshot
+        .get_opt::<ModelsConfig>(&Scope::Machine)
+        .ok_or_else(|| "no models document — prices unchanged".to_string())
 }
 
-/// The `prices_as_of` a models file's text declares, best effort: `None` when it has none or the
-/// text does not parse.
-fn prices_as_of_in(text: &str) -> Option<String> {
-    crate::config::parse_models_config(text)
-        .ok()
-        .and_then(|config| config.prices_as_of)
-}
-
-/// Refreshes the price blocks of the models file at `path` from `sources`, dated `now`'s UTC day.
+/// Refreshes `prices_as_of` and `model_prices` of the `models` document from `sources`, dated
+/// `now`'s UTC day.
 ///
-/// A missing file is not created: `claude_model` and `codex_model` are required keys, so a file
-/// holding only prices would not parse and the daemon would ignore it. That is checked before any
-/// fetch, so a machine without the file costs no network.
+/// A missing document is not created: `claude_model` and `codex_model` are the owner's choice, and a
+/// document holding only prices would invent them. That is checked before any fetch, so a machine
+/// without the document costs no network. An unreadable one is left for the owner to repair.
 ///
-/// The rest of the file is kept byte for byte ([`parse::splice_price_blocks`]); it is written only
-/// when the text changed, and never when the result would no longer parse — a refresh must never be
-/// the reason the models file stops loading.
-///
-/// The text spliced is read AFTER the fetch, not before: a fetch can take up to [`FETCH_TIMEOUT`],
-/// and a splice of the text read before it would put back whatever a hand edit or anything else
-/// changed meanwhile. The re-read, the splice and the write happen under
-/// [`crate::config::MODELS_FILE_WRITE`], so no other in-process writer can land in between.
-pub async fn refresh_file(
+/// The change goes through [`settings::update`], which applies it to the document as it is at the
+/// write and not as it was before the fetch: a fetch can take up to [`FETCH_TIMEOUT`], and an edit
+/// made meanwhile is kept. Prices identical to the stored ones write nothing, so a refresh that
+/// finds no news adds no version to the document's history.
+pub async fn refresh_document(
+    pool: &SqlitePool,
     client: &reqwest::Client,
     sources: &PriceSources,
-    path: &Path,
     now: DateTime<Utc>,
 ) -> PriceRefreshStatus {
-    let shown = crate::config::MODELS_CONFIG_DISPLAY_PATH;
-    let before = match read_models_file(path) {
-        Ok(text) => text,
+    let before = match models_document() {
+        Ok(config) => config,
         Err(problem) => return PriceRefreshStatus::new(now, false, None, vec![problem]),
     };
     let (pricing, catalogue) = tokio::join!(
@@ -222,42 +216,42 @@ pub async fn refresh_file(
         fetch(client, &sources.openrouter_url)
     );
     let today = now.date_naive().to_string();
-    let (blocks, mut problems) =
+    let (refreshed, mut problems) =
         parse::refresh_from_bodies(pricing.as_deref(), catalogue.as_deref(), &today);
-    let Some(blocks) = blocks else {
-        return PriceRefreshStatus::new(now, false, prices_as_of_in(&before), problems);
+    let Some(refreshed) = refreshed else {
+        return PriceRefreshStatus::new(now, false, before.prices_as_of.clone(), problems);
     };
 
-    // Held until the write has landed (or been given up); no `await` below it.
-    let _models_file_write = crate::config::MODELS_FILE_WRITE.lock().await;
-    let original = match read_models_file(path) {
-        Ok(text) => text,
+    let current = match models_document() {
+        Ok(config) => config,
         Err(problem) => {
             problems.push(problem);
             return PriceRefreshStatus::new(now, false, None, problems);
         }
     };
-    let current_as_of = prices_as_of_in(&original);
-    let spliced = parse::splice_price_blocks(&original, &blocks);
-    if spliced != original {
-        if let Err(error) = crate::config::parse_models_config(&spliced) {
-            // The likeliest cause, named because it is invisible in the file: the splice ends the
-            // block at the first column-zero line (the rule `scripts/refresh-models.py` splices
-            // `assistant_choices` by), so a commented-out row there leaves every row below it in
-            // place, and the first of them that the new block also lists is a duplicate key.
-            problems.push(format!(
-                "the refreshed {shown} would not parse ({error}) — prices unchanged; a comment in \
-                 column zero inside `model_prices` ends the block early and leaves the rows below \
-                 it in place, so indent or remove it"
-            ));
-            return PriceRefreshStatus::new(now, false, current_as_of, problems);
-        }
-        if let Err(error) = crate::project::state::write_atomically(path, &spliced) {
-            problems.push(format!(
-                "could not write {shown} ({error}) — prices unchanged"
-            ));
-            return PriceRefreshStatus::new(now, false, current_as_of, problems);
-        }
+    if current.prices_as_of.as_deref() == Some(refreshed.prices_as_of.as_str())
+        && current.model_prices.entries == refreshed.model_prices
+    {
+        return PriceRefreshStatus::new(now, true, Some(today), problems);
+    }
+    let written = settings::update::<ModelsConfig, _>(
+        pool,
+        &Scope::Machine,
+        "price-refresh",
+        move |config| {
+            config.prices_as_of = Some(refreshed.prices_as_of);
+            config.model_prices = PriceTable {
+                entries: refreshed.model_prices,
+                dropped: Vec::new(),
+            };
+        },
+    )
+    .await;
+    if let Err(error) = written {
+        problems.push(format!(
+            "could not write the models document ({error}) — prices unchanged"
+        ));
+        return PriceRefreshStatus::new(now, false, current.prices_as_of.clone(), problems);
     }
     PriceRefreshStatus::new(now, true, Some(today), problems)
 }
@@ -315,28 +309,28 @@ struct RefreshState {
     last_auto_attempt: Option<DateTime<Utc>>,
     /// Every id passed to a trigger whose refresh then ran clean, accumulated (never replaced; see
     /// [`should_trigger`]). Added after the refresh rather than when the trigger fires, so a failed
-    /// refresh leaves its ids to be retried. Not recomputed from the refreshed file: an id the
+    /// refresh leaves its ids to be retried. Not recomputed from the refreshed prices: an id the
     /// refresh priced drops out of the page's list by itself, and an id it could not price (an
     /// alias) stays here and does not trigger again. A refresh started by the loop or the button
     /// leaves it alone, since it knows no unpriced list.
     known_unpriced: BTreeSet<String>,
 }
 
-/// The price refresh of one models file: its sources, its client, and its state.
+/// The price refresh of the `models` document: its pool, its sources, its client, and its state.
 pub struct Refresher {
-    path: PathBuf,
+    pool: SqlitePool,
     sources: PriceSources,
     client: reqwest::Client,
-    /// Serialises refreshes, so two never write the file at once. The button waits on it; an
+    /// Serialises refreshes, so two never fetch and write at once. The button waits on it; an
     /// automatic refresh that finds it held skips, since the refresh running is doing its job.
     running: tokio::sync::Mutex<()>,
     state: std::sync::Mutex<RefreshState>,
 }
 
 impl Refresher {
-    pub fn new(path: PathBuf, sources: PriceSources, client: reqwest::Client) -> Self {
+    pub fn new(pool: SqlitePool, sources: PriceSources, client: reqwest::Client) -> Self {
         Refresher {
-            path,
+            pool,
             sources,
             client,
             running: tokio::sync::Mutex::new(()),
@@ -345,14 +339,14 @@ impl Refresher {
     }
 
     /// The daemon's refresher: the real vendor URLs, and a client with [`FETCH_TIMEOUT`].
-    pub fn for_daemon(path: PathBuf) -> Self {
+    pub fn for_daemon(pool: SqlitePool) -> Self {
         // `expect` for the reason `ConfiguredAssistants::new` gives: the causes are TLS backend
         // and proxy environment problems, i.e. startup misconfiguration.
         let client = reqwest::Client::builder()
             .timeout(FETCH_TIMEOUT)
             .build()
             .expect("HTTP client for the price refresh (check TLS and proxy environment)");
-        Refresher::new(path, PriceSources::default(), client)
+        Refresher::new(pool, PriceSources::default(), client)
     }
 
     /// A poisoned lock only means a panic elsewhere while it was held; the state is plain data and
@@ -369,7 +363,7 @@ impl Refresher {
 
     /// One refresh, the running lock already held by the caller; logs and records its status.
     async fn run(&self, now: DateTime<Utc>) -> PriceRefreshStatus {
-        let status = refresh_file(&self.client, &self.sources, &self.path, now).await;
+        let status = refresh_document(&self.pool, &self.client, &self.sources, now).await;
         if status.ok {
             tracing::info!(
                 prices_as_of = ?status.prices_as_of,
@@ -411,8 +405,8 @@ impl Refresher {
 
     /// The devtime page's unpriced models: starts a background refresh when [`should_trigger`]
     /// says so, and returns its handle (`None` when it did not start one). The page never waits
-    /// for it: it shows this view now, and the next one reads the new prices, the models file
-    /// being re-read per request. Tests await the handle.
+    /// for it: it shows this view now, and the next one reads the new prices, a refresh publishing
+    /// them to the settings snapshot each request reads. Tests await the handle.
     pub fn note_unpriced(
         self: &Arc<Self>,
         unpriced: &[String],
@@ -451,15 +445,14 @@ impl Refresher {
 /// literally in dozens of places, and only two handlers and one loop need this.
 static REFRESHER: OnceLock<Arc<Refresher>> = OnceLock::new();
 
-/// Called once from `main` when there is a models file path. A second call changes nothing.
+/// Called once from `main`. A second call changes nothing.
 pub fn install(refresher: Arc<Refresher>) {
     if REFRESHER.set(refresher).is_err() {
         tracing::warn!("price refresher installed twice; keeping the first");
     }
 }
 
-/// `None` until `main` installs one, which it does only when there is a models file path (so
-/// never under tests).
+/// `None` until `main` installs one, so never under tests.
 pub fn installed() -> Option<Arc<Refresher>> {
     REFRESHER.get().cloned()
 }
@@ -469,7 +462,7 @@ pub fn last_status() -> Option<PriceRefreshStatus> {
     installed().and_then(|refresher| refresher.last())
 }
 
-/// The button. Without a refresher there is no file to refresh, which is a status, not an error.
+/// The button. Without a refresher there is nothing to refresh, which is a status, not an error.
 pub async fn refresh_now(now: DateTime<Utc>) -> PriceRefreshStatus {
     match installed() {
         Some(refresher) => refresher.refresh_now(now).await,
@@ -477,10 +470,7 @@ pub async fn refresh_now(now: DateTime<Utc>) -> PriceRefreshStatus {
             now,
             false,
             None,
-            vec![format!(
-                "the daemon has no {} to refresh",
-                crate::config::MODELS_CONFIG_DISPLAY_PATH
-            )],
+            vec!["the daemon has no price refresher".to_string()],
         ),
     }
 }
@@ -504,8 +494,8 @@ fn sleep_after_tick(tick: Option<&PriceRefreshStatus>) -> Duration {
 }
 
 /// The background refresh: a first look after [`STARTUP_DELAY`], then one every [`CHECK_EVERY`]
-/// (or [`RETRY_AFTER_FAILURE`] after a failed one, [`sleep_after_tick`]), each reading the models
-/// file as it is then, so `auto_refresh_prices: false` takes effect without a restart.
+/// (or [`RETRY_AFTER_FAILURE`] after a failed one, [`sleep_after_tick`]), each reading the `models`
+/// document as it is then, so `auto_refresh_prices: false` takes effect without a restart.
 pub async fn run_refresh_loop(refresher: Arc<Refresher>) {
     tokio::time::sleep(STARTUP_DELAY).await;
     loop {
@@ -519,6 +509,7 @@ pub async fn run_refresh_loop(refresher: Arc<Refresher>) {
 mod tests {
     use super::parse::tests::{GOOD, PRICING_MD};
     use super::*;
+    use crate::project::rules::testing::Home;
     use chrono::TimeZone;
 
     fn day(text: &str) -> NaiveDate {
@@ -535,15 +526,34 @@ mod tests {
         list.iter().map(|id| id.to_string()).collect()
     }
 
-    /// The unrelated block a refresh must keep, verbatim.
-    const CHOICES: &str =
-        "assistant_choices:\n  - { id: \"opus\", label: \"Opus\", brain: \"cloud\" }\n";
-
-    /// A models file with an unrelated block and old prices.
-    fn models_file() -> String {
-        format!(
-            "claude_model: opus\ncodex_model: gpt-a\n{CHOICES}\nprices_as_of: \"2026-01-01\"\nmodel_prices:\n  old: {{ input: 1.0 }}\n"
+    /// A `models` document with an unrelated block and old prices, at version 1. The `Home` keeps
+    /// the settings handle the test wrote it to.
+    async fn priced_document() -> (Home, SqlitePool) {
+        let home = Home::new();
+        let pool = crate::testdb::fresh_pool().await;
+        settings::put(
+            &pool,
+            &Scope::Machine,
+            MODELS_DOCUMENT,
+            &serde_json::json!({
+                "claude_model": "opus",
+                "codex_model": "gpt-a",
+                "assistant_choices": [{ "id": "opus", "label": "Opus", "brain": "cloud" }],
+                "prices_as_of": "2026-01-01",
+                "model_prices": { "old": { "input": 1.0 } },
+            }),
+            "test",
+            None,
         )
+        .await
+        .expect("models is a registered document");
+        (home, pool)
+    }
+
+    fn stored_version() -> Option<i64> {
+        settings::global()
+            .snapshot()
+            .version(&Scope::Machine, MODELS_DOCUMENT)
     }
 
     /// A loopback stand-in for both vendors, `/pricing.md` and `/models`, each answering with the
@@ -584,14 +594,6 @@ mod tests {
         }
     }
 
-    /// A tempdir holding a models file, and the file's path.
-    fn models_dir() -> (tempfile::TempDir, PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(crate::config::MODELS_CONFIG_FILE);
-        std::fs::write(&path, models_file()).unwrap();
-        (dir, path)
-    }
-
     // --- staleness -------------------------------------------------------------------
 
     #[test]
@@ -616,7 +618,7 @@ mod tests {
         let mut config = ModelsConfig::default();
         assert!(
             config.auto_refresh_prices,
-            "on unless the file says otherwise"
+            "on unless the document says otherwise"
         );
         assert!(tick_wants_refresh(&config, today));
         config.prices_as_of = Some("2026-10-18".to_string());
@@ -711,10 +713,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_triggered_refresh_leaves_its_ids_to_retry_after_the_hold() {
-        let dir = tempfile::tempdir().unwrap();
-        // No file: the spawned refresh fails before any fetch (and the sources are dead anyway).
+        // No document: the spawned refresh fails before any fetch (and the sources are dead anyway).
+        let _home = Home::new();
         let refresher = Arc::new(Refresher::new(
-            dir.path().join(crate::config::MODELS_CONFIG_FILE),
+            crate::testdb::fresh_pool().await,
             dead_sources(),
             reqwest::Client::new(),
         ));
@@ -745,9 +747,9 @@ mod tests {
 
     #[tokio::test]
     async fn an_id_still_unpriced_after_a_clean_refresh_does_not_trigger_again() {
-        let (_dir, path) = models_dir();
+        let (_home, pool) = priced_document().await;
         let sources = stub_vendors((200, PRICING_MD), (200, GOOD)).await;
-        let refresher = Arc::new(Refresher::new(path, sources, reqwest::Client::new()));
+        let refresher = Arc::new(Refresher::new(pool, sources, reqwest::Client::new()));
         let now = Utc.with_ymd_and_hms(2026, 10, 19, 12, 0, 0).unwrap();
         let a_day_later = now + chrono::Duration::hours(AUTO_RETRY_HOURS + 1);
 
@@ -772,9 +774,9 @@ mod tests {
 
     #[tokio::test]
     async fn the_known_ids_grow_so_two_views_do_not_take_turns_retriggering() {
-        let (_dir, path) = models_dir();
+        let (_home, pool) = priced_document().await;
         let sources = stub_vendors((200, PRICING_MD), (200, GOOD)).await;
-        let refresher = Arc::new(Refresher::new(path, sources, reqwest::Client::new()));
+        let refresher = Arc::new(Refresher::new(pool, sources, reqwest::Client::new()));
         let start = Utc.with_ymd_and_hms(2026, 10, 19, 12, 0, 0).unwrap();
         let nth_day = |n: i64| start + chrono::Duration::hours(n * (AUTO_RETRY_HOURS + 1));
         // The global view's unpriced list, then one project's 7-day view with a different one.
@@ -800,17 +802,17 @@ mod tests {
         );
     }
 
-    // --- the file --------------------------------------------------------------------
+    // --- the document ----------------------------------------------------------------
 
     #[tokio::test]
-    async fn a_refresh_writes_the_price_blocks_and_keeps_the_rest_of_the_file() {
-        let (_dir, path) = models_dir();
+    async fn a_refresh_writes_the_prices_and_keeps_the_rest_of_the_document() {
+        let (_home, pool) = priced_document().await;
         let sources = stub_vendors((200, PRICING_MD), (200, GOOD)).await;
 
-        let status = refresh_file(
+        let status = refresh_document(
+            &pool,
             &reqwest::Client::new(),
             &sources,
-            &path,
             at("2026-10-19T08:30:00Z"),
         )
         .await;
@@ -819,28 +821,85 @@ mod tests {
         assert_eq!(status.prices_as_of.as_deref(), Some("2026-10-19"));
         assert_eq!(status.at, "2026-10-19T08:30:00Z");
         assert!(status.problems.is_empty(), "{:?}", status.problems);
-        let written = std::fs::read_to_string(&path).unwrap();
-        assert!(written.contains(CHOICES), "{written}");
-        assert!(
-            written.contains("prices_as_of: \"2026-10-19\""),
-            "{written}"
-        );
-        assert!(written.contains("claude-opus-4-7:"), "{written}");
-        assert!(!written.contains("old: { input: 1.0 }"), "{written}");
-        let config = crate::config::parse_models_config(&written).unwrap();
+        let config = settings::get::<ModelsConfig>(&Scope::Machine);
         assert_eq!(config.prices_as_of.as_deref(), Some("2026-10-19"));
+        assert!(config.price_of("claude-opus-4-7").is_some(), "{config:?}");
+        assert!(config.price_of("old").is_none(), "{config:?}");
+        assert_eq!(config.claude_model, "opus");
         assert_eq!(config.assistant_choices.len(), 1);
     }
 
+    /// As the importer leaves the machine: `nucleos-models.yaml` is gone (renamed to
+    /// `nucleos-models.yaml.imported`) and the `models` document is the configuration. The prices are
+    /// read back through `price_of`, from the live reader and from a fresh load of the table (what a
+    /// restarted daemon sees), so a body no reader can price does not pass.
     #[tokio::test]
-    async fn a_source_answering_500_leaves_the_file_untouched_and_says_why() {
-        let (_dir, path) = models_dir();
-        let sources = stub_vendors((200, PRICING_MD), (500, "down")).await;
+    async fn a_refresh_writes_the_new_prices_into_the_models_document_and_creates_no_file() {
+        use crate::settings::{self, Scope, Settings};
 
-        let status = refresh_file(
+        let home = crate::project::rules::testing::Home::new();
+        let pool = crate::testdb::fresh_pool().await;
+        settings::put(
+            &pool,
+            &Scope::Machine,
+            "models",
+            &serde_json::json!({
+                "claude_model": "opus",
+                "codex_model": "gpt-a",
+                "assistant_choices": [{ "id": "opus", "label": "Opus", "brain": "cloud" }],
+                "prices_as_of": "2026-01-01",
+                "model_prices": { "old": { "input": 1.0 } },
+            }),
+            "test",
+            None,
+        )
+        .await
+        .expect("models is a registered document");
+        let path = home.path().join(crate::config::MODELS_CONFIG_FILE);
+        let sources = stub_vendors((200, PRICING_MD), (200, GOOD)).await;
+
+        let status = refresh_document(
+            &pool,
             &reqwest::Client::new(),
             &sources,
-            &path,
+            at("2026-10-19T08:30:00Z"),
+        )
+        .await;
+
+        assert!(status.ok, "{status:?}");
+        assert_eq!(status.prices_as_of.as_deref(), Some("2026-10-19"));
+        assert_eq!(
+            settings::global()
+                .snapshot()
+                .version(&Scope::Machine, "models"),
+            Some(2),
+            "the refresh is one more version of the document"
+        );
+        let live = crate::config::models_config_now();
+        assert!(live.price_of("claude-opus-4-7").is_some(), "{live:?}");
+        let next_start = Settings::new();
+        next_start.load(&pool).await.unwrap();
+        let stored = next_start.snapshot().get::<ModelsConfig>(&Scope::Machine);
+        assert_eq!(stored.prices_as_of.as_deref(), Some("2026-10-19"));
+        assert!(stored.price_of("claude-opus-4-7").is_some(), "{stored:?}");
+        assert!(stored.price_of("old").is_none(), "{stored:?}");
+        assert_eq!(
+            stored.claude_model, "opus",
+            "the rest of the document stays"
+        );
+        assert_eq!(stored.assistant_choices.len(), 1);
+        assert!(!path.exists(), "the refresh must not bring the file back");
+    }
+
+    #[tokio::test]
+    async fn a_source_answering_500_leaves_the_document_untouched_and_says_why() {
+        let (_home, pool) = priced_document().await;
+        let sources = stub_vendors((200, PRICING_MD), (500, "down")).await;
+
+        let status = refresh_document(
+            &pool,
+            &reqwest::Client::new(),
+            &sources,
             at("2026-10-19T08:30:00Z"),
         )
         .await;
@@ -848,65 +907,109 @@ mod tests {
         assert!(!status.ok);
         assert_eq!(status.prices_as_of.as_deref(), Some("2026-01-01"));
         assert!(!status.problems.is_empty());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), models_file());
+        assert_eq!(stored_version(), Some(1));
+        let config = settings::get::<ModelsConfig>(&Scope::Machine);
+        assert!(config.price_of("old").is_some(), "{config:?}");
     }
 
     #[tokio::test]
-    async fn a_second_refresh_with_the_same_prices_leaves_the_file_as_it_was() {
-        let (_dir, path) = models_dir();
+    async fn a_second_refresh_with_the_same_prices_adds_no_version() {
+        let (_home, pool) = priced_document().await;
         let sources = stub_vendors((200, PRICING_MD), (200, GOOD)).await;
         let client = reqwest::Client::new();
         let now = at("2026-10-19T08:30:00Z");
-        assert!(refresh_file(&client, &sources, &path, now).await.ok);
-        let first = std::fs::read_to_string(&path).unwrap();
-        let first_modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(refresh_document(&pool, &client, &sources, now).await.ok);
+        assert_eq!(stored_version(), Some(2));
 
-        let again = refresh_file(&client, &sources, &path, now).await;
+        let again = refresh_document(&pool, &client, &sources, now).await;
 
         assert!(again.ok, "{again:?}");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), first);
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().modified().unwrap(),
-            first_modified
-        );
+        assert_eq!(stored_version(), Some(2));
     }
 
     #[tokio::test]
-    async fn a_missing_models_file_is_not_created_and_nothing_is_fetched() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(crate::config::MODELS_CONFIG_FILE);
+    async fn a_missing_models_document_is_not_created_and_nothing_is_fetched() {
+        let _home = Home::new();
+        let pool = crate::testdb::fresh_pool().await;
         // Nothing listens there: a fetch would add a "could not read" line to the problems.
         let sources = dead_sources();
 
-        let status = refresh_file(
+        let status = refresh_document(
+            &pool,
             &reqwest::Client::new(),
             &sources,
-            &path,
             at("2026-10-19T08:30:00Z"),
         )
         .await;
 
         assert!(!status.ok);
         assert_eq!(status.problems.len(), 1, "{:?}", status.problems);
-        assert!(status.problems[0].contains("does not exist"));
-        assert!(!path.exists());
+        assert!(status.problems[0].contains("no models document"));
+        assert_eq!(stored_version(), None);
+    }
+
+    /// A row a human or an older build left undecodable is the owner's to repair; a refresh that
+    /// replaced it with defaults plus prices would lose what is in it.
+    #[tokio::test]
+    async fn an_unreadable_models_document_is_left_alone_and_said_so() {
+        let _home = Home::new();
+        let pool = crate::testdb::fresh_pool().await;
+        let body = r#"{"claude_model": 5}"#;
+        sqlx::query(
+            "INSERT INTO settings (scope, name, body_json, version, updated_at, updated_by)              VALUES (?, ?, ?, 1, '2026-10-11T00:00:00.000Z', 'test')",
+        )
+        .bind(Scope::Machine.to_string())
+        .bind(MODELS_DOCUMENT)
+        .bind(body)
+        .execute(&pool)
+        .await
+        .unwrap();
+        settings::load(&pool).await.unwrap();
+
+        let status = refresh_document(
+            &pool,
+            &reqwest::Client::new(),
+            &dead_sources(),
+            at("2026-10-19T08:30:00Z"),
+        )
+        .await;
+
+        assert!(!status.ok);
+        assert_eq!(status.prices_as_of, None);
+        assert_eq!(status.problems.len(), 1, "{:?}", status.problems);
+        assert!(status.problems[0].contains("unreadable"));
+        let stored: String = sqlx::query_scalar("SELECT body_json FROM settings WHERE name = ?")
+            .bind(MODELS_DOCUMENT)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, body);
     }
 
     #[tokio::test]
     async fn an_edit_made_while_the_refresh_fetches_is_kept() {
-        let (_dir, path) = models_dir();
-        // The catalogue answers only after the file has changed under the refresh, which is where
-        // a System-page write or a hand edit lands during a slow fetch.
-        let edited = models_file().replace("codex_model: gpt-a", "codex_model: gpt-b");
+        let (_home, pool) = priced_document().await;
+        // The catalogue answers only after the document has changed under the refresh, which is
+        // where a System-page write lands during a slow fetch.
         let app = axum::Router::new()
             .route("/pricing.md", axum::routing::get(|| async { PRICING_MD }))
             .route(
                 "/models",
                 axum::routing::get({
-                    let path = path.clone();
-                    move || async move {
-                        std::fs::write(&path, edited).unwrap();
-                        GOOD
+                    let pool = pool.clone();
+                    move || {
+                        let pool = pool.clone();
+                        async move {
+                            settings::update::<ModelsConfig, _>(
+                                &pool,
+                                &Scope::Machine,
+                                "test",
+                                |config| config.codex_model = "gpt-b".to_string(),
+                            )
+                            .await
+                            .unwrap();
+                            GOOD
+                        }
                     }
                 }),
             );
@@ -916,57 +1019,23 @@ mod tests {
             openrouter_url: format!("{base}/models"),
         };
 
-        let status = refresh_file(
+        let status = refresh_document(
+            &pool,
             &reqwest::Client::new(),
             &sources,
-            &path,
             at("2026-10-19T08:30:00Z"),
         )
         .await;
 
         assert!(status.ok, "{status:?}");
-        let written = std::fs::read_to_string(&path).unwrap();
-        assert!(written.contains("codex_model: gpt-b"), "{written}");
-        assert!(written.contains("claude-opus-4-7:"), "{written}");
+        let config = settings::get::<ModelsConfig>(&Scope::Machine);
+        assert_eq!(config.codex_model, "gpt-b");
+        assert!(config.price_of("claude-opus-4-7").is_some(), "{config:?}");
     }
 
     #[tokio::test]
-    async fn a_column_zero_comment_inside_model_prices_refuses_the_refresh_and_says_so() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(crate::config::MODELS_CONFIG_FILE);
-        // The comment ends the block for the splice, so the row under it stays, and it repeats a
-        // key the new block writes: the result would not parse.
-        let original = "claude_model: opus\ncodex_model: gpt-a\nprices_as_of: \"2026-01-01\"\n\
-                        model_prices:\n  old: { input: 1.0 }\n# old row\n  claude-opus-4-7: { input: 1.0 }\n";
-        crate::config::parse_models_config(original).expect("the file parses as it is");
-        std::fs::write(&path, original).unwrap();
-        let sources = stub_vendors((200, PRICING_MD), (200, GOOD)).await;
-
-        let status = refresh_file(
-            &reqwest::Client::new(),
-            &sources,
-            &path,
-            at("2026-10-19T08:30:00Z"),
-        )
-        .await;
-
-        assert!(!status.ok, "{status:?}");
-        assert_eq!(status.prices_as_of.as_deref(), Some("2026-01-01"));
-        assert!(
-            status
-                .problems
-                .iter()
-                .any(|problem| problem.contains("would not parse")
-                    && problem.contains("comment in column zero inside `model_prices`")),
-            "{:?}",
-            status.problems
-        );
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
-    }
-
-    #[tokio::test]
-    async fn a_body_over_the_cap_is_not_read_and_the_refresh_leaves_the_file() {
-        let (_dir, path) = models_dir();
+    async fn a_body_over_the_cap_is_not_read_and_the_refresh_leaves_the_document() {
+        let (_home, pool) = priced_document().await;
         // A declared length over the cap is refused on the headers alone.
         let oversized = vec![b' '; MAX_BODY_BYTES + 1];
         let app = axum::Router::new()
@@ -984,10 +1053,10 @@ mod tests {
             openrouter_url: format!("{base}/models"),
         };
 
-        let status = refresh_file(
+        let status = refresh_document(
+            &pool,
             &reqwest::Client::new(),
             &sources,
-            &path,
             at("2026-10-19T08:30:00Z"),
         )
         .await;
@@ -1001,7 +1070,7 @@ mod tests {
             "{:?}",
             status.problems
         );
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), models_file());
+        assert_eq!(stored_version(), Some(1));
     }
 
     #[tokio::test]
@@ -1038,9 +1107,9 @@ mod tests {
 
     #[tokio::test]
     async fn the_button_records_its_status_as_the_last_one() {
-        let (_dir, path) = models_dir();
+        let (_home, pool) = priced_document().await;
         let sources = stub_vendors((200, PRICING_MD), (200, GOOD)).await;
-        let refresher = Refresher::new(path, sources, reqwest::Client::new());
+        let refresher = Refresher::new(pool, sources, reqwest::Client::new());
         assert_eq!(refresher.last(), None);
 
         let status = refresher.refresh_now(at("2026-10-19T08:30:00Z")).await;
@@ -1051,8 +1120,8 @@ mod tests {
 
     #[tokio::test]
     async fn the_loop_tick_does_nothing_while_auto_refresh_is_off() {
-        let (_dir, path) = models_dir();
-        let refresher = Refresher::new(path, dead_sources(), reqwest::Client::new());
+        let pool = crate::testdb::fresh_pool().await;
+        let refresher = Refresher::new(pool, dead_sources(), reqwest::Client::new());
         let config = ModelsConfig {
             auto_refresh_prices: false,
             ..ModelsConfig::default()
@@ -1093,7 +1162,7 @@ mod tests {
     /// day. Those two are printed for a human, not asserted on, because the vendors can differ by
     /// a cent on a given day and that is not this parser's fault.
     #[tokio::test]
-    #[ignore = "needs the internet: reads the real Anthropic pricing page and OpenRouter catalogue; run by hand when the vendor pages change: cargo test -p nucleos-core --lib the_real_pricing_pages -- --ignored --nocapture"]
+    #[ignore = "needs the internet: reads the real Anthropic pricing page and OpenRouter catalogue; run by hand when the vendor pages change: cargo test -p nucleos-app --lib the_real_pricing_pages -- --ignored --nocapture"]
     async fn the_real_pricing_pages_are_read_without_a_problem() {
         let client = reqwest::Client::builder()
             .timeout(FETCH_TIMEOUT)
@@ -1111,7 +1180,7 @@ mod tests {
             catalogue.is_some()
         );
 
-        let (blocks, lines) = parse::refresh_from_bodies(
+        let (refreshed, lines) = parse::refresh_from_bodies(
             pricing.as_deref(),
             catalogue.as_deref(),
             &Utc::now().date_naive().to_string(),
@@ -1119,7 +1188,7 @@ mod tests {
         for line in &lines {
             eprintln!("{line}");
         }
-        let blocks = blocks.expect(
+        let refreshed = refreshed.expect(
             "a source did not parse, so a page changed shape — the lines printed above say which",
         );
         let problems: Vec<&String> = lines
@@ -1133,13 +1202,13 @@ mod tests {
             "problems reading the pages: {problems:#?}"
         );
 
-        // The blocks must also make a models file the daemon accepts, with the shapes the cost
-        // accounting depends on.
-        let spliced = parse::splice_price_blocks(&models_file(), &blocks);
-        let config = crate::config::parse_models_config(&spliced)
-            .expect("the spliced file parses as a models file");
-        let claude: Vec<_> = config
-            .model_prices
+        // The prices must also come back whole from the JSON the document stores them as, with the
+        // shapes the cost accounting depends on.
+        let stored: PriceTable =
+            serde_json::from_value(serde_json::to_value(&refreshed.model_prices).unwrap())
+                .expect("the prices read back from the stored body");
+        assert_eq!(stored.dropped, Vec::<String>::new());
+        let claude: Vec<_> = stored
             .iter()
             .filter(|(id, _)| id.starts_with("claude-"))
             .collect();
@@ -1158,7 +1227,7 @@ mod tests {
             "no claude-* model with a geo_us_mult — the data residency multiplier was not read"
         );
         assert!(
-            config.model_prices.iter().any(|(id, price)| {
+            stored.iter().any(|(id, price)| {
                 id.starts_with("gpt-") && price.source.as_deref() == Some("openrouter")
             }),
             "no gpt-* model priced from OpenRouter"

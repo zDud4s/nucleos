@@ -132,7 +132,7 @@ pub struct ModelsConfig {
     pub assistant_choices: Vec<AssistantChoice>,
     /// When the vendors' price pages were last read (`YYYY-MM-DD`), or `None` when they never have
     /// been. Written by the daemon's own price refresh ([`crate::price_refresh`]), the only writer
-    /// of the price block since `scripts/refresh-models.py` stopped writing it. Shown beside every
+    /// of the prices since `scripts/refresh-models.py` stopped writing them. Shown beside every
     /// estimated cost so its age is visible (spec devtime §4.4).
     #[serde(default)]
     pub prices_as_of: Option<String>,
@@ -146,26 +146,60 @@ pub struct ModelsConfig {
     #[serde(default = "default_auto_refresh_prices")]
     pub auto_refresh_prices: bool,
     /// Vendor-published prices, USD per million tokens, keyed by normalised model id. Written by the
-    /// daemon's price refresh (or the script it replaced), never by hand: there is no hand-kept
-    /// price catalogue (owner, 2026-10-17). Read per request like the rest of this file, so a
-    /// refresh needs no restart.
+    /// daemon's price refresh, never by hand: there is no hand-kept price catalogue (owner,
+    /// 2026-10-17). Read per request like the rest of this document, so a refresh needs no restart.
     ///
-    /// Filled by [`parse_models_config`] from `raw_model_prices`, entry by entry, so one unreadable
-    /// entry costs that entry and never the file.
-    #[serde(skip)]
-    pub model_prices: std::collections::BTreeMap<String, ModelPrice>,
-    /// `model_prices` exactly as the file wrote it, any shape. Read as a bare YAML value so that a
-    /// wrong type in one price cannot fail the whole file: model routing must not depend on it
-    /// (owner, 2026-10-18). Emptied by [`parse_models_config`] once converted.
-    /// `pub` only because the daemon binary builds this struct with `..Default::default()`.
-    #[serde(default, rename = "model_prices")]
+    /// Any shape is accepted, and converted entry by entry: a wrong type in one price costs that
+    /// entry and never the document, because model routing must not depend on it (owner,
+    /// 2026-10-18). See [`PriceTable`].
+    #[serde(default)]
     #[schemars(with = "serde_json::Value")]
-    #[doc(hidden)]
-    pub raw_model_prices: serde_yaml::Value,
-    /// One `"<model id>: <reason>"` per price entry [`parse_models_config`] dropped, so the drop is
-    /// visible where the cost is shown and not only in the daemon's log.
-    #[serde(skip)]
-    pub price_warnings: Vec<String>,
+    pub model_prices: PriceTable,
+}
+
+/// The `model_prices` of a [`ModelsConfig`], converted while it is decoded, from YAML (the file the
+/// import reads) or JSON (the document) alike. Reads as the map it holds.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PriceTable {
+    pub entries: std::collections::BTreeMap<String, ModelPrice>,
+    /// One `"<model id>: <reason>"` per price entry the decode dropped, so the drop is visible where
+    /// the cost is shown and not only in the daemon's log. Never stored: what is written back is
+    /// `entries`, so the line lasts as long as the bad entry does.
+    pub dropped: Vec<String>,
+}
+
+impl std::ops::Deref for PriceTable {
+    type Target = std::collections::BTreeMap<String, ModelPrice>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+
+impl std::ops::DerefMut for PriceTable {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.entries
+    }
+}
+
+impl<'de> Deserialize<'de> for PriceTable {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = serde_yaml::Value::deserialize(deserializer)?;
+        let (entries, dropped) = convert_model_prices(raw);
+        Ok(PriceTable { entries, dropped })
+    }
+}
+
+impl serde::Serialize for PriceTable {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serde::Serialize::serialize(&self.entries, serializer)
+    }
 }
 
 /// One row of the conversation's model picker.
@@ -878,9 +912,7 @@ impl Default for ModelsConfig {
             assistant_choices: default_assistant_choices(),
             prices_as_of: None,
             auto_refresh_prices: default_auto_refresh_prices(),
-            model_prices: std::collections::BTreeMap::new(),
-            raw_model_prices: serde_yaml::Value::Null,
-            price_warnings: Vec::new(),
+            model_prices: PriceTable::default(),
         }
     }
 }
@@ -918,19 +950,6 @@ pub const MODELS_CONFIG_FILE: &str = "nucleos-models.yaml";
 /// The same file as a person is shown it, and the only spelling a message uses. See
 /// [`crate::machine_config::ROOT_DISPLAY`].
 pub const MODELS_CONFIG_DISPLAY_PATH: &str = "~/.nucleos/nucleos-models.yaml";
-
-/// Held by every in-process writer of [`MODELS_CONFIG_FILE`]. Since `POST /config/machine` went
-/// that is one: the price refresh ([`crate::price_refresh::refresh_file`], around its re-read,
-/// splice and write).
-///
-/// The refresh rewrites the file from a fresh read, and the lock makes "fresh" hold until its write
-/// lands. [`crate::project::state::write_atomically`] stages the text in the same
-/// `nucleos-models.yaml.nucleos-tmp` beside the target, so two writes at once would collide on that
-/// temporary. It cannot order the daemon against an edit by hand or another process, which is why
-/// the refresh re-reads only after its fetch, keeping that window as short as a read and a write.
-///
-/// A tokio mutex because a holder keeps it across the `await` of its blocking write.
-pub static MODELS_FILE_WRITE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// One model's published prices. A `None` field is a price the script could not read: tokens of that
 /// kind make the model "unpriced", never priced at zero.
@@ -1111,7 +1130,7 @@ impl ModelPrice {
     }
 }
 
-/// Converts the file's raw `model_prices` value entry by entry: what parses and validates is kept,
+/// Converts a raw `model_prices` value entry by entry: what parses and validates is kept,
 /// everything else is dropped with a warning and a `"<id>: <reason>"` line in the second half.
 fn convert_model_prices(
     raw: serde_yaml::Value,
@@ -1204,12 +1223,7 @@ impl ModelsConfig {
 /// buys no new strictness — it buys the write route a function with the shape every other claim's
 /// validator has, and it keeps the door and the loader reading one grammar rather than two.
 pub fn parse_models_config(contents: &str) -> Result<ModelsConfig, String> {
-    let mut config =
-        serde_yaml::from_str::<ModelsConfig>(contents).map_err(|error| error.to_string())?;
-    let (prices, dropped) = convert_model_prices(std::mem::take(&mut config.raw_model_prices));
-    config.model_prices = prices;
-    config.price_warnings = dropped;
-    Ok(config)
+    serde_yaml::from_str::<ModelsConfig>(contents).map_err(|error| error.to_string())
 }
 
 pub fn load_models_config(path: &Path) -> std::io::Result<ModelsConfig> {

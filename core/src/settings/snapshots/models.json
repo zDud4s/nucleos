@@ -183,8 +183,8 @@
       "x-widget": "model-picker"
     },
     "model_prices": {
-      "default": null,
-      "description": "`model_prices` exactly as the file wrote it, any shape. Read as a bare YAML value so that a\nwrong type in one price cannot fail the whole file: model routing must not depend on it\n(owner, 2026-10-18). Emptied by [`parse_models_config`] once converted.\n`pub` only because the daemon binary builds this struct with `..Default::default()`."
+      "default": {},
+      "description": "Vendor-published prices, USD per million tokens, keyed by normalised model id. Written by the\ndaemon's price refresh, never by hand: there is no hand-kept price catalogue (owner,\n2026-10-17). Read per request like the rest of this document, so a refresh needs no restart.\n\nAny shape is accepted, and converted entry by entry: a wrong type in one price costs that\nentry and never the document, because model routing must not depend on it (owner,\n2026-10-18). See [`PriceTable`]."
     },
     "plan_model": {
       "default": null,
@@ -197,7 +197,7 @@
     },
     "prices_as_of": {
       "default": null,
-      "description": "When the vendors' price pages were last read (`YYYY-MM-DD`), or `None` when they never have\nbeen. Written by the daemon's own price refresh ([`crate::price_refresh`]), the only writer\nof the price block since `scripts/refresh-models.py` stopped writing it. Shown beside every\nestimated cost so its age is visible (spec devtime §4.4).",
+      "description": "When the vendors' price pages were last read (`YYYY-MM-DD`), or `None` when they never have\nbeen. Written by the daemon's own price refresh ([`crate::price_refresh`]), the only writer\nof the prices since `scripts/refresh-models.py` stopped writing them. Shown beside every\nestimated cost so its age is visible (spec devtime §4.4).",
       "type": [
         "string",
         "null"
