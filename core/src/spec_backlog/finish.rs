@@ -984,12 +984,174 @@ mod tests {
         }
     }
 
+    struct ScriptedAuditPreparer {
+        verify: VerifyState,
+        verdict: Verdict,
+    }
+
+    impl ScriptedAuditPreparer {
+        fn not_done(verify: VerifyState, status: CriterionStatus) -> Self {
+            Self {
+                verify,
+                verdict: Verdict::NotDone(vec![NotDoneReason::Unresolved { ordinal: 2, status }]),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SpecPreparer for ScriptedAuditPreparer {
+        async fn extract(&self, _spec_id: &str) -> Result<(), String> {
+            panic!("these tests start with an extracted spec")
+        }
+
+        async fn audit(
+            &self,
+            _spec_id: &str,
+            _lineage: &SpecLineage,
+        ) -> Result<AuditReport, String> {
+            Ok(AuditReport {
+                reviewer_run_id: "reviewer-1".to_owned(),
+                verify: self.verify,
+                verdict: self.verdict.clone(),
+                status: SpecStatus::Audited,
+            })
+        }
+    }
+
     fn scope_all() -> FinishScope {
         FinishScope::All { project_id: None }
     }
 
     async fn status_of(pool: &SqlitePool, id: &str) -> SpecStatus {
         store::get_spec(pool, id).await.unwrap().unwrap().status
+    }
+
+    async fn seed_criteria(pool: &SqlitePool, id: &str, statuses: &[CriterionStatus]) {
+        let items: Vec<NewCriterion> = statuses
+            .iter()
+            .enumerate()
+            .map(|(index, status)| NewCriterion {
+                text: format!("criterion {}", index + 1),
+                kind: CriterionKind::Behavior,
+                verify_hint: None,
+                status: status.clone(),
+            })
+            .collect();
+        store::replace_criteria(pool, id, SHA, &items).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_doubt_with_green_verify_does_not_pay_for_another_tree() {
+        let pool = crate::testdb::fresh_pool().await;
+        let id = add_spec(&pool, "green-doubt", SpecStatus::Extracted).await;
+        seed_criteria(&pool, &id, &[CriterionStatus::Met, CriterionStatus::Doubt]).await;
+        let log = Log::default();
+        let launcher = FakeLauncher::new(&log);
+        let prep = ScriptedAuditPreparer::not_done(VerifyState::Green, CriterionStatus::Doubt);
+        let mut config = cfg();
+        config.max_rounds = 3;
+        config.owned_paths = disjoint(&[&id]);
+
+        finish_with(
+            &pool,
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &prep,
+            },
+            &config,
+            scope_all(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(launcher.requests().len(), 1);
+        let spec = store::get_spec(&pool, &id).await.unwrap().unwrap();
+        assert_eq!(spec.status, SpecStatus::NeedsOwner);
+        assert!(spec.status_reason.unwrap_or_default().contains("doubt"));
+    }
+
+    #[tokio::test]
+    async fn a_doubt_with_unknown_verify_does_not_pay_for_another_tree() {
+        let pool = crate::testdb::fresh_pool().await;
+        let id = add_spec(&pool, "unknown-doubt", SpecStatus::Extracted).await;
+        seed_criteria(&pool, &id, &[CriterionStatus::Met, CriterionStatus::Doubt]).await;
+        let log = Log::default();
+        let launcher = FakeLauncher::new(&log);
+        let prep = ScriptedAuditPreparer::not_done(VerifyState::Unknown, CriterionStatus::Doubt);
+        let mut config = cfg();
+        config.max_rounds = 3;
+        config.owned_paths = disjoint(&[&id]);
+
+        finish_with(
+            &pool,
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &prep,
+            },
+            &config,
+            scope_all(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(launcher.requests().len(), 1);
+        let spec = store::get_spec(&pool, &id).await.unwrap().unwrap();
+        assert_eq!(spec.status, SpecStatus::NeedsOwner);
+        assert!(spec.status_reason.unwrap_or_default().contains("doubt"));
+    }
+
+    #[tokio::test]
+    async fn an_unmet_criterion_still_pays_for_another_tree() {
+        let pool = crate::testdb::fresh_pool().await;
+        let id = add_spec(&pool, "unmet", SpecStatus::Extracted).await;
+        seed_criteria(&pool, &id, &[CriterionStatus::Met, CriterionStatus::Unmet]).await;
+        let log = Log::default();
+        let launcher = FakeLauncher::new(&log);
+        let prep = ScriptedAuditPreparer::not_done(VerifyState::Green, CriterionStatus::Unmet);
+        let mut config = cfg();
+        config.max_rounds = 2;
+        config.owned_paths = disjoint(&[&id]);
+
+        finish_with(
+            &pool,
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &prep,
+            },
+            &config,
+            scope_all(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(launcher.requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_doubt_with_red_verify_still_pays_for_another_tree() {
+        let pool = crate::testdb::fresh_pool().await;
+        let id = add_spec(&pool, "red-doubt", SpecStatus::Extracted).await;
+        seed_criteria(&pool, &id, &[CriterionStatus::Doubt]).await;
+        let log = Log::default();
+        let launcher = FakeLauncher::new(&log);
+        let prep = ScriptedAuditPreparer::not_done(VerifyState::Red, CriterionStatus::Doubt);
+        let mut config = cfg();
+        config.max_rounds = 2;
+        config.owned_paths = disjoint(&[&id]);
+
+        finish_with(
+            &pool,
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &prep,
+            },
+            &config,
+            scope_all(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(launcher.requests().len(), 2);
     }
 
     #[tokio::test]
@@ -1835,6 +1997,15 @@ b
         assert!(!shown.contains("NOT EVERYTHING IS SHOWN"));
         let hidden = review_prompt(&sample_spec(), &criteria, &cut);
         assert!(hidden.contains("NOT EVERYTHING IS SHOWN") && hidden.contains("doubt"));
+    }
+
+    #[test]
+    fn the_prompt_says_the_suite_is_run_separately() {
+        let criteria = [crit(1, "the test suite passes", None)];
+        let prompt = review_prompt(&sample_spec(), &criteria, &ReviewMaterial::default());
+
+        assert!(prompt.contains("runs the project's test suite separately"));
+        assert!(prompt.contains("doubt"));
     }
 
     #[tokio::test]
