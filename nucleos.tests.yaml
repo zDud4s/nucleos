@@ -20,7 +20,7 @@ tests:
         # Remote access: the config/pairing module and its owner/device routes. The Go gateway
         # (sidecars/remote/) and the remote shell (shell/src/remote/) are already covered by the
         # sidecars and shell groups' path prefixes.
-        - paths: [core/src/remote.rs, core/src/http/remote.rs]
+        - paths: [core/src/remote.rs, core/src/remote/**, core/src/http/remote.rs]
           expr: 'test(/^remote::/) | test(/^http::remote::/)'
     sidecars:
       paths: [sidecars/, scripts/build-sidecars.sh]
@@ -119,3 +119,5 @@ tests:
     - CONTRIBUTING.md
     - README.md
     - THREAT_MODEL.md
+    - PLATFORM_SUPPORT.md
+    - REMOTE_ACCESS.md

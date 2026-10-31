@@ -28,6 +28,7 @@ the contract, not a snapshot.
 | `startup.rs` | Binary-only, beside `main.rs`: the daemon's one-off start work — seeding the workflow library, the file-to-database migrations (machine settings, project state, onboarding) and `reconcile_after_restart`, the orphan and interrupted-work reconciliation run once the database is open. |
 | `crates/nucleos-base/src/logging.rs` | `tracing` subscriber (rotating daily file + stdout), initialized first to catch a failed startup. |
 | `crates/nucleos-base/src/autostart.rs` | Self-registers OS autostart at login, independent of the shell: a Windows Scheduled Task (`LogonTrigger` + `RestartOnFailure`), a macOS LaunchAgent, or on Linux a systemd user unit or an XDG autostart entry (one Linux backend at a time). Registering never starts a second daemon. Non-fatal on failure. |
+| `crates/nucleos-base/src/keep_awake.rs` | Holds off OS sleep while work runs: one inhibitor tied to the daemon's life (`SetThreadExecutionState`, `caffeinate -w`, `systemd-inhibit`), taken and released by `run_keep_awake_loop` in `shutdown.rs`. |
 | `crates/nucleos-base/src/storage.rs` | SQLite pool + WAL + `sqlx::migrate!`. Knows the storage *mechanism* only — never a table's meaning. |
 | `crates/nucleos-base/src/backup.rs` | Backup files: takes a consistent snapshot, verifies one, and stages a restore for the next startup to apply. |
 | `auth.rs` | Local token generation + the bearer-token middleware on protected routes. |
@@ -163,6 +164,7 @@ the contract, not a snapshot.
 | `http/proposals.rs` | Proposals and the waiting queue (`/proposals/*`, `/waiting/*`). |
 | `http/relay.rs` | Notifications, PII, voice, web and browser seats (`/notifications/*`, `/pii`, `/voice/*`, `/web/*`, `/browser/*`). |
 | `http/remote.rs` | Remote access (`/remote/pair`, `/remote/session`, `/remote/logout`, `/remote/pairing-codes`, `/remote/devices*`): thin over `remote.rs`; who reaches which route is decided in `auth::require_token`. |
+| `remote/setup.rs` | Turning remote access on and off from the app: the closed list of Tailscale calls (never Funnel), the readers of `tailscale status` and `serve status`, finding the gateway page, and writing `remote.yaml`. |
 | `http/repo.rs` | Reading and writing a project's tree (`/projects/{id}/ls`, `/cat`, `/grep`, `/log`, `/diff`, `/write`…). |
 | `http/run_queue.rs` | Runs, the vcs queue, worktrees and the feed (`/runs/*`, `/vcs/*`, `/worktrees`, `/feed`). |
 | `http/tasks.rs` | The HTTP face of `task_claims`: `/tasks/*` per worktree (tools and runs), `/projects/{id}/tasks*` for the owner only (hooks and the shell). A project off the roster is "claims unavailable", never a server error. |
