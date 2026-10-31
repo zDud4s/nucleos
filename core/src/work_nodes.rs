@@ -1253,7 +1253,7 @@ mod tests {
         let limits = NodeLimits::load(Some(dir.path()));
         assert_eq!(
             (limits.max_depth, limits.max_width, limits.summary_max),
-            (5, 2, 1500)
+            (Some(5), 2, 1500)
         );
         std::fs::write(&file, ": not yaml [").unwrap();
         assert_eq!(NodeLimits::load(Some(dir.path())), NodeLimits::default());
@@ -1295,9 +1295,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_refuses_depth_beyond_limit() {
+    async fn open_beyond_old_depth_three_is_allowed_without_a_configured_limit() {
         let pool = test_pool().await;
         let limits = NodeLimits::default();
+        let mut parent = open(&pool, None, &limits, &root_args()).await.unwrap().id;
+        for depth in 1..=10 {
+            let title = format!("o{depth}");
+            let args = child_args(&parent, "orchestrator", &title, &[]);
+            parent = open(&pool, None, &limits, &args).await.unwrap().id;
+        }
+    }
+
+    #[tokio::test]
+    async fn open_still_honours_a_configured_max_depth() {
+        let pool = test_pool().await;
+        let limits = NodeLimits {
+            max_depth: Some(3),
+            ..NodeLimits::default()
+        };
         let mut parent = open(&pool, None, &limits, &root_args()).await.unwrap().id;
         for depth in 1..=3 {
             let title = format!("o{depth}");
@@ -1313,17 +1328,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_refuses_seventh_sibling() {
+    async fn open_width_limit_unchanged() {
         let pool = test_pool().await;
-        let limits = NodeLimits::default();
+        let limits = NodeLimits {
+            max_depth: None,
+            max_width: 2,
+            ..NodeLimits::default()
+        };
         let root = open(&pool, None, &limits, &root_args()).await.unwrap();
-        for i in 0..6 {
+        for i in 0..2 {
             let title = format!("leaf{i}");
             let args = child_args(&root.id, "leaf", &title, &[]);
             open(&pool, None, &limits, &args).await.unwrap();
         }
-        let seventh = child_args(&root.id, "leaf", "7th", &[]);
-        let refused = open(&pool, None, &limits, &seventh).await;
+        let third = child_args(&root.id, "leaf", "third", &[]);
+        let refused = open(&pool, None, &limits, &third).await;
         assert!(
             matches!(refused, Err(NodeError::Conflict(_))),
             "{refused:?}"

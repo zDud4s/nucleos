@@ -425,12 +425,22 @@ mod tests {
         title: &str,
         owned: &[&str],
     ) -> (StatusCode, Value) {
+        open_child(app, parent, title, "Do one part", owned).await
+    }
+
+    async fn open_child(
+        app: &Router,
+        parent: &str,
+        title: &str,
+        goal: &str,
+        owned: &[&str],
+    ) -> (StatusCode, Value) {
         call(
             app,
             "POST",
             "/nodes",
             Some(json!({
-                "parent_id": parent, "kind": "leaf", "title": title, "goal": "Do one part",
+                "parent_id": parent, "kind": "leaf", "title": title, "goal": goal,
                 "owned_paths": owned, "budget_tokens": null,
             })),
         )
@@ -522,6 +532,116 @@ mod tests {
         let (status, body) = open_leaf(&app, &root, "Narrow", &["core/src/x.rs"]).await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
         assert!(body["error"].as_str().unwrap().contains("overlaps"));
+    }
+
+    #[tokio::test]
+    async fn open_refused_for_same_scope_child() {
+        let app = app().await;
+        let root = open_root(&app, "s-same-scope").await;
+        let (status, parent) = open_child(
+            &app,
+            &root,
+            "Parent",
+            "Split the core module",
+            &["core/**"],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{parent}");
+        let parent_id = parent["id"].as_str().unwrap();
+        let (status, first) = open_leaf(&app, parent_id, "First", &["core/a/**"]).await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+
+        let (status, body) = open_child(
+            &app,
+            parent_id,
+            "Unsplit",
+            "Work on all of core",
+            &["core/**"],
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("same scope"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_refused_when_tree_budget_exhausted() {
+        let (app, pool) = app_and_pool().await;
+        let root = open_root(&app, "s-budget-exhausted").await;
+        let run_id = sqlx::query(
+            "INSERT INTO runs (prompt, status, cost_usd, created_at, completed_at) \
+             VALUES ('p', 'completed', 1.0, ?, ?)",
+        )
+        .bind("2026-10-30T10:00:00+00:00")
+        .bind("2026-10-30T10:00:00+00:00")
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        sqlx::query("UPDATE work_nodes SET run_id = ? WHERE id = ?")
+            .bind(run_id.to_string())
+            .bind(&root)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO tree_budgets (tree_id, limit_usd, soft_pct, created_at, updated_at) \
+             VALUES (?, 0.0, 80.0, ?, ?)",
+        )
+        .bind(&root)
+        .bind("2026-10-30T10:00:00+00:00")
+        .bind("2026-10-30T10:00:00+00:00")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let (status, body) = open_leaf(&app, &root, "Blocked", &["core/**"]).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("budget"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_unaffected_for_tree_without_budget() {
+        let app = app().await;
+        let root = open_root(&app, "s-no-budget").await;
+
+        let (status, body) = open_leaf(&app, &root, "Allowed", &["core/**"]).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    #[tokio::test]
+    async fn open_refused_for_repeated_goal_of_an_ancestor() {
+        let app = app().await;
+        let root = open_root(&app, "s-repeated-goal").await;
+        let (status, parent) = open_child(
+            &app,
+            &root,
+            "Parent",
+            "Split the core module",
+            &["core/**"],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{parent}");
+        let parent_id = parent["id"].as_str().unwrap();
+
+        let (status, body) = open_child(
+            &app,
+            parent_id,
+            "Repeated",
+            "ship the tree",
+            &["core/a/**"],
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("repeated goal"),
+            "{body}"
+        );
     }
 
     #[tokio::test]
