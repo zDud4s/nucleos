@@ -1616,6 +1616,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_empty_tree_finishes_held_without_merging() {
+        const JOB: &str = "drv-empty-held";
+        let fx = Fixture::new().await;
+        let master = sha_of(&fx.repo, "master");
+        let gate = FakeGate::answering(vec![]);
+        fx.seed_job(JOB, vec![code_branch("root", "dropped", None)], None)
+            .await;
+        fx.root_done(JOB).await;
+
+        fx.tick(JOB, &gate).await;
+
+        let held = fx.job(JOB).await;
+        assert_eq!(held.state, "finished");
+        assert_eq!(held.manifest.state, "finished");
+        assert_eq!(fx.requests().await, 0, "an empty tree queues no landing");
+        let root = fx.node(&root_node_of(JOB)).await;
+        assert_eq!(root.status, "done");
+        assert!(root.closed_at.is_some());
+        assert_eq!(sha_of(&fx.repo, "master"), master);
+    }
+
+    #[tokio::test]
+    async fn an_empty_integration_tree_queues_no_landing() {
+        const JOB: &str = "drv-empty-integration";
+        let fx = Fixture::new().await;
+        let gate = FakeGate::answering(vec![]);
+        fx.seed_job(
+            JOB,
+            vec![code_branch("root", "dropped", None)],
+            Some("integration"),
+        )
+        .await;
+        fx.root_done(JOB).await;
+
+        fx.tick(JOB, &gate).await;
+
+        assert_eq!(fx.job(JOB).await.state, "finished");
+        assert_eq!(fx.requests().await, 0, "an empty tree queues no landing");
+    }
+
+    /// Guard: this may pass before the empty-tree completion change, but work in flight must not
+    /// finish the job.
+    #[tokio::test]
+    async fn a_branch_still_building_keeps_an_unmerged_tree_open() {
+        const JOB: &str = "drv-empty-building";
+        let fx = Fixture::new().await;
+        let gate = FakeGate::answering(vec![]);
+        fx.seed_job(JOB, vec![code_branch("api", "building", None)], None)
+            .await;
+        fx.root_done(JOB).await;
+
+        fx.tick(JOB, &gate).await;
+
+        assert_ne!(fx.job(JOB).await.state, "finished");
+    }
+
+    #[tokio::test]
     async fn an_integration_job_lands_into_the_integration_branch_and_finishes() {
         const JOB: &str = "drv-integration";
         let fx = Fixture::new().await;
