@@ -10,6 +10,7 @@ use crate::judge::JudgeMode;
 use crate::wip::{open_proposals_term, open_shadow_decisions_term};
 
 mod hook_timeout;
+mod stop_timer;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -884,6 +885,7 @@ fn wire_hook(dir: &Path, overwrite_script: bool) -> Result<(), String> {
     }
     wire_event(hooks, SESSION_START_EVENT, session_start_entry())
         .map_err(|error| format!("{}: {error}", settings_path.display()))?;
+    stop_timer::wire(hooks);
     set_auto_compact_window(
         object,
         &auto_compact_window(std::env::var("NUCLEOS_AUTO_COMPACT_WINDOW").ok().as_deref()),
@@ -899,6 +901,7 @@ fn wire_hook(dir: &Path, overwrite_script: bool) -> Result<(), String> {
         std::fs::write(&script_path, HOOK_SOURCE)
             .map_err(|error| format!("could not write the hook script: {error}"))?;
     }
+    stop_timer::write_script(dir)?;
     std::fs::write(
         &settings_path,
         format!(
@@ -3476,7 +3479,7 @@ pub mod tests {
         )
         .unwrap();
         let stop = settings["hooks"]["Stop"].as_array().unwrap();
-        assert_eq!(stop.len(), 2, "{stop:?}");
+        assert_eq!(stop.len(), 3, "their hook, ours and the timer: {stop:?}");
         assert!(
             serde_json::to_string(&stop[0])
                 .unwrap()

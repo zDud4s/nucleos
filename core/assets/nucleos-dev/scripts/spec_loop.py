@@ -9,9 +9,11 @@ type "segue", "o que falta" or "resume o que foi feito" over and over. Two hooks
   (`- [ ]` open, `- [x]` done, `- [!]` waits on a decision only the owner can make) plus a
   `status:` line (`active` | `blocked` | `handoff` | `done`).
 - `--stop-hook` (Stop): refuses the stop while any `- [ ]` is left, unless the status is
-  `blocked` (with at least one `[!]` item) or `handoff` (context ceiling). It lets go after
-  MAX_IDLE_PUSHES pushes that closed nothing, so a stuck model cannot loop forever. Whenever the
-  checklist changed since the last accepted report, the final message must carry the report
+  `blocked` (with at least one `[!]` item) or `handoff` (context ceiling), or background work the
+  session launched is still running: its completion wakes the session and the hold resumes
+  (`spec_loop_timer.py` wakes it first if the prompt cache is about to expire). It
+  lets go after MAX_IDLE_PUSHES pushes that closed nothing, so a stuck model cannot loop forever.
+  Whenever the checklist changed since the last accepted report, the final message must carry the report
   headings (REPORT_HEADINGS); a done checklist is then closed (`<id>.closed.md`).
 - `--prompt-hook` (UserPromptSubmit): a prompt that names a spec or plan, in a session with no
   open loop, gets the instruction to open one; a session with one gets its open count.
@@ -120,6 +122,15 @@ def _scan(lines: list[str]) -> str:
     return ""
 
 
+def running_tasks(payload: dict) -> list[str]:
+    """Ids of the session's background work still running, as Claude Code reports it at Stop. A
+    payload without the field reads as none: the push stays, which is the safe side."""
+    tasks = payload.get("background_tasks")
+    if not isinstance(tasks, list):
+        return []
+    return sorted(str(t.get("id")) for t in tasks if isinstance(t, dict) and t.get("status") == "running")
+
+
 def _load_state(p: Path) -> dict:
     try:
         return json.loads(p.read_text(encoding="utf-8"))
@@ -156,6 +167,11 @@ def stop_decision(payload: dict) -> dict | None:
     exit_ok = status == "handoff" or (status == "blocked" and loop["blocked"])
     no_items = not (loop["open"] or loop["done"] or loop["blocked"])
     if (n_open or no_items) and not exit_ok:
+        # A push while background work runs buys only a "still waiting" reply, and the context
+        # re-read that costs. Its completion notification starts a new turn, and this hook with it;
+        # spec_loop_timer.py covers the cache running out first, and a completion that never wakes.
+        if n_open and running_tasks(payload):
+            return None
         idle = state.get("idle", 0) + 1 if pushed and n_open >= state.get("last_open", n_open + 1) else 0
         if idle < MAX_IDLE_PUSHES:
             save(last_open=n_open, idle=idle, last_block="work")
