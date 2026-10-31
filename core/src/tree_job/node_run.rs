@@ -21,7 +21,7 @@ const NODE_PROMPT_HEADER: &str = "You are the agent for NucleOS tree node ";
 ///
 /// A relaunch receives the already stored prompt, so the marker must make this a no-op after the
 /// first launch rather than accumulating a second copy of the instructions.
-pub(super) fn node_prompt(node_id: &str, tree_job_id: &str, task: &str) -> String {
+pub(super) fn node_prompt(node_id: &str, root_id: &str, tree_job_id: &str, task: &str) -> String {
     if task.starts_with(NODE_PROMPT_HEADER) {
         return task.to_owned();
     }
@@ -33,21 +33,21 @@ pub(super) fn node_prompt(node_id: &str, tree_job_id: &str, task: &str) -> Strin
             " Its tree job id is {tree_job_id}: when you call tree_branch_start, pass `id` = {tree_job_id} (the tree job id, not a node id) and `node_id` = {node_id}."
         )
     };
-    let report = report_format(node_id);
+    let report = report_format(node_id, root_id);
     format!(
         "{NODE_PROMPT_HEADER}{node_id}.{job_line} If the work is too large for this node, split it with the tree_branch_start tool (a node run cannot open children with node_open). Finish by writing a handoff file and calling node_close. Write the handoff file as `.nucleos-report.md` in your worktree (your current directory; the daemon keeps it out of git, so do not commit it) and pass its absolute path as handoff_path.\n\n{report}\n\n{task}"
     )
 }
 
 /// The report a node writes to `.nucleos-report.md`: the shape `report::parse_report` reads and
-/// `report::report_problems` checks, with this node's id filled in.
-fn report_format(node_id: &str) -> String {
+/// `report::report_problems` checks, with this node's id and its tree's root id filled in.
+fn report_format(node_id: &str, root_id: &str) -> String {
     format!(
         "Write your report to `.nucleos-report.md` in your worktree, in this shape. The daemon checks \
 it, and `node_close` refuses a report that breaks a rule below:\n\n\
 # Node Handoff\n\n\
 Node ID: {node_id}\n\
-Root ID: <the id of the root of your tree; read it from your node record, which node_tree shows>\n\
+Root ID: {root_id}\n\
 Status: <done, blocked, failed or handoff, as the Outcome requires>\n\
 Role: <leaf, orchestrator or review>\n\
 Outcome: <done, split, contract_request, blocked, failed or handoff>\n\
@@ -354,13 +354,19 @@ pub async fn launch(
     // without a worktree there is neither a box nor a handoff location for the node protocol.
     let prompt = match cwd.as_ref() {
         Some(_) => {
-            let tree_job_id: Option<String> =
-                sqlx::query_scalar("SELECT tree_job_id FROM work_nodes WHERE id = ?")
+            // A missing row yields empty ids, as it did before the root id was read.
+            let (tree_job_id, root_id): (Option<String>, Option<String>) =
+                sqlx::query_as("SELECT tree_job_id, root_id FROM work_nodes WHERE id = ?")
                     .bind(node_id)
                     .fetch_optional(pool)
                     .await?
-                    .flatten();
-            node_prompt(node_id, tree_job_id.as_deref().unwrap_or(""), &prompt)
+                    .unwrap_or((None, None));
+            node_prompt(
+                node_id,
+                root_id.as_deref().unwrap_or(""),
+                tree_job_id.as_deref().unwrap_or(""),
+                &prompt,
+            )
         }
         None => prompt,
     };
@@ -1228,7 +1234,7 @@ mod tests {
 
     #[test]
     fn a_node_prompt_names_its_node_id_and_tells_it_to_close() {
-        let prompt = node_prompt("node-abc-123", "job-1", "Implement the parser.");
+        let prompt = node_prompt("node-abc-123", "root-9", "job-1", "Implement the parser.");
 
         assert!(prompt.contains("node-abc-123"), "{prompt}");
         assert!(prompt.contains("node_close"), "{prompt}");
@@ -1236,12 +1242,17 @@ mod tests {
         assert!(prompt.contains("Implement the parser."), "{prompt}");
     }
 
-    /// RED: `node_prompt` must take the tree job's id as a second argument,
-    /// `node_prompt(node_id, tree_job_id, task)`; today it has two parameters, so this fails to
-    /// compile. The branch routes key on the job id, not on the node uuid.
+    /// `node_prompt` takes the tree job's id as its third argument,
+    /// `node_prompt(node_id, root_id, tree_job_id, task)`. The branch routes key on the job id,
+    /// not on the node uuid.
     #[test]
     fn a_node_prompt_names_its_tree_job_id() {
-        let prompt = node_prompt("node-abc-123", "proof-slugify-3", "Implement the parser.");
+        let prompt = node_prompt(
+            "node-abc-123",
+            "root-9",
+            "proof-slugify-3",
+            "Implement the parser.",
+        );
 
         assert!(prompt.contains("proof-slugify-3"), "{prompt}");
         assert!(prompt.contains("tree_branch_start"), "{prompt}");
@@ -1249,12 +1260,23 @@ mod tests {
         assert!(prompt.contains("Implement the parser."), "{prompt}");
     }
 
+    /// RED: `node_prompt` must name the root of the tree in the report it asks for, as
+    /// `Root ID: <root_id>`, so the node does not have to look it up in `node_tree`.
+    #[test]
+    fn a_node_prompt_names_its_root_id() {
+        let prompt = node_prompt("node-abc-123", "root-9", "job-1", "Task.");
+
+        assert!(prompt.contains("Root ID: root-9"), "{prompt}");
+        assert!(!prompt.contains("node_tree shows"), "{prompt}");
+        assert!(!prompt.contains("read it from your node record"), "{prompt}");
+    }
+
     /// RED: `node_prompt` must spell out the report format the daemon validates on `node_close`.
     /// Each literal below is a header or section the report validator reads (report.rs:19-26,
     /// 67-70, 101-106, 130-134, 136-151, 161, 171-173); the prompt does not carry them yet.
     #[test]
     fn a_node_prompt_gives_the_report_format() {
-        let prompt = node_prompt("node-abc-123", "job-1", "Implement the parser.");
+        let prompt = node_prompt("node-abc-123", "root-9", "job-1", "Implement the parser.");
 
         assert!(prompt.contains("node-abc-123"), "{prompt}");
         assert!(prompt.contains("Node ID:"), "{prompt}");
