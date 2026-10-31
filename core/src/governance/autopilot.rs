@@ -933,8 +933,11 @@ fn wire_hook(dir: &Path, overwrite_script: bool) -> Result<(), String> {
     }
     // Before the settings that name it: Python exits 2 on a script it cannot open, and on this
     // entry exit 2 wakes the session, whose next stop would run it again.
-    std::fs::write(claude.join("hooks").join("stop_timer.py"), STOP_TIMER_SOURCE)
-        .map_err(|error| format!("could not write the stop timer: {error}"))?;
+    std::fs::write(
+        claude.join("hooks").join("stop_timer.py"),
+        STOP_TIMER_SOURCE,
+    )
+    .map_err(|error| format!("could not write the stop timer: {error}"))?;
     std::fs::write(
         &settings_path,
         format!(
@@ -3429,7 +3432,11 @@ pub mod tests {
         let stop = settings["hooks"]["Stop"].as_array().unwrap();
         let timers: Vec<_> = stop
             .iter()
-            .filter(|entry| serde_json::to_string(entry).unwrap().contains(STOP_TIMER_SCRIPT))
+            .filter(|entry| {
+                serde_json::to_string(entry)
+                    .unwrap()
+                    .contains(STOP_TIMER_SCRIPT)
+            })
             .collect();
         assert_eq!(timers.len(), 1, "{stop:?}");
         assert_eq!(timers[0]["hooks"][0]["asyncRewake"], true);
@@ -3439,7 +3446,9 @@ pub mod tests {
             STOP_TIMER_SOURCE
         );
         assert!(
-            serde_json::to_string(&stop[0]).unwrap().contains(HOOK_SCRIPT),
+            serde_json::to_string(&stop[0])
+                .unwrap()
+                .contains(HOOK_SCRIPT),
             "the forwarding entry stays first: {stop:?}"
         );
     }
