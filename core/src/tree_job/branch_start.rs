@@ -302,13 +302,8 @@ async fn remember_pending_start(
         "Branch {name} (layer {}) waits for disk space and starts by itself once there is room.",
         pending.layer
     );
-    let asked = match super::decisions::ask_pending(
-        &state.pool,
-        job_id,
-        pending.caller,
-        &question,
-    )
-    .await
+    let asked = match super::decisions::ask_pending(&state.pool, job_id, pending.caller, &question)
+        .await
     {
         Ok(asked) => asked,
         Err(error) => {

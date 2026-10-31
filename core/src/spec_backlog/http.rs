@@ -308,19 +308,30 @@ async fn post_decision(
                 if let Some(spec_id) = answered.reopened {
                     crate::spec_backlog::relaunch_answered(state, spec_id);
                 }
-                (StatusCode::OK, Json(json!({ "question": answered.question })))
+                (
+                    StatusCode::OK,
+                    Json(json!({ "question": answered.question })),
+                )
             }
             Err(store::StoreError::NotFound(_)) => {
                 refuse(StatusCode::NOT_FOUND, format!("decision {id} not found"))
             }
-            Err(store::StoreError::AlreadyDecided(_)) => {
-                refuse(StatusCode::CONFLICT, format!("decision {id} is already decided"))
-            }
+            Err(store::StoreError::AlreadyDecided(_)) => refuse(
+                StatusCode::CONFLICT,
+                format!("decision {id} is already decided"),
+            ),
             Err(error) => failed("could not answer the decision", error),
         };
     }
     if id.starts_with("d-") {
-        return match crate::tree_job::open::answer_and_relaunch(&state, &id, &request.answer, "shell").await {
+        return match crate::tree_job::open::answer_and_relaunch(
+            &state,
+            &id,
+            &request.answer,
+            "shell",
+        )
+        .await
+        {
             Ok(answered) => (
                 StatusCode::OK,
                 Json(json!({ "question": answered.decision.question })),
@@ -328,9 +339,10 @@ async fn post_decision(
             Err(DecisionError::NotFound(_)) => {
                 refuse(StatusCode::NOT_FOUND, format!("decision {id} not found"))
             }
-            Err(DecisionError::AlreadyDecided(_)) => {
-                refuse(StatusCode::CONFLICT, format!("decision {id} is already decided"))
-            }
+            Err(DecisionError::AlreadyDecided(_)) => refuse(
+                StatusCode::CONFLICT,
+                format!("decision {id} is already decided"),
+            ),
             Err(DecisionError::Db(error)) => failed("could not answer the decision", error),
             Err(error) => failed("could not answer the decision", error),
         };

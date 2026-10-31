@@ -535,10 +535,7 @@ fn tree_speed(project_root: &str) -> (usize, u64) {
 
 /// The files each unfinished spec's criteria name, by spec id. A spec naming none, or one whose
 /// criteria are not read yet, has an unknown scope. Best effort: a failed read means no paths.
-async fn owned_paths_by_spec(
-    pool: &SqlitePool,
-    project_id: &str,
-) -> BTreeMap<String, Vec<String>> {
+async fn owned_paths_by_spec(pool: &SqlitePool, project_id: &str) -> BTreeMap<String, Vec<String>> {
     let specs = store::list_specs_by_project(pool, Some(project_id))
         .await
         .unwrap_or_default();
@@ -589,8 +586,7 @@ pub async fn resume_finishes(state: &AppState) {
             };
             if let Err(error) = finish(&state, scope).await {
                 tracing::warn!(%error, %project_id, "the resumed spec finish failed");
-                super::finish::announce_failure(&state.pool, &project_id, &error.to_string())
-                    .await;
+                super::finish::announce_failure(&state.pool, &project_id, &error.to_string()).await;
             }
         });
     }

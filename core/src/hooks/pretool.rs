@@ -357,13 +357,9 @@ pub(super) async fn pretooluse_decision_from(
         return decision;
     }
 
-    if let Some(decision) = node_context::docs_write_decision(
-        &state,
-        &payload,
-        run_id,
-        cwd.as_deref().map(Path::new),
-    )
-    .await
+    if let Some(decision) =
+        node_context::docs_write_decision(&state, &payload, run_id, cwd.as_deref().map(Path::new))
+            .await
     {
         return decision;
     }
@@ -1499,22 +1495,13 @@ mod tests {
 
     /// A tree branch whose node is bound to a running `worktree` run. It does not launch an
     /// agent; the run is the test fixture's inert row.
-    async fn seed_tree_branch_run(
-        state: &AppState,
-        layer: &str,
-        owned_paths: &[&str],
-    ) -> i64 {
+    async fn seed_tree_branch_run(state: &AppState, layer: &str, owned_paths: &[&str]) -> i64 {
         let (run_id, node_id, root_id) =
             seed_node_run(state, "worktree", "leaf", Some(1_000)).await;
         let tree_id = format!("tree-{run_id}");
         let paths: Vec<String> = owned_paths.iter().map(|path| (*path).to_owned()).collect();
-        let mut manifest = Manifest::new(
-            &tree_id,
-            "feature/docs",
-            "Write docs",
-            r"C:\work\repo",
-            &[],
-        );
+        let mut manifest =
+            Manifest::new(&tree_id, "feature/docs", "Write docs", r"C:\work\repo", &[]);
         let mut branch = Branch::new("docs", &paths, layer, None);
         branch.node_id = Some(node_id.clone());
         manifest.branches.insert("docs".to_owned(), branch);

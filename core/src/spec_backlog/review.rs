@@ -417,6 +417,9 @@ mod tests {
         assert!(first < shown && shown < second, "{prompt}");
         assert_eq!(prompt.matches("Owner answer:").count(), 1, "{prompt}");
         // It is context only: `met` still needs a file and line.
-        assert!(prompt.contains("`met` needs evidence naming a file and line"), "{prompt}");
+        assert!(
+            prompt.contains("`met` needs evidence naming a file and line"),
+            "{prompt}"
+        );
     }
 }

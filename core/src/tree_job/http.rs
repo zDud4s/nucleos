@@ -559,7 +559,10 @@ async fn post_branch(
 /// The admission a new branch of `layer` would get from `manifest` right now: the project's disk,
 /// its floor and cap, and the live branches' sizes. The driver asks it before it replays a start
 /// the disk refused. `Err` when the free disk cannot be read.
-pub(super) async fn current_admission(manifest: &Manifest, layer: &str) -> Result<Admission, String> {
+pub(super) async fn current_admission(
+    manifest: &Manifest,
+    layer: &str,
+) -> Result<Admission, String> {
     let (floor_gb, max_live) = tree_limits(&manifest.project_root);
     let free_disk_gb = if layer == DOCS_LAYER {
         0.0
@@ -2272,12 +2275,11 @@ mod tests {
             table_rows(&state.pool, "decisions").await,
             decisions_before + 1
         );
-        let open: Vec<(String, String)> = sqlx::query_as(
-            "SELECT tree_id, status FROM decisions WHERE tree_id IS NOT NULL",
-        )
-        .fetch_all(&state.pool)
-        .await
-        .unwrap();
+        let open: Vec<(String, String)> =
+            sqlx::query_as("SELECT tree_id, status FROM decisions WHERE tree_id IS NOT NULL")
+                .fetch_all(&state.pool)
+                .await
+                .unwrap();
         assert_eq!(open, vec![(JOB.to_owned(), "open".to_owned())]);
         let lines: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM feed WHERE kind = 'work_tree_parked'")
@@ -2297,7 +2299,10 @@ mod tests {
         assert_error(&again, StatusCode::CONFLICT);
         let job = loaded(&state.pool, JOB).await;
         assert_eq!(
-            job.manifest.extra["pending_starts"].as_object().unwrap().len(),
+            job.manifest.extra["pending_starts"]
+                .as_object()
+                .unwrap()
+                .len(),
             1
         );
         assert_eq!(

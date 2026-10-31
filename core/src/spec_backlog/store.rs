@@ -570,12 +570,11 @@ pub async fn answer_question(
     answer: &str,
 ) -> Result<(Question, bool), StoreError> {
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-    let question: Option<(String, String)> = sqlx::query_as(
-        "SELECT spec_id, question FROM spec_questions WHERE id = ?",
-    )
-    .bind(question_id)
-    .fetch_optional(&mut *tx)
-    .await?;
+    let question: Option<(String, String)> =
+        sqlx::query_as("SELECT spec_id, question FROM spec_questions WHERE id = ?")
+            .bind(question_id)
+            .fetch_optional(&mut *tx)
+            .await?;
     let Some((spec_id, question)) = question else {
         return Err(StoreError::NotFound(format!("question {question_id}")));
     };
@@ -589,7 +588,9 @@ pub async fn answer_question(
     .execute(&mut *tx)
     .await?;
     if done.rows_affected() == 0 {
-        return Err(StoreError::AlreadyDecided(format!("question {question_id}")));
+        return Err(StoreError::AlreadyDecided(format!(
+            "question {question_id}"
+        )));
     }
     let reopened = sqlx::query(
         "UPDATE specs SET status = 'discovered', status_reason = NULL, updated_at = ? \
@@ -1305,7 +1306,9 @@ mod tests {
         let surplus_text = format!("{PREFIX}the widget scrolls");
         let kept = add_question(&pool, &spec.id, &kept_text).await.unwrap();
         let surplus = add_question(&pool, &spec.id, &surplus_text).await.unwrap();
-        answer_question(&pool, &kept, "Yes, it renders").await.unwrap();
+        answer_question(&pool, &kept, "Yes, it renders")
+            .await
+            .unwrap();
 
         settle_questions(&pool, &spec.id, PREFIX, std::slice::from_ref(&kept_text))
             .await
@@ -1319,7 +1322,10 @@ mod tests {
         assert_eq!(answered.answer.as_deref(), Some("Yes, it renders"));
         let closed = questions.iter().find(|q| q.id == surplus).unwrap();
         assert_eq!(closed.status, "closed");
-        assert!(questions.iter().all(|q| q.status != "open"), "{questions:?}");
+        assert!(
+            questions.iter().all(|q| q.status != "open"),
+            "{questions:?}"
+        );
     }
 
     #[tokio::test]
@@ -1327,8 +1333,12 @@ mod tests {
         let pool = crate::testdb::fresh_pool().await;
         let waiting = seed(&pool, None, PATH).await;
         let working = seed(&pool, None, OTHER_PATH).await;
-        let asked = add_question(&pool, &waiting.id, "Which port?").await.unwrap();
-        let other = add_question(&pool, &working.id, "Which host?").await.unwrap();
+        let asked = add_question(&pool, &waiting.id, "Which port?")
+            .await
+            .unwrap();
+        let other = add_question(&pool, &working.id, "Which host?")
+            .await
+            .unwrap();
         set_status(&pool, &waiting.id, SpecStatus::NeedsOwner, Some("asked"))
             .await
             .unwrap();

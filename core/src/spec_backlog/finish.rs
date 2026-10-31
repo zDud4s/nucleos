@@ -1053,7 +1053,10 @@ mod tests {
         }
 
         async fn wait_tree(&self, tree_id: &str) -> Result<TreeOutcome, String> {
-            self.waited_tree_ids.lock().unwrap().push(tree_id.to_owned());
+            self.waited_tree_ids
+                .lock()
+                .unwrap()
+                .push(tree_id.to_owned());
             self.wait_outcomes
                 .lock()
                 .unwrap()
@@ -1445,9 +1448,15 @@ mod tests {
         let review = add_spec(&pool, "review-dependency", SpecStatus::Extracted).await;
         let note = add_spec(&pool, "note-dependency", SpecStatus::Extracted).await;
         let dependent = add_spec(&pool, "depends-on-non-specs", SpecStatus::Extracted).await;
-        store::set_extraction_result(&pool, &review, SpecKind::Review, SpecStatus::Extracted, None)
-            .await
-            .unwrap();
+        store::set_extraction_result(
+            &pool,
+            &review,
+            SpecKind::Review,
+            SpecStatus::Extracted,
+            None,
+        )
+        .await
+        .unwrap();
         store::set_extraction_result(&pool, &note, SpecKind::Note, SpecStatus::Extracted, None)
             .await
             .unwrap();
@@ -1463,7 +1472,10 @@ mod tests {
 
         let report = finish_with(
             &pool,
-            &FinishDeps { launcher: &launcher, preparer: &prep },
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &prep,
+            },
             &cfg(),
             scope_all(),
         )
@@ -1471,7 +1483,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(launcher.requests().len(), 1);
-        assert_eq!(report.needs_owner.len(), 0, "satisfied non-spec dependencies need no owner");
+        assert_eq!(
+            report.needs_owner.len(),
+            0,
+            "satisfied non-spec dependencies need no owner"
+        );
         assert_eq!(report.done, vec![dependent]);
     }
 
@@ -1489,7 +1505,10 @@ mod tests {
 
         let report = finish_with(
             &pool,
-            &FinishDeps { launcher: &launcher, preparer: &prep },
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &prep,
+            },
             &cfg(),
             scope_all(),
         )
@@ -1497,15 +1516,25 @@ mod tests {
         .unwrap();
 
         assert_eq!(launcher.requests().len(), 0);
-        assert_eq!(report.needs_owner, vec![dependent.clone()], "the owner is told once");
+        assert_eq!(
+            report.needs_owner,
+            vec![dependent.clone()],
+            "the owner is told once"
+        );
         let reason = store::get_spec(&pool, &dependent)
             .await
             .unwrap()
             .unwrap()
             .status_reason
             .unwrap_or_default();
-        assert!(reason.contains(&dependency), "the reason names the dependency");
-        assert!(reason.contains("abandoned"), "the reason states that it is abandoned");
+        assert!(
+            reason.contains(&dependency),
+            "the reason names the dependency"
+        );
+        assert!(
+            reason.contains("abandoned"),
+            "the reason states that it is abandoned"
+        );
     }
 
     #[tokio::test]
@@ -1522,7 +1551,10 @@ mod tests {
 
         let report = finish_with(
             &pool,
-            &FinishDeps { launcher: &launcher, preparer: &prep },
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &prep,
+            },
             &cfg(),
             scope_all(),
         )
@@ -1530,7 +1562,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(launcher.requests().len(), 0);
-        assert_eq!(report.needs_owner, vec![dependent.clone()], "the owner is told once");
+        assert_eq!(
+            report.needs_owner,
+            vec![dependent.clone()],
+            "the owner is told once"
+        );
         let reason = store::get_spec(&pool, &dependent)
             .await
             .unwrap()
@@ -1538,7 +1574,10 @@ mod tests {
             .status_reason
             .unwrap_or_default();
         assert!(reason.contains(missing), "the reason names the dependency");
-        assert!(reason.contains("does not exist"), "the reason states that it is missing");
+        assert!(
+            reason.contains("does not exist"),
+            "the reason states that it is missing"
+        );
     }
 
     #[tokio::test]
@@ -1559,7 +1598,10 @@ mod tests {
 
         let report = finish_with(
             &pool,
-            &FinishDeps { launcher: &launcher, preparer: &prep },
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &prep,
+            },
             &cfg(),
             scope_all(),
         )
@@ -1567,7 +1609,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(launcher.requests().len(), 0);
-        assert_eq!(report.needs_owner, vec![dependent.clone()], "only the invalid dependency is announced");
+        assert_eq!(
+            report.needs_owner,
+            vec![dependent.clone()],
+            "only the invalid dependency is announced"
+        );
         assert_eq!(status_of(&pool, &dependent).await, SpecStatus::NeedsOwner);
         assert_eq!(status_of(&pool, &downstream).await, SpecStatus::Blocked);
         assert!(report.blocked.contains(&downstream));
@@ -1587,7 +1633,10 @@ mod tests {
 
         let report = finish_with(
             &pool,
-            &FinishDeps { launcher: &launcher, preparer: &prep },
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &prep,
+            },
             &cfg(),
             scope_all(),
         )
@@ -1886,9 +1935,17 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(launcher.requests().len(), 0, "no replacement tree is created");
+        assert_eq!(
+            launcher.requests().len(),
+            0,
+            "no replacement tree is created"
+        );
         assert_eq!(launcher.waited_tree_ids(), vec![adopted]);
-        assert_eq!(report.needs_owner.len(), 0, "the owner is not told about a live tree");
+        assert_eq!(
+            report.needs_owner.len(),
+            0,
+            "the owner is not told about a live tree"
+        );
         assert_eq!(report.done, vec![id]);
     }
 
@@ -1925,12 +1982,21 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(launcher.requests().len(), 0, "the completed tree is adopted, not replaced");
+        assert_eq!(
+            launcher.requests().len(),
+            0,
+            "the completed tree is adopted, not replaced"
+        );
         assert_eq!(launcher.waited_tree_ids(), vec![adopted]);
         assert_eq!(report.needs_owner.len(), 0, "the owner is not told twice");
         let lineages = prep.lineages.lock().unwrap();
         assert!(lineages[0].1.run_ids.contains(&"adopted-run".to_owned()));
-        assert!(lineages[0].1.lineage_roots.contains(&"adopted-root".to_owned()));
+        assert!(
+            lineages[0]
+                .1
+                .lineage_roots
+                .contains(&"adopted-root".to_owned())
+        );
     }
 
     #[tokio::test]
@@ -1959,12 +2025,26 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(launcher.requests().len(), 0, "a missing adopted tree is never replaced");
-        assert_eq!(report.needs_owner, vec![id.clone()], "the owner is told once");
+        assert_eq!(
+            launcher.requests().len(),
+            0,
+            "a missing adopted tree is never replaced"
+        );
+        assert_eq!(
+            report.needs_owner,
+            vec![id.clone()],
+            "the owner is told once"
+        );
         let spec = store::get_spec(&pool, &id).await.unwrap().unwrap();
         let reason = spec.status_reason.unwrap_or_default();
-        assert!(reason.contains(adopted), "the reason names the missing tree");
-        assert!(reason.contains("does not exist"), "the reason states the missing-tree fact");
+        assert!(
+            reason.contains(adopted),
+            "the reason names the missing tree"
+        );
+        assert!(
+            reason.contains("does not exist"),
+            "the reason states the missing-tree fact"
+        );
     }
 
     #[tokio::test]
@@ -2062,7 +2142,10 @@ mod tests {
 
         let report = finish_with(
             &pool,
-            &FinishDeps { launcher: &launcher, preparer: &prep },
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &prep,
+            },
             &config,
             scope_all(),
         )
@@ -2094,7 +2177,10 @@ mod tests {
 
         let report = finish_with(
             &pool,
-            &FinishDeps { launcher: &launcher, preparer: &prep },
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &prep,
+            },
             &config,
             scope_all(),
         )
@@ -2133,16 +2219,31 @@ mod tests {
 
         let report = finish_with(
             &pool,
-            &FinishDeps { launcher: &launcher, preparer: &prep },
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &prep,
+            },
             &config,
             scope_all(),
         )
         .await
         .unwrap();
 
-        assert_eq!(launcher.requests().len(), 0, "the next tree waits for disk space");
-        assert_eq!(report.needs_owner.len(), 0, "low disk is not an owner question");
-        assert_eq!(report.blocked.len(), 0, "low disk does not fail the queued spec");
+        assert_eq!(
+            launcher.requests().len(),
+            0,
+            "the next tree waits for disk space"
+        );
+        assert_eq!(
+            report.needs_owner.len(),
+            0,
+            "low disk is not an owner question"
+        );
+        assert_eq!(
+            report.blocked.len(),
+            0,
+            "low disk does not fail the queued spec"
+        );
         assert_eq!(status_of(&pool, &id).await, SpecStatus::Extracted);
     }
 

@@ -1589,7 +1589,14 @@ mod tests {
         .await
         .unwrap();
 
-        run_as(&state, "telegram", "u1", "c1", explicit("sq-chan-1", "sqlite")).await;
+        run_as(
+            &state,
+            "telegram",
+            "u1",
+            "c1",
+            explicit("sq-chan-1", "sqlite"),
+        )
+        .await;
 
         let (status, answer): (String, Option<String>) =
             sqlx::query_as("SELECT status, answer FROM spec_questions WHERE id = 'sq-chan-1'")

@@ -11,9 +11,11 @@ pub fn owned_glob_matches(glob: &str, path: &str) -> bool {
     let path = path.replace('\\', "/");
     let glob: Vec<&str> = glob.split('/').collect();
     let path: Vec<&str> = path.split('/').collect();
-    if glob.iter().chain(path.iter()).any(|segment| {
-        segment.is_empty() || matches!(*segment, "." | "..")
-    }) {
+    if glob
+        .iter()
+        .chain(path.iter())
+        .any(|segment| segment.is_empty() || matches!(*segment, "." | ".."))
+    {
         return false;
     }
     owned_glob_segments_match(&glob, &path)
@@ -26,10 +28,11 @@ fn owned_glob_segments_match(glob: &[&str], path: &[&str]) -> bool {
             owned_glob_segments_match(rest, path)
                 || (!path.is_empty() && owned_glob_segments_match(glob, &path[1..]))
         }
-        [segment, rest @ ..] => path
-            .first()
-            .is_some_and(|part| owned_glob_segment_matches(segment, part))
-            && owned_glob_segments_match(rest, &path[1..]),
+        [segment, rest @ ..] => {
+            path.first()
+                .is_some_and(|part| owned_glob_segment_matches(segment, part))
+                && owned_glob_segments_match(rest, &path[1..])
+        }
     }
 }
 
@@ -101,12 +104,18 @@ mod tests {
             ".ai/notes/nested/design.md"
         ));
         assert!(owned_glob_matches(".ai/specs/*.md", ".ai/specs/design.md"));
-        assert!(!owned_glob_matches(".ai/specs/*.md", ".ai/specs/nested/design.md"));
+        assert!(!owned_glob_matches(
+            ".ai/specs/*.md",
+            ".ai/specs/nested/design.md"
+        ));
         assert!(!owned_glob_matches(
             ".ai/notes/**",
             ".ai/notes/../specs/design.md"
         ));
-        assert!(!owned_glob_matches(".ai/notes/**", "../.ai/notes/design.md"));
+        assert!(!owned_glob_matches(
+            ".ai/notes/**",
+            "../.ai/notes/design.md"
+        ));
     }
 
     #[test]

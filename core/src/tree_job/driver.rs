@@ -181,7 +181,10 @@ async fn advance(state: &AppState, job_id: &str, gate: Option<GateFn>) {
 /// admits the branch. Still short: nothing is written or announced. Refused for another reason now,
 /// or the caller is gone: the record is dropped and the decision stays open for the owner.
 async fn retry_pending_starts(state: &AppState, job_id: &str) -> Result<(), String> {
-    let Some(job) = store::load(&state.pool, job_id).await.map_err(|e| e.to_string())? else {
+    let Some(job) = store::load(&state.pool, job_id)
+        .await
+        .map_err(|e| e.to_string())?
+    else {
         return Ok(());
     };
     if job.state == JOB_TERMINAL_STATE {
@@ -239,7 +242,10 @@ async fn retry_pending_start(
             }
         }
     }
-    let line = format!("{}: branch {name} admitted automatically, the disk is freed", job.goal);
+    let line = format!(
+        "{}: branch {name} admitted automatically, the disk is freed",
+        job.goal
+    );
     if let Err(error) = crate::feed::append(
         pool,
         job.project_id.as_deref(),
@@ -2421,7 +2427,10 @@ mod tests {
         .await
         .unwrap();
         let mut stored = fx.job(job).await;
-        stored.manifest.costs_gb.insert(PENDING_LAYER.to_owned(), json!(SHORT_GB));
+        stored
+            .manifest
+            .costs_gb
+            .insert(PENDING_LAYER.to_owned(), json!(SHORT_GB));
         stored.manifest.extra.insert(
             "pending_starts".to_owned(),
             json!({ PENDING_NAME: {
@@ -2485,7 +2494,10 @@ mod tests {
             .branches
             .get(PENDING_NAME)
             .expect("the branch was started from the stored body");
-        let node = branch.node_id.clone().expect("the branch is bound to a node");
+        let node = branch
+            .node_id
+            .clone()
+            .expect("the branch is bound to a node");
         assert_eq!(fx.launches(&node, "branch-late").await, 1);
         let (status, answer, origin) = decision_row(&fx, &decision).await;
         assert_eq!(status, decisions::STATUS_ANSWERED);
@@ -2516,7 +2528,11 @@ mod tests {
         assert_eq!(pending_starts(&stored), before, "the record is untouched");
         assert!(stored.manifest.branches.is_empty(), "no branch was started");
         assert_eq!(count_of(&fx, "decisions").await, decisions_before);
-        assert_eq!(count_of(&fx, "feed").await, feed_before, "nothing is announced");
+        assert_eq!(
+            count_of(&fx, "feed").await,
+            feed_before,
+            "nothing is announced"
+        );
         assert_eq!(decision_row(&fx, &decision).await.0, decisions::STATUS_OPEN);
     }
 
@@ -2604,7 +2620,11 @@ mod tests {
         .execute(&fx.state.pool)
         .await
         .unwrap();
-        assert_eq!(claimed.rows_affected(), 1, "an escalated request was waiting");
+        assert_eq!(
+            claimed.rows_affected(),
+            1,
+            "an escalated request was waiting"
+        );
     }
 
     async fn conflict_attempts(fx: &Fixture) -> Option<i64> {

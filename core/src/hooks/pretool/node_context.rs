@@ -169,12 +169,9 @@ pub(super) async fn docs_write_decision(
             return Some(docs_write_deny(&[]));
         }
     };
-    let docs_branch = manifest
-        .branches
-        .values()
-        .find(|branch| {
-            branch.layer == "docs" && branch.node_id.as_deref() == Some(node_id.as_str())
-        });
+    let docs_branch = manifest.branches.values().find(|branch| {
+        branch.layer == "docs" && branch.node_id.as_deref() == Some(node_id.as_str())
+    });
     let Some(docs_branch) = docs_branch else {
         return Some(docs_write_deny(&[]));
     };
@@ -184,15 +181,16 @@ pub(super) async fn docs_write_decision(
         .filter_map(|key| payload.tool_input.get(*key).and_then(Value::as_str))
         .map(|path| docs_relative_path(path, cwd))
         .collect();
-    let allowed = !paths.is_empty() && paths.iter().all(|path| {
-        path.as_deref().is_some_and(|path| {
-            crate::tree_job::docs_paths::is_allowed_docs_path(path)
-                && docs_branch
-                    .paths
-                    .iter()
-                    .any(|glob| crate::tree_job::docs_paths::owned_glob_matches(glob, path))
-        })
-    });
+    let allowed = !paths.is_empty()
+        && paths.iter().all(|path| {
+            path.as_deref().is_some_and(|path| {
+                crate::tree_job::docs_paths::is_allowed_docs_path(path)
+                    && docs_branch
+                        .paths
+                        .iter()
+                        .any(|glob| crate::tree_job::docs_paths::owned_glob_matches(glob, path))
+            })
+        });
     (!allowed).then(|| docs_write_deny(&docs_branch.paths))
 }
 

@@ -691,7 +691,10 @@ pub async fn settle_merge(
             escalated: true,
         } if !claim_conflict => {
             // One attempt per merge request, however many passes see the same conflict.
-            let counted = held.extra.get("conflict_request_id").and_then(Value::as_i64);
+            let counted = held
+                .extra
+                .get("conflict_request_id")
+                .and_then(Value::as_i64);
             if counted != Some(id) {
                 let attempts = held
                     .extra
