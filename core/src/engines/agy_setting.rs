@@ -1,6 +1,32 @@
-//! Tests of the `agy` opt-in settings document (plan Node 2, tests 12, 13, 14 and 16).
-//!
-//! RED: `AgyDoc` and the warning constants do not exist yet, so this module fails to compile.
+//! The `agy` opt-in as a settings document. Off until the owner enables it; enabling is refused unless the
+//! stored acknowledgement names the current warning, whichever door the write came through.
+
+use serde::{Deserialize, Serialize};
+
+use super::agy::WARNING_VERSION;
+use crate::settings::{Document, Kind};
+
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgyDoc {
+    /// Whether the agy engine may be used at all.
+    pub enabled: bool,
+    /// The version of the warning the owner accepted when enabling.
+    pub acknowledged_warning_version: Option<u32>,
+}
+
+impl Document for AgyDoc {
+    const NAME: &'static str = "agy";
+    const KIND: Kind = Kind::Machine;
+    fn finish(self) -> Result<Self, String> {
+        if self.enabled && self.acknowledged_warning_version != Some(WARNING_VERSION) {
+            return Err(format!(
+                "the agy engine cannot be enabled without acknowledging warning version {WARNING_VERSION}"
+            ));
+        }
+        Ok(self)
+    }
+}
 
 #[cfg(test)]
 mod tests {

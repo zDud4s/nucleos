@@ -15,6 +15,7 @@ use crate::config::{
     GithubConfig, ModelsConfig, VerifyConfig, VoiceConfig, WebConfig, validate_devtime,
     validate_rules,
 };
+use crate::engines::agy::AgyDoc;
 use crate::machine_config as files;
 use crate::models::route_doc::RouterDoc;
 use crate::workflows::Pins;
@@ -150,6 +151,10 @@ static DOCUMENTS: LazyLock<Vec<DocType>> = LazyLock::new(|| {
         of::<RouterDoc>(
             files::ROUTER_FILE,
             "when the daemon restarts — the router is read once at startup; an absent file leaves routing off",
+        ),
+        of::<AgyDoc>(
+            files::AGY_FILE,
+            "when the daemon restarts — the primary runner is built once at startup; an absent document leaves the agy engine off",
         ),
         of::<ModelsConfig>(
             crate::config::MODELS_CONFIG_FILE,

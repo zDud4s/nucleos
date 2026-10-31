@@ -1,7 +1,102 @@
-//! Tests of `GET|PUT /engines/agy`, the acknowledged opt-in of the agy engine (plan Node 2, test 15).
+//! The acknowledged opt-in of the agy engine over HTTP (`/engines/agy`, plan Node 2 section 5).
 //!
-//! RED: the handlers (`routes()`) do not exist yet; GREEN writes them above this module and merges
-//! them next to `settings::routes()` in `http.rs`.
+//! Like `/settings`, the route is in no scope table of `auth.rs`: only the control token and an Admin key reach it.
+
+use axum::extract::rejection::JsonRejection;
+use axum::extract::{Extension, State};
+use axum::http::StatusCode;
+use axum::routing::get;
+use axum::{Json, Router};
+use serde::Deserialize;
+use serde_json::{Value, json};
+
+use super::common::refusal_with_detail;
+use crate::auth::Scope as Caller;
+use crate::door::refusal;
+use crate::engines::agy::{self, AgyDoc, WARNING, WARNING_VERSION};
+use crate::governance::autopilot;
+use crate::settings::{self as store, Scope, SettingsError};
+use crate::state::AppState;
+
+type Refused = (StatusCode, Json<Value>);
+
+pub(super) fn routes() -> Router<AppState> {
+    Router::new().route("/engines/agy", get(read).put(write))
+}
+
+#[derive(Deserialize)]
+struct WriteRequest {
+    enabled: bool,
+    /// The owner accepts [`WARNING`]. Needed to enable, ignored to disable.
+    #[serde(default)]
+    acknowledged: bool,
+}
+
+/// `GET /engines/agy`: the state, the warning to show and whether the binary resolves, on or off.
+async fn read() -> Json<Value> {
+    let doc = store::get::<AgyDoc>(&Scope::Machine);
+    Json(json!({
+        "enabled": doc.enabled,
+        "acknowledged": doc.acknowledged_warning_version == Some(WARNING_VERSION),
+        "warning": WARNING,
+        "warning_version": WARNING_VERSION,
+        "installed": agy::installed(),
+    }))
+}
+
+/// `PUT /engines/agy`: the kill switch first, as for every write. Enabling stores the current warning version
+/// and needs `acknowledged: true`; disabling needs nothing. The change applies when the daemon restarts.
+async fn write(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    request: Result<Json<WriteRequest>, JsonRejection>,
+) -> Result<Json<Value>, Refused> {
+    if autopilot::kill_switch_engaged(&state.pool)
+        .await
+        .unwrap_or(true)
+    {
+        return Err(refusal(StatusCode::LOCKED, "kill_switch"));
+    }
+    let Json(request) = request.map_err(|rejection| {
+        refusal_with_detail(rejection.status(), "invalid", rejection.body_text())
+    })?;
+    if request.enabled && !request.acknowledged {
+        return Err(refusal_with_detail(
+            StatusCode::BAD_REQUEST,
+            "warning_not_acknowledged",
+            WARNING.to_owned(),
+        ));
+    }
+    let by = match caller {
+        Caller::Control => "http:control",
+        Caller::ApiToken(_) => "http:api-token",
+        _ => "http:other",
+    };
+    let version = store::update::<AgyDoc, _>(&state.pool, &Scope::Machine, by, |doc| {
+        doc.enabled = request.enabled;
+        if request.enabled {
+            doc.acknowledged_warning_version = Some(WARNING_VERSION);
+        }
+    })
+    .await
+    .map_err(|error| match error {
+        SettingsError::Invalid(detail) => {
+            refusal_with_detail(StatusCode::UNPROCESSABLE_ENTITY, "invalid", detail)
+        }
+        SettingsError::Stale { .. } => refusal(StatusCode::CONFLICT, "stale"),
+        SettingsError::Unreadable { reason, .. } => {
+            refusal_with_detail(StatusCode::UNPROCESSABLE_ENTITY, "unreadable", reason)
+        }
+        other => {
+            tracing::warn!(error = %other, "the agy opt-in could not be written");
+            refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        }
+    })?;
+    Ok(Json(json!({
+        "version": version,
+        "takes_effect": "when the daemon restarts",
+    })))
+}
 
 #[cfg(test)]
 mod tests {
