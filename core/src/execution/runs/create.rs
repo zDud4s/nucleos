@@ -875,7 +875,8 @@ async fn create_run_with_policy(
         if let Some(resolution) = resolution {
             match sqlx::query(
                 "UPDATE vcs_requests SET resolution_run_id = ?
-                  WHERE id = ? AND resolution_run_id IS NULL",
+                  WHERE id = ? AND resolution_run_id IS NULL
+                    AND COALESCE(settled_reason, '') <> 'tree-merge'",
             )
             .bind(id)
             .bind(resolution.request_id)
@@ -1318,7 +1319,10 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(result, Err(CreateRunError::Invalid(_))), "{result:?}");
+        assert!(
+            matches!(result, Err(CreateRunError::Invalid(_))),
+            "{result:?}"
+        );
         let claimed: Option<i64> =
             sqlx::query_scalar("SELECT resolution_run_id FROM vcs_requests WHERE id = ?")
                 .bind(request)

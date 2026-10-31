@@ -509,6 +509,7 @@ pub async fn submit_merge(
 }
 
 /// How a queued request stands.
+#[derive(Debug)]
 enum RequestEnd {
     Pending,
     Succeeded(Option<String>),
@@ -592,20 +593,43 @@ async fn settle_escalated(
                 return Ok(RequestEnd::Pending);
             }
         }
-        None if claim_conflict => {
-            // Guarded by `resolution_run_id IS NULL`, so a resolution that claimed the row first is
-            // never overwritten.
-            sqlx::query(
-                "UPDATE vcs_requests SET settled_at = ?, settled_reason = 'tree-merge'
-                  WHERE id = ? AND status = 'escalated' AND resolution_run_id IS NULL
-                    AND settled_at IS NULL",
-            )
-            .bind(Utc::now().to_rfc3339())
-            .bind(id)
-            .execute(pool)
-            .await?;
-        }
+        None if claim_conflict => return settle_unclaimed(pool, id, reason).await,
         None => {}
+    }
+    Ok(RequestEnd::Failed {
+        reason,
+        escalated: true,
+    })
+}
+
+/// Claims an escalated row no resolution had claimed when it was read. Guarded by
+/// `resolution_run_id IS NULL`, so a resolution that claimed the row first is never overwritten:
+/// when the guard matches nothing and a run now holds the row, the resolver won and the next pass
+/// reads that run.
+async fn settle_unclaimed(
+    pool: &SqlitePool,
+    id: i64,
+    reason: String,
+) -> Result<RequestEnd, LandingError> {
+    let claimed = sqlx::query(
+        "UPDATE vcs_requests SET settled_at = ?, settled_reason = 'tree-merge'
+          WHERE id = ? AND status = 'escalated' AND resolution_run_id IS NULL
+            AND settled_at IS NULL",
+    )
+    .bind(Utc::now().to_rfc3339())
+    .bind(id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    if claimed == 0 {
+        let run: Option<Option<i64>> =
+            sqlx::query_scalar("SELECT resolution_run_id FROM vcs_requests WHERE id = ?")
+                .bind(id)
+                .fetch_optional(pool)
+                .await?;
+        if matches!(run, Some(Some(_))) {
+            return Ok(RequestEnd::Pending);
+        }
     }
     Ok(RequestEnd::Failed {
         reason,
@@ -2185,7 +2209,13 @@ mod tests {
             .unwrap();
 
         assert!(
-            matches!(settled, RequestEnd::Failed { escalated: true, .. }),
+            matches!(
+                settled,
+                RequestEnd::Failed {
+                    escalated: true,
+                    ..
+                }
+            ),
             "{settled:?}"
         );
         let (_, settled_at, settled_reason) = request_row(&h.pool, request_id).await;

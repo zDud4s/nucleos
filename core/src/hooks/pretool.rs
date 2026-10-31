@@ -2018,7 +2018,11 @@ mod tests {
             let run_id = seed_tree_branch_run(&state, "docs", &[".ai/notes/**"]).await;
             let decision = decide(&state, run_id, "Bash", json!({"command": command})).await;
 
-            assert_eq!(decision.decision, "deny", "{command}: got {:?}", decision.reason);
+            assert_eq!(
+                decision.decision, "deny",
+                "{command}: got {:?}",
+                decision.reason
+            );
         }
     }
 

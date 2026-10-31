@@ -161,9 +161,7 @@ pub(super) async fn docs_write_decision(
             return Some(docs_write_deny(&[]));
         }
     };
-    let Some((node_id, manifest)) = docs_node else {
-        return None;
-    };
+    let (node_id, manifest) = docs_node?;
     let manifest: crate::tree_job::model::Manifest = match serde_json::from_str(&manifest) {
         Ok(manifest) => manifest,
         Err(error) => {
