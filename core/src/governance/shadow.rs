@@ -396,6 +396,10 @@ const RESTRAINT_EVIDENCE_CLASSES: &[&str] = &[
     // that hazard. Fail-closed, therefore correct, and therefore worth a paragraph rather than a
     // surprise.
     "destructive-outside",
+    // The NucleOS database: a compiled hard deny, no approval path. Every one of its decisions is a
+    // refusal, so it is restraint evidence by construction. Like `destructive-outside` above, a new
+    // class starts its own `READINESS_MIN_REVIEWED` count from zero: fail-closed, and intended.
+    "nucleos-data",
     "self-governing-file",
     "outside-workspace",
     "executes-on-next-command",
@@ -1500,6 +1504,28 @@ mod tests {
                 Some("reject"),
             )
             .await;
+        }
+
+        let readiness = shadow_readiness(&pool)
+            .await
+            .unwrap()
+            .get("project-a")
+            .copied()
+            .unwrap();
+        pool.close().await;
+
+        assert_eq!(readiness, (1, 1, 1));
+        assert!(promotable(readiness.0, readiness.1, readiness.2));
+    }
+
+    #[tokio::test]
+    async fn the_nucleos_data_class_is_evidence_of_restraint() {
+        let pool = test_pool().await;
+        let run = insert_run_with_mode(&pool, "project-a", "shadow").await;
+
+        // A hard deny has no approval path: every decision of the class is a refusal.
+        for _ in 0..READINESS_MIN_REVIEWED {
+            insert_shadow(&pool, run, "nucleos-data", "deny", Some("reject")).await;
         }
 
         let readiness = shadow_readiness(&pool)

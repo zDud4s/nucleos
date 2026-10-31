@@ -4,5 +4,6 @@ pub mod local_agent;
 pub mod model_catalog;
 pub mod openai_compatible;
 pub mod route_advice;
+pub mod route_doc;
 pub mod route_report;
 pub mod seat_advice;

@@ -131,13 +131,13 @@ pub(super) async fn get_project_workflows(
         .await
         .map_err(|status| refusal(status, "no_project_root"))?;
     let library = library_or_refusal(&state)?;
-    let pins = pins_file(&state, &id)?;
-    let shown = crate::project::state::display_path(&id, crate::project::state::PINS_FILE);
-    tokio::task::spawn_blocking(move || crate::workflows::installed(&root, &pins, &library))
+    let shown = "workflow_pins";
+    let project_id = id.clone();
+    tokio::task::spawn_blocking(move || crate::workflows::installed(&root, &project_id, &library))
         .await
         .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
         .map(Json)
-        // The parser's own words, the same as `POST /write`'s `invalid`: a pins file that will not
+        // The parser's own words: a pins file that will not
         // load is a file somebody has to fix, and "unprocessable entity" does not say which line.
         // Prefixed with where the file is, because that is no longer the project's folder and the
         // page should not have to know where the daemon keeps it.
@@ -221,29 +221,20 @@ pub(super) fn bundle_or_refusal(
         .ok_or(crate::workflows::Refused::NoSuchBundle)
 }
 
-/// This project's pins file, `~/.nucleos/projects/<id>/workflows.yaml`, or the refusal
-/// [`project_state_dir`] gives for a project with no state directory.
-pub(super) fn pins_file(
-    state: &AppState,
-    id: &str,
-) -> Result<PathBuf, (StatusCode, Json<serde_json::Value>)> {
-    Ok(project_state_dir(state, id)?.join(crate::project::state::PINS_FILE))
-}
-
-/// Every route below writes this project's pins, so every one of them asks the same two questions
-/// first, in the same order, for the reasons `POST /write` sets out at length.
+/// Every route below writes this project's pins (the `workflow_pins` document in the settings store), so every one of them asks the same two questions
+/// first, in the same order.
 ///
-/// **The kill switch first.** These write the project's `workflows.yaml`, and one of them copies a
+/// **The kill switch first.** These write the project's `workflow_pins`, and one of them copies a
 /// whole bundle into `.nucleos/workflows/` — bytes in the project's folder, which §7.5 says must go
 /// the way an agent's write goes. That is the line `POST /commands` sits on the other side of: that
 /// one writes a database row and touches nothing on disk.
 ///
-/// Answers the project root (where an ejected copy goes), the pins file (in the project's state
-/// directory, never in the project) and the library.
+/// Answers the project root (where an ejected copy goes) and the library; the pins themselves live
+/// in the settings store, keyed by the project id.
 pub(super) async fn workflow_write_root(
     state: &AppState,
     id: &str,
-) -> Result<(PathBuf, PathBuf, PathBuf), (StatusCode, Json<serde_json::Value>)> {
+) -> Result<(PathBuf, PathBuf), (StatusCode, Json<serde_json::Value>)> {
     let halted = crate::governance::autopilot::kill_switch_engaged(&state.pool)
         .await
         .unwrap_or(true)
@@ -256,7 +247,7 @@ pub(super) async fn workflow_write_root(
     let root = resolve_project_root(state, id)
         .await
         .map_err(|status| refusal(status, "no_project_root"))?;
-    Ok((root, pins_file(state, id)?, library_or_refusal(state)?))
+    Ok((root, library_or_refusal(state)?))
 }
 
 /// Pin a bundle to this project.
@@ -269,30 +260,35 @@ pub(super) async fn post_project_workflow(
     Path(id): Path<String>,
     Json(body): Json<InstallRequest>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
-    let (root, pins, library) = workflow_write_root(&state, &id).await?;
+    let (root, library) = workflow_write_root(&state, &id).await?;
     consent_gate(
         root.clone(),
-        pins.clone(),
+        id.clone(),
         library.clone(),
         body.name.clone(),
         Some(body.version.clone()),
         body.consent_digest.clone(),
     )
     .await?;
-    let record = materialized_record(&state, &id)?;
+    let state_dir = project_state_dir(&state, &id)?;
     let project_id = id.clone();
     let agents_home = agents_home(&state);
 
-    let (installed, placed) = tokio::task::spawn_blocking(move || {
-        let bundle = bundle_or_refusal(&library, &body.name, Some(&body.version))?;
+    let lookup_library = library.clone();
+    let bundle = tokio::task::spawn_blocking(move || {
+        let bundle = bundle_or_refusal(&lookup_library, &body.name, Some(&body.version))?;
         check_bundle_agent_facts(&bundle, agents_home.as_deref())?;
-        crate::workflows::install(&pins, &bundle)?;
-        let placed = materialize_after_pin(&root, &pins, &library, &record, &bundle.name);
-        Ok::<_, crate::workflows::Refused>((bundle, placed))
+        Ok::<_, crate::workflows::Refused>(bundle)
     })
     .await
     .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
     .map_err(workflow_refusal)?;
+    crate::workflows::install(&state.pool, &project_id, &bundle)
+        .await
+        .map_err(workflow_refusal)?;
+    let placed =
+        materialize_after_pin(&root, &project_id, &state_dir, &library, &bundle.name).await;
+    let installed = bundle;
 
     workflow_feed(
         &state,
@@ -352,22 +348,35 @@ pub(super) fn materialized_record(
 /// files is its consequence, and a file that could not be placed — or one left alone because it
 /// was edited — is something to be told about, not a reason to take the decision back. The answer
 /// is the tail of the feed line, and `GET .../materialize` shows the whole report.
-pub(super) fn materialize_after_pin(
+pub(super) async fn materialize_after_pin(
     root: &std::path::Path,
-    pins: &std::path::Path,
+    project_id: &str,
+    state_dir: &std::path::Path,
     library: &std::path::Path,
-    record: &std::path::Path,
     name: &str,
 ) -> String {
     use crate::workflows::materialize;
-    match materialize::sync(
-        root,
-        pins,
-        library,
-        record,
-        Some(name),
-        materialize::Mode::Apply,
-    ) {
+    let record = state_dir.join(crate::project::state::MATERIALIZED_FILE);
+    let (root, project_id, state_dir) = (
+        root.to_path_buf(),
+        project_id.to_string(),
+        state_dir.to_path_buf(),
+    );
+    let (library, only) = (library.to_path_buf(), name.to_string());
+    let synced = tokio::task::spawn_blocking(move || {
+        materialize::sync(
+            &root,
+            &project_id,
+            &state_dir,
+            &library,
+            &record,
+            Some(&only),
+            materialize::Mode::Apply,
+        )
+    })
+    .await
+    .unwrap_or_else(|error| Err(error.to_string()));
+    match synced {
         Ok(outcomes) => outcomes
             .into_iter()
             .find_map(|outcome| match (outcome.report, outcome.error) {
@@ -400,19 +409,18 @@ pub(super) async fn delete_project_workflow(
     State(state): State<AppState>,
     Path((id, name)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let (root, pins, _) = workflow_write_root(&state, &id).await?;
+    let (root, _) = workflow_write_root(&state, &id).await?;
     let record = materialized_record(&state, &id)?;
     let stopped = name.clone();
 
+    crate::workflows::uninstall(&state.pool, &id, &name)
+        .await
+        .map_err(workflow_refusal)?;
     let cleaned = tokio::task::spawn_blocking(move || {
-        crate::workflows::uninstall(&pins, &name)?;
-        Ok::<_, crate::workflows::Refused>(crate::workflows::materialize::unmaterialize(
-            &root, &record, &name,
-        ))
+        crate::workflows::materialize::unmaterialize(&root, &record, &name)
     })
     .await
-    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
-    .map_err(workflow_refusal)?;
+    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?;
 
     let (removal, error) = match cleaned {
         Ok(removal) => (removal, None),
@@ -451,26 +459,28 @@ pub(super) async fn post_project_workflow_eject(
     State(state): State<AppState>,
     Path((id, name)): Path<(String, String)>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
-    let (root, pins, library) = workflow_write_root(&state, &id).await?;
+    let (root, library) = workflow_write_root(&state, &id).await?;
     let now = chrono::Utc::now();
     let ejected = name.clone();
 
-    tokio::task::spawn_blocking(move || {
-        // The pinned version and not the newest: ejecting is taking a copy of what this project
-        // uses, and quietly taking a copy of something else would be an upgrade nobody asked for
-        // performed at the one moment updates stop arriving.
-        let pinned = crate::workflows::read_pins(&pins)
-            .map_err(crate::workflows::Refused::Io)?
-            .workflows
-            .into_iter()
-            .find(|pin| pin.name == name)
-            .ok_or(crate::workflows::Refused::NotInstalled)?;
-        let bundle = bundle_or_refusal(&library, &name, Some(&pinned.version))?;
-        crate::workflows::eject(&root, &pins, &bundle, now)
+    // The pinned version and not the newest: ejecting is taking a copy of what this project
+    // uses, and quietly taking a copy of something else would be an upgrade nobody asked for
+    // performed at the one moment updates stop arriving.
+    let pinned = crate::project::rules::pins(&id)
+        .map_err(|error| workflow_refusal(crate::workflows::Refused::Io(error.to_string())))?
+        .workflows
+        .into_iter()
+        .find(|pin| pin.name == name)
+        .ok_or_else(|| workflow_refusal(crate::workflows::Refused::NotInstalled))?;
+    let bundle = tokio::task::spawn_blocking(move || {
+        bundle_or_refusal(&library, &name, Some(&pinned.version))
     })
     .await
     .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
     .map_err(workflow_refusal)?;
+    crate::workflows::eject(&state.pool, &root, &id, &bundle, now)
+        .await
+        .map_err(workflow_refusal)?;
 
     workflow_feed(
         &state,
@@ -502,31 +512,35 @@ pub(super) async fn post_project_workflow_update(
     Path((id, name)): Path<(String, String)>,
     Json(body): Json<UpdateRequest>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
-    let (root, pins, library) = workflow_write_root(&state, &id).await?;
+    let (root, library) = workflow_write_root(&state, &id).await?;
     consent_gate(
         root.clone(),
-        pins.clone(),
+        id.clone(),
         library.clone(),
         name.clone(),
         body.version.clone(),
         body.consent_digest.clone(),
     )
     .await?;
-    let record = materialized_record(&state, &id)?;
+    let state_dir = project_state_dir(&state, &id)?;
     let now = chrono::Utc::now();
     let project_id = id.clone();
     let agents_home = agents_home(&state);
 
-    let (bundle, placed) = tokio::task::spawn_blocking(move || {
-        let bundle = bundle_or_refusal(&library, &name, body.version.as_deref())?;
+    let lookup_library = library.clone();
+    let bundle = tokio::task::spawn_blocking(move || {
+        let bundle = bundle_or_refusal(&lookup_library, &name, body.version.as_deref())?;
         check_bundle_agent_facts(&bundle, agents_home.as_deref())?;
-        crate::workflows::update(&root, &pins, &bundle, now)?;
-        let placed = materialize_after_pin(&root, &pins, &library, &record, &bundle.name);
-        Ok::<_, crate::workflows::Refused>((bundle, placed))
+        Ok::<_, crate::workflows::Refused>(bundle)
     })
     .await
     .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
     .map_err(workflow_refusal)?;
+    crate::workflows::update(&state.pool, &root, &project_id, &bundle, now)
+        .await
+        .map_err(workflow_refusal)?;
+    let placed =
+        materialize_after_pin(&root, &project_id, &state_dir, &library, &bundle.name).await;
 
     workflow_feed(
         &state,
@@ -564,11 +578,10 @@ pub(super) async fn get_project_workflow_diff(
         .await
         .map_err(|status| refusal(status, "no_project_root"))?;
     let library = library_or_refusal(&state)?;
-    let pins = pins_file(&state, &id)?;
 
     tokio::task::spawn_blocking(move || {
-        let pinned = crate::workflows::read_pins(&pins)
-            .map_err(crate::workflows::Refused::Io)?
+        let pinned = crate::project::rules::pins(&id)
+            .map_err(|error| crate::workflows::Refused::Io(error.to_string()))?
             .workflows
             .into_iter()
             .find(|pin| pin.name == name)
@@ -632,11 +645,10 @@ pub(super) async fn get_project_workflow_graph(
         .await
         .map_err(|status| refusal(status, "no_project_root"))?;
     let library = library_or_refusal(&state)?;
-    let pins = pins_file(&state, &id)?;
 
     tokio::task::spawn_blocking(move || {
-        let pinned = crate::workflows::read_pins(&pins)
-            .map_err(crate::workflows::Refused::Io)?
+        let pinned = crate::project::rules::pins(&id)
+            .map_err(|error| crate::workflows::Refused::Io(error.to_string()))?
             .workflows
             .into_iter()
             .find(|pin| pin.name == name)
@@ -694,7 +706,7 @@ fn graph_in(dir: &std::path::Path) -> Option<crate::workflows::graph::Graph> {
 /// computation behind `GET .../consent` and behind the digest the POSTs check.
 fn compute_consent(
     root: &std::path::Path,
-    pins: &std::path::Path,
+    project_id: &str,
     library: &std::path::Path,
     name: &str,
     version: Option<&str>,
@@ -711,8 +723,8 @@ fn compute_consent(
         Err(error) => return Err(crate::workflows::Refused::Io(error.to_string())),
     };
 
-    let pinned = crate::workflows::read_pins(pins)
-        .map_err(crate::workflows::Refused::Io)?
+    let pinned = crate::project::rules::pins(project_id)
+        .map_err(|error| crate::workflows::Refused::Io(error.to_string()))?
         .workflows
         .into_iter()
         .find(|pin| pin.name == name);
@@ -774,14 +786,14 @@ fn require_consent(
 /// [`compute_consent`] off the async thread, for the three POSTs that enforce it.
 async fn consent_gate(
     root: PathBuf,
-    pins: PathBuf,
+    project_id: String,
     library: PathBuf,
     name: String,
     version: Option<String>,
     given: Option<String>,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     let consent = tokio::task::spawn_blocking(move || {
-        compute_consent(&root, &pins, &library, &name, version.as_deref())
+        compute_consent(&root, &project_id, &library, &name, version.as_deref())
     })
     .await
     .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
@@ -809,10 +821,9 @@ pub(super) async fn get_project_workflow_consent(
         .await
         .map_err(|status| refusal(status, "no_project_root"))?;
     let library = library_or_refusal(&state)?;
-    let pins = pins_file(&state, &id)?;
 
     tokio::task::spawn_blocking(move || {
-        compute_consent(&root, &pins, &library, &name, query.version.as_deref())
+        compute_consent(&root, &id, &library, &name, query.version.as_deref())
     })
     .await
     .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
@@ -836,7 +847,7 @@ pub(super) struct OverlayRequest {
 
 /// Change what this project overrides on one node — or clear it back to inherited.
 ///
-/// **A write, so the stop applies.** It puts bytes in the project's `workflows.yaml`, which the app
+/// **A write, so the stop applies.** It changes the project's `workflow_pins`, which the app
 /// holds on the project's behalf, and §7.5 says that goes the way an agent's write goes.
 ///
 /// A body in which everything is absent clears the row, because an override that overrides nothing
@@ -847,7 +858,7 @@ pub(super) async fn post_project_workflow_node(
     Path((id, name, node)): Path<(String, String, String)>,
     Json(body): Json<OverlayRequest>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
-    let (_, pins, _) = workflow_write_root(&state, &id).await?;
+    workflow_write_root(&state, &id).await?;
     let said = format!("{name}/{node} overridden in this project");
 
     let overlay = crate::workflows::NodeOverlay {
@@ -860,12 +871,9 @@ pub(super) async fn post_project_workflow_node(
         command: body.command.filter(|value| !value.trim().is_empty()),
     };
 
-    tokio::task::spawn_blocking(move || {
-        crate::workflows::set_overlay(&pins, &name, &node, Some(overlay))
-    })
-    .await
-    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
-    .map_err(workflow_refusal)?;
+    crate::workflows::set_overlay(&state.pool, &id, &name, &node, Some(overlay))
+        .await
+        .map_err(workflow_refusal)?;
 
     workflow_feed(&state, &id, &said).await;
     Ok(StatusCode::NO_CONTENT)
@@ -913,7 +921,7 @@ pub(super) async fn post_project_workflow_adopt(
     Path(id): Path<String>,
     Json(body): Json<AdoptRequest>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
-    let (root, pins, _) = workflow_write_root(&state, &id).await?;
+    let (root, _) = workflow_write_root(&state, &id).await?;
     // Adopting is a first pin of a folder the project already has: its command nodes, if it has a
     // graph, are all new, and the person agrees to them like any other install.
     let consent = adopt_consent(&root, &body.path);
@@ -921,12 +929,9 @@ pub(super) async fn post_project_workflow_adopt(
     let now = chrono::Utc::now();
     let said = format!("{} adopted as this project's workflow", body.path);
 
-    tokio::task::spawn_blocking(move || {
-        crate::workflows::adopt(&root, &pins, &body.name, &body.path, now)
-    })
-    .await
-    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
-    .map_err(workflow_refusal)?;
+    crate::workflows::adopt(&state.pool, &root, &id, &body.name, &body.path, now)
+        .await
+        .map_err(workflow_refusal)?;
 
     workflow_feed(&state, &id, &said).await;
     Ok(StatusCode::NO_CONTENT)
@@ -987,11 +992,12 @@ pub(super) async fn post_project_workflow_publish(
     Path((id, name)): Path<(String, String)>,
     Json(body): Json<PublishProjectRequest>,
 ) -> Result<(StatusCode, Json<crate::workflows::Bundle>), (StatusCode, Json<serde_json::Value>)> {
-    let (root, pins, library) = workflow_write_root(&state, &id).await?;
+    let (root, library) = workflow_write_root(&state, &id).await?;
     let said = format!("{name} published to the library as {}", body.version);
 
+    let project_id = id.clone();
     let published = tokio::task::spawn_blocking(move || {
-        crate::workflows::publish_from_project(&root, &pins, &library, &name, &body.version)
+        crate::workflows::publish_from_project(&root, &project_id, &library, &name, &body.version)
     })
     .await
     .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?
@@ -1007,29 +1013,42 @@ pub(super) async fn post_project_workflow_publish(
 /// `not_installed` every route beside this one answers, rather than an empty list.
 pub(super) fn materialize_one(
     root: &std::path::Path,
-    pins: &std::path::Path,
+    project_id: &str,
+    state_dir: &std::path::Path,
     library: &std::path::Path,
     record: &std::path::Path,
     name: &str,
     mode: crate::workflows::materialize::Mode,
 ) -> Result<crate::workflows::materialize::PinOutcome, (StatusCode, Json<serde_json::Value>)> {
-    let pinned = crate::workflows::read_pins(pins).map_err(|detail| {
-        refusal_with_detail(StatusCode::UNPROCESSABLE_ENTITY, "unreadable_pins", detail)
+    let pinned = crate::project::rules::pins(project_id).map_err(|error| {
+        refusal_with_detail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unreadable_pins",
+            error.to_string(),
+        )
     })?;
     if !pinned.workflows.iter().any(|pin| pin.name == name) {
         return Err(workflow_refusal(crate::workflows::Refused::NotInstalled));
     }
-    crate::workflows::materialize::sync(root, pins, library, record, Some(name), mode)
-        .map_err(|detail| {
-            refusal_with_detail(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "unreadable_record",
-                detail,
-            )
-        })?
-        .into_iter()
-        .next()
-        .ok_or_else(|| workflow_refusal(crate::workflows::Refused::NotInstalled))
+    crate::workflows::materialize::sync(
+        root,
+        project_id,
+        state_dir,
+        library,
+        record,
+        Some(name),
+        mode,
+    )
+    .map_err(|detail| {
+        refusal_with_detail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unreadable_record",
+            detail,
+        )
+    })?
+    .into_iter()
+    .next()
+    .ok_or_else(|| workflow_refusal(crate::workflows::Refused::NotInstalled))
 }
 
 /// What materializing this workflow into the project would do, with nothing written.
@@ -1045,12 +1064,13 @@ pub(super) async fn get_project_workflow_materialize(
         .await
         .map_err(|status| refusal(status, "no_project_root"))?;
     let library = library_or_refusal(&state)?;
-    let pins = pins_file(&state, &id)?;
+    let state_dir = project_state_dir(&state, &id)?;
     let record = materialized_record(&state, &id)?;
     tokio::task::spawn_blocking(move || {
         materialize_one(
             &root,
-            &pins,
+            &id,
+            &state_dir,
             &library,
             &record,
             &name,
@@ -1066,19 +1086,22 @@ pub(super) async fn get_project_workflow_materialize(
 /// `workflows/materialize.rs` — and the answer lists every file left alone and why.
 ///
 /// **The stop first**, through `workflow_write_root` like every workflow write: these are files
-/// that govern what an agent does, the same class of write `POST /write` refuses while the kill
-/// switch is engaged.
+/// that govern what an agent does, the same class of write `PUT /settings/{scope}/{name}` refuses
+/// while the kill switch is engaged.
 pub(super) async fn post_project_workflow_materialize(
     State(state): State<AppState>,
     Path((id, name)): Path<(String, String)>,
 ) -> Result<Json<crate::workflows::materialize::PinOutcome>, (StatusCode, Json<serde_json::Value>)>
 {
-    let (root, pins, library) = workflow_write_root(&state, &id).await?;
+    let (root, library) = workflow_write_root(&state, &id).await?;
+    let state_dir = project_state_dir(&state, &id)?;
     let record = materialized_record(&state, &id)?;
+    let project_id = id.clone();
     let outcome = tokio::task::spawn_blocking(move || {
         materialize_one(
             &root,
-            &pins,
+            &project_id,
+            &state_dir,
             &library,
             &record,
             &name,
@@ -1210,7 +1233,6 @@ pub(super) async fn post_workflow_sync(
 
     let library = library_or_refusal(&state)?;
     let state_dir = project_state_dir(&state, &project_id)?;
-    let pins = state_dir.join(crate::project::state::PINS_FILE);
     let is_main = tokio::fs::canonicalize(&root).await.ok().as_ref() == Some(&checkout);
     let record = if is_main {
         state_dir.join(crate::project::state::MATERIALIZED_FILE)
@@ -1218,10 +1240,12 @@ pub(super) async fn post_workflow_sync(
         crate::workflows::materialize::worktree_record(&state_dir, &checkout)
     };
     let target = checkout.clone();
+    let sync_id = project_id.clone();
     let outcomes = tokio::task::spawn_blocking(move || {
         crate::workflows::materialize::sync(
             &target,
-            &pins,
+            &sync_id,
+            &state_dir,
             &library,
             &record,
             None,
@@ -1268,7 +1292,7 @@ pub(super) async fn post_workflow_sync(
 
 /// One feed line, after the fact and loudly on failure.
 ///
-/// The same rule `POST /write` follows: a line about a change that then failed claims something
+/// A line about a change that then failed claims something
 /// that did not happen, and a change whose line was lost is recoverable from the log.
 pub(super) async fn workflow_feed(state: &AppState, project_id: &str, said: &str) {
     if let Err(error) = feed::append(

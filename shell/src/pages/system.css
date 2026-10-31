@@ -741,13 +741,6 @@
   color: var(--text-muted);
 }
 
-.sy-machine-root {
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  color: var(--text);
-  overflow-wrap: anywhere;
-}
-
 /* The files on the left, the chosen one on the right. */
 .sy-settings {
   display: flex;
@@ -858,39 +851,8 @@
   background: var(--text-muted);
 }
 
-.sy-setting-label {
-  display: block;
-  margin: 0 0 var(--space-1);
-  color: var(--text);
-  font-size: var(--text-sm);
-}
-
 .sy-settings-item-dirty {
   margin-left: auto;
-}
-
-.sy-setting-editor {
-  display: block;
-  width: 100%;
-  box-sizing: border-box;
-  padding: var(--space-2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--surface-sunken, var(--surface));
-  color: var(--text);
-  font-family: var(--font-mono);
-  font-size: var(--text-sm);
-  line-height: var(--leading-normal, 1.5);
-  resize: vertical;
-}
-
-.sy-setting-editor:hover:not(:disabled) {
-  border-color: var(--border-strong);
-}
-
-.sy-setting-editor:focus-visible {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: 1px;
 }
 
 .sy-setting-controls {

@@ -43,6 +43,7 @@ import {
   Well,
 } from "../ui";
 import { WorkflowConsentPanel } from "./WorkflowConsent";
+import { ProjectDocument } from "./ProjectDocument";
 import { useFocusOnMount, useInlinePanel, WorkflowChain, WorkflowGraph } from "./WorkflowGraph";
 
 /**
@@ -96,7 +97,7 @@ export function Workflows({ projectId }: WorkflowsProps) {
   // A refusal is an answer and replaces the page; a failure after a good read keeps the good read on
   // screen and says it is old, rather than throwing away what was true a minute ago.
   if (installed.isError && (installed.data === undefined || isApiRefusal(installed.error))) {
-    return <Unreadable error={installed.error} onRetry={reread} />;
+    return <Unreadable projectId={projectId} error={installed.error} onRetry={reread} />;
   }
   if (installed.data === undefined) {
     return <p className="text-sm text-text-faint">Reading this project's workflows…</p>;
@@ -126,6 +127,8 @@ export function Workflows({ projectId }: WorkflowsProps) {
       {/* Folded into the empty state above when both are empty: two stacked nothings said the same
           thing twice, in two sizes, at two different indents. */}
       <Library projectId={projectId} installed={installed.data} quietWhenEmpty={nothing} />
+
+      <PinsDocument projectId={projectId} onChanged={reread} />
 
       <ReadAt at={installed.dataUpdatedAt} onReread={reread} />
     </div>
@@ -224,16 +227,33 @@ function ReadAt({ at, onReread }: { at: number; onReread: () => void }) {
   );
 }
 
+/** The versions this project stands on, as the document the núcleo keeps them in. */
+function PinsDocument({ projectId, onChanged }: { projectId: string; onChanged: () => void }) {
+  return (
+    <Section label="Workflow pins">
+      <ProjectDocument projectId={projectId} name="workflow_pins" onChanged={onChanged} />
+    </Section>
+  );
+}
+
 /**
  * Why the list could not be read, in the daemon's words.
  *
  * Two of these are ordinary and one is not, and they must not read alike. A machine with no library
- * has nowhere for bundles to live; a pins file that will not parse is a file somebody has to fix,
- * and the parser's own words are what say which line — the same reason `POST /write` carries a
- * `detail`. A núcleo that did not answer at all is a failure, and says what it was and how to ask
- * again: PRODUCT.md reads an error here as a bug report, and a bug report with no detail is noise.
+ * has nowhere for bundles to live; a pins document that will not read is something somebody has to
+ * fix, and the parser's own words are what say which line, so the document is offered right here. A
+ * núcleo that did not answer at all is a failure, and says what it was and how to ask again:
+ * PRODUCT.md reads an error here as a bug report, and a bug report with no detail is noise.
  */
-function Unreadable({ error, onRetry }: { error: unknown; onRetry: () => void }) {
+function Unreadable({
+  projectId,
+  error,
+  onRetry,
+}: {
+  projectId: string;
+  error: unknown;
+  onRetry: () => void;
+}) {
   if (!isApiRefusal(error)) {
     return (
       <div className="flex flex-col items-start gap-2">
@@ -251,12 +271,15 @@ function Unreadable({ error, onRetry }: { error: unknown; onRetry: () => void })
   }
   if (error.code === "unreadable_pins") {
     return (
-      <div className="max-w-prose rounded-lg border border-tone-paused-border bg-tone-paused-bg p-4">
-        <p className="text-sm text-text">
-          This project&rsquo;s <span className="font-mono">workflows.yaml</span> does not parse, so
-          the {DAEMON_NAME} cannot say what this project uses.
-        </p>
-        <p className="mt-1 font-mono text-xs text-text-muted">{error.detail}</p>
+      <div className="flex flex-col gap-4">
+        <div className="max-w-prose rounded-lg border border-tone-paused-border bg-tone-paused-bg p-4">
+          <p className="text-sm text-text">
+            This project&rsquo;s pins document does not read, so the {DAEMON_NAME} cannot say what
+            this project uses.
+          </p>
+          <p className="mt-1 font-mono text-xs text-text-muted">{error.detail}</p>
+        </div>
+        <PinsDocument projectId={projectId} onChanged={onRetry} />
       </div>
     );
   }

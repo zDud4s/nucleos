@@ -141,17 +141,13 @@ pub(super) async fn post_admit(
         _ => return Json(AdmitAnswer::none()),
     };
     let kinds = project_id
-        .and_then(|pid| {
-            crate::config::load_schedule_rules(state.machine_config_root.as_deref(), &pid).ok()
-        })
+        .and_then(|pid| crate::project::rules::autopilot(&pid).ok())
         .map(|rules| rules.command_kinds)
         .unwrap_or_default();
-    let config = state
-        .machine_config_root
-        .as_ref()
-        .map(|root| root.join(crate::machine_config::VERIFY_FILE))
-        .map(|path| crate::config::load_verify_config(&path).admission)
-        .unwrap_or_default();
+    let config =
+        crate::settings::get::<crate::config::VerifyConfig>(&crate::settings::Scope::Machine)
+            .admission
+            .clone();
     Json(admit_with(Some(&*book), run_id, body, &kinds, &config, ADMIT_WINDOW).await)
 }
 
@@ -204,7 +200,7 @@ pub(super) async fn admit_with(
 
 #[cfg(test)]
 mod tests {
-    use super::{AdmitRequest, admit_with};
+    use super::{AdmitRequest, admit_with, post_admit};
     use crate::config::{AdmissionConfig, CommandKinds};
     use crate::execution::admission::AdmissionBook;
     use serde_json::json;
@@ -339,5 +335,66 @@ mod tests {
         .await;
         assert_eq!(answer.admission, "none", "admission switched off");
         assert_eq!(book.free(), 1, "none of these took capacity");
+    }
+
+    /// The route as the importer leaves the machine: `verify.yaml` is gone (renamed to
+    /// `verify.yaml.imported`) and the `verify` document is what says admission is off.
+    ///
+    /// The first call is the control: with nothing stored the same request takes a grant, so the
+    /// `none` after the write comes from the document and not from a missing run or book.
+    /// `admission::install` is process-wide and first-wins, but with no waiter a book changes nothing
+    /// for the other tests of this binary: their runs queue for no time.
+    #[tokio::test]
+    async fn post_admit_obeys_the_verify_document_with_no_file_on_disk() {
+        let home = crate::project::rules::testing::Home::new();
+        let mut state = super::super::tests::test_state().await;
+        state.machine_config_root = Some(home.path().to_path_buf());
+        crate::execution::admission::install(std::sync::Arc::new(book(64)));
+        let run_id = sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, created_at)
+             VALUES ('a prompt', 'running', 'worktree', '2026-10-30T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        state
+            .run_handles
+            .lock()
+            .unwrap()
+            .insert(run_id, tokio::spawn(async {}).abort_handle());
+        let admit = |tool_use_id: &'static str| {
+            post_admit(
+                axum::extract::State(state.clone()),
+                axum::Extension(crate::auth::Scope::Run(run_id)),
+                axum::Json(call(Some(tool_use_id), "cargo build")),
+            )
+        };
+
+        let axum::Json(control) = admit("toolu_before_the_document").await;
+        assert_eq!(
+            control.admission, "granted",
+            "with nothing stored, admission is on"
+        );
+        crate::execution::admission::installed()
+            .expect("the book installed above")
+            .release_run(run_id);
+
+        crate::settings::put(
+            &state.pool,
+            &crate::settings::Scope::Machine,
+            "verify",
+            &json!({"admission": {"enabled": false}}),
+            "test",
+            None,
+        )
+        .await
+        .expect("verify is a registered document");
+
+        let axum::Json(answer) = admit("toolu_after_the_document").await;
+        assert_eq!(
+            answer.admission, "none",
+            "the stored document switched admission off"
+        );
     }
 }

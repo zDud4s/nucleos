@@ -1,59 +1,16 @@
-//! Who may write THIS MACHINE's settings, and what a valid one looks like.
+//! The location of this machine's legacy settings files, and the credentials it holds.
 //!
-//! [`crate::ownership`] answers the same question for a file in a PROJECT, and its header explains
-//! at length why these files are deliberately absent from that table: they are this machine's, so a
-//! route under `/projects/{id}` that wrote one would edit a single daemon's configuration through a
-//! URL naming a project, and would do it identically whichever project was named. That reasoning
-//! stands. This module is the other half of it — the same fence, around the files whose owner is
-//! the daemon rather than any project.
+//! This machine's settings are rows in the database now (`crate::settings`); `~/.nucleos/*.yaml` is
+//! what the one-time importer reads, and what it leaves behind as `*.yaml.imported`. [`root`] is that
+//! directory, and the `*_FILE` constants are the names the importer looks for in it.
 //!
-//! # Where they live: `~/.nucleos/`, and no longer the daemon's working directory
-//!
-//! They used to be `.ai/<file>.yaml` relative to wherever the daemon was launched, which made two
-//! mistakes at once. `.ai/` is the agent workflow harness's directory, not the product's, so the
-//! product's settings sat inside somebody else's folder; and "relative to the working directory"
-//! meant a machine with twenty worktrees had twenty candidate copies of every setting, of which the
-//! daemon read whichever one it happened to be started beside. [`root`] is one directory per
-//! person, the same one the council's roster and the workflow library already used, and every row
-//! below is a file name relative to it. The old files are neither read nor copied any more: a file
-//! still there is somebody's leftover.
-//!
-//! Everything that made the project registry work is kept, because the reasons are unchanged:
-//!
-//! - **The boundary is DATA.** A table, one row per file, each carrying the sentence that justifies
-//!   it, served to the page so the fence can be read and argued with.
-//! - **The núcleo owns a file if the núcleo PARSES it.** A claim and a validator arrive together or
-//!   not at all; a claim without a parser is permission to write bytes nobody checks.
-//! - **The path guard is shared, not re-implemented.** [`crate::ownership::normalise`] is what
-//!   decides that a backslash is refused rather than translated, and two copies of that rule would
-//!   be two answers to "which file does this string name" on two platforms.
-//!
-//! # The parsers had to be built before the table could exist
-//!
-//! Nine of these ten loaders are fail-soft on purpose: `load_email_config` and its neighbours
-//! answer a malformed file with defaults and a warning, so a typo in an optional pillar cannot stop
-//! the daemon from starting. That is right for startup and useless as a door — a validator that
-//! cannot say no admits anything. So each loader now delegates to a `parse_*_config` that returns
-//! `Result`, and the loader decides what to do with the `Err`. One grammar, two callers with
-//! different appetites for failure, which is what keeps the file the door accepts and the file the
-//! daemon reads the same file.
-//!
-//! # Every row says a restart is needed, and that is a fact and not an oversight
-//!
-//! `main.rs` reads eight of these exactly once, at startup, and holds the result in `AppState`.
-//! Writing the file therefore changes nothing about the running daemon. A settings page that hid
-//! this would be worse than no settings page: it would report success for an edit that did not take
-//! effect, which is the failure that looks most like success. So `takes_effect` is a field, it is
-//! served with the row, and the page is expected to say it out loud.
-//!
-//! `nucleos-models.yaml` is the one with a nuance rather than a flat answer, and it gets a
-//! sentence of its own below.
+//! What is left of the old fence is the second half of the table: [`SECRETS`], the credentials a
+//! person may set and forget but never read back. A credential is a different kind of thing with a
+//! different store, which is why it never was a field on a settings row.
 
 use std::path::PathBuf;
 
-use crate::ownership::Validator;
-
-/// The directory under the home directory that holds every row of [`SETTINGS`].
+/// The directory under the home directory that holds the legacy settings files the importer reads.
 const ROOT_DIR: &str = ".nucleos";
 
 /// [`root`] as a person is shown it, and the only spelling any message uses.
@@ -63,11 +20,11 @@ const ROOT_DIR: &str = ".nucleos";
 /// `council::CONFIG_DISPLAY_PATH` made the same choice first, for the same reason.
 pub const ROOT_DISPLAY: &str = "~/.nucleos";
 
-/// Where this machine's settings live, or `None` when there is no home directory to hang them off.
+/// `~/.nucleos`, this machine's per-person directory, or `None` when there is no home directory to
+/// hang it off.
 ///
-/// `None` is not an error anybody can fix from here: every loader treats it as "the file is
-/// absent" and the pillar starts on its defaults, which is what an absent file has always meant.
-/// The settings routes refuse by name rather than guess at another directory.
+/// `None` is not an error anybody can fix from here: the importer has nothing to read, and every
+/// document starts on its defaults, which is what an absent file has always meant.
 pub fn root() -> Option<PathBuf> {
     crate::commands::home().map(|home| home.join(ROOT_DIR))
 }
@@ -77,7 +34,8 @@ pub fn display_path(file: &str) -> String {
     format!("{ROOT_DISPLAY}/{file}")
 }
 
-/// The file names, one per row, so `main.rs` loads each from the same string the table serves.
+/// The legacy file names, one per document: the settings registry's `origin_file` names each by the
+/// same string, and that is what the importer looks for.
 pub const EMAIL_FILE: &str = "email.yaml";
 pub const VOICE_FILE: &str = "voice.yaml";
 pub const CALENDAR_FILE: &str = "calendar.yaml";
@@ -91,296 +49,18 @@ pub const ROUTER_FILE: &str = "router.yaml";
 pub const DEVTIME_FILE: &str = "devtime.yaml";
 pub const VERIFY_FILE: &str = "verify.yaml";
 
-/// One of this machine's settings files, with everything a caller needs to act on it safely.
-///
-/// `&'static str` throughout, unlike [`crate::ownership::Claim`]'s `Cow`: that table grows a
-/// per-project half read off a manifest at request time, and this one cannot. The set of files the
-/// daemon parses is a property of the build, so a row that had to be allocated would be a row
-/// describing something this module does not have.
-pub struct Setting {
-    /// A file name relative to [`root`] — the same string `main.rs` joins onto it to load the file,
-    /// and the row's identity on the wire. Compared against a caller's path only after
-    /// [`crate::ownership::normalise`]. A person is shown [`display_path`] of it, never this alone.
-    pub path: &'static str,
-    /// The area this file configures, as a stable wire value the page keys its own words off.
-    pub area: &'static str,
-    /// What editing it changes, in one sentence, for the page that shows the fence.
-    pub what: &'static str,
-    /// When a write to it starts mattering, in one sentence, for the page that must not lie about
-    /// it. See the module header.
-    pub takes_effect: &'static str,
-    /// The parser the candidate must satisfy before a byte is written. Never `None` here — the
-    /// middle state that field exists for in the project registry is a workflow's claim, and a
-    /// workflow declares no rows in this table.
-    pub validate: Validator,
-}
-
-fn validate_email(contents: &str) -> Result<(), String> {
-    crate::config::parse_email_config(contents).map(|_| ())
-}
-
-fn validate_voice(contents: &str) -> Result<(), String> {
-    crate::config::parse_voice_config(contents).map(|_| ())
-}
-
-fn validate_calendar(contents: &str) -> Result<(), String> {
-    crate::config::parse_calendar_config(contents).map(|_| ())
-}
-
-fn validate_web(contents: &str) -> Result<(), String> {
-    crate::config::parse_web_config(contents).map(|_| ())
-}
-
-fn validate_browser(contents: &str) -> Result<(), String> {
-    crate::config::parse_browser_config(contents).map(|_| ())
-}
-
-/// The per-channel file: the same grammar `registry::load_config` reads, but strict. The loader
-/// is fail-soft; the door must be able to say no.
-fn validate_channel_config(contents: &str) -> Result<(), String> {
-    serde_yaml::from_str::<crate::channels::registry::ChannelConfig>(contents)
-        .map(|_| ())
-        .map_err(|error| error.to_string())
-}
-
-fn validate_github(contents: &str) -> Result<(), String> {
-    crate::config::parse_github_config(contents).map(|_| ())
-}
-
-/// `true`, and [`crate::config::parse_council_config`]'s own doc says why: the door refuses what is
-/// wrong about the roster however this machine is configured, and leaves "no local model is up
-/// right now" to startup, which is where that is known. Refusing a local seat because Ollama
-/// happens to be down would make the file uneditable on exactly the machine that needs it edited.
-fn validate_council(contents: &str) -> Result<(), String> {
-    crate::config::parse_council_config(contents, true).map(|_| ())
-}
-
-/// The llm-router adviser's file. `parse_config` is the grammar and also the loopback fence, so the
-/// door refuses a router URL off this machine exactly as the daemon would at startup.
-fn validate_router(contents: &str) -> Result<(), String> {
-    crate::models::route_advice::parse_config(contents).map(|_| ())
-}
-
-/// Parses, and then asks the one question parsing cannot: whether the local route this file
-/// describes is a route the daemon will actually build.
-///
-/// All three of `local_engine`'s refusals deserialise perfectly -- `openai_compatible` with no address, an
-/// engine name that is neither, an address on some other machine -- so a door that stopped at
-/// serde accepted the write, reported success, and left the daemon to refuse the same file on its
-/// next start. That is the failure the module header calls the one that looks most like success.
-///
-/// It belongs here for the reason [`validate_council`] above gives for keeping liveness OUT: these
-/// three are wrong about the file however this machine is configured and whatever is running right
-/// now. "No local server is up" stays a startup question; "that is not an engine, and that is not
-/// this machine" is one the text answers by itself.
-fn validate_models(contents: &str) -> Result<(), String> {
-    let parsed = crate::config::parse_models_config(contents)?;
-    // The refusal's own sentence, never a paraphrase: it names the key to go and edit, which is
-    // the whole reason `LocalEngineRefusal::message` carries the offending value.
-    parsed
-        .local_engine()
-        .map(|_| ())
-        .map_err(|refusal| refusal.message())
-}
-
-fn validate_verify(contents: &str) -> Result<(), String> {
-    crate::config::parse_verify_config(contents).map(|_| ())
-}
-
-/// This machine's settings files. Eleven rows, and the count is asserted in the tests for the same
-/// reason the project registry asserts two: a row added without reading the header above is a row
-/// that has not answered the membership rule.
-pub static SETTINGS: &[Setting] = &[
-    Setting {
-        path: EMAIL_FILE,
-        area: "email",
-        what: "whether this machine reads a mailbox, which one, how often, what interrupts you, and how long a classified message keeps its body",
-        takes_effect: "when the daemon restarts — the mailbox is polled by a sidecar started with this file's contents",
-        validate: validate_email,
-    },
-    Setting {
-        path: VOICE_FILE,
-        area: "voice",
-        what: "whether this machine opens a microphone, the three chords that reach it, the commands that transcribe and speak, and the terms it is told it hears badly",
-        takes_effect: "when the daemon restarts — the chords are registered with the operating system at startup",
-        validate: validate_voice,
-    },
-    Setting {
-        path: CALENDAR_FILE,
-        area: "calendar",
-        what: "the zone an event means when nobody says, and the window a proposal may land in — emphatically not when you are busy, which comes from real events only",
-        takes_effect: "when the daemon restarts",
-        validate: validate_calendar,
-    },
-    Setting {
-        path: WEB_FILE,
-        area: "web",
-        what: "whether this machine searches the web, through whom, and the one list that decides whose extracted text reaches an agent raw",
-        takes_effect: "when the daemon restarts — the search sidecar is started with this file's contents",
-        validate: validate_web,
-    },
-    Setting {
-        path: BROWSER_FILE,
-        area: "browser",
-        what: "whether this machine drives a browser, and the ceilings on live tabs, profiles and disk it may spend doing it",
-        takes_effect: "when the daemon restarts",
-        validate: validate_browser,
-    },
-    Setting {
-        path: CHANNEL_TELEGRAM_FILE,
-        area: "channels/telegram",
-        what: "the Telegram channel's own settings: the doctrine it answers under and the project topics it posts in, and `stream_edits` (a live progress preview made by editing the acknowledgement; on by default, `false` turns it off); the bot token is stored here too",
-        takes_effect: "when the daemon restarts",
-        validate: validate_channel_config,
-    },
-    Setting {
-        path: GITHUB_FILE,
-        area: "github",
-        what: "whether the GitHub pillar is on at all, and the two lists of what a run may read and do there without asking first",
-        takes_effect: "when the daemon restarts — and note that this file EXISTING is itself the pillar's opt-in",
-        validate: validate_github,
-    },
-    Setting {
-        path: COUNCIL_FILE,
-        area: "council",
-        what: "who sits on this machine's council, which model or agent answers for each seat, and how long a seat gets",
-        takes_effect: "when the daemon restarts",
-        validate: validate_council,
-    },
-    Setting {
-        path: ROUTER_FILE,
-        area: "router",
-        what: "whether this machine asks a loopback llm-router which model and effort a run, a seat or a triage item should use, per surface, and which runners it may move a run to",
-        takes_effect: "when the daemon restarts — the router is read once at startup; an absent file leaves routing off",
-        validate: validate_router,
-    },
-    Setting {
-        path: crate::config::MODELS_CONFIG_FILE,
-        area: "models",
-        what: "which model each route runs on, which agent CLI answers a run, and the rows a conversation's model picker offers",
-        // The one row whose answer is not flat, and the nuance is worth the longer sentence: the
-        // picker is re-read per request by `GET /assistant/models`, so a choice added here appears
-        // at once — while `claude_model`, `primary_runner` and the local and hosted routes are used
-        // to BUILD runners at startup and do not move until the daemon does.
-        takes_effect: "the model picker refreshes at once; the routes themselves are built at startup and move when the daemon restarts",
-        validate: validate_models,
-    },
-    Setting {
-        path: VERIFY_FILE,
-        area: "verify",
-        what: "how many verification units run at once on this machine, how long one may take, how long a waiting request waits before it moves up, the disk its warm state may fill, and the broker command every unit runs behind",
-        takes_effect: "when the daemon restarts",
-        validate: validate_verify,
-    },
-];
-
-/// The row for `rel`, or `None` for a path this machine does not configure.
-///
-/// Pure and total, like [`crate::ownership::owner_of`]: everything not in the table is simply not
-/// this module's, and saying so is an answer rather than a refusal to answer.
-pub fn setting_for(rel: &str) -> Option<&'static Setting> {
-    let path = crate::ownership::normalise(rel)?;
-    SETTINGS.iter().find(|setting| setting.path == path)
-}
-
-/* --------------------------------------------------------------- reading health -- */
-
-/// The longest `problem` a [`FileCheck`] carries, in characters. A parser's message can quote the
-/// value that offended it, and a page or a feed line has no use for a paragraph of it.
-pub const PROBLEM_MAX_CHARS: usize = 300;
-
-/// Whether one settings file on disk reads, as `GET /config/machine` and the health readout say it.
-///
-/// Nine of the ten loaders are fail-soft (see the module header), so a file that does not parse
-/// leaves the daemon running on defaults and the owner, who does not read logs, believing otherwise.
-/// This is the same validator the write door runs, applied to what is already on disk.
-#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
-pub struct FileCheck {
-    /// The row's file name relative to [`root`], as [`Setting::path`].
-    pub path: &'static str,
-    /// Whether anything is on disk. An absent file is valid: defaults are its contract.
-    pub exists: bool,
-    pub valid: bool,
-    /// Why it does not read, cut to [`PROBLEM_MAX_CHARS`]. `None` exactly when `valid`.
-    pub problem: Option<String>,
-}
-
-/// `text` cut to [`PROBLEM_MAX_CHARS`] characters, the last being an ellipsis when something went.
-fn cut_problem(text: &str) -> String {
-    if text.chars().count() <= PROBLEM_MAX_CHARS {
-        return text.to_owned();
-    }
-    let mut cut: String = text.chars().take(PROBLEM_MAX_CHARS - 1).collect();
-    cut.push('\u{2026}');
-    cut
-}
-
-/// The verdict on one row, from the result of reading its file. A caller that already holds the
-/// text (the settings route serves it) judges that same read instead of opening the file twice.
-///
-/// A file that exists but cannot be read as text (a directory, bad UTF-8, a permission) is invalid,
-/// and says only the I/O error's kind: its full text embeds the absolute path, which a message
-/// served to a page and written to a feed should not carry.
-pub fn check_read(setting: &Setting, read: &std::io::Result<String>) -> FileCheck {
-    let (exists, verdict) = match read {
-        Ok(contents) => (true, (setting.validate)(contents)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (false, Ok(())),
-        Err(error) => (true, Err(format!("could not be read ({:?})", error.kind()))),
-    };
-    let problem = verdict.err().map(|text| cut_problem(&text));
-    FileCheck {
-        path: setting.path,
-        exists,
-        valid: problem.is_none(),
-        problem,
-    }
-}
-
-/// Runs every row's validator over the file on disk. Absent is valid (defaults are the contract).
-pub fn check_all(root: &std::path::Path) -> Vec<FileCheck> {
-    SETTINGS
-        .iter()
-        .map(|setting| check_read(setting, &std::fs::read_to_string(root.join(setting.path))))
-        .collect()
-}
-
-/// The feed kind a file that did not parse at startup is recorded under.
-pub const CONFIG_UNREADABLE_KIND: &str = "config_unreadable";
-
-/// Writes one machine-level feed line per file in `checks` that does not parse, and returns how many.
-///
-/// Called once at startup with what the loaders started from, so a line says the daemon began on
-/// defaults for that file. The text names the file and not the parser's message: the message can
-/// quote the offending value, and a feed line travels on to Telegram. Best effort, like every other
-/// startup note: a feed that cannot be written must not stop the daemon.
-pub async fn report_unreadable(pool: &sqlx::SqlitePool, checks: &[FileCheck]) -> usize {
-    let mut written = 0;
-    for check in checks.iter().filter(|check| !check.valid) {
-        let summary = format!(
-            "{} did not parse; the daemon started on its defaults for it",
-            display_path(check.path)
-        );
-        match crate::feed::append(pool, None, CONFIG_UNREADABLE_KIND, &summary, None, None).await {
-            Ok(_) => written += 1,
-            Err(error) => tracing::warn!(%error, "could not record an unreadable settings file"),
-        }
-    }
-    written
-}
-
-/* ------------------------------------------------------------ the other half -- */
+/* -------------------------------------------------------------- the credentials -- */
 
 /// One credential this machine holds, named so the page can ask for it without ever being told it.
 ///
-/// The second half of this machine's settings, and it is a separate table rather than a field on
-/// [`Setting`] because it is a different KIND of thing with a different store and a different rule:
-/// a settings file is read and written as text, and a credential may only ever be written. The
-/// asymmetry is the point — see [`SECRETS`].
+/// A separate table rather than a field on a settings document because it is a different KIND of
+/// thing with a different store and a different rule: a settings document is read and written as
+/// text, and a credential may only ever be written. The asymmetry is the point — see [`SECRETS`].
 pub struct Secret {
     /// The key in the OS credential store, under the service name `secrets.rs` pins.
     pub key: &'static str,
-    /// Which pillar this credential belongs to, matching a [`Setting::area`] wherever one exists,
-    /// so the page can put the key beside the file it goes with.
+    /// Which pillar this credential belongs to, matching a settings document's name wherever one
+    /// exists, so the page can put the key beside the document it goes with.
     pub area: &'static str,
     /// What it is and what stops working without it, in one sentence.
     pub what: &'static str,
@@ -388,14 +68,14 @@ pub struct Secret {
 
 /// The credentials the app may set, and the deliberate absence of the one it may not.
 ///
-/// # Why these live in the credential store and not in the files above
+/// # Why these live in the credential store and not in the settings documents
 ///
 /// Every config type in `config.rs` says it where the temptation was closest: `email.yaml` holds
 /// the mailbox but not its password, `web.yaml` holds the provider but not its key,
 /// `nucleos-models.yaml` names the hosted model but not the OpenRouter key. Those files are plain
 /// text a person opens, copies and pastes into a bug report — and until they moved to
 /// `~/.nucleos/` they sat inside a checkout, one `git add` away from somebody's history. Keeping
-/// the split is what lets `GET /config/machine` serve file contents verbatim.
+/// the split is what lets `GET /settings/{scope}/{name}` serve a document's body verbatim.
 ///
 /// # Why the app may write them at all
 ///
@@ -462,8 +142,8 @@ pub static SECRETS: &[Secret] = &[
 
 /// The row for `key`, or `None` for a credential this app does not set.
 ///
-/// Total, like [`setting_for`]: `daemon-token` is not an error to ask about, it is simply not on
-/// this list, and that is an answer.
+/// Total: `daemon-token` is not an error to ask about, it is simply not on this list, and that is
+/// an answer.
 pub fn secret_for(key: &str) -> Option<&'static Secret> {
     SECRETS.iter().find(|secret| secret.key == key)
 }
@@ -471,97 +151,6 @@ pub fn secret_for(key: &str) -> Option<&'static Secret> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The Telegram row names `stream_edits`, so the settings page tells the owner it exists.
-    #[test]
-    fn settings_row_channels_telegram_mentions_stream_edits() {
-        let setting = setting_for(CHANNEL_TELEGRAM_FILE).expect("the telegram row exists");
-        assert!(setting.what.contains("stream_edits"), "{}", setting.what);
-    }
-
-    /// The door accepts `stream_edits: false`, refuses a non-bool, and absent means on.
-    #[test]
-    fn channel_config_stream_edits_defaults_to_true_and_parses_false() {
-        let setting = setting_for(CHANNEL_TELEGRAM_FILE).expect("the telegram row exists");
-        assert!((setting.validate)("stream_edits: false\n").is_ok());
-        assert!((setting.validate)("stream_edits: maybe\n").is_err());
-        let off: crate::channels::registry::ChannelConfig =
-            serde_yaml::from_str("stream_edits: false\n").unwrap();
-        assert!(!off.stream_edits());
-        let unset: crate::channels::registry::ChannelConfig =
-            serde_yaml::from_str("doctrine: x\n").unwrap();
-        assert!(unset.stream_edits());
-    }
-
-    /// The membership rule, asserted rather than trusted: every row can say no, and says both of
-    /// the sentences the page needs.
-    ///
-    /// The count is pinned so a twelfth row cannot arrive without somebody reading the header. That
-    /// is the same guard [`crate::ownership`] puts on its own table, and it is here for the same
-    /// reason: the dangerous edit to a registry is an addition, not a change.
-    #[test]
-    fn every_setting_can_refuse_and_says_what_it_changes() {
-        assert_eq!(
-            SETTINGS.len(),
-            11,
-            "see the module header before adding a row"
-        );
-        for setting in SETTINGS {
-            assert!(
-                (setting.validate)("enabled: [this is not a bool}\n").is_err(),
-                "{} must be able to refuse",
-                setting.path
-            );
-            assert!(
-                !setting.what.is_empty(),
-                "{} must say what it changes",
-                setting.path
-            );
-            assert!(
-                !setting.takes_effect.is_empty(),
-                "{} must say when a write starts mattering",
-                setting.path
-            );
-        }
-    }
-
-    /// The table has the eleven rows the header counts; the pin above names the guard, this one
-    /// names the count.
-    #[test]
-    fn the_settings_table_has_eleven_rows() {
-        assert_eq!(SETTINGS.len(), 11);
-    }
-
-    /// Every production channel manifest has exactly one row, keyed by its `settings_area` and
-    /// naming `<settings_file>.yaml`.
-    #[test]
-    fn machine_config_has_one_channel_area_per_manifest() {
-        for manifest in crate::channels::registry::PROD_MANIFESTS {
-            let rows: Vec<&Setting> = SETTINGS
-                .iter()
-                .filter(|setting| setting.area == manifest.settings_area)
-                .collect();
-            assert_eq!(rows.len(), 1, "{} needs exactly one row", manifest.id);
-            assert_eq!(
-                rows[0].path,
-                format!("{}.yaml", manifest.settings_file),
-                "{} row must name the manifest's file",
-                manifest.id
-            );
-        }
-    }
-
-    /// The page draws `what` for every row, so none may be empty.
-    #[test]
-    fn every_machine_setting_has_a_non_empty_what() {
-        for setting in SETTINGS {
-            assert!(
-                !setting.what.trim().is_empty(),
-                "{} must say what it changes",
-                setting.path
-            );
-        }
-    }
 
     /// The bot token is listed under the channel's own area, beside the rest of its settings.
     #[test]
@@ -596,243 +185,85 @@ mod tests {
         assert_eq!(secret.area, "models");
     }
 
-    /// Every credential names an area that has a settings file, so the page can put the key beside
-    /// the file it goes with rather than in a list of its own.
+    /// Every credential names an area that has a settings document, so the page can put the key beside
+    /// the document it goes with rather than in a list of its own.
     #[test]
     fn every_credential_belongs_beside_a_settings_file() {
         for secret in SECRETS {
             assert!(
-                SETTINGS.iter().any(|setting| setting.area == secret.area),
-                "{} names the area {}, which has no settings file",
+                crate::settings::documents()
+                    .iter()
+                    .any(|document| document.name == secret.area),
+                "{} names the area {}, which has no settings document",
                 secret.key,
                 secret.area
             );
         }
     }
 
-    /// The two registries do not overlap, and this is the assertion that keeps it true.
-    ///
-    /// A path in both would be a file with two doors and two answers about who its author is —
-    /// exactly the confusion the project registry's header introduced its table to end.
+    /// Every production channel manifest has exactly one document, named by its `settings_area` and
+    /// imported from `<settings_file>.yaml`. The Telegram token's area above depends on that name.
+    #[test]
+    fn every_channel_manifest_has_one_document_under_its_settings_area() {
+        for manifest in crate::channels::registry::PROD_MANIFESTS {
+            let rows: Vec<_> = crate::settings::documents()
+                .iter()
+                .filter(|document| document.name == manifest.settings_area)
+                .collect();
+            assert_eq!(rows.len(), 1, "{} needs exactly one document", manifest.id);
+            assert_eq!(
+                rows[0].origin_file,
+                format!("{}.yaml", manifest.settings_file),
+                "{} document must name the manifest's file",
+                manifest.id
+            );
+        }
+        let telegram = crate::settings::doc_type("channels/telegram").expect("registered");
+        assert_eq!(telegram.origin_file, CHANNEL_TELEGRAM_FILE);
+    }
+
+    /// A machine document's origin file is not a project's file too: one name with two doors and two
+    /// answers about who its author is is what the project registry's header introduced its table to end.
     #[test]
     fn no_file_is_claimed_by_both_registries() {
-        for setting in SETTINGS {
+        for document in crate::settings::documents()
+            .iter()
+            .filter(|document| document.kind == crate::settings::Kind::Machine)
+        {
             assert!(
                 matches!(
-                    crate::ownership::owner_of(crate::ownership::CLAIMS, setting.path),
+                    crate::ownership::owner_of(crate::ownership::CLAIMS, document.origin_file),
                     crate::ownership::Owner::Repository
                 ),
                 "{} is this machine's and must not be a project's too",
-                setting.path
+                document.origin_file
             );
         }
     }
 
-    /// An empty file is valid for eight of the ten, and that property is what makes the page
-    /// usable: a settings surface has to be able to write a file that turns a pillar off.
-    ///
-    /// The two exceptions are named here rather than tolerated, because each is a real difference
-    /// in what its file MEANS and the page has to render both:
-    ///
-    /// - **council** — an empty roster is not a council. `faults` refusing it is the whole of that
-    ///   file's contract, and the absent file already means "no council" without anyone writing one.
-    /// - **models** — `claude_model` and `codex_model` carry no `serde(default)`, so a file that
-    ///   exists must name them. `ModelsConfig::default()` is what an ABSENT file means; it is not
-    ///   what an empty one means, and the loader has always drawn that line.
-    ///
-    /// Discovered by this test rather than asserted from the outset: the first version expected all
-    /// nine to accept an empty file, and models said otherwise.
+    /// Every machine document's origin file is a relative file under the root (a channel's sits one
+    /// directory down, in `channels/`), shown with a tilde. The absence is asserted as hard as the
+    /// presence: a file that reached back for `.ai/` would be a setting that exists once per checkout
+    /// again.
     #[test]
-    fn an_empty_file_is_accepted_by_everything_that_defaults() {
-        for setting in SETTINGS {
-            let verdict = (setting.validate)("");
-            match setting.area {
-                "council" => assert!(verdict.is_err(), "an empty roster is not a council"),
-                "models" => assert!(
-                    verdict.is_err(),
-                    "a models file that exists must name the two models it is built from"
-                ),
-                _ => assert!(
-                    verdict.is_ok(),
-                    "{} must accept an empty file, got {verdict:?}",
-                    setting.path
-                ),
-            }
-        }
-    }
-
-    /// The llm-router's file is a row, and its door refuses what the daemon would refuse: a URL off
-    /// this machine, because the head of a prompt travels in the request.
-    #[test]
-    fn the_router_file_is_a_row_and_its_door_refuses_a_remote_router() {
-        let row = setting_for(ROUTER_FILE).expect("router.yaml is registered");
-        assert_eq!(row.area, "router");
-        assert!(
-            (row.validate)(
-                "mode: off
-"
-            )
-            .is_ok()
-        );
-        assert!(
-            (row.validate)(
-                "mode: shadow
-url: http://example.com:8080
-"
-            )
-            .is_err()
-        );
-        assert!(
-            (row.validate)(
-                "mode: sideways
-"
-            )
-            .is_err()
-        );
-    }
-
-    /// The shared path guard is reached, so traversal and the backslash are refused here exactly as
-    /// they are for a project's files rather than by a second rule that could disagree.
-    #[test]
-    fn the_shared_path_guard_is_what_answers() {
-        assert!(
-            setting_for("./email.yaml").is_some(),
-            "the same file, spelled the long way"
-        );
-        for path in [
-            "../email.yaml",
-            "x\\..\\email.yaml",
-            "/email.yaml",
-            "C:/Users/someone/.nucleos/email.yaml",
-            "~/.nucleos/email.yaml",
-            // The old spelling names nothing now: the row is a file under the root, and a caller
-            // still sending `.ai/` would be writing somewhere the daemon no longer reads.
-            ".ai/email.yaml",
-            "",
-        ] {
+    fn every_machine_document_is_a_file_under_the_root_and_is_shown_with_a_tilde() {
+        for document in crate::settings::documents()
+            .iter()
+            .filter(|document| document.kind == crate::settings::Kind::Machine)
+        {
             assert!(
-                setting_for(path).is_none(),
-                "{path} must not resolve to a row"
-            );
-        }
-    }
-
-    /// Everything else on disk is not this module's, including the neighbours a glob would sweep in
-    /// — the `.ai/` workflow harness's files, which the núcleo has never opened, and the two files
-    /// that ARE a project's and have their own door.
-    #[test]
-    fn a_path_outside_the_table_is_not_this_machines_setting() {
-        for path in [
-            "project.yaml",
-            "workflows/x/bundle.yaml",
-            ".ai/project.yaml",
-            ".ai/models.yaml",
-            ".ai/pricing.yaml",
-            ".ai/autopilot.yaml",
-            ".ai/workflows.yaml",
-            "core/src/http.rs",
-            "README.md",
-        ] {
-            assert!(
-                setting_for(path).is_none(),
-                "{path} must not be this machine's setting"
-            );
-        }
-    }
-
-    /// A models file that parses, with `extra` appended.
-    ///
-    /// `claude_model` and `codex_model` are the two keys [`crate::config::ModelsConfig`] requires,
-    /// so a fixture without them is refused before anything below is reached — by serde, saying
-    /// "missing field `claude_model`", which is not what either test is about.
-    fn models_file(extra: &str) -> String {
-        format!("claude_model: sonnet\ncodex_model: gpt-5-codex\n{extra}")
-    }
-
-    /// The models door refuses a local engine the daemon would refuse at startup.
-    ///
-    /// `parse_models_config` alone answers only whether the YAML deserialises, and all three of
-    /// `local_engine`'s refusals deserialise perfectly: `openai_compatible` with no address, an engine name
-    /// that is neither, an address on some other machine. Without this the settings page accepts
-    /// the write, reports success, and the daemon then refuses the same file on its next start —
-    /// which is the failure the module header calls the one that looks most like success.
-    ///
-    /// It belongs at the door for the reason [`validate_council`] gives for NOT putting liveness
-    /// there: these three are wrong about the FILE however this machine is configured and whatever
-    /// is running right now. "No local server is up" stays a startup question; "this is not an
-    /// engine, and that is not this machine" is a question the text answers by itself.
-    #[test]
-    fn the_models_door_refuses_a_local_engine_the_daemon_would_refuse_at_startup() {
-        let refused = validate_models(&models_file("local_engine: openai_compatible\n"))
-            .expect_err("`openai_compatible` with no address is refused");
-        assert_eq!(
-            refused,
-            crate::config::LocalEngineRefusal::NoBaseUrl.message(),
-            "the door says what startup would have said, not a second wording of it"
-        );
-
-        assert!(
-            validate_models(&models_file("local_engine: llamafile\n")).is_err(),
-            "an engine this daemon does not serve is refused"
-        );
-        assert!(
-            validate_models(&models_file(
-                "local_engine: openai_compatible\nlocal_base_url: http://127.0.0.1.example.com/v1\n"
-            ))
-            .is_err(),
-            "an address that only begins like the loopback is refused"
-        );
-    }
-
-    /// An untouched file still passes the same door.
-    ///
-    /// The guard above is only worth having if it refuses what is wrong and nothing else: every
-    /// install that exists today names no engine at all, and a door that started refusing those
-    /// would make `nucleos-models.yaml` uneditable on every machine in the field.
-    #[test]
-    fn a_models_file_that_names_no_local_engine_is_still_accepted() {
-        assert!(
-            validate_models(&models_file("")).is_ok(),
-            "the two required keys and nothing else is a valid file"
-        );
-        assert!(
-            validate_models(&models_file("local_assistant_model: qwen3:8b\n")).is_ok(),
-            "today's shape, which resolves to Ollama at its own default address"
-        );
-        assert!(
-            validate_models(&models_file("local_engine: ollama\n")).is_ok(),
-            "naming the engine it already used changes nothing"
-        );
-        assert!(
-            validate_models(&models_file(
-                "model_prices:\n  m: { input: \"abc\" }\n  ok: { input: 1.0 }\n"
-            ))
-            .is_ok(),
-            "an unreadable price drops that entry at load, so the door does not refuse the file for it"
-        );
-    }
-
-    /// Every row is a relative file under the root (a per-channel row sits one directory down, in
-    /// `channels/`), and a person is shown it as `~/.nucleos/...`.
-    ///
-    /// The absence is asserted as hard as the presence, like the council's own test: a row that
-    /// reached back for `.ai/` would be a setting that exists once per checkout again.
-    #[test]
-    fn every_row_is_a_file_under_the_root_and_is_shown_with_a_tilde() {
-        for setting in SETTINGS {
-            assert!(
-                !setting.path.contains('\\')
-                    && !setting.path.starts_with('/')
-                    && !setting
-                        .path
+                !document.origin_file.contains('\\')
+                    && !document.origin_file.starts_with('/')
+                    && !document
+                        .origin_file
                         .split('/')
                         .any(|part| part.is_empty() || part == ".."),
                 "{} must be a file path relative to the root",
-                setting.path
+                document.origin_file
             );
             assert_eq!(
-                display_path(setting.path),
-                format!("~/.nucleos/{}", setting.path)
+                display_path(document.origin_file),
+                format!("~/.nucleos/{}", document.origin_file)
             );
         }
         // The council was here first, and the two must not drift into two ideas of one directory.
@@ -847,96 +278,5 @@ url: http://example.com:8080
         if let (Some(root), Some(council)) = (root(), crate::council::config_path()) {
             assert_eq!(council, root.join(COUNCIL_FILE));
         }
-    }
-
-    /// A directory holding the given `(file, contents)` pairs, as `~/.nucleos` would.
-    fn root_with(files: &[(&str, &str)]) -> tempfile::TempDir {
-        let dir = tempfile::tempdir().expect("tempdir");
-        for (name, contents) in files {
-            std::fs::write(dir.path().join(name), contents).expect("write");
-        }
-        dir
-    }
-
-    /// Defaults are an absent file's contract, so absence is never a finding.
-    #[test]
-    fn check_all_says_an_absent_file_is_valid() {
-        let root = root_with(&[]);
-        let checks = check_all(root.path());
-        assert_eq!(checks.len(), SETTINGS.len(), "one check per row");
-        for check in &checks {
-            assert!(!check.exists, "{} is not on disk", check.path);
-            assert!(check.valid, "{} is absent, hence valid", check.path);
-            assert_eq!(check.problem, None);
-        }
-    }
-
-    /// The finding names the one file at fault, and leaves a file that parses alone.
-    #[test]
-    fn check_all_names_the_file_that_does_not_parse() {
-        let root = root_with(&[
-            (EMAIL_FILE, "enabled: [this is not a bool}\n"),
-            (WEB_FILE, ""),
-        ]);
-        let checks = check_all(root.path());
-        let bad: Vec<_> = checks.iter().filter(|check| !check.valid).collect();
-        assert_eq!(bad.len(), 1, "only email.yaml is broken: {bad:?}");
-        assert_eq!(bad[0].path, EMAIL_FILE);
-        assert!(bad[0].exists);
-        assert!(bad[0].problem.as_deref().is_some_and(|p| !p.is_empty()));
-        let web = checks.iter().find(|check| check.path == WEB_FILE).unwrap();
-        assert!(web.exists && web.valid && web.problem.is_none());
-    }
-
-    /// A parser message that quotes a huge value is cut, and the cut says it.
-    #[test]
-    fn check_all_cuts_a_long_problem() {
-        let long = "x".repeat(2000);
-        let cut = cut_problem(&long);
-        assert_eq!(cut.chars().count(), PROBLEM_MAX_CHARS);
-        assert!(cut.ends_with('\u{2026}'));
-        assert_eq!(cut_problem("short"), "short");
-        let exact = "y".repeat(PROBLEM_MAX_CHARS);
-        assert_eq!(cut_problem(&exact), exact, "at the limit nothing is cut");
-
-        // End to end: whatever a validator says about a long offending value stays inside the cap.
-        let body = format!("mode: {long}\n");
-        let root = root_with(&[(ROUTER_FILE, body.as_str())]);
-        let checks = check_all(root.path());
-        let router = checks
-            .iter()
-            .find(|check| check.path == ROUTER_FILE)
-            .unwrap();
-        assert!(!router.valid);
-        assert!(router.problem.as_ref().unwrap().chars().count() <= PROBLEM_MAX_CHARS);
-    }
-
-    /// One feed line per file that did not parse, none for the files that did.
-    #[tokio::test]
-    async fn an_unreadable_file_at_startup_writes_one_feed_line() {
-        let pool = crate::testdb::fresh_pool().await;
-        let root = root_with(&[
-            (EMAIL_FILE, "enabled: [this is not a bool}\n"),
-            (WEB_FILE, ""),
-        ]);
-        let checks = check_all(root.path());
-
-        assert_eq!(report_unreadable(&pool, &checks).await, 1);
-
-        let rows: Vec<(String, String, Option<String>)> =
-            sqlx::query_as("SELECT kind, summary, project_id FROM feed")
-                .fetch_all(&pool)
-                .await
-                .unwrap();
-        assert_eq!(rows.len(), 1, "{rows:?}");
-        assert_eq!(rows[0].0, CONFIG_UNREADABLE_KIND);
-        assert_eq!(
-            rows[0].1,
-            "~/.nucleos/email.yaml did not parse; the daemon started on its defaults for it"
-        );
-        assert_eq!(rows[0].2, None, "a machine-level line, no project");
-
-        let clean = root_with(&[]);
-        assert_eq!(report_unreadable(&pool, &check_all(clean.path())).await, 0);
     }
 }

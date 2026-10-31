@@ -140,10 +140,7 @@ async fn resolve_project(state: &AppState, job: &JobRow, node: &Node, name: &str
         ));
     }
     if name == "gate" {
-        match crate::config::load_schedule_rules(
-            state.machine_config_root.as_deref(),
-            &job.project_id,
-        ) {
+        match crate::project::rules::autopilot(&job.project_id) {
             Ok(rules) => {
                 if let Some(argv) = rules.gate_command {
                     return Resolved::Run {
@@ -426,13 +423,9 @@ mod tests {
     async fn setup(autopilot: Option<&str>) -> (AppState, JobRow, tempfile::TempDir) {
         let pool = test_pool().await;
         let home = tempfile::tempdir().unwrap();
-        if let Some(text) = autopilot {
-            crate::project::state::write_for_test(
-                home.path(),
-                "project-a",
-                crate::project::state::AUTOPILOT_FILE,
-                text,
-            );
+        match autopilot {
+            Some(text) => crate::project::rules::testing::publish_rules("project-a", text),
+            None => crate::project::rules::testing::hold_shared(),
         }
         let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
         let state = AppState {

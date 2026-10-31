@@ -53,6 +53,7 @@ mod tests {
     use tower::ServiceExt;
 
     async fn test_state() -> AppState {
+        crate::project::rules::testing::hold_shared();
         let pool = crate::testdb::fresh_pool().await;
         AppState {
             startup_config: Default::default(),
@@ -8664,14 +8665,7 @@ mod tests {
         let mut state = test_state().await;
         let root = tempfile::tempdir().unwrap();
         state.machine_config_root = Some(root.path().to_path_buf());
-        let rules = crate::project::state::file(
-            Some(root.path()),
-            "p",
-            crate::project::state::AUTOPILOT_FILE,
-        )
-        .unwrap();
-        std::fs::create_dir_all(rules.parent().unwrap()).unwrap();
-        std::fs::write(&rules, "gate_command: \"make gate\"\n").unwrap();
+        write_rules(root.path(), "p", "gate_command: \"make gate\"\n");
         let mapped = mapped_cwd();
         let run_id = in_flight_run(
             &state,
@@ -8734,12 +8728,10 @@ mod tests {
 
     // F2b step 2: the refuse switch.
 
-    fn write_rules(root: &Path, project: &str, text: &str) {
-        let rules =
-            crate::project::state::file(Some(root), project, crate::project::state::AUTOPILOT_FILE)
-                .unwrap();
-        std::fs::create_dir_all(rules.parent().unwrap()).unwrap();
-        std::fs::write(&rules, text).unwrap();
+    /// Publishes `project`'s autopilot rules where the hook reads them: the installed settings snapshot.
+    /// `_root` is kept so the existing call sites stay as they were; it is ignored.
+    fn write_rules(_root: &Path, project: &str, text: &str) {
+        crate::project::rules::testing::publish_rules(project, text);
     }
 
     async fn stored_decision(state: &AppState, run_id: i64) -> String {
@@ -8906,6 +8898,80 @@ mod tests {
         assert_eq!(p.decision, "deny");
         assert_eq!(p.reason, q.reason);
         assert_ne!(p.reason, VERIFY_GUARD_REFUSAL);
+    }
+
+    /// An unreadable rules document is the safe side: no gate command is recognised and the guard stays in
+    /// `observe`, so the command is recorded but never refused for a reason the owner cannot see.
+    /// Characterisation: it passes before the GREEN too (no file is read, so the default `observe` applies).
+    #[tokio::test]
+    async fn verification_unreadable_rules_observe_and_never_refuse() {
+        let _home = crate::project::rules::testing::Home::new();
+        let state = test_state().await;
+        crate::project::rules::testing::publish_unreadable(
+            "p",
+            "autopilot",
+            "unknown field `verify_guard`",
+        );
+        let mapped = mapped_cwd();
+        let run_id = in_flight_run(
+            &state,
+            "worktree",
+            Some("p"),
+            Some(mapped.path().to_str().unwrap()),
+            None,
+        )
+        .await;
+        let app = test_router(state.clone());
+
+        let d = ask_tool(
+            &app,
+            run_id,
+            "Bash",
+            serde_json::json!({ "command": "cargo test -p x some_test" }),
+        )
+        .await;
+
+        assert_ne!(d.reason, VERIFY_GUARD_REFUSAL);
+        assert_eq!(observed_rows(&state, run_id).await, 1);
+        assert_eq!(stored_decision(&state, run_id).await, d.decision);
+    }
+
+    /// The hook reads the snapshot on every call: a switch published between two commands governs the second.
+    #[tokio::test]
+    async fn verification_guard_follows_a_switch_published_between_two_calls() {
+        let _home = crate::project::rules::testing::Home::new();
+        let state = test_state().await;
+        write_rules(
+            Path::new(""),
+            "p",
+            "verify_guard: observe
+",
+        );
+        let mapped = mapped_cwd();
+        let run_id = in_flight_run(
+            &state,
+            "worktree",
+            Some("p"),
+            Some(mapped.path().to_str().unwrap()),
+            None,
+        )
+        .await;
+        let app = test_router(state.clone());
+        let input = serde_json::json!({ "command": "cargo test -p x some_test" });
+
+        let first = ask_tool(&app, run_id, "Bash", input.clone()).await;
+        assert_ne!(first.reason, VERIFY_GUARD_REFUSAL);
+
+        write_rules(
+            Path::new(""),
+            "p",
+            "verify_guard: refuse
+",
+        );
+        let second = ask_tool(&app, run_id, "Bash", input).await;
+
+        assert_eq!(second.decision, "deny");
+        assert_eq!(second.reason, VERIFY_GUARD_REFUSAL);
     }
 
     // F2b step 3: detection runs against the union of the worktree's map and the target's.

@@ -347,7 +347,6 @@ pub async fn run_all(
 pub async fn for_payload(
     pool: &sqlx::SqlitePool,
     library: &Path,
-    machine_root: &Path,
     interpreter: &str,
     payload: &serde_json::Value,
 ) -> Vec<HookOutcome> {
@@ -372,14 +371,7 @@ pub async fn for_payload(
         Ok(project_id) => project_id,
         Err(_) => return Vec::new(),
     };
-    let Some(pins_file) = crate::project::state::file(
-        Some(machine_root),
-        &project_id,
-        crate::project::state::PINS_FILE,
-    ) else {
-        return Vec::new();
-    };
-    let pins = match workflows::read_pins(&pins_file) {
+    let pins = match crate::project::rules::pins(&project_id) {
         Ok(pins) => pins,
         Err(error) => {
             tracing::warn!(project = %project_id, %error, "bundle hooks skipped: unreadable pins");
@@ -403,28 +395,24 @@ pub struct BundleHooksAnswer {
 
 /// `POST /hooks/bundle`: the hook payload in, what each matching bundle hook did out.
 ///
-/// Always 200. A machine with no library or no home has no bundle hooks, which is an empty answer
+/// Always 200. A machine with no library has no bundle hooks, which is an empty answer
 /// and not an error — the script would read an error as "nothing to say" anyway, and an empty list
 /// says that without a log line on every prompt.
 pub async fn bundle_hooks(
     axum::extract::State(state): axum::extract::State<crate::state::AppState>,
     axum::Json(payload): axum::Json<serde_json::Value>,
 ) -> axum::Json<BundleHooksAnswer> {
-    let results = match (
-        state.workflow_library.as_deref(),
-        state.machine_config_root.as_deref(),
-    ) {
-        (Some(library), Some(machine_root)) => {
+    let results = match state.workflow_library.as_deref() {
+        Some(library) => {
             for_payload(
                 &state.pool,
                 library,
-                machine_root,
                 crate::governance::autopilot::HOOK_INTERPRETER,
                 &payload,
             )
             .await
         }
-        _ => Vec::new(),
+        None => Vec::new(),
     };
     axum::Json(BundleHooksAnswer { results })
 }
@@ -699,6 +687,7 @@ mod tests {
         if !python_available() {
             return;
         }
+        let _settings = crate::project::rules::testing::Home::new();
         let pool = crate::testdb::fresh_pool().await;
         let repo = crate::execution::git_exec::testkit::space_free_tempdir("nucleos-bundle-hooks-");
         crate::execution::git_exec::testkit::initialize_repo(repo.path());
@@ -720,11 +709,10 @@ mod tests {
             "hooks:\n  - event: UserPromptSubmit\n    script: context.py\n",
             &[("context.py", "print('remember the spec')\n")],
         );
-        let pins_file =
-            crate::project::state::file(Some(home.path()), "p", crate::project::state::PINS_FILE)
-                .unwrap();
-        std::fs::create_dir_all(pins_file.parent().unwrap()).unwrap();
-        std::fs::write(&pins_file, workflows::render_pins(&pins(&[("dev", "1.0")]))).unwrap();
+        crate::project::rules::testing::publish_pins(
+            "p",
+            &workflows::render_pins(&pins(&[("dev", "1.0")])),
+        );
 
         let payload = |cwd: &Path| {
             serde_json::json!({
@@ -736,7 +724,6 @@ mod tests {
         let outcomes = for_payload(
             &pool,
             &library,
-            home.path(),
             crate::governance::autopilot::HOOK_INTERPRETER,
             &payload(repo.path()),
         )
@@ -749,12 +736,66 @@ mod tests {
             for_payload(
                 &pool,
                 &library,
-                home.path(),
                 crate::governance::autopilot::HOOK_INTERPRETER,
                 &payload(elsewhere.path()),
             )
             .await
             .is_empty()
         );
+    }
+
+    /// RED (4.2): `for_payload` loses its `machine_root` argument and reads the pins from the store by project id.
+    /// No pins file is written anywhere; a project with no stored document runs nothing.
+    #[tokio::test]
+    async fn bundle_hooks_follow_the_stored_pins() {
+        if !python_available() {
+            return;
+        }
+        let _home = crate::project::rules::testing::Home::new();
+        let pool = crate::testdb::fresh_pool().await;
+        let repo =
+            crate::execution::git_exec::testkit::space_free_tempdir("nucleos-bundle-hooks-store-");
+        crate::execution::git_exec::testkit::initialize_repo(repo.path());
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES (?, 'shadow', ?)",
+        )
+        .bind("hooks-store-project")
+        .bind(repo.path().to_string_lossy().into_owned())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let home = tempfile::tempdir().unwrap();
+        let library = home.path().join("workflows");
+        shelf(
+            &library,
+            "dev",
+            "1.0",
+            "hooks:\n  - event: UserPromptSubmit\n    script: context.py\n",
+            &[("context.py", "print('remember the spec')\n")],
+        );
+        let payload = serde_json::json!({
+            "hook_event_name": "UserPromptSubmit",
+            "cwd": repo.path().to_string_lossy(),
+            "prompt": "go",
+        });
+        let run = || {
+            for_payload(
+                &pool,
+                &library,
+                crate::governance::autopilot::HOOK_INTERPRETER,
+                &payload,
+            )
+        };
+
+        assert!(run().await.is_empty(), "nothing stored, nothing to run");
+
+        crate::project::rules::testing::publish_pins(
+            "hooks-store-project",
+            "workflows:\n  - name: dev\n    version: '1.0'\n    origin: library:dev@1.0\n    hash: sha256:any\n",
+        );
+        let outcomes = run().await;
+        assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+        assert_eq!(outcomes[0].stdout.trim(), "remember the spec");
     }
 }

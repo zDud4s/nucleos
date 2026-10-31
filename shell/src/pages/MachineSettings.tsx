@@ -1,14 +1,8 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useState } from "react";
 import { isApiRefusal } from "../data/client";
-import {
-  useForgetSecret,
-  useMachineConfig,
-  useMachineSecrets,
-  useStoreSecret,
-  useWriteMachineSetting,
-  type MachineSecret,
-  type MachineSetting,
-} from "../data/machine-config";
+import { useForgetSecret, useMachineSecrets, useStoreSecret, type MachineSecret } from "../data/secrets";
+import { useSettingsIndex, type SettingIndexRow } from "../data/settings";
+import { SettingsForm } from "../settings/SettingsForm";
 import { Button, ConfirmButton, ErrorNote, Panel, RefusalNote, Skeleton, StateBadge } from "../ui";
 import { DistillerModel } from "./DistillerModel";
 import { CaptureWait } from "./CaptureWait";
@@ -17,44 +11,26 @@ import { DAEMON_NAME } from "../copy";
 import { plural } from "../lib/plural";
 
 /**
- * This machine's settings — the files whose author is the daemon rather than
- * any project.
+ * This machine's settings: the documents whose author is the daemon rather than any project.
  *
- * It replaces the read-only `ConfigIndex` that stood here, and in particular it
- * replaces that panel's honest confession: a hard-coded list naming `web`,
- * `browser`, `council` and `models` as areas the núcleo exposed no route for.
- * There were three config routes and all three were GET, so every pillar on
- * this machine was turned on by editing a YAML file by hand and restarting.
+ * Each one is drawn by `SettingsForm` from the schema the núcleo serves with it, so nothing here knows what a
+ * pillar contains. What this page owns is the list: which documents exist, which has an unsaved draft, and the
+ * credentials that sit beside the document they belong with.
  *
- * # Why a validated text box and not nine forms
+ * # What is fetched, and when
  *
- * A form per pillar is the better surface and it is the next slice, not this
- * one: nine forms is nine schemas duplicated in TypeScript, and a schema
- * duplicated is a schema that drifts from the Rust that actually parses it. The
- * daemon already owns the grammar and now answers with the parser's own words,
- * so a text box that cannot save something the daemon would refuse is honest,
- * complete on day one, and cannot fall out of step with `config.rs`. What it is
- * not is easy for somebody who does not know the file's keys — which is exactly
- * what `what` and the placeholder are for, and exactly what the forms will fix.
- *
- * # The two things this page must not hide
- *
- * **Where the file is.** There are twenty-odd worktrees on this machine and
- * every one has an `.ai/`, so the absolute path is shown per row rather than
- * the relative one. Editing settings with great confidence in the wrong
- * checkout is the failure this costs one line to prevent.
- *
- * **When the edit starts mattering.** Eight of the nine files are read once, at
- * startup. A page that reported "saved" and left it there would be claiming an
- * effect that has not happened — so the daemon's own sentence about it is
- * rendered on every row, and again after a save.
+ * The index comes first and is enough to draw the list. A document's own `GET` waits until its panel is first
+ * opened, so opening this screen does not cost a request per pillar. Once opened a panel stays mounted and is only
+ * hidden, so a half-written document survives a look at another one.
  */
 export function MachineSettings() {
-  const config = useMachineConfig();
+  const index = useSettingsIndex();
   const secrets = useMachineSecrets();
   const [chosen, setChosen] = useState<string | null>(null);
-  // Which files have an unsaved draft: every panel stays mounted, so without this a
-  // half-written file is invisible once another one is chosen.
+  // Every panel opened so far. The first document is open without anyone choosing it, so `choose` records the one
+  // being left as well as the one being opened.
+  const [opened, setOpened] = useState<ReadonlySet<string>>(new Set());
+  // Which documents have an unsaved draft: without this a half-written one is invisible once another is chosen.
   const [dirtyAreas, setDirtyAreas] = useState<ReadonlySet<string>>(new Set());
   const markDirty = useCallback((areaName: string, dirty: boolean) => {
     setDirtyAreas((previous) => {
@@ -66,13 +42,23 @@ export function MachineSettings() {
     });
   }, []);
 
-  if (config.isPending) return <Skeleton label="Reading this machine's settings" lines={6} />;
-  if (config.error) {
-    if (isApiRefusal(config.error)) return <RefusalNote refusal={config.error} />;
+  if (index.isPending) return <Skeleton label="Reading this machine's settings" lines={6} />;
+  if (index.error) {
+    if (isApiRefusal(index.error)) return <RefusalNote refusal={index.error} />;
     return <ErrorNote>the {DAEMON_NAME} is not responding: nothing is known about this machine's settings</ErrorNote>;
   }
 
-  const area = chosen ?? config.data.settings[0]?.area ?? null;
+  const rows = index.data.filter((row) => row.scope === "machine");
+  const area = chosen ?? rows[0]?.name ?? null;
+  const choose = (name: string) => {
+    setOpened((previous) => {
+      const next = new Set(previous);
+      if (area !== null) next.add(area);
+      next.add(name);
+      return next;
+    });
+    setChosen(name);
+  };
 
   return (
     <>
@@ -84,52 +70,43 @@ export function MachineSettings() {
         </div>
       </Panel>
 
-      {/* The folder, as one line above the files rather than a panel of its own. */}
       <p className="sy-machine-intro">
-        These files belong to the daemon rather than to any project, and live in{" "}
-        <code className="sy-machine-root" title={config.data.root}>
-          {config.data.root}
-        </code>
-        . Each is validated before a byte is written: a file that would not parse is refused with
-        the parser's own words, and what is on disk is left alone.
+        These settings belong to the daemon rather than to any project. Each is checked before anything is written: a
+        change that would not read is refused with the daemon's own words, and what is stored is left alone.
       </p>
 
-      {/*
-        A list of the files and one of them open, rather than nine editors stacked. Every panel
-        stays mounted and only the chosen one is shown, so a half-written file survives a look
-        at another one.
-      */}
+      {/* A list of the documents and one of them open, rather than nine forms stacked. */}
       <div className="sy-settings">
         <div className="sy-settings-nav">
-        <ul className="sy-settings-list" aria-label="Settings files">
-          {config.data.settings.map((setting) => {
-            const own = (secrets.data?.secrets ?? []).filter((row) => row.area === setting.area);
-            const current = setting.area === area;
+        <ul className="sy-settings-list" aria-label="Settings documents">
+          {rows.map((row) => {
+            const own = (secrets.data?.secrets ?? []).filter((secret) => secret.area === row.name);
+            const current = row.name === area;
             return (
-              <li key={setting.path}>
+              <li key={row.name}>
                 <button
                   type="button"
                   className={current ? "sy-settings-item sy-settings-item-current" : "sy-settings-item"}
                   aria-current={current ? "true" : undefined}
-                  aria-describedby={`marks-${setting.area}`}
-                  onClick={() => setChosen(setting.area)}
+                  aria-describedby={`marks-${row.name}`}
+                  onClick={() => choose(row.name)}
                 >
-                  <span className="sy-settings-item-name">{setting.area}</span>
-                  {dirtyAreas.has(setting.area) && (
+                  <span className="sy-settings-item-name">{row.name}</span>
+                  {dirtyAreas.has(row.name) && (
                     <span className="sy-meta sy-settings-item-dirty" aria-hidden="true">
                       unsaved
                     </span>
                   )}
                   {/* The marks are drawn for the eye; this is what a screen reader gets, as the
                       button's description so its NAME stays the visible area. */}
-                  <span className="sr-only" id={`marks-${setting.area}`}>
-                    {markSummary(setting, own, dirtyAreas.has(setting.area))}
+                  <span className="sr-only" id={`marks-${row.name}`}>
+                    {markSummary(row, own, dirtyAreas.has(row.name))}
                   </span>
-                  {/* Two dots, file and credential: filled when there is one, hollow when not. */}
+                  {/* Two dots, document and credential: filled when there is one, hollow when not. */}
                   <span className="sy-settings-item-marks" aria-hidden="true">
                     <span
-                      className={setting.exists ? "sy-mark sy-mark-on" : "sy-mark"}
-                      title={setting.exists ? "file written" : "file never written"}
+                      className={row.present ? "sy-mark sy-mark-on" : "sy-mark"}
+                      title={row.present ? "written" : "never written"}
                     />
                     {own.map((secret) => (
                       <span
@@ -147,7 +124,7 @@ export function MachineSettings() {
         {/* The marks are aria-hidden words-in-waiting; the legend says them to the eye. */}
         <p className="sy-meta sy-settings-legend" aria-hidden="true">
           <span className="sy-settings-legend-item">
-            <span className="sy-mark sy-mark-on" /> file written
+            <span className="sy-mark sy-mark-on" /> written
           </span>
           <span className="sy-settings-legend-item">
             <span className="sy-mark sy-mark-key sy-mark-on" /> credential set
@@ -156,25 +133,27 @@ export function MachineSettings() {
         </div>
 
         <div className="sy-settings-detail">
-          {config.data.settings.map((setting) => (
-            <div key={setting.path} hidden={setting.area !== area}>
-              <SettingPanel
-                setting={setting}
-                onDirty={markDirty}
-                secrets={(secrets.data?.secrets ?? []).filter((row) => row.area === setting.area)}
-              />
-            </div>
-          ))}
+          {rows
+            .filter((row) => row.name === area || opened.has(row.name))
+            .map((row) => (
+              <div key={row.name} hidden={row.name !== area}>
+                <SettingPanel
+                  row={row}
+                  onDirty={markDirty}
+                  secrets={(secrets.data?.secrets ?? []).filter((secret) => secret.area === row.name)}
+                />
+              </div>
+            ))}
         </div>
       </div>
     </>
   );
 }
 
-/** The file and credential marks as words, for the row's accessible description. */
-function markSummary(setting: MachineSetting, own: MachineSecret[], unsaved: boolean): string {
+/** The document and credential marks as words, for the row's accessible description. */
+function markSummary(row: SettingIndexRow, own: MachineSecret[], unsaved: boolean): string {
   const missing = own.filter((secret) => secret.present !== true).length;
-  const parts = [setting.exists ? "file written" : "file never written"];
+  const parts = [row.present ? "written" : "never written"];
   if (own.length > 0) {
     parts.push(missing === 0 ? "credentials set" : `${plural(missing, "credential")} not set`);
   }
@@ -182,137 +161,26 @@ function markSummary(setting: MachineSetting, own: MachineSecret[], unsaved: boo
   return parts.join(", ");
 }
 
-/**
- * One settings file: what it decides, where it is, what is in it, and a way to
- * change it.
- *
- * The draft is component state keyed by nothing, which is deliberate: a row
- * whose draft survived a refetch would quietly show somebody their own unsaved
- * text as though it were the file. `contents ?? ""` seeds it once and the
- * `saved` flag is what says the two agree.
- */
+/** One document and, after it, the credentials that are the second half of the same decision. */
 function SettingPanel({
-  setting,
+  row,
   secrets,
   onDirty,
 }: {
-  setting: MachineSetting;
+  row: SettingIndexRow;
   secrets: MachineSecret[];
   onDirty: (area: string, dirty: boolean) => void;
 }) {
-  const write = useWriteMachineSetting();
-  const [draft, setDraft] = useState(setting.contents ?? "");
-  const [saved, setSaved] = useState(false);
-
-  const dirty = draft !== (setting.contents ?? "");
-  useEffect(() => {
-    onDirty(setting.area, dirty);
-  }, [onDirty, setting.area, dirty]);
-
-  const save = () => {
-    if (!dirty || write.isPending) return;
-    write.mutate({ path: setting.path, contents: draft }, { onSuccess: () => setSaved(true) });
-  };
-  const errorId = `setting-${setting.area}-error`;
+  const name = row.name;
+  const onFormDirty = useCallback((dirty: boolean) => onDirty(name, dirty), [onDirty, name]);
 
   return (
     <Panel
-      title={setting.area}
-      aside={
-        <>
-          {!setting.valid && <StateBadge domain="machine_file" state="unreadable" />}
-          {!setting.at_startup.valid && <StateBadge domain="machine_file" state="started_on_defaults" />}
-          <StateBadge domain="machine_file" state={setting.exists ? "configured" : "unconfigured"} />
-        </>
-      }
+      title={name}
+      aside={<StateBadge domain="machine_file" state={row.present ? "configured" : "unconfigured"} />}
     >
-      <p className="sy-note">{setting.what}</p>
+      <SettingsForm scope="machine" name={name} takesEffect={row.takes_effect} onDirty={onFormDirty} />
 
-      <dl className="sy-config-facts">
-        <div className="sy-fact">
-          <dt>file</dt>
-          <dd>{setting.resolved}</dd>
-        </div>
-        <div className="sy-fact">
-          <dt>takes effect</dt>
-          <dd>{setting.takes_effect}</dd>
-        </div>
-      </dl>
-
-      <label className="sy-setting-label" htmlFor={`setting-${setting.area}`}>
-        {setting.display}
-      </label>
-      <textarea
-        id={`setting-${setting.area}`}
-        className="sy-setting-editor"
-        spellCheck={false}
-        rows={14}
-        value={draft}
-        aria-invalid={write.error != null ? true : undefined}
-        aria-describedby={write.error != null ? errorId : undefined}
-        onKeyDown={(event) => {
-          if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
-            event.preventDefault();
-            save();
-          }
-        }}
-        placeholder={
-          setting.exists
-            ? undefined
-            : "this file does not exist yet: writing anything here creates it"
-        }
-        onChange={(event) => {
-          setDraft(event.target.value);
-          setSaved(false);
-        }}
-      />
-
-      <div className="sy-setting-controls">
-        <Button
-          disabled={!dirty || write.isPending}
-          onClick={save}
-        >
-          {write.isPending ? "Saving…" : "Save"}
-        </Button>
-        {dirty && !write.isPending && (
-          <Button
-            variant="ghost"
-            onClick={() => {
-              setDraft(setting.contents ?? "");
-              setSaved(false);
-            }}
-          >
-            Revert
-          </Button>
-        )}
-        {dirty && !write.isPending && <span className="sy-meta">unsaved changes</span>}
-        <span className="sy-meta" role="status">
-          {saved && !dirty ? <>saved and takes effect {setting.takes_effect}</> : null}
-        </span>
-      </div>
-
-      {/* Why the file on disk does not read, in the parser's words: the daemon runs on defaults
-          for it, and nobody reads the log that says so. */}
-      {!setting.valid && setting.problem != null && (
-        <ErrorNote>
-          {setting.display} does not parse: {setting.problem}
-        </ErrorNote>
-      )}
-
-      {/* The parser's own words. A generic "invalid" would send somebody back to
-          a file they cannot see to look for a line nobody named. */}
-      {write.error != null && (
-        <div id={errorId}>
-          {isApiRefusal(write.error) ? (
-            <RefusalNote refusal={write.error} />
-          ) : (
-            <ErrorNote>the {DAEMON_NAME} is not responding: nothing was written</ErrorNote>
-          )}
-        </div>
-      )}
-
-      {/* After the file, not before it: the credential is the second half of the same
-          decision, and above the file it pushed every editor in the grid out of line. */}
       {secrets.map((secret) => (
         <SecretControl key={secret.key} secret={secret} />
       ))}

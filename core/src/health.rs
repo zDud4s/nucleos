@@ -28,6 +28,9 @@ use crate::execution::worktree;
 use crate::sidecar::Liveness;
 use crate::state::AppState;
 
+mod settings_row;
+use settings_row::{router_probe, settings_probe};
+
 const PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 const SUBSYSTEM_TIMEOUT: Duration = Duration::from_millis(500);
 const AGGREGATE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -257,10 +260,10 @@ async fn collect_readout(state: AppState) -> HealthReadout {
         github,
         hook,
         router,
+        settings,
         devtime,
         distiller,
         embeddings,
-        machine_config,
     ) = tokio::join!(
         run_subsystem("sqlite_pool", pool_probe(state.pool.clone())),
         run_subsystem("cli_binary", cli_probe()),
@@ -304,31 +307,17 @@ async fn collect_readout(state: AppState) -> HealthReadout {
             hook_interpreter_probe(state.pool.clone()),
         ),
         run_subsystem("llm_router", router_probe()),
+        run_subsystem("settings", settings_probe()),
         run_subsystem("devtime_ingest", devtime_probe(state.pool.clone())),
         run_subsystem("distiller", distiller_probe(state.pool.clone())),
         run_subsystem("embeddings", embeddings_probe()),
-        run_subsystem(
-            "machine_config",
-            machine_config_probe(state.machine_config_root.clone()),
-        ),
     );
     // The channel rows sit where the old hand-written telegram row sat: after `echo_sidecar`.
     let mut subsystems = vec![pool, cli, credentials, disk, echo];
     subsystems.extend(channels);
     subsystems.extend([
-        email,
-        web,
-        browser,
-        quota,
-        voice,
-        speaker,
-        github,
-        hook,
-        router,
-        devtime,
-        distiller,
-        embeddings,
-        machine_config,
+        email, web, browser, quota, voice, speaker, github, hook, router, settings, devtime,
+        distiller, embeddings,
     ]);
 
     HealthReadout {
@@ -398,67 +387,6 @@ async fn cli_probe() -> SubsystemReadout {
         exec_probe(resolved.to_string_lossy().into_owned(), "--version").await
     })
     .await
-}
-
-/// PURE: the machine-settings row, from what [`crate::machine_config::check_all`] found.
-///
-/// `degraded` and never `down`: the daemon runs on defaults for a file that does not parse, which
-/// is the fail-soft posture on purpose, and the row exists so that is not silent. The tally is the
-/// only detail it carries; the file names and the parser's text belong to `GET /config/machine`,
-/// because this readout is a closed vocabulary with no text in it.
-fn machine_config_row(checks: &[crate::machine_config::FileCheck]) -> SubsystemReadout {
-    let unreadable = checks.iter().filter(|check| !check.valid).count() as i64;
-    if unreadable == 0 {
-        return SubsystemReadout::ok("machine_config");
-    }
-    let mut row = SubsystemReadout::degraded("machine_config", FailureCategory::Unknown);
-    row.counts = Some(std::collections::BTreeMap::from([(
-        "unreadable",
-        unreadable,
-    )]));
-    row
-}
-
-/// Reads this machine's settings files off the async threads. No home directory means every file
-/// is absent, which is valid.
-async fn machine_config_probe(root: Option<PathBuf>) -> SubsystemReadout {
-    let Some(root) = root else {
-        return SubsystemReadout::ok("machine_config");
-    };
-    match tokio::task::spawn_blocking(move || crate::machine_config::check_all(&root)).await {
-        Ok(checks) => machine_config_row(&checks),
-        Err(_) => SubsystemReadout::down("machine_config", FailureCategory::Unknown),
-    }
-}
-
-/// What `router.yaml` asks of the daemon, before anybody has asked the router anything.
-#[derive(Debug, PartialEq)]
-enum RouterPlan {
-    /// No file, or every surface off: routing is not asked for, so there is nothing to measure.
-    Off,
-    /// A file that does not parse, or names a router off this machine. The daemon runs without
-    /// routing, but the owner believes it is on, which is what a red row is for.
-    Refused,
-    /// Routing is on. The URL and the budget are the file's own.
-    Ask { url: String, timeout: Duration },
-}
-
-/// PURE: `router.yaml`'s text (`None` for an absent file) as a plan. The grammar and the loopback
-/// fence are `route_advice::parse_config`'s, not restated here, and the error text is dropped:
-/// this readout carries a closed vocabulary and no text.
-fn router_plan(text: Option<&str>) -> RouterPlan {
-    let Some(text) = text else {
-        return RouterPlan::Off;
-    };
-    match crate::models::route_advice::parse_config(text) {
-        Err(_) => RouterPlan::Refused,
-        Ok(config) if config.is_off() => RouterPlan::Off,
-        Ok(config) => RouterPlan::Ask {
-            url: config.url,
-            // Inside the readout's own half-second budget, whatever the file allows a run.
-            timeout: Duration::from_millis(config.timeout_ms).min(PROBE_TIMEOUT),
-        },
-    }
 }
 
 /// The summary `devtime`'s ingestion loop writes after every cycle and this readout reads back.
@@ -693,54 +621,6 @@ async fn embeddings_probe() -> SubsystemReadout {
     embeddings_row(Some(embedder.model()), &listed)
 }
 
-/// PURE: the row. `reachable` matters only for a plan that asks.
-///
-/// An unreachable router is `degraded` and not `down`: the daemon falls back to the choice it
-/// made before routing existed, so nothing stops, and a `down` here would take the whole readout
-/// down for an adviser.
-fn router_row(plan: &RouterPlan, reachable: bool) -> SubsystemReadout {
-    match (plan, reachable) {
-        (RouterPlan::Off, _) => {
-            SubsystemReadout::disabled("llm_router", FailureCategory::NotConfigured)
-        }
-        (RouterPlan::Refused, _) => {
-            SubsystemReadout::down("llm_router", FailureCategory::NotConfigured)
-        }
-        (RouterPlan::Ask { .. }, true) => SubsystemReadout::ok("llm_router"),
-        (RouterPlan::Ask { .. }, false) => {
-            SubsystemReadout::degraded("llm_router", FailureCategory::Unreachable)
-        }
-    }
-}
-
-/// Reads `~/.nucleos/router.yaml` as the settings door does, then asks the router for its tiers.
-/// Task text never travels: `targets` is a GET with no body.
-async fn router_probe() -> SubsystemReadout {
-    // Only the file's text is cached; whether the router answers is asked live every poll.
-    let text = tokio::task::spawn_blocking(|| {
-        cached_lookup(&ROUTER_TEXT_LOOKUP, LOOKUP_CACHE_TTL, || {
-            let path = crate::machine_config::root()?.join(crate::machine_config::ROUTER_FILE);
-            std::fs::read_to_string(path).ok()
-        })
-    })
-    .await
-    .ok()
-    .flatten();
-    router_answer(router_plan(text.as_deref())).await
-}
-
-/// The probe's one question, for a plan already made: does the router answer `targets`?
-async fn router_answer(plan: RouterPlan) -> SubsystemReadout {
-    let reachable = match &plan {
-        RouterPlan::Ask { url, timeout } => crate::router_client::RouterClient::new(url, *timeout)
-            .targets()
-            .await
-            .is_ok(),
-        _ => false,
-    };
-    router_row(&plan, reachable)
-}
-
 /// PURE: the row, from whether the interpreter resolved and whether any rostered project wires
 /// the hook. A resolvable interpreter is `ok` either way.
 fn hook_interpreter_row(resolved: Option<PathBuf>, wired_anywhere: bool) -> SubsystemReadout {
@@ -905,8 +785,8 @@ async fn speaker_probe(configured: bool, command: String) -> SubsystemReadout {
 
 /// Whether the GitHub pillar could act if it were asked to.
 ///
-/// **`asked_for` is `enabled` AND the file existing, and both halves are load-bearing.**
-/// `GithubConfig::enabled` defaults to TRUE so that a machine with no `~/.nucleos/github.yaml` is capable
+/// **`asked_for` is `enabled` AND the document existing, and both halves are load-bearing.**
+/// `GithubConfig::enabled` defaults to TRUE so that a machine with no stored `github` document is capable
 /// of everything and autonomous in nothing — which means `enabled` alone can no longer distinguish
 /// "the owner wants this" from "the owner has never heard of it". Grading on `enabled` alone would
 /// put a red row on every installation that has never touched GitHub, and this module's own header
@@ -1104,7 +984,7 @@ fn binary_candidate(path: &Path) -> Option<PathBuf> {
 
 type ExecVerdict = Result<HealthState, FailureCategory>;
 
-/// How long a slow-moving lookup (a PATH scan, a Credential Manager read, `router.yaml`'s text) is
+/// How long a slow-moving lookup (a PATH scan, a Credential Manager read) is
 /// trusted. The shell polls the readout about once a second; none of these change on that scale.
 const LOOKUP_CACHE_TTL: Duration = Duration::from_secs(30);
 
@@ -1136,7 +1016,6 @@ fn cached_lookup<T: Clone>(slot: &LookupSlot<T>, ttl: Duration, lookup: impl FnO
 
 static CLI_BINARY_LOOKUP: LookupSlot<Option<PathBuf>> = Mutex::new(None);
 static HOOK_INTERPRETER_LOOKUP: LookupSlot<Option<PathBuf>> = Mutex::new(None);
-static ROUTER_TEXT_LOOKUP: LookupSlot<Option<String>> = Mutex::new(None);
 static DAEMON_TOKEN_LOOKUP: LookupSlot<ExecVerdict> = Mutex::new(None);
 
 /// Keyed by the program itself, not by the row: the verdict is a fact about a specific binary, so
@@ -1377,7 +1256,9 @@ fn classify_error<E>(_error: E) -> FailureCategory {
 
 #[cfg(test)]
 mod tests {
+    use super::settings_row::{RouterPlan, router_answer, router_plan, router_row, settings_row};
     use super::*;
+    use crate::models::route_doc::RouterDoc;
 
     fn breached_readout() -> HealthReadout {
         HealthReadout {
@@ -1395,37 +1276,44 @@ mod tests {
         crate::testdb::fresh_pool().await
     }
 
+    /// A router document the way the importer would store `yaml`: through the legacy parser and `RouterDoc`.
+    fn router_doc(yaml: &str) -> RouterDoc {
+        RouterDoc::from_config(
+            &crate::models::route_advice::parse_config(yaml).expect("the fixture is valid"),
+        )
+    }
+
+    /// A document `to_config` refuses: a router that is not on this machine.
+    fn router_doc_off_this_machine() -> RouterDoc {
+        RouterDoc {
+            mode: "shadow".to_string(),
+            url: "http://example.com:1".to_string(),
+            timeout_ms: 1000,
+            runners: Vec::new(),
+            models: std::collections::BTreeMap::new(),
+            surfaces: std::collections::BTreeMap::new(),
+        }
+    }
+
     #[test]
-    fn the_router_row_follows_the_file_and_then_the_router() {
+    fn the_router_row_follows_the_document_and_then_the_router() {
         assert_eq!(router_plan(None), RouterPlan::Off);
         assert_eq!(
-            router_plan(Some(
+            router_plan(Some(&router_doc(
                 "mode: off
 "
-            )),
+            ))),
             RouterPlan::Off
         );
         assert_eq!(
-            router_plan(Some(
-                "mode: shadow
-: [
-"
-            )),
+            router_plan(Some(&router_doc_off_this_machine())),
             RouterPlan::Refused
         );
-        assert_eq!(
-            router_plan(Some(
-                "mode: shadow
-url: http://example.com:1
-"
-            )),
-            RouterPlan::Refused
-        );
-        let ask = router_plan(Some(
+        let ask = router_plan(Some(&router_doc(
             "mode: shadow
 url: http://127.0.0.1:9
 ",
-        ));
+        )));
         assert!(matches!(ask, RouterPlan::Ask { .. }));
 
         let off = router_row(&RouterPlan::Off, false);
@@ -1467,17 +1355,107 @@ connection: close
             }
         });
         let ask = |port: u16| {
-            router_plan(Some(&format!(
+            router_plan(Some(&router_doc(&format!(
                 "mode: shadow
 url: http://127.0.0.1:{port}
 "
-            )))
+            ))))
         };
         assert_eq!(router_answer(ask(port)).await.status, HealthState::Ok);
         let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let dead = free.local_addr().unwrap().port();
         drop(free);
         assert_eq!(router_answer(ask(dead)).await.status, HealthState::Degraded);
+    }
+
+    #[tokio::test]
+    async fn the_router_probe_with_nothing_stored_is_disabled() {
+        use crate::settings::{Settings, testing};
+        let _installed = testing::install(Settings::new());
+        assert_eq!(
+            router_probe().await.status,
+            HealthState::Disabled,
+            "nothing stored is off"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_router_probe_with_a_document_the_fence_refuses_is_down() {
+        use crate::settings::{Scope, Settings, Snapshot, testing};
+        let snapshot =
+            Snapshot::default().with_document(&Scope::Machine, router_doc_off_this_machine());
+        let _installed = testing::install(Settings::from_snapshot(snapshot));
+        assert_eq!(
+            router_probe().await.status,
+            HealthState::Down,
+            "a document the fence refuses is red"
+        );
+    }
+
+    #[test]
+    fn an_empty_or_sound_snapshot_is_a_green_settings_row() {
+        let row = settings_row(&crate::settings::Snapshot::default());
+        assert_eq!((row.name, row.status), ("settings", HealthState::Ok));
+        assert!(row.reason.is_none() && row.counts.is_none());
+    }
+
+    /// A stored document that no longer fits its type falls back to the defaults. The row says so: red, and naming
+    /// WHICH document by its static name, because the readout carries no text.
+    #[tokio::test]
+    async fn an_unreadable_document_is_a_red_row_naming_it() {
+        let pool = migrated_pool().await;
+        // A key the type does not know is stripped on load (a row from a newer daemon), so the autopilot
+        // body must be a real type error to be unreadable.
+        for (scope, name, body) in [
+            ("machine", "email", r#"{"enabled": "not a bool"}"#),
+            ("project:p1", "autopilot", r#"{"schedules": "daily"}"#),
+            ("project:p2", "autopilot", r#"{"schedules": "daily"}"#),
+        ] {
+            sqlx::query(
+                "INSERT INTO settings (scope, name, body_json, version, updated_at, updated_by)                  VALUES (?, ?, ?, 1, '2026-10-11T00:00:00.000Z', 'test')",
+            )
+            .bind(scope)
+            .bind(name)
+            .bind(body)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let snapshot = crate::settings::load_all(&pool).await.unwrap();
+        assert!(
+            !snapshot.unreadable().is_empty(),
+            "the fixture must be unreadable"
+        );
+
+        let row = settings_row(&snapshot);
+
+        assert_eq!(row.status, HealthState::Down);
+        assert_eq!(row.reason, Some(FailureCategory::NotConfigured));
+        let counts = row
+            .counts
+            .expect("the unreadable documents are counted by name");
+        assert_eq!(counts.get("email"), Some(&1));
+        assert_eq!(counts.get("autopilot"), Some(&2), "one per scope");
+    }
+
+    /// The per-file readability row is gone with the files: the settings live in the database, and
+    /// the `settings` row is the only one that speaks for them.
+    #[tokio::test]
+    async fn health_has_no_machine_config_row_and_has_a_settings_row() {
+        let state = crate::channels::testkit::state().await;
+        let names: Vec<&str> = collect_readout(state)
+            .await
+            .subsystems
+            .iter()
+            .map(|row| row.name)
+            .collect();
+
+        assert!(!names.contains(&"machine_config"), "{names:?}");
+        assert_eq!(
+            names.iter().filter(|name| **name == "settings").count(),
+            1,
+            "{names:?}"
+        );
     }
 
     #[test]
@@ -2232,46 +2210,5 @@ url: http://127.0.0.1:{port}
         );
         let row = distiller_row(tally);
         assert_eq!(row.counts.unwrap().get("capture_open"), Some(&2));
-    }
-
-    fn file_check(path: &'static str, problem: Option<&str>) -> crate::machine_config::FileCheck {
-        crate::machine_config::FileCheck {
-            path,
-            exists: true,
-            valid: problem.is_none(),
-            problem: problem.map(str::to_owned),
-        }
-    }
-
-    #[test]
-    fn machine_config_row_degrades_with_one_unreadable_file() {
-        let row = machine_config_row(&[
-            file_check("web.yaml", None),
-            file_check(
-                "email.yaml",
-                Some("expected a bool at line 1 \"secret-ish\""),
-            ),
-        ]);
-        assert_eq!(
-            (row.name, row.status),
-            ("machine_config", HealthState::Degraded)
-        );
-        assert_eq!(row.reason, Some(FailureCategory::Unknown));
-        assert_eq!(row.counts.as_ref().unwrap().get("unreadable"), Some(&1));
-        // The closed vocabulary: no file name and no parser text reach the readout.
-        let json = serde_json::to_string(&row).unwrap();
-        assert!(
-            !json.contains("email.yaml") && !json.contains("secret-ish"),
-            "{json}"
-        );
-    }
-
-    #[test]
-    fn machine_config_row_is_ok_when_everything_parses() {
-        let row =
-            machine_config_row(&[file_check("web.yaml", None), file_check("voice.yaml", None)]);
-        assert_eq!((row.name, row.status), ("machine_config", HealthState::Ok));
-        assert!(row.reason.is_none() && row.counts.is_none());
-        assert_eq!(machine_config_row(&[]).status, HealthState::Ok);
     }
 }

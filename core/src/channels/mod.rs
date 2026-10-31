@@ -37,8 +37,8 @@ pub struct ChannelsRuntime {
     pub outbox: outbox::Waiters,
     /// Who is connected, since when, and the last `hello`. Memory only.
     pub presence: registry::Presence,
-    /// `~/.nucleos/channels/<id>.yaml`, read at startup and re-read by [`ChannelsRuntime::reload`]
-    /// when the app writes one (a hand edit on disk still needs a restart).
+    /// Each channel's `channels/<id>` settings document, read at startup and re-read by
+    /// [`ChannelsRuntime::reload`] when one is published through the settings routes.
     pub configs: RwLock<HashMap<&'static str, registry::ChannelConfig>>,
 }
 
@@ -56,9 +56,10 @@ impl ChannelsRuntime {
         }
     }
 
-    /// Re-reads every channel's yaml under `root` and swaps the map in, so a settings edit made
-    /// through the app applies to the next turn without a restart. Absent or malformed files read
-    /// as defaults, exactly as at startup. Hand edits on disk are not watched.
+    /// Re-reads every channel's document from the settings snapshot and swaps the map in, so a
+    /// settings edit made through the app applies to the next turn without a restart. Absent or
+    /// unreadable documents read as defaults, exactly as at startup. `root` is ignored: it only
+    /// keeps the signature of `load`.
     pub fn reload(&self, root: &Path) {
         let fresh = registry::load_configs(Some(root));
         if let Ok(mut configs) = self.configs.write() {
@@ -141,17 +142,40 @@ mod tests {
         assert!(ChannelsRuntime::default().config("telegram").is_none());
     }
 
-    #[test]
-    fn reload_picks_up_a_changed_yaml() {
-        let temp = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(temp.path().join("channels")).unwrap();
-        let file = temp.path().join("channels/telegram.yaml");
-        std::fs::write(&file, "doctrine: a\n").unwrap();
-        let hub = ChannelsRuntime::load(Some(temp.path()));
+    #[tokio::test]
+    async fn reload_picks_up_a_changed_document() {
+        use crate::settings::{self, Scope};
+        // `Home::new()` first and no `settings::testing::install`: the discipline for the global snapshot.
+        let home = crate::project::rules::testing::Home::new();
+        let pool = crate::testdb::fresh_pool().await;
+        settings::put(
+            &pool,
+            &Scope::Machine,
+            "channels/telegram",
+            &serde_json::json!({ "doctrine": "a" }),
+            "test",
+            None,
+        )
+        .await
+        .expect("channels/telegram is a registered document");
+        let hub = ChannelsRuntime::load(Some(home.path()));
         assert!(hub.config("telegram").unwrap().stream_edits());
 
-        std::fs::write(&file, "stream_edits: false\n").unwrap();
-        hub.reload(temp.path());
+        settings::put(
+            &pool,
+            &Scope::Machine,
+            "channels/telegram",
+            &serde_json::json!({ "stream_edits": false }),
+            "test",
+            Some(1),
+        )
+        .await
+        .expect("the second version is accepted");
+        assert!(
+            hub.config("telegram").unwrap().stream_edits(),
+            "the hub keeps what it loaded until it is told to reload"
+        );
+        hub.reload(home.path());
         assert!(!hub.config("telegram").unwrap().stream_edits());
     }
 

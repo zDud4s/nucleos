@@ -800,9 +800,8 @@ export function rulesFileName(rules: ProjectRules): string {
 }
 
 /**
- * Where a project's `autopilot.yaml` is edited: the workspace's State mode, whose "Files the app
- * owns" section holds the raw editor. The State mode and not the inspector, because the inspector
- * reads the tree and that editor is the file's legitimate author (`project/OwnedFiles.tsx`).
+ * Where a project's `autopilot` document is edited: the workspace's State mode, whose "Autopilot
+ * rules" section holds the form (`project/AutopilotRules.tsx`).
  */
 export function rulesEditorPath(projectId: string): string {
   return `/projects/${projectId}/state`;

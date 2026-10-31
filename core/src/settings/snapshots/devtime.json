@@ -1,0 +1,1258 @@
+{
+  "$defs": {
+    "DevtimeActionsConfig": {
+      "additionalProperties": false,
+      "description": "The automatic actions' thresholds (actions design spec, sections 4 and 6). A partial or absent\nblock is valid: every field has the spec default.",
+      "properties": {
+        "effect_min_days": {
+          "default": 14,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "effect_min_resolved": {
+          "default": 30,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "effect_min_sessions": {
+          "default": 10,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "enabled": {
+          "default": true,
+          "description": "Global switch: false puts every pair in `off`.",
+          "type": "boolean"
+        },
+        "holdout_fraction": {
+          "default": 0.1,
+          "format": "double",
+          "type": "number"
+        },
+        "human_min_marks": {
+          "default": 5,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "inject_cooldown_days": {
+          "default": 3,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "inject_max_per_session": {
+          "default": 3,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "inject_min_cost_ms": {
+          "default": 120000,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "inject_min_count": {
+          "default": 3,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "inject_window_days": {
+          "default": 14,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "min_mean_hit_cost_ms": {
+          "default": 30000,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pairs": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "default": {
+            "inject": [
+              "D3",
+              "D6"
+            ],
+            "propose": [
+              "F1",
+              "F2"
+            ]
+          },
+          "description": "Action to the rule ids that start in shadow.",
+          "type": "object"
+        },
+        "precision_wilson_lower": {
+          "default": 0.6,
+          "format": "double",
+          "type": "number"
+        },
+        "propose_max_open": {
+          "default": 5,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "propose_min_cost_ms": {
+          "default": 600000,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "propose_min_sessions": {
+          "default": 3,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "propose_window_days": {
+          "default": 14,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "reentry_days": {
+          "default": 14,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rollback_window": {
+          "default": 30,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "shadow_hit_rate_min": {
+          "$ref": "#/$defs/DevtimeHitRateMin",
+          "default": {
+            "inject": 0.6,
+            "propose": 0.5
+          }
+        }
+      },
+      "type": "object"
+    },
+    "DevtimeAdaptersConfig": {
+      "additionalProperties": false,
+      "description": "Where the optional adapter sources live. Empty means absent.",
+      "properties": {
+        "heavy_log": {
+          "default": "",
+          "type": "string"
+        },
+        "permission_log": {
+          "default": "",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "DevtimeCommandsConfig": {
+      "additionalProperties": false,
+      "description": "Which programs count as a test, a build, a lint, a mutation, a sleep, a commit or a revert, and\nwhich tool names are shell, edit, read or search tools.",
+      "properties": {
+        "build": {
+          "default": [
+            "cargo build",
+            "cargo check",
+            "go build",
+            "go vet",
+            "npx tsc",
+            "mvn",
+            "gradle",
+            "dotnet build",
+            "make"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "commit": {
+          "default": [
+            "git commit"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "edit_tools": {
+          "default": [
+            "Edit",
+            "Write",
+            "MultiEdit",
+            "NotebookEdit"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "interpreters": {
+          "default": [
+            "bash",
+            "sh",
+            "python",
+            "python3",
+            "node",
+            "pwsh",
+            "powershell"
+          ],
+          "description": "First words that run a script rather than name a program (`bash scripts/gates.sh`).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "lint": {
+          "default": [
+            "cargo fmt",
+            "cargo clippy",
+            "npx eslint",
+            "gofmt"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "mutating": {
+          "default": [
+            "cargo fmt",
+            "gofmt",
+            "git checkout",
+            "git restore",
+            "git stash",
+            "git reset",
+            "git apply",
+            "git merge",
+            "git rebase",
+            "git pull",
+            "sed",
+            "patch"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "per_project": {
+          "additionalProperties": {
+            "$ref": "#/$defs/DevtimeProjectCommands"
+          },
+          "default": {},
+          "description": "Project id to extra programs, appended to the base lists above.",
+          "type": "object"
+        },
+        "read_tools": {
+          "default": [
+            "Read"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "revert_pathless": {
+          "default": [
+            "git reset",
+            "git stash"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "revert_with_paths": {
+          "default": [
+            "git checkout",
+            "git restore"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "search_tools": {
+          "default": [
+            "Grep",
+            "Glob"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "shell_tools": {
+          "default": [
+            "Bash",
+            "PowerShell"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "sleep": {
+          "default": [
+            "sleep",
+            "Start-Sleep",
+            "timeout"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "test": {
+          "default": [
+            "cargo test",
+            "go test",
+            "npm test",
+            "npx vitest",
+            "npx jest",
+            "pytest",
+            "dotnet test",
+            "make test"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "DevtimeHitRateMin": {
+      "additionalProperties": false,
+      "description": "The per-action floor on the shadow hit rate (spec 4.1).",
+      "properties": {
+        "inject": {
+          "default": 0.6,
+          "format": "double",
+          "type": "number"
+        },
+        "propose": {
+          "default": 0.5,
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "type": "object"
+    },
+    "DevtimePathsConfig": {
+      "additionalProperties": false,
+      "description": "What counts as an external path, and which file extensions are code.",
+      "properties": {
+        "code_extensions": {
+          "default": [
+            "rs",
+            "go",
+            "ts",
+            "tsx",
+            "js",
+            "jsx",
+            "mjs",
+            "py",
+            "java",
+            "kt",
+            "cs",
+            "c",
+            "cc",
+            "cpp",
+            "h",
+            "hpp",
+            "swift",
+            "rb",
+            "php",
+            "sql",
+            "sh",
+            "ps1"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "external": {
+          "default": [
+            "*/temp/*",
+            "*/tmp/*",
+            "*scratchpad*",
+            "*.log",
+            "*.output"
+          ],
+          "description": "Globs, case-insensitive, with `\\` read as `/`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "DevtimePrecisionConfig": {
+      "additionalProperties": false,
+      "description": "How a rule's precision is judged (spec §7).",
+      "properties": {
+        "floor": {
+          "default": 0.8,
+          "description": "A rule below this precision is flagged out of phase 2.",
+          "format": "double",
+          "type": "number"
+        },
+        "min_cases": {
+          "default": 20,
+          "description": "Fewer judged cases than this and the precision is not trusted.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "prior_default": {
+          "default": 0.5,
+          "description": "Reported while a rule has fewer than `min_cases` cases.",
+          "format": "double",
+          "type": "number"
+        },
+        "priors": {
+          "additionalProperties": {
+            "format": "double",
+            "type": "number"
+          },
+          "default": {
+            "C2": 0.2
+          },
+          "description": "Rule id to its starting precision, when it is not `prior_default`.",
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "DevtimeProjectCommands": {
+      "additionalProperties": false,
+      "description": "One project's extra test, build and lint programs.",
+      "properties": {
+        "build": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "lint": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "test": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "DevtimeRolesConfig": {
+      "additionalProperties": false,
+      "description": "Case-insensitive globs (`*` only) over a subagent's `agentType`. The reviewer list is tried first.",
+      "properties": {
+        "implementer": {
+          "default": [
+            "*executor*",
+            "*implement*",
+            "general-purpose"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "reviewer": {
+          "default": [
+            "*review*"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "DevtimeRulesConfig": {
+      "additionalProperties": false,
+      "description": "The rule engine's whole configuration: every threshold, program list and vocabulary a rule reads.\nRule code holds no such literal (spec §3.5), so a partial file at any nesting level is valid and\nevery field has the default the spec states.",
+      "properties": {
+        "adapters": {
+          "$ref": "#/$defs/DevtimeAdaptersConfig",
+          "default": {
+            "heavy_log": "",
+            "permission_log": ""
+          }
+        },
+        "commands": {
+          "$ref": "#/$defs/DevtimeCommandsConfig",
+          "default": {
+            "build": [
+              "cargo build",
+              "cargo check",
+              "go build",
+              "go vet",
+              "npx tsc",
+              "mvn",
+              "gradle",
+              "dotnet build",
+              "make"
+            ],
+            "commit": [
+              "git commit"
+            ],
+            "edit_tools": [
+              "Edit",
+              "Write",
+              "MultiEdit",
+              "NotebookEdit"
+            ],
+            "interpreters": [
+              "bash",
+              "sh",
+              "python",
+              "python3",
+              "node",
+              "pwsh",
+              "powershell"
+            ],
+            "lint": [
+              "cargo fmt",
+              "cargo clippy",
+              "npx eslint",
+              "gofmt"
+            ],
+            "mutating": [
+              "cargo fmt",
+              "gofmt",
+              "git checkout",
+              "git restore",
+              "git stash",
+              "git reset",
+              "git apply",
+              "git merge",
+              "git rebase",
+              "git pull",
+              "sed",
+              "patch"
+            ],
+            "per_project": {},
+            "read_tools": [
+              "Read"
+            ],
+            "revert_pathless": [
+              "git reset",
+              "git stash"
+            ],
+            "revert_with_paths": [
+              "git checkout",
+              "git restore"
+            ],
+            "search_tools": [
+              "Grep",
+              "Glob"
+            ],
+            "shell_tools": [
+              "Bash",
+              "PowerShell"
+            ],
+            "sleep": [
+              "sleep",
+              "Start-Sleep",
+              "timeout"
+            ],
+            "test": [
+              "cargo test",
+              "go test",
+              "npm test",
+              "npx vitest",
+              "npx jest",
+              "pytest",
+              "dotnet test",
+              "make test"
+            ]
+          }
+        },
+        "enabled": {
+          "default": true,
+          "type": "boolean"
+        },
+        "paths": {
+          "$ref": "#/$defs/DevtimePathsConfig",
+          "default": {
+            "code_extensions": [
+              "rs",
+              "go",
+              "ts",
+              "tsx",
+              "js",
+              "jsx",
+              "mjs",
+              "py",
+              "java",
+              "kt",
+              "cs",
+              "c",
+              "cc",
+              "cpp",
+              "h",
+              "hpp",
+              "swift",
+              "rb",
+              "php",
+              "sql",
+              "sh",
+              "ps1"
+            ],
+            "external": [
+              "*/temp/*",
+              "*/tmp/*",
+              "*scratchpad*",
+              "*.log",
+              "*.output"
+            ]
+          }
+        },
+        "precision": {
+          "$ref": "#/$defs/DevtimePrecisionConfig",
+          "default": {
+            "floor": 0.8,
+            "min_cases": 20,
+            "prior_default": 0.5,
+            "priors": {
+              "C2": 0.2
+            }
+          }
+        },
+        "roles": {
+          "$ref": "#/$defs/DevtimeRolesConfig",
+          "default": {
+            "implementer": [
+              "*executor*",
+              "*implement*",
+              "general-purpose"
+            ],
+            "reviewer": [
+              "*review*"
+            ]
+          }
+        },
+        "sessions_per_cycle": {
+          "default": 200,
+          "description": "Backlog cap per cycle after a `rules_version` change; sessions touched this cycle always run.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "thresholds": {
+          "$ref": "#/$defs/DevtimeThresholdsConfig",
+          "default": {
+            "d3_flailing_burst": 4,
+            "d3_search_burst": 6,
+            "d5_foreground_agent_seconds": 120,
+            "d6_foreground_command_seconds": 120,
+            "d8_poll_repeats": 3,
+            "d9_context_tokens": 250000,
+            "f_min_sessions": 3,
+            "f_sequence_len": 3,
+            "f_window_days": 30,
+            "late_scope_fraction": 0.3,
+            "late_scope_min_files": 3,
+            "thrash_repeats": 3,
+            "thrash_reset_calls": 40
+          }
+        },
+        "unexplained": {
+          "$ref": "#/$defs/DevtimeUnexplainedConfig",
+          "default": {
+            "class_bounds": [
+              0,
+              5,
+              20
+            ],
+            "max_explained_fraction": 0.2,
+            "median_multiple": 3.0,
+            "min_class_turns": 10,
+            "min_turn_seconds": 300,
+            "window_days": 30
+          }
+        },
+        "vocab": {
+          "$ref": "#/$defs/DevtimeVocabConfig",
+          "default": {
+            "correction_openers": [
+              "não",
+              "nao",
+              "não era isso",
+              "nao era isso",
+              "errado",
+              "está errado",
+              "isso não",
+              "that's not",
+              "that is not",
+              "not what i",
+              "wrong",
+              "no,",
+              "nope"
+            ],
+            "error_signatures": {
+              "edit_not_found": [
+                "matches of the string to replace",
+                "File has not been read yet"
+              ],
+              "hook_block": [
+                "pre-commit hook",
+                "hook rejected",
+                "hook declined"
+              ],
+              "permission_denied": [],
+              "wrong_shell": [
+                "is not recognized as the name of a cmdlet",
+                "is not a valid statement separator",
+                "ParserError",
+                "Windows Subsystem for Linux",
+                "C:/Program Files/Git/"
+              ]
+            },
+            "model_strength": [
+              "haiku",
+              "sonnet",
+              "opus"
+            ]
+          }
+        }
+      },
+      "type": "object"
+    },
+    "DevtimeThresholdsConfig": {
+      "additionalProperties": false,
+      "description": "Every numeric threshold a rule compares against.",
+      "properties": {
+        "d3_flailing_burst": {
+          "default": 4,
+          "description": "FLAILING: a streak without a Read or an Edit.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "d3_search_burst": {
+          "default": 6,
+          "description": "D3: a Grep/Glob streak without an edit.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "d5_foreground_agent_seconds": {
+          "default": 120,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "d6_foreground_command_seconds": {
+          "default": 120,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "d8_poll_repeats": {
+          "default": 3,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "d9_context_tokens": {
+          "default": 250000,
+          "format": "int64",
+          "type": "integer"
+        },
+        "f_min_sessions": {
+          "default": 3,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "f_sequence_len": {
+          "default": 3,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "f_window_days": {
+          "default": 30,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "late_scope_fraction": {
+          "default": 0.3,
+          "description": "D14 / LATE SCOPE.",
+          "format": "double",
+          "type": "number"
+        },
+        "late_scope_min_files": {
+          "default": 3,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "thrash_repeats": {
+          "default": 3,
+          "description": "D1 / THRASH.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "thrash_reset_calls": {
+          "default": 40,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "DevtimeUnexplainedConfig": {
+      "additionalProperties": false,
+      "description": "When a slow turn that no rule explains is worth listing.",
+      "properties": {
+        "class_bounds": {
+          "default": [
+            0,
+            5,
+            20
+          ],
+          "description": "Main-lane calls per turn that split turns into classes `c0..cN`.",
+          "items": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "max_explained_fraction": {
+          "default": 0.2,
+          "format": "double",
+          "type": "number"
+        },
+        "median_multiple": {
+          "default": 3.0,
+          "format": "double",
+          "type": "number"
+        },
+        "min_class_turns": {
+          "default": 10,
+          "description": "A class with fewer turns has no median, and nothing in it is listed.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "min_turn_seconds": {
+          "default": 300,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "window_days": {
+          "default": 30,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "DevtimeVocabConfig": {
+      "additionalProperties": false,
+      "description": "The words the parser and the rules match in memory. Only the derived flag or token is ever stored.",
+      "properties": {
+        "correction_openers": {
+          "default": [
+            "não",
+            "nao",
+            "não era isso",
+            "nao era isso",
+            "errado",
+            "está errado",
+            "isso não",
+            "that's not",
+            "that is not",
+            "not what i",
+            "wrong",
+            "no,",
+            "nope"
+          ],
+          "description": "A prompt that opens with one of these counts as a correction of the previous answer.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "error_signatures": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "default": {
+            "edit_not_found": [
+              "matches of the string to replace",
+              "File has not been read yet"
+            ],
+            "hook_block": [
+              "pre-commit hook",
+              "hook rejected",
+              "hook declined"
+            ],
+            "permission_denied": [],
+            "wrong_shell": [
+              "is not recognized as the name of a cmdlet",
+              "is not a valid statement separator",
+              "ParserError",
+              "Windows Subsystem for Linux",
+              "C:/Program Files/Git/"
+            ]
+          },
+          "description": "Error class to extra substrings that classify a failed tool result into it.",
+          "type": "object"
+        },
+        "model_strength": {
+          "default": [
+            "haiku",
+            "sonnet",
+            "opus"
+          ],
+          "description": "Model families, weakest first.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "The devtime ingestion's settings.\n\nDerives `PartialEq` and not `Eq`, because the amber rate is an `f64`.",
+  "properties": {
+    "actions": {
+      "$ref": "#/$defs/DevtimeActionsConfig",
+      "default": {
+        "effect_min_days": 14,
+        "effect_min_resolved": 30,
+        "effect_min_sessions": 10,
+        "enabled": true,
+        "holdout_fraction": 0.1,
+        "human_min_marks": 5,
+        "inject_cooldown_days": 3,
+        "inject_max_per_session": 3,
+        "inject_min_cost_ms": 120000,
+        "inject_min_count": 3,
+        "inject_window_days": 14,
+        "min_mean_hit_cost_ms": 30000,
+        "pairs": {
+          "inject": [
+            "D3",
+            "D6"
+          ],
+          "propose": [
+            "F1",
+            "F2"
+          ]
+        },
+        "precision_wilson_lower": 0.6,
+        "propose_max_open": 5,
+        "propose_min_cost_ms": 600000,
+        "propose_min_sessions": 3,
+        "propose_window_days": 14,
+        "reentry_days": 14,
+        "rollback_window": 30,
+        "shadow_hit_rate_min": {
+          "inject": 0.6,
+          "propose": 0.5
+        }
+      },
+      "description": "The automatic actions' thresholds (phase 2, shadow mode first)."
+    },
+    "cycle_seconds": {
+      "default": 60,
+      "description": "Seconds between two ingestion cycles.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "enabled": {
+      "default": true,
+      "type": "boolean"
+    },
+    "idle_minutes": {
+      "default": 15,
+      "description": "Minutes of silence after which a session counts as idle.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "parse_failure_amber_rate": {
+      "default": 0.02,
+      "description": "The share of unparseable lines above which the ingest health goes amber.",
+      "format": "double",
+      "type": "number"
+    },
+    "parse_failure_min_lines": {
+      "default": 200,
+      "description": "Fewer lines than this and the rate above is not judged.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "projects_dir": {
+      "default": "",
+      "description": "Where the transcripts live. Empty means `<home>/.claude/projects`.",
+      "type": "string"
+    },
+    "rules": {
+      "$ref": "#/$defs/DevtimeRulesConfig",
+      "default": {
+        "adapters": {
+          "heavy_log": "",
+          "permission_log": ""
+        },
+        "commands": {
+          "build": [
+            "cargo build",
+            "cargo check",
+            "go build",
+            "go vet",
+            "npx tsc",
+            "mvn",
+            "gradle",
+            "dotnet build",
+            "make"
+          ],
+          "commit": [
+            "git commit"
+          ],
+          "edit_tools": [
+            "Edit",
+            "Write",
+            "MultiEdit",
+            "NotebookEdit"
+          ],
+          "interpreters": [
+            "bash",
+            "sh",
+            "python",
+            "python3",
+            "node",
+            "pwsh",
+            "powershell"
+          ],
+          "lint": [
+            "cargo fmt",
+            "cargo clippy",
+            "npx eslint",
+            "gofmt"
+          ],
+          "mutating": [
+            "cargo fmt",
+            "gofmt",
+            "git checkout",
+            "git restore",
+            "git stash",
+            "git reset",
+            "git apply",
+            "git merge",
+            "git rebase",
+            "git pull",
+            "sed",
+            "patch"
+          ],
+          "per_project": {},
+          "read_tools": [
+            "Read"
+          ],
+          "revert_pathless": [
+            "git reset",
+            "git stash"
+          ],
+          "revert_with_paths": [
+            "git checkout",
+            "git restore"
+          ],
+          "search_tools": [
+            "Grep",
+            "Glob"
+          ],
+          "shell_tools": [
+            "Bash",
+            "PowerShell"
+          ],
+          "sleep": [
+            "sleep",
+            "Start-Sleep",
+            "timeout"
+          ],
+          "test": [
+            "cargo test",
+            "go test",
+            "npm test",
+            "npx vitest",
+            "npx jest",
+            "pytest",
+            "dotnet test",
+            "make test"
+          ]
+        },
+        "enabled": true,
+        "paths": {
+          "code_extensions": [
+            "rs",
+            "go",
+            "ts",
+            "tsx",
+            "js",
+            "jsx",
+            "mjs",
+            "py",
+            "java",
+            "kt",
+            "cs",
+            "c",
+            "cc",
+            "cpp",
+            "h",
+            "hpp",
+            "swift",
+            "rb",
+            "php",
+            "sql",
+            "sh",
+            "ps1"
+          ],
+          "external": [
+            "*/temp/*",
+            "*/tmp/*",
+            "*scratchpad*",
+            "*.log",
+            "*.output"
+          ]
+        },
+        "precision": {
+          "floor": 0.8,
+          "min_cases": 20,
+          "prior_default": 0.5,
+          "priors": {
+            "C2": 0.2
+          }
+        },
+        "roles": {
+          "implementer": [
+            "*executor*",
+            "*implement*",
+            "general-purpose"
+          ],
+          "reviewer": [
+            "*review*"
+          ]
+        },
+        "sessions_per_cycle": 200,
+        "thresholds": {
+          "d3_flailing_burst": 4,
+          "d3_search_burst": 6,
+          "d5_foreground_agent_seconds": 120,
+          "d6_foreground_command_seconds": 120,
+          "d8_poll_repeats": 3,
+          "d9_context_tokens": 250000,
+          "f_min_sessions": 3,
+          "f_sequence_len": 3,
+          "f_window_days": 30,
+          "late_scope_fraction": 0.3,
+          "late_scope_min_files": 3,
+          "thrash_repeats": 3,
+          "thrash_reset_calls": 40
+        },
+        "unexplained": {
+          "class_bounds": [
+            0,
+            5,
+            20
+          ],
+          "max_explained_fraction": 0.2,
+          "median_multiple": 3.0,
+          "min_class_turns": 10,
+          "min_turn_seconds": 300,
+          "window_days": 30
+        },
+        "vocab": {
+          "correction_openers": [
+            "não",
+            "nao",
+            "não era isso",
+            "nao era isso",
+            "errado",
+            "está errado",
+            "isso não",
+            "that's not",
+            "that is not",
+            "not what i",
+            "wrong",
+            "no,",
+            "nope"
+          ],
+          "error_signatures": {
+            "edit_not_found": [
+              "matches of the string to replace",
+              "File has not been read yet"
+            ],
+            "hook_block": [
+              "pre-commit hook",
+              "hook rejected",
+              "hook declined"
+            ],
+            "permission_denied": [],
+            "wrong_shell": [
+              "is not recognized as the name of a cmdlet",
+              "is not a valid statement separator",
+              "ParserError",
+              "Windows Subsystem for Linux",
+              "C:/Program Files/Git/"
+            ]
+          },
+          "model_strength": [
+            "haiku",
+            "sonnet",
+            "opus"
+          ]
+        }
+      },
+      "description": "The rule engine's vocabularies and thresholds (sub-project 2)."
+    }
+  },
+  "title": "DevtimeConfig",
+  "type": "object"
+}
