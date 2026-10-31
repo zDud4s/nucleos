@@ -33,7 +33,7 @@ use super::landing::{
     self, LandingError, MergeSettlement, apply_gate_verdict, check_may_land, check_may_merge,
     land_job, scope_caller_id, settle_land, settle_merge, submit_merge,
 };
-use super::model::JOB_TERMINAL_STATE;
+use super::model::{JOB_TERMINAL_STATE, Manifest};
 use super::open::{FIX_PREFIX, relaunch_node, run_is_live};
 use super::relaunch::{budget_refusal, refusal_question};
 use super::store::{self, TreeJob};
@@ -686,6 +686,21 @@ async fn root_is_done(pool: &SqlitePool, root_id: &str) -> Result<bool, String> 
     Ok(!report.live && report.result.as_deref() == Some("done"))
 }
 
+/// PURE: a tree with nothing to land. No branch was merged and every branch is `dropped` or a
+/// `done` docs branch, so nothing is in flight, parked or failed. `check_may_land` refuses such a
+/// tree on purpose; the driver finishes it held instead of leaving it open for ever.
+fn is_empty_tree(manifest: &Manifest) -> bool {
+    !manifest.branches.is_empty()
+        && manifest
+            .branches
+            .values()
+            .all(|branch| match branch.state.as_str() {
+                "dropped" => true,
+                "done" => branch.layer == "docs",
+                _ => false,
+            })
+}
+
 async fn landing_step(state: &AppState, job: &mut TreeJob) -> Result<(), String> {
     let pool = &state.pool;
     if job
@@ -703,13 +718,24 @@ async fn landing_step(state: &AppState, job: &mut TreeJob) -> Result<(), String>
         }
         return Ok(());
     }
-    if !root_is_done(pool, &job.root_node_id).await? || check_may_land(&job.manifest).is_err() {
+    if !root_is_done(pool, &job.root_node_id).await? {
+        return Ok(());
+    }
+    let empty = is_empty_tree(&job.manifest);
+    if !empty && check_may_land(&job.manifest).is_err() {
         return Ok(());
     }
 
     // The children closed earlier in the pass, so the root closes last.
     if let Err(error) = close_with_report(pool, &job.root_node_id).await {
         tracing::warn!(job = %job.id, %error, "tree driver could not close the root node");
+    }
+
+    if empty {
+        job.manifest
+            .extra
+            .insert("empty".to_owned(), Value::Bool(true));
+        return finish_held(pool, job).await;
     }
 
     let integration =
