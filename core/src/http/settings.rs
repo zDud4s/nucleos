@@ -1529,6 +1529,19 @@ mod tests {
             remote_put_changing_a_command_is_refused("project:p1", "autopilot", old, new).await;
         }
 
+        /// Changing a schedule's `cwd` moves where a relative schedule command runs, even when the new
+        /// folder is still inside the project.
+        #[tokio::test]
+        async fn a_remote_put_changing_a_schedule_cwd_is_403() {
+            let mut old = autopilot_body();
+            old["schedules"] = json!([
+                { "name": "r1", "at": "2026-10-22T09:00:00Z", "command": "git --version", "cwd": "tools" }
+            ]);
+            let mut new = old.clone();
+            new["schedules"][0]["cwd"] = json!("scripts");
+            remote_put_changing_a_command_is_refused("project:p1", "autopilot", old, new).await;
+        }
+
         #[tokio::test]
         async fn a_remote_put_changing_a_workflow_pin_node_command_is_403() {
             let pins = |command: &str| {
