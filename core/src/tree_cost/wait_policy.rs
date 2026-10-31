@@ -101,6 +101,9 @@ fn keep_warm_pings(expected_wait_s: i64, ttl_s: i64) -> i64 {
 mod tests {
     use super::*;
 
+    use crate::tree_cost::measure::TtlDistribution;
+    use crate::tree_cost::report::{CacheReport, Figure};
+
     /// Below the default rotation threshold, so only the keep-warm rule can decide.
     const SMALL_CONTEXT: i64 = 10_000;
     /// Above the default rotation threshold of 60 000.
@@ -129,6 +132,82 @@ mod tests {
             keep_warm_enabled: true,
             ..WaitSettings::default()
         }
+    }
+
+    fn report(has_data: bool, effective_ttl_s: Option<i64>, p_resume: Option<f64>) -> CacheReport {
+        CacheReport {
+            has_data,
+            ttl_distribution: TtlDistribution::default(),
+            gap_counts: Figure {
+                value: vec![],
+                estimated: false,
+            },
+            miss_rates: Figure {
+                value: vec![],
+                estimated: false,
+            },
+            effective_ttl_s: Figure {
+                value: effective_ttl_s,
+                estimated: false,
+            },
+            p_resume,
+        }
+    }
+
+    #[tokio::test]
+    async fn record_and_close_a_wait_roundtrip() {
+        let pool = crate::testdb::fresh_pool().await;
+        let wait = input(SMALL_CONTEXT, ONE_HOUR_S, ONE_HOUR_S, Some(0.75), 2.0);
+
+        let id = record(&pool, Some("session-1"), &wait, WaitAction::KeepWarm)
+            .await
+            .unwrap();
+        close(&pool, id, true).await.unwrap();
+
+        let row: (String, i64, i64, i64, String, Option<i64>, Option<String>) = sqlx::query_as(
+            "SELECT session_id, context_tokens, expected_wait_s, ttl_s, action, returned, returned_at \
+             FROM cache_waits WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "session-1");
+        assert_eq!(row.1, SMALL_CONTEXT);
+        assert_eq!(row.2, ONE_HOUR_S);
+        assert_eq!(row.3, ONE_HOUR_S);
+        assert_eq!(row.4, "keep_warm");
+        assert_eq!(row.5, Some(1));
+        assert!(row.6.is_some());
+    }
+
+    #[tokio::test]
+    async fn settings_default_keep_warm_off() {
+        let pool = crate::testdb::fresh_pool().await;
+
+        let settings = load_settings(&pool).await.unwrap();
+
+        assert!(!settings.keep_warm_enabled);
+        assert_eq!(settings.rotate_context_tokens, 60_000);
+        assert_eq!(settings.rotate_min_wait_over_ttl, 1.0);
+        assert_eq!(settings.resume_probability, 0.5);
+        assert_eq!(settings.read_multiplier, 0.1);
+    }
+
+    #[test]
+    fn advice_uses_effective_ttl_from_report_when_present() {
+        let wait = input(SMALL_CONTEXT, 10_800, 0, None, 2.0);
+        let report = report(true, Some(ONE_HOUR_S), Some(0.20));
+
+        assert_eq!(advice(&wait, &keep_warm_on(), &report), WaitAction::KeepWarm);
+    }
+
+    #[test]
+    fn advice_falls_back_to_park_when_report_has_no_data() {
+        let wait = input(SMALL_CONTEXT, 10_800, ONE_HOUR_S, Some(1.0), 2.0);
+        let report = report(false, None, None);
+
+        assert_eq!(advice(&wait, &keep_warm_on(), &report), WaitAction::Park);
     }
 
     #[test]

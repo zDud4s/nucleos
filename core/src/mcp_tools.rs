@@ -2783,12 +2783,17 @@ mod tests {
                 "node_tree",
                 "node_update",
                 "record",
+                "spec_backlog",
+                "spec_finish",
                 "task_claim",
                 "task_done",
                 "task_list",
                 "task_release",
+                "tree_launch",
+                "tree_status",
                 "verify",
-                "verify_status"
+                "verify_status",
+                "wait_advice"
             ]
         );
         assert!(!served_in_box(
@@ -3006,7 +3011,8 @@ mod tests {
                 "{name} is missing from TOOL_EFFECTS"
             );
             let effect = tool_effect(name);
-            let launch_act = ["create_job", "create_run"].contains(&name);
+            let launch_act = ["create_job", "create_run", "spec_finish", "tree_launch"]
+                .contains(&name);
             assert!(
                 effect != ToolEffect::ReadsUntrusted && (effect != ToolEffect::Acts || launch_act),
                 "{name} is graded {effect:?} and must not be served in a worktree box"
@@ -3030,12 +3036,17 @@ mod tests {
                 "node_tree",
                 "node_update",
                 "record",
+                "spec_backlog",
+                "spec_finish",
                 "task_claim",
                 "task_done",
                 "task_list",
                 "task_release",
+                "tree_launch",
+                "tree_status",
                 "verify",
-                "verify_status"
+                "verify_status",
+                "wait_advice"
             ]
         );
 
@@ -3068,6 +3079,46 @@ mod tests {
                 "{name} is missing from WORKTREE_BOX_TOOLS"
             );
         }
+    }
+
+    #[test]
+    fn worktree_box_serves_tree_and_backlog_tools() {
+        for name in [
+            "spec_backlog",
+            "spec_finish",
+            "tree_launch",
+            "tree_status",
+            "wait_advice",
+        ] {
+            assert!(
+                served_in_box(&McpBox::Worktree("/work/a".to_owned()), name),
+                "the worktree box does not serve {name}"
+            );
+            assert!(
+                WORKTREE_BOX_TOOLS.contains(&name),
+                "{name} is missing from WORKTREE_BOX_TOOLS"
+            );
+        }
+    }
+
+    #[test]
+    fn tree_launch_is_acts() {
+        assert_eq!(tool_effect("tree_launch"), ToolEffect::Acts);
+    }
+
+    #[test]
+    fn tree_status_is_reads_own() {
+        assert_eq!(tool_effect("tree_status"), ToolEffect::ReadsOwn);
+    }
+
+    #[test]
+    fn spec_finish_is_acts() {
+        assert_eq!(tool_effect("spec_finish"), ToolEffect::Acts);
+    }
+
+    #[test]
+    fn wait_advice_is_reads_own() {
+        assert_eq!(tool_effect("wait_advice"), ToolEffect::ReadsOwn);
     }
 
     #[test]

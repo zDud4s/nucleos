@@ -19114,6 +19114,78 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
+    // Moved here from `spec_backlog::http` and `conductor::http`: those library-crate modules
+    // cannot name `crate::http::build_router`, which exists only in the binary crate.
+    #[tokio::test]
+    async fn finish_route_requires_owner_token() {
+        let response = build_router(test_state().await)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/backlog/finish")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // The auth layer answers 401 before routing, so only an authorized request proves the
+        // route is mounted. The spec id names nothing, so no paid run starts.
+        let response = build_router(test_state().await)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/backlog/finish")
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"spec_id":"missing-spec"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_ne!(response.status(), StatusCode::NOT_FOUND);
+        assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn resume_route_requires_owner_token() {
+        let response = build_router(test_state().await)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/conductor/resume")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"session_id":"session-1"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // The auth layer answers 401 before routing, so only an authorized request proves the
+        // route is mounted.
+        let response = build_router(test_state().await)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/conductor/resume")
+                    .header("Authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"session_id":"session-1"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_ne!(response.status(), StatusCode::NOT_FOUND);
+        assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
     #[tokio::test]
     async fn health_returns_200_ok() {
         let app = build_router(test_state().await);
