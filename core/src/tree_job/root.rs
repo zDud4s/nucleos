@@ -180,10 +180,234 @@ mod tests {
     use serde_json::json;
     use tower::ServiceExt;
 
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
     use crate::execution::git_exec::testkit::{initialize_repo, space_free_tempdir};
+    use crate::execution::runner::{FakeCommandRunner, Permission};
+    use crate::state::AppState;
     use crate::tree_job::http::routes;
 
     const GOAL: &str = "Ship the unmistakable goal";
+    const TREE: &str = "job-1";
+
+    /// `git <args>` in `dir`, stdout trimmed; asserts a zero exit.
+    fn git_text(dir: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("git should start");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    /// A repository on `master` with a zero disk floor, so that a tree worktree is admitted whatever
+    /// the disk holds. The same set-up the prompt test above does inline.
+    fn tree_repo(container: &tempfile::TempDir) -> PathBuf {
+        let repo = container.path().join("repo");
+        initialize_repo(&repo);
+        git_text(&repo, &["branch", "-M", "master"]);
+        let workflow = repo.join(".nucleos/workflow");
+        std::fs::create_dir_all(&workflow).unwrap();
+        std::fs::write(workflow.join("speed.yaml"), "tree:\n  floor_gb: 0\n").unwrap();
+        repo
+    }
+
+    /// Creates the tree job through the route, which starts its root run in the root worktree.
+    async fn start_tree(repo: &Path, delay: Option<Duration>) -> (AppState, Arc<FakeCommandRunner>) {
+        let (state, runner) =
+            crate::execution::runs::testkit::test_state_with_runner(delay, Duration::from_secs(600))
+                .await;
+        runner.canned.lock().unwrap().as_mut().unwrap().session_id = None;
+        let body = json!({
+            "id": TREE,
+            "goal": GOAL,
+            "feature_branch": "feat/tree",
+            "project_root": repo.to_string_lossy().replace('\\', "/"),
+            "project_id": "project-0",
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/trees")
+            .header("Authorization", "Bearer test-token")
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = routes().with_state(state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        (state, runner)
+    }
+
+    /// The permission and the directory the runner was launched with, once there is a launch.
+    async fn first_launch(runner: &FakeCommandRunner) -> Option<(Permission, PathBuf)> {
+        for _ in 0..300 {
+            let permission = *runner.last_permission.lock().unwrap();
+            let cwd = runner.last_cwd.lock().unwrap().clone();
+            if let (Some(permission), Some(cwd)) = (permission, cwd) {
+                return Some((permission, cwd));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        None
+    }
+
+    /// The worktree the manifest records for the `root` branch.
+    async fn root_worktree(state: &AppState) -> PathBuf {
+        let job = crate::tree_job::store::load(&state.pool, TREE)
+            .await
+            .unwrap()
+            .expect("the tree job is stored");
+        PathBuf::from(
+            job.manifest.branches["root"]
+                .worktree
+                .clone()
+                .expect("the root branch has a worktree"),
+        )
+    }
+
+    /// A tree job's root run is the agent that must call `tree_branch_start` and `node_close` and
+    /// write its report, so a launch in plan mode (`--permission-mode plan`) can do none of it: the
+    /// agent plans, ends, and the wrap parks. With no classifier wired at the project root the
+    /// permission is the plain `Default`: neither `Plan`, nor an ungoverned `Bypass`.
+    #[tokio::test]
+    async fn a_tree_root_run_is_not_launched_in_plan_mode() {
+        let container = space_free_tempdir("tree-root-plan-");
+        let repo = tree_repo(&container);
+        let (_state, runner) = start_tree(&repo, Some(Duration::from_secs(5))).await;
+
+        let (permission, _cwd) = first_launch(&runner)
+            .await
+            .expect("the root run reached the runner");
+
+        assert_ne!(
+            permission,
+            Permission::Plan,
+            "a tree agent launched in plan mode cannot call its tools or write"
+        );
+        assert_eq!(
+            permission,
+            Permission::Default,
+            "no hook is wired at this root, so nothing may stand the CLI's barrier down"
+        );
+    }
+
+    /// The root run works in the worktree `open_branch` made for it, as a run of the mode every
+    /// autonomous code run has, and no second checkout is provisioned for it.
+    #[tokio::test]
+    async fn a_tree_root_run_works_in_the_tree_worktree_without_provisioning_another() {
+        let container = space_free_tempdir("tree-root-cwd-");
+        let repo = tree_repo(&container);
+        let (state, runner) = start_tree(&repo, Some(Duration::from_secs(5))).await;
+        let (_, cwd) = first_launch(&runner)
+            .await
+            .expect("the root run reached the runner");
+
+        let worktree = root_worktree(&state).await;
+
+        assert_eq!(cwd, worktree, "the run starts in the tree's own worktree");
+        let (mode, run_cwd): (String, Option<String>) =
+            sqlx::query_as("SELECT mode, cwd FROM runs ORDER BY id LIMIT 1")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(mode, "worktree", "a tree run is an autonomous code run");
+        assert_eq!(run_cwd.map(PathBuf::from), Some(worktree));
+        let listed = git_text(&repo, &["worktree", "list", "--porcelain"]);
+        let trees = listed.lines().filter(|line| line.starts_with("worktree ")).count();
+        assert_eq!(
+            trees, 2,
+            "the project checkout and the root worktree, and no third one: {listed}"
+        );
+    }
+
+    /// A finished tree run is announced as the worktree run it is; `shadow_run_completed` is the
+    /// feed line of a planning run.
+    #[tokio::test]
+    async fn a_tree_run_completion_is_not_a_shadow_feed_entry() {
+        let container = space_free_tempdir("tree-root-feed-");
+        let repo = tree_repo(&container);
+        let (state, _runner) = start_tree(&repo, None).await;
+
+        let mut kinds: Vec<String> = Vec::new();
+        for _ in 0..300 {
+            let entries = crate::feed::list_feed(&state.pool, None, 50).await.unwrap();
+            kinds = entries.into_iter().map(|entry| entry.kind).collect();
+            if kinds.iter().any(|kind| kind.ends_with("_run_completed")) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert!(
+            kinds.iter().any(|kind| kind == "worktree_run_completed"),
+            "the root run's completion is a worktree run's: {kinds:?}"
+        );
+        assert!(
+            !kinds.iter().any(|kind| kind == "shadow_run_completed"),
+            "{kinds:?}"
+        );
+    }
+
+    /// The project root wires the classifier hook, and `.claude/` is not committed, so a worktree
+    /// carries no `settings.json` until the run inherits one. Without it the CLI's barrier would
+    /// either stay up (nobody to answer it) or come down with nothing watching.
+    #[tokio::test]
+    async fn a_tree_run_is_governed_by_the_classifier_hook() {
+        let container = space_free_tempdir("tree-root-hook-");
+        let repo = tree_repo(&container);
+        crate::governance::autopilot::wire_classifier_hook(&repo).unwrap();
+        let (_state, runner) = start_tree(&repo, Some(Duration::from_secs(5))).await;
+
+        let (permission, cwd) = first_launch(&runner)
+            .await
+            .expect("the root run reached the runner");
+
+        assert!(
+            crate::governance::autopilot::classifier_hook_is_wired(&cwd),
+            "the tree worktree must carry the hook its project root wires"
+        );
+        assert_eq!(permission, Permission::Bypass);
+        assert_eq!(
+            *runner.last_classifier_governs_tools.lock().unwrap(),
+            Some(true),
+            "Bypass is only safe because the classifier governs the tools"
+        );
+    }
+
+    /// `workflow --sync` leaves `.agents/` and `AGENTS.md` untracked in a tree worktree, and
+    /// `checkpoint` is `git add -A`: without an exclusion the agents' workflow files would be
+    /// committed into the feature branch and merged, as the report files would have been.
+    #[tokio::test]
+    async fn workflow_files_stay_out_of_a_tree_checkpoint() {
+        let container = space_free_tempdir("tree-root-sync-");
+        let repo = tree_repo(&container);
+        let (state, _runner) = start_tree(&repo, Some(Duration::from_secs(5))).await;
+        let worktree = root_worktree(&state).await;
+        std::fs::create_dir_all(worktree.join(".agents")).unwrap();
+        std::fs::write(worktree.join(".agents/x"), "workflow\n").unwrap();
+        std::fs::write(worktree.join("AGENTS.md"), "# managed\n").unwrap();
+        let before = git_text(&worktree, &["rev-parse", "HEAD"]);
+
+        let status = git_text(&worktree, &["status", "--porcelain", "--untracked-files=all"]);
+        let sha = crate::execution::worktree::checkpoint(&worktree).await.unwrap();
+
+        assert!(
+            !status.contains("AGENTS.md") && !status.contains(".agents"),
+            "workflow files show as changes of the tree: {status:?}"
+        );
+        assert_eq!(sha, before, "a checkpoint of workflow files alone commits nothing");
+        let tracked = git_text(&worktree, &["ls-files"]);
+        assert!(
+            !tracked.contains("AGENTS.md") && !tracked.contains(".agents"),
+            "{tracked:?}"
+        );
+    }
 
     /// The prompt of the only run `POST /trees` started. It goes through the route, so that the test
     /// names no signature GREEN may still choose.

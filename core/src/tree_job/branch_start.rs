@@ -597,4 +597,89 @@ mod tests {
             .unwrap();
         assert_eq!(after, before);
     }
+
+    /// The permission and directory of the launch the runner saw last, once there is one.
+    async fn seen_launch(
+        runner: &crate::execution::runner::FakeCommandRunner,
+    ) -> Option<(crate::execution::runner::Permission, std::path::PathBuf)> {
+        for _ in 0..300 {
+            let permission = *runner.last_permission.lock().unwrap();
+            let cwd = runner.last_cwd.lock().unwrap().clone();
+            if let (Some(permission), Some(cwd)) = (permission, cwd) {
+                return Some((permission, cwd));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        None
+    }
+
+    /// A branch agent has to write code, run its gate and call `node_close`: launched in plan mode
+    /// (`--permission-mode plan`) it plans, ends, and the wrap parks the branch. It also has to work
+    /// in the worktree `open` made for its branch, not in one of its own.
+    #[tokio::test]
+    async fn a_tree_branch_run_is_not_launched_in_plan_mode() {
+        let (state, runner) = crate::execution::runs::testkit::test_state_with_runner(
+            Some(Duration::from_secs(5)),
+            Duration::from_secs(600),
+        )
+        .await;
+        runner.canned.lock().unwrap().as_mut().unwrap().session_id = None;
+        let app = app(&state);
+        let repo = Repo::new();
+        let (_, created) = post(
+            &app,
+            "/trees",
+            json!({
+                "id": TREE,
+                "goal": "Ship it",
+                "feature_branch": "feat/branch-start",
+                "project_root": repo.path.to_string_lossy().replace('\\', "/"),
+                "project_id": "project-0",
+            }),
+        )
+        .await;
+        let caller = created["root_node_id"]
+            .as_str()
+            .expect("the tree route creates its root node")
+            .to_owned();
+        // The root run launched first; forget it, so that what is read next is the branch's.
+        seen_launch(&runner).await.expect("the root run reached the runner");
+        *runner.last_permission.lock().unwrap() = None;
+        *runner.last_cwd.lock().unwrap() = None;
+
+        let (status, response) = post(
+            &app,
+            &uri(),
+            json!({
+                "name": "api",
+                "goal": "Build the api",
+                "owned_paths": ["core/**"],
+                "prompt": "Build it.",
+                "layer": "core",
+                "node_id": caller,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{response:?}");
+        let (permission, cwd) = seen_launch(&runner)
+            .await
+            .expect("the branch run reached the runner");
+        assert_ne!(
+            permission,
+            crate::execution::runner::Permission::Plan,
+            "a tree agent launched in plan mode cannot call its tools or write"
+        );
+        assert_eq!(
+            Some(cwd),
+            response["worktree"].as_str().map(std::path::PathBuf::from),
+            "the branch run starts in the worktree its branch was opened with"
+        );
+        let mode: String = sqlx::query_scalar("SELECT mode FROM runs WHERE id = ?")
+            .bind(response["run_id"].as_i64().expect("the answer names the run"))
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(mode, "worktree");
+    }
 }

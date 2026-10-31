@@ -512,4 +512,110 @@ mod tests {
 
         assert_eq!(launches(&state, "wrap-root", "wrap-47").await, 1);
     }
+
+    /// A relaunch starts the node from the launch its first start stored, so it carries that launch's
+    /// mode and worktree. A node that was first started in plan mode would be started again in plan
+    /// mode, and would plan, end, and be wrapped again until the chain's cap parks the branch.
+    ///
+    /// Goes through the real root start (the route) and the real wrap, so that the launch the wrap
+    /// reads is the one `root::start` stored, and no signature is named that GREEN may still change.
+    /// The driver's fix and answer relaunches take the same road (`open::relaunch_node` to
+    /// `store::launch_recovering`), so this one pin covers them.
+    #[tokio::test]
+    async fn a_wrap_relaunch_is_not_launched_in_plan_mode() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        use crate::execution::git_exec::testkit::{initialize_repo, space_free_tempdir};
+        use crate::execution::runner::Permission;
+
+        let container = space_free_tempdir("tree-wrap-plan-");
+        let repo = container.path().join("repo");
+        initialize_repo(&repo);
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .expect("git should start");
+            assert!(output.status.success(), "git {args:?} failed");
+        };
+        git(&["branch", "-M", "master"]);
+        let workflow = repo.join(".nucleos/workflow");
+        std::fs::create_dir_all(&workflow).unwrap();
+        std::fs::write(workflow.join("speed.yaml"), "tree:\n  floor_gb: 0\n").unwrap();
+        let (state, runner) = crate::execution::runs::testkit::test_state_with_runner(
+            Some(Duration::from_secs(60)),
+            Duration::from_secs(600),
+        )
+        .await;
+        runner.canned.lock().unwrap().as_mut().unwrap().session_id = None;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/trees")
+            .header("Authorization", "Bearer test-token")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "id": JOB,
+                    "goal": "Wrap the root",
+                    "feature_branch": "feat/wrap",
+                    "project_root": repo.to_string_lossy().replace('\\', "/"),
+                    "project_id": "project-0",
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = crate::tree_job::http::routes()
+            .with_state(state.clone())
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let root = store::load(&state.pool, JOB).await.unwrap().unwrap().root_node_id;
+        let first: i64 = sqlx::query_scalar("SELECT CAST(run_id AS INTEGER) FROM work_nodes WHERE id = ?")
+            .bind(&root)
+            .fetch_one(&state.pool)
+            .await
+            .expect("the root run is linked to the root node");
+        for _ in 0..300 {
+            if runner.last_permission.lock().unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // The first run ended after a handoff report; the wrap has to start the node again.
+        sqlx::query("UPDATE runs SET status = 'interrupted' WHERE id = ?")
+            .bind(first)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE work_nodes SET status = 'running' WHERE id = ?")
+            .bind(&root)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        report(&state, &root, first, "handoff").await;
+        *runner.last_permission.lock().unwrap() = None;
+
+        tick(&state).await;
+
+        assert_eq!(launches(&state, &root, "wrap-").await, 1, "the wrap relaunched the root");
+        let mut seen = None;
+        for _ in 0..300 {
+            seen = *runner.last_permission.lock().unwrap();
+            if seen.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let seen = seen.expect("the relaunched run reached the runner");
+        assert_ne!(
+            seen,
+            Permission::Plan,
+            "a relaunch that plans only ends again and burns the chain's cap"
+        );
+    }
 }
