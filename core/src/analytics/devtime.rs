@@ -30,6 +30,12 @@ pub use turn_efficiency::{
 };
 mod agent_effectiveness;
 pub use agent_effectiveness::{AgentOutcomes, AgentTypeRow, AgentVerification, Agents};
+mod actions;
+pub use actions::{
+    ActionError, ActionPair, ActionPairs, ShadowCursor, ShadowItem, ShadowPage, ShadowQuery,
+    action_pairs, decode_shadow_cursor, encode_shadow_cursor, mark_shadow, promote_pair,
+    shadow_list,
+};
 
 /// The span kinds that are active time on the `main` lane (spec §6.3).
 pub const ACTIVE_KINDS: [&str; 5] = [

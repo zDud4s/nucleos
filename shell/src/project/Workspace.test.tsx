@@ -929,6 +929,13 @@ describe("the settings this app authors", () => {
           reviewed: 18,
           agree: 12,
           disagree: 6,
+          stricter: 4,
+          looser: 2,
+          unreviewed: 28,
+          reviewed_allow: 15,
+          reviewed_pend: 2,
+          reviewed_deny: 1,
+          oldest_unreviewed_at: null,
         },
       ],
     });

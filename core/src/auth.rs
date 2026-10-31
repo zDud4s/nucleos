@@ -393,6 +393,12 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     // gated, because an estimated cost on stale prices is the worse outcome.
     (Method::GET, "/analytics/devtime"),
     (Method::GET, "/analytics/devtime/findings"),
+    // The automatic actions' reads: the promotion report per pair and the shadow decisions list,
+    // closed fields only (template id, params, ids, counts; no session, subject or text). The
+    // verdict mark and the promotion write `devtime_shadow` / `devtime_action_state` and are in NO
+    // table, like the findings mark.
+    (Method::GET, "/analytics/devtime/actions"),
+    (Method::GET, "/analytics/devtime/actions/shadow"),
     (Method::GET, "/projects/{id}/analytics/devtime"),
     (Method::GET, "/projects/{id}/analytics/devtime/findings"),
     (Method::GET, "/projects/{id}/log"),
@@ -4945,10 +4951,18 @@ mod tests {
         for path in [
             "/analytics/devtime",
             "/analytics/devtime/findings",
+            "/analytics/devtime/actions",
+            "/analytics/devtime/actions/shadow",
             "/projects/7/analytics/devtime",
             "/projects/7/analytics/devtime/findings",
         ] {
             assert!(permits(&reader, &Method::GET, path), "GET {path}");
+        }
+        for path in [
+            "/analytics/devtime/actions/shadow/3/verdict",
+            "/analytics/devtime/actions/inject/D3/promote",
+        ] {
+            assert!(!permits(&reader, &Method::POST, path), "POST {path}");
         }
         assert!(!permits(
             &reader,
@@ -4963,6 +4977,8 @@ mod tests {
         for path in [
             "/analytics/devtime/findings/{key}/mark",
             "/analytics/devtime/prices/refresh",
+            "/analytics/devtime/actions/shadow/{id}/verdict",
+            "/analytics/devtime/actions/{action}/{rule}/promote",
         ] {
             let method = Method::POST;
             assert!(

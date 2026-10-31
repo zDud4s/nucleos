@@ -173,6 +173,71 @@ def macos_is_signed_with_the_stable_certificate_or_not_at_all():
     assert "certificate leaf = H" in text, "the signed app's designated requirement is not verified"
 
 
+def the_smoke_job_gates_the_publish():
+    text = workflow_text()
+    assert "\n  smoke-linux:" in text, "no smoke-linux job"
+    start = text.index("\n  smoke-linux:")
+    end = text.find("\n  publish:", start)
+    smoke = text[start : end if end >= 0 else len(text)]
+    for needle in ("needs: build", "ubuntu:22.04", "fedora", "gh release download", "scripts/smoke-bundle.sh"):
+        assert needle in smoke, f"smoke-linux lacks {needle!r}"
+    publish = text[text.index("\n  publish:") :]
+    assert "needs: [build, smoke-linux]" in publish, "publish does not wait for smoke-linux"
+
+
+def the_smoke_script_checks_the_install_and_the_daemon():
+    path = ROOT / "scripts" / "smoke-bundle.sh"
+    assert path.exists(), "scripts/smoke-bundle.sh is missing"
+    data = path.read_bytes()
+    assert b"\r" not in data, "must be LF"
+    assert data.splitlines()[0] == b"#!/usr/bin/env bash", data.splitlines()[0]
+    body = data.decode("utf-8")
+    for needle in ("set -euo pipefail", "apt-get", "dnf", "kill -9", "8791"):
+        assert needle in body, f"smoke-bundle.sh lacks {needle!r}"
+    for binary in (
+        "nucleos-core",
+        "browser-sidecar",
+        "echo-sidecar",
+        "email-sidecar",
+        "quota-sidecar",
+        "remote-sidecar",
+        "telegram-sidecar",
+        "web-sidecar",
+    ):
+        assert binary in body, f"smoke-bundle.sh does not check {binary}"
+
+
+def releasing_documents_the_identifier_change():
+    text = (ROOT / "RELEASING.md").read_text(encoding="utf-8")
+    titles = re.findall(r"^#{1,6}[ \t]+.*Identifier change.*$", text, re.M | re.I)
+    assert len(titles) == 1, f"'Identifier change' must be exactly one heading, found {len(titles)}"
+    heading = re.search(r"^(#{1,6})[ \t]+.*Identifier change.*$", text, re.M | re.I)
+    assert heading, "RELEASING.md has no 'Identifier change' section"
+    rest = text[heading.end() :]
+    # The section ends at the next heading of the same or a higher level.
+    nxt = re.search(rf"^#{{1,{len(heading.group(1))}}}[ \t]+\S", rest, re.M)
+    # The title line is part of the section: it carries the identifier arrow.
+    section = (heading.group(0) + (rest[: nxt.start()] if nxt else rest)).lower()
+    for needle in (
+        "com.pc-multimedia.shell -> com.nucleos.app",
+        "com.pc-multimedia.shell",
+        "com.nucleos.app",
+        "microphone",
+        "accessibility",
+        ".rpm",
+        "gnome-keyring",
+        "package manager",
+    ):
+        assert needle in section, f"'Identifier change' section lacks {needle!r}"
+
+
+def the_nsis_preinstall_hook_still_stops_the_daemon():
+    text = (ROOT / "shell" / "src-tauri" / "windows" / "hooks.nsh").read_text(encoding="utf-8")
+    m = re.search(r"!macro NSIS_HOOK_PREINSTALL\b(.*?)!macroend", text, re.S)
+    assert m, "hooks.nsh has no NSIS_HOOK_PREINSTALL macro"
+    assert "NUCLEOS_STOP_DAEMON" in m.group(1), "NSIS_HOOK_PREINSTALL no longer stops the daemon"
+
+
 TAURI_CONF = ROOT / "shell" / "src-tauri" / "tauri.conf.json"
 
 
@@ -216,8 +281,6 @@ def the_linux_packages_declare_dependencies_and_recommend_a_keyring():
         assert not set(depends) & set(recommends), f"{fmt}: in both depends and recommends: {set(depends) & set(recommends)}"
 
 
-# The smoke-linux publish-gate test moves to K2 (k-update-warning).
-
 
 CASES = [
     verify_accepts_a_complete_release_and_names_what_is_missing,
@@ -228,6 +291,10 @@ CASES = [
     the_workflow_is_tag_only_and_signs_with_known_secrets,
     the_draft_is_proven_complete_before_it_is_published,
     macos_is_signed_with_the_stable_certificate_or_not_at_all,
+    the_smoke_job_gates_the_publish,
+    the_smoke_script_checks_the_install_and_the_daemon,
+    releasing_documents_the_identifier_change,
+    the_nsis_preinstall_hook_still_stops_the_daemon,
     the_bundle_identity_is_nucleos_not_the_old_product_name,
     a_missing_rpm_is_named_and_a_foreign_rpm_version_is_refused,
     the_workflow_builds_and_installs_the_rpm_toolchain,

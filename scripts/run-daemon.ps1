@@ -132,8 +132,13 @@ if ($held.Count -gt 0) {
     }
     else {
         $who = if ($daemons.Count -gt 0) { " (pid " + (@($daemons | ForEach-Object { $_.ProcessId }) -join ', ') + ")" } else { "" }
+        # `schtasks /End` is no use here: the task runs the daemon through `conhost --headless`, and
+        # /End kills only that conhost, leaving the daemon alive.
+        $stopHint = if ($daemons.Count -gt 0) {
+            "Stop-Process -Id " + (@($daemons | ForEach-Object { $_.ProcessId }) -join ',')
+        } else { "Stop-Process -Id <pid>" }
         Fail 3 ("the daemon is running from $RunDir$who; stop it first -- Ctrl+C its terminal, " +
-            "or schtasks /End /TN ""NucleOS Daemon"". Nothing was built or copied.")
+            "or $stopHint. Nothing was built or copied.")
     }
 }
 # --- 2e. is something already answering on the port? -----------------------------------------

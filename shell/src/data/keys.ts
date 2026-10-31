@@ -29,6 +29,8 @@ export const keys = {
   status: ["status"] as const,
   /** The release feed's answer: an update to offer, or null. */
   update: ["update"] as const,
+  /** How this build was installed (AppImage, system package, other). */
+  installKind: ["install-kind"] as const,
 
   /**
    * How much work fits and what is inside it — `GET /concurrency`.
@@ -55,6 +57,11 @@ export const keys = {
     devtime: (days: number) => ["analytics", "devtime", days] as const,
     devtimeFindings: (days: number, order: string, cursor: string) =>
       ["analytics", "devtime-findings", days, order, cursor] as const,
+    /** The automatic actions' pairs with their promotion reports (not windowed by `days`). */
+    devtimeActions: () => ["analytics", "devtime-actions"] as const,
+    /** One page of the shadow decisions, for one (action, rule) filter. */
+    devtimeShadow: (action: string, rule: string, cursor: string) =>
+      ["analytics", "devtime-shadow", action, rule, cursor] as const,
   },
 
   autopilot: {
