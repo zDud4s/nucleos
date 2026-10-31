@@ -104,10 +104,10 @@ sees a new app rather than an update of the old one. What users see:
   in-app updater does not replace them: a system-package install is updated with the package
   manager, and the app only shows an update notice. Secrets stored through the Secret Service need
   `gnome-keyring` (or another Secret Service provider) running.
-- **Windows:** the installer treats it as a new app. The NSIS pre-install hook still stops the
-  daemon before installing.
+- **Windows:** the new installer is not expected to create a second "Apps & features" entry (see
+  below). The NSIS pre-install hook still stops the daemon before installing.
 
-On Windows the installer does not clean up after the old identifier: that is a decision, not an oversight. The `hooks.nsh` pre-install hook only stops the daemon and does not touch the registry. The old install folder and app data are expected to stay behind. Not verified: the Tauri NSIS template is not on disk here, so how it keys the "Apps & features" entry is unconfirmed, and the `com.pc-multimedia.shell` entry may either stay beside the new one or be replaced by it. To remove the old version, uninstall it from "Apps & features" if it is still listed, then delete any leftover registry key by hand in `regedit` and the old app data folder once the copy to the new one has been checked.
+On Windows the installer does not clean up after the old identifier: the owner decided to leave it and document it. The `hooks.nsh` pre-install hook only stops the daemon and the sidecars and does not touch the registry (verified). Expected, but not verified because the Tauri NSIS template is not on disk here: the uninstall entry is keyed by the product name, which is unchanged (NucleOS), so there should be no duplicate "Apps & features" entry and the existing one should point to the new install; an orphaned registry key of the old publisher is expected at `HKCU\Software\pc-multimedia\NucleOS`, which the new uninstaller does not delete (it only removes its own) and which is harmless; and only users who installed the old version in a custom folder are left with that folder, because the new install uses the default path (expected `%LOCALAPPDATA%\Programs\NucleOS`). To remove them, delete the key in `regedit` and the custom folder by hand, after checking that the data copy succeeded.
 
 ## Installing a release
 
