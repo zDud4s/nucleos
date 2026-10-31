@@ -11,5 +11,6 @@ pub mod http;
 pub mod landing;
 pub mod model;
 pub mod node_run;
+pub mod open;
 pub mod report;
 pub mod store;
