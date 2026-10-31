@@ -16140,6 +16140,174 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
+    /// `PUT /assistant/chats/{chat_id}/auto-compact` with `{"enabled": bool}`: the per-conversation
+    /// switch for automatic compaction. Writes `chats.auto_compact`, and the conversation list (what
+    /// the window reads its per-conversation settings from) carries it back as `auto_compact`.
+    #[tokio::test]
+    async fn the_auto_compact_switch_is_written_and_read_back() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        let uri = format!("/assistant/chats/{id}/auto-compact");
+
+        // Off by default, and the list says so explicitly rather than by leaving the key out.
+        let (_, listed) = chats_request(&state, "GET", "/assistant/chats", None).await;
+        assert_eq!(listed[0]["auto_compact"], serde_json::json!(false));
+
+        let (status, _) = chats_request(&state, "PUT", &uri, Some(r#"{"enabled":true}"#)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(crate::chats::auto_compact(&state.pool, &id).await);
+        let (_, listed) = chats_request(&state, "GET", "/assistant/chats", None).await;
+        assert_eq!(listed[0]["auto_compact"], serde_json::json!(true));
+
+        let (status, _) = chats_request(&state, "PUT", &uri, Some(r#"{"enabled":false}"#)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(!crate::chats::auto_compact(&state.pool, &id).await);
+        let (_, listed) = chats_request(&state, "GET", "/assistant/chats", None).await;
+        assert_eq!(listed[0]["auto_compact"], serde_json::json!(false));
+    }
+
+    /// `UPDATE ... WHERE chat_id = ?` on a missing row succeeds having changed nothing, so the
+    /// handler has to look for the row itself: a 204 for a chat that does not exist would tell the
+    /// window a switch had been set.
+    #[tokio::test]
+    async fn the_auto_compact_switch_on_an_unknown_chat_is_a_404() {
+        let state = test_state().await;
+        let (status, _) = chats_request(
+            &state,
+            "PUT",
+            "/assistant/chats/nope/auto-compact",
+            Some(r#"{"enabled":true}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// An archived conversation is gone from the window's list, so a switch for it has nowhere to
+    /// land: a 404, and the column is left as it was.
+    #[tokio::test]
+    async fn the_auto_compact_switch_on_an_archived_chat_is_a_404() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        let uri = format!("/assistant/chats/{id}/auto-compact");
+        let (status, _) = chats_request(&state, "PUT", &uri, Some(r#"{"enabled":false}"#)).await;
+        assert_eq!(
+            status,
+            StatusCode::NO_CONTENT,
+            "control: a live chat takes it"
+        );
+        crate::chats::archive(&state.pool, &id).await.unwrap();
+
+        let (status, _) = chats_request(&state, "PUT", &uri, Some(r#"{"enabled":true}"#)).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let column: i64 = sqlx::query_scalar("SELECT auto_compact FROM chats WHERE chat_id = ?")
+            .bind(&id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(column, 0);
+    }
+
+    /// A body that does not say `enabled: <bool>` is refused and writes nothing. The valid write
+    /// comes first so a route that does not exist yet (also a 4xx) cannot pass for a refusal.
+    #[tokio::test]
+    async fn the_auto_compact_switch_refuses_a_body_that_is_not_a_boolean() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        let uri = format!("/assistant/chats/{id}/auto-compact");
+        let (status, _) = chats_request(&state, "PUT", &uri, Some(r#"{"enabled":true}"#)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        for body in [
+            "{}",
+            r#"{"enabled":"yes"}"#,
+            r#"{"enabled":null}"#,
+            r#"{"enabled":1}"#,
+            "not json",
+            "",
+        ] {
+            let (status, _) = chats_request(&state, "PUT", &uri, Some(body)).await;
+            assert!(
+                matches!(
+                    status,
+                    StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
+                ),
+                "body {body:?} answered {status}"
+            );
+            assert!(
+                crate::chats::auto_compact(&state.pool, &id).await,
+                "a refused body {body:?} must leave the flag as it was"
+            );
+        }
+    }
+
+    /// The emergency stop does not reach this switch, exactly as it does not reach its neighbours
+    /// (`PATCH /assistant/chats/{id}`, `/group`, `/fresh-context`): the route sets a flag and starts
+    /// nothing, and turning compaction OFF must never be what a stop stands in front of. A
+    /// compaction itself is a run and is gated where runs are.
+    #[tokio::test]
+    async fn the_auto_compact_switch_is_not_held_up_by_the_kill_switch() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        let uri = format!("/assistant/chats/{id}/auto-compact");
+        crate::governance::autopilot::set_kill_switch(&state.pool, true)
+            .await
+            .unwrap();
+
+        let (status, _) = chats_request(&state, "PUT", &uri, Some(r#"{"enabled":true}"#)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(crate::chats::auto_compact(&state.pool, &id).await);
+        let (status, _) = chats_request(&state, "PUT", &uri, Some(r#"{"enabled":false}"#)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(!crate::chats::auto_compact(&state.pool, &id).await);
+    }
+
+    /// The switch is a chat write like its neighbours: in no scope table, so a read-only or
+    /// run-creating key is refused (403) and writes nothing, and an Admin key goes through.
+    #[tokio::test]
+    async fn the_auto_compact_switch_needs_an_admin_key() {
+        let state = test_state().await;
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        let uri = format!("/assistant/chats/{id}/auto-compact");
+        let read_only = store_api_token_at_level(&state, "reader", ApiTokenLevel::ReadOnly).await;
+        let run_creating =
+            store_api_token_at_level(&state, "launcher", ApiTokenLevel::RunCreating).await;
+        let admin = store_api_token_at_level(&state, "administrator", ApiTokenLevel::Admin).await;
+
+        for token in [&read_only, &run_creating] {
+            let response = api_token_request(
+                state.clone(),
+                "PUT",
+                &uri,
+                token,
+                Some(serde_json::json!({ "enabled": true })),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert!(!crate::chats::auto_compact(&state.pool, &id).await);
+        }
+        let response = api_token_request(
+            state.clone(),
+            "PUT",
+            &uri,
+            &admin,
+            Some(serde_json::json!({ "enabled": true })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(crate::chats::auto_compact(&state.pool, &id).await);
+    }
+
     async fn mark_seen_request(state: AppState, chat_id: &str) -> StatusCode {
         build_router(state)
             .oneshot(

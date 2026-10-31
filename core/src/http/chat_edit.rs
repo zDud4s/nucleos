@@ -17,6 +17,32 @@ pub(super) fn routes() -> Router<AppState> {
             "/assistant/chats/{chat_id}/group",
             axum::routing::put(put_chat_group),
         )
+        .route(
+            "/assistant/chats/{chat_id}/auto-compact",
+            axum::routing::put(put_chat_auto_compact),
+        )
+}
+
+#[derive(serde::Deserialize)]
+pub(super) struct AutoCompactSwitch {
+    enabled: bool,
+}
+
+/// Turns automatic compaction on or off for one conversation. Sets a flag and starts nothing, so
+/// the kill switch does not stand in front of it, like its neighbours.
+pub(super) async fn put_chat_auto_compact(
+    State(state): State<AppState>,
+    Path(chat_id): Path<String>,
+    Json(body): Json<AutoCompactSwitch>,
+) -> Result<StatusCode, StatusCode> {
+    match crate::chats::set_auto_compact(&state.pool, &chat_id, body.enabled).await {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(StatusCode::NOT_FOUND),
+        Err(error) => {
+            tracing::warn!(%error, "setting the auto-compact switch failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
 }
 
 #[derive(serde::Deserialize)]

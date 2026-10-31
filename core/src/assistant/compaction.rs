@@ -95,6 +95,9 @@ pub async fn start_as(
         &[],
         Origin::Shell,
         None,
+        // Nobody is at the keyboard for an automatic one, and the session may carry text from a
+        // channel or a relay. `Origin::Shell` stays: a channel origin brings doctrine and delivery.
+        auto,
     )
     .await
     .map_err(|e| {
@@ -152,7 +155,18 @@ pub(super) async fn maybe_auto_compact(
     if !should_auto_compact(fill, soft, window, AutoCompactGuards::default()) {
         return;
     }
+    // A stop that cannot be read is treated as engaged, like the guards below.
+    let stopped = crate::governance::autopilot::kill_switch_engaged(pool)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, chat_id, "could not read the kill switch");
+            true
+        });
+    if stopped {
+        return;
+    }
     let is_compaction = is_compaction(pool, run_id).await;
+    let asked_question = asked_question(pool, run_id).await;
     // A `pending` row whose run already ended (a daemon restart cut the compaction) would trip the
     // guard below for good, and `start_as` would never get to settle it. A live compaction's run is
     // still `running`, so this leaves it alone.
@@ -200,6 +214,7 @@ pub(super) async fn maybe_auto_compact(
         nothing_to_compact,
         in_backoff,
         child_waiting,
+        asked_question,
     };
     if !should_auto_compact(fill, soft, window, guards) {
         return;
@@ -272,6 +287,24 @@ pub(super) async fn is_compaction(pool: &SqlitePool, run_id: i64) -> bool {
             tracing::warn!(%error, run_id, "could not tell whether the turn is a compaction");
             false
         })
+}
+
+/// Whether the turn `run_id` called `AskUserQuestion`; `true` on a read error (warned), because a
+/// compaction held back costs one turn and one that forgets the question loses it.
+async fn asked_question(pool: &SqlitePool, run_id: i64) -> bool {
+    sqlx::query_scalar(
+        "SELECT COALESCE((SELECT json_valid(r.tools_used)
+                             AND EXISTS (SELECT 1 FROM json_each(r.tools_used) j
+                                          WHERE json_extract(j.value, '$.name') = 'AskUserQuestion')
+                            FROM runs r WHERE r.id = ?), 0)",
+    )
+    .bind(run_id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or_else(|error| {
+        tracing::warn!(%error, run_id, "could not tell whether the turn asked a question");
+        true
+    })
 }
 
 /// What a settled compaction does to the session, the older rotations and the notices.
@@ -420,6 +453,8 @@ pub struct AutoCompactGuards {
     pub in_backoff: bool,
     /// A child is waiting synchronously on this chat.
     pub child_waiting: bool,
+    /// The turn that just ended finished by asking the person a question (`AskUserQuestion`).
+    pub asked_question: bool,
 }
 
 /// Whether a just-completed turn should trigger an automatic compaction. Pure: no I/O.
@@ -440,8 +475,16 @@ pub fn should_auto_compact(
         nothing_to_compact,
         in_backoff,
         child_waiting,
+        asked_question,
     } = guards;
-    if busy || pending || is_compaction || nothing_to_compact || in_backoff || child_waiting {
+    if busy
+        || pending
+        || is_compaction
+        || nothing_to_compact
+        || in_backoff
+        || child_waiting
+        || asked_question
+    {
         return false;
     }
     let Some(fill) = fill else {
@@ -1270,6 +1313,121 @@ mod tests {
         super::super::turn::after_local_turn(&state, &c, run, None).await;
 
         assert_eq!(compaction_rows(&state.pool, &c, None).await, 0);
+    }
+
+    #[tokio::test]
+    async fn the_kill_switch_stops_an_automatic_compaction_from_starting_a_turn() {
+        let (state, c, run) = auto_chat(true).await;
+        crate::governance::autopilot::set_kill_switch(&state.pool, true)
+            .await
+            .unwrap();
+
+        maybe_auto_compact(
+            &state,
+            &c,
+            run,
+            Some(super::super::rotation::DEFAULT_SOFT_FILL + 1),
+        )
+        .await;
+
+        assert_eq!(compaction_rows(&state.pool, &c, None).await, 0);
+        let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs WHERE chat_id = ?")
+            .bind(&c)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(runs, 1, "an engaged kill switch starts no turn at all");
+    }
+
+    /// The tool policy the runner saw for a compaction turn of a chat rooted in a directory with
+    /// the classifier hook wired, which is the one place a shell-origin turn gets the machine's
+    /// tools. `auto` is whether the daemon started it.
+    async fn compaction_tool_policy(auto: bool) -> Option<crate::execution::runner::ToolPolicy> {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let mut state = crate::channels::testkit::state().await;
+        state.runner = fake.clone();
+        let root = tempfile::TempDir::new().unwrap();
+        crate::governance::autopilot::wire_classifier_hook(root.path()).unwrap();
+        let c = chat(&state.pool).await;
+        chats::set_cwd(&state.pool, &c, root.path().to_str().unwrap())
+            .await
+            .unwrap();
+        exchange(&state.pool, &c, "q", "a").await;
+        *fake.canned.lock().unwrap() = Some(answer("HANDOFF"));
+
+        start_as(&state, &c, "/compact", None, auto).await.unwrap();
+
+        for _ in 0..500 {
+            if fake.last_tool_policy.lock().unwrap().is_some() && !super::super::is_busy(&c) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        super::super::evict_live(&c);
+        *fake.last_tool_policy.lock().unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_typed_compact_keeps_the_tools_of_a_rooted_shell_chat() {
+        assert_eq!(
+            compaction_tool_policy(false).await,
+            Some(crate::execution::runner::ToolPolicy::Unrestricted)
+        );
+    }
+
+    /// A turn with nobody at the keyboard must not get the machine's tools over a session that may
+    /// carry text from Telegram or a relay.
+    #[tokio::test]
+    async fn an_automatic_compaction_runs_without_the_machines_tools() {
+        assert_eq!(
+            compaction_tool_policy(true).await,
+            Some(crate::execution::runner::ToolPolicy::McpOnly)
+        );
+    }
+
+    async fn set_tools_used(pool: &SqlitePool, run: i64, tools: &str) {
+        sqlx::query("UPDATE runs SET tools_used = ? WHERE id = ?")
+            .bind(tools)
+            .bind(run)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn auto_compact_is_held_back_by_a_turn_that_asked_a_question() {
+        assert!(should_auto_compact(Some(500_000), 120_000, None, open()));
+        let asked = AutoCompactGuards {
+            asked_question: true,
+            ..open()
+        };
+        assert!(!should_auto_compact(Some(500_000), 120_000, None, asked));
+    }
+
+    /// The person is about to answer a question the model asked; a compaction in between would
+    /// forget the session that holds the question.
+    #[tokio::test]
+    async fn a_turn_that_ended_asking_a_question_files_no_automatic_compaction() {
+        let (state, c, asked) = auto_chat(true).await;
+        set_tools_used(
+            &state.pool,
+            asked,
+            r#"[{"name":"Read","detail":"a.rs"},{"name":"AskUserQuestion","detail":"Which?"}]"#,
+        )
+        .await;
+        let over = Some(super::super::rotation::DEFAULT_SOFT_FILL + 1);
+
+        maybe_auto_compact(&state, &c, asked, over).await;
+
+        assert_eq!(compaction_rows(&state.pool, &c, None).await, 0);
+
+        // The next turn, which asked nothing, fires as any turn over the limit does.
+        let next = exchange(&state.pool, &c, "the answer", "ok").await;
+        set_tools_used(&state.pool, next, r#"[{"name":"Read","detail":"a.rs"}]"#).await;
+
+        maybe_auto_compact(&state, &c, next, over).await;
+
+        assert_eq!(compaction_rows(&state.pool, &c, Some(1)).await, 1);
     }
 
     #[test]
