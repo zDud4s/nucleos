@@ -1898,12 +1898,18 @@ mod agy_tests {
     #[test]
     fn runner_by_id_routes_agy_prefix_before_claude() {
         // The agy prefix rule runs first: an agy-hosted Claude model is answered by agy.
-        assert_eq!(runner_by_id("agy/claude-sonnet-4-6"), Some(crate::engines::AGY));
+        assert_eq!(
+            runner_by_id("agy/claude-sonnet-4-6"),
+            Some(crate::engines::AGY)
+        );
         assert_eq!(runner_by_id("agy/claude-opus-4-6-thinking"), Some("agy"));
         assert_eq!(runner_by_id("agy/gemini-3.8-flash-high"), Some("agy"));
         assert_eq!(runner_by_id("AGY/gpt-oss-120b-medium"), Some("agy"));
         // The bare ids keep their engines, and a bare Gemini id says nothing about a runner.
-        assert_eq!(runner_by_id("claude-sonnet-4-6"), Some(crate::engines::CLAUDE));
+        assert_eq!(
+            runner_by_id("claude-sonnet-4-6"),
+            Some(crate::engines::CLAUDE)
+        );
         assert_eq!(runner_by_id("gpt-5.5"), Some(crate::engines::CODEX));
         assert_eq!(runner_by_id("gemini-3.8-flash-high"), None);
     }

@@ -547,9 +547,7 @@ pub mod agy_test_support {
     use std::path::{Path, PathBuf};
 
     use super::agy_setting::AgyDoc;
-    use crate::execution::runner::{
-        CommandRunner, Permission, RunOutcome, RunRequest, ToolPolicy,
-    };
+    use crate::execution::runner::{CommandRunner, Permission, RunOutcome, RunRequest, ToolPolicy};
     use crate::settings::testing::{self as settings_testing, Installed};
     use crate::settings::{Scope, Settings, Snapshot};
 
@@ -687,10 +685,7 @@ pub mod agy_test_support {
     }
 
     /// One run of `prompt` as a neutral chat request; see [`run_request`].
-    pub async fn run_once(
-        runner: &dyn CommandRunner,
-        prompt: &str,
-    ) -> std::io::Result<RunOutcome> {
+    pub async fn run_once(runner: &dyn CommandRunner, prompt: &str) -> std::io::Result<RunOutcome> {
         run_request(runner, chat_request(prompt)).await
     }
 

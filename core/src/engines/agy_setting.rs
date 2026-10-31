@@ -37,7 +37,10 @@ mod tests {
     #[test]
     fn agy_doc_default_is_off_and_unacknowledged() {
         let doc = AgyDoc::default();
-        assert!(!doc.enabled, "the agy engine is off until the owner opts in");
+        assert!(
+            !doc.enabled,
+            "the agy engine is off until the owner opts in"
+        );
         assert_eq!(doc.acknowledged_warning_version, None);
         assert_eq!(AgyDoc::NAME, "agy");
 

@@ -417,10 +417,8 @@ async fn main() {
     // operator has asked for it by name. An unrecognised name warns rather than fails startup, for
     // the same reason a bad local-model probe does — a typo in one config key must not take down
     // every unrelated daemon service.
-    let primary_runner = engines::runner_for_primary(
-        models_config.primary_runner.as_deref(),
-        &models_config,
-    );
+    let primary_runner =
+        engines::runner_for_primary(models_config.primary_runner.as_deref(), &models_config);
     // The llm-router as an adviser. Off unless the stored `router` document turns it on, and off
     // hands back the very runner built above. The health row reads the same document, so the two
     // never disagree.

@@ -251,7 +251,9 @@ fn validate(request: &AgentRequest) -> Result<(), AgentError> {
     if let Some(engine) = &request.engine
         && !ENGINES.contains(&engine.as_str())
     {
-        return Err(AgentError::Invalid("engine must be claude, codex, local or agy"));
+        return Err(AgentError::Invalid(
+            "engine must be claude, codex, local or agy",
+        ));
     }
     let mut caps = Vec::with_capacity(request.capabilities.len());
     for text in &request.capabilities {

@@ -1472,7 +1472,10 @@ mod agy_catalogue_tests {
         assert!(allowed.iter().any(|id| id == AGY_MODEL), "{allowed:?}");
         // Claude's allowed list does not pick up agy's rows.
         let claude = allowed_models(&routed, &RouterConfig::off(), RunnerKind::Claude);
-        assert!(claude.iter().all(|id| !id.starts_with("agy/")), "{claude:?}");
+        assert!(
+            claude.iter().all(|id| !id.starts_with("agy/")),
+            "{claude:?}"
+        );
     }
 
     #[test]

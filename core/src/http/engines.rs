@@ -137,8 +137,10 @@ mod tests {
     async fn put_engines_agy_enable_without_ack_is_400_with_warning() {
         let (_home, state) = fixture().await;
 
-        for body in [json!({ "enabled": true }), json!({ "enabled": true, "acknowledged": false })]
-        {
+        for body in [
+            json!({ "enabled": true }),
+            json!({ "enabled": true, "acknowledged": false }),
+        ] {
             let (status, answer) = call(&state, "PUT", "/engines/agy", Some(body.clone())).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {answer}");
             assert!(
@@ -265,7 +267,11 @@ mod tests {
         assert_eq!(answer["refusal"], "kill_switch");
 
         set_kill_switch(&state.pool, false).await.unwrap();
-        assert_eq!(stored(&state).await["body"]["enabled"], false, "nothing written");
+        assert_eq!(
+            stored(&state).await["body"]["enabled"],
+            false,
+            "nothing written"
+        );
     }
 
     /// Like `/settings`, the route is in no scope table: only the control token and an Admin key

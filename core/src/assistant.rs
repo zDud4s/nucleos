@@ -555,7 +555,10 @@ mod tests {
         let config = turn_config();
         assert_eq!(answering_cli(&config, Some("gpt-9.9-nova")), Ok("codex"));
         assert_eq!(answering_cli(&config, Some("o9-mini")), Ok("codex"));
-        assert_eq!(answering_cli(&config, Some("claude-opus-9-9")), Ok("claude"));
+        assert_eq!(
+            answering_cli(&config, Some("claude-opus-9-9")),
+            Ok("claude")
+        );
         // An id that says nothing keeps the active runner.
         assert_eq!(
             answering_cli(&config, Some("llama3.2:3b")),

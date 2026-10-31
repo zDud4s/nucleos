@@ -466,7 +466,6 @@ impl CommandRunner for AgyCliRunner {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -670,7 +669,10 @@ mod tests {
                     Some("plan"),
                     "{policy:?}/{permission:?}: {args:?}"
                 );
-                assert!(has(&args, "--sandbox"), "{policy:?}/{permission:?}: {args:?}");
+                assert!(
+                    has(&args, "--sandbox"),
+                    "{policy:?}/{permission:?}: {args:?}"
+                );
             }
         }
 
@@ -729,7 +731,9 @@ mod tests {
                 r.append_system_prompt = Some("be brief".into())
             }),
             ("denied_tools", |r| r.denied_tools = vec!["Bash".into()]),
-            ("mcp_config", |r| r.mcp_config = Some(PathBuf::from("mcp.json"))),
+            ("mcp_config", |r| {
+                r.mcp_config = Some(PathBuf::from("mcp.json"))
+            }),
             ("classifier_governs_tools", |r| {
                 r.classifier_governs_tools = true
             }),
@@ -785,8 +789,14 @@ mod tests {
 
         let args = build_args(&asked, &staged_options).unwrap();
         let total: usize = args.iter().map(String::len).sum();
-        assert!(total < 10_000, "argv is {total} bytes: it must not carry the prompt");
-        assert!(!args.iter().any(|arg| arg.contains(&long[..100])), "{args:?}");
+        assert!(
+            total < 10_000,
+            "argv is {total} bytes: it must not carry the prompt"
+        );
+        assert!(
+            !args.iter().any(|arg| arg.contains(&long[..100])),
+            "{args:?}"
+        );
         let file = stage.path().join(STAGED_PROMPT_FILE);
         let instruction = pair(&args, "-p").expect("-p is present");
         assert!(
@@ -813,7 +823,10 @@ mod tests {
         let args = build_args(&request(&over), &staged_options).unwrap();
         assert!(has(&args, "--add-dir"), "{args:?}");
         let other = tempfile::tempdir().unwrap();
-        assert_eq!(stage_prompt(&request(&at_limit), other.path()).unwrap(), None);
+        assert_eq!(
+            stage_prompt(&request(&at_limit), other.path()).unwrap(),
+            None
+        );
         assert!(!other.path().join(STAGED_PROMPT_FILE).exists());
 
         // End to end: the fake records its argv, and the 40,000 bytes are not in it.
@@ -823,8 +836,14 @@ mod tests {
         assert_eq!(outcome.exit_code, 0, "{}", outcome.stderr);
         let recorded = fake.recorded_args();
         let recorded_len: usize = recorded.iter().map(String::len).sum();
-        assert!(recorded_len < 10_000, "the CLI saw {recorded_len} bytes of argv");
-        assert!(recorded.iter().any(|arg| arg == "--add-dir"), "{recorded:?}");
+        assert!(
+            recorded_len < 10_000,
+            "the CLI saw {recorded_len} bytes of argv"
+        );
+        assert!(
+            recorded.iter().any(|arg| arg == "--add-dir"),
+            "{recorded:?}"
+        );
     }
 
     // ---- 25 to 29: the runner against a fake binary -----------------------------------------
@@ -923,7 +942,11 @@ mod tests {
     #[cfg(windows)]
     fn write_script(dir: &Path, exit: i32, hang: bool) -> PathBuf {
         let path = dir.join("agy.cmd");
-        let wait = if hang { "ping -n 60 127.0.0.1 >nul\r\n" } else { "" };
+        let wait = if hang {
+            "ping -n 60 127.0.0.1 >nul\r\n"
+        } else {
+            ""
+        };
         let script = format!(
             "@echo off\r\necho %*> \"%~dp0args.txt\"\r\n{wait}type \"%~dp0out.json\"\r\nexit /b {exit}\r\n"
         );
@@ -975,15 +998,27 @@ mod tests {
         assert_eq!(outcome.output_tokens, Some(22));
         assert_eq!(outcome.cache_read_tokens, Some(3));
         assert_eq!(outcome.num_turns, Some(2));
-        assert_eq!(outcome.cost_usd, None, "agy reports no price: unknown, not free");
+        assert_eq!(
+            outcome.cost_usd, None,
+            "agy reports no price: unknown, not free"
+        );
         // The reply is read the way every other runner's is: from a synthesised `result` line.
-        assert_eq!(extract_reply(&outcome.stdout).as_deref(), Some("hello there"));
+        assert_eq!(
+            extract_reply(&outcome.stdout).as_deref(),
+            Some("hello there")
+        );
         let mirrored = transcript.lock().unwrap().clone();
         assert_eq!(extract_reply(&mirrored).as_deref(), Some("hello there"));
         // The vector the fake saw is the one `build_args` makes.
         let recorded = fake.recorded_args();
-        assert!(recorded.iter().any(|arg| arg == "--output-format"), "{recorded:?}");
-        assert!(recorded.iter().any(|arg| arg == "gemini-3.8-flash-high"), "{recorded:?}");
+        assert!(
+            recorded.iter().any(|arg| arg == "--output-format"),
+            "{recorded:?}"
+        );
+        assert!(
+            recorded.iter().any(|arg| arg == "gemini-3.8-flash-high"),
+            "{recorded:?}"
+        );
     }
 
     #[test]
@@ -1001,9 +1036,14 @@ mod tests {
 
             let outcome = fake.run(request("hi"));
 
-            assert_ne!(outcome.exit_code, 0, "status {status} must not read as success");
+            assert_ne!(
+                outcome.exit_code, 0,
+                "status {status} must not read as success"
+            );
             assert!(
-                outcome.stderr.contains(&format!("agy returned status {status}")),
+                outcome
+                    .stderr
+                    .contains(&format!("agy returned status {status}")),
                 "{status}: {}",
                 outcome.stderr
             );
@@ -1015,7 +1055,11 @@ mod tests {
         let fake = FakeAgy::new("this is not json at all", 0, false);
         let outcome = fake.run(request("hi"));
         assert_ne!(outcome.exit_code, 0);
-        assert!(outcome.stderr.contains("this is not json"), "{}", outcome.stderr);
+        assert!(
+            outcome.stderr.contains("this is not json"),
+            "{}",
+            outcome.stderr
+        );
         // The guard holds the test env lock: release it before the next fake takes it.
         drop(fake);
 
@@ -1023,14 +1067,22 @@ mod tests {
         let fake = FakeAgy::new(r#"{"status":"SUCCESS","conversation_id":"c"}"#, 0, false);
         let outcome = fake.run(request("hi"));
         assert_ne!(outcome.exit_code, 0);
-        assert!(outcome.stderr.contains("SUCCESS"), "the first bytes are shown: {}", outcome.stderr);
+        assert!(
+            outcome.stderr.contains("SUCCESS"),
+            "the first bytes are shown: {}",
+            outcome.stderr
+        );
         drop(fake);
 
         // The echoed bytes are bounded.
         let fake = FakeAgy::new(&"x".repeat(5_000), 0, false);
         let outcome = fake.run(request("hi"));
         assert_ne!(outcome.exit_code, 0);
-        assert!(outcome.stderr.len() < 1_500, "{} bytes", outcome.stderr.len());
+        assert!(
+            outcome.stderr.len() < 1_500,
+            "{} bytes",
+            outcome.stderr.len()
+        );
     }
 
     #[test]
@@ -1050,7 +1102,11 @@ mod tests {
         let started = std::time::Instant::now();
         let outcome = fake.run(asked);
 
-        assert_eq!(outcome.exit_code, PROGRESS_TIMEOUT_EXIT_CODE, "{}", outcome.stderr);
+        assert_eq!(
+            outcome.exit_code, PROGRESS_TIMEOUT_EXIT_CODE,
+            "{}",
+            outcome.stderr
+        );
         assert!(
             started.elapsed() < std::time::Duration::from_secs(30),
             "the hanging fake was killed, not waited out"
@@ -1081,6 +1137,10 @@ mod tests {
         let fake = FakeAgy::new(&body(1), 0, false);
         let mut asked = request("hi");
         asked.max_turns = Some(2);
-        assert_eq!(fake.run(asked).exit_code, 0, "one turn is under the ceiling");
+        assert_eq!(
+            fake.run(asked).exit_code,
+            0,
+            "one turn is under the ceiling"
+        );
     }
 }

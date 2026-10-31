@@ -1931,8 +1931,14 @@ mod agy_chat_tests {
         assert!(matches!(refused, Err(EngineDisabled)), "{refused:?}");
 
         // Nothing else changed: Claude and Codex models are still answered by their own engines.
-        assert!(matches!(answering_cli(&config, Some("claude-opus-4-6")), Ok("claude")));
-        assert!(matches!(answering_cli(&config, Some("gpt-5.5")), Ok("codex")));
+        assert!(matches!(
+            answering_cli(&config, Some("claude-opus-4-6")),
+            Ok("claude")
+        ));
+        assert!(matches!(
+            answering_cli(&config, Some("gpt-5.5")),
+            Ok("codex")
+        ));
         assert!(matches!(answering_cli(&config, None), Ok("claude")));
     }
 
