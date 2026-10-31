@@ -5,25 +5,22 @@
 //! `failed` report is left alone here.
 
 use crate::conductor::continuation::with_handoff;
+use crate::conductor::sweep::CONTINUATION_STOPPED;
 use crate::execution::runs::finalize_termination;
 use crate::state::AppState;
 
 use super::decisions;
 use super::engine::branch_node_may_close;
 use super::model::JOB_TERMINAL_STATE;
-use super::open::{latest_launch, relaunch_node, run_is_live};
+use super::open::{DIED_PREFIX, WRAP_PREFIX, latest_launch, relaunch_node, run_is_live};
 use super::store;
 
 /// Nodes one tick acts on, oldest first; nodes it leaves alone do not count.
 const MAX_NODES_PER_TICK: usize = 20;
-/// Key prefix and cap of the relaunches that follow a `handoff` report.
-const WRAP_PREFIX: &str = "wrap-";
+/// Caps of the relaunches that follow a `handoff` report (key prefix `WRAP_PREFIX`) and a run that
+/// died without a report (`DIED_PREFIX`).
 const WRAP_CAP: i64 = 3;
-/// Key prefix and cap of the relaunches that follow a run that died without a report.
-const DIED_PREFIX: &str = "died-";
 const DIED_CAP: i64 = 2;
-/// The feed kind the sweep writes when a handoff chain stops (`conductor::sweep`).
-const CONTINUATION_STOPPED: &str = "node_continuation_stopped";
 const PARKED: &str = "parked";
 
 type NodeRow = (String, String, Option<String>, Option<String>);

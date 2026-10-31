@@ -13,7 +13,8 @@ use crate::state::AppState;
 
 pub const SPAWN_GRACE_SECS: i64 = 60;
 pub const TERMINAL_LOOKBACK_HOURS: i64 = 24;
-const CONTINUATION_STOPPED: &str = "node_continuation_stopped";
+/// The feed kind written when a handoff chain stops; `tree_job::wrap` reads it too.
+pub(crate) const CONTINUATION_STOPPED: &str = "node_continuation_stopped";
 
 /// A source which can be warned, and daemon runs which can also be stopped.
 #[derive(Debug, Clone)]

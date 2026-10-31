@@ -1,18 +1,14 @@
 //! Tree-job root node handling: the top-level node of a job. `start` gives it a worktree on its own
 //! git branch, `tree/<id>/root` cut from the feature branch, and launches the run that plans the job.
 
-use std::path::Path;
-use std::process::Stdio;
-
-use super::http::{job_lock, tree_limits};
+use super::http::job_lock;
 use super::model::Branch;
-use super::open::{self, OpenConfig};
+use super::open;
 use super::store::{self, TreeJob};
 use crate::state::AppState;
 
 /// The manifest name of the root's branch. The worktree is `<root>/.claude/worktrees/<id>-root`.
 const ROOT_BRANCH: &str = "root";
-const BYTES_PER_GB: f64 = 1_073_741_824.0;
 
 /// What the root run is told besides the goal. It must stay true to the tools and to what
 /// `close_node` accepts: the daemon reads the report from the file at `handoff_path` (the MCP tool
@@ -88,93 +84,12 @@ fn root_prompt(job: &TreeJob) -> String {
     )
 }
 
-/// Runs `git -C <root> <args>` and answers its trimmed stdout, or `None` when it fails.
-async fn git_output(root: &str, args: &[&str]) -> Option<String> {
-    let output = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::null())
-        .kill_on_drop(true)
-        .output()
-        .await
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-}
-
-/// The same `OpenConfig` `POST /trees/{id}/branches/{name}/open` builds from `speed.yaml`: the
-/// integration branch (default: the branch the main checkout is on, then `master`) and the links.
-async fn open_config(root: &str) -> OpenConfig {
-    let (floor_gb, max_live_branches) = tree_limits(root);
-    let free_disk_gb = crate::health::available_space(Path::new(root))
-        .map(|bytes| bytes as f64 / BYTES_PER_GB)
-        .unwrap_or(0.0);
-    let doc = std::fs::read_to_string(Path::new(root).join(".nucleos/workflow/speed.yaml"))
-        .ok()
-        .and_then(|text| serde_yaml::from_str::<serde_yaml::Value>(&text).ok());
-    let tree = doc.as_ref().and_then(|doc| doc.get("tree"));
-    let links = tree
-        .and_then(|tree| tree.get("links"))
-        .and_then(serde_yaml::Value::as_sequence)
-        .map(|links| {
-            links
-                .iter()
-                .filter_map(|link| link.as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default();
-    let configured = tree
-        .and_then(|tree| tree.get("base_branch"))
-        .and_then(serde_yaml::Value::as_str)
-        .map(str::to_owned);
-    let base_branch = match configured {
-        Some(base) => base,
-        None => git_output(root, &["symbolic-ref", "--short", "HEAD"])
-            .await
-            .filter(|branch| !branch.is_empty())
-            .unwrap_or_else(|| "master".to_owned()),
-    };
-    OpenConfig {
-        dev_home: open::dev_home(),
-        base_branch,
-        links,
-        free_disk_gb,
-        floor_gb,
-        max_live_branches,
-    }
-}
-
 /// Puts the project's pinned workflow in the new worktree, as the open route does. A failure is
 /// logged and never fails the start; a test build starts no process.
 async fn workflow_sync(worktree: &str) {
-    if cfg!(test) {
-        return;
-    }
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(error) => {
-            tracing::warn!(%error, "root worktree workflow sync could not find the executable");
-            return;
-        }
-    };
-    let output = tokio::process::Command::new(exe)
-        .arg("--workflow-sync")
-        .arg(worktree)
-        .stdin(Stdio::null())
-        .kill_on_drop(true)
-        .output()
-        .await;
-    match output {
-        Ok(output) if output.status.success() => {}
-        Ok(output) => tracing::warn!(
-            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
-            "root worktree workflow sync failed"
-        ),
-        Err(error) => tracing::warn!(%error, "root worktree workflow sync failed"),
+    let result = open::workflow_sync(worktree).await;
+    if result.starts_with("failed") {
+        tracing::warn!(%result, "root worktree workflow sync failed");
     }
 }
 
@@ -226,7 +141,7 @@ async fn drop_unopened_root_branch(state: &AppState, job_id: &str) {
 pub async fn start(state: &AppState, job: &TreeJob) -> Result<i64, String> {
     let id = job.id.as_str();
     add_root_branch(state, id).await?;
-    let config = open_config(&job.manifest.project_root).await;
+    let config = open::open_config(&job.manifest.project_root).await;
     let opened = match open::open_branch(&state.pool, id, ROOT_BRANCH, &config).await {
         Ok(opened) => opened,
         Err(error) => {

@@ -701,10 +701,28 @@ async fn project_tree_config(root: &str) -> (String, Vec<String>) {
     (base, links)
 }
 
+/// The `OpenConfig` the open route builds for a project: `speed.yaml`'s integration branch and
+/// links, the tree limits and the free disk. Shared with the root start.
+pub(super) async fn open_config(root: &str) -> OpenConfig {
+    let (floor_gb, max_live_branches) = tree_limits(root);
+    let free_disk_gb = crate::health::available_space(Path::new(root))
+        .map(|bytes| bytes as f64 / BYTES_PER_GB)
+        .unwrap_or(0.0);
+    let (base_branch, links) = project_tree_config(root).await;
+    OpenConfig {
+        dev_home: dev_home(),
+        base_branch,
+        links,
+        free_disk_gb,
+        floor_gb,
+        max_live_branches,
+    }
+}
+
 /// Puts the project's pinned workflow in the new worktree: `nucleos-core --workflow-sync <tree>`.
 /// The answer is for the caller to read; a failure never fails the open. A test build does not
 /// start a process: its executable is the test harness, not the daemon.
-async fn workflow_sync(worktree: &str) -> String {
+pub(super) async fn workflow_sync(worktree: &str) -> String {
     if cfg!(test) {
         return "skipped: test build".to_owned();
     }
@@ -746,20 +764,7 @@ async fn post_open(
         .await
         .map_err(|error| refusal(error.into()))?
         .ok_or_else(|| refusal(OpenError::JobNotFound(id.clone())))?;
-    let root = job.manifest.project_root.clone();
-    let (floor_gb, max_live_branches) = tree_limits(&root);
-    let free_disk_gb = crate::health::available_space(Path::new(&root))
-        .map(|bytes| bytes as f64 / BYTES_PER_GB)
-        .unwrap_or(0.0);
-    let (base_branch, links) = project_tree_config(&root).await;
-    let config = OpenConfig {
-        dev_home: dev_home(),
-        base_branch,
-        links,
-        free_disk_gb,
-        floor_gb,
-        max_live_branches,
-    };
+    let config = open_config(&job.manifest.project_root).await;
 
     let opened = open_branch(&state.pool, &id, &name, &config)
         .await
@@ -892,7 +897,11 @@ pub async fn latest_launch(
 /// Key prefixes of the relaunches that carry a one-off suffix (the wrap, died, fix and resume
 /// relaunches of `wrap`, `driver` and `relaunch_resumed`). Their stored prompts are never a base
 /// for a new suffix, or each relaunch would repeat the sentences of the earlier ones.
-const SUFFIXED_KEY_PREFIXES: [&str; 4] = ["wrap-", "died-", "fix-", "resume-"];
+pub(super) const WRAP_PREFIX: &str = "wrap-";
+pub(super) const DIED_PREFIX: &str = "died-";
+pub(super) const FIX_PREFIX: &str = "fix-";
+const RESUME_PREFIX: &str = "resume-";
+const SUFFIXED_KEY_PREFIXES: [&str; 4] = [WRAP_PREFIX, DIED_PREFIX, FIX_PREFIX, RESUME_PREFIX];
 
 /// The launch a suffix is appended to: the latest one that is not itself a suffixed relaunch, i.e.
 /// the original prompt, or the last answer relaunch (whose prompt carries the owner's answers, which
@@ -1068,7 +1077,7 @@ pub async fn relaunch_resumed(state: &AppState, resumed: &store::Resumed) -> Rel
             if status != "running" || run_is_live(pool, &run_id).await.unwrap_or(true) {
                 continue;
             }
-            let key = format!("resume-{run_id}");
+            let key = format!("{RESUME_PREFIX}{run_id}");
             match relaunch_node(state, &node, &run_id, &key, None).await {
                 Ok(new_run) => {
                     handled.insert(node.clone());

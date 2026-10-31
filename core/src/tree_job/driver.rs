@@ -34,7 +34,7 @@ use super::landing::{
     land_job, scope_caller_id, settle_land, settle_merge, submit_merge,
 };
 use super::model::JOB_TERMINAL_STATE;
-use super::open::{relaunch_node, run_is_live};
+use super::open::{FIX_PREFIX, relaunch_node, run_is_live};
 use super::store::{self, TreeJob};
 use crate::execution::git_exec::OPERATION_TIMEOUT;
 use crate::execution::vcs::{Origin, ResolvedRepo, resolve_repo};
@@ -45,8 +45,7 @@ use crate::work_nodes::{self, CLOSE_STATUSES, CloseArgs, NodeLimits};
 
 /// How long the production gate waits for the verify queue.
 const GATE_WAIT: Duration = Duration::from_secs(900);
-/// Key prefix and cap of the relaunches that follow a red gate.
-const FIX_PREFIX: &str = "fix-";
+/// Cap of the relaunches that follow a red gate (key prefix `FIX_PREFIX`).
 const FIX_CAP: i64 = 2;
 /// Longest tail of the gate's findings that goes into a relaunch prompt.
 const FINDINGS_MAX: usize = 3000;

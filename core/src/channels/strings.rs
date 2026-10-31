@@ -515,6 +515,16 @@ mod tests {
                 kind: "job_done".into(),
                 summary: "built".into(),
             },
+            Text::DecisionApplied {
+                question: "Which database?".into(),
+                answer: "sqlite".into(),
+            },
+            Text::DecisionUnknown { id: "d1".into() },
+            Text::DecisionConfirm {
+                open: vec![("d1".into(), "Which database?".into())],
+            },
+            Text::NoOpenDecision,
+            Text::DecisionWrongChannel,
         ];
         for t in &all {
             let s = render(t);
