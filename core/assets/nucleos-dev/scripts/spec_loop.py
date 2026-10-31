@@ -12,7 +12,8 @@ type "segue", "o que falta" or "resume o que foi feito" over and over. Two hooks
   `blocked` (with at least one `[!]` item) or `handoff` (context ceiling), or background work the
   session launched is still running: its completion wakes the session and the hold resumes
   (`spec_loop_timer.py` wakes it first if the prompt cache is about to expire). It
-  lets go after MAX_IDLE_PUSHES pushes that closed nothing, so a stuck model cannot loop forever.
+  lets go after MAX_IDLE_PUSHES pushes that closed nothing, so a stuck model cannot loop forever;
+  the timer then wakes that session once, at the end of its cache window.
   Whenever the checklist changed since the last accepted report, the final message must carry the report
   headings (REPORT_HEADINGS); a done checklist is then closed (`<id>.closed.md`).
 - `--prompt-hook` (UserPromptSubmit): a prompt that names a spec or plan, in a session with no
@@ -173,8 +174,15 @@ def stop_decision(payload: dict) -> dict | None:
         if n_open and running_tasks(payload):
             return None
         idle = state.get("idle", 0) + 1 if pushed and n_open >= state.get("last_open", n_open + 1) else 0
+        # The timer's one wake after a let-go is the extra turn; pushes on top of it would make three.
+        # Progress earns the pushes back, and so does any turn the wake did not start.
+        woken = state.pop("woken", False)
+        if woken and n_open >= state.get("last_open", n_open + 1):
+            idle = MAX_IDLE_PUSHES
+        elif not pushed and not woken:
+            state.pop("woken_for", None)
         if idle < MAX_IDLE_PUSHES:
-            save(last_open=n_open, idle=idle, last_block="work")
+            save(last_open=n_open, idle=idle, last_block="work", let_go=None)
             if no_items:
                 return _block(f"Spec loop {rel} has no items. List the spec's deliverables as "
                               "`- [ ]` lines in it, then carry on working through them.")
@@ -188,6 +196,8 @@ def stop_decision(payload: dict) -> dict | None:
                 "done first); context past its ceiling -> `status: handoff` and run the "
                 "nucleos-compact skill.")
         print(f"spec loop: {MAX_IDLE_PUSHES} pushes closed nothing; letting the stop go", file=sys.stderr)
+        # spec_loop_timer.py reads this: nothing else would look at the session again.
+        save(let_go=n_open or None)
 
     # 2. The checklist moved since the last accepted report: the final message must report it.
     mtime = path.stat().st_mtime

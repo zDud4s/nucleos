@@ -78,6 +78,71 @@ class SpecLoop(unittest.TestCase):
         self.assertEqual(self.stop(REPORT, pushed=True)["decision"], "block")
         self.assertIsNone(self.stop(REPORT, pushed=True))
 
+    def let_go(self, body="- [ ] a\n"):
+        """Runs the two pushes out, so the hook lets the stop go with the item still open."""
+        self.write(body)
+        self.stop(REPORT)
+        self.stop(REPORT, pushed=True)
+        self.assertIsNone(self.stop(REPORT, pushed=True))
+
+    def state_file(self):
+        return json.loads(self.loop.with_suffix(".state.json").read_text(encoding="utf-8"))
+
+    def test_letting_go_records_how_many_items_it_left_open(self):
+        self.let_go("- [ ] a\n- [ ] b\n")
+        self.assertEqual(self.state_file()["let_go"], 2)
+
+    def test_timer_wakes_a_session_let_go_with_open_items_once(self):
+        self.let_go()
+        message, slept = self.timer([self.answered(1000)], tasks=())
+        self.assertIn("open item", message)
+        self.assertEqual(slept, 55 * 60)
+        self.assertIsNone(self.timer([self.answered(9000)], tasks=(), clock=9000)[0])
+
+    def test_timer_sees_a_let_go_written_after_it_started(self):
+        self.write("- [ ] a\n")
+        self.stop(REPORT)
+        self.stop(REPORT, pushed=True)
+
+        def hook_answers():
+            if self.timer_at == 1030:
+                self.stop(REPORT, pushed=True)
+        message, _ = self.timer([self.answered(1000)], tasks=(), on_sleep=hook_answers)
+        self.assertIn("open item", message)
+
+    def test_timer_stays_out_of_a_session_the_hook_did_not_let_go(self):
+        self.write("- [ ] a\n")
+        self.assertIsNone(self.timer([self.answered(1000)], tasks=())[0])
+
+    def test_timer_does_not_wake_a_let_go_session_that_got_a_new_turn(self):
+        self.let_go()
+        records = [self.answered(1000)]
+
+        def new_turn():
+            records.append(self.answered(1020))
+            self.transcript(*records)
+        self.assertIsNone(self.timer(records, tasks=(), on_sleep=new_turn)[0])
+
+    def test_the_wake_after_a_let_go_gets_no_pushes_of_its_own(self):
+        self.let_go()
+        self.timer([self.answered(1000)], tasks=())
+        self.assertIsNone(self.stop(REPORT))
+
+    def test_progress_after_the_wake_earns_the_pushes_back(self):
+        self.let_go("- [ ] a\n- [ ] b\n")
+        self.timer([self.answered(1000)], tasks=())
+        self.write("- [x] a\n- [ ] b\n")
+        self.assertEqual(self.stop(REPORT)["decision"], "block")
+
+    def test_a_new_prompt_after_the_wake_earns_another_wake(self):
+        self.let_go()
+        self.timer([self.answered(1000)], tasks=())
+        self.stop(REPORT)  # the woken turn, let go at once
+        self.stop(REPORT)  # the owner's next prompt, pushed again
+        self.stop(REPORT, pushed=True)
+        self.assertIsNone(self.stop(REPORT, pushed=True))
+        self.assertIn("open item", self.timer([self.answered(9000)], tasks=(), clock=9000)[0])
+
     def test_progress_resets_the_idle_count(self):
         self.write("- [ ] a\n- [ ] b\n- [ ] c\n")
         self.stop(REPORT)
@@ -222,7 +287,7 @@ class SpecLoop(unittest.TestCase):
 
     def test_timer_stays_quiet_with_nothing_to_wait_for(self):
         self.write("- [ ] a\n")
-        self.assertEqual(self.timer([self.answered(1000)], tasks=()), (None, 0))
+        self.assertEqual(self.timer([self.answered(1000)], tasks=()), (None, timer.LET_GO_GRACE_SECS))
         self.write("- [x] a\n")
         self.assertEqual(self.timer([self.answered(1000)]), (None, 0))
         self.write("- [ ] a\n- [!] b\n", status="blocked")
