@@ -24,7 +24,11 @@ pub fn ensure_registered(exe_path: &Path) -> std::io::Result<()> {
 
 #[cfg(windows)]
 fn reconcile(exe_path: &Path) -> std::io::Result<()> {
-    match registration_plan(task_state(exe_path)) {
+    let task = task_state(exe_path);
+    if task == TaskPresence::QueryFailed {
+        tracing::warn!("could not query the autostart task; leaving it as it is");
+    }
+    match registration_plan(task) {
         Registration::Keep => Ok(()),
         Registration::CreateAtLogin => register(exe_path),
         Registration::RepointExe => repoint(exe_path),
@@ -117,12 +121,35 @@ fn capability_for(platform: Platform, has_user_systemd: bool) -> Capability {
     }
 }
 
+/// PURE: an AppImage registers no unit (see [`skip_registration`]), and linger without a unit keeps
+/// nothing running, so boot mode is not on offer there.
+fn without_appimage(capability: Capability, appimage: Option<&std::ffi::OsStr>) -> Capability {
+    if capability.at_boot && skip_registration(appimage) {
+        Capability {
+            at_boot: false,
+            why_not: Some(
+                "An AppImage runs from a temporary mount, so no autostart entry is registered \
+                 for it and there is nothing for the system to start at boot."
+                    .to_owned(),
+            ),
+            ..capability
+        }
+    } else {
+        capability
+    }
+}
+
 pub fn capability() -> Capability {
     let platform = Platform::current();
-    capability_for(
+    let capability = capability_for(
         platform,
         platform == Platform::Linux && user_systemd_present(),
-    )
+    );
+    if platform == Platform::Linux {
+        without_appimage(capability, std::env::var_os("APPIMAGE").as_deref())
+    } else {
+        capability
+    }
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -172,22 +199,49 @@ enum Registration {
     RepointExe,
 }
 
+/// What looking for the task came back with. "Could not look" is not "no task": treating a failed
+/// query as absent would overwrite a boot task with the login one and lose its stored password,
+/// which only the owner can give back.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TaskPresence {
+    Absent,
+    QueryFailed,
+    Present(TaskState),
+}
+
 /// PURE: what `ensure_registered` does about the task it found.
 ///
 /// A new registration used to overwrite the task with the login one, which would silently undo
 /// [`Mode::AtBoot`] on the next start. A boot task cannot be recreated here, because that needs
 /// the password NucleOS never keeps, so one that points at a moved executable only has its command
-/// changed and keeps its trigger and its credentials.
+/// changed and keeps its trigger and its credentials. A failed query changes nothing.
 #[cfg_attr(not(any(windows, test)), allow(dead_code))]
-fn registration_plan(task: Option<TaskState>) -> Registration {
+fn registration_plan(task: TaskPresence) -> Registration {
     match task {
-        Some(TaskState {
+        TaskPresence::QueryFailed => Registration::Keep,
+        TaskPresence::Present(TaskState {
             runs_this_exe: true,
             ..
         }) => Registration::Keep,
-        Some(TaskState { at_boot: true, .. }) => Registration::RepointExe,
-        _ => Registration::CreateAtLogin,
+        TaskPresence::Present(TaskState { at_boot: true, .. }) => Registration::RepointExe,
+        TaskPresence::Present(_) | TaskPresence::Absent => Registration::CreateAtLogin,
     }
+}
+
+/// PURE: whether a listing of every task proves ours is not there. `schtasks /Query /TN` exits
+/// non-zero for a missing task and for a broken query alike, and its message is localized, so the
+/// only locale-safe proof of absence is a listing that succeeded without the task's name in it.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn task_is_absent(listing: Option<&str>) -> bool {
+    listing.is_some_and(|listing| !listing.contains(TASK_NAME))
+}
+
+/// PURE: the failure `set_mode` reports for what `schtasks` (or the work before it) said, with the
+/// password taken out of both streams.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn schtasks_failure(stderr: &str, stdout: &str, password: &str) -> SetModeError {
+    SetModeError::Failed(scrub(&format!("{stderr} {stdout}"), password))
 }
 
 /// PURE: whether a task's XML has a boot trigger.
@@ -270,19 +324,38 @@ fn xml_escape(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-/// The registered task's XML, if there is one.
+/// The registered task's XML, or why there is none.
 #[cfg(windows)]
-fn query_task_xml() -> Option<String> {
-    let output = Command::new("schtasks")
+enum TaskLookup {
+    Found(String),
+    Absent,
+    QueryFailed,
+}
+
+#[cfg(windows)]
+fn query_task_xml() -> TaskLookup {
+    let Ok(output) = Command::new("schtasks")
         .args(["/Query", "/TN", TASK_NAME, "/XML", "ONE"])
         .output()
-        .ok()?;
+    else {
+        return TaskLookup::QueryFailed;
+    };
     if !output.status.success() {
-        return None;
+        let listing = Command::new("schtasks")
+            .args(["/Query", "/FO", "CSV", "/NH"])
+            .output()
+            .ok()
+            .filter(|listing| listing.status.success())
+            .map(|listing| String::from_utf8_lossy(&listing.stdout).into_owned());
+        return if task_is_absent(listing.as_deref()) {
+            TaskLookup::Absent
+        } else {
+            TaskLookup::QueryFailed
+        };
     }
     // schtasks emits UTF-16LE here; comparing bytes would never match. Lossy is fine — a path that
     // does not survive the round trip is not one we would match anyway.
-    Some(
+    TaskLookup::Found(
         output
             .stdout
             .chunks_exact(2)
@@ -303,21 +376,24 @@ fn query_task_xml() -> Option<String> {
 /// nothing looked. The unpleasant version is a same-user process pre-creating that name and owning
 /// a logon-persistence slot this daemon would then refuse to correct.
 #[cfg(windows)]
-fn task_state(exe_path: &Path) -> Option<TaskState> {
-    let xml = query_task_xml()?;
-    Some(TaskState {
-        runs_this_exe: xml
-            .to_lowercase()
-            .contains(&xml_escape(&exe_path.to_string_lossy()).to_lowercase()),
-        at_boot: xml_is_at_boot(&xml),
-    })
+fn task_state(exe_path: &Path) -> TaskPresence {
+    match query_task_xml() {
+        TaskLookup::Found(xml) => TaskPresence::Present(TaskState {
+            runs_this_exe: xml
+                .to_lowercase()
+                .contains(&xml_escape(&exe_path.to_string_lossy()).to_lowercase()),
+            at_boot: xml_is_at_boot(&xml),
+        }),
+        TaskLookup::Absent => TaskPresence::Absent,
+        TaskLookup::QueryFailed => TaskPresence::QueryFailed,
+    }
 }
 
 /// The mode the machine is in now.
 #[cfg(windows)]
 pub fn current_mode() -> Mode {
     match query_task_xml() {
-        Some(xml) if xml_is_at_boot(&xml) => Mode::AtBoot,
+        TaskLookup::Found(xml) if xml_is_at_boot(&xml) => Mode::AtBoot,
         _ => Mode::AtLogin,
     }
 }
@@ -344,8 +420,7 @@ pub fn set_mode(mode: Mode, password: Option<&str>, exe_path: &Path) -> Result<(
             let password = password
                 .filter(|password| !password.is_empty())
                 .ok_or(SetModeError::PasswordRequired)?;
-            let failed =
-                |error: std::io::Error| SetModeError::Failed(scrub(&error.to_string(), password));
+            let failed = |error: std::io::Error| schtasks_failure(&error.to_string(), "", password);
             let user = windows_user().map_err(failed)?;
             let xml_path = std::env::temp_dir().join("nucleos-daemon-task.xml");
             write_utf16_xml(&xml_path, &at_boot_task_xml(exe_path, &user)).map_err(failed)?;
@@ -358,12 +433,11 @@ pub fn set_mode(mode: Mode, password: Option<&str>, exe_path: &Path) -> Result<(
             if output.status.success() {
                 return Ok(());
             }
-            let said = format!(
-                "{} {}",
-                String::from_utf8_lossy(&output.stderr),
-                String::from_utf8_lossy(&output.stdout)
-            );
-            Err(SetModeError::Failed(scrub(&said, password)))
+            Err(schtasks_failure(
+                &String::from_utf8_lossy(&output.stderr),
+                &String::from_utf8_lossy(&output.stdout),
+                password,
+            ))
         }
     }
 }
@@ -936,7 +1010,15 @@ mod tests {
     fn ensure_registered_creates_a_real_task() {
         let exe = std::env::current_exe().unwrap();
         ensure_registered(&exe).unwrap();
-        let runs = |path: &Path| task_state(path).is_some_and(|state| state.runs_this_exe);
+        let runs = |path: &Path| {
+            matches!(
+                task_state(path),
+                TaskPresence::Present(TaskState {
+                    runs_this_exe: true,
+                    ..
+                })
+            )
+        };
         assert!(runs(&exe));
         // A task registered for a DIFFERENT executable must not satisfy the check, which is the
         // whole reason it reads the command rather than the name.
@@ -1164,7 +1246,7 @@ mod tests {
     /// would need the password nobody keeps.
     #[test]
     fn reregistering_keeps_at_boot_mode() {
-        let moved_boot_task = Some(TaskState {
+        let moved_boot_task = TaskPresence::Present(TaskState {
             runs_this_exe: false,
             at_boot: true,
         });
@@ -1179,12 +1261,12 @@ mod tests {
             "{args:?}"
         );
 
-        let current_boot_task = Some(TaskState {
+        let current_boot_task = TaskPresence::Present(TaskState {
             runs_this_exe: true,
             at_boot: true,
         });
         assert_eq!(registration_plan(current_boot_task), Registration::Keep);
-        let moved_login_task = Some(TaskState {
+        let moved_login_task = TaskPresence::Present(TaskState {
             runs_this_exe: false,
             at_boot: false,
         });
@@ -1192,7 +1274,35 @@ mod tests {
             registration_plan(moved_login_task),
             Registration::CreateAtLogin
         );
-        assert_eq!(registration_plan(None), Registration::CreateAtLogin);
+        assert_eq!(
+            registration_plan(TaskPresence::Absent),
+            Registration::CreateAtLogin
+        );
+    }
+
+    /// A transient failure to query must not be read as "no task": that would overwrite a boot task
+    /// with the login one and lose the password stored with it.
+    #[test]
+    fn a_failed_query_keeps_the_boot_task() {
+        assert_eq!(
+            registration_plan(TaskPresence::QueryFailed),
+            Registration::Keep
+        );
+        // Only a listing that worked and lacks our name proves the task is absent.
+        assert!(task_is_absent(Some("\"\\Other task\",\"N/A\",\"Ready\"\n")));
+        assert!(!task_is_absent(Some(
+            "\"\\NucleOS Daemon\",\"At system start up\",\"Ready\"\n"
+        )));
+        assert!(!task_is_absent(None));
+    }
+
+    #[test]
+    fn an_appimage_gets_no_boot_mode() {
+        use std::ffi::OsStr;
+        let on = capability_for(Platform::Linux, true);
+        let appimage = without_appimage(on.clone(), Some(OsStr::new("/tmp/NucleOS.AppImage")));
+        assert!(!appimage.at_boot && appimage.why_not.is_some());
+        assert_eq!(without_appimage(on.clone(), None), on);
     }
 
     #[test]
@@ -1230,10 +1340,14 @@ mod tests {
         assert_eq!(args.iter().filter(|arg| arg.contains(password)).count(), 1);
 
         // Whatever the tool says back is scrubbed before it can be shown or logged.
-        let said = format!("ERROR: Invalid credentials for user. Password {password} rejected.");
-        let shown = SetModeError::Failed(scrub(&said, password)).to_string();
+        let stderr = format!("ERROR: Invalid credentials for user. Password {password} rejected.");
+        let stdout = format!("echo of {password}");
+        let failure = schtasks_failure(&stderr, &stdout, password);
+        let shown = failure.to_string();
+        assert!(matches!(failure, SetModeError::Failed(_)));
         assert!(!shown.contains(password), "{shown}");
         assert!(shown.contains("Invalid credentials"), "{shown}");
+        assert!(shown.contains("echo of ***"), "{shown}");
         // An empty password must not turn the scrub into "insert *** between every letter".
         assert_eq!(scrub("abc", ""), "abc");
     }
