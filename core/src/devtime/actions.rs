@@ -315,7 +315,8 @@ pub async fn run_for_session(
     .fetch_one(pool)
     .await?;
     let mut already: Vec<String> = sqlx::query_scalar(
-        "SELECT subject_key FROM devtime_shadow WHERE action = 'propose' AND project_id = ?",
+        "SELECT subject_key FROM devtime_shadow WHERE action = 'propose' AND project_id = ? \
+         AND outcome_state <> 'void'",
     )
     .bind(&project_id)
     .fetch_all(pool)
@@ -623,6 +624,112 @@ mod wiring {
         let inject = rows(&pool, "inject").await;
         assert_eq!(inject.len(), 1);
         assert_eq!(inject[0].2, ms_text(LAST_MS + idle_ms));
+    }
+
+    fn tuned_actions(
+        base: &crate::config::DevtimeActionsConfig,
+    ) -> crate::config::DevtimeActionsConfig {
+        let mut actions = base.clone();
+        actions.propose_min_sessions = 5;
+        actions
+    }
+
+    #[tokio::test]
+    async fn wiring_a_propose_voided_by_a_thresholds_change_is_decided_again() {
+        let pool = pool().await;
+        seed(&pool).await;
+        let cfg = DevtimeConfig::default();
+        assert_eq!(run_for_session(&pool, &cfg, SID, NOW_MS).await.unwrap(), 2);
+        let tuned = tuned_actions(&cfg.actions);
+        // Only the `propose` hash moves with `propose_min_sessions`.
+        assert_eq!(
+            crate::devtime::store::void_stale_thresholds(&pool, &tuned)
+                .await
+                .unwrap(),
+            1
+        );
+
+        let tuned_cfg = DevtimeConfig {
+            actions: tuned.clone(),
+            ..cfg
+        };
+        let again = run_for_session(&pool, &tuned_cfg, SID, NOW_MS + 1_000)
+            .await
+            .unwrap();
+        assert_eq!(again, 1, "the voided key is decided again");
+        let propose = rows(&pool, "propose").await;
+        assert_eq!(propose.len(), 1);
+        assert_eq!(propose[0].1, "pending");
+        let hash: String = sqlx::query_scalar(
+            "SELECT thresholds_hash FROM devtime_shadow WHERE action = 'propose'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            hash,
+            crate::devtime::store::thresholds_hash(&tuned, "propose", "F1")
+        );
+    }
+
+    #[tokio::test]
+    async fn wiring_a_propose_not_voided_is_not_decided_again_under_other_thresholds() {
+        let pool = pool().await;
+        seed(&pool).await;
+        let cfg = DevtimeConfig::default();
+        run_for_session(&pool, &cfg, SID, NOW_MS).await.unwrap();
+        let tuned_cfg = DevtimeConfig {
+            actions: tuned_actions(&cfg.actions),
+            ..cfg.clone()
+        };
+        let again = run_for_session(&pool, &tuned_cfg, SID, NOW_MS + 1_000)
+            .await
+            .unwrap();
+        assert_eq!(again, 0);
+        assert_eq!(rows(&pool, "propose").await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn wiring_rows_decided_after_a_change_carry_the_new_hash_and_survive_the_sweep() {
+        use crate::settings::{Scope, Settings, Snapshot, testing};
+        let started = DevtimeConfig::default();
+        let in_force = DevtimeConfig {
+            actions: tuned_actions(&started.actions),
+            ..DevtimeConfig::default()
+        };
+        let _installed = testing::install(Settings::from_snapshot(
+            Snapshot::default().with_document(&Scope::Machine, in_force.clone()),
+        ));
+        let pool = pool().await;
+        seed(&pool).await;
+
+        // The ingest loop started under the defaults; the document in force is the tuned one.
+        let cfg = DevtimeConfig {
+            actions: crate::devtime::current_actions(&started.actions),
+            ..started
+        };
+        run_for_session(&pool, &cfg, SID, NOW_MS).await.unwrap();
+
+        let stamped: Vec<(String, String, String)> =
+            sqlx::query_as("SELECT action, rule_id, thresholds_hash FROM devtime_shadow")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(stamped.iter().any(|r| r.0 == "propose"));
+        for (action, rule, hash) in stamped {
+            assert_eq!(
+                hash,
+                crate::devtime::store::thresholds_hash(&in_force.actions, &action, &rule),
+                "{action}/{rule}"
+            );
+        }
+        assert_eq!(
+            crate::devtime::store::void_stale_thresholds(&pool, &in_force.actions)
+                .await
+                .unwrap(),
+            0,
+            "the next sweep leaves the new rows pending"
+        );
     }
 
     #[tokio::test]

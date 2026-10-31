@@ -1069,9 +1069,14 @@ pub async fn run_ingest_loop(pool: SqlitePool, cfg: DevtimeConfig, projects_dir:
     let mut totals = CycleStats::default();
     loop {
         ticker.tick().await;
-        let stats = ingest_cycle(&pool, &cfg, &projects_dir).await;
+        // Only `actions` follows the stored document live; the rest of `cfg` waits for a restart.
+        let live = DevtimeConfig {
+            actions: current_actions(&cfg.actions),
+            ..cfg.clone()
+        };
+        let stats = ingest_cycle(&pool, &live, &projects_dir).await;
         accumulate(&mut totals, &stats);
-        if cfg.rules.enabled && cfg.actions.enabled {
+        if live.rules.enabled && live.actions.enabled {
             let now_ms = chrono::Utc::now().timestamp_millis();
             if let Err(error) = close_due_outcomes(&pool, now_ms).await {
                 tracing::warn!(%error, "devtime: closing the actions' outcomes failed");
@@ -1080,6 +1085,44 @@ pub async fn run_ingest_loop(pool: SqlitePool, cfg: DevtimeConfig, projects_dir:
         let row = status_row(true, &cfg, &stats, &totals);
         if let Err(error) = devtime_store::write_ingest_status(&pool, &row).await {
             tracing::warn!(%error, "devtime: could not write the ingest status");
+        }
+    }
+}
+
+/// The `actions` thresholds in force: those of the stored `devtime` document, so rows decided after a
+/// change carry its hash. `started` stays when the document is unreadable or the store is not started.
+pub fn current_actions(
+    started: &crate::config::DevtimeActionsConfig,
+) -> crate::config::DevtimeActionsConfig {
+    crate::settings::get_opt::<DevtimeConfig>(&crate::settings::Scope::Machine)
+        .map_or_else(|| started.clone(), |document| document.actions.clone())
+}
+
+/// The startup sweep: voids the pending shadow rows decided under thresholds other than `actions`.
+/// Skipped, with a warning, when the `devtime` document is unreadable: `actions` are then the defaults,
+/// not the owner's settings. Returns the rows voided.
+pub async fn void_stale_at_startup(
+    pool: &SqlitePool,
+    actions: &crate::config::DevtimeActionsConfig,
+    document_readable: bool,
+) -> u64 {
+    if !document_readable {
+        tracing::warn!("devtime: the devtime document is unreadable; the startup sweep is skipped");
+        return 0;
+    }
+    match devtime_store::void_stale_thresholds(pool, actions).await {
+        Ok(voided) => {
+            if voided > 0 {
+                tracing::info!(
+                    voided,
+                    "devtime: voided pending actions under other thresholds"
+                );
+            }
+            voided
+        }
+        Err(error) => {
+            tracing::warn!(%error, "devtime: voiding the stale pending actions failed");
+            0
         }
     }
 }
@@ -2328,5 +2371,82 @@ mod tests {
         let (version, _, dirty) = rules_state(&h.pool, sid).await;
         assert!(version.is_some());
         assert_eq!(dirty, 0);
+    }
+
+    fn tuned_actions() -> crate::config::DevtimeActionsConfig {
+        crate::config::DevtimeActionsConfig {
+            propose_min_sessions: 5,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn current_actions_reads_the_document_in_force_not_the_one_the_loop_started_with() {
+        use crate::settings::{Scope, Settings, Snapshot, testing};
+        let document = DevtimeConfig {
+            actions: tuned_actions(),
+            ..DevtimeConfig::default()
+        };
+        let _installed = testing::install(Settings::from_snapshot(
+            Snapshot::default().with_document(&Scope::Machine, document),
+        ));
+        let started = crate::config::DevtimeActionsConfig::default();
+        assert_eq!(current_actions(&started), tuned_actions());
+    }
+
+    /// An unreadable document is not in the snapshot either (`mark_unreadable` removes it), and the
+    /// store not started is the same empty snapshot: both read as no document.
+    #[test]
+    fn current_actions_keeps_the_started_ones_when_no_document_is_readable() {
+        use crate::settings::{Settings, testing};
+        let _installed = testing::install(Settings::new());
+        let started = tuned_actions();
+        assert_eq!(current_actions(&started), started);
+    }
+
+    async fn stale_pending_row(pool: &SqlitePool) {
+        let row = devtime_store::ShadowRow {
+            action: "propose".into(),
+            rule_id: "F1".into(),
+            project_id: "p1".into(),
+            subject_key: "F1|k1".into(),
+            mode: "shadow".into(),
+            decision: "fire".into(),
+            template_id: "propose.f1.v1".into(),
+            rule_version: 1,
+            action_version: 1,
+            thresholds_hash: "stale".into(),
+            rules_version: "rv".into(),
+            decided_at: "2026-10-05T10:00:00.000Z".into(),
+            window_end_at: "2026-10-19T10:30:00.000Z".into(),
+            outcome_state: "pending".into(),
+            ..devtime_store::ShadowRow::default()
+        };
+        assert!(devtime_store::insert_decision(pool, &row).await.unwrap());
+    }
+
+    async fn only_row_state(pool: &SqlitePool) -> String {
+        sqlx::query_scalar("SELECT outcome_state FROM devtime_shadow")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_startup_sweep_voids_nothing_while_the_devtime_document_is_unreadable() {
+        let pool = crate::testdb::fresh_pool().await;
+        stale_pending_row(&pool).await;
+        let defaults = crate::config::DevtimeActionsConfig::default();
+        assert_eq!(void_stale_at_startup(&pool, &defaults, false).await, 0);
+        assert_eq!(only_row_state(&pool).await, "pending");
+    }
+
+    #[tokio::test]
+    async fn the_startup_sweep_voids_the_stale_rows_when_the_document_is_readable() {
+        let pool = crate::testdb::fresh_pool().await;
+        stale_pending_row(&pool).await;
+        let defaults = crate::config::DevtimeActionsConfig::default();
+        assert_eq!(void_stale_at_startup(&pool, &defaults, true).await, 1);
+        assert_eq!(only_row_state(&pool).await, "void");
     }
 }

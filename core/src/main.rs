@@ -203,6 +203,7 @@ async fn main() {
             machine_config::ROOT_DISPLAY
         );
     }
+    let mut devtime_readable = false;
     match settings::init(&pool).await {
         Ok(handle) => {
             let outcome =
@@ -215,6 +216,8 @@ async fn main() {
                     "settings import finished"
                 );
             }
+            devtime_readable =
+                !handle.snapshot().is_unreadable(&settings::Scope::Machine, "devtime");
             for unreadable in handle.snapshot().unreadable() {
                 tracing::warn!(
                     document = %unreadable.name,
@@ -1071,6 +1074,10 @@ async fn main() {
     } else {
         Some(std::path::PathBuf::from(&devtime_config.projects_dir))
     };
+    // A `--settings-reset` or `--settings-rollback` run while the daemon was stopped changed the thresholds
+    // without the HTTP hook: void the pending rows decided under the old ones before anything new is
+    // decided (skipped while the `devtime` document is unreadable: its defaults are not the owner's).
+    devtime::void_stale_at_startup(&state.pool, &devtime_config.actions, devtime_readable).await;
     tokio::spawn(devtime::run_ingest_loop(
         state.pool.clone(),
         devtime_config,
