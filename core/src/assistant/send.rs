@@ -564,17 +564,40 @@ pub async fn send_message(
     send_message_with(state, chat_id, text, &[], origin).await
 }
 
+/// The pin of a HOSTED chat, read fresh and without swallowing a failure: a read error comes back
+/// as the refusal text, so the turn is refused instead of answered by the route's default model
+/// (which may belong to another provider than the one the chat was pinned to).
+pub(super) async fn hosted_pin(
+    pool: &sqlx::SqlitePool,
+    chat_id: &str,
+) -> Result<Option<String>, String> {
+    match crate::chats::answering(pool, chat_id).await {
+        Ok(answering) => Ok(answering.model),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                chat_id,
+                "could not read the conversation's pinned model; refusing the hosted turn"
+            );
+            Err(format!(
+                "could not read this conversation's pinned model: {error}"
+            ))
+        }
+    }
+}
+
 /// The conversation's pinned model (`chats::Answering::model`), read fresh rather than cached
-/// across a turn.
+/// across a turn, for the LOCAL branch.
 ///
-/// A failure to read it must NOT refuse the turn: this returns `None` — the route's own configured
-/// default — and logs a warning instead of propagating the error. `recent_exchanges` takes the same
-/// posture when history cannot be read, and `chats::answering`'s own doc makes the same argument for
-/// a missing row answering `Default`.
+/// A failure to read it must NOT refuse a local turn: this returns `None` — the route's own
+/// configured default — and logs a warning instead of propagating the error. `recent_exchanges`
+/// takes the same posture when history cannot be read, and `chats::answering`'s own doc makes the
+/// same argument for a missing row answering `Default`. The hosted branch reads through
+/// `hosted_pin` instead and refuses.
 ///
-/// Called from inside each of `send_message_with`'s two route branches, never above them: a cloud
-/// turn reaches neither branch, and hoisting the call above both would add this query to the
-/// busiest path — the cloud turn — to serve two branches that both return before it even starts.
+/// Called from inside the local branch of `send_message_with`, never above the branches: a cloud
+/// turn reaches neither, and hoisting the call would add this query to the busiest path — the
+/// cloud turn — to serve a branch that returns before the cloud path even starts.
 pub(super) async fn pinned_model(state: &crate::state::AppState, chat_id: &str) -> Option<String> {
     match crate::chats::answering(&state.pool, chat_id).await {
         Ok(answering) => answering.model,
@@ -727,9 +750,14 @@ pub(super) async fn send_message_inner(
     // conversation that asked to stay off the CLI onto the bill, and the person would find out from
     // the invoice.
     if wants_hosted {
-        // The conversation's pinned model — see `pinned_model`'s own doc for why it is read here,
-        // inside the branch, and why a read failure falls back to `None` instead of refusing.
-        let pinned_model = pinned_model(state, chat_id).await;
+        // The conversation's pinned model, read inside the branch (see `pinned_model`'s doc for
+        // why). Unlike the local branch, a failed read REFUSES: answering with the route's default
+        // model would hand a chat pinned to one provider's model to another model, and possibly
+        // another provider, without a word.
+        let pinned_model = hosted_pin(&state.pool, chat_id).await?;
+        let cost_unknown = state
+            .assistants
+            .answers_through_gemini(crate::chats::Brain::OpenRouter, pinned_model.as_deref());
         return match state
             .assistants
             .assistant_for(crate::chats::Brain::OpenRouter, pinned_model.as_deref())
@@ -749,6 +777,7 @@ pub(super) async fn send_message_inner(
                     relay_id,
                     origin,
                     "openrouter",
+                    cost_unknown,
                 )
                 .await
             }
@@ -789,6 +818,7 @@ pub(super) async fn send_message_inner(
                     relay_id,
                     origin,
                     "local",
+                    false,
                 )
                 .await;
             }

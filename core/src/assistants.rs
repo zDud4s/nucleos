@@ -189,6 +189,13 @@ pub trait Assistants: Send + Sync {
     /// Whether this route can answer at all, without building anything to find out.
     fn serves(&self, brain: crate::chats::Brain) -> Result<(), Refusal>;
 
+    /// Whether a turn on `brain` with this `pin` is answered through Gemini, whose price NucleOS
+    /// does not know. Decided on the resolved model, as `assistant_for` does. A factory that never
+    /// serves Gemini keeps this default.
+    fn answers_through_gemini(&self, _brain: crate::chats::Brain, _pin: Option<&str>) -> bool {
+        false
+    }
+
     /// Whether this machine can actually serve `model` on `brain` — the picker's question, asked
     /// before a choice is stored rather than discovered at the first turn.
     ///
@@ -558,14 +565,16 @@ impl Assistants for ConfiguredAssistants {
         // A `gemini-api/` pick on the hosted brain is decided BEFORE `serves`: that check demands
         // the OpenRouter key, which a Google-key-only install does not have, and the Google key is
         // this pick's only key. No key means a refusal naming Gemini, never a fall back to
-        // OpenRouter's key or base.
-        if brain == crate::chats::Brain::OpenRouter && is_gemini_pick(model) {
+        // OpenRouter's key or base. The pick is read from the RESOLVED model: the pin, or else the
+        // route's configured default, so a `gemini-api/` default with no pin is a Gemini pick too.
+        let resolved_pick = model.or(self.hosted_model.as_deref());
+        if brain == crate::chats::Brain::OpenRouter && is_gemini_pick(resolved_pick) {
             let key = self.gemini_key.clone().ok_or(Refusal::GeminiKeyMissing)?;
             let chat = crate::models::openai_compatible::OpenAiCompatibleChat::gemini_with_client(
                 self.hosted_client.clone(),
                 self.gemini_base_url.clone(),
                 // `gemini_with_client` strips the `gemini-api/` and `models/` prefixes.
-                model.unwrap_or_default().to_string(),
+                resolved_pick.unwrap_or_default().to_string(),
                 key,
             );
             let toolbox = toolbox_for(
@@ -641,6 +650,11 @@ impl Assistants for ConfiguredAssistants {
                 ))
             }
         }
+    }
+
+    fn answers_through_gemini(&self, brain: crate::chats::Brain, pin: Option<&str>) -> bool {
+        brain == crate::chats::Brain::OpenRouter
+            && is_gemini_pick(pin.or(self.hosted_model.as_deref()))
     }
 
     /// The availability rule itself: the same configuration `assistant_for` consults, checked in

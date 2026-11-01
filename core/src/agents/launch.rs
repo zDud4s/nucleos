@@ -117,13 +117,20 @@ struct Plan {
 }
 
 /// The engine and model a pin names: the caller's first, then the agent row's. A model alone
-/// pins nothing (the router picks models).
+/// pins nothing (the router picks models), except a `gemini-api/` model id: that names the Gemini
+/// route whatever the engine field says, so it yields the `gemini-api` engine and `plan_launch`
+/// refuses it by name instead of letting it fall through to the router.
 fn effective_pin(pins: &Pins, agent: &Agent) -> Option<(String, String)> {
     if let Some(engine) = pins.engine.as_deref().filter(|e| !e.is_empty()) {
         return Some((engine.to_owned(), pins.model.clone().unwrap_or_default()));
     }
-    let engine = agent.engine.as_deref().filter(|e| !e.is_empty())?;
     let model = pins.model.clone().or_else(|| agent.model.clone());
+    let Some(engine) = agent.engine.as_deref().filter(|e| !e.is_empty()) else {
+        let gemini_prefix = format!("{}/", crate::engines::GEMINI_API);
+        return model
+            .filter(|id| id.starts_with(&gemini_prefix))
+            .map(|id| (crate::engines::GEMINI_API.to_owned(), id));
+    };
     Some((engine.to_owned(), model.unwrap_or_default()))
 }
 

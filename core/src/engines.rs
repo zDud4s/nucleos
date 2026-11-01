@@ -35,26 +35,35 @@ pub const GEMINI_KEY: &str = "gemini-api-key";
 pub const GEMINI_API_REFUSAL: &str =
     "the gemini-api engine is not available for agents, teams, council or quota";
 
+/// The fact "a Gemini API key is stored", published once by the daemon at startup.
+static GEMINI_KEY_PUBLISHED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Publishes whether a Gemini API key was found when the daemon started. A key stored later is
+/// not seen until the daemon restarts.
+pub fn publish_gemini_key(present: bool) {
+    GEMINI_KEY_PUBLISHED.store(present, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether a credential-store read yielded a usable key: blank, absent and a read error are all
+/// "no key".
+pub fn gemini_key_present<E>(read: &Result<Option<String>, E>) -> bool {
+    matches!(read, Ok(Some(key)) if !key.trim().is_empty())
+}
+
 /// Whether a Gemini API key is stored: the one fact the row's gate and the catalogue read.
 ///
-/// Reads only whether a credential exists. A store that cannot be read counts as "no key". Under
-/// `cfg(test)` without an override nothing touches the real credential store: the answer is `false`.
+/// Never touches the credential store: it returns the fact the daemon published at startup (see
+/// `publish_gemini_key`), `false` until then. Under `cfg(test)` / `testkit` a thread-local
+/// override set by `gemini_test_support::gemini_gate` wins when present.
 pub fn gemini_key_stored() -> bool {
     #[cfg(any(test, feature = "testkit"))]
     {
-        if let Some(stored) = *gemini_test_support::OVERRIDE
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-        {
+        if let Some(stored) = gemini_test_support::OVERRIDE.with(|cell| cell.get()) {
             return stored;
         }
-        if cfg!(test) {
-            return false;
-        }
     }
-    crate::secrets::load_secret(GEMINI_KEY)
-        .map(|value| value.is_some_and(|key| !key.trim().is_empty()))
-        .unwrap_or(false)
+    GEMINI_KEY_PUBLISHED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The refusal for agy at every launch site of agents, teams and council.
@@ -672,38 +681,35 @@ mod row_tests {
     }
 }
 
-/// Fixtures for the tests that need the Gemini API key "stored" or "absent" without a real
-/// credential. The override replaces the credential-store read until the guard drops; guards
-/// serialise on a lock, so two tests cannot flip it at once.
+/// Fixtures for the tests that need the Gemini API key "stored" or "absent". The override is
+/// thread-local: it replaces the published fact on the calling thread only until the guard drops,
+/// so tests running in parallel never see each other's gate and need no lock.
 #[cfg(any(test, feature = "testkit"))]
 pub mod gemini_test_support {
-    use std::sync::Mutex;
+    use std::cell::Cell;
 
-    pub(super) static OVERRIDE: Mutex<Option<bool>> = Mutex::new(None);
-    static SERIAL: Mutex<()> = Mutex::new(());
+    thread_local! {
+        pub(super) static OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+    }
 
-    /// Holds the override and the serial lock; dropping it restores the real read.
+    /// Holds the override on this thread; dropping it clears it.
     pub struct GeminiGate {
-        _serial: std::sync::MutexGuard<'static, ()>,
+        // The override lives in this thread's storage, so the guard must drop on this thread.
+        _not_send: std::marker::PhantomData<*const ()>,
     }
 
     impl Drop for GeminiGate {
         fn drop(&mut self) {
-            *OVERRIDE
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            OVERRIDE.with(|cell| cell.set(None));
         }
     }
 
     /// `true` makes a key read as stored, `false` as absent, until the guard drops.
     pub fn gemini_gate(stored: bool) -> GeminiGate {
-        let serial = SERIAL
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *OVERRIDE
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(stored);
-        GeminiGate { _serial: serial }
+        OVERRIDE.with(|cell| cell.set(Some(stored)));
+        GeminiGate {
+            _not_send: std::marker::PhantomData,
+        }
     }
 }
 

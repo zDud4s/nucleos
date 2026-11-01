@@ -58,6 +58,9 @@ pub(super) async fn spawn_local_turn(
     // function local-only in the first place — generalising the call site, per this packet's own
     // instruction, means the one fact that differs travels in, not a second copy of the query.
     answered_by: &'static str,
+    // Whether this turn's price is unknown (it answers through Gemini): `runs.cost_usd` is then
+    // written NULL, not 0. Local and OpenRouter turns pass `false` and keep writing 0.
+    cost_unknown: bool,
 ) -> Result<i64, String> {
     // A session id even though nothing resumes it, because `budget.rs` keys spend on this column
     // and a run row that is the one kind without one is a special case every reader downstream has
@@ -208,9 +211,10 @@ pub(super) async fn spawn_local_turn(
                     let fill =
                         super::compaction::local_fill_estimate(&history, &prompt, &turn.answer);
                     let completed = sqlx::query(
-                        "UPDATE runs SET status = 'completed', exit_code = 0, stdout = ?, cost_usd = 0, context_fill = ?, completed_at = ? WHERE id = ? AND status = 'running'",
+                        "UPDATE runs SET status = 'completed', exit_code = 0, stdout = ?, cost_usd = ?, context_fill = ?, completed_at = ? WHERE id = ? AND status = 'running'",
                     )
                     .bind(&turn.answer)
+                    .bind(if cost_unknown { None } else { Some(0.0_f64) })
                     .bind(fill)
                     .bind(&completed_at)
                     .bind(id)

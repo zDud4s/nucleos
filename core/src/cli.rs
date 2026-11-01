@@ -671,8 +671,12 @@ fn set_gemini_key() {
     match outcome {
         Ok(said) => {
             println!("{said}");
-            // Said here, as for OpenRouter, because the daemon reads the key once at startup.
-            eprintln!("restart the daemon: the Gemini API key is read at startup");
+            // Said here, as for OpenRouter, because the daemon reads the key once at startup and
+            // publishes whether it exists then; a running daemon does not see the new key.
+            eprintln!(
+                "a running daemon must be restarted for the new Gemini API key to take effect: \
+                 the key is read once, at startup"
+            );
         }
         Err(error) => {
             eprintln!("{error}");
