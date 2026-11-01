@@ -1260,11 +1260,8 @@ function StartBox({
   const pickModel = (next: string | null) => {
     setModel(next);
     if (next === null || effort === null) return;
-    const row =
-      frontCatalogue.data?.choices.find((choice) => choice.id === next) ??
-      frontGroups?.flatMap((group) => group.models).find((choice) => choice.id === next);
     // A row not known yet keeps today's behaviour; a known row without the level drops it.
-    if (row !== undefined && !(row.efforts ?? []).includes(effort)) setEffort(null);
+    if (rowLacksEffort(next, effort, frontGroups, frontCatalogue.data?.choices)) setEffort(null);
   };
   const [mode, setMode] = useState<PermissionMode>("auto");
   const [attached, setAttached] = useState<Attachment[]>([]);
@@ -2873,6 +2870,23 @@ function ModelMenu({
 }
 
 /**
+ * Whether `model` has a KNOWN row that lacks the `effort` level. The row is looked up in the order
+ * the dial uses (discovered groups, then the config's catalogue); a model with no row yet is not
+ * "lacking" anything, so the caller keeps its effort.
+ */
+function rowLacksEffort(
+  model: string,
+  effort: string,
+  groups: { models: { id: string; efforts?: string[] }[] }[] | undefined,
+  catalogue: { id: string; efforts?: string[] }[] | undefined,
+): boolean {
+  const row =
+    groups?.flatMap((group) => group.models).find((choice) => choice.id === model) ??
+    catalogue?.find((choice) => choice.id === model);
+  return row !== undefined && !(row.efforts ?? []).includes(effort);
+}
+
+/**
  * How hard the model is asked to think, as a slider over the chosen model's own levels.
  *
  * Position 0 is "default" and writes `null`; the rest are the CLI's own words for the levels.
@@ -2966,6 +2980,9 @@ function ChatModelControls({
   onModelOpenChange?: (open: boolean) => void;
 }) {
   const patch = usePatchChat();
+  // The same two reads the dial makes, so the pick is judged against the row the dial would show.
+  const catalogue = useAssistantModels(chatId, undefined);
+  const groups = useModelGroups(chatId).data?.groups;
   return (
     <>
       <ModelMenu
@@ -2974,7 +2991,17 @@ function ChatModelControls({
         chatId={chatId}
         open={modelOpen}
         onOpenChange={onModelOpenChange}
-        onPick={(picked) => patch.mutate({ chatId, model: picked })}
+        onPick={(picked) =>
+          // The daemon keeps a stored effort across a model change, so a pick whose known row lacks
+          // that level clears it in the same body; otherwise no `effort` key is sent.
+          patch.mutate(
+            picked !== null &&
+              effort !== null &&
+              rowLacksEffort(picked, effort, groups, catalogue.data?.choices)
+              ? { chatId, model: picked, effort: null }
+              : { chatId, model: picked },
+          )
+        }
       >
         {patch.isError && <ModelRefusal error={patch.error} />}
       </ModelMenu>
