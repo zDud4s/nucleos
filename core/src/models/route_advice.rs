@@ -2522,6 +2522,7 @@ mod tests {
 
     #[test]
     fn installed_engines_excludes_agy_when_gate_off() {
+        let _gate = crate::engines::agy_test_support::agy_gate(false);
         // The setting is off by default, so agy is absent even when its binary is on PATH.
         assert!(!crate::engines::agy::enabled());
         assert!(!installed_engines().contains(&RunnerKind::Agy));
@@ -2700,6 +2701,7 @@ mod tests {
 
     #[test]
     fn front_with_ignores_agy_runner_name_when_off() {
+        let _gate = crate::engines::agy_test_support::agy_gate(false);
         let mut config = config(Mode::Shadow, DEFAULT_URL);
         config.runners = vec!["agy".to_owned()];
         let runner = front_with(

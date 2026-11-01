@@ -207,6 +207,7 @@ mod tests {
 
     #[test]
     fn chat_engine_from_stored_uses_chat_ids() {
+        let _gate = crate::engines::agy_test_support::agy_gate(false);
         assert_eq!(ChatEngine::from_stored("claude"), Some(ChatEngine::Claude));
         assert_eq!(ChatEngine::from_stored("codex"), Some(ChatEngine::Codex));
         assert_eq!(ChatEngine::from_stored("local"), Some(ChatEngine::Local));

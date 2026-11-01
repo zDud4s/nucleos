@@ -454,6 +454,7 @@ mod tests {
 
     #[test]
     fn translatable_runners_leave_agy_out_while_its_gate_is_off() {
+        let _gate = crate::engines::agy_test_support::agy_gate(false);
         assert!(!translatable_runners(&[]).contains(&RunnerKind::Agy));
         assert!(!translatable_runners(&[McpNucleos]).contains(&RunnerKind::Agy));
     }

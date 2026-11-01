@@ -464,6 +464,7 @@ mod tests {
 
     #[test]
     fn table_lists_claude_codex_local_agy_with_expected_fields() {
+        let _gate = agy_test_support::agy_gate(false);
         assert_eq!(TABLE.len(), 5);
         let ids: Vec<&str> = TABLE.iter().map(|row| row.id).collect();
         assert_eq!(ids, ["claude", "codex", "local", "agy", "gemini-api"]);
@@ -648,6 +649,7 @@ mod tests {
 
     #[test]
     fn gate_false_row_is_absent_from_every_derived_list() {
+        let _gate = agy_test_support::agy_gate(false);
         let mut rows: Vec<EngineDescription> = TABLE.to_vec();
         rows.push(EngineDescription {
             id: "gated",
@@ -678,6 +680,7 @@ mod tests {
 
     #[test]
     fn runner_id_in_keeps_agy_when_asked_even_if_disabled() {
+        let _gate = agy_test_support::agy_gate(false);
         // The single exception to "unknown collapses to claude": a stored `agy` is named, so the
         // caller can refuse it, even while the gate is shut and agy is absent from the lists.
         assert!(!agy::enabled());
