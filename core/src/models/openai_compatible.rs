@@ -461,6 +461,123 @@ mod tests {
         );
     }
 
+    /// A loopback stand-in for Google's OpenAI-compatible endpoint that records every request it is
+    /// sent (method, path, Authorization header, body) and answers `chat/completions` with one
+    /// usable choice and `models` with Google's `models/`-prefixed id shape. No real Google call.
+    async fn stub_gemini() -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<(String, String, Option<String>, String)>>>,
+    ) {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        let app = axum::Router::new().fallback(
+            move |method: axum::http::Method,
+                  uri: axum::http::Uri,
+                  headers: axum::http::HeaderMap,
+                  body: axum::body::Bytes| {
+                let recorded = recorded.clone();
+                async move {
+                    let auth = headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned);
+                    recorded.lock().unwrap().push((
+                        method.to_string(),
+                        uri.path().to_owned(),
+                        auth,
+                        String::from_utf8_lossy(&body).into_owned(),
+                    ));
+                    if uri.path().ends_with("/models") {
+                        axum::Json(serde_json::json!({
+                            "data": [{ "id": "models/gemini-2.5-flash" }, { "id": "models/gemini-2.5-pro" }]
+                        }))
+                    } else {
+                        axum::Json(serde_json::json!({
+                            "choices": [{ "message": { "content": "ok" } }]
+                        }))
+                    }
+                }
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        // A trailing slash and a path prefix, as in `GEMINI_BASE_URL`.
+        (format!("http://{address}/v1beta/openai/"), seen)
+    }
+
+    /// RED (plan Node 3, test 3; contract E6). New symbols for GREEN: `GEMINI_BASE_URL`,
+    /// `OpenAiCompatibleChat::gemini_with_client(client, base_url, model, key: String)` (normalises
+    /// the model id, always sends Bearer) and `OpenAiCompatibleChat::list_models(&self)`
+    /// (`GET {base}/models` with Bearer, ids with the `models/` prefix stripped).
+    #[tokio::test]
+    async fn gemini_chat_sends_bearer_to_chat_completions_and_models() {
+        assert_eq!(
+            GEMINI_BASE_URL,
+            "https://generativelanguage.googleapis.com/v1beta/openai/"
+        );
+        let (base_url, seen) = stub_gemini().await;
+        let chat = OpenAiCompatibleChat::gemini_with_client(
+            reqwest::Client::new(),
+            base_url,
+            "gemini-api/gemini-2.5-flash".to_string(),
+            "AIza-test-key".to_string(),
+        );
+
+        chat.exchange(
+            vec![serde_json::json!({ "role": "user", "content": "hello" })],
+            None,
+        )
+        .await
+        .expect("the stub answers one usable choice");
+        let ids = chat.list_models().await.expect("the stub lists models");
+        assert_eq!(ids, ["gemini-2.5-flash", "gemini-2.5-pro"]);
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "one chat request and one models request");
+        let (method, path, auth, _) = &seen[0];
+        assert_eq!((method.as_str(), path.as_str()), ("POST", "/v1beta/openai/chat/completions"));
+        assert_eq!(auth.as_deref(), Some("Bearer AIza-test-key"));
+        let (method, path, auth, _) = &seen[1];
+        assert_eq!((method.as_str(), path.as_str()), ("GET", "/v1beta/openai/models"));
+        assert_eq!(auth.as_deref(), Some("Bearer AIza-test-key"));
+    }
+
+    /// RED (plan Node 3, test 4, extended by E22): whichever way the pick is written, the wire
+    /// carries the bare model id. A stored pin keeps its `gemini-api/` prefix; only the wire loses it.
+    #[tokio::test]
+    async fn gemini_model_id_models_prefix_is_stripped() {
+        for given in [
+            "gemini-api/x",
+            "gemini-api/models/x",
+            "models/x",
+            "x",
+        ] {
+            let (base_url, seen) = stub_gemini().await;
+            let chat = OpenAiCompatibleChat::gemini_with_client(
+                reqwest::Client::new(),
+                base_url,
+                given.to_string(),
+                "AIza-test-key".to_string(),
+            );
+            chat.exchange(
+                vec![serde_json::json!({ "role": "user", "content": "hello" })],
+                None,
+            )
+            .await
+            .expect("the stub answers one usable choice");
+
+            let seen = seen.lock().unwrap();
+            let body: serde_json::Value = serde_json::from_str(&seen[0].3).unwrap();
+            assert_eq!(
+                body["model"], "x",
+                "{given:?} must go on the wire as the bare id"
+            );
+        }
+    }
+
     /// The measured number always beats the stated one.
     ///
     /// `resolve_context_window` exists because an OpenAI-compatible server may or may not publish

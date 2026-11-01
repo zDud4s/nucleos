@@ -615,6 +615,21 @@ mod tests {
         assert_eq!(validate_request(&asked), Ok(()));
     }
 
+    /// RED (plan Node 3, test 8). The Gemini API row exists in the core's table, so this crate's
+    /// hand-written list and its refusal sentence must name it too; the `engines_missing_from` guard
+    /// in the core fails loudly otherwise.
+    #[test]
+    fn engines_list_includes_gemini_api() {
+        assert!(ENGINES.contains(&"gemini-api"));
+        let mut asked = request("analyst");
+        asked.engine = Some("nonexistent".to_owned());
+        let refusal = validate_request(&asked).unwrap_err();
+        assert!(refusal.contains("gemini-api"), "{refusal}");
+        // Declaring it passes this crate's validation; the launch surfaces refuse it by name.
+        asked.engine = Some("gemini-api".to_owned());
+        assert_eq!(validate_request(&asked), Ok(()));
+    }
+
     #[tokio::test]
     async fn create_list_get_update_and_delete_round_trip() {
         let pool = pool().await;

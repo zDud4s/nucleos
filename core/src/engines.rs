@@ -358,6 +358,62 @@ mod tests {
         assert!((row("local").runner)(&models).is_none());
     }
 
+    /// RED (plan Node 3, test 1; contract E6/E22). The Gemini API is ONE Http row with no CLI runner,
+    /// whose gate is "a key is stored". The gate is flipped through
+    /// `gemini_test_support::gemini_gate`, which GREEN adds beside `agy_test_support` and which
+    /// replaces the credential-store read for the guard's lifetime; no real credential is touched.
+    #[test]
+    fn gemini_api_row_is_http_without_runner_and_off_cli_lists() {
+        assert_eq!(GEMINI_API, "gemini-api");
+        let rows: Vec<_> = TABLE.iter().filter(|row| row.id == GEMINI_API).collect();
+        assert_eq!(rows.len(), 1, "exactly one gemini-api row");
+        let row = rows[0];
+        assert!(!row.display_name.is_empty());
+        assert_eq!(row.transport, Transport::Http);
+        assert!((row.runner)(&ModelsConfig::default()).is_none());
+        assert_eq!(
+            (row.utility_default)(&[]),
+            None,
+            "no cheap tier is invented for it"
+        );
+
+        // Gate: true only with a key stored.
+        {
+            let _gate = gemini_test_support::gemini_gate(false);
+            assert!(!(row.gate)());
+            assert!(!enabled_in(TABLE).iter().any(|r| r.id == GEMINI_API));
+        }
+        {
+            let _gate = gemini_test_support::gemini_gate(true);
+            assert!((row.gate)());
+            assert!(enabled_in(TABLE).iter().any(|r| r.id == GEMINI_API));
+        }
+
+        // Off the CLI lists: not a CLI row, so no id lookup launches it and an unknown-looking
+        // runner string still collapses to claude.
+        assert!(cli_row_in(TABLE, GEMINI_API).is_none());
+        assert!(!ids_with_transport_in(TABLE, Transport::Cli).contains(&GEMINI_API));
+        assert_eq!(runner_id_in(TABLE, GEMINI_API), CLAUDE);
+        let _gate = gemini_test_support::gemini_gate(true);
+        assert!(
+            !crate::agents::capabilities::translatable_runners(&[])
+                .iter()
+                .any(|kind| kind.as_str() == GEMINI_API)
+        );
+        assert!(
+            !crate::models::route_advice::installed_engines()
+                .iter()
+                .any(|kind| kind.as_str() == GEMINI_API)
+        );
+
+        // Seat-kind based lists include it.
+        assert!(
+            crate::config::ENGINE_SEAT_KINDS
+                .iter()
+                .any(|(id, _)| *id == GEMINI_API)
+        );
+    }
+
     #[test]
     fn derived_lists_follow_the_table() {
         // Seat kinds: `ENGINE_SEAT_KINDS` is the derived list and the only consumer.
