@@ -14,7 +14,8 @@
  * more.
  *
  * **An unknown provider still draws.** The list is whatever the sidecar could read and it will
- * grow — `gemini` is already a name in this repository's tests. A provider with no mark gets its
+ * grow — `gemini` has a mark below, `agy` deliberately has none: no asset exists and none is
+ * invented, so the Antigravity CLI draws the initial "A". A provider with no mark gets its
  * initial, which is legible at this size and reads as a stand-in, rather than vanishing and
  * leaving a ring nobody can attribute.
  *

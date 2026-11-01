@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import { useModelGroups } from "../data/chats";
+import { splitByRoute } from "../chats/model-routes";
 import { useMachineSecrets, type MachineSecret } from "../data/secrets";
 import { Select } from "../ui";
 import { enumOptions, type SchemaNode } from "./schema";
@@ -42,6 +43,12 @@ function ModelPicker(props: WidgetProps) {
   for (const group of groups.data?.groups ?? []) {
     for (const model of group.models) listed.add(model.id);
   }
+  // Route rows (agy, Gemini API) leave their company group and get an optgroup of their own.
+  const split = splitByRoute((groups.data?.groups ?? []).flatMap((group) => group.models));
+  const houseIds = new Set(split.house.map((model) => model.id));
+  const companies = (groups.data?.groups ?? [])
+    .map((group) => ({ ...group, models: group.models.filter((model) => houseIds.has(model.id)) }))
+    .filter((group) => group.models.length > 0);
   return (
     <Select
       value={value}
@@ -50,11 +57,21 @@ function ModelPicker(props: WidgetProps) {
     >
       {nullable || value === "" ? <option value="">{nullable ? "(none)" : "Choose a model"}</option> : null}
       {value !== "" && !listed.has(value) ? <option value={value}>{value}</option> : null}
-      {(groups.data?.groups ?? []).map((group) => (
+      {companies.map((group) => (
         <optgroup key={`${group.provider}/${group.family}`} label={group.label}>
           {group.models.map((model) => (
             <option key={model.id} value={model.id}>
               {model.label}
+            </option>
+          ))}
+        </optgroup>
+      ))}
+      {split.routes.map(({ route, models }) => (
+        <optgroup key={route.runner} label={route.section}>
+          {models.map((model) => (
+            <option key={model.id} value={model.id}>
+              {/* A native option cannot carry a badge element, so the route is in the label. */}
+              {`${model.label} (${route.badge})`}
             </option>
           ))}
         </optgroup>

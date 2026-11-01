@@ -113,6 +113,54 @@ describe("the model picker", () => {
   });
 });
 
+describe("the model picker routes", () => {
+  it("model picker puts agy rows in an agy optgroup with the route in the label", async () => {
+    const sonnet = { id: "claude-sonnet-4-6", label: "Sonnet 4.6", brain: "cloud", efforts: [] };
+    const agySonnet = {
+      id: "agy/claude-sonnet-4-6",
+      label: "Sonnet 4.6",
+      brain: "cloud",
+      efforts: [],
+      runner: "agy",
+    };
+    daemon.apiFetch.mockImplementation((path: string) => {
+      if (path.startsWith("/assistant/models/groups")) {
+        return Promise.resolve({
+          // The daemon files an agy row by the hosted model's family, inside the Claude company.
+          groups: [
+            {
+              provider: "anthropic",
+              family: "sonnet",
+              label: "Claude · Sonnet",
+              models: [sonnet, agySonnet],
+            },
+          ],
+          source: "fallback",
+          catalogue_version: "1",
+          fetched_at: null,
+        });
+      }
+      return Promise.reject(new Error(`unexpected ${path}`));
+    });
+
+    renderWithQuery(<Host widget="model-picker" nullable />);
+    const select = screen.getByLabelText("the field");
+    await waitFor(() => {
+      expect(within(select).getByRole("option", { name: "Sonnet 4.6 (agy CLI)" })).toBeDefined();
+    });
+
+    const agy = within(select).getByRole("group", { name: "Antigravity CLI" });
+    expect(within(agy).getByRole("option", { name: "Sonnet 4.6 (agy CLI)" })).toBeDefined();
+    // The company optgroup keeps only the house row.
+    const claude = within(select).getByRole("group", { name: "Claude · Sonnet" });
+    expect(within(claude).getByRole("option", { name: "Sonnet 4.6" })).toBeDefined();
+    expect(within(claude).queryByRole("option", { name: /agy/ })).toBeNull();
+
+    fireEvent.change(select, { target: { value: "agy/claude-sonnet-4-6" } });
+    expect(screen.getByTestId("value").textContent).toBe("agy/claude-sonnet-4-6");
+  });
+});
+
 describe("the cron box", () => {
   it("says what is wrong while the text is wrong, and writes it anyway", () => {
     renderWithQuery(<Host widget="cron" />);

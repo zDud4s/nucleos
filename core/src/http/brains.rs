@@ -546,6 +546,9 @@ pub(super) const IDE_SESSIONS_SHOWN: usize = 40;
 #[derive(serde::Deserialize)]
 pub(super) struct ModelsQuery {
     pub(super) chat: Option<String>,
+    /// `chat` asks for the chat menu without naming a chat (the front door, before a chat exists).
+    /// Any other value, or none, is the daemon menu: an unknown scope never widens the answer.
+    pub(super) scope: Option<String>,
 }
 
 /// Which models a conversation may be moved to, and how hard each can be asked to think.
@@ -565,9 +568,10 @@ pub(super) async fn get_assistant_models(
     State(state): State<AppState>,
     Query(query): Query<ModelsQuery>,
 ) -> Json<serde_json::Value> {
-    let asking = match query.chat {
-        Some(_) => Asking::Chat,
-        None => Asking::Daemon,
+    let asking = if query.chat.is_some() || query.scope.as_deref() == Some("chat") {
+        Asking::Chat
+    } else {
+        Asking::Daemon
     };
     let (config, choices) = menu(asking).await;
 
@@ -693,4 +697,88 @@ pub(super) async fn get_commands(Query(query): Query<MentionQuery>) -> Json<serd
 /// missing one it does have costs the restriction.
 pub(super) async fn get_deniable_tools() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "tools": crate::execution::runner::BUILTIN_TOOLS }))
+}
+
+#[cfg(test)]
+mod tests {
+    //! The chat-scoped model menu (`GET /assistant/models?scope=chat`).
+    //!
+    //! The Gemini key gate is a thread-local override, so the request runs on the test's own
+    //! thread: a current-thread `#[tokio::test]` driving the router in-process with `oneshot`.
+    //! `agy_gate` publishes a process-global settings snapshot (it holds the settings serial lock
+    //! for the guard's life), so tests that install settings serialise on that lock.
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    use super::*;
+
+    /// One GET through the real router; returns the status and the JSON body.
+    async fn get(state: &AppState, uri: &str) -> (StatusCode, serde_json::Value) {
+        let request = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("Authorization", "Bearer test-token")
+            .body(Body::empty())
+            .unwrap();
+        let response = super::super::build_router(state.clone())
+            .oneshot(request)
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    fn has_runner(body: &serde_json::Value, runner: &str) -> bool {
+        body["choices"]
+            .as_array()
+            .map(|choices| choices.iter().any(|c| c["runner"] == runner))
+            .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn assistant_models_scope_chat_offers_agy_and_gemini_rows() {
+        let _agy = crate::engines::agy_test_support::agy_gate(true);
+        let _key = crate::engines::gemini_test_support::gemini_gate(true);
+        let state = super::super::tests::test_state().await;
+
+        let (status, body) = get(&state, "/assistant/models?scope=chat").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            has_runner(&body, "agy"),
+            "no agy row in the chat scope: {body}"
+        );
+        assert!(
+            has_runner(&body, "gemini-api"),
+            "no gemini-api row in the chat scope: {body}"
+        );
+
+        // Agents ask without a scope and must keep refusing both by name.
+        let (status, body) = get(&state, "/assistant/models").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !has_runner(&body, "agy"),
+            "agy leaked into the daemon scope"
+        );
+        assert!(
+            !has_runner(&body, "gemini-api"),
+            "gemini-api leaked into the daemon scope"
+        );
+
+        // An unknown scope is the daemon scope, never a wider one.
+        let (status, body) = get(&state, "/assistant/models?scope=bogus").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!has_runner(&body, "agy"), "agy leaked through scope=bogus");
+        assert!(
+            !has_runner(&body, "gemini-api"),
+            "gemini-api leaked through scope=bogus"
+        );
+    }
 }
