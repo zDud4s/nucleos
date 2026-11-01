@@ -47,7 +47,13 @@ pub struct OpenAiCompatibleChat {
     base_url: String,
     model: String,
     key: Option<String>,
+    /// The vendor's name in a refusal ("OpenRouter", "Gemini API"); the wire does not depend on it.
+    provider: &'static str,
 }
+
+/// The Gemini API's OpenAI-compatible base (Google's documented endpoint, contract E6). The trailing
+/// slash is trimmed by the constructors, like every base here.
+pub const GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta/openai/";
 
 /// Ceiling on one exchange with the hosted model.
 ///
@@ -107,6 +113,7 @@ impl OpenAiCompatibleChat {
             base_url: base_url.trim_end_matches('/').to_string(),
             model,
             key: Some(key),
+            provider: "OpenRouter",
         })
     }
 
@@ -130,7 +137,61 @@ impl OpenAiCompatibleChat {
             base_url: base_url.trim_end_matches('/').to_string(),
             model,
             key,
+            provider: "OpenRouter",
         }
+    }
+
+    /// The Gemini API client: the same wire, Google's key and Google's errors. `model` may be a
+    /// stored pick (`gemini-api/x`), Google's own id shape (`models/x`) or the bare id; the wire
+    /// carries the bare id. The key is mandatory and always sent as `Bearer`.
+    pub fn gemini_with_client(
+        client: reqwest::Client,
+        base_url: String,
+        model: String,
+        key: String,
+    ) -> Self {
+        let bare = model.strip_prefix("gemini-api/").unwrap_or(&model);
+        let bare = bare.strip_prefix("models/").unwrap_or(bare).to_string();
+        Self {
+            client,
+            base_url: base_url.trim_end_matches('/').to_string(),
+            model: bare,
+            key: Some(key),
+            provider: "Gemini API",
+        }
+    }
+
+    /// The model ids this endpoint lists (`GET {base}/models`, `data[].id`), without the `models/`
+    /// prefix Google puts on them. Sent with the same bearer key as a chat.
+    pub async fn list_models(&self) -> std::io::Result<Vec<String>> {
+        let mut request = self.client.get(format!("{}/models", self.base_url));
+        if let Some(key) = &self.key {
+            request = request.bearer_auth(key);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(std::io::Error::other)?
+            .json::<Value>()
+            .await
+            .map_err(std::io::Error::other)?;
+        let response = response
+            .as_array()
+            .and_then(|items| items.first())
+            .unwrap_or(&response);
+        let Some(data) = response.get("data").and_then(Value::as_array) else {
+            let reason = response
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("returned no model list");
+            return Err(std::io::Error::other(format!("{}: {reason}", self.provider)));
+        };
+        Ok(data
+            .iter()
+            .filter_map(|entry| entry.get("id").and_then(Value::as_str))
+            .map(|id| id.strip_prefix("models/").unwrap_or(id).to_string())
+            .collect())
     }
 }
 
@@ -150,6 +211,17 @@ impl OpenAiCompatibleChat {
 /// so the `Err` it returns carries OpenRouter's own stated reason rather than a generic
 /// "no choices" that tells nobody what to fix.
 fn assistant_message(response: &Value) -> std::io::Result<Value> {
+    assistant_message_of(response, "OpenRouter")
+}
+
+/// `assistant_message` with the provider named in the error: the dialect is shared, the vendor's
+/// name in a refusal is not.
+fn assistant_message_of(response: &Value, provider: &str) -> std::io::Result<Value> {
+    // Google can answer an error as a one-element array holding the same `{"error": ...}` object.
+    let response = response
+        .as_array()
+        .and_then(|items| items.first())
+        .unwrap_or(response);
     if let Some(message) = response
         .get("choices")
         .and_then(Value::as_array)
@@ -167,9 +239,10 @@ fn assistant_message(response: &Value) -> std::io::Result<Value> {
         .get("error")
         .and_then(|error| error.get("message"))
         .and_then(Value::as_str)
-        .unwrap_or("OpenRouter returned no usable choices");
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("{provider} returned no usable choices"));
 
-    Err(std::io::Error::other(format!("OpenRouter: {reason}")))
+    Err(std::io::Error::other(format!("{provider}: {reason}")))
 }
 
 #[async_trait]
@@ -233,7 +306,7 @@ impl crate::models::local_agent::LocalChat for OpenAiCompatibleChat {
             .await
             .map_err(classify)?;
 
-        assistant_message(&response)
+        assistant_message_of(&response, self.provider)
     }
 }
 

@@ -650,6 +650,38 @@ fn set_openrouter_key() {
     }
 }
 
+/// The pure core of `--set-gemini-key`. `read` is `read_secret_from_stdin` in production (the only
+/// source of the key, never `argv`) and `store` is `secrets::store_secret`. Returns the line to
+/// print, which never contains the key, or the failure, which never does either.
+pub(super) fn store_gemini_key(
+    read: impl FnOnce(&str) -> Option<String>,
+    store: impl FnOnce(&str, &str) -> Result<(), String>,
+) -> Result<String, String> {
+    let Some(value) = read("paste the Gemini API key, then press Enter:") else {
+        return Err("no gemini key was read from stdin".to_owned());
+    };
+    store(GEMINI_KEY, &value)
+        .map_err(|error| format!("failed to store gemini key: {error}"))?;
+    Ok("gemini key stored in the system credential store".to_owned())
+}
+
+fn set_gemini_key() {
+    let outcome = store_gemini_key(read_secret_from_stdin, |key, value| {
+        secrets::store_secret(key, value).map_err(|error| error.to_string())
+    });
+    match outcome {
+        Ok(said) => {
+            println!("{said}");
+            // Said here, as for OpenRouter, because the daemon reads the key once at startup.
+            eprintln!("restart the daemon: the Gemini API key is read at startup");
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+    }
+}
+
 async fn mcp_tools() {
     // `--box job-node --job <id>` narrows what this process serves. Refused rather than
     // ignored when the box is not one this server knows: a launcher that misspells it would
@@ -901,6 +933,10 @@ pub(super) async fn run_subcommand() -> bool {
     }
     if std::env::args().any(|a| a == "--set-openrouter-key") {
         set_openrouter_key();
+        return true;
+    }
+    if std::env::args().any(|a| a == "--set-gemini-key") {
+        set_gemini_key();
         return true;
     }
     if std::env::args().any(|a| a == "--mcp-tools") {

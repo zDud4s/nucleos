@@ -33,6 +33,9 @@ const WEB_SEARCH_KEY: &str = "web-search-api-key";
 /// see its own doc comment for why that refusal happens before any request leaves the machine
 /// rather than after a 401 comes back.
 const OPENROUTER_KEY: &str = "openrouter-api-key";
+/// The Gemini API key, in Credential Manager like OpenRouter's. The name lives in `engines` because
+/// the engine row's gate reads the same credential from the library crate.
+const GEMINI_KEY: &str = nucleos_core::engines::GEMINI_KEY;
 
 /// A machine-scoped document from the settings snapshot, or its default when none is stored.
 fn machine_doc<T: settings::Document + Default>() -> T {
