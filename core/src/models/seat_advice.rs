@@ -334,6 +334,10 @@ pub async fn suggest(
             .filter(|kind| *kind != RunnerKind::Agy)
             .collect(),
     };
+    // A request with no globs is "any model" to the router, so nothing is asked.
+    if runners.is_empty() {
+        return Err("the model adviser has no engine that can take a recruit here".to_owned());
+    }
     let sent = router.build_request(&seat_query(task), &runners);
     ask(&router, &sent, None, |advice| {
         router.check_answer(advice, &sent).map(|_| ())
