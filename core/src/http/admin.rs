@@ -1012,6 +1012,9 @@ mod autostart_tests {
 struct SystemShutdownQuery {
     /// How long to wait for the live runs, in seconds. Absent means the default; capped.
     timeout_secs: Option<u64>,
+    /// The run asking for the restart (`NUCLEOS_RUN_ID`). Its chat, not just the run, is left out
+    /// of the wait: a kept process carries the first turn's id into later turns.
+    requester_run: Option<i64>,
 }
 
 /// `POST /system/shutdown`: stop the daemon once no run is live, without ever interrupting one.
@@ -1030,6 +1033,7 @@ async fn post_system_shutdown(
         .map(std::time::Duration::from_secs)
         .unwrap_or(crate::shutdown::DEFAULT_DRAIN_TIMEOUT)
         .min(crate::shutdown::MAX_DRAIN_TIMEOUT);
+    let requester_run = query.requester_run;
 
     if crate::shutdown::begin_draining() {
         tracing::warn!(
@@ -1040,18 +1044,24 @@ async fn post_system_shutdown(
         tokio::spawn(async move {
             match crate::shutdown::drain_until_idle(
                 &pool,
+                requester_run,
                 timeout,
                 crate::shutdown::DRAIN_POLL,
                 request_shutdown,
+                &crate::hooks::run_is_parked,
             )
             .await
             {
                 Ok(crate::shutdown::DrainOutcome::Stopped) => {
-                    tracing::warn!("no run is live: stopping the daemon for the update");
+                    tracing::warn!("no run blocks the restart: stopping the daemon for the update");
                 }
-                Ok(crate::shutdown::DrainOutcome::TimedOut { live_runs }) => {
+                Ok(crate::shutdown::DrainOutcome::TimedOut {
+                    live_runs,
+                    waiting_on,
+                }) => {
                     tracing::warn!(
                         live_runs,
+                        ?waiting_on,
                         "the update drain timed out; the daemon carries on"
                     );
                 }
@@ -1065,7 +1075,7 @@ async fn post_system_shutdown(
         });
     }
 
-    crate::shutdown::readiness(&state.pool)
+    crate::shutdown::readiness_for(&state.pool, requester_run, &crate::hooks::run_is_parked)
         .await
         .map(|readiness| (StatusCode::ACCEPTED, Json(readiness)))
         .map_err(|error| {
