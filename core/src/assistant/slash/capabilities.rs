@@ -18,18 +18,14 @@ pub struct ChatEngine(crate::engines::EngineId);
 
 #[allow(non_upper_case_globals)]
 impl ChatEngine {
-    pub const Claude: ChatEngine =
-        ChatEngine(crate::engines::EngineId::from_row(crate::engines::CLAUDE));
-    pub const Codex: ChatEngine =
-        ChatEngine(crate::engines::EngineId::from_row(crate::engines::CODEX));
-    pub const Local: ChatEngine =
-        ChatEngine(crate::engines::EngineId::from_row(crate::engines::LOCAL));
-    pub const Agy: ChatEngine = ChatEngine(crate::engines::EngineId::from_row(crate::engines::AGY));
+    pub const Claude: ChatEngine = ChatEngine(crate::engines::EngineId::CLAUDE);
+    pub const Codex: ChatEngine = ChatEngine(crate::engines::EngineId::CODEX);
+    pub const Local: ChatEngine = ChatEngine(crate::engines::EngineId::LOCAL);
+    pub const Agy: ChatEngine = ChatEngine(crate::engines::EngineId::AGY);
     /// The Google Gemini API: a hosted chat whose pinned model carries the `gemini-api/` prefix.
-    pub const GeminiApi: ChatEngine =
-        ChatEngine(crate::engines::EngineId::from_row(crate::engines::GEMINI_API));
+    pub const GeminiApi: ChatEngine = ChatEngine(crate::engines::EngineId::GEMINI_API);
     /// Not an engine row: OpenRouter is a hosted brain, not a launchable engine.
-    pub const OpenRouter: ChatEngine = ChatEngine(crate::engines::EngineId::from_row("openrouter"));
+    pub const OpenRouter: ChatEngine = ChatEngine(crate::engines::EngineId::OPENROUTER);
 
     /// The name the refusal text and the cards use.
     pub fn as_str(self) -> &'static str {
@@ -44,7 +40,7 @@ impl ChatEngine {
     /// `of_cli` over an explicit table: a CLI row of it maps to itself, anything else to claude.
     pub fn of_cli_in(table: &[crate::engines::EngineDescription], cli: &str) -> Self {
         match crate::engines::cli_row_in(table, cli) {
-            Some(row) => Self(crate::engines::EngineId::from_row(row.id)),
+            Some(row) => Self(crate::engines::EngineId::of_row(row)),
             None => Self::Claude,
         }
     }
@@ -63,7 +59,8 @@ impl ChatEngine {
         let id = crate::engines::chat_ids_in(&enabled)
             .into_iter()
             .find(|row| *row == id)?;
-        Some(Self(crate::engines::EngineId::from_row(id)))
+        let row = enabled.iter().find(|row| row.id == id)?;
+        Some(Self(crate::engines::EngineId::of_row(row)))
     }
 }
 

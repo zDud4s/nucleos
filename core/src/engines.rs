@@ -338,6 +338,19 @@ pub fn runner_for_primary_in(
 pub struct EngineId(&'static str);
 
 impl EngineId {
+    pub const CLAUDE: EngineId = EngineId(CLAUDE);
+    pub const CODEX: EngineId = EngineId(CODEX);
+    pub const LOCAL: EngineId = EngineId(LOCAL);
+    pub const AGY: EngineId = EngineId(AGY);
+    pub const GEMINI_API: EngineId = EngineId(GEMINI_API);
+    /// Not a table row: OpenRouter is a hosted brain, not a launchable engine.
+    pub const OPENROUTER: EngineId = EngineId("openrouter");
+
+    /// The id of a table row. No public function turns an arbitrary string into an id.
+    pub fn of_row(row: &EngineDescription) -> EngineId {
+        EngineId(row.id)
+    }
+
     /// The id for a stored text that names a `TABLE` row; used by the associated consts of
     /// `Engine`, `RunnerKind` and `ChatEngine`, which pass the `engines::` id constants.
     pub(crate) const fn from_row(id: &'static str) -> EngineId {
