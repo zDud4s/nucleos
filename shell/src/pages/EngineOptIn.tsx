@@ -65,7 +65,7 @@ export function EngineOptIn({ engine, label }: { engine: string; label: string }
         <RefusalNote refusal={refusal} />
       ) : set.error ? (
         // A write that got no answer may still have landed, so it never claims "not changed".
-        <ErrorNote>the {DAEMON_NAME} did not answer: whether {label} was changed is unknown</ErrorNote>
+        <ErrorNote>the {DAEMON_NAME} is not responding: whether {label} was changed is unknown</ErrorNote>
       ) : state.error ? (
         <ErrorNote>
           the {DAEMON_NAME} is not responding: could not read the setting for {label}
