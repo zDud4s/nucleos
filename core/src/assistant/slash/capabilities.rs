@@ -9,37 +9,43 @@ use crate::chats::Brain;
 use crate::config::ModelsConfig;
 
 /// The engine that answers a conversation.
+///
+/// A table-backed id: the named consts are the rows the production code names (plus OpenRouter,
+/// which is a hosted brain and not a table row); any other row is a `ChatEngine` of its own, never
+/// a stand-in for Claude.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChatEngine {
-    Claude,
-    Codex,
-    Local,
-    OpenRouter,
-    Agy,
-    /// The Google Gemini API: a hosted chat whose pinned model carries the `gemini-api/` prefix.
-    GeminiApi,
-}
+pub struct ChatEngine(crate::engines::EngineId);
 
+#[allow(non_upper_case_globals)]
 impl ChatEngine {
+    pub const Claude: ChatEngine =
+        ChatEngine(crate::engines::EngineId::from_row(crate::engines::CLAUDE));
+    pub const Codex: ChatEngine =
+        ChatEngine(crate::engines::EngineId::from_row(crate::engines::CODEX));
+    pub const Local: ChatEngine =
+        ChatEngine(crate::engines::EngineId::from_row(crate::engines::LOCAL));
+    pub const Agy: ChatEngine = ChatEngine(crate::engines::EngineId::from_row(crate::engines::AGY));
+    /// The Google Gemini API: a hosted chat whose pinned model carries the `gemini-api/` prefix.
+    pub const GeminiApi: ChatEngine =
+        ChatEngine(crate::engines::EngineId::from_row(crate::engines::GEMINI_API));
+    /// Not an engine row: OpenRouter is a hosted brain, not a launchable engine.
+    pub const OpenRouter: ChatEngine = ChatEngine(crate::engines::EngineId::from_row("openrouter"));
+
     /// The name the refusal text and the cards use.
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Claude => crate::engines::CLAUDE,
-            Self::Codex => crate::engines::CODEX,
-            Self::Local => crate::engines::LOCAL,
-            Self::Agy => crate::engines::AGY,
-            Self::GeminiApi => crate::engines::GEMINI_API,
-            // Not an engine row: OpenRouter is a hosted brain, not a launchable engine.
-            Self::OpenRouter => "openrouter",
-        }
+        self.0.as_str()
     }
 
     /// The chat engine of a CLI runner string; unknown strings collapse to claude.
     fn of_cli(cli: &str) -> Self {
-        match crate::engines::runner_id_in(crate::engines::TABLE, cli) {
-            crate::engines::CODEX => Self::Codex,
-            crate::engines::AGY => Self::Agy,
-            _ => Self::Claude,
+        Self::of_cli_in(crate::engines::TABLE, cli)
+    }
+
+    /// `of_cli` over an explicit table: a CLI row of it maps to itself, anything else to claude.
+    pub fn of_cli_in(table: &[crate::engines::EngineDescription], cli: &str) -> Self {
+        match crate::engines::cli_row_in(table, cli) {
+            Some(row) => Self(crate::engines::EngineId::from_row(row.id)),
+            None => Self::Claude,
         }
     }
 
@@ -47,21 +53,17 @@ impl ChatEngine {
     /// table does not list (agy with its setting off included) is `None`: the caller refuses it,
     /// it never becomes Claude.
     pub fn from_stored(id: &str) -> Option<Self> {
-        let enabled: Vec<crate::engines::EngineDescription> = crate::engines::enabled_table()
-            .into_iter()
-            .cloned()
-            .collect();
+        Self::from_stored_in(crate::engines::TABLE, id)
+    }
+
+    /// `from_stored` over an explicit table.
+    pub fn from_stored_in(table: &[crate::engines::EngineDescription], id: &str) -> Option<Self> {
+        let enabled: Vec<crate::engines::EngineDescription> =
+            crate::engines::enabled_in(table).into_iter().cloned().collect();
         let id = crate::engines::chat_ids_in(&enabled)
             .into_iter()
             .find(|row| *row == id)?;
-        match id {
-            crate::engines::CLAUDE => Some(Self::Claude),
-            crate::engines::CODEX => Some(Self::Codex),
-            crate::engines::LOCAL => Some(Self::Local),
-            crate::engines::AGY => Some(Self::Agy),
-            crate::engines::GEMINI_API => Some(Self::GeminiApi),
-            _ => None,
-        }
+        Some(Self(crate::engines::EngineId::from_row(id)))
     }
 }
 
@@ -110,7 +112,19 @@ pub fn engine_of(config: &ModelsConfig, brain: Brain, model: Option<&str>) -> Ch
 /// The table of spec section 6.
 pub fn support(engine: ChatEngine, capability: Capability) -> Support {
     use Capability::*;
-    use ChatEngine::*;
+    // Associated consts cannot be imported with `use`; local consts keep the short pattern names.
+    #[allow(non_upper_case_globals)]
+    const Claude: ChatEngine = ChatEngine::Claude;
+    #[allow(non_upper_case_globals)]
+    const Codex: ChatEngine = ChatEngine::Codex;
+    #[allow(non_upper_case_globals)]
+    const Local: ChatEngine = ChatEngine::Local;
+    #[allow(non_upper_case_globals)]
+    const OpenRouter: ChatEngine = ChatEngine::OpenRouter;
+    #[allow(non_upper_case_globals)]
+    const Agy: ChatEngine = ChatEngine::Agy;
+    #[allow(non_upper_case_globals)]
+    const GeminiApi: ChatEngine = ChatEngine::GeminiApi;
     use Support::{No, Warn, Yes};
     match (capability, engine) {
         (Effort | ExtraDirs | RegistryMcp, Claude | Codex) => Yes,

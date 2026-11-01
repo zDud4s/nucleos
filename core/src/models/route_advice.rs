@@ -109,30 +109,40 @@ impl Surface {
 }
 
 /// A CLI the daemon can launch, named as the router names it (`route_api.RUNNERS`).
+///
+/// A table-backed id: the named consts are the rows the production code names, and any other CLI
+/// row is a `RunnerKind` of its own, never a stand-in for Claude. Ordered by table position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum RunnerKind {
-    Claude,
-    Codex,
-    Agy,
-}
+pub struct RunnerKind(pub(crate) crate::engines::EngineId);
 
+#[allow(non_upper_case_globals)]
 impl RunnerKind {
+    pub const Claude: RunnerKind =
+        RunnerKind(crate::engines::EngineId::from_row(crate::engines::CLAUDE));
+    pub const Codex: RunnerKind =
+        RunnerKind(crate::engines::EngineId::from_row(crate::engines::CODEX));
+    pub const Agy: RunnerKind =
+        RunnerKind(crate::engines::EngineId::from_row(crate::engines::AGY));
+
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Claude => crate::engines::CLAUDE,
-            Self::Codex => crate::engines::CODEX,
-            Self::Agy => crate::engines::AGY,
-        }
+        self.0.as_str()
     }
 
-    /// The kind of a CLI row of the engine table; `None` for any other id (`local` included).
+    /// The kind of a CLI row of the production table; `None` for any other id (`local` included).
     pub fn parse(value: &str) -> Option<Self> {
-        match crate::engines::cli_row_in(crate::engines::TABLE, value)?.id {
-            crate::engines::CLAUDE => Some(Self::Claude),
-            crate::engines::CODEX => Some(Self::Codex),
-            crate::engines::AGY => Some(Self::Agy),
-            _ => None,
-        }
+        Self::parse_in(crate::engines::TABLE, value)
+    }
+
+    /// The kind of a CLI row of `table`; `None` for any other id.
+    pub fn parse_in(table: &[crate::engines::EngineDescription], value: &str) -> Option<Self> {
+        let row = crate::engines::cli_row_in(table, value)?;
+        Some(Self(crate::engines::EngineId::from_row(row.id)))
+    }
+
+    /// A kind outside the production table, to exercise the fail-closed arms.
+    #[cfg(any(test, feature = "testkit"))]
+    pub fn for_test(id: &'static str) -> Self {
+        Self(crate::engines::EngineId::for_test(id))
     }
 }
 
@@ -409,8 +419,6 @@ impl Router {
                 // steering, a forked session).
                 RunnerKind::Agy => agy_can_take(shape) && crate::engines::agy::enabled(),
                 // An engine with no arm is never offered as an alternate.
-                // Closes when the id flip lands.
-                #[allow(unreachable_patterns)]
                 _ => false,
             };
             if fits && !kinds.contains(&alternate.kind) {
@@ -1015,8 +1023,7 @@ fn default_model(models: &crate::config::ModelsConfig, kind: RunnerKind) -> Stri
         // No model file names an agy default; the engine's own constant does.
         RunnerKind::Agy => crate::engines::agy::DEFAULT_MODEL.to_owned(),
         // An engine with no arm has no default model: the empty string names none, and never
-        // borrows Claude's. Closes when the id flip lands.
-        #[allow(unreachable_patterns)]
+        // borrows Claude's.
         _ => String::new(),
     }
 }
@@ -1193,6 +1200,8 @@ mod tests {
                 RunnerKind::Claude => "claude-sonnet-5".into(),
                 RunnerKind::Codex => "gpt-5.6-terra".into(),
                 RunnerKind::Agy => "agy/gemini-3.8-flash-high".into(),
+                // A kind the fixtures do not name has no default model.
+                _ => String::new(),
             },
             models: globs.iter().map(|glob| (*glob).to_owned()).collect(),
         }
@@ -2162,7 +2171,11 @@ mod tests {
 
     #[test]
     fn a_restriction_intersects_the_eligible_runners() {
-        use RunnerKind::{Claude, Codex};
+        // Associated consts cannot be imported with `use`; local consts keep the short names.
+        #[allow(non_upper_case_globals)]
+        const Claude: RunnerKind = RunnerKind::Claude;
+        #[allow(non_upper_case_globals)]
+        const Codex: RunnerKind = RunnerKind::Codex;
         let both = vec![Claude, Codex];
         assert_eq!(narrowed_runners(both.clone(), None, &[]), both);
         assert_eq!(
@@ -2182,7 +2195,11 @@ mod tests {
 
     #[test]
     fn a_restriction_is_applied_before_the_quota_brake_subtracts() {
-        use RunnerKind::{Claude, Codex};
+        // Associated consts cannot be imported with `use`; local consts keep the short names.
+        #[allow(non_upper_case_globals)]
+        const Claude: RunnerKind = RunnerKind::Claude;
+        #[allow(non_upper_case_globals)]
+        const Codex: RunnerKind = RunnerKind::Codex;
         let both = vec![Claude, Codex];
         assert_eq!(
             narrowed_runners(both.clone(), Some(&[Claude, Codex]), &[Claude]),

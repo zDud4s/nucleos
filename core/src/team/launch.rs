@@ -762,8 +762,7 @@ fn runner_kind_of(
         Engine::Codex => Ok(Some(RunnerKind::Codex)),
         Engine::Local => Ok(None),
         Engine::Agy => Err(crate::engines::AGY_REFUSAL.to_owned()),
-        // An engine with no arm is refused by name. Closes when the id flip lands.
-        #[allow(unreachable_patterns)]
+        // An engine with no arm is refused by name.
         other => Err(format!(
             "the {} engine is not available for agents, teams or council",
             other.as_str()

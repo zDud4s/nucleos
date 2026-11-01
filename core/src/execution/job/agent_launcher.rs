@@ -58,8 +58,6 @@ fn runner_of(engine: Engine) -> Option<RunnerKind> {
         // Never launches: `pin_of` refuses agy by name before this is asked.
         Engine::Agy => None,
         // An engine with no arm has no runner; `pin_of` then refuses it by name.
-        // Closes when the id flip lands.
-        #[allow(unreachable_patterns)]
         _ => None,
     }
 }
@@ -83,6 +81,14 @@ fn pin_of(
         )));
     }
     let Some(runner) = runner_of(engine) else {
+        // Only the local engine is a known engine without a runner; any other id has no arm and is
+        // refused by name, never reported as the local engine.
+        if engine != Engine::Local {
+            return Err(LaunchRefused::Unavailable(format!(
+                "{label}: the {} engine is not available for agents, teams or council",
+                engine.as_str()
+            )));
+        }
         return Err(LaunchRefused::Unavailable(format!(
             "{label} is pinned to the local engine, which a workflow node cannot run on"
         )));

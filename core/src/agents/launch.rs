@@ -178,8 +178,6 @@ fn plan_launch(
             // Refused above; no runner is ever listed for agy.
             Engine::Agy => Vec::new(),
             // An engine with no arm is refused by name, never run as Claude.
-            // Closes when the id flip lands.
-            #[allow(unreachable_patterns)]
             other => {
                 return Err(LaunchError::NoRunner(format!(
                     "{label}: the {} engine is not available for agents, teams or council",
@@ -340,7 +338,11 @@ pub async fn resolve_agent_launch_with(
 mod tests {
     use super::*;
     use Capability::*;
-    use RunnerKind::{Claude, Codex};
+    // Associated consts cannot be imported with `use`; local consts keep the short names.
+    #[allow(non_upper_case_globals)]
+    const Claude: RunnerKind = RunnerKind::Claude;
+    #[allow(non_upper_case_globals)]
+    const Codex: RunnerKind = RunnerKind::Codex;
 
     /// A pin on an engine the launcher does not know is refused by name, never run as Claude.
     /// The pin reaches `plan_launch` as a string, so "zed" is refused at the parse step; the

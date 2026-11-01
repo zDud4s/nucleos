@@ -334,14 +334,18 @@ pub fn runner_for_primary_in(
 
 /// A table-backed engine id: the `id` string of a `TABLE` row. Copy and hashable so it can stand in
 /// for an enum in patterns; ordered by row position, so Claude < Codex < Agy.
-// The later leaves of the id flip use these items; the flip removes this allow.
-#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EngineId(&'static str);
 
-#[allow(dead_code)]
 impl EngineId {
+    /// The id for a stored text that names a `TABLE` row; used by the associated consts of
+    /// `Engine`, `RunnerKind` and `ChatEngine`, which pass the `engines::` id constants.
+    pub(crate) const fn from_row(id: &'static str) -> EngineId {
+        EngineId(id)
+    }
+
     /// The id of the `TABLE` row named `name`, or `None` for an unknown name.
+    #[cfg_attr(not(test), allow(dead_code))] // the golden tests are its only caller
     pub(crate) fn named(name: &str) -> Option<EngineId> {
         TABLE.iter().find(|row| row.id == name).map(|row| EngineId(row.id))
     }

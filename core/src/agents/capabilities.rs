@@ -21,33 +21,42 @@ use nucleos_base::agent::{Capability, policy_str_for};
 use crate::execution::runner::ToolPolicy;
 use crate::models::route_advice::RunnerKind;
 
-/// The engine a launch targets: the two CLI runners plus the local model.
+/// The engine a launch targets: the CLI runners plus the local model. A table-backed id; the named
+/// consts are the rows the production code names, and any other CLI row is an `Engine` of its own,
+/// never a stand-in for Claude.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Engine {
-    Claude,
-    Codex,
-    Local,
-    Agy,
-}
+pub struct Engine(crate::engines::EngineId);
 
+#[allow(non_upper_case_globals)]
 impl Engine {
+    pub const Claude: Engine = Engine(crate::engines::EngineId::from_row(crate::engines::CLAUDE));
+    pub const Codex: Engine = Engine(crate::engines::EngineId::from_row(crate::engines::CODEX));
+    pub const Local: Engine = Engine(crate::engines::EngineId::from_row(crate::engines::LOCAL));
+    pub const Agy: Engine = Engine(crate::engines::EngineId::from_row(crate::engines::AGY));
+
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Claude => crate::engines::CLAUDE,
-            Self::Codex => crate::engines::CODEX,
-            Self::Local => crate::engines::LOCAL,
-            Self::Agy => crate::engines::AGY,
+        self.0.as_str()
+    }
+
+    /// The engine of a CLI row of `table`, or the local model; `None` for any other id.
+    pub fn parse_in(table: &[crate::engines::EngineDescription], value: &str) -> Option<Self> {
+        if value == crate::engines::LOCAL {
+            return Some(Self::Local);
         }
+        let row = crate::engines::cli_row_in(table, value)?;
+        Some(Self(crate::engines::EngineId::from_row(row.id)))
+    }
+
+    /// An engine outside the production table, to exercise the fail-closed arms.
+    #[cfg(any(test, feature = "testkit"))]
+    pub fn for_test(id: &'static str) -> Self {
+        Self(crate::engines::EngineId::for_test(id))
     }
 }
 
 impl From<RunnerKind> for Engine {
     fn from(kind: RunnerKind) -> Self {
-        match kind {
-            RunnerKind::Claude => Self::Claude,
-            RunnerKind::Codex => Self::Codex,
-            RunnerKind::Agy => Self::Agy,
-        }
+        Self(kind.0)
     }
 }
 
@@ -174,8 +183,6 @@ pub fn translate(engine: Engine, caps: &[Capability]) -> Result<EngineTools, Uns
         }
         // An engine with no arm above refuses the first capability, as agy does: it never
         // falls through to Claude's tool set.
-        // Closes when the id flip lands.
-        #[allow(unreachable_patterns)]
         _ => {
             if let Some(&capability) = caps.first() {
                 return Err(Unsupported { engine, capability });
