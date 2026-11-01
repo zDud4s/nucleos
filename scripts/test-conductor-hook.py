@@ -434,6 +434,154 @@ def test_git_status_allowed():
         deny(fx.verdict("Bash", {"command": f"{G} checkout master"}), "control: checkout")
 
 
+def _project(fx):
+    """Marks the fixture's cwd as a project, as the workflow pointer does; returns its worktrees dir."""
+    pointer = fx.path(".nucleos", "workflow")
+    os.makedirs(pointer, exist_ok=True)
+    with open(os.path.join(pointer, "project.json"), "w", encoding="utf-8") as handle:
+        json.dump({"state_dir": fx.state_dir}, handle)
+    worktrees = fx.path(".claude", "worktrees")
+    os.makedirs(os.path.join(worktrees, "feat"), exist_ok=True)
+    return worktrees
+
+
+def test_read_only_git_additions_allowed():
+    with fixture("on") as fx:
+        for tool in ("Bash", "PowerShell"):
+            for command in (
+                f"{G} merge-base --is-ancestor fix/a master",
+                f"{G} -C . merge-base --is-ancestor HEAD master",
+                f"{G} worktree list",
+                f"{G} branch --list",
+                f"{G} branch --list 'fix/*'",
+            ):
+                allow(fx.verdict(tool, {"command": command}), f"{tool}: {command!r}")
+        for command in (
+            f"{G} merge-base master fix/a",
+            f"{G} merge-base --octopus a b",
+            f"{G} merge-base --is-ancestor a",
+            f"{G} merge-base --is-ancestor a b c",
+            f"{G} merge-base --is-ancestor a b; rm x",
+            f"{G} worktree add x",
+            f"{G} worktree prune",
+            f"{G} branch -D x",
+            f"{G} branch --list -d x",
+        ):
+            deny(fx.verdict("Bash", {"command": command}), repr(command))
+
+
+def test_worktree_remove_allowed_only_under_the_project_worktrees():
+    with fixture("on") as fx:
+        worktrees = _project(fx)
+        inside = (worktrees + "/feat").replace("\\", "/")
+        for tool in ("Bash", "PowerShell"):
+            for command in (
+                f"{G} worktree remove {inside}",
+                f"{G} worktree remove .claude/worktrees/feat",
+                f'{G} worktree remove "{inside}"',
+            ):
+                allow(fx.verdict(tool, {"command": command}), f"{tool}: {command!r}")
+        outside = os.path.join(os.path.dirname(fx.cwd), "elsewhere").replace("\\", "/")
+        for command in (
+            f"{G} worktree remove --force {inside}",
+            f"{G} worktree remove -f {inside}",
+            f"{G} worktree remove {inside} --force",
+            f"{G} worktree remove x",
+            f"{G} worktree remove {outside}",
+            f"{G} worktree remove {fx.cwd}".replace("\\", "/"),
+            f"{G} worktree remove {worktrees}".replace("\\", "/"),
+            f"{G} worktree remove .claude/worktrees/../..",
+            f"{G} worktree remove .claude/worktrees/feat/../../..",
+            f"{G} worktree remove",
+            f"{G} worktree remove {inside} {inside}",
+            f"{G} worktree remove {inside}; rm x",
+            f"{G} worktree remove {inside} && {G} status",
+            f"{G} worktree remove {inside} | cat",
+        ):
+            deny(fx.verdict("Bash", {"command": command}), repr(command))
+
+
+def test_worktree_remove_refused_when_it_holds_a_node_modules_junction():
+    with fixture("on") as fx:
+        worktrees = _project(fx)
+        inside = (worktrees + "/feat").replace("\\", "/")
+        os.makedirs(os.path.join(worktrees, "feat", "shell", "node_modules"))
+        deny(fx.verdict("Bash", {"command": f"{G} worktree remove {inside}"}), "node_modules present")
+
+
+def _land_fixture(fx):
+    worktrees = _project(fx)
+    dev_home = os.path.join(os.path.dirname(fx.cwd), "dev").replace("\\", "/")
+    os.environ["NUCLEOS_DEV_HOME"] = dev_home
+    return (worktrees + "/feat").replace("\\", "/"), dev_home + "/run/nucleos-core.exe", dev_home
+
+
+def test_land_allowed_from_the_root_session():
+    with fixture("on") as fx:
+        inside, exe, _dev = _land_fixture(fx)
+        exe_bs = exe.replace("/", "\\")
+        for tool, command in (
+            ("Bash", f"{exe} --land"),
+            ("Bash", f"{exe} --land master"),
+            ("Bash", f'"{exe}" --land master'),
+            ("Bash", f"cd {inside} && {exe} --land"),
+            ("Bash", f'cd "{inside}" && "{exe}" --land master'),
+            ("Bash", f"cd .claude/worktrees/feat && {exe} --land fix/a"),
+            ("PowerShell", f"& '{exe}' --land"),
+            ("PowerShell", f'& "{exe_bs}" --land master'),
+            ("PowerShell", f"{exe_bs} --land master"),
+            ("PowerShell", f'cd "{inside}" && & "{exe_bs}" --land master'),
+        ):
+            allow(fx.verdict(tool, {"command": command}), f"{tool}: {command!r}")
+    with fixture("on") as fx:
+        _project(fx)
+        os.environ.pop("NUCLEOS_DEV_HOME", None)
+        allow(fx.verdict("Bash", {"command": "C:/nucleos-dev/run/nucleos-core.exe --land"}), "default dev home")
+
+
+def test_land_refused_when_widened_or_elsewhere():
+    with fixture("on") as fx:
+        inside, exe, dev = _land_fixture(fx)
+        outside = os.path.join(os.path.dirname(fx.cwd), "elsewhere").replace("\\", "/")
+        for command in (
+            f"{exe} --print-token",
+            f"{exe} --workflow-sync {inside}",
+            f"{exe} --settings-reset a/b",
+            f"{exe}",
+            f"{exe} --land master extra",
+            f"{exe} --land --force",
+            f"{exe} --land -x",
+            f"{exe} --land master; rm x",
+            f"{exe} --land; rm x",
+            f"{exe} --land || true",
+            f"{exe} --land | cat",
+            f"{exe} --land $(id)",
+            f"{exe} --land `id`",
+            f"{exe} --land\nrm x",
+            f"{exe} --land > out.txt",
+            f"{exe} --land 2>&1",
+            f"{dev}/other/nucleos-core.exe --land",
+            f"{dev}/run/evil.exe --land",
+            f"/tmp/nucleos-core.exe --land",
+            f"cd {outside} && {exe} --land",
+            f"cd x && {exe} --land",
+            f"cd .. && {exe} --land",
+            f"cd .claude/worktrees/../.. && {exe} --land",
+            f"cd {fx.cwd} && {exe} --land".replace("\\", "/"),
+            f"cd {inside} && {G} status",
+            f"cd x && {G} status",
+            f"cd {inside} && {exe} --print-token",
+            f"cd {inside} && {exe} --land && {exe} --land",
+            f"cd {inside} && cd {inside} && {exe} --land",
+            f"cd {inside} ; {exe} --land",
+            f"cd {inside} || {exe} --land",
+            f"{exe} --land && cd {inside}",
+            f"{G} status && {exe} --land",
+            f"rm x && {exe} --land",
+        ):
+            deny(fx.verdict("Bash", {"command": command}), repr(command))
+
+
 def test_git_commit_with_explicit_paths_allowed():
     with fixture("on") as fx:
         allow(fx.verdict("Bash", {"command": f"{G} add scripts/a.py scripts/b.py"}), "add explicit paths")
@@ -868,6 +1016,11 @@ TESTS = [
     test_gates_script_refused_when_chained_or_elsewhere,
     test_chained_command_denied,
     test_git_status_allowed,
+    test_read_only_git_additions_allowed,
+    test_worktree_remove_allowed_only_under_the_project_worktrees,
+    test_worktree_remove_refused_when_it_holds_a_node_modules_junction,
+    test_land_allowed_from_the_root_session,
+    test_land_refused_when_widened_or_elsewhere,
     test_git_commit_with_explicit_paths_allowed,
     test_git_push_denied,
     test_edit_of_source_denied,
