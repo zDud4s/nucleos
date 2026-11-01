@@ -773,6 +773,59 @@ const REMOTE_OWNER_SEGMENTS: &[&str] = &[
     "browser",
 ];
 
+/// First path segments no device reaches at any level, owner included, each with the reason. An
+/// owner is the person; these belong to agent sessions or to the host's own plumbing. Together with
+/// [`REMOTE_OWNER_SEGMENTS`] they make up [`REMOTE_DENIED_SEGMENTS`] exactly (the guard test pins
+/// that), so a segment can only be refused with a written reason. `chats`, `routes` and
+/// `team-recruits` are not agent surfaces; they are listed here because the shell never calls them
+/// over the API, which is the same "no device has a use for it" answer.
+#[cfg_attr(not(test), allow(dead_code))]
+const REMOTE_AGENT_ONLY_SEGMENTS: &[(&str, &str)] = &[
+    (
+        "admission",
+        "the admission gate agent sessions are checked against",
+    ),
+    (
+        "capture-digests",
+        "digests an agent session writes about its own capture",
+    ),
+    (
+        "chats",
+        "only a shell page route; the chat API is `assistant`",
+    ),
+    ("context", "context an agent session pulls for its own turn"),
+    ("hooks", "the hook endpoints agent sessions call back into"),
+    (
+        "models",
+        "the model catalogue agent sessions pick from; the shell never calls it",
+    ),
+    ("nodes", "node registration of agent runtimes"),
+    ("pricing", "price tables the host's cost accounting reads"),
+    ("routes", "the route index searched by agent sessions"),
+    ("tasks", "the claim board agent sessions coordinate through"),
+    ("team-files", "files agents of a team exchange"),
+    ("team-notes", "notes agents of a team exchange"),
+    ("team-pressure", "pressure signals between agents of a team"),
+    (
+        "team-recruits",
+        "agent recruiting inside a team; the shell never calls it",
+    ),
+    ("team-reports", "reports agents of a team file"),
+    ("v1", "the agent-facing versioned API"),
+    (
+        "verify",
+        "the verification endpoints an agent session calls",
+    ),
+    (
+        "webhooks",
+        "inbound webhooks from external services, not a device surface",
+    ),
+    (
+        "workflow",
+        "the workflow phase endpoints an agent session calls",
+    ),
+];
+
 /// Routes inside admin segments that no device reaches, whatever its level. `POST
 /// /assistant/browser-agents` starts a browser on the host, the host-only surface the `browser`
 /// deny covers (listing linked browser conversations, `GET`, stays open). `/email/incoming` and
@@ -2722,24 +2775,49 @@ mod tests {
             .filter(|segment| {
                 !REMOTE_ALLOWED_SEGMENTS.contains(&segment.as_str())
                     && !REMOTE_ADMIN_SEGMENTS.contains(&segment.as_str())
-                    && !REMOTE_DENIED_SEGMENTS.contains(&segment.as_str())
+                    && !REMOTE_OWNER_SEGMENTS.contains(&segment.as_str())
+                    && !REMOTE_AGENT_ONLY_SEGMENTS
+                        .iter()
+                        .any(|(s, _)| *s == segment.as_str())
             })
             .collect();
         assert!(
             unclassified.is_empty(),
-            "route prefixes in none of REMOTE_ALLOWED_SEGMENTS, REMOTE_ADMIN_SEGMENTS, REMOTE_DENIED_SEGMENTS: {unclassified:?}"
+            "route prefixes in none of REMOTE_ALLOWED_SEGMENTS, REMOTE_ADMIN_SEGMENTS, REMOTE_OWNER_SEGMENTS, REMOTE_AGENT_ONLY_SEGMENTS: {unclassified:?}"
         );
         for segment in found.iter() {
             let hits = [
                 REMOTE_ALLOWED_SEGMENTS.contains(&segment.as_str()),
                 REMOTE_ADMIN_SEGMENTS.contains(&segment.as_str()),
-                REMOTE_DENIED_SEGMENTS.contains(&segment.as_str()),
+                REMOTE_OWNER_SEGMENTS.contains(&segment.as_str()),
+                REMOTE_AGENT_ONLY_SEGMENTS
+                    .iter()
+                    .any(|(s, _)| *s == segment.as_str()),
             ]
             .iter()
             .filter(|hit| **hit)
             .count();
             assert_eq!(hits, 1, "{segment} must be in exactly one list");
         }
+        for (segment, reason) in REMOTE_AGENT_ONLY_SEGMENTS {
+            assert!(
+                !reason.trim().is_empty(),
+                "{segment} is agent-only without a reason"
+            );
+        }
+        // REMOTE_DENIED_SEGMENTS (the non-owner refusal list) is exactly OWNER + AGENT_ONLY.
+        let mut denied: Vec<&str> = REMOTE_DENIED_SEGMENTS.to_vec();
+        let mut expected: Vec<&str> = REMOTE_OWNER_SEGMENTS
+            .iter()
+            .copied()
+            .chain(REMOTE_AGENT_ONLY_SEGMENTS.iter().map(|(s, _)| *s))
+            .collect();
+        denied.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(
+            denied, expected,
+            "REMOTE_DENIED_SEGMENTS must equal REMOTE_OWNER_SEGMENTS plus REMOTE_AGENT_ONLY_SEGMENTS"
+        );
     }
 
     /// The three lists are pairwise disjoint, and the hard-deny set (owner decision 2026-10-29)
