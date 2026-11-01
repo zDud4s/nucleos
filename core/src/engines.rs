@@ -666,7 +666,9 @@ pub mod gemini_test_support {
 
     impl Drop for GeminiGate {
         fn drop(&mut self) {
-            *OVERRIDE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            *OVERRIDE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         }
     }
 
@@ -675,7 +677,9 @@ pub mod gemini_test_support {
         let serial = SERIAL
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *OVERRIDE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(stored);
+        *OVERRIDE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(stored);
         GeminiGate { _serial: serial }
     }
 }

@@ -560,10 +560,7 @@ impl Assistants for ConfiguredAssistants {
         // this pick's only key. No key means a refusal naming Gemini, never a fall back to
         // OpenRouter's key or base.
         if brain == crate::chats::Brain::OpenRouter && is_gemini_pick(model) {
-            let key = self
-                .gemini_key
-                .clone()
-                .ok_or(Refusal::GeminiKeyMissing)?;
+            let key = self.gemini_key.clone().ok_or(Refusal::GeminiKeyMissing)?;
             let chat = crate::models::openai_compatible::OpenAiCompatibleChat::gemini_with_client(
                 self.hosted_client.clone(),
                 self.gemini_base_url.clone(),
@@ -740,12 +737,12 @@ impl Assistants for ConfiguredAssistants {
                 !(brain == crate::chats::Brain::OpenRouter && is_gemini_pick(Some(model.as_str())))
             })
             .map(|model| {
-            let key = model.clone();
-            async move {
-                let declared = self.declared_one(brain, &key).await;
-                (key, declared)
-            }
-        });
+                let key = model.clone();
+                async move {
+                    let declared = self.declared_one(brain, &key).await;
+                    (key, declared)
+                }
+            });
 
         crate::join::all(probes).await.into_iter().collect()
     }
@@ -1668,7 +1665,9 @@ mod tests {
             .expect("the stub answers the shape the reader consumes");
     }
 
-    fn refusal_text(result: Result<std::sync::Arc<crate::models::local_agent::LocalAssistant>, Refusal>) -> String {
+    fn refusal_text(
+        result: Result<std::sync::Arc<crate::models::local_agent::LocalAssistant>, Refusal>,
+    ) -> String {
         result
             .err()
             .expect("this pick must be refused")
@@ -1687,12 +1686,18 @@ mod tests {
             provider_factory(None, Some("google-key"), &openrouter_base, &gemini_base).await;
         let assistant = factory
             .assistant_for(Brain::OpenRouter, Some("gemini-api/gemini-2.5-flash"))
-            .unwrap_or_else(|refusal| panic!("a Google key alone serves a gemini-api pick: {refusal:?}"));
+            .unwrap_or_else(|refusal| {
+                panic!("a Google key alone serves a gemini-api pick: {refusal:?}")
+            });
         run_one_turn(&assistant).await;
 
         {
             let seen = gemini_seen.lock().unwrap();
-            assert_eq!(seen.len(), 1, "exactly one exchange on the Gemini base: {seen:?}");
+            assert_eq!(
+                seen.len(),
+                1,
+                "exactly one exchange on the Gemini base: {seen:?}"
+            );
             let (auth, body) = &seen[0];
             assert_eq!(auth.as_deref(), Some("Bearer google-key"));
             assert_eq!(
@@ -1712,7 +1717,10 @@ mod tests {
                 .map(|name| name.to_string())
                 .collect();
             expected.sort();
-            assert_eq!(offered, expected, "the Gemini route gets HOSTED_TOOLS and nothing more");
+            assert_eq!(
+                offered, expected,
+                "the Gemini route gets HOSTED_TOOLS and nothing more"
+            );
         }
         assert!(
             openrouter_seen.lock().unwrap().is_empty(),
@@ -1720,13 +1728,8 @@ mod tests {
         );
 
         // No Google key: refuses, naming Gemini, and touches no network.
-        let keyless = provider_factory(
-            Some("openrouter-key"),
-            None,
-            &openrouter_base,
-            &gemini_base,
-        )
-        .await;
+        let keyless =
+            provider_factory(Some("openrouter-key"), None, &openrouter_base, &gemini_base).await;
         let text = refusal_text(
             keyless.assistant_for(Brain::OpenRouter, Some("gemini-api/gemini-2.5-flash")),
         );
@@ -1738,7 +1741,11 @@ mod tests {
             text, HOSTED_KEY_MISSING,
             "the OpenRouter sentence would send the operator to the wrong key"
         );
-        assert_eq!(gemini_seen.lock().unwrap().len(), 1, "no new Gemini request");
+        assert_eq!(
+            gemini_seen.lock().unwrap().len(),
+            1,
+            "no new Gemini request"
+        );
         assert!(openrouter_seen.lock().unwrap().is_empty());
     }
 
@@ -1756,7 +1763,8 @@ mod tests {
             .assistant_for(Brain::OpenRouter, Some("gemini-api/gemini-2.5-pro"))
             .unwrap_or_else(|refusal| panic!("Google key alone serves gemini-api: {refusal:?}"));
         run_one_turn(&assistant).await;
-        let text = refusal_text(google_only.assistant_for(Brain::OpenRouter, Some("openai/gpt-5.6")));
+        let text =
+            refusal_text(google_only.assistant_for(Brain::OpenRouter, Some("openai/gpt-5.6")));
         assert!(
             text.to_lowercase().contains("openrouter"),
             "an OpenRouter pick without the OpenRouter key must name OpenRouter, got: {text}"
@@ -1767,7 +1775,9 @@ mod tests {
             provider_factory(Some("openrouter-key"), None, &openrouter_base, &gemini_base).await;
         let assistant = openrouter_only
             .assistant_for(Brain::OpenRouter, Some("openai/gpt-5.6"))
-            .unwrap_or_else(|refusal| panic!("OpenRouter key alone serves openrouter: {refusal:?}"));
+            .unwrap_or_else(|refusal| {
+                panic!("OpenRouter key alone serves openrouter: {refusal:?}")
+            });
         run_one_turn(&assistant).await;
         let text = refusal_text(
             openrouter_only.assistant_for(Brain::OpenRouter, Some("gemini-api/gemini-2.5-pro")),
@@ -1791,11 +1801,19 @@ mod tests {
         run_one_turn(&assistant).await;
 
         let gemini = gemini_seen.lock().unwrap();
-        assert_eq!(gemini.len(), 1, "only the one gemini-api turn reached Google: {gemini:?}");
+        assert_eq!(
+            gemini.len(),
+            1,
+            "only the one gemini-api turn reached Google: {gemini:?}"
+        );
         assert_eq!(gemini[0].0.as_deref(), Some("Bearer google-key"));
 
         let openrouter = openrouter_seen.lock().unwrap();
-        assert_eq!(openrouter.len(), 2, "the openrouter pick and the unpinned turn: {openrouter:?}");
+        assert_eq!(
+            openrouter.len(),
+            2,
+            "the openrouter pick and the unpinned turn: {openrouter:?}"
+        );
         for (auth, _) in openrouter.iter() {
             assert_eq!(
                 auth.as_deref(),
@@ -1804,7 +1822,10 @@ mod tests {
             );
         }
         assert_eq!(
-            openrouter[1].1.pointer("/model").and_then(|value| value.as_str()),
+            openrouter[1]
+                .1
+                .pointer("/model")
+                .and_then(|value| value.as_str()),
             Some("anthropic/claude-sonnet-4.5"),
             "no pin keeps the configured OpenRouter model"
         );

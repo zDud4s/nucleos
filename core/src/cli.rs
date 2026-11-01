@@ -660,8 +660,7 @@ pub(super) fn store_gemini_key(
     let Some(value) = read("paste the Gemini API key, then press Enter:") else {
         return Err("no gemini key was read from stdin".to_owned());
     };
-    store(GEMINI_KEY, &value)
-        .map_err(|error| format!("failed to store gemini key: {error}"))?;
+    store(GEMINI_KEY, &value).map_err(|error| format!("failed to store gemini key: {error}"))?;
     Ok("gemini key stored in the system credential store".to_owned())
 }
 
@@ -1014,7 +1013,10 @@ mod tests {
     #[test]
     fn set_gemini_key_reads_stdin_only_and_stores_secret() {
         assert_eq!(GEMINI_KEY, "gemini-api-key");
-        assert_ne!(GEMINI_KEY, OPENROUTER_KEY, "the two providers keep separate keys");
+        assert_ne!(
+            GEMINI_KEY, OPENROUTER_KEY,
+            "the two providers keep separate keys"
+        );
 
         let prompts = RefCell::new(Vec::new());
         let stored = RefCell::new(Vec::new());

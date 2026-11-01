@@ -185,7 +185,10 @@ impl OpenAiCompatibleChat {
                 .and_then(|error| error.get("message"))
                 .and_then(Value::as_str)
                 .unwrap_or("returned no model list");
-            return Err(std::io::Error::other(format!("{}: {reason}", self.provider)));
+            return Err(std::io::Error::other(format!(
+                "{}: {reason}",
+                self.provider
+            )));
         };
         Ok(data
             .iter()
@@ -611,10 +614,16 @@ mod tests {
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 2, "one chat request and one models request");
         let (method, path, auth, _) = &seen[0];
-        assert_eq!((method.as_str(), path.as_str()), ("POST", "/v1beta/openai/chat/completions"));
+        assert_eq!(
+            (method.as_str(), path.as_str()),
+            ("POST", "/v1beta/openai/chat/completions")
+        );
         assert_eq!(auth.as_deref(), Some("Bearer AIza-test-key"));
         let (method, path, auth, _) = &seen[1];
-        assert_eq!((method.as_str(), path.as_str()), ("GET", "/v1beta/openai/models"));
+        assert_eq!(
+            (method.as_str(), path.as_str()),
+            ("GET", "/v1beta/openai/models")
+        );
         assert_eq!(auth.as_deref(), Some("Bearer AIza-test-key"));
     }
 
@@ -622,12 +631,7 @@ mod tests {
     /// carries the bare model id. A stored pin keeps its `gemini-api/` prefix; only the wire loses it.
     #[tokio::test]
     async fn gemini_model_id_models_prefix_is_stripped() {
-        for given in [
-            "gemini-api/x",
-            "gemini-api/models/x",
-            "models/x",
-            "x",
-        ] {
+        for given in ["gemini-api/x", "gemini-api/models/x", "models/x", "x"] {
             let (base_url, seen) = stub_gemini().await;
             let chat = OpenAiCompatibleChat::gemini_with_client(
                 reqwest::Client::new(),

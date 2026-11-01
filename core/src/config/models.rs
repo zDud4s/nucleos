@@ -1564,7 +1564,10 @@ mod agy_catalogue_tests {
             let config = ModelsConfig::default();
             let chat = config.catalogue_for_chat(&[]);
             let rows = gemini_rows(&chat);
-            assert!(!rows.is_empty(), "a stored key lists gemini-api models: {chat:?}");
+            assert!(
+                !rows.is_empty(),
+                "a stored key lists gemini-api models: {chat:?}"
+            );
             for row in &rows {
                 assert!(
                     row.id.len() > "gemini-api/".len() && !row.id["gemini-api/".len()..].is_empty(),
@@ -1605,7 +1608,11 @@ mod agy_catalogue_tests {
             let total = all.len();
             all.sort_unstable();
             all.dedup();
-            assert_eq!(all.len(), total, "a model is listed once per route: {chat:?}");
+            assert_eq!(
+                all.len(),
+                total,
+                "a model is listed once per route: {chat:?}"
+            );
         }
     }
 

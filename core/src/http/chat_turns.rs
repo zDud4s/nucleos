@@ -172,10 +172,9 @@ pub(super) async fn post_assistant_message(
             "no_openrouter_key",
         )),
         // A keyless gemini-api pick answers like the OpenRouter one, with its own slug.
-        Err(msg) if msg == crate::assistants::GEMINI_KEY_MISSING => Err(refusal(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "no_gemini_key",
-        )),
+        Err(msg) if msg == crate::assistants::GEMINI_KEY_MISSING => {
+            Err(refusal(StatusCode::SERVICE_UNAVAILABLE, "no_gemini_key"))
+        }
         // The pictures themselves were refused before anything was spent: too many, too big, not
         // an image the model reads, or a model that reads none. Something the sender changes, so
         // a 422 that names which, never a 500 that sends them looking for a crash.

@@ -240,7 +240,11 @@ mod tests {
         // chat (a bare or `openrouter/` pick, or no pin) is still OpenRouter.
         let config = ModelsConfig::default();
         assert_eq!(
-            engine_of(&config, Brain::OpenRouter, Some("gemini-api/gemini-2.5-flash")),
+            engine_of(
+                &config,
+                Brain::OpenRouter,
+                Some("gemini-api/gemini-2.5-flash")
+            ),
             ChatEngine::GeminiApi
         );
         assert_eq!(
@@ -273,7 +277,10 @@ mod tests {
         // The by-name refusal for the launch sites names the route and every refused surface.
         let refusal = crate::engines::GEMINI_API_REFUSAL;
         for needle in ["gemini-api", "agents", "teams", "council", "quota"] {
-            assert!(refusal.contains(needle), "`{needle}` missing from: {refusal}");
+            assert!(
+                refusal.contains(needle),
+                "`{needle}` missing from: {refusal}"
+            );
         }
     }
 
