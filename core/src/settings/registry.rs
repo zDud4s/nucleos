@@ -154,7 +154,7 @@ static DOCUMENTS: LazyLock<Vec<DocType>> = LazyLock::new(|| {
         ),
         of::<AgyDoc>(
             files::AGY_FILE,
-            "when the daemon restarts — the primary runner is built once at startup; an absent document leaves the agy engine off",
+            "a chat reads the switch at once; a primary_runner of agy takes effect when the daemon restarts",
         ),
         of::<ModelsConfig>(
             crate::config::MODELS_CONFIG_FILE,

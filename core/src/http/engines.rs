@@ -36,7 +36,9 @@ struct WriteRequest {
 async fn read() -> Json<Value> {
     let doc = store::get::<AgyDoc>(&Scope::Machine);
     Json(json!({
-        "enabled": doc.enabled,
+        // The gate, not the raw field: a stored row is not run through `finish`, so `enabled: true`
+        // without the current acknowledgement is not an open gate.
+        "enabled": agy::enabled(),
         "acknowledged": doc.acknowledged_warning_version == Some(WARNING_VERSION),
         "warning": WARNING,
         "warning_version": WARNING_VERSION,
@@ -45,7 +47,8 @@ async fn read() -> Json<Value> {
 }
 
 /// `PUT /engines/agy`: the kill switch first, as for every write. Enabling stores the current warning version
-/// and needs `acknowledged: true`; disabling needs nothing. The change applies when the daemon restarts.
+/// and needs `acknowledged: true`; disabling needs nothing. A chat reads the switch at once; a
+/// `primary_runner: agy` was built at startup and changes when the daemon restarts.
 async fn write(
     State(state): State<AppState>,
     Extension(caller): Extension<Caller>,
@@ -94,7 +97,7 @@ async fn write(
     })?;
     Ok(Json(json!({
         "version": version,
-        "takes_effect": "when the daemon restarts",
+        "takes_effect": "a chat reads the switch at once; a primary_runner of agy takes effect when the daemon restarts",
     })))
 }
 

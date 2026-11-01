@@ -95,10 +95,18 @@ pub fn agy_program() -> Option<PathBuf> {
     )
 }
 
+/// Whether a prompt is staged in a file instead of travelling as the `-p` argument: it is too long,
+/// or it starts with `-` and could be read as a flag. The one predicate `stage_prompt` and
+/// `build_args` share.
+fn needs_staging(prompt: &str) -> bool {
+    prompt.len() > INLINE_PROMPT_LIMIT || prompt.starts_with('-')
+}
+
 /// Writes the prompt to `<stage_dir>/STAGED_PROMPT_FILE` when it is longer than
-/// `INLINE_PROMPT_LIMIT`; returns the file, or `None` when the prompt goes inline (nothing written).
+/// `INLINE_PROMPT_LIMIT` or starts with `-`; returns the file, or `None` when the prompt goes inline
+/// (nothing written).
 pub fn stage_prompt(request: &RunRequest, stage_dir: &Path) -> std::io::Result<Option<PathBuf>> {
-    if request.prompt.len() <= INLINE_PROMPT_LIMIT {
+    if !needs_staging(&request.prompt) {
         return Ok(None);
     }
     std::fs::create_dir_all(stage_dir)?;
@@ -129,6 +137,10 @@ pub fn build_args(request: &RunRequest, options: &Options) -> Result<Vec<String>
         (!request.mcp_servers.is_empty(), "mcp_servers"),
         (request.classifier_governs_tools, "classifier_governs_tools"),
         (!request.images.is_empty(), "images"),
+        (request.steerable, "steerable"),
+        (request.fork_session, "fork_session"),
+        (request.mcp_job.is_some(), "mcp_job"),
+        (request.mcp_team_run.is_some(), "mcp_team_run"),
     ] {
         if asked {
             return Err(Refusal::control(control));
@@ -149,7 +161,7 @@ pub fn build_args(request: &RunRequest, options: &Options) -> Result<Vec<String>
     let mut args = Vec::new();
     let mut add_dirs: Vec<String> = Vec::new();
     args.push("-p".to_string());
-    if request.prompt.len() <= INLINE_PROMPT_LIMIT {
+    if !needs_staging(&request.prompt) {
         args.push(request.prompt.clone());
     } else {
         let file = options.stage_dir.join(STAGED_PROMPT_FILE);
@@ -305,9 +317,16 @@ impl CommandRunner for AgyCliRunner {
         let agy_bin = agy_program().unwrap_or_else(|| PathBuf::from("agy"));
         let mut cmd = Command::new(&agy_bin);
         cmd.args(args);
+        // The control token is never handed to agy, not from the request and not inherited: agy has
+        // no MCP config, so it has no use for one (E15 F1).
+        const CONTROL_TOKEN: &str = "NUCLEOS_DAEMON_TOKEN";
         for (k, v) in &request.env {
+            if k.eq_ignore_ascii_case(CONTROL_TOKEN) {
+                continue;
+            }
             cmd.env(k, v);
         }
+        cmd.env_remove(CONTROL_TOKEN);
         if let Some(dir) = &request.cwd {
             cmd.current_dir(dir);
         }

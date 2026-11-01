@@ -765,6 +765,18 @@ fn runner_kind_of(
     }
 }
 
+/// A member with no pin runs on the daemon's runner, which is agy under `primary_runner: agy`;
+/// teams never run on agy, so it is refused by name. A pinned member is not touched here.
+fn refuse_unpinned_member_on_agy_primary(
+    pin: Option<crate::models::route_advice::RunnerKind>,
+    models: &crate::config::ModelsConfig,
+) -> Result<(), String> {
+    if pin.is_some() {
+        return Ok(());
+    }
+    crate::engines::refuse_agy_primary(models).map_err(str::to_owned)
+}
+
 /// Where one cloud team node runs: the runner, its kind when known, and the router decision (with
 /// the router, to report the outcome to) when the seat was routed.
 struct Seat {
@@ -786,6 +798,7 @@ async fn pick_seat(
     request: &mut crate::execution::runner::RunRequest,
 ) -> Result<Seat, String> {
     use crate::models::seat_advice::{route_agent_seat, route_team_seat};
+    refuse_unpinned_member_on_agy_primary(pin, &crate::config::models_config_now())?;
     let router = state.runner.router();
     let (kind, decision) = match (&router, pin) {
         (None, pin) => (pin, None),

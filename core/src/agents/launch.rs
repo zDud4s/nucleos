@@ -66,6 +66,20 @@ impl std::fmt::Display for LaunchError {
 
 impl std::error::Error for LaunchError {}
 
+/// An unpinned launch lands on the daemon's runner, which is agy under `primary_runner: agy`; agents
+/// never run on agy, so it is refused by name. A pinned launch is not touched here.
+fn refuse_unpinned_on_agy_primary(
+    label: &str,
+    pinned: bool,
+    models: &crate::config::ModelsConfig,
+) -> Result<(), LaunchError> {
+    if pinned {
+        return Ok(());
+    }
+    crate::engines::refuse_agy_primary(models)
+        .map_err(|why| LaunchError::NoRunner(format!("{label}: {why}")))
+}
+
 /// `runners = eligible ∩ translatable − braked`, in `eligible`'s order.
 pub fn narrow_runners(
     eligible: Vec<RunnerKind>,
@@ -248,6 +262,11 @@ pub async fn resolve_agent_launch_with(
     } else {
         Vec::new()
     };
+    refuse_unpinned_on_agy_primary(
+        &label,
+        pinned.is_some(),
+        &crate::config::models_config_now(),
+    )?;
     let plan = plan_launch(&label, &caps, pinned, eligible, &braked)?;
 
     let (prompt, output) = if agent.is_package() {

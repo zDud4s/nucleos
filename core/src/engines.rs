@@ -27,6 +27,16 @@ pub const AGY: &str = "agy";
 /// The refusal for agy at every launch site of agents, teams and council.
 pub const AGY_REFUSAL: &str = "the agy engine is not available for agents, teams or council";
 
+/// Work that names no engine runs on the daemon's runner; under `primary_runner: agy` that is agy,
+/// which agents, teams and council never use. Shared by their launch sites to refuse that work.
+pub fn refuse_agy_primary(models: &crate::config::ModelsConfig) -> Result<(), &'static str> {
+    if models.active_runner() == AGY {
+        Err(AGY_REFUSAL)
+    } else {
+        Ok(())
+    }
+}
+
 /// How an engine is reached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transport {

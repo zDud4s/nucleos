@@ -198,11 +198,17 @@ pub fn front_with(
         url = %config.url,
         "llm-router advice is on"
     );
+    // agy's rows are not in `assistant_choices`; the catalogue holds them while the gate is on.
     let model_efforts = models
         .assistant_choices
         .iter()
         .filter(|choice| choice.brain == "cloud")
         .map(|choice| (choice.id.clone(), choice.efforts.clone()))
+        .chain(
+            crate::models::model_catalog::agy_models()
+                .into_iter()
+                .map(|row| (row.id, row.efforts)),
+        )
         .collect();
     let router = Arc::new(
         Router::new(config, primary_available, alternates).with_model_efforts(model_efforts),
@@ -240,6 +246,18 @@ pub fn allowed_models(
         .filter(|choice| choice.runner.as_deref().unwrap_or("claude") == kind.as_str())
         .map(|choice| choice.id.clone())
         .collect();
+    if kind == RunnerKind::Agy {
+        // agy's rows live in the catalogue, empty while the gate is off, so a closed gate offers
+        // the router no agy id at all, not even the default.
+        if !crate::engines::agy::enabled() {
+            return allowed;
+        }
+        for row in crate::models::model_catalog::agy_models() {
+            if !allowed.contains(&row.id) {
+                allowed.push(row.id);
+            }
+        }
+    }
     let own = default_model(models, kind);
     if !allowed.contains(&own) {
         allowed.push(own);

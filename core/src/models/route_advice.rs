@@ -404,8 +404,9 @@ impl Router {
             let fits = match alternate.kind {
                 RunnerKind::Claude => true,
                 RunnerKind::Codex => codex_can_take(shape),
-                // Agy cannot run an agent node in this delivery: never offered as an alternate.
-                RunnerKind::Agy => false,
+                // Agy is offered only a read-only run it can honour; `spawn.rs` drops it again for a
+                // run whose controls the runner refuses (job MCP, steering, a forked session).
+                RunnerKind::Agy => agy_can_take(shape),
             };
             if fits && !kinds.contains(&alternate.kind) {
                 kinds.push(alternate.kind);
@@ -559,6 +560,16 @@ pub struct RunShape {
     pub resume: bool,
 }
 
+/// Whether a run of this shape may be offered to agy: not a resume, not classifier-governed, not
+/// `Bypass` (the runner refuses it), and read-only, since agy has neither the `PreToolUse` hook nor a
+/// permission ladder: a plan run, or a restricted tool policy (`--mode plan --sandbox`).
+pub fn agy_can_take(shape: RunShape) -> bool {
+    !shape.resume
+        && !shape.classifier_governs_tools
+        && shape.permission != Permission::Bypass
+        && (shape.permission == Permission::Plan || shape.tool_policy != ToolPolicy::Unrestricted)
+}
+
 /// Why `CodexCliRunner` would refuse a run of this shape, in a sentence; `None` when it can take it.
 /// The one place the Codex predicate lives: the router's `eligible` and a pinned launch both ask it.
 pub fn codex_refusal(shape: RunShape) -> Option<String> {
@@ -697,6 +708,19 @@ pub struct CodexProfile {
 }
 
 impl RouteQuery {
+    /// The query with agy taken out of the runners it may choose from, for a run the agy runner
+    /// would refuse. No restriction becomes one naming the other runners.
+    pub fn without_agy(mut self) -> Self {
+        self.restrict_runners = Some(match self.restrict_runners.take() {
+            Some(kinds) => kinds
+                .into_iter()
+                .filter(|kind| *kind != RunnerKind::Agy)
+                .collect(),
+            None => vec![RunnerKind::Claude, RunnerKind::Codex],
+        });
+        self
+    }
+
     /// A query that restricts, pins and defers nothing: how every run but a launcher-shaped node
     /// is routed.
     pub fn plain(
@@ -983,8 +1007,8 @@ fn default_model(models: &crate::config::ModelsConfig, kind: RunnerKind) -> Stri
     match kind {
         RunnerKind::Claude => models.claude_model.clone(),
         RunnerKind::Codex => models.codex_model.clone(),
-        // Agy is never a routed runner here, so no model file names a default for it.
-        RunnerKind::Agy => String::new(),
+        // No model file names an agy default; the engine's own constant does.
+        RunnerKind::Agy => crate::engines::agy::DEFAULT_MODEL.to_owned(),
     }
 }
 

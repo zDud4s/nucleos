@@ -78,6 +78,21 @@ async fn resolve_roster(
     Ok((resolved_chairman, resolved_members))
 }
 
+/// A model seat names no engine, so it runs on the daemon's runner, which is agy under
+/// `primary_runner: agy`; council never uses agy, so it is refused by name. An agent seat that
+/// declares its engine counts as pinned.
+fn refuse_unpinned_seat_on_agy_primary(
+    who: &str,
+    pinned: bool,
+    models: &crate::config::ModelsConfig,
+) -> Result<(), StartError> {
+    if pinned {
+        return Ok(());
+    }
+    crate::engines::refuse_agy_primary(models)
+        .map_err(|why| StartError::Invalid(format!("{who}: {why}")))
+}
+
 /// One declared seat, resolved. `who` is what a refusal calls it — see `config::seat_name`.
 pub(super) async fn resolve_seat(
     state: &crate::state::AppState,
@@ -106,6 +121,7 @@ pub(super) async fn resolve_seat(
         // the file, so `CouncilConfig::faults` has already refused it at load and `start` refuses it
         // for an override — asking a third time would refuse a configured roster that startup
         // accepted, which is a daemon disagreeing with itself.
+        refuse_unpinned_seat_on_agy_primary(who, false, &crate::config::models_config_now())?;
         return Ok(CouncilSeat::of_model(kind, model_ref));
     };
 

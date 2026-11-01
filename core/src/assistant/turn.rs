@@ -359,6 +359,21 @@ pub fn tool_policy_for(
     }
 }
 
+/// The tool policy a turn answered by `cli` runs under. `tool_policy_for` grants `Unrestricted`
+/// because the Claude PreToolUse hook is wired; nothing shows agy honours that hook, so an agy chat
+/// is always MCP-only (`--mode plan --sandbox`). Every other engine keeps the policy it was given.
+pub fn tool_policy_for_engine(
+    cli: &str,
+    policy: crate::execution::runner::ToolPolicy,
+) -> crate::execution::runner::ToolPolicy {
+    use crate::execution::runner::ToolPolicy;
+    if cli == crate::engines::AGY && policy == ToolPolicy::Unrestricted {
+        ToolPolicy::McpOnly
+    } else {
+        policy
+    }
+}
+
 /// A chat bound to the agy engine while its opt-in is off. The turn is refused rather than handed
 /// to another engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -410,12 +425,13 @@ pub fn runner_for_turn(
     if pinned.is_none() || cli == config.active_runner() {
         Ok((daemon.clone(), cli))
     } else {
-        Ok((
-            assistants
-                .cli_runner(cli, pinned)
-                .unwrap_or_else(|| daemon.clone()),
-            cli,
-        ))
+        match assistants.cli_runner(cli, pinned) {
+            Some(runner) => Ok((runner, cli)),
+            // The gate closed between two reads: an agy chat is refused, never answered by the
+            // daemon's own runner.
+            None if cli == crate::engines::AGY => Err(EngineDisabled),
+            None => Ok((daemon.clone(), cli)),
+        }
     }
 }
 
@@ -692,7 +708,7 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
     let daemon_runner = state.runner.clone();
     let utility_model = state.utility_model.clone();
     let assistants = state.assistants.clone();
-    let deadlines = turn_deadlines(state.run_timeout, state.progress_timeout, tool_policy);
+    let (run_timeout, progress_timeout) = (state.run_timeout, state.progress_timeout);
     let control_token = state.token.0.clone();
     // Built HERE, outside the task, and captured by the async block. A task aborted before its first
     // poll drops its captured state without ever running a line of the body, so a guard constructed
@@ -859,6 +875,11 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
                 return;
             }
         };
+
+        // The policy the answering engine runs under, and the deadlines that follow from it: both
+        // wait for `cli`, which is only known here. An agy chat is never rooted.
+        let tool_policy = tool_policy_for_engine(cli, tool_policy);
+        let deadlines = turn_deadlines(run_timeout, progress_timeout, tool_policy);
 
         // Which door this turn goes through. Decided once and named, because the two are not
         // interchangeable and the reason is a security one before it is a speed one.
