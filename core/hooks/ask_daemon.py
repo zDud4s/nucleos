@@ -1215,6 +1215,72 @@ def _conductor_write_refusal(tool_input, state, cwd):
     return "" if _conductor_material(target, state, cwd) else CONDUCTOR_REFUSAL
 
 
+CONDUCTOR_BASH_NAMES = ("bash", "bash.exe")
+# Where Git for Windows keeps the `bash.exe` the project's docs name. Any other path could name a
+# program an agent wrote, so only these (and the bare name) count. Compared after normalisation.
+CONDUCTOR_GIT_BASH = (
+    "c:/program files/git/bin/bash.exe",
+    "c:/program files/git/usr/bin/bash.exe",
+)
+CONDUCTOR_GATE_TARGET = re.compile(r"[a-z][a-z0-9_-]*")
+# An output redirect at the very end of a command, and nothing else: `> file`, `*> file`
+# (PowerShell), `2>&1`. `>>`, `<`, `2> file` and anything mid-command stay refused.
+CONDUCTOR_REDIRECT_TAIL = re.compile(
+    r"\s+(?:2>&1|\*?>\s*(?:\"(?P<dq>[^\"<>&|;`$\r\n]+)\"|'(?P<sq>[^'<>&|;`$\r\n]+)'"
+    r"|(?P<bare>[^\s\"'<>&|;`$]+)))\s*$"
+)
+CONDUCTOR_DEV_HOME_ENV = "NUCLEOS_DEV_HOME"
+CONDUCTOR_DEV_HOME_DEFAULT = "C:/nucleos-dev"
+
+
+def _conductor_log_roots(state, cwd):
+    """Folders a gate's log may be redirected into: scratch space, never a file of the project."""
+    dev_home = os.environ.get(CONDUCTOR_DEV_HOME_ENV) or CONDUCTOR_DEV_HOME_DEFAULT
+    roots = (
+        state.get("tmp_dir") or tempfile.gettempdir(),
+        tempfile.gettempdir(),
+        os.path.join(dev_home, "scratch"),
+    )
+    return [_conductor_path(root, cwd) for root in roots]
+
+
+def _conductor_strip_redirects(command, state, cwd):
+    """`(command without its trailing output redirects, ok, any redirect seen)`. Not ok when a
+    redirect aims outside the scratch folders, so a gate cannot be pointed at a file of the project."""
+    redirected = False
+    while True:
+        match = CONDUCTOR_REDIRECT_TAIL.search(command)
+        if not match:
+            return command, True, redirected
+        redirected = True
+        target = match.group("dq") or match.group("sq") or match.group("bare")
+        if target is not None:
+            resolved = _conductor_path(target, cwd)
+            in_project = any(
+                os.path.isfile(os.path.join(folder, "scripts", "gates.sh")) and _under(resolved, _conductor_path(folder, cwd))
+                for folder in _ancestors(cwd)
+            )
+            if in_project or not any(_under(resolved, root) for root in _conductor_log_roots(state, cwd)):
+                return command, False, redirected
+        command = command[: match.start()]
+
+
+def _conductor_gates_accepts(tokens, cwd):
+    """`[bash] <project>/scripts/gates.sh [target]`: this project's own gate script, which the root
+    controller runs (the subagent guard in `scripts/heavy_guard.py` leaves it to the root)."""
+    if tokens and (tokens[0].lower() in CONDUCTOR_BASH_NAMES or tokens[0].lower() in CONDUCTOR_GIT_BASH):
+        tokens = tokens[1:]
+    if not tokens or len(tokens) > 2:
+        return False
+    script = _conductor_path(tokens[0], cwd)
+    if not any(
+        script == _conductor_path(os.path.join(folder, "scripts", "gates.sh"), cwd)
+        for folder in _ancestors(cwd)
+    ):
+        return False
+    return len(tokens) == 1 or CONDUCTOR_GATE_TARGET.fullmatch(tokens[1]) is not None
+
+
 def _conductor_heavy_accepts(tokens, cwd):
     """`python <project>/scripts/heavy.py [flags] cargo ...`: the broker of this project, not a file
     of that name somewhere an agent may write. A transitional rule of the spec (2.2)."""
@@ -1282,12 +1348,20 @@ def _conductor_git_accepts(tokens):
     return False
 
 
-def _conductor_command_refusal(command, cwd):
+def _conductor_command_refusal(command, cwd, state=None):
     if not isinstance(command, str):
         return ""  # malformed: the tool itself refuses it
     # The spelling tolerance of `claimed_land_override`, but any mention counts, not only a setting.
     if CONDUCTOR_ENV.lower() in re.sub(r"[\\`'\"+${}]", "", command).lower():
         return CONDUCTOR_ENV_REFUSAL
+    # A trailing log redirect and a leading PowerShell `&` are for the gate script alone.
+    gates_only = False
+    stripped, redirects_ok, redirected = _conductor_strip_redirects(command, state or {}, cwd)
+    if redirects_ok and redirected:
+        command, gates_only = stripped, True
+    call_operator = re.match(r"\s*&\s+(?=\S)", command)
+    if call_operator:
+        command, gates_only = command[call_operator.end():], True
     if any(mark in command for mark in CONDUCTOR_METACHARACTERS):
         return CONDUCTOR_REFUSAL
     try:
@@ -1295,7 +1369,9 @@ def _conductor_command_refusal(command, cwd):
         tokens = shlex.split(command.replace("\\", "/"), posix=True)
     except ValueError:
         return CONDUCTOR_REFUSAL
-    if tokens and (_conductor_heavy_accepts(tokens, cwd) or _conductor_git_accepts(tokens)):
+    if tokens and _conductor_gates_accepts(tokens, cwd):
+        return ""
+    if tokens and not gates_only and (_conductor_heavy_accepts(tokens, cwd) or _conductor_git_accepts(tokens)):
         return ""
     return CONDUCTOR_REFUSAL
 
@@ -1309,7 +1385,7 @@ def _conductor_refusal(tool, tool_input, state, cwd):
         name = tool[len("mcp__nucleos__"):]
         return "" if name and "__" not in name else CONDUCTOR_REFUSAL
     if tool in ("Bash", "PowerShell"):
-        return _conductor_command_refusal(tool_input.get("command"), cwd)
+        return _conductor_command_refusal(tool_input.get("command"), cwd, state)
     if tool in ("Read", "Grep", "Glob"):
         return _conductor_read_refusal(tool, tool_input, state, cwd)
     if tool in ("Write", "Edit"):

@@ -333,6 +333,74 @@ def test_heavy_py_cargo_allowed():
         deny(fx.verdict("Bash", {"command": "cargo test"}), "control: bare cargo")
 
 
+def test_gates_script_allowed_from_the_root_session():
+    with fixture("on") as fx:
+        absolute = os.path.join(fx.cwd, "scripts", "gates.sh")
+        log = os.path.join(fx.tmp_dir, "gate.log")
+        git_bash = "C:\\Program Files\\Git\\bin\\bash.exe"
+        for tool, command in (
+            ("Bash", f'"{git_bash}" scripts/gates.sh hooks'),
+            ("Bash", "bash scripts/gates.sh hooks"),
+            ("Bash", "scripts/gates.sh hooks"),
+            ("Bash", "./scripts/gates.sh core"),
+            ("Bash", "scripts/gates.sh"),
+            ("Bash", f"bash {absolute} shell"),
+            ("Bash", f"{absolute} hooks"),
+            ("PowerShell", f"& '{git_bash}' scripts/gates.sh hooks"),
+            ("PowerShell", f'& "{git_bash}" scripts/gates.sh hooks'),
+            ("Bash", f'bash scripts/gates.sh hooks > "{log}" 2>&1'),
+            ("Bash", f"bash scripts/gates.sh hooks > {log}"),
+            ("Bash", "bash scripts/gates.sh hooks 2>&1"),
+            ("PowerShell", f"& '{git_bash}' scripts/gates.sh hooks *> '{log}'"),
+        ):
+            allow(fx.verdict(tool, {"command": command}), repr(command))
+        # Below the folder that holds scripts/gates.sh, as in a subdirectory of a worktree.
+        nested = os.path.join(fx.cwd, "core")
+        os.makedirs(nested, exist_ok=True)
+        payload = fx.payload("Bash", {"command": f"bash {absolute} hooks"})
+        payload["cwd"] = nested
+        allow(_need("conductor_verdict")(payload, fx.state), "cwd inside the project")
+
+
+def test_gates_script_refused_when_chained_or_elsewhere():
+    with fixture("on") as fx:
+        outside = os.path.join(os.path.dirname(fx.cwd), "elsewhere", "scripts", "gates.sh")
+        project_file = fx.path("core", "src", "lib.rs")
+        # The fixture sits under the OS temp dir, so the project must show itself (as a real one
+        # does, by holding scripts/gates.sh) for a log aimed at its files to be told from scratch.
+        os.makedirs(fx.path("scripts"), exist_ok=True)
+        with open(fx.path("scripts", "gates.sh"), "w", encoding="utf-8") as handle:
+            handle.write("#!/usr/bin/env bash\n")
+        for command in (
+            "bash scripts/gates.sh hooks; rm x",
+            "bash scripts/gates.sh hooks && " + G + " push",
+            "bash scripts/gates.sh hooks || true",
+            "bash scripts/gates.sh hooks | cat",
+            "bash scripts/gates.sh hooks $(id)",
+            "bash scripts/gates.sh hooks `id`",
+            "bash scripts/gates.sh hooks\nrm x",
+            "bash scripts/gates.sh hooks & rm x",
+            "bash scripts/gates.sh hooks > log.txt rm x",
+            "bash scripts/gates.sh hooks 2>&1 | tee x",
+            "bash scripts/gates.sh hooks extra --flag",
+            "bash scripts/gates.sh ../../x",
+            f"bash scripts/gates.sh hooks > {project_file}",
+            "bash scripts/gates.sh hooks > scripts/gates.sh",
+            "bash scripts/gates.sh hooks >> " + os.path.join(fx.tmp_dir, "gate.log"),
+            f"bash {outside} hooks",
+            f"{outside} hooks",
+            "bash scripts/other.sh hooks",
+            "bash scripts/heavy.py hooks",
+            "sh -c scripts/gates.sh",
+            "bash -c 'scripts/gates.sh hooks'",
+            "bash /tmp/evil/bash scripts/gates.sh hooks",
+            "/tmp/evil/bash scripts/gates.sh hooks",
+            "& " + G + " status",
+            G + " status > " + os.path.join(fx.tmp_dir, "x"),
+        ):
+            deny(fx.verdict("Bash", {"command": command}), repr(command))
+
+
 def test_chained_command_denied():
     with fixture("on") as fx:
         for command in (
@@ -626,6 +694,8 @@ TESTS = [
     test_subagent_payload_with_agent_id_unaffected,
     test_run_with_run_id_env_unaffected,
     test_heavy_py_cargo_allowed,
+    test_gates_script_allowed_from_the_root_session,
+    test_gates_script_refused_when_chained_or_elsewhere,
     test_chained_command_denied,
     test_git_status_allowed,
     test_git_commit_with_explicit_paths_allowed,
