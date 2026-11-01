@@ -51,8 +51,9 @@ describe("host-only features, remotely", () => {
     expect(isHostOnlyError(new Error("x"))).toBe(false);
   });
 
-  it("dictation, folder dialog, updater and open-in-VS-Code are inert when remote", async () => {
-    // Dictation: pressing the button reaches no host command and records no outcome.
+  it("dictation (needs a microphone API), folder dialog, updater and open-in-VS-Code do not reach the host when remote", async () => {
+    // Dictation: pressing the button reaches no host command; with no microphone API (jsdom, like a
+    // plain-HTTP page) it says why instead of staying silent.
     let press: ((memo: boolean) => Promise<void>) | undefined;
     let outcome: unknown = "unset";
     function Probe() {
@@ -66,12 +67,11 @@ describe("host-only features, remotely", () => {
         <Probe />
       </DictationProvider>,
     );
-    invoke.mockClear();
     await act(async () => {
       await press!(false);
     });
-    expect(invoke).not.toHaveBeenCalledWith("voice_hotkey", expect.anything());
-    expect(outcome).toBeNull();
+    expect(invoke).not.toHaveBeenCalled();
+    expect(outcome).toEqual({ kind: "mic-error", reason: "unsupported" });
 
     // Updater: nothing offered, nothing asked of the host.
     await expect(findUpdate()).resolves.toBeNull();

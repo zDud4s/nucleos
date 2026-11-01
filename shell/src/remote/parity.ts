@@ -18,11 +18,12 @@ export interface ParityEntry {
 
 export const PARITY: ParityEntry[] = [
   // Files that branch on isRemote().
-  { where: "app/BrowserBridge.tsx", status: "exception", why: "phase 5" },
-  { where: "app/Dictation.tsx", status: "exception", why: "phase 5" },
-  { where: "lib/vscode.ts", status: "exception", why: "phase 5" },
-  { where: "data/files.ts", status: "exception", why: "phase 5" },
-  { where: "pages/WebTabs.tsx", status: "exception", why: "phase 5" },
+  { where: "app/BrowserBridge.tsx", status: "exception", why: "the bridge drives the host's native webviews and is not started remotely (task 5.5)" },
+  { where: "app/Dictation.tsx", status: "adapted", why: "remotely the browser captures with lib/capture.ts, posts to /voice/capture and types the text into the field focused when recording started, or copies it to the clipboard (shown if the copy is refused); no host command is called (task 5.2)" },
+  { where: "data/hotkeys.ts", status: "exception", why: "an OS-wide chord cannot be registered from a browser tab; remotely the registration is skipped and the Voice page says the shortcuts only work while the page is focused, where PageDictationShortcuts answers them (task 5.2)" },
+  { where: "lib/vscode.ts", status: "exception", why: "VS Code opens on the host; remotely openInVscode resolves without doing anything, so six call sites look like they worked (task 5.6)" },
+  { where: "data/files.ts", status: "exception", why: "opening a file on disk throws remotely and the page prints it after \"Could not open it\"; the disk path and dropped files are host-only (task 5.3)" },
+  { where: "pages/WebTabs.tsx", status: "exception", why: "the whole Web page, Archive tab included, is replaced by the unavailable notice because the embedded browser is a host webview (task 5.5; the Archive tab alone is task 5.7)" },
   { where: "ui/QueryState.tsx", status: "adapted", why: "a 403 on a remote device reads as unavailable remotely, not as an error" },
   { where: "ui/RefusalNote.tsx", status: "adapted", why: "a 403 on a remote device reads as unavailable remotely, not as an error" },
 
@@ -43,8 +44,8 @@ export const PARITY: ParityEntry[] = [
   { where: "page:mail", status: "same", why: "its account data calls /config/email, which only an owner device reaches" },
   { where: "page:contacts", status: "same", why: "an admin device reaches it" },
   { where: "page:calendar", status: "same", why: "an admin device reaches it" },
-  { where: "page:voice", status: "exception", why: "phase 5" },
-  { where: "page:web", status: "exception", why: "phase 5" },
-  { where: "page:files", status: "adapted", why: "listing works; opening a file on disk stays on the host (phase 5)" },
-  { where: "page:system", status: "exception", why: "phase 5" },
+  { where: "page:voice", status: "adapted", why: "voice is an admin segment, so an admin or owner device reaches it; the capture buttons dictate through the browser microphone, and the global hotkeys become in-page shortcuts (see data/hotkeys.ts); hands-free conversation is not covered here (task 5.2)" },
+  { where: "page:web", status: "exception", why: "shows the unavailable notice for every tab; sessions and live pixels (/browser, owner segment) are task 5.5, the Archive tab (/web, admin segment) is task 5.7" },
+  { where: "page:files", status: "adapted", why: "listing, upload and download work; opening a file on disk and OS drag-and-drop stay on the host (task 5.3)" },
+  { where: "page:system", status: "adapted", why: "every family it calls (system, config, sidecars, backups, api-tokens, remote, channels) is an owner segment; the host's own update cannot be installed from a browser, so no update notice appears (task 5.8); read statically, the real walk is pending" },
 ];
