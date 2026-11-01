@@ -261,28 +261,6 @@ mod tests {
 
         let _lock = crate::execution::worktree::test_env_lock();
     }
-
-    #[test]
-    fn a_scoped_home_stays_on_its_thread_and_ends_with_its_guard() {
-        // A project no other test names: the other thread reads the process handle, which other tests
-        // replace, and this keeps the assertion true whatever they publish.
-        const PROJECT: &str = "scoped-home-alone";
-        let home = testing::Home::scoped();
-        testing::publish_rules(PROJECT, "gate_command: cargo test\n");
-        assert_eq!(
-            autopilot(PROJECT).unwrap().gate_command.as_deref(),
-            Some("cargo test")
-        );
-        assert!(!testing::holds_the_gate(), "a scoped home holds nothing");
-
-        let elsewhere = std::thread::spawn(|| autopilot(PROJECT).unwrap())
-            .join()
-            .unwrap();
-        assert_eq!(elsewhere, AutopilotRules::default());
-
-        drop(home);
-        assert_eq!(autopilot(PROJECT).unwrap(), AutopilotRules::default());
-    }
 }
 
 #[cfg(any(test, feature = "testkit"))]
@@ -311,12 +289,8 @@ pub mod testing {
         static HELD: RefCell<Option<Held>> = const { RefCell::new(None) };
     }
 
-    /// "This test reads rules and publishes none." Idempotent; a no-op when the thread already holds anything, and
-    /// when it has a [`Home::scoped`], whose rules no other test can publish over.
+    /// "This test reads rules and publishes none." Idempotent; a no-op when the thread already holds anything.
     pub fn hold_shared() {
-        if settings::testing::in_scope() {
-            return;
-        }
         HELD.with(|held| {
             let mut held = held.borrow_mut();
             if held.is_none() {
@@ -359,31 +333,14 @@ pub mod testing {
     /// snapshot, even when the thread already published something before.
     pub struct Home {
         dir: tempfile::TempDir,
-        _scope: Option<settings::testing::Scoped>,
     }
 
     impl Home {
         pub fn new() -> Home {
-            if settings::testing::in_scope() {
-                settings::testing::swap_scoped(Settings::new());
-            } else {
-                exclusive();
-                let _ = settings::set_global(Settings::new());
-            }
+            exclusive();
+            let _ = settings::set_global(Settings::new());
             Home {
                 dir: tempfile::tempdir().expect("create a stand-in home"),
-                _scope: None,
-            }
-        }
-
-        /// A `Home` whose EMPTY `Settings` only this thread reads, until it drops. It takes neither the gate nor
-        /// `SERIAL` and leaves the process handle alone, so a slow test blocks nobody and publishes over nobody.
-        /// The price is that only this thread sees it: rules read on a `spawn_blocking` or `std::thread::spawn`
-        /// thread come from the process handle. `tokio::spawn` is fine on `#[tokio::test]`'s current-thread runtime.
-        pub fn scoped() -> Home {
-            Home {
-                dir: tempfile::tempdir().expect("create a stand-in home"),
-                _scope: Some(settings::testing::scope(Settings::new())),
             }
         }
     }
@@ -402,14 +359,8 @@ pub mod testing {
     }
 
     /// Replaces the process snapshot by an edited copy of itself. Takes the exclusive hold first, so a fixture can
-    /// publish before or after the module's `test_state()` (which only holds shared). Under a [`Home::scoped`] it
-    /// replaces this thread's snapshot instead, and takes nothing.
+    /// publish before or after the module's `test_state()` (which only holds shared).
     fn edit(change: impl FnOnce(Snapshot) -> Snapshot) {
-        if settings::testing::in_scope() {
-            let current = settings::global().snapshot();
-            settings::testing::swap_scoped(Settings::from_snapshot(change((*current).clone())));
-            return;
-        }
         exclusive();
         let current = settings::global().snapshot();
         settings::set_global(Settings::from_snapshot(change((*current).clone())));
