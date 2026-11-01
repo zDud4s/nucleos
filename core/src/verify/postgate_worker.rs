@@ -1105,10 +1105,6 @@ pub async fn run_postgate_worker(executor: Arc<Executor>) {
 
 #[cfg(test)]
 mod tests {
-    // The fixture holds the process-wide `test_env_lock` across awaits on purpose: it serialises
-    // mutation of `NUCLEOS_WORKTREE_ROOT`, and no multi-thread runtime is waiting on it.
-    #![allow(clippy::await_holding_lock)]
-
     use super::*;
 
     fn fp(loose_len: u64) -> RefFingerprint {
@@ -1156,13 +1152,13 @@ mod tests {
         assert!(fingerprint_settled(&fp(41), now));
     }
     use crate::config::VerifyConfig;
-    use crate::execution::git_exec::tests::{WorktreeRootEnv, space_free_tempdir};
+    use crate::execution::git_exec::tests::space_free_tempdir;
     use crate::task_claims::{ClaimOutcome, Holder, HolderKind, Status};
     use crate::verify::exec::{self as verify_exec, Executor};
     use crate::verify::postgate as verify_postgate;
     use crate::verify::runs::PRIORITY_POSTGATE;
     use std::path::{Path, PathBuf};
-    use std::sync::{Arc, MutexGuard};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     /// Long enough for a `git --version` unit on a loaded machine, short enough to bound a test.
@@ -1192,27 +1188,34 @@ mod tests {
         String::from_utf8(output.stdout).unwrap().trim().to_owned()
     }
 
+    /// Counts the fixtures built, so each repository gets commits no other fixture's repository has.
+    static FIXTURES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
     struct Fixture {
-        // Field order is drop order: the lock is released last.
         pool: sqlx::SqlitePool,
         ex: Arc<Executor>,
         root: PathBuf,
         /// The tip of `main`.
         tip: String,
-        _env: WorktreeRootEnv,
+        _env: crate::execution::worktree::WorktreeRootOverride,
         _roots: tempfile::TempDir,
+        /// The stand-in home, and the rules this test thread reads.
         _machine: crate::project::rules::testing::Home,
         _repo: tempfile::TempDir,
-        _lock: MutexGuard<'static, ()>,
     }
 
     /// A repository with two commits on `main`, rostered as project `alpha`, whose
     /// `autopilot.yaml` holds `rules` when given. The executor loop is NOT running.
+    ///
+    /// No `test_env_lock`, no rules gate and no settings `SERIAL`: the worktree root is a keyed
+    /// override for this fixture's own project root and the rules live in a `Home::scoped` on this
+    /// thread, so these tests, which run for minutes, block nobody. `#[tokio::test]`'s current-thread
+    /// runtime keeps `tick` and what it `tokio::spawn`s on this thread, where the scope reaches.
+    /// Every fixture is project `alpha`, so what the process-wide caches key by `(project, sha)`
+    /// (`probe::PASSES`/`ABORTS`) is kept apart by giving each repository a root commit of its own:
+    /// no two fixtures share a sha.
     async fn fixture(rules: Option<&str>) -> Fixture {
-        let lock = crate::execution::worktree::test_env_lock();
-        // The worker reads the project's rules from the settings snapshot: hold the shared side of the
-        // rules gate (after the env lock, never before it); a test that publishes upgrades itself.
-        crate::project::rules::testing::hold_shared();
+        let machine = crate::project::rules::testing::Home::scoped();
         let repo = space_free_tempdir("nucleos-postgate-");
         let root = repo.path().to_path_buf();
         git_in(&root, &["init", "-q", "-b", "main"]);
@@ -1225,13 +1228,14 @@ mod tests {
         git_in(&root, &["config", "user.email", "t@t"]);
         std::fs::write(root.join("a.txt"), "one\n").unwrap();
         git_in(&root, &["add", "-A"]);
-        git_in(&root, &["commit", "-q", "-m", "one"]);
+        let serial = FIXTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        git_in(&root, &["commit", "-q", "-m", &format!("one #{serial}")]);
         std::fs::write(root.join("a.txt"), "two\n").unwrap();
         git_in(&root, &["commit", "-q", "-am", "two"]);
         let tip = git_in(&root, &["rev-parse", "HEAD"]);
 
         let roots = space_free_tempdir("nucleos-postgate-wt-");
-        let env = WorktreeRootEnv::set(roots.path());
+        let env = crate::execution::worktree::WorktreeRootOverride::set(&root, roots.path());
 
         let pool = crate::testdb::fresh_pool().await;
         sqlx::query(
@@ -1243,7 +1247,6 @@ mod tests {
         .await
         .unwrap();
 
-        let machine = crate::project::rules::testing::Home::new();
         if let Some(rules) = rules {
             crate::project::rules::testing::publish_rules("alpha", rules);
         }
@@ -1261,7 +1264,6 @@ mod tests {
             _roots: roots,
             _machine: machine,
             _repo: repo,
-            _lock: lock,
         }
     }
 
@@ -1300,8 +1302,6 @@ mod tests {
 
     const GATE_ON: &str = "gate_command: \"git --version\"\ngate_after_land: true\n";
 
-    /// One `fixture` per test: the rules gate's hold outlives the `Fixture` on this thread, so a
-    /// second `fixture` would ask for the env lock with the gate in hand and deadlock.
     async fn assert_a_switched_off_tick_does_nothing(rules: Option<&str>) {
         let f = fixture(rules).await;
 
@@ -2914,50 +2914,26 @@ gate_after_land: true
         assert_eq!(queue_rows(&f.pool).await.len(), 1, "never resubmitted");
     }
 
-    /// Puts `NUCLEOS_MIN_FREE_DISK_GB` at 0 for a test, and back as it stood: the disk floor
-    /// measures the machine, not the code under test.
-    struct DiskFloorOff(Option<std::ffi::OsString>);
-
-    impl DiskFloorOff {
-        fn new() -> Self {
-            let previous = std::env::var_os("NUCLEOS_MIN_FREE_DISK_GB");
-            unsafe { std::env::set_var("NUCLEOS_MIN_FREE_DISK_GB", "0") };
-            Self(previous)
-        }
-    }
-
-    impl Drop for DiskFloorOff {
-        fn drop(&mut self) {
-            unsafe {
-                match &self.0 {
-                    Some(value) => std::env::set_var("NUCLEOS_MIN_FREE_DISK_GB", value),
-                    None => std::env::remove_var("NUCLEOS_MIN_FREE_DISK_GB"),
-                }
-            }
-        }
-    }
-
     /// A project whose revert has landed and whose fix branch is prepared, waiting for its
     /// correction run, with a real `AppState` to open it in.
     struct CorrectionFixture {
-        // Field order is drop order: the lock is released last.
         state: crate::state::AppState,
         fix_branch: String,
-        _floor: DiskFloorOff,
-        _env: WorktreeRootEnv,
+        _env: crate::execution::worktree::WorktreeRootOverride,
         _roots: tempfile::TempDir,
+        /// The rules this test thread reads, as in `fixture`.
+        _machine: crate::project::rules::testing::Home,
         _container: tempfile::TempDir,
-        _lock: MutexGuard<'static, ()>,
     }
 
     async fn correction_fixture() -> CorrectionFixture {
-        let lock = crate::execution::worktree::test_env_lock();
+        // Before `test_state_with_runner`, whose `hold_shared` takes nothing on a scoped thread.
+        let machine = crate::project::rules::testing::Home::scoped();
         let container = space_free_tempdir("nucleos-correction-");
         let root = container.path().join("repo");
         crate::execution::git_exec::testkit::initialize_repo(&root);
         let roots = space_free_tempdir("nucleos-correction-wt-");
-        let env = WorktreeRootEnv::set(roots.path());
-        let floor = DiskFloorOff::new();
+        let env = crate::execution::worktree::WorktreeRootOverride::set(&root, roots.path());
 
         let fix_branch = "fix/merge-1a2b3c4".to_owned();
         let tip = git_in(&root, &["rev-parse", "HEAD"]);
@@ -3000,11 +2976,10 @@ gate_after_land: true
         CorrectionFixture {
             state,
             fix_branch,
-            _floor: floor,
             _env: env,
             _roots: roots,
+            _machine: machine,
             _container: container,
-            _lock: lock,
         }
     }
 
