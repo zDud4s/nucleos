@@ -7726,6 +7726,23 @@ describe("Chats - the model menu separates agy and the Gemini API", () => {
     expect(within(api).queryByRole("menuitemradio", { name: /\(agy\)/ })).toBeNull();
   });
 
+  it("a Gemini API row says it is off this machine and an agy row does not", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetchWithEngineRoutes([chatSummary({ chat_id: "c-1" })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openModelMenu();
+
+    const agy = await openModelSubmenu(/Antigravity CLI/);
+    const agyRow = await within(agy).findByRole("menuitemradio", { name: /^Sonnet 4\.6 \(agy\)/ });
+    expect(agyRow.textContent ?? "").not.toMatch(/off this machine/i);
+
+    const api = await openModelSubmenu(/Google Gemini API/);
+    const apiRow = await within(api).findByRole("menuitemradio", { name: /^Gemini 3 Pro/ });
+    expect(apiRow.textContent ?? "").toMatch(/off this machine/i);
+  });
+
   it("agy rows are not inside the Claude company", async () => {
     daemon.apiFetch.mockImplementation(
       chatsFetchWithEngineRoutes([chatSummary({ chat_id: "c-1" })], { "c-1": [] }),

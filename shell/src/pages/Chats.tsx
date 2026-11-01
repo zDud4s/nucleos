@@ -146,7 +146,6 @@ import { revise, type Provisional } from "../lib/provisional";
 import type { LocalPull, ModelChoice, ModelGroup } from "../data/chats";
 import { routeOf, splitByRoute } from "../chats/model-routes";
 import {
-  Badge,
   Button,
   ConfirmButton,
   Modal,
@@ -2393,6 +2392,25 @@ function AutoTitleRefusal({ error }: { error: unknown }) {
  * `/api/tags`. Reading absent as "not downloaded" would move the whole local menu of such a daemon
  * into the section that says it cannot answer.
  */
+/* The notes a model row carries before it is picked: where the words go, and whether the model
+   can work tools. One place for the wording, shared by the generic rows and the route rows. */
+function modelWhyNotes(choice: ModelChoice, localUnavailable: boolean): string[] {
+  return [
+    choice.brain === "local"
+      ? localUnavailable
+        ? "not running on this machine"
+        : "on this machine"
+      : choice.brain === "openrouter"
+        ? /* Said before the pick, not after: the local mark answers "is it running here", and
+             this one answers whose machine the words end up on. */
+          "off this machine: sent to a third-party provider"
+        : null,
+    /* Only `false` earns a mark. Absent is "nobody asked", the ordinary state of every choice
+       nothing has introspected. */
+    choice.tools === false ? "cannot use tools" : null,
+  ].filter((note): note is string => note !== null);
+}
+
 const MODEL_SECTIONS: {
   key: string;
   label: string;
@@ -2735,12 +2753,18 @@ function ModelMenu({
             </DropdownMenuSubTrigger>
             <DropdownMenuSubContent className="chats-meta-menu chats-model-list">
               <DropdownMenuRadioGroup value={model ?? ""} onValueChange={pick}>
-                {models.map((choice) => (
-                  <DropdownMenuRadioItem key={choice.id} value={choice.id}>
-                    {choice.label}
-                    <Badge tone="info">{route.badge}</Badge>
-                  </DropdownMenuRadioItem>
-                ))}
+                {models.map((choice) => {
+                  const notes = modelWhyNotes(choice, localUnavailable);
+                  return (
+                    <DropdownMenuRadioItem key={choice.id} value={choice.id}>
+                      {choice.label}
+                      <span className="chats-tool-why">{route.badge}</span>
+                      {notes.length > 0 && (
+                        <span className="chats-tool-why">{notes.join(" · ")}</span>
+                      )}
+                    </DropdownMenuRadioItem>
+                  );
+                })}
               </DropdownMenuRadioGroup>
             </DropdownMenuSubContent>
           </DropdownMenuSub>
@@ -2803,22 +2827,7 @@ function ModelMenu({
                   /* Two facts about a choice, read as one verdict on picking it: where the words
                      go, and whether the model can work the tools a turn reaches for. Composed into
                      one line rather than stacked as two spans, because the row is one line tall. */
-                  const why = [
-                    choice.brain === "local"
-                      ? localUnavailable
-                        ? "not running on this machine"
-                        : "on this machine"
-                      : choice.brain === "openrouter"
-                        ? /* Said before the pick, not after: the local mark answers "is it running
-                             here", and this one answers the question that matters just as much for
-                             a hosted choice — whose machine the words end up on. */
-                          "off this machine: sent to a third-party provider"
-                        : null,
-                    /* Only `false` earns a mark. Absent is "nobody asked", which is the ordinary
-                       state of every choice nothing has introspected — marking that would put a
-                       warning on most of the menu and teach people to read past it. */
-                    choice.tools === false ? "cannot use tools" : null,
-                  ].filter((note): note is string => note !== null);
+                  const why = modelWhyNotes(choice, localUnavailable);
 
                   return (
                     <DropdownMenuRadioItem
