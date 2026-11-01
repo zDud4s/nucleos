@@ -459,4 +459,39 @@ mod agy_primary_tests {
             Ok(())
         );
     }
+
+    /// E24: a catalogue agent that declares the gemini-api engine cannot hold a council seat; the
+    /// refusal names the engine and is made by `resolve_seat`, before anything is spent.
+    #[tokio::test]
+    async fn a_gemini_api_agent_cannot_hold_a_council_seat() {
+        let state = crate::channels::testkit::state().await;
+        let agent = crate::agent::create(
+            &state.pool,
+            crate::agent::AgentRequest {
+                name: "gemini-seat".to_string(),
+                speciality: "the speciality of gemini-seat".to_string(),
+                prompt: "The standing instructions of gemini-seat.".to_string(),
+                engine: Some(crate::engines::GEMINI_API.to_string()),
+                model: Some("gemini-3.8-flash".to_string()),
+                capabilities: vec!["mcp.nucleos".to_string()],
+            },
+        )
+        .await
+        .unwrap();
+        let spec = SeatSpec {
+            agent: Some(agent.id.clone()),
+            ..SeatSpec::default()
+        };
+
+        let outcome = resolve_seat(&state, &spec, "member 1").await;
+
+        assert!(
+            matches!(
+                outcome,
+                Err(StartError::Invalid(ref why))
+                    if why.contains(crate::engines::GEMINI_API_REFUSAL)
+            ),
+            "{outcome:?}"
+        );
+    }
 }

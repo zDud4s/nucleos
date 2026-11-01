@@ -423,6 +423,20 @@ mod tests {
         assert!(!plan.runners.contains(&RunnerKind::Agy));
     }
 
+    /// E24: gemini-api is an agent engine name but no launch can run it; the pin is refused by
+    /// name, with the engine's own refusal text rather than "unknown engine".
+    #[test]
+    fn agent_launch_refuses_gemini_api_by_name() {
+        let pin = Some(("gemini-api".to_owned(), "gemini-3.8-flash".to_owned()));
+        let error = plan_launch("coder@1.0.0", &[McpNucleos], pin, None, &[]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(crate::engines::GEMINI_API_REFUSAL),
+            "{error}"
+        );
+    }
+
     /// E16 F3: an unpinned launch under `primary_runner: agy` would land on the daemon's runner.
     #[test]
     fn unpinned_agent_refuses_an_agy_primary() {
