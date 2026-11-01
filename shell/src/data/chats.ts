@@ -670,12 +670,23 @@ export function useChats() {
  * an hour rather than `Infinity` so a daemon restart is eventually noticed
  * without the app being restarted too.
  */
-export function useAssistantModels(chatId?: string) {
+export function useAssistantModels(chatId?: string, scope?: "chat") {
+  // `scope: "chat"` without a chat id is the front door: the menu of a chat that does not exist
+  // yet, which carries the agy and Gemini API rows the daemon-wide menu leaves out.
+  const newChat = chatId === undefined && scope === "chat";
   return useQuery({
-    queryKey: chatId === undefined ? keys.chats.models : keys.chats.modelsFor(chatId),
+    queryKey: chatId !== undefined
+      ? keys.chats.modelsFor(chatId)
+      : newChat
+        ? keys.chats.modelsNewChat
+        : keys.chats.models,
     queryFn: () =>
       apiFetch<AssistantModels>(
-        `/assistant/models${chatId === undefined ? "" : `?chat=${encodeURIComponent(chatId)}`}`,
+        chatId !== undefined
+          ? `/assistant/models?chat=${encodeURIComponent(chatId)}`
+          : newChat
+            ? "/assistant/models?scope=chat"
+            : "/assistant/models",
       ),
     staleTime: 60 * 60 * 1000,
   });

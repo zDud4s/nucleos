@@ -1412,7 +1412,7 @@ describe("Chats - choosing a model", () => {
     });
   });
 
-  it("the front door still asks for the daemon-wide menu", async () => {
+  it("the front door asks for the chat-scoped menu", async () => {
     const requested: string[] = [];
     const base = chatsFetch([], {});
     daemon.apiFetch.mockImplementation(async (path, init) => {
@@ -1423,7 +1423,7 @@ describe("Chats - choosing a model", () => {
     await renderChats("/chats");
 
     await waitFor(() => {
-      expect(requested).toContain("/assistant/models");
+      expect(requested).toContain("/assistant/models?scope=chat");
       expect(requested.filter((path) => path.includes("?chat="))).toHaveLength(0);
     });
   });

@@ -471,6 +471,8 @@ export const keys = {
      */
     models: ["chats", "models"] as const,
     modelsFor: (chatId: string) => ["chats", "models", chatId] as const,
+    /** The chat-scoped menu of the front door — `GET /assistant/models?scope=chat`. */
+    modelsNewChat: ["chats", "models", "new-chat"] as const,
     /** Archived conversations — `GET /assistant/chats?archived=true`. */
     archived: ["chats", "archived"] as const,
     /** The user's session groups — `GET /assistant/chat-groups`. */

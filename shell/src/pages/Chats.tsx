@@ -144,7 +144,9 @@ import { Popover as PopoverPrimitive } from "radix-ui";
 import { useDictation, type DictationView } from "../data/dictation";
 import { revise, type Provisional } from "../lib/provisional";
 import type { LocalPull, ModelChoice, ModelGroup } from "../data/chats";
+import { routeOf, splitByRoute } from "../chats/model-routes";
 import {
+  Badge,
   Button,
   ConfirmButton,
   Modal,
@@ -1427,8 +1429,9 @@ function StartBox({
           />
           {/* Held as state, not written anywhere: there is no conversation to write it to until the
             first message opens one, and it travels with that message. */}
-          <ModelMenu model={model} disabled={pending} onPick={setModel} />
+          <ModelMenu model={model} disabled={pending} onPick={setModel} newChat />
           <EffortSlider
+            newChat
             model={model}
             effort={effort}
             disabled={pending}
@@ -2398,12 +2401,13 @@ const MODEL_SECTIONS: {
   {
     key: "cli",
     label: "On the agent CLI",
-    holds: (choice) => choice.brain === "cloud",
+    holds: (choice) => choice.brain === "cloud" && routeOf(choice) === null,
   },
   {
     key: "hosted",
     label: "Through OpenRouter",
-    holds: (choice) => choice.brain === "openrouter",
+    // Real OpenRouter rows only: the Gemini API rows also say `openrouter` but have their own route.
+    holds: (choice) => choice.brain === "openrouter" && routeOf(choice) === null,
   },
   {
     key: "installed",
@@ -2563,6 +2567,7 @@ function ModelMenu({
   chatId,
   open,
   onOpenChange,
+  newChat = false,
 }: {
   model: string | null;
   onPick: (model: string | null) => void;
@@ -2572,8 +2577,10 @@ function ModelMenu({
   /** Controlled open state, for a slash command that opens the menu; omitted, the menu is its own. */
   open?: boolean;
   onOpenChange?: (open: boolean) => void;
+  /** The front door: asks the chat-scoped menu, which carries the agy and Gemini API rows. */
+  newChat?: boolean;
 }) {
-  const catalogue = useAssistantModels(chatId);
+  const catalogue = useAssistantModels(chatId, newChat ? "chat" : undefined);
   // The agent-CLI section is drawn from the daemon's discovered, grouped list when it has one.
   const grouped = useModelGroups(chatId).data;
   const groups = grouped?.groups;
@@ -2596,9 +2603,13 @@ function ModelMenu({
   const armedAt = useRef(0);
 
   const choices = catalogue.data?.choices ?? [];
+  const groupModels = groups?.flatMap((group) => group.models) ?? [];
   const chosen =
     choices.find((choice) => choice.id === model) ??
-    groups?.flatMap((group) => group.models).find((choice) => choice.id === model);
+    groupModels.find((choice) => choice.id === model);
+  // Route rows come from the flat list and from the groups alike (agy sits in the groups, the
+  // Gemini API only in the flat list), once each.
+  const { routes } = splitByRoute([...choices, ...groupModels]);
   // Unpinned shows the configured model's name, not a blank. A pin the daemon never labelled (a
   // name since removed from the config) is shown as a product name rather than as the raw id: it
   // is still what the next turn will actually run.
@@ -2614,12 +2625,17 @@ function ModelMenu({
     "Model";
   const pick = (picked: string) => onPick(picked === "" ? null : picked);
   const configuredProvider = configured ? providerOf(configured, groups) : null;
-  const shownProvider = markOf(providerOf(model ?? configured ?? "", groups));
+  // A pick that left the company groups (agy, the Gemini API) keeps its route's mark.
+  const shownProvider =
+    (chosen ? routeOf(chosen)?.mark : undefined) ??
+    markOf(providerOf(model ?? configured ?? "", groups));
   const companies = COMPANIES.map((company) => ({
     ...company,
-    groups: (groups ?? []).filter(
-      (group) => group.provider === company.provider && group.models.length > 0,
-    ),
+    groups: (groups ?? [])
+      .filter((group) => group.provider === company.provider)
+      // The daemon files an agy row by the hosted model's family; the route sections own it.
+      .map((group) => ({ ...group, models: group.models.filter((c) => routeOf(c) === null) }))
+      .filter((group) => group.models.length > 0),
   })).filter(
     (company) => company.groups.length > 0 || company.provider === configuredProvider,
   );
@@ -2709,6 +2725,26 @@ function ModelMenu({
             </DropdownMenuSub>
           );
         })}
+        {/* One submenu per route that is not a house CLI (agy, the Gemini API), after the
+            companies. An empty route is not drawn. */}
+        {routes.map(({ route, models }) => (
+          <DropdownMenuSub key={route.runner}>
+            <DropdownMenuSubTrigger className="chats-model-company">
+              <ProviderMark provider={route.mark} size={14} />
+              {route.section}
+            </DropdownMenuSubTrigger>
+            <DropdownMenuSubContent className="chats-meta-menu chats-model-list">
+              <DropdownMenuRadioGroup value={model ?? ""} onValueChange={pick}>
+                {models.map((choice) => (
+                  <DropdownMenuRadioItem key={choice.id} value={choice.id}>
+                    {choice.label}
+                    <Badge tone="info">{route.badge}</Badge>
+                  </DropdownMenuRadioItem>
+                ))}
+              </DropdownMenuRadioGroup>
+            </DropdownMenuSubContent>
+          </DropdownMenuSub>
+        ))}
           {MODEL_SECTIONS.map((section) => {
             // Replaced by the companies above once the daemon has sent its groups.
             if (section.key === "cli" && groups !== undefined) return null;
@@ -2831,14 +2867,17 @@ function EffortSlider({
   onPick,
   disabled = false,
   chatId,
+  newChat = false,
 }: {
   model: string | null;
   effort: string | null;
   onPick: (effort: string | null) => void;
   disabled?: boolean;
   chatId?: string;
+  /** The front door: asks the chat-scoped menu, so an agy or Gemini API pick has its efforts here. */
+  newChat?: boolean;
 }) {
-  const catalogue = useAssistantModels(chatId);
+  const catalogue = useAssistantModels(chatId, newChat ? "chat" : undefined);
   const groups = useModelGroups(chatId).data?.groups;
   const fromGroups = groups
     ?.flatMap((group) => group.models)
