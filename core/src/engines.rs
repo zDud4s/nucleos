@@ -292,29 +292,102 @@ impl CommandRunner for RefusingRunner {
 /// refusing runner while it is off, never Claude; an absent or unknown name keeps the Claude CLI
 /// (an unknown one warns, so a typo does not take the daemon down).
 pub fn runner_for_primary(name: Option<&str>, models: &ModelsConfig) -> Arc<dyn CommandRunner> {
-    match name {
-        Some(CODEX) => {
-            tracing::info!(model = %models.codex_model, "codex CLI selected as the run runner");
-            codex_runner(models)
-        }
-        Some(AGY) => match agy::runner(models) {
+    runner_for_primary_in(TABLE, name, models)
+}
+
+/// `runner_for_primary` over an explicit table. A known CLI row builds its own runner; a row whose
+/// runner is `None` (agy while its opt-in is off) gets a refusing runner naming it, never Claude;
+/// an absent name keeps Claude and an unknown one warns and keeps Claude.
+pub fn runner_for_primary_in(
+    table: &[EngineDescription],
+    name: Option<&str>,
+    models: &ModelsConfig,
+) -> Arc<dyn CommandRunner> {
+    let Some(name) = name else {
+        return claude_runner(models);
+    };
+    match cli_row_in(table, name) {
+        Some(row) => match (row.runner)(models) {
             Some(runner) => {
-                tracing::info!("agy CLI selected as the run runner");
+                if row.id == CODEX {
+                    tracing::info!(model = %models.codex_model, "codex CLI selected as the run runner");
+                } else if row.id != CLAUDE {
+                    tracing::info!("{} CLI selected as the run runner", row.id);
+                }
                 runner
             }
             None => {
-                tracing::warn!("primary_runner is agy, but the agy engine is disabled in settings");
-                Arc::new(RefusingRunner {
-                    message: "primary_runner is agy, but the agy engine is disabled in settings"
-                        .to_string(),
-                })
+                let message = format!(
+                    "primary_runner is {id}, but the {id} engine is disabled in settings",
+                    id = row.id
+                );
+                tracing::warn!("{message}");
+                Arc::new(RefusingRunner { message })
             }
         },
-        Some(other) if other != CLAUDE => {
-            tracing::warn!(%other, "unknown primary_runner — keeping the Claude CLI");
+        None => {
+            tracing::warn!(other = %name, "unknown primary_runner — keeping the Claude CLI");
             claude_runner(models)
         }
-        _ => claude_runner(models),
+    }
+}
+
+/// A table-backed engine id: the `id` string of a `TABLE` row. Copy and hashable so it can stand in
+/// for an enum in patterns; ordered by row position, so Claude < Codex < Agy.
+// The later leaves of the id flip use these items; the flip removes this allow.
+#[allow(dead_code)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EngineId(&'static str);
+
+#[allow(dead_code)]
+impl EngineId {
+    /// The id of the `TABLE` row named `name`, or `None` for an unknown name.
+    pub(crate) fn named(name: &str) -> Option<EngineId> {
+        TABLE.iter().find(|row| row.id == name).map(|row| EngineId(row.id))
+    }
+
+    /// An id outside `TABLE`, to exercise the fail-closed arms with a row nothing wires up.
+    #[cfg(any(test, feature = "testkit"))]
+    pub fn for_test(id: &'static str) -> EngineId {
+        EngineId(id)
+    }
+
+    /// The stored text of the id.
+    pub fn as_str(&self) -> &'static str {
+        self.0
+    }
+
+    fn index(&self) -> usize {
+        TABLE
+            .iter()
+            .position(|row| row.id == self.0)
+            .unwrap_or(usize::MAX)
+    }
+}
+
+impl PartialOrd for EngineId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for EngineId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.index()
+            .cmp(&other.index())
+            .then_with(|| self.0.cmp(other.0))
+    }
+}
+
+impl std::fmt::Debug for EngineId {
+    /// The capitalised id (Claude, Codex, Local, Agy).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut chars = self.0.chars();
+        if let Some(first) = chars.next() {
+            write!(f, "{}{}", first.to_uppercase(), chars.as_str())
+        } else {
+            Ok(())
+        }
     }
 }
 
