@@ -27,8 +27,12 @@ pub const RESUMING_NOTICE: &str =
 pub async fn resume_or_notice(
     pool: &SqlitePool,
     chat_id: &str,
-    origin: Option<&str>,
+    cut: CutTurn<'_>,
 ) -> sqlx::Result<&'static str> {
+    if !cut.is_resumable() {
+        return Ok(super::notices::RESTART_NOTICE);
+    }
+    let origin = cut.origin;
     let queued: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_queue WHERE chat_id = ?")
         .bind(chat_id)
         .fetch_one(pool)
@@ -40,7 +44,8 @@ pub async fn resume_or_notice(
     // longer exists) or a spent count both fall through to the plain notice.
     let spent: Option<i64> = sqlx::query_scalar(
         "UPDATE chats SET auto_resumes = auto_resumes + 1
-          WHERE chat_id = ? AND auto_resumes < ? RETURNING auto_resumes",
+          WHERE chat_id = ? AND auto_resumes < ? AND archived_at IS NULL
+      RETURNING auto_resumes",
     )
     .bind(chat_id)
     .bind(AUTO_RESUME_LIMIT)
@@ -50,8 +55,54 @@ pub async fn resume_or_notice(
         return Ok(super::notices::RESTART_NOTICE);
     }
     let origin = crate::assistant_types::Origin::from_wire(origin).as_wire();
-    super::enqueue(pool, chat_id, AUTO_RESUME_TEXT, origin, "[]").await?;
+    if let Err(error) = super::enqueue(pool, chat_id, AUTO_RESUME_TEXT, origin, "[]").await {
+        // `enqueue` takes no transaction, so the increment and the insert cannot commit together;
+        // give the count back so a failed enqueue does not spend one of the resumes.
+        if let Err(undo) = sqlx::query(
+            "UPDATE chats SET auto_resumes = auto_resumes - 1
+              WHERE chat_id = ? AND auto_resumes > 0",
+        )
+        .bind(chat_id)
+        .execute(pool)
+        .await
+        {
+            tracing::warn!(%undo, chat_id, "could not give back an automatic resume count");
+        }
+        return Err(error);
+    }
     Ok(RESUMING_NOTICE)
+}
+
+/// What `reconcile_orphaned_runs` knows about a turn the restart cut.
+#[derive(Clone, Copy, Debug)]
+pub struct CutTurn<'a> {
+    pub origin: Option<&'a str>,
+    /// `runs.from_relay_id`: a turn another conversation handed over.
+    pub from_relay_id: Option<i64>,
+    /// `runs.read_untrusted`: the turn read third-party text.
+    pub read_untrusted: bool,
+}
+
+impl CutTurn<'_> {
+    /// Only a turn the owner started resumes, and only when its session can be resumed.
+    ///
+    /// - A relay-born turn would be re-queued without its relay, skipping the owner-present and
+    ///   chain-room brakes and going out with person trust.
+    /// - An unprompted turn (`task`) would look as if the owner spoke, spending money with the
+    ///   owner absent; any origin that is not a known user origin counts as unprompted.
+    /// - A turn that read untrusted text has no resumable session, so "continue" would arrive
+    ///   without its context.
+    fn is_resumable(&self) -> bool {
+        if self.from_relay_id.is_some() || self.read_untrusted {
+            return false;
+        }
+        match self.origin {
+            None | Some("shell" | "voice" | "browser-panel" | "telegram") => true,
+            Some(wire) => wire
+                .strip_prefix("channel:")
+                .is_some_and(|id| crate::channels::registry::by_id(id).is_some()),
+        }
+    }
 }
 
 /// A completed turn ends the streak of interruptions.
@@ -174,6 +225,91 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    async fn count_of(pool: &SqlitePool, chat_id: &str) -> i64 {
+        sqlx::query_scalar("SELECT auto_resumes FROM chats WHERE chat_id = ?")
+            .bind(chat_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn cut_and_reconcile(pool: &SqlitePool, chat_id: &str, set: &str) {
+        a_running_turn(pool, chat_id, "shell").await;
+        // `set` is a literal from the tests below, never outside input.
+        let sql = format!("UPDATE runs SET {set} WHERE chat_id = ?");
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(chat_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        crate::execution::runs::reconcile_orphaned_runs(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn assert_not_resumed(pool: &SqlitePool, chat_id: &str) {
+        assert!(waiting(pool, chat_id).await.is_empty());
+        assert_eq!(count_of(pool, chat_id).await, 0);
+        assert_eq!(notice_bodies(pool, chat_id).await, vec![RESTART_NOTICE]);
+    }
+
+    #[tokio::test]
+    async fn a_relay_born_turn_is_not_resumed() {
+        let pool = crate::testdb::fresh_pool().await;
+        a_chat(&pool, "c-1").await;
+        cut_and_reconcile(&pool, "c-1", "from_relay_id = 7").await;
+        assert_not_resumed(&pool, "c-1").await;
+    }
+
+    #[tokio::test]
+    async fn an_unprompted_turn_is_not_resumed() {
+        let pool = crate::testdb::fresh_pool().await;
+        a_chat(&pool, "c-1").await;
+        cut_and_reconcile(&pool, "c-1", "origin = 'task'").await;
+        assert_not_resumed(&pool, "c-1").await;
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_read_untrusted_text_is_not_resumed() {
+        let pool = crate::testdb::fresh_pool().await;
+        a_chat(&pool, "c-1").await;
+        cut_and_reconcile(&pool, "c-1", "read_untrusted = 1").await;
+        assert_not_resumed(&pool, "c-1").await;
+    }
+
+    #[tokio::test]
+    async fn an_archived_chat_is_not_resumed() {
+        let pool = crate::testdb::fresh_pool().await;
+        a_chat(&pool, "c-1").await;
+        sqlx::query("UPDATE chats SET archived_at = ? WHERE chat_id = 'c-1'")
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(&pool)
+            .await
+            .unwrap();
+        cut_and_reconcile(&pool, "c-1", "origin = 'shell'").await;
+        assert_not_resumed(&pool, "c-1").await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_enqueue_does_not_spend_the_count() {
+        let pool = crate::testdb::fresh_pool().await;
+        a_chat(&pool, "c-1").await;
+        sqlx::query(
+            "CREATE TRIGGER refuse_queue BEFORE INSERT ON chat_queue
+             BEGIN SELECT RAISE(ABORT, 'refused'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let cut = CutTurn {
+            origin: Some("shell"),
+            from_relay_id: None,
+            read_untrusted: false,
+        };
+        assert!(resume_or_notice(&pool, "c-1", cut).await.is_err());
+        assert_eq!(count_of(&pool, "c-1").await, 0);
     }
 
     #[tokio::test]

@@ -580,6 +580,13 @@ pub(super) async fn record_spontaneous_answer(
     .execute(pool)
     .await;
     crate::execution::runs::warn_on_terminal_write_err(&completed, id, "completed");
+    if completed
+        .as_ref()
+        .is_ok_and(|written| written.rows_affected() > 0)
+    {
+        // A turn that finished ends the streak of restart interruptions.
+        crate::chats::auto_resume::reset(pool, chat_id).await;
+    }
     if let Some(session_id) = o.session_id.as_deref() {
         // The same rule as a person's turn: a session that read third-party text is not resumable.
         match crate::execution::runs::read_untrusted_context(pool, id).await {

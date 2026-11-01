@@ -221,6 +221,8 @@ pub(super) async fn spawn_local_turn(
                         .is_ok_and(|written| written.rows_affected() > 0)
                     {
                         auto_fill = Some(fill);
+                        // A turn that finished ends the streak of restart interruptions.
+                        crate::chats::auto_resume::reset(&pool, &chat_id).await;
                     }
                     completed
                 }

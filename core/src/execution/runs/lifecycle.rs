@@ -420,6 +420,8 @@ pub(super) type ReconcileRow = (
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<i64>,
+    i64,
 );
 
 /// Marks every run still `"running"` as `"interrupted"` — called once at startup to recover from a
@@ -428,12 +430,12 @@ pub async fn reconcile_orphaned_runs(pool: &sqlx::SqlitePool) -> Result<u64, sql
     let now = chrono::Utc::now().to_rfc3339();
     let reconciled: Vec<ReconcileRow> = sqlx::query_as(
         "UPDATE runs SET status = 'interrupted', completed_at = ? WHERE status = 'running'
-         RETURNING id, project_id, chat_id, mode, origin",
+         RETURNING id, project_id, chat_id, mode, origin, from_relay_id, read_untrusted",
     )
     .bind(&now)
     .fetch_all(pool)
     .await?;
-    for (id, project_id, chat_id, mode, origin) in &reconciled {
+    for (id, project_id, chat_id, mode, origin, from_relay_id, read_untrusted) in &reconciled {
         let _ = crate::feed::append(
             pool,
             project_id.as_deref(),
@@ -450,7 +452,11 @@ pub async fn reconcile_orphaned_runs(pool: &sqlx::SqlitePool) -> Result<u64, sql
             let body = match crate::chats::auto_resume::resume_or_notice(
                 pool,
                 chat_id,
-                origin.as_deref(),
+                crate::chats::auto_resume::CutTurn {
+                    origin: origin.as_deref(),
+                    from_relay_id: *from_relay_id,
+                    read_untrusted: *read_untrusted != 0,
+                },
             )
             .await
             {
