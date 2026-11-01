@@ -23,6 +23,21 @@ pub const LONG_TURN_NOTICE: Duration = Duration::from_secs(10 * 60);
 /// The longest tool name that goes out; a name is the model's choice, so it is capped.
 const TOOL_NAME_MAX: usize = 64;
 
+/// A tool name as it may leave the machine: only what a real tool name is made of, capped. It is
+/// not trusted text, and a channel may render it, so a newline or markup never gets through.
+fn clean_tool_name(tool: &str) -> String {
+    let name: String = tool
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-'))
+        .take(TOOL_NAME_MAX)
+        .collect();
+    if name.is_empty() {
+        "unnamed".to_owned()
+    } else {
+        name
+    }
+}
+
 /// Enqueues one notification to the primary channel's home conversation. `false` when there is no
 /// destination (no primary, or it has no home): the owner then sees it in the app only.
 pub async fn notify_owner(state: &AppState, text: String) -> sqlx::Result<bool> {
@@ -92,7 +107,7 @@ async fn notice_if_open(state: &AppState, chat_id: &str, ask_id: &str, tool: &st
     if !crate::hooks::ask_is_open(ask_id) {
         return;
     }
-    let tool: String = tool.chars().take(TOOL_NAME_MAX).collect();
+    let tool = clean_tool_name(tool);
     let text = with_link(
         state,
         chat_id,
@@ -112,7 +127,7 @@ pub async fn long_turn_ended(
     if from_channel || elapsed < LONG_TURN_NOTICE {
         return;
     }
-    let text = with_link(state, chat_id, "A long turn has finished.".to_owned());
+    let text = with_link(state, chat_id, "A long turn has ended.".to_owned());
     notify_or_warn(state, text).await;
 }
 
@@ -188,6 +203,75 @@ mod tests {
             "{text}"
         );
         crate::hooks::forget_asks_for_chat("notice-chat-1");
+    }
+
+    /// Reads the rows until `want` appear or two seconds of real time pass: the notice's own task
+    /// writes them, and SQLite works on a thread of its own.
+    async fn rows_when(state: &AppState, want: usize) -> Vec<(String, String, String)> {
+        for _ in 0..200 {
+            let found = rows(state).await;
+            if found.len() >= want {
+                return found;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        rows(state).await
+    }
+
+    /// The clock is frozen only around each advance. Left frozen, it would auto-advance past the
+    /// pool's acquire timeout while SQLite works on its own thread.
+    async fn advance_clock(by: Duration) {
+        tokio::time::pause();
+        tokio::time::advance(by).await;
+        tokio::time::resume();
+    }
+
+    #[tokio::test]
+    async fn the_notice_waits_out_the_delay() {
+        let (state, _tmp) = rig(true).await;
+        let ask_id = crate::hooks::ask_about("notice-chat-delay", 910_009, "Bash", None);
+
+        tokio::time::pause();
+        spawn_ask_notice(
+            state.clone(),
+            "notice-chat-delay".to_owned(),
+            ask_id,
+            "Bash".to_owned(),
+        );
+        // Lets the task reach its sleep, so the sleep starts on the frozen clock.
+        tokio::task::yield_now().await;
+        tokio::time::resume();
+
+        advance_clock(ASK_NOTICE_DELAY - Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(rows(&state).await.is_empty(), "the notice came early");
+
+        advance_clock(Duration::from_secs(1)).await;
+        assert_eq!(rows_when(&state, 1).await.len(), 1);
+        crate::hooks::forget_asks_for_chat("notice-chat-delay");
+    }
+
+    #[test]
+    fn a_tool_name_carries_nothing_a_channel_could_render() {
+        assert_eq!(
+            clean_tool_name("mcp__nucleos__verify"),
+            "mcp__nucleos__verify"
+        );
+        assert_eq!(
+            clean_tool_name(
+                "Bash
+*click* [here](x)"
+            ),
+            "Bashclickherex"
+        );
+        assert_eq!(
+            clean_tool_name(
+                "
+	"
+            ),
+            "unnamed"
+        );
+        assert_eq!(clean_tool_name(&"a".repeat(500)).len(), TOOL_NAME_MAX);
     }
 
     #[tokio::test]
