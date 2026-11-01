@@ -443,6 +443,34 @@ mod tests {
         );
     }
 
+    /// E25: a `gemini-api/` model id on an agent that names no engine is still a Gemini pick, so
+    /// it is refused by name instead of falling through to the router. Composes the two pure steps
+    /// `resolve_agent_launch_with` runs: the pin the agent and caller yield, then the plan.
+    #[test]
+    fn a_gemini_model_id_with_no_engine_is_refused_by_name() {
+        let agent = Agent {
+            id: "i".into(),
+            name: "n".into(),
+            speciality: "s".into(),
+            prompt: "p".into(),
+            engine: None,
+            model: Some("gemini-api/x".into()),
+            capabilities: Vec::new(),
+            source: "user".into(),
+            package_ref: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let pin = effective_pin(&Pins::default(), &agent);
+        let error = plan_launch("coder@1.0.0", &[McpNucleos], pin, None, &[]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(crate::engines::GEMINI_API_REFUSAL),
+            "{error}"
+        );
+    }
+
     /// E16 F3: an unpinned launch under `primary_runner: agy` would land on the daemon's runner.
     #[test]
     fn unpinned_agent_refuses_an_agy_primary() {

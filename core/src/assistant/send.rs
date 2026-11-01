@@ -1641,6 +1641,131 @@ mod tests {
         panic!("turn {id} never settled");
     }
 
+    // --- E25: hosted pin read, Gemini routing and cost ---
+
+    /// What a loopback provider stub saw: the `Authorization` header and the JSON body.
+    type Seen = Arc<std::sync::Mutex<Vec<(Option<String>, serde_json::Value)>>>;
+
+    /// A loopback `/chat/completions` that records every request and answers `ok`.
+    async fn provider_stub() -> (String, Seen) {
+        let seen: Seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        let app = axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(
+                move |headers: axum::http::HeaderMap,
+                      axum::Json(body): axum::Json<serde_json::Value>| {
+                    let recorded = recorded.clone();
+                    async move {
+                        let auth = headers
+                            .get("authorization")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string);
+                        recorded.lock().unwrap().push((auth, body));
+                        axum::Json(serde_json::json!({
+                            "choices": [{ "message": { "content": "ok" } }]
+                        }))
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{address}"), seen)
+    }
+
+    /// Sends one message to an `openrouter`-brain chat pinned to `pin`, with both providers' keys
+    /// stored and both bases on local stubs. Returns the finished run's `cost_usd` and what each
+    /// stub saw.
+    async fn hosted_turn_with_both_keys(pin: &str) -> (Option<f64>, Seen, Seen) {
+        let (openrouter_base, openrouter_seen) = provider_stub().await;
+        let (gemini_base, gemini_seen) = provider_stub().await;
+        let mut state = test_state().await;
+        state.assistants = Arc::new(
+            crate::assistants::ConfiguredAssistants::new(
+                None,
+                Some("anthropic/claude-sonnet-4.5".to_string()),
+                Some("openrouter-key".to_string()),
+                "http://127.0.0.1:8791".to_string(),
+                "token".to_string(),
+                state.pool.clone(),
+                crate::execution::runner::OLLAMA_BASE_URL.to_string(),
+            )
+            .with_gemini_key(Some("google-key".to_string()))
+            .with_hosted_base_url(openrouter_base)
+            .with_gemini_base_url(gemini_base),
+        );
+        let chat = crate::chats::create(&state.pool, crate::chats::Brain::OpenRouter, None)
+            .await
+            .unwrap();
+        crate::chats::set_model(&state.pool, &chat, Some(pin))
+            .await
+            .unwrap();
+
+        let sent = send_message_with(&state, &chat, "hello", &[], Origin::Shell).await;
+
+        let id = sent.expect("a free hosted chat starts a turn");
+        settled(&state.pool, id).await;
+        let (status, cost): (String, Option<f64>) =
+            sqlx::query_as("SELECT status, cost_usd FROM runs WHERE id = ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "completed", "the stub answered, so the turn completed");
+        (cost, openrouter_seen, gemini_seen)
+    }
+
+    /// E25: a hosted turn whose pin cannot be read is refused rather than answered by the route's
+    /// default model. On a closed pool the read fails.
+    #[tokio::test]
+    async fn a_failed_pin_read_on_a_hosted_chat_is_refused() {
+        let pool = crate::testdb::fresh_pool().await;
+        pool.close().await;
+
+        let pin = hosted_pin(&pool, "any-chat").await;
+
+        assert!(pin.is_err(), "a failed read must not become `None`: {pin:?}");
+    }
+
+    /// E25: a `gemini-api/` pin on an `openrouter`-brain chat goes to Google with the Google key,
+    /// never to OpenRouter, and its cost is unknown (NULL), not zero.
+    #[tokio::test]
+    async fn a_gemini_pinned_chat_reaches_google_and_records_unknown_cost() {
+        let (cost, openrouter_seen, gemini_seen) =
+            hosted_turn_with_both_keys("gemini-api/x").await;
+
+        {
+            let seen = gemini_seen.lock().unwrap();
+            assert_eq!(seen.len(), 1, "exactly one request reached Google: {seen:?}");
+            assert_eq!(seen[0].0.as_deref(), Some("Bearer google-key"));
+        }
+        assert!(
+            openrouter_seen.lock().unwrap().is_empty(),
+            "a gemini-api pin must never reach OpenRouter"
+        );
+        assert_eq!(cost, None, "Google's price is unknown, not free");
+    }
+
+    /// Guard for existing behaviour (allowed to pass today): an OpenRouter turn still records a
+    /// cost of 0, and goes to OpenRouter with the OpenRouter key.
+    #[tokio::test]
+    async fn an_openrouter_chats_turn_still_records_zero_cost() {
+        let (cost, openrouter_seen, gemini_seen) =
+            hosted_turn_with_both_keys("openai/gpt-5.6").await;
+
+        {
+            let seen = openrouter_seen.lock().unwrap();
+            assert_eq!(seen.len(), 1, "{seen:?}");
+            assert_eq!(seen[0].0.as_deref(), Some("Bearer openrouter-key"));
+        }
+        assert!(gemini_seen.lock().unwrap().is_empty());
+        assert_eq!(cost, Some(0.0));
+    }
+
     /// A browser agent's reply that could not be delivered reaches the mother's NEXT turn: once,
     /// in front of what the person typed, and only the `browser_reply` kind. `runs.prompt` keeps
     /// the typed words, so a later replay of the history cannot repeat the notice.

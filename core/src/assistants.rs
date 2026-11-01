@@ -1749,6 +1749,66 @@ mod tests {
         assert!(openrouter_seen.lock().unwrap().is_empty());
     }
 
+    /// E25: the provider is decided on the RESOLVED model. A configured default of `gemini-api/x`
+    /// with no pin is a Gemini pick: it refuses by name without a Google key, even with an
+    /// OpenRouter key, and with a Google key it builds the Gemini client. Never OpenRouter.
+    #[tokio::test]
+    async fn a_gemini_default_model_with_no_pin_never_reaches_openrouter() {
+        let (openrouter_base, openrouter_seen) = stub_completions_with_auth().await;
+        let (gemini_base, gemini_seen) = stub_completions_with_auth().await;
+        let factory = |openrouter_key: Option<&str>, google_key: Option<&str>| {
+            let (openrouter_base, gemini_base) = (openrouter_base.clone(), gemini_base.clone());
+            let (openrouter_key, google_key) = (
+                openrouter_key.map(str::to_string),
+                google_key.map(str::to_string),
+            );
+            async move {
+                ConfiguredAssistants::new(
+                    None,
+                    Some("gemini-api/x".to_string()),
+                    openrouter_key,
+                    "http://127.0.0.1:8791".to_string(),
+                    "token".to_string(),
+                    test_pool().await,
+                    crate::execution::runner::OLLAMA_BASE_URL.to_string(),
+                )
+                .with_gemini_key(google_key)
+                .with_hosted_base_url(openrouter_base)
+                .with_gemini_base_url(gemini_base)
+            }
+        };
+
+        // No Google key: refuses by name, even with an OpenRouter key stored.
+        let keyless = factory(Some("openrouter-key"), None).await;
+        let text = refusal_text(keyless.assistant_for(Brain::OpenRouter, None));
+        assert!(
+            text.to_lowercase().contains("gemini"),
+            "the refusal must name Gemini, got: {text}"
+        );
+        assert_ne!(text, HOSTED_KEY_MISSING);
+
+        // A Google key: the Gemini client, on the Gemini base, with the bare model id.
+        let keyed = factory(Some("openrouter-key"), Some("google-key")).await;
+        let assistant = keyed
+            .assistant_for(Brain::OpenRouter, None)
+            .unwrap_or_else(|refusal| {
+                panic!("a Google key serves a gemini-api default: {refusal:?}")
+            });
+        run_one_turn(&assistant).await;
+
+        let seen = gemini_seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "exactly one exchange on Google: {seen:?}");
+        assert_eq!(seen[0].0.as_deref(), Some("Bearer google-key"));
+        assert_eq!(
+            seen[0].1.pointer("/model").and_then(|value| value.as_str()),
+            Some("x")
+        );
+        assert!(
+            openrouter_seen.lock().unwrap().is_empty(),
+            "a gemini-api default must never reach OpenRouter"
+        );
+    }
+
     /// E22 provider isolation: each key goes only to its own base, neither provider borrows the
     /// other's key, and a hosted chat with no pin keeps today's OpenRouter behaviour.
     #[tokio::test]

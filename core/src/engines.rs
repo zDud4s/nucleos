@@ -647,6 +647,29 @@ mod row_tests {
         // The production table does not know the row: it collapses to claude.
         assert_eq!(runner_id_in(TABLE, "extra-cli"), "claude");
     }
+
+    /// E25: the override is thread-local, so a gate held here is invisible to any other thread.
+    #[test]
+    fn the_gemini_gate_is_invisible_to_other_threads() {
+        let _gate = gemini_test_support::gemini_gate(true);
+        assert!(gemini_key_stored(), "the holding thread sees the override");
+        let seen_elsewhere = std::thread::spawn(gemini_key_stored)
+            .join()
+            .expect("the probe thread ran");
+        assert!(!seen_elsewhere, "another thread must not see this test's gate");
+    }
+
+    /// E25: a blank, missing or unreadable key is not a key.
+    #[test]
+    fn a_blank_missing_or_unreadable_key_is_not_present() {
+        let ok = |value: Option<&str>| -> Result<Option<String>, String> {
+            Ok(value.map(str::to_string))
+        };
+        assert!(gemini_key_present(&ok(Some("k"))));
+        assert!(!gemini_key_present(&ok(Some("  "))));
+        assert!(!gemini_key_present(&ok(None)));
+        assert!(!gemini_key_present(&Err("store unreadable".to_string())));
+    }
 }
 
 /// Fixtures for the tests that need the Gemini API key "stored" or "absent" without a real
