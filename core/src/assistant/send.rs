@@ -1745,7 +1745,10 @@ mod tests {
                 .fetch_one(&state.pool)
                 .await
                 .unwrap();
-        assert_eq!(status, "completed", "the stub answered, so the turn completed");
+        assert_eq!(
+            status, "completed",
+            "the stub answered, so the turn completed"
+        );
         (cost, openrouter_seen, gemini_seen)
     }
 
@@ -1758,19 +1761,25 @@ mod tests {
 
         let pin = hosted_pin(&pool, "any-chat").await;
 
-        assert!(pin.is_err(), "a failed read must not become `None`: {pin:?}");
+        assert!(
+            pin.is_err(),
+            "a failed read must not become `None`: {pin:?}"
+        );
     }
 
     /// E25: a `gemini-api/` pin on an `openrouter`-brain chat goes to Google with the Google key,
     /// never to OpenRouter, and its cost is unknown (NULL), not zero.
     #[tokio::test]
     async fn a_gemini_pinned_chat_reaches_google_and_records_unknown_cost() {
-        let (cost, openrouter_seen, gemini_seen) =
-            hosted_turn_with_both_keys("gemini-api/x").await;
+        let (cost, openrouter_seen, gemini_seen) = hosted_turn_with_both_keys("gemini-api/x").await;
 
         {
             let seen = gemini_seen.lock().unwrap();
-            assert_eq!(seen.len(), 1, "exactly one request reached Google: {seen:?}");
+            assert_eq!(
+                seen.len(),
+                1,
+                "exactly one request reached Google: {seen:?}"
+            );
             assert_eq!(seen[0].0.as_deref(), Some("Bearer google-key"));
         }
         assert!(

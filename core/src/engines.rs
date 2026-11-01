@@ -665,7 +665,10 @@ mod row_tests {
         let seen_elsewhere = std::thread::spawn(gemini_key_stored)
             .join()
             .expect("the probe thread ran");
-        assert!(!seen_elsewhere, "another thread must not see this test's gate");
+        assert!(
+            !seen_elsewhere,
+            "another thread must not see this test's gate"
+        );
     }
 
     /// E25: a blank, missing or unreadable key is not a key.
