@@ -86,15 +86,31 @@ pub struct CreatedCode {
     pub access_level: ApiTokenLevel,
     pub device_name: String,
     pub expires_at: String,
+    /// The device this code pairs is an owner device (always an Admin one).
+    pub owner: bool,
 }
 
 /// Creates a pairing code valid for [`PAIRING_TTL`], and sweeps codes expired more than a day ago.
+/// The code pairs an ordinary device; see [`create_pairing_code_for`] for the owner one.
 pub async fn create_pairing_code(
     pool: &SqlitePool,
     level: ApiTokenLevel,
     device_name: &str,
     now: DateTime<Utc>,
 ) -> Result<CreatedCode, sqlx::Error> {
+    create_pairing_code_for(pool, level, false, device_name, now).await
+}
+
+/// [`create_pairing_code`] with the owner flag. `owner` only counts at the Admin level: any other
+/// level stores `0`, so a code without Admin can never produce an owner device.
+pub async fn create_pairing_code_for(
+    pool: &SqlitePool,
+    level: ApiTokenLevel,
+    owner: bool,
+    device_name: &str,
+    now: DateTime<Utc>,
+) -> Result<CreatedCode, sqlx::Error> {
+    let owner = owner && level == ApiTokenLevel::Admin;
     let raw: String = {
         let mut rng = rand::rng();
         (0..CODE_LEN)
@@ -109,13 +125,14 @@ pub async fn create_pairing_code(
         .execute(pool)
         .await?;
     sqlx::query(
-        "INSERT INTO pairing_codes (code_hash, access_level, device_name, expires_at) \
-         VALUES (?, ?, ?, ?)",
+        "INSERT INTO pairing_codes (code_hash, access_level, device_name, expires_at, owner) \
+         VALUES (?, ?, ?, ?, ?)",
     )
     .bind(hash_secret(&raw))
     .bind(level.as_str())
     .bind(&device_name)
     .bind(&expires_at)
+    .bind(i64::from(owner))
     .execute(pool)
     .await?;
 
@@ -124,6 +141,7 @@ pub async fn create_pairing_code(
         access_level: level,
         device_name,
         expires_at,
+        owner,
     })
 }
 
@@ -135,6 +153,7 @@ pub struct Paired {
     pub name: String,
     pub access_level: ApiTokenLevel,
     pub expires_at: String,
+    pub owner: bool,
 }
 
 #[derive(Debug)]
@@ -200,21 +219,24 @@ pub async fn exchange(
         return Err(ExchangeError::Invalid);
     }
 
-    let (level_text, name): (String, String) =
-        sqlx::query_as("SELECT access_level, device_name FROM pairing_codes WHERE code_hash = ?")
-            .bind(&hash)
-            .fetch_one(&mut *tx)
-            .await?;
+    let (level_text, name, owner_flag): (String, String, i64) = sqlx::query_as(
+        "SELECT access_level, device_name, owner FROM pairing_codes WHERE code_hash = ?",
+    )
+    .bind(&hash)
+    .fetch_one(&mut *tx)
+    .await?;
     let level = ApiTokenLevel::from_str(&level_text).ok_or(ExchangeError::Invalid)?;
+    let owner = owner_flag != 0 && level == ApiTokenLevel::Admin;
     let session = crate::auth::mint_secret("device");
     let (device_id,): (i64,) = sqlx::query_as(
-        "INSERT INTO remote_devices (name, access_level, session_hash, created_at) \
-         VALUES (?, ?, ?, ?) RETURNING id",
+        "INSERT INTO remote_devices (name, access_level, session_hash, created_at, owner) \
+         VALUES (?, ?, ?, ?, ?) RETURNING id",
     )
     .bind(&name)
     .bind(level.as_str())
     .bind(hash_secret(&session))
     .bind(&now_text)
+    .bind(i64::from(owner))
     .fetch_one(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -225,6 +247,7 @@ pub async fn exchange(
         name,
         access_level: level,
         expires_at: stamp(now + SESSION_ABSOLUTE),
+        owner,
     })
 }
 
@@ -236,6 +259,8 @@ pub struct Device {
     pub level: ApiTokenLevel,
     /// When the session ends no matter what (created + [`SESSION_ABSOLUTE`]).
     pub expires_at: String,
+    /// An owner device: Admin level with the owner flag. Never true for another level.
+    pub owner: bool,
 }
 
 #[derive(Debug)]
@@ -262,7 +287,15 @@ impl std::fmt::Display for SessionError {
 
 impl std::error::Error for SessionError {}
 
-type DeviceRow = (i64, String, String, String, Option<String>, Option<String>);
+type DeviceRow = (
+    i64,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    i64,
+);
 
 /// Looks a session secret up and checks it is revoked, expired or idle for none of the reasons.
 /// Touches `last_seen_at` at most once per [`LAST_SEEN_GRANULARITY`].
@@ -272,13 +305,13 @@ pub async fn authenticate(
     now: DateTime<Utc>,
 ) -> Result<Device, SessionError> {
     let row: Option<DeviceRow> = sqlx::query_as(
-        "SELECT id, name, access_level, created_at, last_seen_at, revoked_at \
+        "SELECT id, name, access_level, created_at, last_seen_at, revoked_at, owner \
          FROM remote_devices WHERE session_hash = ?",
     )
     .bind(hash_secret(session_secret))
     .fetch_optional(pool)
     .await?;
-    let Some((id, name, level_text, created_text, seen_text, revoked)) = row else {
+    let Some((id, name, level_text, created_text, seen_text, revoked, owner_flag)) = row else {
         return Err(SessionError::Invalid);
     };
     if revoked.is_some() {
@@ -306,6 +339,7 @@ pub async fn authenticate(
         name,
         level,
         expires_at: stamp(created + SESSION_ABSOLUTE),
+        owner: owner_flag != 0 && level == ApiTokenLevel::Admin,
     })
 }
 
@@ -318,12 +352,13 @@ pub struct DeviceInfo {
     pub created_at: String,
     pub last_seen_at: Option<String>,
     pub revoked_at: Option<String>,
+    pub owner: bool,
 }
 
 /// Every device ever paired, newest first.
 pub async fn list_devices(pool: &SqlitePool) -> Result<Vec<DeviceInfo>, sqlx::Error> {
     let rows: Vec<DeviceRow> = sqlx::query_as(
-        "SELECT id, name, access_level, created_at, last_seen_at, revoked_at \
+        "SELECT id, name, access_level, created_at, last_seen_at, revoked_at, owner \
          FROM remote_devices ORDER BY id DESC",
     )
     .fetch_all(pool)
@@ -331,7 +366,8 @@ pub async fn list_devices(pool: &SqlitePool) -> Result<Vec<DeviceInfo>, sqlx::Er
     Ok(rows
         .into_iter()
         .map(
-            |(id, name, access_level, created_at, last_seen_at, revoked_at)| DeviceInfo {
+            |(id, name, access_level, created_at, last_seen_at, revoked_at, owner)| DeviceInfo {
+                owner: owner != 0 && access_level == ApiTokenLevel::Admin.as_str(),
                 id,
                 name,
                 access_level,
@@ -664,6 +700,60 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(seen, Some(stamp(t0() + Duration::seconds(61))));
+    }
+
+    #[tokio::test]
+    async fn an_admin_device_stays_admin_after_the_migration() {
+        let pool = pool().await;
+        // A row written the way the code did before the column existed: no `owner` in the INSERT.
+        sqlx::query(
+            "INSERT INTO remote_devices (name, access_level, session_hash, created_at) \
+             VALUES ('old', 'admin', ?, ?)",
+        )
+        .bind(hash_secret("nos_device_old"))
+        .bind(stamp(t0()))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let device = authenticate(&pool, "nos_device_old", t0()).await.unwrap();
+        assert_eq!(device.level, ApiTokenLevel::Admin);
+        assert!(!device.owner);
+        assert!(!list_devices(&pool).await.unwrap()[0].owner);
+    }
+
+    #[tokio::test]
+    async fn an_owner_code_pairs_an_owner_device_and_only_at_admin() {
+        let pool = pool().await;
+        let code = create_pairing_code_for(&pool, ApiTokenLevel::Admin, true, "laptop", t0())
+            .await
+            .unwrap();
+        assert!(code.owner);
+        let paired = exchange(&pool, &code.code, t0()).await.unwrap();
+        assert!(paired.owner);
+        let device = authenticate(&pool, &paired.session, t0()).await.unwrap();
+        assert!(device.owner);
+        assert!(list_devices(&pool).await.unwrap()[0].owner);
+
+        // A code without `owner`, or an owner request below Admin, never produces an owner.
+        let plain = paired_with(&pool, ApiTokenLevel::Admin, false).await;
+        assert!(!plain.owner);
+        let low = paired_with(&pool, ApiTokenLevel::RunCreating, true).await;
+        assert!(!low.owner);
+        // Even a hand-written owner flag on a non-admin row is not honoured when read.
+        sqlx::query("UPDATE remote_devices SET owner = 1 WHERE id = ?")
+            .bind(low.device_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let read = authenticate(&pool, &low.session, t0()).await.unwrap();
+        assert!(!read.owner);
+    }
+
+    async fn paired_with(pool: &SqlitePool, level: ApiTokenLevel, owner: bool) -> Paired {
+        let code = create_pairing_code_for(pool, level, owner, "laptop", t0())
+            .await
+            .unwrap();
+        exchange(pool, &code.code, t0()).await.unwrap()
     }
 
     #[test]

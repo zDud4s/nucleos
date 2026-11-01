@@ -15,12 +15,15 @@ export interface RemoteDevice {
   created_at: string;
   last_seen_at: string | null;
   revoked_at: string | null;
+  /** An owner device: Admin level plus what only the host reached until now. */
+  owner: boolean;
 }
 
-/** `POST /remote/pairing-codes` body. */
+/** `POST /remote/pairing-codes` body. `owner` needs `access_level: "admin"`. */
 export interface NewPairingCode {
   device_name: string;
   access_level: ApiTokenLevel;
+  owner?: boolean;
 }
 
 /** `201` answer. `code` exists only here: the daemon never says it again. */
@@ -29,6 +32,7 @@ export interface PairingCode {
   access_level: ApiTokenLevel;
   device_name: string;
   expires_at: string;
+  owner: boolean;
 }
 
 /** The paired devices. No poll: the list changes only through this panel or a pairing. */

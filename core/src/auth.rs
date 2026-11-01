@@ -753,6 +753,26 @@ const REMOTE_DENIED_SEGMENTS: &[&str] = &[
     "workflow",
 ];
 
+/// First path segments an OWNER device reaches on top of the Admin ones: the owner's own laptop
+/// doing what only the host did until now (secrets and machine settings under `config`, backups,
+/// sidecars, the shutdown/restart/update handshake, messaging identity pairing, remote device
+/// management, minting API tokens, the live browser). Every one of them is also in
+/// [`REMOTE_DENIED_SEGMENTS`], which stays the list for the non-owner levels. The agent-only
+/// families (`tasks`, `hooks`, `admission`, `verify`, ...) are in neither list for an owner: an
+/// owner is the person, never an agent. Graded as the Admin token, like the admin segments.
+const REMOTE_OWNER_SEGMENTS: &[&str] = &[
+    "api-tokens",
+    "backups",
+    "backup",
+    "config",
+    "daemon",
+    "sidecars",
+    "system",
+    "remote",
+    "channels",
+    "browser",
+];
+
 /// Routes inside admin segments that no device reaches, whatever its level. `POST
 /// /assistant/browser-agents` starts a browser on the host, the host-only surface the `browser`
 /// deny covers (listing linked browser conversations, `GET`, stays open). `/email/incoming` and
@@ -778,12 +798,36 @@ const REMOTE_DEVICE_REFUSED_ROUTES: &[(Method, &str)] = &[
 ///    host-only live browser pixels) and any unlisted family.
 ///
 /// A few routes inside admin segments stay refused: see [`REMOTE_DEVICE_REFUSED_ROUTES`].
-pub fn remote_device_permits(level: ApiTokenLevel, method: &Method, route: &str) -> bool {
+///
+/// `owner` is the owner device flag; it only counts at the Admin level. An owner device also
+/// reaches [`REMOTE_OWNER_SEGMENTS`] and the routes in [`REMOTE_DEVICE_REFUSED_ROUTES`] (it is the
+/// owner), graded as the Admin token. It never reaches a segment in none of the lists. The owner
+/// branch comes before the allow-list grading and before the refused routes.
+pub fn remote_device_permits(
+    level: ApiTokenLevel,
+    owner: bool,
+    method: &Method,
+    route: &str,
+) -> bool {
+    let owner = owner && level == ApiTokenLevel::Admin;
     if REMOTE_SELF_ROUTES
         .iter()
         .any(|(allowed, pattern)| allowed == method && *pattern == route)
     {
         return true;
+    }
+    let first = route
+        .trim_start_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or("");
+    if owner && (REMOTE_OWNER_SEGMENTS.contains(&first) || REMOTE_ADMIN_SEGMENTS.contains(&first)) {
+        return grants(
+            &Scope::ApiToken(ApiTokenLevel::Admin),
+            method,
+            route,
+            Target::Route,
+        );
     }
     if REMOTE_DEVICE_REFUSED_ROUTES
         .iter()
@@ -791,11 +835,6 @@ pub fn remote_device_permits(level: ApiTokenLevel, method: &Method, route: &str)
     {
         return false;
     }
-    let first = route
-        .trim_start_matches('/')
-        .split('/')
-        .next()
-        .unwrap_or("");
     if REMOTE_ALLOWED_SEGMENTS.contains(&first) {
         return grants(&Scope::ApiToken(level), method, route, Target::Route);
     }
@@ -815,6 +854,12 @@ pub fn remote_device_permits(level: ApiTokenLevel, method: &Method, route: &str)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RemoteDevice {
     pub id: i64,
+    /// An owner device (Admin level with the owner flag): see [`REMOTE_OWNER_SEGMENTS`].
+    pub owner: bool,
+    /// The owner confirmed this request with a fresh step-up. Nothing sets it yet (always false):
+    /// the step-up arrives in a later task, and until then every device keeps the settings
+    /// command-field refusal.
+    pub stepped_up: bool,
 }
 
 fn is_param(segment: &str) -> bool {
@@ -1424,7 +1469,11 @@ pub async fn require_token(
         match crate::remote::authenticate(&state.pool, secret, chrono::Utc::now()).await {
             Ok(found) => {
                 scope = Scope::ApiToken(found.level);
-                device = Some(RemoteDevice { id: found.id });
+                device = Some(RemoteDevice {
+                    id: found.id,
+                    owner: found.owner,
+                    stepped_up: false,
+                });
             }
             Err(_) => return Ok(session_invalid()),
         }
@@ -1438,12 +1487,16 @@ pub async fn require_token(
     // no template and falls back to its path — it is headed for a 404 either way.
     let mut allowed = match (req.extensions().get::<MatchedPath>(), &device) {
         // A paired device is graded by its own function: the deny list sits in front of `grants`.
-        (Some(matched), Some(_)) => match &scope {
-            Scope::ApiToken(level) => remote_device_permits(*level, req.method(), matched.as_str()),
+        (Some(matched), Some(found)) => match &scope {
+            Scope::ApiToken(level) => {
+                remote_device_permits(*level, found.owner, req.method(), matched.as_str())
+            }
             _ => false,
         },
-        (None, Some(_)) => match &scope {
-            Scope::ApiToken(level) => remote_device_permits(*level, req.method(), req.uri().path()),
+        (None, Some(found)) => match &scope {
+            Scope::ApiToken(level) => {
+                remote_device_permits(*level, found.owner, req.method(), req.uri().path())
+            }
             _ => false,
         },
         (Some(matched), None) => permits_route(&scope, req.method(), matched.as_str()),
@@ -1893,6 +1946,148 @@ mod tests {
         ApiTokenLevel::Admin,
     ];
 
+    /// The tests below this line grade an ordinary (non-owner) device unless they say otherwise;
+    /// this shadows the glob-imported function with the owner flag fixed to false.
+    fn remote_device_permits(level: ApiTokenLevel, method: &Method, route: &str) -> bool {
+        super::remote_device_permits(level, false, method, route)
+    }
+
+    fn owner_permits(method: &Method, route: &str) -> bool {
+        super::remote_device_permits(ApiTokenLevel::Admin, true, method, route)
+    }
+
+    /// Route templates under each owner segment, taken from `REMOTE_OWNER_ONLY` and the restart
+    /// route added later.
+    const OWNER_ROUTES: &[(&str, &str)] = &[
+        ("POST", "/daemon/shutdown"),
+        ("POST", "/daemon/update"),
+        ("POST", "/system/shutdown"),
+        ("POST", "/system/restart"),
+        ("GET", "/system/update-readiness"),
+        ("GET", "/system/autostart"),
+        ("GET", "/api-tokens"),
+        ("DELETE", "/api-tokens/{name}"),
+        ("GET", "/config/secrets"),
+        ("DELETE", "/config/secrets/{key}"),
+        ("POST", "/backup"),
+        ("GET", "/backups"),
+        ("POST", "/backups/{name}/restore"),
+        ("POST", "/sidecars/{name}/restart"),
+        ("POST", "/channels/{channel}/pairing"),
+        ("GET", "/browser/sessions/{id}/live"),
+        ("POST", "/remote/pairing-codes"),
+        ("GET", "/remote/devices"),
+        ("DELETE", "/remote/devices/{id}"),
+    ];
+
+    #[test]
+    fn owner_device_reaches_every_owner_segment() {
+        for segment in REMOTE_OWNER_SEGMENTS {
+            assert!(
+                REMOTE_DENIED_SEGMENTS.contains(segment),
+                "{segment} is an owner segment and must stay denied to the other levels"
+            );
+            assert!(
+                OWNER_ROUTES
+                    .iter()
+                    .any(|(_, route)| route.trim_start_matches('/').starts_with(segment)),
+                "no route below covers the owner segment {segment}"
+            );
+        }
+        for (method, route) in OWNER_ROUTES {
+            let method = Method::from_bytes(method.as_bytes()).unwrap();
+            assert!(owner_permits(&method, route), "owner {method} {route}");
+        }
+        // The owner still reaches the admin and allow-listed working surfaces.
+        for (method, route) in REMOTE_ADMIN_WORKING_ROUTES {
+            let method = Method::from_bytes(method.as_bytes()).unwrap();
+            assert!(owner_permits(&method, route), "owner {method} {route}");
+        }
+        assert!(owner_permits(&Method::GET, "/status"));
+    }
+
+    #[test]
+    fn admin_device_is_still_refused_the_owner_segments() {
+        for (method, route) in OWNER_ROUTES {
+            let method = Method::from_bytes(method.as_bytes()).unwrap();
+            for level in ALL_LEVELS {
+                assert!(
+                    !remote_device_permits(level, &method, route),
+                    "{level:?} {method} {route}"
+                );
+            }
+            // The flag is meaningless below Admin: it never lifts a lower level.
+            for level in [ApiTokenLevel::ReadOnly, ApiTokenLevel::RunCreating] {
+                assert!(
+                    !super::remote_device_permits(level, true, &method, route),
+                    "{level:?} with the owner flag {method} {route}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn owner_device_is_refused_agent_only_segments() {
+        for segment in REMOTE_DENIED_SEGMENTS {
+            if REMOTE_OWNER_SEGMENTS.contains(segment) {
+                continue;
+            }
+            for route in [format!("/{segment}"), format!("/{segment}/{{id}}")] {
+                for method in [Method::GET, Method::POST, Method::PUT, Method::DELETE] {
+                    assert!(!owner_permits(&method, &route), "owner {method} {route}");
+                }
+            }
+        }
+        for route in ["/hooks", "/tasks/{id}/claim", "/brand-new-family/x", "/"] {
+            assert!(!owner_permits(&Method::GET, route), "owner GET {route}");
+            assert!(!owner_permits(&Method::POST, route), "owner POST {route}");
+        }
+    }
+
+    #[test]
+    fn owner_device_is_not_refused_the_device_refused_routes() {
+        for (method, route) in REMOTE_DEVICE_REFUSED_ROUTES {
+            assert!(owner_permits(method, route), "owner {method} {route}");
+            assert!(
+                !remote_device_permits(ApiTokenLevel::Admin, method, route),
+                "admin {method} {route}"
+            );
+        }
+    }
+
+    /// Through the real middleware: a stored owner device reaches an owner route, an admin device
+    /// paired the ordinary way does not.
+    #[tokio::test]
+    async fn the_gate_admits_an_owner_session_and_not_an_admin_one() {
+        let state = test_state("expected-token").await;
+        let key = mint_service_token(&state.pool, Service::Remote)
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        let admin = pair_device(&state, ApiTokenLevel::Admin, now).await;
+        let created = crate::remote::create_pairing_code_for(
+            &state.pool,
+            ApiTokenLevel::Admin,
+            true,
+            "laptop",
+            now,
+        )
+        .await
+        .unwrap();
+        let owner = crate::remote::exchange(&state.pool, &created.code, now)
+            .await
+            .ok()
+            .unwrap();
+        let app = protected_router(state);
+
+        let (status, _) =
+            send_with_session(&app, "POST", "/daemon/shutdown", &key, Some(&admin.session)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) =
+            send_with_session(&app, "POST", "/daemon/shutdown", &key, Some(&owner.session)).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
     #[tokio::test]
     async fn remote_key_alone_reaches_only_the_pairing_exchange() {
         let state = test_state("expected-token").await;
@@ -2232,6 +2427,7 @@ mod tests {
             ("POST", "/daemon/shutdown"),
             ("POST", "/daemon/update"),
             ("POST", "/system/shutdown"),
+            ("POST", "/system/restart"),
             ("POST", "/system/storage/compact"),
             ("GET", "/system/autostart"),
             ("PUT", "/system/autostart"),

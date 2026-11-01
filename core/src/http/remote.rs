@@ -66,6 +66,7 @@ async fn post_pair(State(state): State<AppState>, Json(body): Json<PairBody>) ->
             "device_id": paired.device_id,
             "name": paired.name,
             "access_level": paired.access_level,
+            "owner": paired.owner,
             "expires_at": paired.expires_at,
         }))
         .into_response(),
@@ -104,6 +105,7 @@ async fn get_session(
         "device_id": found.id,
         "name": found.name,
         "access_level": found.access_level,
+        "owner": found.owner,
         "expires_at": expires_at,
     }))
     .into_response()
@@ -128,17 +130,30 @@ struct CodeBody {
     #[serde(default)]
     access_level: Option<ApiTokenLevel>,
     device_name: String,
+    /// Pair an owner device. Needs an explicit `admin` access level, and only the host mints it.
+    #[serde(default)]
+    owner: Option<bool>,
 }
 
 /// `POST /remote/pairing-codes`: the owner mints a code, shown once, at `access_level` (read-only
-/// when omitted; Admin only on an explicit request). 409 while remote access is
+/// when omitted; Admin only on an explicit request). `owner: true` pairs an owner device and
+/// needs `access_level: admin` (400 otherwise); a paired device, owner or not, can never mint
+/// one (403), so the owner level can only be handed out from the host. 409 while remote access is
 /// off, because a code nobody can exchange would only mislead.
 async fn post_pairing_code(
     State(state): State<AppState>,
+    device: Option<Extension<RemoteDevice>>,
     Json(body): Json<CodeBody>,
 ) -> impl IntoResponse {
     if !crate::remote::valid_device_name(&body.device_name) {
         return refusal(StatusCode::BAD_REQUEST, "invalid_device_name").into_response();
+    }
+    let owner = body.owner.unwrap_or(false);
+    if owner && device.is_some() {
+        return refusal(StatusCode::FORBIDDEN, "owner_code_needs_the_host").into_response();
+    }
+    if owner && body.access_level != Some(ApiTokenLevel::Admin) {
+        return refusal(StatusCode::BAD_REQUEST, "owner_needs_admin").into_response();
     }
     match crate::remote::is_armed(&state.pool).await {
         Ok(true) => {}
@@ -148,9 +163,10 @@ async fn post_pairing_code(
     // Least privilege: a code minted without an explicit level pairs a read-only device. Admin has
     // to be asked for by name.
     let level = body.access_level.unwrap_or(ApiTokenLevel::ReadOnly);
-    match crate::remote::create_pairing_code(
+    match crate::remote::create_pairing_code_for(
         &state.pool,
         level,
+        owner,
         &body.device_name,
         chrono::Utc::now(),
     )
@@ -669,6 +685,7 @@ mod tests {
                 "id",
                 "last_seen_at",
                 "name",
+                "owner",
                 "revoked_at"
             ]
         );
@@ -748,10 +765,83 @@ mod tests {
                 axum::http::Method::DELETE,
             ] {
                 assert!(
-                    !crate::auth::remote_device_permits(level, &method, "/remote/setup"),
+                    !crate::auth::remote_device_permits(level, false, &method, "/remote/setup"),
                     "{level:?} {method}"
                 );
             }
+        }
+    }
+
+    fn minting_body(owner: Option<bool>, level: Option<ApiTokenLevel>) -> Json<CodeBody> {
+        Json(CodeBody {
+            access_level: level,
+            device_name: "laptop".to_string(),
+            owner,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_device_cannot_mint_an_owner_code() {
+        let state = test_state().await;
+        for owner_device in [false, true] {
+            let device = RemoteDevice {
+                id: 3,
+                owner: owner_device,
+                stepped_up: true,
+            };
+            let response = post_pairing_code(
+                State(state.clone()),
+                Some(Extension(device)),
+                minting_body(Some(true), Some(ApiTokenLevel::Admin)),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{owner_device}");
+        }
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM pairing_codes")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn an_owner_code_needs_the_admin_level() {
+        let state = test_state().await;
+        for level in [
+            None,
+            Some(ApiTokenLevel::ReadOnly),
+            Some(ApiTokenLevel::RunCreating),
+        ] {
+            let response =
+                post_pairing_code(State(state.clone()), None, minting_body(Some(true), level))
+                    .await
+                    .into_response();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{level:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_host_mints_an_owner_code_only_when_asked_and_a_plain_code_stays_plain() {
+        let state = test_state().await;
+        mint_service_token(&state.pool, Service::Remote)
+            .await
+            .unwrap();
+        for (owner, expected) in [(Some(true), 1_i64), (Some(false), 0), (None, 0)] {
+            let response = post_pairing_code(
+                State(state.clone()),
+                None,
+                minting_body(owner, Some(ApiTokenLevel::Admin)),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), StatusCode::CREATED, "{owner:?}");
+            let (stored,): (i64,) =
+                sqlx::query_as("SELECT owner FROM pairing_codes ORDER BY rowid DESC LIMIT 1")
+                    .fetch_one(&state.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(stored, expected, "{owner:?}");
         }
     }
 

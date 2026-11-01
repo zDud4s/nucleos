@@ -140,6 +140,12 @@ fn written_by(caller: &Caller, device: Option<&RemoteDevice>) -> String {
 /// A paired device is the owner on another machine, but it never changes a command the host will run: `new` is
 /// refused when any command field of `name` differs from `current`. A document that is absent or unreadable has
 /// no commands, so a device may only create it without any.
+/// Whether `device` is held to [`refuse_command_change`]: every device is, except an owner device whose
+/// request carries a fresh step-up (`stepped_up`). An owner without the step-up keeps the refusal.
+fn command_change_is_gated(device: &RemoteDevice) -> bool {
+    !(device.owner && device.stepped_up)
+}
+
 fn refuse_command_change(name: &str, current: &Value, new: &Value) -> Result<(), Refused> {
     if command_fields(name, current) == command_fields(name, new) {
         return Ok(());
@@ -275,7 +281,7 @@ async fn write_document(
     let doc = owned_document(&scope, &name)?;
     let Json(request) = request.map_err(bad_body)?;
     let device = device.map(|Extension(device)| device);
-    if device.is_some() {
+    if device.as_ref().is_some_and(command_change_is_gated) {
         let current = store::global()
             .snapshot()
             .entry(&scope, doc.name)
@@ -351,7 +357,7 @@ async fn rollback_document(
     let doc = owned_document(&scope, &name)?;
     let Json(request) = request.map_err(bad_body)?;
     let device = device.map(|Extension(device)| device);
-    if device.is_some() {
+    if device.as_ref().is_some_and(command_change_is_gated) {
         let rows = store::history(&state.pool, &scope, doc.name)
             .await
             .map_err(refused)?;
@@ -1407,10 +1413,25 @@ mod tests {
             uri: &str,
             body: Value,
         ) -> (StatusCode, Value) {
+            let device = RemoteDevice {
+                id: DEVICE,
+                owner: false,
+                stepped_up: false,
+            };
+            remote_call_as(state, device, method, uri, body).await
+        }
+
+        async fn remote_call_as(
+            state: &AppState,
+            device: RemoteDevice,
+            method: &str,
+            uri: &str,
+            body: Value,
+        ) -> (StatusCode, Value) {
             let app = super::super::routes()
                 .with_state(state.clone())
                 .layer(axum::Extension(Caller::ApiToken(ApiTokenLevel::Admin)))
-                .layer(axum::Extension(RemoteDevice { id: DEVICE }));
+                .layer(axum::Extension(device));
             let request = Request::builder()
                 .method(method)
                 .uri(uri)
@@ -1506,6 +1527,38 @@ mod tests {
                 json!({ "capacity": 2, "broker_prefix": ["python", "evil.py"] }),
             )
             .await;
+        }
+
+        /// Only an owner device with a step-up passes the command-field refusal; an owner without it, and
+        /// a stepped-up device that is not an owner, keep it.
+        #[tokio::test]
+        async fn only_a_stepped_up_owner_may_change_a_command_field() {
+            let old = json!({ "capacity": 2, "broker_prefix": ["python", "heavy.py"] });
+            let new = json!({ "capacity": 2, "broker_prefix": ["python", "other.py"] });
+            let device = |owner, stepped_up| RemoteDevice {
+                id: DEVICE,
+                owner,
+                stepped_up,
+            };
+            let (_home, state) = fixture().await;
+            seed(&state, "machine", "verify", &old, 0).await;
+            let uri = "/settings/machine/verify";
+            for (owner, stepped_up) in [(false, false), (false, true), (true, false)] {
+                let request = json!({ "body": new, "version": 1 });
+                let (status, answer) =
+                    remote_call_as(&state, device(owner, stepped_up), "PUT", uri, request).await;
+                assert_eq!(
+                    status,
+                    StatusCode::FORBIDDEN,
+                    "{owner} {stepped_up}: {answer}"
+                );
+                assert_eq!(answer["refusal"], "remote_command_field");
+            }
+            let request = json!({ "body": new, "version": 1 });
+            let (status, answer) =
+                remote_call_as(&state, device(true, true), "PUT", uri, request).await;
+            assert_eq!(status, StatusCode::OK, "{answer}");
+            assert_eq!(answer["version"], 2);
         }
 
         #[tokio::test]

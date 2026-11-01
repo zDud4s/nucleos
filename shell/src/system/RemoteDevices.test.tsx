@@ -50,6 +50,7 @@ describe("RemoteDevices", () => {
             created_at: "2026-10-29T09:00:00Z",
             last_seen_at: null,
             revoked_at: null,
+            owner: false,
           },
         ];
         return {
@@ -57,6 +58,7 @@ describe("RemoteDevices", () => {
           access_level: body.access_level,
           device_name: body.device_name,
           expires_at: "2026-10-29T09:05:00Z",
+          owner: false,
         };
       }
       if (path === "/remote/devices" && init?.method === undefined) return devices;
@@ -93,6 +95,32 @@ describe("RemoteDevices", () => {
       expect(deleted).toEqual(["/remote/devices/7"]);
     });
     expect(await screen.findByText(/revoked/)).toBeDefined();
+  });
+
+  it("pairs an Owner device as an admin code with the owner flag", async () => {
+    const posted: unknown[] = [];
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === "/remote/pairing-codes" && init?.method === "POST") {
+        const body = JSON.parse(String(init.body)) as { device_name: string };
+        posted.push(body);
+        return {
+          code: "ABCDE-FGHJK",
+          access_level: "admin",
+          device_name: body.device_name,
+          expires_at: "2026-10-29T09:05:00Z",
+          owner: true,
+        };
+      }
+      if (path === "/remote/devices") return [];
+      throw new Error(`unexpected ${path}`);
+    });
+    renderPanel();
+    fireEvent.change(await screen.findByLabelText("Device name"), { target: { value: "Laptop" } });
+    fireEvent.change(screen.getByLabelText("Access level"), { target: { value: "owner" } });
+    expect(screen.getByRole("option", { name: "Owner" })).toBeDefined();
+    fireEvent.click(screen.getByRole("button", { name: "Create code" }));
+    await screen.findByLabelText("the pairing code for Laptop");
+    expect(posted).toEqual([{ device_name: "Laptop", access_level: "admin", owner: true }]);
   });
 
   it("says remote access is switched off on a 409", async () => {
@@ -163,6 +191,7 @@ describe("RemoteDevices", () => {
           access_level: "admin",
           device_name: "Phone",
           expires_at: "2026-10-29T09:05:00Z",
+          owner: false,
         };
       }
       throw new Error(`unexpected ${path}`);

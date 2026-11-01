@@ -32,10 +32,18 @@ import {
   Skeleton,
 } from "../ui";
 
-const LEVELS: ApiTokenLevel[] = ["admin", "run-creating", "read-only"];
+/**
+ * What the owner picks. "owner" is not an API level: it pairs an `admin` device with the owner flag
+ * (`owner: true` in the request), which also reaches what only this machine reached.
+ */
+type Choice = ApiTokenLevel | "owner";
+
+const LEVELS: Choice[] = ["owner", "admin", "run-creating", "read-only"];
 
 /** What each level lets the paired device do, said beside the choice. */
-const LEVEL_HINT: Record<ApiTokenLevel, string> = {
+const LEVEL_HINT: Record<Choice, string> = {
+  owner:
+    "works exactly like you on this machine: also shutdown and restart, secrets, backups, tokens and remote devices.",
   admin:
     "works like you on this machine, except shutdown, secrets, backups, tokens and remote devices.",
   "run-creating": "reads everything and starts runs.",
@@ -52,7 +60,7 @@ export function RemoteDevices() {
   const devices = useRemoteDevices();
   const createCode = useCreatePairingCode();
   const [name, setName] = useState("");
-  const [level, setLevel] = useState<ApiTokenLevel>("admin");
+  const [level, setLevel] = useState<Choice>("admin");
   const [created, setCreated] = useState<PairingCode | null>(null);
   const setup = useRemoteSetup();
 
@@ -60,7 +68,9 @@ export function RemoteDevices() {
     const trimmed = name.trim();
     if (trimmed === "") return;
     createCode.mutate(
-      { device_name: trimmed, access_level: level },
+      level === "owner"
+        ? { device_name: trimmed, access_level: "admin", owner: true }
+        : { device_name: trimmed, access_level: level },
       {
         onSuccess: (code) => {
           setCreated(code);
@@ -117,10 +127,10 @@ export function RemoteDevices() {
           </Field>
         </div>
         <Field label="Access level">
-          <Select value={level} onChange={(event) => setLevel(event.target.value as ApiTokenLevel)}>
+          <Select value={level} onChange={(event) => setLevel(event.target.value as Choice)}>
             {LEVELS.map((candidate) => (
               <option key={candidate} value={candidate}>
-                {candidate}
+                {candidate === "owner" ? "Owner" : candidate}
               </option>
             ))}
           </Select>
@@ -134,7 +144,7 @@ export function RemoteDevices() {
         </Button>
       </form>
       <p className="sy-note">
-        The {level} level {LEVEL_HINT[level]}
+        The {level === "owner" ? "Owner" : level} level {LEVEL_HINT[level]}
       </p>
       {createCode.isError && <CreateError error={createCode.error} />}
 
@@ -336,7 +346,7 @@ function DeviceRow({ device }: { device: RemoteDevice }) {
         {device.name}
       </span>
       <span>
-        <Badge tone="info">{device.access_level}</Badge>
+        <Badge tone="info">{device.owner ? "Owner" : device.access_level}</Badge>
       </span>
       <span className="sy-token-meta">
         {device.revoked_at !== null ? (
