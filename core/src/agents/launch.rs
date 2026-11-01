@@ -117,13 +117,20 @@ struct Plan {
 }
 
 /// The engine and model a pin names: the caller's first, then the agent row's. A model alone
-/// pins nothing (the router picks models).
+/// pins nothing (the router picks models), except a `gemini-api/` model id on an agent with no
+/// engine: that names the Gemini route, so it yields the `gemini-api` engine and `plan_launch`
+/// refuses it by name instead of letting it fall through to the router. An explicit engine wins.
 fn effective_pin(pins: &Pins, agent: &Agent) -> Option<(String, String)> {
     if let Some(engine) = pins.engine.as_deref().filter(|e| !e.is_empty()) {
         return Some((engine.to_owned(), pins.model.clone().unwrap_or_default()));
     }
-    let engine = agent.engine.as_deref().filter(|e| !e.is_empty())?;
     let model = pins.model.clone().or_else(|| agent.model.clone());
+    let Some(engine) = agent.engine.as_deref().filter(|e| !e.is_empty()) else {
+        let gemini_prefix = format!("{}/", crate::engines::GEMINI_API);
+        return model
+            .filter(|id| id.starts_with(&gemini_prefix))
+            .map(|id| (crate::engines::GEMINI_API.to_owned(), id));
+    };
     Some((engine.to_owned(), model.unwrap_or_default()))
 }
 
@@ -144,6 +151,12 @@ fn plan_launch(
     braked: &[RunnerKind],
 ) -> Result<Plan, LaunchError> {
     if let Some((name, model)) = pin {
+        if name == crate::engines::GEMINI_API {
+            return Err(LaunchError::NoRunner(format!(
+                "{label}: {}",
+                crate::engines::GEMINI_API_REFUSAL
+            )));
+        }
         let engine = match name.as_str() {
             "local" => Engine::Local,
             other => RunnerKind::parse(other).map(Engine::from).ok_or_else(|| {
@@ -421,6 +434,48 @@ mod tests {
         // Not pinned: agy is never one of the runners a launch may narrow to, gate or no gate.
         let plan = plan_launch("a", &[McpNucleos], None, None, &[]).unwrap();
         assert!(!plan.runners.contains(&RunnerKind::Agy));
+    }
+
+    /// E24: gemini-api is an agent engine name but no launch can run it; the pin is refused by
+    /// name, with the engine's own refusal text rather than "unknown engine".
+    #[test]
+    fn agent_launch_refuses_gemini_api_by_name() {
+        let pin = Some(("gemini-api".to_owned(), "gemini-3.8-flash".to_owned()));
+        let error = plan_launch("coder@1.0.0", &[McpNucleos], pin, None, &[]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(crate::engines::GEMINI_API_REFUSAL),
+            "{error}"
+        );
+    }
+
+    /// E25: a `gemini-api/` model id on an agent that names no engine is still a Gemini pick, so
+    /// it is refused by name instead of falling through to the router. Composes the two pure steps
+    /// `resolve_agent_launch_with` runs: the pin the agent and caller yield, then the plan.
+    #[test]
+    fn a_gemini_model_id_with_no_engine_is_refused_by_name() {
+        let agent = Agent {
+            id: "i".into(),
+            name: "n".into(),
+            speciality: "s".into(),
+            prompt: "p".into(),
+            engine: None,
+            model: Some("gemini-api/x".into()),
+            capabilities: Vec::new(),
+            source: "user".into(),
+            package_ref: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let pin = effective_pin(&Pins::default(), &agent);
+        let error = plan_launch("coder@1.0.0", &[McpNucleos], pin, None, &[]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(crate::engines::GEMINI_API_REFUSAL),
+            "{error}"
+        );
     }
 
     /// E16 F3: an unpinned launch under `primary_runner: agy` would land on the daemon's runner.

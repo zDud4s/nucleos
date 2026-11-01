@@ -23,6 +23,48 @@ pub const CLAUDE: &str = "claude";
 pub const CODEX: &str = "codex";
 pub const LOCAL: &str = "local";
 pub const AGY: &str = "agy";
+pub const GEMINI_API: &str = "gemini-api";
+
+/// The credential-store name of the Gemini API key. Named here, not in the daemon's `main.rs`,
+/// because this crate (the row's gate and the catalogue) and the daemon (the key writer and loader)
+/// must agree on one fact.
+pub const GEMINI_KEY: &str = "gemini-api-key";
+
+/// The refusal for the Gemini API route at every launch site of agents, teams and council, and for
+/// its quota, which NucleOS does not meter.
+pub const GEMINI_API_REFUSAL: &str =
+    "the gemini-api engine is not available for agents, teams, council or quota";
+
+/// The fact "a Gemini API key is stored", published once by the daemon at startup.
+static GEMINI_KEY_PUBLISHED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Publishes whether a Gemini API key was found when the daemon started. A key stored later is
+/// not seen until the daemon restarts.
+pub fn publish_gemini_key(present: bool) {
+    GEMINI_KEY_PUBLISHED.store(present, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether a credential-store read yielded a usable key: blank, absent and a read error are all
+/// "no key".
+pub fn gemini_key_present<E>(read: &Result<Option<String>, E>) -> bool {
+    matches!(read, Ok(Some(key)) if !key.trim().is_empty())
+}
+
+/// Whether a Gemini API key is stored: the one fact the row's gate and the catalogue read.
+///
+/// Never touches the credential store: it returns the fact the daemon published at startup (see
+/// `publish_gemini_key`), `false` until then. Under `cfg(test)` / `testkit` a thread-local
+/// override set by `gemini_test_support::gemini_gate` wins when present.
+pub fn gemini_key_stored() -> bool {
+    #[cfg(any(test, feature = "testkit"))]
+    {
+        if let Some(stored) = gemini_test_support::OVERRIDE.with(|cell| cell.get()) {
+            return stored;
+        }
+    }
+    GEMINI_KEY_PUBLISHED.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// The refusal for agy at every launch site of agents, teams and council.
 pub const AGY_REFUSAL: &str = "the agy engine is not available for agents, teams or council";
@@ -161,6 +203,17 @@ pub const TABLE: &[EngineDescription] = &[
         gate: agy::enabled,
         utility_default: local_utility_default,
         runner: agy::runner,
+    },
+    // Hosted over HTTP, no CLI runner, and on only while a key is stored.
+    EngineDescription {
+        id: GEMINI_API,
+        display_name: "Gemini API",
+        seat_kind: SeatKind::Cloud,
+        transport: Transport::Http,
+        installed: local_installed,
+        gate: gemini_key_stored,
+        utility_default: local_utility_default,
+        runner: local_runner,
     },
 ];
 
@@ -314,9 +367,9 @@ mod tests {
 
     #[test]
     fn table_lists_claude_codex_local_agy_with_expected_fields() {
-        assert_eq!(TABLE.len(), 4);
+        assert_eq!(TABLE.len(), 5);
         let ids: Vec<&str> = TABLE.iter().map(|row| row.id).collect();
-        assert_eq!(ids, ["claude", "codex", "local", "agy"]);
+        assert_eq!(ids, ["claude", "codex", "local", "agy", "gemini-api"]);
         assert_eq!(AGY, "agy");
 
         let row = |id: &str| find_in(TABLE, id).expect("row present");
@@ -358,6 +411,62 @@ mod tests {
         assert!((row("local").runner)(&models).is_none());
     }
 
+    /// RED (plan Node 3, test 1; contract E6/E22). The Gemini API is ONE Http row with no CLI runner,
+    /// whose gate is "a key is stored". The gate is flipped through
+    /// `gemini_test_support::gemini_gate`, which GREEN adds beside `agy_test_support` and which
+    /// replaces the credential-store read for the guard's lifetime; no real credential is touched.
+    #[test]
+    fn gemini_api_row_is_http_without_runner_and_off_cli_lists() {
+        assert_eq!(GEMINI_API, "gemini-api");
+        let rows: Vec<_> = TABLE.iter().filter(|row| row.id == GEMINI_API).collect();
+        assert_eq!(rows.len(), 1, "exactly one gemini-api row");
+        let row = rows[0];
+        assert!(!row.display_name.is_empty());
+        assert_eq!(row.transport, Transport::Http);
+        assert!((row.runner)(&ModelsConfig::default()).is_none());
+        assert_eq!(
+            (row.utility_default)(&[]),
+            None,
+            "no cheap tier is invented for it"
+        );
+
+        // Gate: true only with a key stored.
+        {
+            let _gate = gemini_test_support::gemini_gate(false);
+            assert!(!(row.gate)());
+            assert!(!enabled_in(TABLE).iter().any(|r| r.id == GEMINI_API));
+        }
+        {
+            let _gate = gemini_test_support::gemini_gate(true);
+            assert!((row.gate)());
+            assert!(enabled_in(TABLE).iter().any(|r| r.id == GEMINI_API));
+        }
+
+        // Off the CLI lists: not a CLI row, so no id lookup launches it and an unknown-looking
+        // runner string still collapses to claude.
+        assert!(cli_row_in(TABLE, GEMINI_API).is_none());
+        assert!(!ids_with_transport_in(TABLE, Transport::Cli).contains(&GEMINI_API));
+        assert_eq!(runner_id_in(TABLE, GEMINI_API), CLAUDE);
+        let _gate = gemini_test_support::gemini_gate(true);
+        assert!(
+            !crate::agents::capabilities::translatable_runners(&[])
+                .iter()
+                .any(|kind| kind.as_str() == GEMINI_API)
+        );
+        assert!(
+            !crate::models::route_advice::installed_engines()
+                .iter()
+                .any(|kind| kind.as_str() == GEMINI_API)
+        );
+
+        // Seat-kind based lists include it.
+        assert!(
+            crate::config::ENGINE_SEAT_KINDS
+                .iter()
+                .any(|(id, _)| *id == GEMINI_API)
+        );
+    }
+
     #[test]
     fn derived_lists_follow_the_table() {
         // Seat kinds: `ENGINE_SEAT_KINDS` is the derived list and the only consumer.
@@ -368,6 +477,7 @@ mod tests {
                 ("codex", SeatKind::Cloud),
                 ("local", SeatKind::Local),
                 ("agy", SeatKind::Cloud),
+                ("gemini-api", SeatKind::Cloud),
             ]
         );
 
@@ -382,11 +492,14 @@ mod tests {
         assert!(
             installed
                 .iter()
-                .all(|id| ["claude", "codex", "local", "agy"].contains(id))
+                .all(|id| ["claude", "codex", "local", "agy", "gemini-api"].contains(id))
         );
 
         // Chat engines a conversation can name.
-        assert_eq!(chat_ids_in(TABLE), ["claude", "codex", "local", "agy"]);
+        assert_eq!(
+            chat_ids_in(TABLE),
+            ["claude", "codex", "local", "agy", "gemini-api"]
+        );
     }
 
     #[test]
@@ -433,7 +546,7 @@ mod tests {
         assert!(ids_with_transport_in(rows, Transport::Http).contains(&"extra"));
         assert_eq!(runner_id_in(rows, "extra"), "claude");
         // The production table is untouched by the test row.
-        assert_eq!(TABLE.len(), 4);
+        assert_eq!(TABLE.len(), 5);
     }
 
     #[test]
@@ -542,6 +655,64 @@ mod row_tests {
         );
         // The production table does not know the row: it collapses to claude.
         assert_eq!(runner_id_in(TABLE, "extra-cli"), "claude");
+    }
+
+    /// E25: the override is thread-local, so a gate held here is invisible to any other thread.
+    #[test]
+    fn the_gemini_gate_is_invisible_to_other_threads() {
+        let _gate = gemini_test_support::gemini_gate(true);
+        assert!(gemini_key_stored(), "the holding thread sees the override");
+        let seen_elsewhere = std::thread::spawn(gemini_key_stored)
+            .join()
+            .expect("the probe thread ran");
+        assert!(
+            !seen_elsewhere,
+            "another thread must not see this test's gate"
+        );
+    }
+
+    /// E25: a blank, missing or unreadable key is not a key.
+    #[test]
+    fn a_blank_missing_or_unreadable_key_is_not_present() {
+        let ok = |value: Option<&str>| -> Result<Option<String>, String> {
+            Ok(value.map(str::to_string))
+        };
+        assert!(gemini_key_present(&ok(Some("k"))));
+        assert!(!gemini_key_present(&ok(Some("  "))));
+        assert!(!gemini_key_present(&ok(None)));
+        assert!(!gemini_key_present(&Err("store unreadable".to_string())));
+    }
+}
+
+/// Fixtures for the tests that need the Gemini API key "stored" or "absent". The override is
+/// thread-local: it replaces the published fact on the calling thread only until the guard drops,
+/// so tests running in parallel never see each other's gate and need no lock.
+#[cfg(any(test, feature = "testkit"))]
+pub mod gemini_test_support {
+    use std::cell::Cell;
+
+    thread_local! {
+        pub(super) static OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+    }
+
+    /// Holds the override on this thread; dropping it clears it.
+    pub struct GeminiGate {
+        // The override lives in this thread's storage, so the guard must drop on this thread.
+        _not_send: std::marker::PhantomData<*const ()>,
+    }
+
+    impl Drop for GeminiGate {
+        fn drop(&mut self) {
+            OVERRIDE.with(|cell| cell.set(None));
+        }
+    }
+
+    /// `true` makes a key read as stored, `false` as absent, until the guard drops.
+    pub fn gemini_gate(stored: bool) -> GeminiGate {
+        OVERRIDE.with(|cell| cell.set(Some(stored)));
+        GeminiGate {
+            _not_send: std::marker::PhantomData,
+        }
     }
 }
 

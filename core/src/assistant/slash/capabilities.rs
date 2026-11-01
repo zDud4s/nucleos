@@ -16,6 +16,8 @@ pub enum ChatEngine {
     Local,
     OpenRouter,
     Agy,
+    /// The Google Gemini API: a hosted chat whose pinned model carries the `gemini-api/` prefix.
+    GeminiApi,
 }
 
 impl ChatEngine {
@@ -26,6 +28,7 @@ impl ChatEngine {
             Self::Codex => crate::engines::CODEX,
             Self::Local => crate::engines::LOCAL,
             Self::Agy => crate::engines::AGY,
+            Self::GeminiApi => crate::engines::GEMINI_API,
             // Not an engine row: OpenRouter is a hosted brain, not a launchable engine.
             Self::OpenRouter => "openrouter",
         }
@@ -56,6 +59,7 @@ impl ChatEngine {
             crate::engines::CODEX => Some(Self::Codex),
             crate::engines::LOCAL => Some(Self::Local),
             crate::engines::AGY => Some(Self::Agy),
+            crate::engines::GEMINI_API => Some(Self::GeminiApi),
             _ => None,
         }
     }
@@ -89,7 +93,14 @@ pub enum Support {
 pub fn engine_of(config: &ModelsConfig, brain: Brain, model: Option<&str>) -> ChatEngine {
     match brain {
         Brain::Local => ChatEngine::Local,
-        Brain::OpenRouter => ChatEngine::OpenRouter,
+        // The provider of a hosted chat is read from the id prefix, as `assistants.rs` does.
+        Brain::OpenRouter => {
+            if model.is_some_and(|id| id.starts_with("gemini-api/")) {
+                ChatEngine::GeminiApi
+            } else {
+                ChatEngine::OpenRouter
+            }
+        }
         // A refusal means the chat is bound to agy while agy is off.
         Brain::Cloud => crate::assistant::answering_cli(config, model)
             .map_or(ChatEngine::Agy, ChatEngine::of_cli),
@@ -109,6 +120,9 @@ pub fn support(engine: ChatEngine, capability: Capability) -> Support {
         // Agy takes `--effort` and `--add-dir` and refuses every other control.
         (Effort | ExtraDirs, Agy) => Yes,
         (DeniedTools | TurnBudget | Agents | RegistryMcp, Agy) => No,
+        // The Gemini API route ignores a per-turn budget (a warning, like OpenRouter) and refuses
+        // every other control; the `_` arm answers `No` for them.
+        (TurnBudget, GeminiApi) => Warn,
         _ => No,
     }
 }
@@ -201,6 +215,73 @@ mod tests {
         // agy's setting is off by default, so a stored agy is not an engine a chat can name: the
         // caller refuses it, it does not become Claude.
         assert_eq!(ChatEngine::from_stored("agy"), None);
+    }
+
+    /// RED (plan Node 3, test 7; contract E22). The Gemini API route is a chat engine of its own
+    /// (`ChatEngine::GeminiApi`, the provider read from the `gemini-api/` id prefix on the hosted
+    /// brain) and every control that needs a CLI, agents, teams, council or quota is refused by
+    /// name, as `AGY_REFUSAL` does for agy.
+    #[test]
+    fn gemini_api_refused_by_name_for_agents_teams_council_quota() {
+        // The engine exists, answers to the table's id, and is not any of the others.
+        assert_eq!(ChatEngine::GeminiApi.as_str(), crate::engines::GEMINI_API);
+        assert_eq!(crate::engines::GEMINI_API, "gemini-api");
+        for other in [
+            ChatEngine::Claude,
+            ChatEngine::Codex,
+            ChatEngine::Local,
+            ChatEngine::OpenRouter,
+            ChatEngine::Agy,
+        ] {
+            assert_ne!(ChatEngine::GeminiApi, other);
+        }
+
+        // A hosted chat pinned to `gemini-api/<model>` is the Gemini engine; every other hosted
+        // chat (a bare or `openrouter/` pick, or no pin) is still OpenRouter.
+        let config = ModelsConfig::default();
+        assert_eq!(
+            engine_of(
+                &config,
+                Brain::OpenRouter,
+                Some("gemini-api/gemini-2.5-flash")
+            ),
+            ChatEngine::GeminiApi
+        );
+        assert_eq!(
+            engine_of(&config, Brain::OpenRouter, Some("google/gemini-2.5-flash")),
+            ChatEngine::OpenRouter
+        );
+        assert_eq!(
+            engine_of(&config, Brain::OpenRouter, None),
+            ChatEngine::OpenRouter
+        );
+
+        // The controls: only a per-turn budget is a warning (the hosted route ignores it, like
+        // OpenRouter); effort, extra dirs, denied tools, agents and registry MCP are refused.
+        for capability in [Effort, ExtraDirs, DeniedTools, Agents, RegistryMcp] {
+            assert_eq!(
+                support(ChatEngine::GeminiApi, capability),
+                No,
+                "{capability:?} on gemini-api"
+            );
+            assert_eq!(
+                require(ChatEngine::GeminiApi, capability, "do that"),
+                Err(SlashError::Unsupported {
+                    engine: ChatEngine::GeminiApi,
+                    what: "do that".to_string(),
+                })
+            );
+        }
+        assert_eq!(support(ChatEngine::GeminiApi, TurnBudget), Warn);
+
+        // The by-name refusal for the launch sites names the route and every refused surface.
+        let refusal = crate::engines::GEMINI_API_REFUSAL;
+        for needle in ["gemini-api", "agents", "teams", "council", "quota"] {
+            assert!(
+                refusal.contains(needle),
+                "`{needle}` missing from: {refusal}"
+            );
+        }
     }
 
     fn codex_choice() -> AssistantChoice {

@@ -357,6 +357,9 @@ pub(super) fn send_refusal(msg: String) -> Refusal {
         unavailable("no_hosted_model", "no hosted model is configured")
     } else if msg == crate::assistants::HOSTED_KEY_MISSING {
         unavailable("no_openrouter_key", "the hosted model's key is not stored")
+    } else if msg == crate::assistants::GEMINI_KEY_MISSING {
+        // A keyless gemini-api pick: the sentence names Gemini, so the operator fixes the right key.
+        unavailable("no_gemini_key", crate::assistants::GEMINI_KEY_MISSING)
     } else {
         tracing::warn!(error = %msg, "sending a slash command's prompt failed");
         internal()
@@ -366,6 +369,16 @@ pub(super) fn send_refusal(msg: String) -> Refusal {
 #[cfg(test)]
 mod tests {
     use crate::assistants::FixedAssistants;
+
+    /// A keyless gemini-api turn is a 503 carrying the Gemini sentence, not a 500 from `internal()`.
+    #[test]
+    fn a_keyless_gemini_turn_is_a_503_naming_gemini() {
+        let (status, body) = super::send_refusal(crate::assistants::GEMINI_KEY_MISSING.to_string());
+        assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.0["error"], "no_gemini_key");
+        assert_eq!(body.0["detail"], crate::assistants::GEMINI_KEY_MISSING);
+    }
+
     use crate::execution::runner::FakeCommandRunner;
     use crate::http::build_router;
     use crate::state::AppState;

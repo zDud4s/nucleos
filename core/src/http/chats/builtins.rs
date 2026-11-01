@@ -220,7 +220,10 @@ async fn context(state: &AppState, chat_id: &str) -> Result<Outcome, SlashError>
     });
 
     use crate::assistant::slash::capabilities::ChatEngine;
-    if matches!(engine, ChatEngine::Local | ChatEngine::OpenRouter) {
+    if matches!(
+        engine,
+        ChatEngine::Local | ChatEngine::OpenRouter | ChatEngine::GeminiApi
+    ) {
         data["note"] = json!("no measure on this engine");
         return Ok(card(CardKind::Context, data));
     }

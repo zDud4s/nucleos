@@ -171,6 +171,10 @@ pub(super) async fn post_assistant_message(
             StatusCode::SERVICE_UNAVAILABLE,
             "no_openrouter_key",
         )),
+        // A keyless gemini-api pick answers like the OpenRouter one, with its own slug.
+        Err(msg) if msg == crate::assistants::GEMINI_KEY_MISSING => {
+            Err(refusal(StatusCode::SERVICE_UNAVAILABLE, "no_gemini_key"))
+        }
         // The pictures themselves were refused before anything was spent: too many, too big, not
         // an image the model reads, or a model that reads none. Something the sender changes, so
         // a 422 that names which, never a 500 that sends them looking for a crash.
@@ -347,6 +351,9 @@ pub(super) fn relayed_send_refusal(msg: String) -> (StatusCode, Json<serde_json:
         }
         _ if msg == crate::assistants::HOSTED_KEY_MISSING => {
             refusal(StatusCode::SERVICE_UNAVAILABLE, "no_openrouter_key")
+        }
+        _ if msg == crate::assistants::GEMINI_KEY_MISSING => {
+            refusal(StatusCode::SERVICE_UNAVAILABLE, "no_gemini_key")
         }
         _ => refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
     }
@@ -1514,6 +1521,45 @@ mod tests {
             Some(serde_json::json!({ "parent_chat_id": parent })),
         )
         .await
+    }
+
+    /// E25: a Gemini-pinned chat with no Google key answers 503 `no_gemini_key` through the real
+    /// route, even when an OpenRouter key is stored, and writes no run row.
+    #[tokio::test]
+    async fn a_keyless_gemini_chat_gets_a_503_through_the_route() {
+        let mut state = state().await;
+        state.assistants = std::sync::Arc::new(crate::assistants::ConfiguredAssistants::new(
+            None,
+            Some("anthropic/claude-sonnet-4.5".to_string()),
+            Some("openrouter-key".to_string()),
+            "http://127.0.0.1:8791".to_string(),
+            "token".to_string(),
+            state.pool.clone(),
+            crate::execution::runner::OLLAMA_BASE_URL.to_string(),
+        ));
+        let chat = crate::chats::create(&state.pool, crate::chats::Brain::OpenRouter, None)
+            .await
+            .unwrap();
+        crate::chats::set_model(&state.pool, &chat, Some("gemini-api/x"))
+            .await
+            .unwrap();
+
+        let (status, body) = call(
+            &state,
+            "POST",
+            "/assistant/message",
+            None,
+            Some(serde_json::json!({ "chat_id": chat, "text": "hello" })),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["refusal"], "no_gemini_key", "{body}");
+        assert_eq!(
+            count(&state, "SELECT COUNT(*) FROM runs").await,
+            0,
+            "a refused turn wrote a row"
+        );
     }
 
     #[tokio::test]

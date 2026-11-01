@@ -33,6 +33,9 @@ const WEB_SEARCH_KEY: &str = "web-search-api-key";
 /// see its own doc comment for why that refusal happens before any request leaves the machine
 /// rather than after a 401 comes back.
 const OPENROUTER_KEY: &str = "openrouter-api-key";
+/// The Gemini API key, in Credential Manager like OpenRouter's. The name lives in `engines` because
+/// the engine row's gate reads the same credential from the library crate.
+const GEMINI_KEY: &str = nucleos_core::engines::GEMINI_KEY;
 
 /// A machine-scoped document from the settings snapshot, or its default when none is stored.
 fn machine_doc<T: settings::Document + Default>() -> T {
@@ -575,7 +578,7 @@ async fn main() {
             tracing::info!(
                 %model,
                 "hosted_assistant_model is configured but no OpenRouter key is stored; \
-                 chats marked openrouter will refuse rather than answer"
+                 OpenRouter models will refuse rather than answer"
             );
             (Some(model), None)
         }
@@ -603,6 +606,27 @@ async fn main() {
         (None, Ok(None)) => (None, None),
         (None, Err(_)) => (None, None),
     };
+
+    // The Google key for `gemini-api/` picks. Independent of the OpenRouter match above: a
+    // Google-key-only install must still serve them. Read ONCE here, as the OpenRouter key is; the
+    // fact is published for the engine row's gate, so a key stored later needs a restart. Never
+    // logged: a store read error is reported by kind only, with neither the error text (a
+    // credential-store error may carry bytes of the value) nor the key.
+    let gemini_read = secrets::load_secret(GEMINI_KEY);
+    nucleos_core::engines::publish_gemini_key(nucleos_core::engines::gemini_key_present(
+        &gemini_read,
+    ));
+    if gemini_read.is_err() {
+        tracing::warn!(
+            kind = "credential_store_read_error",
+            "could not read the Gemini API key from the system credential store; \
+             gemini-api picks will refuse rather than answer"
+        );
+    }
+    let gemini_key = gemini_read
+        .ok()
+        .flatten()
+        .filter(|key| !key.trim().is_empty());
 
     // Model discovery keys: the credential store first, the environment second. Only whether each
     // is present is ever logged. A key stored while the daemon runs takes effect after a restart.
@@ -697,6 +721,7 @@ async fn main() {
             // same constant — and the whole point for one that named another server.
             local_base_url,
         )
+        .with_gemini_key(gemini_key)
         .with_local_engine(local_engine, local_context_tokens)
         .with_agent_clis(
             engines::claude_runner(&models_config),
