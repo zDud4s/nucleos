@@ -1494,7 +1494,10 @@ mod agy_catalogue_tests {
             &RouterConfig::off(),
             RunnerKind::Agy,
         );
-        assert!(allowed.iter().all(|id| !id.starts_with("agy/")), "{allowed:?}");
+        assert!(
+            allowed.iter().all(|id| !id.starts_with("agy/")),
+            "{allowed:?}"
+        );
         assert!(allowed.iter().all(|id| !id.is_empty()), "{allowed:?}");
     }
 

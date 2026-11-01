@@ -273,7 +273,10 @@ mod tests {
         let body = json!({ "enabled": true, "acknowledged": true });
         let (status, answer) = call(&state, "PUT", "/engines/agy", Some(body)).await;
         assert_eq!(status, StatusCode::OK, "{answer}");
-        let text = answer["takes_effect"].as_str().expect("a sentence").to_lowercase();
+        let text = answer["takes_effect"]
+            .as_str()
+            .expect("a sentence")
+            .to_lowercase();
         assert!(text.contains("chat"), "{text}");
         assert!(text.contains("restart"), "{text}");
     }

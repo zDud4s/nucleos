@@ -2523,9 +2523,24 @@ mod tests {
         let takes = |kinds: Vec<RunnerKind>| kinds.contains(&RunnerKind::Agy);
 
         // Read-only: a plan run, or a restricted tool policy.
-        assert!(takes(with(Permission::Plan, ToolPolicy::Unrestricted, false, false)));
-        assert!(takes(with(Permission::Default, ToolPolicy::McpOnly, false, false)));
-        assert!(takes(with(Permission::Default, ToolPolicy::None, false, false)));
+        assert!(takes(with(
+            Permission::Plan,
+            ToolPolicy::Unrestricted,
+            false,
+            false
+        )));
+        assert!(takes(with(
+            Permission::Default,
+            ToolPolicy::McpOnly,
+            false,
+            false
+        )));
+        assert!(takes(with(
+            Permission::Default,
+            ToolPolicy::None,
+            false,
+            false
+        )));
         assert!(agy_can_take(RunShape {
             permission: Permission::Plan,
             classifier_governs_tools: false,
@@ -2533,15 +2548,53 @@ mod tests {
             resume: false,
         }));
         // Anything that writes, bypasses, is classifier-governed or resumes is not.
-        assert!(!takes(with(Permission::Default, ToolPolicy::Unrestricted, false, false)));
-        assert!(!takes(with(Permission::AcceptEdits, ToolPolicy::Unrestricted, false, false)));
-        assert!(!takes(with(Permission::Bypass, ToolPolicy::McpOnly, false, false)));
-        assert!(!takes(with(Permission::Bypass, ToolPolicy::Unrestricted, false, false)));
-        assert!(!takes(with(Permission::Plan, ToolPolicy::McpOnly, true, false)));
-        assert!(!takes(with(Permission::Default, ToolPolicy::McpOnly, true, false)));
-        assert!(!takes(with(Permission::Plan, ToolPolicy::McpOnly, false, true)));
+        assert!(!takes(with(
+            Permission::Default,
+            ToolPolicy::Unrestricted,
+            false,
+            false
+        )));
+        assert!(!takes(with(
+            Permission::AcceptEdits,
+            ToolPolicy::Unrestricted,
+            false,
+            false
+        )));
+        assert!(!takes(with(
+            Permission::Bypass,
+            ToolPolicy::McpOnly,
+            false,
+            false
+        )));
+        assert!(!takes(with(
+            Permission::Bypass,
+            ToolPolicy::Unrestricted,
+            false,
+            false
+        )));
+        assert!(!takes(with(
+            Permission::Plan,
+            ToolPolicy::McpOnly,
+            true,
+            false
+        )));
+        assert!(!takes(with(
+            Permission::Default,
+            ToolPolicy::McpOnly,
+            true,
+            false
+        )));
+        assert!(!takes(with(
+            Permission::Plan,
+            ToolPolicy::McpOnly,
+            false,
+            true
+        )));
         // The primary is always there.
-        assert!(with(Permission::Bypass, ToolPolicy::Unrestricted, false, true).contains(&RunnerKind::Claude));
+        assert!(
+            with(Permission::Bypass, ToolPolicy::Unrestricted, false, true)
+                .contains(&RunnerKind::Claude)
+        );
     }
 
     /// E16 F7: `spawn.rs` drops agy from the route of a run the runner would refuse, through the

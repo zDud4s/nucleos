@@ -430,8 +430,8 @@ mod tests {
             primary_runner: Some(name.to_owned()),
             ..crate::config::ModelsConfig::default()
         };
-        let error = refuse_unpinned_on_agy_primary("coder@1.0.0", false, &primary("agy"))
-            .unwrap_err();
+        let error =
+            refuse_unpinned_on_agy_primary("coder@1.0.0", false, &primary("agy")).unwrap_err();
         assert!(matches!(error, LaunchError::NoRunner(_)), "{error:?}");
         assert_eq!(
             error.to_string(),

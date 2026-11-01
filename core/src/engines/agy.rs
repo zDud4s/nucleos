@@ -19,9 +19,8 @@ pub const WARNING_VERSION: u32 = 1;
 /// reader of the document; false when it cannot be read. A stored row is not run through `finish`
 /// on load, so the acknowledgement is checked here: raising the version revokes.
 pub fn enabled() -> bool {
-    crate::settings::get_opt::<AgyDoc>(&Scope::Machine).is_some_and(|doc| {
-        doc.enabled && doc.acknowledged_warning_version == Some(WARNING_VERSION)
-    })
+    crate::settings::get_opt::<AgyDoc>(&Scope::Machine)
+        .is_some_and(|doc| doc.enabled && doc.acknowledged_warning_version == Some(WARNING_VERSION))
 }
 
 /// The model an agy runner uses when nothing pins one.

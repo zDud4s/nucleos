@@ -435,8 +435,8 @@ mod agy_primary_tests {
             primary_runner: Some(name.to_owned()),
             ..crate::config::ModelsConfig::default()
         };
-        let error = refuse_unpinned_seat_on_agy_primary("member 1", false, &primary("agy"))
-            .unwrap_err();
+        let error =
+            refuse_unpinned_seat_on_agy_primary("member 1", false, &primary("agy")).unwrap_err();
         assert_eq!(
             error,
             StartError::Invalid(format!("member 1: {}", crate::engines::AGY_REFUSAL))

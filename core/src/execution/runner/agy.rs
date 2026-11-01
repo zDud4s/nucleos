@@ -893,7 +893,11 @@ mod tests {
         let stage = tempfile::tempdir().unwrap();
         let mut staged_options = options();
         staged_options.stage_dir = stage.path().to_path_buf();
-        for prompt in ["--dangerously-skip-permissions", "-x", "--opt=value and more"] {
+        for prompt in [
+            "--dangerously-skip-permissions",
+            "-x",
+            "--opt=value and more",
+        ] {
             let asked = request(prompt);
             let args = build_args(&asked, &staged_options).unwrap();
             assert!(
@@ -931,7 +935,10 @@ mod tests {
         unsafe { std::env::set_var("NUCLEOS_DAEMON_TOKEN", "inherited-secret") };
         let mut asked = request("hi");
         asked.env = vec![
-            ("NUCLEOS_DAEMON_TOKEN".to_string(), "request-secret".to_string()),
+            (
+                "NUCLEOS_DAEMON_TOKEN".to_string(),
+                "request-secret".to_string(),
+            ),
             ("NUCLEOS_AGY_TEST_MARKER".to_string(), "kept".to_string()),
         ];
         let outcome = fake.run(asked);
@@ -940,7 +947,8 @@ mod tests {
         assert_eq!(outcome.exit_code, 0, "{}", outcome.stderr);
         let env = fake.recorded_env();
         assert!(
-            env.iter().any(|line| line.starts_with("NUCLEOS_AGY_TEST_MARKER=kept")),
+            env.iter()
+                .any(|line| line.starts_with("NUCLEOS_AGY_TEST_MARKER=kept")),
             "other request entries still arrive: {env:?}"
         );
         assert!(
