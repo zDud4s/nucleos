@@ -432,4 +432,22 @@ mod tests {
         let allowed = allowed_models(&models, &RouterConfig::off(), RunnerKind::for_test("zed"));
         assert!(allowed.iter().all(|id| !id.is_empty()), "{allowed:?}");
     }
+
+    #[test]
+    fn an_installed_kind_with_no_runner_is_not_offered() {
+        // The default models file names Claude as the primary; Codex is installed and wired, the
+        // made-up "zed" is installed but has no row, hence no runner.
+        let models = crate::config::ModelsConfig::default();
+        let primary = codex_runner("primary".to_owned(), "read-only", None);
+        let fronted = front_with(
+            primary,
+            &models,
+            RouterConfig::off(),
+            &[RunnerKind::Codex, RunnerKind::for_test("zed")],
+        );
+        let engines = fronted.engines().expect("the engines are held");
+        assert_eq!(engines.primary.kind, RunnerKind::Claude);
+        assert!(engines.available(RunnerKind::Codex).is_some());
+        assert!(engines.available(RunnerKind::for_test("zed")).is_none());
+    }
 }

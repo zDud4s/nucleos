@@ -347,14 +347,16 @@ impl EngineId {
     pub const OPENROUTER: EngineId = EngineId("openrouter");
 
     /// The id of a table row. Production code gets ids from table rows (this function) and from
-    /// the named consts; `from_row` is crate-private and is only given the `engines::` id
-    /// constants.
+    /// the named consts; `from_row` is crate-private and is given the `engines::` id constants,
+    /// and, by `RunnerKind::parse_in` and `Engine::parse_in`, the id of a row of the table they
+    /// were given.
     pub fn of_row(row: &EngineDescription) -> EngineId {
         EngineId(row.id)
     }
 
     /// The id for a stored text that names a `TABLE` row; used by the associated consts of
-    /// `Engine`, `RunnerKind` and `ChatEngine`, which pass the `engines::` id constants.
+    /// `Engine`, `RunnerKind` and `ChatEngine`, which pass the `engines::` id constants; their
+    /// `parse_in` passes `row.id` from the table it was given.
     pub(crate) const fn from_row(id: &'static str) -> EngineId {
         EngineId(id)
     }
