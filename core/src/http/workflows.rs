@@ -1172,30 +1172,51 @@ pub(super) async fn post_workflow_sync(
     let checkout = tokio::fs::canonicalize(&asked)
         .await
         .map_err(|_| refusal(StatusCode::NOT_FOUND, "no_such_path"))?;
-    let deadline = std::time::Instant::now() + DETECT_GIT_BUDGET;
-    let key = crate::execution::git_exec::repo_key(&checkout, deadline)
-        .await
-        .map_err(|detail| {
-            refusal_with_detail(StatusCode::UNPROCESSABLE_ENTITY, "not_a_checkout", detail)
-        })?;
-
-    let rows: Vec<(String, Option<String>)> =
-        sqlx::query_as("SELECT project_id, project_root FROM autopilot_state")
-            .fetch_all(&state.pool)
+    let mut matches = loop {
+        if crate::governance::autopilot::kill_switch_engaged(&state.pool)
+            .await
+            .unwrap_or(true)
+        {
+            return Err(refusal(StatusCode::LOCKED, "kill_switch"));
+        }
+        let deadline = std::time::Instant::now() + DETECT_GIT_BUDGET;
+        let key = crate::execution::git_exec::repo_key(&checkout, deadline)
+            .await
+            .map_err(|detail| {
+                refusal_with_detail(StatusCode::UNPROCESSABLE_ENTITY, "not_a_checkout", detail)
+            })?;
+        // Read before the roster, never after it. A repair writes the root and only then drops the
+        // lease, so a lease seen gone here means the roster read below has the new root. Read
+        // afterwards, a repair landing between the two looked like no repair at all, and the rows
+        // it had just replaced became a `no_project`.
+        let lease = super::projects::live_repair_wait(&state.pool)
             .await
             .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?;
-    let mut matches = Vec::new();
-    for (project_id, root) in rows {
-        let Some(root) = root else { continue };
-        let root = std::path::PathBuf::from(root);
-        if crate::execution::git_exec::repo_key(&root, deadline)
-            .await
-            .as_ref()
-            == Ok(&key)
-        {
-            matches.push((project_id, root));
+        let rows: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT project_id, project_root FROM autopilot_state")
+                .fetch_all(&state.pool)
+                .await
+                .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?;
+        let mut matches = Vec::new();
+        for (project_id, root) in rows {
+            let Some(root) = root else { continue };
+            let root = std::path::PathBuf::from(root);
+            if crate::execution::git_exec::repo_key(&root, deadline)
+                .await
+                .as_ref()
+                == Ok(&key)
+            {
+                matches.push((project_id, root));
+            }
         }
-    }
+        if !matches.is_empty() {
+            break matches;
+        }
+        let Some(remaining) = lease else {
+            break matches;
+        };
+        tokio::time::sleep(remaining.min(std::time::Duration::from_millis(50))).await;
+    };
     if matches.is_empty() {
         return Err(refusal(StatusCode::NOT_FOUND, "no_project"));
     }
@@ -1524,5 +1545,560 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    }
+
+    /* ------------------------------------------------- R9: the project registry -- */
+
+    /// How long a sync may take before a test calls it stuck. Shorter than [`LONG_LEASE`], so a
+    /// sync that answers inside it did not sit out a repair's lease.
+    const WAIT_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+    const LONG_LEASE: u64 = 60;
+    const WORKFLOW_FILE: &str = ".nucleos/workflow/workflow.md";
+
+    async fn bounded<T>(what: &str, work: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(WAIT_BOUND, work)
+            .await
+            .unwrap_or_else(|_| panic!("{what} did not answer within {WAIT_BOUND:?}"))
+    }
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+        assert!(ok, "git {args:?}");
+    }
+
+    /// A main checkout with one commit, so a worktree can branch off it.
+    fn git_repository() -> tempfile::TempDir {
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init", "--quiet"]);
+        std::fs::write(repo.path().join("README.md"), "x").unwrap();
+        git(repo.path(), &["add", "README.md"]);
+        git(repo.path(), &["commit", "--quiet", "-m", "init"]);
+        repo
+    }
+
+    /// A worktree of `repo`, made by hand, under a temp dir of its own.
+    fn worktree_of(repo: &std::path::Path) -> (tempfile::TempDir, std::path::PathBuf) {
+        let trees = tempfile::tempdir().unwrap();
+        let tree = trees.path().join("by-hand");
+        git(
+            repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "side",
+                &tree.to_string_lossy(),
+            ],
+        );
+        (trees, tree)
+    }
+
+    /// Lesson L3 and L12: `alpha` is rostered and pinned, but its root is a path that no longer
+    /// resolves, so the repository it really lives in is `no_project` to the daemon. Everything is
+    /// under temp dirs, the registry included: `machine_config_root` is the stand-in home.
+    struct StaleProject {
+        state: crate::state::AppState,
+        home: tempfile::TempDir,
+        repo: tempfile::TempDir,
+        stale: String,
+        _lib: tempfile::TempDir,
+        _project: tempfile::TempDir,
+    }
+
+    async fn stale_project() -> StaleProject {
+        let mut state = test_state().await;
+        let (lib, library) = library_with(&[("dev", "1.0", "owns:\n  - .nucleos/workflow/\n")]);
+        let bundle = library.join("dev/1.0");
+        std::fs::create_dir_all(bundle.join(".nucleos/workflow")).unwrap();
+        std::fs::write(bundle.join(WORKFLOW_FILE), "the pipeline").unwrap();
+        state.workflow_library = Some(library.clone());
+        let home = with_project_home(&mut state);
+        let project = project_with_rules(&state, "alpha", "gate_command: cargo test\n").await;
+        let stale = project
+            .path()
+            .join("moved-away")
+            .to_string_lossy()
+            .into_owned();
+        sqlx::query("UPDATE autopilot_state SET project_root = ? WHERE project_id = 'alpha'")
+            .bind(&stale)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        crate::workflows::install(
+            &state.pool,
+            "alpha",
+            &crate::workflows::read_bundle(&bundle, "dev", "1.0")
+                .unwrap()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        StaleProject {
+            state,
+            home,
+            repo: git_repository(),
+            stale,
+            _lib: lib,
+            _project: project,
+        }
+    }
+
+    async fn sync(
+        state: &crate::state::AppState,
+        checkout: &std::path::Path,
+    ) -> (StatusCode, serde_json::Value) {
+        bounded(
+            "the sync",
+            workflow_call(
+                state.clone(),
+                "POST",
+                "/workflows/sync",
+                Some(serde_json::json!({ "path": checkout.to_string_lossy() })),
+            ),
+        )
+        .await
+    }
+
+    async fn repair(
+        state: &crate::state::AppState,
+        project_id: &str,
+        root: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        workflow_call(
+            state.clone(),
+            "POST",
+            &format!("/projects/{project_id}/repair"),
+            Some(serde_json::json!({ "project_root": root })),
+        )
+        .await
+    }
+
+    async fn begin_repair(
+        state: &crate::state::AppState,
+        project_id: &str,
+        lease_secs: u64,
+    ) -> (StatusCode, serde_json::Value) {
+        workflow_call(
+            state.clone(),
+            "POST",
+            &format!("/projects/{project_id}/repair/begin"),
+            Some(serde_json::json!({ "lease_secs": lease_secs })),
+        )
+        .await
+    }
+
+    async fn repair_is_under_way(state: &crate::state::AppState, lease_secs: u64) {
+        let (status, body) = begin_repair(state, "alpha", lease_secs).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    async fn rostered_root(state: &crate::state::AppState, project_id: &str) -> Option<String> {
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT project_root FROM autopilot_state WHERE project_id = ?",
+        )
+        .bind(project_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap()
+    }
+
+    /// A sync of `checkout` while a repair is under way, which finishes `held_for` later. Asserts
+    /// the sync had not answered when it did, and hands back what the sync finally said.
+    async fn sync_across_a_repair(
+        fixture: &StaleProject,
+        checkout: &std::path::Path,
+        held_for: std::time::Duration,
+    ) -> (StatusCode, serde_json::Value) {
+        let answered = std::cell::Cell::new(false);
+        let syncing = async {
+            let answer = sync(&fixture.state, checkout).await;
+            answered.set(true);
+            answer
+        };
+        let repairing = async {
+            tokio::time::sleep(held_for).await;
+            assert!(
+                !answered.get(),
+                "the sync answered while the repair was under way instead of waiting for it"
+            );
+            let (status, body) = repair(
+                &fixture.state,
+                "alpha",
+                &fixture.repo.path().to_string_lossy(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        };
+        let (answer, ()) = tokio::join!(syncing, repairing);
+        answer
+    }
+
+    /// R9: the repair is an operation of the daemon. After it the roster row is what resolves the
+    /// repository, for the main checkout's worktrees too, and the state stays in the daemon's home.
+    #[tokio::test]
+    async fn a_repair_points_the_roster_at_the_checkout_and_its_worktree_then_syncs() {
+        let fixture = stale_project().await;
+        let state = &fixture.state;
+        let (_trees, tree) = worktree_of(fixture.repo.path());
+
+        // Nothing under way: the refusal answers at once, and it stays the same refusal.
+        let (status, answer) = sync(state, &tree).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{answer}");
+        assert_eq!(answer["refusal"], "no_project");
+
+        let (status, answer) = repair(state, "alpha", &fixture.repo.path().to_string_lossy()).await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        assert_eq!(answer["project_id"], "alpha");
+        assert_eq!(answer["previous_root"], fixture.stale.as_str());
+
+        // Stored in the spelling git can use, as `set_project_mode` stores it: the queue hands this
+        // root to `git worktree add`.
+        let stored = rostered_root(state, "alpha").await.unwrap();
+        assert_eq!(answer["project_root"], stored.as_str());
+        assert_ne!(stored, fixture.stale);
+        assert!(!stored.starts_with(r"\\?\"), "{stored}");
+
+        let (status, answer) = sync(state, &tree).await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        assert_eq!(answer["project_id"], "alpha");
+        assert_eq!(
+            std::fs::read_to_string(tree.join(WORKFLOW_FILE)).unwrap(),
+            "the pipeline"
+        );
+        let records = fixture
+            .home
+            .path()
+            .join("projects/alpha")
+            .join(crate::project::state::WORKTREE_RECORDS_DIR);
+        assert_eq!(std::fs::read_dir(&records).unwrap().count(), 1);
+    }
+
+    /// Repairing where a project lives changes nothing about what it is allowed to do: the repair
+    /// is not a way to re-activate one, and it is not `set_project_mode` under another name.
+    #[tokio::test]
+    async fn a_repair_keeps_the_projects_mode_and_judge() {
+        let fixture = stale_project().await;
+        let state = &fixture.state;
+        sqlx::query(
+            "UPDATE autopilot_state SET mode = 'active', judge = 'enforce' WHERE project_id = 'alpha'",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let (status, answer) = repair(state, "alpha", &fixture.repo.path().to_string_lossy()).await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+
+        let (mode, judge): (String, Option<String>) =
+            sqlx::query_as("SELECT mode, judge FROM autopilot_state WHERE project_id = 'alpha'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(mode, "active");
+        assert_eq!(judge.as_deref(), Some("enforce"));
+    }
+
+    /// Each refusal by the name `POST /workflows/sync` already gives the same fact, and the roster
+    /// is left as it was: a failed repair must not make a bad row worse.
+    #[tokio::test]
+    async fn a_repair_refuses_by_name_and_leaves_the_roster_alone() {
+        let fixture = stale_project().await;
+        let state = &fixture.state;
+        let plain = tempfile::tempdir().unwrap();
+
+        let refused = [
+            (
+                "relative/path".to_string(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "path_not_absolute",
+            ),
+            (
+                fixture
+                    .repo
+                    .path()
+                    .join("nothing-here")
+                    .to_string_lossy()
+                    .into_owned(),
+                StatusCode::NOT_FOUND,
+                "no_such_path",
+            ),
+            (
+                plain.path().to_string_lossy().into_owned(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "not_a_checkout",
+            ),
+        ];
+        for (root, expected, name) in refused {
+            let (status, answer) = repair(state, "alpha", &root).await;
+            assert_eq!(status, expected, "{root}: {answer}");
+            assert_eq!(answer["refusal"], name, "{root}");
+            assert_eq!(
+                rostered_root(state, "alpha").await.as_deref(),
+                Some(fixture.stale.as_str())
+            );
+        }
+    }
+
+    /// Lesson L12's own trap: the session that repairs is usually standing in a worktree. A root
+    /// that is a worktree shares the repository, so it would match and work today, and then the
+    /// project would have lost its root the day that branch lands and the worktree is removed.
+    #[tokio::test]
+    async fn a_repair_refuses_a_linked_worktree_as_the_root() {
+        let fixture = stale_project().await;
+        let state = &fixture.state;
+        let (_trees, tree) = worktree_of(fixture.repo.path());
+
+        let (status, answer) = repair(state, "alpha", &tree.to_string_lossy()).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+        assert_eq!(answer["refusal"], "not_the_main_checkout");
+        assert_eq!(
+            rostered_root(state, "alpha").await.as_deref(),
+            Some(fixture.stale.as_str())
+        );
+    }
+
+    /// The repair mends a row, it does not enrol a project: bringing one under NucleOS is
+    /// `/projects/{id}/onboard`, with its own confirmation. An id that cannot name a state
+    /// directory is refused before anything else is asked of it.
+    #[tokio::test]
+    async fn a_repair_never_adds_a_project_or_takes_a_bad_id() {
+        let fixture = stale_project().await;
+        let state = &fixture.state;
+        let root = fixture.repo.path().to_string_lossy().into_owned();
+
+        let (status, answer) = repair(state, "nobody", &root).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{answer}");
+        assert_eq!(answer["refusal"], "unknown_project");
+        let (status, answer) = begin_repair(state, "nobody", LONG_LEASE).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{answer}");
+        assert_eq!(answer["refusal"], "unknown_project");
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM autopilot_state WHERE project_id = 'nobody'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, 0);
+
+        // Percent-encoded, so the separators reach the handler as part of the one segment.
+        for bad in ["bad%3Aid", "..%2Fevil"] {
+            let (status, answer) = repair(state, bad, &root).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{bad}: {answer}");
+            assert_eq!(answer["refusal"], "bad_project_id", "{bad}");
+        }
+    }
+
+    /// Both doors write, and the kill switch stops everything that writes.
+    #[tokio::test]
+    async fn the_kill_switch_stops_a_repair() {
+        let fixture = stale_project().await;
+        let state = &fixture.state;
+        crate::governance::autopilot::set_kill_switch(&state.pool, true)
+            .await
+            .unwrap();
+
+        let (status, answer) = repair(state, "alpha", &fixture.repo.path().to_string_lossy()).await;
+        assert_eq!(status, StatusCode::LOCKED, "{answer}");
+        assert_eq!(answer["refusal"], "kill_switch");
+        let (status, answer) = begin_repair(state, "alpha", LONG_LEASE).await;
+        assert_eq!(status, StatusCode::LOCKED, "{answer}");
+        assert_eq!(answer["refusal"], "kill_switch");
+        assert_eq!(
+            rostered_root(state, "alpha").await.as_deref(),
+            Some(fixture.stale.as_str())
+        );
+    }
+
+    /// Re-rooting a project decides which checkout its workflow and its gate run in, so no run and
+    /// no lesser API token reach it. Safe by being in no table; this says no to filing it in one.
+    #[test]
+    fn a_repair_is_in_no_scope_table() {
+        use crate::auth::{ApiTokenLevel, Scope, permits};
+        use axum::http::Method;
+        for path in ["/projects/7/repair", "/projects/7/repair/begin"] {
+            for scope in [
+                Scope::Run(7),
+                Scope::ApiToken(ApiTokenLevel::ReadOnly),
+                Scope::ApiToken(ApiTokenLevel::RunCreating),
+            ] {
+                assert!(
+                    !permits(&scope, &Method::POST, path),
+                    "{scope:?} must not reach POST {path}"
+                );
+            }
+        }
+    }
+
+    /// R9's second half, lessons L12 and L33: a tree that syncs while another session repairs the
+    /// roster waits for that repair and goes on, instead of failing with `no_project`.
+    #[tokio::test]
+    async fn a_sync_waits_for_a_repair_under_way_and_then_resolves() {
+        let fixture = stale_project().await;
+        let state = &fixture.state;
+        let (_trees, tree) = worktree_of(fixture.repo.path());
+        repair_is_under_way(state, LONG_LEASE).await;
+
+        let (status, answer) =
+            sync_across_a_repair(&fixture, &tree, std::time::Duration::from_millis(500)).await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        assert_eq!(answer["project_id"], "alpha");
+        assert_eq!(
+            std::fs::read_to_string(tree.join(WORKFLOW_FILE)).unwrap(),
+            "the pipeline"
+        );
+
+        // The finished repair let go: a repository nobody rosters is refused without sitting out
+        // the rest of the lease.
+        let stranger = git_repository();
+        let (status, answer) = sync(state, stranger.path()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{answer}");
+        assert_eq!(answer["refusal"], "no_project");
+    }
+
+    /// The handler takes one deadline for its git calls before it reads the roster. A wait longer
+    /// than that budget must not spend it: resolving again with a deadline already past would make
+    /// every root unreadable, and a repair that took a while would still end in `no_project`.
+    #[tokio::test]
+    async fn a_sync_that_waited_past_the_git_budget_still_resolves() {
+        let fixture = stale_project().await;
+        let state = &fixture.state;
+        repair_is_under_way(state, LONG_LEASE).await;
+
+        let held_for = super::DETECT_GIT_BUDGET + std::time::Duration::from_millis(500);
+        let (status, answer) = sync_across_a_repair(&fixture, fixture.repo.path(), held_for).await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        assert_eq!(answer["project_id"], "alpha");
+    }
+
+    /// Only what cannot be resolved waits. A repair of a project must not stop the syncs of every
+    /// checkout the roster can already answer for.
+    #[tokio::test]
+    async fn a_sync_that_already_resolves_does_not_wait_for_a_repair() {
+        let fixture = stale_project().await;
+        let state = &fixture.state;
+        let (status, answer) = repair(state, "alpha", &fixture.repo.path().to_string_lossy()).await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        repair_is_under_way(state, LONG_LEASE).await;
+
+        let (status, answer) = sync(state, fixture.repo.path()).await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        assert_eq!(answer["project_id"], "alpha");
+    }
+
+    /// The session repairing can die. Its lease ends the wait, and what the sync then says is the
+    /// plain refusal, so nothing hangs on a repair nobody will finish.
+    #[tokio::test]
+    async fn an_abandoned_repair_ends_the_wait_at_its_lease() {
+        let fixture = stale_project().await;
+        let state = &fixture.state;
+
+        let started = std::time::Instant::now();
+        repair_is_under_way(state, 1).await;
+        let (status, answer) = sync(state, fixture.repo.path()).await;
+        let waited = started.elapsed();
+
+        assert_eq!(status, StatusCode::NOT_FOUND, "{answer}");
+        assert_eq!(answer["refusal"], "no_project");
+        assert!(
+            waited >= std::time::Duration::from_millis(900),
+            "the sync answered after {waited:?}, before the lease ended"
+        );
+    }
+
+    /// While a repair is under way every sync without a match waits, whichever project it is about:
+    /// the daemon cannot tell which one the repository will turn out to be. So nobody gets to hold
+    /// that for a day, and a request that names no lease still gets a finite one.
+    #[tokio::test]
+    async fn a_repair_lease_is_finite_and_capped() {
+        let fixture = stale_project().await;
+        let state = &fixture.state;
+
+        let (status, answer) = begin_repair(state, "alpha", 86_400).await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        assert_eq!(answer["project_id"], "alpha");
+        let capped = answer["lease_secs"].as_u64().unwrap();
+        assert!((1..=600).contains(&capped), "{answer}");
+
+        let (status, answer) = workflow_call(
+            state.clone(),
+            "POST",
+            "/projects/alpha/repair/begin",
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        let default = answer["lease_secs"].as_u64().unwrap();
+        assert!((1..=600).contains(&default), "{answer}");
+    }
+
+    /// A wait can outlast the kill-switch check at the top of the handler. A switch thrown during
+    /// it stops the sync: nothing gets written on a check made minutes earlier.
+    #[tokio::test]
+    async fn the_kill_switch_thrown_during_the_wait_stops_the_sync() {
+        let fixture = stale_project().await;
+        let state = &fixture.state;
+        repair_is_under_way(state, 2).await;
+
+        let syncing = sync(state, fixture.repo.path());
+        let killing = async {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            crate::governance::autopilot::set_kill_switch(&state.pool, true)
+                .await
+                .unwrap();
+        };
+        let ((status, answer), ()) = tokio::join!(syncing, killing);
+
+        assert_eq!(status, StatusCode::LOCKED, "{answer}");
+        assert_eq!(answer["refusal"], "kill_switch");
+        assert!(!fixture.repo.path().join(WORKFLOW_FILE).exists());
+    }
+
+    /// Lesson L3: a `project.json` copied from another machine names a state directory that is not
+    /// this daemon's. It is no source: it does not make the repository a project, nothing is
+    /// written where it points, and once the roster answers the daemon's own paths replace it.
+    #[tokio::test]
+    async fn a_copied_project_pointer_is_no_source_and_the_daemon_rewrites_it() {
+        let fixture = stale_project().await;
+        let state = &fixture.state;
+        let elsewhere = tempfile::tempdir().unwrap();
+        let pointer_at = fixture
+            .repo
+            .path()
+            .join(crate::workflows::materialize::PROJECT_POINTER);
+        std::fs::create_dir_all(pointer_at.parent().unwrap()).unwrap();
+        std::fs::write(
+            &pointer_at,
+            serde_json::json!({
+                "id": "alpha",
+                "state_dir": elsewhere.path().to_string_lossy(),
+                "bundle_dir": elsewhere.path().to_string_lossy(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let (status, answer) = sync(state, fixture.repo.path()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{answer}");
+        assert_eq!(answer["refusal"], "no_project");
+
+        let (status, answer) = repair(state, "alpha", &fixture.repo.path().to_string_lossy()).await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        let (status, answer) = sync(state, fixture.repo.path()).await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+
+        let pointer: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&pointer_at).unwrap()).unwrap();
+        assert_eq!(
+            std::path::Path::new(pointer["state_dir"].as_str().unwrap()),
+            std::path::absolute(fixture.home.path().join("projects/alpha")).unwrap()
+        );
+        assert_eq!(std::fs::read_dir(elsewhere.path()).unwrap().count(), 0);
     }
 }

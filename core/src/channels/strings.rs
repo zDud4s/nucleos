@@ -108,6 +108,23 @@ pub enum Text {
         kind: String,
         summary: String,
     },
+    /// A tree decision took this answer.
+    DecisionApplied {
+        question: String,
+        answer: String,
+    },
+    /// `/decide` named a decision that does not exist.
+    DecisionUnknown {
+        id: String,
+    },
+    /// A plain text that could not be pinned to one decision: each open one as (id, question).
+    DecisionConfirm {
+        open: Vec<(String, String)>,
+    },
+    /// An answer with no decision waiting for one.
+    NoOpenDecision,
+    /// An owner answering a decision from a channel that may not approve one.
+    DecisionWrongChannel,
 }
 
 /// Longest progress snippet, in chars; keeps the whole message far below any channel's piece limit.
@@ -160,7 +177,8 @@ pub fn render(text: &Text) -> String {
 /kill - engage the kill switch\n/unkill - disengage it\n/budget - show the budget\n\
 /proposals - list open proposals\napprove N - approve proposal N\nreject N - reject proposal N\n\
 /projects [filter] - list projects\n/inbox - queued mail\n/note <text> - save a note\n\
-/cap <N> <text> - answer capture request N"
+/cap <N> <text> - answer capture request N\n\
+/decide <id> <text> - answer a pending decision"
             .to_string(),
         Text::Working { turn } => format!("Working on it (turn {turn})."),
         Text::StillWorking => {
@@ -241,6 +259,23 @@ pub fn render(text: &Text) -> String {
         Text::ProjectPrefix { project } => format!("[{project}] "),
         Text::MailNotArmed => "Mail is not armed.".to_string(),
         Text::Feed { kind, summary } => format!("{kind}: {summary}"),
+        Text::DecisionApplied { question, answer } => {
+            format!("Decision recorded. {question}\nAnswer: {answer}")
+        }
+        Text::DecisionUnknown { id } => format!("There is no decision {id}."),
+        Text::DecisionConfirm { open } => {
+            let list = open
+                .iter()
+                .map(|(id, question)| format!("{id}: {question}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "I did not take that as an answer, and it did not start a turn. Waiting for a \
+decision:\n{list}\nAnswer with /decide <id> <text>."
+            )
+        }
+        Text::NoOpenDecision => "No decision is waiting for an answer.".to_string(),
+        Text::DecisionWrongChannel => "Decisions are answered from Telegram only.".to_string(),
     }
 }
 
@@ -480,6 +515,16 @@ mod tests {
                 kind: "job_done".into(),
                 summary: "built".into(),
             },
+            Text::DecisionApplied {
+                question: "Which database?".into(),
+                answer: "sqlite".into(),
+            },
+            Text::DecisionUnknown { id: "d1".into() },
+            Text::DecisionConfirm {
+                open: vec![("d1".into(), "Which database?".into())],
+            },
+            Text::NoOpenDecision,
+            Text::DecisionWrongChannel,
         ];
         for t in &all {
             let s = render(t);

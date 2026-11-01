@@ -7,12 +7,13 @@
 //! Every refusal is `{error}` with the status `NodeError::status_code` names. A field sent as
 //! `null` reads exactly as an absent one, because the MCP client sends every field it has.
 //!
-//! **Who reaches them.** No route here is in any `auth.rs` table, so only the control token and an
+//! **Who reaches them.** No route here is in any `auth.rs` table, so the control token and an
 //! Admin API key get in — the same reach as `/hooks/bundle`, whose caller (the hook forwarder in a
 //! person's own Claude Code session) is the main caller here too, alongside the MCP daemon client
-//! of such a session. `Scope::Run` is deliberately left out: it only ever matches literal POST
-//! paths, so it could not reach `PATCH /nodes/{id}` or the `GET` reads anyway, and a half-reachable
-//! tree is worse than none. Letting an autonomous run keep its own tree is a later decision.
+//! of such a session. The one exception is an autonomous tree run: `auth::tree_run_admits` lets a
+//! `Scope::Run` key use `PATCH /nodes/{id}` and `POST /nodes/{id}/close` for the node its run is
+//! bound to (`work_nodes.run_id`) and no other. `POST /nodes`, `GET /nodes/active` and the tree
+//! read stay out of a run key's reach, so a tree run cannot open or list nodes itself.
 
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::routing::patch;
@@ -20,6 +21,8 @@ use serde_json::{Value, json};
 use std::path::Path as FsPath;
 
 use super::*;
+use crate::conductor::depth::{self, AncestorView, ChildArgs, DepthRefusal, TreeLimits};
+use crate::tree_cost::budget::{self, Permit};
 use crate::work_nodes::{self, CloseArgs, NodeError, NodeLimits, OpenArgs, UpdateArgs, View};
 
 pub(super) fn routes() -> Router<AppState> {
@@ -88,6 +91,45 @@ fn required(field: &str, value: Option<String>) -> Result<String, Refusal> {
     value.ok_or_else(|| refuse(StatusCode::BAD_REQUEST, format!("{field} is required")))
 }
 
+fn depth_refusal_message(refusal: DepthRefusal) -> &'static str {
+    match refusal {
+        DepthRefusal::SameScopeAsParent => "child has the same scope as its parent",
+        DepthRefusal::SingleChildChain => {
+            "child has the same scope as its parent and would only extend the chain"
+        }
+        DepthRefusal::RepeatedGoal => "child repeats the goal of an ancestor (repeated goal)",
+        DepthRefusal::TreeNodeCeiling => "tree has reached its node ceiling",
+    }
+}
+
+/// Builds the root-first ancestor chain required by the structural opening guard.
+async fn ancestor_chain(
+    pool: &sqlx::SqlitePool,
+    mut node: work_nodes::Node,
+) -> Result<Vec<AncestorView>, NodeError> {
+    let mut chain = Vec::new();
+    loop {
+        let open_children: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM work_nodes \
+             WHERE parent_id = ? AND status IN ('planned', 'running')",
+        )
+        .bind(&node.id)
+        .fetch_one(pool)
+        .await?;
+        chain.push(AncestorView {
+            owned_paths: node.owned_paths.clone(),
+            goal: node.goal.clone(),
+            open_children,
+        });
+        let Some(parent_id) = node.parent_id else {
+            break;
+        };
+        node = work_nodes::get(pool, &parent_id).await?;
+    }
+    chain.reverse();
+    Ok(chain)
+}
+
 /// `POST /nodes`: opens a root (no `parent_id`) or a child under a running node.
 ///
 /// The project is best effort: a root opened by the owner has none (the body names no worktree),
@@ -109,20 +151,57 @@ async fn post_node(
         chat_id: present(body.chat_id),
         run_id: None,
     };
-    let parent_project = match args.parent_id.as_deref() {
+    let parent = match args.parent_id.as_deref() {
         // A missing parent is refused by `open` itself, with the same 404.
         Some(parent_id) => match work_nodes::get(&state.pool, parent_id).await {
-            Ok(parent) => parent.project_id,
+            Ok(parent) => Some(parent),
             Err(NodeError::NotFound) => None,
             Err(error) => return Err(refused(error)),
         },
         None => None,
     };
-    let limits = limits_for(&state, parent_project.as_deref()).await;
-    work_nodes::open(&state.pool, None, &limits, &args)
+    let limits = limits_for(
+        &state,
+        parent.as_ref().and_then(|node| node.project_id.as_deref()),
+    )
+    .await;
+    let (chain, root_id) = match parent {
+        Some(parent) => {
+            let root_id = parent.root_id.clone();
+            let chain = ancestor_chain(&state.pool, parent).await.map_err(refused)?;
+            (chain, Some(root_id))
+        }
+        None => (Vec::new(), None),
+    };
+    let tree_total = match root_id.as_deref() {
+        Some(root_id) => sqlx::query_scalar("SELECT COUNT(*) FROM work_nodes WHERE root_id = ?")
+            .bind(root_id)
+            .fetch_one(&state.pool)
+            .await
+            .map_err(|error| refused(NodeError::Db(error)))?,
+        None => 0,
+    };
+    let guard_args = ChildArgs {
+        owned_paths: args.owned_paths.clone(),
+        goal: args.goal.clone(),
+    };
+    depth::check_child(&chain, &guard_args, tree_total, &TreeLimits::default())
+        .map_err(|refusal| refuse(StatusCode::CONFLICT, depth_refusal_message(refusal)))?;
+    if let Some(root_id) = root_id.as_deref()
+        && let Permit::No { reason } = budget::permits_next_node(&state.pool, root_id).await
+    {
+        return Err(refuse(StatusCode::CONFLICT, reason));
+    }
+    let opened = work_nodes::open(&state.pool, None, &limits, &args)
         .await
-        .map(Json)
-        .map_err(refused)
+        .map_err(refused)?;
+    if let Some(root_id) = root_id.as_deref()
+        && let Err(error) =
+            budget::report_soft_threshold(&state.pool, root_id, chrono::Utc::now()).await
+    {
+        tracing::warn!(%error, root_id, "could not report the tree's soft budget threshold");
+    }
+    Ok(Json(opened))
 }
 
 /// `PATCH /nodes/{id}`: `{status?, decision?, context_peak?}`; only what is sent changes.
@@ -143,16 +222,43 @@ struct CloseBody {
     status: Option<String>,
     summary: Option<String>,
     handoff_path: Option<String>,
+    /// A tree node's report; read from `handoff_path` when absent.
+    report: Option<String>,
+    /// A tree node's checklist, validated with the report.
+    checklist: Option<String>,
 }
 
 /// `POST /nodes/{id}/close`: `{status, summary, handoff_path}`; 422 when the summary is too long
 /// or the handoff file does not exist.
+///
+/// A node of a tree job closes through `tree_job::close::close_node` instead, from `{report,
+/// checklist}` (the report falls back to the file at `handoff_path`); a 422 there carries every
+/// problem in `problems`.
 async fn post_close(
     State(state): State<AppState>,
     Path(id): Path<String>,
     body: Result<Json<CloseBody>, JsonRejection>,
-) -> Result<Json<work_nodes::Node>, Refusal> {
+) -> Result<Json<Value>, Refusal> {
     let Json(body) = body.map_err(bad_body)?;
+    let tree_job = crate::tree_job::close::tree_job_of(&state.pool, &id)
+        .await
+        .map_err(|error| refuse(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    if tree_job.is_some() {
+        let closed = close_tree_node(&state, &id, body).await?;
+        // A report on a node that may not close yet is recorded and the node stays running: it is
+        // not a close, so there is no feed line, and the agent is told its work is done.
+        if closed.closed_at.is_none() {
+            let mut value = node_value(&closed)?;
+            value["recorded"] = json!(true);
+            value["message"] = json!(
+                "Your report is recorded. This node closes later, when the daemon has merged \
+                 your work. Stop now: do not call node_close again or do any further work."
+            );
+            return Ok(Json(value));
+        }
+        announce_close(&state.pool, &closed).await;
+        return Ok(Json(node_value(&closed)?));
+    }
     let args = CloseArgs {
         status: required("status", body.status)?,
         summary: required("summary", body.summary)?,
@@ -164,7 +270,73 @@ async fn post_close(
         .await
         .map_err(refused)?;
     announce_close(&state.pool, &closed).await;
-    Ok(Json(closed))
+    Ok(Json(node_value(&closed)?))
+}
+
+fn node_value(node: &work_nodes::Node) -> Result<Value, Refusal> {
+    serde_json::to_value(node)
+        .map_err(|error| refuse(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
+}
+
+/// The tree-node half of `post_close`. The handoff lands in the node's project state directory
+/// (`<state_dir>/nodes/<root>/<id>.md`), so a node without a project cannot close this way.
+async fn close_tree_node(
+    state: &AppState,
+    id: &str,
+    body: CloseBody,
+) -> Result<work_nodes::Node, Refusal> {
+    let report = match (body.report, body.handoff_path) {
+        (Some(report), _) => report,
+        (None, Some(path)) => tokio::fs::read_to_string(&path).await.map_err(|error| {
+            refuse(
+                StatusCode::BAD_REQUEST,
+                format!("could not read the handoff file {path}: {error}"),
+            )
+        })?,
+        (None, None) => {
+            return Err(refuse(
+                StatusCode::BAD_REQUEST,
+                "report is required (or a readable handoff_path)",
+            ));
+        }
+    };
+    let node = work_nodes::get(&state.pool, id).await.map_err(refused)?;
+    let Some(project_id) = node.project_id.as_deref() else {
+        return Err(refuse(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "this tree node has no project, so there is no state directory for its handoff",
+        ));
+    };
+    let state_dir = project_state_dir(state, project_id)?;
+    let limits = limits_for(state, Some(project_id)).await;
+    crate::tree_job::close::close_node(
+        &state.pool,
+        &state_dir,
+        id,
+        &limits,
+        &report,
+        body.checklist.as_deref(),
+    )
+    .await
+    .map_err(|error| {
+        let status = error.status_code();
+        if status == StatusCode::INTERNAL_SERVER_ERROR {
+            tracing::warn!(node = id, error = ?error, "tree node close failed");
+        }
+        let body = match error.problems() {
+            [] => json!({ "error": close_message(&error) }),
+            problems => json!({ "error": "the report is not acceptable", "problems": problems }),
+        };
+        (status, Json(body))
+    })
+}
+
+fn close_message(error: &crate::tree_job::close::CloseError) -> String {
+    use crate::tree_job::close::CloseError;
+    match error {
+        CloseError::Node(error) => error.to_string(),
+        other => format!("{other:?}"),
+    }
 }
 
 /// Leaves the feed line a close earns (`work_nodes::feed_line`), if any.
@@ -348,12 +520,22 @@ mod tests {
         title: &str,
         owned: &[&str],
     ) -> (StatusCode, Value) {
+        open_child(app, parent, title, "Do one part", owned).await
+    }
+
+    async fn open_child(
+        app: &Router,
+        parent: &str,
+        title: &str,
+        goal: &str,
+        owned: &[&str],
+    ) -> (StatusCode, Value) {
         call(
             app,
             "POST",
             "/nodes",
             Some(json!({
-                "parent_id": parent, "kind": "leaf", "title": title, "goal": "Do one part",
+                "parent_id": parent, "kind": "leaf", "title": title, "goal": goal,
                 "owned_paths": owned, "budget_tokens": null,
             })),
         )
@@ -445,6 +627,95 @@ mod tests {
         let (status, body) = open_leaf(&app, &root, "Narrow", &["core/src/x.rs"]).await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
         assert!(body["error"].as_str().unwrap().contains("overlaps"));
+    }
+
+    #[tokio::test]
+    async fn open_refused_for_same_scope_child() {
+        let app = app().await;
+        let root = open_root(&app, "s-same-scope").await;
+        let (status, parent) =
+            open_child(&app, &root, "Parent", "Split the core module", &["core/**"]).await;
+        assert_eq!(status, StatusCode::OK, "{parent}");
+        let parent_id = parent["id"].as_str().unwrap();
+        let (status, first) = open_leaf(&app, parent_id, "First", &["core/a/**"]).await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+
+        let (status, body) = open_child(
+            &app,
+            parent_id,
+            "Unsplit",
+            "Work on all of core",
+            &["core/**"],
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("same scope"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_refused_when_tree_budget_exhausted() {
+        let (app, pool) = app_and_pool().await;
+        let root = open_root(&app, "s-budget-exhausted").await;
+        let run_id = sqlx::query(
+            "INSERT INTO runs (prompt, status, cost_usd, created_at, completed_at) \
+             VALUES ('p', 'completed', 1.0, ?, ?)",
+        )
+        .bind("2026-10-30T10:00:00+00:00")
+        .bind("2026-10-30T10:00:00+00:00")
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        sqlx::query("UPDATE work_nodes SET run_id = ? WHERE id = ?")
+            .bind(run_id.to_string())
+            .bind(&root)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO tree_budgets (tree_id, limit_usd, soft_pct, created_at, updated_at) \
+             VALUES (?, 0.0, 80.0, ?, ?)",
+        )
+        .bind(&root)
+        .bind("2026-10-30T10:00:00+00:00")
+        .bind("2026-10-30T10:00:00+00:00")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let (status, body) = open_leaf(&app, &root, "Blocked", &["core/**"]).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body["error"].as_str().unwrap().contains("budget"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn open_unaffected_for_tree_without_budget() {
+        let app = app().await;
+        let root = open_root(&app, "s-no-budget").await;
+
+        let (status, body) = open_leaf(&app, &root, "Allowed", &["core/**"]).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    #[tokio::test]
+    async fn open_refused_for_repeated_goal_of_an_ancestor() {
+        let app = app().await;
+        let root = open_root(&app, "s-repeated-goal").await;
+        let (status, parent) =
+            open_child(&app, &root, "Parent", "Split the core module", &["core/**"]).await;
+        assert_eq!(status, StatusCode::OK, "{parent}");
+        let parent_id = parent["id"].as_str().unwrap();
+
+        let (status, body) =
+            open_child(&app, parent_id, "Repeated", "ship the tree", &["core/a/**"]).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("repeated goal"),
+            "{body}"
+        );
     }
 
     #[tokio::test]

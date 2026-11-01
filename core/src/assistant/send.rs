@@ -1680,19 +1680,39 @@ mod tests {
             .collect()
     }
 
+    /// Waits until the run has left `running` AND its chat's slot is free. The turn task writes the
+    /// terminal status first and drops its `ChatSlot` only when the task ends, so a test that sends
+    /// again right after the status flips can still meet "a turn is already in progress". The chat
+    /// is read off the row, so no call site can forget to wait for it.
     async fn settled(pool: &SqlitePool, id: i64) {
+        let mut chat_id = None;
         for _ in 0..500 {
-            let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
-                .bind(id)
-                .fetch_one(pool)
-                .await
-                .unwrap();
-            if status != "running" {
+            let row: (String, Option<String>) =
+                sqlx::query_as("SELECT status, chat_id FROM runs WHERE id = ?")
+                    .bind(id)
+                    .fetch_one(pool)
+                    .await
+                    .unwrap();
+            if row.0 != "running" {
+                chat_id = Some(row.1);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let Some(chat_id) = chat_id else {
+            panic!("turn {id} never settled");
+        };
+        // A run with no chat holds no slot.
+        let Some(chat_id) = chat_id else {
+            return;
+        };
+        for _ in 0..100 {
+            if !is_busy(&chat_id) {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        panic!("turn {id} never settled");
+        panic!("turn {id} settled but chat {chat_id} was never released");
     }
 
     // --- E25: hosted pin read, Gemini routing and cost ---

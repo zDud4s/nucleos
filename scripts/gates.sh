@@ -465,6 +465,7 @@ if [ "$target" = hooks ] || [ "$target" = all ]; then
     failures="$failures  hooks: python not installed"$'\n'
   else
     run "hooks: filter"   . "$py" scripts/test-hook-filter.py
+    run "hooks: conductor" . "$py" scripts/test-conductor-hook.py
     run "gates: summary"  . "$py" scripts/test-gates-summary.py
     run "gates: own target" . "$py" scripts/test-own-cargo-target.py
     run "gates: build slot" . "$py" scripts/test-build-slot.py

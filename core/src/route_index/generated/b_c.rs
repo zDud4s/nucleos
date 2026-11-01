@@ -4,6 +4,20 @@ use crate::route_index::{Body, RouteEntry};
 
 pub(super) const ROUTES: &[RouteEntry] = &[
     RouteEntry {
+        method: "GET",
+        path: "/backlog",
+        purpose: "Get backlog.",
+        body: Body::None,
+        handler: "get_backlog",
+    },
+    RouteEntry {
+        method: "POST",
+        path: "/backlog/finish",
+        purpose: "Post finish.",
+        body: Body::Shapeless("FinishRequest"),
+        handler: "post_finish",
+    },
+    RouteEntry {
         method: "POST",
         path: "/backup",
         purpose: "Post backup.",
@@ -424,6 +438,27 @@ pub(super) const ROUTES: &[RouteEntry] = &[
         handler: "post_wave_renew",
     },
     RouteEntry {
+        method: "POST",
+        path: "/conductor/feed",
+        purpose: "Post feed.",
+        body: Body::Shapeless("FeedRequest"),
+        handler: "post_feed",
+    },
+    RouteEntry {
+        method: "GET",
+        path: "/conductor/liveness",
+        purpose: "Get liveness.",
+        body: Body::None,
+        handler: "get_liveness",
+    },
+    RouteEntry {
+        method: "POST",
+        path: "/conductor/resume",
+        purpose: "Post resume.",
+        body: Body::Shapeless("ResumeRequest"),
+        handler: "post_resume",
+    },
+    RouteEntry {
         method: "GET",
         path: "/config/capture",
         purpose: "Get capture config.",
@@ -569,6 +604,20 @@ pub(super) const ROUTES: &[RouteEntry] = &[
         purpose: "Owner-only: in no scope table.",
         body: Body::Shapeless("ReadContextRequest"),
         handler: "post_read_context",
+    },
+    RouteEntry {
+        method: "GET",
+        path: "/cost/cache-report",
+        purpose: "Get cache report.",
+        body: Body::None,
+        handler: "get_cache_report",
+    },
+    RouteEntry {
+        method: "GET",
+        path: "/cost/wait-advice",
+        purpose: "Wait advice handler.",
+        body: Body::None,
+        handler: "wait_advice_handler",
     },
     RouteEntry {
         method: "GET",

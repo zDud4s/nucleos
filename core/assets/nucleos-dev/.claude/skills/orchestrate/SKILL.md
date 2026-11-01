@@ -10,6 +10,8 @@ description: Use when a development task (code or docs) should run end-to-end fr
 
 You are the orchestrator. You run the full workflow pipeline end-to-end from one task description.
 
+**The top-level session does not execute: it launches.** A top-level session reaching this skill dispatches phases (`Agent`) and never edits source itself; see the `conduct` skill for the size routing.
+
 **Read `.nucleos/workflow/workflow.md` and `.nucleos/workflow/dispatch.md` once before starting.** `workflow.md` holds the rules (Rule 3 verification, Rule 6 review) and introduces `<state_dir>` and `<bundle_dir>`, both read from `.nucleos/workflow/project.json`; this skill names those rules and never restates them. `dispatch.md` defines the dispatch contract, routing logic (`inline | agent | dispatcher`), prompt-passing convention (temp file -> stdin), resume rule, and dispatch-time error table. Everything below assumes those rules. Do not duplicate them.
 
 **Packets are read-only templates.** `.nucleos/workflow/packets/*.md` is the schema layer: phases READ them and EMIT filled copies in their output. Filled execution packets flow through temp files to the executor and are deleted after dispatch. For medium/large tasks the planner MAY persist a filled plan at `<state_dir>/plans/<YYYY-MM-DD>-<slug>.md` (new file only). You must never call Edit/Write on `.nucleos/workflow/packets/`.

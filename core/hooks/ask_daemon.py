@@ -41,7 +41,8 @@ daemon, a missing token, a payload it cannot use. Never `deny()`, never `approve
 carry the claims notices, as context only.
 
 All malformed-input, configuration, and daemon errors still fail closed ON THE PreToolUse PATH —
-the one path where failing open would matter.
+the one path where failing open would matter. The exception is the conductor policy in front of the
+interactive branch (`conductor_verdict`): local, and fail-open on any internal error of its own.
 """
 
 import fnmatch
@@ -993,12 +994,423 @@ def verify_hint(payload: dict, now=None) -> str:
         return ""
 
 
+# The conductor policy (spec 2026-10-30, 2.2-2.3). A top-level session launches agents and trees and
+# does not work source by hand. Local and fail-open: it must not cost latency, must not depend on the
+# daemon, and a broken guard must not take a person's session down.
+#
+# Measured 2026-10-30 with `claude -p` and a probe hook: top-level calls carry no `agent_id`, subagent calls do.
+PROBE_CONFIRMED = True
+# The mode with no conductor.json, derived from the probe; `conductor_mode` re-derives it on each call.
+DEFAULT_CONDUCTOR_MODE = "on" if PROBE_CONFIRMED else "observe"
+CONDUCTOR_MODES = ("on", "observe", "off")
+# A conductor.json that exists but cannot be used is not a reason to refuse, whatever the default.
+CONDUCTOR_UNREADABLE_MODE = "observe"
+CONDUCTOR_FILE = "conductor.json"
+CONDUCTOR_FLAG_DIR = "nucleos-conductor"
+# `off` in the owner's own terminal; an agent's command that mentions it is refused.
+CONDUCTOR_ENV = "NUCLEOS_CONDUCTOR"
+# Test overrides only. In production the state directory comes from the workflow pointer.
+CONDUCTOR_STATE_DIR_ENV = "NUCLEOS_CONDUCTOR_STATE_DIR"
+CONDUCTOR_TMP_DIR_ENV = "NUCLEOS_CONDUCTOR_TMP_DIR"
+HOOK_PROBE_ENV = "NUCLEOS_HOOK_PROBE"
+CONDUCTOR_FEED_KIND = "conductor_would_deny"
+CONDUCTOR_FEED_TIMEOUT_SECONDS = 1
+# The file `agents::prefix::state_dir_for` reads the `state_dir` key of.
+WORKFLOW_POINTER = (".nucleos", "workflow", "project.json")
+CONDUCTOR_TOOLS = ("Agent", "Task", "Skill", "TodoWrite", "AskUserQuestion", "ExitPlanMode", "ToolSearch",
+                   "TaskOutput", "BashOutput", "SendMessage", "LSP", "Monitor", "TaskStop",
+                   "TaskCreate", "TaskList", "TaskGet", "TaskUpdate")
+CONDUCTOR_MATERIAL_DIRS = (".ai", ".nucleos")
+CONDUCTOR_METACHARACTERS = (";", "&", "|", "<", ">", "`", "$(", "\n", "\r")
+CONDUCTOR_GIT_READS = ("status", "log", "diff", "show", "rev-parse", "ls-tree", "cat-file")
+CONDUCTOR_HEAVY_VALUE_FLAGS = ("--prio", "--agent", "--kind")
+CONDUCTOR_REFUSAL = (
+    "This session is a conductor: launch an agent (`Agent`, `create_run`) or a tree (`tree_launch`) "
+    "instead of doing this by hand. If you are the owner and want manual work, start the prompt "
+    "with `manual:`."
+)
+CONDUCTOR_ENV_REFUSAL = (
+    f"{CONDUCTOR_ENV} is for the project's owner at their own terminal, not for an agent. "
+    "Launch an agent or a tree instead; the owner can start the prompt with `manual:`."
+)
+
+
+def _workflow_state_dir(cwd):
+    """The `state_dir` of the nearest workflow pointer at or above `cwd`, or None.
+
+    Same file and key as `agents::prefix::state_dir_for`, which takes the project root; a session
+    may stand in a subdirectory of it, so this walks up. A project with no pointer has no state
+    directory, and no conductor policy.
+    """
+    if not isinstance(cwd, str) or not cwd.strip():
+        return None
+    for folder in _ancestors(cwd):
+        pointer = os.path.join(folder, *WORKFLOW_POINTER)
+        if os.path.isfile(pointer):
+            with open(pointer, encoding="utf-8") as handle:
+                loaded = json.load(handle)
+            found = loaded.get("state_dir") if isinstance(loaded, dict) else None
+            return found if isinstance(found, str) and found else None
+    return None
+
+
+def _ancestors(path):
+    """`path` made absolute, then each directory above it."""
+    current = os.path.abspath(path)
+    while True:
+        yield current
+        parent = os.path.dirname(current)
+        if parent == current:
+            return
+        current = parent
+
+
+def conductor_state(payload):
+    """`{state_dir, tmp_dir}` for this session. Raises nothing; an unreadable pointer is no state."""
+    try:
+        state_dir = os.environ.get(CONDUCTOR_STATE_DIR_ENV) or _workflow_state_dir(payload.get("cwd"))
+    except Exception:
+        state_dir = None
+    return {
+        "state_dir": state_dir,
+        "tmp_dir": os.environ.get(CONDUCTOR_TMP_DIR_ENV) or tempfile.gettempdir(),
+    }
+
+
+def conductor_mode(state):
+    """on | observe | off. The owner's env wins; no state directory means no policy."""
+    if os.environ.get(CONDUCTOR_ENV, "").strip().lower() == "off":
+        return "off"
+    state_dir = state.get("state_dir")
+    if not isinstance(state_dir, str) or not state_dir:
+        return "off"
+    try:
+        # `-sig`: this file is edited by hand, and PowerShell's redirection writes a BOM.
+        with open(os.path.join(state_dir, CONDUCTOR_FILE), encoding="utf-8-sig") as handle:
+            loaded = json.load(handle)
+    except FileNotFoundError:
+        return "on" if PROBE_CONFIRMED else "observe"
+    except Exception:
+        return CONDUCTOR_UNREADABLE_MODE
+    mode = loaded.get("mode") if isinstance(loaded, dict) else None
+    return mode if mode in CONDUCTOR_MODES else CONDUCTOR_UNREADABLE_MODE
+
+
+def conductor_flag_path(session_id, state):
+    """This session's `manual:` flag file, or None for an unsafe id (as `pending_path` does)."""
+    if not isinstance(session_id, str) or not SESSION_ID_SHAPE.fullmatch(session_id):
+        return None
+    base = state.get("tmp_dir") or tempfile.gettempdir()
+    return os.path.join(base, CONDUCTOR_FLAG_DIR, f"{session_id}.json")
+
+
+def _conductor_manual(payload, state):
+    path = conductor_flag_path(payload.get("session_id"), state)
+    if path is None:
+        return False
+    try:
+        with open(path, encoding="utf-8") as handle:
+            loaded = json.load(handle)
+    except Exception:
+        return False
+    return isinstance(loaded, dict) and loaded.get("manual") is True
+
+
+def conductor_prompt(payload, state):
+    """The owner's escape: `manual:` opens this prompt to manual work, any other prompt closes it.
+
+    Only UserPromptSubmit reaches the file, which is what an agent cannot produce; the verdict
+    refuses it `Write`, `Edit` and any shell redirection. Silent on every error.
+    """
+    try:
+        if payload.get("hook_event_name") != "UserPromptSubmit":
+            return
+        path = conductor_flag_path(payload.get("session_id"), state)
+        if path is None:
+            return
+        prompt = payload.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip().lower().startswith("manual:"):
+            if os.path.exists(path):
+                os.remove(path)
+            return
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump({"manual": True, "prompt_at": time.time()}, handle)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _conductor_path(path, cwd):
+    """`path` as comparable text. Resolved, so neither `..` nor a link leaves a root unnoticed."""
+    path = os.path.expanduser(path)
+    if not os.path.isabs(path):
+        path = os.path.join(cwd, path)
+    return os.path.normcase(os.path.realpath(path))
+
+
+def _under(target, root):
+    return target == root or target.startswith(root.rstrip(os.sep) + os.sep)
+
+
+def _conductor_material(target, state, cwd):
+    """Whether a resolved path is summary material: state dir, `.ai`, `.nucleos`, user memory.
+
+    `.ai` and `.nucleos` count at the working directory and above it, so a session in a linked
+    worktree under the main checkout still reaches the main checkout's plans.
+    """
+    state_dir = state.get("state_dir")
+    if isinstance(state_dir, str) and state_dir and _under(target, _conductor_path(state_dir, cwd)):
+        return True
+    for folder in _ancestors(cwd):
+        for name in CONDUCTOR_MATERIAL_DIRS:
+            if _under(target, _conductor_path(os.path.join(folder, name), cwd)):
+                return True
+    claude_projects = _conductor_path(os.path.join("~", ".claude", "projects"), cwd)
+    if _under(target, claude_projects):
+        return "memory" in os.path.relpath(target, claude_projects).split(os.sep)
+    return False
+
+
+def _conductor_read_refusal(tool, tool_input, state, cwd):
+    if tool == "Read":
+        path = tool_input.get("file_path")
+    else:
+        # Grep and Glob search the working directory when they are given no path.
+        path = tool_input.get("path") or cwd
+    if not isinstance(path, str) or not path:
+        return ""  # malformed: the tool itself refuses it
+    if tool == "Glob":
+        # A pattern can leave the path it is anchored to.
+        pattern = tool_input.get("pattern")
+        if isinstance(pattern, str) and (
+            os.path.isabs(pattern)
+            or pattern.startswith("~")
+            or ":" in pattern
+            or ".." in re.split(r"[\\/]", pattern)
+        ):
+            return CONDUCTOR_REFUSAL
+    return "" if _conductor_material(_conductor_path(path, cwd), state, cwd) else CONDUCTOR_REFUSAL
+
+
+def _conductor_write_refusal(tool_input, state, cwd):
+    path = tool_input.get("file_path")
+    if not isinstance(path, str) or not path:
+        return ""  # malformed: the tool itself refuses it
+    target = _conductor_path(path, cwd)
+    # What decides the policy itself is not material, even where it sits among material.
+    flags = _conductor_path(os.path.join(state.get("tmp_dir") or tempfile.gettempdir(), CONDUCTOR_FLAG_DIR), cwd)
+    state_dir = state.get("state_dir")
+    if (
+        _under(target, flags)
+        or (
+            isinstance(state_dir, str)
+            and state_dir
+            and target == _conductor_path(os.path.join(state_dir, CONDUCTOR_FILE), cwd)
+        )
+        or target.split(os.sep)[-len(WORKFLOW_POINTER):] == [os.path.normcase(p) for p in WORKFLOW_POINTER]
+    ):
+        return CONDUCTOR_REFUSAL
+    return "" if _conductor_material(target, state, cwd) else CONDUCTOR_REFUSAL
+
+
+def _conductor_heavy_accepts(tokens, cwd):
+    """`python <project>/scripts/heavy.py [flags] cargo ...`: the broker of this project, not a file
+    of that name somewhere an agent may write. A transitional rule of the spec (2.2)."""
+    if len(tokens) < 3 or tokens[0].lower() not in ("python", "python.exe", "python3", "py"):
+        return False
+    script = _conductor_path(tokens[1], cwd)
+    if not any(
+        script == _conductor_path(os.path.join(folder, "scripts", "heavy.py"), cwd)
+        for folder in _ancestors(cwd)
+    ):
+        return False
+    index = 2
+    while index < len(tokens) and tokens[index].startswith("-"):
+        index += 2 if tokens[index] in CONDUCTOR_HEAVY_VALUE_FLAGS else 1
+    return index < len(tokens) and tokens[index].lower() in ("cargo", "cargo.exe")
+
+
+def _conductor_add_accepts(args):
+    """Explicit paths only: no flag, no glob, no pathspec magic, nothing that names the whole tree."""
+    paths = args[1:] if args[:1] == ["--"] else args
+    if not paths:
+        return False
+    for path in paths:
+        if path.startswith(("-", ":")) or any(char in path for char in "*?["):
+            return False
+        if os.path.normpath(path).split(os.sep)[0] in (os.curdir, os.pardir):
+            return False
+    return True
+
+
+def _conductor_commit_accepts(args):
+    """Messages and nothing else, which leaves out `-a`, `-am`, `--amend` and `--no-verify`."""
+    index, has_message = 0, False
+    while index < len(args):
+        if args[index] in ("-m", "--message") and index + 1 < len(args):
+            index, has_message = index + 2, True
+        elif args[index].startswith("--message="):
+            index, has_message = index + 1, True
+        else:
+            return False
+    return has_message
+
+
+def _conductor_git_accepts(tokens):
+    # By bare name, as with python and cargo above: a path could name a script an agent wrote.
+    if tokens[0].lower() not in ("git", "git.exe"):
+        return False
+    rest = tokens[1:]
+    if rest[:1] == ["-C"]:
+        rest = rest[2:]
+    if not rest:
+        return False
+    verb, args = rest[0], rest[1:]
+    if verb in CONDUCTOR_GIT_READS:
+        # `--output=<file>` turns a read into a write.
+        return not any(arg.startswith("--output") for arg in args)
+    if verb == "branch":
+        return args[:1] == ["--list"] and not any(arg.startswith("-") for arg in args[1:])
+    if verb == "worktree":
+        return args[:1] == ["list"]
+    if verb == "add":
+        return _conductor_add_accepts(args)
+    if verb == "commit":
+        return _conductor_commit_accepts(args)
+    return False
+
+
+def _conductor_command_refusal(command, cwd):
+    if not isinstance(command, str):
+        return ""  # malformed: the tool itself refuses it
+    # The spelling tolerance of `claimed_land_override`, but any mention counts, not only a setting.
+    if CONDUCTOR_ENV.lower() in re.sub(r"[\\`'\"+${}]", "", command).lower():
+        return CONDUCTOR_ENV_REFUSAL
+    if any(mark in command for mark in CONDUCTOR_METACHARACTERS):
+        return CONDUCTOR_REFUSAL
+    try:
+        # Backslashes become slashes first, as in `_verb_in_command`: posix shlex would eat them.
+        tokens = shlex.split(command.replace("\\", "/"), posix=True)
+    except ValueError:
+        return CONDUCTOR_REFUSAL
+    if tokens and (_conductor_heavy_accepts(tokens, cwd) or _conductor_git_accepts(tokens)):
+        return ""
+    return CONDUCTOR_REFUSAL
+
+
+def _conductor_refusal(tool, tool_input, state, cwd):
+    """Why the rules refuse this call, or `""`. Everything not named here is refused."""
+    if tool in CONDUCTOR_TOOLS:
+        return ""
+    if tool.startswith("mcp__nucleos__"):
+        # One segment after the prefix, as `hooks/contexts.rs` does it.
+        name = tool[len("mcp__nucleos__"):]
+        return "" if name and "__" not in name else CONDUCTOR_REFUSAL
+    if tool in ("Bash", "PowerShell"):
+        return _conductor_command_refusal(tool_input.get("command"), cwd)
+    if tool in ("Read", "Grep", "Glob"):
+        return _conductor_read_refusal(tool, tool_input, state, cwd)
+    if tool in ("Write", "Edit"):
+        return _conductor_write_refusal(tool_input, state, cwd)
+    return CONDUCTOR_REFUSAL
+
+
+def conductor_verdict(payload, state):
+    """`{decision, reason, would_deny}` for this tool call. Local, no daemon, and it never raises."""
+    allowed = {"decision": "allow", "reason": "", "would_deny": False}
+    try:
+        if not isinstance(payload, dict) or not isinstance(state, dict):
+            return allowed
+        if os.environ.get("NUCLEOS_RUN_ID") is not None or payload.get("agent_id"):
+            return allowed
+        mode = conductor_mode(state)
+        if mode == "off" or _conductor_manual(payload, state):
+            return allowed
+        tool, tool_input, cwd = payload.get("tool_name"), payload.get("tool_input"), payload.get("cwd")
+        if (
+            not isinstance(tool, str)
+            or not isinstance(tool_input, dict)
+            or not isinstance(cwd, str)
+            or not cwd.strip()
+        ):
+            return allowed
+        reason = _conductor_refusal(tool, tool_input, state, cwd)
+        if not reason:
+            return allowed
+        return {"decision": "deny" if mode == "on" else "allow", "reason": reason, "would_deny": True}
+    except Exception as exc:
+        sys.stderr.write(f"conductor: guard failed, allowing the call ({exc})\n")
+        return allowed
+
+
+def _conductor_probe(payload):
+    """`NUCLEOS_HOOK_PROBE=<file>`: one line per PreToolUse, the JSON list of its sorted keys."""
+    try:
+        path = os.environ.get(HOOK_PROBE_ENV)
+        if path and payload.get("hook_event_name") == "PreToolUse":
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(sorted(payload)) + "\n")
+    except Exception:
+        pass
+
+
+def _conductor_report(payload, reason):
+    """One feed line for what observe mode would have refused. One light request, silent on failure."""
+    try:
+        cwd = payload.get("cwd")
+        token, _why = read_control_token(cwd, 1, 1, total_timeout=1)
+        if not token:
+            return
+        daemon_url = os.environ.get("NUCLEOS_DAEMON_URL") or DEFAULT_DAEMON_URL
+        request = urllib.request.Request(
+            f"{daemon_url}/conductor/feed",
+            data=json.dumps(
+                {
+                    "kind": CONDUCTOR_FEED_KIND,
+                    "session_id": payload.get("session_id"),
+                    "cwd": cwd,
+                    "tool_name": payload.get("tool_name"),
+                    "reason": reason,
+                }
+            ).encode(),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=CONDUCTOR_FEED_TIMEOUT_SECONDS):
+            pass
+    except Exception:
+        pass
+
+
+def conductor_gate(payload):
+    """Applies the verdict: blocks on "deny", reports a would-deny, and otherwise says nothing."""
+    _conductor_probe(payload)
+    try:
+        verdict = conductor_verdict(payload, conductor_state(payload))
+    except Exception as exc:
+        sys.stderr.write(f"conductor: guard failed, allowing the call ({exc})\n")
+        return
+    if not isinstance(verdict, dict):
+        return
+    if verdict.get("decision") == "deny":
+        deny(verdict.get("reason") or CONDUCTOR_REFUSAL)
+    if verdict.get("would_deny"):
+        _conductor_report(payload, verdict.get("reason"))
+
+
 def interactive_session(payload: dict) -> None:
-    """A session a person opened. Refuses queue operations; may add context. The one thing it ever
-    approves is a call to one of the four `mcp__nucleos__task_*` tools, to stamp the session id.
+    """A session a person opened. Answers to the conductor policy first (`conductor_gate`), then
+    refuses queue operations; may add context. The one thing it ever approves is a call to one of the
+    four `mcp__nucleos__task_*` tools, to stamp the session id.
 
     The non-git branch may also add the verify hint (context only, never a decision).
     """
+    conductor_gate(payload)
     tool = payload.get("tool_name")
     session_id = payload.get("session_id")
     tool_input = payload.get("tool_input")
@@ -1216,6 +1628,8 @@ def main() -> None:
     # Before the run branch, which would otherwise send a `Stop` to the tool gate: these events
     # carry no tool call, and they fail open whoever's session fired them.
     if event in SESSION_EVENTS:
+        if event == "UserPromptSubmit" and os.environ.get("NUCLEOS_RUN_ID") is None:
+            conductor_prompt(payload, conductor_state(payload))
         extra = ""
         if event in ("UserPromptSubmit", "SessionStart") and os.environ.get("NUCLEOS_RUN_ID") is None:
             # Forced: a prompt is rare next to tool calls, and a list that is a minute stale is not
@@ -1289,6 +1703,8 @@ def main() -> None:
         deny("daemon returned a non-object decision body - failing closed")
 
     rewrite = decision.get("updated_input")
+    # Read before an `asking` answer replaces `decision`: context rides on this first answer only.
+    context = decision.get("additional_context")
     verdict = decision.get("decision")
     if verdict == "asking":
         decision = wait_for_answer(daemon_url, token, run_id)
@@ -1298,7 +1714,7 @@ def main() -> None:
     if verdict != "allow":
         deny(f"daemon returned an unrecognized decision {verdict!r} - failing closed")
     admit_heavy(daemon_url, token, run_id, payload)
-    approve(decision.get("reason", "autopilot: allowed"), rewrite)
+    approve(decision.get("reason", "autopilot: allowed"), rewrite, context)
 
 
 def wait_for_answer(daemon_url, token, run_id):

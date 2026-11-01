@@ -337,6 +337,12 @@ pub(super) const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     ("shadow_scoreboard", ToolEffect::ReadsOwn),
     // `ReadsOwn`: it asks this machine's own model adviser, on loopback, and files nothing. What it
     // sends is the director's own description of a candidate; what it answers is a model name.
+    // The backlog list and a tree job's status are rows in this machine's own database, and the
+    // wait advice is the daemon's own tally of its own cache waits: nobody else's words in any of
+    // them. `Acts` for the two that start or end something: `tree_launch` opens a root node that a
+    // paid run follows, and `spec_finish` closes a spec out of the backlog.
+    ("spec_backlog", ToolEffect::ReadsOwn),
+    ("spec_finish", ToolEffect::Acts),
     ("suggest_model", ToolEffect::ReadsOwn),
     // `WritesOwn`: a row in this machine's own claim table, keyed to the caller; nothing leaves the
     // machine and nothing is acted on. A claim is advisory until the land gate reads it.
@@ -344,6 +350,10 @@ pub(super) const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     ("task_done", ToolEffect::WritesOwn),
     ("task_list", ToolEffect::ReadsOwn),
     ("task_release", ToolEffect::WritesOwn),
+    // `Acts`: it adds a branch, makes its worktree and starts a paid run in it.
+    ("tree_branch_start", ToolEffect::Acts),
+    ("tree_launch", ToolEffect::Acts),
+    ("tree_status", ToolEffect::ReadsOwn),
     ("triage_email", ToolEffect::Acts),
     ("vcs_request", ToolEffect::Acts),
     ("vcs_ticket", ToolEffect::ReadsOwn),
@@ -351,6 +361,7 @@ pub(super) const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     // ticket and cache rows; nothing leaves the machine. `verify_status` only reads that ticket.
     ("verify", ToolEffect::WritesOwn),
     ("verify_status", ToolEffect::ReadsOwn),
+    ("wait_advice", ToolEffect::ReadsOwn),
     ("web_read", ToolEffect::ReadsUntrusted),
     ("web_search", ToolEffect::ReadsUntrusted),
 ];
@@ -471,5 +482,50 @@ pub(super) async fn run_read_effect(
             );
             ToolEffect::ReadsUntrusted
         }
+    }
+}
+
+/// `effect_of_call` for the stdio MCP server, which holds a `DaemonClient` and no pool: `get_run`'s
+/// mode comes from `GET /runs/{id}` rather than from the row.
+///
+/// Stricter than `run_read_effect` in one place, on purpose: a run the daemon does not answer for
+/// is `ReadsUntrusted` here, because its caller refuses that answer instead of marking a turn, so
+/// nothing is lost by refusing, and the daemon being down or older (no `mode` field) is "I could
+/// not tell". The mode is read in one request and the tool reads the run in another; a run's mode
+/// does not change after it is created, so the two cannot disagree.
+pub(super) async fn effect_of_call_via_daemon(
+    client: &crate::daemon_client::DaemonClient,
+    tool: &str,
+    arguments: &serde_json::Value,
+) -> ToolEffect {
+    let effect = tool_effect(tool);
+    if effect != ToolEffect::ReadsOwn {
+        return effect;
+    }
+    match tool {
+        "get_run" => {
+            let Some(id) = arguments.get("id").and_then(serde_json::Value::as_i64) else {
+                return ToolEffect::ReadsUntrusted;
+            };
+            let run = client.get_run(id).await.unwrap_or_default();
+            match run.get("mode").and_then(serde_json::Value::as_str) {
+                Some(mode) if mode != crate::integrations::email::TRIAGE_MODE => {
+                    ToolEffect::ReadsOwn
+                }
+                _ => ToolEffect::ReadsUntrusted,
+            }
+        }
+        "github_read" => github_read_effect(arguments),
+        _ => effect,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tree_branch_start_is_an_acting_tool() {
+        assert!(TOOL_EFFECTS.contains(&("tree_branch_start", ToolEffect::Acts)));
     }
 }

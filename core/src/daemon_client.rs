@@ -9,6 +9,7 @@ use crate::governance::autopilot::{Mode, ProjectSummary};
 mod browser;
 mod delivery;
 mod nodes;
+mod trees;
 
 pub use delivery::*;
 

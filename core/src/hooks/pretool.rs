@@ -2,6 +2,7 @@
 
 use super::*;
 
+mod node_context;
 mod web_builtin;
 
 pub async fn pretooluse_decision(
@@ -22,9 +23,16 @@ pub async fn pretooluse_decision(
     } else {
         None
     };
+    // A node run in its warn band is told to split, on an allow only: a refusal already says why.
+    let additional_context = if decision.decision == "allow" {
+        node_context::warn_hint(&state, run_id).await
+    } else {
+        None
+    };
     Json(PreToolUseAnswer {
         decision,
         updated_input,
+        additional_context,
     })
 }
 
@@ -342,6 +350,18 @@ pub(super) async fn pretooluse_decision_from(
     // `propose_action`'s own grading exists precisely so this door shuts.
     if mode == crate::team::TEAM_MODE {
         return team_decision(&state, &payload).await;
+    }
+
+    // The forced split (spec §4.2): a node over its wrap limit may only wind itself down.
+    if let Some(decision) = node_context::wind_down_decision(&state, &payload, run_id).await {
+        return decision;
+    }
+
+    if let Some(decision) =
+        node_context::docs_write_decision(&state, &payload, run_id, cwd.as_deref().map(Path::new))
+            .await
+    {
+        return decision;
     }
 
     // A job's node may call its box's base tools (a finding, verification, `request_tool`,
@@ -1252,6 +1272,30 @@ pub(super) async fn pretooluse_decision_from(
         });
     }
 
+    // A tree run's park is never answered (no timeout, and `reconcile_running` reads the parked
+    // run as live), so it is spelled as a refusal the agent can act on. Same position and shape
+    // as the two conversions above: it only ever converts a `pending_approval`.
+    if classification.decision.decision == "pending_approval"
+        && is_in_flight
+        && node_context::is_tree_run(&state, run_id).await
+    {
+        tracing::info!(
+            run_id,
+            tool_name = %payload.tool_name,
+            action_class = classification.action_class,
+            "pretooluse-decision: refused rather than parked — a tree run has nobody to ask"
+        );
+        record_refused_action(&state, &payload, &payload.tool_name, &classification.reason).await;
+        return Json(Decision {
+            decision: "deny".to_owned(),
+            reason: format!(
+                "{} {}",
+                classification.reason,
+                node_context::TREE_RUN_CANNOT_WAIT_FOR_APPROVAL
+            ),
+        });
+    }
+
     // Spec B E3, D10: after the branches above that already turn a park into a refusal
     // (`unrecognized-tool`, a job node's park, `dont_ask`), so only a real park is asked about;
     // after spec A's judge, so what reaches here is what it left alone. In observe the question is
@@ -1356,4 +1400,910 @@ pub(super) async fn pretooluse_decision_from(
     }
 
     Json(classification.decision)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::conductor::context::handoff_path;
+    use crate::tree_job::{
+        model::{Branch, Manifest},
+        store::{self, TreeJob},
+    };
+    use serde_json::json;
+
+    /// `limits("leaf")`: warn 80k, wrap 100k. `limits("orchestrator")`: wrap 125k. Block is 200k.
+    const LEAF_IN_WARN: i64 = 90_000;
+    const LEAF_OVER_WRAP: i64 = 110_000;
+    const ORCHESTRATOR_OVER_WRAP: i64 = 130_000;
+    const AT_BLOCK: i64 = 200_000;
+
+    /// A tree node's run is `shadow` unless its launch names `worktree` (`tree_job::http::launch`).
+    const NODE_MODES: [&str; 2] = ["shadow", "worktree"];
+    const PROJECT: &str = "p";
+
+    async fn test_state() -> AppState {
+        nucleos_core::channels::testkit::state().await
+    }
+
+    /// A state whose project state directory is real, the guard that keeps it, and its path.
+    async fn state_with_state_dir() -> (AppState, tempfile::TempDir, std::path::PathBuf) {
+        let mut state = test_state().await;
+        let root = tempfile::tempdir().unwrap();
+        state.machine_config_root = Some(root.path().to_path_buf());
+        let state_dir = crate::project::state::dir(root.path(), PROJECT).unwrap();
+        (state, root, state_dir)
+    }
+
+    /// A run in flight, with no node.
+    async fn seed_run(state: &AppState, mode: &str, fill: Option<i64>) -> i64 {
+        let run_id = sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, project_id, cwd, created_at, context_fill)
+             VALUES ('x', 'running', ?, ?, 'C:\\work\\repo', '2026-10-30T00:00:00Z', ?)",
+        )
+        .bind(mode)
+        .bind(PROJECT)
+        .bind(fill)
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let task = tokio::spawn(async { tokio::time::sleep(Duration::from_secs(60)).await });
+        state
+            .run_handles
+            .lock()
+            .unwrap()
+            .insert(run_id, task.abort_handle());
+        run_id
+    }
+
+    /// A run in flight behind a node of `kind`, with the ids of the node and its root.
+    async fn seed_node_run(
+        state: &AppState,
+        mode: &str,
+        kind: &str,
+        fill: Option<i64>,
+    ) -> (i64, String, String) {
+        let run_id = seed_run(state, mode, fill).await;
+        let node_id = format!("node-{run_id}");
+        let root_id = format!("root-{run_id}");
+        sqlx::query(
+            "INSERT INTO work_nodes
+               (id, project_id, root_id, depth, kind, title, goal, status, run_id, created_at,
+                updated_at)
+             VALUES (?, ?, ?, 1, ?, 't', 'g', 'running', ?, '2026-10-30T00:00:00Z',
+                '2026-10-30T00:00:00Z')",
+        )
+        .bind(&node_id)
+        .bind(PROJECT)
+        .bind(&root_id)
+        .bind(kind)
+        .bind(run_id.to_string())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        (run_id, node_id, root_id)
+    }
+
+    /// A tree branch whose node is bound to a running `worktree` run. It does not launch an
+    /// agent; the run is the test fixture's inert row.
+    async fn seed_tree_branch_run(state: &AppState, layer: &str, owned_paths: &[&str]) -> i64 {
+        let (run_id, node_id, root_id) =
+            seed_node_run(state, "worktree", "leaf", Some(1_000)).await;
+        let tree_id = format!("tree-{run_id}");
+        let paths: Vec<String> = owned_paths.iter().map(|path| (*path).to_owned()).collect();
+        let mut manifest =
+            Manifest::new(&tree_id, "feature/docs", "Write docs", r"C:\work\repo", &[]);
+        let mut branch = Branch::new("docs", &paths, layer, None);
+        branch.node_id = Some(node_id.clone());
+        manifest.branches.insert("docs".to_owned(), branch);
+        store::save(
+            &state.pool,
+            &TreeJob {
+                id: tree_id.clone(),
+                root_node_id: root_id,
+                project_id: Some(PROJECT.to_owned()),
+                feature_branch: Some("feature/docs".to_owned()),
+                goal: "Write docs".to_owned(),
+                state: "open".to_owned(),
+                manifest,
+                contract: None,
+                created_at: "2026-10-30T00:00:00Z".to_owned(),
+                updated_at: "2026-10-30T00:00:00Z".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE work_nodes SET tree_job_id = ? WHERE id = ?")
+            .bind(tree_id)
+            .bind(node_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        run_id
+    }
+
+    fn payload(run_id: i64, tool: &str, input: Value) -> PreToolUsePayload {
+        PreToolUsePayload {
+            run_id,
+            tool_name: tool.to_owned(),
+            tool_input: input,
+        }
+    }
+
+    async fn decide(state: &AppState, run_id: i64, tool: &str, input: Value) -> Decision {
+        let Json(decision) = pretooluse_decision_from(
+            state.clone(),
+            Scope::Run(run_id),
+            payload(run_id, tool, input),
+            Instant::now(),
+        )
+        .await;
+        decision
+    }
+
+    async fn answer(state: &AppState, run_id: i64, tool: &str, input: Value) -> PreToolUseAnswer {
+        let Json(answer) = pretooluse_decision(
+            State(state.clone()),
+            Extension(Scope::Run(run_id)),
+            Json(payload(run_id, tool, input)),
+        )
+        .await;
+        answer
+    }
+
+    fn read_input() -> Value {
+        json!({"file_path": "C:\\work\\repo\\src\\lib.rs"})
+    }
+
+    fn edit_input() -> Value {
+        json!({
+            "file_path": "C:\\work\\repo\\src\\lib.rs",
+            "old_string": "a",
+            "new_string": "b",
+        })
+    }
+
+    fn write_input(path: &Path) -> Value {
+        json!({"file_path": path.to_str().unwrap(), "content": "the handoff"})
+    }
+
+    /// A refusal from the forced split and from no other rule: `shadow` refuses an edit too, but
+    /// its reason does not name the handoff.
+    fn assert_forced_deny(decision: &Decision, what: &str) {
+        assert_eq!(decision.decision, "deny", "{what}: {}", decision.reason);
+        assert!(
+            decision.reason.contains("handoff"),
+            "{what}: the reason must name the way out, got {:?}",
+            decision.reason
+        );
+    }
+
+    fn assert_allowed(decision: &Decision, what: &str) {
+        assert_eq!(decision.decision, "allow", "{what}: {}", decision.reason);
+    }
+
+    #[tokio::test]
+    async fn node_run_over_wrap_limit_denies_an_edit() {
+        let state = test_state().await;
+        for mode in NODE_MODES {
+            let (run_id, _, _) = seed_node_run(&state, mode, "leaf", Some(LEAF_OVER_WRAP)).await;
+            let decision = decide(&state, run_id, "Edit", edit_input()).await;
+            assert_forced_deny(&decision, mode);
+        }
+    }
+
+    #[tokio::test]
+    async fn node_run_over_wrap_limit_allows_node_close() {
+        // Neither mode lets this tool through by itself (`shadow` refuses what is not read-only,
+        // `worktree` parks an unrecognized tool), so the branch has to answer `allow` on its own.
+        let state = test_state().await;
+        for mode in NODE_MODES {
+            for fill in [LEAF_OVER_WRAP, AT_BLOCK] {
+                let (run_id, _, _) = seed_node_run(&state, mode, "leaf", Some(fill)).await;
+                let decision = decide(
+                    &state,
+                    run_id,
+                    "mcp__nucleos__node_close",
+                    json!({"outcome": "handoff"}),
+                )
+                .await;
+                assert_allowed(&decision, &format!("{mode} at {fill}"));
+            }
+        }
+    }
+
+    /// Well under every context limit, so nothing but the tool's own classification decides: an
+    /// autonomous tree run must be able to close its node and delegate, or the tree cannot work.
+    #[tokio::test]
+    async fn an_autonomous_tree_run_may_close_its_node_and_start_a_branch() {
+        let state = test_state().await;
+        let (run_id, _, _) = seed_node_run(&state, "worktree", "orchestrator", Some(1_000)).await;
+        for tool in [
+            "mcp__nucleos__node_close",
+            "mcp__nucleos__tree_branch_start",
+        ] {
+            let decision = decide(&state, run_id, tool, json!({"outcome": "handoff"})).await;
+            assert_allowed(&decision, tool);
+        }
+    }
+
+    #[tokio::test]
+    async fn node_run_in_warn_adds_context_and_allows() {
+        let state = test_state().await;
+        let (run_id, _, _) = seed_node_run(&state, "shadow", "leaf", Some(LEAF_IN_WARN)).await;
+
+        let answer = answer(&state, run_id, "Read", read_input()).await;
+
+        assert_allowed(&answer.decision, "a read in warn");
+        let context = answer
+            .additional_context
+            .expect("a warn must reach the agent");
+        assert!(context.contains("handoff"), "got {context:?}");
+    }
+
+    #[tokio::test]
+    async fn run_without_node_is_unaffected() {
+        let state = test_state().await;
+        for (mode, tool, input) in [
+            ("shadow", "Read", read_input()),
+            ("shadow", "Edit", edit_input()),
+            ("worktree", "Read", read_input()),
+        ] {
+            let low = seed_run(&state, mode, Some(1_000)).await;
+            let high = seed_run(&state, mode, Some(AT_BLOCK * 2)).await;
+
+            let at_low = answer(&state, low, tool, input.clone()).await;
+            let at_high = answer(&state, high, tool, input).await;
+
+            assert_eq!(
+                at_high.decision.decision, at_low.decision.decision,
+                "{mode} {tool}: {}",
+                at_high.decision.reason
+            );
+            assert!(
+                !at_high.decision.reason.contains("handoff"),
+                "{mode} {tool}: {}",
+                at_high.decision.reason
+            );
+            assert!(at_low.additional_context.is_none(), "{mode} {tool}");
+            assert!(at_high.additional_context.is_none(), "{mode} {tool}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_context_fill_does_not_deny() {
+        let state = test_state().await;
+        let (run_id, _, _) = seed_node_run(&state, "shadow", "leaf", None).await;
+
+        let answer = answer(&state, run_id, "Read", read_input()).await;
+
+        assert_allowed(&answer.decision, "a read with no measure yet");
+        assert!(answer.additional_context.is_none());
+    }
+
+    #[tokio::test]
+    async fn node_run_at_block_denies_a_read() {
+        let state = test_state().await;
+        let (run_id, _, _) = seed_node_run(&state, "shadow", "leaf", Some(AT_BLOCK)).await;
+        let decision = decide(&state, run_id, "Read", read_input()).await;
+        assert_forced_deny(&decision, "a read at block");
+    }
+
+    #[tokio::test]
+    async fn leaf_over_wrap_limit_cannot_open_a_child() {
+        let state = test_state().await;
+        for mode in NODE_MODES {
+            let (run_id, _, _) = seed_node_run(&state, mode, "leaf", Some(LEAF_OVER_WRAP)).await;
+            let decision = decide(
+                &state,
+                run_id,
+                "mcp__nucleos__node_open",
+                json!({"title": "split"}),
+            )
+            .await;
+            assert_forced_deny(&decision, mode);
+        }
+    }
+
+    #[tokio::test]
+    async fn orchestrator_over_wrap_limit_may_open_a_child() {
+        let state = test_state().await;
+        for mode in NODE_MODES {
+            let (run_id, _, _) =
+                seed_node_run(&state, mode, "orchestrator", Some(ORCHESTRATOR_OVER_WRAP)).await;
+            let decision = decide(
+                &state,
+                run_id,
+                "mcp__nucleos__node_open",
+                json!({"title": "split"}),
+            )
+            .await;
+            assert_allowed(&decision, mode);
+        }
+    }
+
+    #[tokio::test]
+    async fn node_run_over_wrap_limit_may_write_its_own_handoff() {
+        let (state, _root, state_dir) = state_with_state_dir().await;
+        for mode in NODE_MODES {
+            let (run_id, node_id, root_id) =
+                seed_node_run(&state, mode, "leaf", Some(LEAF_OVER_WRAP)).await;
+            let own = handoff_path(&state_dir, &root_id, &node_id);
+            let decision = decide(&state, run_id, "Write", write_input(&own)).await;
+            assert_allowed(&decision, mode);
+        }
+    }
+
+    #[tokio::test]
+    async fn node_run_over_wrap_limit_may_not_write_another_nodes_handoff() {
+        let (state, _root, state_dir) = state_with_state_dir().await;
+        for mode in NODE_MODES {
+            let (run_id, node_id, root_id) =
+                seed_node_run(&state, mode, "leaf", Some(LEAF_OVER_WRAP)).await;
+            for other in [
+                handoff_path(&state_dir, &root_id, "another-node"),
+                handoff_path(&state_dir, "another-root", &node_id),
+            ] {
+                let decision = decide(&state, run_id, "Write", write_input(&other)).await;
+                assert_forced_deny(&decision, &format!("{mode} writing {}", other.display()));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn deny_does_not_terminate_or_mint_a_proposal() {
+        // `worktree`, and a command that parks there, so a refusal left to the classifier would
+        // show up as a proposal. Repeated, because a counted refusal stops a run after a few.
+        let state = test_state().await;
+        let (run_id, _, _) = seed_node_run(&state, "worktree", "leaf", Some(LEAF_OVER_WRAP)).await;
+
+        for _ in 0..5 {
+            let decision = decide(
+                &state,
+                run_id,
+                "Bash",
+                json!({"command": "git push origin main"}),
+            )
+            .await;
+            assert_forced_deny(&decision, "a push over the wrap limit");
+        }
+
+        let proposals: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM proposals")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(proposals, 0);
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "running");
+        assert!(state.run_handles.lock().unwrap().contains_key(&run_id));
+    }
+
+    /// A command that writes a file by redirection: unrecognized by the classifier, so a
+    /// `worktree` run is parked for it (`redirects_a_file`).
+    const REDIRECTING_COMMAND: &str = "cat > .nucleos-report.md <<'EOF'\nx\nEOF";
+
+    async fn run_status_and_action_approvals(state: &AppState, run_id: i64) -> (String, i64) {
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        let approvals: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM proposals WHERE kind = 'action-approval'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        (status, approvals)
+    }
+
+    /// Nothing ever answers a tree run's park: no timeout, and `reconcile_running` reads it as
+    /// live, so the tree would hang holding a slot. It must be a refusal the agent can act on.
+    #[tokio::test]
+    async fn a_tree_runs_unapproved_action_is_refused_not_parked() {
+        let state = test_state().await;
+        let (run_id, node_id, _) = seed_node_run(&state, "worktree", "leaf", Some(1_000)).await;
+        sqlx::query("UPDATE work_nodes SET tree_job_id = 'tree-job-1' WHERE id = ?")
+            .bind(&node_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let decision = decide(
+            &state,
+            run_id,
+            "Bash",
+            json!({"command": REDIRECTING_COMMAND}),
+        )
+        .await;
+
+        assert_eq!(decision.decision, "deny", "got {:?}", decision.reason);
+        assert!(
+            decision.reason.contains("approval") && decision.reason.contains("Write"),
+            "the reason must say the run cannot wait for approval and point at the Write tool, got {:?}",
+            decision.reason
+        );
+        let (status, approvals) = run_status_and_action_approvals(&state, run_id).await;
+        assert_ne!(status, "awaiting_approval");
+        assert_eq!(status, "running");
+        assert_eq!(approvals, 0);
+        assert!(state.run_handles.lock().unwrap().contains_key(&run_id));
+    }
+
+    /// Regression guard: a docs branch may write a declared file in an allowed docs directory.
+    #[tokio::test]
+    async fn docs_run_write_inside_declared_paths_is_allowed() {
+        let state = test_state().await;
+        let run_id = seed_tree_branch_run(&state, "docs", &[".ai/notes/**"]).await;
+
+        let decision = decide(
+            &state,
+            run_id,
+            "Write",
+            write_input(Path::new(r"C:\work\repo\.ai\notes\design.md")),
+        )
+        .await;
+
+        assert_allowed(&decision, "a declared docs write");
+    }
+
+    #[tokio::test]
+    async fn docs_run_absolute_unix_path_inside_declared_paths_is_allowed() {
+        let state = test_state().await;
+        let run_id = seed_tree_branch_run(&state, "docs", &[".ai/notes/**"]).await;
+        sqlx::query("UPDATE runs SET cwd = '/repo' WHERE id = ?")
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let decision = decide(
+            &state,
+            run_id,
+            "Write",
+            write_input(Path::new("/repo/.ai/notes/design.md")),
+        )
+        .await;
+
+        assert_allowed(
+            &decision,
+            "an absolute Unix path under the declared docs path",
+        );
+    }
+
+    #[tokio::test]
+    async fn docs_run_path_differing_only_in_case_follows_the_platform() {
+        let state = test_state().await;
+        let run_id = seed_tree_branch_run(&state, "docs", &[".ai/notes/**"]).await;
+
+        let decision = decide(
+            &state,
+            run_id,
+            "Write",
+            write_input(Path::new(r"C:\WORK\REPO\.ai\notes\design.md")),
+        )
+        .await;
+
+        assert_eq!(
+            decision.decision,
+            if cfg!(windows) { "allow" } else { "deny" },
+            "Windows paths are case-insensitive, while Unix paths are case-sensitive: {:?}",
+            decision.reason
+        );
+    }
+
+    #[tokio::test]
+    async fn docs_run_write_outside_declared_paths_is_denied_not_parked() {
+        let state = test_state().await;
+        let run_id = seed_tree_branch_run(&state, "docs", &[".ai/notes/**"]).await;
+
+        let decision = decide(
+            &state,
+            run_id,
+            "Write",
+            write_input(Path::new(r"C:\work\repo\.ai\specs\design.md")),
+        )
+        .await;
+
+        assert_eq!(decision.decision, "deny", "got {:?}", decision.reason);
+        let (status, approvals) = run_status_and_action_approvals(&state, run_id).await;
+        assert_eq!(status, "running");
+        assert_eq!(approvals, 0);
+    }
+
+    #[tokio::test]
+    async fn docs_run_write_to_an_allowed_dir_but_undeclared_file_is_denied() {
+        let state = test_state().await;
+        let run_id = seed_tree_branch_run(&state, "docs", &[".ai/notes/declared.md"]).await;
+
+        let decision = decide(
+            &state,
+            run_id,
+            "Write",
+            write_input(Path::new(r"C:\work\repo\.ai\notes\undeclared.md")),
+        )
+        .await;
+
+        assert_eq!(decision.decision, "deny", "got {:?}", decision.reason);
+    }
+
+    /// Regression guard: the docs-only write restriction must not change code branches.
+    #[tokio::test]
+    async fn code_branch_run_is_not_affected_by_the_docs_rule() {
+        let state = test_state().await;
+        let run_id = seed_tree_branch_run(&state, "core", &["core/src/**"]).await;
+
+        let decision = decide(
+            &state,
+            run_id,
+            "Write",
+            write_input(Path::new(r"C:\work\repo\core\src\lib.rs")),
+        )
+        .await;
+
+        assert_allowed(&decision, "a code branch write");
+    }
+
+    /// The docs guard's refusal of a shell command from a docs node. It must be a `deny` that names
+    /// the docs branch, leave the run running and mint no approval. Without the guard the command
+    /// reaches the classifier, and a refusal from there (a tree run's converted park) names no docs
+    /// branch, so this helper fails on it.
+    async fn assert_docs_run_refuses_shell(state: &AppState, command: &str, what: &str) {
+        let run_id = seed_tree_branch_run(state, "docs", &[".ai/notes/**"]).await;
+        let decision = decide(state, run_id, "Bash", json!({"command": command})).await;
+        assert_eq!(
+            decision.decision, "deny",
+            "{what}: got {:?}",
+            decision.reason
+        );
+        assert!(
+            decision.reason.contains("docs"),
+            "{what}: the docs guard must refuse it at once and name the docs branch, got {:?}",
+            decision.reason
+        );
+        let (status, approvals) = run_status_and_action_approvals(state, run_id).await;
+        assert_eq!(
+            status, "running",
+            "{what}: the refusal must not park the run"
+        );
+        assert_eq!(
+            approvals, 0,
+            "{what}: the refusal must not mint an approval"
+        );
+    }
+
+    /// A docs output is local and never committed, so a docs run may not commit. Fails today: the
+    /// classifier allows `git commit` (`vcs-local`) and nothing in the docs path intervenes.
+    #[tokio::test]
+    async fn docs_run_git_commit_is_denied_not_parked() {
+        let state = test_state().await;
+        assert_docs_run_refuses_shell(&state, "git commit -m x", "git commit").await;
+    }
+
+    /// Fails today: `git add` is `vcs-local` and the classifier allows it.
+    #[tokio::test]
+    async fn docs_run_git_add_is_denied() {
+        let state = test_state().await;
+        assert_docs_run_refuses_shell(&state, "git add .", "git add .").await;
+    }
+
+    #[tokio::test]
+    async fn docs_run_other_spellings_of_a_checkout_write_are_refused() {
+        let state = test_state().await;
+
+        for command in [
+            "git.exe add .",
+            "env git add .",
+            "command git add .",
+            "git --config-env user.name=X add .",
+            "git -c alias.a=add a .",
+            "git checkout .",
+            "git restore .",
+            "git rm ./f",
+            "cp a ./b",
+            "touch ./f",
+        ] {
+            let run_id = seed_tree_branch_run(&state, "docs", &[".ai/notes/**"]).await;
+            let decision = decide(&state, run_id, "Bash", json!({"command": command})).await;
+
+            assert_eq!(
+                decision.decision, "deny",
+                "{command}: got {:?}",
+                decision.reason
+            );
+        }
+    }
+
+    /// Fails today: `cd sub && git commit` is allowed segment by segment, and `git -C sub commit`
+    /// is not a recognised form, so it is refused for the wrong reason (no docs branch named).
+    #[tokio::test]
+    async fn docs_run_wrapped_git_commit_is_denied() {
+        let state = test_state().await;
+        assert_docs_run_refuses_shell(&state, "cd sub && git commit -m x", "cd sub && git commit")
+            .await;
+        assert_docs_run_refuses_shell(&state, "git -C sub commit -m x", "git -C sub commit").await;
+    }
+
+    /// Fails today: a writing `cargo fmt` is allowed where it lands, and it lands in the checkout.
+    /// The `heavy.py` form is not unwrapped here (its script resolves inside the fixture's cwd), so
+    /// it is refused as a plain interpreter for the wrong reason (no docs branch named).
+    #[tokio::test]
+    async fn docs_run_cargo_fmt_is_denied() {
+        let state = test_state().await;
+        assert_docs_run_refuses_shell(&state, "cargo fmt", "cargo fmt").await;
+        assert_docs_run_refuses_shell(
+            &state,
+            "python scripts/heavy.py -- cargo fmt",
+            "heavy.py cargo fmt",
+        )
+        .await;
+    }
+
+    /// Regression guard: a read-only `cargo fmt --check` writes nothing, and the docs guard must
+    /// leave it to the classifier, which allows it. Passes today.
+    #[tokio::test]
+    async fn docs_run_cargo_fmt_check_is_allowed() {
+        let state = test_state().await;
+        let run_id = seed_tree_branch_run(&state, "docs", &[".ai/notes/**"]).await;
+
+        let decision = decide(
+            &state,
+            run_id,
+            "Bash",
+            json!({"command": "cargo fmt --check"}),
+        )
+        .await;
+
+        assert_allowed(&decision, "a read-only cargo fmt");
+    }
+
+    #[tokio::test]
+    async fn docs_run_environment_wrapped_git_commit_is_denied() {
+        let state = test_state().await;
+        assert_docs_run_refuses_shell(&state, "FOO=1 git commit -m x", "environment git commit")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn docs_run_for_loop_git_add_is_denied() {
+        let state = test_state().await;
+        assert_docs_run_refuses_shell(
+            &state,
+            "for f in a; do git add $f; done",
+            "for-loop git add",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn docs_run_if_git_commit_is_denied() {
+        let state = test_state().await;
+        assert_docs_run_refuses_shell(
+            &state,
+            "if true; then git commit -m x; fi",
+            "conditional git commit",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn docs_run_command_substitution_git_add_is_denied() {
+        let state = test_state().await;
+        assert_docs_run_refuses_shell(
+            &state,
+            "echo \"$(git add .)\"",
+            "command substitution git add",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn docs_run_unreadable_shell_command_is_denied() {
+        let state = test_state().await;
+        assert_docs_run_refuses_shell(&state, "echo \"unterminated", "unreadable shell command")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn docs_run_powershell_quoted_semicolon_fails_closed() {
+        let state = test_state().await;
+        let run_id = seed_tree_branch_run(&state, "docs", &[".ai/notes/**"]).await;
+
+        let decision = decide(
+            &state,
+            run_id,
+            "PowerShell",
+            json!({"command": "rg \"a; git add b\""}),
+        )
+        .await;
+
+        // The PowerShell reader splits inside quotes on purpose (`blind_walk`), so this reads as a
+        // `git add`. A rare false refusal is the safe side for a run in the main checkout.
+        assert_eq!(decision.decision, "deny");
+        assert!(decision.reason.contains("docs"), "{}", decision.reason);
+    }
+
+    #[tokio::test]
+    async fn docs_run_cd_then_git_status_is_allowed() {
+        let state = test_state().await;
+        let run_id = seed_tree_branch_run(&state, "docs", &[".ai/notes/**"]).await;
+
+        let decision = decide(
+            &state,
+            run_id,
+            "Bash",
+            json!({"command": "cd sub && git status"}),
+        )
+        .await;
+
+        assert_allowed(&decision, "a directory change followed by git status");
+    }
+
+    #[tokio::test]
+    async fn docs_run_mkdir_in_declared_docs_area_is_allowed() {
+        let state = test_state().await;
+        let run_id = seed_tree_branch_run(&state, "docs", &[".ai/notes/**"]).await;
+
+        let decision = decide(
+            &state,
+            run_id,
+            "Bash",
+            json!({"command": "mkdir -p .ai/notes/x"}),
+        )
+        .await;
+
+        assert_allowed(&decision, "a docs directory creation");
+    }
+
+    #[tokio::test]
+    async fn docs_run_powershell_set_location_is_allowed() {
+        let state = test_state().await;
+        let run_id = seed_tree_branch_run(&state, "docs", &[".ai/notes/**"]).await;
+
+        let decision = decide(
+            &state,
+            run_id,
+            "PowerShell",
+            json!({"command": "Set-Location x"}),
+        )
+        .await;
+
+        assert_allowed(&decision, "a PowerShell directory change");
+    }
+
+    #[tokio::test]
+    async fn docs_run_cd_then_git_commit_is_denied_by_docs_guard() {
+        let state = test_state().await;
+        assert_docs_run_refuses_shell(
+            &state,
+            "cd sub && git commit -m x",
+            "directory change followed by git commit",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn docs_run_cargo_fmt_is_still_denied() {
+        let state = test_state().await;
+        assert_docs_run_refuses_shell(&state, "cargo fmt", "cargo fmt").await;
+    }
+
+    #[tokio::test]
+    async fn docs_run_heavy_wrapper_options_cargo_fmt_is_denied() {
+        let state = test_state().await;
+        assert_docs_run_refuses_shell(
+            &state,
+            "python scripts/heavy.py --prio 1 -- cargo fmt",
+            "heavy.py options cargo fmt",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn docs_run_heavy_wrapper_without_separator_cargo_fmt_is_denied() {
+        let state = test_state().await;
+        assert_docs_run_refuses_shell(
+            &state,
+            "python scripts/heavy.py cargo fmt",
+            "heavy.py cargo fmt without separator",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn docs_run_heavy_wrapper_options_cargo_fmt_check_passes_the_docs_guard() {
+        let state = test_state().await;
+        let run_id = seed_tree_branch_run(&state, "docs", &[".ai/notes/**"]).await;
+
+        let decision = decide(
+            &state,
+            run_id,
+            "Bash",
+            json!({"command": "python scripts/heavy.py --prio 1 -- cargo fmt --check"}),
+        )
+        .await;
+
+        // The docs guard lets a read-only check through. The classifier then decides on its own:
+        // it does not unwrap a broker that lives inside the checkout.
+        assert!(
+            !decision.reason.contains("docs branches"),
+            "the docs guard must not refuse a read-only check: {}",
+            decision.reason
+        );
+    }
+
+    #[tokio::test]
+    async fn docs_run_git_work_tree_option_commit_is_denied() {
+        let state = test_state().await;
+        assert_docs_run_refuses_shell(
+            &state,
+            "git --work-tree . commit -m x",
+            "git commit with work-tree option",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn docs_run_uppercase_git_commit_is_denied() {
+        let state = test_state().await;
+        assert_docs_run_refuses_shell(&state, "git COMMIT -m x", "uppercase git commit").await;
+    }
+
+    /// Regression guard: a plain read in a docs run is not touched by the docs guard. The
+    /// classifier allows `git status` as `read-local`. Passes today.
+    #[tokio::test]
+    async fn docs_run_plain_read_is_allowed() {
+        let state = test_state().await;
+        let run_id = seed_tree_branch_run(&state, "docs", &[".ai/notes/**"]).await;
+
+        let decision = decide(&state, run_id, "Bash", json!({"command": "git status"})).await;
+
+        assert_allowed(&decision, "a plain git status in a docs run");
+    }
+
+    /// Regression guard: the docs guard applies to docs nodes only, so a code branch run may still
+    /// commit. The classifier allows `git commit` as `vcs-local`. Passes today.
+    #[tokio::test]
+    async fn code_branch_run_may_still_commit() {
+        let state = test_state().await;
+        let run_id = seed_tree_branch_run(&state, "core", &["core/src/**"]).await;
+
+        let decision = decide(
+            &state,
+            run_id,
+            "Bash",
+            json!({"command": "git commit -m x"}),
+        )
+        .await;
+
+        assert_allowed(&decision, "a code branch commit");
+    }
+
+    /// Pins that ordinary `worktree` runs are unchanged. Passes today.
+    #[tokio::test]
+    async fn a_run_bound_to_no_tree_node_still_parks() {
+        let state = test_state().await;
+        let run_id = seed_run(&state, "worktree", Some(1_000)).await;
+
+        let decision = decide(
+            &state,
+            run_id,
+            "Bash",
+            json!({"command": REDIRECTING_COMMAND}),
+        )
+        .await;
+
+        assert_eq!(
+            decision.decision, "pending_approval",
+            "got {:?}",
+            decision.reason
+        );
+        let (status, approvals) = run_status_and_action_approvals(&state, run_id).await;
+        assert_eq!(status, "awaiting_approval");
+        assert_eq!(approvals, 1);
+    }
 }

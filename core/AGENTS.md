@@ -24,11 +24,13 @@ the contract, not a snapshot.
 |---|---|
 | `main.rs` | The binary of the `nucleos-daemon` package (exe `nucleos-core`). Startup orchestration ONLY: logging → autostart → storage → reconcile orphaned runs/stranded approvals/orphaned worktrees → secrets/token → model config → `AppState` → HTTP router → sidecar + scheduler + repo-poller + worktree-GC + devtime-ingestion background tasks → serve. No business logic. |
 | `shutdown.rs` | Draining the daemon before an update replaces it: an in-memory `draining` flag (never persisted), the live-run count the updater waits on (`GET /system/update-readiness`), the wait that calls `stop` only after two quiet reads in a row and reopens the door instead of interrupting anything when it times out, and the middleware that answers 503 to the routes that start a run without a slot. Slot-taking work is refused one layer down (`concurrency::NoRoom::Draining`). Judges nothing about WHAT to run; the routes themselves (`/system/*`) live in `http/admin.rs`. |
+| `supervisor.rs` | The `--supervise` loop the Windows logon task runs: spawns the daemon as a child, asks the supervise policy after each exit, sleeps and relaunches. |
 | `cli.rs` | Binary-only, beside `main.rs`: the command-line subcommands that run instead of the daemon (`--print-token`, `--land`, `--verify`, `--pressao`, the `--set-*` secret prompts, `--mcp-tools`, `--workflow-sync`, `--workflow-package`, `--filter-run`) and their argument helpers. `run_subcommand` checks the flags in the order `main` always did. |
 | `startup.rs` | Binary-only, beside `main.rs`: the daemon's one-off start work — seeding the workflow library, the file-to-database migrations (machine settings, project state, onboarding) and `reconcile_after_restart`, the orphan and interrupted-work reconciliation run once the database is open. |
 | `crates/nucleos-base/src/logging.rs` | `tracing` subscriber (rotating daily file + stdout), initialized first to catch a failed startup. |
 | `crates/nucleos-base/src/autostart.rs` | Self-registers OS autostart at login, independent of the shell: a Windows Scheduled Task (`LogonTrigger`, action `conhost --headless <exe> --supervise`; `core/src/supervisor.rs` relaunches the daemon after a failure, because the Task Scheduler's `RestartOnFailure` was measured inert), a macOS LaunchAgent, or on Linux a systemd user unit or an XDG autostart entry (one Linux backend at a time). Registering never starts a second daemon. Non-fatal on failure. |
 | `crates/nucleos-base/src/storage.rs` | SQLite pool + WAL + `sqlx::migrate!`. Knows the storage *mechanism* only — never a table's meaning. |
+| `crates/nucleos-base/src/supervise.rs` | Pure decisions of `--supervise`: which daemon exit is a failure, how long to pause, when to give up. |
 | `crates/nucleos-base/src/backup.rs` | Backup files: takes a consistent snapshot, verifies one, and stages a restore for the next startup to apply. |
 | `auth.rs` | Local token generation + the bearer-token middleware on protected routes. |
 | `agents.rs` | Agent packages: the versioned, file-based source of the factory agents (spec agentes-agnosticos §3); module root, each submodule has exactly one owner. |
@@ -117,6 +119,7 @@ the contract, not a snapshot.
 | `hooks/judge.rs` | Asking the judge: the per-turn verdict cache, the prompt and the spawned judge run. |
 | `hooks/posttool.rs` | The PostToolUse outcome, the policy for an unrecognised context, and when parking would only destroy work. |
 | `hooks/pretool.rs` | The PreToolUse decision: `pretooluse_decision` and the one function that walks every rule in order. |
+| `hooks/pretool/node_context.rs` | The PreToolUse branches that read a node run's context fill: the hint in the warn band, and the forced split that lets a node over its wrap limit do nothing but wind itself down. |
 | `hooks/pretool/web_builtin.rs` | The PreToolUse branch that lets a job node whose agent declares `web` use Claude's `WebFetch`/`WebSearch`, recording the untrusted read first (a failure to record it refuses the call). |
 | `hooks/proposals.rs` | Advice on a proposal before it is filed, and telling the council about it. |
 | `hooks/rooted.rs` | Deciding for a run rooted in a conversation: its turn, what is allowed there, and `rooted_decision`. |
@@ -160,7 +163,7 @@ the contract, not a snapshot.
 | `http/map_flows.rs` | Declared flows of a project, verified against its code (`/projects/{id}/map/flows`). Read-only. |
 | `http/map.rs` | The project map (`/projects/{id}/map/*`). |
 | `http/map_states.rs` | The state machines a project's code draws (`/projects/{id}/map/states`). |
-| `http/nodes.rs` | The work-node tree routes (`/nodes`, `/nodes/{id}`, `/nodes/{id}/close`, `/nodes/tree/{root_id}`, `/nodes/active`): thin JSON over `work_nodes`, reachable with the control token or an Admin key. |
+| `http/nodes.rs` | The work-node tree routes (`/nodes`, `/nodes/{id}`, `/nodes/{id}/close`, `/nodes/tree/{root_id}`, `/nodes/active`): thin JSON over `work_nodes`, reachable with the control token or an Admin key; a tree run's key reaches only `PATCH /nodes/{id}` and `POST /nodes/{id}/close` for its own node (`auth::tree_run_admits`). |
 | `http/projects.rs` | The roster: adding, reading and removing projects (`/projects*`). |
 | `http/analytics_pipeline.rs` | The pipeline routes (`/analytics/pipeline`, `/projects/{id}/analytics/pipeline`): `/analytics`' `days` rules (400 outside 7/30/90) and 404, then `analytics_pipeline::build`, whose blocks carry their own errors. |
 | `http/analytics.rs` | The analytics routes (`/analytics`, `/analytics/quota`, `/projects/{id}/analytics`, and development time's `/analytics/devtime`, `/analytics/devtime/findings`, their `/projects/{id}/…` twins and the global `POST /analytics/devtime/findings/{key}/mark` and `POST /analytics/devtime/prices/refresh`, plus the automatic actions' `GET /analytics/devtime/actions`, `GET .../actions/shadow`, `POST .../actions/shadow/{id}/verdict` and `POST .../actions/{action}/{rule}/promote`): read `days`, refuse anything but 7/30/90 with a 400 rather than clamping, 404 a project off the roster, refuse a bad findings `order`/`limit`/`cursor`, mark `verdict`/`cause` or action pair with a JSON code (promotion of a pair that is not `ready` is a 409 `not_ready`), and hand the window to `analytics.rs` / `analytics/devtime.rs`. |
@@ -301,6 +304,55 @@ the contract, not a snapshot.
 | `verify_cli.rs` | `nucleos-core --verify` and `nucleos-core --verify-ticket <id>`: the CLI client of `POST /verify` with `cover` (F3-14), and the background wait on an existing ticket that the IDE box's `wait_with` names (by the daemon's full path). Sends the cwd as the worktree, follows the ticket through `/verify/status` up to a wait limit, prints the units and maps the verdict to an exit code (0/1/3/4). Never starts a daemon; nothing calls it automatically. |
 | `verify/provision.rs` | Makes the IDE verify box available to a project's IDE worktrees (spec 2026-10-05 section 4.7.1; F2c-2). `reconcile` writes a daemon-owned `.mcp.json` plus `enabledMcpjsonServers` in `.claude/settings.local.json` into each IDE worktree when `autopilot_state.ide_verify` is on, hides both through a marked `info/exclude` block, and removes exactly that when it goes off; provenance lives in each worktree's private git dir. Daemon-owned and detached worktrees are skipped, tracked or foreign files are never touched. Runs only on `POST /projects/{id}/ide-verify` (control or admin key). |
 | `work_nodes.rs` | The hierarchical-orchestration store (migration 0216): one row per root, orchestrator or leaf node, with depth/width/budget limits from `speed.yaml`, owned-path overlap checks, decisions, close summaries, and the brief/full tree render. |
+| `tree_job/mod.rs` | Tree jobs (migration 0262): the daemon-side driver of a tree of work nodes, from manifest to landing. Module root; declares the submodules and holds no logic. |
+| `tree_job/model.rs` | The durable tree manifest: the serde port of `tree_state.py`'s branch and manifest shapes. |
+| `tree_job/store.rs` | Durable storage of tree jobs: one `tree_jobs` row per job, with its manifest as JSON text. |
+| `tree_job/report.rs` | A node's report: parse it, list what makes it unacceptable, and render it as a handoff. No database. |
+| `tree_job/commands.rs` | The closed list of heavy commands the daemon runs for a leaf, scoped to its branch; anything outside it parks the node. |
+| `tree_job/checklist.rs` | The node checklist close rule: a node closes only with all items `[x]` or one `[!]`. No database. |
+| `tree_job/docs_paths.rs` | The rules of a docs branch: the paths it may write under `.ai/` and the states it may end in. No database. |
+| `tree_job/engine.rs` | Stub, not implemented yet (wave 5): the branch state machine and the grouping of branches by width and path overlap. |
+| `tree_job/node_run.rs` | Stub, not implemented yet (wave 5): keyed idempotent transitions over `tree_transitions`, launching a node's agent, and reconciling `running` nodes whose run is gone. |
+| `tree_job/budget.rs` | Stub, not implemented yet (wave 5): the admission budget of a tree's branches, per layer, with a docs branch costing nothing. |
+| `tree_job/close.rs` | Stub, not implemented yet (wave 6): validating a tree node's close through `report` and `checklist` before `work_nodes::close`. |
+| `tree_job/landing.rs` | Stub, not implemented yet (wave 6): gates, merge and land of a tree, with the reviewer's findings kept as data in the manifest. |
+| `tree_job/http.rs` | Stub, not implemented yet (wave 6): the local `/trees` routes. |
+| `tree_job/open.rs` | Opening a branch: `open_branch` (worktree on `tree/<id>/<name>`, links, target dir name, admission; a docs branch only changes state), `bind_branch` (node to branch, `building`), `routes()` (`POST /trees/{id}/branches/{name}/open` and `/bind`, merged in `http.rs` beside `tree_job::http::routes()`, never inside it), the stored launches (`tree_launches`, migration 0266) and the two relaunches built on them: `relaunch_resumed` at boot and `answer_and_relaunch` for every entry point that answers a decision. |
+| `tree_job/relaunch.rs` | Starting a node's agent again: the stored launches (`tree_launches`) and the relaunches built on them, `relaunch_resumed` at boot and `answer_and_relaunch` for every entry point that answers a decision. Re-exported by `open`. |
+| `tree_job/branch_start.rs` | `POST /trees/{id}/branch_start`, the whole start of one branch in a single idempotent call for the `tree_branch_start` tool: add, open, node, bind, launch. |
+| `tree_job/driver.rs` | The tree-job driver tick: advances every unfinished job one step per pass (gate a reported branch, fix a red one, queue or settle a merge, close finished nodes, land). |
+| `tree_job/root.rs` | The root node of a tree job: its worktree on `tree/<id>/root`, and the run that plans the job. |
+| `tree_job/wrap.rs` | Wrapping up a node run that already reported, and starting a branch node again when its run ended with a handoff or died without a report. |
+| `tree_job/decisions.rs` | Parking a branch on a decision for the owner (`park`), resuming it on the answer (`answer`, which only moves state: call `open::answer_and_relaunch` to also start the node again), and the single list of decisions. Both hold the job lock. |
+| `conductor/mod.rs` | Conductor: session liveness, context limits, depth guards and resume. Module root; declares the submodules. |
+| `conductor/liveness.rs` | Stub, not implemented yet: session liveness classification. |
+| `conductor/context.rs` | Stub, not implemented yet: context-fill limits and verdicts. |
+| `conductor/depth.rs` | Stub, not implemented yet: child-node depth guards. |
+| `conductor/continuation.rs` | Stub, not implemented yet: continuation of a handed-off node. |
+| `conductor/resume.rs` | Stub, not implemented yet: run resume after a stop. |
+| `conductor/sweep.rs` | Stub, not implemented yet: the liveness sweep. |
+| `conductor/http.rs` | Stub, not implemented yet: the conductor's HTTP routes. |
+| `spec_backlog/mod.rs` | Spec backlog (migration 0264): a registry of spec files, their criteria, dependencies and owner questions. Module root; declares the submodules. |
+| `spec_backlog/model.rs` | The spec backlog's closed vocabularies, the stable spec id and the registry's row types. |
+| `spec_backlog/store.rs` | The spec backlog's storage: reads and writes over the registry tables and the owner's decisions. |
+| `spec_backlog/scan.rs` | Discovery of spec files, which are read-only inputs to the backlog. |
+| `spec_backlog/criteria.rs` | Validation of what the extraction agent returns: a spec's kind, criteria, dependencies and open questions. |
+| `spec_backlog/extract.rs` | Criteria extraction over registered, immutable spec files. |
+| `spec_backlog/prompts.rs` | The extraction prompts: how a large spec is cut into sections and what the agent is told to return. |
+| `spec_backlog/deps.rs` | Pure dependency planning for specs: a topological order, cycles reported as owner questions, and parallel groups. |
+| `spec_backlog/audit.rs` | Independent review and verification of extracted specs. |
+| `spec_backlog/verdict.rs` | The pure "finished" rule: a spec is done only with a green verify and an independent reviewer's confirmation. |
+| `spec_backlog/finish.rs` | Finishing the backlog: one tree per spec, in dependency order, audited as each tree closes. |
+| `spec_backlog/daemon.rs` | The finish plan's daemon-side wiring: the launcher, preparer, verify and reviewer adapters, and how a project's root is resolved. |
+| `spec_backlog/review.rs` | The independent reviewer of a spec's criteria: the files it is shown under size caps, its prompt, and reading its JSON answer back. |
+| `spec_backlog/http.rs` | HTTP routes for the spec backlog. |
+| `tree_cost/mod.rs` | Tree cost (migration 0265): per-tree spending, budgets, cache measurement and the wait policy. Module root; declares the submodules and holds the migration's tests. |
+| `tree_cost/ledger.rs` | Stub, not implemented yet: the tree cost ledger. |
+| `tree_cost/budget.rs` | Stub, not implemented yet: tree budgets. |
+| `tree_cost/measure.rs` | Stub, not implemented yet: cache measurement. |
+| `tree_cost/report.rs` | Stub, not implemented yet: the cache report. |
+| `tree_cost/wait_policy.rs` | Stub, not implemented yet: the wait policy decision. |
+| `tree_cost/http.rs` | Stub, not implemented yet: the tree cost HTTP routes. |
 | `workflow_records.rs` | The AI workflow's ledgers kept by the daemon (F4, migration 0204): the `workflow_records` table (kind `metric`/`rework`/`intent`/`event`, `task_id`, `phase`, `caught_by`, a JSON `payload` capped at 16 KiB), `POST /workflow/records` behind the `record` MCP tool (owner or run key; the worktree and project are resolved and fenced exactly as `verify` does, never taken from the caller), and the reads that join a task's rework to the step that caught it and to its verifications (`verify_runs.task_id`, set from `verify`'s optional `task_id`). |
 | `crates/nucleos-base/src/verify_sched.rs` | **Pure.** Picks the next verification unit to start from the queue, the free capacity and when each project last started something: best effective priority (one level better after aging), then the project whose last start is oldest, then FIFO. A head that does not fit blocks the queue, so heavy units are not starved. No I/O. |
 | `crates/nucleos-base/src/wake.rs` | Process-wide level-triggered change hints (`Topic::{Feed,Proposals,Kill,Budget,Runs}`, `bump`, `subscribe`) over one `tokio::sync::watch<u64>` per topic. A hint carries no data and may be spurious; bursts coalesce into one wake-up and the database stays the source of truth. Global to the process so writers that only hold a pool need no bus handle. |
@@ -453,6 +505,7 @@ the contract, not a snapshot.
 | `daemon_client/browser.rs` | The browser agent verbs (`browser_open`, snapshot, act, look, handoff, close). |
 | `daemon_client/delivery.rs` | The code-delivery verbs: the git queue (`vcs_request`, `vcs_ticket`), GitHub, and verify. |
 | `daemon_client/nodes.rs` | The work-node verbs (`node_open`, `node_update`, `node_close`, `node_tree`, `node_active`) over `/nodes`. |
+| `daemon_client/trees.rs` | The tree-job verbs (`tree_launch`, `tree_branch_start`, ...), the spec backlog and wait-advice routes. |
 | `integrations/email.rs` | The email pillar's domain core: ingestion, the noise gate, and the cursor. The only module that touches the `emails` / `email_cursor` tables. |
 | `files.rs` | The files folder: attachment names and bytes, the owner's own uploads, and the read/move/delete surface the Files tab drives — all rooted in one directory and kept from escaping it by `resolve_within`. A delete is a MOVE into `files-trash/`, a sibling of the root and never inside it (so no route over the root reaches it): one entry per delete with an `origin.json`, restorable by id through `restore` — which puts the recorded path back through `resolve_within` and, like `move_entry`, refuses a taken name or a missing parent rather than numbering or creating — and purged past `TRASH_RETENTION` (30 days) at startup and on every delete. A failed move is an error, never a fallback to removing. (Renamed from `mailfiles.rs` on master.) |
 | `fleet.rs` | The live fleet tree (spec 2026-10-20): module root, `FleetEnv` and the `sources()` registry that each harness adapter adds one line to. |

@@ -42,8 +42,9 @@ pub use self::turn::*;
 /// The context window a conversation is given, unless its own row asks for a different one.
 ///
 /// An ABSOLUTE token count, not a fraction, because everything it is compared against is one:
-/// `runs.context_fill` is `input_tokens + cache_read_input_tokens` off the live assistant events,
-/// and `sessions::Conversation::context_estimate` is a character count divided by four. 140k is
+/// `runs.context_fill` is `input_tokens + cache_read_input_tokens + cache_creation_input_tokens` off
+/// the live assistant events, and `sessions::Conversation::context_estimate` is a character count
+/// divided by four. 140k is
 /// ≈0.7 of the 200k window the runner assumes as its conservative floor — deliberately below it, so
 /// an ordinary conversation is summarised while it is still cheap to summarise.
 ///
@@ -2420,7 +2421,10 @@ mod tests {
     async fn an_ordinary_chats_turn_still_runs_nowhere_in_particular() {
         let (state, _dir, runner) = files_root_state().await;
 
-        let id = send_message(&state, "plain-chat", "olá", Origin::Shell)
+        // Its own chat id: `BUSY_CHATS` is process-wide, and a shared literal made this test and
+        // `a_turn_sent_with_nothing_keeps_the_argument_vector` refuse each other under load.
+        let chat = a_chat("plain-chat");
+        let id = send_message(&state, &chat, "olá", Origin::Shell)
             .await
             .unwrap();
         settled_turn(&state.pool, id).await;
@@ -6870,10 +6874,11 @@ mod tests {
         .await
         .unwrap();
 
-        prewarm_open_chat(&state, "warm-open");
-
         let mut kept = false;
+        // As a transcript's poll does: another test's warm-up holds the one global `WARMING` flag
+        // for a moment, and a call that finds it set does nothing.
         for _ in 0..500 {
+            prewarm_open_chat(&state, "warm-open");
             kept = *fake.calls.lock().unwrap() == 1
                 && LIVE_CHATS.lock().unwrap().contains_key("warm-open");
             if kept {
@@ -7060,7 +7065,8 @@ mod tests {
         let mut state = test_state().await;
         state.runner = fake.clone();
 
-        let id = send_message(&state, "plain-chat", "arranja o parser", Origin::Shell)
+        let chat = a_chat("plain-chat");
+        let id = send_message(&state, &chat, "arranja o parser", Origin::Shell)
             .await
             .unwrap();
         settled_turn(&state.pool, id).await;

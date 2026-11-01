@@ -1474,16 +1474,18 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(30)).await;
             false
         };
+        // Built before the clock starts: the fixture may wait on the rules gate.
+        let question = asked(
+            run_id,
+            Event::Park,
+            "cargo test | tee t.log",
+            "unrecognized",
+        );
         let started = Instant::now();
         let row = ask_unless(
             &pool,
             &runtime,
-            &asked(
-                run_id,
-                Event::Park,
-                "cargo test | tee t.log",
-                "unrecognized",
-            ),
+            &question,
             crate::judge::JUDGE_DEADLINE,
             hanging,
         )
@@ -1547,16 +1549,17 @@ mod tests {
             tokio::time::sleep(crate::judge::JUDGE_DEADLINE / 2).await;
             false
         };
+        let question = asked(
+            run_id,
+            Event::Park,
+            "cargo test | tee t.log",
+            "unrecognized",
+        );
         let started = Instant::now();
         let row = ask_unless(
             &pool,
             &runtime,
-            &asked(
-                run_id,
-                Event::Park,
-                "cargo test | tee t.log",
-                "unrecognized",
-            ),
+            &question,
             crate::judge::JUDGE_DEADLINE,
             slow_but_clear,
         )
@@ -1582,14 +1585,11 @@ mod tests {
         let pool = pool().await;
         let run_id = running_run(&pool).await;
         let runtime = JudgeRuntime::with(ScriptedJudge::slow(Duration::from_secs(30)));
+        let question = asked(run_id, Event::HardDeny, "rm -rf x", "destructive");
         let started = Instant::now();
-        let row = ask_unless(
-            &pool,
-            &runtime,
-            &asked(run_id, Event::HardDeny, "rm -rf x", "destructive"),
-            Duration::from_secs(20),
-            async { false },
-        )
+        let row = ask_unless(&pool, &runtime, &question, Duration::from_secs(20), async {
+            false
+        })
         .await
         .expect("a lineage that is not a resolution is asked about");
         assert!(

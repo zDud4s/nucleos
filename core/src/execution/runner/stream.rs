@@ -201,10 +201,21 @@ pub fn context_fill_from_line(line: &str, current: Option<i64>) -> Option<i64> {
         let cache_read_tokens = usage
             .and_then(|usage| usage.get("cache_read_input_tokens"))
             .and_then(serde_json::Value::as_i64);
+        // Optional: older streams do not carry this counter, and for them the sum stays as it was.
+        let cache_creation_tokens = usage
+            .and_then(|usage| usage.get("cache_creation_input_tokens"))
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
 
         if let (Some(input_tokens), Some(cache_read_tokens)) = (input_tokens, cache_read_tokens) {
-            // Cache-read tokens occupy the context window exactly as fresh input tokens do.
-            return input_tokens.checked_add(cache_read_tokens).or(current);
+            // Cached tokens occupy the context window exactly as fresh input tokens do, whether
+            // they were read from the cache or written to it. After a cache miss the read is 0 and
+            // nearly the whole prompt arrives as creation, so leaving it out reads a full window
+            // as nearly empty.
+            return input_tokens
+                .checked_add(cache_read_tokens)
+                .and_then(|sum| sum.checked_add(cache_creation_tokens))
+                .or(current);
         }
     }
 
@@ -219,8 +230,8 @@ pub fn context_fill_from_line(line: &str, current: Option<i64>) -> Option<i64> {
 /// The fullest the stream ever got, rather than where it ended.
 ///
 /// Written on top of `context_fill_from_line` instead of re-reading the JSON: there is one
-/// definition of "what occupies the window" — `input_tokens + cache_read_input_tokens` — and it
-/// lives there. Two copies would drift the day the CLI added a third counter, and drift silently.
+/// definition of "what occupies the window" — `input_tokens + cache_read_input_tokens +
+/// cache_creation_input_tokens` — and it lives there. Two copies would drift the day the CLI added a third counter, and drift silently.
 ///
 /// The `None` in the call is deliberate: what is wanted is what THIS line says, not the running
 /// total, so that the larger of the two can be chosen here.
@@ -406,5 +417,47 @@ pub fn track_open_tools(line: &str, open: &mut std::collections::HashSet<String>
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{context_fill_from_line, context_peak_from_line};
+
+    /// A cold-cache turn: nothing is read from the cache, the whole prompt is written to it.
+    const COLD: &str = r#"{"type":"assistant","message":{"usage":{"input_tokens":6,"cache_creation_input_tokens":100000,"cache_read_input_tokens":0,"output_tokens":42}}}"#;
+
+    #[test]
+    fn context_fill_counts_cache_creation_tokens() {
+        let line = r#"{"type":"assistant","message":{"usage":{"input_tokens":1000,"cache_creation_input_tokens":2500,"cache_read_input_tokens":9000}}}"#;
+
+        assert_eq!(context_fill_from_line(line, None), Some(12_500));
+    }
+
+    #[test]
+    fn context_fill_after_cache_miss_is_the_whole_prompt() {
+        // cache_read is 0, so the window is almost entirely cache_creation.
+        assert_eq!(context_fill_from_line(COLD, None), Some(100_006));
+    }
+
+    /// Regression guard: older streams carry no cache_creation field and keep the old sum.
+    #[test]
+    fn context_fill_without_cache_creation_field_unchanged() {
+        let line = r#"{"type":"assistant","message":{"usage":{"input_tokens":1000,"cache_read_input_tokens":9000}}}"#;
+
+        assert_eq!(context_fill_from_line(line, None), Some(10_000));
+    }
+
+    #[test]
+    fn context_peak_follows_new_definition() {
+        let warm = r#"{"type":"assistant","message":{"usage":{"input_tokens":500,"cache_creation_input_tokens":0,"cache_read_input_tokens":39500}}}"#;
+
+        let mut peak = None;
+        peak = context_peak_from_line(warm, peak);
+        peak = context_peak_from_line(COLD, peak);
+        peak = context_peak_from_line(warm, peak);
+
+        // The cold turn is the fullest moment, and only the new definition sees it.
+        assert_eq!(peak, Some(100_006));
     }
 }

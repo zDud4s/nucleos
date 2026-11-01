@@ -170,6 +170,24 @@ async fn main() {
     tracing::info!("nucleos-core database ready at {}", db_path.display());
 
     startup::reconcile_after_restart(&pool).await;
+    // After the runs were reconciled and before the server or any loop can call `launch`: it clears
+    // the empty launch reservations of unfinished tree jobs. It relaunches below, after AppState exists.
+    // The result is kept for `open::relaunch_resumed`, which needs an `AppState` and so runs below.
+    let resumed_trees = match tree_job::store::resume_all(&pool).await {
+        Ok(resumed) => {
+            tracing::info!(
+                jobs = resumed.jobs.len(),
+                failed_nodes = resumed.failed_nodes.len(),
+                cleared_launches = resumed.cleared_launches.len(),
+                "resumed tree jobs"
+            );
+            Some(resumed)
+        }
+        Err(error) => {
+            tracing::error!(%error, "could not resume tree jobs; continuing startup");
+            None
+        }
+    };
     startup::install_agents(&pool, is_primary).await;
     startup::refresh_wired_hooks(&pool, is_primary).await;
 
@@ -1023,7 +1041,55 @@ async fn main() {
     // The v1 Telegram supervisor is gone on purpose: the channel registry launches the v2 adapter
     // (`channels::registry::launch_all`, below). Two supervisors on one bot would both long-poll
     // `getUpdates` and Telegram answers the loser with a 409.
+    // Starts again the tree nodes that boot recovery left without a run. Once per boot, off the
+    // startup path: each start creates a run.
+    // Then takes up again the spec finishes the restart cut off, after tree recovery so that each
+    // adopts the trees its specs already have: the restart writes an intent per project and one
+    // sweep runs them. Off the startup path, since a finish waits on its trees.
+    tokio::spawn({
+        let state = state.clone();
+        async move {
+            if let Some(resumed) = resumed_trees {
+                let relaunched = tree_job::open::relaunch_resumed(&state, &resumed).await;
+                tracing::info!(
+                    started = relaunched.started.len(),
+                    skipped = relaunched.skipped.len(),
+                    "relaunched tree nodes"
+                );
+            }
+            spec_backlog::finish::resume_finishes(&state).await;
+            spec_backlog::finish::sweep_finishes(&state).await;
+        }
+    });
+    // Retries the finish intents a pass left (disk short) or a busy claim skipped.
+    tokio::spawn(spec_backlog::finish::run_sweep_loop(state.clone()));
     tokio::spawn(execution::scheduler::run_scheduler(state.clone()));
+    tokio::spawn({
+        let state = state.clone();
+        async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                ticker.tick().await;
+                match conductor::sweep::daemon_observations(&state).await {
+                    Ok(observed) => {
+                        if let Err(error) = conductor::sweep::tick(
+                            &state,
+                            &observed,
+                            &conductor::liveness::Limits::default(),
+                            chrono::Utc::now(),
+                        )
+                        .await
+                        {
+                            tracing::warn!(%error, "conductor liveness sweep failed");
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "could not collect conductor observations")
+                    }
+                }
+            }
+        }
+    });
     // Its own loop, not a step inside the scheduler's: a job pass can sit inside `run_gate` for the
     // whole gate timeout, and sharing a loop would stall every scheduled rule in the daemon behind
     // one project's test suite.

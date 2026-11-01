@@ -696,4 +696,133 @@ impl NucleosTools {
     ) -> String {
         json_result(self.client.browser_agent(&task, url.as_deref()).await)
     }
+
+    // The tree and backlog tools. Each is one daemon route and nothing else: the daemon owns every
+    // rule (admission, branch checks, who may finish a spec), so a refusal comes back as its text.
+
+    #[tool(
+        description = "Launch a tree job: opens a root work node for `goal` on `feature_branch` in \
+                       `project_root` and stores the job. `id` is yours to choose and makes the call \
+                       repeatable: launching the same id again answers with the stored job and \
+                       opens nothing. `project_id`, `contract` and `dirty_owner_files` are \
+                       optional. Returns {id, root_node_id, state, replayed}."
+    )]
+    pub(super) async fn tree_launch(
+        &self,
+        Parameters(TreeLaunchParams {
+            id,
+            goal,
+            feature_branch,
+            project_root,
+            project_id,
+            contract,
+            dirty_owner_files,
+        }): Parameters<TreeLaunchParams>,
+    ) -> String {
+        json_result(
+            self.client
+                .tree_launch(&serde_json::json!({
+                    "id": id,
+                    "goal": goal,
+                    "feature_branch": feature_branch,
+                    "project_root": project_root,
+                    "project_id": project_id,
+                    "contract": contract,
+                    "dirty_owner_files": dirty_owner_files,
+                }))
+                .await,
+        )
+    }
+
+    #[tool(
+        description = "Start one branch of a tree job in one call. `id` is the tree JOB id named in \
+                       your prompt, not a node id (a node id is refused). Adds the branch `name`, makes its \
+                       worktree, opens a work node for it as a child of your `node_id` and starts \
+                       its agent with `prompt`. `owned_paths` are the globs it may write; `layer` \
+                       (default `code`) and `base` are optional. Calling it again with the same \
+                       `name` repeats nothing and finishes any step an earlier call did not reach. \
+                       Refused when the job is finished, `node_id` is not a node of this tree, or \
+                       the branch is not admitted for disk or slots. Returns {branch, node_id, \
+                       run_id, worktree, replayed}."
+    )]
+    pub(super) async fn tree_branch_start(
+        &self,
+        Parameters(TreeBranchStartParams {
+            id,
+            name,
+            goal,
+            owned_paths,
+            prompt,
+            layer,
+            base,
+            node_id,
+        }): Parameters<TreeBranchStartParams>,
+    ) -> String {
+        json_result(
+            self.client
+                .tree_branch_start(
+                    &id,
+                    &serde_json::json!({
+                        "name": name,
+                        "goal": goal,
+                        "owned_paths": owned_paths,
+                        "prompt": prompt,
+                        "layer": layer,
+                        "base": base,
+                        "node_id": node_id,
+                    }),
+                )
+                .await,
+        )
+    }
+
+    #[tool(
+        description = "Read one tree job by the id it was launched with: its state, root node \
+                       and progress."
+    )]
+    pub(super) async fn tree_status(
+        &self,
+        Parameters(TreeIdParams { id }): Parameters<TreeIdParams>,
+    ) -> String {
+        json_result(self.client.tree_status(&id).await)
+    }
+
+    #[tool(description = "List the spec backlog: the specs waiting to be built, with their state.")]
+    pub(super) async fn spec_backlog(&self) -> String {
+        json_result(self.client.spec_backlog().await)
+    }
+
+    #[tool(
+        description = "Start the work of finishing specs: extract their criteria, audit them and \
+                       run one tree per spec that is not done. Finishes one spec by `spec_id`, or \
+                       every spec of a project by `project_id` or `project_root` (your cwd's \
+                       project root). The daemon refuses a call that names none of the three, and \
+                       answers at once while the work goes on."
+    )]
+    pub(super) async fn spec_finish(
+        &self,
+        Parameters(SpecFinishParams {
+            spec_id,
+            project_id,
+            project_root,
+        }): Parameters<SpecFinishParams>,
+    ) -> String {
+        json_result(
+            self.client
+                .spec_finish(&serde_json::json!({
+                    "spec_id": spec_id,
+                    "project_id": project_id,
+                    "project_root": project_root,
+                }))
+                .await,
+        )
+    }
+
+    #[tool(
+        description = "Advice on how long a pause between turns is worth, from the daemon's own \
+                       measurement of cache waits. Read it before deciding to sleep or to wait."
+    )]
+    pub(super) async fn wait_advice(&self) -> String {
+        json_result(self.client.wait_advice().await)
+    }
 }

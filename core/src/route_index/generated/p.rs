@@ -431,6 +431,20 @@ pub(super) const ROUTES: &[RouteEntry] = &[
         handler: "get_project_record",
     },
     RouteEntry {
+        method: "POST",
+        path: "/projects/{id}/repair",
+        purpose: "Repairing points an existing daemon project back at its main checkout.",
+        body: Body::Shapeless("RepairRequest"),
+        handler: "post_project_repair",
+    },
+    RouteEntry {
+        method: "POST",
+        path: "/projects/{id}/repair/begin",
+        purpose: "Post project repair begin.",
+        body: Body::Shapeless("RepairBeginRequest"),
+        handler: "post_project_repair_begin",
+    },
+    RouteEntry {
         method: "GET",
         path: "/projects/{id}/rules",
         purpose: "Get project rules.",

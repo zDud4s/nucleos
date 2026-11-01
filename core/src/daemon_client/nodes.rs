@@ -92,7 +92,7 @@ impl DaemonClient {
 }
 
 /// Percent-encodes one path segment so an id with `/`, `?` or spaces cannot change the route.
-fn encode_segment(segment: &str) -> String {
+pub(super) fn encode_segment(segment: &str) -> String {
     let mut out = String::with_capacity(segment.len());
     for byte in segment.bytes() {
         match byte {

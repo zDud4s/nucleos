@@ -1089,16 +1089,22 @@ mod tests {
                 "set_kill",
                 "shadow_queue",
                 "shadow_scoreboard",
+                "spec_backlog",
+                "spec_finish",
                 "suggest_model",
                 "task_claim",
                 "task_done",
                 "task_list",
                 "task_release",
+                "tree_branch_start",
+                "tree_launch",
+                "tree_status",
                 "triage_email",
                 "vcs_request",
                 "vcs_ticket",
                 "verify",
                 "verify_status",
+                "wait_advice",
                 "web_read",
                 "web_search",
             ]
@@ -2772,18 +2778,29 @@ mod tests {
         assert_eq!(
             advertised(&listed),
             [
+                "create_job",
+                "create_run",
+                "get_job",
+                "get_run",
+                "list_jobs",
                 "node_active",
                 "node_close",
                 "node_open",
                 "node_tree",
                 "node_update",
                 "record",
+                "spec_backlog",
+                "spec_finish",
                 "task_claim",
                 "task_done",
                 "task_list",
                 "task_release",
+                "tree_branch_start",
+                "tree_launch",
+                "tree_status",
                 "verify",
-                "verify_status"
+                "verify_status",
+                "wait_advice"
             ]
         );
         assert!(!served_in_box(
@@ -2792,8 +2809,81 @@ mod tests {
         ));
         assert!(!served_in_box(
             &McpBox::Worktree("/work/a".to_owned()),
-            "create_run"
+            "cancel_run"
         ));
+    }
+
+    /// The table calls `get_run` `ReadsOwn`, so the box's name filter serves it; a triage run's
+    /// stdout is a model's answer over a stranger's mail, and this box can also call `create_run`.
+    /// So the refusal is per call. It goes through the real `GET /runs/{id}` handler rather than a
+    /// stub, because the `mode` this rule reads is a field that route has to go on answering.
+    #[tokio::test]
+    async fn worktree_box_refuses_get_run_of_a_triage_run() {
+        let state = crate::channels::testkit::state().await;
+        sqlx::query(
+            "INSERT INTO runs (id, prompt, status, mode, stdout, created_at)
+             VALUES (1, 'triage', 'completed', ?, 'words a stranger chose', '2026-10-30T00:00:00Z'),
+                    (2, 'ordinary', 'completed', 'assistant', 'our own words', '2026-10-30T00:00:00Z')",
+        )
+        .bind(crate::integrations::email::TRIAGE_MODE)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let app = axum::Router::new()
+            .route(
+                "/runs/{id}",
+                axum::routing::get(crate::execution::runs::get_run),
+            )
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let server = NucleosTools::for_box(
+            crate::daemon_client::DaemonClient::new(
+                format!("http://{address}"),
+                "unused".to_string(),
+            ),
+            McpBox::Worktree("/work/a".to_owned()),
+        );
+        let get_run = |id: i64| {
+            rmcp::model::CallToolRequestParams::new("get_run").with_arguments(
+                serde_json::json!({"id": id})
+                    .as_object()
+                    .expect("the fixture is an object")
+                    .clone(),
+            )
+        };
+        let (_running, context) = served_request_context().await;
+
+        let triage = server.call_tool(get_run(1), context.clone()).await;
+        assert!(
+            refusal_names(&triage, "get_run"),
+            "a triage run's read was not refused by name: {triage:?}"
+        );
+        assert!(
+            !format!("{triage:?}").contains("words a stranger chose"),
+            "the refusal carried the stdout it refused: {triage:?}"
+        );
+
+        // A run the box cannot read the mode of is refused too: "I could not tell" is not "no".
+        let unknown = server.call_tool(get_run(3), context.clone()).await;
+        assert!(
+            refusal_names(&unknown, "get_run"),
+            "a run with no readable mode was not refused: {unknown:?}"
+        );
+
+        // The control: an ordinary run still answers, so the refusal above is not "refuse get_run".
+        let ordinary = server.call_tool(get_run(2), context).await;
+        assert!(
+            !refusal_names(&ordinary, "get_run"),
+            "an ordinary run was refused: {ordinary:?}"
+        );
+        assert!(
+            format!("{ordinary:?}").contains("our own words"),
+            "an ordinary run did not come back: {ordinary:?}"
+        );
     }
 
     fn node_open_request() -> rmcp::model::CallToolRequestParams {
@@ -2904,7 +2994,7 @@ mod tests {
     }
 
     #[test]
-    fn worktree_box_tools_hold_every_box_tools_and_grant_nothing_that_acts_or_reads_untrusted() {
+    fn worktree_box_tools_hold_every_box_tools_and_grant_only_launch_acts_and_no_untrusted_read() {
         let worktree: Vec<&str> = WORKTREE_BOX_TOOLS.to_vec();
         let registered: Vec<String> = NucleosTools::tool_router()
             .list_all()
@@ -2928,8 +3018,16 @@ mod tests {
                 "{name} is missing from TOOL_EFFECTS"
             );
             let effect = tool_effect(name);
+            let launch_act = [
+                "create_job",
+                "create_run",
+                "spec_finish",
+                "tree_branch_start",
+                "tree_launch",
+            ]
+            .contains(&name);
             assert!(
-                effect != ToolEffect::Acts && effect != ToolEffect::ReadsUntrusted,
+                effect != ToolEffect::ReadsUntrusted && (effect != ToolEffect::Acts || launch_act),
                 "{name} is graded {effect:?} and must not be served in a worktree box"
             );
         }
@@ -2940,18 +3038,29 @@ mod tests {
         assert_eq!(
             worktree,
             [
+                "create_job",
+                "create_run",
+                "get_job",
+                "get_run",
+                "list_jobs",
                 "node_active",
                 "node_close",
                 "node_open",
                 "node_tree",
                 "node_update",
                 "record",
+                "spec_backlog",
+                "spec_finish",
                 "task_claim",
                 "task_done",
                 "task_list",
                 "task_release",
+                "tree_branch_start",
+                "tree_launch",
+                "tree_status",
                 "verify",
-                "verify_status"
+                "verify_status",
+                "wait_advice"
             ]
         );
 
@@ -2962,6 +3071,99 @@ mod tests {
                 served_in_box(&McpBox::Worktree("/work/a".to_owned()), name),
                 worktree.contains(name),
                 "{name}: the worktree box disagrees with WORKTREE_BOX_TOOLS"
+            );
+        }
+    }
+
+    #[test]
+    fn worktree_box_serves_launch_and_read_tools() {
+        for name in [
+            "create_job",
+            "create_run",
+            "get_job",
+            "get_run",
+            "list_jobs",
+        ] {
+            assert!(
+                served_in_box(&McpBox::Worktree("/work/a".to_owned()), name),
+                "the worktree box does not serve {name}"
+            );
+            assert!(
+                WORKTREE_BOX_TOOLS.contains(&name),
+                "{name} is missing from WORKTREE_BOX_TOOLS"
+            );
+        }
+    }
+
+    #[test]
+    fn worktree_box_serves_tree_and_backlog_tools() {
+        for name in [
+            "spec_backlog",
+            "spec_finish",
+            "tree_launch",
+            "tree_status",
+            "wait_advice",
+        ] {
+            assert!(
+                served_in_box(&McpBox::Worktree("/work/a".to_owned()), name),
+                "the worktree box does not serve {name}"
+            );
+            assert!(
+                WORKTREE_BOX_TOOLS.contains(&name),
+                "{name} is missing from WORKTREE_BOX_TOOLS"
+            );
+        }
+    }
+
+    #[test]
+    fn tree_launch_is_acts() {
+        assert_eq!(tool_effect("tree_launch"), ToolEffect::Acts);
+    }
+
+    #[test]
+    fn tree_status_is_reads_own() {
+        assert_eq!(tool_effect("tree_status"), ToolEffect::ReadsOwn);
+    }
+
+    #[test]
+    fn spec_finish_is_acts() {
+        assert_eq!(tool_effect("spec_finish"), ToolEffect::Acts);
+    }
+
+    #[test]
+    fn spec_finish_can_name_its_project() {
+        let schema = rmcp::schemars::schema_for!(SpecFinishParams);
+        let schema = serde_json::to_value(schema).unwrap();
+        let properties = schema["properties"].as_object().expect("properties");
+
+        for field in ["spec_id", "project_id", "project_root"] {
+            assert!(properties.contains_key(field), "missing {field}: {schema}");
+        }
+    }
+
+    #[test]
+    fn wait_advice_is_reads_own() {
+        assert_eq!(tool_effect("wait_advice"), ToolEffect::ReadsOwn);
+    }
+
+    #[test]
+    fn worktree_box_still_refuses_untrusted_reads() {
+        // The tools graded `ReadsUntrusted` in TOOL_EFFECTS that boxes.rs keeps out of this box.
+        for name in [
+            "browser_act",
+            "browser_open",
+            "browser_snapshot",
+            "get_email",
+            "get_email_queue",
+            "list_files",
+            "read_context",
+            "read_team_file",
+            "web_read",
+            "web_search",
+        ] {
+            assert!(
+                !served_in_box(&McpBox::Worktree("/work/a".to_owned()), name),
+                "the worktree box serves the untrusted read {name}"
             );
         }
     }

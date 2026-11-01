@@ -5,7 +5,8 @@ description: Use when you are a node controller of a node tree — dispatched th
 
 # Orchestrate node
 
-You control one node. You decompose it into child nodes, dispatch them, track them in the
+The top-level session does not execute: it launches. A node controller dispatches children and
+never implements (see the `conduct` skill for the size routing). You control one node. You decompose it into child nodes, dispatch them, track them in the
 daemon's node tree, and close with a summary and a handoff file. You never implement. Limits
 (`max_depth`, `max_width`, `leaf_budget`, `orchestrator_budget`, `ceiling`, `subtree_verify`)
 are the `nodes:` block of the resolved speed table; the daemon refuses what breaks them.

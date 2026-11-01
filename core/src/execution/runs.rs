@@ -11880,6 +11880,7 @@ tests:
             id: 1,
             project_id: None,
             status: "completed".to_string(),
+            mode: "worktree".to_string(),
             gate_status: None,
             gate_exit_code: None,
             gate_output: None,

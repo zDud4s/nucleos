@@ -230,7 +230,7 @@ pub(super) fn writes_outside_cwd(tool_input: &Value, cwd: Option<&Path>) -> bool
 
 /// PURE: splits the first whitespace-delimited token (quotes respected) off `raw`, returning the
 /// token's unquoted text and the raw remainder with its leading whitespace trimmed.
-pub(super) fn split_first_token(raw: &str) -> Option<(String, &str)> {
+pub fn split_first_token(raw: &str) -> Option<(String, &str)> {
     let raw = raw.trim_start();
     if raw.is_empty() {
         return None;
@@ -268,7 +268,7 @@ pub(super) fn heavy_wrapper_inner(segment: &str, cwd: Option<&Path>) -> Option<S
     if !(program.starts_with("python") || program == "py") {
         return None;
     }
-    let (script, mut rest) = split_first_token(rest)?;
+    let (script, rest) = split_first_token(rest)?;
     let normalized = normalize_path(&script, cwd);
     if !path_has_suffix(&normalized, "scripts/heavy.py") {
         return None;
@@ -286,10 +286,17 @@ pub(super) fn heavy_wrapper_inner(segment: &str, cwd: Option<&Path>) -> Option<S
     if target != broker {
         return None;
     }
+    heavy_wrapper_arguments(rest).map(ToOwned::to_owned)
+}
+
+/// PURE: the argv wrapped by `scripts/heavy.py`, after its script path. The docs hook uses this
+/// without the main-checkout trust check because it only refuses commands; the classifier keeps
+/// that check in [`heavy_wrapper_inner`] before reaching this scanner.
+pub fn heavy_wrapper_arguments(mut rest: &str) -> Option<&str> {
     loop {
         let (token, after) = split_first_token(rest)?;
         if token == "--" {
-            return (!after.is_empty()).then(|| after.to_owned());
+            return (!after.is_empty()).then_some(after);
         }
         if matches!(
             token.as_str(),
@@ -301,20 +308,16 @@ pub(super) fn heavy_wrapper_inner(segment: &str, cwd: Option<&Path>) -> Option<S
         }
         if ["--prio=", "--agent=", "--kind=", "--wait-max="]
             .iter()
-            .any(|p| token.starts_with(p))
+            .any(|prefix| token.starts_with(prefix))
         {
             rest = after;
             continue;
         }
-        if token.starts_with('-') {
+        if token.starts_with('-') || token == "hold-worktree" {
             return None;
         }
-        // PowerShell may swallow `--`: the first token after the options starts the argv. A bare
-        // word such as `hold-worktree` is a broker subcommand, not a command to unwrap.
-        if token == "hold-worktree" {
-            return None;
-        }
-        return Some(rest.to_owned());
+        // PowerShell may swallow `--`, so its first non-option token starts the wrapped argv.
+        return Some(rest);
     }
 }
 
@@ -338,7 +341,7 @@ pub(super) fn main_checkout_of(cwd: &Path) -> Option<String> {
     (!main.is_empty()).then(|| normalize_path(main, None))
 }
 
-pub(super) fn path_has_suffix(path: &str, suffix: &str) -> bool {
+pub fn path_has_suffix(path: &str, suffix: &str) -> bool {
     path == suffix || path.ends_with(&format!("/{suffix}"))
 }
 
