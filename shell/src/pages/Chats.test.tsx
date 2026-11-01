@@ -7650,7 +7650,9 @@ function chatsFetchWithEngineRoutes(
     id: "agy/claude-sonnet-4-6",
     label: "Sonnet 4.6 (agy)",
     brain: "cloud",
-    efforts: [],
+    // Core gives the hosted Claude row three levels (no `xhigh`, no `max`); only the Gemini agy row
+    // below has none.
+    efforts: ["low", "medium", "high"],
     runner: "agy",
   };
   const agyGemini: ModelChoice = {
@@ -7870,7 +7872,7 @@ describe("Chats - the model route's mark, effort and stored model (review 7)", (
     fireEvent.keyDown(thumb, { key: "Escape" });
     await screen.findByRole("button", { name: /^Effort high/ });
 
-    await pickRow(/Antigravity CLI/, /^Sonnet 4\.6 \(agy\)/);
+    await pickRow(/Antigravity CLI/, /^Gemini 3 Pro \(agy\)/);
     // The slider is gone with the route's levels, so the held "high" must be gone too.
     await waitFor(() => {
       expect(screen.queryByRole("button", { name: /change the effort/i })).toBeNull();
@@ -7884,8 +7886,76 @@ describe("Chats - the model route's mark, effort and stored model (review 7)", (
       expect(callsTo("/assistant/chats", "POST")).toHaveLength(1);
     });
     const body = JSON.parse(String((callsTo("/assistant/chats", "POST")[0][1] as RequestInit).body));
+    expect(body.model).toBe("agy/gemini-3-pro");
+    expect(body.effort).toBeUndefined();
+  });
+
+  it("a held xhigh is not sent when the picked row offers levels without it (front door)", async () => {
+    daemon.apiFetch.mockImplementation(chatsFetchWithEngineRoutes([], {}));
+
+    await renderChats("/chats");
+    await pickRow("Claude", /^Sonnet 4\.6$/);
+
+    const thumb = await effortThumb();
+    for (let press = 0; press < 4; press += 1) fireEvent.keyDown(thumb, { key: "ArrowRight" });
+    expect(thumb.getAttribute("aria-valuetext")).toBe("xhigh");
+    fireEvent.keyDown(thumb, { key: "Escape" });
+    await screen.findByRole("button", { name: /^Effort xhigh/ });
+
+    // The agy Sonnet row offers low, medium and high, so the dial stays but `xhigh` is not on it.
+    await pickRow(/Antigravity CLI/, /^Sonnet 4\.6 \(agy\)/);
+
+    const textarea = (await screen.findByLabelText("Message")) as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: "olá" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => {
+      expect(callsTo("/assistant/chats", "POST")).toHaveLength(1);
+    });
+    const body = JSON.parse(String((callsTo("/assistant/chats", "POST")[0][1] as RequestInit).body));
     expect(body.model).toBe("agy/claude-sonnet-4-6");
     expect(body.effort).toBeUndefined();
+  });
+
+  /** Open chat c-1 holding Sonnet 4.6 at `effort`, pick a row, and return the one PATCH body. */
+  async function patchAfterPick(
+    effort: string,
+    section: RegExp | string,
+    row: RegExp,
+  ): Promise<Record<string, unknown>> {
+    daemon.apiFetch.mockImplementation(
+      chatsFetchWithEngineRoutes(
+        [chatSummary({ chat_id: "c-1", model: "claude-sonnet-4-6", effort })],
+        { "c-1": [] },
+      ),
+    );
+    await renderChats("/chats/c-1");
+    await screen.findByRole("button", { name: new RegExp(`^Effort ${effort}`) });
+    await pickRow(section, row);
+
+    await waitFor(() => {
+      expect(callsTo("/assistant/chats/c-1", "PATCH")).toHaveLength(1);
+    });
+    return JSON.parse(String((callsTo("/assistant/chats/c-1", "PATCH")[0][1] as RequestInit).body));
+  }
+
+  it("picking a row with no levels clears the held effort in the same PATCH", async () => {
+    const body = await patchAfterPick("high", /Antigravity CLI/, /^Gemini 3 Pro \(agy\)/);
+    expect(body.model).toBe("agy/gemini-3-pro");
+    expect(body).toHaveProperty("effort", null);
+  });
+
+  it("picking a row whose levels lack the held xhigh clears the effort in the PATCH", async () => {
+    const body = await patchAfterPick("xhigh", /Antigravity CLI/, /^Sonnet 4\.6 \(agy\)/);
+    expect(body.model).toBe("agy/claude-sonnet-4-6");
+    expect(body).toHaveProperty("effort", null);
+  });
+
+  // A guard: it may pass before the change. It fails if the effort is cleared on every pick.
+  it("picking a row that offers the held effort leaves the effort out of the PATCH", async () => {
+    const body = await patchAfterPick("high", /Antigravity CLI/, /^Sonnet 4\.6 \(agy\)/);
+    expect(body.model).toBe("agy/claude-sonnet-4-6");
+    expect(body).not.toHaveProperty("effort");
   });
 
   it("a chat pinned to a model outside the catalogue shows no effort dial", async () => {

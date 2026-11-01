@@ -201,15 +201,48 @@ describe("EngineOptIn - what the window claims (review 7)", () => {
     await waitFor(() => expect(invalidated(queryClient)).toEqual(MENUS.map(() => true)));
   });
 
-  // Wording assumed: the note must match /not sure|unknown|may have/i, e.g. "the daemon did not
-  // answer: whether {label} was changed is unknown".
-  it("a write that got no answer does not claim the engine was not changed", async () => {
-    answer({ put: () => Promise.reject(new Error("socket closed")) });
+  /** A fetch whose PUT fails and whose reads after it wait on `release`; the first read is instant. */
+  function failedWriteThenHeldRead(): () => void {
+    let release: () => void = () => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let reads = 0;
+    daemon.apiFetch.mockImplementation(async (_path: string, init?: RequestInit) => {
+      if (init?.method === "PUT") throw new Error("socket closed");
+      reads += 1;
+      if (reads > 1) await held;
+      return { enabled: false, acknowledged: false, warning: WARNING, warning_version: 1, installed: true };
+    });
+    return release;
+  }
+
+  // Wording assumed: while the read is pending the note matches /unknown|not sure|may have/i, e.g.
+  // "whether {label} was changed is unknown". Once the read settles that note is replaced by one
+  // matching /no reply/i, e.g. "the daemon gave no reply to that change: the switch shows the
+  // current setting".
+  it("a write that got no reply is unknown while the read after it is pending", async () => {
+    const release = failedWriteThenHeldRead();
     mount();
 
     await enable();
 
-    expect(await screen.findByText(/not sure|unknown|may have/i)).toBeDefined();
+    expect(await screen.findByText(/unknown/i)).toBeDefined();
+    expect(screen.queryByText(/was not changed/i)).toBeNull();
+    release();
+  });
+
+  it("once the read after a write with no reply settles, the switch shows the current setting", async () => {
+    const release = failedWriteThenHeldRead();
+    mount();
+
+    await enable();
+    await screen.findByText(/unknown/i);
+    release();
+
+    expect(await screen.findByText(/no reply/i)).toBeDefined();
+    await waitFor(() => expect(screen.queryByText(/unknown/i)).toBeNull());
+    expect(screen.queryByText(/not responding/i)).toBeNull();
     expect(screen.queryByText(/was not changed/i)).toBeNull();
   });
 
@@ -231,6 +264,7 @@ describe("EngineOptIn - what the window claims (review 7)", () => {
     });
 
     expect(screen.getByText(TAKES_EFFECT)).toBeDefined();
+    expect(screen.getByText(/could not read/i)).toBeDefined();
     expect(screen.queryByText(/was not changed/i)).toBeNull();
   });
 
