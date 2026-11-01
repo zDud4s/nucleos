@@ -7,8 +7,9 @@
 //! in the handoff of the change that added it.
 
 use nucleos_core::process_tree::KillOnCloseJob;
+use nucleos_core::relaunch::{self, SUPERVISED_VAR, SwapOutcome};
 use nucleos_core::supervise::{
-    Decision, EXIT_PORT_BUSY, Policy, SUPERVISE_FLAG, StopReason, Tracker,
+    Decision, EXIT_PORT_BUSY, EXIT_RESTART_REQUESTED, Policy, SUPERVISE_FLAG, StopReason, Tracker,
 };
 use nucleos_core::{daemon_client, data_dir, settings_cli};
 use std::io::Write;
@@ -95,6 +96,9 @@ pub(super) async fn run() -> i32 {
         journal.say(&format!("launching {}", exe.display()));
         let code = match tokio::process::Command::new(&exe)
             .args(&child_args)
+            // Tells the daemon that this process relaunches it, so a restart is an exit and not a
+            // relauncher of its own (which this job would kill).
+            .env(SUPERVISED_VAR, "1")
             .kill_on_drop(true)
             .spawn()
         {
@@ -135,6 +139,21 @@ pub(super) async fn run() -> i32 {
                     "the daemon exited with code {shown}: something already answers on 127.0.0.1:{port}, not restarting"
                 ));
                 return EXIT_PORT_BUSY;
+            }
+            Decision::Restart { after } if code == Some(EXIT_RESTART_REQUESTED) => {
+                journal.say(&format!(
+                    "restart requested after {}s; relaunching",
+                    ran.as_secs()
+                ));
+                // The staged build, if there is one, goes in before the next launch.
+                match relaunch::swap_staged(&exe) {
+                    SwapOutcome::NothingStaged => {}
+                    SwapOutcome::Swapped => journal.say("swapped in the staged executable"),
+                    SwapOutcome::Failed(reason) => journal.say(&format!(
+                        "could not swap in the staged executable, relaunching the current one: {reason}"
+                    )),
+                }
+                tokio::time::sleep(after).await;
             }
             Decision::Restart { after } => {
                 journal.say(&format!(

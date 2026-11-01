@@ -9,6 +9,8 @@ pub(super) fn routes() -> Router<AppState> {
         // `/daemon/shutdown`. A run's key must not read the readiness or begin a drain.
         .route("/system/update-readiness", get(get_update_readiness))
         .route("/system/shutdown", post(post_system_shutdown))
+        // Restarts the daemon once running work has settled. Control and Admin only, by the `system` segment, like `/system/shutdown`.
+        .route("/system/restart", post(super::restart::post_system_restart))
         // Control token only, checked inside the handler (`require_control`) and not only by the
         // `system` segment: a later device level must not open a route that takes a password.
         .route(
@@ -657,18 +659,32 @@ pub(super) async fn post_ingest_chats(
     }
 }
 
+#[derive(Deserialize)]
+pub(super) struct UpdateReadinessQuery {
+    /// The run asking, left out of `waiting_on` with its chat (see `shutdown::blocking_runs`).
+    pub(super) requester_run: Option<i64>,
+}
+
 /// `GET /system/update-readiness`: the version, how many runs are live, and whether the daemon is
 /// already draining. What the updater asks before it stops anything.
+///
+/// `waiting_on` leaves out runs parked on a question, and the requester's own chat when
+/// `requester_run` is given.
 async fn get_update_readiness(
     State(state): State<AppState>,
+    Query(query): Query<UpdateReadinessQuery>,
 ) -> Result<Json<crate::shutdown::Readiness>, StatusCode> {
-    crate::shutdown::readiness(&state.pool)
-        .await
-        .map(Json)
-        .map_err(|error| {
-            tracing::warn!(%error, "could not count the live runs for the update readiness");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })
+    crate::shutdown::readiness_for(
+        &state.pool,
+        query.requester_run,
+        &crate::hooks::run_is_parked,
+    )
+    .await
+    .map(Json)
+    .map_err(|error| {
+        tracing::warn!(%error, "could not count the live runs for the update readiness");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
 }
 
 /// Only the control token: not an API key of any level, not a run, not a paired device.

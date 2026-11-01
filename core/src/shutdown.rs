@@ -292,6 +292,39 @@ pub async fn drain_until_idle(
     }
 }
 
+/// Set when the daemon is leaving to be started again (`POST /system/restart`), so `main` picks the
+/// exit that relaunches it instead of the plain stop. Never cleared: the process is on its way out.
+static RESTART_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Remembers that the stop in progress is a restart.
+pub fn mark_restart_requested() {
+    RESTART_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+/// Whether the stop in progress is a restart.
+pub fn restart_requested() -> bool {
+    RESTART_REQUESTED.load(Ordering::SeqCst)
+}
+
+/// Waits like [`drain_until_idle`], or with `force` does not wait at all: `stop` is called at once
+/// and the runs still live are left to the next start's orphan reconciliation. A timed-out wait
+/// calls nothing and reopens the door, exactly as the update drain does.
+pub async fn restart_when_idle(
+    pool: &SqlitePool,
+    requester_run: Option<i64>,
+    timeout: Duration,
+    poll: Duration,
+    force: bool,
+    stop: impl FnOnce(),
+    parked: ParkedTest<'_>,
+) -> sqlx::Result<DrainOutcome> {
+    if force {
+        stop();
+        return Ok(DrainOutcome::Stopped);
+    }
+    drain_until_idle(pool, requester_run, timeout, poll, stop, parked).await
+}
+
 /// Whether a request starts a run without taking a slot, which `concurrency` cannot refuse for us.
 /// Pure, over the concrete path, and deliberately a list: a route that is not here keeps working
 /// while the daemon drains, which is what the hooks of a run still in flight need.
@@ -470,6 +503,107 @@ mod tests {
             claim(&pool, "project-a", Owner::Run(fresh)).await.unwrap(),
             ClaimOutcome::Claimed(1)
         );
+    }
+
+    /// A restart that cannot wait out the work leaves the daemon serving: nothing stopped, nothing
+    /// interrupted, the door open again.
+    #[tokio::test]
+    async fn a_timed_out_restart_keeps_the_daemon_up_and_spawns_nothing() {
+        let pool = crate::testdb::fresh_pool().await;
+        let run = seed_run(&pool, "running").await;
+        let _reopen = Reopen;
+        assert!(begin_draining());
+        let stopped = std::cell::Cell::new(false);
+        let outcome = restart_when_idle(
+            &pool,
+            None,
+            Duration::ZERO,
+            Duration::from_millis(1),
+            false,
+            || stopped.set(true),
+            &|_| false,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            DrainOutcome::TimedOut { live_runs: 1, .. }
+        ));
+        assert!(!stopped.get(), "nothing is stopped");
+        assert!(!is_draining(), "a later restart can start");
+        assert_eq!(status_of(&pool, run).await, "running");
+    }
+
+    #[tokio::test]
+    async fn force_restarts_without_waiting() {
+        let pool = crate::testdb::fresh_pool().await;
+        seed_run(&pool, "running").await;
+        let stopped = std::cell::Cell::new(false);
+        let outcome = restart_when_idle(
+            &pool,
+            None,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+            true,
+            || stopped.set(true),
+            &|_| false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, DrainOutcome::Stopped);
+        assert!(stopped.get());
+    }
+
+    /// Running work holds a restart back until it settles; `force` is the way past it.
+    #[tokio::test]
+    async fn an_update_waits_for_running_work_and_can_be_forced() {
+        let pool = crate::testdb::fresh_pool().await;
+        let run = seed_run(&pool, "running").await;
+        let stopped = std::cell::Cell::new(false);
+        // Timing out, not cancelling: a cancelled query closes the only connection, and the
+        // in-memory database with it.
+        let waited = restart_when_idle(
+            &pool,
+            None,
+            Duration::from_millis(60),
+            Duration::from_millis(5),
+            false,
+            || stopped.set(true),
+            &|_| false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(waited, DrainOutcome::TimedOut { .. }),
+            "{waited:?}"
+        );
+        assert!(!stopped.get());
+
+        // Settled: two quiet reads and it stops.
+        sqlx::query("UPDATE runs SET status = 'completed' WHERE id = ?")
+            .bind(run)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let outcome = restart_when_idle(
+            &pool,
+            None,
+            Duration::from_secs(3600),
+            Duration::from_millis(5),
+            false,
+            || stopped.set(true),
+            &|_| false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, DrainOutcome::Stopped);
+        assert!(stopped.get());
+    }
+
+    #[test]
+    fn a_marked_restart_is_remembered() {
+        mark_restart_requested();
+        assert!(restart_requested());
     }
 
     #[test]

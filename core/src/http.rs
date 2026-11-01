@@ -56,6 +56,7 @@ mod proposals;
 mod relay;
 mod remote;
 mod repo;
+mod restart;
 mod run_queue;
 mod settings;
 mod tasks;
@@ -24254,6 +24255,7 @@ mod tests {
 
         for (method, path) in [
             ("POST", "/system/shutdown"),
+            ("POST", "/system/restart"),
             ("GET", "/system/update-readiness"),
         ] {
             let response = build_router(state.clone())

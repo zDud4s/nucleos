@@ -387,12 +387,11 @@ async fn turn_on(
     {
         // Serve was published by this call and nothing is behind it now: take it back, but never a
         // publication that was already there.
-        if published_here {
-            if let Some(cli) = cli.as_deref() {
-                if let Err(failure) = setup::run(cli, TailscaleCall::ServeOff).await {
-                    tracing::warn!(why = %failure.why, "could not roll back publishing the gateway on Tailscale");
-                }
-            }
+        if published_here
+            && let Some(cli) = cli.as_deref()
+            && let Err(failure) = setup::run(cli, TailscaleCall::ServeOff).await
+        {
+            tracing::warn!(why = %failure.why, "could not roll back publishing the gateway on Tailscale");
         }
         return setup_error(error).into_response();
     }
@@ -434,10 +433,10 @@ async fn turn_off(
     }
     // Best effort: the gateway is already off, so a Tailscale that will not answer changes nothing
     // about who can get in. Only a publication that points at the gateway is stopped.
-    if let Some(cli) = cli {
-        if let Err(failure) = setup::serve_off(&cli).await {
-            tracing::warn!(why = %failure.why, "could not stop publishing the gateway on Tailscale");
-        }
+    if let Some(cli) = cli
+        && let Err(failure) = setup::serve_off(&cli).await
+    {
+        tracing::warn!(why = %failure.why, "could not stop publishing the gateway on Tailscale");
     }
     Json(setup_view(root).await).into_response()
 }

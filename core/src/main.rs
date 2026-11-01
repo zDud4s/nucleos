@@ -44,6 +44,11 @@ fn machine_doc<T: settings::Document + Default>() -> T {
 #[tokio::main]
 async fn main() {
     http::remember_home();
+    // The relauncher a restarted daemon spawns (`relaunch.rs`): first, because it must start
+    // nothing but the daemon it relaunches.
+    if let Some(code) = relaunch::dispatch(&std::env::args_os().collect::<Vec<_>>()) {
+        std::process::exit(code);
+    }
     if cli::run_subcommand().await {
         return;
     }
@@ -88,6 +93,13 @@ async fn main() {
 
     let log_dir = data_dir.join("logs");
     let _log_guard = logging::init(&log_dir);
+    // The executable a swap replaced waits here to be deleted; a supervisor still running from it
+    // keeps it locked, and then it goes at a later start.
+    if let Ok(exe) = std::env::current_exe()
+        && let Err(error) = relaunch::clean_old(&exe)
+    {
+        tracing::info!(%error, "could not remove the replaced executable yet");
+    }
 
     // Something that answers on a taken port must make this process leave before it touches
     // anything: the startup below marks the live runs of whoever owns the port as `interrupted`,
@@ -1310,11 +1322,20 @@ async fn main() {
     // A held long-poll (`/hooks/ask-wait`) would keep graceful shutdown waiting forever, and the
     // old binary alive under the installer; after the deadline the process just leaves. The
     // watchdog runs on its own OS thread, so it outlives the runtime.
-    http::spawn_exit_watchdog(std::time::Duration::from_secs(10), || std::process::exit(0));
+    // A restart leaves with the exit the supervisor relaunches on, or spawns its relauncher first
+    // (`relaunch::exit_code_for_stop`); any other stop is a plain 0.
+    http::spawn_exit_watchdog(std::time::Duration::from_secs(10), || {
+        std::process::exit(relaunch::exit_code_for_stop())
+    });
     axum::serve(listener, app)
         .with_graceful_shutdown(http::shutdown_requested())
         .await
         .unwrap();
+    let code = relaunch::exit_code_for_stop();
+    if code != 0 {
+        drop(_log_guard); // flush the log before `exit` skips destructors
+        std::process::exit(code);
+    }
 }
 
 #[cfg(test)]
