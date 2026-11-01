@@ -82,6 +82,34 @@ mod tests {
         }
     }
 
+    /// E15 F2: a stored row is not run through `finish` on load, so `enabled()` itself must require
+    /// the current acknowledgement. `with_document` publishes the raw value, as the load does.
+    #[test]
+    fn a_stored_row_without_the_current_acknowledgement_does_not_open_the_gate() {
+        use crate::settings::testing::{self as settings_testing};
+        use crate::settings::{Scope, Settings, Snapshot};
+
+        let install = |doc: AgyDoc| {
+            let snapshot = Snapshot::default().with_document(&Scope::Machine, doc);
+            settings_testing::install(Settings::from_snapshot(snapshot))
+        };
+        for acknowledged in [None, Some(0), Some(WARNING_VERSION + 1)] {
+            let _gate = install(AgyDoc {
+                enabled: true,
+                acknowledged_warning_version: acknowledged,
+            });
+            assert!(
+                !crate::engines::agy::enabled(),
+                "enabled:true with acknowledgement {acknowledged:?} must not open the gate"
+            );
+        }
+        let _gate = install(AgyDoc {
+            enabled: true,
+            acknowledged_warning_version: Some(WARNING_VERSION),
+        });
+        assert!(crate::engines::agy::enabled());
+    }
+
     /// The registry snapshot of the document's schema. The settings schema tests only list their
     /// documents by name, so the agy one is pinned here, with the same `UPDATE_SNAPSHOTS=1` rule.
     #[test]

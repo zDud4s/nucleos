@@ -169,6 +169,43 @@ pub(super) async fn resolve_seat(
     })
 }
 
+#[cfg(test)]
+mod agy_primary_tests {
+    use super::*;
+
+    /// E16 F3: a model seat names no engine, so under `primary_runner: agy` it would run on agy.
+    #[test]
+    fn an_unpinned_seat_refuses_an_agy_primary() {
+        let primary = |name: &str| crate::config::ModelsConfig {
+            primary_runner: Some(name.to_owned()),
+            ..crate::config::ModelsConfig::default()
+        };
+        let error = refuse_unpinned_seat_on_agy_primary("member 1", false, &primary("agy"))
+            .unwrap_err();
+        assert_eq!(
+            error,
+            StartError::Invalid(format!("member 1: {}", crate::engines::AGY_REFUSAL))
+        );
+        // A seat pinned to claude or codex (an agent that declares its engine) still starts.
+        assert_eq!(
+            refuse_unpinned_seat_on_agy_primary("member 1", true, &primary("agy")),
+            Ok(())
+        );
+        assert_eq!(
+            refuse_unpinned_seat_on_agy_primary("member 1", false, &primary("claude")),
+            Ok(())
+        );
+        assert_eq!(
+            refuse_unpinned_seat_on_agy_primary(
+                "member 1",
+                false,
+                &crate::config::ModelsConfig::default()
+            ),
+            Ok(())
+        );
+    }
+}
+
 /// Deletes a council's throwaway MCP config however the council ends.
 ///
 /// Built BEFORE the driver task and captured by it, which is the first of the three cancellation

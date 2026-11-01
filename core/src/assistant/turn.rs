@@ -1976,6 +1976,57 @@ mod agy_chat_tests {
         assert!(fake.was_launched());
     }
 
+    /// E16 F5: nothing shows agy honours the PreToolUse hook that makes `Unrestricted` safe, so an agy
+    /// chat is always MCP-only.
+    #[test]
+    fn an_agy_chat_is_never_unrestricted() {
+        use crate::execution::runner::ToolPolicy;
+        assert_eq!(
+            tool_policy_for_engine("agy", ToolPolicy::Unrestricted),
+            ToolPolicy::McpOnly
+        );
+        assert_eq!(
+            tool_policy_for_engine("agy", ToolPolicy::McpOnly),
+            ToolPolicy::McpOnly
+        );
+        for cli in ["claude", "codex"] {
+            for policy in [
+                ToolPolicy::Unrestricted,
+                ToolPolicy::McpOnly,
+                ToolPolicy::None,
+            ] {
+                assert_eq!(tool_policy_for_engine(cli, policy), policy, "{cli}");
+            }
+        }
+    }
+
+    /// E16 F9: if the factory has no runner for agy (the gate closed between two reads), the turn is
+    /// refused, never answered by the daemon's own runner.
+    #[test]
+    fn runner_for_turn_never_answers_agy_with_the_daemon_runner() {
+        let _gate = agy_gate(true);
+        let config = ModelsConfig::default();
+        assert_eq!(config.active_runner(), "claude");
+        let daemon: std::sync::Arc<dyn crate::execution::runner::CommandRunner> =
+            std::sync::Arc::new(crate::execution::runner::FakeCommandRunner::default());
+        // `NoAssistants` answers `None` from `cli_runner`, as a closed gate does.
+        let result = runner_for_turn(
+            &daemon,
+            &crate::assistants::NoAssistants,
+            &config,
+            Some(AGY_MODEL),
+        );
+        assert!(matches!(result, Err(EngineDisabled)));
+        // A claude pin still gets the daemon runner.
+        let claude = runner_for_turn(
+            &daemon,
+            &crate::assistants::NoAssistants,
+            &config,
+            Some("claude-opus-4-6"),
+        );
+        assert!(matches!(claude, Ok((_, "claude"))));
+    }
+
     /// The chat request for `cli`, as the real caller builds it for an MCP-only chat turn.
     fn mcp_only_request(cli: &str) -> crate::execution::runner::RunRequest {
         chat_run_request(

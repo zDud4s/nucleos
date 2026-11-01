@@ -757,6 +757,19 @@ mod primary_tests {
         assert!(!fake.was_launched(), "the refusal never reaches the binary");
     }
 
+    /// E16 F3: the helper agents, teams and council share to refuse unpinned work under an agy primary.
+    #[test]
+    fn refuse_agy_primary_names_agy_only_when_the_primary_is_agy() {
+        let with = |name: Option<&str>| ModelsConfig {
+            primary_runner: name.map(str::to_string),
+            ..ModelsConfig::default()
+        };
+        assert_eq!(refuse_agy_primary(&with(Some("agy"))), Err(AGY_REFUSAL));
+        assert_eq!(refuse_agy_primary(&with(None)), Ok(()));
+        assert_eq!(refuse_agy_primary(&with(Some("codex"))), Ok(()));
+        assert_eq!(refuse_agy_primary(&with(Some("claude"))), Ok(()));
+    }
+
     #[test]
     fn primary_runner_unknown_still_warns_and_uses_claude() {
         let _gate = agy_gate(false);

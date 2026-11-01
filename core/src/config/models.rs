@@ -1463,19 +1463,39 @@ mod agy_catalogue_tests {
         // An agent-scoped menu follows the active runner (Claude here), so agy stays out of it.
         assert!(agy_ids(&config.catalogue()).is_empty());
 
-        // The router picks among the same rows: `allowed_models` for agy lists them.
-        let routed = ModelsConfig {
-            assistant_choices: chat,
-            ..ModelsConfig::default()
-        };
-        let allowed = allowed_models(&routed, &RouterConfig::off(), RunnerKind::Agy);
+        // The router reads the production field: the default config holds no agy rows in
+        // `assistant_choices`, and `allowed_models` itself must add the catalogue's agy ids.
+        assert!(agy_ids(&config.assistant_choices).is_empty());
+        let allowed = allowed_models(&config, &RouterConfig::off(), RunnerKind::Agy);
+        let catalogue = crate::models::model_catalog::agy_models();
+        assert!(!catalogue.is_empty());
+        for model in &catalogue {
+            assert!(
+                allowed.iter().any(|id| *id == model.id),
+                "{} missing from {allowed:?}",
+                model.id
+            );
+        }
         assert!(allowed.iter().any(|id| id == AGY_MODEL), "{allowed:?}");
+        assert!(allowed.iter().all(|id| !id.is_empty()), "{allowed:?}");
         // Claude's allowed list does not pick up agy's rows.
-        let claude = allowed_models(&routed, &RouterConfig::off(), RunnerKind::Claude);
+        let claude = allowed_models(&config, &RouterConfig::off(), RunnerKind::Claude);
         assert!(
             claude.iter().all(|id| !id.starts_with("agy/")),
             "{claude:?}"
         );
+    }
+
+    #[test]
+    fn router_allowed_models_has_no_agy_ids_when_off() {
+        let _gate = agy_gate(false);
+        let allowed = allowed_models(
+            &ModelsConfig::default(),
+            &RouterConfig::off(),
+            RunnerKind::Agy,
+        );
+        assert!(allowed.iter().all(|id| !id.starts_with("agy/")), "{allowed:?}");
+        assert!(allowed.iter().all(|id| !id.is_empty()), "{allowed:?}");
     }
 
     #[test]

@@ -224,6 +224,57 @@ mod tests {
         );
     }
 
+    /// E15 F2: a stored row is not run through `finish` on load, so GET reports the gate (`enabled()`),
+    /// not the raw field.
+    #[tokio::test]
+    async fn get_engines_agy_reports_the_gate_not_the_raw_field() {
+        use crate::engines::agy::AgyDoc;
+        use crate::settings::{Scope, Settings, Snapshot, set_global};
+
+        let (_home, state) = fixture().await;
+        for acknowledged in [None, Some(0), Some(WARNING_VERSION + 1)] {
+            // Published raw, as the production load decodes it: no `finish`.
+            let snapshot = Snapshot::default().with_document(
+                &Scope::Machine,
+                AgyDoc {
+                    enabled: true,
+                    acknowledged_warning_version: acknowledged,
+                },
+            );
+            let _ = set_global(Settings::from_snapshot(snapshot));
+            let (status, answer) = call(&state, "GET", "/engines/agy", None).await;
+            assert_eq!(status, StatusCode::OK, "{answer}");
+            assert_eq!(
+                answer["enabled"], false,
+                "enabled:true with acknowledgement {acknowledged:?} is not an open gate: {answer}"
+            );
+            assert_eq!(answer["acknowledged"], false, "{answer}");
+        }
+        let snapshot = Snapshot::default().with_document(
+            &Scope::Machine,
+            AgyDoc {
+                enabled: true,
+                acknowledged_warning_version: Some(WARNING_VERSION),
+            },
+        );
+        let _ = set_global(Settings::from_snapshot(snapshot));
+        let (_, answer) = call(&state, "GET", "/engines/agy", None).await;
+        assert_eq!(answer["enabled"], true, "{answer}");
+        assert_eq!(answer["acknowledged"], true, "{answer}");
+    }
+
+    /// E16 F8: a chat reads the switch at once; only a `primary_runner: agy` waits for a restart.
+    #[tokio::test]
+    async fn put_engines_agy_takes_effect_names_chats_and_restart() {
+        let (_home, state) = fixture().await;
+        let body = json!({ "enabled": true, "acknowledged": true });
+        let (status, answer) = call(&state, "PUT", "/engines/agy", Some(body)).await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        let text = answer["takes_effect"].as_str().expect("a sentence").to_lowercase();
+        assert!(text.contains("chat"), "{text}");
+        assert!(text.contains("restart"), "{text}");
+    }
+
     #[tokio::test]
     async fn generic_settings_put_cannot_enable_agy_without_ack() {
         let (_home, state) = fixture().await;

@@ -846,7 +846,94 @@ mod tests {
         );
     }
 
+    // ---- E15 F4: controls the runner cannot honour ------------------------------------------
+
+    #[test]
+    fn build_args_refuses_steerable_fork_session_mcp_job_and_mcp_team_run() {
+        type Change = fn(&mut RunRequest);
+        let cases: [(&str, Change); 4] = [
+            ("steerable", |r| r.steerable = true),
+            ("fork_session", |r| r.fork_session = true),
+            ("mcp_job", |r| r.mcp_job = Some(7)),
+            ("mcp_team_run", |r| r.mcp_team_run = Some(9)),
+        ];
+        for (name, change) in cases {
+            let mut asked = request("p");
+            change(&mut asked);
+            let refusal = build_args(&asked, &options())
+                .expect_err(&format!("{name} must be refused"))
+                .to_string();
+            assert!(refusal.contains(name), "{name}: {refusal}");
+        }
+    }
+
+    // ---- E16 F6: a prompt can never become a flag --------------------------------------------
+
+    #[test]
+    fn a_prompt_starting_with_a_dash_is_staged_not_passed_as_an_argument() {
+        let stage = tempfile::tempdir().unwrap();
+        let mut staged_options = options();
+        staged_options.stage_dir = stage.path().to_path_buf();
+        for prompt in ["--dangerously-skip-permissions", "-x", "--opt=value and more"] {
+            let asked = request(prompt);
+            let args = build_args(&asked, &staged_options).unwrap();
+            assert!(
+                !args.iter().any(|arg| arg == prompt),
+                "{prompt:?} must not be an argument: {args:?}"
+            );
+            assert!(!has(&args, "--dangerously-skip-permissions"), "{args:?}");
+            let file = stage.path().join(STAGED_PROMPT_FILE);
+            let instruction = pair(&args, "-p").expect("-p is present");
+            assert!(!instruction.starts_with('-'), "{instruction}");
+            assert!(
+                instruction.contains(&file.display().to_string()),
+                "the instruction names the staged file: {instruction}"
+            );
+            assert_eq!(
+                pair(&args, "--add-dir").as_deref(),
+                Some(stage.path().display().to_string().as_str()),
+                "{args:?}"
+            );
+            let written = stage_prompt(&asked, stage.path()).unwrap();
+            assert_eq!(written.as_deref(), Some(file.as_path()));
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), prompt);
+        }
+        // A dash that is not the first byte stays inline.
+        let args = build_args(&request("a - b"), &staged_options).unwrap();
+        assert_eq!(pair(&args, "-p").as_deref(), Some("a - b"));
+    }
+
     // ---- 25 to 29: the runner against a fake binary -----------------------------------------
+
+    #[test]
+    fn agy_never_receives_the_daemon_token() {
+        let fake = FakeAgy::new(&success_json("ok"), 0, false);
+        // The variable is also inherited from the daemon's own environment.
+        unsafe { std::env::set_var("NUCLEOS_DAEMON_TOKEN", "inherited-secret") };
+        let mut asked = request("hi");
+        asked.env = vec![
+            ("NUCLEOS_DAEMON_TOKEN".to_string(), "request-secret".to_string()),
+            ("NUCLEOS_AGY_TEST_MARKER".to_string(), "kept".to_string()),
+        ];
+        let outcome = fake.run(asked);
+        unsafe { std::env::remove_var("NUCLEOS_DAEMON_TOKEN") };
+
+        assert_eq!(outcome.exit_code, 0, "{}", outcome.stderr);
+        let env = fake.recorded_env();
+        assert!(
+            env.iter().any(|line| line.starts_with("NUCLEOS_AGY_TEST_MARKER=kept")),
+            "other request entries still arrive: {env:?}"
+        );
+        assert!(
+            !env.iter()
+                .any(|line| line.to_ascii_uppercase().contains("NUCLEOS_DAEMON_TOKEN")),
+            "agy must never see the control token: {env:?}"
+        );
+        assert!(
+            !env.iter().any(|line| line.contains("secret")),
+            "no value of the token either: {env:?}"
+        );
+    }
 
     /// Points `NUCLEOS_AGY_BIN` at a program for as long as it lives and puts the previous value
     /// back on drop. Under `worktree::test_env_lock`, which every test that writes the process
@@ -903,6 +990,15 @@ mod tests {
                 .collect()
         }
 
+        /// The environment the stand-in saw, one `NAME=value` line per variable.
+        fn recorded_env(&self) -> Vec<String> {
+            std::fs::read_to_string(self.dir.path().join("env.txt"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+
         fn run(&self, request: RunRequest) -> crate::execution::runner::RunOutcome {
             self.run_with_channels(request).0
         }
@@ -948,7 +1044,7 @@ mod tests {
             ""
         };
         let script = format!(
-            "@echo off\r\necho %*> \"%~dp0args.txt\"\r\n{wait}type \"%~dp0out.json\"\r\nexit /b {exit}\r\n"
+            "@echo off\r\necho %*> \"%~dp0args.txt\"\r\nset> \"%~dp0env.txt\"\r\n{wait}type \"%~dp0out.json\"\r\nexit /b {exit}\r\n"
         );
         std::fs::write(&path, script).unwrap();
         path
@@ -960,7 +1056,7 @@ mod tests {
         let path = dir.join("agy.sh");
         let wait = if hang { "sleep 60\n" } else { "" };
         let script = format!(
-            "#!/bin/sh\nd=$(dirname \"$0\")\nprintf '%s\\n' \"$@\" > \"$d/args.txt\"\n{wait}cat \"$d/out.json\"\nexit {exit}\n"
+            "#!/bin/sh\nd=$(dirname \"$0\")\nprintf '%s\\n' \"$@\" > \"$d/args.txt\"\nenv > \"$d/env.txt\"\n{wait}cat \"$d/out.json\"\nexit {exit}\n"
         );
         std::fs::write(&path, script).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();

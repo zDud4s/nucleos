@@ -404,6 +404,33 @@ mod tests {
         assert!(!plan.runners.contains(&RunnerKind::Agy));
     }
 
+    /// E16 F3: an unpinned launch under `primary_runner: agy` would land on the daemon's runner.
+    #[test]
+    fn unpinned_agent_refuses_an_agy_primary() {
+        let primary = |name: &str| crate::config::ModelsConfig {
+            primary_runner: Some(name.to_owned()),
+            ..crate::config::ModelsConfig::default()
+        };
+        let error = refuse_unpinned_on_agy_primary("coder@1.0.0", false, &primary("agy"))
+            .unwrap_err();
+        assert!(matches!(error, LaunchError::NoRunner(_)), "{error:?}");
+        assert_eq!(
+            error.to_string(),
+            "coder@1.0.0: the agy engine is not available for agents, teams or council"
+        );
+        // A pin to another engine under an agy primary still launches.
+        assert!(refuse_unpinned_on_agy_primary("coder@1.0.0", true, &primary("agy")).is_ok());
+        assert!(refuse_unpinned_on_agy_primary("coder@1.0.0", false, &primary("claude")).is_ok());
+        assert!(
+            refuse_unpinned_on_agy_primary(
+                "coder@1.0.0",
+                false,
+                &crate::config::ModelsConfig::default()
+            )
+            .is_ok()
+        );
+    }
+
     #[test]
     fn without_a_router_only_translation_narrows() {
         let plan = plan_launch("a", &[FsRead], None, None, &[Claude]).unwrap();

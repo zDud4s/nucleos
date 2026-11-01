@@ -980,4 +980,35 @@ mod tests {
         assert_eq!(runner_kind_of(Engine::Codex), Ok(Some(RunnerKind::Codex)));
         assert_eq!(runner_kind_of(Engine::Local), Ok(None));
     }
+
+    /// E16 F3: a member with no pin falls to `state.runner`, which is agy under `primary_runner: agy`.
+    #[test]
+    fn an_unpinned_team_member_refuses_an_agy_primary() {
+        let primary = |name: &str| crate::config::ModelsConfig {
+            primary_runner: Some(name.to_owned()),
+            ..crate::config::ModelsConfig::default()
+        };
+        assert_eq!(
+            refuse_unpinned_member_on_agy_primary(None, &primary("agy")),
+            Err(crate::engines::AGY_REFUSAL.to_owned())
+        );
+        // A pin to claude (or codex) still launches under an agy primary.
+        assert_eq!(
+            refuse_unpinned_member_on_agy_primary(Some(RunnerKind::Claude), &primary("agy")),
+            Ok(())
+        );
+        assert_eq!(
+            refuse_unpinned_member_on_agy_primary(Some(RunnerKind::Codex), &primary("agy")),
+            Ok(())
+        );
+        // No pin under a claude primary, or no primary at all, is today's behaviour.
+        assert_eq!(
+            refuse_unpinned_member_on_agy_primary(None, &primary("claude")),
+            Ok(())
+        );
+        assert_eq!(
+            refuse_unpinned_member_on_agy_primary(None, &crate::config::ModelsConfig::default()),
+            Ok(())
+        );
+    }
 }

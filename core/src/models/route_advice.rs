@@ -2475,6 +2475,77 @@ mod tests {
         assert!(!installed_engines().contains(&RunnerKind::Agy));
     }
 
+    /// E16 F7: agy is a router alternate for read-only work only.
+    #[test]
+    fn agy_alternate_is_eligible_only_for_a_read_only_run() {
+        let _gate = crate::engines::agy_test_support::agy_gate(true);
+        let router = Router::new(
+            config(Mode::Shadow, DEFAULT_URL),
+            available(RunnerKind::Claude, Arc::new(Probe), &["claude-*"]),
+            vec![available(
+                RunnerKind::Agy,
+                Arc::new(crate::execution::runner::FakeCommandRunner::default()),
+                &["agy/*"],
+            )],
+        );
+        let with = |permission, tool_policy, classifier, resume| {
+            router.eligible(RunShape {
+                permission,
+                classifier_governs_tools: classifier,
+                tool_policy,
+                resume,
+            })
+        };
+        let takes = |kinds: Vec<RunnerKind>| kinds.contains(&RunnerKind::Agy);
+
+        // Read-only: a plan run, or a restricted tool policy.
+        assert!(takes(with(Permission::Plan, ToolPolicy::Unrestricted, false, false)));
+        assert!(takes(with(Permission::Default, ToolPolicy::McpOnly, false, false)));
+        assert!(takes(with(Permission::Default, ToolPolicy::None, false, false)));
+        assert!(agy_can_take(RunShape {
+            permission: Permission::Plan,
+            classifier_governs_tools: false,
+            tool_policy: ToolPolicy::Unrestricted,
+            resume: false,
+        }));
+        // Anything that writes, bypasses, is classifier-governed or resumes is not.
+        assert!(!takes(with(Permission::Default, ToolPolicy::Unrestricted, false, false)));
+        assert!(!takes(with(Permission::AcceptEdits, ToolPolicy::Unrestricted, false, false)));
+        assert!(!takes(with(Permission::Bypass, ToolPolicy::McpOnly, false, false)));
+        assert!(!takes(with(Permission::Bypass, ToolPolicy::Unrestricted, false, false)));
+        assert!(!takes(with(Permission::Plan, ToolPolicy::McpOnly, true, false)));
+        assert!(!takes(with(Permission::Default, ToolPolicy::McpOnly, true, false)));
+        assert!(!takes(with(Permission::Plan, ToolPolicy::McpOnly, false, true)));
+        // The primary is always there.
+        assert!(with(Permission::Bypass, ToolPolicy::Unrestricted, false, true).contains(&RunnerKind::Claude));
+    }
+
+    /// E16 F7: `spawn.rs` drops agy from the route of a run the runner would refuse, through the
+    /// existing `restrict_runners`.
+    #[test]
+    fn route_query_without_agy_leaves_the_other_runners() {
+        let none = query().without_agy();
+        let kinds = none
+            .restrict_runners
+            .expect("no restriction becomes one that names the other runners");
+        assert!(!kinds.contains(&RunnerKind::Agy), "{kinds:?}");
+        assert!(kinds.contains(&RunnerKind::Claude), "{kinds:?}");
+        assert!(kinds.contains(&RunnerKind::Codex), "{kinds:?}");
+
+        let mut restricted = query();
+        restricted.restrict_runners = Some(vec![RunnerKind::Agy, RunnerKind::Codex]);
+        assert_eq!(
+            restricted.without_agy().restrict_runners,
+            Some(vec![RunnerKind::Codex])
+        );
+        let mut only_claude = query();
+        only_claude.restrict_runners = Some(vec![RunnerKind::Claude]);
+        assert_eq!(
+            only_claude.without_agy().restrict_runners,
+            Some(vec![RunnerKind::Claude])
+        );
+    }
+
     #[test]
     fn front_with_ignores_agy_runner_name_when_off() {
         let mut config = config(Mode::Shadow, DEFAULT_URL);
