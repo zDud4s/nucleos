@@ -329,15 +329,32 @@ export async function probeHealth(): Promise<boolean> {
   }
 }
 
+/** A live run a restart or an update is waiting on (`core/src/shutdown.rs`, `BlockingRun`). */
+export interface BlockingRun {
+  run_id: number;
+  chat_id: string | null;
+}
+
 /**
- * What `GET /system/update-readiness` answers: the daemon's version, how many
- * runs are live (`running` or `awaiting_approval`), and whether it is already
- * draining for an update. The updater waits for `live_runs` to reach zero.
+ * What `GET /system/update-readiness` answers, and what `POST /system/restart` and
+ * `POST /system/shutdown` answer with 202: the daemon's version, how many runs are live
+ * (`running` or `awaiting_approval`), whether it is already draining, what a restart would
+ * wait on right now, and the process id (so a new daemon can be told from the one asked).
  */
 export interface UpdateReadiness {
   version: string;
   live_runs: number;
   draining: boolean;
+  waiting_on: BlockingRun[];
+  pid: number;
+}
+
+/** How the shell names what a restart or an update is waiting on, in one sentence fragment. */
+export function describeBlocking(waitingOn: BlockingRun[]): string {
+  if (waitingOn.length === 0) return "nothing: it is about to stop";
+  return waitingOn
+    .map((run) => (run.chat_id === null ? `run ${run.run_id}` : `run ${run.run_id} in chat ${run.chat_id}`))
+    .join(", ");
 }
 
 /**

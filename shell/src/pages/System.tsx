@@ -79,6 +79,7 @@ import {
 } from "../ui";
 import { RemoteDevices } from "../system/RemoteDevices";
 import { Autostart } from "../system/Autostart";
+import { RestartDaemon } from "../system/RestartDaemon";
 import { MachineSettings } from "./MachineSettings";
 import { ChannelsView } from "./ChannelsView";
 import { RestartSidecar } from "../channels/RestartSidecar";
@@ -1353,6 +1354,7 @@ function TokensView() {
       <TokensPanel />
       <RemoteDevices />
       <Autostart />
+      <RestartDaemon />
       <ConfigIndex />
     </>
   );
