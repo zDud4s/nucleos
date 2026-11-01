@@ -3532,7 +3532,11 @@ ok: {{ input: 2.0, output: 8.0 }}\n"
                 "{bad}: routing still loads"
             );
             assert!(
-                config.model_prices.dropped.iter().any(|w| w.starts_with("m: ")),
+                config
+                    .model_prices
+                    .dropped
+                    .iter()
+                    .any(|w| w.starts_with("m: ")),
                 "{bad}: and the drop is recorded, not only logged: {:?}",
                 config.model_prices.dropped
             );

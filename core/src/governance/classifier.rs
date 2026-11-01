@@ -616,7 +616,8 @@ pub fn classify(
 
     // The same database, for the tools that READ: a governed run's hook matches every tool, so
     // without this they fall to the `READ_LOCAL_TOOLS` allow below. See `reads_nucleos_data`.
-    if matches!(tool_name, "Read" | "Grep" | "Glob") && reads_nucleos_data(tool_name, tool_input, cwd)
+    if matches!(tool_name, "Read" | "Grep" | "Glob")
+        && reads_nucleos_data(tool_name, tool_input, cwd)
     {
         return classification("deny", NUCLEOS_DATA_CLASS, NUCLEOS_DATA_REASON);
     }
@@ -5720,7 +5721,10 @@ mod tests {
                     );
                 }
             }
-            for path in [format!(".ai/{origin}"), format!(".ai/{origin}{IMPORTED_SUFFIX}")] {
+            for path in [
+                format!(".ai/{origin}"),
+                format!(".ai/{origin}{IMPORTED_SUFFIX}"),
+            ] {
                 assert_classification(
                     classify("Write", &json!({ "file_path": path }), cwd),
                     "allow",
@@ -5895,8 +5899,14 @@ mod tests {
             assert!(!names_nucleos_data_in(path, &dirs), "{path}");
         }
         // No directory known at all: only the static spellings can match.
-        assert!(!names_nucleos_data_in("D:/scratch/second-daemon/nucleos.db", &[]));
-        assert!(names_nucleos_data_in("~/.local/share/nucleos/nucleos.db", &[]));
+        assert!(!names_nucleos_data_in(
+            "D:/scratch/second-daemon/nucleos.db",
+            &[]
+        ));
+        assert!(names_nucleos_data_in(
+            "~/.local/share/nucleos/nucleos.db",
+            &[]
+        ));
     }
 
     /// The scan is per WORD of the whole line, so glue, quoting and position do not matter.
@@ -5991,7 +6001,11 @@ mod tests {
                 // A home-rooted spelling lands "inside" a workspace once glued onto it, so the
                 // compiled outside-workspace deny does not catch it first: this rule does.
                 assert_classification(
-                    classify(tool, &json!({ key: path }), Some(Path::new(r"C:\work\repo"))),
+                    classify(
+                        tool,
+                        &json!({ key: path }),
+                        Some(Path::new(r"C:\work\repo")),
+                    ),
                     "deny",
                     "nucleos-data",
                 );
@@ -6096,7 +6110,8 @@ mod tests {
             guard("Bash", r#"sqlite3 ./other.db "select 1""#),
             Some(JudgeGuard::SensitiveSource)
         );
-        let recognised = r#"sqlite3 "$HOME/AppData/Local/nucleos/NucleOS/data/nucleos.db" "select 1""#;
+        let recognised =
+            r#"sqlite3 "$HOME/AppData/Local/nucleos/NucleOS/data/nucleos.db" "select 1""#;
         assert_eq!(guard("Bash", recognised), Some(JudgeGuard::SensitiveSource));
         assert_classification(
             classify("Bash", &json!({ "command": recognised }), cwd),
@@ -6157,20 +6172,47 @@ mod tests {
     fn a_read_tool_naming_the_database_is_denied_as_nucleos_data() {
         for cwd in [None, Some(Path::new(r"C:\work\repo"))] {
             for (tool, input) in [
-                ("Read", json!({ "file_path": r"%LOCALAPPDATA%\nucleos\NucleOS\data\nucleos.db" })),
-                ("Read", json!({ "file_path": "~/.local/share/nucleos/nucleos.db-wal" })),
+                (
+                    "Read",
+                    json!({ "file_path": r"%LOCALAPPDATA%\nucleos\NucleOS\data\nucleos.db" }),
+                ),
+                (
+                    "Read",
+                    json!({ "file_path": "~/.local/share/nucleos/nucleos.db-wal" }),
+                ),
                 (
                     "Read",
                     json!({ "file_path": "$HOME/Library/Application Support/dev.nucleos.NucleOS/nucleos.db" }),
                 ),
-                ("Grep", json!({ "pattern": "x", "path": "~/.local/share/nucleos/backups" })),
-                ("Grep", json!({ "pattern": "x", "path": "~/.local/share/nucleos" })),
-                ("Grep", json!({ "pattern": "x", "path": r"%LOCALAPPDATA%\nucleos\NucleOS\data" })),
-                ("Grep", json!({ "pattern": "x", "glob": "~/.local/share/nucleos/nucleos.*" })),
+                (
+                    "Grep",
+                    json!({ "pattern": "x", "path": "~/.local/share/nucleos/backups" }),
+                ),
+                (
+                    "Grep",
+                    json!({ "pattern": "x", "path": "~/.local/share/nucleos" }),
+                ),
+                (
+                    "Grep",
+                    json!({ "pattern": "x", "path": r"%LOCALAPPDATA%\nucleos\NucleOS\data" }),
+                ),
+                (
+                    "Grep",
+                    json!({ "pattern": "x", "glob": "~/.local/share/nucleos/nucleos.*" }),
+                ),
                 ("Glob", json!({ "pattern": "~/.local/share/nucleos/**" })),
-                ("Glob", json!({ "pattern": r"%LOCALAPPDATA%\nucleos\NucleOS\data\*" })),
-                ("Glob", json!({ "pattern": "~/.local/share/nucleos/nucleos.db*" })),
-                ("Glob", json!({ "pattern": "*.db", "path": "~/.local/share/nucleos" })),
+                (
+                    "Glob",
+                    json!({ "pattern": r"%LOCALAPPDATA%\nucleos\NucleOS\data\*" }),
+                ),
+                (
+                    "Glob",
+                    json!({ "pattern": "~/.local/share/nucleos/nucleos.db*" }),
+                ),
+                (
+                    "Glob",
+                    json!({ "pattern": "*.db", "path": "~/.local/share/nucleos" }),
+                ),
             ] {
                 assert_classification(classify(tool, &input, cwd), "deny", "nucleos-data");
             }
@@ -6179,12 +6221,21 @@ mod tests {
         // settings files (a different rule), and a regex that merely spells the file name.
         for (tool, input) in [
             ("Read", json!({ "file_path": "core/testdata/nucleos.db" })),
-            ("Read", json!({ "file_path": "~/.local/share/nucleos/logs/core.log" })),
+            (
+                "Read",
+                json!({ "file_path": "~/.local/share/nucleos/logs/core.log" }),
+            ),
             ("Read", json!({ "file_path": "~/.nucleos/github.yaml" })),
-            ("Grep", json!({ "pattern": "nucleos.db", "path": "core/src" })),
+            (
+                "Grep",
+                json!({ "pattern": "nucleos.db", "path": "core/src" }),
+            ),
             ("Grep", json!({ "pattern": "nucleos.db" })),
             ("Glob", json!({ "pattern": "**/*.rs" })),
-            ("Glob", json!({ "pattern": "*.db", "path": "core/testdata" })),
+            (
+                "Glob",
+                json!({ "pattern": "*.db", "path": "core/testdata" }),
+            ),
         ] {
             assert_classification(
                 classify(tool, &input, Some(Path::new(r"C:\work\repo"))),
