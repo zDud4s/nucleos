@@ -18,14 +18,15 @@ export interface ParityEntry {
 
 export const PARITY: ParityEntry[] = [
   // Files that branch on isRemote().
-  { where: "app/BrowserBridge.tsx", status: "exception", why: "the bridge drives the host's native webviews and is not started remotely (task 5.5)" },
+  { where: "app/BrowserBridge.tsx", status: "exception", why: "owner tabs use host native webviews and are not started remotely; replacing them with a tower Chrome screencast is the owner's decision, with measurements coming from the task 5.5 script" },
   { where: "app/Dictation.tsx", status: "adapted", why: "remotely the browser captures with lib/capture.ts, posts to /voice/capture and types the text into the field focused when recording started, or copies it to the clipboard (shown if the copy is refused); no host command is called (task 5.2)" },
   { where: "data/hotkeys.ts", status: "exception", why: "an OS-wide chord cannot be registered from a browser tab; remotely the registration is skipped and the Voice page says the shortcuts only work while the page is focused, where PageDictationShortcuts answers them (task 5.2)" },
   { where: "lib/vscode.ts", status: "exception", why: "VS Code opens on the host; remotely openInVscode rejects with a sentence (the editor opens on the main machine only); the three call sites with a catch show it, and the five without one hide their button (task 5.3)" },
   { where: "data/files.ts", status: "adapted", why: "remotely \"open on disk\" downloads the file as a native browser download (an anchor to /files/download, so a large file streams to disk; a failed one shows in the browser's downloads list, not in the page), because the disk is the host's; the Files page takes drops through the DOM and the File API and uploads them by the picker's route (a dropped folder is refused in words); ContextRefs cannot take a drop, since a context ref is a host path a browser never has, and says to type it (task 5.3)" },
   { where: "pages/NewProject.tsx", status: "adapted", why: "remotely Browse opens PathPicker, which lists directories from the tower only for an owner device; desktop Browse keeps its native dialog (task 5.4)" },
   { where: "app/desktop-toast.ts", status: "adapted", why: "remotely a toast is a Web Notification, shown only when the browser already granted permission; permission is requested from a click in System, never on load (task 5.3)" },
-  { where: "pages/WebTabs.tsx", status: "exception", why: "the whole Web page, Archive tab included, is replaced by the unavailable notice because the embedded browser is a host webview (task 5.5; the Archive tab alone is task 5.7)" },
+  { where: "pages/Browser.tsx", status: "adapted", why: "remotely the live-session list remains visible even from a Windows laptop, because no native WebView replaces it; its owner-authorised live stream uses the gateway (task 5.5)" },
+  { where: "pages/WebTabs.tsx", status: "adapted", why: "remotely /web shows the API-backed agent-session panel and live pixels, while the Archive and /web/pages/$id render directly; native owner tabs remain unavailable (task 5.5)" },
   { where: "ui/QueryState.tsx", status: "adapted", why: "a 403 on a remote device reads as unavailable remotely, not as an error" },
   { where: "ui/RefusalNote.tsx", status: "adapted", why: "a 403 on a remote device reads as unavailable remotely, not as an error" },
 
@@ -47,7 +48,7 @@ export const PARITY: ParityEntry[] = [
   { where: "page:contacts", status: "same", why: "an admin device reaches it" },
   { where: "page:calendar", status: "same", why: "an admin device reaches it" },
   { where: "page:voice", status: "adapted", why: "voice is an admin segment, so an admin or owner device reaches it; the capture buttons dictate through the browser microphone, and the global hotkeys become in-page shortcuts (see data/hotkeys.ts); hands-free conversation is not covered here (task 5.2)" },
-  { where: "page:web", status: "exception", why: "shows the unavailable notice for every tab; sessions and live pixels (/browser, owner segment) are task 5.5, the Archive tab (/web, admin segment) is task 5.7" },
+  { where: "page:web", status: "adapted", why: "agent sessions and their live pixels use the owner /browser API, and Archive routes use the admin /web API; native owner tabs remain an exception because only the owner can decide whether to replace them with a tower Chrome screencast" },
   { where: "page:files", status: "adapted", why: "listing, upload, download and browser drag-and-drop work; \"open on disk\" downloads the file instead (task 5.3)" },
   { where: "page:system", status: "adapted", why: "every family it calls (system, config, sidecars, backups, api-tokens, remote, channels) is an owner segment; the host's own update cannot be installed from a browser, so no update notice appears (task 5.8); read statically, the real walk is pending" },
 ];

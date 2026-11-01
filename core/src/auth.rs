@@ -5258,8 +5258,8 @@ mod tests {
     }
 
     /// The live view of a browser session is pixels of a page the agent is driving, so it is the
-    /// owner's to watch and nobody else's. Safe today by being in no table; this is what says no to
-    /// filing it beside the other `/browser/...` reads (spec browser-ao-vivo).
+    /// owner's to watch and nobody else's. It stays out of ordinary scope tables, while an owner
+    /// device reaches it through the explicit `browser` owner segment.
     #[test]
     fn the_live_view_is_in_no_scope_table() {
         const LIVE_ROUTE: &str = "/browser/sessions/{id}/live";
@@ -5289,6 +5289,18 @@ mod tests {
             assert!(
                 permits(&scope, &Method::GET, "/browser/sessions/7/live"),
                 "{scope:?} is the owner and may watch"
+            );
+        }
+
+        assert!(owner_permits(&Method::GET, LIVE_ROUTE));
+        for level in [
+            ApiTokenLevel::ReadOnly,
+            ApiTokenLevel::RunCreating,
+            ApiTokenLevel::Admin,
+        ] {
+            assert!(
+                !remote_device_permits(level, &Method::GET, LIVE_ROUTE),
+                "a non-owner {level:?} device must not watch the live browser"
             );
         }
     }
