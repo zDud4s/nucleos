@@ -3403,25 +3403,33 @@ function ContextControls({ chatId }: { chatId: string }) {
  * drawn as one that happened, so there is no optimistic flip and a failure says so in the menu.
  * With no row (still loading, or the list failed) the state is unknown, and a clickable off would
  * claim otherwise, so it is disabled; likewise until the list has landed after a write.
+ * An engine with no context reading gets a disabled off and a sentence saying why, whatever the row stores.
  */
 function AutoCompactSwitch({ chatId }: { chatId: string }) {
   const row = useChatRow(chatId);
   const set = useSetChatAutoCompact();
   const on = row?.auto_compact === true;
+  const cannot = row?.cannot_auto_compact === true;
 
   return (
     <>
       <DropdownMenuCheckboxItem
-        checked={on}
-        disabled={row === undefined || set.isPending}
+        checked={on && !cannot}
+        disabled={row === undefined || set.isPending || cannot}
         /* Keeps the menu open, so a refusal is read where the switch is. */
         onSelect={(event) => {
           event.preventDefault();
+          if (cannot) return;
           set.mutate({ chatId, enabled: !on });
         }}
       >
         Compact automatically
       </DropdownMenuCheckboxItem>
+      {cannot && (
+        <p className="chats-context-why">
+          This engine reports no context reading, so this conversation cannot compact itself.
+        </p>
+      )}
       {set.isError && <AutoCompactRefusal error={set.error} />}
     </>
   );

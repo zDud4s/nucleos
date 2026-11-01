@@ -124,6 +124,8 @@ export interface ChatSummary {
   context_window: number | null;
   /** Whether the conversation compacts itself past the soft limit. Absent from an older daemon: off. */
   auto_compact?: boolean;
+  /** The engine reports no context reading, so it cannot compact itself. Absent from an older daemon: it can. */
+  cannot_auto_compact?: boolean;
   created_at: string;
   /** Set only when this conversation continues a session had somewhere else. */
   cwd: string | null;

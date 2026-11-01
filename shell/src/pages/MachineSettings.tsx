@@ -49,7 +49,9 @@ export function MachineSettings() {
     return <ErrorNote>the {DAEMON_NAME} is not responding: nothing is known about this machine's settings</ErrorNote>;
   }
 
-  const rows = index.data.filter((row) => row.scope === "machine");
+  // agy's own panel below shows the daemon's warning before anything is turned on; the generic form would enable it
+  // without that. The daemon's acknowledgement check stays as the guard for scripted writes.
+  const rows = index.data.filter((row) => row.scope === "machine" && row.name !== "agy");
   const area = chosen ?? rows[0]?.name ?? null;
   const choose = (name: string) => {
     setOpened((previous) => {

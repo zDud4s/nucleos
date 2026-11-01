@@ -32,6 +32,16 @@ impl ChatEngine {
         self.0.as_str()
     }
 
+    /// Whether this engine reports how full its context is. Automatic compaction and rotation act
+    /// on a fill reading, and agy's output carries none. An allow-list: a row nobody classified
+    /// fails closed.
+    pub fn measures_fill(self) -> bool {
+        matches!(
+            self,
+            Self::Claude | Self::Codex | Self::Local | Self::OpenRouter | Self::GeminiApi
+        )
+    }
+
     /// The chat engine of a CLI runner string; unknown strings collapse to claude.
     fn of_cli(cli: &str) -> Self {
         Self::of_cli_in(crate::engines::TABLE, cli)

@@ -1,6 +1,7 @@
 //! Reading a conversation and the state around it (`/assistant/chats*`).
 
 use super::*;
+use crate::assistant::slash::capabilities::engine_of;
 
 mod builtins;
 mod builtins_config;
@@ -1002,12 +1003,20 @@ pub(super) async fn list_chats(
     } else {
         crate::chats::list(&state.pool).await
     };
+    let config = crate::config::models_config_now();
     rows.map(|rows| {
         Json(
             rows.into_iter()
                 .map(|row| {
                     let asks = crate::hooks::asks_for(&row.chat_id).len();
-                    crate::chats::settle(row, asks)
+                    let mut row = crate::chats::settle(row, asks);
+                    row.cannot_auto_compact = !engine_of(
+                        &config,
+                        crate::chats::Brain::from_wire(&row.brain),
+                        row.model.as_deref(),
+                    )
+                    .measures_fill();
+                    row
                 })
                 .collect(),
         )
