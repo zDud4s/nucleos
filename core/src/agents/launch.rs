@@ -342,6 +342,24 @@ mod tests {
     use Capability::*;
     use RunnerKind::{Claude, Codex};
 
+    /// A pin on an engine the launcher does not know is refused by name, never run as Claude.
+    /// The pin reaches `plan_launch` as a string, so "zed" is refused at the parse step; the
+    /// wildcard arm after `translate` is reached only once an id parses but has no arm.
+    #[test]
+    fn plan_launch_refuses_unwired_engine() {
+        let error = plan_launch(
+            "r@1.0.0",
+            &[FsRead],
+            Some(("zed".to_owned(), "any-model".to_owned())),
+            None,
+            &[],
+        )
+        .expect_err("an unwired engine is refused");
+        assert!(matches!(error, LaunchError::NoRunner(_)), "{error:?}");
+        assert!(error.to_string().contains("zed"), "{error}");
+        assert!(!error.to_string().contains("Claude"), "{error}");
+    }
+
     #[test]
     fn narrowing_is_eligible_and_translatable_minus_braked() {
         assert_eq!(

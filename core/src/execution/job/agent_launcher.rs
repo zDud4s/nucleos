@@ -238,6 +238,30 @@ mod tests {
         assert_eq!(none, Pins::default());
     }
 
+    /// An engine with no arm has no runner: it is neither Claude nor Codex.
+    #[test]
+    fn runner_of_unwired_is_none() {
+        assert_eq!(runner_of(Engine::for_test("zed")), None);
+    }
+
+    /// A pin on an engine with no arm is refused by that engine's name, not as the local engine.
+    #[test]
+    fn pin_of_refuses_unwired_engine_by_name() {
+        let refused = pin_of(
+            Some((Engine::for_test("zed"), "any-model".to_owned())),
+            None,
+            "r@1.0.0",
+            None,
+            false,
+        )
+        .expect_err("an unwired engine is refused");
+        let LaunchRefused::Unavailable(text) = refused else {
+            panic!("expected Unavailable, got {refused:?}");
+        };
+        assert!(text.contains("zed"), "{text}");
+        assert!(!text.contains("local"), "{text}");
+    }
+
     #[test]
     fn a_cli_pin_maps_to_its_runner_with_the_nodes_effort() {
         let pin = pin_of(

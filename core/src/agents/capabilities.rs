@@ -212,6 +212,31 @@ mod tests {
             .claude_allowed_tools
     }
 
+    /// An engine with no arm refuses by name; it never falls through to Claude's tool set.
+    #[test]
+    fn translate_refuses_unwired_engine() {
+        let zed = Engine::for_test("zed");
+        let error = translate(zed, &[FsRead]).expect_err("an unwired engine refuses");
+        assert_eq!(error.capability, FsRead);
+        assert!(error.to_string().contains("zed"), "{error}");
+    }
+
+    /// An unwired engine is never a translatable runner, whatever the capability list.
+    #[test]
+    fn translatable_runners_excludes_unwired() {
+        let zed = RunnerKind::for_test("zed");
+        for caps in [&[][..], &[FsRead][..], &[Shell, Web][..]] {
+            let runners = translatable_runners(caps);
+            assert!(!runners.contains(&zed), "{runners:?}");
+            assert!(
+                runners
+                    .iter()
+                    .all(|kind| *kind == RunnerKind::Claude || *kind == RunnerKind::Codex),
+                "{runners:?}"
+            );
+        }
+    }
+
     #[test]
     fn claude_table_per_capability() {
         assert_eq!(claude(&[FsRead]), ["Read", "Glob", "Grep"]);

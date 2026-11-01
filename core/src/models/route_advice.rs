@@ -2634,6 +2634,25 @@ mod tests {
         assert!(kinds.contains(&RunnerKind::Claude), "{kinds:?}");
     }
 
+    /// An alternate whose runner kind has no arm in `eligible` is never offered, for any shape.
+    #[test]
+    fn eligible_excludes_unwired_runner() {
+        let zed = RunnerKind::for_test("zed");
+        let router = Router::new(
+            config(Mode::Shadow, DEFAULT_URL),
+            available(RunnerKind::Claude, Arc::new(Probe), &["claude-*"]),
+            vec![Available {
+                kind: zed,
+                runner: Arc::new(crate::execution::runner::FakeCommandRunner::default()),
+                default_model: String::new(),
+                models: vec!["zed/*".to_owned()],
+            }],
+        );
+        let kinds = router.eligible(shape());
+        assert!(!kinds.contains(&zed), "{kinds:?}");
+        assert!(kinds.contains(&RunnerKind::Claude), "{kinds:?}");
+    }
+
     /// E16 F7: `spawn.rs` drops agy from the route of a run the runner would refuse, through the
     /// existing `restrict_runners`.
     #[test]
