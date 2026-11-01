@@ -1471,7 +1471,7 @@ mod agy_catalogue_tests {
         assert!(!catalogue.is_empty());
         for model in &catalogue {
             assert!(
-                allowed.iter().any(|id| *id == model.id),
+                allowed.contains(&model.id),
                 "{} missing from {allowed:?}",
                 model.id
             );
