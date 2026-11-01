@@ -10,9 +10,9 @@ scheme and appends one telemetry line per run.
 
 Admission is a machine token queue: every request has a weight (heavy_classify) and a
 priority; the head of the queue (priority, then arrival) is admitted by the admission mode
-(`NUCLEOS_HEAVY_ADMISSION`): `dynamic` (default) while fewer than capacity() jobs are held and
-the live probe shows room (free RAM, idle cores, and a settle window since the last admission
-when that room is close to the floors),
+(`NUCLEOS_HEAVY_ADMISSION`): `dynamic` (default) while fewer than NUCLEOS_HEAVY_DYNAMIC_MAX_JOBS (default 8) jobs are held
+and the live probe shows room (free RAM, default min(10 GB, a quarter of total), idle cores, and
+a settle window since the last admission when that room is close to the floors),
 or nothing is held; an unreadable probe falls back to `static`, the held weights plus its own
 fitting the capacity (`NUCLEOS_HEAVY_CAPACITY`, default 4; setting it forces `static`);
 `shadow` decides as static and only logs the cost model's opinion. Underneath it sits the
@@ -780,8 +780,8 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
                                 since = time.time() - max(f.stat().st_mtime for f, _ in held_ents)
                             except (OSError, ValueError):
                                 since = float("inf")
-                            fit, adm = hc.dynamic_fit(len(held_recs), pr, since, capacity(),
-                                                      static_fit)
+                            fit, adm = hc.dynamic_fit(len(held_recs), pr, since,
+                                                      hc.dynamic_max_jobs(pr), static_fit)
                         except Exception:
                             fit, adm = static_fit, None
                         if fit and adm:
@@ -1890,6 +1890,29 @@ def with_target_dir(argv: list[str], td: str) -> list[str] | None:
     return None
 
 
+def env_target_dir_flag(argv, environ):
+    """Turn an inherited target dir env var into a `--target-dir` flag on a direct cargo call.
+
+    Why: sccache keys a compile on the environment cargo hands rustc, and the target dir
+    set through the env changes that key. Measured 2026-10-31: env var gave 3 misses then 3
+    misses again; the flag gave 3 misses then 3 hits. Wrappers keep the env: only a direct
+    cargo call (one `with_target_dir` can place the flag on) is rewritten.
+
+    Returns (flagged argv, env keys to remove from the child), or None to leave the call
+    alone: opted out (`NUCLEOS_HEAVY_TARGET=0`), not cargo, no env dir, an explicit flag
+    already present, or no place for a flag (a wrapper).
+    """
+    if environ.get("NUCLEOS_HEAVY_TARGET") == "0" or not _is_cargo(argv):
+        return None
+    td = environ.get("CARGO_TARGET_DIR") or environ.get("CARGO_BUILD_TARGET_DIR")
+    if not td or _flag_values(_cargo_args(argv), "--target-dir"):
+        return None
+    flagged = with_target_dir(argv, td)
+    if flagged is None:
+        return None
+    return (flagged, [k for k in ("CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR") if k in environ])
+
+
 def _fp_argv(argv: list[str]) -> list[str]:
     """The argv part of the fingerprint: the subcommand, flags and their values, without a
     positional test filter or anything after `--`."""
@@ -2721,6 +2744,7 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
         # side, and expects them to share the machine budget rather than serialise).
         crate, named = None, False
         inject = None
+        stripped: dict[str, str] = {}  # env vars moved to a flag; restored if the fallback re-runs
         pool = False  # eligible for a leased pool dir
         cargo_argv = None
         try:
@@ -2950,6 +2974,12 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
             run_argv = with_target_dir(argv, inject) or argv
             if run_argv is argv:
                 env["CARGO_TARGET_DIR"] = inject
+        elif env is not None:
+            moved = env_target_dir_flag(argv, env)
+            if moved:
+                run_argv = moved[0]
+                for k in moved[1]:
+                    stripped[k] = env.pop(k)
         eff_td = None
         if kind in ("cargo", "auto") and _is_cargo(argv):
             eff_td = (inject or os.environ.get("CARGO_TARGET_DIR")
@@ -2994,6 +3024,8 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
     except Exception as exc:
         if lease is not None and env is not None:
             env.pop("CARGO_TARGET_DIR", None)  # the lease goes now: build without it
+        if env is not None:
+            env.update(stripped)  # the fallback re-runs the original argv: give back the dirs
         had_token = bool(holding)  # _release_all hands it back; the row says what it WAS
         _release_all(directory, lock_hash, holding, lease)
         code, stats = run_child(argv, env, None)

@@ -477,6 +477,50 @@ def _env_pos(name: str, default: float) -> float:
         return default
 
 
+DEFAULT_DYNAMIC_MAX_JOBS = 8
+DEFAULT_MIN_AVAIL_MB = 10240.0
+# RAM budgeted per job when sizing the ceiling (cargo test peaks near 7 GB), and its floor.
+JOB_BUDGET_MB = 8192
+MIN_DYNAMIC_MAX_JOBS = 4
+# From this many held jobs on, the settle window is never waived (a burst has not ramped up).
+SETTLE_ALWAYS_HELD = 4
+
+
+def dynamic_max_jobs(p=None) -> int:
+    """Ceiling on held jobs in dynamic admission. NUCLEOS_HEAVY_DYNAMIC_MAX_JOBS (an int >= 1)
+    is used verbatim. Otherwise the default 8, limited by RAM when the probe `p` carries a usable
+    total: one job budgets about 8 GB (cargo test peaks near 7 GB), floor 4, so machines up to
+    32 GB stay at 4. Garbage or a value below 1 takes the default path: a zero ceiling would
+    deadlock the queue."""
+    try:
+        v = int(os.environ.get("NUCLEOS_HEAVY_DYNAMIC_MAX_JOBS", ""))
+        if v >= 1:
+            return v
+    except ValueError:
+        pass
+    total = p.get("total_mb") if isinstance(p, dict) else None
+    if _num(total) and total > 0:
+        return min(DEFAULT_DYNAMIC_MAX_JOBS,
+                   max(MIN_DYNAMIC_MAX_JOBS, round(total / JOB_BUDGET_MB)))
+    return DEFAULT_DYNAMIC_MAX_JOBS
+
+
+def min_avail_mb(p) -> float:
+    """Free-RAM floor for dynamic admission. NUCLEOS_HEAVY_MIN_AVAIL_MB, when a positive number,
+    is used verbatim (owner override). Otherwise min(10 GB, a quarter of the machine's RAM);
+    10 GB when the probe does not carry a usable total."""
+    try:
+        v = float(os.environ.get("NUCLEOS_HEAVY_MIN_AVAIL_MB", ""))
+        if v > 0:
+            return v
+    except ValueError:
+        pass
+    total = p.get("total_mb") if isinstance(p, dict) else None
+    if _num(total) and total > 0:
+        return min(DEFAULT_MIN_AVAIL_MB, float(total) / 4)
+    return DEFAULT_MIN_AVAIL_MB
+
+
 def admission_mode() -> str:
     if os.environ.get("NUCLEOS_HEAVY_CAPACITY", "").strip():
         return "static"
@@ -605,9 +649,10 @@ def dynamic_fit(n_held: int, p: dict | None, since_admit_s: float, ceiling: int,
     record kept with the admission (it is meaningful on a denial too, the caller ignores it).
 
     Nothing held: admitted ("alone"). Unreadable probe: the static weight-sum decision stands
-    ("static_fallback"). Otherwise held COUNT must be under `ceiling` and the probe must show
-    room: free RAM, idle cores (skipped when busy_cores is unknown) and, only when that room is
-    close to the floors, a settle window since the last admission (see settle_needed)."""
+    ("static_fallback"). Otherwise the held COUNT must be under `ceiling` (the caller passes
+    dynamic_max_jobs()) and the probe must show room: free RAM, idle cores (skipped when busy_cores is unknown) and, only when that room is
+    close to the floors (or from SETTLE_ALWAYS_HELD held jobs on, whatever the room), a settle
+    window since the last admission (see settle_needed)."""
     avail = None
     idle = None
     usable = isinstance(p, dict)
@@ -636,9 +681,9 @@ def dynamic_fit(n_held: int, p: dict | None, since_admit_s: float, ceiling: int,
         return bool(static_fit), adm("static_fallback")
     if n_held >= ceiling:
         return False, adm("room")
-    ok = (avail >= _env_pos("NUCLEOS_HEAVY_MIN_AVAIL_MB", 1536.0)
+    ok = (avail >= min_avail_mb(p)
           and (idle is None or idle >= _env_pos("NUCLEOS_HEAVY_MIN_IDLE_CORES", 1.0))
-          and (not settle_needed(avail, idle, p)
+          and (not (settle_needed(avail, idle, p) or n_held >= SETTLE_ALWAYS_HELD)
                or since_admit_s >= _env_pos("NUCLEOS_HEAVY_SETTLE_S", 20.0)))
     return ok, adm("room")
 

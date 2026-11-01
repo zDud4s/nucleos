@@ -176,12 +176,14 @@ def ts_epoch(ts) -> float | None:
         return None
 
 
-def dynamic_state(held: list, cap: int) -> dict | None:
+def dynamic_state(held: list, cap: int | None = None) -> dict | None:
     """What dynamic admission sees right now, or None when the broker decides by weight
     (`static`/`shadow`) or the probe is unreadable (it then falls back to weight too).
 
     `short` lists the conditions that hold the head back, each with its threshold, so the view
-    says why nothing starts ("idle 0.6 < 1.0 cores") instead of a weight sum the broker ignores."""
+    says why nothing starts ("idle 0.6 < 1.0 cores") instead of a weight sum the broker ignores.
+    `cap` is the job ceiling for `short`; None sizes it from this probe, as the broker does. The
+    ceiling used is returned as "cap"."""
     hc = heavy._cost_mod()
     if hc is None or hc.admission_mode() != "dynamic":
         return None
@@ -196,10 +198,12 @@ def dynamic_state(held: list, cap: int) -> dict | None:
         since = time.time() - max(f.stat().st_mtime for f, _ in held)
     except (OSError, ValueError):
         since = float("inf")
-    min_avail = hc._env_pos("NUCLEOS_HEAVY_MIN_AVAIL_MB", 1536.0)
+    min_avail = hc.min_avail_mb(p)
     min_idle = hc._env_pos("NUCLEOS_HEAVY_MIN_IDLE_CORES", 1.0)
     settle = hc._env_pos("NUCLEOS_HEAVY_SETTLE_S", 20.0)
-    settle_on = hc.settle_needed(avail, idle, p)
+    if cap is None:
+        cap = hc.dynamic_max_jobs(p)
+    settle_on = hc.settle_needed(avail, idle, p) or len(held) >= hc.SETTLE_ALWAYS_HELD
     short = []
     if held:
         if len(held) >= cap:
@@ -211,7 +215,7 @@ def dynamic_state(held: list, cap: int) -> dict | None:
         if since < settle and settle_on:
             short.append(f"settle {since:.0f}s < {settle:.0f}s")
     return {"avail_mb": avail, "idle": idle, "since": since, "min_avail_mb": min_avail,
-            "min_idle": min_idle, "settle": settle, "settle_on": settle_on, "short": short}
+            "min_idle": min_idle, "settle": settle, "settle_on": settle_on, "short": short, "cap": cap}
 
 
 def dynamic_line(dyn: dict) -> str:
@@ -684,10 +688,12 @@ def frame(primed: dict) -> str:
     locks = worktree_locks(d)
     lock_ages = {l["rec"].get("pid"): l["age"] for l in locks if l["alive"]}
     alerts: list[str] = []
-    dyn = dynamic_state(held, cap)
+    dyn = dynamic_state(held)
+    # The dynamic ceiling comes from the same probe the state was read with.
+    dcap = dyn["cap"] if dyn is not None else cap
     # Dynamic admission counts jobs, not weight: show what it counts.
     head = (f"{BOLD}heavy broker{RESET}  {time.strftime('%H:%M:%S')}   "
-            + (f"jobs {bar(len(held), cap)}" if dyn is not None else f"capacity {bar(used, cap)}"))
+            + (f"jobs {bar(len(held), dcap)}" if dyn is not None else f"capacity {bar(used, cap)}"))
     if psutil is not None:
         vm, sw = psutil.virtual_memory(), psutil.swap_memory()
         colour = RED if vm.available < 2 * 2**30 else (YELLOW if vm.available < 4 * 2**30 else GREEN)
@@ -790,7 +796,7 @@ def frame(primed: dict) -> str:
     # the alerts, the slots or the health line.
     lines.append(f"{BOLD}QUEUED ({len(queue)}){RESET}")
     for i, (f, r) in enumerate(queue, 1):
-        reason = queue_reason(i, r, used, cap, dyn)
+        reason = queue_reason(i, r, used, dcap, dyn)
         n_retry = retries(r, rows, now)
         prio = heavy._int_prio(r.get("prio"))
         if len(queue) > 3:
