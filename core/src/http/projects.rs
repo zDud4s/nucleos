@@ -37,6 +37,13 @@ pub(super) fn routes() -> Router<AppState> {
             "/projects/{id}/onboard",
             get(get_project_onboarding).post(post_project_onboard),
         )
+        // Repairing points an existing daemon project back at its main checkout. It is deliberately
+        // outside the scope tables: changing where a project runs is an owner-only operation.
+        .route("/projects/{id}/repair", post(post_project_repair))
+        .route(
+            "/projects/{id}/repair/begin",
+            post(post_project_repair_begin),
+        )
         .route("/projects/{id}/readings", get(get_project_readings))
         .route("/projects/{id}/tests-map", get(get_project_tests_map))
         // Control/admin only: absent from the `auth.rs` scope tables; the handler re-checks the owner.
@@ -184,6 +191,184 @@ pub(super) async fn delete_project(
             ))
         }
     }
+}
+
+const DEFAULT_REPAIR_LEASE_SECS: u64 = 30;
+const MAX_REPAIR_LEASE_SECS: u64 = 600;
+
+#[derive(Deserialize)]
+pub(super) struct RepairRequest {
+    pub(super) project_root: String,
+}
+
+#[derive(Deserialize)]
+pub(super) struct RepairBeginRequest {
+    #[serde(default)]
+    pub(super) lease_secs: Option<u64>,
+}
+
+#[derive(serde::Serialize)]
+pub(super) struct RepairAnswer {
+    pub(super) project_id: String,
+    pub(super) project_root: String,
+    pub(super) previous_root: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub(super) struct RepairBeginAnswer {
+    pub(super) project_id: String,
+    pub(super) lease_secs: u64,
+}
+
+fn repair_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(i64::MAX)
+}
+
+async fn repair_project_exists(
+    state: &AppState,
+    id: &str,
+) -> Result<bool, (StatusCode, Json<serde_json::Value>)> {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT EXISTS(SELECT 1 FROM autopilot_state WHERE project_id = ?)",
+    )
+    .bind(id)
+    .fetch_one(&state.pool)
+    .await
+    .map(|exists| exists != 0)
+    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))
+}
+
+/// Points an existing roster entry at the main checkout that now contains it.
+pub(super) async fn post_project_repair(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<RepairRequest>,
+) -> Result<Json<RepairAnswer>, (StatusCode, Json<serde_json::Value>)> {
+    if !crate::project::state::valid_id(&id) {
+        return Err(refusal(StatusCode::UNPROCESSABLE_ENTITY, "bad_project_id"));
+    }
+    if !repair_project_exists(&state, &id).await? {
+        return Err(refusal(StatusCode::NOT_FOUND, "unknown_project"));
+    }
+    if crate::governance::autopilot::kill_switch_engaged(&state.pool)
+        .await
+        .unwrap_or(true)
+    {
+        return Err(refusal(StatusCode::LOCKED, "kill_switch"));
+    }
+
+    let named = std::path::PathBuf::from(body.project_root);
+    if !named.is_absolute() {
+        return Err(refusal(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "path_not_absolute",
+        ));
+    }
+    let canonical = tokio::fs::canonicalize(&named)
+        .await
+        .map_err(|_| refusal(StatusCode::NOT_FOUND, "no_such_path"))?;
+    let deadline = std::time::Instant::now() + DETECT_GIT_BUDGET;
+    crate::execution::git_exec::repo_key(&canonical, deadline)
+        .await
+        .map_err(|detail| {
+            refusal_with_detail(StatusCode::UNPROCESSABLE_ENTITY, "not_a_checkout", detail)
+        })?;
+    if tokio::fs::metadata(canonical.join(".git"))
+        .await
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false)
+    {
+        return Err(refusal(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "not_the_main_checkout",
+        ));
+    }
+
+    let project_root = crate::execution::git_exec::without_verbatim_prefix(&canonical)
+        .to_string_lossy()
+        .into_owned();
+    let previous_root: Option<String> =
+        sqlx::query_scalar("SELECT project_root FROM autopilot_state WHERE project_id = ?")
+            .bind(&id)
+            .fetch_one(&state.pool)
+            .await
+            .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?;
+    sqlx::query("UPDATE autopilot_state SET project_root = ? WHERE project_id = ?")
+        .bind(&project_root)
+        .bind(&id)
+        .execute(&state.pool)
+        .await
+        .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?;
+    sqlx::query("DELETE FROM project_repair_leases WHERE singleton = 1")
+        .execute(&state.pool)
+        .await
+        .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?;
+
+    Ok(Json(RepairAnswer {
+        project_id: id,
+        project_root,
+        previous_root,
+    }))
+}
+
+/// Starts the finite daemon-wide repair hand-off before a caller moves a checkout.
+pub(super) async fn post_project_repair_begin(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<RepairBeginRequest>,
+) -> Result<Json<RepairBeginAnswer>, (StatusCode, Json<serde_json::Value>)> {
+    if !crate::project::state::valid_id(&id) {
+        return Err(refusal(StatusCode::UNPROCESSABLE_ENTITY, "bad_project_id"));
+    }
+    if !repair_project_exists(&state, &id).await? {
+        return Err(refusal(StatusCode::NOT_FOUND, "unknown_project"));
+    }
+    if crate::governance::autopilot::kill_switch_engaged(&state.pool)
+        .await
+        .unwrap_or(true)
+    {
+        return Err(refusal(StatusCode::LOCKED, "kill_switch"));
+    }
+
+    let lease_secs = body
+        .lease_secs
+        .unwrap_or(DEFAULT_REPAIR_LEASE_SECS)
+        .clamp(1, MAX_REPAIR_LEASE_SECS);
+    let expires_at_ms = repair_now_ms()
+        .saturating_add(i64::try_from(lease_secs.saturating_mul(1_000)).unwrap_or(i64::MAX));
+    sqlx::query(
+        "INSERT INTO project_repair_leases (singleton, expires_at_ms) VALUES (1, ?) \
+         ON CONFLICT(singleton) DO UPDATE SET expires_at_ms = excluded.expires_at_ms",
+    )
+    .bind(expires_at_ms)
+    .execute(&state.pool)
+    .await
+    .map_err(|_| refusal(StatusCode::INTERNAL_SERVER_ERROR, "internal"))?;
+
+    Ok(Json(RepairBeginAnswer {
+        project_id: id,
+        lease_secs,
+    }))
+}
+
+/// The remaining lease time, if a repair is still live. The query returns its connection before
+/// the caller sleeps, which matters for the one-connection HTTP test pool.
+pub(super) async fn live_repair_wait(
+    pool: &sqlx::SqlitePool,
+) -> Result<Option<std::time::Duration>, sqlx::Error> {
+    let expires_at_ms: Option<i64> =
+        sqlx::query_scalar("SELECT expires_at_ms FROM project_repair_leases WHERE singleton = 1")
+            .fetch_optional(pool)
+            .await?;
+    Ok(expires_at_ms.and_then(|expires_at_ms| {
+        let remaining_ms = expires_at_ms.saturating_sub(repair_now_ms());
+        (remaining_ms > 0).then(|| std::time::Duration::from_millis(remaining_ms as u64))
+    }))
 }
 
 /// A guard that would refuse, named so the screen can say it before anybody presses anything.

@@ -8,6 +8,54 @@ pub(super) struct RunParams {
     pub(super) prompt: String,
 }
 
+/// The body of `POST /trees`, field for field (`TreeBody` in `tree_job/http.rs`).
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub(super) struct TreeLaunchParams {
+    /// Your own id for the job; launching it again replays the stored one.
+    pub(super) id: String,
+    pub(super) goal: String,
+    pub(super) feature_branch: String,
+    pub(super) project_root: String,
+    pub(super) project_id: Option<String>,
+    pub(super) contract: Option<String>,
+    pub(super) dirty_owner_files: Option<Vec<String>>,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub(super) struct TreeIdParams {
+    pub(super) id: String,
+}
+
+/// The body of `POST /trees/{id}/branch_start`, with the job id lifted out into the path.
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub(super) struct TreeBranchStartParams {
+    /// The tree job the branch belongs to.
+    pub(super) id: String,
+    /// The branch's name: letters, digits, `.`, `_` and `-`. Starting the same name again replays.
+    pub(super) name: String,
+    pub(super) goal: String,
+    /// The paths the branch may write, as globs.
+    pub(super) owned_paths: Vec<String>,
+    /// What the branch's agent is told to do.
+    pub(super) prompt: String,
+    /// The branch's layer; absent is `code`. `docs` takes only docs paths and builds nothing.
+    pub(super) layer: Option<String>,
+    /// A branch of this tree this one is based on; it opens once that one is merged.
+    pub(super) base: Option<String>,
+    /// Your own work node: the new branch's node becomes its child.
+    pub(super) node_id: String,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub(super) struct SpecFinishParams {
+    /// One spec to finish, with whatever it depends on that is not done yet.
+    pub(super) spec_id: Option<String>,
+    /// Finish every spec of this project.
+    pub(super) project_id: Option<String>,
+    /// Finish every spec of the project with this root: your session's project root.
+    pub(super) project_root: Option<String>,
+}
+
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 pub(super) struct JobParams {
     pub(super) project_id: String,

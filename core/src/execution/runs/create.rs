@@ -60,7 +60,34 @@ pub async fn create_run_inner(
     mode: &str,
     steerable: bool,
 ) -> Result<i64, CreateRunError> {
-    create_run_with(
+    create_run_inner_with_mcp_box(state, prompt, project_id, cwd, mode, steerable, false).await
+}
+
+/// Starts a run with a transient worktree MCP box rooted at the directory the CLI will enter.
+///
+/// This is deliberately separate from [`create_run_inner`]: ordinary runs retain their exact MCP
+/// shape, while tree-node launches opt into the node protocol's box.
+pub async fn create_run_with_worktree_box(
+    state: &AppState,
+    prompt: String,
+    project_id: Option<String>,
+    cwd: Option<String>,
+    mode: &str,
+    steerable: bool,
+) -> Result<i64, CreateRunError> {
+    create_run_inner_with_mcp_box(state, prompt, project_id, cwd, mode, steerable, true).await
+}
+
+async fn create_run_inner_with_mcp_box(
+    state: &AppState,
+    prompt: String,
+    project_id: Option<String>,
+    cwd: Option<String>,
+    mode: &str,
+    steerable: bool,
+    worktree_mcp_box: bool,
+) -> Result<i64, CreateRunError> {
+    create_run_with_policy(
         state,
         NewRun {
             prompt,
@@ -71,6 +98,8 @@ pub async fn create_run_inner(
             provisioning: None,
             permission_mode: None,
         },
+        None,
+        worktree_mcp_box,
     )
     .await
 }
@@ -170,6 +199,30 @@ pub async fn create_job_item_run(
     .await
 }
 
+/// Starts one run of a tree job, inside the worktree `tree_job::open` already made for its branch.
+///
+/// A `mode = "worktree"` run like every other autonomous code run, so it is not launched in plan
+/// mode and is governed by the classifier where the project wires one. It is NOT a
+/// [`create_job_node_run`]: that writes `runs.job_id`, which the old job chain would then try to
+/// finalise. `project_root` is the project checkout (where settings are inherited from) and `tree`
+/// the worktree the CLI starts in. The box is the worktree box, so the agent has `node_close` and
+/// `tree_branch_start`.
+pub async fn create_tree_node_run(
+    state: &AppState,
+    prompt: String,
+    project_id: String,
+    project_root: String,
+    tree: TreeWorktree,
+) -> Result<i64, CreateRunError> {
+    create_run_with_policy(
+        state,
+        NewRun::provisioned(prompt, project_id, project_root, Provisioning::Tree(tree)),
+        None,
+        true,
+    )
+    .await
+}
+
 /// What a run is handed to start from, when it is handed anything at all.
 ///
 /// **An enum and not two `Option`s, because the two are mutually exclusive and the type should say
@@ -195,6 +248,16 @@ pub(super) enum Provisioning {
     /// A correction run: a worktree of its own, born on the `fix/` branch the post-merge gate
     /// prepared. Standalone for the gate and the slot, `Item`-like only for the base.
     Correction(Correction),
+    /// A run of a tree job, inside the worktree its branch already owns. Like `Node` it brings no
+    /// tree, slot or `worktrees` row (the tree job's own bookkeeping owns the checkout), but unlike
+    /// `Node` it carries no job identity, so the old job chain never sees the run.
+    Tree(TreeWorktree),
+}
+
+/// The worktree a tree job's run works in, already made and owned by the tree job.
+pub struct TreeWorktree {
+    pub worktree_path: String,
+    pub branch: String,
 }
 
 /// A correction run about to be given a tree of its own (F3-4, spec 2026-10-05 §6.2 D4).
@@ -224,40 +287,47 @@ impl Provisioning {
     pub(super) fn node(&self) -> Option<&JobNode> {
         match self {
             Self::Node(node) => Some(node.as_ref()),
-            Self::Resolution(_) | Self::Item(_) | Self::Correction(_) => None,
+            Self::Resolution(_) | Self::Item(_) | Self::Correction(_) | Self::Tree(_) => None,
         }
     }
 
     pub(super) fn resolution(&self) -> Option<&Resolution> {
         match self {
             Self::Resolution(resolution) => Some(resolution),
-            Self::Node(_) | Self::Item(_) | Self::Correction(_) => None,
+            Self::Node(_) | Self::Item(_) | Self::Correction(_) | Self::Tree(_) => None,
         }
     }
 
     pub(super) fn item(&self) -> Option<&JobItem> {
         match self {
             Self::Item(item) => Some(item),
-            Self::Node(_) | Self::Resolution(_) | Self::Correction(_) => None,
+            Self::Node(_) | Self::Resolution(_) | Self::Correction(_) | Self::Tree(_) => None,
         }
     }
 
     pub(super) fn correction(&self) -> Option<&Correction> {
         match self {
             Self::Correction(correction) => Some(correction),
-            Self::Node(_) | Self::Resolution(_) | Self::Item(_) => None,
+            Self::Node(_) | Self::Resolution(_) | Self::Item(_) | Self::Tree(_) => None,
+        }
+    }
+
+    pub(super) fn tree(&self) -> Option<&TreeWorktree> {
+        match self {
+            Self::Tree(tree) => Some(tree),
+            Self::Node(_) | Self::Resolution(_) | Self::Item(_) | Self::Correction(_) => None,
         }
     }
 
     /// Whether this provisioning gets a checkout of its own — and therefore a concurrency slot, a
     /// `worktrees` row, and a share of the disk.
     ///
-    /// **The house rule, in one place.** `Node` is the only exception, and it is the exception
-    /// because it gets no tree: it works inside the one its job already owns, and charging it a
-    /// second slot would have a five-item job refuse itself at the second item. Everything else —
-    /// a standalone run, a resolution, an item — brings a tree and pays for it.
+    /// **The house rule, in one place.** `Node` and `Tree` are the exceptions, and they are the
+    /// exceptions because they get no tree: they work inside the one their job already owns, and
+    /// charging them a second slot would have a five-item job refuse itself at the second item.
+    /// Everything else — a standalone run, a resolution, an item — brings a tree and pays for it.
     pub(super) fn owns_a_tree(&self) -> bool {
-        !matches!(self, Self::Node(_))
+        !matches!(self, Self::Node(_) | Self::Tree(_))
     }
 }
 
@@ -367,6 +437,47 @@ pub(super) async fn create_run_with(
     state: &AppState,
     run: NewRun<'_>,
 ) -> Result<i64, CreateRunError> {
+    create_run_with_policy(state, run, None, false).await
+}
+
+/// Starts a standalone run that launches with no tools at all (`ToolPolicy::None`), whatever its
+/// mode would otherwise grant, and never steerable.
+///
+/// A new function beside `create_run_inner` rather than a parameter on it: every existing caller
+/// goes on getting the policy its mode implies. The policy lands in the same `tool_policy` that
+/// `spawn_run` turns into the CLI's own deny list, so the restriction is the CLI's refusal and not
+/// a hook's cooperation, and a handoff successor inherits it from the same value.
+pub async fn create_no_tools_run(
+    state: &AppState,
+    prompt: String,
+    project_id: Option<String>,
+    cwd: Option<String>,
+) -> Result<i64, CreateRunError> {
+    create_run_with_policy(
+        state,
+        NewRun {
+            prompt,
+            project_id,
+            cwd,
+            mode: "real",
+            steerable: false,
+            provisioning: None,
+            permission_mode: None,
+        },
+        Some(crate::execution::runner::ToolPolicy::None),
+        false,
+    )
+    .await
+}
+
+/// `create_run_with` with the tool policy optionally fixed by the caller instead of derived from
+/// the mode.
+async fn create_run_with_policy(
+    state: &AppState,
+    run: NewRun<'_>,
+    policy_override: Option<crate::execution::runner::ToolPolicy>,
+    worktree_mcp_box: bool,
+) -> Result<i64, CreateRunError> {
     let NewRun {
         prompt,
         project_id,
@@ -380,6 +491,7 @@ pub(super) async fn create_run_with(
     let resolution = provisioning.as_ref().and_then(Provisioning::resolution);
     let item = provisioning.as_ref().and_then(Provisioning::item);
     let correction = provisioning.as_ref().and_then(Provisioning::correction);
+    let tree = provisioning.as_ref().and_then(Provisioning::tree);
     // The house rule, asked once: everything but a job node brings a checkout of its own, and
     // therefore claims a slot, records a row and is charged disk for it. `None` — a standalone
     // run — brings one too.
@@ -484,7 +596,7 @@ pub(super) async fn create_run_with(
     let plan_only = mode == "shadow";
     // Derived here for the same reason `plan_only` is: the mode is what the caller asked for, and
     // `spawn_run` must not learn to read modes.
-    let tool_policy = tool_policy_for_mode(mode);
+    let tool_policy = policy_override.unwrap_or_else(|| tool_policy_for_mode(mode));
     let mut spawn_cwd = cwd.clone().map(std::path::PathBuf::from);
     let mut completion_feed = plan_only.then(|| {
         (
@@ -523,7 +635,8 @@ pub(super) async fn create_run_with(
         // refusing: the gate below already turns that into `Unreadable`, which stops the run with a
         // reason. A second refusal here would report the same fault as a different one.
         max_turns = rules.as_ref().ok().and_then(|rules| rules.max_turns);
-        gate_config = if node.is_some() || item.is_some() {
+        // A tree run is not gated here either: the tree job runs its own gates per branch.
+        gate_config = if node.is_some() || item.is_some() || tree.is_some() {
             GateConfig::NotConfigured
         } else {
             GateConfig::of_project(worktree_project_id, project_root)
@@ -532,8 +645,8 @@ pub(super) async fn create_run_with(
         // both the `create` and the `record` is what lets a sequence of nodes accumulate work on one
         // tree — and it is why nothing here writes a `worktrees` row for a node: the job already
         // owns one, and a second row for the same directory would give the GC two owners to reconcile.
-        let info = match &node {
-            Some(node) => crate::execution::worktree::WorktreeInfo {
+        let info = match (&node, tree) {
+            (Some(node), _) => crate::execution::worktree::WorktreeInfo {
                 path: std::path::PathBuf::from(&node.worktree_path),
                 branch: node.branch.clone(),
                 // `None`, and it costs nothing: the base belongs to the tree, the job's own
@@ -542,7 +655,13 @@ pub(super) async fn create_run_with(
                 // on, which is not where the tree was born.
                 base_sha: None,
             },
-            None => {
+            // The tree job opened this worktree and owns its bookkeeping; same reasoning as a node.
+            (None, Some(tree)) => crate::execution::worktree::WorktreeInfo {
+                path: std::path::PathBuf::from(&tree.worktree_path),
+                branch: tree.branch.clone(),
+                base_sha: None,
+            },
+            (None, None) => {
                 // The tree's name, and with it the slot's owner. An item's is its row's id and
                 // comes back the same on every retry; everything else is named after this run.
                 let owner = match item {
@@ -692,6 +811,7 @@ pub(super) async fn create_run_with(
             .bind(item.job_id)
             .bind(item.stage.as_str())
             .bind(item.item_id),
+            // A tree run carries no job identity on purpose; see `Provisioning::Tree`.
             (None, None) => {
                 sqlx::query("UPDATE runs SET cwd = ? WHERE id = ?").bind(&worktree_path)
             }
@@ -735,7 +855,8 @@ pub(super) async fn create_run_with(
         if let Some(resolution) = resolution {
             match sqlx::query(
                 "UPDATE vcs_requests SET resolution_run_id = ?
-                  WHERE id = ? AND resolution_run_id IS NULL",
+                  WHERE id = ? AND resolution_run_id IS NULL
+                    AND COALESCE(settled_reason, '') <> 'tree-merge'",
             )
             .bind(id)
             .bind(resolution.request_id)
@@ -968,6 +1089,20 @@ pub(super) async fn create_run_with(
     {
         tracing::warn!(run_id = id, %error, "could not record a run's loadout");
     }
+    let job_mcp = if worktree_mcp_box {
+        JobNodeMcp::for_worktree_box(id, spawn_cwd.as_deref())
+    } else {
+        JobNodeMcp::for_run(
+            id,
+            node.as_ref()
+                .map(|node| node.job_id)
+                .or(item.as_ref().map(|item| item.job_id)),
+        )
+        .map(|mcp| match run_tools {
+            Some(run_tools) => mcp.with_loadout(run_tools),
+            None => mcp,
+        })
+    };
     spawn_run(
         state,
         runner,
@@ -999,16 +1134,7 @@ pub(super) async fn create_run_with(
         state.runner.model_for_stage(model_stage),
         state.runner.effort_for_stage(model_stage),
         route,
-        JobNodeMcp::for_run(
-            id,
-            node.as_ref()
-                .map(|node| node.job_id)
-                .or(item.as_ref().map(|item| item.job_id)),
-        )
-        .map(|mcp| match run_tools {
-            Some(run_tools) => mcp.with_loadout(run_tools),
-            None => mcp,
-        }),
+        job_mcp,
         max_turns,
     );
 
@@ -1018,9 +1144,53 @@ pub(super) async fn create_run_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
+
     use crate::execution::runs::tests::{
         WorktreeRootEnv, init_contained_repo, space_free_tempdir, test_state_with_runner,
     };
+
+    fn git(repo: &std::path::Path, args: &[&str]) {
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .status()
+                .expect("git should start")
+                .success(),
+            "git {args:?}"
+        );
+    }
+
+    async fn escalated_resolution_request(state: &AppState, project_root: &str) -> i64 {
+        let repo = crate::execution::vcs::ResolvedRepo::synthetic("proj", project_root, "proj");
+        let request = crate::execution::vcs::submit(
+            &state.pool,
+            &repo,
+            &crate::execution::vcs::Op::Merge {
+                source: "source".into(),
+                target: "master".into(),
+            },
+            crate::execution::vcs::Origin::Shell,
+        )
+        .await
+        .expect("admit the merge");
+        sqlx::query("UPDATE vcs_requests SET status = 'escalated' WHERE id = ?")
+            .bind(request)
+            .execute(&state.pool)
+            .await
+            .expect("escalate the merge");
+        request
+    }
+
+    fn resolution(request_id: i64) -> Resolution {
+        Resolution {
+            request_id,
+            source: "source".into(),
+            target: "master".into(),
+        }
+    }
 
     /// A node's stage is whatever the workflow graph's node id is, not one of three literals: the
     /// run row records it verbatim.
@@ -1099,5 +1269,91 @@ mod tests {
                 .unwrap();
         assert_eq!(stage, "triage");
         assert_eq!(node_job_id, job_id);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_tree_merge_settled_conflict_is_not_claimed_for_resolution() {
+        let _env_lock = crate::execution::worktree::test_env_lock();
+        let wt_root = space_free_tempdir("nucleos-create-tree-merge-wt-");
+        let _env = WorktreeRootEnv::set(wt_root.path());
+        let (_repo_container, repo) = init_contained_repo("nucleos-create-tree-merge-");
+        git(&repo, &["checkout", "-q", "-b", "source"]);
+        git(&repo, &["checkout", "-q", "master"]);
+        let (state, _runner) =
+            test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+        let project_root = repo.to_string_lossy().into_owned();
+        let request = escalated_resolution_request(&state, &project_root).await;
+        sqlx::query("UPDATE vcs_requests SET settled_reason = 'tree-merge' WHERE id = ?")
+            .bind(request)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let result = create_resolution_run(
+            &state,
+            "resolve the conflict".into(),
+            "proj".into(),
+            project_root,
+            resolution(request),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(CreateRunError::Invalid(_))),
+            "{result:?}"
+        );
+        let claimed: Option<i64> =
+            sqlx::query_scalar("SELECT resolution_run_id FROM vcs_requests WHERE id = ?")
+                .bind(request)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(claimed, None, "a tree merge keeps the resolver claim empty");
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn another_settlement_reason_does_not_block_a_resolution_claim() {
+        let _env_lock = crate::execution::worktree::test_env_lock();
+        let wt_root = space_free_tempdir("nucleos-create-other-settlement-wt-");
+        let _env = WorktreeRootEnv::set(wt_root.path());
+        let (_repo_container, repo) = init_contained_repo("nucleos-create-other-settlement-");
+        std::fs::write(repo.join("conflict.txt"), "base\n").unwrap();
+        git(&repo, &["add", "conflict.txt"]);
+        git(&repo, &["commit", "-qm", "base"]);
+        git(&repo, &["checkout", "-q", "-b", "source"]);
+        std::fs::write(repo.join("conflict.txt"), "source\n").unwrap();
+        git(&repo, &["commit", "-am", "source"]);
+        git(&repo, &["checkout", "-q", "master"]);
+        std::fs::write(repo.join("conflict.txt"), "master\n").unwrap();
+        git(&repo, &["commit", "-am", "master"]);
+        let (state, _runner) =
+            test_state_with_runner(None, crate::state::DEFAULT_RUN_TIMEOUT).await;
+        let project_root = repo.to_string_lossy().into_owned();
+        let request = escalated_resolution_request(&state, &project_root).await;
+        sqlx::query("UPDATE vcs_requests SET settled_reason = 'dismissed' WHERE id = ?")
+            .bind(request)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let run = create_resolution_run(
+            &state,
+            "resolve the conflict".into(),
+            "proj".into(),
+            project_root,
+            resolution(request),
+        )
+        .await
+        .expect("a non-tree settlement does not spend the resolution claim");
+
+        let claimed: Option<i64> =
+            sqlx::query_scalar("SELECT resolution_run_id FROM vcs_requests WHERE id = ?")
+                .bind(request)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(claimed, Some(run));
     }
 }

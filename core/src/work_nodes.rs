@@ -56,8 +56,8 @@ macro_rules! select_nodes {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct NodeLimits {
-    /// The deepest `depth` a node may have (the root is 0).
-    pub max_depth: i64,
+    /// The optional deepest `depth` a node may have (the root is 0).
+    pub max_depth: Option<i64>,
     /// The most `planned`/`running` children one node may have at a time.
     pub max_width: i64,
     /// The longest `summary` accepted on close, in characters.
@@ -67,7 +67,7 @@ pub struct NodeLimits {
 impl Default for NodeLimits {
     fn default() -> Self {
         Self {
-            max_depth: 3,
+            max_depth: None,
             max_width: 6,
             summary_max: 1500,
         }
@@ -95,7 +95,7 @@ impl NodeLimits {
                 .and_then(serde_yaml::Value::as_u64)
         };
         if let Some(value) = pick("max_depth").and_then(|v| i64::try_from(v).ok()) {
-            limits.max_depth = value;
+            limits.max_depth = Some(value);
         }
         if let Some(value) = pick("max_width").and_then(|v| i64::try_from(v).ok()) {
             limits.max_width = value;
@@ -470,6 +470,26 @@ pub async fn open(
     limits: &NodeLimits,
     args: &OpenArgs,
 ) -> Result<Opened, NodeError> {
+    open_linked(pool, project_id, limits, args, OpenLinks::default()).await
+}
+
+/// Columns no caller of the `/nodes` shape may set, written by the same insert as the node so that a
+/// continuation is never visible without its link.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OpenLinks<'a> {
+    pub tree_job_id: Option<&'a str>,
+    pub continues_node_id: Option<&'a str>,
+}
+
+/// [`open`], with its limits and guards, for a node that also carries `links`. A second continuation
+/// of one node comes back as the unique violation of `work_nodes_continues`, inside `NodeError::Db`.
+pub async fn open_linked(
+    pool: &SqlitePool,
+    project_id: Option<&str>,
+    limits: &NodeLimits,
+    args: &OpenArgs,
+    links: OpenLinks<'_>,
+) -> Result<Opened, NodeError> {
     let title = args.title.trim();
     let goal = args.goal.trim();
     if title.is_empty() {
@@ -512,10 +532,11 @@ pub async fn open(
                     )));
                 }
                 let depth = parent.depth + 1;
-                if depth > limits.max_depth {
+                if let Some(max_depth) = limits.max_depth
+                    && depth > max_depth
+                {
                     return Err(NodeError::Conflict(format!(
-                        "depth {depth} exceeds the limit of {}",
-                        limits.max_depth
+                        "depth {depth} exceeds the limit of {max_depth}"
                     )));
                 }
                 let siblings: Vec<NodeRow> = sqlx::query_as(select_nodes!(
@@ -555,8 +576,9 @@ pub async fn open(
     sqlx::query(
         "INSERT INTO work_nodes \
          (id, project_id, root_id, parent_id, depth, kind, title, goal, status, owned_paths, \
-          budget_tokens, run_id, session_id, chat_id, task_id, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?)",
+          budget_tokens, run_id, session_id, chat_id, task_id, tree_job_id, continues_node_id, \
+          created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&project)
@@ -572,6 +594,8 @@ pub async fn open(
     .bind(&args.session_id)
     .bind(&args.chat_id)
     .bind(&task_id)
+    .bind(links.tree_job_id)
+    .bind(links.continues_node_id)
     .bind(&now)
     .bind(&now)
     .execute(pool)
@@ -1253,7 +1277,7 @@ mod tests {
         let limits = NodeLimits::load(Some(dir.path()));
         assert_eq!(
             (limits.max_depth, limits.max_width, limits.summary_max),
-            (5, 2, 1500)
+            (Some(5), 2, 1500)
         );
         std::fs::write(&file, ": not yaml [").unwrap();
         assert_eq!(NodeLimits::load(Some(dir.path())), NodeLimits::default());
@@ -1295,9 +1319,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_refuses_depth_beyond_limit() {
+    async fn open_beyond_old_depth_three_is_allowed_without_a_configured_limit() {
         let pool = test_pool().await;
         let limits = NodeLimits::default();
+        let mut parent = open(&pool, None, &limits, &root_args()).await.unwrap().id;
+        for depth in 1..=10 {
+            let title = format!("o{depth}");
+            let args = child_args(&parent, "orchestrator", &title, &[]);
+            parent = open(&pool, None, &limits, &args).await.unwrap().id;
+        }
+    }
+
+    #[tokio::test]
+    async fn open_still_honours_a_configured_max_depth() {
+        let pool = test_pool().await;
+        let limits = NodeLimits {
+            max_depth: Some(3),
+            ..NodeLimits::default()
+        };
         let mut parent = open(&pool, None, &limits, &root_args()).await.unwrap().id;
         for depth in 1..=3 {
             let title = format!("o{depth}");
@@ -1313,17 +1352,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_refuses_seventh_sibling() {
+    async fn open_width_limit_unchanged() {
         let pool = test_pool().await;
-        let limits = NodeLimits::default();
+        let limits = NodeLimits {
+            max_depth: None,
+            max_width: 2,
+            ..NodeLimits::default()
+        };
         let root = open(&pool, None, &limits, &root_args()).await.unwrap();
-        for i in 0..6 {
+        for i in 0..2 {
             let title = format!("leaf{i}");
             let args = child_args(&root.id, "leaf", &title, &[]);
             open(&pool, None, &limits, &args).await.unwrap();
         }
-        let seventh = child_args(&root.id, "leaf", "7th", &[]);
-        let refused = open(&pool, None, &limits, &seventh).await;
+        let third = child_args(&root.id, "leaf", "third", &[]);
+        let refused = open(&pool, None, &limits, &third).await;
         assert!(
             matches!(refused, Err(NodeError::Conflict(_))),
             "{refused:?}"

@@ -51,6 +51,7 @@ owns:
   - .claude/skills/bootstrap/
   - .claude/skills/claude/
   - .claude/skills/codex/
+  - .claude/skills/conduct/
   - .claude/skills/executor/
   - .claude/skills/maintenance/
   - .claude/skills/orchestrate/
@@ -81,6 +82,7 @@ owns:
   - .agents/skills/bootstrap/
   - .agents/skills/claude/
   - .agents/skills/codex/
+  - .agents/skills/conduct/
   - .agents/skills/executor/
   - .agents/skills/maintenance/
   - .agents/skills/orchestrate/

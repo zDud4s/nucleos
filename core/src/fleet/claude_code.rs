@@ -735,7 +735,51 @@ fn root_sighting(id: &str, root: &RootCache, state: NodeState) -> Sighting {
     }
 }
 
+/// What the last pass knows about one root session, in the vocabulary of the liveness classifier.
+#[derive(Clone, Debug)]
+pub struct RootObservation {
+    pub session_id: String,
+    /// The pid the registry entry names; `None` once Claude Code deleted the entry.
+    pub pid: Option<u32>,
+    pub observation: crate::conductor::liveness::Observation,
+}
+
 impl ClaudeCode {
+    /// One observation per root session, from the cache of the last `discover`; reads no file.
+    /// Roots owned by a daemon run are left out (the daemon watches those itself), and so are
+    /// children: the sweep watches roots.
+    pub fn observations(&self) -> Vec<RootObservation> {
+        use crate::conductor::liveness::{Observation, SubjectStatus};
+        let st = self.inner.lock();
+        let mut out: Vec<RootObservation> = st
+            .roots
+            .iter()
+            .filter(|(_, root)| root.run.is_none())
+            .map(|(id, root)| {
+                let file = root.registry.as_ref();
+                let status = file.and_then(|(f, _)| match f.status.as_deref() {
+                    Some("busy") => Some(SubjectStatus::Busy),
+                    Some("waiting") => Some(SubjectStatus::Waiting),
+                    _ => None,
+                });
+                RootObservation {
+                    session_id: id.clone(),
+                    pid: file.map(|(f, _)| f.pid),
+                    observation: Observation {
+                        process_alive: file.map(|(_, alive)| *alive),
+                        status,
+                        status_since: file.and_then(|(f, _)| f.updated_at),
+                        started_at: root.started_at,
+                        last_transcript_write: root.transcript.as_ref().and(root.last_activity),
+                        ..Default::default()
+                    },
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+        out
+    }
+
     /// The runs that name a Claude session and are live or inside the retention window. Runs are
     /// the only way to find a root launched in print mode, which has no `sessions/*.json` entry
     /// (spec §4).
@@ -1992,5 +2036,124 @@ mod tests {
                 "fusion precedence: claude_code before codex_cli, got {names:?}"
             );
         }
+    }
+
+    fn observation_of<'a>(all: &'a [RootObservation], session_id: &str) -> &'a RootObservation {
+        all.iter()
+            .find(|o| o.session_id == session_id)
+            .unwrap_or_else(|| panic!("no observation of {session_id}"))
+    }
+
+    #[tokio::test]
+    async fn observations_exposes_status_pid_and_transcript_mtime() {
+        use crate::conductor::liveness::SubjectStatus;
+
+        const WAITING: &str = "22222222-2222-4222-8222-222222222222";
+        const IDLE: &str = "33333333-3333-4333-8333-333333333333";
+        let home = Home::new();
+        let probe = Arc::new(FakeProbe::new());
+        home.session_file(100, fx::SESSION, "busy", "777");
+        home.session_file(200, WAITING, "waiting", "888");
+        home.session_file(300, IDLE, "idle", "999");
+        probe.alive(100, "777");
+        probe.alive(200, "888");
+        probe.alive(300, "999");
+        let transcript = home.transcript(fx::SESSION, &fx::open_turn());
+        fx::age(&transcript, 30);
+        // A child of the root: the sweep watches roots, so this must add no observation.
+        home.subagent(
+            fx::SESSION,
+            "a1",
+            json!({"agentType":"Explore","description":"read specs"}),
+            &fx::open_turn(),
+        );
+        let (cc, _db) = setup(&home, &probe).await;
+        cc.discover(since()).await.unwrap();
+
+        let all = cc.observations();
+
+        assert_eq!(all.len(), 3);
+        let busy = observation_of(&all, fx::SESSION);
+        assert_eq!(busy.pid, Some(100));
+        assert_eq!(busy.observation.process_alive, Some(true));
+        assert_eq!(busy.observation.status, Some(SubjectStatus::Busy));
+        // The two constants of `Home::session_file`.
+        assert_eq!(
+            busy.observation.status_since.map(|t| t.timestamp_millis()),
+            Some(1_600_000_000_000)
+        );
+        assert_eq!(
+            busy.observation.started_at.map(|t| t.timestamp_millis()),
+            Some(1_792_523_514_511)
+        );
+        let mtime: Timestamp = std::fs::metadata(&transcript)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .into();
+        assert_eq!(busy.observation.last_transcript_write, Some(mtime));
+
+        assert_eq!(
+            observation_of(&all, WAITING).observation.status,
+            Some(SubjectStatus::Waiting)
+        );
+        let idle = &observation_of(&all, IDLE).observation;
+        assert_eq!(idle.status, None);
+        assert_eq!(idle.last_transcript_write, None);
+    }
+
+    #[tokio::test]
+    async fn observations_leaves_out_a_root_owned_by_a_daemon_run() {
+        const OTHER: &str = "22222222-2222-4222-8222-222222222222";
+        let home = Home::new();
+        let probe = Arc::new(FakeProbe::new());
+        home.session_file(100, fx::SESSION, "busy", "777");
+        home.session_file(200, OTHER, "busy", "888");
+        probe.alive(100, "777");
+        probe.alive(200, "888");
+        home.transcript(fx::SESSION, &fx::open_turn());
+        home.transcript(OTHER, &fx::open_turn());
+        let (cc, db) = setup(&home, &probe).await;
+        // `insert_run` names `fx::SESSION`, so that root is the run's and `OTHER` nobody's.
+        insert_run(&db.pool, 5, "running", "claude", None).await;
+        cc.discover(since()).await.unwrap();
+
+        let all = cc.observations();
+
+        let ids: Vec<&str> = all.iter().map(|o| o.session_id.as_str()).collect();
+        assert_eq!(ids, [OTHER]);
+    }
+
+    #[tokio::test]
+    async fn observations_reports_a_dead_registry_entry_as_not_alive() {
+        use crate::conductor::liveness::SubjectStatus;
+
+        let home = Home::new();
+        // No probe entry: the pid is dead. The fresh transcript keeps the root in the window.
+        let entry = home.session_file(100, fx::SESSION, "busy", "777");
+        home.transcript(fx::SESSION, &fx::open_turn());
+        let probe = Arc::new(FakeProbe::new());
+        let (cc, _db) = setup(&home, &probe).await;
+        cc.discover(since()).await.unwrap();
+
+        let all = cc.observations();
+
+        let dead = observation_of(&all, fx::SESSION);
+        assert_eq!(dead.pid, Some(100));
+        assert_eq!(dead.observation.process_alive, Some(false));
+        assert_eq!(dead.observation.status, Some(SubjectStatus::Busy));
+
+        // Claude Code deleted the entry: nothing is known about the process any more, which is a
+        // different answer from "it is dead".
+        std::fs::remove_file(entry).unwrap();
+        cc.discover(since()).await.unwrap();
+
+        let all = cc.observations();
+
+        let gone = observation_of(&all, fx::SESSION);
+        assert_eq!(gone.pid, None);
+        assert_eq!(gone.observation.process_alive, None);
+        assert_eq!(gone.observation.status, None);
+        assert_eq!(gone.observation.status_since, None);
     }
 }
