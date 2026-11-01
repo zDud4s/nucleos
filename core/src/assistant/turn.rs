@@ -2134,7 +2134,11 @@ mod agy_chat_tests {
                 }]
             }]}
         });
-        std::fs::write(root.path().join(".claude/settings.json"), settings.to_string()).unwrap();
+        std::fs::write(
+            root.path().join(".claude/settings.json"),
+            settings.to_string(),
+        )
+        .unwrap();
         // The premise: for any other engine this chat is `Unrestricted`.
         assert!(crate::governance::autopilot::classifier_hook_is_wired(
             root.path()
