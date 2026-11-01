@@ -578,7 +578,7 @@ async fn main() {
             tracing::info!(
                 %model,
                 "hosted_assistant_model is configured but no OpenRouter key is stored; \
-                 chats marked openrouter will refuse rather than answer"
+                 OpenRouter models will refuse rather than answer"
             );
             (Some(model), None)
         }
