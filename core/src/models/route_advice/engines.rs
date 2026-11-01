@@ -277,35 +277,6 @@ pub fn allowed_models(
     allowed
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn engine_runner_of_unwired_kind_is_none() {
-        let models = crate::config::ModelsConfig::default();
-        assert!(engine_runner(&models, RunnerKind::for_test("zed")).is_none());
-    }
-
-    #[test]
-    fn default_model_of_unwired_kind_is_empty_never_claudes() {
-        let models = crate::config::ModelsConfig {
-            claude_model: "claude-configured".to_owned(),
-            ..Default::default()
-        };
-        let model = default_model(&models, RunnerKind::for_test("zed"));
-        assert!(model.is_empty(), "{model:?}");
-        assert_ne!(model, models.claude_model);
-    }
-
-    #[test]
-    fn allowed_models_of_unwired_kind_offers_no_empty_id() {
-        let models = crate::config::ModelsConfig::default();
-        let allowed = allowed_models(&models, &RouterConfig::off(), RunnerKind::for_test("zed"));
-        assert!(allowed.iter().all(|id| !id.is_empty()), "{allowed:?}");
-    }
-}
-
 /// The primary runner, answering `router()`. Every other method is the wrapped runner's own: a
 /// method left to the trait's default here would silently change what the daemon launches, which
 /// is what `the_fronted_runner_answers_exactly_as_the_runner_it_fronts` holds shut.
@@ -425,5 +396,34 @@ impl CommandRunner for RoutedRunner {
 
     fn engines(&self) -> Option<Arc<Engines>> {
         self.engines.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn engine_runner_of_unwired_kind_is_none() {
+        let models = crate::config::ModelsConfig::default();
+        assert!(engine_runner(&models, RunnerKind::for_test("zed")).is_none());
+    }
+
+    #[test]
+    fn default_model_of_unwired_kind_is_empty_never_claudes() {
+        let models = crate::config::ModelsConfig {
+            claude_model: "claude-configured".to_owned(),
+            ..Default::default()
+        };
+        let model = default_model(&models, RunnerKind::for_test("zed"));
+        assert!(model.is_empty(), "{model:?}");
+        assert_ne!(model, models.claude_model);
+    }
+
+    #[test]
+    fn allowed_models_of_unwired_kind_offers_no_empty_id() {
+        let models = crate::config::ModelsConfig::default();
+        let allowed = allowed_models(&models, &RouterConfig::off(), RunnerKind::for_test("zed"));
+        assert!(allowed.iter().all(|id| !id.is_empty()), "{allowed:?}");
     }
 }
