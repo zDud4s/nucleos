@@ -170,7 +170,10 @@ pub fn front_with(
             continue;
         }
         let Some(runner) = engine_runner(models, kind) else {
-            tracing::warn!(kind = kind.as_str(), "router config names an engine with no runner; ignoring it");
+            tracing::warn!(
+                kind = kind.as_str(),
+                "router config names an engine with no runner; ignoring it"
+            );
             continue;
         };
         alternates.push(make(kind, runner));
@@ -183,7 +186,10 @@ pub fn front_with(
     for kind in installed {
         if *kind != primary_kind && !others.iter().any(|available| available.kind == *kind) {
             let Some(runner) = engine_runner(models, *kind) else {
-                tracing::warn!(kind = kind.as_str(), "installed engine has no runner; not offering it");
+                tracing::warn!(
+                    kind = kind.as_str(),
+                    "installed engine has no runner; not offering it"
+                );
                 continue;
             };
             others.push(make(*kind, runner));

@@ -252,7 +252,9 @@ mod tests {
         }
     }
 
-    fn zed_no_utility_default(_known: &[crate::models::model_catalog::Discovered]) -> Option<String> {
+    fn zed_no_utility_default(
+        _known: &[crate::models::model_catalog::Discovered],
+    ) -> Option<String> {
         None
     }
 
