@@ -177,6 +177,15 @@ fn plan_launch(
             Engine::Local => Vec::new(),
             // Refused above; no runner is ever listed for agy.
             Engine::Agy => Vec::new(),
+            // An engine with no arm is refused by name, never run as Claude.
+            // Closes when the id flip lands.
+            #[allow(unreachable_patterns)]
+            other => {
+                return Err(LaunchError::NoRunner(format!(
+                    "{label}: the {} engine is not available for agents, teams or council",
+                    other.as_str()
+                )));
+            }
         };
         return Ok(Plan {
             runners,

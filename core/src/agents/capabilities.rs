@@ -172,6 +172,15 @@ pub fn translate(engine: Engine, caps: &[Capability]) -> Result<EngineTools, Uns
                 return Err(Unsupported { engine, capability });
             }
         }
+        // An engine with no arm above refuses the first capability, as agy does: it never
+        // falls through to Claude's tool set.
+        // Closes when the id flip lands.
+        #[allow(unreachable_patterns)]
+        _ => {
+            if let Some(&capability) = caps.first() {
+                return Err(Unsupported { engine, capability });
+            }
+        }
     }
     Ok(tools)
 }
@@ -185,8 +194,9 @@ pub fn translatable_runners(caps: &[Capability]) -> Vec<RunnerKind> {
     crate::engines::ids_with_transport_in(&enabled, crate::engines::Transport::Cli)
         .into_iter()
         .filter_map(RunnerKind::parse)
-        // An empty capability list translates for agy, but agents never run on it.
-        .filter(|&kind| kind != RunnerKind::Agy)
+        // An empty capability list translates for agy, but agents never run on it: allow-list the
+        // engines that do, so a new engine is excluded until it is wired.
+        .filter(|&kind| kind == RunnerKind::Claude || kind == RunnerKind::Codex)
         .filter(|&kind| translate(kind.into(), caps).is_ok())
         .collect()
 }

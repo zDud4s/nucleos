@@ -57,6 +57,10 @@ fn runner_of(engine: Engine) -> Option<RunnerKind> {
         Engine::Local => None,
         // Never launches: `pin_of` refuses agy by name before this is asked.
         Engine::Agy => None,
+        // An engine with no arm has no runner; `pin_of` then refuses it by name.
+        // Closes when the id flip lands.
+        #[allow(unreachable_patterns)]
+        _ => None,
     }
 }
 

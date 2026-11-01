@@ -408,6 +408,10 @@ impl Router {
                 // `spawn.rs` drops it again for a run whose controls the runner refuses (job MCP,
                 // steering, a forked session).
                 RunnerKind::Agy => agy_can_take(shape) && crate::engines::agy::enabled(),
+                // An engine with no arm is never offered as an alternate.
+                // Closes when the id flip lands.
+                #[allow(unreachable_patterns)]
+                _ => false,
             };
             if fits && !kinds.contains(&alternate.kind) {
                 kinds.push(alternate.kind);
@@ -1010,6 +1014,10 @@ fn default_model(models: &crate::config::ModelsConfig, kind: RunnerKind) -> Stri
         RunnerKind::Codex => models.codex_model.clone(),
         // No model file names an agy default; the engine's own constant does.
         RunnerKind::Agy => crate::engines::agy::DEFAULT_MODEL.to_owned(),
+        // An engine with no arm has no default model: the empty string names none, and never
+        // borrows Claude's. Closes when the id flip lands.
+        #[allow(unreachable_patterns)]
+        _ => String::new(),
     }
 }
 
