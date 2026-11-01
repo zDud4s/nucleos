@@ -35,8 +35,7 @@ pub const HOSTED_KEY_MISSING: &str =
 
 /// The sentence `Refusal::GeminiKeyMissing` renders as. It names Gemini on purpose: the OpenRouter
 /// sentence above would send the operator to the wrong key.
-pub const GEMINI_KEY_MISSING: &str =
-    "a Gemini API key is required before a gemini-api model can answer; a key stored while the \
+pub const GEMINI_KEY_MISSING: &str = "a Gemini API key is required before a gemini-api model can answer; a key stored while the \
      daemon runs needs a daemon restart";
 
 /// Whether `model` is a `gemini-api/` pick. The provider of a hosted chat is read from the id
