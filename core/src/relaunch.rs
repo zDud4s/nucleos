@@ -5,7 +5,8 @@
 //! the supervisor relaunches it; the supervisor kills its job when the daemon exits, so a
 //! relauncher spawned by a supervised daemon would die with it. Any other daemon (macOS, Linux,
 //! `run-daemon.ps1`, started by hand) spawns `<exe> --relaunch-after <pid> <its own args>`, detached
-//! from its job and session, and exits. That process waits for the pid to be gone, swaps a staged
+//! from its job and session, BEFORE it stops ([`prepare_restart`]; a failed spawn cancels the stop),
+//! and then exits. That process waits for the pid to be gone, swaps a staged
 //! executable in, starts the daemon again and leaves. Both paths call [`swap_staged`].
 //!
 //! UNTESTED: a daemon under a systemd unit with the default `KillMode=control-group` has its
@@ -23,7 +24,8 @@ use std::time::Duration;
 pub const RELAUNCH_FLAG: &str = "--relaunch-after";
 
 /// Set by `--supervise` on the daemon it launches. A daemon that sees it leaves with
-/// `supervise::EXIT_RESTART_REQUESTED` and spawns nothing.
+/// `supervise::EXIT_RESTART_REQUESTED` and spawns nothing. The daemon removes it from its
+/// environment at start (see [`take_supervised_marker`]).
 pub const SUPERVISED_VAR: &str = "NUCLEOS_SUPERVISED";
 
 /// How often the relauncher looks for the old daemon.
@@ -31,43 +33,70 @@ const WAIT_POLL: Duration = Duration::from_millis(500);
 /// How many looks before it gives up: one minute, well past the daemon's 10 s exit watchdog.
 const MAX_POLLS: u32 = 120;
 
+/// Whether this daemon was launched by `--supervise`. Set once by [`take_supervised_marker`].
+static SUPERVISED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Reads `NUCLEOS_SUPERVISED` and removes it from the process environment, so no child (agents,
+/// sidecars, a relauncher) inherits it and mistakes itself for a supervised daemon. Called once at
+/// the very start of the daemon's `main`; later calls change nothing.
+pub fn take_supervised_marker() {
+    SUPERVISED.get_or_init(|| {
+        let marked = std::env::var(SUPERVISED_VAR).is_ok_and(|value| value == "1");
+        // SAFETY: this is the first thing `main` does. The tokio runtime has its worker threads, but
+        // they are idle: no task has been spawned yet and nothing else reads or writes the
+        // environment at this point.
+        unsafe { std::env::remove_var(SUPERVISED_VAR) };
+        marked
+    });
+}
+
+fn supervised() -> bool {
+    SUPERVISED.get().copied().unwrap_or(false)
+}
+
 /// What the daemon does once it has stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitPlan {
-    /// Exit 0: an ordinary stop.
+    /// Exit 0: an ordinary stop, or a restart whose relauncher was spawned before the stop.
     Plain,
     /// Exit `EXIT_RESTART_REQUESTED` and let the supervisor relaunch.
     ForSupervisor,
-    /// Spawn the relauncher, then exit 0.
-    SpawnRelauncher,
 }
 
 /// PURE: how a stopping daemon leaves.
 pub fn exit_plan(restart_requested: bool, supervised: bool) -> ExitPlan {
-    match (restart_requested, supervised) {
-        (false, _) => ExitPlan::Plain,
-        (true, true) => ExitPlan::ForSupervisor,
-        (true, false) => ExitPlan::SpawnRelauncher,
+    if restart_requested && supervised {
+        ExitPlan::ForSupervisor
+    } else {
+        ExitPlan::Plain
     }
 }
 
-/// The exit code of a daemon that has stopped, after spawning the relauncher when that is the plan.
-/// Called from both the graceful path and the exit watchdog; the relauncher is spawned once.
+/// The exit code of a daemon that has stopped. Spawns nothing: [`prepare_restart`] already did,
+/// before the stop. Called from both the graceful path and the exit watchdog.
 pub fn exit_code_for_stop() -> i32 {
-    static SPAWNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    let supervised = std::env::var(SUPERVISED_VAR).is_ok_and(|value| value == "1");
-    match exit_plan(crate::shutdown::restart_requested(), supervised) {
+    match exit_plan(crate::shutdown::restart_requested(), supervised()) {
         ExitPlan::Plain => 0,
         ExitPlan::ForSupervisor => crate::supervise::EXIT_RESTART_REQUESTED,
-        ExitPlan::SpawnRelauncher => {
-            if !SPAWNED.swap(true, std::sync::atomic::Ordering::SeqCst)
-                && let Err(error) = spawn_relauncher()
-            {
-                tracing::error!(%error, "could not spawn the relauncher; the daemon stays down");
-            }
-            0
-        }
     }
+}
+
+/// Call right before marking the restart and stopping. A supervised daemon needs nothing: the
+/// supervisor relaunches it. Any other spawns its relauncher now, which is safe early because the
+/// relauncher waits for this pid to be gone. On `Err` the caller must not stop: the daemon keeps
+/// serving rather than leaving with nobody to start it again.
+pub fn prepare_restart() -> Result<(), String> {
+    prepare_restart_with(supervised(), spawn_relauncher)
+}
+
+fn prepare_restart_with(
+    supervised: bool,
+    spawn: impl FnOnce() -> std::io::Result<()>,
+) -> Result<(), String> {
+    if supervised {
+        return Ok(());
+    }
+    spawn().map_err(|error| format!("could not spawn the relauncher: {error}"))
 }
 
 /// `nucleos-core.next(.exe)` beside the executable: where a build is staged.
@@ -545,7 +574,22 @@ mod tests {
         assert_eq!(exit_plan(false, true), ExitPlan::Plain);
         assert_eq!(exit_plan(false, false), ExitPlan::Plain);
         assert_eq!(exit_plan(true, true), ExitPlan::ForSupervisor);
-        assert_eq!(exit_plan(true, false), ExitPlan::SpawnRelauncher);
+        assert_eq!(exit_plan(true, false), ExitPlan::Plain);
+    }
+
+    #[test]
+    fn the_relauncher_is_spawned_before_the_stop_unless_supervised() {
+        let spawned = std::cell::Cell::new(0);
+        let ok = || {
+            spawned.set(spawned.get() + 1);
+            Ok(())
+        };
+        assert_eq!(prepare_restart_with(true, ok), Ok(()));
+        assert_eq!(spawned.get(), 0, "a supervised daemon spawns nothing");
+        assert_eq!(prepare_restart_with(false, ok), Ok(()));
+        assert_eq!(spawned.get(), 1);
+        let refused = prepare_restart_with(false, || Err(std::io::Error::other("refused")));
+        assert!(refused.unwrap_err().contains("refused"));
     }
 
     #[test]

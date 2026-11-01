@@ -214,6 +214,8 @@ pub struct Readiness {
     pub draining: bool,
     /// What a restart would wait on right now. Additive: `live_runs` keeps its meaning.
     pub waiting_on: Vec<BlockingRun>,
+    /// This daemon's process id, so `--restart` can tell a new daemon from the one it asked.
+    pub pid: u32,
 }
 
 /// The readiness with every live run counted as blocking (no requester, nothing parked).
@@ -232,6 +234,7 @@ pub async fn readiness_for(
         live_runs: live_runs(pool).await?,
         draining: is_draining(),
         waiting_on: blocking_runs(pool, requester_run, parked).await?,
+        pid: std::process::id(),
     })
 }
 

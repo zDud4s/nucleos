@@ -26,8 +26,10 @@ pub const EXIT_CREDENTIAL_STORE: i32 = 78;
 
 /// The exit code of a daemon that was asked to restart (`POST /system/restart`) and has settled.
 /// The supervisor relaunches at once, after swapping in a staged executable, and the restart does
-/// not count against the failure budget. An older supervisor that predates this code reads 21 as
-/// a plain failure and still restarts the daemon, only inside the budget and after a pause.
+/// not count against the failure budget. An older supervisor would read 21 as a failure and
+/// restart, but it sets no supervised marker, so its daemon takes the relauncher path and exits 0.
+/// In that narrow case (a supervisor that predates this and outlives an exe replacement) the job
+/// kills the relauncher and the daemon stays down until the next logon or a manual start.
 pub const EXIT_RESTART_REQUESTED: i32 = 21;
 
 /// `STATUS_CONTROL_C_EXIT` (0xC000013A) as the signed code `ExitStatus::code` reports.

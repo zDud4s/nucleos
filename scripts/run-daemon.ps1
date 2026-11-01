@@ -200,7 +200,11 @@ if ($Stage) {
     if (-not (Test-Path -LiteralPath $RunDir)) {
         Fail 2 "-Stage needs the run dir of a running daemon, and $RunDir does not exist (run without -Stage first)"
     }
-    Copy-Item -LiteralPath $core -Destination (Join-Path $RunDir 'nucleos-core.next.exe') -Force
+    # Copy to a temp name, then move onto the real one: a restart that swaps at that moment sees
+    # either no staged file or a whole one, never a half-copied exe.
+    $tmpNext = Join-Path $RunDir 'nucleos-core.next.exe.tmp'
+    Copy-Item -LiteralPath $core -Destination $tmpNext -Force
+    Move-Item -LiteralPath $tmpNext -Destination (Join-Path $RunDir 'nucleos-core.next.exe') -Force
     Write-Output "staged nucleos-core.next.exe into $RunDir; the daemon swaps it in at its next restart"
     exit 0
 }

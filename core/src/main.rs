@@ -42,7 +42,10 @@ fn machine_doc<T: settings::Document + Default>() -> T {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> std::process::ExitCode {
+    // Before anything spawns: reads the supervised marker and keeps it out of every child's
+    // environment (`relaunch::take_supervised_marker`).
+    relaunch::take_supervised_marker();
     http::remember_home();
     // The relauncher a restarted daemon spawns (`relaunch.rs`): first, because it must start
     // nothing but the daemon it relaunches.
@@ -50,7 +53,7 @@ async fn main() {
         std::process::exit(code);
     }
     if cli::run_subcommand().await {
-        return;
+        return std::process::ExitCode::SUCCESS;
     }
 
     // The offline recovery commands (`--settings-reset`, `--settings-rollback`) are answered here and exit: they
@@ -1322,8 +1325,8 @@ async fn main() {
     // A held long-poll (`/hooks/ask-wait`) would keep graceful shutdown waiting forever, and the
     // old binary alive under the installer; after the deadline the process just leaves. The
     // watchdog runs on its own OS thread, so it outlives the runtime.
-    // A restart leaves with the exit the supervisor relaunches on, or spawns its relauncher first
-    // (`relaunch::exit_code_for_stop`); any other stop is a plain 0.
+    // A restart leaves with the exit the supervisor relaunches on (`relaunch::exit_code_for_stop`);
+    // any other stop is a plain 0. The relauncher, when there is one, was spawned before the stop.
     http::spawn_exit_watchdog(std::time::Duration::from_secs(10), || {
         std::process::exit(relaunch::exit_code_for_stop())
     });
@@ -1331,11 +1334,9 @@ async fn main() {
         .with_graceful_shutdown(http::shutdown_requested())
         .await
         .unwrap();
-    let code = relaunch::exit_code_for_stop();
-    if code != 0 {
-        drop(_log_guard); // flush the log before `exit` skips destructors
-        std::process::exit(code);
-    }
+    // Returned, not `exit`ed, so a restart (21) unwinds like a plain stop (0): locals drop, the
+    // runtime drops and its `kill_on_drop` sidecars are killed, the log guard flushes.
+    std::process::ExitCode::from(u8::try_from(relaunch::exit_code_for_stop()).unwrap_or(1))
 }
 
 #[cfg(test)]

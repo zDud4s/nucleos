@@ -24314,6 +24314,7 @@ mod tests {
         assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(body["live_runs"], 1);
         assert_eq!(body["draining"], false);
+        assert_eq!(body["pid"], std::process::id());
         assert_eq!(body["waiting_on"].as_array().map(Vec::len), Some(1));
         assert!(body["waiting_on"][0]["run_id"].is_i64());
     }

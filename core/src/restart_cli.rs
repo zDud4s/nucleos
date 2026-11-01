@@ -1,8 +1,9 @@
 //! `nucleos-core --restart [--force] [--timeout-secs N]`: asks the daemon to restart once running
 //! work has settled, and follows the wait.
 //!
-//! Exit 0 means the restart is under way (the daemon stopped answering, or `--force`), exit 4 that
-//! the limit passed with work still running (the runs are listed on stderr), exit 1 that the
+//! Exit 0 means the restart is under way (the daemon stopped answering, another pid answers, or
+//! `--force`), exit 4 that the drain ended with the same daemon still up (the runs it was waiting
+//! on are listed on stderr; a reading without a pid is exit 1), exit 1 that the
 //! daemon could not be asked, exit 2 a bad command line. It never starts a daemon. `requester_run`
 //! is `NUCLEOS_RUN_ID`, so the run that asks for the restart is not waited on by itself.
 
@@ -105,12 +106,22 @@ pub struct Outcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reading {
     pub draining: bool,
+    /// The answering daemon's process id.
+    pub pid: u32,
     /// `(run_id, chat_id)` of each run the restart is waiting on.
     pub waiting_on: Vec<(i64, Option<String>)>,
 }
 
 impl Reading {
-    pub fn from_json(value: &Value) -> Self {
+    /// `Err` names what is missing: a body that is not the readiness, or one without a pid.
+    pub fn from_json(value: &Value) -> Result<Self, String> {
+        if !value.is_object() {
+            return Err("the readiness body could not be parsed as JSON".to_owned());
+        }
+        let pid = value["pid"]
+            .as_u64()
+            .and_then(|pid| u32::try_from(pid).ok())
+            .ok_or_else(|| "the readiness has no pid".to_owned())?;
         let waiting_on = value["waiting_on"]
             .as_array()
             .map(|runs| {
@@ -124,10 +135,11 @@ impl Reading {
                     .collect()
             })
             .unwrap_or_default();
-        Self {
+        Ok(Self {
             draining: value["draining"].as_bool().unwrap_or(false),
+            pid,
             waiting_on,
-        }
+        })
     }
 }
 
@@ -135,28 +147,37 @@ impl Reading {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
     Wait,
-    /// A daemon that is no longer draining and had nothing left to wait on: the restart went through
-    /// and this is the new daemon.
+    /// A different daemon answers: the restart went through and this is the new one.
     Restarting,
-    /// No longer draining while runs were still blocking: the daemon's wait timed out.
-    LimitPassed,
+    /// The same daemon, no longer draining: the drain ended without a restart (its wait timed out).
+    DrainEnded,
 }
 
-/// PURE: `was_waiting` is whether the last reading that was still draining had runs blocking.
-pub fn judge(reading: &Reading, was_waiting: bool) -> Step {
-    match (reading.draining, was_waiting) {
-        (true, _) => Step::Wait,
-        (false, true) => Step::LimitPassed,
-        (false, false) => Step::Restarting,
+/// PURE: `started_pid` is the pid of the daemon that was asked. A daemon that stopped answering is
+/// judged by the caller as under way.
+pub fn judge(reading: &Reading, started_pid: u32) -> Step {
+    if reading.pid != started_pid {
+        Step::Restarting
+    } else if reading.draining {
+        Step::Wait
+    } else {
+        Step::DrainEnded
     }
 }
 
 fn limit_passed(last: &Reading, call: &Call) -> Outcome {
-    let mut stderr = format!(
-        "not restarted: {} run(s) still working after {}s; the daemon carries on\n",
-        last.waiting_on.len(),
-        call.timeout.as_secs()
-    );
+    let mut stderr = if last.waiting_on.is_empty() {
+        format!(
+            "not restarted: the drain ended without a restart after {}s; the daemon carries on\n",
+            call.timeout.as_secs()
+        )
+    } else {
+        format!(
+            "not restarted: {} run(s) still working after {}s; the daemon carries on\n",
+            last.waiting_on.len(),
+            call.timeout.as_secs()
+        )
+    };
     for (run, chat) in &last.waiting_on {
         match chat {
             Some(chat) => stderr.push_str(&format!("  waiting_on: run {run} (chat {chat})\n")),
@@ -205,14 +226,17 @@ pub async fn run(base_url: &str, token: &str, call: &Call, poll: Duration) -> Ou
             let text = response.text().await.unwrap_or_default();
             return failed(format!("the daemon refused ({status}): {text}"));
         }
-        Ok(response) => Reading::from_json(&response.json().await.unwrap_or(Value::Null)),
+        Ok(response) => match Reading::from_json(&response.json().await.unwrap_or(Value::Null)) {
+            Ok(reading) => reading,
+            Err(reason) => return failed(format!("the restart answer: {reason}")),
+        },
     };
     if call.force {
         return restarting();
     }
+    let started_pid = first.pid;
     let deadline = Instant::now() + call.timeout + GRACE;
     let mut last = first;
-    let mut was_waiting = !last.waiting_on.is_empty();
     loop {
         if Instant::now() >= deadline {
             return limit_passed(&last, call);
@@ -232,15 +256,17 @@ pub async fn run(base_url: &str, token: &str, call: &Call, poll: Duration) -> Ou
             Ok(response) if !response.status().is_success() => {
                 return failed(format!("the readiness was refused ({})", response.status()));
             }
-            Ok(response) => Reading::from_json(&response.json().await.unwrap_or(Value::Null)),
-        };
-        match judge(&reading, was_waiting) {
-            Step::Wait => {
-                was_waiting = !reading.waiting_on.is_empty();
-                last = reading;
+            Ok(response) => {
+                match Reading::from_json(&response.json().await.unwrap_or(Value::Null)) {
+                    Ok(reading) => reading,
+                    Err(reason) => return failed(format!("the readiness answer: {reason}")),
+                }
             }
+        };
+        match judge(&reading, started_pid) {
+            Step::Wait => last = reading,
             Step::Restarting => return restarting(),
-            Step::LimitPassed => return limit_passed(&last, call),
+            Step::DrainEnded => return limit_passed(&reading, call),
         }
     }
 }
@@ -324,18 +350,52 @@ mod tests {
 
     #[test]
     fn restart_follows_a_wait_to_its_end() {
-        let draining = |blocked: bool| Reading {
-            draining: true,
+        let reading = |pid: u32, draining: bool, blocked: bool| Reading {
+            draining,
+            pid,
             waiting_on: if blocked { vec![(7, None)] } else { vec![] },
         };
-        let door_open = Reading {
+        assert_eq!(judge(&reading(10, true, true), 10), Step::Wait);
+        assert_eq!(judge(&reading(10, true, false), 10), Step::Wait);
+        assert_eq!(judge(&reading(10, false, true), 10), Step::DrainEnded);
+    }
+
+    #[test]
+    fn restart_is_not_reported_when_the_drain_ended_with_the_daemon_up() {
+        let up = Reading {
             draining: false,
+            pid: 10,
             waiting_on: vec![],
         };
-        assert_eq!(judge(&draining(true), true), Step::Wait);
-        assert_eq!(judge(&draining(false), true), Step::Wait);
-        assert_eq!(judge(&door_open, true), Step::LimitPassed);
-        assert_eq!(judge(&door_open, false), Step::Restarting);
+        assert_eq!(judge(&up, 10), Step::DrainEnded);
+        let call = Call {
+            force: false,
+            timeout: Duration::from_secs(5),
+            requester_run: None,
+        };
+        let outcome = limit_passed(&up, &call);
+        assert_eq!(outcome.code, EXIT_LIMIT_PASSED);
+        assert!(outcome.stderr.contains("drain ended"), "{outcome:?}");
+    }
+
+    #[test]
+    fn restart_seen_through_a_new_pid_within_one_poll() {
+        // The new daemon is not draining and has no runs: only the pid tells it from the old one.
+        let new_daemon = Reading {
+            draining: false,
+            pid: 11,
+            waiting_on: vec![],
+        };
+        assert_eq!(judge(&new_daemon, 10), Step::Restarting);
+    }
+
+    #[test]
+    fn a_reading_without_a_pid_or_a_body_is_refused_by_name() {
+        let no_pid = Reading::from_json(&serde_json::json!({ "draining": true }));
+        assert!(no_pid.unwrap_err().contains("pid"));
+        let no_body = Reading::from_json(&Value::Null);
+        assert!(no_body.unwrap_err().contains("parsed"));
+        assert!(Reading::from_json(&serde_json::json!({ "pid": 3 })).is_ok());
     }
 
     /// A daemon whose drain timed out answers `draining: false` with the runs still live: exit 4,
@@ -345,10 +405,12 @@ mod tests {
         use axum::routing::{get, post};
         let waiting = serde_json::json!({
             "draining": true,
+            "pid": 100,
             "waiting_on": [{ "run_id": 5, "chat_id": "chat-a" }]
         });
         let timed_out = serde_json::json!({
             "draining": false,
+            "pid": 100,
             "waiting_on": [{ "run_id": 5, "chat_id": "chat-a" }]
         });
         let app = axum::Router::new()
