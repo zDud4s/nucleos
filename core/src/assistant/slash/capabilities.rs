@@ -203,6 +203,66 @@ mod tests {
         assert_eq!(ChatEngine::from_stored("agy"), None);
     }
 
+    /// RED (plan Node 3, test 7; contract E22). The Gemini API route is a chat engine of its own
+    /// (`ChatEngine::GeminiApi`, the provider read from the `gemini-api/` id prefix on the hosted
+    /// brain) and every control that needs a CLI, agents, teams, council or quota is refused by
+    /// name, as `AGY_REFUSAL` does for agy.
+    #[test]
+    fn gemini_api_refused_by_name_for_agents_teams_council_quota() {
+        // The engine exists, answers to the table's id, and is not any of the others.
+        assert_eq!(ChatEngine::GeminiApi.as_str(), crate::engines::GEMINI_API);
+        assert_eq!(crate::engines::GEMINI_API, "gemini-api");
+        for other in [
+            ChatEngine::Claude,
+            ChatEngine::Codex,
+            ChatEngine::Local,
+            ChatEngine::OpenRouter,
+            ChatEngine::Agy,
+        ] {
+            assert_ne!(ChatEngine::GeminiApi, other);
+        }
+
+        // A hosted chat pinned to `gemini-api/<model>` is the Gemini engine; every other hosted
+        // chat (a bare or `openrouter/` pick, or no pin) is still OpenRouter.
+        let config = ModelsConfig::default();
+        assert_eq!(
+            engine_of(&config, Brain::OpenRouter, Some("gemini-api/gemini-2.5-flash")),
+            ChatEngine::GeminiApi
+        );
+        assert_eq!(
+            engine_of(&config, Brain::OpenRouter, Some("google/gemini-2.5-flash")),
+            ChatEngine::OpenRouter
+        );
+        assert_eq!(
+            engine_of(&config, Brain::OpenRouter, None),
+            ChatEngine::OpenRouter
+        );
+
+        // The controls: only a per-turn budget is a warning (the hosted route ignores it, like
+        // OpenRouter); effort, extra dirs, denied tools, agents and registry MCP are refused.
+        for capability in [Effort, ExtraDirs, DeniedTools, Agents, RegistryMcp] {
+            assert_eq!(
+                support(ChatEngine::GeminiApi, capability),
+                No,
+                "{capability:?} on gemini-api"
+            );
+            assert_eq!(
+                require(ChatEngine::GeminiApi, capability, "do that"),
+                Err(SlashError::Unsupported {
+                    engine: ChatEngine::GeminiApi,
+                    what: "do that".to_string(),
+                })
+            );
+        }
+        assert_eq!(support(ChatEngine::GeminiApi, TurnBudget), Warn);
+
+        // The by-name refusal for the launch sites names the route and every refused surface.
+        let refusal = crate::engines::GEMINI_API_REFUSAL;
+        for needle in ["gemini-api", "agents", "teams", "council", "quota"] {
+            assert!(refusal.contains(needle), "`{needle}` missing from: {refusal}");
+        }
+    }
+
     fn codex_choice() -> AssistantChoice {
         AssistantChoice {
             id: "gpt-test".to_string(),
