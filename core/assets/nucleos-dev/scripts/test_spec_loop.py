@@ -16,12 +16,14 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("spec_loop", HERE / "spec_loop.py")
 sl = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(sl)
 sys.modules["spec_loop"] = sl
+REAL_REPORT_LET_GO = sl.report_let_go
 timer_spec = importlib.util.spec_from_file_location("spec_loop_timer", HERE / "spec_loop_timer.py")
 timer = importlib.util.module_from_spec(timer_spec)
 timer_spec.loader.exec_module(timer)
@@ -42,6 +44,10 @@ class SpecLoop(unittest.TestCase):
             json.dumps({"id": "t", "state_dir": str(self.state), "bundle_dir": str(HERE.parent)}),
             encoding="utf-8")
         self.loop = self.state / "loops" / "s1.md"
+        # A test run must never write to the live daemon's feed.
+        patcher = mock.patch.object(sl, "report_let_go")
+        self.reported = patcher.start()
+        self.addCleanup(patcher.stop)
         old = os.environ.get("NUCLEOS_PROJECT_ROOT")
         os.environ["NUCLEOS_PROJECT_ROOT"] = str(self.root)
         self.addCleanup(lambda: os.environ.pop("NUCLEOS_PROJECT_ROOT", None) if old is None
@@ -87,6 +93,55 @@ class SpecLoop(unittest.TestCase):
 
     def state_file(self):
         return json.loads(self.loop.with_suffix(".state.json").read_text(encoding="utf-8"))
+
+    def test_letting_go_reports_once_to_the_feed(self):
+        self.let_go("- [ ] a\n- [ ] b\n")
+        self.assertEqual(self.reported.call_count, 1)
+        payload, n_open = self.reported.call_args.args
+        self.assertEqual((payload["session_id"], n_open), ("s1", 2))
+
+    def test_a_push_reports_nothing(self):
+        self.write("- [ ] a\n")
+        self.assertIsNotNone(self.stop(REPORT))
+        self.assertIsNotNone(self.stop(REPORT, pushed=True))
+        self.reported.assert_not_called()
+
+    def test_the_timers_wake_does_not_report_the_same_let_go_again(self):
+        self.let_go()
+        state = self.state_file()
+        state["woken"] = True
+        self.loop.with_suffix(".state.json").write_text(json.dumps(state), encoding="utf-8")
+        self.assertIsNone(self.stop(REPORT))
+        self.assertEqual(self.reported.call_count, 1)
+
+    def test_a_new_round_of_pushes_that_closes_nothing_reports_again(self):
+        self.let_go()
+        self.assertIsNotNone(self.stop(REPORT))
+        self.assertIsNotNone(self.stop(REPORT, pushed=True))
+        self.assertIsNone(self.stop(REPORT, pushed=True))
+        self.assertEqual(self.reported.call_count, 2)
+
+    def test_the_report_posts_one_feed_line(self):
+        env = {"NUCLEOS_DAEMON_TOKEN": "tok", "NUCLEOS_DAEMON_URL": "http://daemon"}
+        with mock.patch.dict(os.environ, env), mock.patch("urllib.request.urlopen") as urlopen:
+            REAL_REPORT_LET_GO({"session_id": "s1", "cwd": "C:/p"}, 2)
+        request = urlopen.call_args.args[0]
+        self.assertEqual((request.full_url, request.get_method()),
+                         ("http://daemon/conductor/feed", "POST"))
+        self.assertEqual(request.get_header("Authorization"), "Bearer tok")
+        body = json.loads(request.data)
+        self.assertEqual((body["kind"], body["session_id"], body["cwd"], body["tool_name"]),
+                         ("spec_loop_let_go", "s1", "C:/p", "spec loop"))
+        self.assertIn("2", body["reason"])
+
+    def test_the_report_is_silent_when_the_daemon_does_not_answer(self):
+        with mock.patch.dict(os.environ, {"NUCLEOS_DAEMON_TOKEN": "tok"}),                 mock.patch("urllib.request.urlopen", side_effect=OSError("refused")):
+            REAL_REPORT_LET_GO({"session_id": "s1", "cwd": "C:/p"}, 2)
+
+    def test_the_report_posts_nothing_without_a_token(self):
+        with mock.patch("rehydrate.find_token", return_value=None),                 mock.patch("urllib.request.urlopen") as urlopen:
+            REAL_REPORT_LET_GO({"session_id": "s1", "cwd": "C:/p"}, 2)
+        urlopen.assert_not_called()
 
     def test_letting_go_records_how_many_items_it_left_open(self):
         self.let_go("- [ ] a\n- [ ] b\n")

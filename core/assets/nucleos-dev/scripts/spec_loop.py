@@ -13,7 +13,7 @@ type "segue", "o que falta" or "resume o que foi feito" over and over. Two hooks
   session launched is still running: its completion wakes the session and the hold resumes
   (`spec_loop_timer.py` wakes it first if the prompt cache is about to expire). It
   lets go after MAX_IDLE_PUSHES pushes that closed nothing, so a stuck model cannot loop forever;
-  the timer then wakes that session once, at the end of its cache window.
+  the timer then wakes that session once, at the end of its cache window, and the feed gets one line.
   Whenever the checklist changed since the last accepted report, the final message must carry the report
   headings (REPORT_HEADINGS); a done checklist is then closed (`<id>.closed.md`).
 - `--prompt-hook` (UserPromptSubmit): a prompt that names a spec or plan, in a session with no
@@ -34,11 +34,14 @@ import os
 import re
 import sys
 import unicodedata
+import urllib.request
 from pathlib import Path
 
 import nucleos_paths
 
 MAX_IDLE_PUSHES = 2
+LET_GO_FEED_KIND = "spec_loop_let_go"
+FEED_TIMEOUT_SECS = 2
 REPORT_HEADINGS = ("Feito", "Falta", "Verificação", "Próximo passo")
 REPORT_TEMPLATE = (
     "## Feito\n- <item> — <evidência: ficheiro, commit ou teste>\n"
@@ -143,6 +146,34 @@ def _block(reason: str) -> dict:
     return {"decision": "block", "reason": reason}
 
 
+def report_let_go(payload: dict, n_open: int) -> None:
+    """One feed line saying a session stopped with work open. One light request, silent on failure:
+    the daemon may be down, and the stop must go either way."""
+    try:
+        import rehydrate
+
+        cwd = payload.get("cwd")
+        token = rehydrate.find_token(str(cwd or os.getcwd()))
+        if not token:
+            return
+        base = (os.environ.get("NUCLEOS_DAEMON_URL") or rehydrate.DEFAULT_DAEMON_URL).rstrip("/")
+        request = urllib.request.Request(
+            f"{base}/conductor/feed",
+            data=json.dumps({
+                "kind": LET_GO_FEED_KIND,
+                "session_id": payload.get("session_id"),
+                "cwd": cwd,
+                "tool_name": "spec loop",
+                "reason": f"let go with {n_open} open item(s), pushes closed nothing",
+            }).encode(),
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(request, timeout=FEED_TIMEOUT_SECS).close()
+    except Exception:
+        pass
+
+
 def stop_decision(payload: dict) -> dict | None:
     """The hook's JSON answer, or None to let the stop go."""
     session = payload.get("session_id")
@@ -197,7 +228,10 @@ def stop_decision(payload: dict) -> dict | None:
                 "nucleos-compact skill.")
         print(f"spec loop: {MAX_IDLE_PUSHES} pushes closed nothing; letting the stop go", file=sys.stderr)
         # spec_loop_timer.py reads this: nothing else would look at the session again.
+        first = state.get("let_go") != n_open
         save(let_go=n_open or None)
+        if first:
+            report_let_go(payload, n_open)
 
     # 2. The checklist moved since the last accepted report: the final message must report it.
     mtime = path.stat().st_mtime
