@@ -171,20 +171,7 @@ fn plan_launch(
         }
         let tools = capabilities::translate(engine, caps)
             .map_err(|why| LaunchError::Unsupported(label.to_owned(), why))?;
-        let runners = match engine {
-            Engine::Claude => vec![RunnerKind::Claude],
-            Engine::Codex => vec![RunnerKind::Codex],
-            Engine::Local => Vec::new(),
-            // Refused above; no runner is ever listed for agy.
-            Engine::Agy => Vec::new(),
-            // An engine with no arm is refused by name, never run as Claude.
-            other => {
-                return Err(LaunchError::NoRunner(format!(
-                    "{label}: the {} engine is not available for agents, teams or council",
-                    other.as_str()
-                )));
-            }
-        };
+        let runners = runners_for_pin(engine, label)?;
         return Ok(Plan {
             runners,
             pin: Some((engine, model)),
@@ -206,6 +193,24 @@ fn plan_launch(
         runners,
         pin: None,
         tools: None,
+    })
+}
+
+/// The runners a pin on `engine` may use. An engine with no arm is refused by name, never run
+/// as Claude.
+fn runners_for_pin(engine: Engine, label: &str) -> Result<Vec<RunnerKind>, LaunchError> {
+    Ok(match engine {
+        Engine::Claude => vec![RunnerKind::Claude],
+        Engine::Codex => vec![RunnerKind::Codex],
+        Engine::Local => Vec::new(),
+        // Refused by the caller; no runner is ever listed for agy.
+        Engine::Agy => Vec::new(),
+        other => {
+            return Err(LaunchError::NoRunner(format!(
+                "{label}: the {} engine is not available for agents, teams or council",
+                other.as_str()
+            )));
+        }
     })
 }
 
@@ -346,7 +351,7 @@ mod tests {
 
     /// A pin on an engine the launcher does not know is refused by name, never run as Claude.
     /// The pin reaches `plan_launch` as a string, so "zed" is refused at the parse step; the
-    /// wildcard arm after `translate` is reached only once an id parses but has no arm.
+    /// wildcard arm of `runners_for_pin` is covered by its own test below.
     #[test]
     fn plan_launch_refuses_unwired_engine() {
         let error = plan_launch(
@@ -360,6 +365,19 @@ mod tests {
         assert!(matches!(error, LaunchError::NoRunner(_)), "{error:?}");
         assert!(error.to_string().contains("zed"), "{error}");
         assert!(!error.to_string().contains("Claude"), "{error}");
+    }
+
+    #[test]
+    fn runners_for_pin_refuses_unwired_engine_by_name() {
+        let error = runners_for_pin(Engine::for_test("zed"), "r@1.0.0")
+            .expect_err("an unwired engine has no runner list");
+        assert!(matches!(error, LaunchError::NoRunner(_)), "{error:?}");
+        assert!(
+            error
+                .to_string()
+                .contains("the zed engine is not available for agents, teams or council"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -1023,7 +1023,10 @@ fn default_model(models: &crate::config::ModelsConfig, kind: RunnerKind) -> Stri
         RunnerKind::Agy => crate::engines::agy::DEFAULT_MODEL.to_owned(),
         // An engine with no arm has no default model: the empty string names none, and never
         // borrows Claude's.
-        _ => String::new(),
+        _ => {
+            tracing::warn!(kind = kind.as_str(), "engine has no default model");
+            String::new()
+        }
     }
 }
 

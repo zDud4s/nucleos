@@ -346,7 +346,9 @@ impl EngineId {
     /// Not a table row: OpenRouter is a hosted brain, not a launchable engine.
     pub const OPENROUTER: EngineId = EngineId("openrouter");
 
-    /// The id of a table row. No public function turns an arbitrary string into an id.
+    /// The id of a table row. Production code gets ids from table rows (this function) and from
+    /// the named consts; `from_row` is crate-private and is only given the `engines::` id
+    /// constants.
     pub fn of_row(row: &EngineDescription) -> EngineId {
         EngineId(row.id)
     }
@@ -696,7 +698,8 @@ mod tests {
         }
     }
 
-    /// AC1: the id flip leaves every stored text, the ordering and the Debug text as they were.
+    /// AC1: the id flip leaves every stored text and the ordering as they were, and pins
+    /// `EngineId`'s own Debug text. Wrapper types print around it, e.g. `RunnerKind(Claude)`.
     #[test]
     fn engine_ids_keep_stored_text_order_and_debug() {
         use crate::agents::capabilities::Engine;
@@ -732,8 +735,9 @@ mod tests {
             kinds,
             [RunnerKind::Claude, RunnerKind::Codex, RunnerKind::Agy]
         );
-        assert!(EngineId::named("claude") < EngineId::named("codex"));
-        assert!(EngineId::named("local") < EngineId::named("agy"));
+        let id = |name: &str| EngineId::named(name).expect("a table row");
+        assert!(id("claude") < id("codex"));
+        assert!(id("local") < id("agy"));
 
         // Debug prints the capitalised id.
         for (id, want) in [

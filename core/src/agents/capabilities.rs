@@ -198,9 +198,17 @@ pub fn translatable_runners(caps: &[Capability]) -> Vec<RunnerKind> {
         .into_iter()
         .cloned()
         .collect();
-    crate::engines::ids_with_transport_in(&enabled, crate::engines::Transport::Cli)
+    translatable_runners_in(&enabled, caps)
+}
+
+/// The CLI runners of `table` that translate `caps` without error.
+pub fn translatable_runners_in(
+    table: &[crate::engines::EngineDescription],
+    caps: &[Capability],
+) -> Vec<RunnerKind> {
+    crate::engines::ids_with_transport_in(table, crate::engines::Transport::Cli)
         .into_iter()
-        .filter_map(RunnerKind::parse)
+        .filter_map(|id| RunnerKind::parse_in(table, id))
         // An empty capability list translates for agy, but agents never run on it: allow-list the
         // engines that do, so a new engine is excluded until it is wired.
         .filter(|&kind| kind == RunnerKind::Claude || kind == RunnerKind::Codex)
@@ -242,6 +250,43 @@ mod tests {
                 "{runners:?}"
             );
         }
+    }
+
+    fn zed_no_utility_default(_known: &[crate::models::model_catalog::Discovered]) -> Option<String> {
+        None
+    }
+
+    fn zed_no_runner(
+        _models: &crate::config::ModelsConfig,
+    ) -> Option<std::sync::Arc<dyn crate::execution::runner::CommandRunner>> {
+        None
+    }
+
+    fn zed_true() -> bool {
+        true
+    }
+
+    /// A CLI row with no wiring is dropped by the allow-list alone: empty caps translate for any
+    /// engine, so nothing else could exclude it.
+    #[test]
+    fn translatable_runners_in_excludes_a_cli_row_with_no_wiring() {
+        let mut table = crate::engines::TABLE.to_vec();
+        table.push(crate::engines::EngineDescription {
+            id: "zed",
+            display_name: "Zed",
+            seat_kind: crate::config::SeatKind::Cloud,
+            transport: crate::engines::Transport::Cli,
+            installed: zed_true,
+            gate: zed_true,
+            utility_default: zed_no_utility_default,
+            runner: zed_no_runner,
+        });
+        let runners = translatable_runners_in(&table, &[]);
+        assert!(runners.contains(&RunnerKind::Claude), "{runners:?}");
+        assert!(
+            runners.iter().all(|kind| kind.as_str() != "zed"),
+            "{runners:?}"
+        );
     }
 
     #[test]
