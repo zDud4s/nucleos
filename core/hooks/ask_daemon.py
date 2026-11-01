@@ -1441,12 +1441,43 @@ def _conductor_commit_accepts(args):
     return has_message
 
 
-def _conductor_git_accepts(tokens):
+def _conductor_worktree_path(path, cwd):
+    """`path` resolved, when it lies strictly under `<project>/.claude/worktrees/`, else None.
+
+    Resolved with `realpath`, so `..` and links cannot leave the folder unnoticed. The project is
+    found as in the gates rule: a folder at or above `cwd` holding the workflow pointer or the gate
+    script. The worktrees folder itself, the main checkout and anything outside are not accepted.
+    """
+    resolved = _conductor_path(path, cwd)
+    for folder in _ancestors(cwd):
+        if os.path.isfile(os.path.join(folder, *WORKFLOW_POINTER)) or os.path.isfile(
+            os.path.join(folder, "scripts", "gates.sh")
+        ):
+            root = _conductor_path(os.path.join(folder, ".claude", "worktrees"), cwd)
+            if resolved != root and _under(resolved, root):
+                return resolved
+    return None
+
+
+def _conductor_worktree_remove_accepts(args, cwd):
+    """`git worktree remove <path>`: no flag at all (so no `--force`), one path under the project's
+    worktrees. A `shell/node_modules` there is a junction `git worktree remove` follows, emptying the
+    main checkout's; that case keeps going through an agent, as does removing the cwd itself."""
+    if len(args) != 1 or args[0].startswith("-"):
+        return False
+    target = _conductor_worktree_path(args[0], cwd)
+    if target is None or _under(_conductor_path(cwd, cwd), target):
+        return False
+    return not os.path.lexists(os.path.join(target, "shell", "node_modules"))
+
+
+def _conductor_git_accepts(tokens, cwd):
     # By bare name, as with python and cargo above: a path could name a script an agent wrote.
     if tokens[0].lower() not in ("git", "git.exe"):
         return False
     rest = tokens[1:]
-    if rest[:1] == ["-C"]:
+    redirected_root = rest[:1] == ["-C"]
+    if redirected_root:
         rest = rest[2:]
     if not rest:
         return False
@@ -1454,15 +1485,62 @@ def _conductor_git_accepts(tokens):
     if verb in CONDUCTOR_GIT_READS:
         # `--output=<file>` turns a read into a write.
         return not any(arg.startswith("--output") for arg in args)
+    if verb == "merge-base":
+        # Only the yes/no question; the other forms print or walk, and stay with an agent.
+        return len(args) == 3 and args[0] == "--is-ancestor" and not any(a.startswith("-") for a in args[1:])
     if verb == "branch":
         return args[:1] == ["--list"] and not any(arg.startswith("-") for arg in args[1:])
     if verb == "worktree":
-        return args[:1] == ["list"]
+        if args[:1] == ["list"]:
+            return True
+        # With `-C` the path would be read against another root; not worth reasoning about.
+        return args[:1] == ["remove"] and not redirected_root and _conductor_worktree_remove_accepts(args[1:], cwd)
     if verb == "add":
         return _conductor_add_accepts(args)
     if verb == "commit":
         return _conductor_commit_accepts(args)
     return False
+
+
+CONDUCTOR_LAND_TARGET = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
+
+
+def _conductor_land_tokens(part):
+    """The tokens of one `&&` part, or None when it carries a metacharacter or does not parse."""
+    if any(mark in part for mark in CONDUCTOR_METACHARACTERS):
+        return None
+    try:
+        return shlex.split(part.replace("\\", "/"), posix=True)
+    except ValueError:
+        return None
+
+
+def _conductor_land_accepts(command, cwd):
+    """`<dev home>/run/nucleos-core.exe --land [target]`, alone or after exactly one `cd <worktree> &&`.
+
+    `--land` lands the branch of the cwd, hence the `cd`; its path must lie under the project's
+    worktrees. Every other argument of that program (`--print-token`, `--settings-reset`, ...) is
+    refused. The hook does not check the owner's word: landing still takes the owner's "aterra", and
+    the approve/refuse endpoints stay the owner's alone; nothing here reaches them.
+    """
+    parts = re.split(r"\s+&&\s+", command.strip())
+    if len(parts) > 2:
+        return False
+    # A leading PowerShell call operator, for the quoted program path; on the last part only.
+    parts[-1] = re.sub(r"^&\s+(?=\S)", "", parts[-1])
+    parsed = [_conductor_land_tokens(part) for part in parts]
+    if any(not tokens for tokens in parsed):
+        return False
+    if len(parsed) == 2:
+        left = parsed[0]
+        if len(left) != 2 or left[0].lower() != "cd" or _conductor_worktree_path(left[1], cwd) is None:
+            return False
+    tokens = parsed[-1]
+    dev_home = os.environ.get(CONDUCTOR_DEV_HOME_ENV) or CONDUCTOR_DEV_HOME_DEFAULT
+    program = _conductor_path(os.path.join(dev_home, "run", "nucleos-core.exe"), cwd)
+    if len(tokens) not in (2, 3) or _conductor_path(tokens[0], cwd) != program or tokens[1] != "--land":
+        return False
+    return len(tokens) == 2 or CONDUCTOR_LAND_TARGET.fullmatch(tokens[2]) is not None
 
 
 def _conductor_command_refusal(command, cwd, state=None):
@@ -1471,6 +1549,8 @@ def _conductor_command_refusal(command, cwd, state=None):
     # The spelling tolerance of `claimed_land_override`, but any mention counts, not only a setting.
     if CONDUCTOR_ENV.lower() in re.sub(r"[\\`'\"+${}]", "", command).lower():
         return CONDUCTOR_ENV_REFUSAL
+    if _conductor_land_accepts(command, cwd):
+        return ""
     # A trailing log redirect and a leading PowerShell `&` are for the gate script alone.
     gates_only = False
     stripped, redirects_ok, redirected = _conductor_strip_redirects(command, state or {}, cwd)
@@ -1488,7 +1568,7 @@ def _conductor_command_refusal(command, cwd, state=None):
         return CONDUCTOR_REFUSAL
     if tokens and _conductor_gates_accepts(tokens, cwd):
         return ""
-    if tokens and not gates_only and (_conductor_heavy_accepts(tokens, cwd) or _conductor_git_accepts(tokens)):
+    if tokens and not gates_only and (_conductor_heavy_accepts(tokens, cwd) or _conductor_git_accepts(tokens, cwd)):
         return ""
     return CONDUCTOR_REFUSAL
 
