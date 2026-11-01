@@ -2078,6 +2078,43 @@ mod tests {
         release_queue(&held);
     }
 
+    /// A queued automatic resume is not sent into a chat whose newest turn was stopped, or whose
+    /// queue is held: the drain's own rules apply to it like to any waiting message.
+    #[tokio::test]
+    async fn a_cancelled_or_held_chat_is_not_resumed() {
+        let state = test_state().await;
+        let cancelled = a_chat("resume-cancelled");
+        let held = a_chat("resume-held");
+        for chat in [&cancelled, &held] {
+            crate::chats::enqueue(
+                &state.pool,
+                chat,
+                crate::chats::auto_resume::AUTO_RESUME_TEXT,
+                "shell",
+                "[]",
+            )
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, chat_id, created_at)
+             VALUES ('p', 'cancelled', 'assistant', ?, ?)",
+        )
+        .bind(&cancelled)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        hold_queue(&held);
+
+        drain_queued(&state, &cancelled).await;
+        drain_queued(&state, &held).await;
+
+        assert_eq!(waiting_texts(&state.pool, &cancelled).await.len(), 1);
+        assert_eq!(waiting_texts(&state.pool, &held).await.len(), 1);
+        release_queue(&held);
+    }
+
     /// A new message does not jump over the ones already waiting, even when the chat is free.
     #[tokio::test]
     async fn a_new_message_waits_behind_what_is_already_waiting() {

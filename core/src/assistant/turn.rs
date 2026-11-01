@@ -1112,6 +1112,8 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
                             .is_ok_and(|written| written.rows_affected() > 0)
                     {
                         linked_reply = reply.clone();
+                        // A turn that finished ends the streak of restart interruptions.
+                        crate::chats::auto_resume::reset(&pool, &turn.slot.chat_id).await;
                     }
                     if let Some(session_id) = o.session_id.as_deref() {
                         // `get_session` would refuse to resume this session anyway, by looking at the

@@ -1,3 +1,4 @@
+pub mod auto_resume;
 pub mod compactions;
 pub mod groups;
 pub mod links;
