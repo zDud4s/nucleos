@@ -15,6 +15,10 @@
 # Usage: scripts/gates.sh [core|sidecars|shell|tauri|hooks|security|broker|all]   (default: all)
 set -uo pipefail
 
+# A gate reads nothing. A daemon started without a console hands down a dead stdin handle, and every
+# Python `subprocess` under this script then dies with WinError 6: a false red.
+exec </dev/null
+
 failures=""
 skipped=""
 

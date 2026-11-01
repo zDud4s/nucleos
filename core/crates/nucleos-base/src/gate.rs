@@ -336,6 +336,9 @@ pub async fn run_argv(
                 .map(|(name, value)| (name.as_str(), value.as_str())),
         )
         .current_dir(cwd)
+        // Nobody answers a gate, and a dead inherited handle fails every Python `subprocess` under
+        // it with WinError 6: a false red.
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
