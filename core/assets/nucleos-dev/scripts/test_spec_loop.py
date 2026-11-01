@@ -78,6 +78,71 @@ class SpecLoop(unittest.TestCase):
         self.assertEqual(self.stop(REPORT, pushed=True)["decision"], "block")
         self.assertIsNone(self.stop(REPORT, pushed=True))
 
+    def let_go(self, body="- [ ] a\n"):
+        """Runs the two pushes out, so the hook lets the stop go with the item still open."""
+        self.write(body)
+        self.stop(REPORT)
+        self.stop(REPORT, pushed=True)
+        self.assertIsNone(self.stop(REPORT, pushed=True))
+
+    def state_file(self):
+        return json.loads(self.loop.with_suffix(".state.json").read_text(encoding="utf-8"))
+
+    def test_letting_go_records_how_many_items_it_left_open(self):
+        self.let_go("- [ ] a\n- [ ] b\n")
+        self.assertEqual(self.state_file()["let_go"], 2)
+
+    def test_timer_wakes_a_session_let_go_with_open_items_once(self):
+        self.let_go()
+        message, slept = self.timer([self.answered(1000)], tasks=())
+        self.assertIn("open item", message)
+        self.assertEqual(slept, 55 * 60)
+        self.assertIsNone(self.timer([self.answered(9000)], tasks=(), clock=9000)[0])
+
+    def test_timer_sees_a_let_go_written_after_it_started(self):
+        self.write("- [ ] a\n")
+        self.stop(REPORT)
+        self.stop(REPORT, pushed=True)
+
+        def hook_answers():
+            if self.timer_at == 1030:
+                self.stop(REPORT, pushed=True)
+        message, _ = self.timer([self.answered(1000)], tasks=(), on_sleep=hook_answers)
+        self.assertIn("open item", message)
+
+    def test_timer_stays_out_of_a_session_the_hook_did_not_let_go(self):
+        self.write("- [ ] a\n")
+        self.assertIsNone(self.timer([self.answered(1000)], tasks=())[0])
+
+    def test_timer_does_not_wake_a_let_go_session_that_got_a_new_turn(self):
+        self.let_go()
+        records = [self.answered(1000)]
+
+        def new_turn():
+            records.append(self.answered(1020))
+            self.transcript(*records)
+        self.assertIsNone(self.timer(records, tasks=(), on_sleep=new_turn)[0])
+
+    def test_the_wake_after_a_let_go_gets_no_pushes_of_its_own(self):
+        self.let_go()
+        self.timer([self.answered(1000)], tasks=())
+        self.assertIsNone(self.stop(REPORT))
+
+    def test_progress_after_the_wake_earns_the_pushes_back(self):
+        self.let_go("- [ ] a\n- [ ] b\n")
+        self.timer([self.answered(1000)], tasks=())
+        self.write("- [x] a\n- [ ] b\n")
+        self.assertEqual(self.stop(REPORT)["decision"], "block")
+
+    def test_a_new_prompt_after_the_wake_earns_another_wake(self):
+        self.let_go()
+        self.timer([self.answered(1000)], tasks=())
+        self.stop(REPORT)  # the woken turn, let go at once
+        self.stop(REPORT)  # the owner's next prompt, pushed again
+        self.stop(REPORT, pushed=True)
+        self.assertIsNone(self.stop(REPORT, pushed=True))
+        self.assertIn("open item", self.timer([self.answered(9000)], tasks=(), clock=9000)[0])
+
     def test_progress_resets_the_idle_count(self):
         self.write("- [ ] a\n- [ ] b\n- [ ] c\n")
         self.stop(REPORT)
@@ -222,7 +287,7 @@ class SpecLoop(unittest.TestCase):
 
     def test_timer_stays_quiet_with_nothing_to_wait_for(self):
         self.write("- [ ] a\n")
-        self.assertEqual(self.timer([self.answered(1000)], tasks=()), (None, 0))
+        self.assertEqual(self.timer([self.answered(1000)], tasks=()), (None, timer.LET_GO_GRACE_SECS))
         self.write("- [x] a\n")
         self.assertEqual(self.timer([self.answered(1000)]), (None, 0))
         self.write("- [ ] a\n- [!] b\n", status="blocked")
@@ -235,12 +300,31 @@ class SpecLoop(unittest.TestCase):
         message, _ = self.timer([self.answered(1000)], on_sleep=lambda: self.write("- [x] a\n"))
         self.assertIsNone(message)
 
-    def test_timer_stops_waking_for_tasks_that_never_change(self):
+    def test_timer_stops_waking_once_unchanged_tasks_outlast_the_budget(self):
         self.write("- [ ] a\n")
-        for _ in range(timer.MAX_WAKES):
-            self.assertIsNotNone(self.timer([self.answered(1000)])[0])
-        self.assertIsNone(self.timer([self.answered(1000)])[0])
-        self.assertIsNotNone(self.timer([self.answered(1000)], tasks=("b2",))[0], "new work resets it")
+        self.assertIsNotNone(self.timer([self.answered(1000)])[0])
+        end = self.timer_at + timer.MAX_WAKE_SECS
+        self.assertIsNotNone(self.timer([self.answered(1000)], clock=end - 1)[0])
+        self.assertEqual(self.timer([self.answered(1000)], clock=end), (None, 0))
+        self.assertIsNotNone(self.timer([self.answered(1000)], tasks=("b2",), clock=end)[0],
+                             "new work resets it")
+
+    def test_timer_budget_is_time_so_a_short_cache_gets_the_same_hours(self):
+        self.write("- [ ] a\n")
+        at = 1000
+        for _ in range(20):
+            message, _ = self.timer([self.answered(at, "ephemeral_5m_input_tokens")], clock=at)
+            self.assertIsNotNone(message)
+            at = self.timer_at
+
+    def test_timer_treats_a_count_left_by_an_older_version_as_a_new_budget(self):
+        self.write("- [ ] a\n")
+        self.timer([self.answered(1000)])
+        state_path = self.loop.with_suffix(".state.json")
+        state = json.loads(state_path.read_text())
+        state["wakes"] = {"tasks": state["wakes"]["tasks"], "count": 6}
+        state_path.write_text(json.dumps(state))
+        self.assertIsNotNone(self.timer([self.answered(1000)], clock=1000 + 100 * 3600)[0])
 
     def test_a_wake_leaves_the_stop_hooks_state_alone(self):
         self.write("- [ ] a\n")
@@ -298,6 +382,62 @@ class SpecLoop(unittest.TestCase):
                            capture_output=True, text=True, env=env)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("- [ ] b", (self.state / "loops" / "s9.md").read_text(encoding="utf-8"))
+
+    def run_start(self, session, *args, name_env=None):
+        env = {**os.environ, "CLAUDE_CODE_SESSION_ID": session, "NUCLEOS_PROJECT_ROOT": str(self.root)}
+        env.pop("NUCLEOS_LOOP_NAME", None)
+        if name_env is not None:
+            env["NUCLEOS_LOOP_NAME"] = name_env
+        return subprocess.run([sys.executable, str(HERE / "spec_loop.py"), "start", *args],
+                              capture_output=True, text=True, env=env)
+
+    def test_start_name_flag_replaces_the_session_id_in_the_file_name(self):
+        r = self.run_start("s9", "--name", "branch-a", "x.md", "a")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("- [ ] a", (self.state / "loops" / "branch-a.md").read_text(encoding="utf-8"))
+        self.assertFalse((self.state / "loops" / "s9.md").exists())
+
+    def test_start_name_env_replaces_the_session_id_in_the_file_name(self):
+        r = self.run_start("s9", "x.md", "a", name_env="branch-b")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue((self.state / "loops" / "branch-b.md").exists())
+        self.assertFalse((self.state / "loops" / "s9.md").exists())
+
+    def test_start_name_flag_wins_over_the_env(self):
+        r = self.run_start("s9", "--name", "from-flag", "x.md", "a", name_env="from-env")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue((self.state / "loops" / "from-flag.md").exists())
+        self.assertFalse((self.state / "loops" / "from-env.md").exists())
+
+    def test_start_name_does_not_leak_into_the_spec_and_items(self):
+        r = self.run_start("s9", "--name", "n", "x.md", "a", "b")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        text = (self.state / "loops" / "n.md").read_text(encoding="utf-8")
+        self.assertIn("spec: x.md", text)
+        self.assertNotIn("--name", text)
+        self.assertIn("- [ ] b", text)
+
+    def test_start_refuses_a_named_loop_owned_by_another_session(self):
+        first = self.run_start("s1", "--name", "shared", "x.md", "a")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        before = (self.state / "loops" / "shared.md").read_text(encoding="utf-8")
+        r = self.run_start("s2", "--name", "shared", "y.md", "other")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("shared", r.stdout + r.stderr)
+        self.assertEqual((self.state / "loops" / "shared.md").read_text(encoding="utf-8"), before)
+
+    def test_start_by_the_owning_session_again_is_still_a_no_op(self):
+        self.run_start("s1", "--name", "shared", "x.md", "a")
+        r = self.run_start("s1", "--name", "shared", "x.md", "a")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("already open", r.stdout)
+
+    def test_hooks_still_look_loops_up_by_session_id_only(self):
+        # A named loop is not found by a session whose id differs from the name.
+        (self.state / "loops" / "n.md").write_text(
+            "# Spec loop\nspec: x.md\nstatus: active\n\n## Items\n- [ ] a\n", encoding="utf-8")
+        self.assertIsNone(self.stop(session="s1"))
+        self.assertIsNone(sl.prompt_context({"session_id": "s1", "cwd": str(self.root), "prompt": "hi"}))
 
     def test_hook_cli_fails_open_on_garbage(self):
         r = subprocess.run([sys.executable, str(HERE / "spec_loop.py"), "--stop-hook"],

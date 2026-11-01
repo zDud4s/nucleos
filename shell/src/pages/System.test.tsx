@@ -19,7 +19,8 @@ vi.mock("../data/client", async (original) => ({
 }));
 
 import { System, normaliseView, takenAt, validateSystemSearch } from "./System";
-import type { MachineConfig, MachineSecret } from "../data/machine-config";
+import type { MachineSecret } from "../data/secrets";
+import { isSettingsPath, settingsDouble, type SeedDoc, type SettingsDouble } from "../test/settings-double";
 import { createAppQueryClient } from "../app/queryClient";
 import { ApiRefusal } from "../data/client";
 import type {
@@ -124,14 +125,14 @@ interface SystemWorld {
   emailConfig: EmailConfig;
   voiceConfig: VoiceConfig;
   calendarConfig: CalendarConfig;
-  machine: MachineConfig;
+  settings: SettingsDouble;
   secrets: MachineSecret[];
   /** What `/route/report` answers; `undefined` is an older daemon's 404. */
   routeReport?: RouteReport;
 }
 
 /**
- * Every area the núcleo serves a settings row for, in the order it serves them.
+ * Every area the núcleo serves a settings document for, in the order it serves them.
  *
  * The four at the end are the ones the removed "Not exposed by the núcleo"
  * panel used to name. They are in this list rather than in a comment because
@@ -149,24 +150,24 @@ const MACHINE_AREAS = [
   "models",
 ] as const;
 
-function machineWorld(): MachineConfig {
-  return {
-    root: "C:/Users/someone/.nucleos",
-    root_display: "~/.nucleos",
-    settings: MACHINE_AREAS.map((area) => ({
-      path: `${area}.yaml`,
-      display: `~/.nucleos/${area}.yaml`,
-      area,
-      what: `what ${area} does`,
-      takes_effect: "when the daemon restarts",
-      exists: false,
-      valid: true,
-      problem: null,
-      at_startup: { valid: true, problem: null },
-      contents: null,
-      resolved: `C:/Users/someone/.nucleos/${area}.yaml`,
-    })),
-  };
+/**
+ * The machine's documents, each with the smallest schema that draws one field. The double validates before it
+ * writes, as the núcleo does; it is only as strict as a test needs to keep that ordering observable.
+ *
+ * `validate` names no `field` on purpose. The core's 422 is `{refusal, detail}` today, so the form's path for a
+ * refusal that names a field stays optional (a contract_request is open) and no test here may depend on it.
+ */
+function machineSeeds(): SeedDoc[] {
+  return MACHINE_AREAS.map((area): SeedDoc => ({
+    scope: "machine",
+    name: area,
+    schema: { type: "object", properties: { host: { type: "string" } } },
+    takes_effect: "when the daemon restarts",
+    validate: (body) =>
+      String((body as { host?: unknown }).host ?? "").includes("!!bad")
+        ? { message: "did not find expected node content" }
+        : null,
+  }));
 }
 
 function systemWorld(overrides: Partial<SystemWorld> = {}): SystemWorld {
@@ -188,7 +189,7 @@ function systemWorld(overrides: Partial<SystemWorld> = {}): SystemWorld {
     emailConfig: DEFAULT_EMAIL_CONFIG,
     voiceConfig: DEFAULT_VOICE_CONFIG,
     calendarConfig: DEFAULT_CALENDAR_CONFIG,
-    machine: machineWorld(),
+    settings: settingsDouble(machineSeeds()),
     secrets: [
       { key: "github-token", area: "github", what: "the token gh is handed", present: false },
       { key: "web-search-api-key", area: "web", what: "the search provider's key", present: true },
@@ -219,6 +220,7 @@ function systemFetch(
 ): (path: string, init?: RequestInit) => Promise<unknown> {
   const shared = daemonFetch(daemonState({ projects: world.projects }));
   return async (path, init) => {
+    if (isSettingsPath(path)) return world.settings.handle(path, init);
     if (init?.method === "POST") {
       if (path === "/autopilot/kill/scoped" && typeof init.body === "string") {
         const change = JSON.parse(init.body) as ScopedKill;
@@ -241,25 +243,6 @@ function systemFetch(
         const change = JSON.parse(init.body) as Omit<QuotaBrakeView, "provider">;
         world.quotaBrake = { ...change, provider: world.quotaBrake.provider };
         return world.quotaBrake;
-      }
-      if (path === "/config/machine" && typeof init.body === "string") {
-        const write = JSON.parse(init.body) as { path: string; contents: string };
-        const row = world.machine.settings.find((entry) => entry.path === write.path);
-        if (row === undefined) throw new ApiRefusal(403, "not_ours", "not_ours");
-        // The daemon validates before it writes; the double is only as strict as
-        // it needs to be to keep that ordering observable from a test.
-        if (write.contents.includes("!!bad")) {
-          throw new ApiRefusal(422, "invalid", "did not find expected node content");
-        }
-        world.machine = {
-          ...world.machine,
-          settings: world.machine.settings.map((entry) =>
-            entry.path === write.path
-              ? { ...entry, exists: true, contents: write.contents }
-              : entry,
-          ),
-        };
-        return undefined;
       }
       if (path === "/backup") {
         const created: BackupInfo = {
@@ -375,8 +358,6 @@ function systemFetch(
         return world.voiceConfig;
       case "/calendar/config":
         return world.calendarConfig;
-      case "/config/machine":
-        return world.machine;
       case "/config/secrets":
         return { secrets: world.secrets };
       case "/route/report?days=30":
@@ -422,10 +403,15 @@ async function renderSystemAt(initialPath: string) {
   return { ...result, router, queryClient };
 }
 
-/** The settings tab shows one file at a time: pick it from the list first. */
-async function openSettingsFile(area: string): Promise<void> {
-  const list = await screen.findByRole("list", { name: "Settings files" });
+/** The settings tab shows one document at a time: pick it from the list first. */
+async function openSetting(area: string): Promise<void> {
+  const list = await screen.findByRole("list", { name: "Settings documents" });
   fireEvent.click(within(list).getByRole("button", { name: new RegExp(`^${area}\\b`) }));
+}
+
+/** The chosen document's panel. An opened panel stays mounted, so a query must be scoped to its own. */
+async function settingPanel(area: string): Promise<HTMLElement> {
+  return (await screen.findByRole("heading", { name: area })).closest("section") as HTMLElement;
 }
 
 function rowFor(list: HTMLElement, name: string): HTMLElement {
@@ -1409,126 +1395,173 @@ describe("System - config index", () => {
 /* --------------------------------------------------------- machine settings -- */
 
 describe("System - this machine's settings", () => {
-  it("offers every area the núcleo serves, including the four that had no route", async () => {
+  it("offers every document the núcleo serves, asking the index with no scope", async () => {
     const world = systemWorld();
     daemon.apiFetch.mockImplementation(systemFetch(world));
 
     await renderSystemAt("/system/settings");
 
-    // The four the removed panel used to name are now editable like the rest — each in
-    // the list, and each opening its own file.
-    const list = await screen.findByRole("list", { name: "Settings files" });
-    for (const area of ["web", "browser", "council", "models"]) {
-      fireEvent.click(within(list).getByRole("button", { name: new RegExp(`^${area}\\b`) }));
+    for (const area of MACHINE_AREAS) {
+      await openSetting(area);
       expect(await screen.findByRole("heading", { name: area })).toBeDefined();
     }
-    expect(daemon.apiFetch).toHaveBeenCalledWith("/config/machine");
+    expect(daemon.apiFetch).toHaveBeenCalledWith("/settings");
   });
 
-  it("names the absolute file each row would write, beside the name a person is shown", async () => {
+  it("keeps only the machine's documents, whatever the index serves", async () => {
+    const world = systemWorld();
+    const fetcher = systemFetch(world);
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path !== "/settings") return fetcher(path, init);
+      const rows = (await fetcher(path, init)) as { name: string }[];
+      return [
+        ...rows,
+        {
+          scope: "project:alpha",
+          name: "autopilot",
+          kind: "project",
+          takes_effect: "live",
+          present: false,
+          unreadable: false,
+          version: 0,
+        },
+      ];
+    });
+
+    await renderSystemAt("/system/settings");
+
+    const list = await screen.findByRole("list", { name: "Settings documents" });
+    expect(within(list).getByRole("button", { name: /^email\b/ })).toBeDefined();
+    expect(within(list).queryByRole("button", { name: /^autopilot\b/ })).toBeNull();
+  });
+
+  it("does not fetch a document until it is chosen", async () => {
     const world = systemWorld();
     daemon.apiFetch.mockImplementation(systemFetch(world));
 
     await renderSystemAt("/system/settings");
 
-    // "Which file is this" gets the real answer, and the editor is labelled with
-    // the `~/.nucleos/` spelling rather than a bare file name.
-    expect(await screen.findByText("C:/Users/someone/.nucleos/voice.yaml")).toBeDefined();
-    expect(await screen.findByLabelText("~/.nucleos/voice.yaml")).toBeDefined();
+    // The first document is open from the start; nothing else is asked for up front.
+    await waitFor(() => expect(daemon.apiFetch).toHaveBeenCalledWith("/settings/machine/email"));
+    expect(daemon.apiFetch).not.toHaveBeenCalledWith("/settings/machine/voice");
+
+    await openSetting("voice");
+    await waitFor(() => expect(daemon.apiFetch).toHaveBeenCalledWith("/settings/machine/voice"));
   });
 
-  it("saves a file and shows what the daemon said about when it starts mattering", async () => {
+  it("asks for channels/telegram as one path segment", async () => {
     const world = systemWorld();
     daemon.apiFetch.mockImplementation(systemFetch(world));
 
     await renderSystemAt("/system/settings");
 
-    await openSettingsFile("calendar");
-    const editor = await screen.findByLabelText("~/.nucleos/calendar.yaml");
-    fireEvent.change(editor, { target: { value: 'working_hours_start: "10:00"\n' } });
-    fireEvent.click(within(editor.closest("section") as HTMLElement).getByRole("button", { name: "Save" }));
+    await openSetting("channels/telegram");
+    await waitFor(() =>
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/settings/machine/channels%2Ftelegram"),
+    );
+    expect(await within(await settingPanel("channels/telegram")).findByLabelText("Host")).toBeDefined();
+  });
+
+  it("saves a document with the version it read, and says when it starts mattering", async () => {
+    const world = systemWorld();
+    daemon.apiFetch.mockImplementation(systemFetch(world));
+
+    await renderSystemAt("/system/settings");
+
+    await openSetting("calendar");
+    const panel = await settingPanel("calendar");
+    fireEvent.change(await within(panel).findByLabelText("Host"), { target: { value: "cal.example.com" } });
+    fireEvent.click(within(panel).getByRole("button", { name: "Save" }));
 
     await waitFor(() => {
-      expect(
-        world.machine.settings.find((row) => row.path === "calendar.yaml")?.contents,
-      ).toContain("10:00");
+      expect(world.settings.writes).toEqual([
+        { scope: "machine", name: "calendar", body: { host: "cal.example.com" }, version: 0 },
+      ]);
     });
-    // Saved is not the same as in effect, and the page says which it means. The
-    // marker has to be the SAVED line specifically: every row on the page also
-    // carries this sentence as a standing fact, so a bare match for it would
-    // pass without anything having been saved at all.
-    expect(await screen.findByText(/^saved .* when the daemon restarts/)).toBeDefined();
+    // Saved is not the same as in effect, and the page says which it means. The marker has to be the SAVED
+    // line: the form also carries the sentence as a standing fact.
+    expect(await within(panel).findByText(/^saved .* when the daemon restarts/)).toBeDefined();
   });
 
-  it("shows the parser's own words when a file is refused, and does not claim it saved", async () => {
+  it("shows the núcleo's own words when a document is refused, and does not claim it saved", async () => {
     const world = systemWorld();
     daemon.apiFetch.mockImplementation(systemFetch(world));
 
     await renderSystemAt("/system/settings");
 
-    await openSettingsFile("browser");
-    const editor = await screen.findByLabelText("~/.nucleos/browser.yaml");
-    fireEvent.change(editor, { target: { value: "!!bad\n" } });
-    fireEvent.click(within(editor.closest("section") as HTMLElement).getByRole("button", { name: "Save" }));
+    await openSetting("browser");
+    const panel = await settingPanel("browser");
+    fireEvent.change(await within(panel).findByLabelText("Host"), { target: { value: "!!bad" } });
+    fireEvent.click(within(panel).getByRole("button", { name: "Save" }));
 
-    // The daemon's sentence, not a generic "invalid" that would send somebody
-    // back to a file they cannot see to look for a line nobody named.
-    expect(await screen.findByText(/did not find expected node content/)).toBeDefined();
-    expect(world.machine.settings.find((row) => row.path === "browser.yaml")?.exists).toBe(false);
+    // The refusal carries no `field` (see `machineSeeds`), so the words are asserted on the panel and not on
+    // the input: where they land when a refusal does name a field is the form's optional path, not this page's.
+    expect(await within(panel).findByText(/did not find expected node content/)).toBeDefined();
+    expect(within(panel).queryByText(/^saved /)).toBeNull();
+    expect(world.settings.writes).toEqual([]);
+  });
+
+  it("marks a document with a draft, and the draft survives a look at another one", async () => {
+    const world = systemWorld();
+    daemon.apiFetch.mockImplementation(systemFetch(world));
+
+    await renderSystemAt("/system/settings");
+
+    await openSetting("calendar");
+    const panel = await settingPanel("calendar");
+    const field = await within(panel).findByLabelText("Host");
+    fireEvent.change(field, { target: { value: "half-written" } });
+
+    const list = await screen.findByRole("list", { name: "Settings documents" });
+    const row = within(list).getByRole("button", { name: /^calendar\b/ });
+    await waitFor(() => expect(within(row).getByText("unsaved")).toBeDefined());
+
+    await openSetting("voice");
+    await settingPanel("voice");
+    await openSetting("calendar");
+    expect((field as HTMLInputElement).value).toBe("half-written");
+  });
+
+  it("describes a document by whether it was ever written", async () => {
+    const world = systemWorld({
+      settings: settingsDouble(
+        machineSeeds().map((seed) => (seed.name === "voice" ? { ...seed, body: { host: "x" }, version: 3 } : seed)),
+      ),
+    });
+    daemon.apiFetch.mockImplementation(systemFetch(world));
+
+    await renderSystemAt("/system/settings");
+
+    const list = await screen.findByRole("list", { name: "Settings documents" });
+    expect(
+      within(list).getByRole("button", { name: /^voice\b/ }).getAttribute("aria-describedby"),
+    ).toBe("marks-voice");
+    expect(document.getElementById("marks-voice")?.textContent).toBe("written");
+    expect(document.getElementById("marks-email")?.textContent).toBe("never written");
   });
 });
 
-describe("System - a settings file that does not read", () => {
-  it("a file that does not parse says so and shows why", async () => {
+describe("System - a settings document that does not read", () => {
+  it("says so in its own panel with the núcleo's words, and only there", async () => {
     const world = systemWorld();
-    world.machine.settings = world.machine.settings.map((row) =>
-      row.path === "email.yaml"
-        ? {
-            ...row,
-            exists: true,
-            contents: "enabled: [oops\n",
-            valid: false,
-            problem: "did not find expected ',' or ']' at line 2",
-          }
-        : row,
-    );
-    daemon.apiFetch.mockImplementation(systemFetch(world));
+    const fetcher = systemFetch(world);
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === "/settings/machine/email") {
+        throw new ApiRefusal(422, "unreadable", "did not find expected ',' or ']' at line 2");
+      }
+      return fetcher(path, init);
+    });
 
     await renderSystemAt("/system/settings");
 
-    await openSettingsFile("email");
-    const panel = (await screen.findByRole("heading", { name: "email" })).closest("section") as HTMLElement;
-    expect(within(panel).getByText("does not parse")).toBeDefined();
-    expect(within(panel).getByText(/did not find expected ',' or '\]' at line 2/)).toBeDefined();
-    // A healthy file beside it carries neither the badge nor the note.
-    await openSettingsFile("web");
-    const web = (await screen.findByRole("heading", { name: "web" })).closest("section") as HTMLElement;
-    expect(within(web).queryByText("does not parse")).toBeNull();
-  });
+    const panel = await settingPanel("email");
+    expect(await within(panel).findByText(/does not read: did not find expected ',' or '\]' at line 2/)).toBeDefined();
 
-  it("a file the daemon started without says a restart is needed", async () => {
-    const world = systemWorld();
-    // Broken when the daemon read it, fixed on disk since: valid now, defaults in force.
-    world.machine.settings = world.machine.settings.map((row) =>
-      row.path === "voice.yaml"
-        ? {
-            ...row,
-            exists: true,
-            contents: "enabled: false\n",
-            at_startup: { valid: false, problem: "bad chord" },
-          }
-        : row,
-    );
-    daemon.apiFetch.mockImplementation(systemFetch(world));
-
-    await renderSystemAt("/system/settings");
-
-    await openSettingsFile("voice");
-    const panel = (await screen.findByRole("heading", { name: "voice" })).closest("section") as HTMLElement;
-    expect(
-      within(panel).getByText("the daemon started on defaults — restart after fixing"),
-    ).toBeDefined();
-    expect(within(panel).queryByText("does not parse")).toBeNull();
+    // A healthy document beside it carries no such note.
+    await openSetting("web");
+    const web = await settingPanel("web");
+    expect(await within(web).findByLabelText("Host")).toBeDefined();
+    expect(within(web).queryByText(/does not read/)).toBeNull();
   });
 });
 
@@ -1541,7 +1574,7 @@ describe("System - credentials", () => {
 
     // The github credential renders inside the github panel, not in a list of
     // its own: a pillar and its key are one decision.
-    await openSettingsFile("github");
+    await openSetting("github");
     const githubPanel = (await screen.findByRole("heading", { name: "github" })).closest(
       "section",
     ) as HTMLElement;
@@ -1560,7 +1593,7 @@ describe("System - credentials", () => {
 
     await renderSystemAt("/system/settings");
 
-    await openSettingsFile("github");
+    await openSetting("github");
     const githubPanel = (await screen.findByRole("heading", { name: "github" })).closest(
       "section",
     ) as HTMLElement;

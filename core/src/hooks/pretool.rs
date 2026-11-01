@@ -48,7 +48,7 @@ pub(super) async fn filter_rewrite(
             .ok()?
             .flatten();
     let kinds = match project_id.as_deref() {
-        Some(pid) => crate::config::load_schedule_rules(state.machine_config_root.as_deref(), pid)
+        Some(pid) => crate::project::rules::autopilot(pid)
             .map(|r| r.command_kinds)
             .unwrap_or_default(),
         None => crate::config::CommandKinds::default(),
@@ -556,7 +556,6 @@ pub(super) async fn pretooluse_decision_from(
                             &state.pool,
                             &state.judge,
                             judge_asked(
-                                &state,
                                 run_id,
                                 Some(decision_id),
                                 project_id.as_deref(),
@@ -939,7 +938,6 @@ pub(super) async fn pretooluse_decision_from(
                 &state.pool,
                 &state.judge,
                 judge_asked(
-                    &state,
                     run_id,
                     shadow_decision_id,
                     project_id.as_deref(),
@@ -958,7 +956,6 @@ pub(super) async fn pretooluse_decision_from(
                     &state.pool,
                     &state.judge,
                     judge_asked(
-                        &state,
                         run_id,
                         shadow_decision_id,
                         project_id.as_deref(),
@@ -975,7 +972,6 @@ pub(super) async fn pretooluse_decision_from(
                     &state.pool,
                     &state.judge,
                     judge_asked(
-                        &state,
                         run_id,
                         shadow_decision_id,
                         project_id.as_deref(),
@@ -987,7 +983,6 @@ pub(super) async fn pretooluse_decision_from(
             }
             crate::judge::JudgeMode::Enforce => {
                 let a_asked = judge_asked(
-                    &state,
                     run_id,
                     shadow_decision_id,
                     project_id.as_deref(),
@@ -1016,7 +1011,6 @@ pub(super) async fn pretooluse_decision_from(
                         cwd,
                     };
                     let b_asked = resolve_asked(
-                        &state,
                         crate::judge::resolve::Event::Park,
                         &run,
                         &payload,
@@ -1105,7 +1099,6 @@ pub(super) async fn pretooluse_decision_from(
                     cwd,
                 };
                 let asked = resolve_asked(
-                    &state,
                     crate::judge::resolve::Event::HardDeny,
                     &run,
                     &payload,
@@ -1278,7 +1271,6 @@ pub(super) async fn pretooluse_decision_from(
             cwd,
         };
         let asked = resolve_asked(
-            &state,
             crate::judge::resolve::Event::Park,
             &run,
             &payload,

@@ -7,7 +7,7 @@
 
 use sqlx::SqlitePool;
 
-use crate::config::DevtimeRulesConfig;
+use crate::config::{DevtimeActionsConfig, DevtimeRulesConfig};
 use crate::devtime::rules::{Level, RULES, Rule};
 use crate::devtime::store::{
     self as devtime_store, FEEDBACK_CAUSES, FEEDBACK_VERDICTS, FeedbackRow, LEVERS, RuleCaseCounts,
@@ -173,6 +173,33 @@ pub async fn base_rates(
         .collect())
 }
 
+/// Lower bound of the 95% Wilson interval (z = 1.96) for `right` out of `n`; 0.0 when `n <= 0`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn wilson_lower(right: i64, n: i64) -> f64 {
+    if n <= 0 {
+        return 0.0;
+    }
+    let right = right.clamp(0, n) as f64;
+    let n = n as f64;
+    let z = 1.96_f64;
+    let z2 = z * z;
+    let p = right / n;
+    let centre = p + z2 / (2.0 * n);
+    let margin = z * (p * (1.0 - p) / n + z2 / (4.0 * n * n)).sqrt();
+    ((centre - margin) / (1.0 + z2 / n)).clamp(0.0, 1.0)
+}
+
+/// A rule may drive an action only when it is eligible and the Wilson lower bound of its
+/// precision reaches `cfg.precision_wilson_lower`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn action_eligible(p: &RulePrecision, cfg: &DevtimeActionsConfig) -> bool {
+    if !p.eligible || p.level != Level::Base {
+        return false;
+    }
+    let right = (p.n_cases - p.n_not_rework).max(0);
+    wilson_lower(right, p.n_cases) >= cfg.precision_wilson_lower
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,6 +238,93 @@ mod tests {
         (0..n)
             .map(|i| finding(&format!("{rule_id}-{i}"), rule_id, confidence))
             .collect()
+    }
+
+    fn precision_row(level: Level, n_cases: i64, right: i64, eligible: bool) -> RulePrecision {
+        RulePrecision {
+            rule_id: "r".to_string(),
+            level,
+            n_cases,
+            n_not_rework: n_cases - right,
+            precision: (n_cases > 0).then(|| right as f64 / n_cases as f64),
+            prior: 0.5,
+            eligible,
+        }
+    }
+
+    #[test]
+    fn wilson_lower_16_of_20_is_about_0_58() {
+        let v = wilson_lower(16, 20);
+        assert!((0.57..0.60).contains(&v), "got {v}");
+    }
+
+    #[test]
+    fn wilson_lower_20_of_20_is_about_0_84() {
+        let v = wilson_lower(20, 20);
+        assert!((0.83..0.85).contains(&v), "got {v}");
+    }
+
+    #[test]
+    fn wilson_lower_zero_n_is_zero() {
+        assert_eq!(wilson_lower(0, 0), 0.0);
+        assert_eq!(wilson_lower(5, -1), 0.0);
+    }
+
+    #[test]
+    fn wilson_lower_is_monotonic_in_successes() {
+        let values: Vec<f64> = (0..=30).map(|k| wilson_lower(k, 30)).collect();
+        assert!(values.windows(2).all(|w| w[0] <= w[1]), "{values:?}");
+        assert!(values[30] > values[0], "{values:?}");
+    }
+
+    #[test]
+    fn action_eligible_rejects_16_of_20_at_default_floor() {
+        let cfg = DevtimeActionsConfig::default();
+        assert!(!action_eligible(
+            &precision_row(Level::Base, 20, 16, true),
+            &cfg
+        ));
+    }
+
+    #[test]
+    fn action_eligible_accepts_20_of_20_at_default_floor() {
+        let cfg = DevtimeActionsConfig::default();
+        assert!(action_eligible(
+            &precision_row(Level::Base, 20, 20, true),
+            &cfg
+        ));
+    }
+
+    #[test]
+    fn action_eligible_rejects_when_not_eligible() {
+        // 20/20 would pass the floor, but the rule is below min_cases.
+        let cfg = DevtimeActionsConfig::default();
+        assert!(!action_eligible(
+            &precision_row(Level::Base, 20, 20, false),
+            &cfg
+        ));
+    }
+
+    #[test]
+    fn action_eligible_rejects_deferred_rule() {
+        let cfg = DevtimeActionsConfig::default();
+        assert!(!action_eligible(
+            &precision_row(Level::Deferred, 20, 20, false),
+            &cfg
+        ));
+    }
+
+    #[test]
+    fn action_eligible_follows_the_configured_floor() {
+        // 16/20 has a Wilson lower bound near 0.58: it passes a looser floor from the config.
+        let cfg = DevtimeActionsConfig {
+            precision_wilson_lower: 0.5,
+            ..Default::default()
+        };
+        assert!(action_eligible(
+            &precision_row(Level::Base, 20, 16, true),
+            &cfg
+        ));
     }
 
     async fn store(pool: &SqlitePool, rows: &[FindingRow]) {

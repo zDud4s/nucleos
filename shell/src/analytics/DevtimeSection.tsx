@@ -33,6 +33,7 @@ import {
   wastedByClass,
 } from "./devtime-series";
 import { versus, windowShares } from "./series";
+import { ActionsShadowPanel } from "./ActionsShadowPanel";
 import { hasAgents } from "./agent-effectiveness";
 import { AgentEffectivenessPanel } from "./AgentEffectivenessPanel";
 import { hasToolFailures } from "./tool-failures";
@@ -114,6 +115,8 @@ function Body({ report, projectId, days, open, onOpen }: BodyProps) {
       )}
       {/* Outside the empty branch: it costs nothing until opened. */}
       <FindingsSection projectId={projectId} days={days} />
+      {/* Global only (a pair's shadow decisions span every project), and after the overview read: its own queries, its own failure. */}
+      {projectId === undefined ? <ActionsShadowPanel /> : null}
     </>
   );
 }

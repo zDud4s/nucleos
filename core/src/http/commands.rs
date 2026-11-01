@@ -226,8 +226,8 @@ pub(super) struct ProjectRules {
 
 /// What a project does on its own.
 ///
-/// The rules live in `~/.nucleos/projects/<id>/autopilot.yaml` and were readable only by opening
-/// the file; the WIP ceiling lives in the database and was readable only through the roster's
+/// The rules are the project's stored `autopilot` settings (they were a file,
+/// `~/.nucleos/projects/<id>/autopilot.yaml`, readable only by opening it); the WIP ceiling lives in the database and was readable only through the roster's
 /// summary. Both decide whether autonomous work happens at all, so they answer one question and are
 /// served together.
 pub(super) async fn get_project_rules(
@@ -242,20 +242,17 @@ pub(super) async fn get_project_rules(
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
             .flatten();
 
-    // Read whether or not the project has a root. The file is keyed by the project's id, so an
-    // `off` project — which has no root on record — can still have rules waiting for the day it is
-    // switched back on, and saying `absent` about a file that is there would be the wrong fact.
-    let machine_root = state.machine_config_root.clone();
-    let rules_id = id.clone();
-    let (rules_file, rules_error, loaded) = tokio::task::spawn_blocking(move || {
-        match crate::config::load_schedule_rules(machine_root.as_deref(), &rules_id) {
+    // Read whether or not the project has a root. The document is keyed by the project's id, so an
+    // `off` project - which has no root on record - can still have rules waiting for the day it is
+    // switched back on, and saying `absent` about a document that is there would be the wrong fact.
+    // One snapshot answers all three questions, so they cannot disagree with one another.
+    let (rules_file, rules_error, loaded) = {
+        let snapshot = crate::settings::global().snapshot();
+        match crate::project::rules::read_from::<crate::config::AutopilotRules>(&snapshot, &id) {
             Ok(rules) => {
-                let present = crate::project::state::file(
-                    machine_root.as_deref(),
-                    &rules_id,
-                    crate::project::state::AUTOPILOT_FILE,
-                )
-                .is_some_and(|path| path.exists());
+                let present = snapshot
+                    .entry(&crate::settings::Scope::project(&id), "autopilot")
+                    .is_some();
                 (if present { "present" } else { "absent" }, None, rules)
             }
             Err(error) => (
@@ -264,9 +261,7 @@ pub(super) async fn get_project_rules(
                 crate::config::AutopilotRules::default(),
             ),
         }
-    })
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    };
     let rules_path =
         crate::project::state::display_path(&id, crate::project::state::AUTOPILOT_FILE);
 
@@ -496,9 +491,10 @@ pub(super) struct DeclareRequest {
 
 /// Declares one of this project's own commands, replacing any of the same name.
 ///
-/// **No kill-switch check here, and the asymmetry with `POST /write` is deliberate.** That one puts
-/// bytes in the project's own folder, which §7.5 says must go the way an agent's write goes. This
-/// writes a database row, like `POST /wip-limit` beside it, and neither of those starts anything.
+/// **No kill-switch check here, and the asymmetry with `PUT /settings/{scope}/{name}` is
+/// deliberate.** That one changes what governs a project's agents, which §7.5 says must go the way
+/// an agent's write goes. This records a command, like `POST /wip-limit` beside it, and neither of
+/// those starts anything.
 /// The stop belongs on the route that spawns a process, which is the next one down.
 pub(super) async fn post_project_command(
     State(state): State<AppState>,

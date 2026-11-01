@@ -91,6 +91,7 @@ import {
   MODE_MEANING,
   MODE_REFUSAL_PROSE,
   MODE_SENTENCES,
+  promotionBlocker,
   promotionConfirmLabel,
   promotionConsequence,
 } from "../lib/mode";
@@ -1243,7 +1244,8 @@ function FocusSetting({
       </p>
       <ModeSwitch
         value={project.mode}
-        actAllowed={project.promotable}
+        proven={project.promotable === true}
+        shortReason={promotionBlocker(project, project.withheld_classes_ready ?? 0)}
         actArmedLabel={promotionConfirmLabel(project)}
         actConsequence={promotionConsequence(project)}
         onArmedChange={setArmed}
@@ -1547,7 +1549,7 @@ function ScoreboardPanel({
           <Skeleton label="Reading the scoreboard" lines={3} />
         )}
       {evidence.length > 0 && (
-        <TallyTable label="Shadow evidence" rows={evidence} />
+        <TallyTable label="Shadow evidence" rows={evidence} projectMode={project?.mode} />
       )}
       {history.length > 0 && (
         <div className="ap-group">
@@ -1556,7 +1558,7 @@ function ScoreboardPanel({
               screen reader the enforced rows are a section of the page rather
               than a group within this one. */}
           <Section label="enforced, and not evidence for promotion" level={3}>
-            <TallyTable label="Enforced decisions" rows={history} />
+            <TallyTable label="Enforced decisions" rows={history} projectMode={project?.mode} />
           </Section>
         </div>
       )}
@@ -1569,44 +1571,110 @@ function ScoreboardPanel({
   );
 }
 
-function TallyTable({ label, rows }: { label: string; rows: ClassTally[] }) {
+function TallyTable({
+  label,
+  rows,
+  projectMode,
+}: {
+  label: string;
+  rows: ClassTally[];
+  projectMode: AutopilotMode | undefined;
+}) {
+  // A class that withheld decisions and had none of them reviewed: its agreement is measured on
+  // allows alone, which says nothing about the cases that mattered.
+  const unreviewedWithheld = rows.filter((row) => row.would_pend > 0 && row.reviewed_pend === 0);
   return (
-    <Table caption={label}>
-      <thead>
-        <tr>
-          <Th>action class</Th>
-          <Th>mode</Th>
-          <Th num>seen</Th>
-          <Th num>allow</Th>
-          <Th num>ask</Th>
-          <Th num>deny</Th>
-          <Th num>reviewed</Th>
-          <Th num>agreed</Th>
-          <Th num>disagreed</Th>
-          <Th>agreement</Th>
-        </tr>
-      </thead>
-      <tbody>
-        {rows.map((row) => (
-          <tr key={`${row.mode}:${row.action_class}`}>
-            <th scope="row" className="ap-score-class">
-              {row.action_class}
-            </th>
-            <Td>{row.mode}</Td>
-            <Td num>{row.total}</Td>
-            <Td num>{row.would_allow}</Td>
-            <Td num>{row.would_pend}</Td>
-            <Td num>{row.would_deny}</Td>
-            <Td num>{row.reviewed}</Td>
-            <Td num>{row.agree}</Td>
-            <Td num>{row.disagree}</Td>
-            <Td>
-              <Agreement row={row} />
-            </Td>
+    <>
+      <Table caption={label}>
+        <thead>
+          <tr>
+            <Th>action class</Th>
+            <Th>mode</Th>
+            <Th num>seen</Th>
+            <Th num>allow</Th>
+            <Th num>ask</Th>
+            <Th num>deny</Th>
+            <Th num>reviewed</Th>
+            <Th num>agreed</Th>
+            <Th num>disagreed</Th>
+            <Th num>stricter</Th>
+            <Th num>looser</Th>
+            <Th num>unreviewed</Th>
+            <Th>oldest unreviewed</Th>
+            <Th>review rate</Th>
+            <Th>agreement</Th>
           </tr>
-        ))}
-      </tbody>
-    </Table>
+        </thead>
+        <tbody>
+          {rows.map((row) => (
+            <tr key={`${row.mode}:${row.action_class}`}>
+              <th scope="row" className="ap-score-class">
+                {row.action_class}
+              </th>
+              <Td>{row.mode}</Td>
+              <Td num>{row.total}</Td>
+              <Td num>{row.would_allow}</Td>
+              <Td num>{row.would_pend}</Td>
+              <Td num>{row.would_deny}</Td>
+              <Td num>{row.reviewed}</Td>
+              <Td num>{row.agree}</Td>
+              <Td num>{row.disagree}</Td>
+              <Td num>{row.stricter}</Td>
+              <Td num>{row.looser}</Td>
+              <Td num>{row.unreviewed}</Td>
+              <Td>{oldestAge(row.oldest_unreviewed_at)}</Td>
+              <Td>
+                <ReviewRates row={row} />
+              </Td>
+              <Td>
+                <Agreement row={row} />
+              </Td>
+            </tr>
+          ))}
+        </tbody>
+      </Table>
+      <p className="ap-note">
+        These verdicts are hypothetical: what the classifier would do, not something it did.
+      </p>
+      {unreviewedWithheld.map((row) => (
+        <p key={`${row.mode}:${row.action_class}`} className="ap-note">
+          {/* Only shadow rows count toward the bar: the same table also lists enforced decisions. */}
+          {`${row.action_class}: ${row.would_pend} withheld decisions, none reviewed${
+            row.mode === SHADOW_EVIDENCE_MODE && projectMode === "shadow"
+              ? ": this blocks promotion until one is"
+              : ""
+          }`}
+        </p>
+      ))}
+    </>
+  );
+}
+
+/** Age of the oldest unreviewed decision, in whole days (or hours under a day); a dash when none. */
+function oldestAge(at: string | null) {
+  if (at === null) return <span className="ap-oldest-none">—</span>;
+  const ms = Date.now() - new Date(at).getTime();
+  if (!Number.isFinite(ms)) return <span className="ap-oldest-none">—</span>;
+  const hours = Math.max(0, Math.floor(ms / 3_600_000));
+  return hours >= 24 ? `${Math.floor(hours / 24)}d` : `${hours}h`;
+}
+
+/** Share of each severity's decisions a human reviewed; a dash where the severity has no decisions. */
+function ReviewRates({ row }: { row: ClassTally }) {
+  const rate = (label: string, reviewed: number, seen: number) =>
+    seen === 0 ? (
+      <span key={label} className="ap-rate-none" title={`${label}: none seen`}>—</span>
+    ) : (
+      <span key={label} className="ap-rate" title={`${label}: reviewed of seen`}>
+        {`${Math.round((reviewed / seen) * 100)}%`}
+      </span>
+    );
+  return (
+    <span className="ap-rates">
+      {rate("allow", row.reviewed_allow, row.would_allow)}{" "}
+      {rate("ask", row.reviewed_pend, row.would_pend)}{" "}
+      {rate("deny", row.reviewed_deny, row.would_deny)}
+    </span>
   );
 }
 
@@ -1624,9 +1692,11 @@ function Agreement({ row }: { row: ClassTally }) {
   const verdict =
     percent < READINESS_MIN_AGREE_PERCENT
       ? "below the bar"
-      : enough
-        ? "ready"
-        : `${READINESS_MIN_REVIEWED - row.reviewed} more reviews needed`;
+      : row.mode === SHADOW_EVIDENCE_MODE && row.would_pend > 0 && row.reviewed_pend === 0
+        ? "withheld not reviewed"
+        : enough
+          ? "ready"
+          : `${READINESS_MIN_REVIEWED - row.reviewed} more reviews needed`;
   return (
     <span className="ap-agree">
       <span className="ap-agree-figure">{percent}%</span>

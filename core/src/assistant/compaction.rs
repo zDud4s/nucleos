@@ -33,6 +33,9 @@ pub enum StartError {
     Store(String),
 }
 
+/// What `runs.prompt` keeps for a compaction the daemon started on its own.
+pub const AUTO_TYPED: &str = "/compact (auto)";
+
 /// What a failed compaction says in the chat.
 pub const FAILED_NOTICE: &str = "The compaction failed; the session stays as it was.";
 
@@ -43,6 +46,17 @@ pub async fn start(
     chat_id: &str,
     typed: &str,
     focus: Option<&str>,
+) -> Result<i64, StartError> {
+    start_as(state, chat_id, typed, focus, false).await
+}
+
+/// [`start`] for a compaction the daemon began itself (`auto`) or the user typed.
+pub async fn start_as(
+    state: &AppState,
+    chat_id: &str,
+    typed: &str,
+    focus: Option<&str>,
+    auto: bool,
 ) -> Result<i64, StartError> {
     if super::is_busy(chat_id) {
         return Err(StartError::Busy);
@@ -81,6 +95,9 @@ pub async fn start(
         &[],
         Origin::Shell,
         None,
+        // Nobody is at the keyboard for an automatic one, and the session may carry text from a
+        // channel or a relay. `Origin::Shell` stays: a channel origin brings doctrine and delivery.
+        auto,
     )
     .await
     .map_err(|e| {
@@ -91,7 +108,7 @@ pub async fn start(
         }
     })?;
     let focus = focus.map(str::trim).filter(|f| !f.is_empty());
-    compactions::insert_pending(
+    compactions::insert_pending_as(
         &state.pool,
         chat_id,
         id,
@@ -99,6 +116,7 @@ pub async fn start(
         engine.as_str(),
         model.as_deref(),
         focus,
+        auto,
     )
     .await
     .map_err(store)?;
@@ -107,12 +125,134 @@ pub async fn start(
     Ok(id)
 }
 
+/// Completed turns that must pass after a failed automatic compaction before another is tried.
+const AUTO_BACKOFF_TURNS: i64 = 3;
+
+/// Files an automatic compaction after a completed turn when the guards allow it. Never fails.
+///
+/// Reads the guards cheapest first and stops at the first that settles the question. `run_id` is
+/// the turn that just ended and `fill` its context fill: measured on the CLI path, estimated on the
+/// local one.
+pub(super) async fn maybe_auto_compact(
+    state: &AppState,
+    chat_id: &str,
+    run_id: i64,
+    fill: Option<i64>,
+) {
+    let pool = &state.pool;
+    if !crate::chats::auto_compact(pool, chat_id).await {
+        return;
+    }
+    let window = match crate::chats::answering(pool, chat_id).await {
+        Ok(answering) => answering.context_window,
+        Err(error) => {
+            tracing::warn!(%error, chat_id, "could not read the chat's context window");
+            return;
+        }
+    };
+    let soft = super::rotation::soft_fill();
+    // A fill that cannot fire needs none of the reads below.
+    if !should_auto_compact(fill, soft, window, AutoCompactGuards::default()) {
+        return;
+    }
+    // A stop that cannot be read is treated as engaged, like the guards below.
+    let stopped = crate::governance::autopilot::kill_switch_engaged(pool)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, chat_id, "could not read the kill switch");
+            true
+        });
+    if stopped {
+        return;
+    }
+    let is_compaction = is_compaction(pool, run_id).await;
+    let asked_question = asked_question(pool, run_id).await;
+    // A `pending` row whose run already ended (a daemon restart cut the compaction) would trip the
+    // guard below for good, and `start_as` would never get to settle it. A live compaction's run is
+    // still `running`, so this leaves it alone.
+    settle_stale(pool, chat_id).await;
+    let pending = compactions::has_pending(pool, chat_id)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, chat_id, "could not read pending compactions");
+            true
+        });
+    let busy = super::is_busy(chat_id);
+    let in_backoff = match compactions::latest_auto(pool, chat_id).await {
+        Ok(latest) => {
+            let turns_since = match latest {
+                Some((since, _)) => sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM runs
+                      WHERE chat_id = ? AND mode = 'assistant' AND status = 'completed' AND id > ?",
+                )
+                .bind(chat_id)
+                .bind(since)
+                .fetch_one(pool)
+                .await
+                .unwrap_or(0),
+                None => 0,
+            };
+            in_backoff(latest, turns_since)
+        }
+        Err(error) => {
+            tracing::warn!(%error, chat_id, "could not read the last automatic compaction");
+            true
+        }
+    };
+    let nodes = super::rotation::root_nodes(pool);
+    let child_waiting = match nodes.active_root_for_chat(chat_id).await {
+        Some(root) => nodes.has_waiting_child(&root).await,
+        None => false,
+    };
+    let nothing_to_compact = !compactions::has_exchanges_since_clear(pool, chat_id)
+        .await
+        .unwrap_or(false);
+    let guards = AutoCompactGuards {
+        busy,
+        pending,
+        is_compaction,
+        nothing_to_compact,
+        in_backoff,
+        child_waiting,
+        asked_question,
+    };
+    if !should_auto_compact(fill, soft, window, guards) {
+        return;
+    }
+    match start_as(state, chat_id, AUTO_TYPED, None, true).await {
+        Ok(id) => tracing::info!(chat_id, run_id = id, "automatic compaction started"),
+        Err(StartError::Busy | StartError::NothingToCompact) => {
+            tracing::debug!(chat_id, "automatic compaction not started");
+        }
+        Err(error) => tracing::warn!(?error, chat_id, "automatic compaction failed to start"),
+    }
+}
+
+/// Whether the latest automatic compaction failed too recently to try another: it is `failed` and
+/// fewer than the backoff window of completed turns have passed since it.
+fn in_backoff(latest: Option<(i64, Status)>, turns_since: i64) -> bool {
+    matches!(latest, Some((_, Status::Failed))) && turns_since < AUTO_BACKOFF_TURNS
+}
+
+/// What a failed compaction says in the chat, worded for who started it.
+fn failed_notice(auto: bool) -> &'static str {
+    if auto {
+        "The automatic compaction failed; the session stays as it was."
+    } else {
+        FAILED_NOTICE
+    }
+}
+
 /// The notice a done compaction posts: its size in tokens, estimated as characters over four.
-fn done_notice(summary_chars: i64) -> String {
-    format!(
-        "Compacted: the next turn starts from the handoff (~{} tokens).",
-        (summary_chars.max(0) as u64).div_ceil(4)
-    )
+fn done_notice(summary_chars: i64, auto: bool) -> String {
+    let tokens = (summary_chars.max(0) as u64).div_ceil(4);
+    if auto {
+        format!(
+            "Compacted automatically: the next turn starts from the handoff (~{tokens} tokens)."
+        )
+    } else {
+        format!("Compacted: the next turn starts from the handoff (~{tokens} tokens).")
+    }
 }
 
 /// Settles the compaction of `run_id`, if it is one and its turn has ended, and acts on it. Never
@@ -149,6 +289,24 @@ pub(super) async fn is_compaction(pool: &SqlitePool, run_id: i64) -> bool {
         })
 }
 
+/// Whether the turn `run_id` called `AskUserQuestion`; `true` on a read error (warned), because a
+/// compaction held back costs one turn and one that forgets the question loses it.
+async fn asked_question(pool: &SqlitePool, run_id: i64) -> bool {
+    sqlx::query_scalar(
+        "SELECT COALESCE((SELECT json_valid(r.tools_used)
+                             AND EXISTS (SELECT 1 FROM json_each(r.tools_used) j
+                                          WHERE json_extract(j.value, '$.name') = 'AskUserQuestion')
+                            FROM runs r WHERE r.id = ?), 0)",
+    )
+    .bind(run_id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or_else(|error| {
+        tracing::warn!(%error, run_id, "could not tell whether the turn asked a question");
+        true
+    })
+}
+
 /// What a settled compaction does to the session, the older rotations and the notices.
 async fn act(pool: &SqlitePool, run_id: i64, settled: Settled) {
     match settled {
@@ -160,15 +318,30 @@ async fn act(pool: &SqlitePool, run_id: i64, settled: Settled) {
                 tracing::warn!(%error, run_id, "the compaction could not consume older rotations");
             }
             forget(pool, &chat_id).await;
-            notice(pool, &chat_id, run_id, &done_notice(summary_chars)).await;
+            let auto = is_auto(pool, run_id).await;
+            notice(pool, &chat_id, run_id, &done_notice(summary_chars, auto)).await;
         }
-        Settled::Failed { chat_id } => notice(pool, &chat_id, run_id, FAILED_NOTICE).await,
+        Settled::Failed { chat_id } => {
+            let auto = is_auto(pool, run_id).await;
+            notice(pool, &chat_id, run_id, failed_notice(auto)).await;
+        }
         Settled::Already {
             chat_id,
             status: Status::Done,
         } => forget(pool, &chat_id).await,
         Settled::Already { .. } | Settled::NotACompaction | Settled::StillRunning => {}
     }
+}
+
+/// Whether the daemon started the compaction of `run_id`; `false` on a read error (warned), which
+/// words the notice as a manual one.
+async fn is_auto(pool: &SqlitePool, run_id: i64) -> bool {
+    compactions::is_auto(pool, run_id)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, run_id, "could not tell whether the compaction was automatic");
+            false
+        })
 }
 
 async fn forget(pool: &SqlitePool, chat_id: &str) {
@@ -246,6 +419,84 @@ pub(super) fn with_handoff(handoff: Option<&str>, prompt: String) -> String {
             "Earlier in this conversation, before the exchanges you can see, in summary (what you and the other person had already settled):\n{handoff}\n\nThe new message follows.\n\n{prompt}"
         ),
     }
+}
+
+/// Estimated context of a local or OpenRouter turn, for `runs.context_fill`.
+///
+/// Characters over four of what the NEXT request will resend: the replayed history, this turn's
+/// prompt (handoff included) and its answer. Same convention as `Conversation::context_estimate`;
+/// these engines report no usage we read, so an estimate beats a NULL that would exempt them from
+/// auto-compaction.
+pub(super) fn local_fill_estimate(history: &[(String, String)], prompt: &str, answer: &str) -> i64 {
+    let chars: usize = history
+        .iter()
+        .map(|(asked, answered)| asked.chars().count() + answered.chars().count())
+        .sum::<usize>()
+        + prompt.chars().count()
+        + answer.chars().count();
+    (chars / 4) as i64
+}
+
+/// What the caller knows about the chat when a turn has just completed. Every field is a fact read
+/// elsewhere; the decision below does no I/O.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AutoCompactGuards {
+    /// A turn is in flight for the chat (`is_busy`).
+    pub busy: bool,
+    /// The chat already has a `pending` compaction.
+    pub pending: bool,
+    /// The turn that just ended was itself a compaction.
+    pub is_compaction: bool,
+    /// No answered exchange since the last `/clear` (`NothingToCompact`).
+    pub nothing_to_compact: bool,
+    /// The previous automatic compaction failed within the backoff window.
+    pub in_backoff: bool,
+    /// A child is waiting synchronously on this chat.
+    pub child_waiting: bool,
+    /// The turn that just ended finished by asking the person a question (`AskUserQuestion`).
+    pub asked_question: bool,
+}
+
+/// Whether a just-completed turn should trigger an automatic compaction. Pure: no I/O.
+///
+/// Unknown fill never fires. The limit is `soft`, lowered to the chat's `window` when that is
+/// smaller; fires only strictly above it. Any guard held back wins over the threshold.
+pub fn should_auto_compact(
+    fill: Option<i64>,
+    soft: i64,
+    window: Option<i64>,
+    guards: AutoCompactGuards,
+) -> bool {
+    // Destructured without `..` so a new guard field is a compile error here, not silently ignored.
+    let AutoCompactGuards {
+        busy,
+        pending,
+        is_compaction,
+        nothing_to_compact,
+        in_backoff,
+        child_waiting,
+        asked_question,
+    } = guards;
+    if busy
+        || pending
+        || is_compaction
+        || nothing_to_compact
+        || in_backoff
+        || child_waiting
+        || asked_question
+    {
+        return false;
+    }
+    let Some(fill) = fill else {
+        return false;
+    };
+    // A window of zero or less is a bad row, not a tiny window: ignoring it keeps one corrupt value
+    // from compacting the chat on every turn.
+    let limit = match window {
+        Some(w) if w > 0 && w < soft => w,
+        _ => soft,
+    };
+    fill > limit
 }
 
 #[cfg(test)]
@@ -696,5 +947,499 @@ mod tests {
         assert!(!handed.contains("OLD-ANSWER"), "{handed}");
         assert!(!handed.contains("Additional focus"), "{handed}");
         assert!(next > id);
+    }
+
+    #[test]
+    fn local_fill_estimate_is_chars_over_four_of_what_the_next_request_resends() {
+        assert_eq!(
+            local_fill_estimate(&[("abcd".into(), "efgh".into())], "ijkl", "mnop"),
+            4
+        );
+    }
+
+    #[test]
+    fn local_fill_estimate_counts_characters_not_bytes() {
+        assert_eq!(
+            local_fill_estimate(&[("ééééé".into(), String::new())], "", ""),
+            1
+        );
+    }
+
+    #[test]
+    fn local_fill_estimate_of_nothing_is_zero() {
+        assert_eq!(local_fill_estimate(&[], "", ""), 0);
+    }
+
+    #[test]
+    fn local_fill_estimate_includes_the_handoff_through_the_prompt() {
+        let prompt = with_handoff(Some(&"h".repeat(400)), "q".into());
+        assert!(local_fill_estimate(&[], &prompt, "") >= 100);
+    }
+
+    fn open() -> AutoCompactGuards {
+        AutoCompactGuards::default()
+    }
+
+    #[test]
+    fn auto_compact_fires_strictly_above_soft() {
+        assert!(should_auto_compact(Some(120_001), 120_000, None, open()));
+    }
+
+    #[test]
+    fn auto_compact_does_not_fire_at_exactly_soft() {
+        assert!(!should_auto_compact(Some(120_000), 120_000, None, open()));
+        assert!(!should_auto_compact(Some(119_999), 120_000, None, open()));
+    }
+
+    #[test]
+    fn auto_compact_does_not_fire_without_a_measurement() {
+        assert!(!should_auto_compact(None, 120_000, None, open()));
+    }
+
+    #[test]
+    fn auto_compact_is_held_back_by_each_guard() {
+        let rows = [
+            (
+                "busy",
+                AutoCompactGuards {
+                    busy: true,
+                    ..open()
+                },
+            ),
+            (
+                "pending",
+                AutoCompactGuards {
+                    pending: true,
+                    ..open()
+                },
+            ),
+            (
+                "is_compaction",
+                AutoCompactGuards {
+                    is_compaction: true,
+                    ..open()
+                },
+            ),
+            (
+                "nothing_to_compact",
+                AutoCompactGuards {
+                    nothing_to_compact: true,
+                    ..open()
+                },
+            ),
+            (
+                "in_backoff",
+                AutoCompactGuards {
+                    in_backoff: true,
+                    ..open()
+                },
+            ),
+            (
+                "child_waiting",
+                AutoCompactGuards {
+                    child_waiting: true,
+                    ..open()
+                },
+            ),
+        ];
+        // Control: with every guard clear the same fill does fire.
+        assert!(should_auto_compact(Some(500_000), 120_000, None, open()));
+        for (name, guards) in rows {
+            assert!(
+                !should_auto_compact(Some(500_000), 120_000, None, guards),
+                "{name} must hold the compaction back"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_compact_uses_a_smaller_context_window_as_the_limit() {
+        assert!(should_auto_compact(
+            Some(50_001),
+            120_000,
+            Some(50_000),
+            open()
+        ));
+        assert!(!should_auto_compact(
+            Some(50_000),
+            120_000,
+            Some(50_000),
+            open()
+        ));
+    }
+
+    #[test]
+    fn auto_compact_ignores_a_window_larger_than_soft() {
+        assert!(should_auto_compact(
+            Some(120_001),
+            120_000,
+            Some(200_000),
+            open()
+        ));
+        assert!(!should_auto_compact(
+            Some(120_000),
+            120_000,
+            Some(200_000),
+            open()
+        ));
+    }
+
+    #[test]
+    fn auto_compact_with_a_window_equal_to_soft_behaves_like_soft() {
+        assert!(should_auto_compact(
+            Some(120_001),
+            120_000,
+            Some(120_000),
+            open()
+        ));
+        assert!(!should_auto_compact(
+            Some(120_000),
+            120_000,
+            Some(120_000),
+            open()
+        ));
+    }
+
+    #[test]
+    fn auto_compact_with_a_nonpositive_window_falls_back_to_soft() {
+        for window in [Some(0), Some(-5)] {
+            assert!(!should_auto_compact(Some(120_000), 120_000, window, open()));
+            assert!(should_auto_compact(Some(120_001), 120_000, window, open()));
+        }
+    }
+
+    #[test]
+    fn done_notice_says_automatic_for_an_auto_compaction() {
+        let auto = done_notice(400, true);
+        assert!(auto.contains("automatically"), "{auto}");
+        assert!(auto.contains("~100 tokens"), "{auto}");
+        assert_eq!(
+            done_notice(400, false),
+            "Compacted: the next turn starts from the handoff (~100 tokens)."
+        );
+    }
+
+    #[test]
+    fn failed_notice_says_automatic_for_an_auto_compaction() {
+        let auto = failed_notice(true);
+        assert!(auto.contains("automatic"), "{auto}");
+        assert_ne!(auto, FAILED_NOTICE);
+        assert_eq!(failed_notice(false), FAILED_NOTICE);
+    }
+
+    #[tokio::test]
+    async fn settling_an_auto_compaction_posts_the_automatic_notice() {
+        let pool = crate::testdb::fresh_pool().await;
+        let auto_chat = chat(&pool).await;
+        let manual_chat = chat(&pool).await;
+        // Nine characters: ceil(9 / 4) = 3 tokens.
+        let auto_run = exchange(&pool, &auto_chat, "/compact (auto)", "123456789").await;
+        compactions::insert_pending_as(
+            &pool,
+            &auto_chat,
+            auto_run,
+            "nucleos-compact v1",
+            "claude",
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        let manual_run = compaction(&pool, &manual_chat, "123456789").await;
+
+        settle(&pool, auto_run).await;
+        settle(&pool, manual_run).await;
+
+        let auto_notices = notices(&pool, &auto_chat).await;
+        assert_eq!(auto_notices.len(), 1, "{auto_notices:?}");
+        assert!(
+            auto_notices[0].contains("automatically"),
+            "{auto_notices:?}"
+        );
+        assert_eq!(
+            notices(&pool, &manual_chat).await,
+            vec!["Compacted: the next turn starts from the handoff (~3 tokens).".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_manual_compact_row_is_not_auto_after_start() {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let mut state = crate::channels::testkit::state().await;
+        state.runner = fake.clone();
+        let c = chat(&state.pool).await;
+        exchange(&state.pool, &c, "q", "a").await;
+        *fake.canned.lock().unwrap() = Some(answer("HANDOFF"));
+
+        let id = start(&state, &c, "/compact", None).await.unwrap();
+
+        let auto: i64 = sqlx::query_scalar("SELECT auto FROM chat_compactions WHERE run_id = ?")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(auto, 0);
+    }
+
+    #[tokio::test]
+    async fn maybe_auto_compact_does_nothing_when_the_flag_is_off() {
+        let state = crate::channels::testkit::state().await;
+        let c = chat(&state.pool).await;
+        let run = exchange(&state.pool, &c, "q", "a").await;
+
+        maybe_auto_compact(
+            &state,
+            &c,
+            run,
+            Some(super::super::rotation::DEFAULT_SOFT_FILL + 1),
+        )
+        .await;
+
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_compactions")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    async fn compaction_rows(pool: &SqlitePool, chat: &str, auto: Option<i64>) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM chat_compactions WHERE chat_id = ? AND (? IS NULL OR auto = ?)",
+        )
+        .bind(chat)
+        .bind(auto)
+        .bind(auto)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// A state whose summarising engine answers, and a chat with auto-compact on and one exchange.
+    async fn auto_chat(on: bool) -> (crate::state::AppState, String, i64) {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let mut state = crate::channels::testkit::state().await;
+        state.runner = fake.clone();
+        let c = chat(&state.pool).await;
+        chats::set_auto_compact(&state.pool, &c, on).await.unwrap();
+        let run = exchange(&state.pool, &c, "q", "a").await;
+        *fake.canned.lock().unwrap() = Some(answer("HANDOFF"));
+        (state, c, run)
+    }
+
+    #[tokio::test]
+    async fn a_local_turn_over_soft_with_auto_compact_on_files_an_automatic_compaction() {
+        let (state, c, run) = auto_chat(true).await;
+
+        super::super::turn::after_local_turn(
+            &state,
+            &c,
+            run,
+            Some(super::super::rotation::DEFAULT_SOFT_FILL + 1),
+        )
+        .await;
+
+        assert_eq!(compaction_rows(&state.pool, &c, Some(1)).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_local_turn_with_auto_compact_off_files_no_compaction() {
+        let (state, c, run) = auto_chat(false).await;
+
+        super::super::turn::after_local_turn(
+            &state,
+            &c,
+            run,
+            Some(super::super::rotation::DEFAULT_SOFT_FILL + 1),
+        )
+        .await;
+
+        assert_eq!(compaction_rows(&state.pool, &c, None).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_local_compaction_turn_triggers_no_further_compaction() {
+        let (state, c, _) = auto_chat(true).await;
+        let compact_run = compaction(&state.pool, &c, "HANDOFF").await;
+        // In production the turn's own settle has already left `pending` when `after_local_turn`
+        // runs; settle here too, so only the `is_compaction` guard can stop a further compaction.
+        settle(&state.pool, compact_run).await;
+        assert!(
+            !compactions::has_pending(&state.pool, &c).await.unwrap(),
+            "the row must be settled before the call"
+        );
+        let before = compaction_rows(&state.pool, &c, None).await;
+
+        super::super::turn::after_local_turn(
+            &state,
+            &c,
+            compact_run,
+            Some(super::super::rotation::DEFAULT_SOFT_FILL + 1),
+        )
+        .await;
+
+        assert_eq!(compaction_rows(&state.pool, &c, None).await, before);
+    }
+
+    #[tokio::test]
+    async fn a_pending_row_of_an_ended_run_does_not_block_the_automatic_compaction() {
+        let (state, c, run) = auto_chat(true).await;
+        // A compaction cut by a daemon restart: its run is `completed`, its row still `pending`.
+        let stale = compaction(&state.pool, &c, "HANDOFF").await;
+        assert!(compactions::has_pending(&state.pool, &c).await.unwrap());
+
+        super::super::turn::after_local_turn(
+            &state,
+            &c,
+            run,
+            Some(super::super::rotation::DEFAULT_SOFT_FILL + 1),
+        )
+        .await;
+
+        assert_eq!(compaction_rows(&state.pool, &c, Some(1)).await, 1);
+        let stale_status: String =
+            sqlx::query_scalar("SELECT status FROM chat_compactions WHERE run_id = ?")
+                .bind(stale)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_ne!(stale_status, "pending");
+    }
+
+    #[tokio::test]
+    async fn a_local_turn_without_a_measured_fill_never_compacts() {
+        let (state, c, run) = auto_chat(true).await;
+
+        super::super::turn::after_local_turn(&state, &c, run, None).await;
+
+        assert_eq!(compaction_rows(&state.pool, &c, None).await, 0);
+    }
+
+    #[tokio::test]
+    async fn the_kill_switch_stops_an_automatic_compaction_from_starting_a_turn() {
+        let (state, c, run) = auto_chat(true).await;
+        crate::governance::autopilot::set_kill_switch(&state.pool, true)
+            .await
+            .unwrap();
+
+        maybe_auto_compact(
+            &state,
+            &c,
+            run,
+            Some(super::super::rotation::DEFAULT_SOFT_FILL + 1),
+        )
+        .await;
+
+        assert_eq!(compaction_rows(&state.pool, &c, None).await, 0);
+        let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs WHERE chat_id = ?")
+            .bind(&c)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(runs, 1, "an engaged kill switch starts no turn at all");
+    }
+
+    /// The tool policy the runner saw for a compaction turn of a chat rooted in a directory with
+    /// the classifier hook wired, which is the one place a shell-origin turn gets the machine's
+    /// tools. `auto` is whether the daemon started it.
+    async fn compaction_tool_policy(auto: bool) -> Option<crate::execution::runner::ToolPolicy> {
+        let fake = Arc::new(FakeCommandRunner::default());
+        let mut state = crate::channels::testkit::state().await;
+        state.runner = fake.clone();
+        let root = tempfile::TempDir::new().unwrap();
+        crate::governance::autopilot::wire_classifier_hook(root.path()).unwrap();
+        let c = chat(&state.pool).await;
+        chats::set_cwd(&state.pool, &c, root.path().to_str().unwrap())
+            .await
+            .unwrap();
+        exchange(&state.pool, &c, "q", "a").await;
+        *fake.canned.lock().unwrap() = Some(answer("HANDOFF"));
+
+        start_as(&state, &c, "/compact", None, auto).await.unwrap();
+
+        for _ in 0..500 {
+            if fake.last_tool_policy.lock().unwrap().is_some() && !super::super::is_busy(&c) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        super::super::evict_live(&c);
+        *fake.last_tool_policy.lock().unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_typed_compact_keeps_the_tools_of_a_rooted_shell_chat() {
+        assert_eq!(
+            compaction_tool_policy(false).await,
+            Some(crate::execution::runner::ToolPolicy::Unrestricted)
+        );
+    }
+
+    /// A turn with nobody at the keyboard must not get the machine's tools over a session that may
+    /// carry text from Telegram or a relay.
+    #[tokio::test]
+    async fn an_automatic_compaction_runs_without_the_machines_tools() {
+        assert_eq!(
+            compaction_tool_policy(true).await,
+            Some(crate::execution::runner::ToolPolicy::McpOnly)
+        );
+    }
+
+    async fn set_tools_used(pool: &SqlitePool, run: i64, tools: &str) {
+        sqlx::query("UPDATE runs SET tools_used = ? WHERE id = ?")
+            .bind(tools)
+            .bind(run)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn auto_compact_is_held_back_by_a_turn_that_asked_a_question() {
+        assert!(should_auto_compact(Some(500_000), 120_000, None, open()));
+        let asked = AutoCompactGuards {
+            asked_question: true,
+            ..open()
+        };
+        assert!(!should_auto_compact(Some(500_000), 120_000, None, asked));
+    }
+
+    /// The person is about to answer a question the model asked; a compaction in between would
+    /// forget the session that holds the question.
+    #[tokio::test]
+    async fn a_turn_that_ended_asking_a_question_files_no_automatic_compaction() {
+        let (state, c, asked) = auto_chat(true).await;
+        set_tools_used(
+            &state.pool,
+            asked,
+            r#"[{"name":"Read","detail":"a.rs"},{"name":"AskUserQuestion","detail":"Which?"}]"#,
+        )
+        .await;
+        let over = Some(super::super::rotation::DEFAULT_SOFT_FILL + 1);
+
+        maybe_auto_compact(&state, &c, asked, over).await;
+
+        assert_eq!(compaction_rows(&state.pool, &c, None).await, 0);
+
+        // The next turn, which asked nothing, fires as any turn over the limit does.
+        let next = exchange(&state.pool, &c, "the answer", "ok").await;
+        set_tools_used(&state.pool, next, r#"[{"name":"Read","detail":"a.rs"}]"#).await;
+
+        maybe_auto_compact(&state, &c, next, over).await;
+
+        assert_eq!(compaction_rows(&state.pool, &c, Some(1)).await, 1);
+    }
+
+    #[test]
+    fn in_backoff_holds_for_three_turns_after_a_failed_automatic_compaction() {
+        assert!(!in_backoff(None, 0));
+        assert!(!in_backoff(None, 5));
+        assert!(!in_backoff(Some((1, Status::Done)), 0));
+        assert!(!in_backoff(Some((1, Status::Pending)), 0));
+        for turns in 0..3 {
+            assert!(in_backoff(Some((1, Status::Failed)), turns), "{turns}");
+        }
+        assert!(!in_backoff(Some((1, Status::Failed)), 3));
+        assert!(!in_backoff(Some((1, Status::Failed)), 10));
     }
 }

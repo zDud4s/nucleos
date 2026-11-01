@@ -4,7 +4,7 @@ use super::*;
 
 /// `~/.nucleos/email.yaml` (spec §3.4). Every field has a default, so a partial file is valid and an
 /// absent one switches the pillar off in silence rather than blocking startup.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(default)]
 pub struct EmailConfig {
     /// Opt-in. The pillar reads a real mailbox, so nothing about it starts by accident.
@@ -65,7 +65,7 @@ impl EmailConfig {
     /// Clamps the two validated fields, warning about what it changed. Out-of-range values are
     /// corrected rather than fatal, for the same reason the whole file is: nothing in this config
     /// is worth refusing to start the daemon over.
-    pub(super) fn validated(mut self) -> Self {
+    pub(crate) fn validated(mut self) -> Self {
         if self.digest_hour_utc > 21 {
             tracing::warn!(
                 digest_hour_utc = self.digest_hour_utc,
@@ -122,7 +122,7 @@ pub fn load_email_config(path: &Path) -> EmailConfig {
 /// means when the caller does not say; the working window is where a PROPOSAL may land — and it is
 /// emphatically not when you are busy. Busy comes from real events only, and keeping the two apart
 /// is what stops "I do not work Sundays" from quietly becoming "tell me nothing on Sundays".
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct CalendarConfig {
     /// An IANA name. Empty means "ask the operating system", which is right far more often than
@@ -181,7 +181,7 @@ pub fn load_calendar_config(path: &Path) -> CalendarConfig {
 }
 
 /// The verification executor's machine settings, `~/.nucleos/verify.yaml`.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct VerifyConfig {
     /// Weight units that may run at once across the whole machine.
@@ -205,7 +205,7 @@ pub struct VerifyConfig {
 pub const ADMISSION_MAX_WAIT_CEILING_SECONDS: u64 = 3000;
 
 /// `verify.yaml`'s `admission:` block: the bound on heavy commands launched at once.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct AdmissionConfig {
     /// Off means every heavy command is admitted at once.
@@ -259,38 +259,7 @@ pub fn parse_verify_config(contents: &str) -> Result<VerifyConfig, String> {
     }
     let config =
         serde_yaml::from_str::<VerifyConfig>(contents).map_err(|error| error.to_string())?;
-    if config.capacity < 1 {
-        return Err("capacity must be at least 1".to_string());
-    }
-    if config.aging_seconds < 1 {
-        return Err("aging_seconds must be at least 1".to_string());
-    }
-    if config.unit_timeout_seconds < 1 {
-        return Err("unit_timeout_seconds must be at least 1".to_string());
-    }
-    if config.disk_cap_gb < 1 {
-        return Err("disk_cap_gb must be at least 1".to_string());
-    }
-    if config.cache_days < 1 {
-        return Err("cache_days must be at least 1".to_string());
-    }
-    let admission = &config.admission;
-    if admission.capacity == Some(0) {
-        return Err("admission.capacity must be at least 1".to_string());
-    }
-    if admission.heavy_weight < 1 || admission.full_suite_weight < 1 {
-        return Err("admission weights must be at least 1".to_string());
-    }
-    if admission.max_wait_seconds < 1
-        || admission.max_wait_seconds > ADMISSION_MAX_WAIT_CEILING_SECONDS
-    {
-        return Err(format!(
-            "admission.max_wait_seconds must be between 1 and {ADMISSION_MAX_WAIT_CEILING_SECONDS}"
-        ));
-    }
-    if admission.grant_ttl_seconds < 60 {
-        return Err("admission.grant_ttl_seconds must be at least 60".to_string());
-    }
+    config.check()?;
     Ok(config)
 }
 
@@ -312,7 +281,7 @@ pub fn load_verify_config(path: &Path) -> VerifyConfig {
 }
 
 /// `~/.nucleos/keep_awake.yaml`: whether the machine is kept from idle-sleeping while a run is live.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct KeepAwakeConfig {
     /// On by default. Only the automatic idle sleep is held off; closing the lid still obeys the
@@ -328,34 +297,9 @@ impl Default for KeepAwakeConfig {
     }
 }
 
-/// `keep_awake.yaml`'s grammar. An empty file says nothing, which is the defaults.
-pub fn parse_keep_awake_config(contents: &str) -> Result<KeepAwakeConfig, String> {
-    if contents.trim().is_empty() {
-        return Ok(KeepAwakeConfig::default());
-    }
-    serde_yaml::from_str::<KeepAwakeConfig>(contents).map_err(|error| error.to_string())
-}
-
-pub fn load_keep_awake_config(path: &Path) -> KeepAwakeConfig {
-    if !path.exists() {
-        return KeepAwakeConfig::default();
-    }
-    match std::fs::read_to_string(path).map(|text| parse_keep_awake_config(&text)) {
-        Ok(Ok(config)) => config,
-        Ok(Err(error)) => {
-            tracing::warn!(%error, path = %path.display(), "keep-awake config: could not be parsed; defaults apply");
-            KeepAwakeConfig::default()
-        }
-        Err(error) => {
-            tracing::warn!(%error, path = %path.display(), "keep-awake config: could not be read; defaults apply");
-            KeepAwakeConfig::default()
-        }
-    }
-}
-
 /// `~/.nucleos/background.yaml`: how long a chat's background task may say nothing before its
 /// process stops being kept alive for it.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct BackgroundConfig {
     /// Hours of silence, 24 by default. Counted from the task's last report, never from a client's
@@ -371,40 +315,39 @@ impl Default for BackgroundConfig {
     }
 }
 
-/// `background.yaml`'s grammar. An empty file says nothing, which is the defaults; zero hours is
-/// refused, since it would retire every process with a task running the moment it fell silent.
+impl BackgroundConfig {
+    /// Zero hours is refused: it would retire every process with a task running the moment it fell
+    /// silent.
+    pub fn check(&self) -> Result<(), String> {
+        if self.background_silence_hours == 0 {
+            return Err("background_silence_hours must be at least 1".to_owned());
+        }
+        Ok(())
+    }
+}
+
+/// A blank legacy `keep_awake.yaml` means the defaults, as the old reader did.
+pub fn parse_keep_awake_config(contents: &str) -> Result<KeepAwakeConfig, String> {
+    if contents.trim().is_empty() {
+        return Ok(KeepAwakeConfig::default());
+    }
+    serde_yaml::from_str(contents).map_err(|error| error.to_string())
+}
+
+/// A blank legacy `background.yaml` means the defaults; zero hours is refused here as at the PUT.
 pub fn parse_background_config(contents: &str) -> Result<BackgroundConfig, String> {
     if contents.trim().is_empty() {
         return Ok(BackgroundConfig::default());
     }
-    let config =
-        serde_yaml::from_str::<BackgroundConfig>(contents).map_err(|error| error.to_string())?;
-    if config.background_silence_hours == 0 {
-        return Err("background_silence_hours must be at least 1".to_owned());
-    }
+    let config: BackgroundConfig =
+        serde_yaml::from_str(contents).map_err(|error| error.to_string())?;
+    config.check()?;
     Ok(config)
-}
-
-pub fn load_background_config(path: &Path) -> BackgroundConfig {
-    if !path.exists() {
-        return BackgroundConfig::default();
-    }
-    match std::fs::read_to_string(path).map(|text| parse_background_config(&text)) {
-        Ok(Ok(config)) => config,
-        Ok(Err(error)) => {
-            tracing::warn!(%error, path = %path.display(), "background config: could not be parsed; defaults apply");
-            BackgroundConfig::default()
-        }
-        Err(error) => {
-            tracing::warn!(%error, path = %path.display(), "background config: could not be read; defaults apply");
-            BackgroundConfig::default()
-        }
-    }
 }
 
 /// `~/.nucleos/web.yaml`. The web pillar's settings, including the one list in this system that decides
 /// what counts as trustworthy.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(default)]
 pub struct WebConfig {
     /// Opt-in, like every pillar that reaches the network.
@@ -495,7 +438,7 @@ pub fn load_web_config(path: &Path) -> WebConfig {
 /// There is also no field that widens the fence. Spec §6.4: the boundary of §6.2 is not
 /// configurable, because a switch to loosen it is a switch somebody eventually finds a reason to
 /// flip at 2am.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct BrowserConfig {
     /// Opt-in, like every pillar that reaches the network. Ships off (spec §14.2).
@@ -588,7 +531,7 @@ where
 /// Neither list is authoritative on its own. `github::Policy` intersects both with a compiled
 /// ceiling, so what is written here can only ever NARROW what the code already allows — which is
 /// what makes a per-developer gitignored YAML a defensible place for this at all.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(default)]
 pub struct GithubConfig {
     pub enabled: bool,

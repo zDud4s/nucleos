@@ -1,6 +1,17 @@
-import { describe, expect, it } from "vitest";
+import { createElement, type ReactNode } from "react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { renderHook, waitFor } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const daemon = vi.hoisted(() => ({ apiFetch: vi.fn() }));
+vi.mock("./client", async (original) => ({ ...(await original<typeof import("./client")>()), ...daemon }));
+
 import { ApiRefusal } from "./client";
-import { devtimeFindingsPath, devtimeMarkPath, devtimePath } from "./devtime";
+import {
+  DEVTIME_ACTIONS_PATH, devtimeActionPromotePath, devtimeFindingsPath, devtimeMarkPath, devtimePath,
+  devtimeShadowPath, devtimeShadowVerdictPath, useDevtimeActions, useDevtimeShadow, useMarkShadow, usePromoteAction,
+} from "./devtime";
+import { keys } from "./keys";
 import {
   daemonFetch, daemonState, devtimeAgents, devtimeFindings, devtimeOverview, devtimeToolFailures, devtimeTurnClasses,
   devtimeUnexplained, project,
@@ -88,5 +99,91 @@ describe("the fake daemon's devtime routes", () => {
     await expect(
       answer(`/analytics/devtime/findings/${key}/mark?days=30`, { method: "POST", body: JSON.stringify({ verdict: "confirmed", cause: null }) }),
     ).rejects.toBeInstanceOf(ApiRefusal);
+  });
+});
+
+describe("devtime action paths", () => {
+  it("names the four action routes", () => {
+    expect(DEVTIME_ACTIONS_PATH).toBe("/analytics/devtime/actions");
+    expect(devtimeShadowVerdictPath(7)).toBe("/analytics/devtime/actions/shadow/7/verdict");
+    expect(devtimeActionPromotePath("inject", "A1")).toBe("/analytics/devtime/actions/inject/A1/promote");
+    expect(devtimeActionPromotePath("propose", "a b")).toBe("/analytics/devtime/actions/propose/a%20b/promote");
+  });
+
+  it("sends only the shadow parameters that are set, the rule as `rule`", () => {
+    expect(devtimeShadowPath({})).toBe("/analytics/devtime/actions/shadow?limit=50");
+    expect(devtimeShadowPath({ action: "inject", rule: "A1", cursor: "0a1b" })).toBe(
+      "/analytics/devtime/actions/shadow?limit=50&action=inject&rule=A1&cursor=0a1b",
+    );
+  });
+
+  it("keys the action reads under analytics, apart from the windowed devtime keys", () => {
+    expect(keys.analytics.devtimeActions()).toEqual(["analytics", "devtime-actions"]);
+    expect(keys.analytics.devtimeShadow("inject", "A1", "")).toEqual(["analytics", "devtime-shadow", "inject", "A1", ""]);
+  });
+});
+
+describe("the devtime action hooks", () => {
+  let client: QueryClient;
+  // `createElement`, not JSX: this file is `.ts`.
+  const wrapper = ({ children }: { children: ReactNode }) => createElement(QueryClientProvider, { client }, children);
+
+  beforeEach(() => {
+    daemon.apiFetch.mockReset();
+    client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  });
+
+  it("reads the pairs from the actions route", async () => {
+    daemon.apiFetch.mockResolvedValue({ pairs: [] });
+    const { result } = renderHook(() => useDevtimeActions(), { wrapper });
+    await waitFor(() => expect(result.current.data).toEqual({ pairs: [] }));
+    expect(daemon.apiFetch).toHaveBeenCalledWith("/analytics/devtime/actions");
+  });
+
+  it("reads the shadow page, and waits while disabled", async () => {
+    daemon.apiFetch.mockResolvedValue({ items: [], next_cursor: null });
+    const idle = renderHook(() => useDevtimeShadow({ action: "inject" }, false), { wrapper });
+    expect(idle.result.current.fetchStatus).toBe("idle");
+    expect(daemon.apiFetch).not.toHaveBeenCalled();
+    const { result } = renderHook(() => useDevtimeShadow({ action: "inject", rule: "A1" }), { wrapper });
+    await waitFor(() => expect(result.current.data).toEqual({ items: [], next_cursor: null }));
+    expect(daemon.apiFetch).toHaveBeenCalledWith("/analytics/devtime/actions/shadow?limit=50&action=inject&rule=A1");
+  });
+
+  it("marks a shadow decision with a POST and re-reads the shadow and the pairs", async () => {
+    daemon.apiFetch.mockResolvedValue({ id: 7, human_verdict: "useful" });
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    const { result } = renderHook(() => useMarkShadow(), { wrapper });
+    result.current.mutate({ id: 7, verdict: "useful" });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(daemon.apiFetch).toHaveBeenCalledWith("/analytics/devtime/actions/shadow/7/verdict", {
+      method: "POST",
+      body: JSON.stringify({ verdict: "useful" }),
+    });
+    const keysSeen = invalidate.mock.calls.map((call) => call[0]?.queryKey);
+    expect(keysSeen).toContainEqual(["analytics", "devtime-shadow"]);
+    expect(keysSeen).toContainEqual(["analytics", "devtime-actions"]);
+  });
+
+  it("promotes a pair with a POST and re-reads the shadow and the pairs", async () => {
+    daemon.apiFetch.mockResolvedValue({ action: "inject", rule_id: "A1", mode: "live" });
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    const { result } = renderHook(() => usePromoteAction(), { wrapper });
+    result.current.mutate({ action: "inject", rule: "A1" });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(daemon.apiFetch).toHaveBeenCalledWith("/analytics/devtime/actions/inject/A1/promote", { method: "POST" });
+    const keysSeen = invalidate.mock.calls.map((call) => call[0]?.queryKey);
+    expect(keysSeen).toContainEqual(["analytics", "devtime-actions"]);
+    expect(keysSeen).toContainEqual(["analytics", "devtime-shadow"]);
+  });
+
+  it("surfaces a refusal (not_ready) as an error and re-reads nothing", async () => {
+    daemon.apiFetch.mockRejectedValue(new ApiRefusal(409, "not_ready", ""));
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    const { result } = renderHook(() => usePromoteAction(), { wrapper });
+    result.current.mutate({ action: "inject", rule: "A1" });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect((result.current.error as ApiRefusal).code).toBe("not_ready");
+    expect(invalidate).not.toHaveBeenCalled();
   });
 });

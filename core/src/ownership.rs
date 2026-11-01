@@ -18,39 +18,22 @@
 //! are asserted against [`crate::project::state`]'s file names rather than written out again, so a
 //! claim cannot come to name a file no loader reads.
 //!
-//! # Two homes: the project's state directory, and the project
+//! # The núcleo claims no file
 //!
-//! The núcleo's own two files no longer live in the project. They are
-//! `~/.nucleos/projects/<id>/autopilot.yaml` and `.../workflows.yaml` — see `project/state.rs` for
-//! why neither the project's `.ai/` nor a folder inside the project could hold them. A workflow's
-//! claims are still files IN the project, relative to its root. So every row says which of the two
-//! it is relative to ([`Home`]), and the write door resolves a row against that home and nothing
-//! else: a core row's `path` is a bare file name joined onto the state directory, never onto the
-//! project root.
+//! The project's two state documents, the rules (`autopilot`) and the pins (`workflow_pins`), used to
+//! be the two rows of this table, as `autopilot.yaml` and `workflows.yaml` in the project's state
+//! directory. They are rows of the settings store now (`settings.rs`), written through
+//! `settings::update`/`put` with a version check and a history line, so [`CLAIMS`] is empty: a row
+//! here would be write access to a file nobody reads any more.
 //!
-//! # The table has two rows, and the spec asked for eight
+//! The machine-level files (`email`, `voice`, `calendar`, ...) were never this table's: they are the
+//! DAEMON's, and have their own table in [`crate::machine_config`] — same shape, same membership
+//! rule, different root. What this module must never do is claim one of them, and a test in that
+//! module asserts the two registries stay disjoint.
 //!
-//! The design said the núcleo claims `.ai/*.yaml`. Measured against `main.rs`, that is wrong twice
-//! over, and both mistakes point outward from the project:
-//!
-//! - **Seven of those files are not a project's.** `email`, `voice`, `calendar`, `web`, `browser`,
-//!   `github`, `council` and `nucleos-models` are this machine's settings — then loaded relative to
-//!   the daemon's own working directory, now from `~/.nucleos/`. A route under `/projects/{id}` that wrote them
-//!   would edit one daemon's configuration through a URL naming a project, and would do it
-//!   identically whichever project was named.
-//! - **`.ai/` in a project usually belongs to somebody else.** In this repository it holds
-//!   `project.yaml`, `models.yaml` and `pricing.yaml`, which are the `.ai/` workflow harness's and
-//!   which the núcleo has never opened. A glob would have claimed a workflow's config as the
-//!   núcleo's — the precise confusion §7.3 of the design introduced the registry to end.
-//!
-//! Those seven machine-level files are not unowned, they are owned by the DAEMON, and they have
-//! their own table in [`crate::machine_config`] — same shape, same membership rule, different
-//! root. What this module must never do is claim one of them, and a test in that module asserts
-//! the two registries stay disjoint.
-//!
-//! So: the project's `autopilot.yaml`, and its `workflows.yaml` beside it once there was a module
-//! that parses that one too. That is not a thin registry, it is an accurate one, and the first row
-//! is the load-bearing one — see below.
+//! Every row says which directory it is relative to ([`Home`]). A workflow's claims are files IN the
+//! project, relative to its root; `Home::State` is kept for the page, which still draws a row's
+//! home, though no row uses it now.
 //!
 //! # A third answer: files a WORKFLOW authors
 //!
@@ -69,15 +52,6 @@
 //! author lives — instead of a text box that would make this app a second author of somebody else's
 //! file.
 //!
-//! # The one claimed file is the most dangerous file in the project
-//!
-//! The rules file carries `gate_command`. Whoever writes it decides what *green* means, so an agent
-//! able to rewrite it could make every gate it will ever face pass. Moving it out of the project did
-//! not change that; `classifier.rs` refuses an agent's write to it in its new home as it did in the
-//! old one. The write route is
-//! therefore Admin's, by appearing in no table in `auth.rs` — `permits` is default-deny — and there
-//! is a test in that module pinning it, because default-deny protects a route nobody thought about
-//! and would stop protecting this one the moment somebody added it to a list "for consistency".
 
 /// A parser that must accept the candidate text before it is written.
 ///
@@ -112,7 +86,7 @@ pub struct Claim {
     ///
     /// **The `None` is the whole of the middle state.** The membership rule at the top of this
     /// module is that the núcleo owns what the núcleo parses; a row with no parser is therefore not
-    /// the núcleo's to write, and the write route refuses it by asking this question rather than by
+    /// the núcleo's to write, and the fence serves it as not writable by asking this question rather than by
     /// keeping a second list of exceptions somewhere else.
     pub validate: Option<Validator>,
 }
@@ -120,7 +94,8 @@ pub struct Claim {
 /// Which directory a claim's `path` is relative to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Home {
-    /// The project's state directory, `~/.nucleos/projects/<id>/`. The núcleo's own rows.
+    /// The project's state directory, `~/.nucleos/projects/<id>/`. No row uses it since the state
+    /// documents moved to the settings store.
     State,
     /// The project's root. A workflow's rows.
     Project,
@@ -155,33 +130,10 @@ pub enum Owner<'a> {
     Repository,
 }
 
-fn validate_autopilot(contents: &str) -> Result<(), String> {
-    crate::config::parse_schedule_rules(contents)
-        .map(|_| ())
-        .map_err(|error| error.to_string())
-}
-
-/// The núcleo's own claims. See the module header for why there are two and not eight.
-pub static CLAIMS: &[Claim] = &[
-    Claim {
-        path: std::borrow::Cow::Borrowed(crate::project::state::AUTOPILOT_FILE),
-        home: Home::State,
-        owner: std::borrow::Cow::Borrowed("core"),
-        what: std::borrow::Cow::Borrowed(
-            "what this project does on its own: its schedules, its repository triggers, and the gate command that decides what green means",
-        ),
-        validate: Some(validate_autopilot),
-    },
-    Claim {
-        path: std::borrow::Cow::Borrowed(crate::project::state::PINS_FILE),
-        home: Home::State,
-        owner: std::borrow::Cow::Borrowed("core"),
-        what: std::borrow::Cow::Borrowed(
-            "which workflows this project uses, which version of each, and what it overrides on their nodes",
-        ),
-        validate: Some(crate::workflows::validate_pins),
-    },
-];
+/// The núcleo's own claims: none. The project's `autopilot` and `workflow_pins` documents live in
+/// the settings store, so no file in the state directory is the núcleo's to author by path. Only
+/// the rows a workflow declares (see [`claims_for`]) exist, and those carry no validator.
+pub static CLAIMS: &[Claim] = &[];
 
 /// Every claim in force in one project: the núcleo's, plus whatever its workflows declare.
 ///
@@ -189,27 +141,22 @@ pub static CLAIMS: &[Claim] = &[
 /// half depends on what is installed *here* — which is the whole difference between a fence that
 /// describes a project and a fence that describes a build of this app.
 ///
-/// A workflow's row carries no validator, so the write route refuses it. See the module header:
+/// A workflow's row carries no validator, so the fence serves it as not writable. See the module header:
 /// the exit for those files is their author, not a text box in this app.
 ///
-/// A path a workflow declares that the núcleo already claims is dropped, and the núcleo keeps it.
-/// The two homes differ, so a workflow naming `autopilot.yaml` means a file at the project's root
-/// and not the rules file — but one identity on the wire must answer one question, and the row
-/// that decides what *green* means is the last one that should become ambiguous because somebody
-/// wrote a line in a manifest.
+/// A path a workflow declares that the núcleo already claims is dropped, and the núcleo keeps it
+/// (nothing is claimed today, so nothing is dropped): one identity on the wire must answer one
+/// question.
 ///
-/// `pins_file` is the project's `workflows.yaml` in its state directory; `None` (no home directory,
-/// or an id that cannot name one) means nothing is installed, and the núcleo's rows still stand.
+/// The project's pins are its stored `workflow_pins` document, read by `project_id`; a project with
+/// none (or an unreadable one) has nothing installed, and the núcleo's rows still stand.
 pub fn claims_for(
     project_root: &std::path::Path,
-    pins_file: Option<&std::path::Path>,
+    project_id: &str,
     library_root: &std::path::Path,
 ) -> Vec<Claim> {
     let mut claims: Vec<Claim> = CLAIMS.to_vec();
-    let Some(pins_file) = pins_file else {
-        return claims;
-    };
-    let Ok(installed) = crate::workflows::installed(project_root, pins_file, library_root) else {
+    let Ok(installed) = crate::workflows::installed(project_root, project_id, library_root) else {
         return claims;
     };
     for workflow in installed {
@@ -310,23 +257,39 @@ pub fn owner_of<'a>(claims: &'a [Claim], rel: &str) -> Owner<'a> {
 mod tests {
     use super::*;
 
-    /// The claim and the loader name the same file BY CONSTRUCTION, and this is the assertion that
-    /// keeps it that way if somebody inlines the const back into a literal.
-    ///
-    /// The module's whole rule is that the núcleo owns what the núcleo parses. A registry row
-    /// pointing at a path no loader reads is write access to bytes nobody checks — the file would
-    /// pass validation, be written, and change nothing, which is the failure that looks most like
-    /// success.
+    /// The rules parser the `autopilot` document is held to. The registry no longer validates it
+    /// (the settings store does), so these tests call the loader's own parser directly.
+    fn rules_parser(contents: &str) -> Result<(), String> {
+        crate::config::parse_schedule_rules(contents)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    /// The project's two state documents live in the settings store now, so the static table claims
+    /// no file at all: a row there would be write access to a file nobody reads any more.
     #[test]
     fn every_claim_names_a_file_the_nucleo_actually_parses() {
-        assert_eq!(CLAIMS.len(), 2, "see the module header before adding a row");
-        assert_eq!(CLAIMS[0].path, crate::project::state::AUTOPILOT_FILE);
-        assert_eq!(CLAIMS[1].path, crate::project::state::PINS_FILE);
-        // Both are the project's STATE, never a file in the project: see the module header.
-        assert!(CLAIMS.iter().all(|claim| claim.home == Home::State));
-        // A `static` row with no parser would be write access to bytes nobody checks. The `None`
-        // exists for the rows that come from a workflow, and those are never in here.
+        assert_eq!(CLAIMS.len(), 0, "the static table is empty by design");
+        let paths: Vec<&str> = CLAIMS.iter().map(|claim| claim.path.as_ref()).collect();
+        assert!(paths.is_empty(), "{paths:?}");
+        // Whatever a future row is, a `static` one never lacks a parser.
         assert!(CLAIMS.iter().all(|claim| claim.validate.is_some()));
+    }
+
+    /// `autopilot.yaml` and `workflows.yaml` are no longer the núcleo's to author by file.
+    #[test]
+    fn the_state_files_are_no_longer_claimed() {
+        for path in [
+            crate::project::state::AUTOPILOT_FILE,
+            crate::project::state::PINS_FILE,
+            "autopilot.yaml",
+            "workflows.yaml",
+        ] {
+            assert!(
+                matches!(owner_of(CLAIMS, path), Owner::Repository),
+                "{path} must belong to nobody this app writes as"
+            );
+        }
     }
 
     /// Everything not in the table belongs to the repository, including the files this app is
@@ -360,22 +323,6 @@ mod tests {
                 "{path} must belong to nobody this app writes as"
             );
         }
-    }
-
-    /// The claimed file, and the one sentence about it worth keeping in a test: it holds the gate
-    /// command, so writing it is deciding what green means.
-    #[test]
-    fn the_rules_file_is_declared_and_carries_its_own_validator() {
-        let Owner::Declared(claim) = owner_of(CLAIMS, "autopilot.yaml") else {
-            panic!("the rules file must be declared");
-        };
-        assert_eq!(claim.owner, "core");
-        assert_eq!(
-            claim.display("alpha"),
-            "~/.nucleos/projects/alpha/autopilot.yaml"
-        );
-        assert!(claim.what.contains("gate command"));
-        assert!((claim.validate.unwrap())("gate_command: cargo test\n").is_ok());
     }
 
     /// Traversal reaches nothing, and the reason this test exists is that it is the SECOND guard.
@@ -422,15 +369,22 @@ mod tests {
     /// the ownership answer and the path guard cannot disagree about which file was named.
     #[test]
     fn a_dot_segment_or_a_doubled_slash_does_not_change_the_answer() {
+        let claims = vec![Claim {
+            path: std::borrow::Cow::Borrowed(".ai/models.yaml"),
+            home: Home::Project,
+            owner: std::borrow::Cow::Borrowed("harness"),
+            what: std::borrow::Cow::Borrowed("the harness's"),
+            validate: None,
+        }];
         for path in [
-            "./autopilot.yaml",
-            ".//autopilot.yaml",
-            "././autopilot.yaml",
-            "  autopilot.yaml  ",
+            "./.ai/models.yaml",
+            ".ai//models.yaml",
+            "././.ai/models.yaml",
+            "  .ai/models.yaml  ",
         ] {
             assert!(
-                matches!(owner_of(CLAIMS, path), Owner::Declared(_)),
-                "{path} is the rules file"
+                matches!(owner_of(&claims, path), Owner::Declared(_)),
+                "{path} is the declared file"
             );
         }
     }
@@ -467,14 +421,14 @@ mod tests {
     /// A file that is nothing but comments is VALID, and this is the trap the validator was most
     /// likely to fall into.
     ///
-    /// `load_schedule_rules` has an explicit branch for it, with a comment saying why: commenting
+    /// `parse_schedule_rules` has an explicit branch for it, with a comment saying why: commenting
     /// the `gate_command:` line out is how somebody switches a gate off for an afternoon, and in
     /// this repository's own config that leaves a file of comments. A validator that refused it
     /// would refuse to save the exact edit the loader was written to accept — the app would be
     /// stricter than the daemon about the daemon's own file.
     #[test]
     fn a_file_of_nothing_but_comments_saves_because_that_is_how_a_gate_is_switched_off() {
-        let validate = CLAIMS[0].validate.unwrap();
+        let validate = rules_parser;
         assert!(validate("# gate_command: cargo test\n").is_ok());
         assert!(validate("").is_ok());
         assert!(validate("   \n\n").is_ok());
@@ -489,7 +443,7 @@ mod tests {
     /// not recognise.
     #[test]
     fn a_key_the_daemon_does_not_know_cannot_be_saved() {
-        let validate = CLAIMS[0].validate.unwrap();
+        let validate = rules_parser;
         let refusal = validate("gate_commmand: cargo test\n").expect_err("a typo must not save");
         assert!(
             refusal.contains("gate_commmand"),
@@ -505,7 +459,7 @@ mod tests {
     /// reads as though it had asked for something generous.
     #[test]
     fn a_number_no_rule_could_have_meant_is_refused_by_the_loaders_own_check() {
-        let validate = CLAIMS[0].validate.unwrap();
+        let validate = rules_parser;
         let rule = |budget: &str| {
             format!(
                 "schedules:\n  - name: nightly\n    cron: \"0 3 * * *\"\n    prompt: go\n    graph:\n      budget_usd: {budget}\n"
@@ -522,8 +476,10 @@ mod tests {
     /// Three answers where the first version of this module had two. The row exists so the page can
     /// say who authors the file and offer the right exit; the missing validator is what stops the
     /// app from becoming a second author of it.
-    #[test]
-    fn a_workflow_declared_file_is_shown_and_not_written() {
+    #[tokio::test]
+    async fn a_workflow_declared_file_is_shown_and_not_written() {
+        let _settings = crate::project::rules::testing::Home::new();
+        let pool = crate::testdb::fresh_pool().await;
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
@@ -538,13 +494,11 @@ mod tests {
         let bundle = crate::workflows::read_bundle(&bundle_dir, "harness", "1.0")
             .unwrap()
             .unwrap();
-        let pins = temp
-            .path()
-            .join("state")
-            .join(crate::project::state::PINS_FILE);
-        crate::workflows::install(&pins, &bundle).unwrap();
+        crate::workflows::install(&pool, "alpha", &bundle)
+            .await
+            .unwrap();
 
-        let claims = claims_for(&project, Some(&pins), &library);
+        let claims = claims_for(&project, "alpha", &library);
         let Owner::Declared(claim) = owner_of(&claims, ".ai/models.yaml") else {
             panic!("an installed workflow's file must be in the fence");
         };
@@ -556,11 +510,12 @@ mod tests {
             "the app does not parse it, so it does not write it"
         );
 
-        // And the núcleo's own row is still writable beside it, so the page shows two kinds.
-        let Owner::Declared(rules) = owner_of(&claims, "autopilot.yaml") else {
-            panic!("the rules file must still be declared");
-        };
-        assert!(rules.validate.is_some());
+        // The núcleo's former state rows are gone: nothing else is declared beside it.
+        assert_eq!(claims.len(), 1);
+        assert!(matches!(
+            owner_of(&claims, "autopilot.yaml"),
+            Owner::Repository
+        ));
     }
 
     /// A directory a workflow owns answers for every file beneath it, and for nothing beside it.
@@ -601,13 +556,12 @@ mod tests {
         ));
     }
 
-    /// A bundle cannot take the file that decides what green means.
-    ///
-    /// The rules file carries `gate_command`. A manifest naming the same identity would make the
-    /// row ambiguous, and a row with no validator in its place would be write access with the check
-    /// removed — which is the one substitution this merge must not perform.
-    #[test]
-    fn a_workflow_cannot_claim_a_file_the_nucleo_already_parses() {
+    /// The rules live in the store now, so a manifest naming `autopilot.yaml` means the project's
+    /// own file at its root: a workflow row with no validator, never the gate-carrying document.
+    #[tokio::test]
+    async fn a_workflow_naming_autopilot_yaml_claims_the_projects_file_not_the_state_one() {
+        let _settings = crate::project::rules::testing::Home::new();
+        let pool = crate::testdb::fresh_pool().await;
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
@@ -622,19 +576,17 @@ mod tests {
         let bundle = crate::workflows::read_bundle(&bundle_dir, "greedy", "1.0")
             .unwrap()
             .unwrap();
-        let pins = temp
-            .path()
-            .join("state")
-            .join(crate::project::state::PINS_FILE);
-        crate::workflows::install(&pins, &bundle).unwrap();
+        crate::workflows::install(&pool, "alpha", &bundle)
+            .await
+            .unwrap();
 
-        let claims = claims_for(&project, Some(&pins), &library);
+        let claims = claims_for(&project, "alpha", &library);
         let Owner::Declared(rules) = owner_of(&claims, "autopilot.yaml") else {
-            panic!("the rules file must still be declared");
+            panic!("the workflow's declared file must be in the fence");
         };
-        assert_eq!(rules.owner, "core");
-        assert_eq!(rules.home, Home::State);
-        assert!(rules.validate.is_some());
+        assert_eq!(rules.owner, "greedy");
+        assert_eq!(rules.home, Home::Project);
+        assert!(rules.validate.is_none(), "shown, never written");
         // The traversal never becomes a row at all — `normalise` refuses it before it is stored,
         // so the fence cannot be made to describe a file outside the project.
         assert!(claims.iter().all(|claim| !claim.path.contains("outside")));
@@ -644,19 +596,17 @@ mod tests {
     /// there is an empty library rather than a failure that would empty the fence.
     #[test]
     fn a_project_with_no_workflow_has_the_nucleos_rows_and_no_others() {
+        let _settings = crate::project::rules::testing::Home::new();
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
-        let pins = temp
-            .path()
-            .join("state")
-            .join(crate::project::state::PINS_FILE);
-        let claims = claims_for(&project, Some(&pins), &temp.path().join("no-library-here"));
+        let claims = claims_for(&project, "alpha", &temp.path().join("no-library-here"));
         assert_eq!(claims.len(), CLAIMS.len());
+        assert!(claims.is_empty(), "the registry has no rows of its own");
         assert_eq!(
-            claims_for(&project, None, &temp.path().join("no-library-here")).len(),
+            claims_for(&project, "no:such:id", &temp.path().join("no-library-here")).len(),
             CLAIMS.len(),
-            "no state directory is nothing installed, never an empty fence"
+            "an id that cannot name a project is nothing installed, never an empty fence"
         );
     }
 
@@ -665,8 +615,7 @@ mod tests {
     /// somebody to an editor, which is the surface the hatch exists to replace.
     #[test]
     fn malformed_yaml_is_refused_in_the_parsers_own_words() {
-        let refusal =
-            (CLAIMS[0].validate.unwrap())("schedules: [\n").expect_err("this is not YAML");
+        let refusal = rules_parser("schedules: [\n").expect_err("this is not YAML");
         assert!(!refusal.is_empty());
         assert!(
             refusal.to_lowercase().contains("line") || refusal.to_lowercase().contains("column"),

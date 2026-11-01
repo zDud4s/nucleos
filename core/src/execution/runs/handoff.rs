@@ -638,6 +638,35 @@ pub(super) enum GateConfig {
     Unreadable(String),
 }
 
+impl GateConfig {
+    /// The gate a run of `project_id` is measured by, read from the settings snapshot on every call.
+    /// Nothing stored, or no gate command in it, is `NotConfigured`; a document that cannot be read is
+    /// `Unreadable`, which stops the run with a reason instead of passing it unmeasured.
+    pub(super) fn of_project(project_id: &str, project_root: &str) -> GateConfig {
+        match crate::project::rules::autopilot(project_id) {
+            Ok(rules) => {
+                let scoped_final = rules.scoped_final();
+                rules
+                    .gate_command
+                    .map_or(GateConfig::NotConfigured, |command| GateConfig::Command {
+                        command,
+                        project_root: project_root.to_string(),
+                        scoped_final,
+                    })
+            }
+            Err(error) => {
+                tracing::warn!(
+                    project_id,
+                    project_root,
+                    %error,
+                    "failed to load worktree gate configuration"
+                );
+                GateConfig::Unreadable(format!("gate configuration is unreadable: {error}"))
+            }
+        }
+    }
+}
+
 /// The gate of a finished run. With `scoped_final`, a running executor and a map the worktree has
 /// not rewritten, the run is measured by `verify scope` over its diff, in its own name; a scope
 /// that cannot be submitted measures nothing and falls through to the full gate, which is also

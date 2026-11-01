@@ -180,6 +180,32 @@ pub fn forget_asks_for_chat(chat_id: &str) {
         .retain(|_, pending| pending.ask.chat_id != chat_id);
 }
 
+/// The first `ReadsUntrusted` tool each chat's current session called. In memory only, like `ASKS`:
+/// a restart ends the turn that raised it.
+static UNTRUSTED_FIRST_CALLS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, String>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Records that a `ReadsUntrusted` MCP tool was called in this chat's session. The first call is
+/// remembered; later ones do not replace it.
+pub fn note_untrusted_call(chat_id: &str, tool: &str) {
+    let mut calls = UNTRUSTED_FIRST_CALLS.lock().unwrap();
+    calls
+        .entry(chat_id.to_owned())
+        .or_insert_with(|| tool.to_owned());
+}
+
+/// The tool whose first `ReadsUntrusted` call this chat's current session raised the notice for,
+/// or `None` when no such call was seen. Non-blocking: it never feeds a decision.
+pub fn untrusted_first_call_for(chat_id: &str) -> Option<String> {
+    UNTRUSTED_FIRST_CALLS.lock().unwrap().get(chat_id).cloned()
+}
+
+/// Forgets the notice when the chat's session is rotated, so the next session raises it afresh.
+pub fn forget_untrusted_session(chat_id: &str) {
+    UNTRUSTED_FIRST_CALLS.lock().unwrap().remove(chat_id);
+}
+
 /// What this conversation is waiting to be allowed, which is nearly always nothing or one thing.
 pub fn asks_for(chat_id: &str) -> Vec<Ask> {
     let mut asks = ASKS.lock().unwrap();

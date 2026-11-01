@@ -155,10 +155,60 @@ pub(super) fn parse_search_limit(value: Option<String>) -> Result<i64, StatusCod
     }
 }
 
+/// A feed line plus the origin of the run it belongs to (F4 provenance).
+///
+/// `FeedEntry` lives in nucleos-base and stays untouched; the wrapper flattens it so every
+/// pre-existing key keeps its place and `origin` is one more key beside them.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(super) struct FeedLine {
+    #[serde(flatten)]
+    pub(super) entry: FeedEntry,
+    /// `null` when the run has no origin, the line has no `run_id`, or the run is unknown.
+    pub(super) origin: Option<String>,
+}
+
+/// Wraps `entries` with the origin of their runs, from one query over the distinct `run_id`s.
+pub(super) async fn with_origins(
+    pool: &sqlx::SqlitePool,
+    entries: Vec<FeedEntry>,
+) -> sqlx::Result<Vec<FeedLine>> {
+    let mut run_ids: Vec<i64> = entries.iter().filter_map(|entry| entry.run_id).collect();
+    run_ids.sort_unstable();
+    run_ids.dedup();
+    let mut origins: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
+    if !run_ids.is_empty() {
+        let ids = serde_json::to_string(&run_ids).unwrap_or_else(|_| "[]".to_owned());
+        let rows = sqlx::query_as::<_, (i64, Option<String>)>(
+            "SELECT id, origin FROM runs WHERE id IN (SELECT value FROM json_each(?))",
+        )
+        .bind(ids)
+        .fetch_all(pool)
+        .await?;
+        origins.extend(
+            rows.into_iter()
+                .filter_map(|(id, origin)| origin.map(|origin| (id, origin))),
+        );
+    }
+    Ok(entries
+        .into_iter()
+        .map(|entry| {
+            let origin = entry.run_id.and_then(|id| origins.get(&id).cloned());
+            FeedLine { entry, origin }
+        })
+        .collect())
+}
+
+/// `feed::Timeline` with each line wrapped in its origin; the envelope is unchanged.
+#[derive(Debug, serde::Serialize)]
+pub(super) struct TimelineLines {
+    entries: Vec<FeedLine>,
+    truncated: bool,
+}
+
 pub(super) async fn get_feed(
     State(state): State<AppState>,
     Query(query): Query<FeedQuery>,
-) -> Result<Json<Vec<FeedEntry>>, StatusCode> {
+) -> Result<Json<Vec<FeedLine>>, StatusCode> {
     let has_search_filters = query.q.is_some()
         || query.kind.is_some()
         || query.since.is_some()
@@ -170,7 +220,9 @@ pub(super) async fn get_feed(
         } else {
             feed::list_feed(&state.pool, query.project_id.as_deref(), 50).await
         };
-        return entries
+        let entries = entries.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        return with_origins(&state.pool, entries)
+            .await
             .map(Json)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
     }
@@ -194,7 +246,9 @@ pub(super) async fn get_feed(
         },
     )
     .await;
-    entries
+    let entries = entries.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    with_origins(&state.pool, entries)
+        .await
         .map(Json)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
@@ -202,11 +256,11 @@ pub(super) async fn get_feed(
 pub(super) async fn get_feed_timeline(
     State(state): State<AppState>,
     Query(query): Query<FeedTimelineQuery>,
-) -> Result<Json<feed::Timeline>, StatusCode> {
+) -> Result<Json<TimelineLines>, StatusCode> {
     let since = parse_time_bound(query.since)?.ok_or(StatusCode::BAD_REQUEST)?;
     let until = parse_time_bound(query.until)?;
     feed::timeline_window(since, until, chrono::Utc::now()).map_err(|_| StatusCode::BAD_REQUEST)?;
-    feed::timeline(
+    let timeline = feed::timeline(
         &state.pool,
         since,
         until,
@@ -214,8 +268,14 @@ pub(super) async fn get_feed_timeline(
         feed::TIMELINE_MAX,
     )
     .await
-    .map(Json)
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let entries = with_origins(&state.pool, timeline.entries)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(TimelineLines {
+        entries,
+        truncated: timeline.truncated,
+    }))
 }
 
 pub(super) async fn get_feed_seen(
@@ -571,7 +631,7 @@ pub(super) async fn list_awaiting_approval_runs(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 pub(super) struct RunMessageRequest {
     pub(super) message: String,
 }
@@ -589,8 +649,22 @@ pub(super) struct RunMessageRequest {
 pub(super) async fn post_run_message(
     State(state): State<AppState>,
     Path(id): Path<i64>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<RunMessageRequest>,
 ) -> Result<StatusCode, StatusCode> {
+    // There is no per-message column: the run keeps the origin it was created with. A voice
+    // message is only logged, so the spoken instruction can be told apart in the daemon log.
+    if headers
+        .get(runs::ORIGIN_HEADER)
+        .and_then(|value| value.to_str().ok())
+        == Some(crate::assistant_types::Origin::Voice.as_wire())
+    {
+        tracing::info!(
+            run_id = id,
+            origin = crate::assistant_types::Origin::Voice.as_wire(),
+            "message to a run came from the voice supervisor"
+        );
+    }
     let run = sqlx::query_as::<_, (String, String, i64)>(
         "SELECT status, mode, steerable FROM runs WHERE id = ?",
     )
@@ -776,4 +850,236 @@ pub(super) async fn get_judge_opinions_of_run(
         .await
         .map(Json)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+#[cfg(test)]
+mod feed_origin_tests {
+    use super::*;
+    use crate::auth::Token;
+    use crate::execution::runner::FakeCommandRunner;
+    use axum::body::Body;
+    use axum::http::Request as HttpRequest;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    const CONTROL: &str = "control-token";
+
+    async fn test_state() -> AppState {
+        let pool = crate::testdb::fresh_pool().await;
+        AppState {
+            startup_config: Default::default(),
+            token: Token(CONTROL.to_string()),
+            pool,
+            channels: Default::default(),
+            runner: Arc::new(FakeCommandRunner::default()),
+            triage_runner: None,
+            local_triage_disabled: None,
+            utility_model: None,
+            assistants: std::sync::Arc::new(crate::assistants::NoAssistants),
+            run_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            run_messages: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            run_tails: Default::default(),
+            fleet: Default::default(),
+            turns: Default::default(),
+            files_root: None,
+            files_trash: None,
+            workflow_library: None,
+            machine_config_root: None,
+            secrets: std::sync::Arc::new(crate::secrets::InMemorySecrets::default()),
+            email: std::sync::Arc::new(crate::state::EmailRuntime::default()),
+            voice: std::sync::Arc::new(crate::integrations::voice::VoiceRuntime::default()),
+            browser: std::sync::Arc::new(crate::browser::BrowserRuntime::disabled()),
+            github: std::sync::Arc::new(crate::integrations::github::GithubRuntime::default()),
+            web: std::sync::Arc::new(crate::integrations::web::WebRuntime::disabled()),
+            quota: std::sync::Arc::new(crate::quota::QuotaRuntime::disabled()),
+            judge: std::sync::Arc::new(crate::judge::JudgeRuntime::disabled()),
+            calendar: std::sync::Arc::new(crate::integrations::calendar::CalendarRuntime::default()),
+            council: std::sync::Arc::new(crate::council::CouncilRuntime::default()),
+            progress_timeout: crate::state::DEFAULT_PROGRESS_TIMEOUT,
+            run_timeout: crate::state::DEFAULT_RUN_TIMEOUT,
+        }
+    }
+
+    fn now() -> String {
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    }
+
+    async fn run_with_origin(state: &AppState, origin: Option<&str>) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO runs (prompt, status, mode, origin, created_at)
+             VALUES ('p', 'done', 'headless', ?, ?) RETURNING id",
+        )
+        .bind(origin)
+        .bind(now())
+        .fetch_one(&state.pool)
+        .await
+        .unwrap()
+    }
+
+    async fn feed_line(state: &AppState, run_id: Option<i64>, summary: &str) {
+        sqlx::query(
+            "INSERT INTO feed (project_id, kind, summary, run_id, created_at)
+             VALUES (NULL, 'run_finished', ?, ?, ?)",
+        )
+        .bind(summary)
+        .bind(run_id)
+        .bind(now())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+
+    async fn get_json(state: &AppState, uri: &str) -> serde_json::Value {
+        let app = routes()
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::auth::require_token,
+            ))
+            .with_state(state.clone());
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .header("Authorization", format!("Bearer {CONTROL}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "GET {uri}");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// The line whose `summary` is `summary`, out of a feed array.
+    fn line<'a>(rows: &'a serde_json::Value, summary: &str) -> &'a serde_json::Value {
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["summary"] == summary)
+            .unwrap_or_else(|| panic!("no line {summary:?} in {rows}"))
+    }
+
+    fn timeline_uri() -> String {
+        let since = (chrono::Utc::now() - chrono::Duration::hours(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        format!("/feed/timeline?since={since}")
+    }
+
+    #[tokio::test]
+    async fn feed_line_of_a_voice_run_carries_origin_voice() {
+        let state = test_state().await;
+        let run = run_with_origin(&state, Some("voice")).await;
+        feed_line(&state, Some(run), "voice-line").await;
+        let rows = get_json(&state, "/feed?scope=all").await;
+        assert_eq!(line(&rows, "voice-line")["origin"], "voice");
+    }
+
+    #[tokio::test]
+    async fn feed_line_of_a_run_without_origin_carries_an_explicit_null() {
+        let state = test_state().await;
+        let run = run_with_origin(&state, None).await;
+        feed_line(&state, Some(run), "plain-line").await;
+        let rows = get_json(&state, "/feed?scope=all").await;
+        let row = line(&rows, "plain-line");
+        assert!(
+            row.as_object().unwrap().contains_key("origin"),
+            "key present: {row}"
+        );
+        assert!(row["origin"].is_null());
+    }
+
+    #[tokio::test]
+    async fn feed_line_without_run_id_carries_an_explicit_null() {
+        let state = test_state().await;
+        feed_line(&state, None, "job-level-line").await;
+        let rows = get_json(&state, "/feed?scope=all").await;
+        let row = line(&rows, "job-level-line");
+        assert!(
+            row.as_object().unwrap().contains_key("origin"),
+            "key present: {row}"
+        );
+        assert!(row["origin"].is_null());
+    }
+
+    #[tokio::test]
+    async fn feed_line_keeps_every_pre_existing_key() {
+        let state = test_state().await;
+        let run = run_with_origin(&state, Some("voice")).await;
+        feed_line(&state, Some(run), "keys-line").await;
+        let rows = get_json(&state, "/feed?scope=all").await;
+        let row = line(&rows, "keys-line");
+        for key in [
+            "id",
+            "project_id",
+            "kind",
+            "summary",
+            "run_id",
+            "subject",
+            "created_at",
+        ] {
+            assert!(
+                row.as_object().unwrap().contains_key(key),
+                "missing {key}: {row}"
+            );
+        }
+        assert_eq!(row["run_id"], run);
+        assert_eq!(row["kind"], "run_finished");
+    }
+
+    #[tokio::test]
+    async fn timeline_line_of_a_voice_run_carries_origin_voice() {
+        let state = test_state().await;
+        let run = run_with_origin(&state, Some("voice")).await;
+        feed_line(&state, Some(run), "voice-line").await;
+        let body = get_json(&state, &timeline_uri()).await;
+        assert_eq!(line(&body["entries"], "voice-line")["origin"], "voice");
+        assert!(
+            body.get("truncated").is_some(),
+            "timeline envelope kept: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn timeline_lines_without_origin_or_run_id_carry_an_explicit_null() {
+        let state = test_state().await;
+        let run = run_with_origin(&state, None).await;
+        feed_line(&state, Some(run), "plain-line").await;
+        feed_line(&state, None, "job-level-line").await;
+        let body = get_json(&state, &timeline_uri()).await;
+        for summary in ["plain-line", "job-level-line"] {
+            let row = line(&body["entries"], summary);
+            assert!(
+                row.as_object().unwrap().contains_key("origin"),
+                "key present: {row}"
+            );
+            assert!(row["origin"].is_null());
+        }
+    }
+
+    #[tokio::test]
+    async fn with_origins_labels_only_the_voice_run() {
+        let state = test_state().await;
+        let voice = run_with_origin(&state, Some("voice")).await;
+        let plain = run_with_origin(&state, None).await;
+        for (run, summary) in [(Some(voice), "a"), (Some(plain), "b"), (None, "c")] {
+            feed_line(&state, run, summary).await;
+        }
+        let entries = feed::list_all(&state.pool, 50).await.unwrap();
+        let lines = with_origins(&state.pool, entries).await.unwrap();
+        let origin = |summary: &str| {
+            lines
+                .iter()
+                .find(|l| l.entry.summary == summary)
+                .unwrap()
+                .origin
+                .clone()
+        };
+        assert_eq!(origin("a").as_deref(), Some("voice"));
+        assert_eq!(origin("b"), None);
+        assert_eq!(origin("c"), None);
+    }
 }

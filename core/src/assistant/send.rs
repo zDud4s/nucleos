@@ -117,7 +117,11 @@ async fn send_or_queue_inner(
         spawn_drain_if_free(state, chat_id);
         return Ok(Sent::Queued);
     }
-    match send_message_inner(state, chat_id, text, model_text, images, origin, None).await {
+    match send_message_inner(
+        state, chat_id, text, model_text, images, origin, None, false,
+    )
+    .await
+    {
         Ok(id) => Ok(Sent::Turn(id)),
         Err(refusal) if refusal == TURN_IN_PROGRESS => {
             enqueue().await?;
@@ -424,6 +428,7 @@ async fn drain_inner(state: &crate::state::AppState, chat_id: &str, respect_hold
                 &images,
                 origin,
                 None,
+                false,
             ))
             .await
         }
@@ -610,7 +615,7 @@ pub async fn send_message_with(
     images: &[crate::execution::runner::Attachment],
     origin: Origin,
 ) -> Result<i64, String> {
-    send_message_inner(state, chat_id, text, None, images, origin, None).await
+    send_message_inner(state, chat_id, text, None, images, origin, None, false).await
 }
 
 /// Sends a message that arrived by relay from another conversation, recording which relay bore it.
@@ -627,7 +632,17 @@ pub async fn send_relayed_message(
     origin: Origin,
     relay_id: i64,
 ) -> Result<i64, String> {
-    send_message_inner(state, chat_id, text, None, &[], origin, Some(relay_id)).await
+    send_message_inner(
+        state,
+        chat_id,
+        text,
+        None,
+        &[],
+        origin,
+        Some(relay_id),
+        false,
+    )
+    .await
 }
 
 /// Sends a relayed message, or keeps it until the destination has a turn free.
@@ -684,6 +699,10 @@ pub async fn send_relayed_or_queue(
 /// would stop its walk there and hand `relay::admits` a chain that reads as one hop shorter than it
 /// is. A failure between the two statements would make that misreading permanent rather than a race
 /// that usually loses.
+///
+/// `force_mcp_only` withholds the machine's tools whatever `tool_policy_for` would answer: for a
+/// turn nobody at the keyboard asked for, which keeps its `origin` for all else the origin decides.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn send_message_inner(
     state: &crate::state::AppState,
     chat_id: &str,
@@ -692,6 +711,7 @@ pub(super) async fn send_message_inner(
     images: &[crate::execution::runner::Attachment],
     origin: Origin,
     relay_id: Option<i64>,
+    force_mcp_only: bool,
 ) -> Result<i64, String> {
     // What the model reads. `runs.prompt` keeps `text`, the words that were typed (spec D1).
     let model_text = model_text.unwrap_or(text);
@@ -856,16 +876,20 @@ pub(super) async fn send_message_inner(
         .unwrap_or(false),
         None => false,
     };
-    let tool_policy = tool_policy_for(
-        cwd.as_deref(),
-        origin,
-        hook_wired,
-        // Whether another conversation handed this turn over, and if so whether it may keep the
-        // tools: the first hop out of a typed turn, from a sender that read nothing untrusted
-        // (decision of 2026-10-11). Read here, as the turn starts, so a relay that waited in the
-        // queue is judged by what its sender has read by now.
-        crate::relay::handover_of(&state.pool, relay_id).await,
-    );
+    let tool_policy = if force_mcp_only {
+        crate::execution::runner::ToolPolicy::McpOnly
+    } else {
+        tool_policy_for(
+            cwd.as_deref(),
+            origin,
+            hook_wired,
+            // Whether another conversation handed this turn over, and if so whether it may keep the
+            // tools: the first hop out of a typed turn, from a sender that read nothing untrusted
+            // (decision of 2026-10-11). Read here, as the turn starts, so a relay that waited in
+            // the queue is judged by what its sender has read by now.
+            crate::relay::handover_of(&state.pool, relay_id).await,
+        )
+    };
     // The configured Telegram doctrine, resolved HERE and not inside the spawned task below,
     // because `origin` is what decides it and `origin` does not survive to that task: the task
     // reads `chats::answering` instead, which knows the chat's own instructions and nothing about

@@ -18,6 +18,17 @@ pub fn should_spawn(release_bundle: bool, answered: bool, present: bool) -> bool
     release_bundle && !answered && present
 }
 
+/// The arguments the shell gives the bundled daemon. On Windows it runs under `--supervise`, like
+/// the logon task, so a daemon relaunched after an update is restarted if it fails; elsewhere the
+/// daemon is started plain.
+pub fn daemon_args(windows: bool) -> &'static [&'static str] {
+    if windows {
+        &["--supervise"]
+    } else {
+        &[]
+    }
+}
+
 fn answers() -> bool {
     let addr = SocketAddr::from(([127, 0, 0, 1], 8791));
     TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok()
@@ -48,6 +59,7 @@ pub fn ensure_running() {
             return;
         }
         let mut cmd = std::process::Command::new(&exe);
+        cmd.args(daemon_args(cfg!(windows)));
         if let Some(dir) = exe.parent() {
             cmd.current_dir(dir);
         }
@@ -76,9 +88,84 @@ pub fn updates_enabled() -> bool {
     cfg!(feature = "release-bundle")
 }
 
+/// How this shell was installed, which decides whether it may update itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InstallKind {
+    AppImage,
+    SystemPackage,
+    Other,
+}
+
+/// Classifies the install from the executable path and whether `APPIMAGE` is set. An AppImage
+/// mounts itself under a temp dir, but the variable wins regardless of where the exe sits.
+/// Under `/usr/bin` or `/usr/lib` the package manager owns the files, so the shell must not
+/// replace them itself.
+pub fn install_kind_of(exe: &Path, appimage_env: bool) -> InstallKind {
+    if appimage_env {
+        InstallKind::AppImage
+    } else if exe.starts_with("/usr/bin") || exe.starts_with("/usr/lib") {
+        InstallKind::SystemPackage
+    } else {
+        InstallKind::Other
+    }
+}
+
+/// How this shell was installed: an AppImage, a .deb/.rpm system package, or something else.
+#[tauri::command]
+pub fn install_kind() -> InstallKind {
+    let exe = std::env::current_exe().unwrap_or_default();
+    install_kind_of(&exe, std::env::var_os("APPIMAGE").is_some())
+}
+
 #[cfg(test)]
 mod tests {
+    use super::InstallKind;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn install_kind_appimage_env_wins_even_under_usr_bin() {
+        assert_eq!(
+            super::install_kind_of(Path::new("/tmp/.mount_x/usr/bin/nucleos-shell"), true),
+            InstallKind::AppImage
+        );
+        assert_eq!(
+            super::install_kind_of(Path::new("/usr/bin/nucleos-shell"), true),
+            InstallKind::AppImage,
+            "APPIMAGE takes priority over /usr/bin"
+        );
+    }
+
+    #[test]
+    fn install_kind_usr_bin_is_a_system_package() {
+        assert_eq!(
+            super::install_kind_of(Path::new("/usr/bin/nucleos-shell"), false),
+            InstallKind::SystemPackage
+        );
+    }
+
+    #[test]
+    fn install_kind_usr_lib_is_a_system_package() {
+        assert_eq!(
+            super::install_kind_of(Path::new("/usr/lib/nucleos/x"), false),
+            InstallKind::SystemPackage
+        );
+    }
+
+    #[test]
+    fn install_kind_other_locations_are_other() {
+        for p in [
+            "/opt/nucleos/nucleos-shell",
+            "C:/apps/nucleos/shell.exe",
+            "/usrx/bin/nucleos-shell",
+        ] {
+            assert_eq!(
+                super::install_kind_of(Path::new(p), false),
+                InstallKind::Other,
+                "{p}"
+            );
+        }
+    }
 
     /// The shell starts a daemon only from a release bundle, when nothing answers on the port
     /// and the bundled binary is actually there.
@@ -97,6 +184,12 @@ mod tests {
             !super::should_spawn(true, false, false),
             "no binary, nothing to spawn"
         );
+    }
+
+    #[test]
+    fn only_windows_starts_the_daemon_under_the_supervisor() {
+        assert_eq!(super::daemon_args(true), ["--supervise"]);
+        assert!(super::daemon_args(false).is_empty());
     }
 
     #[test]

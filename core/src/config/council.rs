@@ -50,7 +50,9 @@ pub const MAX_COUNCIL_ROUNDS: u32 = 3;
 /// Two variants and no `Auto`. Which machine a question leaves — or does not leave — is the whole
 /// reason a mixed roster is a feature, and a variant that decided it for the operator would make
 /// the roster stop being the statement of that.
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Copy, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq, Eq,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum SeatKind {
     /// An agent CLI, through `runner.rs`.
@@ -102,13 +104,16 @@ pub fn seat_kind_for_engine(engine: &str) -> Option<SeatKind> {
 /// rewrite it. A form retired here does not produce an error on the machines still using it;
 /// `load_council_config` returns `None` on a roster with faults, so it produces a council that
 /// silently stops existing at the next daemon start.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Default, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq, Eq,
+)]
 #[serde(deny_unknown_fields)]
 pub struct SeatSpec {
     pub kind: Option<SeatKind>,
     /// Spelled `ref` in the file, because that is what the design and the Python it came from call
     /// it, and `model_ref` in Rust, because `ref` is a keyword.
     #[serde(rename = "ref")]
+    #[schemars(extend("x-widget" = "model-picker"))]
     pub model_ref: Option<String>,
     /// An `agents` row id. Never resolved here — see `council::resolve_seat`.
     pub agent: Option<String>,
@@ -231,7 +236,7 @@ impl CouncilSeat {
 /// `deny_unknown_fields`, and here it is load-bearing rather than tidy: `member:` for `members:`
 /// would otherwise parse into a council with no seats, which is a council that answers every
 /// question with the chairman's own opinion while looking like it deliberated.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CouncilConfig {
     #[serde(default = "default_council_timeout")]
@@ -270,7 +275,9 @@ pub struct CouncilConfig {
 /// `.ai/decisions.md` fixed that second half — the arbiter of an ambiguity is the person, and the
 /// council gates nothing — so a flag here that approved anything would contradict a standing
 /// decision rather than extend a feature.
-#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Copy, Default, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq, Eq,
+)]
 #[serde(deny_unknown_fields)]
 pub struct CouncilConsumers {
     /// Before a job's `review` node starts, put the job's task to the council and leave the
@@ -298,7 +305,7 @@ impl CouncilConfig {
     ///
     /// An operator editing this file by hand is going to get more than one thing wrong at once, and
     /// a loader that reports only the first turns a single correction into three restarts.
-    pub(super) fn faults(&self, local_available: bool) -> Vec<String> {
+    pub(crate) fn faults(&self, local_available: bool) -> Vec<String> {
         let mut faults = Vec::new();
 
         if self.members.is_empty() {
@@ -331,7 +338,7 @@ impl CouncilConfig {
         std::iter::once(&self.chairman).chain(self.members.iter())
     }
 
-    pub(super) fn validated(mut self) -> Self {
+    pub(crate) fn validated(mut self) -> Self {
         if self.timeout_seconds == 0 {
             tracing::warn!(
                 "council config: timeout_seconds must be above zero; using {DEFAULT_COUNCIL_TIMEOUT_SECONDS}"
@@ -399,4 +406,59 @@ pub fn parse_council_config(
         return Err(faults.join("; "));
     }
     Ok(config.validated())
+}
+
+/// The stored council as startup may run it: `None` when there is none, or when it names a `kind: local` seat and
+/// no local model answered the probe.
+///
+/// The stored document was accepted with `local_available = true` (the write route's rule, and the importer's); the
+/// machine this daemon runs on may disagree today, and a roster naming a local seat that cannot be answered is
+/// refused rather than quietly re-routed to the cloud, the failure [`load_council_config`] was written to prevent.
+pub fn runnable_council(
+    stored: Option<std::sync::Arc<CouncilConfig>>,
+    local_available: bool,
+) -> Option<CouncilConfig> {
+    let stored = stored?;
+    let faults = stored.faults(local_available);
+    if !faults.is_empty() {
+        tracing::warn!(
+            faults = %faults.join("; "),
+            "the stored council roster is not runnable on this machine, so the council stays off"
+        );
+        return None;
+    }
+    Some((*stored).clone())
+}
+
+#[cfg(test)]
+mod runnable_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    // Flush-left on purpose: a raw continuation line keeps its indentation, and an indented
+    // `members:` under an unindented `chairman:` is not a YAML mapping.
+    const MIXED: &str = "chairman: { kind: cloud, ref: claude-opus-4-8 }
+members:
+  - { kind: cloud, ref: claude-opus-4-8 }
+  - { kind: local, ref: 'qwen3.5:4b' }
+";
+
+    #[test]
+    fn a_stored_roster_naming_a_local_seat_runs_only_with_a_local_model() {
+        let stored = Arc::new(parse_council_config(MIXED, true).unwrap());
+
+        assert!(runnable_council(Some(stored.clone()), false).is_none());
+        assert_eq!(
+            runnable_council(Some(stored), true)
+                .expect("the same roster once a model is up")
+                .members
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn no_stored_roster_is_no_council() {
+        assert!(runnable_council(None, true).is_none());
+    }
 }

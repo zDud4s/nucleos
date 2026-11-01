@@ -6,7 +6,7 @@ import type { ThemeDetail, ThemeRow } from "../data/themes";
 import type { RelatedNote, TargetNote, WeeklyReview } from "../data/owner-notes";
 import { sidecarKeyOf } from "../data/system";
 import { mergePolicy } from "../data/feed";
-import type { MachineConfig } from "../data/machine-config";
+import type { PreviewMachineConfig } from "./daemon";
 import { readEfficiencySignal, readFeedKind, waitReasonFromSummary } from "../data/feed";
 import { LANE_FOLD_ABOVE, buildSequences, traceLanes } from "../lib/sequences";
 import { quietGaps } from "../lib/timeline";
@@ -386,7 +386,7 @@ describe("the channel management fixtures", () => {
 
   it("aligns the older fixtures with the channels", () => {
     expect(OWNER_NOTES.find((note) => note.id === 2)?.origin).toBe("channel:telegram");
-    const config = answer("/config/machine") as MachineConfig;
+    const config = answer("/config/machine") as PreviewMachineConfig;
     const area = config.settings.find((row) => row.area === "channels/telegram");
     expect(area?.path).toBe("channels/telegram.yaml");
     expect(area?.what).toBe(CHANNEL_WHAT);

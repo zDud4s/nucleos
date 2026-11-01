@@ -17,7 +17,19 @@ import {
   promotionConfirmLabel,
   promotionConsequence,
 } from "../lib/mode";
-import { ErrorNote, Inset, ModeSwitch, Quiet, StaleNote, Table, Td, Th } from "../ui";
+import { projectPathPlaceholder } from "../lib/platform";
+import {
+  Button,
+  ErrorNote,
+  Field,
+  Inset,
+  ModeSwitch,
+  Quiet,
+  StaleNote,
+  Table,
+  Td,
+  Th,
+} from "../ui";
 import { OnboardPanel } from "./Onboard";
 
 /**
@@ -28,14 +40,11 @@ import { OnboardPanel } from "./Onboard";
  * editor is, because it knows the schema — there is no way to set the mode to a fourth value, and
  * no way to write a negative ceiling, because there is nowhere to write one.
  *
- * The other half of layer 1 is a *file*, and it is next door in `OwnedFiles` for a reason worth
- * stating: a form that round-tripped YAML would delete the comment somebody left explaining why a
- * schedule is switched off. "A shell that offered to write it would be a second author of a
- * document git already owns" stays true about the file's SHAPE even where it has stopped being
- * true about the file.
+ * The other half of layer 1 is a settings document, and it is next door in `AutopilotRules`: one
+ * editor for it, drawn from the schema the núcleo serves, and not a second one here.
  *
  * Two of the three things here are settings and the third is evidence. The classes are in this
- * section anyway, because they are what unlocks the third mode — and they are drawn as facts
+ * section anyway, because they are the proof the third mode warns about — and they are drawn as facts
  * rather than as controls, because nothing in the núcleo lets a person grant a class by hand and a
  * chip that looked clickable would be a lie about who decides.
  */
@@ -134,10 +143,11 @@ function Block({
 }
 
 /**
- * The biggest lever on the page, with the one setting that has to be earned.
+ * The biggest lever on the page, with the one setting that is meant to be earned.
  *
- * `promotable` is the daemon's arithmetic and is never recomputed here — a control that unlocked on
- * different numbers from the ones `shadow.rs` enforces would offer a button that always refuses.
+ * `promotable` is the daemon's arithmetic and is never recomputed here — a control that judged on
+ * different numbers from the ones `shadow.rs` computes would misreport whether the proof is
+ * enough. Nothing is blocked either way: an unproven offer warns and lets the person go ahead.
  * The blocker sentence comes from `lib/mode.ts` for the same reason: the Autopilot page says the
  * same thing about the same state, and two copies of a sentence about restraint would eventually
  * say two different things.
@@ -149,8 +159,23 @@ function Block({
 function ModeChoice({ project }: { project: ProjectSummary }) {
   const setMode = useSetProjectMode();
   const refused = setMode.isError && isApiRefusal(setMode.error) ? setMode.error : null;
+  // Any other failure is the daemon not answering: said as such, never silence.
+  const unreachable = setMode.isError && refused === null;
+  /**
+   * The folder to send with the next change.
+   *
+   * A project in `off` has no `project_root` in the roster, so the first change may be refused
+   * with the bare 422 that asks for one. The field below is where the owner supplies it.
+   */
+  const [root, setRoot] = useState(project.project_root ?? "");
+  // The same reading `Autopilot.tsx` makes: the bare 422 that is not `not_onboarded`.
+  const needsRoot = refused !== null && refused.status === 422 && refused.code !== "not_onboarded";
+  /** The change that was refused, to be sent again with the folder. */
+  const refusedMode = setMode.variables?.mode;
   const withheld = project.withheld_classes_ready ?? 0;
   const blocker = promotionBlocker(project, withheld);
+  // Only an explicit verdict counts as enough proof; a row without one warns.
+  const proven = project.promotable === true;
   /**
    * Whether the third segment is armed, so this block can say what confirming it would do.
    *
@@ -162,22 +187,22 @@ function ModeChoice({ project }: { project: ProjectSummary }) {
   /** The id the armed switch points at, so the sentence is read as the button's description. */
   const consequenceId = useId();
   /**
-   * The id of the blocker sentence, for a "Let it act" that is locked.
+   * The id of the blocker sentence, for a "Let it act" without enough shadow proof.
    *
-   * The switch keeps a locked segment focusable here (`focusableWhenInert`), and a control you
-   * can land on but not press owes the reason it cannot be pressed. That reason is the blocker
-   * paragraph below; the consequence sentence is for an offer that can be taken.
+   * That segment is live (it warns, it does not refuse), and what is missing is still worth
+   * saying before anyone presses it. That reason is the blocker paragraph below; the consequence
+   * sentence is for an offer that has the proof.
    */
   const blockerId = useId();
 
-  function change(mode: AutopilotMode) {
+  function change(mode: AutopilotMode, folder?: string) {
+    // The folder typed below wins; otherwise the one the daemon already has. A project that is
+    // `off` has none in the roster, and then the daemon may answer 422 asking for it.
+    const sent = folder ?? project.project_root;
     setMode.mutate({
       project_id: project.project_id,
       mode,
-      // The folder the daemon already has. Naming it again is what the Autopilot page does when
-      // its input is empty, and a project reached through this page has one by definition — every
-      // other panel here reads files.
-      ...(project.project_root === null ? {} : { project_root: project.project_root }),
+      ...(sent === null || sent.trim() === "" ? {} : { project_root: sent }),
     });
   }
 
@@ -190,14 +215,15 @@ function ModeChoice({ project }: { project: ProjectSummary }) {
       */}
       <ModeSwitch
         value={project.mode}
-        actAllowed={project.promotable}
+        proven={proven}
+        shortReason={blocker}
         actArmedLabel={promotionConfirmLabel(project)}
         actConsequence={promotionConsequence(project)}
         onArmedChange={setArmed}
-        actDescribedBy={project.promotable ? consequenceId : blockerId}
+        actDescribedBy={proven ? consequenceId : blockerId}
         busy={setMode.isPending}
         focusableWhenInert
-        onChoose={change}
+        onChoose={(mode) => change(mode)}
       />
 
       {/* Immediately under the switch and above everything else this block says, so arming
@@ -218,12 +244,39 @@ function ModeChoice({ project }: { project: ProjectSummary }) {
       */}
       {project.mode !== "active" ? (
         <p id={blockerId} className="text-xs text-text-muted">
-          {sentence(project.promotable ? PROMOTION_EARNED : blocker)}
+          {sentence(proven ? PROMOTION_EARNED : blocker)}
         </p>
       ) : null}
 
       {refused !== null ? (
         <ErrorNote>{MODE_REFUSAL_PROSE[refused.code] ?? refused.detail}</ErrorNote>
+      ) : null}
+      {unreachable ? (
+        <ErrorNote>
+          Could not reach the {DAEMON_NAME}: this project&rsquo;s setting is unchanged.
+        </ErrorNote>
+      ) : null}
+      {/* The bare 422 asks for a folder, and this is where it is given: a project in `off` has
+          none in the roster. Same field and same retry as the Autopilot page. */}
+      {needsRoot && refusedMode !== undefined ? (
+        <Inset>
+          <Field label={`Folder for ${project.project_id}`}>
+            <input
+              type="text"
+              value={root}
+              spellCheck={false}
+              placeholder={projectPathPlaceholder()}
+              onChange={(event) => setRoot(event.target.value)}
+            />
+          </Field>
+          <Button
+            variant="ghost"
+            disabled={root.trim() === "" || setMode.isPending}
+            onClick={() => change(refusedMode, root.trim())}
+          >
+            Try again with this folder
+          </Button>
+        </Inset>
       ) : null}
       {/* The one refusal this block can resolve in place: onboard, then choose again. */}
       {refused?.code === "not_onboarded" ? (

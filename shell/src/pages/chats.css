@@ -926,6 +926,14 @@
   }
 }
 
+/* The parallel-subagents note above the question box: muted, same side padding as the box. */
+.chats-hint {
+  margin: var(--space-2) 0;
+  padding: 0 var(--space-3);
+  font-size: var(--text-sm);
+  color: var(--text-faint);
+}
+
 /* A tool call this conversation is being held on. Drawn where the next thing would have
    appeared, and not tucked away: a turn is stopped while this stands, and the question stands for as
    long as the CLI lives. */

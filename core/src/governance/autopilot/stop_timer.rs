@@ -12,7 +12,7 @@ use super::HOOK_INTERPRETER;
 /// Under the hook directory, which `materialize::reserved` keeps out of a bundle's reach. A directory
 /// of its own because a worktree has to stay clean and no project tracks this file: the `.gitignore`
 /// inside hides it without a git process or an edit to anything the project owns.
-const SCRIPT: &str = ".claude/hooks/nucleos/stop_timer.py";
+pub(super) const SCRIPT: &str = ".claude/hooks/nucleos/stop_timer.py";
 const SOURCE: &str = include_str!("../../../hooks/stop_timer.py");
 
 /// Enforced by Claude Code on an `asyncRewake` hook, so it has to outlast the longest window the

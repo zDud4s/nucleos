@@ -53,6 +53,7 @@ mod tests {
     use tower::ServiceExt;
 
     async fn test_state() -> AppState {
+        crate::project::rules::testing::hold_shared();
         let pool = crate::testdb::fresh_pool().await;
         AppState {
             startup_config: Default::default(),
@@ -2774,6 +2775,70 @@ mod tests {
         .await
         .unwrap()
         .last_insert_rowid()
+    }
+
+    /// A chat of its own with one running assistant turn, for the untrusted-notice tests. The
+    /// notice map is process-wide like `ASKS`, so every test gets a fresh chat id.
+    async fn chat_with_turn(state: &AppState) -> (String, i64) {
+        let chat_id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        let run_id = turn_of(state, &chat_id).await;
+        (chat_id, run_id)
+    }
+
+    /// The first `ReadsUntrusted` MCP call of a chat's session registers a non-blocking notice
+    /// naming the tool; the hook's decision is whatever it was before.
+    #[tokio::test]
+    async fn first_untrusted_call_of_a_chat_registers_the_notice_with_the_tool_name() {
+        let state = test_state().await;
+        let (chat_id, run_id) = chat_with_turn(&state).await;
+        let app = test_router(state.clone());
+        assert_eq!(untrusted_first_call_for(&chat_id), None);
+
+        let verdict = orchestrator_tool(&app, run_id, "get_email", serde_json::json!({})).await;
+        assert_eq!(verdict.decision, "allow", "{}", verdict.reason);
+        assert_eq!(
+            untrusted_first_call_for(&chat_id).as_deref(),
+            Some("get_email")
+        );
+    }
+
+    /// A second untrusted call in the same session does not raise the notice again (the tool
+    /// recorded stays the first one) and the decision is the same as without the notice.
+    #[tokio::test]
+    async fn second_untrusted_call_keeps_the_first_notice_and_the_same_decision() {
+        let state = test_state().await;
+        let (chat_id, run_id) = chat_with_turn(&state).await;
+        let app = test_router(state.clone());
+
+        let first = orchestrator_tool(&app, run_id, "get_email", serde_json::json!({})).await;
+        let second =
+            orchestrator_tool(&app, run_id, "get_email_queue", serde_json::json!({})).await;
+        assert_eq!(first.decision, "allow", "{}", first.reason);
+        assert_eq!(second.decision, first.decision, "{}", second.reason);
+        assert_eq!(second.reason, first.reason);
+        assert_eq!(
+            untrusted_first_call_for(&chat_id).as_deref(),
+            Some("get_email"),
+            "the second untrusted call must not replace or re-raise the notice"
+        );
+    }
+
+    /// A tool that is not `ReadsUntrusted` registers nothing.
+    #[tokio::test]
+    async fn a_tool_that_does_not_read_untrusted_registers_no_notice() {
+        let state = test_state().await;
+        let (chat_id, run_id) = chat_with_turn(&state).await;
+        let app = test_router(state.clone());
+        assert_eq!(
+            crate::mcp_tools::tool_effect("get_budget"),
+            crate::mcp_tools::ToolEffect::ReadsOwn
+        );
+
+        let verdict = orchestrator_tool(&app, run_id, "get_budget", serde_json::json!({})).await;
+        assert_eq!(verdict.decision, "allow", "{}", verdict.reason);
+        assert_eq!(untrusted_first_call_for(&chat_id), None);
     }
 
     /// `run_id` comes from the request body, so it is a claim the caller makes about itself. Every
@@ -8665,14 +8730,7 @@ mod tests {
         let mut state = test_state().await;
         let root = tempfile::tempdir().unwrap();
         state.machine_config_root = Some(root.path().to_path_buf());
-        let rules = crate::project::state::file(
-            Some(root.path()),
-            "p",
-            crate::project::state::AUTOPILOT_FILE,
-        )
-        .unwrap();
-        std::fs::create_dir_all(rules.parent().unwrap()).unwrap();
-        std::fs::write(&rules, "gate_command: \"make gate\"\n").unwrap();
+        write_rules(root.path(), "p", "gate_command: \"make gate\"\n");
         let mapped = mapped_cwd();
         let run_id = in_flight_run(
             &state,
@@ -8735,12 +8793,10 @@ mod tests {
 
     // F2b step 2: the refuse switch.
 
-    fn write_rules(root: &Path, project: &str, text: &str) {
-        let rules =
-            crate::project::state::file(Some(root), project, crate::project::state::AUTOPILOT_FILE)
-                .unwrap();
-        std::fs::create_dir_all(rules.parent().unwrap()).unwrap();
-        std::fs::write(&rules, text).unwrap();
+    /// Publishes `project`'s autopilot rules where the hook reads them: the installed settings snapshot.
+    /// `_root` is kept so the existing call sites stay as they were; it is ignored.
+    fn write_rules(_root: &Path, project: &str, text: &str) {
+        crate::project::rules::testing::publish_rules(project, text);
     }
 
     async fn stored_decision(state: &AppState, run_id: i64) -> String {
@@ -8907,6 +8963,80 @@ mod tests {
         assert_eq!(p.decision, "deny");
         assert_eq!(p.reason, q.reason);
         assert_ne!(p.reason, VERIFY_GUARD_REFUSAL);
+    }
+
+    /// An unreadable rules document is the safe side: no gate command is recognised and the guard stays in
+    /// `observe`, so the command is recorded but never refused for a reason the owner cannot see.
+    /// Characterisation: it passes before the GREEN too (no file is read, so the default `observe` applies).
+    #[tokio::test]
+    async fn verification_unreadable_rules_observe_and_never_refuse() {
+        let _home = crate::project::rules::testing::Home::new();
+        let state = test_state().await;
+        crate::project::rules::testing::publish_unreadable(
+            "p",
+            "autopilot",
+            "unknown field `verify_guard`",
+        );
+        let mapped = mapped_cwd();
+        let run_id = in_flight_run(
+            &state,
+            "worktree",
+            Some("p"),
+            Some(mapped.path().to_str().unwrap()),
+            None,
+        )
+        .await;
+        let app = test_router(state.clone());
+
+        let d = ask_tool(
+            &app,
+            run_id,
+            "Bash",
+            serde_json::json!({ "command": "cargo test -p x some_test" }),
+        )
+        .await;
+
+        assert_ne!(d.reason, VERIFY_GUARD_REFUSAL);
+        assert_eq!(observed_rows(&state, run_id).await, 1);
+        assert_eq!(stored_decision(&state, run_id).await, d.decision);
+    }
+
+    /// The hook reads the snapshot on every call: a switch published between two commands governs the second.
+    #[tokio::test]
+    async fn verification_guard_follows_a_switch_published_between_two_calls() {
+        let _home = crate::project::rules::testing::Home::new();
+        let state = test_state().await;
+        write_rules(
+            Path::new(""),
+            "p",
+            "verify_guard: observe
+",
+        );
+        let mapped = mapped_cwd();
+        let run_id = in_flight_run(
+            &state,
+            "worktree",
+            Some("p"),
+            Some(mapped.path().to_str().unwrap()),
+            None,
+        )
+        .await;
+        let app = test_router(state.clone());
+        let input = serde_json::json!({ "command": "cargo test -p x some_test" });
+
+        let first = ask_tool(&app, run_id, "Bash", input.clone()).await;
+        assert_ne!(first.reason, VERIFY_GUARD_REFUSAL);
+
+        write_rules(
+            Path::new(""),
+            "p",
+            "verify_guard: refuse
+",
+        );
+        let second = ask_tool(&app, run_id, "Bash", input).await;
+
+        assert_eq!(second.decision, "deny");
+        assert_eq!(second.reason, VERIFY_GUARD_REFUSAL);
     }
 
     // F2b step 3: detection runs against the union of the worktree's map and the target's.

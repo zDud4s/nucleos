@@ -25,9 +25,10 @@ const ALLOWED = new Map<string, { literals: number; tables?: string[]; reason: s
   ["pages/Browser.tsx", { literals: 3, reason: "a grant's kind and whether it submits forms are permissions the shell decides, and a write's HTTP method is an identifier." }],
   ["pages/Calendar.tsx", { literals: 1, reason: "busy or free right now is computed from the calendar in the browser; the daemon sends no such literal." }],
   ["pages/Contacts.tsx", { literals: 4, reason: "a contact's verdict, whether you write back, and a merge are facts about a person, not a lifecycle." }],
-  ["pages/Feed.tsx", { literals: 1, tables: ["readFeedKind"], reason: "the ignorance device for an unknown feed kind — the same posture as StateBadge, in the slice that owns feed kinds." }],
+  ["pages/Feed.tsx", { literals: 2, tables: ["readFeedKind"], reason: "the ignorance device for an unknown feed kind — the same posture as StateBadge, in the slice that owns feed kinds — and the `voice` origin marker: an origin is an identifier the voice supervisor stamps on a line, not a lifecycle state, and no núcleo state machine writes it (Chip is a toggle, state-map has no origin domain)." }],
   ["pages/RunDetail.tsx", { literals: 1, reason: "the llm-router mode a run was routed under (shadow or apply) is machine configuration read off the run, not a lifecycle state of the run." }],
   ["pages/System.tsx", { literals: 1, reason: "a token's authority level is an identifier off the wire, not a lifecycle state." }],
+  ["system/Autostart.tsx", { literals: 2, reason: "whether the daemon starts with the machine is a machine setting read off the wire, not a lifecycle state of anything." }],
   ["system/RemoteDevices.tsx", { literals: 1, reason: "a remote device's access level is an identifier off the wire, like an API token's; revocation is shown as text, not as a tone." }],
   ["team/Decisions.tsx", { literals: 1, reason: "`granted: nobody decides` is a sentence about an absent proposal, not a state of one." }],
 ]);

@@ -103,13 +103,10 @@ import { plural } from "../lib/plural";
  * secret, plus a config index reading the three `/config/*`-shaped routes that
  * existed — and naming, honestly, the four areas that had no route at all.
  *
- * The settings view is what answers that confession. `GET`/`POST
- * /config/machine` now serve the whole of this machine's settings — the nine
- * files under `~/.nucleos/` whose author is the daemon rather than any project — so every
- * pillar can be configured here instead of in a text editor followed by a
- * restart. The config index above it stays, narrowed to what it is actually
- * good at: showing what the daemon is RUNNING, which is a different reading
- * from what is on disk whenever the two have been allowed to drift.
+ * The settings view is what answers that confession. `/settings` serves the whole of this machine's settings as
+ * documents whose author is the daemon rather than any project, so every pillar can be configured here. The config
+ * index above it stays, narrowed to what it is actually good at: showing what the daemon is RUNNING, which is a
+ * different reading from what is stored whenever the two have been allowed to drift.
  *
  * The notifications tab is the newest, and belongs here for the same reason the
  * budget does: it is the machine's own behaviour, not a project's. It edits

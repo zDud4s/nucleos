@@ -98,6 +98,7 @@ import {
   useClearContext,
   useDeniableTools,
   useFreshContext,
+  useSetChatAutoCompact,
   useOlderTurns,
   useSaid,
   useTurnTools,
@@ -165,7 +166,8 @@ import { useNow } from "../lib/useNow";
 import { tokenCount } from "../ui/readings";
 import { SessionColumn } from "../chats/SessionColumn";
 import { ChatTabs } from "../chats/ChatTabs";
-import { ChatChips } from "../chats/AgentMap";
+import { ChatChips, ParallelHint } from "../chats/AgentMap";
+import { UntrustedNotice } from "../chats/UntrustedNotice";
 import { ProjectPicker } from "../chats/ProjectPicker";
 import { holdMessage, takeHeld, useHeldMessage } from "../chats/held";
 import { clearDraft, readDraft, readScroll, saveDraft, saveScroll } from "../chats/drafts";
@@ -1103,6 +1105,8 @@ function ChatDetail({
         )}
         {/* Below the transcript and above the box, which is where these words are in time: said
             after everything above them, and not yet said at all. */}
+        <ParallelHint chatId={chatId} turns={transcript.data?.turns} />
+        <UntrustedNotice chatId={chatId} firstCall={transcript.data?.untrusted_first_call} />
         {/* Above what is waiting to be said, because this is what everything else is waiting ON:
             a turn is held while a question stands, and the queue behind it cannot move until it is
             answered. */}
@@ -1706,6 +1710,7 @@ function ChatMenu({ chatId }: { chatId: string }) {
           {/* Content and not items, like `ArchiveControl` below: the stronger of the two is a
               `ConfirmButton`, whose two-click interlock a menu item would collapse into one. */}
           <ContextControls chatId={chatId} />
+          <AutoCompactSwitch chatId={chatId} />
           <DropdownMenuSeparator />
           {/* The one thing that must not be a menu ITEM: see `ArchiveControl`, whose two-click
               interlock a menu item would collapse. */}
@@ -3296,6 +3301,56 @@ function ContextControls({ chatId }: { chatId: string }) {
       {fresh.isError && <HelperRefusal error={fresh.error} />}
       {clear.isError && <HelperRefusal error={clear.error} />}
     </div>
+  );
+}
+
+/**
+ * Whether this conversation compacts itself when its context grows past the soft limit.
+ *
+ * The state is the daemon's row, not a guess made on the click: a write that failed must not be
+ * drawn as one that happened, so there is no optimistic flip and a failure says so in the menu.
+ * With no row (still loading, or the list failed) the state is unknown, and a clickable off would
+ * claim otherwise, so it is disabled; likewise until the list has landed after a write.
+ */
+function AutoCompactSwitch({ chatId }: { chatId: string }) {
+  const row = useChatRow(chatId);
+  const set = useSetChatAutoCompact();
+  const on = row?.auto_compact === true;
+
+  return (
+    <>
+      <DropdownMenuCheckboxItem
+        checked={on}
+        disabled={row === undefined || set.isPending}
+        /* Keeps the menu open, so a refusal is read where the switch is. */
+        onSelect={(event) => {
+          event.preventDefault();
+          set.mutate({ chatId, enabled: !on });
+        }}
+      >
+        Compact automatically
+      </DropdownMenuCheckboxItem>
+      {set.isError && <AutoCompactRefusal error={set.error} />}
+    </>
+  );
+}
+
+function AutoCompactRefusal({ error }: { error: unknown }) {
+  if (!isApiRefusal(error)) {
+    return (
+      <ErrorNote>
+        The {DAEMON_NAME} is not responding. Automatic compaction was not changed
+      </ErrorNote>
+    );
+  }
+  return (
+    <RefusalNote
+      refusal={error}
+      sentences={{
+        not_found: "This conversation no longer exists. Automatic compaction was not changed",
+        forbidden: `The ${DAEMON_NAME} refused the change: this key may not change conversation settings. Automatic compaction was not changed`,
+      }}
+    />
   );
 }
 

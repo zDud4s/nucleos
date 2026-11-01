@@ -498,8 +498,102 @@ class RecordTests(unittest.TestCase):
         out = self.rec("L1", self.report("L1", []), owned=str(owned))
         self.assertEqual(out["reverted"], ["c/z.txt"])
 
+    # -- F1-RECORD: --nodes-from and correction leaves hung on the root ------------------------
+
+    def rec_from(self, node_id, text, nodes_from, stdin=None):
+        """Like rec(), but through --nodes-from (a file path or `-` for stdin), no --nodes."""
+        report_file = self.tmp / "report.txt"
+        report_file.write_text(text, encoding="utf-8")
+        args = argparse.Namespace(
+            node_id=node_id,
+            branch="core",
+            nodes=None,
+            nodes_from=nodes_from,
+            report_file=str(report_file),
+            owned=None,
+            tree="R",
+        )
+        if stdin is None:
+            return tree_record.run_record(args)
+        wrapper = io.TextIOWrapper(io.BytesIO(stdin.encode("utf-8")), encoding="utf-8")
+        with mock.patch.object(sys, "stdin", wrapper):
+            return tree_record.run_record(args)
+
+    def add_correction_leaf(self, branch_status="done"):
+        """A correction leaf C hung on the root R, after the branch node B closed."""
+        for n in self.nodes:
+            if n["id"] == "B":
+                n["status"] = branch_status
+        self.nodes.append(self.node("C", "R", 1, "leaf", ["a/**"]))
+
+    def test_nodes_from_file_is_read_like_nodes(self):
+        nodes_file = self.tmp / "from.json"
+        nodes_file.write_text(json.dumps({"root_id": "R", "nodes": self.nodes}), encoding="utf-8")
+        write(self.repo, "a/x.txt", "x1\n")
+        out = self.rec_from("L1", self.report("L1", ["a/x.txt"]), str(nodes_file))
+        self.assertEqual(out["verdict"], "accepted")
+        self.assertEqual(out["accepted"], ["a/x.txt"])
+
+    def test_nodes_from_dash_reads_the_node_tree_from_stdin(self):
+        write(self.repo, "a/x.txt", "x1\n")
+        payload = json.dumps({"root_id": "R", "nodes": self.nodes})
+        out = self.rec_from("L1", self.report("L1", ["a/x.txt"]), "-", stdin=payload)
+        self.assertEqual(out["verdict"], "accepted")
+        self.assertEqual(out["accepted"], ["a/x.txt"])
+
+    def test_nodes_from_unreadable_file_is_a_tree_error(self):
+        with self.assertRaises(TreeError):
+            self.rec_from("L1", self.report("L1", []), str(self.tmp / "missing.json"))
+
+    def test_correction_leaf_on_the_root_is_recorded_once_the_branch_node_closed(self):
+        self.add_correction_leaf()
+        write(self.repo, "a/x.txt", "fixed\n")
+        out = self.rec("C", self.report("C", ["a/x.txt"]))
+        self.assertEqual(out["verdict"], "accepted")
+        self.assertEqual(out["accepted"], ["a/x.txt"])
+        self.assertEqual(out["failed_nodes"], [])
+        self.assertEqual(read(self.repo, "a/x.txt"), "fixed\n")
+        self.assertEqual(self.manifest["records"][-1]["node_id"], "C")
+
+    def test_correction_leaf_foreign_write_is_still_reverted(self):
+        self.add_correction_leaf()
+        write(self.repo, "b/y.txt", "y1\n")  # owned by L2, not by C
+        out = self.rec("C", self.report("C", ["b/y.txt"]))
+        self.assertEqual(out["verdict"], "failed")
+        self.assertEqual(out["refused"], ["b/y.txt"])
+
+    def test_leaf_on_the_root_is_refused_while_the_branch_node_still_runs(self):
+        self.add_correction_leaf(branch_status="running")
+        write(self.repo, "a/x.txt", "x1\n")
+        with self.assertRaises(TreeError) as ctx:
+            self.rec("C", self.report("C", ["a/x.txt"]))
+        self.assertIn("not under the branch node", str(ctx.exception))
+
+    def test_classify_treats_a_root_correction_leaf_as_a_candidate_owner(self):
+        self.add_correction_leaf()
+        subtree = tree_record.subtree_ids(self.nodes, "B")
+        self.assertNotIn("C", subtree)
+        out = tree_record.classify(
+            [("??", "a/x.txt")], "C", {"a/x.txt"}, self.nodes, subtree, "B"
+        )
+        self.assertEqual(out["accepted"], ["a/x.txt"])
+        self.assertEqual(out["refused"], [])
+        self.assertEqual(out["failed"], set())
+
 
 class RegisterTests(unittest.TestCase):
+    def test_register_accepts_nodes_from_instead_of_nodes(self):
+        verbs = {}
+        tree_record.register(verbs)
+        parser = argparse.ArgumentParser()
+        verbs["record"][0](parser)
+        args = parser.parse_args(["L1", "--branch", "core", "--nodes-from", "-"])
+        self.assertEqual(args.nodes_from, "-")
+        self.assertIsNone(args.nodes)
+        args = parser.parse_args(["L1", "--branch", "core", "--nodes", "n.json"])
+        self.assertEqual(args.nodes, "n.json")
+        self.assertIsNone(args.nodes_from)
+
     def test_register_adds_the_record_verb_with_its_options(self):
         verbs = {}
         tree_record.register(verbs)

@@ -24,8 +24,7 @@
 //! # What the files are
 //!
 //! YAML, with exactly the contents they always had. Only the location changed. The parsers are
-//! still `config::parse_schedule_rules` and `workflows::parse_pins`, and the write door in
-//! `http.rs` still holds a candidate to them before a byte is written.
+//! still `config::parse_schedule_rules` and `workflows::parse_pins`.
 //!
 //! Ejected workflow copies (`workflows::EJECTED_DIR`) are NOT here and never will be: an ejected
 //! copy is the project's own files by definition, and it stays in the project.
@@ -33,7 +32,7 @@
 use std::path::{Path, PathBuf};
 
 /// The directory under [`crate::machine_config::root`] that holds one directory per project.
-const PROJECTS_DIR: &str = "projects";
+pub const PROJECTS_DIR: &str = "projects";
 
 /// What a project does on its own: schedules, repository triggers, and the gate command.
 /// Parsed by [`crate::config::parse_schedule_rules`].
@@ -76,7 +75,7 @@ pub const ALL_FILES: &[&str] = &[AUTOPILOT_FILE, PINS_FILE, ONBOARDED_FILE, MATE
 /// CHECK on it and the route that writes it has never validated it. Joined onto a path, an id with
 /// a separator, a `..`, a drive letter or a Windows-reserved character would name a different
 /// directory from the one it reads as, so an id outside this set simply has no state directory:
-/// its rules read as absent and the write door refuses it. Every id the shell has ever suggested is
+/// its rules read as absent and the routes that need one refuse it (`bad_project_id`). Every id the shell has ever suggested is
 /// inside the set.
 ///
 /// Wider than [`crate::workflows::valid_name`] on purpose — a space is a legitimate character in a
@@ -128,7 +127,7 @@ pub fn display_path(project_id: &str, name: &str) -> String {
 
 /// Write through a temporary file in the same directory, then rename over the target.
 ///
-/// Every writer of a state file goes through this: the write door (`http.rs`) and onboarding.
+/// Every writer of a state file goes through this, onboarding among them.
 ///
 /// A plain truncate-and-write leaves the rules file half-written if anything goes wrong mid-write,
 /// and a half-written `autopilot.yaml` is not a smaller file — it is an *unreadable* one, which

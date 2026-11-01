@@ -12,7 +12,8 @@ type "segue", "o que falta" or "resume o que foi feito" over and over. Two hooks
   `blocked` (with at least one `[!]` item) or `handoff` (context ceiling), or background work the
   session launched is still running: its completion wakes the session and the hold resumes
   (`spec_loop_timer.py` wakes it first if the prompt cache is about to expire). It
-  lets go after MAX_IDLE_PUSHES pushes that closed nothing, so a stuck model cannot loop forever.
+  lets go after MAX_IDLE_PUSHES pushes that closed nothing, so a stuck model cannot loop forever;
+  the timer then wakes that session once, at the end of its cache window.
   Whenever the checklist changed since the last accepted report, the final message must carry the report
   headings (REPORT_HEADINGS); a done checklist is then closed (`<id>.closed.md`).
 - `--prompt-hook` (UserPromptSubmit): a prompt that names a spec or plan, in a session with no
@@ -173,8 +174,15 @@ def stop_decision(payload: dict) -> dict | None:
         if n_open and running_tasks(payload):
             return None
         idle = state.get("idle", 0) + 1 if pushed and n_open >= state.get("last_open", n_open + 1) else 0
+        # The timer's one wake after a let-go is the extra turn; pushes on top of it would make three.
+        # Progress earns the pushes back, and so does any turn the wake did not start.
+        woken = state.pop("woken", False)
+        if woken and n_open >= state.get("last_open", n_open + 1):
+            idle = MAX_IDLE_PUSHES
+        elif not pushed and not woken:
+            state.pop("woken_for", None)
         if idle < MAX_IDLE_PUSHES:
-            save(last_open=n_open, idle=idle, last_block="work")
+            save(last_open=n_open, idle=idle, last_block="work", let_go=None)
             if no_items:
                 return _block(f"Spec loop {rel} has no items. List the spec's deliverables as "
                               "`- [ ]` lines in it, then carry on working through them.")
@@ -188,6 +196,8 @@ def stop_decision(payload: dict) -> dict | None:
                 "done first); context past its ceiling -> `status: handoff` and run the "
                 "nucleos-compact skill.")
         print(f"spec loop: {MAX_IDLE_PUSHES} pushes closed nothing; letting the stop go", file=sys.stderr)
+        # spec_loop_timer.py reads this: nothing else would look at the session again.
+        save(let_go=n_open or None)
 
     # 2. The checklist moved since the last accepted report: the final message must report it.
     mtime = path.stat().st_mtime
@@ -231,23 +241,40 @@ def prompt_context(payload: dict) -> str | None:
 
 def start(argv: list[str]) -> int:
     session = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    name = None
+    rest: list[str] = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--name" and i + 1 < len(argv):
+            name = argv[i + 1]
+            i += 2
+        else:
+            rest.append(argv[i])
+            i += 1
+    argv = rest
     if not argv or not session:
-        print("usage: spec_loop.py start <spec-path> [\"item\" ...]  (needs CLAUDE_CODE_SESSION_ID)",
-              file=sys.stderr)
+        print("usage: spec_loop.py start [--name <id>] <spec-path> [\"item\" ...]  "
+              "(needs CLAUDE_CODE_SESSION_ID)", file=sys.stderr)
         return 2
+    name = name or os.environ.get("NUCLEOS_LOOP_NAME") or session
     try:
         loops = nucleos_paths.state_dir() / "loops"
     except nucleos_paths.ProjectNotFound as exc:
         print(f"spec loop: {exc}", file=sys.stderr)
         return 2
-    path = loop_path(loops, session)
+    path = loop_path(loops, name)
     if path.exists():
+        m = re.search(r"^session:\s*(\S+)", path.read_text(encoding="utf-8"), re.MULTILINE)
+        if m and m.group(1) != session:
+            print(f"spec loop '{name}' is owned by another session ({m.group(1)}); "
+                  "pick a different --name", file=sys.stderr)
+            return 2
         print(f"spec loop already open: {path}")
         return 0
     path.parent.mkdir(parents=True, exist_ok=True)
     items = "\n".join(f"- [ ] {i}" for i in argv[1:])
     path.write_text(
-        f"# Spec loop\nspec: {argv[0]}\nstatus: active\n"
+        f"# Spec loop\nspec: {argv[0]}\nsession: {session}\nstatus: active\n"
         "<!-- active | blocked (needs a [!] item) | handoff (context ceiling) | done -->\n\n"
         f"## Items\n{items}\n", encoding="utf-8")
     print(f"spec loop opened: {path}")

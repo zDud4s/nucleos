@@ -1,6 +1,8 @@
 mod cli;
 mod http;
 mod startup;
+#[cfg(windows)]
+mod supervisor;
 
 use nucleos_app::*;
 use nucleos_core::*;
@@ -34,6 +36,11 @@ const WEB_SEARCH_KEY: &str = "web-search-api-key";
 /// rather than after a 401 comes back.
 const OPENROUTER_KEY: &str = "openrouter-api-key";
 
+/// A machine-scoped document from the settings snapshot, or its default when none is stored.
+fn machine_doc<T: settings::Document + Default>() -> T {
+    (*settings::get::<T>(&settings::Scope::Machine)).clone()
+}
+
 #[tokio::main]
 async fn main() {
     http::remember_home();
@@ -41,8 +48,22 @@ async fn main() {
         return;
     }
 
-    let dirs = directories::ProjectDirs::from("dev", "nucleos", "NucleOS")
-        .expect("could not resolve local app data directory");
+    // The offline recovery commands (`--settings-reset`, `--settings-rollback`) are answered here and exit: they
+    // must not start a daemon, take the instance lock or open a port. See `settings_cli::dispatch`.
+    if let Some(code) = settings_cli::dispatch(&std::env::args().collect::<Vec<_>>()).await {
+        std::process::exit(code);
+    }
+
+    // The logon task's mode: launch this same exe as the daemon and relaunch it after a failure. After
+    // the subcommands above, so `--version --supervise` still only answers. Off Windows the flag is
+    // ignored and this process is the daemon itself: no other autostart backend passes it.
+    #[cfg(windows)]
+    if supervise::wants_supervisor(&std::env::args().collect::<Vec<_>>()) {
+        std::process::exit(supervisor::run().await);
+    }
+
+    let default_dir =
+        data_dir::default_data_dir().expect("could not resolve local app data directory");
 
     // Whether this process is the machine's daemon or a second one somebody is testing with, and
     // where its database and logs go. Resolved HERE, before the first thing that acts on either,
@@ -57,10 +78,7 @@ async fn main() {
     let data_dir_override = std::env::var(daemon_client::DATA_DIR_VAR).ok();
     let is_primary =
         daemon_client::is_primary(port_override.as_deref(), data_dir_override.as_deref());
-    let data_dir = match data_dir_override.as_deref().filter(|dir| !dir.is_empty()) {
-        Some(dir) => std::path::PathBuf::from(dir),
-        None => dirs.data_local_dir().to_path_buf(),
-    };
+    let data_dir = data_dir::data_dir_from(data_dir_override.as_deref(), &default_dir);
     if !is_primary {
         eprintln!(
             "nucleos-core: secondary instance — data in {}, no autostart, no sidecars",
@@ -70,6 +88,21 @@ async fn main() {
 
     let log_dir = data_dir.join("logs");
     let _log_guard = logging::init(&log_dir);
+
+    // Something that answers on a taken port must make this process leave before it touches
+    // anything: the startup below marks the live runs of whoever owns the port as `interrupted`,
+    // applies a pending restore and compacts the database. The probe only proves that something
+    // accepts connections. The bind further down stays as the last word.
+    if settings_cli::daemon_answers_on(daemon_client::port(), settings_cli::PROBE_WAIT).await {
+        let sentence = format!(
+            "nucleos-core: something already answers on 127.0.0.1:{}; leaving without touching its data",
+            daemon_client::port()
+        );
+        tracing::error!("{sentence}");
+        eprintln!("{sentence}");
+        drop(_log_guard); // flush the line above before `exit` skips destructors
+        std::process::exit(supervise::EXIT_PORT_BUSY);
+    }
 
     // Only the machine's daemon claims the logon entry. `ensure_registered` overwrites it (on
     // Windows with `schtasks /F`), so a secondary doing this would point the autostart at whatever
@@ -88,7 +121,7 @@ async fn main() {
         }
     }
 
-    let db_path = data_dir.join("nucleos.db");
+    let db_path = data_dir::db_path(&data_dir);
     match backup::apply_pending_restore(&db_path).await {
         Ok(Some(applied)) => tracing::warn!(
             "applied pending database restore from {}; safety backup at {}",
@@ -140,6 +173,7 @@ async fn main() {
         Err(error) => tracing::warn!("could not rewire the wired projects: {error}"),
     }
     startup::install_agents(&pool, is_primary).await;
+    startup::refresh_wired_hooks(&pool, is_primary).await;
 
     // Before anything can launch a Claude run, so the first run's credential is already watched.
     execution::runner::watch_claude_auth(pool.clone());
@@ -157,34 +191,57 @@ async fn main() {
             // start is the one person who can fix the store, and may not be reading the log.
             tracing::error!("{sentence}");
             eprintln!("{sentence}");
-            std::process::exit(1);
+            // Its own code, not 1: 1 is what `taskkill /F` leaves, and the supervisor must restart
+            // this (the store may be unlocked a minute later) but not a deliberate stop.
+            std::process::exit(supervise::EXIT_CREDENTIAL_STORE);
         }
     };
     tracing::info!("nucleos-core token loaded from the system credential store");
 
-    // This machine's settings, all under one root — see `machine_config`'s header for why it is
-    // `~/.nucleos/` and no longer the directory the daemon happened to be launched from. `None` (no
-    // home directory) reads every file as absent, which is what an absent file has always meant:
-    // each pillar starts on its defaults.
+    // This machine's settings live in the database. `machine_config::root()` (`~/.nucleos/`) is
+    // still where the one-time import finds the old YAML files and where the files not yet moved
+    // are read; `None` (no home directory) means no import, and each pillar starts on its defaults.
     let machine_config_root = machine_config::root();
     if machine_config_root.is_none() {
         tracing::warn!(
-            "no home directory, so {} cannot be read; every pillar starts on its defaults",
+            "no home directory, so {} cannot be read; nothing is imported and every pillar starts on its defaults",
             machine_config::ROOT_DISPLAY
         );
     }
+    let mut devtime_readable = false;
+    match settings::init(&pool).await {
+        Ok(handle) => {
+            let outcome =
+                settings::import::run(&pool, &handle, machine_config_root.as_deref(), is_primary)
+                    .await;
+            if !outcome.imported.is_empty() || !outcome.refused.is_empty() {
+                tracing::info!(
+                    imported = outcome.imported.len(),
+                    refused = outcome.refused.len(),
+                    "settings import finished"
+                );
+            }
+            devtime_readable = !handle
+                .snapshot()
+                .is_unreadable(&settings::Scope::Machine, "devtime");
+            for unreadable in handle.snapshot().unreadable() {
+                tracing::warn!(
+                    document = %unreadable.name,
+                    scope = %unreadable.scope,
+                    reason = %unreadable.reason,
+                    "a stored settings document is unreadable; it runs on its defaults until it is replaced"
+                );
+            }
+        }
+        Err(error) => tracing::error!(
+            %error,
+            "could not read the settings tables, so every pillar starts on its defaults and nothing was imported"
+        ),
+    }
+    // Still a file: the remote pairing is not a settings document.
     let machine_file = |file: &str| machine_config_root.as_ref().map(|root| root.join(file));
 
-    let models_config = machine_file(config::MODELS_CONFIG_FILE)
-        .map(|path| config::load_models_config(&path))
-        .unwrap_or_else(|| Ok(config::ModelsConfig::default()))
-        .unwrap_or_else(|e| {
-            tracing::warn!(
-                "failed to parse {} ({e}), using defaults",
-                config::MODELS_CONFIG_DISPLAY_PATH
-            );
-            config::ModelsConfig::default()
-        });
+    let models_config: config::ModelsConfig = machine_doc();
     // The owner's saved choice (Settings) wins over the file, which is the default of an untouched
     // install; `embed::install` is called again by the settings door when the choice changes.
     embed::install(Arc::new(embed::OllamaEmbedder::new(
@@ -248,17 +305,12 @@ async fn main() {
         (None, None)
     };
 
-    let email_config_path = machine_file(machine_config::EMAIL_FILE);
-    let email_config_found = email_config_path
-        .as_deref()
-        .is_some_and(std::path::Path::exists);
-    let email_config = email_config_path
-        .as_deref()
-        .map(config::load_email_config)
-        .unwrap_or_default();
+    let email_config_found =
+        settings::get_opt::<config::EmailConfig>(&settings::Scope::Machine).is_some();
+    let email_config: config::EmailConfig = machine_doc();
     // Built whether or not the pillar is enabled: it is two small files, and having it always in a
     // known state means enabling email later is a config edit rather than a fresh directory.
-    let triage_sandbox = dirs.data_local_dir().join("triage-sandbox");
+    let triage_sandbox = default_dir.join("triage-sandbox");
     if let Err(error) = governance::triage::ensure_sandbox(&triage_sandbox) {
         tracing::warn!(%error, "could not build the triage sandbox — the email pillar will stay off");
     }
@@ -268,7 +320,7 @@ async fn main() {
     // reason as the sandbox: a directory that always exists is one less thing to go wrong the day
     // email is switched on, and this one is reachable from its own tab with the pillar off. `None`
     // means every route under it refuses, which is the right answer when it could not be made.
-    let files_root = match files::ensure_root(dirs.data_local_dir()) {
+    let files_root = match files::ensure_root(&default_dir) {
         Ok(root) => Some(root),
         Err(error) => {
             tracing::warn!(%error, "could not create the files folder — the Files tab will be unavailable");
@@ -279,7 +331,7 @@ async fn main() {
     // in it (`files::trash_for`). The retention sweep runs here once, off the startup path because
     // an expired folder can be a large tree, and again on every delete; nothing else keeps a timer
     // for it. `None` means a delete refuses rather than removing for good.
-    let files_trash = match files::ensure_trash(dirs.data_local_dir()) {
+    let files_trash = match files::ensure_trash(&default_dir) {
         Ok(trash) => {
             let sweep = trash.clone();
             tokio::task::spawn_blocking(move || {
@@ -301,55 +353,27 @@ async fn main() {
         }
     };
 
-    let voice_config = machine_file(machine_config::VOICE_FILE)
-        .as_deref()
-        .map(config::load_voice_config)
-        .unwrap_or_default();
-    let calendar_config = machine_file(machine_config::CALENDAR_FILE)
-        .as_deref()
-        .map(config::load_calendar_config)
-        .unwrap_or_default();
-    // Startup copy: ingestion keeps it for the run; the findings routes read the cached file per request.
-    let devtime_config = machine_file(machine_config::DEVTIME_FILE)
-        .as_deref()
-        .map(config::load_devtime_config)
-        .unwrap_or_default();
-    let verify_config = machine_file(machine_config::VERIFY_FILE)
-        .as_deref()
-        .map(config::load_verify_config)
-        .unwrap_or_default();
-    let keep_awake_config = machine_file(machine_config::KEEP_AWAKE_FILE)
-        .as_deref()
-        .map(config::load_keep_awake_config)
-        .unwrap_or_default();
-    let background_config = machine_file(machine_config::BACKGROUND_FILE)
-        .as_deref()
-        .map(config::load_background_config)
-        .unwrap_or_default();
+    let voice_config: config::VoiceConfig = machine_doc();
+    let calendar_config: config::CalendarConfig = machine_doc();
+    // Startup copy: ingestion keeps it for the run; the findings routes read the snapshot per request.
+    let devtime_config: config::DevtimeConfig = machine_doc();
+    let verify_config: config::VerifyConfig = machine_doc();
+    let keep_awake_config: config::KeepAwakeConfig = machine_doc();
+    let background_config: config::BackgroundConfig = machine_doc();
     // Read once for the run, like the rest: the reaper consults it for every kept process.
     assistant::set_background_silence(background_config.background_silence_hours);
-    let web_config = machine_file(machine_config::WEB_FILE)
-        .as_deref()
-        .map(config::load_web_config)
-        .unwrap_or_default();
+    let web_config: config::WebConfig = machine_doc();
     let remote_config = machine_file(remote::REMOTE_FILE)
         .as_deref()
         .map(remote::RemoteConfig::load)
         .unwrap_or_default();
-    let browser_config = machine_file(machine_config::BROWSER_FILE)
-        .as_deref()
-        .map(config::load_browser_config)
-        .unwrap_or_default();
-    // The path is named once and reused, because two facts come off it: what the file SAYS
-    // (`load_github_config`) and whether it EXISTS at all. The second is the pillar's opt-in — see
-    // `GithubRuntime::configured` — and deriving it from a second lookup is how the two would come
-    // to disagree about which file they mean.
-    let github_path = machine_file(machine_config::GITHUB_FILE);
-    let github_config = github_path
-        .as_deref()
-        .map(config::load_github_config)
-        .unwrap_or_default();
-    let github_configured = github_path.as_deref().is_some_and(std::path::Path::exists);
+    let browser_config: config::BrowserConfig = machine_doc();
+    // Two facts come off the one document: what it SAYS, and whether it EXISTS at all. The second
+    // is the pillar's opt-in — see `GithubRuntime::configured` — because
+    // `GithubConfig::default().enabled` is true.
+    let github_configured =
+        settings::get_opt::<config::GithubConfig>(&settings::Scope::Machine).is_some();
+    let github_config: config::GithubConfig = machine_doc();
     // Resolved here and carried on the runtime, so the daemon and the health probe can never end up
     // asking about two different programs — the mistake `cli_probe` names when it says to use "the
     // resolved path, not the configured name".
@@ -457,15 +481,13 @@ async fn main() {
         }
         None => Arc::new(claude_runner()),
     };
-    // The llm-router as an adviser. Off unless `~/.nucleos/router.yaml` turns it on, and off hands
-    // back the very runner built above. Read from the same root the settings page writes and the
-    // health row probes, so the three never disagree about which file is in force.
+    // The llm-router as an adviser. Off unless the stored `router` document turns it on, and off
+    // hands back the very runner built above. The health row reads the same document, so the two
+    // never disagree.
     let primary_runner = models::route_advice::front(
         primary_runner,
         &models_config,
-        machine_file(machine_config::ROUTER_FILE)
-            .map(|path| models::route_advice::load_config(&path))
-            .unwrap_or_else(models::route_advice::RouterConfig::off),
+        models::route_advice::current_config(),
     );
 
     // The email sidecar's own key, minted before `AppState` exists rather than beside the spawn.
@@ -676,20 +698,10 @@ async fn main() {
     // Read after the local model has been probed, because whether a `kind: local` seat is runnable
     // is not something a config file can assert — startup PROVES it, and a roster naming a local
     // seat this daemon cannot answer with is refused rather than quietly re-routed to the cloud.
-    let council_config = match council::config_path() {
-        Some(path) => config::load_council_config(&path, local_model.is_some()),
-        // No home directory means there is nowhere a roster could be, so there is no council —
-        // and that is all it means. Warned rather than fatal, like every other missing-pillar
-        // path here: a daemon that will not boot costs the operator mail, autopilot and the API
-        // over a feature that ships off.
-        None => {
-            tracing::warn!(
-                "no home directory, so {} cannot be read; the council stays off",
-                council::CONFIG_DISPLAY_PATH
-            );
-            None
-        }
-    };
+    let council_config = config::runnable_council(
+        settings::get_opt::<config::CouncilConfig>(&settings::Scope::Machine),
+        local_model.is_some(),
+    );
     // Minted only when there is a council to use it, and never the control token: a seat is an
     // agent CLI deciding what to call next, and `auth::COUNCIL_ROUTES` is what it can reach. A
     // failure to mint leaves `None`, and `council::start` refuses — a seat with a key that
@@ -751,25 +763,8 @@ async fn main() {
         .with_agent_clis(Arc::new(claude_runner()), models_config.codex_model.clone()),
     );
 
-    // What every settings file looked like when the loaders above read it. A loader answers a file
-    // it cannot parse with defaults and a warning, so the owner learns of it from the settings page
-    // (this, set against the file as it is now) and from one feed line each, not from a log.
-    let startup_config = Arc::new(
-        machine_config_root
-            .as_deref()
-            .map(machine_config::check_all)
-            .unwrap_or_default(),
-    );
-    for check in startup_config.iter().filter(|check| !check.valid) {
-        tracing::warn!(
-            file = %machine_config::display_path(check.path),
-            "this settings file does not parse; the daemon started on its defaults for it"
-        );
-    }
-    machine_config::report_unreadable(&pool, &startup_config).await;
-
     let state = AppState {
-        startup_config,
+        startup_config: (),
         token: Token(token_value),
         pool,
         runner: primary_runner,
@@ -783,8 +778,8 @@ async fn main() {
         // not per request, like `files_root` above: it is a fact about the machine.
         workflow_library: seeded_library(),
         secrets: std::sync::Arc::new(secrets::OsCredentialStore),
-        // The root every file above was read from, so the settings page writes the same files the
-        // daemon reads. `None` was already warned about where it was resolved.
+        // The root every file above was read from, so a project's state directory hangs off the
+        // same home the daemon reads. `None` was already warned about where it was resolved.
         machine_config_root: machine_config_root.clone(),
         email: Arc::new(state::EmailRuntime::from_config(
             &email_config,
@@ -849,9 +844,22 @@ async fn main() {
     assistant::install_turns(&state);
 
     let app = http::build_router(state.clone());
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", daemon_client::port()))
-        .await
-        .unwrap();
+    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", daemon_client::port())).await {
+        Ok(listener) => listener,
+        // Another daemon won the race since the probe at the top. Not a crash (101): the supervisor
+        // must not relaunch into it.
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            let sentence = format!(
+                "nucleos-core: port {} is taken ({e}); leaving",
+                daemon_client::port()
+            );
+            tracing::error!("{sentence}");
+            eprintln!("{sentence}");
+            drop(_log_guard);
+            std::process::exit(supervise::EXIT_PORT_BUSY);
+        }
+        Err(e) => panic!("failed to bind 127.0.0.1:{}: {e}", daemon_client::port()),
+    };
     tracing::info!(
         "nucleos-core listening on {}",
         listener.local_addr().unwrap()
@@ -1078,20 +1086,21 @@ async fn main() {
     } else {
         Some(std::path::PathBuf::from(&devtime_config.projects_dir))
     };
+    // A `--settings-reset` or `--settings-rollback` run while the daemon was stopped changed the thresholds
+    // without the HTTP hook: void the pending rows decided under the old ones before anything new is
+    // decided (skipped while the `devtime` document is unreadable: its defaults are not the owner's).
+    devtime::void_stale_at_startup(&state.pool, &devtime_config.actions, devtime_readable).await;
     tokio::spawn(devtime::run_ingest_loop(
         state.pool.clone(),
         devtime_config,
         devtime_projects_dir,
     ));
     // The devtime cost's prices, kept fresh by the daemon rather than by somebody remembering
-    // `scripts/refresh-models.py`. Installed for the "refresh prices" button even when the file
-    // turns `auto_refresh_prices` off: the loop reads that per tick, the button ignores it. The
-    // path is the one `models_config_now` reads, so the refresh writes the file the costs come from.
-    if let Some(models_path) = config::models_config_path() {
-        let refresher = Arc::new(price_refresh::Refresher::for_daemon(models_path));
-        price_refresh::install(Arc::clone(&refresher));
-        tokio::spawn(price_refresh::run_refresh_loop(refresher));
-    }
+    // `scripts/refresh-models.py`. Installed for the "refresh prices" button even when the `models`
+    // document turns `auto_refresh_prices` off: the loop reads that per tick, the button ignores it.
+    let refresher = Arc::new(price_refresh::Refresher::for_daemon(state.pool.clone()));
+    price_refresh::install(Arc::clone(&refresher));
+    tokio::spawn(price_refresh::run_refresh_loop(refresher));
     // `POST /verify` submits to it, so the handlers need the very instance the worker drains: it is
     // parked in `verify::install` (an `OnceLock`, because `AppState` is built literally in dozens of
     // places) before the worker starts. The restart above hands interrupted units straight back to it.
@@ -1141,7 +1150,6 @@ async fn main() {
     tokio::spawn(execution::vcs::run_queue_worker(
         state.pool.clone(),
         std::sync::Arc::new(execution::git_exec::GitExecutor {
-            machine_root: machine_config_root.clone(),
             pool: Some(state.pool.clone()),
             verify: verify::installed(),
             ..execution::git_exec::GitExecutor::default()
@@ -1291,19 +1299,12 @@ async fn main() {
             }
         });
     } else if email_config_found {
-        tracing::info!(
-            "email pillar disabled ({} says enabled: false)",
-            machine_config::display_path(machine_config::EMAIL_FILE)
-        );
+        tracing::info!("email pillar disabled (the email settings say enabled: false)");
     } else {
-        // Not the same thing, and saying so cost a diagnosis: a daemon started from the wrong
-        // directory once reported the user's config as switched off while that file sat there
-        // reading `enabled: true`. The files no longer depend on where the daemon was started, but
-        // "off because absent" and "off because it says so" are still two different sentences.
-        tracing::info!(
-            "email pillar off — {} does not exist",
-            machine_config::display_path(machine_config::EMAIL_FILE)
-        );
+        // Not the same thing, and saying so cost a diagnosis: "off because there is no document"
+        // and "off because it says so" are two different sentences, and a daemon that reports the
+        // wrong one sends somebody to edit the wrong place.
+        tracing::info!("email pillar off — no email settings document");
     }
 
     // A held long-poll (`/hooks/ask-wait`) would keep graceful shutdown waiting forever, and the

@@ -125,6 +125,8 @@ pub async fn get_session(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<Optio
 ///
 /// Not an error path: this is what a turn that read third-party text is supposed to leave behind.
 pub async fn forget_session(pool: &SqlitePool, chat_id: &str) -> sqlx::Result<()> {
+    // The fresh session raises the untrusted-read notice afresh.
+    crate::hooks::forget_untrusted_session(chat_id);
     sqlx::query("DELETE FROM assistant_sessions WHERE chat_id = ?")
         .bind(chat_id)
         .execute(pool)
@@ -7489,6 +7491,272 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows, 0);
+    }
+
+    // ---- automatic compaction (steps 3-5) --------------------------------------------------------
+
+    /// A chat with a real `chats` row, so the `auto_compact` flag has somewhere to live.
+    async fn auto_chat(state: &AppState, auto_compact: bool) -> String {
+        let id = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::chats::set_auto_compact(&state.pool, &id, auto_compact)
+            .await
+            .unwrap();
+        id
+    }
+
+    /// `(auto, status)` of every compaction row of the chat, oldest first.
+    async fn compaction_rows(pool: &SqlitePool, chat_id: &str) -> Vec<(i64, String)> {
+        sqlx::query_as("SELECT auto, status FROM chat_compactions WHERE chat_id = ? ORDER BY id")
+            .bind(chat_id)
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Polls until the chat has at least `rows` compaction rows and none is `pending`, up to ~5 s.
+    /// Returns the rows seen; a timeout returns what was there, for the assertion to explain.
+    async fn wait_for_compactions(
+        pool: &SqlitePool,
+        chat_id: &str,
+        rows: usize,
+    ) -> Vec<(i64, String)> {
+        let mut seen = Vec::new();
+        for _ in 0..200 {
+            seen = compaction_rows(pool, chat_id).await;
+            if seen.len() >= rows && seen.iter().all(|(_, status)| status != "pending") {
+                return seen;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        seen
+    }
+
+    async fn typed_prompts(pool: &SqlitePool, chat_id: &str) -> Vec<String> {
+        sqlx::query_scalar("SELECT prompt FROM runs WHERE chat_id = ? ORDER BY id")
+            .bind(chat_id)
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn rotation_rows(pool: &SqlitePool, chat_id: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM root_rotations WHERE chat_id = ?")
+            .bind(chat_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Sends `text`, waits for the turn to settle and returns its run id.
+    async fn send_and_settle(state: &AppState, chat_id: &str, text: &str) -> i64 {
+        let id = send_message(state, chat_id, text, Origin::Shell)
+            .await
+            .unwrap();
+        settled_turn(&state.pool, id).await;
+        id
+    }
+
+    #[tokio::test]
+    async fn a_turn_past_soft_files_exactly_one_automatic_compaction() {
+        let mut state = test_state().await;
+        state.runner = runner_reporting_fill(rotation::DEFAULT_SOFT_FILL + 50_000);
+        let chat_id = auto_chat(&state, true).await;
+
+        send_and_settle(&state, &chat_id, "olá").await;
+        let rows = wait_for_compactions(&state.pool, &chat_id, 1).await;
+
+        assert_eq!(rows, vec![(1, "done".to_string())]);
+        let prompts = typed_prompts(&state.pool, &chat_id).await;
+        assert!(
+            prompts.iter().any(|p| p == "/compact (auto)"),
+            "{prompts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_below_soft_files_no_compaction() {
+        let mut state = test_state().await;
+        state.runner = runner_reporting_fill(10_000);
+        let chat_id = auto_chat(&state, true).await;
+
+        send_and_settle(&state, &chat_id, "olá").await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(compaction_rows(&state.pool, &chat_id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_automatic_compaction_turn_does_not_chain_another() {
+        let mut state = test_state().await;
+        // The compaction turn reports the same large fill, so only the guard stops a second one.
+        state.runner = runner_reporting_fill(rotation::DEFAULT_SOFT_FILL + 50_000);
+        let chat_id = auto_chat(&state, true).await;
+
+        send_and_settle(&state, &chat_id, "olá").await;
+        let rows = wait_for_compactions(&state.pool, &chat_id, 1).await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(compaction_rows(&state.pool, &chat_id).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn two_consecutive_turns_past_soft_never_run_two_compactions_at_once() {
+        let mut state = test_state().await;
+        state.runner = runner_reporting_fill(rotation::DEFAULT_SOFT_FILL + 50_000);
+        let chat_id = auto_chat(&state, true).await;
+
+        send_and_settle(&state, &chat_id, "primeiro").await;
+        // The second turn goes in at once, while the first one's compaction may still be pending.
+        // Whether it is accepted or refused as busy is not the point; the sampling below is.
+        let _second = send_message(&state, &chat_id, "segundo", Origin::Shell).await;
+        let mut max_pending = 0;
+        for _ in 0..200 {
+            let rows = compaction_rows(&state.pool, &chat_id).await;
+            let pending = rows.iter().filter(|(_, s)| s == "pending").count();
+            max_pending = max_pending.max(pending);
+            if !rows.is_empty() && pending == 0 && !is_busy(&chat_id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        assert!(max_pending <= 1, "{max_pending} compactions at once");
+        let done: Vec<i64> = sqlx::query_scalar(
+            "SELECT run_id FROM chat_compactions WHERE chat_id = ? AND status = 'done'",
+        )
+        .bind(&chat_id)
+        .fetch_all(&state.pool)
+        .await
+        .unwrap();
+        let distinct: HashSet<i64> = done.iter().copied().collect();
+        assert!(!done.is_empty() && done.len() <= 2, "{done:?}");
+        assert_eq!(distinct.len(), done.len(), "{done:?}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_automatic_compaction_backs_off_for_three_turns() {
+        let mut state = test_state().await;
+        state.runner = runner_reporting_fill(rotation::DEFAULT_SOFT_FILL + 50_000);
+        let chat_id = auto_chat(&state, true).await;
+        past_exchange(&state.pool, &chat_id, "q", "a").await;
+        let failed_run: i64 = sqlx::query_scalar("SELECT MAX(id) FROM runs WHERE chat_id = ?")
+            .bind(&chat_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        crate::chats::compactions::insert_pending_as(
+            &state.pool,
+            &chat_id,
+            failed_run,
+            "nucleos-compact v1",
+            "claude",
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE chat_compactions SET status = 'failed' WHERE run_id = ?")
+            .bind(failed_run)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        // Turns 1 and 2 after the failure stay inside the window of three.
+        for turn in ["um", "dois"] {
+            send_and_settle(&state, &chat_id, turn).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(
+                compaction_rows(&state.pool, &chat_id).await.len(),
+                1,
+                "still backing off after {turn}"
+            );
+        }
+
+        send_and_settle(&state, &chat_id, "tres").await;
+        let rows = wait_for_compactions(&state.pool, &chat_id, 2).await;
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[1], (1, "done".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_chat_with_a_waiting_child_does_not_auto_compact() {
+        let mut state = test_state().await;
+        state.runner = runner_reporting_fill(rotation::DEFAULT_SOFT_FILL + 50_000);
+        let chat_id = auto_chat(&state, true).await;
+        rotation::test_nodes::give_root(&chat_id, "root-waiting");
+        rotation::test_nodes::give_waiting_child(&chat_id);
+
+        send_and_settle(&state, &chat_id, "olá").await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(compaction_rows(&state.pool, &chat_id).await.is_empty());
+    }
+
+    // ---- rotation suppressed when auto_compact is on ---------------------------------------------
+
+    #[tokio::test]
+    async fn a_large_root_turn_does_not_rotate_when_auto_compact_is_on() {
+        let mut state = test_state().await;
+        state.runner = runner_reporting_fill(rotation::DEFAULT_SOFT_FILL + 50_000);
+        let chat_id = auto_chat(&state, true).await;
+        rotation::test_nodes::give_root(&chat_id, "root-1");
+
+        let id = send_and_settle(&state, &chat_id, "olá").await;
+        let (status, _) = settled_turn(&state.pool, id).await;
+        assert_eq!(status, "completed");
+
+        assert_eq!(rotation_rows(&state.pool, &chat_id).await, 0);
+        // The automatic compaction that follows forgets the session by design, so the session is
+        // not asserted here; it must not leave a rotation behind either.
+        wait_for_compactions(&state.pool, &chat_id, 1).await;
+        assert_eq!(rotation_rows(&state.pool, &chat_id).await, 0);
+    }
+
+    #[tokio::test]
+    async fn rotation_is_explicitly_off_when_auto_compact_is_off() {
+        let mut state = test_state().await;
+        state.runner = runner_reporting_fill(rotation::DEFAULT_SOFT_FILL + 50_000);
+        let chat_id = auto_chat(&state, false).await;
+        rotation::test_nodes::give_root(&chat_id, "root-1");
+
+        send_and_settle(&state, &chat_id, "olá").await;
+
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM root_rotations WHERE chat_id = ? AND delivered_run_id IS NULL",
+        )
+        .bind(&chat_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(pending, 1);
+        assert!(compaction_rows(&state.pool, &chat_id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_root_chat_with_auto_compact_on_compacts_instead_of_rotating() {
+        let mut state = test_state().await;
+        state.runner = runner_reporting_fill(rotation::DEFAULT_SOFT_FILL + 50_000);
+        let chat_id = auto_chat(&state, true).await;
+        rotation::test_nodes::give_root(&chat_id, "root-1");
+
+        send_and_settle(&state, &chat_id, "olá").await;
+        let rows = wait_for_compactions(&state.pool, &chat_id, 1).await;
+
+        assert_eq!(rows, vec![(1, "done".to_string())]);
+        assert_eq!(rotation_rows(&state.pool, &chat_id).await, 0);
+        let both: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM root_rotations r
+               JOIN chat_compactions c
+                 ON c.chat_id = r.chat_id AND c.run_id = r.from_run_id AND c.auto = 1",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(both, 0);
     }
 
     // ---- chat turn silence deadline -------------------------------------------------------------

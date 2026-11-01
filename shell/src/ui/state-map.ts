@@ -118,13 +118,6 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
   machine_file: {
     configured: { tone: "info", label: "configured" },
     unconfigured: { tone: "off", label: "never configured" },
-    /** The file on disk now does not parse (`MachineSetting.valid` is false). */
-    unreadable: { tone: "danger", label: "does not parse" },
-    /** The daemon found the file unreadable at startup (`at_startup.valid` is false). */
-    started_on_defaults: {
-      tone: "pending",
-      label: "the daemon started on defaults — restart after fixing",
-    },
   },
   /**
    * Whether a credential is in the store (`MachineSecret.present`: true, false, or null when the
@@ -303,9 +296,9 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     email_fetch_skipped: { tone: "info", label: "e-mail skipped" },
     email_sent_mailbox_foreign: { tone: "danger", label: "sent mail filed elsewhere" },
     // Project settings and machine lines.
-    config_written: { tone: "info", label: "project file written" },
-    // A machine settings file that did not parse when the daemon started (`machine_config.rs`).
-    config_unreadable: { tone: "danger", label: "settings file did not parse" },
+    config_written: { tone: "info", label: "setting written" },
+    // A settings file imported into the database at startup, or refused and left in place (`settings/import.rs`).
+    config_migrated: { tone: "info", label: "settings imported" },
     // A project brought under NucleOS: by a person on the onboarding panel, or at startup for one
     // that passed the old check (`onboarding.rs`). A record, like the write beside it.
     project_onboarded: { tone: "info", label: "project onboarded" },

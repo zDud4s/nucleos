@@ -252,6 +252,8 @@ pub struct ChatSummary {
     pub group_id: Option<i64>,
     /// When this conversation was archived, or `None` while it is on the list.
     pub archived_at: Option<String>,
+    /// Whether this conversation compacts itself when its context grows past the soft limit.
+    pub auto_compact: bool,
     /// Tool calls held for approval right now. Filled by `settle`, never read from the database.
     #[sqlx(skip)]
     pub pending_asks: i64,
@@ -660,6 +662,31 @@ pub async fn set_extra_dirs(
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// Whether automatic compaction is switched on for the chat; `false` for a chat with no row and for
+/// an archived one, which answers nobody whatever its column says.
+pub async fn auto_compact(pool: &SqlitePool, chat_id: &str) -> bool {
+    let on: Option<i64> = sqlx::query_scalar(
+        "SELECT auto_compact FROM chats WHERE chat_id = ? AND archived_at IS NULL",
+    )
+    .bind(chat_id)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or(None);
+    on == Some(1)
+}
+
+/// Switches automatic compaction on or off for the chat. `false` when there is no such chat or it
+/// is archived, so a caller can tell a switch that was set from one that had nowhere to land.
+pub async fn set_auto_compact(pool: &SqlitePool, chat_id: &str, on: bool) -> sqlx::Result<bool> {
+    let done =
+        sqlx::query("UPDATE chats SET auto_compact = ? WHERE chat_id = ? AND archived_at IS NULL")
+            .bind(i64::from(on))
+            .bind(chat_id)
+            .execute(pool)
+            .await?;
+    Ok(done.rows_affected() > 0)
 }
 
 /// Moves the floor of this conversation's replay to now — the app's `/clear`.
@@ -1201,7 +1228,7 @@ macro_rules! list_select {
         "SELECT c.chat_id, c.title, c.brain, c.model, c.effort, c.fallback_model,
                 c.extra_dirs, c.turn_budget_usd, c.agents, c.system_prompt, c.denied_tools,
                 c.cleared_after_run_id, c.context_window, c.created_at, c.cwd, c.ide_session_id,
-                c.group_id, c.archived_at,
+                c.group_id, c.archived_at, c.auto_compact,
                 (SELECT substr(r.prompt, 1, 200) FROM runs r
                   WHERE r.chat_id = c.chat_id AND r.mode = 'assistant'
                   ORDER BY r.id ASC LIMIT 1) AS first_message,
@@ -1494,6 +1521,53 @@ mod tests {
 
     async fn test_pool() -> SqlitePool {
         crate::testdb::fresh_pool().await
+    }
+
+    #[tokio::test]
+    async fn auto_compact_defaults_off_and_round_trips() {
+        let pool = test_pool().await;
+        let id = create(&pool, Brain::Cloud, None).await.unwrap();
+        assert!(!auto_compact(&pool, &id).await);
+        set_auto_compact(&pool, &id, true).await.unwrap();
+        assert!(auto_compact(&pool, &id).await);
+        set_auto_compact(&pool, &id, false).await.unwrap();
+        assert!(!auto_compact(&pool, &id).await);
+        assert!(!auto_compact(&pool, "no-such-chat").await);
+    }
+
+    async fn auto_compact_column(pool: &SqlitePool, chat_id: &str) -> i64 {
+        sqlx::query_scalar("SELECT auto_compact FROM chats WHERE chat_id = ?")
+            .bind(chat_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// An archived chat answers nobody, so a leftover `1` must not compact it in the background.
+    #[tokio::test]
+    async fn auto_compact_is_off_for_an_archived_chat_whatever_the_column_says() {
+        let pool = test_pool().await;
+        let id = create(&pool, Brain::Cloud, None).await.unwrap();
+        set_auto_compact(&pool, &id, true).await.unwrap();
+        assert!(auto_compact(&pool, &id).await, "control: on while live");
+
+        archive(&pool, &id).await.unwrap();
+
+        assert_eq!(auto_compact_column(&pool, &id).await, 1);
+        assert!(!auto_compact(&pool, &id).await);
+    }
+
+    #[tokio::test]
+    async fn setting_auto_compact_on_an_archived_chat_reports_no_chat_and_writes_nothing() {
+        let pool = test_pool().await;
+        let id = create(&pool, Brain::Cloud, None).await.unwrap();
+        assert!(set_auto_compact(&pool, &id, true).await.unwrap(), "control");
+        set_auto_compact(&pool, &id, false).await.unwrap();
+        archive(&pool, &id).await.unwrap();
+
+        assert!(!set_auto_compact(&pool, &id, true).await.unwrap());
+
+        assert_eq!(auto_compact_column(&pool, &id).await, 0);
     }
 
     async fn seed_run(pool: &SqlitePool, chat: &str, status: &str, tools: Option<&str>) {

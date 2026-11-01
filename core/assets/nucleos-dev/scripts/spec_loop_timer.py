@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Wakes a spec session that is parked on background work just before its prompt cache expires.
+"""Wakes a spec session that is parked on background work just before its prompt cache expires, and
+once a session the Stop hook let go with items still open.
 
 `spec_loop.py --stop-hook` lets such a session stop, because a push while it waits buys nothing.
 But the Stop hook only runs at the end of a turn, so nothing would look at the session again if
-the work outlasts the cache, or if its completion never wakes the session. This runs in the
-background from every Stop (`core/hooks/stop_timer.py`, `asyncRewake`) and exits 2 when the session
-has been idle for WINDOW_SECS: a read of the cache costs about 0.1 of the context, and writing it
-back after a miss about 2.0 at the 1 h TTL.
+the work outlasts the cache, if its completion never wakes the session, or if the hook gave up on
+it. This runs in the background from every Stop (`core/hooks/stop_timer.py`, `asyncRewake`) and
+exits 2 when the session has been idle for WINDOW_SECS: a read of the cache costs about 0.1 of the
+context, and writing it back after a miss about 2.0 at the 1 h TTL.
 
 A later turn in the session means a later Stop and a new timer, so this one bows out as soon as it
 sees one. Every other exit is 0 and silent: exit 2 is the only thing the session ever notices.
@@ -28,9 +29,13 @@ import spec_loop
 WINDOW_SECS = {"ephemeral_1h_input_tokens": 55 * 60, "ephemeral_5m_input_tokens": 4 * 60}
 DEFAULT_WINDOW_SECS = 55 * 60
 POLL_SECS = 30
-# Wakes for one unchanged set of tasks. Past this a hung task stops costing a turn per window. The
-# longest real wait measured is 4.4 h.
-MAX_WAKES = 6
+# How long one unchanged set of tasks keeps being woken, from its first wake. Past this a hung task
+# stops costing a turn per window. Time and not a count: the count that fitted the 1 h cache gave
+# the 5 min one only 24 minutes. The longest real wait measured is 4.4 h.
+MAX_WAKE_SECS = 5.5 * 3600
+# How long a timer with no tasks waits to learn whether its own Stop let the session go. The two
+# start together, and the daemon's bundle hooks answer within 50 s.
+LET_GO_GRACE_SECS = 60
 
 
 def _window(usage: dict) -> int | None:
@@ -76,7 +81,7 @@ def wake_message(payload: dict, now=time.time, sleep=time.sleep) -> str | None:
     session, transcript = payload.get("session_id"), payload.get("transcript_path")
     loops = spec_loop.loops_dir(payload.get("cwd"))
     tasks = spec_loop.running_tasks(payload)
-    if not (session and transcript and loops and tasks):
+    if not (session and transcript and loops):
         return None
     path = spec_loop.loop_path(loops, session)
 
@@ -89,22 +94,38 @@ def wake_message(payload: dict, now=time.time, sleep=time.sleep) -> str | None:
 
     state_path = path.with_suffix(".state.json")
     wakes = spec_loop._load_state(state_path).get("wakes") or {}
-    count = wakes.get("count", 0) if wakes.get("tasks") == tasks else 0
+    since = wakes.get("since") if wakes.get("tasks") == tasks else None
     start = last_request(transcript)
-    if not start or count >= MAX_WAKES or not still_parked():
+    if not start or (since and now() - since >= MAX_WAKE_SECS) or not still_parked():
         return None
 
+    began = now()
     deadline = start[0] + start[1]
     while now() < deadline:
         sleep(min(POLL_SECS, max(0, deadline - now())))
         latest = last_request(transcript)
         if not latest or latest[0] != start[0]:
             return None
+        if (not tasks and now() - began >= LET_GO_GRACE_SECS
+                and not spec_loop._load_state(state_path).get("let_go")):
+            return None
     if not still_parked():
         return None
 
     state = spec_loop._load_state(state_path)
-    state["wakes"] = {"tasks": tasks, "count": count + 1}
+    if not tasks:
+        # Read after the sleep: this timer starts alongside the very Stop that may let the session go.
+        n_open = state.get("let_go")
+        if not n_open or state.get("woken_for") == n_open:
+            return None
+        state.update(woken=True, woken_for=n_open)
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        return (f"Spec loop timer: this session stopped with {n_open} open item(s) in "
+                f"{path.as_posix()} after the pushes closed nothing, and nothing else will wake it. "
+                "Carry on with the next item. If it waits on something outside this session, say "
+                "what in one line; if only the owner can decide it, mark it `- [!]` and set "
+                "`status: blocked`.")
+    state["wakes"] = {"tasks": tasks, "since": since or now()}
     state_path.write_text(json.dumps(state), encoding="utf-8")
     return ("Spec loop timer: background work is still running and the prompt cache is about to "
             f"expire ({', '.join(tasks)}). This wake-up exists to keep the cache: if the work is "

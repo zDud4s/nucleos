@@ -89,6 +89,26 @@ the escape is `NUCLEOS_ALLOW_DIRECT_GIT=1 git push origin vX.Y.Z`.
 macOS minutes bill at ten times while the repository is private, which is why this workflow runs
 only on a tag.
 
+## Identifier change (com.pc-multimedia.shell -> com.nucleos.app)
+
+The bundle identifier changed from `com.pc-multimedia.shell` to `com.nucleos.app`, so every OS
+sees a new app rather than an update of the old one. What users see:
+
+- **macOS:** the microphone and accessibility permissions (TCC) are tied to the identifier, so
+  they must be granted again, once; macOS cannot migrate them. The self-signed certificate is
+  unchanged. The keychain entries (stored secrets) are not migrated automatically.
+- **All platforms:** the app data folders (config, WebView profile) are copied once on first
+  launch. The old folders are left in place and may be deleted by hand.
+- **Linux:** the release carries a `.rpm` asset next to the `.deb`; both packages `Recommends`
+  `gnome-keyring`. The `.deb` and `.rpm` are installed by the system package manager, and the
+  in-app updater does not replace them: a system-package install is updated with the package
+  manager, and the app only shows an update notice. Secrets stored through the Secret Service need
+  `gnome-keyring` (or another Secret Service provider) running.
+- **Windows:** the new installer is not expected to create a second "Apps & features" entry (see
+  below). The NSIS pre-install hook still stops the daemon before installing.
+
+On Windows the installer does not clean up after the old identifier: the owner decided to leave it and document it. The `hooks.nsh` pre-install hook only stops the daemon and the sidecars and does not touch the registry (verified). Expected, but not verified because the Tauri NSIS template is not on disk here: the uninstall entry is keyed by the product name, which is unchanged (NucleOS), so there should be no duplicate "Apps & features" entry and the existing one should point to the new install; an orphaned registry key of the old publisher is expected at `HKCU\Software\pc-multimedia\NucleOS`, which the new uninstaller does not delete (it only removes its own) and which is harmless; and only users who installed the old version in a custom folder are left with that folder, because the new install uses the default path (expected `%LOCALAPPDATA%\Programs\NucleOS`). To remove them, delete the key in `regedit` and the custom folder by hand, after checking that the data copy succeeded.
+
 ## Installing a release
 
 The scripts are attached to every release, so the `latest` URLs always match the newest one. Both

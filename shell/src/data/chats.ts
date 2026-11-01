@@ -122,6 +122,8 @@ export interface ChatSummary {
    * window wide enough to hold what it inherited.
    */
   context_window: number | null;
+  /** Whether the conversation compacts itself past the soft limit. Absent from an older daemon: off. */
+  auto_compact?: boolean;
   created_at: string;
   /** Set only when this conversation continues a session had somewhere else. */
   cwd: string | null;
@@ -326,6 +328,11 @@ export type Exchange = [string, string];
  * this" and is false.
  */
 export interface Transcript {
+  /**
+   * Set once the chat's current session has called a tool that reads third-party text. A
+   * non-blocking notice; absent from an older daemon.
+   */
+  untrusted_first_call?: { tool: string } | null;
   handed: Exchange[];
   turns: Turn[];
   /**
@@ -778,8 +785,29 @@ export function useSetChatGroup() {
   });
 }
 
+/**
+ * Turn automatic compaction on or off for one conversation.
+ *
+ * `onSuccess` returns the invalidation so the mutation stays pending until the list has landed: the
+ * switch draws the row, and a click before then would send the old value again. `exact`, because
+ * only the list carries this flag and the wait must not hang on anything else under the prefix.
+ */
+export function useSetChatAutoCompact() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (v: { chatId: string; enabled: boolean }) =>
+      apiFetch<void>(`/assistant/chats/${encodeURIComponent(v.chatId)}/auto-compact`, {
+        method: "PUT",
+        body: JSON.stringify({ enabled: v.enabled }),
+      }),
+    retry: false,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: keys.chats.all, exact: true }),
+  });
+}
+
 /** The transcript route's answer. */
 interface TranscriptRead {
+  untrusted_first_call?: { tool: string } | null;
   handed: Exchange[];
   turns: AssistantTurnRow[];
   queued: Waiting[];
@@ -876,6 +904,7 @@ export function useChatTranscript(chatId: string | null) {
       // column answers with turns and no `handed`, and a conversation that will not draw over a
       // missing field is a worse answer than one that draws without the note.
       return {
+        untrusted_first_call: read.untrusted_first_call ?? null,
         handed: read.handed ?? [],
         queued: read.queued ?? [],
         asks: read.asks ?? [],
@@ -1492,6 +1521,7 @@ function writeTurns(
     const turns = change(current?.turns ?? []);
     if (current === undefined && turns.length === 0) return undefined;
     return {
+      untrusted_first_call: current?.untrusted_first_call ?? null,
       handed: current?.handed ?? [],
       queued: current?.queued ?? [],
       asks: current?.asks ?? [],

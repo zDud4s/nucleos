@@ -8,7 +8,7 @@ use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use croner::Cron;
 
-use crate::config::{self, ScheduleRule};
+use crate::config::ScheduleRule;
 use crate::execution::runs::{CreateRunError, create_run_inner};
 use crate::governance::autopilot::Mode;
 use crate::state::AppState;
@@ -414,19 +414,18 @@ pub async fn scheduler_tick(state: &AppState, now: DateTime<Utc>) {
             continue;
         }
 
-        let rules =
-            match config::load_schedule_rules(state.machine_config_root.as_deref(), &project_id) {
-                Ok(rules) => rules.schedules,
-                Err(error) => {
-                    tracing::warn!(
-                        project_id = %project_id,
-                        project_root = %project_root,
-                        %error,
-                        "failed to load project schedule rules"
-                    );
-                    continue;
-                }
-            };
+        let rules = match crate::project::rules::autopilot(&project_id) {
+            Ok(rules) => rules.schedules,
+            Err(error) => {
+                tracing::warn!(
+                    project_id = %project_id,
+                    project_root = %project_root,
+                    %error,
+                    "failed to load project schedule rules"
+                );
+                continue;
+            }
+        };
 
         let rows: Vec<RuleState> = match sqlx::query_as(
             "SELECT rule_name, last_fired_at, last_head_sha, fires_date, fires_today
@@ -503,7 +502,7 @@ pub async fn scheduler_tick(state: &AppState, now: DateTime<Utc>) {
         }
 
         // From the row, not from a counter the loop holds: the map reset on every daemon start, and
-        // the Task Scheduler registration restarts the daemon three times on failure. A crashing
+        // the supervisor relaunches the daemon on failure, within its restart budget. A crashing
         // daemon is the one situation this cap is named for, and it was the one that rearmed it.
         let today = now.date_naive().to_string();
         let project_fires: HashMap<String, u32> = rows
@@ -946,6 +945,7 @@ mod tests {
     /// A state whose `machine_config_root` is a temporary directory standing in for `~/.nucleos`,
     /// returned beside it so the directory lives exactly as long as the test that holds it.
     async fn test_state(delay: Option<Duration>) -> (AppState, tempfile::TempDir) {
+        crate::project::rules::testing::hold_shared();
         let home = tempfile::tempdir().expect("create a stand-in home");
         let pool = crate::testdb::fresh_pool().await;
 
@@ -1037,18 +1037,9 @@ mod tests {
         );
     }
 
-    /// Writes `project_id`'s rules where the scheduler reads them: its directory under the state's
-    /// stand-in home.
-    fn write_rules(state: &AppState, project_id: &str, contents: &str) {
-        crate::project::state::write_for_test(
-            state
-                .machine_config_root
-                .as_deref()
-                .expect("the test state has a stand-in home"),
-            project_id,
-            crate::project::state::AUTOPILOT_FILE,
-            contents,
-        );
+    /// Publishes `project_id`'s rules where the scheduler reads them: the installed settings snapshot.
+    fn write_rules(_state: &AppState, project_id: &str, contents: &str) {
+        crate::project::rules::testing::publish_rules(project_id, contents);
     }
 
     fn write_schedule(state: &AppState, project_id: &str) {
@@ -1502,8 +1493,8 @@ mod tests {
     }
 
     /// The runaway guard used to be a `HashMap` the scheduler loop held, so it emptied every time
-    /// the daemon started — and the Task Scheduler registration restarts the daemon three times on
-    /// failure. A crashing daemon is the one situation this cap is named for, and it was the
+    /// the daemon started — and the supervisor relaunches the daemon on failure, within its restart
+    /// budget. A crashing daemon is the one situation this cap is named for, and it was the
     /// situation that rearmed it. `scheduler_tick` is called directly here, which is exactly what a
     /// restart looks like: no loop state survives between the calls.
     #[tokio::test]
@@ -2409,6 +2400,64 @@ mod tests {
                 .unwrap();
         assert_eq!(mode, "shadow");
         assert_eq!(project_id.as_deref(), Some("proj"));
+    }
+
+    #[tokio::test]
+    async fn tick_skips_a_project_whose_stored_rules_are_unreadable() {
+        let project = tempfile::tempdir().expect("create shadow project");
+        let (state, _home) = test_state(None).await;
+        let now = timestamp("2026-07-18T10:10:00Z");
+        let old = timestamp("2026-07-18T10:00:00Z").to_rfc3339();
+        seed_project(&state, project.path(), "shadow", &old).await;
+        crate::project::rules::testing::publish_unreadable(
+            "proj",
+            "autopilot",
+            "invalid type: map",
+        );
+
+        scheduler_tick(&state, now).await;
+
+        let run_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            run_count, 0,
+            "an unreadable rules document must not schedule anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rule_published_between_two_ticks_is_seen_by_the_second() {
+        let project = tempfile::tempdir().expect("create shadow project");
+        let (state, _home) = test_state(None).await;
+        let now = timestamp("2026-07-18T10:10:00Z");
+        let old = timestamp("2026-07-18T10:00:00Z").to_rfc3339();
+        seed_project(&state, project.path(), "shadow", &old).await;
+        crate::project::rules::testing::publish_rules(
+            "proj",
+            "schedules: []
+",
+        );
+
+        scheduler_tick(&state, now).await;
+        let after_first: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(after_first, 0, "no schedule is configured yet");
+
+        write_schedule(&state, "proj");
+        scheduler_tick(&state, now).await;
+
+        let after_second: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            after_second, 1,
+            "the rule published after the first tick fires on the second"
+        );
     }
 
     /// "Busy" used to mean the attention brake: a run in flight in this project deferred it. That

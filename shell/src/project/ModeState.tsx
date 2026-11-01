@@ -12,10 +12,10 @@ import { useBudget, useKillSwitch, useProjects } from "../data/system";
 import { driftingWorkflows, useProjectWorkflows } from "../data/workflows";
 import { clockText } from "../lib/when";
 import { ErrorNote, Section, StaleNote, StatCard } from "../ui";
+import { AutopilotRules } from "./AutopilotRules";
 import { Branches } from "./Branches";
 import { Commands } from "./Commands";
 import { Occupancy } from "./Occupancy";
-import { OwnedFiles } from "./OwnedFiles";
 import { TestsMap } from "./TestsMap";
 import { WorkflowSummary } from "./Workflows";
 import { leadingConcern, toneFor, type LeadingConcern, type ProjectConcerns } from "./priority";
@@ -126,8 +126,8 @@ export function ModeState({ projectId, answered }: ModeStateProps) {
             <Commands projectId={projectId} />
           </Section>
 
-          <Section label="Files the app owns">
-            <OwnedFiles projectId={projectId} />
+          <Section label="Autopilot rules">
+            <AutopilotRules projectId={projectId} />
           </Section>
 
           <Section label="Test map">
