@@ -684,7 +684,177 @@ def test_probe_writes_payload_keys():
             raise AssertionError("the probe wrote without NUCLEOS_HOOK_PROBE")
 
 
+# --- small bounded reads by the root ------------------------------------------------------------
+
+
+def _sized(fx, name, size):
+    """A file of `size` bytes under the project, outside `.ai`; its path."""
+    path = fx.path("src", name)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as handle:
+        handle.write(b"x" * size)
+    return path
+
+
+def _spent(fx, session="sess-1"):
+    """Tokens charged so far to this session, from the budget file beside the `manual:` flag."""
+    path = os.path.join(fx.tmp_dir, "nucleos-conductor", f"{session}.budget.json")
+    if not os.path.exists(path):
+        return 0
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)["tokens"]
+
+
+def test_small_read_allowed_large_read_denied():
+    with fixture("on") as fx:
+        allow(fx.verdict("Read", {"file_path": _sized(fx, "small.rs", 400)}), "small Read")
+        big = _sized(fx, "big.rs", 40000)
+        result = deny(fx.verdict("Read", {"file_path": big}), "large Read")
+        for needle in ("3000", "Explore", "manual:"):
+            if needle not in result["reason"]:
+                raise AssertionError(f"the refusal should mention {needle!r}, got {result['reason']!r}")
+        allow(fx.verdict("Read", {"file_path": big, "limit": 100}), "large Read with a small limit")
+        deny(fx.verdict("Read", {"file_path": big, "limit": 400}), "limit that still exceeds the call budget")
+        deny(fx.verdict("Read", {"file_path": fx.path("src", "missing.rs")}), "unreadable path")
+        image = _sized(fx, "shot.png", 100)
+        deny(fx.verdict("Read", {"file_path": image}), "image")
+        pdf = _sized(fx, "doc.pdf", 100)
+        deny(fx.verdict("Read", {"file_path": pdf, "pages": "1-2"}), "paged pdf")
+        deny(fx.verdict("Read", {"file_path": _sized(fx, "n.ipynb", 100)}), "notebook")
+
+
+def test_grep_modes_and_head_limit():
+    with fixture("on") as fx:
+        _sized(fx, "a.rs", 10)
+        where = fx.path("src")
+        allow(fx.verdict("Grep", {"pattern": "x", "path": where}), "Grep default mode")
+        allow(
+            fx.verdict("Grep", {"pattern": "x", "path": where, "output_mode": "files_with_matches"}),
+            "Grep files_with_matches",
+        )
+        allow(fx.verdict("Grep", {"pattern": "x", "path": where, "output_mode": "count"}), "Grep count")
+        content = {"pattern": "x", "path": where, "output_mode": "content"}
+        deny(fx.verdict("Grep", content), "content without head_limit")
+        allow(fx.verdict("Grep", {**content, "head_limit": 20}), "content with head_limit")
+        deny(fx.verdict("Grep", {**content, "head_limit": 0}), "head_limit 0")
+        deny(fx.verdict("Grep", {**content, "head_limit": 61}), "head_limit over 60")
+        deny(fx.verdict("Grep", {"pattern": "x", "path": where, "head_limit": 0}), "head_limit 0, default mode")
+        deny(fx.verdict("Grep", {"pattern": "x", "path": fx.path("nope")}), "Grep of a missing path")
+
+
+def test_grep_context_flags_are_charged():
+    with fixture("on") as fx:
+        _sized(fx, "a.rs", 10)
+        base = {"pattern": "x", "path": fx.path("src"), "output_mode": "content", "head_limit": 20}
+        allow(fx.verdict("Grep", {**base, "-C": 2}), "content with -C 2")
+        if _spent(fx) != 20 * 12 * 3:
+            raise AssertionError(f"head_limit 20 with -C 2 should cost 720, spent {_spent(fx)}")
+        deny(fx.verdict("Grep", {**base, "head_limit": 60, "-A": 5}), "head_limit 60 with -A 5 is over 3000")
+        if _spent(fx) != 720:
+            raise AssertionError("a refused call must not be charged")
+
+
+def test_glob_allowed_and_flat_charge():
+    with fixture("on") as fx:
+        _sized(fx, "a.rs", 10)
+        allow(fx.verdict("Glob", {"pattern": "*.rs", "path": fx.path("src")}), "Glob")
+        if _spent(fx) != 100:
+            raise AssertionError(f"Glob should cost 100, spent {_spent(fx)}")
+
+
+def test_budget_accumulates_and_the_crossing_call_is_denied():
+    with fixture("on") as fx:
+        mid = {"file_path": _sized(fx, "mid.rs", 11000)}  # 2750 tokens
+        allow(fx.verdict("Read", mid), "first")
+        allow(fx.verdict("Read", mid), "second")
+        result = deny(fx.verdict("Read", mid), "third crosses 6000")
+        if "6000" not in result["reason"]:
+            raise AssertionError(f"the refusal should name the prompt budget, got {result['reason']!r}")
+        if _spent(fx) != 5500:
+            raise AssertionError(f"the refused call must not be charged, spent {_spent(fx)}")
+        allow(fx.verdict("Glob", {"pattern": "*", "path": fx.path("src")}), "a small call still fits")
+        deny(fx.verdict("Read", mid, session="sess-1"), "still over")
+        allow(fx.verdict("Read", mid, session="sess-2"), "another session has its own budget")
+
+
+def test_new_prompt_resets_the_budget():
+    with fixture("on") as fx:
+        mid = {"file_path": _sized(fx, "mid.rs", 11000)}
+        allow(fx.verdict("Read", mid), "first")
+        allow(fx.verdict("Read", mid), "second")
+        deny(fx.verdict("Read", mid), "third")
+        _prompt(fx, "go on")
+        if _spent(fx) != 0:
+            raise AssertionError("the next prompt must clear the budget")
+        allow(fx.verdict("Read", mid), "after the reset")
+        _prompt(fx, "manual: do it by hand")
+        if _spent(fx) != 0:
+            raise AssertionError("a manual prompt must clear the budget too")
+
+
+def test_manual_bypasses_the_budget_and_writes_stay_denied():
+    with fixture("on") as fx:
+        big = _sized(fx, "big.rs", 40000)
+        edit = {"file_path": big, "old_string": "a", "new_string": "b"}
+        deny(fx.verdict("Edit", edit), "Edit")
+        deny(fx.verdict("Write", {"file_path": big, "content": "x"}), "Write")
+        deny(fx.verdict("Read", {"file_path": big}), "large Read")
+        _prompt(fx, "manual: read it")
+        allow(fx.verdict("Read", {"file_path": big}), "manual Read")
+
+
+def test_allow_listed_paths_are_not_charged():
+    with fixture("on") as fx:
+        os.makedirs(fx.path(".ai", "specs"), exist_ok=True)
+        spec = fx.path(".ai", "specs", "x.md")
+        with open(spec, "wb") as handle:
+            handle.write(b"x" * 400000)
+        for _ in range(3):
+            allow(fx.verdict("Read", {"file_path": spec}), "allow-listed Read, however large")
+        if _spent(fx) != 0:
+            raise AssertionError(f"allow-listed reads must not be charged, spent {_spent(fx)}")
+
+
+def test_state_failure_fails_closed_for_the_new_allowance():
+    small = None
+    with fixture("on") as fx:
+        small = _sized(fx, "small.rs", 400)
+        folder = os.path.join(fx.tmp_dir, "nucleos-conductor")
+        with open(folder, "w", encoding="utf-8") as handle:  # a file where the directory should be
+            handle.write("x")
+        deny(fx.verdict("Read", {"file_path": small}), "state cannot be written")
+        # What the allow-list already permits is never blocked by it.
+        os.makedirs(fx.path(".ai"), exist_ok=True)
+        allow(fx.verdict("Read", {"file_path": fx.path(".ai", "x.md")}), "allow-listed path")
+    with fixture("on") as fx:
+        small = _sized(fx, "small.rs", 400)
+        folder = os.path.join(fx.tmp_dir, "nucleos-conductor")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "sess-1.budget.json"), "w", encoding="utf-8") as handle:
+            handle.write("{not json")
+        deny(fx.verdict("Read", {"file_path": small}), "unreadable state")
+        deny(fx.verdict("Read", {"file_path": small}, session="bad/id"), "unsafe session id")
+
+
+def test_observe_mode_still_only_observes_a_big_read():
+    with fixture("observe") as fx:
+        result = fx.verdict("Read", {"file_path": _sized(fx, "big.rs", 40000)})
+        allow(result, "observe")
+        if not result.get("would_deny"):
+            raise AssertionError("observe should still flag the big read")
+
+
 TESTS = [
+    test_small_read_allowed_large_read_denied,
+    test_grep_modes_and_head_limit,
+    test_grep_context_flags_are_charged,
+    test_glob_allowed_and_flat_charge,
+    test_budget_accumulates_and_the_crossing_call_is_denied,
+    test_new_prompt_resets_the_budget,
+    test_manual_bypasses_the_budget_and_writes_stay_denied,
+    test_allow_listed_paths_are_not_charged,
+    test_state_failure_fails_closed_for_the_new_allowance,
+    test_observe_mode_still_only_observes_a_big_read,
     test_top_level_read_of_source_denied,
     test_read_of_ai_specs_allowed,
     test_mcp_nucleos_tool_allowed,
