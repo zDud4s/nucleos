@@ -751,7 +751,10 @@ mod tests {
 
         let (status, body) = get(&state, "/assistant/models?scope=chat").await;
         assert_eq!(status, StatusCode::OK);
-        assert!(has_runner(&body, "agy"), "no agy row in the chat scope: {body}");
+        assert!(
+            has_runner(&body, "agy"),
+            "no agy row in the chat scope: {body}"
+        );
         assert!(
             has_runner(&body, "gemini-api"),
             "no gemini-api row in the chat scope: {body}"
@@ -760,7 +763,10 @@ mod tests {
         // Agents ask without a scope and must keep refusing both by name.
         let (status, body) = get(&state, "/assistant/models").await;
         assert_eq!(status, StatusCode::OK);
-        assert!(!has_runner(&body, "agy"), "agy leaked into the daemon scope");
+        assert!(
+            !has_runner(&body, "agy"),
+            "agy leaked into the daemon scope"
+        );
         assert!(
             !has_runner(&body, "gemini-api"),
             "gemini-api leaked into the daemon scope"
