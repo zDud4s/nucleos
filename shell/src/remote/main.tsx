@@ -9,12 +9,15 @@ import "./remote.css";
 import { createAppQueryClient } from "../app/queryClient";
 import { setTransport } from "../data/transport";
 import { adoptStyleNonce } from "../lib/style-nonce";
+import { installDropGuard } from "./drop-guard";
 import { remoteTransport } from "./transport";
 import { startRemoteApp } from "./RemoteApp";
 
 // Same order and reasons as `src/main.tsx`; the transport is set before anything can fetch.
 setTransport(remoteTransport);
 adoptStyleNonce();
+// A file dropped outside a drop zone must not navigate the tab away from the app, on any page.
+installDropGuard();
 
 const queryClient = createAppQueryClient();
 const root = ReactDOM.createRoot(document.getElementById("root") as HTMLElement);

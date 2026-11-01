@@ -26,7 +26,7 @@ import {
   type WorkflowConsent,
 } from "../data/workflows";
 import { useNow } from "../lib/useNow";
-import { openInVscode } from "../lib/vscode";
+import { editorAvailable, openInVscode } from "../lib/vscode";
 import { clockText } from "../lib/when";
 import {
   Button,
@@ -158,7 +158,7 @@ function NothingInstalled({ library }: { library: Bundle[] | undefined }) {
   const empty = library !== undefined && library.length === 0;
 
   const action =
-    root !== null ? (
+    root !== null && editorAvailable() ? (
       <Button onClick={() => void openInVscode(root, null)}>Open the library folder</Button>
     ) : empty ? (
       <LibraryPath />
@@ -639,19 +639,22 @@ function EjectGuard({
         <Button disabled={pending} onClick={onEject}>
           eject and edit
         </Button>
-        <Button
-          disabled={originPath === null}
-          onClick={() => {
-            if (originPath === null) return;
-            // The library path, not the project's. `openInVscode` is the same door layer 2 uses for
-            // everything this app does not author — and a bundle in the library is the clearest
-            // case of that there is.
-            void openInVscode(originPath, null);
-            onEditOrigin();
-          }}
-        >
-          edit in the library
-        </Button>
+        {/* Hidden on a remote device: VS Code opens on the main machine only. */}
+        {editorAvailable() ? (
+          <Button
+            disabled={originPath === null}
+            onClick={() => {
+              if (originPath === null) return;
+              // The library path, not the project's. `openInVscode` is the same door layer 2 uses for
+              // everything this app does not author — and a bundle in the library is the clearest
+              // case of that there is.
+              void openInVscode(originPath, null);
+              onEditOrigin();
+            }}
+          >
+            edit in the library
+          </Button>
+        ) : null}
         <Button variant="quiet" onClick={onCancel}>
           cancel
         </Button>
