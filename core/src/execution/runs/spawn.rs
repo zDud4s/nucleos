@@ -459,6 +459,13 @@ pub(super) fn spawn_run(
         // The router is asked HERE, inside the run's own task and before its first attempt, so
         // neither the HTTP handler nor the job tick ever waits on it. With routing off this hands
         // back exactly what it was given and writes nothing.
+        // The agy runner refuses job MCP, steering and a forked session, so the router may not move
+        // such a run onto it.
+        let route = if job_mcp.is_some() || steerable || fork_session {
+            route.map(crate::models::route_advice::RouteQuery::without_agy)
+        } else {
+            route
+        };
         let resolved = crate::models::route_advice::resolve(
             &pool,
             id,

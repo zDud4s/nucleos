@@ -417,30 +417,8 @@ async fn main() {
     // operator has asked for it by name. An unrecognised name warns rather than fails startup, for
     // the same reason a bad local-model probe does — a typo in one config key must not take down
     // every unrelated daemon service.
-    let claude_runner = || execution::runner::ClaudeCliRunner {
-        model: models_config.claude_model.clone(),
-        plan_model: models_config.plan_model.clone(),
-        review_model: models_config.review_model.clone(),
-        resolve_model: models_config.resolve_model.clone(),
-        resolve_effort: models_config.resolve_effort.clone(),
-    };
-    let configured_runner = models_config.primary_runner.as_deref();
-    let primary_runner: Arc<dyn execution::runner::CommandRunner> = match configured_runner {
-        Some("codex") => {
-            tracing::info!(model = %models_config.codex_model, "codex CLI selected as the run runner");
-            Arc::new(execution::runner::CodexCliRunner {
-                model: models_config.codex_model.clone(),
-                // A run keeps the user's Codex config; only chats pin a sandbox (`for_chat`).
-                sandbox_mode: None,
-                web_search: None,
-            })
-        }
-        Some(other) => {
-            tracing::warn!(%other, "unknown primary_runner — keeping the Claude CLI");
-            Arc::new(claude_runner())
-        }
-        None => Arc::new(claude_runner()),
-    };
+    let primary_runner =
+        engines::runner_for_primary(models_config.primary_runner.as_deref(), &models_config);
     // The llm-router as an adviser. Off unless the stored `router` document turns it on, and off
     // hands back the very runner built above. The health row reads the same document, so the two
     // never disagree.
@@ -720,7 +698,10 @@ async fn main() {
             local_base_url,
         )
         .with_local_engine(local_engine, local_context_tokens)
-        .with_agent_clis(Arc::new(claude_runner()), models_config.codex_model.clone()),
+        .with_agent_clis(
+            engines::claude_runner(&models_config),
+            models_config.codex_model.clone(),
+        ),
     );
 
     let state = AppState {

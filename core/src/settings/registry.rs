@@ -15,6 +15,7 @@ use crate::config::{
     GithubConfig, ModelsConfig, VerifyConfig, VoiceConfig, WebConfig, validate_devtime,
     validate_rules,
 };
+use crate::engines::agy::AgyDoc;
 use crate::machine_config as files;
 use crate::models::route_doc::RouterDoc;
 use crate::workflows::Pins;
@@ -150,6 +151,10 @@ static DOCUMENTS: LazyLock<Vec<DocType>> = LazyLock::new(|| {
         of::<RouterDoc>(
             files::ROUTER_FILE,
             "when the daemon restarts — the router is read once at startup; an absent file leaves routing off",
+        ),
+        of::<AgyDoc>(
+            files::AGY_FILE,
+            "a chat reads the switch at once; the router drops agy at once but only gains it when the daemon restarts; a primary_runner of agy takes effect when the daemon restarts",
         ),
         of::<ModelsConfig>(
             crate::config::MODELS_CONFIG_FILE,
@@ -323,15 +328,15 @@ mod tests {
 
     #[test]
     fn there_are_thirteen_documents_with_unique_names() {
-        // 13 fixed documents plus one `channels/<id>` per manifest.
+        // 14 fixed documents plus one `channels/<id>` per manifest.
         let channels = crate::channels::registry::MANIFESTS.len();
         let docs = documents();
-        assert_eq!(docs.len(), 13 + channels);
+        assert_eq!(docs.len(), 14 + channels);
         let names: BTreeSet<_> = docs.iter().map(|doc| doc.name).collect();
-        assert_eq!(names.len(), 13 + channels);
+        assert_eq!(names.len(), 14 + channels);
         assert_eq!(
             docs.iter().filter(|doc| doc.kind == Kind::Machine).count(),
-            11 + channels
+            12 + channels
         );
         let project: Vec<_> = docs
             .iter()

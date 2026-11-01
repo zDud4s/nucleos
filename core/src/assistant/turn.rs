@@ -359,9 +359,41 @@ pub fn tool_policy_for(
     }
 }
 
-/// Chooses the CLI that should answer a conversation turn.
-pub fn answering_cli(config: &crate::config::ModelsConfig, pinned: Option<&str>) -> &'static str {
-    pinned
+/// The tool policy a turn answered by `cli` runs under. `tool_policy_for` grants `Unrestricted`
+/// because the Claude PreToolUse hook is wired; nothing shows agy honours that hook, so an agy chat
+/// is always MCP-only (`--mode plan --sandbox`). Every other engine keeps the policy it was given.
+pub fn tool_policy_for_engine(
+    cli: &str,
+    policy: crate::execution::runner::ToolPolicy,
+) -> crate::execution::runner::ToolPolicy {
+    use crate::execution::runner::ToolPolicy;
+    if cli == crate::engines::AGY && policy == ToolPolicy::Unrestricted {
+        ToolPolicy::McpOnly
+    } else {
+        policy
+    }
+}
+
+/// A chat bound to the agy engine while its opt-in is off. The turn is refused rather than handed
+/// to another engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineDisabled;
+
+impl std::fmt::Display for EngineDisabled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("this chat uses the agy engine, which is disabled in settings")
+    }
+}
+
+impl std::error::Error for EngineDisabled {}
+
+/// Chooses the CLI that should answer a conversation turn, or refuses when that CLI is agy and
+/// agy is switched off.
+pub fn answering_cli(
+    config: &crate::config::ModelsConfig,
+    pinned: Option<&str>,
+) -> Result<&'static str, EngineDisabled> {
+    let cli = pinned
         .and_then(|id| {
             config
                 .runner_of(id)
@@ -369,7 +401,11 @@ pub fn answering_cli(config: &crate::config::ModelsConfig, pinned: Option<&str>)
         })
         .unwrap_or_else(|| {
             crate::engines::runner_id_in(crate::engines::TABLE, config.active_runner())
-        })
+        });
+    if cli == crate::engines::AGY && !crate::engines::agy::enabled() {
+        return Err(EngineDisabled);
+    }
+    Ok(cli)
 }
 
 /// Chooses a runner for a turn without replacing the daemon's default unnecessarily.
@@ -378,20 +414,24 @@ pub fn runner_for_turn(
     assistants: &dyn crate::assistants::Assistants,
     config: &crate::config::ModelsConfig,
     pinned: Option<&str>,
-) -> (
-    std::sync::Arc<dyn crate::execution::runner::CommandRunner>,
-    &'static str,
-) {
-    let cli = answering_cli(config, pinned);
+) -> Result<
+    (
+        std::sync::Arc<dyn crate::execution::runner::CommandRunner>,
+        &'static str,
+    ),
+    EngineDisabled,
+> {
+    let cli = answering_cli(config, pinned)?;
     if pinned.is_none() || cli == config.active_runner() {
-        (daemon.clone(), cli)
+        Ok((daemon.clone(), cli))
     } else {
-        (
-            assistants
-                .cli_runner(cli, pinned)
-                .unwrap_or_else(|| daemon.clone()),
-            cli,
-        )
+        match assistants.cli_runner(cli, pinned) {
+            Some(runner) => Ok((runner, cli)),
+            // The gate closed between two reads: an agy chat is refused, never answered by the
+            // daemon's own runner.
+            None if cli == crate::engines::AGY => Err(EngineDisabled),
+            None => Ok((daemon.clone(), cli)),
+        }
     }
 }
 
@@ -474,7 +514,9 @@ pub(super) fn chat_run_request(
         cwd,
         permission,
         resume_session_id: resume,
-        mcp_config: Some(mcp_config),
+        // An MCP config only grants, and agy has no flag to take it, so an agy chat answers without
+        // NucleOS tools; the runner keeps refusing a config it cannot honour.
+        mcp_config: (cli != crate::engines::AGY).then_some(mcp_config),
         mcp_job: None,
         mcp_team_run: None,
         // Decided by `tool_policy_for`, which is where the rule is written out. The
@@ -666,7 +708,7 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
     let daemon_runner = state.runner.clone();
     let utility_model = state.utility_model.clone();
     let assistants = state.assistants.clone();
-    let deadlines = turn_deadlines(state.run_timeout, state.progress_timeout, tool_policy);
+    let (run_timeout, progress_timeout) = (state.run_timeout, state.progress_timeout);
     let control_token = state.token.0.clone();
     // Built HERE, outside the task, and captured by the async block. A task aborted before its first
     // poll drops its captured state without ever running a line of the body, so a guard constructed
@@ -807,12 +849,37 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
             .await
             .unwrap_or_default();
         let config = crate::config::models_config_now();
-        let (runner, cli) = runner_for_turn(
+        let (runner, cli) = match runner_for_turn(
             &daemon_runner,
             assistants.as_ref(),
             &config,
             answering.model.as_deref(),
-        );
+        ) {
+            Ok(chosen) => chosen,
+            Err(refusal) => {
+                // The chat is bound to an engine that is switched off: fail the turn with the
+                // reason, never answer it with another engine.
+                tracing::warn!(run_id = id, chat_id = %turn.slot.chat_id, %refusal, "refusing the turn");
+                let failed = sqlx::query(
+                    "UPDATE runs SET status = 'failed', stderr = ?, completed_at = ? WHERE id = ? AND status = 'running'",
+                )
+                .bind(refusal.to_string())
+                .bind(chrono::Utc::now().to_rfc3339())
+                .bind(id)
+                .execute(&pool)
+                .await;
+                crate::execution::runs::warn_on_terminal_write_err(&failed, id, "failed");
+                // Ends like any failed turn: the guard goes first, then whatever waited behind it.
+                drop(turn);
+                drain_queued(&after, &drained_chat).await;
+                return;
+            }
+        };
+
+        // The policy the answering engine runs under, and the deadlines that follow from it: both
+        // wait for `cli`, which is only known here. An agy chat is never rooted.
+        let tool_policy = tool_policy_for_engine(cli, tool_policy);
+        let deadlines = turn_deadlines(run_timeout, progress_timeout, tool_policy);
 
         // Which door this turn goes through. Decided once and named, because the two are not
         // interchangeable and the reason is a security one before it is a speed one.
@@ -1481,7 +1548,7 @@ mod tests {
         assert_eq!(rotation_fill(None, "plain text", None, home.path()), None);
     }
 
-    async fn test_state(runner: Arc<FakeCommandRunner>) -> AppState {
+    pub(super) async fn test_state(runner: Arc<FakeCommandRunner>) -> AppState {
         AppState {
             startup_config: Default::default(),
             token: crate::auth::Token("t".into()),
@@ -1836,5 +1903,298 @@ mod tests {
             matches!(sent, Some(Some(ref prompt)) if prompt.contains("zanzibar house rule")),
             "the spawn that replaced a dead kept process lost the turn's briefing: {sent:?}"
         );
+    }
+}
+
+/// A chat bound to agy (plan Node 2, tests 34 and 35). RED: `answering_cli` still returns a bare
+/// `&'static str`, so it can neither refuse nor name `EngineDisabled`.
+///
+/// GREEN contract these tests hold: `answering_cli(&ModelsConfig, Option<&str>) ->
+/// Result<&'static str, EngineDisabled>`, and `EngineDisabled` is a unit-like error implementing
+/// `Debug` and `Display`.
+#[cfg(test)]
+mod agy_chat_tests {
+    use super::*;
+    use crate::assistants::{Assistants, ConfiguredAssistants};
+    use crate::config::{AssistantChoice, ModelsConfig};
+    use crate::engines::agy_test_support::{FakeAgyBin, agy_gate, run_once, run_request};
+    use crate::execution::runner::extract_reply;
+
+    const AGY_MODEL: &str = "agy/gemini-3.8-flash-high";
+
+    #[test]
+    fn chat_bound_to_agy_with_flag_off_is_refused_not_answered_by_claude() {
+        let _gate = agy_gate(false);
+        let config = ModelsConfig::default();
+
+        // Bound by the model id's agy/ prefix.
+        let refused = answering_cli(&config, Some(AGY_MODEL));
+        assert!(matches!(refused, Err(EngineDisabled)), "{refused:?}");
+        assert_eq!(
+            EngineDisabled.to_string(),
+            "this chat uses the agy engine, which is disabled in settings"
+        );
+
+        // Bound by a stored runner on the catalogue row, whatever the model id looks like.
+        let stored = ModelsConfig {
+            assistant_choices: vec![AssistantChoice {
+                id: "some-model".to_string(),
+                label: "Some model".to_string(),
+                brain: "cloud".to_string(),
+                efforts: Vec::new(),
+                runner: Some("agy".to_string()),
+                tools: None,
+                installed: None,
+            }],
+            ..ModelsConfig::default()
+        };
+        let refused = answering_cli(&stored, Some("some-model"));
+        assert!(matches!(refused, Err(EngineDisabled)), "{refused:?}");
+
+        // Nothing else changed: Claude and Codex models are still answered by their own engines.
+        assert!(matches!(
+            answering_cli(&config, Some("claude-opus-4-6")),
+            Ok("claude")
+        ));
+        assert!(matches!(
+            answering_cli(&config, Some("gpt-5.5")),
+            Ok("codex")
+        ));
+        assert!(matches!(answering_cli(&config, None), Ok("claude")));
+    }
+
+    #[tokio::test]
+    async fn chat_on_agy_model_is_answered_by_the_fake_agy_runner() {
+        // Lock order: the stand-in binary (env lock) first, then the gate.
+        let fake = FakeAgyBin::success("pong from the fake agy");
+        let _gate = agy_gate(true);
+        let config = ModelsConfig::default();
+
+        let cli = answering_cli(&config, Some(AGY_MODEL));
+        assert!(matches!(cli, Ok("agy")), "{cli:?}");
+
+        let assistants = ConfiguredAssistants::new(
+            None,
+            None,
+            None,
+            "http://127.0.0.1:8791".to_string(),
+            "token".to_string(),
+            crate::testdb::fresh_pool().await,
+            crate::execution::runner::OLLAMA_BASE_URL.to_string(),
+        );
+        let runner = assistants
+            .cli_runner("agy", Some(AGY_MODEL))
+            .expect("an enabled agy row has a runner");
+        let outcome = run_once(runner.as_ref(), "ping")
+            .await
+            .expect("the agy runner spawned the stand-in");
+
+        assert_eq!(outcome.exit_code, 0, "{}", outcome.stderr);
+        assert_eq!(
+            extract_reply(&outcome.stdout).as_deref(),
+            Some("pong from the fake agy")
+        );
+        assert!(fake.was_launched());
+    }
+
+    /// E16 F5: nothing shows agy honours the PreToolUse hook that makes `Unrestricted` safe, so an agy
+    /// chat is always MCP-only.
+    #[test]
+    fn an_agy_chat_is_never_unrestricted() {
+        use crate::execution::runner::ToolPolicy;
+        assert_eq!(
+            tool_policy_for_engine("agy", ToolPolicy::Unrestricted),
+            ToolPolicy::McpOnly
+        );
+        assert_eq!(
+            tool_policy_for_engine("agy", ToolPolicy::McpOnly),
+            ToolPolicy::McpOnly
+        );
+        for cli in ["claude", "codex"] {
+            for policy in [
+                ToolPolicy::Unrestricted,
+                ToolPolicy::McpOnly,
+                ToolPolicy::None,
+            ] {
+                assert_eq!(tool_policy_for_engine(cli, policy), policy, "{cli}");
+            }
+        }
+    }
+
+    /// E16 F9: if the factory has no runner for agy (the gate closed between two reads), the turn is
+    /// refused, never answered by the daemon's own runner.
+    #[test]
+    fn runner_for_turn_never_answers_agy_with_the_daemon_runner() {
+        let _gate = agy_gate(true);
+        let config = ModelsConfig::default();
+        assert_eq!(config.active_runner(), "claude");
+        let daemon: std::sync::Arc<dyn crate::execution::runner::CommandRunner> =
+            std::sync::Arc::new(crate::execution::runner::FakeCommandRunner::default());
+        // `NoAssistants` answers `None` from `cli_runner`, as a closed gate does.
+        let result = runner_for_turn(
+            &daemon,
+            &crate::assistants::NoAssistants,
+            &config,
+            Some(AGY_MODEL),
+        );
+        assert!(matches!(result, Err(EngineDisabled)));
+        // A claude pin still gets the daemon runner.
+        let claude = runner_for_turn(
+            &daemon,
+            &crate::assistants::NoAssistants,
+            &config,
+            Some("claude-opus-4-6"),
+        );
+        assert!(matches!(claude, Ok((_, "claude"))));
+    }
+
+    /// The chat request for `cli`, as the real caller builds it for an MCP-only chat turn.
+    fn mcp_only_request(cli: &str) -> crate::execution::runner::RunRequest {
+        chat_run_request(
+            "ping".to_owned(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            crate::execution::runner::Permission::Default,
+            Some("s-1".to_owned()),
+            "s-1".to_owned(),
+            std::env::temp_dir().join("agy-chat-mcp.json"),
+            crate::execution::runner::ToolPolicy::McpOnly,
+            crate::chats::Answering::default(),
+            None,
+            cli,
+            None,
+        )
+    }
+
+    #[test]
+    fn chat_run_request_gives_agy_no_mcp_config_and_keeps_it_for_the_others() {
+        assert!(mcp_only_request("agy").mcp_config.is_none());
+        assert!(mcp_only_request("codex").mcp_config.is_some());
+        assert!(mcp_only_request("claude").mcp_config.is_some());
+    }
+
+    #[tokio::test]
+    async fn real_chat_request_on_agy_reaches_the_runner_in_plan_mode_with_sandbox() {
+        // Lock order: the stand-in binary (env lock) first, then the gate.
+        let fake = FakeAgyBin::success("pong from the fake agy");
+        let _gate = agy_gate(true);
+
+        let assistants = ConfiguredAssistants::new(
+            None,
+            None,
+            None,
+            "http://127.0.0.1:8791".to_string(),
+            "token".to_string(),
+            crate::testdb::fresh_pool().await,
+            crate::execution::runner::OLLAMA_BASE_URL.to_string(),
+        );
+        let runner = assistants
+            .cli_runner("agy", Some(AGY_MODEL))
+            .expect("an enabled agy row has a runner");
+        let request = mcp_only_request("agy");
+        let outcome = run_request(runner.as_ref(), request)
+            .await
+            .expect("the agy runner spawned the stand-in");
+
+        assert_eq!(outcome.exit_code, 0, "{}", outcome.stderr);
+        assert_eq!(
+            extract_reply(&outcome.stdout).as_deref(),
+            Some("pong from the fake agy")
+        );
+        assert!(fake.was_launched());
+        let args = fake.args();
+        assert!(args.contains("--mode plan"), "{args}");
+        assert!(args.contains("--sandbox"), "{args}");
+    }
+
+    /// E19 F5 at turn level: a rooted chat whose hook is wired would be `Unrestricted` for claude, and
+    /// the turn must still launch agy in plan mode with the sandbox. Driven through `send_message`, so
+    /// it fails if the `tool_policy_for_engine` call in the turn is deleted. A regression guard: the
+    /// override exists today, so this is expected to pass.
+    #[tokio::test]
+    async fn a_rooted_agy_chat_launches_in_plan_mode_with_the_sandbox() {
+        // Lock order: the stand-in binary (env lock) first, then the gate.
+        let fake = FakeAgyBin::success("pong from the fake agy");
+        let _gate = agy_gate(true);
+
+        // A directory whose PreToolUse hook is wired, as `classifier_hook_is_wired` reads it.
+        let root = tempfile::tempdir().unwrap();
+        let script = root.path().join(crate::governance::autopilot::HOOK_SCRIPT);
+        std::fs::create_dir_all(script.parent().unwrap()).unwrap();
+        std::fs::write(&script, "# hook").unwrap();
+        let settings = serde_json::json!({
+            "hooks": {"PreToolUse": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": format!(
+                        "python \"${{CLAUDE_PROJECT_DIR}}/{}\"",
+                        crate::governance::autopilot::HOOK_SCRIPT
+                    ),
+                }]
+            }]}
+        });
+        std::fs::write(
+            root.path().join(".claude/settings.json"),
+            settings.to_string(),
+        )
+        .unwrap();
+        // The premise: for any other engine this chat is `Unrestricted`.
+        assert!(crate::governance::autopilot::classifier_hook_is_wired(
+            root.path()
+        ));
+        assert_eq!(
+            tool_policy_for(
+                Some(&root.path().to_string_lossy()),
+                Origin::Shell,
+                true,
+                crate::relay::Handover::Typed
+            ),
+            crate::execution::runner::ToolPolicy::Unrestricted
+        );
+
+        let mut state = tests::test_state(std::sync::Arc::new(
+            crate::execution::runner::FakeCommandRunner::default(),
+        ))
+        .await;
+        state.assistants = std::sync::Arc::new(ConfiguredAssistants::new(
+            None,
+            None,
+            None,
+            "http://127.0.0.1:8791".to_string(),
+            "token".to_string(),
+            state.pool.clone(),
+            crate::execution::runner::OLLAMA_BASE_URL.to_string(),
+        ));
+        let chat = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::chats::set_model(&state.pool, &chat, Some(AGY_MODEL))
+            .await
+            .unwrap();
+        crate::chats::set_cwd(&state.pool, &chat, &root.path().to_string_lossy())
+            .await
+            .unwrap();
+
+        let id = crate::assistant::send_message(&state, &chat, "ping", Origin::Shell)
+            .await
+            .expect("the turn was accepted");
+        let mut status = String::new();
+        for _ in 0..500 {
+            status = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+            if status != "running" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        assert!(fake.was_launched(), "agy never ran (status {status})");
+        let args = fake.args();
+        assert!(args.contains("--mode plan"), "{args}");
+        assert!(args.contains("--sandbox"), "{args}");
     }
 }

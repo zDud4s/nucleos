@@ -63,6 +63,8 @@ pub fn yaml_to_body(name: &str, text: &str) -> Result<Value, String> {
             to_json(config::parse_schedule_rules(text).map_err(|error| error.to_string())?)
         }
         "workflow_pins" => to_json(workflows::parse_pins(text)?),
+        // agy is new in the settings store: no legacy file ever held it.
+        "agy" => Err("agy has no legacy file".into()),
         channel if channel.starts_with("channels/") => {
             // A blank file means the defaults, as the old reader did.
             if text.trim().is_empty() {

@@ -106,8 +106,22 @@ fn is_o_series(token: &str) -> bool {
     c.next() == Some('o') && c.next().is_some_and(|d| d.is_ascii_digit())
 }
 
+/// The catalogue prefix of the models the agy CLI hosts, matched case-insensitively.
+const AGY_PREFIX: &str = "agy/";
+
+/// The id without the agy prefix, or `None` when it carries none.
+fn strip_agy_prefix(id: &str) -> Option<&str> {
+    let id = id.trim();
+    let head = id.get(..AGY_PREFIX.len())?;
+    head.eq_ignore_ascii_case(AGY_PREFIX)
+        .then(|| &id[AGY_PREFIX.len()..])
+}
+
 /// The name a person reads for a vendor id. Pure; see the table in the tests.
 pub fn display_name(id: &str) -> String {
+    if let Some(rest) = strip_agy_prefix(id) {
+        return format!("{} (agy)", display_name(rest));
+    }
     let s = normalise(id);
     let tokens: Vec<&str> = s.split('-').filter(|t| !t.is_empty()).collect();
     if tokens.is_empty() {
@@ -162,6 +176,8 @@ pub fn display_name(id: &str) -> String {
 
 /// `(provider, family)` an id belongs to.
 pub fn family_of(id: &str) -> (&'static str, String) {
+    // The family is the hosted model's own; the prefix only says who answers.
+    let id = strip_agy_prefix(id).unwrap_or(id);
     let s = normalise(id);
     let tokens: Vec<&str> = s.split('-').filter(|t| !t.is_empty()).collect();
     match tokens.first().copied() {
@@ -183,6 +199,10 @@ pub fn family_of(id: &str) -> (&'static str, String) {
 pub fn runner_by_id(id: &str) -> Option<&'static str> {
     let s = id.trim().to_lowercase();
     // The id patterns stay here (a table row cannot express them); the answers are the table's ids.
+    // The agy prefix goes first: `agy/claude-sonnet-4-6` is answered by agy, not by Claude.
+    if s.starts_with(AGY_PREFIX) {
+        return Some(crate::engines::AGY);
+    }
     if s.starts_with("claude-") || ALIASES.contains(&s.as_str()) {
         return Some(crate::engines::CLAUDE);
     }
@@ -190,6 +210,38 @@ pub fn runner_by_id(id: &str) -> Option<&'static str> {
         return Some(crate::engines::CODEX);
     }
     None
+}
+
+/// The models the agy CLI hosts, in the order the picker shows them. Empty while the agy opt-in is
+/// off. A static list: agy cannot be asked for its models without running it.
+pub fn agy_models() -> Vec<Discovered> {
+    if !crate::engines::agy::enabled() {
+        return Vec::new();
+    }
+    // The Gemini and gpt-oss ids carry their level in the id itself; only Sonnet takes an effort.
+    const MODELS: [(&str, &[&str]); 6] = [
+        ("gemini-3.8-flash-high", &[]),
+        ("gemini-3.8-flash-medium", &[]),
+        ("gemini-3.8-flash-low", &[]),
+        ("claude-sonnet-4-6", THREE),
+        ("claude-opus-4-6-thinking", &[]),
+        ("gpt-oss-120b-medium", &[]),
+    ];
+    MODELS
+        .iter()
+        .map(|(model, efforts)| {
+            let id = format!("{AGY_PREFIX}{model}");
+            Discovered {
+                label: display_name(&id),
+                family: family_of(&id).1,
+                id,
+                provider: crate::engines::AGY,
+                runner: crate::engines::AGY,
+                efforts: efforts.iter().map(|e| (*e).to_string()).collect(),
+                created: None,
+            }
+        })
+        .collect()
 }
 
 /// The cheap model a background one-shot should ask `runner` for, or `None` when the runner has no
@@ -1833,5 +1885,60 @@ mod tests {
         assert_eq!(utility_default("codex", &known), None);
         assert_eq!(utility_default("codex", &[]), None);
         assert_eq!(utility_default("ollama", &known), None);
+    }
+}
+
+/// The agy rows of the catalogue (plan Node 2, tests 30 and 31). RED: `agy_models` does not exist
+/// yet, and `runner_by_id` still sends `agy/claude-...` to Claude.
+#[cfg(test)]
+mod agy_tests {
+    use super::*;
+    use crate::engines::agy_test_support::agy_gate;
+
+    #[test]
+    fn runner_by_id_routes_agy_prefix_before_claude() {
+        // The agy prefix rule runs first: an agy-hosted Claude model is answered by agy.
+        assert_eq!(
+            runner_by_id("agy/claude-sonnet-4-6"),
+            Some(crate::engines::AGY)
+        );
+        assert_eq!(runner_by_id("agy/claude-opus-4-6-thinking"), Some("agy"));
+        assert_eq!(runner_by_id("agy/gemini-3.8-flash-high"), Some("agy"));
+        assert_eq!(runner_by_id("AGY/gpt-oss-120b-medium"), Some("agy"));
+        // The bare ids keep their engines, and a bare Gemini id says nothing about a runner.
+        assert_eq!(
+            runner_by_id("claude-sonnet-4-6"),
+            Some(crate::engines::CLAUDE)
+        );
+        assert_eq!(runner_by_id("gpt-5.5"), Some(crate::engines::CODEX));
+        assert_eq!(runner_by_id("gemini-3.8-flash-high"), None);
+    }
+
+    #[test]
+    fn agy_models_listed_only_when_gate_on() {
+        {
+            let _off = agy_gate(false);
+            assert!(agy_models().is_empty(), "off means absent");
+        }
+        let _on = agy_gate(true);
+        let models = agy_models();
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "agy/gemini-3.8-flash-high",
+                "agy/gemini-3.8-flash-medium",
+                "agy/gemini-3.8-flash-low",
+                "agy/claude-sonnet-4-6",
+                "agy/claude-opus-4-6-thinking",
+                "agy/gpt-oss-120b-medium",
+            ]
+        );
+        for model in &models {
+            assert_eq!(model.runner, "agy", "{}", model.id);
+            assert_eq!(model.provider, "agy", "{}", model.id);
+            // The picker row carries the runner, so the chat path routes it to agy.
+            assert_eq!(as_choice(model).runner.as_deref(), Some("agy"));
+        }
     }
 }

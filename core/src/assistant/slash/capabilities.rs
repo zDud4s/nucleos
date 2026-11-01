@@ -15,6 +15,7 @@ pub enum ChatEngine {
     Codex,
     Local,
     OpenRouter,
+    Agy,
 }
 
 impl ChatEngine {
@@ -24,6 +25,7 @@ impl ChatEngine {
             Self::Claude => crate::engines::CLAUDE,
             Self::Codex => crate::engines::CODEX,
             Self::Local => crate::engines::LOCAL,
+            Self::Agy => crate::engines::AGY,
             // Not an engine row: OpenRouter is a hosted brain, not a launchable engine.
             Self::OpenRouter => "openrouter",
         }
@@ -33,7 +35,28 @@ impl ChatEngine {
     fn of_cli(cli: &str) -> Self {
         match crate::engines::runner_id_in(crate::engines::TABLE, cli) {
             crate::engines::CODEX => Self::Codex,
+            crate::engines::AGY => Self::Agy,
             _ => Self::Claude,
+        }
+    }
+
+    /// The chat engine a stored engine id names, among the rows that are switched on. An id the
+    /// table does not list (agy with its setting off included) is `None`: the caller refuses it,
+    /// it never becomes Claude.
+    pub fn from_stored(id: &str) -> Option<Self> {
+        let enabled: Vec<crate::engines::EngineDescription> = crate::engines::enabled_table()
+            .into_iter()
+            .cloned()
+            .collect();
+        let id = crate::engines::chat_ids_in(&enabled)
+            .into_iter()
+            .find(|row| *row == id)?;
+        match id {
+            crate::engines::CLAUDE => Some(Self::Claude),
+            crate::engines::CODEX => Some(Self::Codex),
+            crate::engines::LOCAL => Some(Self::Local),
+            crate::engines::AGY => Some(Self::Agy),
+            _ => None,
         }
     }
 }
@@ -67,7 +90,9 @@ pub fn engine_of(config: &ModelsConfig, brain: Brain, model: Option<&str>) -> Ch
     match brain {
         Brain::Local => ChatEngine::Local,
         Brain::OpenRouter => ChatEngine::OpenRouter,
-        Brain::Cloud => ChatEngine::of_cli(crate::assistant::answering_cli(config, model)),
+        // A refusal means the chat is bound to agy while agy is off.
+        Brain::Cloud => crate::assistant::answering_cli(config, model)
+            .map_or(ChatEngine::Agy, ChatEngine::of_cli),
     }
 }
 
@@ -81,6 +106,9 @@ pub fn support(engine: ChatEngine, capability: Capability) -> Support {
         (DeniedTools | Agents, Claude) => Yes,
         (TurnBudget, Claude) => Yes,
         (TurnBudget, Local | OpenRouter) => Warn,
+        // Agy takes `--effort` and `--add-dir` and refuses every other control.
+        (Effort | ExtraDirs, Agy) => Yes,
+        (DeniedTools | TurnBudget | Agents | RegistryMcp, Agy) => No,
         _ => No,
     }
 }
@@ -106,20 +134,22 @@ mod tests {
 
     #[test]
     fn slash_b_capabilities_table_matches_spec() {
-        // Columns: claude, codex, local, openrouter. Spec section 6.
+        // Columns: claude, codex, local, openrouter, agy. Spec section 6; agy has `--effort` and
+        // `--add-dir` and refuses every other control by name.
         let table = [
-            (Effort, [Yes, Yes, No, No]),
-            (ExtraDirs, [Yes, Yes, No, No]),
-            (DeniedTools, [Yes, No, No, No]),
-            (TurnBudget, [Yes, No, Warn, Warn]),
-            (Agents, [Yes, No, No, No]),
-            (RegistryMcp, [Yes, Yes, No, No]),
+            (Effort, [Yes, Yes, No, No, Yes]),
+            (ExtraDirs, [Yes, Yes, No, No, Yes]),
+            (DeniedTools, [Yes, No, No, No, No]),
+            (TurnBudget, [Yes, No, Warn, Warn, No]),
+            (Agents, [Yes, No, No, No, No]),
+            (RegistryMcp, [Yes, Yes, No, No, No]),
         ];
         let engines = [
             ChatEngine::Claude,
             ChatEngine::Codex,
             ChatEngine::Local,
             ChatEngine::OpenRouter,
+            ChatEngine::Agy,
         ];
         for (capability, expected) in table {
             for (engine, want) in engines.into_iter().zip(expected) {
@@ -149,6 +179,28 @@ mod tests {
         );
         assert!(require(ChatEngine::Codex, TurnBudget, "set a budget").is_err());
         assert!(require(ChatEngine::Codex, DeniedTools, "deny a tool").is_err());
+    }
+
+    #[test]
+    fn chat_engine_of_cli_maps_agy_not_claude() {
+        assert_eq!(ChatEngine::of_cli("agy"), ChatEngine::Agy);
+        assert_eq!(ChatEngine::of_cli("codex"), ChatEngine::Codex);
+        assert_eq!(ChatEngine::of_cli("claude"), ChatEngine::Claude);
+        // An unknown string still collapses to claude.
+        assert_eq!(ChatEngine::of_cli("gemini"), ChatEngine::Claude);
+        assert_eq!(ChatEngine::Agy.as_str(), crate::engines::AGY);
+    }
+
+    #[test]
+    fn chat_engine_from_stored_uses_chat_ids() {
+        assert_eq!(ChatEngine::from_stored("claude"), Some(ChatEngine::Claude));
+        assert_eq!(ChatEngine::from_stored("codex"), Some(ChatEngine::Codex));
+        assert_eq!(ChatEngine::from_stored("local"), Some(ChatEngine::Local));
+        assert_eq!(ChatEngine::from_stored("gemini"), None);
+        assert_eq!(ChatEngine::from_stored(""), None);
+        // agy's setting is off by default, so a stored agy is not an engine a chat can name: the
+        // caller refuses it, it does not become Claude.
+        assert_eq!(ChatEngine::from_stored("agy"), None);
     }
 
     fn codex_choice() -> AssistantChoice {

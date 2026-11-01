@@ -15,10 +15,27 @@ use crate::config::{ModelsConfig, SeatKind};
 use crate::execution::runner::CommandRunner;
 use crate::models::model_catalog::Discovered;
 
+pub mod agy;
+mod agy_setting;
+
 /// Engine ids, named once so the enums that mirror the table can match on them.
 pub const CLAUDE: &str = "claude";
 pub const CODEX: &str = "codex";
 pub const LOCAL: &str = "local";
+pub const AGY: &str = "agy";
+
+/// The refusal for agy at every launch site of agents, teams and council.
+pub const AGY_REFUSAL: &str = "the agy engine is not available for agents, teams or council";
+
+/// Work that names no engine runs on the daemon's runner; under `primary_runner: agy` that is agy,
+/// which agents, teams and council never use. Shared by their launch sites to refuse that work.
+pub fn refuse_agy_primary(models: &crate::config::ModelsConfig) -> Result<(), &'static str> {
+    if models.active_runner() == AGY {
+        Err(AGY_REFUSAL)
+    } else {
+        Ok(())
+    }
+}
 
 /// How an engine is reached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +55,8 @@ pub struct EngineDescription {
     pub transport: Transport,
     /// Whether the engine is usable on this machine (nothing is run).
     pub installed: fn() -> bool,
+    /// Whether the row is switched on; a row that is off is absent from every derived list.
+    pub gate: fn() -> bool,
     /// The cheap model a background one-shot asks this engine for, among the models known now.
     pub utility_default: fn(&[Discovered]) -> Option<String>,
     /// The runner this engine launches, built from the models file; `None` when it has no CLI runner.
@@ -61,7 +80,7 @@ fn local_installed() -> bool {
 }
 
 /// The Claude runner, built from the models file as `main.rs` builds the primary.
-pub(crate) fn claude_runner(models: &ModelsConfig) -> Arc<dyn CommandRunner> {
+pub fn claude_runner(models: &ModelsConfig) -> Arc<dyn CommandRunner> {
     Arc::new(crate::execution::runner::ClaudeCliRunner {
         model: models.claude_model.clone(),
         plan_model: models.plan_model.clone(),
@@ -72,7 +91,7 @@ pub(crate) fn claude_runner(models: &ModelsConfig) -> Arc<dyn CommandRunner> {
 }
 
 /// The Codex runner, built from the models file as `main.rs` builds the primary.
-pub(crate) fn codex_runner(models: &ModelsConfig) -> Arc<dyn CommandRunner> {
+pub fn codex_runner(models: &ModelsConfig) -> Arc<dyn CommandRunner> {
     Arc::new(crate::execution::runner::CodexCliRunner {
         model: models.codex_model.clone(),
         sandbox_mode: None,
@@ -86,6 +105,11 @@ fn claude_row_runner(models: &ModelsConfig) -> Option<Arc<dyn CommandRunner>> {
 
 fn codex_row_runner(models: &ModelsConfig) -> Option<Arc<dyn CommandRunner>> {
     Some(codex_runner(models))
+}
+
+/// The gate of the engines that are always on.
+fn always() -> bool {
+    true
 }
 
 fn local_runner(_models: &ModelsConfig) -> Option<Arc<dyn CommandRunner>> {
@@ -104,6 +128,7 @@ pub const TABLE: &[EngineDescription] = &[
         seat_kind: SeatKind::Cloud,
         transport: Transport::Cli,
         installed: claude_installed,
+        gate: always,
         utility_default: crate::models::model_catalog::claude_utility_default,
         runner: claude_row_runner,
     },
@@ -113,6 +138,7 @@ pub const TABLE: &[EngineDescription] = &[
         seat_kind: SeatKind::Cloud,
         transport: Transport::Cli,
         installed: codex_installed,
+        gate: always,
         utility_default: crate::models::model_catalog::codex_utility_default,
         runner: codex_row_runner,
     },
@@ -122,10 +148,31 @@ pub const TABLE: &[EngineDescription] = &[
         seat_kind: SeatKind::Local,
         transport: Transport::Http,
         installed: local_installed,
+        gate: always,
         utility_default: local_utility_default,
         runner: local_runner,
     },
+    EngineDescription {
+        id: AGY,
+        display_name: "Antigravity",
+        seat_kind: SeatKind::Cloud,
+        transport: Transport::Cli,
+        installed: agy::installed,
+        gate: agy::enabled,
+        utility_default: local_utility_default,
+        runner: agy::runner,
+    },
 ];
+
+/// The rows whose gate is open, in table order.
+pub fn enabled_in(table: &[EngineDescription]) -> Vec<&EngineDescription> {
+    table.iter().filter(|row| (row.gate)()).collect()
+}
+
+/// The production rows that are switched on: what every derived list reads.
+pub fn enabled_table() -> Vec<&'static EngineDescription> {
+    enabled_in(TABLE)
+}
 
 /// The row with this id.
 pub fn find_in<'a>(table: &'a [EngineDescription], id: &str) -> Option<&'a EngineDescription> {
@@ -135,11 +182,6 @@ pub fn find_in<'a>(table: &'a [EngineDescription], id: &str) -> Option<&'a Engin
 /// The row with this id when it is a CLI runner.
 pub fn cli_row_in<'a>(table: &'a [EngineDescription], id: &str) -> Option<&'a EngineDescription> {
     find_in(table, id).filter(|row| row.transport == Transport::Cli)
-}
-
-/// `(id, seat kind)` per row, in table order.
-pub fn seat_kinds_in(table: &[EngineDescription]) -> Vec<(&'static str, SeatKind)> {
-    table.iter().map(|row| (row.id, row.seat_kind)).collect()
 }
 
 /// The ids of the rows reached through `transport`.
@@ -173,6 +215,56 @@ pub fn runner_id_in(table: &[EngineDescription], id: &str) -> &'static str {
     cli_row_in(table, id).map_or(CLAUDE, |row| row.id)
 }
 
+/// A runner that fails every run with a fixed message. Stands in for an engine the owner asked for
+/// by name but has not enabled, so the daemon never answers with a different engine instead.
+struct RefusingRunner {
+    message: String,
+}
+
+#[async_trait::async_trait]
+impl CommandRunner for RefusingRunner {
+    async fn run_prompt(
+        &self,
+        _request: crate::execution::runner::RunRequest,
+        _session_tx: tokio::sync::mpsc::UnboundedSender<String>,
+        _transcript: Arc<std::sync::Mutex<String>>,
+    ) -> std::io::Result<crate::execution::runner::RunOutcome> {
+        Err(std::io::Error::other(self.message.clone()))
+    }
+}
+
+/// The runner the daemon launches runs with, from `primary_runner` in the models file.
+///
+/// `codex` builds the Codex runner; `agy` builds the agy runner while its opt-in is on and a
+/// refusing runner while it is off, never Claude; an absent or unknown name keeps the Claude CLI
+/// (an unknown one warns, so a typo does not take the daemon down).
+pub fn runner_for_primary(name: Option<&str>, models: &ModelsConfig) -> Arc<dyn CommandRunner> {
+    match name {
+        Some(CODEX) => {
+            tracing::info!(model = %models.codex_model, "codex CLI selected as the run runner");
+            codex_runner(models)
+        }
+        Some(AGY) => match agy::runner(models) {
+            Some(runner) => {
+                tracing::info!("agy CLI selected as the run runner");
+                runner
+            }
+            None => {
+                tracing::warn!("primary_runner is agy, but the agy engine is disabled in settings");
+                Arc::new(RefusingRunner {
+                    message: "primary_runner is agy, but the agy engine is disabled in settings"
+                        .to_string(),
+                })
+            }
+        },
+        Some(other) if other != CLAUDE => {
+            tracing::warn!(%other, "unknown primary_runner — keeping the Claude CLI");
+            claude_runner(models)
+        }
+        _ => claude_runner(models),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,7 +285,15 @@ mod tests {
         None
     }
 
-    /// The fourth engine of the "one description plus tests" proof. It lives only in this module
+    fn gate_open() -> bool {
+        true
+    }
+
+    fn gate_shut() -> bool {
+        false
+    }
+
+    /// The extra engine of the "one description plus tests" proof. It lives only in this module
     /// and reaches the lookups as part of a table argument; no production registration path.
     const EXTRA: EngineDescription = EngineDescription {
         id: "extra",
@@ -201,6 +301,7 @@ mod tests {
         seat_kind: SeatKind::Cloud,
         transport: Transport::Http,
         installed: always_installed,
+        gate: gate_open,
         utility_default: no_utility_default,
         runner: no_runner,
     };
@@ -212,22 +313,36 @@ mod tests {
     }
 
     #[test]
-    fn table_lists_claude_codex_local_with_expected_fields() {
+    fn table_lists_claude_codex_local_agy_with_expected_fields() {
+        assert_eq!(TABLE.len(), 4);
         let ids: Vec<&str> = TABLE.iter().map(|row| row.id).collect();
-        assert_eq!(ids, ["claude", "codex", "local"]);
+        assert_eq!(ids, ["claude", "codex", "local", "agy"]);
+        assert_eq!(AGY, "agy");
 
         let row = |id: &str| find_in(TABLE, id).expect("row present");
         assert_eq!(row("claude").display_name, "Claude");
         assert_eq!(row("codex").display_name, "Codex");
         assert_eq!(row("local").display_name, "Local");
+        assert!(!row("agy").display_name.is_empty());
 
         assert_eq!(row("claude").seat_kind, SeatKind::Cloud);
         assert_eq!(row("codex").seat_kind, SeatKind::Cloud);
         assert_eq!(row("local").seat_kind, SeatKind::Local);
+        // The config guard demands a seat kind for every row; agy is a cloud engine.
+        assert_eq!(row("agy").seat_kind, SeatKind::Cloud);
 
         assert_eq!(row("claude").transport, Transport::Cli);
         assert_eq!(row("codex").transport, Transport::Cli);
         assert_eq!(row("local").transport, Transport::Http);
+        assert_eq!(row("agy").transport, Transport::Cli);
+
+        // The three original engines are always on; agy answers to its opt-in setting, which is
+        // off by default.
+        assert!((row("claude").gate)());
+        assert!((row("codex").gate)());
+        assert!((row("local").gate)());
+        assert_eq!((row("agy").gate)(), agy::enabled());
+        assert!(!(row("agy").gate)());
 
         // Utility defaults keep their legacy values: Claude's alias, no cheap tier for Local.
         assert_eq!(
@@ -245,24 +360,21 @@ mod tests {
 
     #[test]
     fn derived_lists_follow_the_table() {
-        // Seat kinds: byte-identical to the legacy `ENGINE_SEAT_KINDS`.
+        // Seat kinds: `ENGINE_SEAT_KINDS` is the derived list and the only consumer.
         assert_eq!(
-            seat_kinds_in(TABLE),
+            crate::config::ENGINE_SEAT_KINDS.to_vec(),
             vec![
                 ("claude", SeatKind::Cloud),
                 ("codex", SeatKind::Cloud),
                 ("local", SeatKind::Local),
+                ("agy", SeatKind::Cloud),
             ]
-        );
-        assert_eq!(
-            seat_kinds_in(TABLE),
-            crate::config::ENGINE_SEAT_KINDS.to_vec()
         );
 
         // CLI runners (what `translatable_runners` iterates) are the CLI-transport rows.
         assert_eq!(
             ids_with_transport_in(TABLE, Transport::Cli),
-            ["claude", "codex"]
+            ["claude", "codex", "agy"]
         );
 
         // Installed engines: only rows whose probe says so, in table order.
@@ -270,11 +382,11 @@ mod tests {
         assert!(
             installed
                 .iter()
-                .all(|id| ["claude", "codex", "local"].contains(id))
+                .all(|id| ["claude", "codex", "local", "agy"].contains(id))
         );
 
         // Chat engines a conversation can name.
-        assert_eq!(chat_ids_in(TABLE), ["claude", "codex", "local"]);
+        assert_eq!(chat_ids_in(TABLE), ["claude", "codex", "local", "agy"]);
     }
 
     #[test]
@@ -311,8 +423,8 @@ mod tests {
         assert!(find_in(rows, "extra").is_some());
         assert!(find_in(TABLE, "extra").is_none());
         assert_eq!(
-            seat_kinds_in(rows).last(),
-            Some(&("extra", SeatKind::Cloud))
+            find_in(rows, "extra").map(|row| row.seat_kind),
+            Some(SeatKind::Cloud)
         );
         assert!(installed_in(rows).contains(&"extra"));
         assert!(chat_ids_in(rows).contains(&"extra"));
@@ -321,7 +433,47 @@ mod tests {
         assert!(ids_with_transport_in(rows, Transport::Http).contains(&"extra"));
         assert_eq!(runner_id_in(rows, "extra"), "claude");
         // The production table is untouched by the test row.
-        assert_eq!(TABLE.len(), 3);
+        assert_eq!(TABLE.len(), 4);
+    }
+
+    #[test]
+    fn gate_false_row_is_absent_from_every_derived_list() {
+        let mut rows: Vec<EngineDescription> = TABLE.to_vec();
+        rows.push(EngineDescription {
+            id: "gated",
+            display_name: "Gated",
+            seat_kind: SeatKind::Cloud,
+            transport: Transport::Cli,
+            installed: always_installed,
+            gate: gate_shut,
+            utility_default: no_utility_default,
+            runner: no_runner,
+        });
+        // The lookups still take the table (E3); the gate decides which rows reach them.
+        let enabled: Vec<EngineDescription> = enabled_in(&rows).into_iter().cloned().collect();
+        let enabled = enabled.as_slice();
+        assert!(find_in(enabled, "claude").is_some());
+        assert!(find_in(enabled, "gated").is_none());
+        assert!(!installed_in(enabled).contains(&"gated"));
+        assert!(!chat_ids_in(enabled).contains(&"gated"));
+        assert!(!ids_with_transport_in(enabled, Transport::Cli).contains(&"gated"));
+        assert_eq!(runner_id_in(enabled, "gated"), "claude");
+        // Without the gate the same row would have shown up everywhere.
+        assert!(installed_in(&rows).contains(&"gated"));
+
+        // The production table with agy's setting off (the default) loses agy and nothing else.
+        let ids: Vec<&str> = enabled_table().iter().map(|row| row.id).collect();
+        assert_eq!(ids, ["claude", "codex", "local"]);
+    }
+
+    #[test]
+    fn runner_id_in_keeps_agy_when_asked_even_if_disabled() {
+        // The single exception to "unknown collapses to claude": a stored `agy` is named, so the
+        // caller can refuse it, even while the gate is shut and agy is absent from the lists.
+        assert!(!agy::enabled());
+        assert_eq!(runner_id_in(TABLE, "agy"), "agy");
+        assert_eq!(runner_id_in(TABLE, "gemini"), "claude");
+        assert_eq!(runner_id_in(TABLE, "local"), "claude");
     }
 }
 
@@ -356,6 +508,7 @@ mod row_tests {
             seat_kind: SeatKind::Cloud,
             transport,
             installed,
+            gate: probe_true,
             utility_default: no_utility_default,
             runner: no_runner,
         }
@@ -385,9 +538,262 @@ mod row_tests {
         assert!(cli_row_in(rows, "extra-cli").is_some());
         assert_eq!(
             ids_with_transport_in(rows, Transport::Cli),
-            ["claude", "codex", "extra-cli"]
+            ["claude", "codex", "agy", "extra-cli"]
         );
         // The production table does not know the row: it collapses to claude.
         assert_eq!(runner_id_in(TABLE, "extra-cli"), "claude");
+    }
+}
+
+/// Shared fixtures for the tests that need agy's opt-in on or off, or a stand-in `agy` binary.
+///
+/// RED (plan Node 2, leaf D). The gate is turned on by publishing the real `AgyDoc` through the same
+/// settings snapshot the document is read from; there is no test-only registration path (E3).
+/// Lock order, for every test that uses both: the stand-in binary first (it takes
+/// `worktree::test_env_lock`), then the gate (it takes the settings serial lock).
+#[cfg(any(test, feature = "testkit"))]
+pub mod agy_test_support {
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+
+    use super::agy_setting::AgyDoc;
+    use crate::execution::runner::{CommandRunner, Permission, RunOutcome, RunRequest, ToolPolicy};
+    use crate::settings::testing::{self as settings_testing, Installed};
+    use crate::settings::{Scope, Settings, Snapshot};
+
+    /// Publishes a machine-scope `AgyDoc` and keeps it installed until the guard drops. `true` writes
+    /// the document the endpoint would store after an acknowledged enable; `false` is a stored `off`.
+    pub fn agy_gate(enabled: bool) -> Installed {
+        let document = AgyDoc {
+            enabled,
+            acknowledged_warning_version: enabled.then_some(super::agy::WARNING_VERSION),
+        };
+        let snapshot = Snapshot::default().with_document(&Scope::Machine, document);
+        settings_testing::install(Settings::from_snapshot(snapshot))
+    }
+
+    /// A stand-in `agy`, found through `NUCLEOS_AGY_BIN`: records its argv to `args.txt`, prints the
+    /// one-shot success JSON for `reply`. The real `agy` is never called.
+    pub struct FakeAgyBin {
+        dir: tempfile::TempDir,
+        previous: Option<OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl FakeAgyBin {
+        pub fn success(reply: &str) -> Self {
+            let lock = crate::execution::worktree::test_env_lock();
+            let dir = tempfile::tempdir().unwrap();
+            let body = serde_json::json!({
+                "conversation_id": "conv-fake",
+                "status": "SUCCESS",
+                "response": reply,
+                "duration_seconds": 0.5,
+                "num_turns": 1,
+                "usage": {
+                    "input_tokens": 5,
+                    "output_tokens": 7,
+                    "thinking_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "total_tokens": 12
+                }
+            })
+            .to_string();
+            std::fs::write(dir.path().join("out.json"), body).unwrap();
+            let program = write_script(dir.path());
+            let previous = std::env::var_os("NUCLEOS_AGY_BIN");
+            unsafe { std::env::set_var("NUCLEOS_AGY_BIN", &program) };
+            Self {
+                dir,
+                previous,
+                _lock: lock,
+            }
+        }
+
+        /// Whether the binary was launched at all (it writes `args.txt` first thing).
+        pub fn was_launched(&self) -> bool {
+            self.dir.path().join("args.txt").exists()
+        }
+
+        /// The argv the stand-in recorded, whitespace-normalised to single spaces. The Windows stand-in
+        /// writes one line and the Unix one writes one argument per line; this reads both the same way.
+        pub fn args(&self) -> String {
+            std::fs::read_to_string(self.dir.path().join("args.txt"))
+                .unwrap_or_default()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+    }
+
+    impl Drop for FakeAgyBin {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var("NUCLEOS_AGY_BIN", value),
+                    None => std::env::remove_var("NUCLEOS_AGY_BIN"),
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn write_script(dir: &Path) -> PathBuf {
+        let path = dir.join("agy.cmd");
+        let script =
+            "@echo off\r\necho %*> \"%~dp0args.txt\"\r\ntype \"%~dp0out.json\"\r\nexit /b 0\r\n";
+        std::fs::write(&path, script).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn write_script(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("agy.sh");
+        let script = "#!/bin/sh\nd=$(dirname \"$0\")\nprintf '%s\\n' \"$@\" > \"$d/args.txt\"\ncat \"$d/out.json\"\nexit 0\n";
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// A request with every control at its neutral value, as a chat turn would send it.
+    pub fn chat_request(prompt: &str) -> RunRequest {
+        RunRequest {
+            prompt: prompt.to_string(),
+            env: Vec::new(),
+            cwd: None,
+            permission: Permission::Default,
+            resume_session_id: None,
+            mcp_config: None,
+            mcp_job: None,
+            mcp_team_run: None,
+            tool_policy: ToolPolicy::McpOnly,
+            progress_timeout: None,
+            max_turns: None,
+            session_id: None,
+            fork_session: false,
+            include_partial_messages: false,
+            images: Vec::new(),
+            steerable: false,
+            classifier_governs_tools: false,
+            mcp_servers: Vec::new(),
+            model: None,
+            effort: None,
+            fallback_model: Vec::new(),
+            add_dirs: Vec::new(),
+            max_budget_usd: None,
+            agents: Vec::new(),
+            append_system_prompt: None,
+            denied_tools: Vec::new(),
+            session_name: None,
+            context_window: None,
+            messages: None,
+            request_tx: None,
+            allowed_mcp_tools: None,
+            background_tasks: false,
+        }
+    }
+
+    /// One run of `prompt` as a neutral chat request; see [`run_request`].
+    pub async fn run_once(runner: &dyn CommandRunner, prompt: &str) -> std::io::Result<RunOutcome> {
+        run_request(runner, chat_request(prompt)).await
+    }
+
+    /// One run of `request` through `runner`, with a minute's ceiling so a wedged stand-in fails the test.
+    pub async fn run_request(
+        runner: &dyn CommandRunner,
+        request: RunRequest,
+    ) -> std::io::Result<RunOutcome> {
+        let (session_tx, _session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let transcript = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            runner.run_prompt(request, session_tx, transcript),
+        )
+        .await
+        .expect("the run finished within a minute")
+    }
+}
+
+/// `runner_for_primary` and `RefusingRunner` (plan Node 2, test 32). They live here, not in
+/// `main.rs`, so they are unit-testable in the lib: the plan's `--bin nucleos-core` filter does not
+/// apply; the command is `cargo test -p nucleos-core --lib engines::primary_tests`.
+#[cfg(test)]
+mod primary_tests {
+    use super::agy_test_support::{FakeAgyBin, agy_gate, run_once};
+    use super::*;
+    use crate::execution::runner::extract_reply;
+
+    #[tokio::test]
+    async fn primary_runner_agy_gate_on_builds_agy_runner() {
+        let fake = FakeAgyBin::success("answered by the fake agy");
+        let _gate = agy_gate(true);
+
+        let runner = runner_for_primary(Some("agy"), &ModelsConfig::default());
+
+        // Not Claude and not Codex: neither of their markers is set.
+        assert!(!runner.honours_max_budget());
+        assert!(runner.codex_pins().is_none());
+        let outcome = run_once(runner.as_ref(), "hello")
+            .await
+            .expect("the agy runner spawned the stand-in");
+        assert_eq!(outcome.exit_code, 0, "{}", outcome.stderr);
+        assert_eq!(
+            extract_reply(&outcome.stdout).as_deref(),
+            Some("answered by the fake agy")
+        );
+        assert!(fake.was_launched());
+    }
+
+    #[tokio::test]
+    async fn primary_runner_agy_gate_off_builds_refusing_runner_naming_agy() {
+        // The binary is present and would work: the setting alone decides.
+        let fake = FakeAgyBin::success("must never be asked");
+        let _gate = agy_gate(false);
+
+        let runner = runner_for_primary(Some("agy"), &ModelsConfig::default());
+
+        // Never Claude: the Claude CLI's marker is absent.
+        assert!(!runner.honours_max_budget());
+        let error = run_once(runner.as_ref(), "hello")
+            .await
+            .expect_err("a refusing runner fails every run");
+        assert!(
+            error
+                .to_string()
+                .contains("primary_runner is agy, but the agy engine is disabled in settings"),
+            "{error}"
+        );
+        assert!(!fake.was_launched(), "the refusal never reaches the binary");
+    }
+
+    /// E16 F3: the helper agents, teams and council share to refuse unpinned work under an agy primary.
+    #[test]
+    fn refuse_agy_primary_names_agy_only_when_the_primary_is_agy() {
+        let with = |name: Option<&str>| ModelsConfig {
+            primary_runner: name.map(str::to_string),
+            ..ModelsConfig::default()
+        };
+        assert_eq!(refuse_agy_primary(&with(Some("agy"))), Err(AGY_REFUSAL));
+        assert_eq!(refuse_agy_primary(&with(None)), Ok(()));
+        assert_eq!(refuse_agy_primary(&with(Some("codex"))), Ok(()));
+        assert_eq!(refuse_agy_primary(&with(Some("claude"))), Ok(()));
+    }
+
+    #[test]
+    fn primary_runner_unknown_still_warns_and_uses_claude() {
+        let _gate = agy_gate(false);
+        let models = ModelsConfig::default();
+
+        // An unknown name keeps today's warn + Claude; so do an absent name and `claude` itself.
+        for name in [Some("gemini"), Some("claude"), None] {
+            let runner = runner_for_primary(name, &models);
+            assert!(runner.honours_max_budget(), "{name:?} is the Claude CLI");
+            assert!(runner.codex_pins().is_none(), "{name:?}");
+        }
+        // Codex is still Codex.
+        let codex = runner_for_primary(Some("codex"), &models);
+        assert!(codex.codex_pins().is_some());
+        assert!(!codex.honours_max_budget());
     }
 }

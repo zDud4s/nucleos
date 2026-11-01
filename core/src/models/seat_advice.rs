@@ -321,7 +321,8 @@ pub async fn suggest(
     let runners: Vec<RunnerKind> = match runner {
         // An engine the router does not hold has no globs, and a request without any is "any
         // model" to the router: nothing is asked.
-        Some(kind) if router.available(kind).is_none() => {
+        // Seats refuse agy (E8), so offering it only misleads: a named agy is treated as unknown.
+        Some(kind) if kind == RunnerKind::Agy || router.available(kind).is_none() => {
             return Err(format!(
                 "the model adviser does not know the {} engine here",
                 kind.as_str()
@@ -330,8 +331,13 @@ pub async fn suggest(
         Some(kind) => vec![kind],
         None => std::iter::once(router.primary.kind)
             .chain(router.alternates.iter().map(|available| available.kind))
+            .filter(|kind| *kind != RunnerKind::Agy)
             .collect(),
     };
+    // A request with no globs is "any model" to the router, so nothing is asked.
+    if runners.is_empty() {
+        return Err("the model adviser has no engine that can take a recruit here".to_owned());
+    }
     let sent = router.build_request(&seat_query(task), &runners);
     ask(&router, &sent, None, |advice| {
         router.check_answer(advice, &sent).map(|_| ())
@@ -868,6 +874,81 @@ mod tests {
             recruit_default(Some(apply), "codex", "s", "w", "p").await,
             None
         );
+        assert!(sent.try_recv().is_err(), "the router was asked");
+    }
+
+    /// E19 N3: a seat refuses agy, so `suggest` with no runner must not put agy (or its models) in the
+    /// request, whatever alternates the router holds.
+    #[tokio::test]
+    async fn suggest_never_offers_an_agy_model() {
+        let _gate = crate::engines::agy_test_support::agy_gate(true);
+        let (url, mut sent) = stub_router(200, answer("claude-opus-5", "high")).await;
+        let config = RouterConfig {
+            mode: Mode::Shadow,
+            url,
+            timeout_ms: 2500,
+            surfaces: [("recruit", Mode::Shadow)].into_iter().collect(),
+            ..RouterConfig::off()
+        };
+        let primary = Available {
+            kind: RunnerKind::Claude,
+            runner: Arc::new(crate::execution::runner::FakeCommandRunner::default()),
+            default_model: "claude-sonnet-5".into(),
+            models: vec!["claude-*".into()],
+        };
+        let agy = Available {
+            kind: RunnerKind::Agy,
+            runner: Arc::new(crate::execution::runner::FakeCommandRunner::default()),
+            default_model: "agy/gemini-3.8-flash-high".into(),
+            models: vec!["agy/*".into()],
+        };
+        let router = Arc::new(Router::new(config, primary, vec![agy]));
+        assert!(
+            router
+                .alternates
+                .iter()
+                .any(|available| available.kind == RunnerKind::Agy),
+            "the fixture must hold an agy alternate"
+        );
+
+        let _ = suggest(Some(Arc::clone(&router)), None, "task").await;
+
+        let body = sent.try_recv().expect("the router was asked");
+        let text = body.to_string();
+        assert!(!text.contains("agy"), "agy was offered: {text}");
+        assert!(text.contains("claude"), "{text}");
+
+        // An explicit agy runner is refused too, and nothing NEW reaches the router (the request
+        // above was drained by `try_recv`).
+        let refused = suggest(Some(router), Some(RunnerKind::Agy), "task").await;
+        assert!(refused.is_err(), "{refused:?}");
+        assert!(sent.try_recv().is_err(), "the router was asked for agy");
+    }
+
+    /// E20: with agy as the only engine the seat filter leaves no runner to offer, and a request
+    /// without model globs is "any model" to the router, so nothing is asked at all.
+    #[tokio::test]
+    async fn suggest_with_agy_as_the_only_engine_asks_nothing() {
+        let _gate = crate::engines::agy_test_support::agy_gate(true);
+        let (url, mut sent) = stub_router(200, answer("claude-opus-5", "high")).await;
+        let config = RouterConfig {
+            mode: Mode::Shadow,
+            url,
+            timeout_ms: 2500,
+            surfaces: [("recruit", Mode::Shadow)].into_iter().collect(),
+            ..RouterConfig::off()
+        };
+        let primary = Available {
+            kind: RunnerKind::Agy,
+            runner: Arc::new(crate::execution::runner::FakeCommandRunner::default()),
+            default_model: "agy/gemini-3.8-flash-high".into(),
+            models: vec!["agy/*".into()],
+        };
+        let router = Arc::new(Router::new(config, primary, Vec::new()));
+
+        let refused = suggest(Some(router), None, "task").await;
+
+        assert!(refused.is_err(), "{refused:?}");
         assert!(sent.try_recv().is_err(), "the router was asked");
     }
 

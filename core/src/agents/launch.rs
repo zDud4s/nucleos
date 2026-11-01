@@ -66,6 +66,20 @@ impl std::fmt::Display for LaunchError {
 
 impl std::error::Error for LaunchError {}
 
+/// An unpinned launch lands on the daemon's runner, which is agy under `primary_runner: agy`; agents
+/// never run on agy, so it is refused by name. A pinned launch is not touched here.
+fn refuse_unpinned_on_agy_primary(
+    label: &str,
+    pinned: bool,
+    models: &crate::config::ModelsConfig,
+) -> Result<(), LaunchError> {
+    if pinned {
+        return Ok(());
+    }
+    crate::engines::refuse_agy_primary(models)
+        .map_err(|why| LaunchError::NoRunner(format!("{label}: {why}")))
+}
+
 /// `runners = eligible ∩ translatable − braked`, in `eligible`'s order.
 pub fn narrow_runners(
     eligible: Vec<RunnerKind>,
@@ -136,12 +150,20 @@ fn plan_launch(
                 LaunchError::NoRunner(format!("{label} is pinned to unknown engine `{other}`"))
             })?,
         };
+        if engine == Engine::Agy {
+            return Err(LaunchError::NoRunner(format!(
+                "{label}: {}",
+                crate::engines::AGY_REFUSAL
+            )));
+        }
         let tools = capabilities::translate(engine, caps)
             .map_err(|why| LaunchError::Unsupported(label.to_owned(), why))?;
         let runners = match engine {
             Engine::Claude => vec![RunnerKind::Claude],
             Engine::Codex => vec![RunnerKind::Codex],
             Engine::Local => Vec::new(),
+            // Refused above; no runner is ever listed for agy.
+            Engine::Agy => Vec::new(),
         };
         return Ok(Plan {
             runners,
@@ -240,6 +262,11 @@ pub async fn resolve_agent_launch_with(
     } else {
         Vec::new()
     };
+    refuse_unpinned_on_agy_primary(
+        &label,
+        pinned.is_some(),
+        &crate::config::models_config_now(),
+    )?;
     let plan = plan_launch(&label, &caps, pinned, eligible, &braked)?;
 
     let (prompt, output) = if agent.is_package() {
@@ -378,6 +405,49 @@ mod tests {
             plan_launch("a", &[], Some(("gemini".into(), String::new())), None, &[]),
             Err(LaunchError::NoRunner(_))
         ));
+    }
+
+    #[test]
+    fn agent_launch_refuses_agy_by_name() {
+        // Pinned by the caller or by the agent row: the pin is where an engine name enters.
+        let pin = Some(("agy".to_owned(), "agy/gemini-3.8-flash-high".to_owned()));
+        let error = plan_launch("coder@1.0.0", &[McpNucleos], pin, None, &[]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("the agy engine is not available for agents, teams or council"),
+            "{error}"
+        );
+        // Not pinned: agy is never one of the runners a launch may narrow to, gate or no gate.
+        let plan = plan_launch("a", &[McpNucleos], None, None, &[]).unwrap();
+        assert!(!plan.runners.contains(&RunnerKind::Agy));
+    }
+
+    /// E16 F3: an unpinned launch under `primary_runner: agy` would land on the daemon's runner.
+    #[test]
+    fn unpinned_agent_refuses_an_agy_primary() {
+        let primary = |name: &str| crate::config::ModelsConfig {
+            primary_runner: Some(name.to_owned()),
+            ..crate::config::ModelsConfig::default()
+        };
+        let error =
+            refuse_unpinned_on_agy_primary("coder@1.0.0", false, &primary("agy")).unwrap_err();
+        assert!(matches!(error, LaunchError::NoRunner(_)), "{error:?}");
+        assert_eq!(
+            error.to_string(),
+            "coder@1.0.0: the agy engine is not available for agents, teams or council"
+        );
+        // A pin to another engine under an agy primary still launches.
+        assert!(refuse_unpinned_on_agy_primary("coder@1.0.0", true, &primary("agy")).is_ok());
+        assert!(refuse_unpinned_on_agy_primary("coder@1.0.0", false, &primary("claude")).is_ok());
+        assert!(
+            refuse_unpinned_on_agy_primary(
+                "coder@1.0.0",
+                false,
+                &crate::config::ModelsConfig::default()
+            )
+            .is_ok()
+        );
     }
 
     #[test]

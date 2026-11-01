@@ -446,6 +446,8 @@ impl Assistants for ConfiguredAssistants {
                 )) as std::sync::Arc<dyn crate::execution::runner::CommandRunner>
             }),
             crate::engines::CLAUDE => self.claude_cli.clone(),
+            // Not wired through `with_agent_clis`: agy needs no daemon-held state, only its opt-in.
+            crate::engines::AGY => crate::engines::agy::runner_for(pinned),
             _ => None,
         }
     }
@@ -1779,5 +1781,55 @@ mod tests {
             "a local engine this daemon refused must leave the route disabled — serving it from \
              the default engine would answer a turn from a server the operator did not name"
         );
+    }
+}
+
+/// `cli_runner` and the agy row (plan Node 2, test 33). RED: the `match row.id` has no agy arm yet,
+/// and `cli_row_in` is still handed the whole table instead of the enabled rows.
+#[cfg(test)]
+mod agy_runner_tests {
+    use super::*;
+    use crate::engines::agy_test_support::agy_gate;
+
+    const AGY_MODEL: &str = "agy/gemini-3.8-flash-high";
+
+    /// No Claude or Codex wired in: the agy runner must not depend on `with_agent_clis`.
+    async fn assistants() -> ConfiguredAssistants {
+        ConfiguredAssistants::new(
+            None,
+            None,
+            None,
+            "http://127.0.0.1:8791".to_string(),
+            "token".to_string(),
+            crate::testdb::fresh_pool().await,
+            crate::execution::runner::OLLAMA_BASE_URL.to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn cli_runner_returns_agy_runner_for_agy_row_when_on() {
+        let _gate = agy_gate(true);
+        let assistants = assistants().await;
+
+        for pinned in [Some(AGY_MODEL), None] {
+            let runner = assistants
+                .cli_runner("agy", pinned)
+                .unwrap_or_else(|| panic!("an enabled agy row has a runner (pinned {pinned:?})"));
+            // Neither the Claude CLI's marker nor Codex's.
+            assert!(!runner.honours_max_budget());
+            assert!(runner.codex_pins().is_none());
+        }
+        // The other rows are unchanged: no Claude or Codex was wired in, so none is handed out.
+        assert!(assistants.cli_runner("claude", None).is_none());
+        assert!(assistants.cli_runner("codex", None).is_none());
+    }
+
+    #[tokio::test]
+    async fn cli_runner_none_for_agy_row_when_off() {
+        let _gate = agy_gate(false);
+        let assistants = assistants().await;
+
+        assert!(assistants.cli_runner("agy", Some(AGY_MODEL)).is_none());
+        assert!(assistants.cli_runner("agy", None).is_none());
     }
 }

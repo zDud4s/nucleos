@@ -89,6 +89,16 @@ pub const ENGINE_SEAT_KINDS: &[(&str, SeatKind)] = &{
     out
 };
 
+/// The engine rows `list` (the hand-written `nucleos_base::agent::ENGINES`) leaves out, in table
+/// order. The guard test fails on a non-empty answer, naming the rows.
+pub fn engines_missing_from(list: &[&str]) -> Vec<&'static str> {
+    ENGINE_SEAT_KINDS
+        .iter()
+        .map(|(id, _)| *id)
+        .filter(|id| !list.contains(id))
+        .collect()
+}
+
 /// PURE: where an agent of the catalogue would run, or `None` for an engine no seat can host.
 pub fn seat_kind_for_engine(engine: &str) -> Option<SeatKind> {
     ENGINE_SEAT_KINDS

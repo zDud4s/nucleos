@@ -55,6 +55,8 @@ fn runner_of(engine: Engine) -> Option<RunnerKind> {
         Engine::Claude => Some(RunnerKind::Claude),
         Engine::Codex => Some(RunnerKind::Codex),
         Engine::Local => None,
+        // Never launches: `pin_of` refuses agy by name before this is asked.
+        Engine::Agy => None,
     }
 }
 
@@ -70,6 +72,12 @@ fn pin_of(
     let Some((engine, model)) = pin else {
         return Ok(None);
     };
+    if engine == Engine::Agy {
+        return Err(LaunchRefused::Unavailable(format!(
+            "{label}: {}",
+            crate::engines::AGY_REFUSAL
+        )));
+    }
     let Some(runner) = runner_of(engine) else {
         return Err(LaunchRefused::Unavailable(format!(
             "{label} is pinned to the local engine, which a workflow node cannot run on"
