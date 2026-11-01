@@ -217,6 +217,60 @@ mod tests {
         assert_eq!(ChatEngine::from_stored("agy"), None);
     }
 
+    fn zed_installed() -> bool {
+        true
+    }
+
+    fn zed_utility(_known: &[crate::models::model_catalog::Discovered]) -> Option<String> {
+        None
+    }
+
+    fn zed_runner(
+        _models: &ModelsConfig,
+    ) -> Option<std::sync::Arc<dyn crate::execution::runner::CommandRunner>> {
+        None
+    }
+
+    /// AC3: a row only the table argument lists is itself, not Claude. The row is built from the
+    /// public fields of `EngineDescription`, so nothing here needs a `cfg(test)` item of the core
+    /// crate; the lookups take the table as an argument.
+    #[test]
+    fn of_cli_in_and_from_stored_in_keep_unknown_row() {
+        use crate::engines::{EngineDescription, TABLE, Transport};
+
+        let mut rows: Vec<EngineDescription> = TABLE.to_vec();
+        rows.push(EngineDescription {
+            id: "zed",
+            display_name: "Zed",
+            seat_kind: crate::config::SeatKind::Cloud,
+            transport: Transport::Cli,
+            installed: zed_installed,
+            gate: zed_installed,
+            utility_default: zed_utility,
+            runner: zed_runner,
+        });
+        let rows = rows.as_slice();
+
+        // A CLI row of the table passed in maps to itself.
+        let zed = ChatEngine::of_cli_in(rows, "zed");
+        assert_eq!(zed.as_str(), "zed");
+        assert_ne!(zed, ChatEngine::Claude);
+        assert_ne!(zed, ChatEngine::Agy);
+        // Known rows are unchanged, and an unknown string still collapses to claude.
+        assert_eq!(ChatEngine::of_cli_in(rows, "codex"), ChatEngine::Codex);
+        assert_eq!(ChatEngine::of_cli_in(rows, "gemini"), ChatEngine::Claude);
+        // The production table does not list it.
+        assert_eq!(ChatEngine::of_cli_in(TABLE, "zed"), ChatEngine::Claude);
+
+        // A stored id the table lists is a chat engine of that text; one it lacks is `None`.
+        let stored = ChatEngine::from_stored_in(rows, "zed").expect("zed is listed");
+        assert_eq!(stored.as_str(), "zed");
+        assert_eq!(stored, zed);
+        assert_eq!(ChatEngine::from_stored_in(rows, "claude"), Some(ChatEngine::Claude));
+        assert_eq!(ChatEngine::from_stored_in(rows, "gemini"), None);
+        assert_eq!(ChatEngine::from_stored_in(TABLE, "zed"), None);
+    }
+
     /// RED (plan Node 3, test 7; contract E22). The Gemini API route is a chat engine of its own
     /// (`ChatEngine::GeminiApi`, the provider read from the `gemini-api/` id prefix on the hosted
     /// brain) and every control that needs a CLI, agents, teams, council or quota is refused by

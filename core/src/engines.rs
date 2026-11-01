@@ -661,6 +661,128 @@ mod tests {
         assert_eq!(runner_id_in(TABLE, "gemini"), "claude");
         assert_eq!(runner_id_in(TABLE, "local"), "claude");
     }
+
+    /// A CLI row no production code names: the stand-in for "a new engine".
+    fn zed_cli_row() -> EngineDescription {
+        EngineDescription {
+            id: "zed",
+            display_name: "Zed",
+            seat_kind: SeatKind::Cloud,
+            transport: Transport::Cli,
+            installed: always_installed,
+            gate: gate_open,
+            utility_default: no_utility_default,
+            runner: no_runner,
+        }
+    }
+
+    /// AC1: the id flip leaves every stored text, the ordering and the Debug text as they were.
+    #[test]
+    fn engine_ids_keep_stored_text_order_and_debug() {
+        use crate::agents::capabilities::Engine;
+        use crate::models::route_advice::RunnerKind;
+
+        // Stored text of every named const.
+        assert_eq!(Engine::Claude.as_str(), "claude");
+        assert_eq!(Engine::Codex.as_str(), "codex");
+        assert_eq!(Engine::Local.as_str(), "local");
+        assert_eq!(Engine::Agy.as_str(), "agy");
+        assert_eq!(RunnerKind::Claude.as_str(), "claude");
+        assert_eq!(RunnerKind::Codex.as_str(), "codex");
+        assert_eq!(RunnerKind::Agy.as_str(), "agy");
+
+        // Parse round trip through the production table.
+        assert_eq!(Engine::parse_in(TABLE, "claude"), Some(Engine::Claude));
+        assert_eq!(Engine::parse_in(TABLE, "codex"), Some(Engine::Codex));
+        assert_eq!(Engine::parse_in(TABLE, "local"), Some(Engine::Local));
+        assert_eq!(Engine::parse_in(TABLE, "agy"), Some(Engine::Agy));
+        assert_eq!(Engine::parse_in(TABLE, "gemini-api"), None);
+        assert_eq!(Engine::parse_in(TABLE, ""), None);
+        assert_eq!(RunnerKind::parse("claude"), Some(RunnerKind::Claude));
+        assert_eq!(RunnerKind::parse("codex"), Some(RunnerKind::Codex));
+        assert_eq!(RunnerKind::parse("agy"), Some(RunnerKind::Agy));
+        assert_eq!(RunnerKind::parse("local"), None);
+
+        // Ordering follows the table: Claude < Codex < Agy.
+        assert!(RunnerKind::Claude < RunnerKind::Codex);
+        assert!(RunnerKind::Codex < RunnerKind::Agy);
+        let mut kinds = vec![RunnerKind::Agy, RunnerKind::Claude, RunnerKind::Codex];
+        kinds.sort();
+        assert_eq!(
+            kinds,
+            [RunnerKind::Claude, RunnerKind::Codex, RunnerKind::Agy]
+        );
+        assert!(EngineId::named("claude") < EngineId::named("codex"));
+        assert!(EngineId::named("local") < EngineId::named("agy"));
+
+        // Debug prints the capitalised id.
+        for (id, want) in [
+            ("claude", "Claude"),
+            ("codex", "Codex"),
+            ("local", "Local"),
+            ("agy", "Agy"),
+        ] {
+            let named = EngineId::named(id).expect("a table row");
+            assert_eq!(format!("{named:?}"), want);
+        }
+    }
+
+    /// AC2: every named const is a row of the production table.
+    #[test]
+    fn named_consts_are_table_rows() {
+        use crate::agents::capabilities::Engine;
+        use crate::models::route_advice::RunnerKind;
+
+        for (engine, id) in [
+            (Engine::Claude, "claude"),
+            (Engine::Codex, "codex"),
+            (Engine::Local, "local"),
+            (Engine::Agy, "agy"),
+        ] {
+            assert_eq!(engine.as_str(), id);
+            assert_eq!(find_in(TABLE, id).map(|row| row.id), Some(id));
+        }
+        for (kind, id) in [
+            (RunnerKind::Claude, "claude"),
+            (RunnerKind::Codex, "codex"),
+            (RunnerKind::Agy, "agy"),
+        ] {
+            assert_eq!(kind.as_str(), id);
+            assert_eq!(
+                cli_row_in(TABLE, id).map(|row| row.id),
+                Some(id),
+                "{id} is a CLI row"
+            );
+        }
+        // The kind and the engine of one row carry the same text.
+        assert_eq!(Engine::from(RunnerKind::Agy).as_str(), "agy");
+        assert_eq!(Engine::from(RunnerKind::Codex), Engine::Codex);
+    }
+
+    /// AC3: a CLI row the production code never names is itself, not Claude.
+    #[test]
+    fn fake_cli_row_round_trips_and_is_not_claude() {
+        use crate::agents::capabilities::Engine;
+        use crate::models::route_advice::RunnerKind;
+
+        let mut rows: Vec<EngineDescription> = TABLE.to_vec();
+        rows.push(zed_cli_row());
+        let rows = rows.as_slice();
+
+        let zed = Engine::parse_in(rows, "zed").expect("a CLI row of the table passed in");
+        assert_eq!(zed.as_str(), "zed");
+        assert_ne!(zed, Engine::Claude);
+        assert_ne!(zed, Engine::Agy);
+        // The production table does not list it.
+        assert_eq!(Engine::parse_in(TABLE, "zed"), None);
+
+        // Its runner kind converts to the engine of the same text.
+        let kind = RunnerKind::for_test("zed");
+        assert_eq!(kind.as_str(), "zed");
+        assert_eq!(Engine::from(kind), zed);
+        assert_eq!(Engine::from(kind).as_str(), "zed");
+        assert_ne!(Engine::from(kind), Engine::Claude);
+    }
 }
 
 #[cfg(test)]
@@ -1039,5 +1161,65 @@ mod primary_tests {
         let codex = runner_for_primary(Some("codex"), &models);
         assert!(codex.codex_pins().is_some());
         assert!(!codex.honours_max_budget());
+    }
+
+    fn zed_none_runner(_models: &ModelsConfig) -> Option<Arc<dyn CommandRunner>> {
+        None
+    }
+
+    fn zed_utility(_known: &[crate::models::model_catalog::Discovered]) -> Option<String> {
+        None
+    }
+
+    fn zed_probe() -> bool {
+        true
+    }
+
+    /// A CLI row "zed" whose runner constructor gives `None`, in a table of its own.
+    fn zed_table() -> Vec<EngineDescription> {
+        let mut rows: Vec<EngineDescription> = TABLE.to_vec();
+        rows.push(EngineDescription {
+            id: "zed",
+            display_name: "Zed",
+            seat_kind: crate::config::SeatKind::Cloud,
+            transport: Transport::Cli,
+            installed: zed_probe,
+            gate: zed_probe,
+            utility_default: zed_utility,
+            runner: zed_none_runner,
+        });
+        rows
+    }
+
+    /// AC5: a known row whose runner is `None` is refused by name, never answered by Claude.
+    #[tokio::test]
+    async fn runner_for_primary_in_known_row_without_runner_is_refused_by_name() {
+        let rows = zed_table();
+        let runner = runner_for_primary_in(&rows, Some("zed"), &ModelsConfig::default());
+
+        assert!(!runner.honours_max_budget(), "not the Claude CLI");
+        assert!(runner.codex_pins().is_none());
+        let error = super::agy_test_support::run_once(runner.as_ref(), "hello")
+            .await
+            .expect_err("a refusing runner fails every run");
+        assert!(
+            error
+                .to_string()
+                .contains("primary_runner is zed, but the zed engine is disabled in settings"),
+            "{error}"
+        );
+    }
+
+    /// AC5: a name the table does not know keeps Claude (the warning is logged, not asserted).
+    #[test]
+    fn runner_for_primary_in_unknown_name_keeps_claude() {
+        let rows = zed_table();
+        // "zed" is absent from the production table, so it is unknown there.
+        let runner = runner_for_primary_in(TABLE, Some("zed"), &ModelsConfig::default());
+        assert!(runner.honours_max_budget(), "the Claude CLI");
+        assert!(runner.codex_pins().is_none());
+        // The same name is known in the table that lists it.
+        let known = runner_for_primary_in(&rows, Some("zed"), &ModelsConfig::default());
+        assert!(!known.honours_max_budget());
     }
 }
