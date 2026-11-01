@@ -546,6 +546,9 @@ pub(super) const IDE_SESSIONS_SHOWN: usize = 40;
 #[derive(serde::Deserialize)]
 pub(super) struct ModelsQuery {
     pub(super) chat: Option<String>,
+    /// `chat` asks for the chat menu without naming a chat (the front door, before a chat exists).
+    /// Any other value, or none, is the daemon menu: an unknown scope never widens the answer.
+    pub(super) scope: Option<String>,
 }
 
 /// Which models a conversation may be moved to, and how hard each can be asked to think.
@@ -565,9 +568,10 @@ pub(super) async fn get_assistant_models(
     State(state): State<AppState>,
     Query(query): Query<ModelsQuery>,
 ) -> Json<serde_json::Value> {
-    let asking = match query.chat {
-        Some(_) => Asking::Chat,
-        None => Asking::Daemon,
+    let asking = if query.chat.is_some() || query.scope.as_deref() == Some("chat") {
+        Asking::Chat
+    } else {
+        Asking::Daemon
     };
     let (config, choices) = menu(asking).await;
 
