@@ -43,6 +43,7 @@ mod common;
 mod email;
 mod files;
 mod fleet;
+mod fs;
 mod git_ops;
 mod hooks;
 mod judging;
@@ -134,6 +135,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(email::routes())
         .merge(files::routes())
         .merge(fleet::routes())
+        .merge(fs::routes())
         .merge(crate::fleet::route::routes())
         .merge(git_ops::routes())
         .merge(hooks::routes())

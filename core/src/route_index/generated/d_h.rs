@@ -257,6 +257,13 @@ pub(super) const ROUTES: &[RouteEntry] = &[
     },
     RouteEntry {
         method: "GET",
+        path: "/fs/dirs",
+        purpose: "Lists directories on the tower for the remote path picker.",
+        body: Body::None,
+        handler: "get_dirs",
+    },
+    RouteEntry {
+        method: "GET",
         path: "/github/declarable-ops",
         purpose: "The catalogue `POST /projects/{id}/github-ops` validates against, read out loud.",
         body: Body::None,

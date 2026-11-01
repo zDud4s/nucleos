@@ -155,6 +155,7 @@ the contract, not a snapshot.
 | `http/email.rs` | Mail, contacts and calendar (`/email/*`, `/contacts/*`, `/calendar/*`). |
 | `http/files.rs` | The shared files area (`/files/*`). |
 | `http/fleet.rs` | Autopilot state, kill switches, quota and fleet capacity (`/autopilot/*`, `/quota`, `/fleet/*`, `/concurrency`). |
+| `http/fs.rs` | Owner-only directory browsing for a remote browser (`/fs/dirs`), limited to directory names and metadata. |
 | `http/git_ops.rs` | Declared git and GitHub operations and land targets (`/projects/{id}/git-ops`, `/github-ops`, `/land-targets`, `/github/*`). |
 | `http/hooks.rs` | Claude Code hook decisions (`/hooks/*`). |
 | `http/judging.rs` | Shadow decisions, judge verdicts and the scoreboard (`/shadow-decisions/*`, `/judge-*`, `/scoreboard`, `/verify/*`). |

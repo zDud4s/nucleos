@@ -741,6 +741,7 @@ const REMOTE_DENIED_SEGMENTS: &[&str] = &[
     "config",
     "context",
     "daemon",
+    "fs",
     "hooks",
     "models",
     "nodes",
@@ -774,6 +775,7 @@ const REMOTE_OWNER_SEGMENTS: &[&str] = &[
     "backup",
     "config",
     "daemon",
+    "fs",
     "sidecars",
     "system",
     "remote",
@@ -2068,6 +2070,7 @@ mod tests {
         ("GET", "/backups"),
         ("POST", "/backups/{name}/restore"),
         ("POST", "/sidecars/{name}/restart"),
+        ("GET", "/fs/dirs"),
         ("POST", "/channels/{channel}/pairing"),
         ("GET", "/browser/sessions/{id}/live"),
         ("POST", "/remote/pairing-codes"),
@@ -2134,6 +2137,25 @@ mod tests {
                     "{level:?} with the owner flag {method} {route}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn fs_dirs_is_refused_to_an_admin_device() {
+        let route = "/fs/dirs";
+
+        assert!(owner_permits(&Method::GET, route));
+        for level in ALL_LEVELS {
+            assert!(
+                !remote_device_permits(level, &Method::GET, route),
+                "{level:?} must not browse the tower"
+            );
+        }
+        for scope in [Scope::Run(7), Scope::Service(Service::Remote)] {
+            assert!(
+                !permits(&scope, &Method::GET, route),
+                "{scope:?} must not browse the tower"
+            );
         }
     }
 
