@@ -902,6 +902,9 @@ pub fn remote_device_permits(
     false
 }
 
+mod grave;
+pub use grave::{GRAVE_ROUTES, is_grave};
+
 /// Request extension set when the caller is a paired remote device: which one. Handlers that need
 /// to know (logout) read this instead of trusting a body.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -909,9 +912,9 @@ pub struct RemoteDevice {
     pub id: i64,
     /// An owner device (Admin level with the owner flag): see [`REMOTE_OWNER_SEGMENTS`].
     pub owner: bool,
-    /// The owner confirmed this request with a fresh step-up. Nothing sets it yet (always false):
-    /// the step-up arrives in a later task, and until then every device keeps the settings
-    /// command-field refusal.
+    /// The session holds a live step-up (`remote_devices.stepup_until` in the future), read by
+    /// `remote::authenticate` on this very request. Grave routes need it ([`GRAVE_ROUTES`]) and so
+    /// does a settings command-field change.
     pub stepped_up: bool,
 }
 
@@ -1525,7 +1528,7 @@ pub async fn require_token(
                 device = Some(RemoteDevice {
                     id: found.id,
                     owner: found.owner,
-                    stepped_up: false,
+                    stepped_up: found.stepped_up,
                 });
             }
             Err(_) => return Ok(session_invalid()),
@@ -1629,6 +1632,28 @@ pub async fn require_token(
             "refused a request outside the caller's scope"
         );
         return Err(StatusCode::FORBIDDEN);
+    }
+    // A grave action needs a live step-up from the device. Only a device is asked: every other
+    // caller has `device == None` and passes untouched. Graded after the reach check, so a route
+    // the device may not reach at all stays a bodiless 403.
+    if let Some(found) = &device
+        && !found.stepped_up
+        && is_grave(
+            req.method(),
+            route.as_deref().unwrap_or_else(|| req.uri().path()),
+        )
+    {
+        tracing::warn!(
+            device = found.id,
+            method = %req.method(),
+            path = %req.uri().path(),
+            "refused a grave action without a fresh step-up"
+        );
+        return Ok((
+            StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({ "refusal": "step_up_required" })),
+        )
+            .into_response());
     }
 
     // Any admitted request of a channel key is a sign of life for that adapter, not only the
@@ -2131,6 +2156,12 @@ mod tests {
             .await
             .ok()
             .unwrap();
+        // `/daemon/shutdown` is a grave route: the owner needs a live step-up to get through it.
+        assert!(
+            crate::remote::grant_step_up(&state.pool, owner.device_id, now)
+                .await
+                .unwrap()
+        );
         let app = protected_router(state);
 
         let (status, _) =
@@ -2139,6 +2170,261 @@ mod tests {
         let (status, _) =
             send_with_session(&app, "POST", "/daemon/shutdown", &key, Some(&owner.session)).await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    /// An owner device paired the ordinary way (a code minted with the owner flag).
+    async fn pair_owner(
+        state: &AppState,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> crate::remote::Paired {
+        let created = crate::remote::create_pairing_code_for(
+            &state.pool,
+            ApiTokenLevel::Admin,
+            true,
+            "laptop",
+            now,
+        )
+        .await
+        .unwrap();
+        crate::remote::exchange(&state.pool, &created.code, now)
+            .await
+            .ok()
+            .unwrap()
+    }
+
+    /// Every entry of `GRAVE_ROUTES` mounted behind the gate, plus one owner route that is not
+    /// grave. `{param}` segments are filled with a literal when a request is built.
+    fn grave_router(state: AppState) -> Router {
+        let mut router = Router::new().route("/sidecars/{name}/restart", post(|| async {}));
+        for (method, route) in GRAVE_ROUTES {
+            let filter = axum::routing::MethodFilter::try_from(method.clone()).unwrap();
+            router = router.route(route, axum::routing::on(filter, || async {}));
+        }
+        router
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                require_token,
+            ))
+            .with_state(state)
+    }
+
+    fn concrete(route: &str) -> String {
+        route
+            .split('/')
+            .map(|part| if is_param(part) { "1" } else { part })
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    #[tokio::test]
+    async fn a_grave_route_without_step_up_is_refused() {
+        let state = test_state("control-token").await;
+        let key = mint_service_token(&state.pool, Service::Remote)
+            .await
+            .unwrap();
+        let owner = pair_owner(&state, chrono::Utc::now()).await;
+        let app = grave_router(state);
+
+        for (method, route) in GRAVE_ROUTES {
+            let (status, body) = send_with_session(
+                &app,
+                method.as_str(),
+                &concrete(route),
+                &key,
+                Some(&owner.session),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {route}");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+                serde_json::json!({ "refusal": "step_up_required" }),
+                "{method} {route}"
+            );
+        }
+        // A route that is not grave is not asked for the step-up.
+        let (status, _) = send_with_session(
+            &app,
+            "POST",
+            "/sidecars/echo/restart",
+            &key,
+            Some(&owner.session),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn step_up_opens_every_grave_route_for_five_minutes() {
+        let state = test_state("control-token").await;
+        let key = mint_service_token(&state.pool, Service::Remote)
+            .await
+            .unwrap();
+        let owner = pair_owner(&state, chrono::Utc::now()).await;
+        assert!(
+            crate::remote::grant_step_up(&state.pool, owner.device_id, chrono::Utc::now())
+                .await
+                .unwrap()
+        );
+        let (until,): (String,) =
+            sqlx::query_as("SELECT stepup_until FROM remote_devices WHERE id = ?")
+                .bind(owner.device_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        let until = chrono::DateTime::parse_from_rfc3339(&until).unwrap();
+        let ahead = until.with_timezone(&chrono::Utc) - chrono::Utc::now();
+        assert!(
+            ahead > chrono::Duration::minutes(4) && ahead <= crate::remote::STEP_UP_WINDOW,
+            "the window is five minutes, got {ahead}"
+        );
+        let app = grave_router(state);
+
+        for (method, route) in GRAVE_ROUTES {
+            let (status, body) = send_with_session(
+                &app,
+                method.as_str(),
+                &concrete(route),
+                &key,
+                Some(&owner.session),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{method} {route}: {body}");
+        }
+    }
+
+    /// Past, malformed and implausibly distant `stepup_until` values all read as "not stepped up".
+    #[tokio::test]
+    async fn step_up_expires() {
+        let state = test_state("control-token").await;
+        let key = mint_service_token(&state.pool, Service::Remote)
+            .await
+            .unwrap();
+        let owner = pair_owner(&state, chrono::Utc::now()).await;
+        let app = grave_router(state.clone());
+        let now = chrono::Utc::now();
+
+        let stamps = [
+            (now - chrono::Duration::seconds(1)).to_rfc3339(),
+            (now - chrono::Duration::days(1)).to_rfc3339(),
+            (now + chrono::Duration::days(365)).to_rfc3339(),
+            "not a date".to_owned(),
+            String::new(),
+        ];
+        for stamp in stamps {
+            sqlx::query("UPDATE remote_devices SET stepup_until = ? WHERE id = ?")
+                .bind(&stamp)
+                .bind(owner.device_id)
+                .execute(&state.pool)
+                .await
+                .unwrap();
+            let (status, body) =
+                send_with_session(&app, "POST", "/daemon/shutdown", &key, Some(&owner.session))
+                    .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{stamp:?}");
+            assert!(body.contains("step_up_required"), "{stamp:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_new_session_does_not_inherit_step_up() {
+        let state = test_state("control-token").await;
+        let key = mint_service_token(&state.pool, Service::Remote)
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        let first = pair_owner(&state, now).await;
+        crate::remote::grant_step_up(&state.pool, first.device_id, now)
+            .await
+            .unwrap();
+        // Logging in again is a new pairing: a new row, a new session, nothing carried over.
+        let second = pair_owner(&state, now).await;
+        assert_ne!(first.device_id, second.device_id);
+        let app = grave_router(state);
+
+        let (status, _) =
+            send_with_session(&app, "POST", "/daemon/shutdown", &key, Some(&first.session)).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, body) = send_with_session(
+            &app,
+            "POST",
+            "/daemon/shutdown",
+            &key,
+            Some(&second.session),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.contains("step_up_required"));
+    }
+
+    #[tokio::test]
+    async fn the_desktop_shell_is_never_asked_for_step_up() {
+        let state = test_state("control-token").await;
+        let app = grave_router(state);
+
+        for (method, route) in GRAVE_ROUTES {
+            let (status, body) = send_with_session(
+                &app,
+                method.as_str(),
+                &concrete(route),
+                "control-token",
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{method} {route}: {body}");
+        }
+    }
+
+    /// Every entry names a route the daemon really registers, with that method: the table cannot
+    /// drift into protecting a path nobody serves while the real one is left open. Read from the
+    /// production source the way `every_route_prefix_is_classified_for_remote_devices` reads it.
+    #[test]
+    fn every_grave_route_is_a_registered_route() {
+        fn walk(dir: &std::path::Path, found: &mut Vec<(String, String)>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, found);
+                    continue;
+                }
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                if path.extension().is_none_or(|e| e != "rs") || name.contains("conformance") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).unwrap();
+                let cut = source
+                    .match_indices("#[cfg(test)]")
+                    .find(|(at, attr)| source[at + attr.len()..].trim_start().starts_with("mod "))
+                    .map_or(source.len(), |(at, _)| at);
+                for part in source[..cut].split(".route(").skip(1) {
+                    let Some(literal) = part.trim_start().strip_prefix('"') else {
+                        continue;
+                    };
+                    let Some((route, rest)) = literal.split_once('"') else {
+                        continue;
+                    };
+                    // The handlers of this route: up to the next `.route(` (cut by the split) and
+                    // no further than the end of the function that builds the router.
+                    let handlers = rest.split("\n}").next().unwrap_or(rest);
+                    found.push((route.to_owned(), handlers.to_owned()));
+                }
+            }
+        }
+
+        let mut found = Vec::new();
+        walk(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut found,
+        );
+        assert!(found.len() > 50, "the route scan found too little");
+        for (method, route) in GRAVE_ROUTES {
+            let call = format!("{}(", method.as_str().to_ascii_lowercase());
+            assert!(
+                found
+                    .iter()
+                    .any(|(path, handlers)| path == route && handlers.contains(&call)),
+                "{method} {route} is in GRAVE_ROUTES but no `.route(\"{route}\", ..{call}..)` registers it"
+            );
+        }
     }
 
     #[tokio::test]

@@ -32,6 +32,8 @@ pub const SESSION_ABSOLUTE: Duration = Duration::days(30);
 pub const SESSION_IDLE: Duration = Duration::days(14);
 /// `last_seen_at` is written at most this often per device.
 pub const LAST_SEEN_GRANULARITY: Duration = Duration::seconds(60);
+/// How long a step-up confirmation opens the grave routes (`auth::GRAVE_ROUTES`).
+pub const STEP_UP_WINDOW: Duration = Duration::minutes(5);
 
 /// The machine-config file, under `~/.nucleos`, that arms remote access.
 pub const REMOTE_FILE: &str = "remote.yaml";
@@ -261,6 +263,9 @@ pub struct Device {
     pub expires_at: String,
     /// An owner device: Admin level with the owner flag. Never true for another level.
     pub owner: bool,
+    /// The session holds a live step-up: `stepup_until` is in the future and no further away than
+    /// [`STEP_UP_WINDOW`]. Anything else in the column (absent, unparseable, too far ahead) is false.
+    pub stepped_up: bool,
 }
 
 #[derive(Debug)]
@@ -295,6 +300,7 @@ type DeviceRow = (
     Option<String>,
     Option<String>,
     i64,
+    Option<String>,
 );
 
 /// Looks a session secret up and checks it is revoked, expired or idle for none of the reasons.
@@ -305,13 +311,15 @@ pub async fn authenticate(
     now: DateTime<Utc>,
 ) -> Result<Device, SessionError> {
     let row: Option<DeviceRow> = sqlx::query_as(
-        "SELECT id, name, access_level, created_at, last_seen_at, revoked_at, owner \
+        "SELECT id, name, access_level, created_at, last_seen_at, revoked_at, owner, stepup_until \
          FROM remote_devices WHERE session_hash = ?",
     )
     .bind(hash_secret(session_secret))
     .fetch_optional(pool)
     .await?;
-    let Some((id, name, level_text, created_text, seen_text, revoked, owner_flag)) = row else {
+    let Some((id, name, level_text, created_text, seen_text, revoked, owner_flag, stepup_text)) =
+        row
+    else {
         return Err(SessionError::Invalid);
     };
     if revoked.is_some() {
@@ -334,13 +342,39 @@ pub async fn authenticate(
             .execute(pool)
             .await?;
     }
+    // Fail closed: a missing, malformed or implausibly distant value is "not stepped up". Only
+    // `grant_step_up` writes the column, always `now + STEP_UP_WINDOW`, so a value further ahead
+    // than the window was not written by it.
+    let stepped_up = stepup_text
+        .as_deref()
+        .and_then(parse_stamp)
+        .is_some_and(|until| until > now && until <= now + STEP_UP_WINDOW);
     Ok(Device {
         id,
         name,
         level,
         expires_at: stamp(created + SESSION_ABSOLUTE),
         owner: owner_flag != 0 && level == ApiTokenLevel::Admin,
+        stepped_up,
     })
+}
+
+/// Opens the step-up window of one device's session: `stepup_until = now + STEP_UP_WINDOW`. False
+/// when no live (unrevoked) device has that id. The caller has already proved the owner's
+/// confirmation.
+pub async fn grant_step_up(
+    pool: &SqlitePool,
+    device_id: i64,
+    now: DateTime<Utc>,
+) -> Result<bool, sqlx::Error> {
+    let done = sqlx::query(
+        "UPDATE remote_devices SET stepup_until = ? WHERE id = ? AND revoked_at IS NULL",
+    )
+    .bind(stamp(now + STEP_UP_WINDOW))
+    .bind(device_id)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected() == 1)
 }
 
 /// A device as the owner sees it. Carries no hash and no secret.
@@ -357,7 +391,17 @@ pub struct DeviceInfo {
 
 /// Every device ever paired, newest first.
 pub async fn list_devices(pool: &SqlitePool) -> Result<Vec<DeviceInfo>, sqlx::Error> {
-    let rows: Vec<DeviceRow> = sqlx::query_as(
+    // Step-up state is deliberately not selected: the listing never exposes it.
+    type ListRow = (
+        i64,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        i64,
+    );
+    let rows: Vec<ListRow> = sqlx::query_as(
         "SELECT id, name, access_level, created_at, last_seen_at, revoked_at, owner \
          FROM remote_devices ORDER BY id DESC",
     )
@@ -787,5 +831,60 @@ mod tests {
         assert!(slow.validate().is_ok());
 
         assert!(RemoteConfig::parse("enabled: [").is_err());
+    }
+
+    #[tokio::test]
+    async fn step_up_lasts_exactly_the_window_and_a_new_pairing_starts_without_one() {
+        let pool = pool().await;
+        let first = paired(&pool, ApiTokenLevel::Admin).await;
+        let none = authenticate(&pool, &first.session, t0()).await.unwrap();
+        assert!(!none.stepped_up, "a fresh pairing has no step-up");
+
+        assert!(grant_step_up(&pool, first.device_id, t0()).await.unwrap());
+        for (after, expected) in [
+            (Duration::zero(), true),
+            (Duration::seconds(299), true),
+            (Duration::seconds(300), false),
+            (Duration::seconds(301), false),
+        ] {
+            let device = authenticate(&pool, &first.session, t0() + after)
+                .await
+                .unwrap();
+            assert_eq!(device.stepped_up, expected, "{after}");
+        }
+
+        // Another pairing is another row: it does not read the first one's step-up.
+        let second = paired(&pool, ApiTokenLevel::Admin).await;
+        let device = authenticate(&pool, &second.session, t0()).await.unwrap();
+        assert!(!device.stepped_up);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_or_distant_step_up_reads_as_none() {
+        let pool = pool().await;
+        let paired = paired(&pool, ApiTokenLevel::Admin).await;
+        for text in [
+            "garbage".to_owned(),
+            String::new(),
+            stamp(t0() + STEP_UP_WINDOW + Duration::seconds(1)),
+            stamp(t0() + Duration::days(30)),
+        ] {
+            sqlx::query("UPDATE remote_devices SET stepup_until = ?")
+                .bind(&text)
+                .execute(&pool)
+                .await
+                .unwrap();
+            let device = authenticate(&pool, &paired.session, t0()).await.unwrap();
+            assert!(!device.stepped_up, "{text:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_revoked_device_cannot_be_granted_a_step_up() {
+        let pool = pool().await;
+        let paired = paired(&pool, ApiTokenLevel::Admin).await;
+        revoke_device(&pool, paired.device_id, t0()).await.unwrap();
+        assert!(!grant_step_up(&pool, paired.device_id, t0()).await.unwrap());
+        assert!(!grant_step_up(&pool, 9999, t0()).await.unwrap());
     }
 }

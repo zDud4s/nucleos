@@ -36,6 +36,7 @@ the contract, not a snapshot.
 | `crates/nucleos-base/src/storage.rs` | SQLite pool + WAL + `sqlx::migrate!`. Knows the storage *mechanism* only — never a table's meaning. |
 | `crates/nucleos-base/src/backup.rs` | Backup files: takes a consistent snapshot, verifies one, and stages a restore for the next startup to apply. |
 | `auth.rs` | Local token generation + the bearer-token middleware on protected routes. |
+| `auth/grave.rs` | `GRAVE_ROUTES` + `is_grave`: the routes a paired remote device may call only inside a live step-up window (`remote::STEP_UP_WINDOW`, `remote_devices.stepup_until`, migration 0264); `require_token` answers 403 `{"refusal":"step_up_required"}` otherwise. Only a device is asked. Settings routes are grave only for a command-field change, decided in the handler. Never who reaches which route (`auth.rs`) nor how a step-up is granted (`remote.rs`). |
 | `agents.rs` | Agent packages: the versioned, file-based source of the factory agents (spec agentes-agnosticos §3); module root, each submodule has exactly one owner. |
 | `agents/package.rs` | The agent package format and its reader: `<name>/<version>/` with `agent.md` (frontmatter + prompt body), `output.md` and the `knowledge/` files the frontmatter names. |
 | `agents/harness.rs` | Claude Code agent files generated from the installed agent packages: `<claude_home>/agents/<name>.md`, highest version of each name winning; ownership of a file is decided by a record of written hashes, never by the marker comment, so a hand-edited file is left alone. |

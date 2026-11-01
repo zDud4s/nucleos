@@ -8970,6 +8970,35 @@ mod tests {
         );
     }
 
+    /// No grave GET route serves a stored credential back, even after a step-up opened it: the
+    /// listing is presence only. Every parameterless GET in `GRAVE_ROUTES` that needs no disk is
+    /// read after a secret is stored, and the value is searched in each whole body.
+    #[tokio::test]
+    async fn no_route_returns_a_stored_secret() {
+        let state = test_state().await;
+        let (status, _) = workflow_call(
+            state.clone(),
+            "PUT",
+            "/config/secrets/github-token",
+            Some(serde_json::json!({ "value": "ghp_never_served_back" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        for (method, route) in crate::auth::GRAVE_ROUTES {
+            if *method != axum::http::Method::GET || route.contains('{') || *route == "/backups" {
+                continue;
+            }
+            let (_, body) = workflow_call(state.clone(), "GET", route, None).await;
+            assert!(
+                !body.to_string().contains("ghp_never_served_back"),
+                "GET {route} served a stored credential"
+            );
+        }
+        let (_, listing) = workflow_call(state, "GET", "/config/secrets", None).await;
+        assert!(!listing.to_string().contains("ghp_never_served_back"));
+    }
+
     /// The daemon's own token is not a credential this app may set.
     ///
     /// It is the app's key to the daemon: overwriting it through the API would lock out the caller
