@@ -50,6 +50,10 @@ export function useSetEngineOptIn(engine: string) {
     retry: false,
     onSettled: () => {
       void queryClient.invalidateQueries({ queryKey: keys.system.engine(engine) });
+      // The opt-in changes which models a chat may pick, so every model menu
+      // (global, per-chat, front door and the grouped ones) goes stale too.
+      void queryClient.invalidateQueries({ queryKey: keys.chats.models });
+      void queryClient.invalidateQueries({ queryKey: keys.chats.modelGroups });
     },
   });
 }

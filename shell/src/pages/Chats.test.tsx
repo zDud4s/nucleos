@@ -7846,12 +7846,12 @@ describe("Chats - the model route's mark, effort and stored model (review 7)", (
       const initial = (await modelTrigger()).querySelector(".ui-provider-mark-initial");
       expect(initial?.textContent).toBe("A");
     });
-    expect((await modelTrigger()).querySelector("svg path")).toBeNull();
+    expect((await modelTrigger()).querySelector(".ui-provider-mark path")).toBeNull();
 
     await pickRow(/Google Gemini API/, /^Gemini 3 Pro/);
 
     await waitFor(async () => {
-      const path = (await modelTrigger()).querySelector("svg path");
+      const path = (await modelTrigger()).querySelector(".ui-provider-mark path");
       // The first segment of the gemini glyph in ProviderMark.
       expect(path?.getAttribute("d") ?? "").toMatch(/^M11\.04 19\.32/);
     });

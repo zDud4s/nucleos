@@ -63,8 +63,13 @@ export function EngineOptIn({ engine, label }: { engine: string; label: string }
       {set.isSuccess && set.data.takes_effect !== "" ? <span className="sy-meta">{set.data.takes_effect}</span> : null}
       {refusal ? (
         <RefusalNote refusal={refusal} />
-      ) : set.error || state.error ? (
-        <ErrorNote>the {DAEMON_NAME} is not responding: {label} was not changed</ErrorNote>
+      ) : set.error ? (
+        // A write that got no answer may still have landed, so it never claims "not changed".
+        <ErrorNote>the {DAEMON_NAME} did not answer: whether {label} was changed is unknown</ErrorNote>
+      ) : state.error ? (
+        <ErrorNote>
+          the {DAEMON_NAME} is not responding: could not read the setting for {label}
+        </ErrorNote>
       ) : null}
     </div>
   );

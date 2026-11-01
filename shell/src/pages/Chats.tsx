@@ -1253,6 +1253,19 @@ function StartBox({
   const [highlight, setHighlight] = useState(0);
   const [model, setModel] = useState<string | null>(null);
   const [effort, setEffort] = useState<string | null>(null);
+  // The same two answers the menu and the dial read (one cache entry each), so a pick can be
+  // checked against its own row before an effort chosen for another model travels with it.
+  const frontCatalogue = useAssistantModels(undefined, "chat");
+  const frontGroups = useModelGroups(undefined).data?.groups;
+  const pickModel = (next: string | null) => {
+    setModel(next);
+    if (next === null || effort === null) return;
+    const row =
+      frontCatalogue.data?.choices.find((choice) => choice.id === next) ??
+      frontGroups?.flatMap((group) => group.models).find((choice) => choice.id === next);
+    // A row not known yet keeps today's behaviour; a known row without the level drops it.
+    if (row !== undefined && !(row.efforts ?? []).includes(effort)) setEffort(null);
+  };
   const [mode, setMode] = useState<PermissionMode>("auto");
   const [attached, setAttached] = useState<Attachment[]>([]);
   const [attachError, setAttachError] = useState<string | null>(null);
@@ -1428,7 +1441,7 @@ function StartBox({
           />
           {/* Held as state, not written anywhere: there is no conversation to write it to until the
             first message opens one, and it travels with that message. */}
-          <ModelMenu model={model} disabled={pending} onPick={setModel} newChat />
+          <ModelMenu model={model} disabled={pending} onPick={pickModel} newChat />
           <EffortSlider
             newChat
             model={model}
@@ -2365,6 +2378,25 @@ function AutoTitleRefusal({ error }: { error: unknown }) {
 
 /* ----------------------------------------------------------------- model -- */
 
+/* The notes a model row carries before it is picked: where the words go, and whether the model
+   can work tools. One place for the wording, shared by the generic rows and the route rows. */
+function modelWhyNotes(choice: ModelChoice, localUnavailable: boolean): string[] {
+  return [
+    choice.brain === "local"
+      ? localUnavailable
+        ? "not running on this machine"
+        : "on this machine"
+      : choice.brain === "openrouter"
+        ? /* Said before the pick, not after: the local mark answers "is it running here", and
+             this one answers whose machine the words end up on. */
+          "off this machine: sent to a third-party provider"
+        : null,
+    /* Only `false` earns a mark. Absent is "nobody asked", the ordinary state of every choice
+       nothing has introspected. */
+    choice.tools === false ? "cannot use tools" : null,
+  ].filter((note): note is string => note !== null);
+}
+
 /**
  * Which model answers.
  *
@@ -2392,25 +2424,6 @@ function AutoTitleRefusal({ error }: { error: unknown }) {
  * `/api/tags`. Reading absent as "not downloaded" would move the whole local menu of such a daemon
  * into the section that says it cannot answer.
  */
-/* The notes a model row carries before it is picked: where the words go, and whether the model
-   can work tools. One place for the wording, shared by the generic rows and the route rows. */
-function modelWhyNotes(choice: ModelChoice, localUnavailable: boolean): string[] {
-  return [
-    choice.brain === "local"
-      ? localUnavailable
-        ? "not running on this machine"
-        : "on this machine"
-      : choice.brain === "openrouter"
-        ? /* Said before the pick, not after: the local mark answers "is it running here", and
-             this one answers whose machine the words end up on. */
-          "off this machine: sent to a third-party provider"
-        : null,
-    /* Only `false` earns a mark. Absent is "nobody asked", the ordinary state of every choice
-       nothing has introspected. */
-    choice.tools === false ? "cannot use tools" : null,
-  ].filter((note): note is string => note !== null);
-}
-
 const MODEL_SECTIONS: {
   key: string;
   label: string;
@@ -2894,7 +2907,11 @@ function EffortSlider({
   const chosen = catalogue.data?.choices.find((choice) => choice.id === model);
   // The union stands in only while nothing is pinned — the front door, where the model question is
   // still open.
-  const levels = fromGroups ?? chosen?.efforts ?? catalogue.data?.efforts ?? [];
+  // A pinned model the catalogue does not know shows no dial rather than the union's levels.
+  const levels =
+    fromGroups ??
+    chosen?.efforts ??
+    (model === null ? (catalogue.data?.efforts ?? []) : []);
   if (levels.length === 0) return null;
   const at = effort === null ? 0 : Math.max(0, levels.indexOf(effort) + 1);
 
