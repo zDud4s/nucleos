@@ -130,11 +130,14 @@ pub fn installed_engines() -> Vec<RunnerKind> {
         .collect()
 }
 
-/// The runner a kind launches, built from the models file as `main.rs` builds the primary.
-fn engine_runner(models: &crate::config::ModelsConfig, kind: RunnerKind) -> Arc<dyn CommandRunner> {
+/// The runner a kind launches, built from the models file as `main.rs` builds the primary. `None`
+/// when the kind has no row or its row has no runner: such a kind is never launched as Claude.
+fn engine_runner(
+    models: &crate::config::ModelsConfig,
+    kind: RunnerKind,
+) -> Option<Arc<dyn CommandRunner>> {
     crate::engines::find_in(crate::engines::TABLE, kind.as_str())
         .and_then(|row| (row.runner)(models))
-        .unwrap_or_else(|| crate::engines::claude_runner(models))
 }
 
 /// `front` with the installed engines given, so a test does not depend on this machine's PATH.
@@ -166,7 +169,14 @@ pub fn front_with(
         if kind == primary_kind || alternates.iter().any(|available| available.kind == kind) {
             continue;
         }
-        alternates.push(make(kind, engine_runner(models, kind)));
+        let Some(runner) = engine_runner(models, kind) else {
+            tracing::warn!(
+                kind = kind.as_str(),
+                "router config names an engine with no runner; ignoring it"
+            );
+            continue;
+        };
+        alternates.push(make(kind, runner));
     }
     // What a pin may name: the router's alternates plus every installed CLI.
     let mut others: Vec<Available> = alternates
@@ -175,7 +185,14 @@ pub fn front_with(
         .collect();
     for kind in installed {
         if *kind != primary_kind && !others.iter().any(|available| available.kind == *kind) {
-            others.push(make(*kind, engine_runner(models, *kind)));
+            let Some(runner) = engine_runner(models, *kind) else {
+                tracing::warn!(
+                    kind = kind.as_str(),
+                    "installed engine has no runner; not offering it"
+                );
+                continue;
+            };
+            others.push(make(*kind, runner));
         }
     }
     let engines = Arc::new(Engines {
@@ -259,7 +276,8 @@ pub fn allowed_models(
         }
     }
     let own = default_model(models, kind);
-    if !allowed.contains(&own) {
+    // An engine with no default model offers none: an empty id is never a model.
+    if !own.is_empty() && !allowed.contains(&own) {
         allowed.push(own);
     }
     allowed
@@ -384,5 +402,52 @@ impl CommandRunner for RoutedRunner {
 
     fn engines(&self) -> Option<Arc<Engines>> {
         self.engines.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn engine_runner_of_unwired_kind_is_none() {
+        let models = crate::config::ModelsConfig::default();
+        assert!(engine_runner(&models, RunnerKind::for_test("zed")).is_none());
+    }
+
+    #[test]
+    fn default_model_of_unwired_kind_is_empty_never_claudes() {
+        let models = crate::config::ModelsConfig {
+            claude_model: "claude-configured".to_owned(),
+            ..Default::default()
+        };
+        let model = default_model(&models, RunnerKind::for_test("zed"));
+        assert!(model.is_empty(), "{model:?}");
+        assert_ne!(model, models.claude_model);
+    }
+
+    #[test]
+    fn allowed_models_of_unwired_kind_offers_no_empty_id() {
+        let models = crate::config::ModelsConfig::default();
+        let allowed = allowed_models(&models, &RouterConfig::off(), RunnerKind::for_test("zed"));
+        assert!(allowed.iter().all(|id| !id.is_empty()), "{allowed:?}");
+    }
+
+    #[test]
+    fn an_installed_kind_with_no_runner_is_not_offered() {
+        // The default models file names Claude as the primary; Codex is installed and wired, the
+        // made-up "zed" is installed but has no row, hence no runner.
+        let models = crate::config::ModelsConfig::default();
+        let primary = codex_runner("primary".to_owned(), "read-only", None);
+        let fronted = front_with(
+            primary,
+            &models,
+            RouterConfig::off(),
+            &[RunnerKind::Codex, RunnerKind::for_test("zed")],
+        );
+        let engines = fronted.engines().expect("the engines are held");
+        assert_eq!(engines.primary.kind, RunnerKind::Claude);
+        assert!(engines.available(RunnerKind::Codex).is_some());
+        assert!(engines.available(RunnerKind::for_test("zed")).is_none());
     }
 }

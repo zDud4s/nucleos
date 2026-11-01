@@ -9,37 +9,39 @@ use crate::chats::Brain;
 use crate::config::ModelsConfig;
 
 /// The engine that answers a conversation.
+///
+/// A table-backed id: the named consts are the rows the production code names (plus OpenRouter,
+/// which is a hosted brain and not a table row); any other row is a `ChatEngine` of its own, never
+/// a stand-in for Claude.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChatEngine {
-    Claude,
-    Codex,
-    Local,
-    OpenRouter,
-    Agy,
-    /// The Google Gemini API: a hosted chat whose pinned model carries the `gemini-api/` prefix.
-    GeminiApi,
-}
+pub struct ChatEngine(crate::engines::EngineId);
 
+#[allow(non_upper_case_globals)]
 impl ChatEngine {
+    pub const Claude: ChatEngine = ChatEngine(crate::engines::EngineId::CLAUDE);
+    pub const Codex: ChatEngine = ChatEngine(crate::engines::EngineId::CODEX);
+    pub const Local: ChatEngine = ChatEngine(crate::engines::EngineId::LOCAL);
+    pub const Agy: ChatEngine = ChatEngine(crate::engines::EngineId::AGY);
+    /// The Google Gemini API: a hosted chat whose pinned model carries the `gemini-api/` prefix.
+    pub const GeminiApi: ChatEngine = ChatEngine(crate::engines::EngineId::GEMINI_API);
+    /// Not an engine row: OpenRouter is a hosted brain, not a launchable engine.
+    pub const OpenRouter: ChatEngine = ChatEngine(crate::engines::EngineId::OPENROUTER);
+
     /// The name the refusal text and the cards use.
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Claude => crate::engines::CLAUDE,
-            Self::Codex => crate::engines::CODEX,
-            Self::Local => crate::engines::LOCAL,
-            Self::Agy => crate::engines::AGY,
-            Self::GeminiApi => crate::engines::GEMINI_API,
-            // Not an engine row: OpenRouter is a hosted brain, not a launchable engine.
-            Self::OpenRouter => "openrouter",
-        }
+        self.0.as_str()
     }
 
     /// The chat engine of a CLI runner string; unknown strings collapse to claude.
     fn of_cli(cli: &str) -> Self {
-        match crate::engines::runner_id_in(crate::engines::TABLE, cli) {
-            crate::engines::CODEX => Self::Codex,
-            crate::engines::AGY => Self::Agy,
-            _ => Self::Claude,
+        Self::of_cli_in(crate::engines::TABLE, cli)
+    }
+
+    /// `of_cli` over an explicit table: a CLI row of it maps to itself, anything else to claude.
+    pub fn of_cli_in(table: &[crate::engines::EngineDescription], cli: &str) -> Self {
+        match crate::engines::cli_row_in(table, cli) {
+            Some(row) => Self(crate::engines::EngineId::of_row(row)),
+            None => Self::Claude,
         }
     }
 
@@ -47,21 +49,20 @@ impl ChatEngine {
     /// table does not list (agy with its setting off included) is `None`: the caller refuses it,
     /// it never becomes Claude.
     pub fn from_stored(id: &str) -> Option<Self> {
-        let enabled: Vec<crate::engines::EngineDescription> = crate::engines::enabled_table()
+        Self::from_stored_in(crate::engines::TABLE, id)
+    }
+
+    /// `from_stored` over an explicit table.
+    pub fn from_stored_in(table: &[crate::engines::EngineDescription], id: &str) -> Option<Self> {
+        let enabled: Vec<crate::engines::EngineDescription> = crate::engines::enabled_in(table)
             .into_iter()
             .cloned()
             .collect();
         let id = crate::engines::chat_ids_in(&enabled)
             .into_iter()
             .find(|row| *row == id)?;
-        match id {
-            crate::engines::CLAUDE => Some(Self::Claude),
-            crate::engines::CODEX => Some(Self::Codex),
-            crate::engines::LOCAL => Some(Self::Local),
-            crate::engines::AGY => Some(Self::Agy),
-            crate::engines::GEMINI_API => Some(Self::GeminiApi),
-            _ => None,
-        }
+        let row = enabled.iter().find(|row| row.id == id)?;
+        Some(Self(crate::engines::EngineId::of_row(row)))
     }
 }
 
@@ -110,19 +111,18 @@ pub fn engine_of(config: &ModelsConfig, brain: Brain, model: Option<&str>) -> Ch
 /// The table of spec section 6.
 pub fn support(engine: ChatEngine, capability: Capability) -> Support {
     use Capability::*;
-    use ChatEngine::*;
     use Support::{No, Warn, Yes};
     match (capability, engine) {
-        (Effort | ExtraDirs | RegistryMcp, Claude | Codex) => Yes,
-        (DeniedTools | Agents, Claude) => Yes,
-        (TurnBudget, Claude) => Yes,
-        (TurnBudget, Local | OpenRouter) => Warn,
+        (Effort | ExtraDirs | RegistryMcp, ChatEngine::Claude | ChatEngine::Codex) => Yes,
+        (DeniedTools | Agents, ChatEngine::Claude) => Yes,
+        (TurnBudget, ChatEngine::Claude) => Yes,
+        (TurnBudget, ChatEngine::Local | ChatEngine::OpenRouter) => Warn,
         // Agy takes `--effort` and `--add-dir` and refuses every other control.
-        (Effort | ExtraDirs, Agy) => Yes,
-        (DeniedTools | TurnBudget | Agents | RegistryMcp, Agy) => No,
+        (Effort | ExtraDirs, ChatEngine::Agy) => Yes,
+        (DeniedTools | TurnBudget | Agents | RegistryMcp, ChatEngine::Agy) => No,
         // The Gemini API route ignores a per-turn budget (a warning, like OpenRouter) and refuses
         // every other control; the `_` arm answers `No` for them.
-        (TurnBudget, GeminiApi) => Warn,
+        (TurnBudget, ChatEngine::GeminiApi) => Warn,
         _ => No,
     }
 }
@@ -207,6 +207,7 @@ mod tests {
 
     #[test]
     fn chat_engine_from_stored_uses_chat_ids() {
+        let _gate = crate::engines::agy_test_support::agy_gate(false);
         assert_eq!(ChatEngine::from_stored("claude"), Some(ChatEngine::Claude));
         assert_eq!(ChatEngine::from_stored("codex"), Some(ChatEngine::Codex));
         assert_eq!(ChatEngine::from_stored("local"), Some(ChatEngine::Local));
@@ -215,6 +216,63 @@ mod tests {
         // agy's setting is off by default, so a stored agy is not an engine a chat can name: the
         // caller refuses it, it does not become Claude.
         assert_eq!(ChatEngine::from_stored("agy"), None);
+    }
+
+    fn zed_installed() -> bool {
+        true
+    }
+
+    fn zed_utility(_known: &[crate::models::model_catalog::Discovered]) -> Option<String> {
+        None
+    }
+
+    fn zed_runner(
+        _models: &ModelsConfig,
+    ) -> Option<std::sync::Arc<dyn crate::execution::runner::CommandRunner>> {
+        None
+    }
+
+    /// AC3: a row only the table argument lists is itself, not Claude. The row is built from the
+    /// public fields of `EngineDescription`, so nothing here needs a `cfg(test)` item of the core
+    /// crate; the lookups take the table as an argument.
+    #[test]
+    fn of_cli_in_and_from_stored_in_keep_unknown_row() {
+        use crate::engines::{EngineDescription, TABLE, Transport};
+
+        let mut rows: Vec<EngineDescription> = TABLE.to_vec();
+        rows.push(EngineDescription {
+            id: "zed",
+            display_name: "Zed",
+            seat_kind: crate::config::SeatKind::Cloud,
+            transport: Transport::Cli,
+            installed: zed_installed,
+            gate: zed_installed,
+            utility_default: zed_utility,
+            runner: zed_runner,
+        });
+        let rows = rows.as_slice();
+
+        // A CLI row of the table passed in maps to itself.
+        let zed = ChatEngine::of_cli_in(rows, "zed");
+        assert_eq!(zed.as_str(), "zed");
+        assert_ne!(zed, ChatEngine::Claude);
+        assert_ne!(zed, ChatEngine::Agy);
+        // Known rows are unchanged, and an unknown string still collapses to claude.
+        assert_eq!(ChatEngine::of_cli_in(rows, "codex"), ChatEngine::Codex);
+        assert_eq!(ChatEngine::of_cli_in(rows, "gemini"), ChatEngine::Claude);
+        // The production table does not list it.
+        assert_eq!(ChatEngine::of_cli_in(TABLE, "zed"), ChatEngine::Claude);
+
+        // A stored id the table lists is a chat engine of that text; one it lacks is `None`.
+        let stored = ChatEngine::from_stored_in(rows, "zed").expect("zed is listed");
+        assert_eq!(stored.as_str(), "zed");
+        assert_eq!(stored, zed);
+        assert_eq!(
+            ChatEngine::from_stored_in(rows, "claude"),
+            Some(ChatEngine::Claude)
+        );
+        assert_eq!(ChatEngine::from_stored_in(rows, "gemini"), None);
+        assert_eq!(ChatEngine::from_stored_in(TABLE, "zed"), None);
     }
 
     /// RED (plan Node 3, test 7; contract E22). The Gemini API route is a chat engine of its own

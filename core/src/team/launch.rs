@@ -762,6 +762,11 @@ fn runner_kind_of(
         Engine::Codex => Ok(Some(RunnerKind::Codex)),
         Engine::Local => Ok(None),
         Engine::Agy => Err(crate::engines::AGY_REFUSAL.to_owned()),
+        // An engine with no arm is refused by name.
+        other => Err(format!(
+            "the {} engine is not available for agents, teams or council",
+            other.as_str()
+        )),
     }
 }
 
@@ -992,6 +997,16 @@ mod tests {
         assert_eq!(runner_kind_of(Engine::Claude), Ok(Some(RunnerKind::Claude)));
         assert_eq!(runner_kind_of(Engine::Codex), Ok(Some(RunnerKind::Codex)));
         assert_eq!(runner_kind_of(Engine::Local), Ok(None));
+    }
+
+    /// An engine with no arm is refused by name, never answered with `None` or a Claude kind.
+    #[test]
+    fn runner_kind_of_refuses_unwired_names_it() {
+        let error = runner_kind_of(Engine::for_test("zed")).expect_err("an unwired engine refuses");
+        assert!(
+            error.contains("the zed engine is not available for agents, teams or council"),
+            "{error}"
+        );
     }
 
     /// E16 F3: a member with no pin falls to `state.runner`, which is agy under `primary_runner: agy`.
