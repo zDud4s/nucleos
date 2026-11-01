@@ -228,6 +228,13 @@ pub(super) const ROUTES: &[RouteEntry] = &[
         handler: "patch_chat",
     },
     RouteEntry {
+        method: "PUT",
+        path: "/assistant/chats/{chat_id}/auto-compact",
+        purpose: "Put chat auto compact.",
+        body: Body::Shapeless("AutoCompactSwitch"),
+        handler: "put_chat_auto_compact",
+    },
+    RouteEntry {
         method: "POST",
         path: "/assistant/chats/{chat_id}/clear",
         purpose: "Post clear context.",

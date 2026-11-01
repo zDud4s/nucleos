@@ -502,7 +502,7 @@ pub async fn scheduler_tick(state: &AppState, now: DateTime<Utc>) {
         }
 
         // From the row, not from a counter the loop holds: the map reset on every daemon start, and
-        // the Task Scheduler registration restarts the daemon three times on failure. A crashing
+        // the supervisor relaunches the daemon on failure, within its restart budget. A crashing
         // daemon is the one situation this cap is named for, and it was the one that rearmed it.
         let today = now.date_naive().to_string();
         let project_fires: HashMap<String, u32> = rows
@@ -1493,8 +1493,8 @@ mod tests {
     }
 
     /// The runaway guard used to be a `HashMap` the scheduler loop held, so it emptied every time
-    /// the daemon started — and the Task Scheduler registration restarts the daemon three times on
-    /// failure. A crashing daemon is the one situation this cap is named for, and it was the
+    /// the daemon started — and the supervisor relaunches the daemon on failure, within its restart
+    /// budget. A crashing daemon is the one situation this cap is named for, and it was the
     /// situation that rearmed it. `scheduler_tick` is called directly here, which is exactly what a
     /// restart looks like: no loop state survives between the calls.
     #[tokio::test]

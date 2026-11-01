@@ -22,6 +22,12 @@ import { ModeSwitch } from "./ModeSwitch";
  */
 const LABEL = "Let alpha act";
 
+/** Why the proof is not enough, as `promotionBlocker` words it. */
+const REASON = "3 of 5 action classes are still short of the bar";
+
+/** The warning an unproven press opens. */
+const WARNING = { name: "Not enough shadow evidence" };
+
 /**
  * And what the ear gets when that segment arms.
  *
@@ -55,7 +61,8 @@ describe("ModeSwitch", () => {
     render(
       <ModeSwitch
         value="shadow"
-        actAllowed
+        proven
+        shortReason={REASON}
         actArmedLabel={LABEL}
         actConsequence={CONSEQUENCE}
         onChoose={onChoose}
@@ -96,53 +103,64 @@ describe("ModeSwitch", () => {
     expect(onChoose).toHaveBeenCalledWith("off");
   });
 
-  it("letting it act takes two presses and is not green when locked", () => {
+  it("letting it act takes two presses when proven; unproven it is live, not green, and warns", () => {
     const onChoose = vi.fn();
-    const locked = render(
+    const unproven = render(
       <ModeSwitch
         value="shadow"
-        actAllowed={false}
+        proven={false}
+        shortReason={REASON}
         actArmedLabel={LABEL}
         actConsequence={CONSEQUENCE}
         onChoose={onChoose}
       />,
     );
 
-    const blocked = screen.getByRole("button", { name: "Let it act" });
-    expect((blocked as HTMLButtonElement).disabled).toBe(true);
-    /*
-      And it refuses without a tooltip.
+    // Changed from "refuses": the owner's rule is that activating is never blocked, so the
+    // segment is a live button and pressing it opens the warning instead of doing nothing.
+    const live = screen.getByRole("button", { name: "Let it act" });
+    expect((live as HTMLButtonElement).disabled).toBe(false);
+    expect(live.getAttribute("aria-disabled")).toBeNull();
+    // Nothing is earned, so it does not advertise the tone of an earned offer.
+    expect(live.className).not.toContain("ui-button-approve");
+    expect(live.getAttribute("title")).toBeNull();
+    expect(screen.queryByRole("group", WARNING)).toBeNull();
 
-      The blocker used to ride here as a `title`, which made it the third copy of one
-      sentence: both callers already print it, visibly, under exactly the condition that
-      locks this segment. A copy you have to hover to read, on a disabled control that
-      does not reliably receive hover, is the copy nobody reads.
-    */
-    expect(blocked.getAttribute("title")).toBeNull();
-    fireEvent.click(blocked);
+    fireEvent.click(live);
+    const warning = screen.getByRole("group", WARNING);
+    expect(warning.textContent).toContain(REASON);
     expect(onChoose).not.toHaveBeenCalled();
 
-    /*
-      And it is not green while it is refusing.
+    fireEvent.click(within(warning).getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("group", WARNING)).toBeNull();
+    expect(onChoose).not.toHaveBeenCalled();
 
-      jsdom applies no stylesheet, so the only place this claim can be made is
-      the sheet itself: the segment keeps `ui-button-approve` — that is what
-      makes it green when it CAN be pressed — and `ui.css` takes the paint back
-      off it while it is disabled. Acting Green at 45% opacity still reads as
-      "this will act".
+    fireEvent.click(live);
+    fireEvent.click(
+      within(screen.getByRole("group", WARNING)).getByRole("button", { name: "Activate anyway" }),
+    );
+    expect(onChoose).toHaveBeenCalledTimes(1);
+    expect(onChoose).toHaveBeenCalledWith("active");
+    expect(screen.queryByRole("group", WARNING)).toBeNull();
+    onChoose.mockClear();
+
+    /*
+      The paint rule for a refusing approve button still lives in the sheet: a busy proven
+      segment is `disabled`, and acting Green at 45% opacity still reads as "this will act".
+      jsdom applies no stylesheet, so the sheet is the only place this claim can be made.
     */
-    expect(blocked.className).toContain("ui-button-approve");
     const ui = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "ui.css"), "utf8");
     const rule = /\.ui-button-approve:disabled\s*\{([^}]*)\}/.exec(ui);
     expect(rule).not.toBeNull();
     expect(rule?.[1]).toMatch(/background:\s*none/);
 
-    locked.unmount();
+    unproven.unmount();
 
     render(
       <ModeSwitch
         value="shadow"
-        actAllowed
+        proven
+        shortReason={REASON}
         actArmedLabel={LABEL}
         actConsequence={CONSEQUENCE}
         onChoose={onChoose}
@@ -181,7 +199,8 @@ describe("ModeSwitch", () => {
     render(
       <ModeSwitch
         value="shadow"
-        actAllowed
+        proven
+        shortReason={REASON}
         actArmedLabel={LABEL}
         actConsequence={CONSEQUENCE}
         onChoose={onChoose}
@@ -210,7 +229,8 @@ describe("ModeSwitch", () => {
     render(
       <ModeSwitch
         value="active"
-        actAllowed
+        proven
+        shortReason={REASON}
         actArmedLabel={LABEL}
         actConsequence={CONSEQUENCE}
         onChoose={onChoose}
@@ -230,7 +250,8 @@ describe("ModeSwitch", () => {
     render(
       <ModeSwitch
         value="shadow"
-        actAllowed
+        proven
+        shortReason={REASON}
         busy
         actArmedLabel={LABEL}
         actConsequence={CONSEQUENCE}
@@ -261,7 +282,8 @@ describe("ModeSwitch", () => {
     render(
       <ModeSwitch
         value="shadow"
-        actAllowed
+        proven
+        shortReason={REASON}
         actArmedLabel={LABEL}
         actConsequence={CONSEQUENCE}
         onArmedChange={onArmedChange}
@@ -300,7 +322,8 @@ describe("ModeSwitch", () => {
         <>
           <ModeSwitch
             value="shadow"
-            actAllowed
+            proven
+            shortReason={REASON}
             actArmedLabel={LABEL}
             actConsequence={CONSEQUENCE}
             onArmedChange={setArmed}
@@ -378,12 +401,13 @@ describe("ModeSwitch", () => {
    * `focusableWhenInert` the locked segment says it is unavailable with `aria-disabled` instead,
    * is still described, and still does nothing when pressed.
    */
-  it("focusable when inert, a locked let it act is aria-disabled, described, and does nothing", () => {
+  it("focusable when inert, an unproven let it act is live and described, and warns", () => {
     const onChoose = vi.fn();
     render(
       <ModeSwitch
         value="shadow"
-        actAllowed={false}
+        proven={false}
+        shortReason={REASON}
         actArmedLabel={LABEL}
         actConsequence={CONSEQUENCE}
         actDescribedBy="gate"
@@ -392,17 +416,40 @@ describe("ModeSwitch", () => {
       />,
     );
 
-    const locked = screen.getByRole("button", { name: "Let it act" });
-    expect(locked.getAttribute("aria-disabled")).toBe("true");
-    expect((locked as HTMLButtonElement).disabled).toBe(false);
-    expect(locked.getAttribute("aria-describedby")).toBe("gate");
+    // Changed from "aria-disabled, and does nothing": it is no longer locked, so it keeps the
+    // description that says what is missing but is not inert.
+    const offer = screen.getByRole("button", { name: "Let it act" });
+    expect(offer.getAttribute("aria-disabled")).toBeNull();
+    expect((offer as HTMLButtonElement).disabled).toBe(false);
+    expect(offer.getAttribute("aria-describedby")).toBe("gate");
 
-    // The pair that confirms an unlocked segment, on the same node.
-    fireEvent.click(locked);
-    act(() => {
-      vi.advanceTimersByTime(350);
-    });
-    fireEvent.click(locked);
+    fireEvent.click(offer);
+    expect(onChoose).not.toHaveBeenCalled();
+    fireEvent.click(
+      within(screen.getByRole("group", WARNING)).getByRole("button", { name: "Activate anyway" }),
+    );
+    expect(onChoose).toHaveBeenCalledWith("active");
+  });
+
+  it("an unproven let it act is inert while a write is in flight, and shows no warning", () => {
+    const onChoose = vi.fn();
+    render(
+      <ModeSwitch
+        value="shadow"
+        proven={false}
+        shortReason={REASON}
+        busy
+        actArmedLabel={LABEL}
+        actConsequence={CONSEQUENCE}
+        focusableWhenInert
+        onChoose={onChoose}
+      />,
+    );
+
+    const offer = screen.getByRole("button", { name: "Let it act" });
+    expect(offer.getAttribute("aria-disabled")).toBe("true");
+    fireEvent.click(offer);
+    expect(screen.queryByRole("group", WARNING)).toBeNull();
     expect(onChoose).not.toHaveBeenCalled();
   });
 
@@ -411,7 +458,8 @@ describe("ModeSwitch", () => {
     const { rerender } = render(
       <ModeSwitch
         value="shadow"
-        actAllowed
+        proven
+        shortReason={REASON}
         actArmedLabel={LABEL}
         actConsequence={CONSEQUENCE}
         focusableWhenInert
@@ -430,7 +478,8 @@ describe("ModeSwitch", () => {
     rerender(
       <ModeSwitch
         value="shadow"
-        actAllowed
+        proven
+        shortReason={REASON}
         busy
         actArmedLabel={LABEL}
         actConsequence={CONSEQUENCE}
@@ -469,5 +518,112 @@ describe("ModeSwitch", () => {
       /\.ui-button-approve\[aria-disabled="true"\],\s*\.ui-button-approve:disabled\s*\{([^}]*)\}/.exec(ui);
     expect(rule).not.toBeNull();
     expect(rule?.[1]).toMatch(/background:\s*none/);
+  });
+
+  /** The unproven switch, with its warning already open. */
+  function openWarning(extra: { busy?: boolean; value?: "off" | "shadow" } = {}) {
+    const onChoose = vi.fn();
+    const props = {
+      value: extra.value ?? ("shadow" as const),
+      proven: false,
+      shortReason: REASON,
+      actArmedLabel: LABEL,
+      actConsequence: CONSEQUENCE,
+      focusableWhenInert: true,
+      onChoose,
+    };
+    const view = render(<ModeSwitch {...props} />);
+    fireEvent.click(screen.getByRole("button", { name: "Let it act" }));
+    return { onChoose, props, ...view };
+  }
+
+  describe("the warning an unproven press opens", () => {
+    it("does not send 'Activate anyway' while a write is in flight", () => {
+      const { onChoose, props, rerender } = openWarning();
+      rerender(<ModeSwitch {...props} busy />);
+
+      fireEvent.click(
+        within(screen.getByRole("group", WARNING)).getByRole("button", { name: "Activate anyway" }),
+      );
+      expect(onChoose).not.toHaveBeenCalled();
+    });
+
+    it("closes when another segment is chosen", () => {
+      const { onChoose } = openWarning();
+
+      fireEvent.click(screen.getByRole("button", { name: "Turn off" }));
+      expect(onChoose).toHaveBeenCalledWith("off");
+      expect(screen.queryByRole("group", WARNING)).toBeNull();
+      // And a second request cannot leave from a warning that is gone.
+      expect(onChoose).toHaveBeenCalledTimes(1);
+    });
+
+    it("gives the focus back to 'Let it act' on Cancel, Activate anyway and Escape", () => {
+      const offer = () => screen.getByRole("button", { name: "Let it act" });
+
+      const first = openWarning();
+      const cancel = within(screen.getByRole("group", WARNING)).getByRole("button", {
+        name: "Cancel",
+      });
+      cancel.focus();
+      fireEvent.click(cancel);
+      expect(document.activeElement).toBe(offer());
+      first.unmount();
+
+      const second = openWarning();
+      const anyway = within(screen.getByRole("group", WARNING)).getByRole("button", {
+        name: "Activate anyway",
+      });
+      anyway.focus();
+      fireEvent.click(anyway);
+      expect(document.activeElement).toBe(offer());
+      second.unmount();
+
+      openWarning();
+      const inside = within(screen.getByRole("group", WARNING)).getByRole("button", {
+        name: "Cancel",
+      });
+      inside.focus();
+      fireEvent.keyDown(inside, { key: "Escape" });
+      expect(screen.queryByRole("group", WARNING)).toBeNull();
+      expect(document.activeElement).toBe(offer());
+    });
+
+    it("says what activating means, visibly, inside the warning", () => {
+      openWarning();
+      const warning = screen.getByRole("group", WARNING);
+      expect(warning.textContent).toContain(CONSEQUENCE);
+      const anyway = within(warning).getByRole("button", { name: "Activate anyway" });
+      expect(
+        document.getElementById(anyway.getAttribute("aria-describedby") ?? "")?.textContent,
+      ).toBe(CONSEQUENCE);
+    });
+
+    it("does not reopen by itself after it was hidden by proof", () => {
+      const { onChoose, props, rerender } = openWarning();
+
+      rerender(<ModeSwitch {...props} proven />);
+      expect(screen.queryByRole("group", WARNING)).toBeNull();
+      rerender(<ModeSwitch {...props} proven={false} />);
+      expect(screen.queryByRole("group", WARNING)).toBeNull();
+      expect(onChoose).not.toHaveBeenCalled();
+    });
+
+    it("is a disclosure of the segment: controlled, folded by a second press, and announced", () => {
+      const { container } = openWarning();
+      const offer = screen.getByRole("button", { name: "Let it act" });
+      const warning = screen.getByRole("group", WARNING);
+
+      expect(offer.getAttribute("aria-expanded")).toBe("true");
+      expect(warning.id).not.toBe("");
+      expect(offer.getAttribute("aria-controls")).toBe(warning.id);
+      expect(screen.getByRole("status").textContent).toContain("Not enough shadow evidence");
+      expect(container.querySelectorAll("[role=status]")).toHaveLength(1);
+
+      fireEvent.click(offer);
+      expect(screen.queryByRole("group", WARNING)).toBeNull();
+      expect(offer.getAttribute("aria-expanded")).toBe("false");
+      expect(offer.getAttribute("aria-controls")).toBeNull();
+    });
   });
 });

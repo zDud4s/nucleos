@@ -2753,6 +2753,27 @@ ol.ui-well {
   border-left: 1px solid var(--border);
 }
 
+/* The warning an unproven "Let it act" opens under the track: a reason and two choices. */
+.ui-switch-warning {
+  align-self: stretch;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  font-size: var(--text-sm);
+}
+
+.ui-switch-warning-text {
+  margin: 0;
+}
+
+.ui-switch-warning-actions {
+  display: flex;
+  gap: var(--space-2);
+}
+
 .ui-switch-seg {
   padding: 0.34rem var(--space-3);
   border: 0;
@@ -2880,9 +2901,9 @@ ol.ui-well {
   change of ground, a filled segment reads as the current one — on the State page "Let it act"
   looked selected while the project was in shadow. At rest it keeps the tone's text and edge (the
   edge inset, because the track clips and the segment has no border of its own) and drops the
-  fill; the fill comes back once armed, where it belongs to the moment of deciding. A locked offer
-  is excluded here and stays with `.ui-button-approve:disabled` below, which takes the tone away
-  altogether.
+  fill; the fill comes back once armed, where it belongs to the moment of deciding. An inert offer
+  (busy) is excluded here and stays with `.ui-button-approve:disabled` below, which takes the
+  tone away altogether.
 */
 .ui-switch-seg-wrap
   > .ui-confirm:not(.ui-confirm-armed)
@@ -2898,7 +2919,7 @@ ol.ui-well {
 }
 
 /*
-  Locked, and still focusable. `ModeSwitch`'s `focusableWhenInert` hands the interlock
+  Inert (a write in flight), and still focusable. `ModeSwitch`'s `focusableWhenInert` hands the interlock
   `aria-disabled` instead of `disabled`, and `.ui-button:disabled` never reaches a button that is
   not `:disabled` — so the half-visible paint is restated here, for the segment only.
 */
@@ -2911,7 +2932,7 @@ ol.ui-well {
   A control that cannot be pressed does not advertise the consequence of pressing it.
   Acting Green at 45% opacity still reads as "this will act" — three of the four "Let it act"
   buttons on the roster are disabled, and all four were green.
-  The same holds for a locked segment that keeps its focus, which is `aria-disabled` and not
+  The same holds for an inert segment that keeps its focus, which is `aria-disabled` and not
   `:disabled` — that selector comes first so `:disabled` stays directly before the brace.
 */
 .ui-button-approve[aria-disabled="true"],

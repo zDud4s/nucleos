@@ -65,7 +65,7 @@ vi.mock("../chats/held", async (original) => {
 import { Chats } from "./Chats";
 import { createAppQueryClient } from "../app/queryClient";
 import { PaletteProvider } from "../ui";
-import { ApiRefusal } from "../data/client";
+import { ApiRefusal, ApiUnavailable } from "../data/client";
 import type {
   Ask,
   AssistantModels,
@@ -2661,6 +2661,240 @@ describe("Chats - what a conversation may reach and spend", () => {
         method: "PATCH",
         body: JSON.stringify({ fallback_model: ["opus"] }),
       });
+    });
+  });
+});
+
+describe("Chats - automatic compaction", () => {
+  const SWITCH = /compact automatically/i;
+  const AUTO_COMPACT_PATH = "/assistant/chats/c-1/auto-compact";
+
+  /** The list as the daemon serves it, with the PUT of the switch answered (or refused). */
+  function withSwitch(summary: ChatSummary, put: () => unknown) {
+    const base = chatsFetch([summary], { "c-1": [] });
+    return async (path: string, init?: RequestInit) => {
+      if (path === AUTO_COMPACT_PATH && init?.method === "PUT") return put();
+      return base(path, init);
+    };
+  }
+
+  it("is off by default and sends nothing until it is turned on", async () => {
+    // No `auto_compact` key at all, as from a daemon older than the field: reads as off.
+    daemon.apiFetch.mockImplementation(withSwitch(chatSummary({ chat_id: "c-1" }), () => undefined));
+
+    await renderChats("/chats/c-1");
+    await openConversationSettings();
+
+    const item = await screen.findByRole("menuitemcheckbox", { name: SWITCH });
+    expect(item.getAttribute("aria-checked")).toBe("false");
+    expect(
+      daemon.apiFetch.mock.calls.some(([path]) => String(path) === AUTO_COMPACT_PATH),
+    ).toBe(false);
+  });
+
+  it("shows on when the conversation says so", async () => {
+    daemon.apiFetch.mockImplementation(
+      withSwitch(chatSummary({ chat_id: "c-1", auto_compact: true }), () => undefined),
+    );
+
+    await renderChats("/chats/c-1");
+    await openConversationSettings();
+
+    const item = await screen.findByRole("menuitemcheckbox", { name: SWITCH });
+    expect(item.getAttribute("aria-checked")).toBe("true");
+  });
+
+  it("turning it on asks the daemon with an explicit boolean", async () => {
+    daemon.apiFetch.mockImplementation(
+      withSwitch(chatSummary({ chat_id: "c-1" }), () => undefined),
+    );
+
+    await renderChats("/chats/c-1");
+    await openConversationSettings();
+    fireEvent.click(await screen.findByRole("menuitemcheckbox", { name: SWITCH }));
+
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith(AUTO_COMPACT_PATH, {
+        method: "PUT",
+        body: JSON.stringify({ enabled: true }),
+      });
+    });
+  });
+
+  it("a refused request shows an error and does not leave the switch looking on", async () => {
+    daemon.apiFetch.mockImplementation(
+      withSwitch(chatSummary({ chat_id: "c-1" }), () => {
+        throw new Error("daemon down");
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openConversationSettings();
+    fireEvent.click(await screen.findByRole("menuitemcheckbox", { name: SWITCH }));
+
+    // The state is the daemon's row and not a guess made on the click, so a write that did not
+    // happen cannot be drawn as one that did.
+    expect(await screen.findByText(/automatic compaction was not changed/i)).toBeDefined();
+    const item = await screen.findByRole("menuitemcheckbox", { name: SWITCH });
+    expect(item.getAttribute("aria-checked")).toBe("false");
+  });
+
+  it("is disabled, and not a clickable off, while the chat list is still loading", async () => {
+    const base = chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] });
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      // The list never answers: the row is unknown, so the state is unknown.
+      if (path === "/assistant/chats") return new Promise(() => {});
+      return base(path, init);
+    });
+
+    await renderChats("/chats/c-1");
+    await openConversationSettings();
+
+    const item = await screen.findByRole("menuitemcheckbox", { name: SWITCH });
+    expect(item.getAttribute("aria-disabled")).toBe("true");
+    fireEvent.click(item);
+    expect(
+      daemon.apiFetch.mock.calls.some(([path]) => String(path) === AUTO_COMPACT_PATH),
+    ).toBe(false);
+  });
+
+  it("is disabled when the chat list failed to load", async () => {
+    const base = chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] });
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === "/assistant/chats") throw new Error("daemon down");
+      return base(path, init);
+    });
+
+    await renderChats("/chats/c-1");
+    await openConversationSettings();
+
+    const item = await screen.findByRole("menuitemcheckbox", { name: SWITCH });
+    expect(item.getAttribute("aria-disabled")).toBe("true");
+  });
+
+  it("a 404 says the conversation is gone and not that the service is down", async () => {
+    daemon.apiFetch.mockImplementation(
+      withSwitch(chatSummary({ chat_id: "c-1" }), () => {
+        throw new ApiRefusal(404, "not_found", "Not Found");
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openConversationSettings();
+    fireEvent.click(await screen.findByRole("menuitemcheckbox", { name: SWITCH }));
+
+    expect(
+      await screen.findByText(
+        /this conversation no longer exists\. automatic compaction was not changed/i,
+      ),
+    ).toBeDefined();
+    expect(screen.queryByText(/is not responding/i)).toBeNull();
+  });
+
+  it("a 403 says the key may not change this and not that the service is down", async () => {
+    daemon.apiFetch.mockImplementation(
+      withSwitch(chatSummary({ chat_id: "c-1" }), () => {
+        throw new ApiRefusal(403, "forbidden", "Forbidden");
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openConversationSettings();
+    fireEvent.click(await screen.findByRole("menuitemcheckbox", { name: SWITCH }));
+
+    expect(
+      await screen.findByText(
+        /refused the change: this key may not change conversation settings\. automatic compaction was not changed/i,
+      ),
+    ).toBeDefined();
+    expect(screen.queryByText(/is not responding/i)).toBeNull();
+  });
+
+  it("a network failure still says the service is not responding", async () => {
+    daemon.apiFetch.mockImplementation(
+      withSwitch(chatSummary({ chat_id: "c-1" }), () => {
+        throw new ApiUnavailable("transport", "network down");
+      }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openConversationSettings();
+    fireEvent.click(await screen.findByRole("menuitemcheckbox", { name: SWITCH }));
+
+    expect(await screen.findByText(/is not responding/i)).toBeDefined();
+  });
+
+  it("after a successful write the list is refetched and the switch shows the new state", async () => {
+    let stored = false;
+    const listCalls: boolean[] = [];
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === AUTO_COMPACT_PATH && init?.method === "PUT") {
+        stored = JSON.parse(String(init.body)).enabled === true;
+        return undefined;
+      }
+      if (path === "/assistant/chats") {
+        listCalls.push(stored);
+        return [chatSummary({ chat_id: "c-1", auto_compact: stored })];
+      }
+      return chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] })(path, init);
+    });
+
+    await renderChats("/chats/c-1");
+    await openConversationSettings();
+    fireEvent.click(await screen.findByRole("menuitemcheckbox", { name: SWITCH }));
+
+    await waitFor(() => {
+      const item = screen.getByRole("menuitemcheckbox", { name: SWITCH });
+      expect(item.getAttribute("aria-checked")).toBe("true");
+    });
+    expect(listCalls).toContain(true);
+  });
+
+  it("stays disabled until the refetch lands, so a second click cannot resend the old value", async () => {
+    let stored = false;
+    let releaseRefetch: () => void = () => {};
+    let hold = false;
+    const puts: boolean[] = [];
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === AUTO_COMPACT_PATH && init?.method === "PUT") {
+        const enabled = JSON.parse(String(init.body)).enabled === true;
+        puts.push(enabled);
+        stored = enabled;
+        hold = true;
+        return undefined;
+      }
+      if (path === "/assistant/chats") {
+        const snapshot = stored;
+        if (hold) {
+          // The refetch after the write: it answers only when the test lets it.
+          await new Promise<void>((resolve) => {
+            releaseRefetch = resolve;
+          });
+        }
+        return [chatSummary({ chat_id: "c-1", auto_compact: snapshot })];
+      }
+      return chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] })(path, init);
+    });
+
+    await renderChats("/chats/c-1");
+    await openConversationSettings();
+    fireEvent.click(await screen.findByRole("menuitemcheckbox", { name: SWITCH }));
+
+    await waitFor(() => {
+      expect(puts).toEqual([true]);
+    });
+    // Mid-refetch the row still says off; clicking now would send `true` again.
+    const during = screen.getByRole("menuitemcheckbox", { name: SWITCH });
+    expect(during.getAttribute("aria-disabled")).toBe("true");
+    fireEvent.click(during);
+    expect(puts).toEqual([true]);
+
+    hold = false;
+    releaseRefetch();
+    await waitFor(() => {
+      const item = screen.getByRole("menuitemcheckbox", { name: SWITCH });
+      expect(item.getAttribute("aria-checked")).toBe("true");
+      expect(item.getAttribute("aria-disabled")).not.toBe("true");
     });
   });
 });

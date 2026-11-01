@@ -91,6 +91,7 @@ import {
   MODE_MEANING,
   MODE_REFUSAL_PROSE,
   MODE_SENTENCES,
+  promotionBlocker,
   promotionConfirmLabel,
   promotionConsequence,
 } from "../lib/mode";
@@ -1243,7 +1244,8 @@ function FocusSetting({
       </p>
       <ModeSwitch
         value={project.mode}
-        actAllowed={project.promotable}
+        proven={project.promotable === true}
+        shortReason={promotionBlocker(project, project.withheld_classes_ready ?? 0)}
         actArmedLabel={promotionConfirmLabel(project)}
         actConsequence={promotionConsequence(project)}
         onArmedChange={setArmed}

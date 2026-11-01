@@ -531,11 +531,11 @@ describe("Autopilot - the carousel sets one project at a time, most urgent first
   });
 
   /**
-   * Locked and still reachable. A native `disabled` takes the button out of the tab order, and
-   * with it the one sentence that says why it is locked; `aria-disabled` keeps both, and the
-   * press does nothing.
+   * Changed from "focusable and inert": activating is never blocked (owner's rule). While the
+   * núcleo says the project is not ready the offer stays live and described by why, and pressing
+   * it warns first; cancelling sends nothing, confirming asks for the mode.
    */
-  it("keeps let it act focusable and inert while the núcleo says the project is not ready", async () => {
+  it("keeps let it act live while the núcleo says the project is not ready, and warns before sending", async () => {
     const beta = project({
       project_id: "beta",
       mode: "shadow",
@@ -550,7 +550,7 @@ describe("Autopilot - the carousel sets one project at a time, most urgent first
     await renderCockpit();
 
     const offer = within(await screen.findByRole("group", { name: "Autopilot mode" })).getByRole("button", { name: "Let it act" }) as HTMLButtonElement;
-    expect(offer.getAttribute("aria-disabled")).toBe("true");
+    expect(offer.getAttribute("aria-disabled")).not.toBe("true");
     expect(offer.disabled).toBe(false);
     offer.focus();
     expect(document.activeElement).toBe(offer);
@@ -561,10 +561,33 @@ describe("Autopilot - the carousel sets one project at a time, most urgent first
     expect(why?.className).toContain("ap-fan-gate-locked");
     expect(why?.textContent).toBe(promotionBlocker(beta, 0));
 
+    const writes = () =>
+      daemon.apiFetch.mock.calls.filter(
+        ([path, init]) => path === "/autopilot/state" && init?.method === "POST",
+      );
+
     fireEvent.click(offer);
+    // No hold interlock for the unproven offer: the warning is the confirmation.
     expect(screen.queryByRole("button", { name: "Let beta act" })).toBeNull();
-    expect(offer.getAttribute("aria-disabled")).toBe("true");
-    expect(daemon.apiFetch.mock.calls.some(([path]) => path === "/autopilot/state")).toBe(false);
+    let warning = await screen.findByRole("group", { name: "Not enough shadow evidence" });
+    expect(warning.textContent).toContain(promotionBlocker(beta, 0));
+    expect(writes()).toHaveLength(0);
+
+    fireEvent.click(within(warning).getByRole("button", { name: "Cancel" }));
+    await waitFor(() =>
+      expect(screen.queryByRole("group", { name: "Not enough shadow evidence" })).toBeNull(),
+    );
+    expect(writes()).toHaveLength(0);
+
+    fireEvent.click(offer);
+    warning = await screen.findByRole("group", { name: "Not enough shadow evidence" });
+    fireEvent.click(within(warning).getByRole("button", { name: "Activate anyway" }));
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/autopilot/state", {
+        method: "POST",
+        body: JSON.stringify({ project_id: "beta", mode: "active", project_root: "C:/repos/beta" }),
+      });
+    });
   });
 
   /**

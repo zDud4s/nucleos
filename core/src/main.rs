@@ -1,6 +1,8 @@
 mod cli;
 mod http;
 mod startup;
+#[cfg(windows)]
+mod supervisor;
 
 use nucleos_app::*;
 use nucleos_core::*;
@@ -55,6 +57,14 @@ async fn main() {
         std::process::exit(code);
     }
 
+    // The logon task's mode: launch this same exe as the daemon and relaunch it after a failure. After
+    // the subcommands above, so `--version --supervise` still only answers. Off Windows the flag is
+    // ignored and this process is the daemon itself: no other autostart backend passes it.
+    #[cfg(windows)]
+    if supervise::wants_supervisor(&std::env::args().collect::<Vec<_>>()) {
+        std::process::exit(supervisor::run().await);
+    }
+
     let default_dir =
         data_dir::default_data_dir().expect("could not resolve local app data directory");
 
@@ -81,6 +91,21 @@ async fn main() {
 
     let log_dir = data_dir.join("logs");
     let _log_guard = logging::init(&log_dir);
+
+    // Something that answers on a taken port must make this process leave before it touches
+    // anything: the startup below marks the live runs of whoever owns the port as `interrupted`,
+    // applies a pending restore and compacts the database. The probe only proves that something
+    // accepts connections. The bind further down stays as the last word.
+    if settings_cli::daemon_answers_on(daemon_client::port(), settings_cli::PROBE_WAIT).await {
+        let sentence = format!(
+            "nucleos-core: something already answers on 127.0.0.1:{}; leaving without touching its data",
+            daemon_client::port()
+        );
+        tracing::error!("{sentence}");
+        eprintln!("{sentence}");
+        drop(_log_guard); // flush the line above before `exit` skips destructors
+        std::process::exit(supervise::EXIT_PORT_BUSY);
+    }
 
     // Only the machine's daemon claims the logon entry. `ensure_registered` overwrites it (on
     // Windows with `schtasks /F`), so a secondary doing this would point the autostart at whatever
@@ -164,7 +189,9 @@ async fn main() {
             // start is the one person who can fix the store, and may not be reading the log.
             tracing::error!("{sentence}");
             eprintln!("{sentence}");
-            std::process::exit(1);
+            // Its own code, not 1: 1 is what `taskkill /F` leaves, and the supervisor must restart
+            // this (the store may be unlocked a minute later) but not a deliberate stop.
+            std::process::exit(supervise::EXIT_CREDENTIAL_STORE);
         }
     };
     tracing::info!("nucleos-core token loaded from the system credential store");
@@ -179,6 +206,7 @@ async fn main() {
             machine_config::ROOT_DISPLAY
         );
     }
+    let mut devtime_readable = false;
     match settings::init(&pool).await {
         Ok(handle) => {
             let outcome =
@@ -191,6 +219,8 @@ async fn main() {
                     "settings import finished"
                 );
             }
+            devtime_readable =
+                !handle.snapshot().is_unreadable(&settings::Scope::Machine, "devtime");
             for unreadable in handle.snapshot().unreadable() {
                 tracing::warn!(
                     document = %unreadable.name,
@@ -810,9 +840,22 @@ async fn main() {
     assistant::install_turns(&state);
 
     let app = http::build_router(state.clone());
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", daemon_client::port()))
-        .await
-        .unwrap();
+    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", daemon_client::port())).await {
+        Ok(listener) => listener,
+        // Another daemon won the race since the probe at the top. Not a crash (101): the supervisor
+        // must not relaunch into it.
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            let sentence = format!(
+                "nucleos-core: port {} is taken ({e}); leaving",
+                daemon_client::port()
+            );
+            tracing::error!("{sentence}");
+            eprintln!("{sentence}");
+            drop(_log_guard);
+            std::process::exit(supervise::EXIT_PORT_BUSY);
+        }
+        Err(e) => panic!("failed to bind 127.0.0.1:{}: {e}", daemon_client::port()),
+    };
     tracing::info!(
         "nucleos-core listening on {}",
         listener.local_addr().unwrap()
@@ -1037,6 +1080,10 @@ async fn main() {
     } else {
         Some(std::path::PathBuf::from(&devtime_config.projects_dir))
     };
+    // A `--settings-reset` or `--settings-rollback` run while the daemon was stopped changed the thresholds
+    // without the HTTP hook: void the pending rows decided under the old ones before anything new is
+    // decided (skipped while the `devtime` document is unreadable: its defaults are not the owner's).
+    devtime::void_stale_at_startup(&state.pool, &devtime_config.actions, devtime_readable).await;
     tokio::spawn(devtime::run_ingest_loop(
         state.pool.clone(),
         devtime_config,
