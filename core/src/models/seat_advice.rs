@@ -915,6 +915,33 @@ mod tests {
         assert!(text.contains("claude"), "{text}");
     }
 
+    /// E20: with agy as the only engine the seat filter leaves no runner to offer, and a request
+    /// without model globs is "any model" to the router, so nothing is asked at all.
+    #[tokio::test]
+    async fn suggest_with_agy_as_the_only_engine_asks_nothing() {
+        let _gate = crate::engines::agy_test_support::agy_gate(true);
+        let (url, mut sent) = stub_router(200, answer("claude-opus-5", "high")).await;
+        let config = RouterConfig {
+            mode: Mode::Shadow,
+            url,
+            timeout_ms: 2500,
+            surfaces: [("recruit", Mode::Shadow)].into_iter().collect(),
+            ..RouterConfig::off()
+        };
+        let primary = Available {
+            kind: RunnerKind::Agy,
+            runner: Arc::new(crate::execution::runner::FakeCommandRunner::default()),
+            default_model: "agy/gemini-3.8-flash-high".into(),
+            models: vec!["agy/*".into()],
+        };
+        let router = Arc::new(Router::new(config, primary, Vec::new()));
+
+        let refused = suggest(Some(router), None, "task").await;
+
+        assert!(refused.is_err(), "{refused:?}");
+        assert!(sent.try_recv().is_err(), "the router was asked");
+    }
+
     // ---- outcomes ----
 
     async fn seed_ended(
