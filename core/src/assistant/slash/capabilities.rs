@@ -32,9 +32,9 @@ impl ChatEngine {
         self.0.as_str()
     }
 
-    /// Whether this engine reports how full its context is. Automatic compaction and rotation act
-    /// on a fill reading, and agy's output carries none. An allow-list: a row nobody classified
-    /// fails closed.
+    /// Whether this engine has a fill reading of its context, measured or estimated. Automatic
+    /// compaction and rotation act on that reading, and agy's output carries none. An allow-list: a
+    /// row nobody classified fails closed.
     pub fn measures_fill(self) -> bool {
         matches!(
             self,
@@ -316,6 +316,29 @@ mod tests {
         let zed = ChatEngine::of_cli_in(rows.as_slice(), "zed");
         assert_eq!(zed.as_str(), "zed", "the fake row is itself, not Claude");
         assert!(!zed.measures_fill());
+    }
+
+    /// A chat with no pinned model falls back to the primary runner, so under an agy primary it is
+    /// agy whichever way the gate stands: answered by agy when on, refused as agy when off.
+    #[test]
+    fn an_unpinned_chat_under_an_agy_primary_is_agy_and_cannot_compact() {
+        let config = ModelsConfig {
+            primary_runner: Some("agy".to_string()),
+            ..ModelsConfig::default()
+        };
+        // The guard holds the settings serial lock, so each must drop before the next is taken.
+        for enabled in [true, false] {
+            let _gate = crate::engines::agy_test_support::agy_gate(enabled);
+            let engine = engine_of(&config, Brain::Cloud, None);
+            assert_eq!(engine, ChatEngine::Agy, "gate {enabled}");
+            assert!(!engine.measures_fill(), "gate {enabled}");
+        }
+
+        // Control, outside any gate: the default primary resolves to claude, which never reads it.
+        assert_eq!(
+            engine_of(&ModelsConfig::default(), Brain::Cloud, None),
+            ChatEngine::Claude
+        );
     }
 
     /// RED (plan Node 3, test 7; contract E22). The Gemini API route is a chat engine of its own
