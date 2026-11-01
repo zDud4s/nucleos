@@ -321,7 +321,8 @@ pub async fn suggest(
     let runners: Vec<RunnerKind> = match runner {
         // An engine the router does not hold has no globs, and a request without any is "any
         // model" to the router: nothing is asked.
-        Some(kind) if router.available(kind).is_none() => {
+        // Seats refuse agy (E8), so offering it only misleads: a named agy is treated as unknown.
+        Some(kind) if kind == RunnerKind::Agy || router.available(kind).is_none() => {
             return Err(format!(
                 "the model adviser does not know the {} engine here",
                 kind.as_str()
@@ -330,6 +331,7 @@ pub async fn suggest(
         Some(kind) => vec![kind],
         None => std::iter::once(router.primary.kind)
             .chain(router.alternates.iter().map(|available| available.kind))
+            .filter(|kind| *kind != RunnerKind::Agy)
             .collect(),
     };
     let sent = router.build_request(&seat_query(task), &runners);

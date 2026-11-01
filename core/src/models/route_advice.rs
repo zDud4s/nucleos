@@ -404,9 +404,10 @@ impl Router {
             let fits = match alternate.kind {
                 RunnerKind::Claude => true,
                 RunnerKind::Codex => codex_can_take(shape),
-                // Agy is offered only a read-only run it can honour; `spawn.rs` drops it again for a
-                // run whose controls the runner refuses (job MCP, steering, a forked session).
-                RunnerKind::Agy => agy_can_take(shape),
+                // Agy is offered only while its gate is open and for a read-only run it can honour;
+                // `spawn.rs` drops it again for a run whose controls the runner refuses (job MCP,
+                // steering, a forked session).
+                RunnerKind::Agy => agy_can_take(shape) && crate::engines::agy::enabled(),
             };
             if fits && !kinds.contains(&alternate.kind) {
                 kinds.push(alternate.kind);
