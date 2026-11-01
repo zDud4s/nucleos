@@ -607,6 +607,14 @@ async fn main() {
         (None, Err(_)) => (None, None),
     };
 
+    // The Google key for `gemini-api/` picks. Independent of the OpenRouter match above: a
+    // Google-key-only install must still serve them. Never logged; a store that cannot be read
+    // counts as no key.
+    let gemini_key = secrets::load_secret(GEMINI_KEY)
+        .ok()
+        .flatten()
+        .filter(|key| !key.trim().is_empty());
+
     // Model discovery keys: the credential store first, the environment second. Only whether each
     // is present is ever logged. A key stored while the daemon runs takes effect after a restart.
     {
@@ -700,6 +708,7 @@ async fn main() {
             // same constant — and the whole point for one that named another server.
             local_base_url,
         )
+        .with_gemini_key(gemini_key)
         .with_local_engine(local_engine, local_context_tokens)
         .with_agent_clis(
             engines::claude_runner(&models_config),

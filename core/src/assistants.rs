@@ -33,6 +33,20 @@
 pub const HOSTED_KEY_MISSING: &str =
     "an OpenRouter key is required before the hosted assistant can answer";
 
+/// The sentence `Refusal::GeminiKeyMissing` renders as. It names Gemini on purpose: the OpenRouter
+/// sentence above would send the operator to the wrong key.
+pub const GEMINI_KEY_MISSING: &str =
+    "a Gemini API key is required before a gemini-api model can answer";
+
+/// Whether `model` is a `gemini-api/` pick. The provider of a hosted chat is read from the id
+/// prefix and never from a stored brain value (the stored brain stays `openrouter`).
+fn is_gemini_pick(model: Option<&str>) -> bool {
+    model.is_some_and(|id| {
+        id.strip_prefix(crate::engines::GEMINI_API)
+            .is_some_and(|rest| rest.starts_with('/'))
+    })
+}
+
 /// Why a route could not produce an assistant for a turn.
 ///
 /// `RouteNotConfigured` renders as the exact sentence `http.rs` already compares with `==`
@@ -55,6 +69,9 @@ pub enum Refusal {
     /// stored in the OS credential manager. Distinct from `RouteNotConfigured` on purpose — see
     /// this type's own doc comment.
     HostedModelNamedButNoKey,
+    /// A `gemini-api/` model was picked but no Google key is stored. Its own variant so the
+    /// sentence names Gemini; an OpenRouter key never stands in for it.
+    GeminiKeyMissing,
     /// `chats::Brain::Cloud` asked this factory for an assistant. `Cloud` is the agent CLI — a
     /// different mechanism entirely (`spawn_assistant_turn`, sessions, a subprocess) — and this
     /// factory never serves it. Wrong door, not misconfiguration.
@@ -93,6 +110,7 @@ impl Refusal {
             }
             .to_string(),
             Refusal::HostedModelNamedButNoKey => HOSTED_KEY_MISSING.to_string(),
+            Refusal::GeminiKeyMissing => GEMINI_KEY_MISSING.to_string(),
             Refusal::NotServedByThisFactory => {
                 "this route answers through the agent CLI, not this factory".to_string()
             }
@@ -301,6 +319,12 @@ pub struct ConfiguredAssistants {
     /// `assistant_for` already builds an `OpenAiCompatibleChat` against — and `with_hosted_base_url`
     /// below is the test-only seam for pointing it at a stub instead.
     hosted_base_url: String,
+    /// The Google key, or `None` when none is stored. Read ONLY by `gemini-api/` picks and sent
+    /// ONLY to `gemini_base_url`; the OpenRouter key (`hosted_key`) is never used for them.
+    gemini_key: Option<String>,
+    /// Where `gemini-api/` picks are sent; `openai_compatible::GEMINI_BASE_URL` unless a test
+    /// points it at a stub through `with_gemini_base_url`.
+    gemini_base_url: String,
     /// One probe per (route, model) pair, not per `can_serve`/`declared_for` call — the reason
     /// `capabilities::DiscoveryCache` exists at all (see its own doc). Owned by the factory rather
     /// than built per call: a `Mutex` created fresh on every call would cache nothing across the
@@ -367,6 +391,8 @@ impl ConfiguredAssistants {
             local_engine: crate::config::LocalEngine::Ollama,
             local_declared_context_tokens: None,
             hosted_base_url: crate::models::openai_compatible::OPENROUTER_BASE_URL.to_string(),
+            gemini_key: None,
+            gemini_base_url: crate::models::openai_compatible::GEMINI_BASE_URL.to_string(),
             discovery_cache: crate::capabilities::DiscoveryCache::new(),
             introspection_client: reqwest::Client::builder()
                 .timeout(CAPABILITY_PROBE_TIMEOUT)
@@ -416,6 +442,20 @@ impl ConfiguredAssistants {
     #[cfg(any(test, feature = "testkit"))]
     pub fn with_hosted_base_url(mut self, hosted_base_url: String) -> Self {
         self.hosted_base_url = hosted_base_url;
+        self
+    }
+
+    /// Production wiring: the Google key `main.rs` read from the credential store, if any.
+    /// A builder for the reason `with_local_engine` is one: `new` keeps its seven parameters.
+    pub fn with_gemini_key(mut self, gemini_key: Option<String>) -> Self {
+        self.gemini_key = gemini_key;
+        self
+    }
+
+    /// Test-only seam for `gemini_base_url`, so a stub can stand in for Google.
+    #[cfg(any(test, feature = "testkit"))]
+    pub fn with_gemini_base_url(mut self, gemini_base_url: String) -> Self {
+        self.gemini_base_url = gemini_base_url;
         self
     }
 }
@@ -514,6 +554,33 @@ impl Assistants for ConfiguredAssistants {
         // refusal from `serves` are the same check, not two copies of it. Harmless to repeat below:
         // `resolve_model`'s and the key's own checks only ever fail for the same reason `serves`
         // just ruled out, so they cannot fail here having passed there.
+        //
+        // A `gemini-api/` pick on the hosted brain is decided BEFORE `serves`: that check demands
+        // the OpenRouter key, which a Google-key-only install does not have, and the Google key is
+        // this pick's only key. No key means a refusal naming Gemini, never a fall back to
+        // OpenRouter's key or base.
+        if brain == crate::chats::Brain::OpenRouter && is_gemini_pick(model) {
+            let key = self
+                .gemini_key
+                .clone()
+                .ok_or(Refusal::GeminiKeyMissing)?;
+            let chat = crate::models::openai_compatible::OpenAiCompatibleChat::gemini_with_client(
+                self.hosted_client.clone(),
+                self.gemini_base_url.clone(),
+                // `gemini_with_client` strips the `gemini-api/` and `models/` prefixes.
+                model.unwrap_or_default().to_string(),
+                key,
+            );
+            let toolbox = toolbox_for(
+                brain,
+                self.loopback_url.clone(),
+                self.token.clone(),
+                self.pool.clone(),
+            );
+            return Ok(std::sync::Arc::new(
+                crate::models::local_agent::LocalAssistant::new(Box::new(chat), toolbox),
+            ));
+        }
         self.serves(brain)?;
         match brain {
             crate::chats::Brain::Cloud => Err(Refusal::NotServedByThisFactory),
@@ -622,6 +689,16 @@ impl Assistants for ConfiguredAssistants {
         // existed, EVERY hosted `can_serve` call probed the LOCAL Ollama instead, which is a
         // second bug this same guard also forecloses: there is no discovery attempt left to
         // misroute.
+        if brain == crate::chats::Brain::OpenRouter && is_gemini_pick(Some(model)) {
+            // The Google key decides, and only it. No discovery: Google's catalogue needs the key
+            // as a bearer and `discover_openai_compatible` sends none, so asking would either fail
+            // or probe the wrong service. The route offers HOSTED_TOOLS only, which needs no
+            // declared capability to be safe.
+            return match self.gemini_key {
+                Some(_) => Ok(()),
+                None => Err(Refusal::GeminiKeyMissing),
+            };
+        }
         if brain == crate::chats::Brain::OpenRouter && self.hosted_key.is_none() {
             return Err(Refusal::HostedModelNamedButNoKey);
         }
@@ -655,7 +732,14 @@ impl Assistants for ConfiguredAssistants {
             return std::collections::HashMap::new();
         }
 
-        let probes = models.iter().map(|model| {
+        // A `gemini-api/` id is never probed against OpenRouter's catalogue (it would ask the wrong
+        // service); it stays absent from the map, i.e. unmarked, as `can_serve` explains.
+        let probes = models
+            .iter()
+            .filter(|model| {
+                !(brain == crate::chats::Brain::OpenRouter && is_gemini_pick(Some(model.as_str())))
+            })
+            .map(|model| {
             let key = model.clone();
             async move {
                 let declared = self.declared_one(brain, &key).await;
