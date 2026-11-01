@@ -95,6 +95,9 @@ pub(super) async fn run() -> i32 {
         journal.say(&format!("launching {}", exe.display()));
         let code = match tokio::process::Command::new(&exe)
             .args(&child_args)
+            // The task runs under `conhost --headless`, whose stdin handle may be dead, and the
+            // daemon would hand that to everything it starts.
+            .stdin(std::process::Stdio::null())
             .kill_on_drop(true)
             .spawn()
         {
