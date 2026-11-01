@@ -126,6 +126,9 @@ def run_sh(release_url, tmp: Path, extra_env=None, args=()):
 
 def run_ps1(release_url, tmp: Path, extra_env=None):
     env = dict(os.environ)
+    # A pwsh 7 parent exports its own module path; Windows PowerShell 5.1 then cannot find Get-FileHash.
+    # os.environ upper-cases keys on Windows, hence the spelling.
+    env.pop("PSMODULEPATH", None)
     env.update(
         {
             "NUCLEOS_RELEASE_BASE": release_url,
