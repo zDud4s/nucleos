@@ -681,6 +681,8 @@ export const keys = {
     /** `GET /system/storage` — what the database file and the folders beside it occupy. */
     storage: ["system", "storage"] as const,
     tokens: ["system", "tokens"] as const,
+    /** `GET /engines/<engine>` — the opt-in state of one CLI engine. */
+    engine: (engine: string) => ["system", "engine", engine] as const,
     pii: ["system", "pii"] as const,
     /**
      * Which feed kinds still reach a messaging channel — `GET /notifications/policy` — and

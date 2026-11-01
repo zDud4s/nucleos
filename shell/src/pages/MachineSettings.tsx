@@ -4,6 +4,7 @@ import { useForgetSecret, useMachineSecrets, useStoreSecret, type MachineSecret 
 import { useSettingsIndex, type SettingIndexRow } from "../data/settings";
 import { SettingsForm } from "../settings/SettingsForm";
 import { Button, ConfirmButton, ErrorNote, Panel, RefusalNote, Skeleton, StateBadge } from "../ui";
+import { EngineOptIn } from "./EngineOptIn";
 import { DistillerModel } from "./DistillerModel";
 import { CaptureWait } from "./CaptureWait";
 import { EmbeddingModel } from "./EmbeddingModel";
@@ -68,6 +69,10 @@ export function MachineSettings() {
           <CaptureWait />
           <EmbeddingModel />
         </div>
+      </Panel>
+
+      <Panel title="Engines">
+        <EngineOptIn engine="agy" label="Antigravity CLI (agy)" />
       </Panel>
 
       <p className="sy-machine-intro">
