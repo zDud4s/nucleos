@@ -1128,6 +1128,14 @@ def conductor_prompt(payload, state):
         path = conductor_flag_path(payload.get("session_id"), state)
         if path is None:
             return
+        # A new prompt starts a new read budget. Background-task notifications fire this event too
+        # and cannot be told apart cheaply; they reset it as well, which only errs towards the owner.
+        try:
+            budget = _conductor_budget_path(payload.get("session_id"), state)
+            if budget is not None and os.path.exists(budget):
+                os.remove(budget)
+        except Exception:
+            pass  # never keep the `manual:` flag below from being handled
         prompt = payload.get("prompt")
         if not isinstance(prompt, str) or not prompt.strip().lower().startswith("manual:"):
             if os.path.exists(path):
@@ -1173,7 +1181,116 @@ def _conductor_material(target, state, cwd):
     return False
 
 
-def _conductor_read_refusal(tool, tool_input, state, cwd):
+# What a root read may cost, in estimated tokens. Measured 2026-10-31: delegating a read costs
+# about $0.07 whatever its size, a read in the root about $0.0167 per 1k tokens, so the break-even
+# is ~4k tokens; a single call stays under it, and a prompt's worth stays under two of them.
+CONDUCTOR_READ_CALL_TOKENS = 3000
+CONDUCTOR_READ_PROMPT_TOKENS = 6000
+CONDUCTOR_READ_BYTES_PER_TOKEN = 4
+CONDUCTOR_READ_TOKENS_PER_LINE = 12
+CONDUCTOR_GREP_LIST_TOKENS = 300
+CONDUCTOR_GLOB_TOKENS = 100
+CONDUCTOR_GREP_MAX_HEAD_LIMIT = 60
+CONDUCTOR_UNPAGEABLE = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".pdf", ".ipynb")
+CONDUCTOR_TOO_BIG = (
+    f"This read is too big for the root session (limit {CONDUCTOR_READ_CALL_TOKENS} estimated tokens a "
+    f"call, {CONDUCTOR_READ_PROMPT_TOKENS} a prompt). Narrow it with offset/limit/head_limit, or "
+    "delegate it to `Explore`/`worker`. If you are the owner and want manual work, start the prompt "
+    "with `manual:`."
+)
+
+
+def _conductor_read_cost(tool, tool_input, target):
+    """Estimated tokens of this read, or None when it is not eligible. Over the call limit is a cost."""
+    over = CONDUCTOR_READ_CALL_TOKENS + 1
+    if tool == "Read":
+        if not os.path.isfile(target) or target.endswith(CONDUCTOR_UNPAGEABLE) or "pages" in tool_input:
+            return None
+        cost = -(-os.path.getsize(target) // CONDUCTOR_READ_BYTES_PER_TOKEN)
+        limit = tool_input.get("limit")
+        if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
+            cost = min(cost, limit * CONDUCTOR_READ_TOKENS_PER_LINE)
+        return cost
+    if not os.path.isdir(target):
+        return None
+    if tool == "Glob":
+        return CONDUCTOR_GLOB_TOKENS
+    mode, head = tool_input.get("output_mode"), tool_input.get("head_limit")
+    if head == 0 and not isinstance(head, bool):
+        return over  # unlimited
+    if mode in (None, "files_with_matches", "count"):
+        return CONDUCTOR_GREP_LIST_TOKENS
+    if mode != "content" or not isinstance(head, int) or isinstance(head, bool):
+        return over if mode == "content" else None
+    if not 1 <= head <= CONDUCTOR_GREP_MAX_HEAD_LIMIT:
+        return over
+    context = 0
+    for flag in ("-A", "-B", "-C", "context"):
+        value = tool_input.get(flag)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            context = max(context, value)
+    return head * CONDUCTOR_READ_TOKENS_PER_LINE * (1 + context)
+
+
+def _conductor_budget_path(session_id, state):
+    """This session's running read total, beside its `manual:` flag; reset by `conductor_prompt`."""
+    flag = conductor_flag_path(session_id, state)
+    return None if flag is None else flag[: -len(".json")] + ".budget.json"
+
+
+def _conductor_charge(session_id, state, cost):
+    """Adds `cost` to the prompt's total and returns True, or False when it would pass the limit.
+    None when the state cannot be read or written: the new allowance fails closed."""
+    path = _conductor_budget_path(session_id, state)
+    if path is None:
+        return None
+    try:
+        try:
+            with open(path, encoding="utf-8") as handle:
+                spent = json.load(handle)["tokens"]
+        except FileNotFoundError:
+            spent = 0
+        if not isinstance(spent, int) or isinstance(spent, bool) or spent < 0:
+            return None
+        if spent + cost > CONDUCTOR_READ_PROMPT_TOKENS:
+            return False
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump({"tokens": spent + cost}, handle)
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        return None
+
+
+def _conductor_small_read_refusal(tool, tool_input, state, cwd, session_id):
+    """The root may read small things itself, within a per-call and a per-prompt budget."""
+    path = tool_input.get("file_path") if tool == "Read" else (tool_input.get("path") or cwd)
+    if not isinstance(path, str) or not path:
+        return CONDUCTOR_REFUSAL
+    try:
+        cost = _conductor_read_cost(tool, tool_input, _conductor_path(path, cwd))
+    except OSError:
+        return CONDUCTOR_REFUSAL
+    if cost is None:
+        return CONDUCTOR_REFUSAL
+    if cost > CONDUCTOR_READ_CALL_TOKENS:
+        return CONDUCTOR_TOO_BIG
+    charged = _conductor_charge(session_id, state, cost)
+    if charged is None:
+        return CONDUCTOR_REFUSAL
+    return "" if charged else CONDUCTOR_TOO_BIG
+
+
+def _conductor_read_refusal(tool, tool_input, state, cwd, session_id=None):
+    refusal = _conductor_material_read_refusal(tool, tool_input, state, cwd)
+    if not refusal:
+        return refusal
+    return _conductor_small_read_refusal(tool, tool_input, state, cwd, session_id)
+
+
+def _conductor_material_read_refusal(tool, tool_input, state, cwd):
     if tool == "Read":
         path = tool_input.get("file_path")
     else:
@@ -1213,6 +1330,72 @@ def _conductor_write_refusal(tool_input, state, cwd):
     ):
         return CONDUCTOR_REFUSAL
     return "" if _conductor_material(target, state, cwd) else CONDUCTOR_REFUSAL
+
+
+CONDUCTOR_BASH_NAMES = ("bash", "bash.exe")
+# Where Git for Windows keeps the `bash.exe` the project's docs name. Any other path could name a
+# program an agent wrote, so only these (and the bare name) count. Compared after normalisation.
+CONDUCTOR_GIT_BASH = (
+    "c:/program files/git/bin/bash.exe",
+    "c:/program files/git/usr/bin/bash.exe",
+)
+CONDUCTOR_GATE_TARGET = re.compile(r"[a-z][a-z0-9_-]*")
+# An output redirect at the very end of a command, and nothing else: `> file`, `*> file`
+# (PowerShell), `2>&1`. `>>`, `<`, `2> file` and anything mid-command stay refused.
+CONDUCTOR_REDIRECT_TAIL = re.compile(
+    r"\s+(?:2>&1|\*?>\s*(?:\"(?P<dq>[^\"<>&|;`$\r\n]+)\"|'(?P<sq>[^'<>&|;`$\r\n]+)'"
+    r"|(?P<bare>[^\s\"'<>&|;`$]+)))\s*$"
+)
+CONDUCTOR_DEV_HOME_ENV = "NUCLEOS_DEV_HOME"
+CONDUCTOR_DEV_HOME_DEFAULT = "C:/nucleos-dev"
+
+
+def _conductor_log_roots(state, cwd):
+    """Folders a gate's log may be redirected into: scratch space, never a file of the project."""
+    dev_home = os.environ.get(CONDUCTOR_DEV_HOME_ENV) or CONDUCTOR_DEV_HOME_DEFAULT
+    roots = (
+        state.get("tmp_dir") or tempfile.gettempdir(),
+        tempfile.gettempdir(),
+        os.path.join(dev_home, "scratch"),
+    )
+    return [_conductor_path(root, cwd) for root in roots]
+
+
+def _conductor_strip_redirects(command, state, cwd):
+    """`(command without its trailing output redirects, ok, any redirect seen)`. Not ok when a
+    redirect aims outside the scratch folders, so a gate cannot be pointed at a file of the project."""
+    redirected = False
+    while True:
+        match = CONDUCTOR_REDIRECT_TAIL.search(command)
+        if not match:
+            return command, True, redirected
+        redirected = True
+        target = match.group("dq") or match.group("sq") or match.group("bare")
+        if target is not None:
+            resolved = _conductor_path(target, cwd)
+            in_project = any(
+                os.path.isfile(os.path.join(folder, "scripts", "gates.sh")) and _under(resolved, _conductor_path(folder, cwd))
+                for folder in _ancestors(cwd)
+            )
+            if in_project or not any(_under(resolved, root) for root in _conductor_log_roots(state, cwd)):
+                return command, False, redirected
+        command = command[: match.start()]
+
+
+def _conductor_gates_accepts(tokens, cwd):
+    """`[bash] <project>/scripts/gates.sh [target]`: this project's own gate script, which the root
+    controller runs (the subagent guard in `scripts/heavy_guard.py` leaves it to the root)."""
+    if tokens and (tokens[0].lower() in CONDUCTOR_BASH_NAMES or tokens[0].lower() in CONDUCTOR_GIT_BASH):
+        tokens = tokens[1:]
+    if not tokens or len(tokens) > 2:
+        return False
+    script = _conductor_path(tokens[0], cwd)
+    if not any(
+        script == _conductor_path(os.path.join(folder, "scripts", "gates.sh"), cwd)
+        for folder in _ancestors(cwd)
+    ):
+        return False
+    return len(tokens) == 1 or CONDUCTOR_GATE_TARGET.fullmatch(tokens[1]) is not None
 
 
 def _conductor_heavy_accepts(tokens, cwd):
@@ -1282,12 +1465,20 @@ def _conductor_git_accepts(tokens):
     return False
 
 
-def _conductor_command_refusal(command, cwd):
+def _conductor_command_refusal(command, cwd, state=None):
     if not isinstance(command, str):
         return ""  # malformed: the tool itself refuses it
     # The spelling tolerance of `claimed_land_override`, but any mention counts, not only a setting.
     if CONDUCTOR_ENV.lower() in re.sub(r"[\\`'\"+${}]", "", command).lower():
         return CONDUCTOR_ENV_REFUSAL
+    # A trailing log redirect and a leading PowerShell `&` are for the gate script alone.
+    gates_only = False
+    stripped, redirects_ok, redirected = _conductor_strip_redirects(command, state or {}, cwd)
+    if redirects_ok and redirected:
+        command, gates_only = stripped, True
+    call_operator = re.match(r"\s*&\s+(?=\S)", command)
+    if call_operator:
+        command, gates_only = command[call_operator.end():], True
     if any(mark in command for mark in CONDUCTOR_METACHARACTERS):
         return CONDUCTOR_REFUSAL
     try:
@@ -1295,12 +1486,14 @@ def _conductor_command_refusal(command, cwd):
         tokens = shlex.split(command.replace("\\", "/"), posix=True)
     except ValueError:
         return CONDUCTOR_REFUSAL
-    if tokens and (_conductor_heavy_accepts(tokens, cwd) or _conductor_git_accepts(tokens)):
+    if tokens and _conductor_gates_accepts(tokens, cwd):
+        return ""
+    if tokens and not gates_only and (_conductor_heavy_accepts(tokens, cwd) or _conductor_git_accepts(tokens)):
         return ""
     return CONDUCTOR_REFUSAL
 
 
-def _conductor_refusal(tool, tool_input, state, cwd):
+def _conductor_refusal(tool, tool_input, state, cwd, session_id=None):
     """Why the rules refuse this call, or `""`. Everything not named here is refused."""
     if tool in CONDUCTOR_TOOLS:
         return ""
@@ -1309,9 +1502,9 @@ def _conductor_refusal(tool, tool_input, state, cwd):
         name = tool[len("mcp__nucleos__"):]
         return "" if name and "__" not in name else CONDUCTOR_REFUSAL
     if tool in ("Bash", "PowerShell"):
-        return _conductor_command_refusal(tool_input.get("command"), cwd)
+        return _conductor_command_refusal(tool_input.get("command"), cwd, state)
     if tool in ("Read", "Grep", "Glob"):
-        return _conductor_read_refusal(tool, tool_input, state, cwd)
+        return _conductor_read_refusal(tool, tool_input, state, cwd, session_id)
     if tool in ("Write", "Edit"):
         return _conductor_write_refusal(tool_input, state, cwd)
     return CONDUCTOR_REFUSAL
@@ -1336,7 +1529,7 @@ def conductor_verdict(payload, state):
             or not cwd.strip()
         ):
             return allowed
-        reason = _conductor_refusal(tool, tool_input, state, cwd)
+        reason = _conductor_refusal(tool, tool_input, state, cwd, payload.get("session_id"))
         if not reason:
             return allowed
         return {"decision": "deny" if mode == "on" else "allow", "reason": reason, "would_deny": True}
