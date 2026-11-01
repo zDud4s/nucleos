@@ -35,6 +35,13 @@ pub struct WorktreeInfo {
 }
 
 pub fn worktree_root(project_root: &Path) -> PathBuf {
+    // A test's keyed override wins over the env var; a release build compiles none of this.
+    #[cfg(any(test, feature = "testkit"))]
+    {
+        if let Some(root) = keyed_worktree_root(project_root) {
+            return root;
+        }
+    }
     if let Some(root) = std::env::var_os("NUCLEOS_WORKTREE_ROOT") {
         return PathBuf::from(root);
     }
@@ -1422,6 +1429,52 @@ pub fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Test-only overrides keyed by project root, so a test can pin a worktree root for its own project
+/// without touching the process environment (and without `test_env_lock`).
+///
+/// A map and not a thread-local on purpose: `free_space_for_worktrees` reads the root on a
+/// `spawn_blocking` thread, which a thread-local set by the test would not reach. Keys are compared
+/// as given (no canonicalisation), so a test must set and read through the same project root.
+/// Setting the same key twice at once is not supported: the first guard dropped removes the entry.
+#[cfg(any(test, feature = "testkit"))]
+static ROOT_OVERRIDES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, PathBuf>>,
+> = std::sync::LazyLock::new(Default::default);
+
+#[cfg(any(test, feature = "testkit"))]
+fn keyed_worktree_root(project_root: &Path) -> Option<PathBuf> {
+    ROOT_OVERRIDES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(project_root)
+        .cloned()
+}
+
+/// Makes `worktree_root(project_root)` answer `root` until dropped.
+#[cfg(any(test, feature = "testkit"))]
+pub struct WorktreeRootOverride(PathBuf);
+
+#[cfg(any(test, feature = "testkit"))]
+impl WorktreeRootOverride {
+    pub fn set(project_root: &Path, root: &Path) -> Self {
+        ROOT_OVERRIDES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(project_root.to_path_buf(), root.to_path_buf());
+        Self(project_root.to_path_buf())
+    }
+}
+
+#[cfg(any(test, feature = "testkit"))]
+impl Drop for WorktreeRootOverride {
+    fn drop(&mut self) {
+        ROOT_OVERRIDES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // `env_lock()` returns a process-wide MutexGuard deliberately held across the
@@ -1767,6 +1820,26 @@ mod tests {
         let root = space_free_tempdir();
         let _env = WorktreeRootEnv::set(Some(root.path()));
         assert_eq!(worktree_root(Path::new(r"C:\work\repo")), root.path());
+    }
+
+    #[test]
+    fn a_keyed_root_override_beats_the_env_and_ends_on_drop() {
+        let _lock = env_lock();
+        let from_env = space_free_tempdir();
+        let keyed = space_free_tempdir();
+        let _env = WorktreeRootEnv::set(Some(from_env.path()));
+        let project = keyed.path().join("project");
+
+        let pin = WorktreeRootOverride::set(&project, keyed.path());
+        assert_eq!(worktree_root(&project), keyed.path());
+        assert_eq!(
+            worktree_root(Path::new(r"C:\work\repo")),
+            from_env.path(),
+            "only the pinned project"
+        );
+
+        drop(pin);
+        assert_eq!(worktree_root(&project), from_env.path());
     }
 
     /// The nested default this task is moving `worktree_root` to, pinned above by
