@@ -147,6 +147,12 @@ pub(super) async fn resolve_seat(
             crate::engines::AGY_REFUSAL
         )));
     }
+    if engine == crate::engines::GEMINI_API {
+        return Err(StartError::Invalid(format!(
+            "{who} names the agent `{agent_id}`: {}",
+            crate::engines::GEMINI_API_REFUSAL
+        )));
+    }
     let kind = crate::config::seat_kind_for_engine(engine).ok_or_else(|| {
         StartError::Invalid(format!(
             "{who} names the agent `{agent_id}`, whose engine `{engine}` is not one a seat can run"

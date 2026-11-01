@@ -448,10 +448,11 @@ pub(super) fn default_assistant_choices() -> Vec<AssistantChoice> {
 
 /// The Gemini API models of the chat menu, bare (Google's `models/` form is stripped on the wire).
 /// A static list, like `agy_models`: the picker must not call Google to draw itself.
-const GEMINI_API_MODELS: [&str; 3] = [
-    "gemini-2.5-pro",
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
+const GEMINI_API_MODELS: [&str; 4] = [
+    "gemini-4-argon",
+    "gemini-3.8-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash-lite",
 ];
 
 impl ModelsConfig {

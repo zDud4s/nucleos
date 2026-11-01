@@ -144,6 +144,12 @@ fn plan_launch(
     braked: &[RunnerKind],
 ) -> Result<Plan, LaunchError> {
     if let Some((name, model)) = pin {
+        if name == crate::engines::GEMINI_API {
+            return Err(LaunchError::NoRunner(format!(
+                "{label}: {}",
+                crate::engines::GEMINI_API_REFUSAL
+            )));
+        }
         let engine = match name.as_str() {
             "local" => Engine::Local,
             other => RunnerKind::parse(other).map(Engine::from).ok_or_else(|| {
