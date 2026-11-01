@@ -109,26 +109,39 @@ impl Surface {
 }
 
 /// A CLI the daemon can launch, named as the router names it (`route_api.RUNNERS`).
+///
+/// A table-backed id: the named consts are the rows the production code names, and any other CLI
+/// row is a `RunnerKind` of its own, never a stand-in for Claude. Ordered by table position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum RunnerKind {
-    Claude,
-    Codex,
-}
+pub struct RunnerKind(pub(crate) crate::engines::EngineId);
 
+#[allow(non_upper_case_globals)]
 impl RunnerKind {
+    pub const Claude: RunnerKind =
+        RunnerKind(crate::engines::EngineId::from_row(crate::engines::CLAUDE));
+    pub const Codex: RunnerKind =
+        RunnerKind(crate::engines::EngineId::from_row(crate::engines::CODEX));
+    pub const Agy: RunnerKind = RunnerKind(crate::engines::EngineId::from_row(crate::engines::AGY));
+
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Claude => "claude",
-            Self::Codex => "codex",
-        }
+        self.0.as_str()
     }
 
+    /// The kind of a CLI row of the production table; `None` for any other id (`local` included).
     pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "claude" => Some(Self::Claude),
-            "codex" => Some(Self::Codex),
-            _ => None,
-        }
+        Self::parse_in(crate::engines::TABLE, value)
+    }
+
+    /// The kind of a CLI row of `table`; `None` for any other id.
+    pub fn parse_in(table: &[crate::engines::EngineDescription], value: &str) -> Option<Self> {
+        let row = crate::engines::cli_row_in(table, value)?;
+        Some(Self(crate::engines::EngineId::from_row(row.id)))
+    }
+
+    /// A kind outside the production table, to exercise the fail-closed arms.
+    #[cfg(any(test, feature = "testkit"))]
+    pub fn for_test(id: &'static str) -> Self {
+        Self(crate::engines::EngineId::for_test(id))
     }
 }
 
@@ -400,6 +413,12 @@ impl Router {
             let fits = match alternate.kind {
                 RunnerKind::Claude => true,
                 RunnerKind::Codex => codex_can_take(shape),
+                // Agy is offered only while its gate is open and for a read-only run it can honour;
+                // `spawn.rs` drops it again for a run whose controls the runner refuses (job MCP,
+                // steering, a forked session).
+                RunnerKind::Agy => agy_can_take(shape) && crate::engines::agy::enabled(),
+                // An engine with no arm is never offered as an alternate.
+                _ => false,
             };
             if fits && !kinds.contains(&alternate.kind) {
                 kinds.push(alternate.kind);
@@ -553,6 +572,16 @@ pub struct RunShape {
     pub resume: bool,
 }
 
+/// Whether a run of this shape may be offered to agy: not a resume, not classifier-governed, not
+/// `Bypass` (the runner refuses it), and read-only, since agy has neither the `PreToolUse` hook nor a
+/// permission ladder: a plan run, or a restricted tool policy (`--mode plan --sandbox`).
+pub fn agy_can_take(shape: RunShape) -> bool {
+    !shape.resume
+        && !shape.classifier_governs_tools
+        && shape.permission != Permission::Bypass
+        && (shape.permission == Permission::Plan || shape.tool_policy != ToolPolicy::Unrestricted)
+}
+
 /// Why `CodexCliRunner` would refuse a run of this shape, in a sentence; `None` when it can take it.
 /// The one place the Codex predicate lives: the router's `eligible` and a pinned launch both ask it.
 pub fn codex_refusal(shape: RunShape) -> Option<String> {
@@ -691,6 +720,19 @@ pub struct CodexProfile {
 }
 
 impl RouteQuery {
+    /// The query with agy taken out of the runners it may choose from, for a run the agy runner
+    /// would refuse. No restriction becomes one naming the other runners.
+    pub fn without_agy(mut self) -> Self {
+        self.restrict_runners = Some(match self.restrict_runners.take() {
+            Some(kinds) => kinds
+                .into_iter()
+                .filter(|kind| *kind != RunnerKind::Agy)
+                .collect(),
+            None => vec![RunnerKind::Claude, RunnerKind::Codex],
+        });
+        self
+    }
+
     /// A query that restricts, pins and defers nothing: how every run but a launcher-shaped node
     /// is routed.
     pub fn plain(
@@ -977,6 +1019,14 @@ fn default_model(models: &crate::config::ModelsConfig, kind: RunnerKind) -> Stri
     match kind {
         RunnerKind::Claude => models.claude_model.clone(),
         RunnerKind::Codex => models.codex_model.clone(),
+        // No model file names an agy default; the engine's own constant does.
+        RunnerKind::Agy => crate::engines::agy::DEFAULT_MODEL.to_owned(),
+        // An engine with no arm has no default model: the empty string names none, and never
+        // borrows Claude's.
+        _ => {
+            tracing::warn!(kind = kind.as_str(), "engine has no default model");
+            String::new()
+        }
     }
 }
 
@@ -1151,6 +1201,9 @@ mod tests {
             default_model: match kind {
                 RunnerKind::Claude => "claude-sonnet-5".into(),
                 RunnerKind::Codex => "gpt-5.6-terra".into(),
+                RunnerKind::Agy => "agy/gemini-3.8-flash-high".into(),
+                // A kind the fixtures do not name has no default model.
+                _ => String::new(),
             },
             models: globs.iter().map(|glob| (*glob).to_owned()).collect(),
         }
@@ -2120,7 +2173,11 @@ mod tests {
 
     #[test]
     fn a_restriction_intersects_the_eligible_runners() {
-        use RunnerKind::{Claude, Codex};
+        // Associated consts cannot be imported with `use`; local consts keep the short names.
+        #[allow(non_upper_case_globals)]
+        const Claude: RunnerKind = RunnerKind::Claude;
+        #[allow(non_upper_case_globals)]
+        const Codex: RunnerKind = RunnerKind::Codex;
         let both = vec![Claude, Codex];
         assert_eq!(narrowed_runners(both.clone(), None, &[]), both);
         assert_eq!(
@@ -2140,7 +2197,11 @@ mod tests {
 
     #[test]
     fn a_restriction_is_applied_before_the_quota_brake_subtracts() {
-        use RunnerKind::{Claude, Codex};
+        // Associated consts cannot be imported with `use`; local consts keep the short names.
+        #[allow(non_upper_case_globals)]
+        const Claude: RunnerKind = RunnerKind::Claude;
+        #[allow(non_upper_case_globals)]
+        const Codex: RunnerKind = RunnerKind::Codex;
         let both = vec![Claude, Codex];
         assert_eq!(
             narrowed_runners(both.clone(), Some(&[Claude, Codex]), &[Claude]),
@@ -2456,6 +2517,209 @@ mod tests {
                 .unwrap()
                 .available(RunnerKind::Codex)
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn installed_engines_excludes_agy_when_gate_off() {
+        let _gate = crate::engines::agy_test_support::agy_gate(false);
+        // The setting is off by default, so agy is absent even when its binary is on PATH.
+        assert!(!crate::engines::agy::enabled());
+        assert!(!installed_engines().contains(&RunnerKind::Agy));
+    }
+
+    /// E16 F7: agy is a router alternate for read-only work only.
+    #[test]
+    fn agy_alternate_is_eligible_only_for_a_read_only_run() {
+        let _gate = crate::engines::agy_test_support::agy_gate(true);
+        let router = Router::new(
+            config(Mode::Shadow, DEFAULT_URL),
+            available(RunnerKind::Claude, Arc::new(Probe), &["claude-*"]),
+            vec![available(
+                RunnerKind::Agy,
+                Arc::new(crate::execution::runner::FakeCommandRunner::default()),
+                &["agy/*"],
+            )],
+        );
+        let with = |permission, tool_policy, classifier, resume| {
+            router.eligible(RunShape {
+                permission,
+                classifier_governs_tools: classifier,
+                tool_policy,
+                resume,
+            })
+        };
+        let takes = |kinds: Vec<RunnerKind>| kinds.contains(&RunnerKind::Agy);
+
+        // Read-only: a plan run, or a restricted tool policy.
+        assert!(takes(with(
+            Permission::Plan,
+            ToolPolicy::Unrestricted,
+            false,
+            false
+        )));
+        assert!(takes(with(
+            Permission::Default,
+            ToolPolicy::McpOnly,
+            false,
+            false
+        )));
+        assert!(takes(with(
+            Permission::Default,
+            ToolPolicy::None,
+            false,
+            false
+        )));
+        assert!(agy_can_take(RunShape {
+            permission: Permission::Plan,
+            classifier_governs_tools: false,
+            tool_policy: ToolPolicy::Unrestricted,
+            resume: false,
+        }));
+        // Anything that writes, bypasses, is classifier-governed or resumes is not.
+        assert!(!takes(with(
+            Permission::Default,
+            ToolPolicy::Unrestricted,
+            false,
+            false
+        )));
+        assert!(!takes(with(
+            Permission::AcceptEdits,
+            ToolPolicy::Unrestricted,
+            false,
+            false
+        )));
+        assert!(!takes(with(
+            Permission::Bypass,
+            ToolPolicy::McpOnly,
+            false,
+            false
+        )));
+        assert!(!takes(with(
+            Permission::Bypass,
+            ToolPolicy::Unrestricted,
+            false,
+            false
+        )));
+        assert!(!takes(with(
+            Permission::Plan,
+            ToolPolicy::McpOnly,
+            true,
+            false
+        )));
+        assert!(!takes(with(
+            Permission::Default,
+            ToolPolicy::McpOnly,
+            true,
+            false
+        )));
+        assert!(!takes(with(
+            Permission::Plan,
+            ToolPolicy::McpOnly,
+            false,
+            true
+        )));
+        // The primary is always there.
+        assert!(
+            with(Permission::Bypass, ToolPolicy::Unrestricted, false, true)
+                .contains(&RunnerKind::Claude)
+        );
+    }
+
+    /// E19 N1: closing the opt-in removes agy from the router at once, on the same built value.
+    #[test]
+    fn closing_the_gate_removes_agy_from_the_router() {
+        let router = Router::new(
+            config(Mode::Shadow, DEFAULT_URL),
+            available(RunnerKind::Claude, Arc::new(Probe), &["claude-*"]),
+            vec![available(
+                RunnerKind::Agy,
+                Arc::new(crate::execution::runner::FakeCommandRunner::default()),
+                &["agy/*"],
+            )],
+        );
+        let read_only = RunShape {
+            permission: Permission::Plan,
+            classifier_governs_tools: false,
+            tool_policy: ToolPolicy::McpOnly,
+            resume: false,
+        };
+        {
+            let _open = crate::engines::agy_test_support::agy_gate(true);
+            assert!(router.eligible(read_only).contains(&RunnerKind::Agy));
+        }
+        let _closed = crate::engines::agy_test_support::agy_gate(false);
+        let kinds = router.eligible(read_only);
+        assert!(!kinds.contains(&RunnerKind::Agy), "{kinds:?}");
+        assert!(kinds.contains(&RunnerKind::Claude), "{kinds:?}");
+    }
+
+    /// An alternate whose runner kind has no arm in `eligible` is never offered, for any shape.
+    #[test]
+    fn eligible_excludes_unwired_runner() {
+        let zed = RunnerKind::for_test("zed");
+        let router = Router::new(
+            config(Mode::Shadow, DEFAULT_URL),
+            available(RunnerKind::Claude, Arc::new(Probe), &["claude-*"]),
+            vec![Available {
+                kind: zed,
+                runner: Arc::new(crate::execution::runner::FakeCommandRunner::default()),
+                default_model: String::new(),
+                models: vec!["zed/*".to_owned()],
+            }],
+        );
+        let kinds = router.eligible(shape());
+        assert!(!kinds.contains(&zed), "{kinds:?}");
+        assert!(kinds.contains(&RunnerKind::Claude), "{kinds:?}");
+    }
+
+    /// E16 F7: `spawn.rs` drops agy from the route of a run the runner would refuse, through the
+    /// existing `restrict_runners`.
+    #[test]
+    fn route_query_without_agy_leaves_the_other_runners() {
+        let none = query().without_agy();
+        let kinds = none
+            .restrict_runners
+            .expect("no restriction becomes one that names the other runners");
+        assert!(!kinds.contains(&RunnerKind::Agy), "{kinds:?}");
+        assert!(kinds.contains(&RunnerKind::Claude), "{kinds:?}");
+        assert!(kinds.contains(&RunnerKind::Codex), "{kinds:?}");
+
+        let mut restricted = query();
+        restricted.restrict_runners = Some(vec![RunnerKind::Agy, RunnerKind::Codex]);
+        assert_eq!(
+            restricted.without_agy().restrict_runners,
+            Some(vec![RunnerKind::Codex])
+        );
+        let mut only_claude = query();
+        only_claude.restrict_runners = Some(vec![RunnerKind::Claude]);
+        assert_eq!(
+            only_claude.without_agy().restrict_runners,
+            Some(vec![RunnerKind::Claude])
+        );
+    }
+
+    #[test]
+    fn front_with_ignores_agy_runner_name_when_off() {
+        let _gate = crate::engines::agy_test_support::agy_gate(false);
+        let mut config = config(Mode::Shadow, DEFAULT_URL);
+        config.runners = vec!["agy".to_owned()];
+        let runner = front_with(
+            Arc::new(Probe),
+            &crate::config::ModelsConfig::default(),
+            config,
+            &[RunnerKind::Claude],
+        );
+        let router = runner.router().expect("routing is on");
+        assert!(
+            router.alternates.is_empty(),
+            "a runner name the daemon cannot launch is ignored"
+        );
+        // No engine is held for a pin either: it is refused with the existing sentence.
+        assert!(
+            runner
+                .engines()
+                .is_none_or(|engines| engines.available(RunnerKind::Agy).is_none())
         );
     }
 

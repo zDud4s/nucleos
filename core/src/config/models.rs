@@ -446,15 +446,26 @@ pub(super) fn default_assistant_choices() -> Vec<AssistantChoice> {
         .collect()
 }
 
+/// The Gemini API models of the chat menu, bare (Google's `models/` form is stripped on the wire).
+/// A static list, like `agy_models`: the picker must not call Google to draw itself.
+const GEMINI_API_MODELS: [&str; 4] = [
+    "gemini-4-argon",
+    "gemini-3.8-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash-lite",
+];
+
 impl ModelsConfig {
     /// Returns the CLI configured for a cloud model id.
     pub fn runner_of(&self, id: &str) -> Option<&'static str> {
         self.assistant_choices
             .iter()
             .find(|choice| choice.brain == "cloud" && choice.id == id)
-            .map(|choice| match choice.runner.as_deref() {
-                Some("codex") => "codex",
-                _ => "claude",
+            .map(|choice| {
+                crate::engines::runner_id_in(
+                    crate::engines::TABLE,
+                    choice.runner.as_deref().unwrap_or_default(),
+                )
             })
     }
 
@@ -559,6 +570,16 @@ impl ModelsConfig {
                     installed: None,
                 },
             );
+        }
+        // The agy models belong to the chat menu only (`every_runner`), and only while the opt-in is
+        // on (`agy_models` is empty otherwise). An agent-scoped menu follows the running CLI, which is
+        // never agy, so it keeps them out. A row the file already lists is not added twice.
+        if every_runner {
+            for model in crate::models::model_catalog::agy_models() {
+                if !choices.iter().any(|choice| choice.id == model.id) {
+                    choices.push(crate::models::model_catalog::as_choice(&model));
+                }
+            }
         }
         // Which server the local route resolves to, asked once for both questions below: whether
         // these rows belong on the menu at all, and whether "is it installed?" is even a question
@@ -686,6 +707,28 @@ impl ModelsConfig {
                 });
             }
         }
+        // The Gemini API rows belong to the chat menu only, and only while a Google key is stored
+        // (the same fact as the engine row's gate). Agents refuse the route by name, so an
+        // agent-scoped menu never offers it. The brain stays the one hosted brain; the provider is
+        // the `gemini-api/` id prefix. A row the file already lists is not added twice. Added after the hosted block
+        // above, whose `None` arm drops every `openrouter`-brain row when no OpenRouter model is set.
+        if every_runner && crate::engines::gemini_key_stored() {
+            for model in GEMINI_API_MODELS {
+                let id = format!("gemini-api/{model}");
+                if !choices.iter().any(|choice| choice.id == id) {
+                    choices.push(AssistantChoice {
+                        id,
+                        label: format!("{model} (Gemini API)"),
+                        brain: "openrouter".to_string(),
+                        // No effort dial is offered: the hosted route does not forward one.
+                        efforts: Vec::new(),
+                        runner: Some(crate::engines::GEMINI_API.to_string()),
+                        tools: None,
+                        installed: None,
+                    });
+                }
+            }
+        }
         choices
     }
 
@@ -703,10 +746,10 @@ impl ModelsConfig {
 
     /// Which agent CLI this daemon runs. Unknown names fall to `claude`, exactly as `main.rs` does.
     pub fn active_runner(&self) -> &str {
-        match self.primary_runner.as_deref() {
-            Some("codex") => "codex",
-            _ => "claude",
-        }
+        crate::engines::runner_id_in(
+            crate::engines::TABLE,
+            self.primary_runner.as_deref().unwrap_or_default(),
+        )
     }
 
     /// Every effort level any model on the menu takes, weakest-first, without repeats.
@@ -1418,5 +1461,166 @@ mod snapshot_tests {
     fn with_nothing_stored_it_answers_the_defaults() {
         let _installed = testing::install(Settings::new());
         assert_eq!(models_config_now(), ModelsConfig::default());
+    }
+}
+
+/// What the chat menu and the router's allowed models offer of agy (plan Node 2, test 36). RED:
+/// `catalogue_scoped` does not add the agy rows yet, and `RunnerKind::Agy` does not exist.
+#[cfg(test)]
+mod agy_catalogue_tests {
+    use super::*;
+    use crate::engines::agy_test_support::agy_gate;
+    use crate::models::route_advice::{RouterConfig, RunnerKind, allowed_models};
+
+    const AGY_MODEL: &str = "agy/gemini-3.8-flash-high";
+
+    fn agy_ids(choices: &[AssistantChoice]) -> Vec<&str> {
+        choices
+            .iter()
+            .filter(|choice| choice.runner.as_deref() == Some("agy"))
+            .map(|choice| choice.id.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn router_allowed_models_includes_agy_choices_when_on() {
+        let _gate = agy_gate(true);
+        let config = ModelsConfig::default();
+
+        // The chat path offers every runner's models, agy's included, as cloud rows of the agy runner.
+        let chat = config.catalogue_for_chat(&[]);
+        assert!(agy_ids(&chat).contains(&AGY_MODEL), "{chat:?}");
+        assert!(chat.iter().all(|c| c.id != AGY_MODEL || c.brain == "cloud"));
+        // An agent-scoped menu follows the active runner (Claude here), so agy stays out of it.
+        assert!(agy_ids(&config.catalogue()).is_empty());
+
+        // The router reads the production field: the default config holds no agy rows in
+        // `assistant_choices`, and `allowed_models` itself must add the catalogue's agy ids.
+        assert!(agy_ids(&config.assistant_choices).is_empty());
+        let allowed = allowed_models(&config, &RouterConfig::off(), RunnerKind::Agy);
+        let catalogue = crate::models::model_catalog::agy_models();
+        assert!(!catalogue.is_empty());
+        for model in &catalogue {
+            assert!(
+                allowed.contains(&model.id),
+                "{} missing from {allowed:?}",
+                model.id
+            );
+        }
+        assert!(allowed.iter().any(|id| id == AGY_MODEL), "{allowed:?}");
+        assert!(allowed.iter().all(|id| !id.is_empty()), "{allowed:?}");
+        // Claude's allowed list does not pick up agy's rows.
+        let claude = allowed_models(&config, &RouterConfig::off(), RunnerKind::Claude);
+        assert!(
+            claude.iter().all(|id| !id.starts_with("agy/")),
+            "{claude:?}"
+        );
+    }
+
+    #[test]
+    fn router_allowed_models_has_no_agy_ids_when_off() {
+        let _gate = agy_gate(false);
+        let allowed = allowed_models(
+            &ModelsConfig::default(),
+            &RouterConfig::off(),
+            RunnerKind::Agy,
+        );
+        assert!(
+            allowed.iter().all(|id| !id.starts_with("agy/")),
+            "{allowed:?}"
+        );
+        assert!(allowed.iter().all(|id| !id.is_empty()), "{allowed:?}");
+    }
+
+    /// RED (plan Node 3, test 5; contract E1/E22). The Gemini API rows are `gemini-api/<model>`,
+    /// listed only while a key is stored, kept apart from the `agy/<model>` rows of the same models,
+    /// and flagged with their route. The key is simulated through
+    /// `engines::gemini_test_support::gemini_gate` (named by the engines.rs RED too), so the
+    /// catalogue must read the same "key stored" fact as the table row's gate.
+    #[test]
+    fn catalogue_lists_gemini_api_only_with_key_and_apart_from_agy() {
+        use crate::engines::gemini_test_support::gemini_gate;
+
+        fn gemini_rows(choices: &[AssistantChoice]) -> Vec<&AssistantChoice> {
+            choices
+                .iter()
+                .filter(|choice| choice.id.starts_with("gemini-api/"))
+                .collect()
+        }
+
+        // No key: no Gemini API rows, with agy on or off.
+        {
+            let _agy = agy_gate(true);
+            let _key = gemini_gate(false);
+            let chat = ModelsConfig::default().catalogue_for_chat(&[]);
+            assert!(gemini_rows(&chat).is_empty(), "{chat:?}");
+            assert!(!agy_ids(&chat).is_empty(), "agy rows stay: {chat:?}");
+        }
+
+        // Key stored, agy off: Gemini API rows exist and are flagged with their route.
+        {
+            let _agy = agy_gate(false);
+            let _key = gemini_gate(true);
+            let config = ModelsConfig::default();
+            let chat = config.catalogue_for_chat(&[]);
+            let rows = gemini_rows(&chat);
+            assert!(
+                !rows.is_empty(),
+                "a stored key lists gemini-api models: {chat:?}"
+            );
+            for row in &rows {
+                assert!(
+                    row.id.len() > "gemini-api/".len() && !row.id["gemini-api/".len()..].is_empty(),
+                    "{row:?}"
+                );
+                assert!(
+                    !row.id["gemini-api/".len()..].starts_with("models/"),
+                    "the menu id carries the bare model, not Google's models/ form: {row:?}"
+                );
+                assert_eq!(row.runner.as_deref(), Some("gemini-api"), "{row:?}");
+                assert_eq!(
+                    row.brain, "openrouter",
+                    "the hosted brain stays the one HTTP route; the provider is the id prefix: {row:?}"
+                );
+            }
+            assert!(agy_ids(&chat).is_empty(), "agy is off: {chat:?}");
+            // Agents refuse the route by name, so an agent-scoped menu does not offer it.
+            assert!(
+                gemini_rows(&config.catalogue()).is_empty(),
+                "{:?}",
+                config.catalogue()
+            );
+        }
+
+        // Both on: two distinct id families, no id in both, and ids unique overall.
+        {
+            let _agy = agy_gate(true);
+            let _key = gemini_gate(true);
+            let chat = ModelsConfig::default().catalogue_for_chat(&[]);
+            let gemini: Vec<&str> = gemini_rows(&chat)
+                .iter()
+                .map(|choice| choice.id.as_str())
+                .collect();
+            let agy = agy_ids(&chat);
+            assert!(!gemini.is_empty() && !agy.is_empty(), "{chat:?}");
+            assert!(gemini.iter().all(|id| !agy.contains(id)), "{chat:?}");
+            let mut all: Vec<&str> = chat.iter().map(|choice| choice.id.as_str()).collect();
+            let total = all.len();
+            all.sort_unstable();
+            all.dedup();
+            assert_eq!(
+                all.len(),
+                total,
+                "a model is listed once per route: {chat:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_chat_menu_has_no_agy_rows_when_the_gate_is_off() {
+        let _gate = agy_gate(false);
+        let chat = ModelsConfig::default().catalogue_for_chat(&[]);
+        assert!(agy_ids(&chat).is_empty(), "{chat:?}");
+        assert!(chat.iter().all(|c| !c.id.starts_with("agy/")), "{chat:?}");
     }
 }

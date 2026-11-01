@@ -66,6 +66,20 @@ impl std::fmt::Display for LaunchError {
 
 impl std::error::Error for LaunchError {}
 
+/// An unpinned launch lands on the daemon's runner, which is agy under `primary_runner: agy`; agents
+/// never run on agy, so it is refused by name. A pinned launch is not touched here.
+fn refuse_unpinned_on_agy_primary(
+    label: &str,
+    pinned: bool,
+    models: &crate::config::ModelsConfig,
+) -> Result<(), LaunchError> {
+    if pinned {
+        return Ok(());
+    }
+    crate::engines::refuse_agy_primary(models)
+        .map_err(|why| LaunchError::NoRunner(format!("{label}: {why}")))
+}
+
 /// `runners = eligible ∩ translatable − braked`, in `eligible`'s order.
 pub fn narrow_runners(
     eligible: Vec<RunnerKind>,
@@ -103,13 +117,20 @@ struct Plan {
 }
 
 /// The engine and model a pin names: the caller's first, then the agent row's. A model alone
-/// pins nothing (the router picks models).
+/// pins nothing (the router picks models), except a `gemini-api/` model id on an agent with no
+/// engine: that names the Gemini route, so it yields the `gemini-api` engine and `plan_launch`
+/// refuses it by name instead of letting it fall through to the router. An explicit engine wins.
 fn effective_pin(pins: &Pins, agent: &Agent) -> Option<(String, String)> {
     if let Some(engine) = pins.engine.as_deref().filter(|e| !e.is_empty()) {
         return Some((engine.to_owned(), pins.model.clone().unwrap_or_default()));
     }
-    let engine = agent.engine.as_deref().filter(|e| !e.is_empty())?;
     let model = pins.model.clone().or_else(|| agent.model.clone());
+    let Some(engine) = agent.engine.as_deref().filter(|e| !e.is_empty()) else {
+        let gemini_prefix = format!("{}/", crate::engines::GEMINI_API);
+        return model
+            .filter(|id| id.starts_with(&gemini_prefix))
+            .map(|id| (crate::engines::GEMINI_API.to_owned(), id));
+    };
     Some((engine.to_owned(), model.unwrap_or_default()))
 }
 
@@ -130,19 +151,27 @@ fn plan_launch(
     braked: &[RunnerKind],
 ) -> Result<Plan, LaunchError> {
     if let Some((name, model)) = pin {
+        if name == crate::engines::GEMINI_API {
+            return Err(LaunchError::NoRunner(format!(
+                "{label}: {}",
+                crate::engines::GEMINI_API_REFUSAL
+            )));
+        }
         let engine = match name.as_str() {
             "local" => Engine::Local,
             other => RunnerKind::parse(other).map(Engine::from).ok_or_else(|| {
                 LaunchError::NoRunner(format!("{label} is pinned to unknown engine `{other}`"))
             })?,
         };
+        if engine == Engine::Agy {
+            return Err(LaunchError::NoRunner(format!(
+                "{label}: {}",
+                crate::engines::AGY_REFUSAL
+            )));
+        }
         let tools = capabilities::translate(engine, caps)
             .map_err(|why| LaunchError::Unsupported(label.to_owned(), why))?;
-        let runners = match engine {
-            Engine::Claude => vec![RunnerKind::Claude],
-            Engine::Codex => vec![RunnerKind::Codex],
-            Engine::Local => Vec::new(),
-        };
+        let runners = runners_for_pin(engine, label)?;
         return Ok(Plan {
             runners,
             pin: Some((engine, model)),
@@ -164,6 +193,24 @@ fn plan_launch(
         runners,
         pin: None,
         tools: None,
+    })
+}
+
+/// The runners a pin on `engine` may use. An engine with no arm is refused by name, never run
+/// as Claude.
+fn runners_for_pin(engine: Engine, label: &str) -> Result<Vec<RunnerKind>, LaunchError> {
+    Ok(match engine {
+        Engine::Claude => vec![RunnerKind::Claude],
+        Engine::Codex => vec![RunnerKind::Codex],
+        Engine::Local => Vec::new(),
+        // Refused by the caller; no runner is ever listed for agy.
+        Engine::Agy => Vec::new(),
+        other => {
+            return Err(LaunchError::NoRunner(format!(
+                "{label}: the {} engine is not available for agents, teams or council",
+                other.as_str()
+            )));
+        }
     })
 }
 
@@ -240,6 +287,11 @@ pub async fn resolve_agent_launch_with(
     } else {
         Vec::new()
     };
+    refuse_unpinned_on_agy_primary(
+        &label,
+        pinned.is_some(),
+        &crate::config::models_config_now(),
+    )?;
     let plan = plan_launch(&label, &caps, pinned, eligible, &braked)?;
 
     let (prompt, output) = if agent.is_package() {
@@ -291,7 +343,42 @@ pub async fn resolve_agent_launch_with(
 mod tests {
     use super::*;
     use Capability::*;
-    use RunnerKind::{Claude, Codex};
+    // Associated consts cannot be imported with `use`; local consts keep the short names.
+    #[allow(non_upper_case_globals)]
+    const Claude: RunnerKind = RunnerKind::Claude;
+    #[allow(non_upper_case_globals)]
+    const Codex: RunnerKind = RunnerKind::Codex;
+
+    /// A pin on an engine the launcher does not know is refused by name, never run as Claude.
+    /// The pin reaches `plan_launch` as a string, so "zed" is refused at the parse step; the
+    /// wildcard arm of `runners_for_pin` is covered by its own test below.
+    #[test]
+    fn plan_launch_refuses_unwired_engine() {
+        let error = plan_launch(
+            "r@1.0.0",
+            &[FsRead],
+            Some(("zed".to_owned(), "any-model".to_owned())),
+            None,
+            &[],
+        )
+        .expect_err("an unwired engine is refused");
+        assert!(matches!(error, LaunchError::NoRunner(_)), "{error:?}");
+        assert!(error.to_string().contains("zed"), "{error}");
+        assert!(!error.to_string().contains("Claude"), "{error}");
+    }
+
+    #[test]
+    fn runners_for_pin_refuses_unwired_engine_by_name() {
+        let error = runners_for_pin(Engine::for_test("zed"), "r@1.0.0")
+            .expect_err("an unwired engine has no runner list");
+        assert!(matches!(error, LaunchError::NoRunner(_)), "{error:?}");
+        assert!(
+            error
+                .to_string()
+                .contains("the zed engine is not available for agents, teams or council"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn narrowing_is_eligible_and_translatable_minus_braked() {
@@ -378,6 +465,91 @@ mod tests {
             plan_launch("a", &[], Some(("gemini".into(), String::new())), None, &[]),
             Err(LaunchError::NoRunner(_))
         ));
+    }
+
+    #[test]
+    fn agent_launch_refuses_agy_by_name() {
+        // Pinned by the caller or by the agent row: the pin is where an engine name enters.
+        let pin = Some(("agy".to_owned(), "agy/gemini-3.8-flash-high".to_owned()));
+        let error = plan_launch("coder@1.0.0", &[McpNucleos], pin, None, &[]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("the agy engine is not available for agents, teams or council"),
+            "{error}"
+        );
+        // Not pinned: agy is never one of the runners a launch may narrow to, gate or no gate.
+        let plan = plan_launch("a", &[McpNucleos], None, None, &[]).unwrap();
+        assert!(!plan.runners.contains(&RunnerKind::Agy));
+    }
+
+    /// E24: gemini-api is an agent engine name but no launch can run it; the pin is refused by
+    /// name, with the engine's own refusal text rather than "unknown engine".
+    #[test]
+    fn agent_launch_refuses_gemini_api_by_name() {
+        let pin = Some(("gemini-api".to_owned(), "gemini-3.8-flash".to_owned()));
+        let error = plan_launch("coder@1.0.0", &[McpNucleos], pin, None, &[]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(crate::engines::GEMINI_API_REFUSAL),
+            "{error}"
+        );
+    }
+
+    /// E25: a `gemini-api/` model id on an agent that names no engine is still a Gemini pick, so
+    /// it is refused by name instead of falling through to the router. Composes the two pure steps
+    /// `resolve_agent_launch_with` runs: the pin the agent and caller yield, then the plan.
+    #[test]
+    fn a_gemini_model_id_with_no_engine_is_refused_by_name() {
+        let agent = Agent {
+            id: "i".into(),
+            name: "n".into(),
+            speciality: "s".into(),
+            prompt: "p".into(),
+            engine: None,
+            model: Some("gemini-api/x".into()),
+            capabilities: Vec::new(),
+            source: "user".into(),
+            package_ref: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let pin = effective_pin(&Pins::default(), &agent);
+        let error = plan_launch("coder@1.0.0", &[McpNucleos], pin, None, &[]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(crate::engines::GEMINI_API_REFUSAL),
+            "{error}"
+        );
+    }
+
+    /// E16 F3: an unpinned launch under `primary_runner: agy` would land on the daemon's runner.
+    #[test]
+    fn unpinned_agent_refuses_an_agy_primary() {
+        let primary = |name: &str| crate::config::ModelsConfig {
+            primary_runner: Some(name.to_owned()),
+            ..crate::config::ModelsConfig::default()
+        };
+        let error =
+            refuse_unpinned_on_agy_primary("coder@1.0.0", false, &primary("agy")).unwrap_err();
+        assert!(matches!(error, LaunchError::NoRunner(_)), "{error:?}");
+        assert_eq!(
+            error.to_string(),
+            "coder@1.0.0: the agy engine is not available for agents, teams or council"
+        );
+        // A pin to another engine under an agy primary still launches.
+        assert!(refuse_unpinned_on_agy_primary("coder@1.0.0", true, &primary("agy")).is_ok());
+        assert!(refuse_unpinned_on_agy_primary("coder@1.0.0", false, &primary("claude")).is_ok());
+        assert!(
+            refuse_unpinned_on_agy_primary(
+                "coder@1.0.0",
+                false,
+                &crate::config::ModelsConfig::default()
+            )
+            .is_ok()
+        );
     }
 
     #[test]

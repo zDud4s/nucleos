@@ -87,4 +87,23 @@ describe("RefusalNote", () => {
     expect(notes.map((n) => n.getAttribute("role"))).toEqual(["status", "alert"]);
     expect(notes[0].className).not.toBe(notes[1].className);
   });
+
+  it("no_gemini_key and no_openrouter_key read as sentences; warning_not_acknowledged shows the daemon's detail", () => {
+    const gemini = render(<RefusalNote refusal={new ApiRefusal(503, "no_gemini_key", "no_gemini_key")} />);
+    expect(screen.getByRole("status").textContent ?? "").toMatch(/gemini api key/i);
+    expect(screen.getByRole("status").textContent ?? "").not.toMatch(/refused this/i);
+    gemini.unmount();
+
+    const router = render(
+      <RefusalNote refusal={new ApiRefusal(503, "no_openrouter_key", "no_openrouter_key")} />,
+    );
+    expect(screen.getByRole("status").textContent ?? "").toMatch(/openrouter/i);
+    expect(screen.getByRole("status").textContent ?? "").not.toMatch(/refused this/i);
+    router.unmount();
+
+    // No page sentence for this code: the daemon's warning text must reach the screen.
+    const warning = "agy runs unattended with your Google account; read this before enabling it";
+    render(<RefusalNote refusal={new ApiRefusal(400, "warning_not_acknowledged", warning)} />);
+    expect(screen.getByRole("status").textContent).toContain(warning);
+  });
 });

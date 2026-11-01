@@ -160,12 +160,16 @@ async fn warm_chat(state: &crate::state::AppState, chat_id: &str) {
         .await
         .unwrap_or_default();
     let config = crate::config::models_config_now();
-    let (runner, cli) = runner_for_turn(
+    let Ok((runner, cli)) = runner_for_turn(
         &state.runner,
         state.assistants.as_ref(),
         &config,
         answering.model.as_deref(),
-    );
+    ) else {
+        // A chat bound to a disabled engine has nothing to warm; its turn is refused when it comes.
+        note_declined(chat_id);
+        return;
+    };
     // Reads the conversation's settings file: off the runtime thread, as `send_message_inner` does,
     // and a join failure reads as "not wired".
     let hook_wired = match cwd.clone() {

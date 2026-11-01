@@ -650,6 +650,41 @@ fn set_openrouter_key() {
     }
 }
 
+/// The pure core of `--set-gemini-key`. `read` is `read_secret_from_stdin` in production (the only
+/// source of the key, never `argv`) and `store` is `secrets::store_secret`. Returns the line to
+/// print, which never contains the key, or the failure, which never does either.
+pub(super) fn store_gemini_key(
+    read: impl FnOnce(&str) -> Option<String>,
+    store: impl FnOnce(&str, &str) -> Result<(), String>,
+) -> Result<String, String> {
+    let Some(value) = read("paste the Gemini API key, then press Enter:") else {
+        return Err("no gemini key was read from stdin".to_owned());
+    };
+    store(GEMINI_KEY, &value).map_err(|error| format!("failed to store gemini key: {error}"))?;
+    Ok("gemini key stored in the system credential store".to_owned())
+}
+
+fn set_gemini_key() {
+    let outcome = store_gemini_key(read_secret_from_stdin, |key, value| {
+        secrets::store_secret(key, value).map_err(|error| error.to_string())
+    });
+    match outcome {
+        Ok(said) => {
+            println!("{said}");
+            // Said here, as for OpenRouter, because the daemon reads the key once at startup and
+            // publishes whether it exists then; a running daemon does not see the new key.
+            eprintln!(
+                "a running daemon must be restarted for the new Gemini API key to take effect: \
+                 the key is read once, at startup"
+            );
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+    }
+}
+
 async fn mcp_tools() {
     // `--box job-node --job <id>` narrows what this process serves. Refused rather than
     // ignored when the box is not one this server knows: a launcher that misspells it would
@@ -903,6 +938,10 @@ pub(super) async fn run_subcommand() -> bool {
         set_openrouter_key();
         return true;
     }
+    if std::env::args().any(|a| a == "--set-gemini-key") {
+        set_gemini_key();
+        return true;
+    }
     if std::env::args().any(|a| a == "--mcp-tools") {
         mcp_tools().await;
         return true;
@@ -960,5 +999,70 @@ mod claimed_override_tests {
             claimed_override_decision(true, None, false),
             ClaimedOverride::Refused(_)
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    const PASTED: &str = "AIza-pasted-secret";
+
+    /// RED (plan Node 3, test 2). New symbols for GREEN: `GEMINI_KEY` in `main.rs` (value
+    /// `"gemini-api-key"`, beside `OPENROUTER_KEY`) and `cli::store_gemini_key(read, store)`, the
+    /// pure core of `set_gemini_key`: `read` is `read_secret_from_stdin` in production (the only
+    /// source of the key, never `argv`), `store` is `secrets::store_secret`. It returns the line to
+    /// print, which must never contain the key.
+    #[test]
+    fn set_gemini_key_reads_stdin_only_and_stores_secret() {
+        assert_eq!(GEMINI_KEY, "gemini-api-key");
+        assert_ne!(
+            GEMINI_KEY, OPENROUTER_KEY,
+            "the two providers keep separate keys"
+        );
+
+        let prompts = RefCell::new(Vec::new());
+        let stored = RefCell::new(Vec::new());
+        let said = store_gemini_key(
+            |prompt| {
+                prompts.borrow_mut().push(prompt.to_owned());
+                Some(PASTED.to_owned())
+            },
+            |key, value| {
+                stored.borrow_mut().push((key.to_owned(), value.to_owned()));
+                Ok(())
+            },
+        )
+        .expect("a pasted key is stored");
+        assert_eq!(prompts.borrow().len(), 1, "stdin is read once");
+        assert!(!prompts.borrow()[0].contains(PASTED));
+        assert_eq!(
+            *stored.borrow(),
+            vec![(GEMINI_KEY.to_owned(), PASTED.to_owned())]
+        );
+        assert!(!said.contains(PASTED), "the key is never echoed: {said}");
+
+        // Empty stdin fails and stores nothing.
+        let stored = RefCell::new(0);
+        let refused = store_gemini_key(
+            |_| None,
+            |_, _| {
+                *stored.borrow_mut() += 1;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(*stored.borrow(), 0);
+        assert!(refused.contains("stdin"), "{refused}");
+
+        // A store that fails reports the failure without the key in it.
+        let failed = store_gemini_key(
+            |_| Some(PASTED.to_owned()),
+            |_, _| Err("credential store is locked".to_owned()),
+        )
+        .unwrap_err();
+        assert!(failed.contains("credential store is locked"), "{failed}");
+        assert!(!failed.contains(PASTED), "{failed}");
     }
 }

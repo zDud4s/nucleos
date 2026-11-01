@@ -260,6 +260,11 @@ pub struct ChatSummary {
     /// The one word the list draws for this conversation. Filled by `settle`.
     #[sqlx(skip)]
     pub activity: Activity,
+    /// That this conversation's engine cannot compact it automatically. Filled by the list route,
+    /// never read from the database. Named negatively so a missing key from an older daemon means
+    /// the switch works.
+    #[sqlx(skip)]
+    pub cannot_auto_compact: bool,
 }
 
 /// What a conversation is doing, as one word. Precedence is `activity_of`'s.

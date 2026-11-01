@@ -684,6 +684,7 @@ const REMOTE_ADMIN_SEGMENTS: &[&str] = &[
     "council",
     "distill",
     "email",
+    "engines",
     "files",
     "github",
     "home",

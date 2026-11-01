@@ -530,10 +530,19 @@ pub(super) async fn spawn_agent(
         .map(|(_, model)| model.clone())
         .filter(|model| !model.is_empty())
         .or_else(|| agent.model.clone());
-    let pin_kind = launch
+    let pin_kind = match launch
         .pin
         .as_ref()
-        .and_then(|(engine, _)| runner_kind_of(*engine));
+        .map(|(engine, _)| runner_kind_of(*engine))
+        .transpose()
+    {
+        Ok(kind) => kind.flatten(),
+        Err(why) => {
+            fail_run(&pool, run_id, &why).await;
+            stop_if_the_run_ended(state, &run.id, run_id).await;
+            return;
+        }
+    };
     let runners = launch.runners.clone();
     // Only a package agent has an output shape its answer is held to; a user agent's is free.
     let shape = agent.is_package().then_some(launch.output);
@@ -742,17 +751,35 @@ pub(super) async fn spawn_agent(
     stop_if_the_run_ended(state, &run.id, run_id).await;
 }
 
-/// The runner kind a CLI engine launches on; the local engine has none.
+/// The runner kind a CLI engine launches on; the local engine has none and agy is refused.
 fn runner_kind_of(
     engine: crate::agents::capabilities::Engine,
-) -> Option<crate::models::route_advice::RunnerKind> {
+) -> Result<Option<crate::models::route_advice::RunnerKind>, String> {
     use crate::agents::capabilities::Engine;
     use crate::models::route_advice::RunnerKind;
     match engine {
-        Engine::Claude => Some(RunnerKind::Claude),
-        Engine::Codex => Some(RunnerKind::Codex),
-        Engine::Local => None,
+        Engine::Claude => Ok(Some(RunnerKind::Claude)),
+        Engine::Codex => Ok(Some(RunnerKind::Codex)),
+        Engine::Local => Ok(None),
+        Engine::Agy => Err(crate::engines::AGY_REFUSAL.to_owned()),
+        // An engine with no arm is refused by name.
+        other => Err(format!(
+            "the {} engine is not available for agents, teams or council",
+            other.as_str()
+        )),
     }
+}
+
+/// A member with no pin runs on the daemon's runner, which is agy under `primary_runner: agy`;
+/// teams never run on agy, so it is refused by name. A pinned member is not touched here.
+fn refuse_unpinned_member_on_agy_primary(
+    pin: Option<crate::models::route_advice::RunnerKind>,
+    models: &crate::config::ModelsConfig,
+) -> Result<(), String> {
+    if pin.is_some() {
+        return Ok(());
+    }
+    crate::engines::refuse_agy_primary(models).map_err(str::to_owned)
 }
 
 /// Where one cloud team node runs: the runner, its kind when known, and the router decision (with
@@ -776,6 +803,7 @@ async fn pick_seat(
     request: &mut crate::execution::runner::RunRequest,
 ) -> Result<Seat, String> {
     use crate::models::seat_advice::{route_agent_seat, route_team_seat};
+    refuse_unpinned_member_on_agy_primary(pin, &crate::config::models_config_now())?;
     let router = state.runner.router();
     let (kind, decision) = match (&router, pin) {
         (None, pin) => (pin, None),
@@ -948,4 +976,69 @@ async fn team_and_director(
         .ok()
         .flatten();
     Ok(director.map(|director| (team, director)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agents::capabilities::Engine;
+    use crate::models::route_advice::RunnerKind;
+
+    /// A team seat reaches its runner through `runner_kind_of`. For agy it must refuse by name
+    /// rather than answer `None` (the local engine's arm) or fall into a Claude arm.
+    #[test]
+    fn team_launch_refuses_agy_by_name() {
+        let error = runner_kind_of(Engine::Agy).expect_err("a team cannot run agy");
+        assert!(
+            error.contains("the agy engine is not available for agents, teams or council"),
+            "{error}"
+        );
+        // The engines a team can run keep their kinds.
+        assert_eq!(runner_kind_of(Engine::Claude), Ok(Some(RunnerKind::Claude)));
+        assert_eq!(runner_kind_of(Engine::Codex), Ok(Some(RunnerKind::Codex)));
+        assert_eq!(runner_kind_of(Engine::Local), Ok(None));
+    }
+
+    /// An engine with no arm is refused by name, never answered with `None` or a Claude kind.
+    #[test]
+    fn runner_kind_of_refuses_unwired_names_it() {
+        let error = runner_kind_of(Engine::for_test("zed")).expect_err("an unwired engine refuses");
+        assert!(
+            error.contains("the zed engine is not available for agents, teams or council"),
+            "{error}"
+        );
+    }
+
+    /// E16 F3: a member with no pin falls to `state.runner`, which is agy under `primary_runner: agy`.
+    #[test]
+    fn an_unpinned_team_member_refuses_an_agy_primary() {
+        let primary = |name: &str| crate::config::ModelsConfig {
+            primary_runner: Some(name.to_owned()),
+            ..crate::config::ModelsConfig::default()
+        };
+        assert_eq!(
+            refuse_unpinned_member_on_agy_primary(None, &primary("agy")),
+            Err(crate::engines::AGY_REFUSAL.to_owned())
+        );
+        // This helper lets a pin to claude (or codex) through. E19 N2: under an agy primary with
+        // routing off, the launch then goes to the primary and is refused later through `steerable`
+        // (fails closed), so the pin does not in fact launch on that path.
+        assert_eq!(
+            refuse_unpinned_member_on_agy_primary(Some(RunnerKind::Claude), &primary("agy")),
+            Ok(())
+        );
+        assert_eq!(
+            refuse_unpinned_member_on_agy_primary(Some(RunnerKind::Codex), &primary("agy")),
+            Ok(())
+        );
+        // No pin under a claude primary, or no primary at all, is today's behaviour.
+        assert_eq!(
+            refuse_unpinned_member_on_agy_primary(None, &primary("claude")),
+            Ok(())
+        );
+        assert_eq!(
+            refuse_unpinned_member_on_agy_primary(None, &crate::config::ModelsConfig::default()),
+            Ok(())
+        );
+    }
 }

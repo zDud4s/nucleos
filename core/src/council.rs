@@ -2131,6 +2131,41 @@ mod tests {
         );
     }
 
+    /// E8: agy gets a seat kind (the config guard demands one) but no council seat can run it. A
+    /// catalogue agent that declares it is refused by name when the council starts, before anything
+    /// is spent. The refusal is made in `council::launch::resolve_seat`, reached through `start`.
+    #[tokio::test]
+    async fn council_refuses_agy_by_name() {
+        let runner = std::sync::Arc::new(ScriptedRunner::default());
+        let state = council_state(
+            runner,
+            Some(CouncilConfig {
+                timeout_seconds: 1,
+                rounds: crate::config::DEFAULT_COUNCIL_ROUNDS,
+                consumers: crate::config::CouncilConsumers::default(),
+                chairman: spec(SeatKind::Cloud, "the-chairman"),
+                members: vec![agent_spec("antigravity")],
+            }),
+        )
+        .await;
+        let mut request = agent_request("antigravity");
+        request.engine = Some("agy".to_string());
+        request.model = Some("agy/gemini-3.8-flash-high".to_string());
+        // The agent id is the name's slug, as `agent_spec` of the other tests relies on.
+        catalogue(&state.pool, request).await;
+
+        let outcome = start(&state, "why?", None).await;
+
+        assert!(
+            matches!(
+                outcome,
+                Err(StartError::Invalid(ref why))
+                    if why.contains("the agy engine is not available for agents, teams or council")
+            ),
+            "{outcome:?}"
+        );
+    }
+
     /// Phase 2 is a blind vote, and giving seats identities put three new strings at risk of
     /// leaking into it: an agent's name, its speciality, and its prompt.
     ///

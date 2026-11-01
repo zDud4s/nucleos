@@ -145,6 +145,7 @@ import { Popover as PopoverPrimitive } from "radix-ui";
 import { useDictation, type DictationView } from "../data/dictation";
 import { revise, type Provisional } from "../lib/provisional";
 import type { LocalPull, ModelChoice, ModelGroup } from "../data/chats";
+import { routeOf, splitByRoute } from "../chats/model-routes";
 import {
   Button,
   ConfirmButton,
@@ -1253,6 +1254,16 @@ function StartBox({
   const [highlight, setHighlight] = useState(0);
   const [model, setModel] = useState<string | null>(null);
   const [effort, setEffort] = useState<string | null>(null);
+  // The same two answers the menu and the dial read (one cache entry each), so a pick can be
+  // checked against its own row before an effort chosen for another model travels with it.
+  const frontCatalogue = useAssistantModels(undefined, "chat");
+  const frontGroups = useModelGroups(undefined).data?.groups;
+  const pickModel = (next: string | null) => {
+    setModel(next);
+    if (next === null || effort === null) return;
+    // A row not known yet keeps today's behaviour; a known row without the level drops it.
+    if (rowLacksEffort(next, effort, frontGroups, frontCatalogue.data?.choices)) setEffort(null);
+  };
   const [mode, setMode] = useState<PermissionMode>("auto");
   const [attached, setAttached] = useState<Attachment[]>([]);
   const [attachError, setAttachError] = useState<string | null>(null);
@@ -1428,8 +1439,9 @@ function StartBox({
           />
           {/* Held as state, not written anywhere: there is no conversation to write it to until the
             first message opens one, and it travels with that message. */}
-          <ModelMenu model={model} disabled={pending} onPick={setModel} />
+          <ModelMenu model={model} disabled={pending} onPick={pickModel} newChat />
           <EffortSlider
+            newChat
             model={model}
             effort={effort}
             disabled={pending}
@@ -2365,6 +2377,25 @@ function AutoTitleRefusal({ error }: { error: unknown }) {
 
 /* ----------------------------------------------------------------- model -- */
 
+/* The notes a model row carries before it is picked: where the words go, and whether the model
+   can work tools. One place for the wording, shared by the generic rows and the route rows. */
+function modelWhyNotes(choice: ModelChoice, localUnavailable: boolean): string[] {
+  return [
+    choice.brain === "local"
+      ? localUnavailable
+        ? "not running on this machine"
+        : "on this machine"
+      : choice.brain === "openrouter"
+        ? /* Said before the pick, not after: the local mark answers "is it running here", and
+             this one answers whose machine the words end up on. */
+          "off this machine: sent to a third-party provider"
+        : null,
+    /* Only `false` earns a mark. Absent is "nobody asked", the ordinary state of every choice
+       nothing has introspected. */
+    choice.tools === false ? "cannot use tools" : null,
+  ].filter((note): note is string => note !== null);
+}
+
 /**
  * Which model answers.
  *
@@ -2400,12 +2431,13 @@ const MODEL_SECTIONS: {
   {
     key: "cli",
     label: "On the agent CLI",
-    holds: (choice) => choice.brain === "cloud",
+    holds: (choice) => choice.brain === "cloud" && routeOf(choice) === null,
   },
   {
     key: "hosted",
     label: "Through OpenRouter",
-    holds: (choice) => choice.brain === "openrouter",
+    // Real OpenRouter rows only: the Gemini API rows also say `openrouter` but have their own route.
+    holds: (choice) => choice.brain === "openrouter" && routeOf(choice) === null,
   },
   {
     key: "installed",
@@ -2565,6 +2597,7 @@ function ModelMenu({
   chatId,
   open,
   onOpenChange,
+  newChat = false,
 }: {
   model: string | null;
   onPick: (model: string | null) => void;
@@ -2574,8 +2607,10 @@ function ModelMenu({
   /** Controlled open state, for a slash command that opens the menu; omitted, the menu is its own. */
   open?: boolean;
   onOpenChange?: (open: boolean) => void;
+  /** The front door: asks the chat-scoped menu, which carries the agy and Gemini API rows. */
+  newChat?: boolean;
 }) {
-  const catalogue = useAssistantModels(chatId);
+  const catalogue = useAssistantModels(chatId, newChat ? "chat" : undefined);
   // The agent-CLI section is drawn from the daemon's discovered, grouped list when it has one.
   const grouped = useModelGroups(chatId).data;
   const groups = grouped?.groups;
@@ -2598,9 +2633,13 @@ function ModelMenu({
   const armedAt = useRef(0);
 
   const choices = catalogue.data?.choices ?? [];
+  const groupModels = groups?.flatMap((group) => group.models) ?? [];
   const chosen =
     choices.find((choice) => choice.id === model) ??
-    groups?.flatMap((group) => group.models).find((choice) => choice.id === model);
+    groupModels.find((choice) => choice.id === model);
+  // Route rows come from the flat list and from the groups alike (agy sits in the groups, the
+  // Gemini API only in the flat list), once each.
+  const { routes } = splitByRoute([...choices, ...groupModels]);
   // Unpinned shows the configured model's name, not a blank. A pin the daemon never labelled (a
   // name since removed from the config) is shown as a product name rather than as the raw id: it
   // is still what the next turn will actually run.
@@ -2616,12 +2655,17 @@ function ModelMenu({
     "Model";
   const pick = (picked: string) => onPick(picked === "" ? null : picked);
   const configuredProvider = configured ? providerOf(configured, groups) : null;
-  const shownProvider = markOf(providerOf(model ?? configured ?? "", groups));
+  // A pick that left the company groups (agy, the Gemini API) keeps its route's mark.
+  const shownProvider =
+    (chosen ? routeOf(chosen)?.mark : undefined) ??
+    markOf(providerOf(model ?? configured ?? "", groups));
   const companies = COMPANIES.map((company) => ({
     ...company,
-    groups: (groups ?? []).filter(
-      (group) => group.provider === company.provider && group.models.length > 0,
-    ),
+    groups: (groups ?? [])
+      .filter((group) => group.provider === company.provider)
+      // The daemon files an agy row by the hosted model's family; the route sections own it.
+      .map((group) => ({ ...group, models: group.models.filter((c) => routeOf(c) === null) }))
+      .filter((group) => group.models.length > 0),
   })).filter(
     (company) => company.groups.length > 0 || company.provider === configuredProvider,
   );
@@ -2711,6 +2755,32 @@ function ModelMenu({
             </DropdownMenuSub>
           );
         })}
+        {/* One submenu per route that is not a house CLI (agy, the Gemini API), after the
+            companies. An empty route is not drawn. */}
+        {routes.map(({ route, models }) => (
+          <DropdownMenuSub key={route.runner}>
+            <DropdownMenuSubTrigger className="chats-model-company">
+              <ProviderMark provider={route.mark} size={14} />
+              {route.section}
+            </DropdownMenuSubTrigger>
+            <DropdownMenuSubContent className="chats-meta-menu chats-model-list">
+              <DropdownMenuRadioGroup value={model ?? ""} onValueChange={pick}>
+                {models.map((choice) => {
+                  const notes = modelWhyNotes(choice, localUnavailable);
+                  return (
+                    <DropdownMenuRadioItem key={choice.id} value={choice.id}>
+                      {choice.label}
+                      <span className="chats-tool-why">{route.badge}</span>
+                      {notes.length > 0 && (
+                        <span className="chats-tool-why">{notes.join(" · ")}</span>
+                      )}
+                    </DropdownMenuRadioItem>
+                  );
+                })}
+              </DropdownMenuRadioGroup>
+            </DropdownMenuSubContent>
+          </DropdownMenuSub>
+        ))}
           {MODEL_SECTIONS.map((section) => {
             // Replaced by the companies above once the daemon has sent its groups.
             if (section.key === "cli" && groups !== undefined) return null;
@@ -2769,22 +2839,7 @@ function ModelMenu({
                   /* Two facts about a choice, read as one verdict on picking it: where the words
                      go, and whether the model can work the tools a turn reaches for. Composed into
                      one line rather than stacked as two spans, because the row is one line tall. */
-                  const why = [
-                    choice.brain === "local"
-                      ? localUnavailable
-                        ? "not running on this machine"
-                        : "on this machine"
-                      : choice.brain === "openrouter"
-                        ? /* Said before the pick, not after: the local mark answers "is it running
-                             here", and this one answers the question that matters just as much for
-                             a hosted choice — whose machine the words end up on. */
-                          "off this machine: sent to a third-party provider"
-                        : null,
-                    /* Only `false` earns a mark. Absent is "nobody asked", which is the ordinary
-                       state of every choice nothing has introspected — marking that would put a
-                       warning on most of the menu and teach people to read past it. */
-                    choice.tools === false ? "cannot use tools" : null,
-                  ].filter((note): note is string => note !== null);
+                  const why = modelWhyNotes(choice, localUnavailable);
 
                   return (
                     <DropdownMenuRadioItem
@@ -2817,6 +2872,23 @@ function ModelMenu({
 }
 
 /**
+ * Whether `model` has a KNOWN row that lacks the `effort` level. The row is looked up in the order
+ * the dial uses (discovered groups, then the config's catalogue); a model with no row yet is not
+ * "lacking" anything, so the caller keeps its effort.
+ */
+function rowLacksEffort(
+  model: string,
+  effort: string,
+  groups: { models: { id: string; efforts?: string[] }[] }[] | undefined,
+  catalogue: { id: string; efforts?: string[] }[] | undefined,
+): boolean {
+  const row =
+    groups?.flatMap((group) => group.models).find((choice) => choice.id === model) ??
+    catalogue?.find((choice) => choice.id === model);
+  return row !== undefined && !(row.efforts ?? []).includes(effort);
+}
+
+/**
  * How hard the model is asked to think, as a slider over the chosen model's own levels.
  *
  * Position 0 is "default" and writes `null`; the rest are the CLI's own words for the levels.
@@ -2833,14 +2905,17 @@ function EffortSlider({
   onPick,
   disabled = false,
   chatId,
+  newChat = false,
 }: {
   model: string | null;
   effort: string | null;
   onPick: (effort: string | null) => void;
   disabled?: boolean;
   chatId?: string;
+  /** The front door: asks the chat-scoped menu, so an agy or Gemini API pick has its efforts here. */
+  newChat?: boolean;
 }) {
-  const catalogue = useAssistantModels(chatId);
+  const catalogue = useAssistantModels(chatId, newChat ? "chat" : undefined);
   const groups = useModelGroups(chatId).data?.groups;
   const fromGroups = groups
     ?.flatMap((group) => group.models)
@@ -2848,7 +2923,11 @@ function EffortSlider({
   const chosen = catalogue.data?.choices.find((choice) => choice.id === model);
   // The union stands in only while nothing is pinned — the front door, where the model question is
   // still open.
-  const levels = fromGroups ?? chosen?.efforts ?? catalogue.data?.efforts ?? [];
+  // A pinned model the catalogue does not know shows no dial rather than the union's levels.
+  const levels =
+    fromGroups ??
+    chosen?.efforts ??
+    (model === null ? (catalogue.data?.efforts ?? []) : []);
   if (levels.length === 0) return null;
   const at = effort === null ? 0 : Math.max(0, levels.indexOf(effort) + 1);
 
@@ -2903,6 +2982,9 @@ function ChatModelControls({
   onModelOpenChange?: (open: boolean) => void;
 }) {
   const patch = usePatchChat();
+  // The same two reads the dial makes, so the pick is judged against the row the dial would show.
+  const catalogue = useAssistantModels(chatId, undefined);
+  const groups = useModelGroups(chatId).data?.groups;
   return (
     <>
       <ModelMenu
@@ -2911,7 +2993,17 @@ function ChatModelControls({
         chatId={chatId}
         open={modelOpen}
         onOpenChange={onModelOpenChange}
-        onPick={(picked) => patch.mutate({ chatId, model: picked })}
+        onPick={(picked) =>
+          // The daemon keeps a stored effort across a model change, so a pick whose known row lacks
+          // that level clears it in the same body; otherwise no `effort` key is sent.
+          patch.mutate(
+            picked !== null &&
+              effort !== null &&
+              rowLacksEffort(picked, effort, groups, catalogue.data?.choices)
+              ? { chatId, model: picked, effort: null }
+              : { chatId, model: picked },
+          )
+        }
       >
         {patch.isError && <ModelRefusal error={patch.error} />}
       </ModelMenu>
@@ -3311,25 +3403,33 @@ function ContextControls({ chatId }: { chatId: string }) {
  * drawn as one that happened, so there is no optimistic flip and a failure says so in the menu.
  * With no row (still loading, or the list failed) the state is unknown, and a clickable off would
  * claim otherwise, so it is disabled; likewise until the list has landed after a write.
+ * An engine with no context reading gets a disabled off and a sentence saying why, whatever the row stores.
  */
 function AutoCompactSwitch({ chatId }: { chatId: string }) {
   const row = useChatRow(chatId);
   const set = useSetChatAutoCompact();
   const on = row?.auto_compact === true;
+  const cannot = row?.cannot_auto_compact === true;
 
   return (
     <>
       <DropdownMenuCheckboxItem
-        checked={on}
-        disabled={row === undefined || set.isPending}
+        checked={on && !cannot}
+        disabled={row === undefined || set.isPending || cannot}
         /* Keeps the menu open, so a refusal is read where the switch is. */
         onSelect={(event) => {
           event.preventDefault();
+          if (cannot) return;
           set.mutate({ chatId, enabled: !on });
         }}
       >
         Compact automatically
       </DropdownMenuCheckboxItem>
+      {cannot && (
+        <p className="chats-context-why">
+          This engine reports no context reading, so this conversation cannot compact itself.
+        </p>
+      )}
       {set.isError && <AutoCompactRefusal error={set.error} />}
     </>
   );

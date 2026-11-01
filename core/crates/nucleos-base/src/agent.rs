@@ -216,7 +216,7 @@ impl std::error::Error for AgentError {
 /// A constant rather than a `matches!` arm, because `council.rs` has to translate every one of them
 /// into a `SeatKind`: an engine added here with no translation there is a seat that cannot run, and
 /// the test that catches it needs both lists to be readable from one place.
-pub const ENGINES: &[&str] = &["claude", "codex", "local"];
+pub const ENGINES: &[&str] = &["claude", "codex", "local", "agy", "gemini-api"];
 
 /// PURE: what a `user` agent is allowed to declare about itself.
 ///
@@ -251,7 +251,9 @@ fn validate(request: &AgentRequest) -> Result<(), AgentError> {
     if let Some(engine) = &request.engine
         && !ENGINES.contains(&engine.as_str())
     {
-        return Err(AgentError::Invalid("engine must be claude, codex or local"));
+        return Err(AgentError::Invalid(
+            "engine must be claude, codex, local, agy or gemini-api",
+        ));
     }
     let mut caps = Vec::with_capacity(request.capabilities.len());
     for text in &request.capabilities {
@@ -595,6 +597,37 @@ mod tests {
             create(&pool, asked).await,
             Err(AgentError::Invalid(_))
         ));
+    }
+
+    /// The engine list and its refusal sentence name the same engines, agy included. The row lives
+    /// in the core's engine table; this crate keeps its own list, so the sentence is the contract.
+    #[test]
+    fn agent_validate_message_lists_agy() {
+        assert!(ENGINES.contains(&"agy"));
+        let mut asked = request("analyst");
+        asked.engine = Some("gemini".to_owned());
+        assert_eq!(
+            validate_request(&asked),
+            Err("engine must be claude, codex, local, agy or gemini-api")
+        );
+        // Declaring agy passes this crate's validation; the launch surfaces refuse it by name.
+        asked.engine = Some("agy".to_owned());
+        assert_eq!(validate_request(&asked), Ok(()));
+    }
+
+    /// RED (plan Node 3, test 8). The Gemini API row exists in the core's table, so this crate's
+    /// hand-written list and its refusal sentence must name it too; the `engines_missing_from` guard
+    /// in the core fails loudly otherwise.
+    #[test]
+    fn engines_list_includes_gemini_api() {
+        assert!(ENGINES.contains(&"gemini-api"));
+        let mut asked = request("analyst");
+        asked.engine = Some("nonexistent".to_owned());
+        let refusal = validate_request(&asked).unwrap_err();
+        assert!(refusal.contains("gemini-api"), "{refusal}");
+        // Declaring it passes this crate's validation; the launch surfaces refuse it by name.
+        asked.engine = Some("gemini-api".to_owned());
+        assert_eq!(validate_request(&asked), Ok(()));
     }
 
     #[tokio::test]

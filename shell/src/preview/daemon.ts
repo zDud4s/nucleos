@@ -4031,6 +4031,15 @@ export function answer(path: string, init?: RequestInit): unknown {
   if (path === "/api-tokens" && init?.method === undefined) return API_TOKENS;
   if (path === "/config/machine" && init?.method === undefined) return MACHINE_CONFIG;
   if (path === "/config/distiller" && init?.method === undefined) return { model: "cloud" };
+  if (path === "/engines/agy" && init?.method === undefined) {
+    return {
+      enabled: false,
+      acknowledged: false,
+      warning: "Preview text: the real warning comes from the daemon when you switch this engine on.",
+      warning_version: 1,
+      installed: true,
+    };
+  }
   if (path === "/config/capture" && init?.method === undefined) return { answer_days: 5, digest_hour: 18 };
   if (path === "/capture-digests") return [];
   if (path === "/config/embedding" && init?.method === undefined) return { model: "nomic-embed-text" };

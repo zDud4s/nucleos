@@ -471,6 +471,8 @@ export const keys = {
      */
     models: ["chats", "models"] as const,
     modelsFor: (chatId: string) => ["chats", "models", chatId] as const,
+    /** The chat-scoped menu of the front door — `GET /assistant/models?scope=chat`. */
+    modelsNewChat: ["chats", "models", "new-chat"] as const,
     /** Archived conversations — `GET /assistant/chats?archived=true`. */
     archived: ["chats", "archived"] as const,
     /** The user's session groups — `GET /assistant/chat-groups`. */
@@ -679,6 +681,8 @@ export const keys = {
     /** `GET /system/storage` — what the database file and the folders beside it occupy. */
     storage: ["system", "storage"] as const,
     tokens: ["system", "tokens"] as const,
+    /** `GET /engines/<engine>` — the opt-in state of one CLI engine. */
+    engine: (engine: string) => ["system", "engine", engine] as const,
     pii: ["system", "pii"] as const,
     /**
      * Which feed kinds still reach a messaging channel — `GET /notifications/policy` — and

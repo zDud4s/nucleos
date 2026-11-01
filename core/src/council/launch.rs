@@ -78,6 +78,21 @@ async fn resolve_roster(
     Ok((resolved_chairman, resolved_members))
 }
 
+/// A model seat names no engine, so it runs on the daemon's runner, which is agy under
+/// `primary_runner: agy`; council never uses agy, so it is refused by name. An agent seat that
+/// declares its engine counts as pinned.
+fn refuse_unpinned_seat_on_agy_primary(
+    who: &str,
+    pinned: bool,
+    models: &crate::config::ModelsConfig,
+) -> Result<(), StartError> {
+    if pinned {
+        return Ok(());
+    }
+    crate::engines::refuse_agy_primary(models)
+        .map_err(|why| StartError::Invalid(format!("{who}: {why}")))
+}
+
 /// One declared seat, resolved. `who` is what a refusal calls it — see `config::seat_name`.
 pub(super) async fn resolve_seat(
     state: &crate::state::AppState,
@@ -106,6 +121,7 @@ pub(super) async fn resolve_seat(
         // the file, so `CouncilConfig::faults` has already refused it at load and `start` refuses it
         // for an override — asking a third time would refuse a configured roster that startup
         // accepted, which is a daemon disagreeing with itself.
+        refuse_unpinned_seat_on_agy_primary(who, false, &crate::config::models_config_now())?;
         return Ok(CouncilSeat::of_model(kind, model_ref));
     };
 
@@ -125,6 +141,18 @@ pub(super) async fn resolve_seat(
             "{who} names the agent `{agent_id}`, which declares no engine — a package agent              cannot take a council seat"
         )));
     };
+    if engine == crate::engines::AGY {
+        return Err(StartError::Invalid(format!(
+            "{who} names the agent `{agent_id}`: {}",
+            crate::engines::AGY_REFUSAL
+        )));
+    }
+    if engine == crate::engines::GEMINI_API {
+        return Err(StartError::Invalid(format!(
+            "{who} names the agent `{agent_id}`: {}",
+            crate::engines::GEMINI_API_REFUSAL
+        )));
+    }
     let kind = crate::config::seat_kind_for_engine(engine).ok_or_else(|| {
         StartError::Invalid(format!(
             "{who} names the agent `{agent_id}`, whose engine `{engine}` is not one a seat can run"
@@ -400,4 +428,76 @@ fn seat_roles(
         *slot = Some(role);
     }
     Ok(roles)
+}
+
+#[cfg(test)]
+mod agy_primary_tests {
+    use super::*;
+
+    /// E16 F3: a model seat names no engine, so under `primary_runner: agy` it would run on agy.
+    #[test]
+    fn an_unpinned_seat_refuses_an_agy_primary() {
+        let primary = |name: &str| crate::config::ModelsConfig {
+            primary_runner: Some(name.to_owned()),
+            ..crate::config::ModelsConfig::default()
+        };
+        let error =
+            refuse_unpinned_seat_on_agy_primary("member 1", false, &primary("agy")).unwrap_err();
+        assert_eq!(
+            error,
+            StartError::Invalid(format!("member 1: {}", crate::engines::AGY_REFUSAL))
+        );
+        // A seat pinned to claude or codex (an agent that declares its engine) still starts.
+        assert_eq!(
+            refuse_unpinned_seat_on_agy_primary("member 1", true, &primary("agy")),
+            Ok(())
+        );
+        assert_eq!(
+            refuse_unpinned_seat_on_agy_primary("member 1", false, &primary("claude")),
+            Ok(())
+        );
+        assert_eq!(
+            refuse_unpinned_seat_on_agy_primary(
+                "member 1",
+                false,
+                &crate::config::ModelsConfig::default()
+            ),
+            Ok(())
+        );
+    }
+
+    /// E24: a catalogue agent that declares the gemini-api engine cannot hold a council seat; the
+    /// refusal names the engine and is made by `resolve_seat`, before anything is spent.
+    #[tokio::test]
+    async fn a_gemini_api_agent_cannot_hold_a_council_seat() {
+        let state = crate::channels::testkit::state().await;
+        let agent = crate::agent::create(
+            &state.pool,
+            crate::agent::AgentRequest {
+                name: "gemini-seat".to_string(),
+                speciality: "the speciality of gemini-seat".to_string(),
+                prompt: "The standing instructions of gemini-seat.".to_string(),
+                engine: Some(crate::engines::GEMINI_API.to_string()),
+                model: Some("gemini-3.8-flash".to_string()),
+                capabilities: vec!["mcp.nucleos".to_string()],
+            },
+        )
+        .await
+        .unwrap();
+        let spec = SeatSpec {
+            agent: Some(agent.id.clone()),
+            ..SeatSpec::default()
+        };
+
+        let outcome = resolve_seat(&state, &spec, "member 1").await;
+
+        assert!(
+            matches!(
+                outcome,
+                Err(StartError::Invalid(ref why))
+                    if why.contains(crate::engines::GEMINI_API_REFUSAL)
+            ),
+            "{outcome:?}"
+        );
+    }
 }

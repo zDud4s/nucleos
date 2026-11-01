@@ -21,30 +21,42 @@ use nucleos_base::agent::{Capability, policy_str_for};
 use crate::execution::runner::ToolPolicy;
 use crate::models::route_advice::RunnerKind;
 
-/// The engine a launch targets: the two CLI runners plus the local model.
+/// The engine a launch targets: the CLI runners plus the local model. A table-backed id; the named
+/// consts are the rows the production code names, and any other CLI row is an `Engine` of its own,
+/// never a stand-in for Claude.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Engine {
-    Claude,
-    Codex,
-    Local,
-}
+pub struct Engine(crate::engines::EngineId);
 
+#[allow(non_upper_case_globals)]
 impl Engine {
+    pub const Claude: Engine = Engine(crate::engines::EngineId::from_row(crate::engines::CLAUDE));
+    pub const Codex: Engine = Engine(crate::engines::EngineId::from_row(crate::engines::CODEX));
+    pub const Local: Engine = Engine(crate::engines::EngineId::from_row(crate::engines::LOCAL));
+    pub const Agy: Engine = Engine(crate::engines::EngineId::from_row(crate::engines::AGY));
+
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Claude => "claude",
-            Self::Codex => "codex",
-            Self::Local => "local",
+        self.0.as_str()
+    }
+
+    /// The engine of a CLI row of `table`, or the local model; `None` for any other id.
+    pub fn parse_in(table: &[crate::engines::EngineDescription], value: &str) -> Option<Self> {
+        if value == crate::engines::LOCAL {
+            return Some(Self::Local);
         }
+        let row = crate::engines::cli_row_in(table, value)?;
+        Some(Self(crate::engines::EngineId::from_row(row.id)))
+    }
+
+    /// An engine outside the production table, to exercise the fail-closed arms.
+    #[cfg(any(test, feature = "testkit"))]
+    pub fn for_test(id: &'static str) -> Self {
+        Self(crate::engines::EngineId::for_test(id))
     }
 }
 
 impl From<RunnerKind> for Engine {
     fn from(kind: RunnerKind) -> Self {
-        match kind {
-            RunnerKind::Claude => Self::Claude,
-            RunnerKind::Codex => Self::Codex,
-        }
+        Self(kind.0)
     }
 }
 
@@ -163,14 +175,43 @@ pub fn translate(engine: Engine, caps: &[Capability]) -> Result<EngineTools, Uns
                 }
             }
         }
+        // Agents cannot run agy in this delivery: every capability is refused by name.
+        Engine::Agy => {
+            if let Some(&capability) = caps.first() {
+                return Err(Unsupported { engine, capability });
+            }
+        }
+        // An engine with no arm above refuses the first capability, as agy does: it never
+        // falls through to Claude's tool set.
+        _ => {
+            if let Some(&capability) = caps.first() {
+                return Err(Unsupported { engine, capability });
+            }
+        }
     }
     Ok(tools)
 }
 
 /// The CLI runners that translate `caps` without error.
 pub fn translatable_runners(caps: &[Capability]) -> Vec<RunnerKind> {
-    [RunnerKind::Claude, RunnerKind::Codex]
+    let enabled: Vec<crate::engines::EngineDescription> = crate::engines::enabled_table()
         .into_iter()
+        .cloned()
+        .collect();
+    translatable_runners_in(&enabled, caps)
+}
+
+/// The CLI runners of `table` that translate `caps` without error.
+pub fn translatable_runners_in(
+    table: &[crate::engines::EngineDescription],
+    caps: &[Capability],
+) -> Vec<RunnerKind> {
+    crate::engines::ids_with_transport_in(table, crate::engines::Transport::Cli)
+        .into_iter()
+        .filter_map(|id| RunnerKind::parse_in(table, id))
+        // An empty capability list translates for agy, but agents never run on it: allow-list the
+        // engines that do, so a new engine is excluded until it is wired.
+        .filter(|&kind| kind == RunnerKind::Claude || kind == RunnerKind::Codex)
         .filter(|&kind| translate(kind.into(), caps).is_ok())
         .collect()
 }
@@ -184,6 +225,70 @@ mod tests {
         translate(Engine::Claude, caps)
             .unwrap()
             .claude_allowed_tools
+    }
+
+    /// An engine with no arm refuses by name; it never falls through to Claude's tool set.
+    #[test]
+    fn translate_refuses_unwired_engine() {
+        let zed = Engine::for_test("zed");
+        let error = translate(zed, &[FsRead]).expect_err("an unwired engine refuses");
+        assert_eq!(error.capability, FsRead);
+        assert!(error.to_string().contains("zed"), "{error}");
+    }
+
+    /// An unwired engine is never a translatable runner, whatever the capability list.
+    #[test]
+    fn translatable_runners_excludes_unwired() {
+        let zed = RunnerKind::for_test("zed");
+        for caps in [&[][..], &[FsRead][..], &[Shell, Web][..]] {
+            let runners = translatable_runners(caps);
+            assert!(!runners.contains(&zed), "{runners:?}");
+            assert!(
+                runners
+                    .iter()
+                    .all(|kind| *kind == RunnerKind::Claude || *kind == RunnerKind::Codex),
+                "{runners:?}"
+            );
+        }
+    }
+
+    fn zed_no_utility_default(
+        _known: &[crate::models::model_catalog::Discovered],
+    ) -> Option<String> {
+        None
+    }
+
+    fn zed_no_runner(
+        _models: &crate::config::ModelsConfig,
+    ) -> Option<std::sync::Arc<dyn crate::execution::runner::CommandRunner>> {
+        None
+    }
+
+    fn zed_true() -> bool {
+        true
+    }
+
+    /// A CLI row with no wiring is dropped by the allow-list alone: empty caps translate for any
+    /// engine, so nothing else could exclude it.
+    #[test]
+    fn translatable_runners_in_excludes_a_cli_row_with_no_wiring() {
+        let mut table = crate::engines::TABLE.to_vec();
+        table.push(crate::engines::EngineDescription {
+            id: "zed",
+            display_name: "Zed",
+            seat_kind: crate::config::SeatKind::Cloud,
+            transport: crate::engines::Transport::Cli,
+            installed: zed_true,
+            gate: zed_true,
+            utility_default: zed_no_utility_default,
+            runner: zed_no_runner,
+        });
+        let runners = translatable_runners_in(&table, &[]);
+        assert!(runners.contains(&RunnerKind::Claude), "{runners:?}");
+        assert!(
+            runners.iter().all(|kind| kind.as_str() != "zed"),
+            "{runners:?}"
+        );
     }
 
     #[test]
@@ -304,5 +409,53 @@ mod tests {
     fn engine_from_runner_kind() {
         assert_eq!(Engine::from(RunnerKind::Claude), Engine::Claude);
         assert_eq!(Engine::from(RunnerKind::Codex), Engine::Codex);
+        assert_eq!(Engine::from(RunnerKind::Agy), Engine::Agy);
+    }
+
+    #[test]
+    fn engine_and_runner_kind_strings_agree_with_the_table() {
+        assert_eq!(Engine::Agy.as_str(), crate::engines::AGY);
+        assert_eq!(RunnerKind::Agy.as_str(), crate::engines::AGY);
+        assert_eq!(RunnerKind::parse("agy"), Some(RunnerKind::Agy));
+        // Every CLI row of the table round-trips through both vocabularies.
+        for id in crate::engines::ids_with_transport_in(
+            crate::engines::TABLE,
+            crate::engines::Transport::Cli,
+        ) {
+            let kind = RunnerKind::parse(id).unwrap_or_else(|| panic!("no RunnerKind for `{id}`"));
+            assert_eq!(kind.as_str(), id);
+            assert_eq!(Engine::from(kind).as_str(), id);
+        }
+        // The local model is not a CLI runner.
+        assert_eq!(RunnerKind::parse("local"), None);
+    }
+
+    #[test]
+    fn translate_agy_refuses_unsupported_capabilities_by_name() {
+        // Agents cannot run agy in this delivery: every capability is refused, by engine and name.
+        for &capability in Capability::ALL {
+            let err = translate(Engine::Agy, &[capability]).unwrap_err();
+            assert_eq!(
+                err,
+                Unsupported {
+                    engine: Engine::Agy,
+                    capability
+                }
+            );
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "the agy engine does not support the capability `{}`",
+                    capability.as_str()
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn translatable_runners_leave_agy_out_while_its_gate_is_off() {
+        let _gate = crate::engines::agy_test_support::agy_gate(false);
+        assert!(!translatable_runners(&[]).contains(&RunnerKind::Agy));
+        assert!(!translatable_runners(&[McpNucleos]).contains(&RunnerKind::Agy));
     }
 }

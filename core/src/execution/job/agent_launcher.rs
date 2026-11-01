@@ -55,6 +55,10 @@ fn runner_of(engine: Engine) -> Option<RunnerKind> {
         Engine::Claude => Some(RunnerKind::Claude),
         Engine::Codex => Some(RunnerKind::Codex),
         Engine::Local => None,
+        // Never launches: `pin_of` refuses agy by name before this is asked.
+        Engine::Agy => None,
+        // An engine with no arm has no runner; `pin_of` then refuses it by name.
+        _ => None,
     }
 }
 
@@ -70,7 +74,21 @@ fn pin_of(
     let Some((engine, model)) = pin else {
         return Ok(None);
     };
+    if engine == Engine::Agy {
+        return Err(LaunchRefused::Unavailable(format!(
+            "{label}: {}",
+            crate::engines::AGY_REFUSAL
+        )));
+    }
     let Some(runner) = runner_of(engine) else {
+        // Only the local engine is a known engine without a runner; any other id has no arm and is
+        // refused by name, never reported as the local engine.
+        if engine != Engine::Local {
+            return Err(LaunchRefused::Unavailable(format!(
+                "{label}: the {} engine is not available for agents, teams or council",
+                engine.as_str()
+            )));
+        }
         return Err(LaunchRefused::Unavailable(format!(
             "{label} is pinned to the local engine, which a workflow node cannot run on"
         )));
@@ -224,6 +242,30 @@ mod tests {
         assert_eq!(pins.model.as_deref(), Some("gpt-5"));
         let none = pins_of(&node("id: a\ntype: agent\ntool: \"\"\n"));
         assert_eq!(none, Pins::default());
+    }
+
+    /// An engine with no arm has no runner: it is neither Claude nor Codex.
+    #[test]
+    fn runner_of_unwired_is_none() {
+        assert_eq!(runner_of(Engine::for_test("zed")), None);
+    }
+
+    /// A pin on an engine with no arm is refused by that engine's name, not as the local engine.
+    #[test]
+    fn pin_of_refuses_unwired_engine_by_name() {
+        let refused = pin_of(
+            Some((Engine::for_test("zed"), "any-model".to_owned())),
+            None,
+            "r@1.0.0",
+            None,
+            false,
+        )
+        .expect_err("an unwired engine is refused");
+        let LaunchRefused::Unavailable(text) = refused else {
+            panic!("expected Unavailable, got {refused:?}");
+        };
+        assert!(text.contains("zed"), "{text}");
+        assert!(!text.contains("local"), "{text}");
     }
 
     #[test]

@@ -306,10 +306,14 @@ async fn void_stale_after(state: &AppState, scope: &Scope, name: &str) {
     if !matches!(scope, Scope::Machine) || name != "devtime" {
         return;
     }
-    let config = store::get_opt::<crate::config::DevtimeConfig>(&Scope::Machine).unwrap_or_default();
+    let config =
+        store::get_opt::<crate::config::DevtimeConfig>(&Scope::Machine).unwrap_or_default();
     match crate::devtime::store::void_stale_thresholds(&state.pool, &config.actions).await {
         Ok(voided) if voided > 0 => {
-            tracing::info!(voided, "voided the pending devtime actions after a thresholds change");
+            tracing::info!(
+                voided,
+                "voided the pending devtime actions after a thresholds change"
+            );
         }
         Ok(_) => {}
         Err(error) => {

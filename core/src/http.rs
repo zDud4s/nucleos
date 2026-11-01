@@ -41,6 +41,7 @@ mod chats;
 mod commands;
 mod common;
 mod email;
+mod engines;
 mod files;
 mod fleet;
 mod git_ops;
@@ -149,6 +150,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(remote::routes())
         .merge(repo::routes())
         .merge(run_queue::routes())
+        .merge(engines::routes())
         .merge(settings::routes())
         .merge(crate::route_index::routes())
         .merge(team::routes())

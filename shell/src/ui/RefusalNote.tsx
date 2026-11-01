@@ -24,6 +24,13 @@ const SENTENCES: Record<string, string> = {
   turn_in_progress: "this conversation already has a turn in flight; it clears on its own",
   no_local_model: "no local model is available, and this asked for one",
   internal: `the ${DAEMON_NAME} hit an error of its own handling this`,
+  // The send path's hosted-route refusals, in the núcleo's own words (`assistants.rs`
+  // GEMINI_KEY_MISSING / HOSTED_KEY_MISSING, `assistant_types.rs` NO_HOSTED_MODEL). They carry no
+  // detail, so without a sentence here the note falls to the generic floor.
+  no_gemini_key:
+    "a Gemini API key is required before a gemini-api model can answer; a key stored while the daemon runs needs a daemon restart",
+  no_openrouter_key: "an OpenRouter key is required before the hosted assistant can answer",
+  no_hosted_model: "this chat is set to the hosted model and none is configured",
 
   // Derived from the status, for routes that refused without a name.
   bad_request: `the ${DAEMON_NAME} would not accept that request`,

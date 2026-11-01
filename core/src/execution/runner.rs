@@ -11,6 +11,7 @@ use tokio::sync::mpsc::UnboundedSender;
 // `taskkill` with no `cfg` at all — a silent no-op on every other platform.
 use crate::process_tree::TreeKiller;
 
+mod agy;
 mod auth_watch;
 mod claude;
 mod claude_args;
@@ -26,6 +27,7 @@ mod stream;
 mod turns;
 mod wire;
 
+pub use self::agy::{AgyCliRunner, agy_program};
 pub use self::auth_watch::watch_claude_auth;
 pub use self::claude::*;
 pub use self::claude_args::*;

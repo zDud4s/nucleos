@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "acknowledged_warning_version": {
+      "default": null,
+      "description": "The version of the warning the owner accepted when enabling.",
+      "format": "uint32",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "enabled": {
+      "default": false,
+      "description": "Whether the agy engine may be used at all.",
+      "type": "boolean"
+    }
+  },
+  "title": "AgyDoc",
+  "type": "object"
+}

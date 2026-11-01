@@ -1840,12 +1840,11 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
                 "the catalogue accepts `{engine}` and no seat can host it"
             );
         }
-        for (engine, _) in ENGINE_SEAT_KINDS {
-            assert!(
-                crate::agent::ENGINES.contains(engine),
-                "`{engine}` translates to a seat and no agent may declare it"
-            );
-        }
+        let missing = engines_missing_from(crate::agent::ENGINES);
+        assert!(
+            missing.is_empty(),
+            "{missing:?} translate to a seat and no agent may declare them"
+        );
         for kind in [SeatKind::Cloud, SeatKind::Local] {
             assert!(
                 ENGINE_SEAT_KINDS.iter().any(|(_, mapped)| *mapped == kind),
@@ -1853,6 +1852,26 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
             );
         }
         assert_eq!(seat_kind_for_engine("gemini"), None);
+        // The new row is covered in both lists: the hand-written one and the derived one.
+        assert!(crate::agent::ENGINES.contains(&"agy"));
+        assert_eq!(seat_kind_for_engine("agy"), Some(SeatKind::Cloud));
+    }
+
+    /// The guard's own check, over a list it is given: a table row missing from the hand-written
+    /// `nucleos_base::agent::ENGINES` must fail loudly, naming the row. (GREEN extracts the check
+    /// the test above runs inline into `engines_missing_from(list)`.)
+    #[test]
+    fn engines_list_missing_a_row_fails_the_guard() {
+        let complete: Vec<&str> = ENGINE_SEAT_KINDS.iter().map(|(id, _)| *id).collect();
+        assert!(engines_missing_from(&complete).is_empty());
+        assert_eq!(
+            engines_missing_from(&["claude", "codex", "local"]),
+            vec!["agy", "gemini-api"]
+        );
+        assert_eq!(
+            engines_missing_from(&[]),
+            vec!["claude", "codex", "local", "agy", "gemini-api"]
+        );
     }
 
     #[test]
@@ -3513,7 +3532,11 @@ ok: {{ input: 2.0, output: 8.0 }}\n"
                 "{bad}: routing still loads"
             );
             assert!(
-                config.model_prices.dropped.iter().any(|w| w.starts_with("m: ")),
+                config
+                    .model_prices
+                    .dropped
+                    .iter()
+                    .any(|w| w.starts_with("m: ")),
                 "{bad}: and the drop is recorded, not only logged: {:?}",
                 config.model_prices.dropped
             );

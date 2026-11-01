@@ -46,6 +46,7 @@ pub const CHANNEL_TELEGRAM_FILE: &str = "channels/telegram.yaml";
 pub const GITHUB_FILE: &str = "github.yaml";
 pub const COUNCIL_FILE: &str = "council.yaml";
 pub const ROUTER_FILE: &str = "router.yaml";
+pub const AGY_FILE: &str = "agy.yaml";
 pub const DEVTIME_FILE: &str = "devtime.yaml";
 pub const VERIFY_FILE: &str = "verify.yaml";
 

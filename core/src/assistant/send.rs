@@ -569,17 +569,40 @@ pub async fn send_message(
     send_message_with(state, chat_id, text, &[], origin).await
 }
 
+/// The pin of a HOSTED chat, read fresh and without swallowing a failure: a read error comes back
+/// as the refusal text, so the turn is refused instead of answered by the route's default model
+/// (which may belong to another provider than the one the chat was pinned to).
+pub(super) async fn hosted_pin(
+    pool: &sqlx::SqlitePool,
+    chat_id: &str,
+) -> Result<Option<String>, String> {
+    match crate::chats::answering(pool, chat_id).await {
+        Ok(answering) => Ok(answering.model),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                chat_id,
+                "could not read the conversation's pinned model; refusing the hosted turn"
+            );
+            Err(format!(
+                "could not read this conversation's pinned model: {error}"
+            ))
+        }
+    }
+}
+
 /// The conversation's pinned model (`chats::Answering::model`), read fresh rather than cached
-/// across a turn.
+/// across a turn, for the LOCAL branch.
 ///
-/// A failure to read it must NOT refuse the turn: this returns `None` — the route's own configured
-/// default — and logs a warning instead of propagating the error. `recent_exchanges` takes the same
-/// posture when history cannot be read, and `chats::answering`'s own doc makes the same argument for
-/// a missing row answering `Default`.
+/// A failure to read it must NOT refuse a local turn: this returns `None` — the route's own
+/// configured default — and logs a warning instead of propagating the error. `recent_exchanges`
+/// takes the same posture when history cannot be read, and `chats::answering`'s own doc makes the
+/// same argument for a missing row answering `Default`. The hosted branch reads through
+/// `hosted_pin` instead and refuses.
 ///
-/// Called from inside each of `send_message_with`'s two route branches, never above them: a cloud
-/// turn reaches neither branch, and hoisting the call above both would add this query to the
-/// busiest path — the cloud turn — to serve two branches that both return before it even starts.
+/// Called from inside the local branch of `send_message_with`, never above the branches: a cloud
+/// turn reaches neither, and hoisting the call would add this query to the busiest path — the
+/// cloud turn — to serve a branch that returns before the cloud path even starts.
 pub(super) async fn pinned_model(state: &crate::state::AppState, chat_id: &str) -> Option<String> {
     match crate::chats::answering(&state.pool, chat_id).await {
         Ok(answering) => answering.model,
@@ -747,9 +770,14 @@ pub(super) async fn send_message_inner(
     // conversation that asked to stay off the CLI onto the bill, and the person would find out from
     // the invoice.
     if wants_hosted {
-        // The conversation's pinned model — see `pinned_model`'s own doc for why it is read here,
-        // inside the branch, and why a read failure falls back to `None` instead of refusing.
-        let pinned_model = pinned_model(state, chat_id).await;
+        // The conversation's pinned model, read inside the branch (see `pinned_model`'s doc for
+        // why). Unlike the local branch, a failed read REFUSES: answering with the route's default
+        // model would hand a chat pinned to one provider's model to another model, and possibly
+        // another provider, without a word.
+        let pinned_model = hosted_pin(&state.pool, chat_id).await?;
+        let cost_unknown = state
+            .assistants
+            .answers_through_gemini(crate::chats::Brain::OpenRouter, pinned_model.as_deref());
         return match state
             .assistants
             .assistant_for(crate::chats::Brain::OpenRouter, pinned_model.as_deref())
@@ -769,6 +797,7 @@ pub(super) async fn send_message_inner(
                     relay_id,
                     origin,
                     "openrouter",
+                    cost_unknown,
                 )
                 .await
             }
@@ -809,6 +838,7 @@ pub(super) async fn send_message_inner(
                     relay_id,
                     origin,
                     "local",
+                    false,
                 )
                 .await;
             }
@@ -1663,6 +1693,209 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("turn {id} never settled");
+    }
+
+    // --- E25: hosted pin read, Gemini routing and cost ---
+
+    /// What a loopback provider stub saw: the `Authorization` header and the JSON body.
+    type Seen = Arc<std::sync::Mutex<Vec<(Option<String>, serde_json::Value)>>>;
+
+    /// A loopback `/chat/completions` that records every request and answers `ok`.
+    async fn provider_stub() -> (String, Seen) {
+        let seen: Seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        let app = axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(
+                move |headers: axum::http::HeaderMap,
+                      axum::Json(body): axum::Json<serde_json::Value>| {
+                    let recorded = recorded.clone();
+                    async move {
+                        let auth = headers
+                            .get("authorization")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string);
+                        recorded.lock().unwrap().push((auth, body));
+                        axum::Json(serde_json::json!({
+                            "choices": [{ "message": { "content": "ok" } }]
+                        }))
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{address}"), seen)
+    }
+
+    /// Sends one message to an `openrouter`-brain chat pinned to `pin`, with both providers' keys
+    /// stored and both bases on local stubs. Returns the finished run's `cost_usd` and what each
+    /// stub saw.
+    async fn hosted_turn_with_both_keys(pin: &str) -> (Option<f64>, Seen, Seen) {
+        hosted_turn("anthropic/claude-sonnet-4.5", Some(pin)).await
+    }
+
+    /// [`hosted_turn_with_both_keys`] with the route's default model configurable and the pin
+    /// optional (`None` leaves the chat unpinned).
+    async fn hosted_turn(default_model: &str, pin: Option<&str>) -> (Option<f64>, Seen, Seen) {
+        let (openrouter_base, openrouter_seen) = provider_stub().await;
+        let (gemini_base, gemini_seen) = provider_stub().await;
+        let mut state = test_state().await;
+        state.assistants = Arc::new(
+            crate::assistants::ConfiguredAssistants::new(
+                None,
+                Some(default_model.to_string()),
+                Some("openrouter-key".to_string()),
+                "http://127.0.0.1:8791".to_string(),
+                "token".to_string(),
+                state.pool.clone(),
+                crate::execution::runner::OLLAMA_BASE_URL.to_string(),
+            )
+            .with_gemini_key(Some("google-key".to_string()))
+            .with_hosted_base_url(openrouter_base)
+            .with_gemini_base_url(gemini_base),
+        );
+        let chat = crate::chats::create(&state.pool, crate::chats::Brain::OpenRouter, None)
+            .await
+            .unwrap();
+        if let Some(pin) = pin {
+            crate::chats::set_model(&state.pool, &chat, Some(pin))
+                .await
+                .unwrap();
+        }
+
+        let sent = send_message_with(&state, &chat, "hello", &[], Origin::Shell).await;
+
+        let id = sent.expect("a free hosted chat starts a turn");
+        settled(&state.pool, id).await;
+        let (status, cost): (String, Option<f64>) =
+            sqlx::query_as("SELECT status, cost_usd FROM runs WHERE id = ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            status, "completed",
+            "the stub answered, so the turn completed"
+        );
+        (cost, openrouter_seen, gemini_seen)
+    }
+
+    /// E25: an unpinned chat whose route default is a `gemini-api/` model goes to Google and
+    /// records an unknown cost.
+    #[tokio::test]
+    async fn a_gemini_default_model_with_no_pin_records_unknown_cost() {
+        let (cost, openrouter_seen, gemini_seen) = hosted_turn("gemini-api/x", None).await;
+
+        {
+            let seen = gemini_seen.lock().unwrap();
+            assert_eq!(seen.len(), 1, "Google got the request: {seen:?}");
+            assert_eq!(seen[0].0.as_deref(), Some("Bearer google-key"));
+        }
+        assert!(
+            openrouter_seen.lock().unwrap().is_empty(),
+            "a gemini-api default must never reach OpenRouter"
+        );
+        assert_eq!(cost, None, "Google's price is unknown, not free");
+    }
+
+    /// E25 through `send_message_with`: only the pin read (`chats::answering`) fails, while
+    /// `brain_of` succeeds, so the refusal comes from the pin read alone. The turn starts no run
+    /// and the chat's slot is left free.
+    #[tokio::test]
+    async fn a_failed_pin_read_refuses_the_turn_through_send() {
+        let mut state = test_state().await;
+        state.assistants = Arc::new(crate::assistants::ConfiguredAssistants::new(
+            None,
+            Some("anthropic/claude-sonnet-4.5".to_string()),
+            Some("openrouter-key".to_string()),
+            "http://127.0.0.1:8791".to_string(),
+            "token".to_string(),
+            state.pool.clone(),
+            crate::execution::runner::OLLAMA_BASE_URL.to_string(),
+        ));
+        let chat = crate::chats::create(&state.pool, crate::chats::Brain::OpenRouter, None)
+            .await
+            .unwrap();
+        // `brain_of` reads only `brain`; `answering` also reads `context_window`.
+        sqlx::query("ALTER TABLE chats DROP COLUMN context_window")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let runs_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+
+        let sent = send_message_with(&state, &chat, "hello", &[], Origin::Shell).await;
+
+        assert!(sent.is_err(), "an unreadable pin refuses the turn");
+        let runs_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(runs_before, runs_after, "no run was started");
+        // A held slot would turn the next send into `Ok(Queued)`; a free slot reaches the pin read
+        // again and is refused the same way.
+        let again = send_message_with(&state, &chat, "again", &[], Origin::Shell).await;
+        assert!(again.is_err(), "the slot was released: {again:?}");
+    }
+
+    /// E25: a hosted turn whose pin cannot be read is refused rather than answered by the route's
+    /// default model. On a closed pool the read fails. (Does not cover the `send_message_with`
+    /// path; see `a_failed_pin_read_refuses_the_turn_through_send`.)
+    #[tokio::test]
+    async fn a_failed_pin_read_on_a_hosted_chat_is_refused() {
+        let pool = crate::testdb::fresh_pool().await;
+        pool.close().await;
+
+        let pin = hosted_pin(&pool, "any-chat").await;
+
+        assert!(
+            pin.is_err(),
+            "a failed read must not become `None`: {pin:?}"
+        );
+    }
+
+    /// E25: a `gemini-api/` pin on an `openrouter`-brain chat goes to Google with the Google key,
+    /// never to OpenRouter, and its cost is unknown (NULL), not zero.
+    #[tokio::test]
+    async fn a_gemini_pinned_chat_reaches_google_and_records_unknown_cost() {
+        let (cost, openrouter_seen, gemini_seen) = hosted_turn_with_both_keys("gemini-api/x").await;
+
+        {
+            let seen = gemini_seen.lock().unwrap();
+            assert_eq!(
+                seen.len(),
+                1,
+                "exactly one request reached Google: {seen:?}"
+            );
+            assert_eq!(seen[0].0.as_deref(), Some("Bearer google-key"));
+        }
+        assert!(
+            openrouter_seen.lock().unwrap().is_empty(),
+            "a gemini-api pin must never reach OpenRouter"
+        );
+        assert_eq!(cost, None, "Google's price is unknown, not free");
+    }
+
+    /// Guard for existing behaviour (allowed to pass today): an OpenRouter turn still records a
+    /// cost of 0, and goes to OpenRouter with the OpenRouter key.
+    #[tokio::test]
+    async fn an_openrouter_chats_turn_still_records_zero_cost() {
+        let (cost, openrouter_seen, gemini_seen) =
+            hosted_turn_with_both_keys("openai/gpt-5.6").await;
+
+        {
+            let seen = openrouter_seen.lock().unwrap();
+            assert_eq!(seen.len(), 1, "{seen:?}");
+            assert_eq!(seen[0].0.as_deref(), Some("Bearer openrouter-key"));
+        }
+        assert!(gemini_seen.lock().unwrap().is_empty());
+        assert_eq!(cost, Some(0.0));
     }
 
     /// A browser agent's reply that could not be delivered reaches the mother's NEXT turn: once,

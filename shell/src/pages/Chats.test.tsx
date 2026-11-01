@@ -1412,7 +1412,7 @@ describe("Chats - choosing a model", () => {
     });
   });
 
-  it("the front door still asks for the daemon-wide menu", async () => {
+  it("the front door asks for the chat-scoped menu", async () => {
     const requested: string[] = [];
     const base = chatsFetch([], {});
     daemon.apiFetch.mockImplementation(async (path, init) => {
@@ -1423,7 +1423,7 @@ describe("Chats - choosing a model", () => {
     await renderChats("/chats");
 
     await waitFor(() => {
-      expect(requested).toContain("/assistant/models");
+      expect(requested).toContain("/assistant/models?scope=chat");
       expect(requested.filter((path) => path.includes("?chat="))).toHaveLength(0);
     });
   });
@@ -2770,6 +2770,45 @@ describe("Chats - automatic compaction", () => {
 
     const item = await screen.findByRole("menuitemcheckbox", { name: SWITCH });
     expect(item.getAttribute("aria-disabled")).toBe("true");
+  });
+
+  it("cannot be turned on where the engine reports no context reading", async () => {
+    daemon.apiFetch.mockImplementation(
+      withSwitch(chatSummary({ chat_id: "c-1", cannot_auto_compact: true }), () => undefined),
+    );
+
+    await renderChats("/chats/c-1");
+    await openConversationSettings();
+
+    // The sentence comes first: a list still loading is disabled too, and says nothing.
+    expect(await screen.findByText(/cannot compact itself/i)).toBeDefined();
+    const item = await screen.findByRole("menuitemcheckbox", { name: SWITCH });
+    expect(item.getAttribute("aria-disabled")).toBe("true");
+
+    fireEvent.click(item);
+    // A mutation reaches `apiFetch` after the click returns, so give it the chance to.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(
+      daemon.apiFetch.mock.calls.some(([path]) => String(path) === AUTO_COMPACT_PATH),
+    ).toBe(false);
+  });
+
+  it("does not claim to be on where the engine cannot act on it", async () => {
+    daemon.apiFetch.mockImplementation(
+      withSwitch(
+        chatSummary({ chat_id: "c-1", auto_compact: true, cannot_auto_compact: true }),
+        () => undefined,
+      ),
+    );
+
+    await renderChats("/chats/c-1");
+    await openConversationSettings();
+
+    const item = await screen.findByRole("menuitemcheckbox", { name: SWITCH });
+    expect(item.getAttribute("aria-checked")).toBe("false");
+    // Read again once the row has certainly landed: a list still loading also draws an off.
+    await screen.findByText(/cannot compact itself/i);
+    expect(item.getAttribute("aria-checked")).toBe("false");
   });
 
   it("a 404 says the conversation is gone and not that the service is down", async () => {
@@ -7858,5 +7897,356 @@ describe("Chats - turns the owner did not write", () => {
       turnRow({ id: 1, status: "failed", answer: null, error: null }),
     ]);
     expect(await within(transcript).findByText("Turn failed with no reason recorded")).toBeDefined();
+  });
+});
+
+/* ------------------------------------- engine routes: agy and the Gemini API -- */
+
+/**
+ * `chatsFetch` with the two extra routes a chat can run on: the agy CLI (rows filed by the daemon
+ * inside the Claude and Gemini company groups) and the Gemini API (brain `openrouter`, so flat
+ * `choices` only, never in the groups). Like the daemon, the rows ride only on a chat-scoped ask,
+ * that is `?chat=<id>` or `?scope=chat`; the plain `/assistant/models` is the agent-scoped menu.
+ */
+function chatsFetchWithEngineRoutes(
+  chats: ChatSummary[],
+  transcripts: Record<string, AssistantTurnRow[]>,
+): (path: string, init?: RequestInit) => Promise<unknown> {
+  const base = chatsFetch(chats, transcripts);
+  const claude: ModelChoice = {
+    id: "claude-sonnet-4-6",
+    label: "Sonnet 4.6",
+    brain: "cloud",
+    efforts: CLAUDE_EFFORTS,
+  };
+  const agySonnet: ModelChoice = {
+    id: "agy/claude-sonnet-4-6",
+    label: "Sonnet 4.6 (agy)",
+    brain: "cloud",
+    // Core gives the hosted Claude row three levels (no `xhigh`, no `max`); only the Gemini agy row
+    // below has none.
+    efforts: ["low", "medium", "high"],
+    runner: "agy",
+  };
+  const agyGemini: ModelChoice = {
+    id: "agy/gemini-3-pro",
+    label: "Gemini 3 Pro (agy)",
+    brain: "cloud",
+    efforts: [],
+    runner: "agy",
+  };
+  const geminiApi: ModelChoice = {
+    id: "gemini-3-pro",
+    label: "Gemini 3 Pro",
+    brain: "openrouter",
+    efforts: [],
+    runner: "gemini-api",
+  };
+  const openrouter: ModelChoice = {
+    id: "openrouter-gpt",
+    label: "GPT via OpenRouter",
+    brain: "openrouter",
+    efforts: [],
+  };
+  return async (path, init) => {
+    const [route, query = ""] = path.split("?");
+    if (route === "/assistant/models") {
+      const models = (await base(path, init)) as AssistantModels;
+      const chatScoped = query.startsWith("chat=") || query === "scope=chat";
+      return {
+        ...models,
+        choices: chatScoped
+          ? [...models.choices, claude, agySonnet, agyGemini, geminiApi, openrouter]
+          : [...models.choices, openrouter],
+      };
+    }
+    if (route === "/assistant/models/groups") {
+      return {
+        groups: [
+          {
+            provider: "anthropic",
+            family: "sonnet",
+            label: "Claude · Sonnet",
+            models: [claude, agySonnet],
+          },
+          { provider: "google", family: "gemini", label: "Other · Gemini", models: [agyGemini] },
+        ],
+        source: "fallback",
+        catalogue_version: "2026-10-02",
+        fetched_at: null,
+      };
+    }
+    return base(path, init);
+  };
+}
+
+describe("Chats - the model menu separates agy and the Gemini API", () => {
+  it("the model menu lists agy and Gemini API in separate submenus, each row badged", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetchWithEngineRoutes([chatSummary({ chat_id: "c-1" })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openModelMenu();
+
+    const agy = await openModelSubmenu(/Antigravity CLI/);
+    const agyRow = await within(agy).findByRole("menuitemradio", { name: /^Sonnet 4\.6 \(agy\)/ });
+    expect(within(agyRow).getByText("agy CLI")).toBeDefined();
+    expect(within(agy).getByRole("menuitemradio", { name: /^Gemini 3 Pro \(agy\)/ })).toBeDefined();
+
+    const api = await openModelSubmenu(/Google Gemini API/);
+    const apiRow = await within(api).findByRole("menuitemradio", { name: /^Gemini 3 Pro/ });
+    expect(within(apiRow).getByText("Gemini API")).toBeDefined();
+    // The two routes do not share a submenu.
+    expect(within(api).queryByRole("menuitemradio", { name: /\(agy\)/ })).toBeNull();
+  });
+
+  it("a Gemini API row says it is off this machine and an agy row does not", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetchWithEngineRoutes([chatSummary({ chat_id: "c-1" })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openModelMenu();
+
+    const agy = await openModelSubmenu(/Antigravity CLI/);
+    const agyRow = await within(agy).findByRole("menuitemradio", { name: /^Sonnet 4\.6 \(agy\)/ });
+    expect(agyRow.textContent ?? "").not.toMatch(/off this machine/i);
+
+    const api = await openModelSubmenu(/Google Gemini API/);
+    const apiRow = await within(api).findByRole("menuitemradio", { name: /^Gemini 3 Pro/ });
+    expect(apiRow.textContent ?? "").toMatch(/off this machine/i);
+  });
+
+  it("agy rows are not inside the Claude company", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetchWithEngineRoutes([chatSummary({ chat_id: "c-1" })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openModelMenu();
+
+    const claude = await openModelSubmenu("Claude");
+    expect(await within(claude).findByRole("menuitemradio", { name: /^Sonnet 4\.6$/ })).toBeDefined();
+    // The daemon files an agy row by the hosted model's family; the shell sorts by `runner`.
+    expect(within(claude).queryByRole("menuitemradio", { name: /agy/i })).toBeNull();
+  });
+
+  it("Through OpenRouter holds only real OpenRouter rows", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetchWithEngineRoutes([chatSummary({ chat_id: "c-1" })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openModelMenu();
+
+    const hosted = await openModelSubmenu("Through OpenRouter");
+    expect(await within(hosted).findByRole("menuitemradio", { name: /^GPT via OpenRouter/ })).toBeDefined();
+    // The Gemini API row also has brain `openrouter`; it belongs to its own submenu.
+    expect(within(hosted).queryByRole("menuitemradio", { name: /Gemini/ })).toBeNull();
+  });
+
+  it("the front door asks for the chat-scoped menu and can pick a Gemini row", async () => {
+    const requested: string[] = [];
+    const base = chatsFetchWithEngineRoutes([], {});
+    daemon.apiFetch.mockImplementation(async (path, init) => {
+      requested.push(path);
+      return base(path, init);
+    });
+
+    await renderChats("/chats");
+    await waitFor(() => {
+      expect(requested).toContain("/assistant/models?scope=chat");
+    });
+    // Literally the chat-scoped ask, and never the bare daemon-scoped one beside it.
+    expect(requested).not.toContain("/assistant/models");
+
+    await openModelMenu();
+    const api = await openModelSubmenu(/Google Gemini API/);
+    fireEvent.click(await within(api).findByRole("menuitemradio", { name: /^Gemini 3 Pro/ }));
+
+    const textarea = (await screen.findByLabelText("Message")) as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: "olá" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats", {
+        method: "POST",
+        body: JSON.stringify({ model: "gemini-3-pro", permission_mode: "auto" }),
+      });
+    });
+  });
+
+  // A guard: the conversation header already asks with its chat id, so this may pass before the
+  // change. It fails if the new scope leaks into a menu that already knows its chat.
+  it("a chat-scoped menu is requested with the chat id as before", async () => {
+    const requested: string[] = [];
+    const base = chatsFetchWithEngineRoutes([chatSummary({ chat_id: "c-1" })], { "c-1": [] });
+    daemon.apiFetch.mockImplementation(async (path, init) => {
+      requested.push(path);
+      return base(path, init);
+    });
+
+    await renderChats("/chats/c-1");
+
+    await waitFor(() => {
+      expect(requested).toContain("/assistant/models?chat=c-1");
+    });
+    expect(requested.filter((path) => path.includes("scope="))).toHaveLength(0);
+  });
+});
+
+describe("Chats - the model route's mark, effort and stored model (review 7)", () => {
+  /** Pick a row of a submenu at the front door; the menu is opened here and closes on the pick. */
+  async function pickRow(section: RegExp | string, row: RegExp): Promise<void> {
+    await openModelMenu();
+    const menu = await openModelSubmenu(section);
+    fireEvent.click(await within(menu).findByRole("menuitemradio", { name: row }));
+  }
+
+  async function modelTrigger(): Promise<HTMLElement> {
+    return screen.findByRole("button", { name: /change the model/i });
+  }
+
+  // A guard: it may pass before any change. It fails if `routeOf(chosen)?.mark` is dropped from the
+  // trigger: an agy row would then take the Claude mark of its group (a path, no initial "A") and
+  // a Gemini API row, whose id is in no group, would draw no mark at all.
+  it("the trigger wears the mark of the route picked at the front door", async () => {
+    daemon.apiFetch.mockImplementation(chatsFetchWithEngineRoutes([], {}));
+
+    await renderChats("/chats");
+    await pickRow(/Antigravity CLI/, /^Sonnet 4\.6 \(agy\)/);
+
+    await waitFor(async () => {
+      const initial = (await modelTrigger()).querySelector(".ui-provider-mark-initial");
+      expect(initial?.textContent).toBe("A");
+    });
+    expect((await modelTrigger()).querySelector(".ui-provider-mark path")).toBeNull();
+
+    await pickRow(/Google Gemini API/, /^Gemini 3 Pro/);
+
+    await waitFor(async () => {
+      const path = (await modelTrigger()).querySelector(".ui-provider-mark path");
+      // The first segment of the gemini glyph in ProviderMark.
+      expect(path?.getAttribute("d") ?? "").toMatch(/^M11\.04 19\.32/);
+    });
+    expect((await modelTrigger()).querySelector(".ui-provider-mark-initial")).toBeNull();
+  });
+
+  it("an effort set for one model is not sent with a route that has no levels", async () => {
+    daemon.apiFetch.mockImplementation(chatsFetchWithEngineRoutes([], {}));
+
+    await renderChats("/chats");
+    await pickRow("Claude", /^Sonnet 4\.6$/);
+
+    const thumb = await effortThumb();
+    for (let press = 0; press < 3; press += 1) fireEvent.keyDown(thumb, { key: "ArrowRight" });
+    expect(thumb.getAttribute("aria-valuetext")).toBe("high");
+    fireEvent.keyDown(thumb, { key: "Escape" });
+    await screen.findByRole("button", { name: /^Effort high/ });
+
+    await pickRow(/Antigravity CLI/, /^Gemini 3 Pro \(agy\)/);
+    // The slider is gone with the route's levels, so the held "high" must be gone too.
+    await waitFor(() => {
+      expect(screen.queryByRole("button", { name: /change the effort/i })).toBeNull();
+    });
+
+    const textarea = (await screen.findByLabelText("Message")) as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: "olá" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => {
+      expect(callsTo("/assistant/chats", "POST")).toHaveLength(1);
+    });
+    const body = JSON.parse(String((callsTo("/assistant/chats", "POST")[0][1] as RequestInit).body));
+    expect(body.model).toBe("agy/gemini-3-pro");
+    expect(body.effort).toBeUndefined();
+  });
+
+  it("a held xhigh is not sent when the picked row offers levels without it (front door)", async () => {
+    daemon.apiFetch.mockImplementation(chatsFetchWithEngineRoutes([], {}));
+
+    await renderChats("/chats");
+    await pickRow("Claude", /^Sonnet 4\.6$/);
+
+    const thumb = await effortThumb();
+    for (let press = 0; press < 4; press += 1) fireEvent.keyDown(thumb, { key: "ArrowRight" });
+    expect(thumb.getAttribute("aria-valuetext")).toBe("xhigh");
+    fireEvent.keyDown(thumb, { key: "Escape" });
+    await screen.findByRole("button", { name: /^Effort xhigh/ });
+
+    // The agy Sonnet row offers low, medium and high, so the dial stays but `xhigh` is not on it.
+    await pickRow(/Antigravity CLI/, /^Sonnet 4\.6 \(agy\)/);
+
+    const textarea = (await screen.findByLabelText("Message")) as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: "olá" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => {
+      expect(callsTo("/assistant/chats", "POST")).toHaveLength(1);
+    });
+    const body = JSON.parse(String((callsTo("/assistant/chats", "POST")[0][1] as RequestInit).body));
+    expect(body.model).toBe("agy/claude-sonnet-4-6");
+    expect(body.effort).toBeUndefined();
+  });
+
+  /** Open chat c-1 holding Sonnet 4.6 at `effort`, pick a row, and return the one PATCH body. */
+  async function patchAfterPick(
+    effort: string,
+    section: RegExp | string,
+    row: RegExp,
+  ): Promise<Record<string, unknown>> {
+    daemon.apiFetch.mockImplementation(
+      chatsFetchWithEngineRoutes(
+        [chatSummary({ chat_id: "c-1", model: "claude-sonnet-4-6", effort })],
+        { "c-1": [] },
+      ),
+    );
+    await renderChats("/chats/c-1");
+    await screen.findByRole("button", { name: new RegExp(`^Effort ${effort}`) });
+    await pickRow(section, row);
+
+    await waitFor(() => {
+      expect(callsTo("/assistant/chats/c-1", "PATCH")).toHaveLength(1);
+    });
+    return JSON.parse(String((callsTo("/assistant/chats/c-1", "PATCH")[0][1] as RequestInit).body));
+  }
+
+  it("picking a row with no levels clears the held effort in the same PATCH", async () => {
+    const body = await patchAfterPick("high", /Antigravity CLI/, /^Gemini 3 Pro \(agy\)/);
+    expect(body.model).toBe("agy/gemini-3-pro");
+    expect(body).toHaveProperty("effort", null);
+  });
+
+  it("picking a row whose levels lack the held xhigh clears the effort in the PATCH", async () => {
+    const body = await patchAfterPick("xhigh", /Antigravity CLI/, /^Sonnet 4\.6 \(agy\)/);
+    expect(body.model).toBe("agy/claude-sonnet-4-6");
+    expect(body).toHaveProperty("effort", null);
+  });
+
+  // A guard: it may pass before the change. It fails if the effort is cleared on every pick.
+  it("picking a row that offers the held effort leaves the effort out of the PATCH", async () => {
+    const body = await patchAfterPick("high", /Antigravity CLI/, /^Sonnet 4\.6 \(agy\)/);
+    expect(body.model).toBe("agy/claude-sonnet-4-6");
+    expect(body).not.toHaveProperty("effort");
+  });
+
+  it("a chat pinned to a model outside the catalogue shows no effort dial", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1", model: "retired-model-9" })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+    await modelTrigger();
+    await waitFor(() => {
+      expect(
+        daemon.apiFetch.mock.calls.some((call) => String(call[0]) === "/assistant/models?chat=c-1"),
+      ).toBe(true);
+    });
+    // Real time, so the catalogue answer (with its union of levels) has landed before asserting
+    // that nothing was drawn from it.
+    await aMoment();
+
+    expect(screen.queryByRole("button", { name: /change the effort/i })).toBeNull();
   });
 });
