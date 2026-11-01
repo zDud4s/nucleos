@@ -1,6 +1,6 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { DAEMON_NAME } from "../copy";
-import { describeBlocking, type UpdateReadiness } from "../data/client";
+import { apiFetch, describeBlocking, type UpdateReadiness } from "../data/client";
 import { applyUpdate, useInstallKind, useUpdate, type UpdatePhase } from "../data/updater";
 import { Button, ErrorNote } from "../ui";
 
@@ -25,6 +25,26 @@ export function UpdateNotice() {
   const [failure, setFailure] = useState<unknown>(null);
   const [waitingOn, setWaitingOn] = useState<UpdateReadiness | null>(null);
   const forced = useRef(false);
+  const running = useRef(false);
+  const [joined, setJoined] = useState<UpdateReadiness | null>(null);
+
+  // After a reload a drain may be under way already: show the wait instead of a plain "Update".
+  useEffect(() => {
+    let live = true;
+    apiFetch<UpdateReadiness>("/system/update-readiness")
+      .then((seen) => {
+        if (!live || !seen.draining || running.current) return;
+        setJoined(seen);
+        setWaitingOn(seen);
+        setPhase("waiting");
+      })
+      .catch(() => {
+        // Nothing to follow.
+      });
+    return () => {
+      live = false;
+    };
+  }, []);
 
   if (kind.data === "system-package") {
     return (
@@ -39,18 +59,25 @@ export function UpdateNotice() {
   const offered = update.data;
   if (!offered) return null;
 
-  const apply = () => {
+  const apply = (join?: UpdateReadiness) => {
     setFailure(null);
     setWaitingOn(null);
-    forced.current = false;
+    running.current = true;
+    forced.current = join !== undefined;
     setPhase("downloading");
     applyUpdate(offered, setPhase, {
       onWaiting: setWaitingOn,
       forced: () => forced.current,
-    }).catch((error: unknown) => {
-      setFailure(error);
-      setPhase(null);
-    });
+      join,
+    })
+      .catch((error: unknown) => {
+        setFailure(error);
+        setPhase(null);
+      })
+      .finally(() => {
+        running.current = false;
+        setJoined(null);
+      });
   };
 
   return (
@@ -61,14 +88,16 @@ export function UpdateNotice() {
       {phase === "waiting" && waitingOn !== null ? (
         <p className="app-kill-unread">Waiting on: {describeBlocking(waitingOn.waiting_on)}</p>
       ) : null}
-      <Button onClick={apply} disabled={phase !== null}>
+      <Button onClick={() => apply()} disabled={phase !== null}>
         Update
       </Button>
       {phase === "waiting" ? (
         <Button
           variant="ghost"
           onClick={() => {
-            forced.current = true;
+            // With no update running here (a drain seen after a reload) this one takes it over.
+            if (joined !== null && !running.current) apply(joined);
+            else forced.current = true;
           }}
         >
           Update now

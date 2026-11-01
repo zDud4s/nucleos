@@ -10,8 +10,22 @@ const updater = vi.hoisted(() => ({
 }));
 vi.mock("../data/updater", () => updater);
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+const daemon = vi.hoisted(() => ({ apiFetch: vi.fn() }));
+vi.mock("../data/client", async (original) => ({
+  ...(await original<typeof import("../data/client")>()),
+  ...daemon,
+}));
 
 beforeEach(() => {
+  daemon.apiFetch.mockReset();
+  daemon.apiFetch.mockResolvedValue({
+    version: "0.1.0",
+    live_runs: 0,
+    draining: false,
+    waiting_on: [],
+    pid: 100,
+  });
+  updater.applyUpdate.mockReset();
   updater.useUpdate.mockReset();
   updater.useInstallKind.mockReset();
   updater.useInstallKind.mockReturnValue({ data: "other" });
@@ -33,6 +47,25 @@ describe("UpdateNotice", () => {
 
     expect(screen.getByText("NucleOS 0.2.0 is available")).toBeDefined();
     expect(screen.getByRole("button", { name: "Update" })).toBeDefined();
+  });
+
+  it("shows the wait, with Update now, when remounted during a drain", async () => {
+    daemon.apiFetch.mockResolvedValue({
+      version: "0.1.0",
+      live_runs: 1,
+      draining: true,
+      waiting_on: [{ run_id: 7, chat_id: "c1" }],
+      pid: 100,
+    });
+    updater.useUpdate.mockReturnValue({ data: { version: "0.2.0" } });
+
+    renderWithQuery(<UpdateNotice />);
+
+    expect(await screen.findByText(/Waiting on: run 7 in chat c1/)).toBeDefined();
+    expect(screen.getByRole("button", { name: "Update now" })).toBeDefined();
+    expect((screen.getByRole("button", { name: "Update" }) as HTMLButtonElement).disabled).toBe(
+      true,
+    );
   });
 
   it("shows the version and Update button for an AppImage", () => {

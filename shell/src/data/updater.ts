@@ -62,6 +62,8 @@ export interface UpdateWait {
   pollMs?: number;
   /** How long the daemon may wait for running work, in seconds. */
   timeoutSecs?: number;
+  /** A drain already under way (seen after a reload): follow it instead of asking for a new one. */
+  join?: UpdateReadiness;
 }
 
 /** The daemon's own default wait for running work, `DEFAULT_DRAIN_TIMEOUT`. */
@@ -90,10 +92,12 @@ export async function applyUpdate(
   onPhase("waiting");
   let stopNow = false;
   try {
-    const first = await apiFetch<UpdateReadiness>(
-      `/system/shutdown?timeout_secs=${wait.timeoutSecs ?? DRAIN_SECS}`,
-      { method: "POST" },
-    );
+    const first =
+      wait.join ??
+      (await apiFetch<UpdateReadiness>(
+        `/system/shutdown?timeout_secs=${wait.timeoutSecs ?? DRAIN_SECS}`,
+        { method: "POST" },
+      ));
     wait.onWaiting?.(first);
     for (;;) {
       if (wait.forced?.()) {
@@ -111,6 +115,10 @@ export async function applyUpdate(
       } catch (error) {
         if (isApiUnavailable(error)) break; // the daemon went away: the check below confirms it
         throw error;
+      }
+      if (readiness.pid !== first.pid) {
+        // The drain was a restart's: the relaunched daemon answers, not draining, with another pid.
+        throw new Error("The daemon restarted before the update could install. Try again.");
       }
       if (!readiness.draining) {
         throw new Error(

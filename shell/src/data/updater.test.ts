@@ -190,6 +190,34 @@ describe("applyUpdate", () => {
     expect(mocks.relaunch).not.toHaveBeenCalled();
   });
 
+  it("says the daemon restarted when a restart drain relaunched it before the install", async () => {
+    mocks.apiFetch.mockImplementation(async (path: string) =>
+      path.startsWith("/system/shutdown")
+        ? readiness({ pid: 100 })
+        : readiness({ pid: 200, draining: false }),
+    );
+    const update = fakeUpdate();
+
+    await expect(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      applyUpdate(update as any, () => {}, { pollMs: 1 }),
+    ).rejects.toThrow(/daemon restarted before the update could install/);
+    expect(update.install).not.toHaveBeenCalled();
+  });
+
+  it("follows a drain already under way instead of asking for another", async () => {
+    mocks.apiFetch.mockImplementation(async (path: string) => {
+      mocks.log.push(path);
+      throw gone();
+    });
+    const update = fakeUpdate();
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await applyUpdate(update as any, () => {}, { pollMs: 1, join: readiness() });
+
+    expect(mocks.log).toEqual(["download", "/system/update-readiness", "install", "relaunch"]);
+  });
+
   it("does not install while the daemon still answers its health check", async () => {
     mocks.apiFetch.mockRejectedValue(gone());
     mocks.probeHealth.mockResolvedValue(true);
