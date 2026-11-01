@@ -1,8 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor } from "@testing-library/react";
+import type { QueryClient } from "@tanstack/react-query";
 import { EngineOptIn } from "./EngineOptIn";
 import { ApiRefusal } from "../data/client";
 import { renderWithQuery } from "../test/harness";
+import { createAppQueryClient } from "../app/queryClient";
+import { keys } from "../data/keys";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
@@ -147,5 +150,101 @@ describe("EngineOptIn", () => {
     // RefusalNote draws the code beside the sentence, and role=status; an ErrorNote would not.
     expect(await screen.findByText("warning_not_acknowledged")).toBeDefined();
     expect(await screen.findByText(detail)).toBeDefined();
+  });
+});
+
+describe("EngineOptIn - what the window claims (review 7)", () => {
+  /** Every menu a chat may read, cached as the front door and an open chat would have them. */
+  const MENUS = [
+    keys.chats.models,
+    keys.chats.modelsNewChat,
+    keys.chats.modelsFor("c-1"),
+    keys.chats.modelGroups,
+    keys.chats.modelGroupsFor("c-1"),
+  ];
+
+  function withCachedMenus() {
+    const queryClient = createAppQueryClient();
+    for (const key of MENUS) queryClient.setQueryData(key, { cached: true });
+    return queryClient;
+  }
+
+  function invalidated(queryClient: QueryClient): boolean[] {
+    return MENUS.map((key) => queryClient.getQueryState(key)?.isInvalidated === true);
+  }
+
+  async function enable(): Promise<void> {
+    fireEvent.click(await theSwitch());
+    await screen.findByText(WARNING);
+    fireEvent.click(screen.getByRole("button", { name: "Enable" }));
+  }
+
+  it("a successful write invalidates the model menus, which cache for an hour", async () => {
+    answer();
+    const queryClient = withCachedMenus();
+    renderWithQuery(<EngineOptIn engine="agy" label="Antigravity CLI (agy)" />, { queryClient });
+
+    await enable();
+    await screen.findByText(TAKES_EFFECT);
+
+    await waitFor(() => expect(invalidated(queryClient)).toEqual(MENUS.map(() => true)));
+  });
+
+  it("a failed write invalidates them too, since it may have landed", async () => {
+    answer({ put: () => Promise.reject(new Error("socket closed")) });
+    const queryClient = withCachedMenus();
+    renderWithQuery(<EngineOptIn engine="agy" label="Antigravity CLI (agy)" />, { queryClient });
+
+    await enable();
+    await waitFor(() => expect(puts()).toHaveLength(1));
+
+    await waitFor(() => expect(invalidated(queryClient)).toEqual(MENUS.map(() => true)));
+  });
+
+  // Wording assumed: the note must match /not sure|unknown|may have/i, e.g. "the daemon did not
+  // answer: whether {label} was changed is unknown".
+  it("a write that got no answer does not claim the engine was not changed", async () => {
+    answer({ put: () => Promise.reject(new Error("socket closed")) });
+    mount();
+
+    await enable();
+
+    expect(await screen.findByText(/not sure|unknown|may have/i)).toBeDefined();
+    expect(screen.queryByText(/was not changed/i)).toBeNull();
+  });
+
+  it("a write that went through and a read that then failed still shows takes_effect", async () => {
+    let reads = 0;
+    daemon.apiFetch.mockImplementation(async (_path: string, init?: RequestInit) => {
+      if (init?.method === "PUT") return { version: 2, takes_effect: TAKES_EFFECT };
+      reads += 1;
+      if (reads > 1) throw new Error("socket closed");
+      return { enabled: false, acknowledged: false, warning: WARNING, warning_version: 1, installed: true };
+    });
+    mount();
+
+    await enable();
+    expect(await screen.findByText(TAKES_EFFECT)).toBeDefined();
+    await waitFor(() => expect(reads).toBeGreaterThan(1));
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    expect(screen.getByText(TAKES_EFFECT)).toBeDefined();
+    expect(screen.queryByText(/was not changed/i)).toBeNull();
+  });
+
+  // Wording assumed: the read note matches /could not read/i, e.g. "the daemon is not responding:
+  // could not read the setting for {label}".
+  it("a first read that fails offers no switch and does not claim a change was refused", async () => {
+    daemon.apiFetch.mockImplementation(async () => {
+      throw new Error("socket closed");
+    });
+    mount();
+
+    expect(await screen.findByText(/could not read/i)).toBeDefined();
+    expect(screen.queryByText(/was not changed/i)).toBeNull();
+    expect(screen.queryByRole("switch")).toBeNull();
+    expect(puts()).toHaveLength(0);
   });
 });

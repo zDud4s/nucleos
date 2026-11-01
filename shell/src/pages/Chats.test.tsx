@@ -7820,3 +7820,90 @@ describe("Chats - the model menu separates agy and the Gemini API", () => {
     expect(requested.filter((path) => path.includes("scope="))).toHaveLength(0);
   });
 });
+
+describe("Chats - the model route's mark, effort and stored model (review 7)", () => {
+  /** Pick a row of a submenu at the front door; the menu is opened here and closes on the pick. */
+  async function pickRow(section: RegExp | string, row: RegExp): Promise<void> {
+    await openModelMenu();
+    const menu = await openModelSubmenu(section);
+    fireEvent.click(await within(menu).findByRole("menuitemradio", { name: row }));
+  }
+
+  async function modelTrigger(): Promise<HTMLElement> {
+    return screen.findByRole("button", { name: /change the model/i });
+  }
+
+  // A guard: it may pass before any change. It fails if `routeOf(chosen)?.mark` is dropped from the
+  // trigger: an agy row would then take the Claude mark of its group (a path, no initial "A") and
+  // a Gemini API row, whose id is in no group, would draw no mark at all.
+  it("the trigger wears the mark of the route picked at the front door", async () => {
+    daemon.apiFetch.mockImplementation(chatsFetchWithEngineRoutes([], {}));
+
+    await renderChats("/chats");
+    await pickRow(/Antigravity CLI/, /^Sonnet 4\.6 \(agy\)/);
+
+    await waitFor(async () => {
+      const initial = (await modelTrigger()).querySelector(".ui-provider-mark-initial");
+      expect(initial?.textContent).toBe("A");
+    });
+    expect((await modelTrigger()).querySelector("svg path")).toBeNull();
+
+    await pickRow(/Google Gemini API/, /^Gemini 3 Pro/);
+
+    await waitFor(async () => {
+      const path = (await modelTrigger()).querySelector("svg path");
+      // The first segment of the gemini glyph in ProviderMark.
+      expect(path?.getAttribute("d") ?? "").toMatch(/^M11\.04 19\.32/);
+    });
+    expect((await modelTrigger()).querySelector(".ui-provider-mark-initial")).toBeNull();
+  });
+
+  it("an effort set for one model is not sent with a route that has no levels", async () => {
+    daemon.apiFetch.mockImplementation(chatsFetchWithEngineRoutes([], {}));
+
+    await renderChats("/chats");
+    await pickRow("Claude", /^Sonnet 4\.6$/);
+
+    const thumb = await effortThumb();
+    for (let press = 0; press < 3; press += 1) fireEvent.keyDown(thumb, { key: "ArrowRight" });
+    expect(thumb.getAttribute("aria-valuetext")).toBe("high");
+    fireEvent.keyDown(thumb, { key: "Escape" });
+    await screen.findByRole("button", { name: /^Effort high/ });
+
+    await pickRow(/Antigravity CLI/, /^Sonnet 4\.6 \(agy\)/);
+    // The slider is gone with the route's levels, so the held "high" must be gone too.
+    await waitFor(() => {
+      expect(screen.queryByRole("button", { name: /change the effort/i })).toBeNull();
+    });
+
+    const textarea = (await screen.findByLabelText("Message")) as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: "olá" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => {
+      expect(callsTo("/assistant/chats", "POST")).toHaveLength(1);
+    });
+    const body = JSON.parse(String((callsTo("/assistant/chats", "POST")[0][1] as RequestInit).body));
+    expect(body.model).toBe("agy/claude-sonnet-4-6");
+    expect(body.effort).toBeUndefined();
+  });
+
+  it("a chat pinned to a model outside the catalogue shows no effort dial", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetch([chatSummary({ chat_id: "c-1", model: "retired-model-9" })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+    await modelTrigger();
+    await waitFor(() => {
+      expect(
+        daemon.apiFetch.mock.calls.some((call) => String(call[0]) === "/assistant/models?chat=c-1"),
+      ).toBe(true);
+    });
+    // Real time, so the catalogue answer (with its union of levels) has landed before asserting
+    // that nothing was drawn from it.
+    await aMoment();
+
+    expect(screen.queryByRole("button", { name: /change the effort/i })).toBeNull();
+  });
+});
