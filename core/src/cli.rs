@@ -447,6 +447,7 @@ async fn restart() -> bool {
         &token,
         &call,
         restart_cli::POLL,
+        restart_cli::FORCE_GRACE,
     )
     .await;
     print!("{}", outcome.stdout);

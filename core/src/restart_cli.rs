@@ -1,8 +1,9 @@
 //! `nucleos-core --restart [--force] [--timeout-secs N]`: asks the daemon to restart once running
 //! work has settled, and follows the wait.
 //!
-//! Exit 0 means the restart is under way (the daemon stopped answering, another pid answers, or
-//! `--force`), exit 4 that the drain ended with the same daemon still up (the runs it was waiting
+//! Exit 0 means the restart is under way (the daemon stopped answering or another pid answers; with
+//! `--force` that is watched for up to 15s), exit 4 that the drain ended, or the forced grace
+//! passed, with the same daemon still up (the runs it was waiting
 //! on are listed on stderr; a reading without a pid is exit 1), exit 1 that the
 //! daemon could not be asked, exit 2 a bad command line. It never starts a daemon. `requester_run`
 //! is `NUCLEOS_RUN_ID`, so the run that asks for the restart is not waited on by itself.
@@ -17,7 +18,8 @@ pub const USAGE: &str = "usage: nucleos-core --restart [--force] [--timeout-secs
   restarts the daemon once no run is working (a run parked on a question does not count).\n\
   --force           restart now, without waiting for running work\n\
   --timeout-secs N  how long to wait for running work (default 1800, at most 86400)\n\
-  exit 0: the restart is under way   exit 4: the limit passed with work still running";
+  exit 0: the restart is under way   exit 4: the limit passed with work still running,\n\
+  or a forced restart left the same daemon up";
 
 /// The limit passed with work still running.
 pub const EXIT_LIMIT_PASSED: i32 = 4;
@@ -25,6 +27,8 @@ pub const EXIT_LIMIT_PASSED: i32 = 4;
 pub const EXIT_USAGE: i32 = 2;
 /// How often the follow looks at the readiness.
 pub const POLL: Duration = Duration::from_secs(2);
+/// How long a forced restart is watched for the daemon to leave (the daemon's exit watchdog is 10s).
+pub const FORCE_GRACE: Duration = Duration::from_secs(15);
 /// Slack past the daemon's own limit before the client gives up on seeing it end.
 const GRACE: Duration = Duration::from_secs(60);
 
@@ -207,9 +211,64 @@ fn failed(reason: String) -> Outcome {
     }
 }
 
-/// Asks the daemon at `base_url` to restart and, unless forced, follows it every `poll` until it
-/// stops answering (under way), stops draining (see [`judge`]) or the limit plus a minute passes.
-pub async fn run(base_url: &str, token: &str, call: &Call, poll: Duration) -> Outcome {
+/// A forced restart answers 202 before the relauncher is spawned, so the answer proves nothing:
+/// watch for up to `grace` until the daemon stops answering or another pid does. The same pid still
+/// answering at the end means the restart did not happen (exit 4).
+async fn follow_forced(
+    http: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    call: &Call,
+    poll: Duration,
+    grace: Duration,
+    started_pid: u32,
+) -> Outcome {
+    let deadline = Instant::now() + grace;
+    loop {
+        tokio::time::sleep(poll).await;
+        let response = http
+            .get(format!(
+                "{base_url}/system/update-readiness{}",
+                call.readiness_query()
+            ))
+            .bearer_auth(token)
+            .send()
+            .await;
+        match response {
+            Err(_) => return restarting(),
+            Ok(response) if response.status().is_success() => {
+                let body = response.json().await.unwrap_or(Value::Null);
+                if let Ok(reading) = Reading::from_json(&body)
+                    && judge(&reading, started_pid) == Step::Restarting
+                {
+                    return restarting();
+                }
+            }
+            Ok(_) => {}
+        }
+        if Instant::now() >= deadline {
+            return Outcome {
+                code: EXIT_LIMIT_PASSED,
+                stdout: String::new(),
+                stderr: format!(
+                    "not restarted: the daemon is still answering {}s after the forced request; it carries on\n",
+                    grace.as_secs()
+                ),
+            };
+        }
+    }
+}
+
+/// Asks the daemon at `base_url` to restart and follows it every `poll` until it stops answering
+/// (under way), stops draining (see [`judge`]) or the limit plus a minute passes. A forced request
+/// is watched for `force_grace` instead (see [`follow_forced`]).
+pub async fn run(
+    base_url: &str,
+    token: &str,
+    call: &Call,
+    poll: Duration,
+    force_grace: Duration,
+) -> Outcome {
     let http = reqwest::Client::new();
     let asked = http
         .post(format!(
@@ -231,10 +290,10 @@ pub async fn run(base_url: &str, token: &str, call: &Call, poll: Duration) -> Ou
             Err(reason) => return failed(format!("the restart answer: {reason}")),
         },
     };
-    if call.force {
-        return restarting();
-    }
     let started_pid = first.pid;
+    if call.force {
+        return follow_forced(&http, base_url, token, call, poll, force_grace, started_pid).await;
+    }
     let deadline = Instant::now() + call.timeout + GRACE;
     let mut last = first;
     loop {
@@ -437,12 +496,83 @@ mod tests {
             timeout: Duration::from_secs(5),
             requester_run: None,
         };
-        let outcome = run(&base, "token", &call, Duration::from_millis(5)).await;
+        let outcome = run(
+            &base,
+            "token",
+            &call,
+            Duration::from_millis(5),
+            Duration::from_millis(50),
+        )
+        .await;
         assert_eq!(outcome.code, EXIT_LIMIT_PASSED);
         assert!(
             outcome.stderr.contains("run 5 (chat chat-a)"),
             "{outcome:?}"
         );
+    }
+
+    /// Serves a restart answer from pid 100 and a readiness from `readiness_pid`.
+    async fn serve_forced(readiness_pid: u32) -> String {
+        use axum::routing::{get, post};
+        let app = axum::Router::new()
+            .route(
+                "/system/restart",
+                post(|| async {
+                    (
+                        axum::http::StatusCode::ACCEPTED,
+                        axum::Json(serde_json::json!({ "draining": true, "pid": 100 })),
+                    )
+                }),
+            )
+            .route(
+                "/system/update-readiness",
+                get(move || async move {
+                    axum::Json(serde_json::json!({ "draining": false, "pid": readiness_pid }))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        base
+    }
+
+    fn forced() -> Call {
+        Call {
+            force: true,
+            timeout: Duration::from_secs(5),
+            requester_run: None,
+        }
+    }
+
+    /// The 202 comes before the relauncher is spawned: if the same daemon is still answering at the
+    /// end of the grace, the restart did not happen.
+    #[tokio::test]
+    async fn a_forced_restart_that_leaves_the_same_daemon_up_is_not_reported_as_done() {
+        let base = serve_forced(100).await;
+        let outcome = run(
+            &base,
+            "token",
+            &forced(),
+            Duration::from_millis(5),
+            Duration::from_millis(50),
+        )
+        .await;
+        assert_eq!(outcome.code, EXIT_LIMIT_PASSED, "{outcome:?}");
+        assert!(outcome.stderr.contains("not restarted"), "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn a_forced_restart_seen_through_a_new_pid_exits_0() {
+        let base = serve_forced(101).await;
+        let outcome = run(
+            &base,
+            "token",
+            &forced(),
+            Duration::from_millis(5),
+            Duration::from_millis(500),
+        )
+        .await;
+        assert_eq!(outcome.code, 0, "{outcome:?}");
     }
 
     #[tokio::test]
@@ -453,7 +583,7 @@ mod tests {
             requester_run: None,
         };
         // Port 1 is never a daemon.
-        let outcome = run("http://127.0.0.1:1", "token", &call, POLL).await;
+        let outcome = run("http://127.0.0.1:1", "token", &call, POLL, FORCE_GRACE).await;
         assert_eq!(outcome.code, 1);
     }
 }

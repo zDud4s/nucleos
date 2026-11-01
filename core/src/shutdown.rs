@@ -88,16 +88,23 @@ pub fn begin_draining() -> bool {
     DRAINING_IN_THIS_TEST.with(|flag| !flag.replace(true))
 }
 
-/// Reopens the door: the wait gave up, so the daemon goes on serving.
+/// Reopens the door: the wait gave up, so the daemon goes on serving. A no-op once a restart is
+/// requested: the daemon is leaving, and a drain task a forced restart took over must not reopen
+/// the door on its way out. (The failed-relauncher path calls this before marking the restart.)
 #[cfg(not(test))]
 pub fn stop_draining() {
-    DRAINING.store(false, Ordering::SeqCst);
+    if !restart_requested() {
+        DRAINING.store(false, Ordering::SeqCst);
+    }
 }
 
-/// Reopens the door: the wait gave up, so the daemon goes on serving.
+/// Reopens the door: the wait gave up, so the daemon goes on serving. A no-op once a restart is
+/// requested.
 #[cfg(test)]
 pub fn stop_draining() {
-    DRAINING_IN_THIS_TEST.with(|flag| flag.set(false));
+    if !restart_requested() {
+        DRAINING_IN_THIS_TEST.with(|flag| flag.set(false));
+    }
 }
 
 /// How many runs are live: the same two statuses a slot is held for (`LIVE_RUN_STATUSES`).
@@ -297,16 +304,39 @@ pub async fn drain_until_idle(
 
 /// Set when the daemon is leaving to be started again (`POST /system/restart`), so `main` picks the
 /// exit that relaunches it instead of the plain stop. Never cleared: the process is on its way out.
+#[cfg(not(test))]
 static RESTART_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+// Per thread under `cfg(test)`, like the draining flag: a test that marks a restart must not make
+// its neighbours' `stop_draining` a no-op.
+#[cfg(test)]
+thread_local! {
+    static RESTART_REQUESTED_IN_THIS_TEST: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 /// Remembers that the stop in progress is a restart.
+#[cfg(not(test))]
 pub fn mark_restart_requested() {
     RESTART_REQUESTED.store(true, Ordering::SeqCst);
 }
 
+/// Remembers that the stop in progress is a restart.
+#[cfg(test)]
+pub fn mark_restart_requested() {
+    RESTART_REQUESTED_IN_THIS_TEST.with(|flag| flag.set(true));
+}
+
 /// Whether the stop in progress is a restart.
+#[cfg(not(test))]
 pub fn restart_requested() -> bool {
     RESTART_REQUESTED.load(Ordering::SeqCst)
+}
+
+/// Whether the stop in progress is a restart.
+#[cfg(test)]
+pub fn restart_requested() -> bool {
+    RESTART_REQUESTED_IN_THIS_TEST.with(|flag| flag.get())
 }
 
 /// Waits like [`drain_until_idle`], or with `force` does not wait at all: `stop` is called at once
@@ -601,6 +631,28 @@ mod tests {
         .unwrap();
         assert_eq!(outcome, DrainOutcome::Stopped);
         assert!(stopped.get());
+    }
+
+    /// A forced restart takes over a running drain; the old drain task timing out while the daemon
+    /// leaves must leave the door closed.
+    #[tokio::test]
+    async fn a_drain_timing_out_after_a_forced_restart_does_not_reopen_the_door() {
+        let pool = crate::testdb::fresh_pool().await;
+        seed_run(&pool, "running").await;
+        assert!(begin_draining());
+        mark_restart_requested();
+        let outcome = drain_until_idle(
+            &pool,
+            None,
+            Duration::ZERO,
+            Duration::from_millis(1),
+            || {},
+            &|_| false,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, DrainOutcome::TimedOut { .. }));
+        assert!(is_draining(), "the daemon is leaving: the door stays shut");
     }
 
     #[test]
