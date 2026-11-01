@@ -154,7 +154,7 @@ static DOCUMENTS: LazyLock<Vec<DocType>> = LazyLock::new(|| {
         ),
         of::<AgyDoc>(
             files::AGY_FILE,
-            "a chat and the router read the switch at once; a primary_runner of agy takes effect when the daemon restarts",
+            "a chat reads the switch at once; the router drops agy at once but only gains it when the daemon restarts; a primary_runner of agy takes effect when the daemon restarts",
         ),
         of::<ModelsConfig>(
             crate::config::MODELS_CONFIG_FILE,

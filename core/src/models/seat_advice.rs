@@ -911,12 +911,18 @@ mod tests {
             "the fixture must hold an agy alternate"
         );
 
-        let _ = suggest(Some(router), None, "task").await;
+        let _ = suggest(Some(Arc::clone(&router)), None, "task").await;
 
         let body = sent.try_recv().expect("the router was asked");
         let text = body.to_string();
         assert!(!text.contains("agy"), "agy was offered: {text}");
         assert!(text.contains("claude"), "{text}");
+
+        // An explicit agy runner is refused too, and nothing NEW reaches the router (the request
+        // above was drained by `try_recv`).
+        let refused = suggest(Some(router), Some(RunnerKind::Agy), "task").await;
+        assert!(refused.is_err(), "{refused:?}");
+        assert!(sent.try_recv().is_err(), "the router was asked for agy");
     }
 
     /// E20: with agy as the only engine the seat filter leaves no runner to offer, and a request

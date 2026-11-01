@@ -97,7 +97,7 @@ async fn write(
     })?;
     Ok(Json(json!({
         "version": version,
-        "takes_effect": "a chat and the router read the switch at once; a primary_runner of agy takes effect when the daemon restarts",
+        "takes_effect": "a chat reads the switch at once; the router drops agy at once but only gains it when the daemon restarts; a primary_runner of agy takes effect when the daemon restarts",
     })))
 }
 
@@ -266,7 +266,7 @@ mod tests {
         assert_eq!(answer["acknowledged"], true, "{answer}");
     }
 
-    /// E16 F8: a chat and the router read the switch at once; only a `primary_runner: agy` waits for a restart.
+    /// E16 F8 / E21: a chat reads the switch at once; the router drops agy at once but only gains it when the daemon restarts; a `primary_runner` of agy takes effect when the daemon restarts.
     #[tokio::test]
     async fn put_engines_agy_takes_effect_names_chats_and_restart() {
         let (_home, state) = fixture().await;
@@ -278,6 +278,7 @@ mod tests {
             .expect("a sentence")
             .to_lowercase();
         assert!(text.contains("chat"), "{text}");
+        assert!(text.contains("router"), "{text}");
         assert!(text.contains("restart"), "{text}");
     }
 
