@@ -16,6 +16,8 @@ pub enum ChatEngine {
     Local,
     OpenRouter,
     Agy,
+    /// The Google Gemini API: a hosted chat whose pinned model carries the `gemini-api/` prefix.
+    GeminiApi,
 }
 
 impl ChatEngine {
@@ -26,6 +28,7 @@ impl ChatEngine {
             Self::Codex => crate::engines::CODEX,
             Self::Local => crate::engines::LOCAL,
             Self::Agy => crate::engines::AGY,
+            Self::GeminiApi => crate::engines::GEMINI_API,
             // Not an engine row: OpenRouter is a hosted brain, not a launchable engine.
             Self::OpenRouter => "openrouter",
         }
@@ -56,6 +59,7 @@ impl ChatEngine {
             crate::engines::CODEX => Some(Self::Codex),
             crate::engines::LOCAL => Some(Self::Local),
             crate::engines::AGY => Some(Self::Agy),
+            crate::engines::GEMINI_API => Some(Self::GeminiApi),
             _ => None,
         }
     }
@@ -89,7 +93,14 @@ pub enum Support {
 pub fn engine_of(config: &ModelsConfig, brain: Brain, model: Option<&str>) -> ChatEngine {
     match brain {
         Brain::Local => ChatEngine::Local,
-        Brain::OpenRouter => ChatEngine::OpenRouter,
+        // The provider of a hosted chat is read from the id prefix, as `assistants.rs` does.
+        Brain::OpenRouter => {
+            if model.is_some_and(|id| id.starts_with("gemini-api/")) {
+                ChatEngine::GeminiApi
+            } else {
+                ChatEngine::OpenRouter
+            }
+        }
         // A refusal means the chat is bound to agy while agy is off.
         Brain::Cloud => crate::assistant::answering_cli(config, model)
             .map_or(ChatEngine::Agy, ChatEngine::of_cli),
@@ -109,6 +120,9 @@ pub fn support(engine: ChatEngine, capability: Capability) -> Support {
         // Agy takes `--effort` and `--add-dir` and refuses every other control.
         (Effort | ExtraDirs, Agy) => Yes,
         (DeniedTools | TurnBudget | Agents | RegistryMcp, Agy) => No,
+        // The Gemini API route ignores a per-turn budget (a warning, like OpenRouter) and refuses
+        // every other control; the `_` arm answers `No` for them.
+        (TurnBudget, GeminiApi) => Warn,
         _ => No,
     }
 }

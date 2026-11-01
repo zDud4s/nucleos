@@ -446,6 +446,14 @@ pub(super) fn default_assistant_choices() -> Vec<AssistantChoice> {
         .collect()
 }
 
+/// The Gemini API models of the chat menu, bare (Google's `models/` form is stripped on the wire).
+/// A static list, like `agy_models`: the picker must not call Google to draw itself.
+const GEMINI_API_MODELS: [&str; 3] = [
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+];
+
 impl ModelsConfig {
     /// Returns the CLI configured for a cloud model id.
     pub fn runner_of(&self, id: &str) -> Option<&'static str> {
@@ -696,6 +704,28 @@ impl ModelsConfig {
                     tools: None,
                     installed: None,
                 });
+            }
+        }
+        // The Gemini API rows belong to the chat menu only, and only while a Google key is stored
+        // (the same fact as the engine row's gate). Agents refuse the route by name, so an
+        // agent-scoped menu never offers it. The brain stays the one hosted brain; the provider is
+        // the `gemini-api/` id prefix. A row the file already lists is not added twice. Added after the hosted block
+        // above, whose `None` arm drops every `openrouter`-brain row when no OpenRouter model is set.
+        if every_runner && crate::engines::gemini_key_stored() {
+            for model in GEMINI_API_MODELS {
+                let id = format!("gemini-api/{model}");
+                if !choices.iter().any(|choice| choice.id == id) {
+                    choices.push(AssistantChoice {
+                        id,
+                        label: format!("{model} (Gemini API)"),
+                        brain: "openrouter".to_string(),
+                        // No effort dial is offered: the hosted route does not forward one.
+                        efforts: Vec::new(),
+                        runner: Some(crate::engines::GEMINI_API.to_string()),
+                        tools: None,
+                        installed: None,
+                    });
+                }
             }
         }
         choices

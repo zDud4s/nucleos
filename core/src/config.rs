@@ -1866,11 +1866,11 @@ hosted_assistant_model: \"  anthropic/claude-sonnet-4.5  \"
         assert!(engines_missing_from(&complete).is_empty());
         assert_eq!(
             engines_missing_from(&["claude", "codex", "local"]),
-            vec!["agy"]
+            vec!["agy", "gemini-api"]
         );
         assert_eq!(
             engines_missing_from(&[]),
-            vec!["claude", "codex", "local", "agy"]
+            vec!["claude", "codex", "local", "agy", "gemini-api"]
         );
     }
 
