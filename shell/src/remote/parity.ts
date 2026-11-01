@@ -1,9 +1,10 @@
 /**
  * The laptop works exactly as the tower: this table says, for every place the shell branches on
- * `isRemote()` and for every page in the nav, whether the remote shell behaves the same, behaves
- * the same through an adapter, or is an exception with a reason. `parity.test.ts` fails on a file
- * that branches on `isRemote()` or a nav page that has no row, so a new host-only branch cannot
- * land unclassified.
+ * `isRemote` / `isHostOnlyError` (imported from `remote/host`) and for every page in the nav,
+ * whether the remote shell behaves the same, behaves the same through an adapter, or is an
+ * exception with a reason. `parity.test.ts` fails on a file that imports them or a nav page that
+ * has no row, and on a file row whose file no longer does, so a new host-only branch cannot land
+ * unclassified.
  *
  * `where` is a path under `shell/src` for a file, or `page:<nav id>` for a nav page.
  */
@@ -26,20 +27,20 @@ export const PARITY: ParityEntry[] = [
   { where: "ui/RefusalNote.tsx", status: "adapted", why: "a 403 on a remote device reads as unavailable remotely, not as an error" },
 
   // Nav pages.
-  { where: "page:home", status: "same", why: "reads allowed and admin segments" },
+  { where: "page:home", status: "same", why: "reads allowed and admin segments; imports no LiveView, AgentPanel or AgentControlBar, so no browser pixels" },
   { where: "page:fleet", status: "same", why: "reads an allowed segment" },
   { where: "page:projects", status: "same", why: "reads an allowed segment" },
   { where: "page:autopilot", status: "same", why: "reads an allowed segment" },
-  { where: "page:waiting", status: "same", why: "an admin device reaches it" },
+  { where: "page:waiting", status: "same", why: "an admin device reaches it; a wheel approval only hands over a seat, the live pixels it opens stay host-only on page:web (phase 5)" },
   { where: "page:runs", status: "same", why: "reads an allowed segment" },
   { where: "page:analytics", status: "same", why: "reads an allowed segment" },
   { where: "page:feed", status: "same", why: "reads an allowed segment" },
-  { where: "page:brain", status: "same", why: "an admin device reaches it" },
-  { where: "page:chats", status: "same", why: "the chat API is `assistant`, an admin segment" },
+  { where: "page:brain", status: "same", why: "its settings data calls /config/*, which only an owner device reaches" },
+  { where: "page:chats", status: "same", why: "the chat API is `assistant`, an admin segment; imports no LiveView, AgentPanel or AgentControlBar, which only page:web pulls" },
   { where: "page:teams", status: "same", why: "an admin device reaches it" },
   { where: "page:agents", status: "same", why: "an admin device reaches it" },
   { where: "page:council", status: "same", why: "an admin device reaches it" },
-  { where: "page:mail", status: "same", why: "an admin device reaches it" },
+  { where: "page:mail", status: "same", why: "its account data calls /config/email, which only an owner device reaches" },
   { where: "page:contacts", status: "same", why: "an admin device reaches it" },
   { where: "page:calendar", status: "same", why: "an admin device reaches it" },
   { where: "page:voice", status: "exception", why: "phase 5" },
