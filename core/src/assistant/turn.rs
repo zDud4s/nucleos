@@ -1548,7 +1548,7 @@ mod tests {
         assert_eq!(rotation_fill(None, "plain text", None, home.path()), None);
     }
 
-    async fn test_state(runner: Arc<FakeCommandRunner>) -> AppState {
+    pub(super) async fn test_state(runner: Arc<FakeCommandRunner>) -> AppState {
         AppState {
             startup_config: Default::default(),
             token: crate::auth::Token("t".into()),
@@ -2103,6 +2103,92 @@ mod agy_chat_tests {
             Some("pong from the fake agy")
         );
         assert!(fake.was_launched());
+        let args = fake.args();
+        assert!(args.contains("--mode plan"), "{args}");
+        assert!(args.contains("--sandbox"), "{args}");
+    }
+
+    /// E19 F5 at turn level: a rooted chat whose hook is wired would be `Unrestricted` for claude, and
+    /// the turn must still launch agy in plan mode with the sandbox. Driven through `send_message`, so
+    /// it fails if the `tool_policy_for_engine` call in the turn is deleted. A regression guard: the
+    /// override exists today, so this is expected to pass.
+    #[tokio::test]
+    async fn a_rooted_agy_chat_launches_in_plan_mode_with_the_sandbox() {
+        // Lock order: the stand-in binary (env lock) first, then the gate.
+        let fake = FakeAgyBin::success("pong from the fake agy");
+        let _gate = agy_gate(true);
+
+        // A directory whose PreToolUse hook is wired, as `classifier_hook_is_wired` reads it.
+        let root = tempfile::tempdir().unwrap();
+        let script = root.path().join(crate::governance::autopilot::HOOK_SCRIPT);
+        std::fs::create_dir_all(script.parent().unwrap()).unwrap();
+        std::fs::write(&script, "# hook").unwrap();
+        let settings = serde_json::json!({
+            "hooks": {"PreToolUse": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": format!(
+                        "python \"${{CLAUDE_PROJECT_DIR}}/{}\"",
+                        crate::governance::autopilot::HOOK_SCRIPT
+                    ),
+                }]
+            }]}
+        });
+        std::fs::write(root.path().join(".claude/settings.json"), settings.to_string()).unwrap();
+        // The premise: for any other engine this chat is `Unrestricted`.
+        assert!(crate::governance::autopilot::classifier_hook_is_wired(
+            root.path()
+        ));
+        assert_eq!(
+            tool_policy_for(
+                Some(&root.path().to_string_lossy()),
+                Origin::Shell,
+                true,
+                crate::relay::Handover::Typed
+            ),
+            crate::execution::runner::ToolPolicy::Unrestricted
+        );
+
+        let mut state = tests::test_state(std::sync::Arc::new(
+            crate::execution::runner::FakeCommandRunner::default(),
+        ))
+        .await;
+        state.assistants = std::sync::Arc::new(ConfiguredAssistants::new(
+            None,
+            None,
+            None,
+            "http://127.0.0.1:8791".to_string(),
+            "token".to_string(),
+            state.pool.clone(),
+            crate::execution::runner::OLLAMA_BASE_URL.to_string(),
+        ));
+        let chat = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        crate::chats::set_model(&state.pool, &chat, Some(AGY_MODEL))
+            .await
+            .unwrap();
+        crate::chats::set_cwd(&state.pool, &chat, &root.path().to_string_lossy())
+            .await
+            .unwrap();
+
+        let id = crate::assistant::send_message(&state, &chat, "ping", Origin::Shell)
+            .await
+            .expect("the turn was accepted");
+        let mut status = String::new();
+        for _ in 0..500 {
+            status = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+                .bind(id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+            if status != "running" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        assert!(fake.was_launched(), "agy never ran (status {status})");
         let args = fake.args();
         assert!(args.contains("--mode plan"), "{args}");
         assert!(args.contains("--sandbox"), "{args}");

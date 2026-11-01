@@ -871,6 +871,48 @@ mod tests {
         assert!(sent.try_recv().is_err(), "the router was asked");
     }
 
+    /// E19 N3: a seat refuses agy, so `suggest` with no runner must not put agy (or its models) in the
+    /// request, whatever alternates the router holds.
+    #[tokio::test]
+    async fn suggest_never_offers_an_agy_model() {
+        let _gate = crate::engines::agy_test_support::agy_gate(true);
+        let (url, mut sent) = stub_router(200, answer("claude-opus-5", "high")).await;
+        let config = RouterConfig {
+            mode: Mode::Shadow,
+            url,
+            timeout_ms: 2500,
+            surfaces: [("recruit", Mode::Shadow)].into_iter().collect(),
+            ..RouterConfig::off()
+        };
+        let primary = Available {
+            kind: RunnerKind::Claude,
+            runner: Arc::new(crate::execution::runner::FakeCommandRunner::default()),
+            default_model: "claude-sonnet-5".into(),
+            models: vec!["claude-*".into()],
+        };
+        let agy = Available {
+            kind: RunnerKind::Agy,
+            runner: Arc::new(crate::execution::runner::FakeCommandRunner::default()),
+            default_model: "agy/gemini-3.8-flash-high".into(),
+            models: vec!["agy/*".into()],
+        };
+        let router = Arc::new(Router::new(config, primary, vec![agy]));
+        assert!(
+            router
+                .alternates
+                .iter()
+                .any(|available| available.kind == RunnerKind::Agy),
+            "the fixture must hold an agy alternate"
+        );
+
+        let _ = suggest(Some(router), None, "task").await;
+
+        let body = sent.try_recv().expect("the router was asked");
+        let text = body.to_string();
+        assert!(!text.contains("agy"), "agy was offered: {text}");
+        assert!(text.contains("claude"), "{text}");
+    }
+
     // ---- outcomes ----
 
     async fn seed_ended(

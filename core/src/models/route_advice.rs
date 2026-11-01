@@ -2597,6 +2597,34 @@ mod tests {
         );
     }
 
+    /// E19 N1: closing the opt-in removes agy from the router at once, on the same built value.
+    #[test]
+    fn closing_the_gate_removes_agy_from_the_router() {
+        let router = Router::new(
+            config(Mode::Shadow, DEFAULT_URL),
+            available(RunnerKind::Claude, Arc::new(Probe), &["claude-*"]),
+            vec![available(
+                RunnerKind::Agy,
+                Arc::new(crate::execution::runner::FakeCommandRunner::default()),
+                &["agy/*"],
+            )],
+        );
+        let read_only = RunShape {
+            permission: Permission::Plan,
+            classifier_governs_tools: false,
+            tool_policy: ToolPolicy::McpOnly,
+            resume: false,
+        };
+        {
+            let _open = crate::engines::agy_test_support::agy_gate(true);
+            assert!(router.eligible(read_only).contains(&RunnerKind::Agy));
+        }
+        let _closed = crate::engines::agy_test_support::agy_gate(false);
+        let kinds = router.eligible(read_only);
+        assert!(!kinds.contains(&RunnerKind::Agy), "{kinds:?}");
+        assert!(kinds.contains(&RunnerKind::Claude), "{kinds:?}");
+    }
+
     /// E16 F7: `spawn.rs` drops agy from the route of a run the runner would refuse, through the
     /// existing `restrict_runners`.
     #[test]

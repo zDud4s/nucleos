@@ -1005,7 +1005,9 @@ mod tests {
             refuse_unpinned_member_on_agy_primary(None, &primary("agy")),
             Err(crate::engines::AGY_REFUSAL.to_owned())
         );
-        // A pin to claude (or codex) still launches under an agy primary.
+        // This helper lets a pin to claude (or codex) through. E19 N2: under an agy primary with
+        // routing off, the launch then goes to the primary and is refused later through `steerable`
+        // (fails closed), so the pin does not in fact launch on that path.
         assert_eq!(
             refuse_unpinned_member_on_agy_primary(Some(RunnerKind::Claude), &primary("agy")),
             Ok(())
