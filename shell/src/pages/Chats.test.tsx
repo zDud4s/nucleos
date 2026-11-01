@@ -7626,3 +7626,180 @@ describe("Chats - turns the owner did not write", () => {
     expect(await within(transcript).findByText("Turn failed with no reason recorded")).toBeDefined();
   });
 });
+
+/* ------------------------------------- engine routes: agy and the Gemini API -- */
+
+/**
+ * `chatsFetch` with the two extra routes a chat can run on: the agy CLI (rows filed by the daemon
+ * inside the Claude and Gemini company groups) and the Gemini API (brain `openrouter`, so flat
+ * `choices` only, never in the groups). Like the daemon, the rows ride only on a chat-scoped ask,
+ * that is `?chat=<id>` or `?scope=chat`; the plain `/assistant/models` is the agent-scoped menu.
+ */
+function chatsFetchWithEngineRoutes(
+  chats: ChatSummary[],
+  transcripts: Record<string, AssistantTurnRow[]>,
+): (path: string, init?: RequestInit) => Promise<unknown> {
+  const base = chatsFetch(chats, transcripts);
+  const claude: ModelChoice = {
+    id: "claude-sonnet-4-6",
+    label: "Sonnet 4.6",
+    brain: "cloud",
+    efforts: CLAUDE_EFFORTS,
+  };
+  const agySonnet: ModelChoice = {
+    id: "agy/claude-sonnet-4-6",
+    label: "Sonnet 4.6 (agy)",
+    brain: "cloud",
+    efforts: [],
+    runner: "agy",
+  };
+  const agyGemini: ModelChoice = {
+    id: "agy/gemini-3-pro",
+    label: "Gemini 3 Pro (agy)",
+    brain: "cloud",
+    efforts: [],
+    runner: "agy",
+  };
+  const geminiApi: ModelChoice = {
+    id: "gemini-3-pro",
+    label: "Gemini 3 Pro",
+    brain: "openrouter",
+    efforts: [],
+    runner: "gemini-api",
+  };
+  const openrouter: ModelChoice = {
+    id: "openrouter-gpt",
+    label: "GPT via OpenRouter",
+    brain: "openrouter",
+    efforts: [],
+  };
+  return async (path, init) => {
+    const [route, query = ""] = path.split("?");
+    if (route === "/assistant/models") {
+      const models = (await base(path, init)) as AssistantModels;
+      const chatScoped = query.startsWith("chat=") || query === "scope=chat";
+      return {
+        ...models,
+        choices: chatScoped
+          ? [...models.choices, claude, agySonnet, agyGemini, geminiApi, openrouter]
+          : [...models.choices, openrouter],
+      };
+    }
+    if (route === "/assistant/models/groups") {
+      return {
+        groups: [
+          {
+            provider: "anthropic",
+            family: "sonnet",
+            label: "Claude · Sonnet",
+            models: [claude, agySonnet],
+          },
+          { provider: "google", family: "gemini", label: "Other · Gemini", models: [agyGemini] },
+        ],
+        source: "fallback",
+        catalogue_version: "2026-10-02",
+        fetched_at: null,
+      };
+    }
+    return base(path, init);
+  };
+}
+
+describe("Chats - the model menu separates agy and the Gemini API", () => {
+  it("the model menu lists agy and Gemini API in separate submenus, each row badged", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetchWithEngineRoutes([chatSummary({ chat_id: "c-1" })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openModelMenu();
+
+    const agy = await openModelSubmenu(/Antigravity CLI/);
+    const agyRow = await within(agy).findByRole("menuitemradio", { name: /^Sonnet 4\.6 \(agy\)/ });
+    expect(within(agyRow).getByText("agy CLI")).toBeDefined();
+    expect(within(agy).getByRole("menuitemradio", { name: /^Gemini 3 Pro \(agy\)/ })).toBeDefined();
+
+    const api = await openModelSubmenu(/Google Gemini API/);
+    const apiRow = await within(api).findByRole("menuitemradio", { name: /^Gemini 3 Pro/ });
+    expect(within(apiRow).getByText("Gemini API")).toBeDefined();
+    // The two routes do not share a submenu.
+    expect(within(api).queryByRole("menuitemradio", { name: /\(agy\)/ })).toBeNull();
+  });
+
+  it("agy rows are not inside the Claude company", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetchWithEngineRoutes([chatSummary({ chat_id: "c-1" })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openModelMenu();
+
+    const claude = await openModelSubmenu("Claude");
+    expect(await within(claude).findByRole("menuitemradio", { name: /^Sonnet 4\.6$/ })).toBeDefined();
+    // The daemon files an agy row by the hosted model's family; the shell sorts by `runner`.
+    expect(within(claude).queryByRole("menuitemradio", { name: /agy/i })).toBeNull();
+  });
+
+  it("Through OpenRouter holds only real OpenRouter rows", async () => {
+    daemon.apiFetch.mockImplementation(
+      chatsFetchWithEngineRoutes([chatSummary({ chat_id: "c-1" })], { "c-1": [] }),
+    );
+
+    await renderChats("/chats/c-1");
+    await openModelMenu();
+
+    const hosted = await openModelSubmenu("Through OpenRouter");
+    expect(await within(hosted).findByRole("menuitemradio", { name: /^GPT via OpenRouter/ })).toBeDefined();
+    // The Gemini API row also has brain `openrouter`; it belongs to its own submenu.
+    expect(within(hosted).queryByRole("menuitemradio", { name: /Gemini/ })).toBeNull();
+  });
+
+  it("the front door asks for the chat-scoped menu and can pick a Gemini row", async () => {
+    const requested: string[] = [];
+    const base = chatsFetchWithEngineRoutes([], {});
+    daemon.apiFetch.mockImplementation(async (path, init) => {
+      requested.push(path);
+      return base(path, init);
+    });
+
+    await renderChats("/chats");
+    await waitFor(() => {
+      expect(requested).toContain("/assistant/models?scope=chat");
+    });
+    // Literally the chat-scoped ask, and never the bare daemon-scoped one beside it.
+    expect(requested).not.toContain("/assistant/models");
+
+    await openModelMenu();
+    const api = await openModelSubmenu(/Google Gemini API/);
+    fireEvent.click(await within(api).findByRole("menuitemradio", { name: /^Gemini 3 Pro/ }));
+
+    const textarea = (await screen.findByLabelText("Message")) as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: "olá" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => {
+      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats", {
+        method: "POST",
+        body: JSON.stringify({ model: "gemini-3-pro", permission_mode: "auto" }),
+      });
+    });
+  });
+
+  // A guard: the conversation header already asks with its chat id, so this may pass before the
+  // change. It fails if the new scope leaks into a menu that already knows its chat.
+  it("a chat-scoped menu is requested with the chat id as before", async () => {
+    const requested: string[] = [];
+    const base = chatsFetchWithEngineRoutes([chatSummary({ chat_id: "c-1" })], { "c-1": [] });
+    daemon.apiFetch.mockImplementation(async (path, init) => {
+      requested.push(path);
+      return base(path, init);
+    });
+
+    await renderChats("/chats/c-1");
+
+    await waitFor(() => {
+      expect(requested).toContain("/assistant/models?chat=c-1");
+    });
+    expect(requested.filter((path) => path.includes("scope="))).toHaveLength(0);
+  });
+});
