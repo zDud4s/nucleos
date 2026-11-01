@@ -109,31 +109,18 @@ pub fn engine_of(config: &ModelsConfig, brain: Brain, model: Option<&str>) -> Ch
 /// The table of spec section 6.
 pub fn support(engine: ChatEngine, capability: Capability) -> Support {
     use Capability::*;
-    // Associated consts cannot be imported with `use`; local consts keep the short pattern names.
-    #[allow(non_upper_case_globals)]
-    const Claude: ChatEngine = ChatEngine::Claude;
-    #[allow(non_upper_case_globals)]
-    const Codex: ChatEngine = ChatEngine::Codex;
-    #[allow(non_upper_case_globals)]
-    const Local: ChatEngine = ChatEngine::Local;
-    #[allow(non_upper_case_globals)]
-    const OpenRouter: ChatEngine = ChatEngine::OpenRouter;
-    #[allow(non_upper_case_globals)]
-    const Agy: ChatEngine = ChatEngine::Agy;
-    #[allow(non_upper_case_globals)]
-    const GeminiApi: ChatEngine = ChatEngine::GeminiApi;
     use Support::{No, Warn, Yes};
     match (capability, engine) {
-        (Effort | ExtraDirs | RegistryMcp, Claude | Codex) => Yes,
-        (DeniedTools | Agents, Claude) => Yes,
-        (TurnBudget, Claude) => Yes,
-        (TurnBudget, Local | OpenRouter) => Warn,
+        (Effort | ExtraDirs | RegistryMcp, ChatEngine::Claude | ChatEngine::Codex) => Yes,
+        (DeniedTools | Agents, ChatEngine::Claude) => Yes,
+        (TurnBudget, ChatEngine::Claude) => Yes,
+        (TurnBudget, ChatEngine::Local | ChatEngine::OpenRouter) => Warn,
         // Agy takes `--effort` and `--add-dir` and refuses every other control.
-        (Effort | ExtraDirs, Agy) => Yes,
-        (DeniedTools | TurnBudget | Agents | RegistryMcp, Agy) => No,
+        (Effort | ExtraDirs, ChatEngine::Agy) => Yes,
+        (DeniedTools | TurnBudget | Agents | RegistryMcp, ChatEngine::Agy) => No,
         // The Gemini API route ignores a per-turn budget (a warning, like OpenRouter) and refuses
         // every other control; the `_` arm answers `No` for them.
-        (TurnBudget, GeminiApi) => Warn,
+        (TurnBudget, ChatEngine::GeminiApi) => Warn,
         _ => No,
     }
 }
