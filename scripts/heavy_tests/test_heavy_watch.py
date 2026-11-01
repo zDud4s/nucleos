@@ -155,7 +155,7 @@ class WatchTests(unittest.TestCase):
         dyn = W.dynamic_state(held, 4)
         reason = W.queue_reason(1, {"weight": 1}, 1, 4, dyn)
         self.assertIn("idle 0.6 < 1.0 cores", reason)
-        self.assertIn("RAM 0.4 < 1.5 GB", reason)
+        self.assertIn("RAM 0.4 < 3.9 GB", reason)
         self.assertNotIn("weight must be freed", reason)
         self.assertIn("1 ahead", W.queue_reason(2, {"weight": 1}, 1, 4, dyn))
         # A head whose weight does not fit is flagged: an old broker would still refuse it.
@@ -176,6 +176,26 @@ class WatchTests(unittest.TestCase):
         self.assertIn("jobs ", text)
         self.assertIn("admission dynamic:", text)
         self.assertIn("idle 10.0/1.0 cores", text)
+
+    def test_dynamic_frame_has_no_weight_suffix_with_more_than_four_held(self) -> None:
+        # Guards an applied fix: above the static capacity of 4, the head's reason must not
+        # carry the "weight-based broker" suffix when the probe shows room.
+        self.dynamic({"logical": 32, "total_mb": 65536, "avail_mb": 50000, "busy_cores": 2.0})
+        for i in range(5):
+            f = self.dir / "held" / str(i + 1)
+            f.write_text(json.dumps(self.live(weight=1)), encoding="utf-8")
+            os.utime(f, (time.time() - 60, time.time() - 60))
+        q = self.dir / "queue" / f"1-{time.time_ns()}-{os.getpid()}"
+        q.write_text(json.dumps(self.live(weight=1)), encoding="utf-8")
+        text = W.frame({})
+        self.assertNotIn("weight-based", text)
+
+    def test_dynamic_frame_uses_dynamic_ceiling(self) -> None:
+        self.dynamic({"logical": 12, "total_mb": 16000, "avail_mb": 8000, "busy_cores": 2.0})
+        # The head bar counts against the dynamic job ceiling, not the static capacity.
+        with mock.patch.dict(os.environ, {"NUCLEOS_HEAVY_DYNAMIC_MAX_JOBS": "6"}):
+            text = W.frame({})
+        self.assertIn("0/6", text)
 
     def test_static_frame_keeps_the_weight_bar(self) -> None:
         text = W.frame({})

@@ -196,10 +196,12 @@ class Broker(unittest.TestCase):
         # enough that "b is still waiting at 2 s" cannot be explained by start-up alone.
         # 6 GB of 32 free is above the floor but short of the settle waiver's 25%.
         tight = probe_json(avail_mb=6000)
-        a = self.broker("a", "check", probe=tight, settle="4")
+        # The default floor on this probe (32000 MB total) is 8000 MB, so pin the old one.
+        floor = {"NUCLEOS_HEAVY_MIN_AVAIL_MB": "1536"}
+        a = self.broker("a", "check", probe=tight, settle="4", **floor)
         self.assert_started("a")
         t_a = time.time()
-        b = self.broker("b", "check", probe=tight, settle="4")
+        b = self.broker("b", "check", probe=tight, settle="4", **floor)
         time.sleep(2.0)
         self.assertFalse(self.started("b"), "b admitted inside the settle window")
         self.assert_started("b")
@@ -214,7 +216,8 @@ class Broker(unittest.TestCase):
     # 4
     def test_never_more_than_capacity_held(self) -> None:
         tags = ["a", "b", "c", "d", "e"]
-        ps = [self.broker(t, "check") for t in tags]
+        # The dynamic job ceiling defaults to 8; pin it to 4 so the fifth job must wait.
+        ps = [self.broker(t, "check", NUCLEOS_HEAVY_DYNAMIC_MAX_JOBS="4") for t in tags]
         # The five brokers race to the queue, so which one waits is not known in advance.
         def running() -> list[str]:
             return [t for t in tags if self.started(t)]
@@ -305,7 +308,7 @@ class Pure(unittest.TestCase):
         keys = ("NUCLEOS_HEAVY_CAPACITY", "NUCLEOS_HEAVY_ADMISSION",
                 "NUCLEOS_HEAVY_MIN_AVAIL_MB", "NUCLEOS_HEAVY_MIN_IDLE_CORES",
                 "NUCLEOS_HEAVY_SETTLE_S", "NUCLEOS_HEAVY_FAKE_PROBE",
-                "NUCLEOS_HEAVY_SETTLE_FREE_PCT")
+                "NUCLEOS_HEAVY_SETTLE_FREE_PCT", "NUCLEOS_HEAVY_DYNAMIC_MAX_JOBS")
         patcher = mock.patch.dict(os.environ, {}, clear=False)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -323,6 +326,8 @@ class Pure(unittest.TestCase):
     # 9
     def test_dynamic_fit_idle_cores_and_none_busy(self) -> None:
         c = self.load()
+        # Pin the old 1536 MB floor so the 6000 MB case below still exercises the settle window.
+        os.environ["NUCLEOS_HEAVY_MIN_AVAIL_MB"] = "1536"
         # 11.5 of 12 cores busy: 0.5 idle, under the 1.0 default.
         ok, adm = c.dynamic_fit(1, self.probe(11.5), 100.0, 4, True)
         self.assertFalse(ok)
@@ -373,6 +378,83 @@ class Pure(unittest.TestCase):
         ok, adm = c.dynamic_fit(1, None, 100.0, 4, False)
         self.assertFalse(ok)
         self.assertEqual(adm["rule"], "static_fallback")
+
+    # T4
+    def test_dynamic_max_jobs_default_and_invalid(self) -> None:
+        c = self.load()
+        self.assertEqual(c.dynamic_max_jobs(), 8)
+        os.environ["NUCLEOS_HEAVY_DYNAMIC_MAX_JOBS"] = "12"
+        self.assertEqual(c.dynamic_max_jobs(), 12)
+        for bad in ("abc", "0", "-3", "4.5", ""):
+            os.environ["NUCLEOS_HEAVY_DYNAMIC_MAX_JOBS"] = bad
+            self.assertEqual(c.dynamic_max_jobs(), 8, bad)
+
+    # T5
+    def test_dynamic_ceiling_and_idle_floor(self) -> None:
+        c = self.load()
+        ceiling = c.dynamic_max_jobs()
+        idle = self.probe(2)
+        ok, _ = c.dynamic_fit(7, idle, 100.0, ceiling, True)
+        self.assertTrue(ok)
+        ok, adm = c.dynamic_fit(8, idle, 100.0, ceiling, True)
+        self.assertFalse(ok)
+        self.assertEqual(adm["rule"], "room")
+        # 11.5 of 12 cores busy: the idle-core floor still holds below the ceiling.
+        ok, _ = c.dynamic_fit(5, self.probe(11.5), 100.0, ceiling, True)
+        self.assertFalse(ok)
+
+    # T6
+    def test_min_avail_default_is_10gb_clamped_to_quarter_of_total(self) -> None:
+        c = self.load()
+
+        def probe(total, avail):
+            return {"logical": 12, "total_mb": total, "avail_mb": avail, "busy_cores": 2}
+
+        # 64 GB box: the floor is 10 GB (10240 MB).
+        ok, _ = c.dynamic_fit(1, probe(65536, 9000), 100.0, 8, True)
+        self.assertFalse(ok)
+        ok, _ = c.dynamic_fit(1, probe(65536, 11000), 100.0, 8, True)
+        self.assertTrue(ok)
+        # 16 GB box: a quarter of the total (4096 MB) is lower than 10 GB.
+        ok, _ = c.dynamic_fit(1, probe(16384, 5000), 100.0, 8, True)
+        self.assertTrue(ok)
+        ok, _ = c.dynamic_fit(1, probe(16384, 3000), 100.0, 8, True)
+        self.assertFalse(ok)
+        # An explicit env value is used verbatim, with no clamp.
+        os.environ["NUCLEOS_HEAVY_MIN_AVAIL_MB"] = "2000"
+        ok, _ = c.dynamic_fit(1, probe(65536, 3000), 100.0, 8, True)
+        self.assertTrue(ok)
+
+    # T7
+    def test_dynamic_max_jobs_scales_with_the_machines_ram(self) -> None:
+        c = self.load()
+
+        def p(total):
+            return {"logical": 32, "total_mb": total, "avail_mb": 20000, "busy_cores": 2}
+
+        for total, want in ((65536, 8), (65400, 8), (49152, 6), (32768, 4),
+                            (16384, 4), (8192, 4)):
+            self.assertEqual(c.dynamic_max_jobs(p(total)), want, total)
+        self.assertEqual(c.dynamic_max_jobs({"logical": 32}), 8)
+        self.assertEqual(c.dynamic_max_jobs(None), 8)
+        self.assertEqual(c.dynamic_max_jobs(), 8)
+        # An explicit env value is used verbatim, whatever the probe.
+        os.environ["NUCLEOS_HEAVY_DYNAMIC_MAX_JOBS"] = "12"
+        self.assertEqual(c.dynamic_max_jobs(p(16384)), 12)
+
+    # T8
+    def test_from_four_held_the_settle_window_is_never_waived(self) -> None:
+        c = self.load()
+        p = {"logical": 32, "total_mb": 65536, "avail_mb": 60000, "busy_cores": 2}
+        ok, _ = c.dynamic_fit(3, p, 0.0, 8, True)
+        self.assertTrue(ok)
+        ok, adm = c.dynamic_fit(4, p, 0.0, 8, True)
+        self.assertFalse(ok)
+        self.assertEqual(adm["rule"], "room")
+        ok, _ = c.dynamic_fit(4, p, 100.0, 8, True)
+        self.assertTrue(ok)
+        ok, _ = c.dynamic_fit(7, p, 0.0, 8, True)
+        self.assertFalse(ok)
 
 
 if __name__ == "__main__":

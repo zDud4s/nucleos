@@ -296,8 +296,11 @@ class TargetDirTests(unittest.TestCase):
         # CARGO_BUILD_TARGET_DIR counts as explicit: nothing is added next to it.
         other = self.tmp / "other"
         _, seen, row = self.run_broker(CARGO_BUILD_TARGET_DIR=str(other))
-        self.assertIsNone(seen.get("td"), f"CARGO_TARGET_DIR must not be injected: {seen}")
-        self.assertEqual(real(seen.get("btd") or ""), real(other), seen)
+        # Since 2026-10-31 the broker moves it to the flag (sccache keys on the env var), so
+        # the dir is still the caller's but arrives as `--target-dir`, and the env var is gone.
+        self.assertEqual(real(seen.get("flag_td") or ""), real(other), seen)
+        self.assertIsNone(seen.get("btd"), f"CARGO_BUILD_TARGET_DIR must be stripped: {seen}")
+        self.assertEqual(real(seen.get("td") or ""), real(other), seen)
         self.assertEqual(real(row.get("target_dir") or ""), real(other), row)
         # `--target-dir` in argv is explicit too.
         flagged = self.tmp / "flagged"
@@ -310,6 +313,95 @@ class TargetDirTests(unittest.TestCase):
         self.assertFalse((self.td_root / ".cargo-target-feat-x-y").exists())
         self.assertEqual(sorted(p.name for p in self.td_root.glob(".cargo-target-pool-*")), [],
                          "an explicit target dir leases no pool dir")
+
+    # 2a
+    def test_env_target_dir_becomes_flag_on_direct_cargo(self) -> None:
+        # sccache keys on the CARGO_* env a rustc inherits (measured 2026-10-31: env 3 misses
+        # then 3 misses, flag 3 misses then 3 hits), so the caller's own dir moves to the flag.
+        for var, name in (("CARGO_TARGET_DIR", "mine"), ("CARGO_BUILD_TARGET_DIR", "other")):
+            d = self.tmp / name
+            rc, seen, row = self.run_broker(**{var: str(d)})
+            self.assertEqual(rc, 0)
+            self.assertEqual(seen.get("argv", [])[:3], ["test", "--target-dir", str(d)], seen)
+            self.assertIsNone(seen.get("env_td"), f"{var}: CARGO_TARGET_DIR leaked: {seen}")
+            self.assertIsNone(seen.get("btd"), f"{var}: CARGO_BUILD_TARGET_DIR leaked: {seen}")
+            self.assertEqual(real(row.get("target_dir") or ""), real(d), row)
+            self.assertEqual(sorted(p.name for p in self.td_root.glob(".cargo-target-pool-*")),
+                             [], f"{var}: the caller's own dir leases no pool slot")
+
+    # 2a'
+    def test_stripped_target_dir_env_returns_on_a_broker_error_fallback(self) -> None:
+        # The broker moves CARGO_TARGET_DIR into a `--target-dir` flag and pops the env var; if
+        # it then fails, the fallback re-runs the ORIGINAL argv, so the env var must come back.
+        # In-process: a black-box run has no way to make the broker raise after the strip.
+        import importlib.util
+        from unittest import mock
+        spec = importlib.util.spec_from_file_location("heavy_td_fallback_probe", HEAVY)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mine = self.tmp / "mine"
+        calls: list[tuple[list, dict | None]] = []
+
+        def fake_run_child(argv, env, job, *a, **kw):
+            calls.append((list(argv), None if env is None else dict(env)))
+            return 0, {"compiled": False}
+
+        old_cwd = os.getcwd()
+        self.addCleanup(os.chdir, old_cwd)
+        os.chdir(self.repo)
+        argv = [str(self.cargo), "test", "-p", "nucleos-core"]
+        with mock.patch.dict(os.environ, self.env(CARGO_TARGET_DIR=str(mine)), clear=True), \
+                mock.patch.object(mod, "make_kill_on_close_job", side_effect=RuntimeError("boom")), \
+                mock.patch.object(mod, "run_child", side_effect=fake_run_child):
+            rc = mod._broker_attempt(["--wait-max", "60", "--", *argv])
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(calls), 1, calls)
+        ran_argv, ran_env = calls[0]
+        self.assertEqual(ran_argv, argv)
+        self.assertNotIn("--target-dir", ran_argv)
+        self.assertEqual(real((ran_env or {}).get("CARGO_TARGET_DIR") or ""), real(mine))
+        self.assertIn("RuntimeError", self.log_rows()[-1].get("broker_error", ""))
+
+    # 2a
+    def test_env_target_dir_kept_when_flag_in_argv_or_subcommand_has_none(self) -> None:
+        mine = self.tmp / "mine"
+        # An explicit `--target-dir` in argv wins: argv unchanged, the env var stays.
+        flagged = self.tmp / "flagged"
+        argv = ["test", "-p", "nucleos-core", "--target-dir", str(flagged)]
+        _, seen, _ = self.run_broker(argv, CARGO_TARGET_DIR=str(mine))
+        self.assertEqual(seen.get("argv"), argv, seen)
+        self.assertEqual(seen.get("argv", []).count("--target-dir"), 1, seen)
+        self.assertEqual(real(seen.get("env_td") or ""), real(mine), seen)
+        # A subcommand that takes no `--target-dir`: argv unchanged, the env var stays.
+        _, seen, _ = self.run_broker(["fmt", "--all"], CARGO_TARGET_DIR=str(mine))
+        self.assertEqual(seen.get("argv"), ["fmt", "--all"], seen)
+        self.assertEqual(real(seen.get("env_td") or ""), real(mine), seen)
+        # NUCLEOS_HEAVY_TARGET=0 opts out of every target-dir rewrite.
+        _, seen, _ = self.run_broker(CARGO_TARGET_DIR=str(mine), NUCLEOS_HEAVY_TARGET="0")
+        self.assertEqual(seen.get("argv"), ["test", "-p", "nucleos-core"], seen)
+        self.assertEqual(real(seen.get("env_td") or ""), real(mine), seen)
+        self.assertIsNone(seen.get("flag_td"), seen)
+
+    # 2a
+    def test_env_target_dir_flag_pure(self) -> None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("heavy_env_flag_probe", HEAVY)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        fn = mod.env_target_dir_flag
+        # Not a cargo command: nothing to move.
+        self.assertIsNone(fn(["bash", "gates.sh"], {"CARGO_TARGET_DIR": "/a"}))
+        # Both vars set: CARGO_TARGET_DIR wins, and both are listed to be dropped.
+        both = {"CARGO_TARGET_DIR": "/a", "CARGO_BUILD_TARGET_DIR": "/b"}
+        moved = fn(["cargo", "build"], both)
+        self.assertIsNotNone(moved)
+        flagged, drop = moved
+        self.assertEqual(flagged[flagged.index("--target-dir") + 1], "/a", flagged)
+        self.assertNotIn("/b", flagged)
+        self.assertEqual(sorted(drop), ["CARGO_BUILD_TARGET_DIR", "CARGO_TARGET_DIR"])
+        # Neither var, or an empty one: nothing to move.
+        self.assertIsNone(fn(["cargo", "build"], {}))
+        self.assertIsNone(fn(["cargo", "build"], {"CARGO_TARGET_DIR": ""}))
 
     # 2b
     def test_direct_cargo_gets_the_slot_as_a_flag(self) -> None:

@@ -313,7 +313,8 @@ class WarmTests(unittest.TestCase):
         self.assertLess(elapsed, 4.0, "warm must return within ~3 s, not wait for the build")
         # The build continues in a background broker.
         self.assert_started("no-run")
-        self.assertEqual((self.d / "no-run.argv").read_text(), "test -p nucleos-core -p nucleos-app -p nucleos-daemon --no-run")
+        self.assertEqual((self.d / "no-run.argv").read_text(),
+                         f"test --target-dir {self.td} -p nucleos-core -p nucleos-app -p nucleos-daemon --no-run")
         self.assertTrue(same_path((self.d / "no-run.cwd").read_text(), self.repo_a),
                         "the build must run in the --cwd worktree")
         self.assertEqual(self.log_rows(), [], "the row is written when the build ends")
@@ -332,7 +333,7 @@ class WarmTests(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertIn("warming", out)
         self.assert_started("custom")
-        self.assertEqual((self.d / "custom.argv").read_text(), "check custom")
+        self.assertEqual((self.d / "custom.argv").read_text(), f"check --target-dir {self.td} custom")
         self.assertTrue(same_path((self.d / "custom.cwd").read_text(), self.repo_a))
         self.assertFalse(self.started("no-run"), "the default argv must not run when overridden")
 
