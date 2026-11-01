@@ -1728,9 +1728,11 @@ def run_child(argv: list[str], env: dict | None, job, low: bool = False,
     limit = stall_secs()
     own_group = (yield_check is not None or limit > 0) and os.name != "nt"
     popen_kw = {"start_new_session": True} if own_group else {}
+    # stdin is never inherited: a queued command has nobody to read from, and on Windows a dead
+    # inherited handle (a daemon started without a console) fails the spawn with WinError 6.
     proc = subprocess.Popen(
-        argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=flags,
-        **popen_kw
+        argv, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        creationflags=flags, **popen_kw
     )
     try:
         in_job = assign_to_job(job, proc)
