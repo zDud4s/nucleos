@@ -280,7 +280,8 @@ mod tests {
     use serde_json::{Value, json};
     use tower::ServiceExt;
 
-    async fn context_turns(state: &AppState, chat: &str) -> Value {
+    /// The data of the chat's `/context` card.
+    async fn context_data(state: &AppState, chat: &str) -> Value {
         let response = build_router(state.clone())
             .oneshot(
                 Request::builder()
@@ -299,7 +300,84 @@ mod tests {
             .unwrap();
         let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
         assert_eq!(status, StatusCode::OK, "{body}");
-        body["card"]["data"]["turns"].clone()
+        body["card"]["data"].clone()
+    }
+
+    async fn context_turns(state: &AppState, chat: &str) -> Value {
+        context_data(state, chat).await["turns"].clone()
+    }
+
+    /// A new Cloud chat pinned to an agy model.
+    ///
+    /// It holds no `agy_gate`, on purpose: `runner_by_id` routes the `agy/` prefix to agy, and
+    /// `engine_of` answers `ChatEngine::Agy` both when `answering_cli` returns "agy" (gate on) and
+    /// when it refuses with `EngineDisabled` (gate off). The fixture therefore cannot depend on the
+    /// settings another test has installed, and these tests never take the settings serial lock.
+    async fn agy_chat(state: &AppState) -> String {
+        let chat = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE chats SET model = 'agy/gemini-3.8-flash-high' WHERE chat_id = ?")
+            .bind(&chat)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        chat
+    }
+
+    /// The chat's row in `GET /assistant/chats`.
+    async fn listed_chat(state: &AppState, chat: &str) -> Value {
+        let response = build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/assistant/chats")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body.as_array()
+            .and_then(|rows| rows.iter().find(|row| row["chat_id"] == json!(chat)))
+            .cloned()
+            .unwrap_or_else(|| panic!("{chat} is not listed: {body}"))
+    }
+
+    /// agy never reports a fill, so `maybe_auto_compact` never runs and the switch must not offer it.
+    #[tokio::test]
+    async fn the_chat_list_says_an_agy_chat_cannot_compact_itself() {
+        let state = crate::http::tests::test_state().await;
+        let chat = agy_chat(&state).await;
+        let row = listed_chat(&state, &chat).await;
+        assert_eq!(row["cannot_auto_compact"], json!(true), "{row}");
+    }
+
+    /// Serialized as an explicit `false`: an unpinned Cloud chat runs on Claude, which measures.
+    #[tokio::test]
+    async fn the_chat_list_lets_a_claude_chat_compact_itself() {
+        let state = crate::http::tests::test_state().await;
+        let chat = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
+            .await
+            .unwrap();
+        let row = listed_chat(&state, &chat).await;
+        assert_eq!(row["cannot_auto_compact"], json!(false), "{row}");
+    }
+
+    /// The card says why it has no numbers rather than drawing an empty measure.
+    #[tokio::test]
+    async fn context_on_an_agy_chat_says_there_is_no_measure() {
+        let state = crate::http::tests::test_state().await;
+        let chat = agy_chat(&state).await;
+        let data = context_data(&state, &chat).await;
+        assert_eq!(data["engine"], json!("agy"), "{data}");
+        assert_eq!(data["note"], json!("no measure on this engine"), "{data}");
     }
 
     async fn seed_chat(state: &AppState, chat: &str) {

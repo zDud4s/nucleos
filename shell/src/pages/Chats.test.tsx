@@ -2772,6 +2772,45 @@ describe("Chats - automatic compaction", () => {
     expect(item.getAttribute("aria-disabled")).toBe("true");
   });
 
+  it("cannot be turned on where the engine reports no context reading", async () => {
+    daemon.apiFetch.mockImplementation(
+      withSwitch(chatSummary({ chat_id: "c-1", cannot_auto_compact: true }), () => undefined),
+    );
+
+    await renderChats("/chats/c-1");
+    await openConversationSettings();
+
+    // The sentence comes first: a list still loading is disabled too, and says nothing.
+    expect(await screen.findByText(/cannot compact itself/i)).toBeDefined();
+    const item = await screen.findByRole("menuitemcheckbox", { name: SWITCH });
+    expect(item.getAttribute("aria-disabled")).toBe("true");
+
+    fireEvent.click(item);
+    // A mutation reaches `apiFetch` after the click returns, so give it the chance to.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(
+      daemon.apiFetch.mock.calls.some(([path]) => String(path) === AUTO_COMPACT_PATH),
+    ).toBe(false);
+  });
+
+  it("does not claim to be on where the engine cannot act on it", async () => {
+    daemon.apiFetch.mockImplementation(
+      withSwitch(
+        chatSummary({ chat_id: "c-1", auto_compact: true, cannot_auto_compact: true }),
+        () => undefined,
+      ),
+    );
+
+    await renderChats("/chats/c-1");
+    await openConversationSettings();
+
+    const item = await screen.findByRole("menuitemcheckbox", { name: SWITCH });
+    expect(item.getAttribute("aria-checked")).toBe("false");
+    // Read again once the row has certainly landed: a list still loading also draws an off.
+    await screen.findByText(/cannot compact itself/i);
+    expect(item.getAttribute("aria-checked")).toBe("false");
+  });
+
   it("a 404 says the conversation is gone and not that the service is down", async () => {
     daemon.apiFetch.mockImplementation(
       withSwitch(chatSummary({ chat_id: "c-1" }), () => {

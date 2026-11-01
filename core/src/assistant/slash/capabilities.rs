@@ -275,6 +275,39 @@ mod tests {
         assert_eq!(ChatEngine::from_stored_in(TABLE, "zed"), None);
     }
 
+    /// `maybe_auto_compact` needs a fill reading, so only an engine that reports one can compact
+    /// itself. An allow-list: a row nobody classified fails closed, like the other engine sites.
+    #[test]
+    fn only_engines_with_a_fill_reading_can_compact_themselves() {
+        use crate::engines::{EngineDescription, TABLE, Transport};
+
+        for engine in [
+            ChatEngine::Claude,
+            ChatEngine::Codex,
+            ChatEngine::Local,
+            ChatEngine::OpenRouter,
+            ChatEngine::GeminiApi,
+        ] {
+            assert!(engine.measures_fill(), "{engine:?} measures its fill");
+        }
+        assert!(!ChatEngine::Agy.measures_fill());
+
+        let mut rows: Vec<EngineDescription> = TABLE.to_vec();
+        rows.push(EngineDescription {
+            id: "zed",
+            display_name: "Zed",
+            seat_kind: crate::config::SeatKind::Cloud,
+            transport: Transport::Cli,
+            installed: zed_installed,
+            gate: zed_installed,
+            utility_default: zed_utility,
+            runner: zed_runner,
+        });
+        let zed = ChatEngine::of_cli_in(rows.as_slice(), "zed");
+        assert_eq!(zed.as_str(), "zed", "the fake row is itself, not Claude");
+        assert!(!zed.measures_fill());
+    }
+
     /// RED (plan Node 3, test 7; contract E22). The Gemini API route is a chat engine of its own
     /// (`ChatEngine::GeminiApi`, the provider read from the `gemini-api/` id prefix on the hosted
     /// brain) and every control that needs a CLI, agents, teams, council or quota is refused by
