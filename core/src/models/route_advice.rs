@@ -121,8 +121,7 @@ impl RunnerKind {
         RunnerKind(crate::engines::EngineId::from_row(crate::engines::CLAUDE));
     pub const Codex: RunnerKind =
         RunnerKind(crate::engines::EngineId::from_row(crate::engines::CODEX));
-    pub const Agy: RunnerKind =
-        RunnerKind(crate::engines::EngineId::from_row(crate::engines::AGY));
+    pub const Agy: RunnerKind = RunnerKind(crate::engines::EngineId::from_row(crate::engines::AGY));
 
     pub fn as_str(self) -> &'static str {
         self.0.as_str()

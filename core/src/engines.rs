@@ -360,7 +360,10 @@ impl EngineId {
     /// The id of the `TABLE` row named `name`, or `None` for an unknown name.
     #[cfg_attr(not(test), allow(dead_code))] // the golden tests are its only caller
     pub(crate) fn named(name: &str) -> Option<EngineId> {
-        TABLE.iter().find(|row| row.id == name).map(|row| EngineId(row.id))
+        TABLE
+            .iter()
+            .find(|row| row.id == name)
+            .map(|row| EngineId(row.id))
     }
 
     /// An id outside `TABLE`, to exercise the fail-closed arms with a row nothing wires up.

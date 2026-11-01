@@ -54,8 +54,10 @@ impl ChatEngine {
 
     /// `from_stored` over an explicit table.
     pub fn from_stored_in(table: &[crate::engines::EngineDescription], id: &str) -> Option<Self> {
-        let enabled: Vec<crate::engines::EngineDescription> =
-            crate::engines::enabled_in(table).into_iter().cloned().collect();
+        let enabled: Vec<crate::engines::EngineDescription> = crate::engines::enabled_in(table)
+            .into_iter()
+            .cloned()
+            .collect();
         let id = crate::engines::chat_ids_in(&enabled)
             .into_iter()
             .find(|row| *row == id)?;
@@ -264,7 +266,10 @@ mod tests {
         let stored = ChatEngine::from_stored_in(rows, "zed").expect("zed is listed");
         assert_eq!(stored.as_str(), "zed");
         assert_eq!(stored, zed);
-        assert_eq!(ChatEngine::from_stored_in(rows, "claude"), Some(ChatEngine::Claude));
+        assert_eq!(
+            ChatEngine::from_stored_in(rows, "claude"),
+            Some(ChatEngine::Claude)
+        );
         assert_eq!(ChatEngine::from_stored_in(rows, "gemini"), None);
         assert_eq!(ChatEngine::from_stored_in(TABLE, "zed"), None);
     }
