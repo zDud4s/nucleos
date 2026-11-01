@@ -169,7 +169,8 @@ the contract, not a snapshot.
 | `http/proposals.rs` | Proposals and the waiting queue (`/proposals/*`, `/waiting/*`). |
 | `http/relay.rs` | Notifications, PII, voice, web and browser seats (`/notifications/*`, `/pii`, `/voice/*`, `/web/*`, `/browser/*`). |
 | `http/restart.rs` | `POST /system/restart`: starts the drain and, when running work has settled (or `force`), stops the daemon for a relaunch; a timed-out wait keeps it up. |
-| `http/remote.rs` | Remote access (`/remote/pair`, `/remote/session`, `/remote/logout`, `/remote/pairing-codes`, `/remote/devices*`): thin over `remote.rs`; who reaches which route is decided in `auth::require_token`. |
+| `http/remote.rs` | Remote access (`/remote/pair`, `/remote/session`, `/remote/logout`, `/remote/pairing-codes`, `/remote/devices*`, and the gateway-only passkey calls `/remote/passkeys*` and `/remote/step-up`): thin over `remote.rs` and `remote/passkeys.rs`; who reaches which route is decided in `auth::require_token`. |
+| `remote/passkeys.rs` | The passkeys of an owner's remote device (table `remote_passkeys`, migration 0265): `standing` (owner, step-up, credentials), `add_passkey` (owner AND (no passkey yet OR stepped up), decided inside the INSERT), `replace_passkey` (a device's own row only, the new sign count) and `open_step_up` (live owner device with a passkey). Stores the gateway's opaque credential JSON, never logs it; the WebAuthn ceremony itself is the gateway's (`sidecars/remote/serve/passkey.go`). |
 | `remote/setup.rs` | Turning remote access on and off from the app: the closed list of Tailscale calls (never Funnel), the readers of `tailscale status` and `serve status`, finding the gateway page, and writing `remote.yaml`. |
 | `http/repo.rs` | Reading a project's tree (`/projects/{id}/ls`, `/cat`, `/grep`, `/log`, `/diff`…). |
 | `http/run_queue.rs` | Runs, the vcs queue, worktrees and the feed (`/runs/*`, `/vcs/*`, `/worktrees`, `/feed`). |

@@ -632,8 +632,16 @@ fn route_is_listed_as(
 pub const DEVICE_SESSION_HEADER: &str = "x-nucleos-device-session";
 
 /// What the gateway's key reaches on its own, with no device session: the pairing exchange, which
-/// is the one call made before a browser has a session.
-const REMOTE_GATEWAY_ROUTES: &[(Method, &str)] = &[(Method::POST, "/remote/pair")];
+/// is the one call made before a browser has a session, and the three calls of the passkey
+/// ceremony, which the gateway runs for an owner device (it names the device itself, from the
+/// answer to `/remote/session`). A device session never reaches these: `remote` is not in any
+/// segment list a device may use.
+const REMOTE_GATEWAY_ROUTES: &[(Method, &str)] = &[
+    (Method::POST, "/remote/pair"),
+    (Method::GET, "/remote/passkeys/{device}"),
+    (Method::POST, "/remote/passkeys"),
+    (Method::POST, "/remote/step-up"),
+];
 
 /// Open to every paired device whatever its level: reading itself and logging out.
 const REMOTE_SELF_ROUTES: &[(Method, &str)] = &[
@@ -863,6 +871,15 @@ pub fn remote_device_permits(
     route: &str,
 ) -> bool {
     let owner = owner && level == ApiTokenLevel::Admin;
+    // The gateway's own routes are the gateway's alone, whatever the device. The owner branch
+    // below would otherwise open them (`remote` is an owner segment), and a stolen owner session
+    // could then grant itself a step-up or enrol its own passkey.
+    if REMOTE_GATEWAY_ROUTES
+        .iter()
+        .any(|(gateway, pattern)| gateway == method && *pattern == route)
+    {
+        return false;
+    }
     if REMOTE_SELF_ROUTES
         .iter()
         .any(|(allowed, pattern)| allowed == method && *pattern == route)
@@ -2082,6 +2099,22 @@ mod tests {
             assert!(owner_permits(&method, route), "owner {method} {route}");
         }
         assert!(owner_permits(&Method::GET, "/status"));
+    }
+
+    #[test]
+    fn no_device_reaches_a_gateway_only_route() {
+        for (method, route) in REMOTE_GATEWAY_ROUTES {
+            assert!(!owner_permits(method, route), "owner {method} {route}");
+            for level in ALL_LEVELS {
+                assert!(
+                    !remote_device_permits(level, method, route),
+                    "{level:?} {method} {route}"
+                );
+            }
+        }
+        // Next to them the owner still manages devices and codes.
+        assert!(owner_permits(&Method::GET, "/remote/devices"));
+        assert!(owner_permits(&Method::POST, "/remote/pairing-codes"));
     }
 
     #[test]

@@ -181,7 +181,7 @@ async function refusalFrom(res: Response): Promise<ApiRefusal> {
 async function request(path: string, init: RequestInit | undefined): Promise<Response> {
   const transport = getTransport();
   try {
-    return await requestOnce(transport, path, init);
+    return await withStepUp(transport, path, init);
   } catch (error) {
     if (!(error instanceof ApiRefusal) || error.status !== 401) throw error;
     const decision = await transport.onUnauthorized();
@@ -190,6 +190,34 @@ async function request(path: string, init: RequestInit | undefined): Promise<Res
       throw new ApiRefusal(401, transport.unauthorizedCode, error.detail, error.body);
     }
     throw error;
+  }
+}
+
+/**
+ * A grave action refused with `step_up_required` under a transport that can ask for a passkey: ask,
+ * and send the request exactly once more if the passkey verified. The second answer, whatever it is,
+ * is final, so a gateway that keeps refusing never becomes a loop. A request is only ever repeated
+ * after a verification, so a mutation is not sent twice without the person having confirmed it.
+ */
+async function withStepUp(
+  transport: ReturnType<typeof getTransport>,
+  path: string,
+  init: RequestInit | undefined,
+): Promise<Response> {
+  try {
+    return await requestOnce(transport, path, init);
+  } catch (error) {
+    if (
+      !(error instanceof ApiRefusal) ||
+      error.status !== 403 ||
+      error.code !== "step_up_required" ||
+      transport.onStepUp === undefined
+    ) {
+      throw error;
+    }
+    const outcome = await transport.onStepUp();
+    if (outcome.kind === "failed") throw new ApiRefusal(403, outcome.code, outcome.detail, error.body);
+    return await requestOnce(transport, path, init);
   }
 }
 

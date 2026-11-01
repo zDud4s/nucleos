@@ -46,6 +46,20 @@ pub(super) const ROUTES: &[RouteEntry] = &[
         handler: "post_pairing_code",
     },
     RouteEntry {
+        method: "POST",
+        path: "/remote/passkeys",
+        purpose: "Post passkey.",
+        body: Body::Shapeless("PasskeyBody"),
+        handler: "post_passkey",
+    },
+    RouteEntry {
+        method: "GET",
+        path: "/remote/passkeys/{device}",
+        purpose: "The gateway's key without a device session, only: the passkey ceremony's three calls (`auth::REMOTE_GATEWAY_ROUTES`).",
+        body: Body::None,
+        handler: "get_passkeys",
+    },
+    RouteEntry {
         method: "GET",
         path: "/remote/session",
         purpose: "A paired device, any level.",
@@ -72,6 +86,13 @@ pub(super) const ROUTES: &[RouteEntry] = &[
         purpose: "The setup wizard.",
         body: Body::Shapeless("SetupBody"),
         handler: "post_setup",
+    },
+    RouteEntry {
+        method: "POST",
+        path: "/remote/step-up",
+        purpose: "Post step up.",
+        body: Body::Shapeless("StepUpBody"),
+        handler: "post_step_up",
     },
     RouteEntry {
         method: "GET",

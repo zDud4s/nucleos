@@ -8,6 +8,8 @@ use crate::auth::RemoteDevice;
 
 /// The pairing body is a code and a name: a few dozen bytes. Anything bigger is not one.
 const PAIR_BODY_LIMIT: usize = 4 * 1024;
+/// A stored passkey record: a public key and a counter, well under this.
+const PASSKEY_BODY_LIMIT: usize = 24 * 1024;
 
 pub(super) fn routes() -> Router<AppState> {
     Router::new()
@@ -15,6 +17,19 @@ pub(super) fn routes() -> Router<AppState> {
         .route(
             "/remote/pair",
             post(post_pair).layer(DefaultBodyLimit::max(PAIR_BODY_LIMIT)),
+        )
+        // The gateway's key without a device session, only: the passkey ceremony's three calls
+        // (`auth::REMOTE_GATEWAY_ROUTES`). The device is named in the request, and the daemon applies
+        // its own rules to it (owner, step-up, a passkey to stand on); a device session reaching
+        // these is refused by the deny list.
+        .route("/remote/passkeys/{device}", get(get_passkeys))
+        .route(
+            "/remote/passkeys",
+            post(post_passkey).layer(DefaultBodyLimit::max(PASSKEY_BODY_LIMIT)),
+        )
+        .route(
+            "/remote/step-up",
+            post(post_step_up).layer(DefaultBodyLimit::max(PAIR_BODY_LIMIT)),
         )
         // A paired device, any level. The handlers still refuse a request with no device behind it.
         .route("/remote/session", get(get_session))
@@ -122,6 +137,104 @@ async fn post_logout(
     match crate::remote::revoke_device(&state.pool, device.id, chrono::Utc::now()).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => storage_failure(error).into_response(),
+    }
+}
+
+/// The refusal word and status of a passkey call. The words are the contract with the gateway.
+fn passkey_refusal(error: crate::remote::passkeys::PasskeyError) -> axum::response::Response {
+    use crate::remote::passkeys::PasskeyError as E;
+    match error {
+        E::NoDevice => refusal(StatusCode::NOT_FOUND, "device_not_found").into_response(),
+        E::NotOwner => refusal(StatusCode::FORBIDDEN, "not_an_owner").into_response(),
+        E::PairingWindowClosed => {
+            refusal(StatusCode::FORBIDDEN, "pairing_window_closed").into_response()
+        }
+        E::StepUpRequired => refusal(StatusCode::FORBIDDEN, "step_up_required").into_response(),
+        E::NoPasskey => refusal(StatusCode::FORBIDDEN, "no_passkey").into_response(),
+        E::BadRecord => refusal(StatusCode::BAD_REQUEST, "bad_record").into_response(),
+        E::Storage(error) => storage_failure(error).into_response(),
+    }
+}
+
+/// `GET /remote/passkeys/{device}`: the device's stored credentials and standing, for the gateway to
+/// run a ceremony against. Only that device's rows, never another's.
+async fn get_passkeys(
+    State(state): State<AppState>,
+    axum::extract::Path(device): axum::extract::Path<i64>,
+) -> impl IntoResponse {
+    match crate::remote::passkeys::standing(&state.pool, device, chrono::Utc::now()).await {
+        Ok(Some(found)) => Json(serde_json::json!({
+            "credentials": found.passkeys,
+            "owner": found.owner,
+            "stepped_up": found.stepped_up,
+            "can_register": found.can_register(),
+        }))
+        .into_response(),
+        Ok(None) => passkey_refusal(crate::remote::passkeys::PasskeyError::NoDevice),
+        Err(error) => storage_failure(error).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct PasskeyBody {
+    device_id: i64,
+    credential_json: String,
+    /// Set after a verify: the stored credential (of this device) whose record is replaced.
+    #[serde(default)]
+    replaces: Option<i64>,
+}
+
+/// `POST /remote/passkeys`: stores a credential for a device, or with `replaces` updates one of its
+/// own. Storing is refused unless the device is an owner AND (has no passkey yet OR is stepped up
+/// now), so a stolen owner session cannot enrol its own passkey.
+async fn post_passkey(
+    State(state): State<AppState>,
+    Json(body): Json<PasskeyBody>,
+) -> impl IntoResponse {
+    let outcome = match body.replaces {
+        Some(row) => crate::remote::passkeys::replace_passkey(
+            &state.pool,
+            body.device_id,
+            row,
+            &body.credential_json,
+        )
+        .await
+        .map(|()| (StatusCode::OK, serde_json::json!({ "ok": true }))),
+        None => crate::remote::passkeys::add_passkey(
+            &state.pool,
+            body.device_id,
+            &body.credential_json,
+            chrono::Utc::now(),
+        )
+        .await
+        .map(|id| (StatusCode::CREATED, serde_json::json!({ "id": id }))),
+    };
+    match outcome {
+        Ok((status, value)) => (status, Json(value)).into_response(),
+        Err(error) => passkey_refusal(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct StepUpBody {
+    device_id: i64,
+}
+
+/// `POST /remote/step-up`: the gateway reports a passed ceremony; opens the device's step-up window.
+/// Refused for a revoked or non-owner device and for one with no passkey.
+async fn post_step_up(
+    State(state): State<AppState>,
+    Json(body): Json<StepUpBody>,
+) -> impl IntoResponse {
+    match crate::remote::passkeys::open_step_up(&state.pool, body.device_id, chrono::Utc::now())
+        .await
+    {
+        Ok(()) => Json(serde_json::json!({
+            "stepped_up": true,
+            "window_seconds": crate::remote::STEP_UP_WINDOW.num_seconds(),
+        }))
+        .into_response(),
+        Err(error) => passkey_refusal(error),
     }
 }
 
@@ -1109,5 +1222,256 @@ mod tests {
         let (status, text) = send(&app, "GET", "/remote/devices", CONTROL, None, None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json(&text), serde_json::json!([]));
+    }
+
+    /// Pairs a device of the given level and owner flag; returns its session secret and id.
+    async fn pair_as(state: &AppState, level: ApiTokenLevel, owner: bool) -> (String, i64) {
+        let created = crate::remote::create_pairing_code_for(
+            &state.pool,
+            level,
+            owner,
+            "laptop",
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        match crate::remote::exchange(&state.pool, &created.code, chrono::Utc::now()).await {
+            Ok(paired) => (paired.session, paired.device_id),
+            Err(_) => panic!("a fresh code must exchange"),
+        }
+    }
+
+    fn cred(n: u32) -> serde_json::Value {
+        serde_json::json!({ "credential_json": format!("{{\"id\":\"c{n}\",\"signCount\":0}}") })
+    }
+
+    fn with_device(mut body: serde_json::Value, id: i64) -> serde_json::Value {
+        body["device_id"] = serde_json::json!(id);
+        body
+    }
+
+    #[tokio::test]
+    async fn only_the_gateway_can_grant_step_up() {
+        let state = test_state().await;
+        let key = mint_service_token(&state.pool, Service::Remote)
+            .await
+            .unwrap();
+        let (owner_session, owner_id) = pair_as(&state, ApiTokenLevel::Admin, true).await;
+        let (admin_session, _) = pair_as(&state, ApiTokenLevel::Admin, false).await;
+        let (low_session, _) = pair_as(&state, ApiTokenLevel::ReadOnly, false).await;
+        let app = router(state);
+        // Something to step up with.
+        let (status, text) = send(
+            &app,
+            "POST",
+            "/remote/passkeys",
+            &key,
+            None,
+            Some(with_device(cred(1), owner_id)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{text}");
+
+        // A device session, owner or not, never reaches the three routes: not even for itself.
+        let passkeys_uri = format!("/remote/passkeys/{owner_id}");
+        for session in [&owner_session, &admin_session, &low_session] {
+            for (method, uri, body) in [
+                (
+                    "POST",
+                    "/remote/step-up",
+                    Some(serde_json::json!({ "device_id": owner_id })),
+                ),
+                (
+                    "POST",
+                    "/remote/passkeys",
+                    Some(with_device(cred(2), owner_id)),
+                ),
+                ("GET", passkeys_uri.as_str(), None),
+            ] {
+                let (status, text) = send(&app, method, uri, &key, Some(session), body).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}: {text}");
+            }
+        }
+        // The gateway's key on its own does reach them.
+        let (status, text) = send(
+            &app,
+            "POST",
+            "/remote/step-up",
+            &key,
+            None,
+            Some(serde_json::json!({ "device_id": owner_id })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        assert_eq!(json(&text)["window_seconds"], 300);
+    }
+
+    #[tokio::test]
+    async fn an_owner_with_no_passkey_stays_refused() {
+        let state = test_state().await;
+        let key = mint_service_token(&state.pool, Service::Remote)
+            .await
+            .unwrap();
+        let (session, id) = pair_as(&state, ApiTokenLevel::Admin, true).await;
+        let pool = state.pool.clone();
+        let app = router(state);
+
+        let (status, text) = send(
+            &app,
+            "POST",
+            "/remote/step-up",
+            &key,
+            None,
+            Some(serde_json::json!({ "device_id": id })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{text}");
+        assert_eq!(json(&text)["refusal"], "no_passkey");
+        let device = crate::remote::authenticate(&pool, &session, chrono::Utc::now())
+            .await
+            .unwrap();
+        assert!(!device.stepped_up);
+    }
+
+    #[tokio::test]
+    async fn step_up_is_refused_for_a_non_owner_a_revoked_and_an_unknown_device() {
+        let state = test_state().await;
+        let key = mint_service_token(&state.pool, Service::Remote)
+            .await
+            .unwrap();
+        let (_, plain) = pair_as(&state, ApiTokenLevel::Admin, false).await;
+        let (_, gone) = pair_as(&state, ApiTokenLevel::Admin, true).await;
+        let pool = state.pool.clone();
+        let app = router(state);
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/remote/passkeys",
+            &key,
+            None,
+            Some(with_device(cred(1), gone)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        crate::remote::revoke_device(&pool, gone, chrono::Utc::now())
+            .await
+            .unwrap();
+
+        for (id, expected, word) in [
+            (plain, StatusCode::FORBIDDEN, "not_an_owner"),
+            (gone, StatusCode::NOT_FOUND, "device_not_found"),
+            (987_654, StatusCode::NOT_FOUND, "device_not_found"),
+        ] {
+            let (status, text) = send(
+                &app,
+                "POST",
+                "/remote/step-up",
+                &key,
+                None,
+                Some(serde_json::json!({ "device_id": id })),
+            )
+            .await;
+            assert_eq!(status, expected, "{id}: {text}");
+            assert_eq!(json(&text)["refusal"], word);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_second_passkey_needs_a_live_step_up_and_a_non_owner_never_registers() {
+        let state = test_state().await;
+        let key = mint_service_token(&state.pool, Service::Remote)
+            .await
+            .unwrap();
+        let (_, owner) = pair_as(&state, ApiTokenLevel::Admin, true).await;
+        let (_, plain) = pair_as(&state, ApiTokenLevel::Admin, false).await;
+        let pool = state.pool.clone();
+        let app = router(state);
+        let post = |id: i64, n: u32| {
+            let app = app.clone();
+            let key = key.clone();
+            async move {
+                send(
+                    &app,
+                    "POST",
+                    "/remote/passkeys",
+                    &key,
+                    None,
+                    Some(with_device(cred(n), id)),
+                )
+                .await
+            }
+        };
+
+        let (status, text) = post(plain, 1).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{text}");
+        assert_eq!(json(&text)["refusal"], "not_an_owner");
+
+        assert_eq!(post(owner, 1).await.0, StatusCode::CREATED);
+        // Has a passkey and is not stepped up: a stolen owner session cannot add its own.
+        let (status, text) = post(owner, 2).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{text}");
+        assert_eq!(json(&text)["refusal"], "step_up_required");
+        let (status, text) = send(
+            &app,
+            "GET",
+            &format!("/remote/passkeys/{owner}"),
+            &key,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let seen = json(&text);
+        assert_eq!(seen["credentials"].as_array().unwrap().len(), 1);
+        assert_eq!(seen["can_register"], false);
+
+        crate::remote::grant_step_up(&pool, owner, chrono::Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(post(owner, 2).await.0, StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn a_credential_is_replaced_only_on_its_own_device() {
+        let state = test_state().await;
+        let key = mint_service_token(&state.pool, Service::Remote)
+            .await
+            .unwrap();
+        let (_, one) = pair_as(&state, ApiTokenLevel::Admin, true).await;
+        let (_, two) = pair_as(&state, ApiTokenLevel::Admin, true).await;
+        let app = router(state);
+        let mut rows = Vec::new();
+        for id in [one, two] {
+            let (status, text) = send(
+                &app,
+                "POST",
+                "/remote/passkeys",
+                &key,
+                None,
+                Some(with_device(cred(1), id)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{text}");
+            rows.push(json(&text)["id"].as_i64().unwrap());
+        }
+        let mut update = with_device(cred(9), one);
+        update["replaces"] = serde_json::json!(rows[1]);
+        let (status, _) = send(&app, "POST", "/remote/passkeys", &key, None, Some(update)).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "device one cannot rewrite device two's row"
+        );
+        let mut update = with_device(cred(9), one);
+        update["replaces"] = serde_json::json!(rows[0]);
+        let (status, _) = send(&app, "POST", "/remote/passkeys", &key, None, Some(update)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // A record that is not a JSON object is refused.
+        let mut bad = with_device(cred(1), one);
+        bad["credential_json"] = serde_json::json!("not json");
+        bad["replaces"] = serde_json::json!(rows[0]);
+        let (status, _) = send(&app, "POST", "/remote/passkeys", &key, None, Some(bad)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 }

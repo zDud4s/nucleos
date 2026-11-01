@@ -214,7 +214,7 @@ Open items for this pillar: gaps 11 and 12.
 
 ## Remote access
 
-Remote access (`~/.nucleos/remote.yaml`, off until `enabled: true`) lets the owner use the shell from another device's browser over their Tailscale tailnet. Operating steps are in `docs/remote-access.md`; this section is the fence. The daemon and all processing stay on the host; the other device renders an interface.
+Remote access (`~/.nucleos/remote.yaml`, off until `enabled: true`) lets the owner use the shell from another device's browser over their Tailscale tailnet. Operating steps are in `REMOTE_ACCESS.md`; this section is the fence. The daemon and all processing stay on the host; the other device renders an interface.
 
 **Assets.** What a stolen or abused session can reach: the agents (runs, chats, councils), the project files and knowledge the owner's shell reaches, and the mail and calendar tools. What it must never reach: the control token, API tokens, machine config and secrets, backups, the daemon's shutdown and update handshake, sidecar control, and remote management itself.
 
@@ -234,7 +234,13 @@ Remote access (`~/.nucleos/remote.yaml`, off until `enabled: true`) lets the own
 
 **A question outlives the connection that asked it, and the hook ends it, not the CLI.** A tool question from a Claude CLI session stands as long as that CLI lives (`ASK_WINDOW` in `core/src/hooks/asks.rs`, thirty days less an hour), so it can be answered hours later from another device. Measured on the real CLI: a hook the CLI cuts by timeout does NOT block the tool, it falls through to the normal permission flow. That is why the hook's own wait (`ASK_WAIT_TIMEOUT_SECONDS`) ends before the settings entry's timeout (`HOOK_TIMEOUT_SECONDS`): the hook, not the cut, gives the answer, and every failure on that path is a refusal. **Residual:** a question that stands that long can be answered by anyone holding valid admin access (a stolen device, say) for as long as it stands, until that access is revoked in Settings.
 
-**Deferred.** Passkeys (a device-bound credential in place of a typed code) are not built; until they are, the typed code and the session cookie are the whole proof.
+**Passkeys confirm grave actions (task 4.4; changes the 2026-10-29 decision above).** The 2026-10-29 decision made an admin device the owner working from another machine, with the typed code and the session cookie as the whole proof. An **owner** device now has one more proof for grave actions: a WebAuthn passkey with user verification required. A grave request from a device session without a live step-up is refused `403 {"refusal":"step_up_required"}`; the remote shell then runs a passkey ceremony at the gateway and repeats the request once. The ceremony runs in `sidecars/remote` (`go-webauthn`): the challenge is single use, lasts 5 minutes and is bound to the device and the cookie that began it; the relying party is the hostname of `public_origin` and only that origin is accepted; a clone warning fails the verify; a device verifies only with its own credentials. The daemon stores the credentials and applies the owner, first-passkey and step-up rules again itself. The routes that grant it (`/remote/passkeys`, `/remote/step-up`) are in `REMOTE_GATEWAY_ROUTES` and refused to every device session, owner included, so a device cannot grant itself a step-up; only the gateway key reaches them. A device with no passkey and no way to enrol stays refused and is told to act on the main machine.
+
+**Residual risks of the passkey step.**
+1. **Enrolment window.** The first passkey needs no step-up, because there is nothing yet to step up with. An owner session stolen within 15 minutes of pairing, before the real owner enrols, can enrol its own passkey and then confirm grave actions. After the window the first passkey is refused (`pairing_window_closed`), and a later one needs a live step-up.
+2. **Skipping enrolment is final for that device.** A device that skipped, or missed the 15 minutes, keeps a working session with grave actions refused. It must be paired again with a new owner code made on the main machine.
+3. **The step-up window is 5 minutes after a verify.** Whatever holds the session in that time, a stolen cookie included, can make grave requests without another passkey.
+4. **The ceremony limiter is global.** The gateway's 30 per minute limit on passkey routes is shared by every client, so a tailnet client can use it up and delay a ceremony. Denial of service only: it cannot create or skip a ceremony.
 
 ## Known gaps
 

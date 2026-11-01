@@ -36,7 +36,15 @@ export interface Transport {
    * is sent bare, exactly as the desktop always did.
    */
   probeHeaders?: Record<string, string>;
+  /**
+   * Called after a 403 `step_up_required`. `verified` asks the client to send the
+   * request once more; `failed` ends it with that refusal. Absent on the desktop
+   * transport, which is never asked for a passkey.
+   */
+  onStepUp?(): Promise<StepUpOutcome>;
 }
+
+export type StepUpOutcome = { kind: "verified" } | { kind: "failed"; code: string; detail: string };
 
 /**
  * The credential, fetched once for the life of the window.

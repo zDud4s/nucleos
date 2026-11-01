@@ -64,6 +64,31 @@ changes nothing.
 Revoke a device in the same panel; its session stops at once for new requests and open streams are cut
 within `stream_max_seconds`. A device can also log itself out.
 
+## The owner level and passkeys
+
+The **Owner** level is an admin device that also reaches what only the host reached before. It is
+created on the main machine only: in **Settings, System, Remote devices** pick **Owner**, name the
+device and press **Create code**. No device, whatever its level, can create an owner code, so this
+step needs you at the main machine.
+
+Grave actions from a browser (the ones the daemon marks as needing a fresh confirmation) ask for a
+**passkey**. They work like this:
+
+1. After an owner code is entered, the page goes on to **Register a passkey**. Use Windows Hello, a
+   security key, or choose your phone if the device has no authenticator.
+2. The passkey must be registered **within 15 minutes of pairing**. **Skip for now** is allowed: the
+   session works, but grave actions stay refused. If the 15 minutes pass, create a new owner code on the
+   main machine and pair again.
+3. When a grave action is refused for lack of a confirmation, the browser opens a dialog; you click
+   **Confirm with passkey** (or **Register a passkey** first, when this browser has none and may still
+   register one) and the browser repeats the action once. The confirmation lasts 5 minutes. If you
+   cancel, nothing is done.
+4. A device with no passkey that cannot register one is not asked at all: do that action on the main
+   machine.
+
+The gateway can add a second passkey (it needs a fresh confirmation with an existing one), but there is
+no screen for it yet.
+
 ## Setup is host-only
 
 `GET/POST/DELETE /remote/setup` answer only to the host's own control token, checked in the handler

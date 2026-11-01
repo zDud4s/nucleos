@@ -5,11 +5,14 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/go-webauthn/webauthn/webauthn"
 
 	"nucleosremote/config"
 )
@@ -180,7 +183,9 @@ type deviceInfo struct {
 	DeviceID    json.RawMessage `json:"device_id"`
 	Name        json.RawMessage `json:"name"`
 	AccessLevel json.RawMessage `json:"access_level"`
-	ExpiresAt   json.RawMessage `json:"expires_at"`
+	// Owner is present only when the daemon sent it, so the shell knows whether to offer a passkey.
+	Owner     json.RawMessage `json:"owner,omitempty"`
+	ExpiresAt json.RawMessage `json:"expires_at"`
 }
 
 // authHandler serves /auth/*.
@@ -189,11 +194,23 @@ type authHandler struct {
 	d           *daemonClient
 	lim         *limiter
 	bodyTimeout time.Duration
+	// The passkey ceremonies (passkey.go). wa is nil when the public origin cannot be a relying
+	// party; the passkey routes then answer 503.
+	wa   *webauthn.WebAuthn
+	cer  *ceremonyStore
+	plim *limiter
 }
 
 // NewAuth builds the /auth/* handler.
 func NewAuth(cfg config.Config) http.Handler {
-	return &authHandler{cfg: cfg, d: newDaemonClient(cfg), lim: newLimiter(pairLimit, pairWindow), bodyTimeout: BodyReadTimeout}
+	wa, err := newRelyingParty(cfg)
+	if err != nil {
+		log.Printf("serve: passkeys disabled: %v", err)
+	}
+	return &authHandler{
+		cfg: cfg, d: newDaemonClient(cfg), lim: newLimiter(pairLimit, pairWindow), bodyTimeout: BodyReadTimeout,
+		wa: wa, cer: newCeremonyStore(), plim: newLimiter(passkeyLimit, pairWindow),
+	}
 }
 
 func (a *authHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -206,7 +223,9 @@ func (a *authHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "/auth/logout":
 		a.logout(w, r)
 	default:
-		writeJSONError(w, http.StatusNotFound, "not_found")
+		if !a.passkeyRoute(w, r) {
+			writeJSONError(w, http.StatusNotFound, "not_found")
+		}
 	}
 }
 

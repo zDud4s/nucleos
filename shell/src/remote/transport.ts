@@ -1,4 +1,5 @@
 import { emitSessionLost, type Transport } from "../data/transport";
+import { stepUp } from "./StepUp";
 
 /**
  * The browser's way in: same-origin `/api` on the gateway, authenticated by the
@@ -18,6 +19,9 @@ export const remoteTransport: Transport = {
     emitSessionLost();
     return "fail";
   },
+  // A grave action refused with `step_up_required`: confirm with the passkey, then the client repeats
+  // the request once. Only this transport has the hook; the desktop shell is never asked.
+  onStepUp: stepUp,
   label: "the remote gateway",
   unauthorizedCode: "session_invalid",
   probeHeaders: { "X-Nucleos-Csrf": "1" },

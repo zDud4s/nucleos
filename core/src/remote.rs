@@ -20,6 +20,7 @@ use sqlx::SqlitePool;
 
 use crate::auth::ApiTokenLevel;
 
+pub mod passkeys;
 pub mod setup;
 
 /// How long a pairing code can be exchanged.
@@ -342,13 +343,7 @@ pub async fn authenticate(
             .execute(pool)
             .await?;
     }
-    // Fail closed: a missing, malformed or implausibly distant value is "not stepped up". Only
-    // `grant_step_up` writes the column, always `now + STEP_UP_WINDOW`, so a value further ahead
-    // than the window was not written by it.
-    let stepped_up = stepup_text
-        .as_deref()
-        .and_then(parse_stamp)
-        .is_some_and(|until| until > now && until <= now + STEP_UP_WINDOW);
+    let stepped_up = step_up_is_live(stepup_text.as_deref(), now);
     Ok(Device {
         id,
         name,
@@ -357,6 +352,15 @@ pub async fn authenticate(
         owner: owner_flag != 0 && level == ApiTokenLevel::Admin,
         stepped_up,
     })
+}
+
+/// Whether a stored `stepup_until` is a live step-up at `now`. Fails closed: a missing, malformed or
+/// implausibly distant value is "not stepped up". Only `grant_step_up` writes the column, always
+/// `now + STEP_UP_WINDOW`, so a value further ahead than the window was not written by it.
+fn step_up_is_live(stepup_until: Option<&str>, now: DateTime<Utc>) -> bool {
+    stepup_until
+        .and_then(parse_stamp)
+        .is_some_and(|until| until > now && until <= now + STEP_UP_WINDOW)
 }
 
 /// Opens the step-up window of one device's session: `stepup_until = now + STEP_UP_WINDOW`. False
@@ -886,5 +890,141 @@ mod tests {
         revoke_device(&pool, paired.device_id, t0()).await.unwrap();
         assert!(!grant_step_up(&pool, paired.device_id, t0()).await.unwrap());
         assert!(!grant_step_up(&pool, 9999, t0()).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_passkey_is_added_by_an_owner_with_none_or_inside_a_step_up_and_cascades_away() {
+        use passkeys::{PasskeyError, add_passkey, open_step_up, standing};
+        let pool = pool().await;
+        let owner = paired_with(&pool, ApiTokenLevel::Admin, true).await;
+        let plain = paired_with(&pool, ApiTokenLevel::Admin, false).await;
+        let record = r#"{"id":"a"}"#;
+
+        assert!(matches!(
+            add_passkey(&pool, plain.device_id, record, t0()).await,
+            Err(PasskeyError::NotOwner)
+        ));
+        assert!(matches!(
+            add_passkey(&pool, 9999, record, t0()).await,
+            Err(PasskeyError::NoDevice)
+        ));
+        assert!(matches!(
+            open_step_up(&pool, owner.device_id, t0()).await,
+            Err(PasskeyError::NoPasskey)
+        ));
+        add_passkey(&pool, owner.device_id, record, t0())
+            .await
+            .unwrap();
+        assert!(matches!(
+            add_passkey(&pool, owner.device_id, record, t0()).await,
+            Err(PasskeyError::StepUpRequired)
+        ));
+
+        open_step_up(&pool, owner.device_id, t0()).await.unwrap();
+        add_passkey(
+            &pool,
+            owner.device_id,
+            record,
+            t0() + Duration::seconds(299),
+        )
+        .await
+        .unwrap();
+        // The window lapsed: the owner needs a new confirmation for a third.
+        assert!(matches!(
+            add_passkey(&pool, owner.device_id, record, t0() + STEP_UP_WINDOW).await,
+            Err(PasskeyError::StepUpRequired)
+        ));
+
+        let seen = standing(&pool, owner.device_id, t0())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(seen.passkeys.len(), 2);
+        assert!(seen.owner && seen.stepped_up);
+
+        // Deleting the device row takes its passkeys with it.
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM remote_devices WHERE id = ?")
+            .bind(owner.device_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let left: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM remote_passkeys")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left.0, 0);
+    }
+
+    #[tokio::test]
+    async fn the_first_passkey_is_refused_after_the_window() {
+        use passkeys::{FIRST_PASSKEY_WINDOW, PasskeyError, add_passkey, standing};
+        let pool = pool().await;
+        let owner = paired_with(&pool, ApiTokenLevel::Admin, true).await;
+        let record = r#"{"id":"a"}"#;
+        let late = t0() + FIRST_PASSKEY_WINDOW;
+
+        // Paired at t0: exactly the window later is outside it.
+        let seen = standing(&pool, owner.device_id, late)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!seen.can_register());
+        assert!(matches!(
+            add_passkey(&pool, owner.device_id, record, late).await,
+            Err(PasskeyError::PairingWindowClosed)
+        ));
+
+        // A malformed or future created_at reads as outside the window, in the INSERT and in the answer.
+        for text in [
+            "garbage".to_owned(),
+            String::new(),
+            "2026-01-01T00:00:00Z".to_owned(),
+            stamp(t0() + Duration::days(1)),
+        ] {
+            sqlx::query("UPDATE remote_devices SET created_at = ?")
+                .bind(&text)
+                .execute(&pool)
+                .await
+                .unwrap();
+            assert!(
+                matches!(
+                    add_passkey(&pool, owner.device_id, record, t0()).await,
+                    Err(PasskeyError::PairingWindowClosed)
+                ),
+                "{text:?}"
+            );
+            let seen = standing(&pool, owner.device_id, t0())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!seen.can_register(), "{text:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_passkey_inside_the_window_is_accepted() {
+        use passkeys::{FIRST_PASSKEY_WINDOW, add_passkey, standing};
+        let pool = pool().await;
+        let owner = paired_with(&pool, ApiTokenLevel::Admin, true).await;
+        let record = r#"{"id":"a"}"#;
+
+        // Back-date the pairing to just inside the window.
+        sqlx::query("UPDATE remote_devices SET created_at = ?")
+            .bind(stamp(t0() - FIRST_PASSKEY_WINDOW + Duration::seconds(1)))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let seen = standing(&pool, owner.device_id, t0())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(seen.can_register());
+        add_passkey(&pool, owner.device_id, record, t0())
+            .await
+            .unwrap();
     }
 }
