@@ -242,6 +242,19 @@ describe("links, and the schemes that never become one", () => {
     }
   });
 
+  it("reads a link to a file as its words, because it cannot open anything", () => {
+    expect(spans("ver [sessions.rs:42](core/src/sessions.rs#L42) aqui")).toEqual([
+      { kind: "plain", text: "ver sessions.rs:42 aqui" },
+    ]);
+    expect(spans("[AGENTS.md](AGENTS.md)")).toEqual([{ kind: "plain", text: "AGENTS.md" }]);
+    expect(spans("[w](C:/Projects/nucleos/a_b.rs)")).toEqual([{ kind: "plain", text: "w" }]);
+    expect(spans("[`a_b.rs`](core/a_b.rs)")).toEqual([{ kind: "code", text: "a_b.rs" }]);
+  });
+
+  it("keeps an indexed call as the characters it is", () => {
+    expect(spans("handlers[i](arg)")).toEqual([{ kind: "plain", text: "handlers[i](arg)" }]);
+  });
+
   it("leaves a bracket that opens nothing as the character it is", () => {
     expect(spans("um [ sozinho")).toEqual([{ kind: "plain", text: "um [ sozinho" }]);
     expect(spans("[sem endereco]()")).toEqual([{ kind: "plain", text: "[sem endereco]()" }]);
@@ -266,6 +279,17 @@ describe("emphasis, and the names it must not eat", () => {
     expect(spans("de year_start ate year_end")).toEqual([
       { kind: "plain", text: "de year_start ate year_end" },
     ]);
+  });
+
+  it("never turns a path into emphasis", () => {
+    for (const path of [
+      "core/**/foo/**/bar.rs",
+      "core/*/foo_*.rs",
+      "pkg/_private_/mod.rs",
+      "2*3*4",
+    ]) {
+      expect(spans(path)).toEqual([{ kind: "plain", text: path }]);
+    }
   });
 
   it("does not read arithmetic as emphasis", () => {

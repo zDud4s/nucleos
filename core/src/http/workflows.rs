@@ -1277,12 +1277,7 @@ pub(super) async fn post_workflow_sync(
         )
         .collect();
     if !said.is_empty() {
-        workflow_feed(
-            &state,
-            &project_id,
-            &format!("synced into {}: {}", checkout.display(), said.join("; ")),
-        )
-        .await;
+        workflow_feed(&state, &project_id, &synced_line(&checkout, &said)).await;
     }
     Ok(Json(WorkflowSyncAnswer {
         project_id,
@@ -1309,12 +1304,33 @@ pub(super) async fn workflow_feed(state: &AppState, project_id: &str, said: &str
     }
 }
 
+/// The feed line of a sync. `checkout` is canonical and the line is for a person: the feed goes out
+/// to the primary channel as it is, so the `\\?\` of a Windows canonical path stops here.
+fn synced_line(checkout: &std::path::Path, said: &[String]) -> String {
+    format!(
+        "synced into {}: {}",
+        crate::execution::git_exec::without_verbatim_prefix(checkout).display(),
+        said.join("; ")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use crate::http::tests::{
         library_with, project_with_rules, test_state, with_project_home, workflow_call,
     };
     use axum::http::StatusCode;
+
+    #[test]
+    fn a_sync_line_names_the_checkout_without_the_verbatim_prefix() {
+        assert_eq!(
+            super::synced_line(
+                std::path::Path::new(r"\\?\C:\Projects\nucleos"),
+                &["harness: 1 written".to_string(), "b: 2 written".to_string()],
+            ),
+            r"synced into C:\Projects\nucleos: harness: 1 written; b: 2 written"
+        );
+    }
 
     const GRAPH_A: &str = "nodes:\n  - {id: gate, type: command, command: cargo test}\n";
     const GRAPH_B: &str =
