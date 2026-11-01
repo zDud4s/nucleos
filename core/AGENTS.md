@@ -358,6 +358,7 @@ the contract, not a snapshot.
 | `channels/outbox/ack.rs` | Outbox acknowledgement handling. |
 | `channels/outbox/degrade.rs` | Outbox degradation of unsupported content. |
 | `channels/outbox/lease.rs` | Outbox lease handling: claim, renew, expiry. |
+| `channels/owner_notice.rs` | Tells the owner through the primary channel that a question is parked (after 60 s) or a long turn ended; the text carries the tool's name and a link, never tool input. |
 | `channels/port_tests_commands.rs` | Test-only: v1 Telegram tests ported to the chat commands, access policy and strings (`port_<original_name>`). |
 | `channels/port_tests_flow.rs` | Test-only: v1 Telegram tests ported to ingest, replies, routing and media (`port_<original_name>`). |
 | `channels/registry.rs` | Channel manifests, per-channel configuration and presence: in-memory `Presence` (last hello/request, launch time, drop counters, secrets cache), `record_hello` (contract check, `channel_presence` upsert, leased outbox rows released), `capabilities`, and the `GET /channels` readout (`list`, `channel_state`, `RoutingState`). |

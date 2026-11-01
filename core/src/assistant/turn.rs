@@ -623,6 +623,9 @@ pub(super) struct TurnLaunch {
     /// is read and the doctrine fills its `system_prompt` only when that is empty — a person's own
     /// instructions must never be replaced, only completed.
     pub(super) doctrine: Option<String>,
+    /// The turn came in through a channel, whose conversation already carries the reply; a long
+    /// turn then does not tell the owner a second time. Carried for the same reason as `doctrine`.
+    pub(super) from_channel: bool,
 }
 
 pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
@@ -637,7 +640,9 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
         cwd,
         tool_policy,
         doctrine,
+        from_channel,
     } = launch;
+    let started = std::time::Instant::now();
     let pool = state.pool.clone();
     let daemon_runner = state.runner.clone();
     let utility_model = state.utility_model.clone();
@@ -1196,6 +1201,14 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
         // cannot set another aside before this one is written.
         record_set_aside(&after, &drained_chat).await;
         drop(turn);
+        // The final state is written; a turn that ran long tells an owner who may have walked away.
+        crate::channels::owner_notice::long_turn_ended(
+            &after,
+            &drained_chat,
+            started.elapsed(),
+            from_channel,
+        )
+        .await;
         // A linked child's answer travels to its parent now that this chat's slot is free. An
         // unlinked chat costs one read inside `deliver_reply`.
         if let Some(reply) = linked_reply {

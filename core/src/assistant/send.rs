@@ -1108,6 +1108,7 @@ pub(super) async fn send_message_inner(
             cwd,
             tool_policy,
             doctrine,
+            from_channel: matches!(origin, Origin::Channel(_)),
         },
     );
     Ok(id)
