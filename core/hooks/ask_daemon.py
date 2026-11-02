@@ -1229,10 +1229,18 @@ def _conductor_read_cost(tool, tool_input, target):
         if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
             cost = min(cost, limit * CONDUCTOR_READ_TOKENS_PER_LINE)
         return cost
-    if not os.path.isdir(target):
-        return None
     if tool == "Glob":
-        return CONDUCTOR_GLOB_TOKENS
+        return CONDUCTOR_GLOB_TOKENS if os.path.exists(target) else None
+    if os.path.isfile(target):
+        # A file path: never more than reading the whole file, and no more than the head_limit rule.
+        listed = _conductor_grep_cost(tool_input, over)
+        whole = -(-os.path.getsize(target) // CONDUCTOR_READ_BYTES_PER_TOKEN)
+        return None if listed is None else min(whole, listed)
+    return _conductor_grep_cost(tool_input, over) if os.path.isdir(target) else None
+
+
+def _conductor_grep_cost(tool_input, over):
+    """Estimated tokens of a Grep's output from its mode and head_limit, `over` when unbounded."""
     mode, head = tool_input.get("output_mode"), tool_input.get("head_limit")
     if head == 0 and not isinstance(head, bool):
         return over  # unlimited

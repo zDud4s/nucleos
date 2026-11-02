@@ -910,6 +910,24 @@ def test_glob_allowed_and_flat_charge():
             raise AssertionError(f"Glob should cost 100, spent {_spent(fx)}")
 
 
+def test_grep_and_glob_on_a_file_cost_like_a_read():
+    with fixture("on") as fx:
+        small = _sized(fx, "small.rs", 400)
+        big = _sized(fx, "big.rs", 40000)
+        allow(fx.verdict("Grep", {"pattern": "x", "path": small}), "Grep list mode on a small file")
+        if _spent(fx) != 100:
+            raise AssertionError(f"a 400 byte file costs 100 tokens, spent {_spent(fx)}")
+        allow(fx.verdict("Grep", {"pattern": "x", "path": small, "output_mode": "content"}), "content, small file")
+        allow(fx.verdict("Glob", {"pattern": "*", "path": small}), "Glob with a file path")
+        content = {"pattern": "x", "path": big, "output_mode": "content"}
+        deny(fx.verdict("Grep", content), "content on a big file without head_limit")
+        allow(fx.verdict("Grep", {**content, "head_limit": 20}), "content on a big file, head_limit 20")
+        deny(fx.verdict("Grep", {**content, "head_limit": 0}), "head_limit 0 on a big file")
+        deny(fx.verdict("Grep", {**content, "head_limit": 61}), "head_limit over 60 on a big file")
+        allow(fx.verdict("Grep", {"pattern": "x", "path": big}), "list mode on a big file stays a list")
+        deny(fx.verdict("Grep", {"pattern": "x", "path": fx.path("src", "missing.rs")}), "missing file")
+
+
 def test_budget_accumulates_and_the_crossing_call_is_denied():
     with fixture("on") as fx:
         mid = {"file_path": _sized(fx, "mid.rs", 11000)}  # 2750 tokens
@@ -1077,6 +1095,7 @@ TESTS = [
     test_off_mode_allows_everything,
     test_fail_open_on_internal_error,
     test_probe_writes_payload_keys,
+    test_grep_and_glob_on_a_file_cost_like_a_read,
     test_notifications_neither_set_nor_clear_manual,
     test_notifications_do_not_reset_the_read_budget,
 ]
