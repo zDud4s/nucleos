@@ -774,7 +774,10 @@ mod tests {
         assert!(tail_of(&timed).starts_with("timed out after 3s"));
 
         let spawn_failed = outcome(None, false, Some("spawn failed"));
-        assert_eq!(status_of(&spawn_failed, false).0, verify_runs::STATUS_ERRORED);
+        assert_eq!(
+            status_of(&spawn_failed, false).0,
+            verify_runs::STATUS_ERRORED
+        );
         assert!(tail_of(&spawn_failed).starts_with("spawn failed"));
 
         assert_eq!(

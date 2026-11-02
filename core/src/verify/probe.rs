@@ -869,11 +869,20 @@ mod tests {
 
     #[test]
     fn an_incident_needs_the_whole_gate_for_a_gate_command_or_no_handle() {
-        assert!(needs_whole_gate(&names(&["a.rs"]), &names(&["core", GATE_UNIT])));
+        assert!(needs_whole_gate(
+            &names(&["a.rs"]),
+            &names(&["core", GATE_UNIT])
+        ));
         assert!(needs_whole_gate(&[], &names(&[GATE_UNIT])));
         assert!(needs_whole_gate(&[], &[]), "no handle at all");
-        assert!(!needs_whole_gate(&names(&["a.rs"]), &[]), "a guard path is a handle");
-        assert!(!needs_whole_gate(&[], &names(&["core"])), "a red group is a handle");
+        assert!(
+            !needs_whole_gate(&names(&["a.rs"]), &[]),
+            "a guard path is a handle"
+        );
+        assert!(
+            !needs_whole_gate(&[], &names(&["core"])),
+            "a red group is a handle"
+        );
     }
 
     #[test]
