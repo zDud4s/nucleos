@@ -36,6 +36,7 @@ mod analytics;
 mod analytics_pipeline;
 mod brains;
 mod chat_edit;
+mod chat_transfer;
 mod chat_turns;
 mod chats;
 mod commands;
@@ -129,6 +130,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(brains::routes())
         .merge(crate::channels::routes())
         .merge(chat_edit::routes())
+        .merge(chat_transfer::routes())
         .merge(chat_turns::routes())
         .merge(chats::routes())
         .merge(commands::routes())

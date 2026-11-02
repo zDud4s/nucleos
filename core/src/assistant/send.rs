@@ -66,6 +66,12 @@ async fn send_or_queue_inner(
     // Refused before anything waits: a picture that cannot be sent now cannot be sent from the
     // queue either, and finding that out at the drain is finding it out after the person left.
     check_images(images)?;
+    // A chat that moved to another machine takes no turn here; one being moved takes the message
+    // into the queue below, and the package carries it.
+    let gate = crate::chats::transfer::gate(&state.pool, chat_id).await;
+    if let crate::chats::transfer::Gate::Moved(to) = &gate {
+        return Err(crate::chats::transfer::moved_sentence(to));
+    }
     // A person sending again is what ends a hold (after Stop, or after a failed send).
     release_queue(chat_id);
     // The same moment re-arms the "queue paused" announcement for a channel conversation.
@@ -112,6 +118,11 @@ async fn send_or_queue_inner(
         };
         written.map_err(|error| error.to_string())
     };
+    if gate == crate::chats::transfer::Gate::Frozen {
+        // No drain: nothing may start while the chat is frozen. `abort` drains it again.
+        enqueue().await?;
+        return Ok(Sent::Queued);
+    }
     if !waiting.is_empty() {
         enqueue().await?;
         spawn_drain_if_free(state, chat_id);
@@ -123,6 +134,11 @@ async fn send_or_queue_inner(
     .await
     {
         Ok(id) => Ok(Sent::Turn(id)),
+        // The freeze landed between the check above and the slot: the message waits like the rest.
+        Err(refusal) if refusal == crate::chats::transfer::CHAT_FROZEN => {
+            enqueue().await?;
+            Ok(Sent::Queued)
+        }
         Err(refusal) if refusal == TURN_IN_PROGRESS => {
             enqueue().await?;
             // The turn may have ended between the refusal and the write; then nobody would drain it.
@@ -263,7 +279,19 @@ pub(super) async fn drain_queued_now(state: &crate::state::AppState, chat_id: &s
     drain_inner(state, chat_id, false).await;
 }
 
+/// Lets a chat's queue drain again after a move was aborted. A plain function for the same reason
+/// as [`spawn_drain_through`]. A queue held by a Stop (a move `now`) stays held until the person sends.
+pub fn resume_queue_after_freeze(state: &crate::state::AppState, chat_id: &str) {
+    spawn_drain_through(state, chat_id, true);
+}
+
 async fn drain_inner(state: &crate::state::AppState, chat_id: &str, respect_hold: bool) {
+    // A chat being moved or already moved sends nothing from its queue: the package carries it.
+    if crate::chats::transfer::gate(&state.pool, chat_id).await
+        != crate::chats::transfer::Gate::Open
+    {
+        return;
+    }
     if respect_hold {
         if queue_is_held(chat_id) {
             return;
@@ -473,6 +501,11 @@ async fn put_back_refused(
         // The same door this drain came through: a drain that respected a hold must not become
         // one that ignores it just because it lost a race.
         spawn_drain_through(state, chat_id, respect_hold);
+        return;
+    }
+    // Frozen in the instant between the drain's check and the send: the row is back, and the abort
+    // (or the expiry) is what drains it again. No hold and no notice for a move.
+    if refusal == crate::chats::transfer::CHAT_FROZEN {
         return;
     }
     hold_queue(chat_id);
@@ -724,6 +757,17 @@ pub(super) async fn send_message_inner(
     let slot = ChatSlot::acquire_past_warmup(chat_id)
         .await
         .ok_or(TURN_IN_PROGRESS.to_string())?;
+    // Checked with the slot held, so a freeze that lands now is seen by the move's wait (it sees
+    // this slot) or by this check, never by neither.
+    match crate::chats::transfer::gate(&state.pool, chat_id).await {
+        crate::chats::transfer::Gate::Open => {}
+        crate::chats::transfer::Gate::Frozen => {
+            return Err(crate::chats::transfer::CHAT_FROZEN.to_string());
+        }
+        crate::chats::transfer::Gate::Moved(to) => {
+            return Err(crate::chats::transfer::moved_sentence(&to));
+        }
+    }
 
     // Who answers this conversation. Two steps, in order of how specific the fact is: the chat's
     // own row, then the origin — every Telegram conversation with no row lands on the last one.
@@ -3051,6 +3095,152 @@ mod tests {
         assert!(
             !seen.contains("you: question 1\n"),
             "older exchanges are summarised, not replayed"
+        );
+    }
+
+    /// Assistant turns recorded for a chat.
+    async fn assistant_turns_of(pool: &SqlitePool, chat: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM runs WHERE chat_id = ? AND mode = 'assistant'")
+            .bind(chat)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_move_after_the_turn_waits_for_the_turn_and_carries_the_queue() {
+        use crate::chats::transfer::{self, Gate, When};
+        let fake = Arc::new(FakeCommandRunner::default());
+        let mut state = live_channel_state().await;
+        state.runner = fake.clone();
+        let chat = a_chat("telegram");
+        sqlx::query("INSERT INTO chats (chat_id, brain, created_at) VALUES (?, 'cloud', ?)")
+            .bind(&chat)
+            .bind("2026-01-01T00:00:00Z")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        *fake.delay.lock().unwrap() = Some(Duration::from_millis(700));
+        send_message(&state, &chat, "the turn in flight", Origin::Shell)
+            .await
+            .unwrap();
+
+        let (st, c) = (state.clone(), chat.clone());
+        let moving = tokio::spawn(async move {
+            crate::assistant::chat_move::begin(&st, &c, When::AfterTurn, "t-1").await
+        });
+        for _ in 0..100 {
+            if transfer::gate(&state.pool, &chat).await == Gate::Frozen {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let meanwhile =
+            send_or_queue(&state, &chat, "typed during the freeze", &[], Origin::Shell).await;
+
+        assert_eq!(meanwhile, Ok(Sent::Queued));
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(!moving.is_finished(), "the move must wait for the turn");
+        assert!(is_busy(&chat));
+
+        let begun = tokio::time::timeout(Duration::from_secs(10), moving)
+            .await
+            .expect("the move should end with the turn")
+            .unwrap()
+            .unwrap();
+        assert_eq!(begun.cut_turn, None);
+        assert_eq!(begun.queued, 1);
+        assert!(!is_busy(&chat));
+        // The turn ending did not start the queued message: it travels instead.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(assistant_turns_of(&state.pool, &chat).await, 1);
+        let waiting = crate::chats::queued(&state.pool, &chat).await.unwrap();
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].text, "typed during the freeze");
+        release_queue(&chat);
+    }
+
+    #[tokio::test]
+    async fn a_move_now_cuts_the_turn_and_warns_what_dies() {
+        use crate::chats::transfer::{self, When};
+        let (state, chat, turn) = slow_channel_turn().await;
+        sqlx::query(
+            "INSERT INTO chat_tasks (chat_id, launched_by_run_id, tool_use_id, kind, status, started_at)
+             VALUES (?, ?, 'tu-1', 'subagent', 'running', '2026-01-01T00:00:00Z')",
+        )
+        .bind(&chat)
+        .bind(turn)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let warned = transfer::preview(&state.pool, &chat, is_busy(&chat))
+            .await
+            .unwrap();
+        assert!(warned.running);
+        assert_eq!(warned.will_stop.len(), 2, "{warned:?}");
+        assert!(
+            warned.will_stop[0].contains("turn in progress"),
+            "{warned:?}"
+        );
+        assert!(warned.will_stop[1].contains("subagent"), "{warned:?}");
+
+        let begun = crate::assistant::chat_move::begin(&state, &chat, When::Now, "t-1")
+            .await
+            .unwrap();
+
+        assert_eq!(begun.cut_turn, Some(turn));
+        assert!(!is_busy(&chat));
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(turn)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "cancelled");
+        assert_eq!(
+            transfer::gate(&state.pool, &chat).await,
+            transfer::Gate::Frozen
+        );
+        release_queue(&chat);
+    }
+
+    #[tokio::test]
+    async fn a_moved_chat_refuses_new_turns_at_the_origin_and_points_at_the_destination() {
+        use crate::chats::transfer;
+        let state = live_channel_state().await;
+        let chat = a_chat("telegram");
+        sqlx::query("INSERT INTO chats (chat_id, brain, created_at) VALUES (?, 'cloud', ?)")
+            .bind(&chat)
+            .bind("2026-01-01T00:00:00Z")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        transfer::freeze_at(&state.pool, &chat, "t-1", transfer::unix_now())
+            .await
+            .unwrap();
+        transfer::finish_at(
+            &state.pool,
+            &chat,
+            "t-1",
+            "the laptop",
+            transfer::unix_now(),
+        )
+        .await
+        .unwrap();
+
+        let queued = send_or_queue(&state, &chat, "anyone there?", &[], Origin::Shell).await;
+        let direct = send_message(&state, &chat, "anyone there?", Origin::Shell).await;
+
+        for refusal in [queued.unwrap_err(), direct.unwrap_err()] {
+            assert!(refusal.contains("the laptop"), "{refusal}");
+            assert!(refusal.contains("moved"), "{refusal}");
+        }
+        assert_eq!(assistant_turns_of(&state.pool, &chat).await, 0);
+        assert!(
+            crate::chats::queued(&state.pool, &chat)
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 }

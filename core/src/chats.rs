@@ -7,6 +7,7 @@ pub mod mcp_servers;
 pub mod notices;
 pub mod seed;
 pub mod tasks;
+pub mod transfer;
 
 use sqlx::SqlitePool;
 

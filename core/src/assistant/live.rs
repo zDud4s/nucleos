@@ -716,6 +716,32 @@ pub fn evict_live(chat_id: &str) {
     relock(&LIVE_CHATS).remove(chat_id);
 }
 
+/// A move `now` ends the turn in flight: the same Stop a person presses (interrupt, then the kill
+/// path), then the conversation's kept process goes too, because the session continues on another
+/// machine and a process left here would keep writing to a transcript that has been packaged.
+/// Answers the id of the turn it cut, if one was running.
+pub async fn cut_turn_for_move(state: &crate::state::AppState, chat_id: &str) -> Option<i64> {
+    let cut = stop_chat(state, chat_id).await.map(|(turn_id, _)| turn_id);
+    // The slot is released as the turn's task unwinds; wait for it so nothing is left running.
+    wait_for_turn_end(chat_id, std::time::Duration::from_secs(10)).await;
+    evict_live(chat_id);
+    cut
+}
+
+/// A move `after_turn` waits here: answers true once no turn is in flight for the chat, false when
+/// `limit` passed first (the caller confirms its freeze alive and asks again). The freeze already
+/// stops a new turn from starting, so "not busy" cannot flip back.
+pub async fn wait_for_turn_end(chat_id: &str, limit: std::time::Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + limit;
+    while is_busy(chat_id) {
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    true
+}
+
 /// Keeps a stand-in process for a conversation, for the tests of modules that must see one stopped.
 ///
 /// Nothing runs behind it; the abort handle is a pending task's, so dropping it stops nothing real.
