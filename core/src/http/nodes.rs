@@ -894,7 +894,10 @@ mod tests {
             }
         };
         assert_eq!(stored(root).await.as_deref(), Some("s-launch"));
-        assert_eq!(stored(anonymous["id"].as_str().unwrap().to_owned()).await, None);
+        assert_eq!(
+            stored(anonymous["id"].as_str().unwrap().to_owned()).await,
+            None
+        );
         assert_eq!(stored(odd["id"].as_str().unwrap().to_owned()).await, None);
     }
 
