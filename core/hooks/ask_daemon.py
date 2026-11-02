@@ -1023,7 +1023,8 @@ CONDUCTOR_TOOLS = ("Agent", "Task", "Skill", "TodoWrite", "AskUserQuestion", "Ex
 CONDUCTOR_MATERIAL_DIRS = (".ai", ".nucleos")
 CONDUCTOR_METACHARACTERS = (";", "&", "|", "<", ">", "`", "$(", "\n", "\r")
 CONDUCTOR_GIT_READS = ("status", "log", "diff", "show", "rev-parse", "ls-tree", "cat-file")
-CONDUCTOR_HEAVY_VALUE_FLAGS = ("--prio", "--agent", "--kind")
+CONDUCTOR_HEAVY_VALUE_FLAGS = ("--prio", "--agent", "--kind", "--wait-max")
+CONDUCTOR_HEAVY_PROGRAMS = ("cargo", "cargo.exe", "go", "go.exe", "npx", "npx.cmd", "npm", "npm.cmd")
 CONDUCTOR_REFUSAL = (
     "This session is a conductor: launch an agent (`Agent`, `create_run`) or a tree (`tree_launch`) "
     "instead of doing this by hand. If you are the owner and want manual work, start the prompt "
@@ -1440,8 +1441,8 @@ def _conductor_gates_accepts(tokens, cwd):
 
 
 def _conductor_heavy_accepts(tokens, cwd):
-    """`python <project>/scripts/heavy.py [flags] cargo ...`: the broker of this project, not a file
-    of that name somewhere an agent may write. A transitional rule of the spec (2.2)."""
+    """`python <project>/scripts/heavy.py [flags] cargo|go|npx|npm ...` or `... status`: the broker of
+    this project, not a file of that name somewhere an agent may write. A transitional rule of the spec (2.2)."""
     if len(tokens) < 3 or tokens[0].lower() not in ("python", "python.exe", "python3", "py"):
         return False
     script = _conductor_path(tokens[1], cwd)
@@ -1450,10 +1451,20 @@ def _conductor_heavy_accepts(tokens, cwd):
         for folder in _ancestors(cwd)
     ):
         return False
+    if tokens[2:] == ["status"]:
+        return True
+    # The broker's own `parse_args`: known flags (`--flag=value` or `--flag value`), an optional `--`,
+    # and the first token that is none of them starts the command it runs.
     index = 2
-    while index < len(tokens) and tokens[index].startswith("-"):
-        index += 2 if tokens[index] in CONDUCTOR_HEAVY_VALUE_FLAGS else 1
-    return index < len(tokens) and tokens[index].lower() in ("cargo", "cargo.exe")
+    while index < len(tokens):
+        flag, equals, _value = tokens[index].partition("=")
+        if tokens[index] == "--":
+            index += 1
+            break
+        if flag not in CONDUCTOR_HEAVY_VALUE_FLAGS:
+            break
+        index += 1 if equals or index + 1 >= len(tokens) else 2
+    return index < len(tokens) and tokens[index].lower() in CONDUCTOR_HEAVY_PROGRAMS
 
 
 def _conductor_add_accepts(args):

@@ -664,6 +664,49 @@ def test_composition_of_accepted_parts_and_closing_tails():
         deny(fx.verdict("PowerShell", {"command": f"cd {inside} ; & {G} status"}), "call operator on git")
 
 
+def test_broker_runs_cargo_go_node_and_status():
+    with fixture("on") as fx:
+        for command in (
+            "python scripts/heavy.py go test ./...",
+            "python scripts/heavy.py go build",
+            "python scripts/heavy.py npx tsc --noEmit",
+            "python scripts/heavy.py npm run build",
+            "python scripts/heavy.py --kind node npm test",
+            "python scripts/heavy.py --kind=go go vet ./...",
+            "python scripts/heavy.py --wait-max 600 --prio 1 --agent me cargo build",
+            "python scripts/heavy.py --wait-max=600 cargo build",
+            "python scripts/heavy.py -- cargo test",
+            "python scripts/heavy.py --prio 1 -- npm test",
+            "python scripts/heavy.py cargo test -- --nocapture",
+            "python scripts/heavy.py status",
+            "python scripts/heavy.py status > " + os.path.join(fx.tmp_dir, "s.log"),
+        ):
+            allow(fx.verdict("Bash", {"command": command}), repr(command))
+        for command in (
+            "python scripts/heavy.py status extra",
+            "python scripts/heavy.py report",
+            "python scripts/heavy.py gc",
+            "python scripts/heavy.py warm",
+            "python scripts/heavy.py hold-worktree",
+            "python scripts/heavy.py",
+            "python scripts/heavy.py --kind node",
+            "python scripts/heavy.py --prio",
+            "python scripts/heavy.py --bogus cargo test",
+            "python scripts/heavy.py -x cargo test",
+            "python scripts/heavy.py -- bash -c x",
+            "python scripts/heavy.py rm -rf x",
+            "python scripts/heavy.py python evil.py",
+            "python scripts/heavy.py --kind node node evil.js",
+            "python scripts/heavy.py -- -- cargo test",
+            "python scripts/heavy.py status; rm x",
+            "python scripts/heavy.py npm test | cat",
+            "go test ./...",
+            "npm test",
+            "npx tsc",
+        ):
+            deny(fx.verdict("Bash", {"command": command}), repr(command))
+
+
 def _git_bash(path):
     """`C:\\x\\y` as Git Bash spells it, `/c/x/y`."""
     path = path.replace("\\", "/")
@@ -1216,6 +1259,7 @@ TESTS = [
     test_grep_and_glob_on_a_file_cost_like_a_read,
     test_git_bash_drive_paths_are_understood_on_windows,
     test_composition_of_accepted_parts_and_closing_tails,
+    test_broker_runs_cargo_go_node_and_status,
     test_notifications_neither_set_nor_clear_manual,
     test_notifications_do_not_reset_the_read_budget,
 ]
