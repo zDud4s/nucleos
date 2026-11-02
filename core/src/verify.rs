@@ -155,6 +155,10 @@ pub enum Caller {
     Probe,
 }
 
+/// The post-merge gate runs the whole gate as one unit: run 86 took 1746 s and run 83 was cut at
+/// the 1800 s default, so this is about twice the observed time.
+pub const POSTGATE_UNIT_TIMEOUT: Duration = Duration::from_secs(3600);
+
 impl Caller {
     /// Every other key is refused: a sidecar, a team run or a narrower API token has no worktree
     /// of its own to verify, and running arbitrary groups is not part of what those keys grant.
@@ -203,10 +207,14 @@ impl Caller {
         }
     }
 
-    /// A proof unit is cut off well before its lease (`PROBE_LEASE_SECONDS`) lapses; every other
-    /// caller keeps the executor's configured timeout (0 = "derive it").
+    /// A proof unit is cut off well before its lease (`PROBE_LEASE_SECONDS`) lapses; the
+    /// post-merge family gets `POSTGATE_UNIT_TIMEOUT`; every other caller keeps the executor's
+    /// configured timeout (0 = "derive it").
     pub fn unit_timeout_ms(self) -> i64 {
         match self {
+            Caller::Postgate | Caller::FlakeCheck | Caller::Bisect => {
+                i64::try_from(POSTGATE_UNIT_TIMEOUT.as_millis()).unwrap_or(i64::MAX)
+            }
             Caller::Probe => i64::try_from(probe::UNIT_TIMEOUT.as_millis()).unwrap_or(i64::MAX),
             _ => 0,
         }

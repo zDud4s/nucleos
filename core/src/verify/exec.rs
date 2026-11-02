@@ -65,7 +65,6 @@ const BROKER_SPAWN_FAILED_MARKER: &str = "heavy: spawn failed: ";
 /// How a finished process maps onto a row's status and exit code. `via_broker` says the argv
 /// ran behind the heavy-command broker prefix.
 fn status_of(outcome: &ArgvOutcome, via_broker: bool) -> (&'static str, Option<i64>) {
-    let _ = via_broker;
     if outcome.timed_out || outcome.error.is_some() {
         return (
             verify_runs::STATUS_ERRORED,
@@ -74,6 +73,16 @@ fn status_of(outcome: &ArgvOutcome, via_broker: bool) -> (&'static str, Option<i
     }
     match outcome.exit_code {
         Some(0) => (verify_runs::STATUS_PASSED, Some(0)),
+        // A broker that could not start the command measured nothing, so the unit is errored.
+        // 127 alone stays failed: a wrapped program can exit 127 itself (e.g. a missing tool
+        // inside the gate script).
+        Some(code)
+            if via_broker
+                && code == BROKER_SPAWN_FAILED_EXIT
+                && outcome.tail.contains(BROKER_SPAWN_FAILED_MARKER) =>
+        {
+            (verify_runs::STATUS_ERRORED, Some(i64::from(code)))
+        }
         Some(code) => (verify_runs::STATUS_FAILED, Some(i64::from(code))),
         None => (verify_runs::STATUS_ERRORED, None),
     }

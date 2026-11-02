@@ -716,6 +716,14 @@ pub(super) async fn ensure_fresh(
     if flying {
         return Ok(Freshness::InFlight { started: false });
     }
+    // An incident whose only handle is the whole gate is closed by the next post-merge gate on the
+    // new head (postgate `finish_green`), never by a probe: no lease, no request.
+    if probe::needs_whole_gate(
+        &incident.guard_paths,
+        &detail_strings(&incident.detail, "red_groups"),
+    ) {
+        return Ok(Freshness::GaveUp);
+    }
     let Some(executor) = executor.filter(|_| !already_tried) else {
         return Ok(Freshness::GaveUp);
     };

@@ -323,16 +323,21 @@ impl Step {
 }
 
 /// Whether re-proving an incident takes the whole gate: a `gate_command` among its red groups, or
-/// no handle at all (no guard path and no red group). Stub: the behaviour comes with the GREEN step.
+/// no handle at all (no guard path and no red group).
 pub(super) fn needs_whole_gate(guard_paths: &[String], red_groups: &[String]) -> bool {
-    let _ = (guard_paths, red_groups);
-    false
+    red_groups.iter().any(|group| group == GATE_UNIT)
+        || (guard_paths.is_empty() && red_groups.is_empty())
 }
 
 /// Refuses a plan that would run the whole gate (a `Full` step with no files and no groups) for an
-/// incident; a groups proof may plan one. Stub: the behaviour comes with the GREEN step.
+/// incident; a groups proof may plan one.
 fn refuse_whole_gate(incident: bool, steps: &[Step]) -> Result<(), String> {
-    let _ = (incident, steps);
+    if incident && steps.iter().any(|step| step.scope == ScopeArg::Full) {
+        return Err(
+            "an incident whose only handle is the whole gate is proved by the post-merge gate, not by a probe"
+                .to_string(),
+        );
+    }
     Ok(())
 }
 
@@ -419,6 +424,9 @@ fn answered(units: &[UnitReport], named: Option<&[String]>) -> bool {
 
 /// Proves `what` on the master head. `Ok` is conclusive: either a unit failed, or every step
 /// measured something and nothing failed. A proof where nothing ran is an `Err`, never a pass.
+///
+/// Invariant: an incident is never re-proved by the whole gate; such a plan is refused before any
+/// unit is submitted (the next post-merge gate closes it).
 pub(super) async fn prove(
     executor: &Arc<Executor>,
     project_id: &str,
@@ -430,7 +438,9 @@ pub(super) async fn prove(
     let head = master_head(&executor.pool, project_id, project_root, deadline).await?;
     let tree = git_exec::prepare_probe_worktree(project_root, &head, deadline).await?;
 
+    let incident = matches!(what, What::Incident { .. });
     let steps = plan_proof(what, |path| tree.join(path).is_file());
+    refuse_whole_gate(incident, &steps)?;
     let mut ticket_ids: Vec<i64> = Vec::new();
     for step in &steps {
         let request = VerifyArgs {
