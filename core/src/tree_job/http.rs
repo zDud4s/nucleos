@@ -444,8 +444,8 @@ async fn post_tree(
         .map_err(store_refusal)?;
     // The Claude Code session that launched the tree, stamped by its hook into the MCP call; a value
     // that is not a plain session id is dropped, and the root is a root all the same.
-    let launching_session = launching_session
-        .filter(|session| crate::daemon_client::valid_session_id(session));
+    let launching_session =
+        launching_session.filter(|session| crate::daemon_client::valid_session_id(session));
     sqlx::query("UPDATE work_nodes SET tree_job_id = ?, launching_session_id = ? WHERE id = ?")
         .bind(&id)
         .bind(launching_session)
@@ -1913,12 +1913,18 @@ mod tests {
         let mut body = tree_body(JOB);
         body["launching_session_id"] = json!("sess-9");
         let response = post(&app, "/trees", body).await;
-        let root = response.1["root_node_id"].as_str().expect("a root").to_owned();
+        let root = response.1["root_node_id"]
+            .as_str()
+            .expect("a root")
+            .to_owned();
 
         let mut bad = tree_body("job-bad-session");
         bad["launching_session_id"] = json!("not a session id!");
         let bad_response = post(&app, "/trees", bad).await;
-        let bad_root = bad_response.1["root_node_id"].as_str().expect("a root").to_owned();
+        let bad_root = bad_response.1["root_node_id"]
+            .as_str()
+            .expect("a root")
+            .to_owned();
 
         let stored = |id: String| {
             let pool = state.pool.clone();
