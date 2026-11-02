@@ -396,13 +396,13 @@ def test_gates_script_refused_when_chained_or_elsewhere():
             "bash /tmp/evil/bash scripts/gates.sh hooks",
             "/tmp/evil/bash scripts/gates.sh hooks",
             "& " + G + " status",
-            G + " status > " + os.path.join(fx.tmp_dir, "x"),
         ):
             deny(fx.verdict("Bash", {"command": command}), repr(command))
 
 
 def test_chained_command_denied():
     with fixture("on") as fx:
+        _gate_marker(fx)
         for command in (
             f"python scripts/heavy.py cargo test && {G} push",
             f"{G} status; rm x",
@@ -432,6 +432,13 @@ def test_git_status_allowed():
         ):
             allow(fx.verdict("Bash", {"command": command}), repr(command))
         deny(fx.verdict("Bash", {"command": f"{G} checkout master"}), "control: checkout")
+
+
+def _gate_marker(fx):
+    """Gives the fixture the gate script a real project holds, so a redirect into it is told from scratch."""
+    os.makedirs(fx.path("scripts"), exist_ok=True)
+    with open(fx.path("scripts", "gates.sh"), "w", encoding="utf-8") as handle:
+        handle.write("#!/usr/bin/env bash\n")
 
 
 def _project(fx):
@@ -495,7 +502,6 @@ def test_worktree_remove_allowed_only_under_the_project_worktrees():
             f"{G} worktree remove",
             f"{G} worktree remove {inside} {inside}",
             f"{G} worktree remove {inside}; rm x",
-            f"{G} worktree remove {inside} && {G} status",
             f"{G} worktree remove {inside} | cat",
         ):
             deny(fx.verdict("Bash", {"command": command}), repr(command))
@@ -542,6 +548,7 @@ def test_land_allowed_from_the_root_session():
 def test_land_refused_when_widened_or_elsewhere():
     with fixture("on") as fx:
         inside, exe, dev = _land_fixture(fx)
+        _gate_marker(fx)
         outside = os.path.join(os.path.dirname(fx.cwd), "elsewhere").replace("\\", "/")
         for command in (
             f"{exe} --print-token",
@@ -559,25 +566,316 @@ def test_land_refused_when_widened_or_elsewhere():
             f"{exe} --land `id`",
             f"{exe} --land\nrm x",
             f"{exe} --land > out.txt",
-            f"{exe} --land 2>&1",
             f"{dev}/other/nucleos-core.exe --land",
             f"{dev}/run/evil.exe --land",
             f"/tmp/nucleos-core.exe --land",
             f"cd {outside} && {exe} --land",
-            f"cd x && {exe} --land",
             f"cd .. && {exe} --land",
-            f"cd .claude/worktrees/../.. && {exe} --land",
-            f"cd {fx.cwd} && {exe} --land".replace("\\", "/"),
-            f"cd {inside} && {G} status",
-            f"cd x && {G} status",
             f"cd {inside} && {exe} --print-token",
-            f"cd {inside} && {exe} --land && {exe} --land",
-            f"cd {inside} && cd {inside} && {exe} --land",
-            f"cd {inside} ; {exe} --land",
             f"cd {inside} || {exe} --land",
-            f"{exe} --land && cd {inside}",
-            f"{G} status && {exe} --land",
             f"rm x && {exe} --land",
+        ):
+            deny(fx.verdict("Bash", {"command": command}), repr(command))
+
+
+def test_composition_of_accepted_parts_and_closing_tails():
+    with fixture("on") as fx:
+        inside, exe, dev = _land_fixture(fx)
+        _gate_marker(fx)
+        log = f"{dev}/scratch/g.log"
+        for command in (
+            f"cd {inside} && scripts/gates.sh core",
+            f"cd {inside} && {exe} --land",
+            f"cd {fx.cwd} && {exe} --land".replace("\\", "/"),
+            f"cd x && {G} status",
+            f"cd {inside} && cd {inside} && {exe} --land master",
+            f"cd {inside} ; {exe} --land",
+            f"{G} status && {exe} --land",
+            f"{exe} --land && cd {inside}",
+            f"scripts/gates.sh core && {G} status",
+            f"{G} status; {G} log --oneline -3",
+            f"cd .claude/worktrees/feat; python scripts/heavy.py cargo test",
+            f"cd {inside} && {G} status",
+            f"{G} status 2>&1",
+            f"{G} log | tail -n 5",
+            f"{G} log | tail -5",
+            f"{G} log | head -n 3",
+            f"{G} log|head -20",
+            f"{G} log 2>&1 | tail -n 5",
+            f"scripts/gates.sh core > {log} 2>&1 | tail -20",
+            f"scripts/gates.sh core 2>&1 | tail -20",
+            f"{G} log > {log}",
+            f"python scripts/heavy.py cargo test > {log} 2>&1",
+            f"{exe} --land 2>&1",
+            f"{G} status > {os.path.join(fx.tmp_dir, 'x')}",
+            f"cd {inside} && scripts/gates.sh core > {log} 2>&1 | tail -n 40",
+            f"CARGO_BUILD_JOBS=2 python scripts/heavy.py cargo test",
+            f"RUSTC_BOOTSTRAP=1 RUST_BACKTRACE=1 scripts/gates.sh core",
+            f"NUCLEOS_GATE_KEEP_GOING=1 bash scripts/gates.sh core",
+            f"NUCLEOS_HEAVY_STALL_SECS=0 python scripts/heavy.py --prio 1 cargo check",
+            f"CARGO_TERM_COLOR=never python scripts/heavy.py cargo test",
+            f"CARGO_TARGET_DIR=x CARGO_INCREMENTAL=0 python scripts/heavy.py cargo test",
+            f"RUST_BACKTRACE=1 python scripts/heavy.py cargo test",
+            f"RUSTC_BOOTSTRAP=1 python scripts/heavy.py cargo test",
+        ):
+            allow(fx.verdict("Bash", {"command": command}), repr(command))
+        allow(fx.verdict("PowerShell", {"command": f"cd {inside} ; & '{exe}' --land *> '{log}'"}), "PowerShell")
+        outside = os.path.join(os.path.dirname(fx.cwd), "elsewhere").replace("\\", "/")
+        flag = fx.flag("sess-1").replace("\\", "/")
+        for command in (
+            f"{G} status | cat",
+            f"{G} log | tail -n 5 | cat",
+            f"{G} log | tail -f x",
+            f"{G} log | tail -n 5 && {G} status",
+            f"{G} log | head -n 5 > out.txt",
+            f"{G} status || true",
+            f"{G} status && {G} status || true",
+            f"{G} status $(id)",
+            f"{G} status `id`",
+            f"{G} status\n{G} log",
+            f"{G} log >> {log}",
+            f"{G} status > out.txt",
+            f"{G} status > {flag}",
+            f"scripts/gates.sh core > {flag}",
+            f"{G} status > {G}",
+            f"{G} status && {G} push",
+            f"{G} status && rm x",
+            f"{G} status; rm x",
+            f"cd {outside} && {G} status",
+            f"cd {outside}/.. && {G} status",
+            f"cd .. && {G} status",
+            f"cd /tmp && {G} status",
+            f"cd && {G} status",
+            f"cd - && {G} status",
+            f"cd {inside} extra && {G} status",
+            f"{G} status &",
+            f"{G} status & {G} log",
+            f"{G} status &&& {G} log",
+            f"{G} status;",
+            f"; {G} status",
+            f"{G} status &&",
+            f"PATH=/tmp/x python scripts/heavy.py cargo test",
+            f"RUSTFLAGS=-Cx scripts/gates.sh core",
+            f"CARGO_BUILD_RUSTC=x python scripts/heavy.py cargo test",
+            f"CARGO_BUILD_RUSTC_WRAPPER=x python scripts/heavy.py cargo test",
+            f"CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER=x python scripts/heavy.py cargo test",
+            f"CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=x python scripts/heavy.py cargo test",
+            f"RUSTC_WRAPPER=x python scripts/heavy.py cargo test",
+            f"CARGO_HOME=x python scripts/heavy.py cargo test",
+            f"RUST_FOO=x python scripts/heavy.py cargo test",
+            f"NUCLEOS_HEAVY_PYTHON=x scripts/gates.sh core",
+            f"NUCLEOS_HEAVY_GDB=x python scripts/heavy.py cargo test",
+            f"NUCLEOS_HEAVY_MAIN=x scripts/gates.sh core",
+            f"CARGO_BUILD_JOBS=2 {G} status",
+            f"CARGO_BUILD_JOBS=2 {exe} --land",
+            f"CARGO_BUILD_JOBS=2 cd {inside}",
+            f"CARGO_BUILD_JOBS=2",
+            f"CARGO_BUILD_JOBS=2; {G} status",
+            f"cat <<EOF\nx\nEOF",
+            f"scripts/gates.sh core < input.txt",
+        ):
+            deny(fx.verdict("Bash", {"command": command}), repr(command))
+        deny(fx.verdict("PowerShell", {"command": f"cd {inside} ; & {G} status"}), "call operator on git")
+
+
+def test_broker_runs_cargo_go_node_and_status():
+    with fixture("on") as fx:
+        for command in (
+            "python scripts/heavy.py go test ./...",
+            "python scripts/heavy.py go build",
+            "python scripts/heavy.py npx tsc --noEmit",
+            "python scripts/heavy.py npm run build",
+            "python scripts/heavy.py --kind node npm test",
+            "python scripts/heavy.py --kind=go go vet ./...",
+            "python scripts/heavy.py --wait-max 600 --prio 1 --agent me cargo build",
+            "python scripts/heavy.py --wait-max=600 cargo build",
+            "python scripts/heavy.py -- cargo test",
+            "python scripts/heavy.py --prio 1 -- npm test",
+            "python scripts/heavy.py cargo test -- --nocapture",
+            "python scripts/heavy.py status",
+            "python scripts/heavy.py status > " + os.path.join(fx.tmp_dir, "s.log"),
+        ):
+            allow(fx.verdict("Bash", {"command": command}), repr(command))
+        for command in (
+            "python scripts/heavy.py status extra",
+            "python scripts/heavy.py report",
+            "python scripts/heavy.py gc",
+            "python scripts/heavy.py warm",
+            "python scripts/heavy.py hold-worktree",
+            "python scripts/heavy.py",
+            "python scripts/heavy.py --kind node",
+            "python scripts/heavy.py --prio",
+            "python scripts/heavy.py --bogus cargo test",
+            "python scripts/heavy.py -x cargo test",
+            "python scripts/heavy.py -- bash -c x",
+            "python scripts/heavy.py rm -rf x",
+            "python scripts/heavy.py python evil.py",
+            "python scripts/heavy.py --kind node node evil.js",
+            "python scripts/heavy.py -- -- cargo test",
+            "python scripts/heavy.py status; rm x",
+            "python scripts/heavy.py npm test | cat",
+            "go test ./...",
+            "npm test",
+            "npx tsc",
+        ):
+            deny(fx.verdict("Bash", {"command": command}), repr(command))
+
+
+def test_daemon_script_and_verify_ticket_accepted():
+    with fixture("on") as fx:
+        inside, exe, dev = _land_fixture(fx)
+        _gate_marker(fx)
+        script = fx.path("scripts", "run-daemon.ps1").replace("\\", "/")
+        script_bs = script.replace("/", "\\")
+        for tool, command in (
+            ("PowerShell", f"& '{script_bs}'"),
+            ("PowerShell", f'& "{script}"'),
+            ("PowerShell", f"{script_bs}"),
+            ("PowerShell", "scripts/run-daemon.ps1"),
+            ("PowerShell", ".\\scripts\\run-daemon.ps1"),
+            ("PowerShell", f"pwsh -File {script_bs}"),
+            ("PowerShell", f"powershell -File '{script_bs}'"),
+            ("PowerShell", f"powershell.exe -File {script}"),
+            ("Bash", f"pwsh -File {script}"),
+            ("Bash", f"cd {inside} && pwsh -File {script}"),
+            ("Bash", f"{exe} --verify-ticket 123"),
+            ("Bash", f"{exe} --verify-ticket 123 2>&1 | tail -5"),
+            ("PowerShell", f"& '{exe.replace('/', chr(92))}' --verify-ticket 7"),
+        ):
+            allow(fx.verdict(tool, {"command": command}), f"{tool}: {command!r}")
+        for command in (
+            f"{script} -Foo",
+            f"{script} extra",
+            f"pwsh -File {script} extra",
+            f"pwsh -File {script} -Foo",
+            f"pwsh -Command {script}",
+            f"pwsh -NoProfile -File {script}",
+            f"pwsh {script}",
+            f"pwsh -File {os.path.dirname(fx.cwd).replace(chr(92), '/')}/elsewhere/scripts/run-daemon.ps1",
+            "pwsh -File /tmp/evil/scripts/run-daemon.ps1",
+            "bash -File scripts/run-daemon.ps1",
+            "scripts/run-daemon.ps1; rm x",
+            "scripts/run-daemon.ps1 | cat",
+            "scripts/run-daemon.ps1 && rm x",
+            "scripts/run-daemon.ps1 > out.txt",
+            f"{exe} --verify-ticket abc",
+            f"{exe} --verify-ticket -1",
+            f"{exe} --verify-ticket 1.5",
+            f"{exe} --verify-ticket 12 13",
+            f"{exe} --verify-ticket",
+            f"{exe} --verify-ticket 1; rm x",
+            f"{dev}/other/nucleos-core.exe --verify-ticket 1",
+            f"/tmp/nucleos-core.exe --verify-ticket 1",
+            f"{exe} --print-token",
+            f"{exe} --settings-reset a/b",
+            f"{exe} --settings-rollback a/b 1",
+            f"{exe} --workflow-sync {inside}",
+            f"{exe} --verify-ticket 1 --land",
+        ):
+            deny(fx.verdict("PowerShell", {"command": command}), repr(command))
+
+
+def test_small_read_only_commands_and_list_agents():
+    with fixture("on") as fx:
+        _gate_marker(fx)
+        allow(fx.verdict("ListAgents", {}), "ListAgents")
+        for tool, command in (
+            ("Bash", "date"),
+            ("Bash", "date +%H:%M"),
+            ("Bash", "date '+%Y-%m-%d %H:%M'"),
+            ("PowerShell", "Get-Date"),
+            ("PowerShell", "get-date -Format 'HH:mm'"),
+            ("Bash", "sleep 5"),
+            ("Bash", "sleep 60"),
+            ("PowerShell", "Start-Sleep 30"),
+            ("PowerShell", "Start-Sleep -Seconds 30"),
+            ("PowerShell", "start-sleep 1"),
+            ("Bash", f"sleep 20 && {G} status"),
+            ("Bash", f"date; {G} log --oneline -3"),
+        ):
+            allow(fx.verdict(tool, {"command": command}), f"{tool}: {command!r}")
+        for command in (
+            "sleep 61",
+            "sleep 600",
+            "sleep",
+            "sleep 5m",
+            "sleep 1.5",
+            "sleep -1",
+            "sleep 5 5",
+            "sleep infinity",
+            "Start-Sleep 61",
+            "Start-Sleep -Milliseconds 5",
+            "Start-Sleep -Seconds 61",
+            "Start-Sleep",
+            "date -s 2020-01-01",
+            "date --set=x",
+            "date +%H > out.txt",
+            "date 010112002020",
+            "date +%H extra",
+            "Get-Date -Foo",
+            "Get-Date -Format x y",
+            "Set-Date x",
+            "sleep 5 &",
+            "sleep 5 | cat",
+        ):
+            deny(fx.verdict("PowerShell", {"command": command}), repr(command))
+
+
+def test_refusal_says_what_the_root_may_do_itself():
+    with fixture("on") as fx:
+        reason = deny(fx.verdict("Bash", {"command": f"{G} push"}), "push")["reason"]
+        if not reason.startswith("This session is a conductor: launch an agent"):
+            raise AssertionError(f"the first sentence must stay, got {reason!r}")
+        for needle in (
+            "scripts/gates.sh",
+            "scripts/heavy.py cargo|go|npx|npm",
+            "read-only git",
+            "--land",
+            "--verify-ticket",
+            "run-daemon.ps1",
+            "Read/Grep/Glob",
+            "3k tokens",
+            "neither the root nor an agent may do",
+            "`manual:`",
+        ):
+            if needle not in reason:
+                raise AssertionError(f"the refusal should mention {needle!r}, got {reason!r}")
+        if reason.count("\n") > 1 or len(reason) > 700:
+            raise AssertionError(f"the refusal should stay compact, got {len(reason)} characters")
+
+
+def _git_bash(path):
+    """`C:\\x\\y` as Git Bash spells it, `/c/x/y`."""
+    path = path.replace("\\", "/")
+    return f"/{path[0].lower()}{path[2:]}"
+
+
+def test_git_bash_drive_paths_are_understood_on_windows():
+    if os.name != "nt":
+        return
+    with fixture("on") as fx:
+        inside, exe, dev = _land_fixture(fx)
+        os.makedirs(fx.path("scripts"), exist_ok=True)
+        with open(fx.path("scripts", "gates.sh"), "w", encoding="utf-8") as handle:
+            handle.write("#!/usr/bin/env bash\n")
+        gb_exe, gb_inside, gb_gates = _git_bash(exe), _git_bash(inside), _git_bash(fx.path("scripts", "gates.sh"))
+        for command in (
+            f"scripts/gates.sh core > {_git_bash(dev)}/scratch/g.log 2>&1",
+            f"{gb_exe} --land",
+            f"cd {gb_inside} && {gb_exe} --land",
+            f"cd {gb_inside} && {exe} --land",
+            f"{G} worktree remove {gb_inside}",
+            f"{gb_gates} core",
+            f"bash {gb_gates} core",
+        ):
+            allow(fx.verdict("Bash", {"command": command}), repr(command))
+        for command in (
+            f"scripts/gates.sh core > {_git_bash(fx.path('core', 'src', 'lib.rs'))}",
+            f"scripts/gates.sh core > /tmp/g.log",
+            f"{_git_bash(dev)}/other/nucleos-core.exe --land",
+            f"{G} worktree remove {_git_bash(fx.cwd)}",
+            f"{G} worktree remove {_git_bash(os.path.dirname(fx.cwd))}/elsewhere",
+            f"/z/nowhere/scripts/gates.sh core",
         ):
             deny(fx.verdict("Bash", {"command": command}), repr(command))
 
@@ -910,6 +1208,24 @@ def test_glob_allowed_and_flat_charge():
             raise AssertionError(f"Glob should cost 100, spent {_spent(fx)}")
 
 
+def test_grep_and_glob_on_a_file_cost_like_a_read():
+    with fixture("on") as fx:
+        small = _sized(fx, "small.rs", 400)
+        big = _sized(fx, "big.rs", 40000)
+        allow(fx.verdict("Grep", {"pattern": "x", "path": small}), "Grep list mode on a small file")
+        if _spent(fx) != 100:
+            raise AssertionError(f"a 400 byte file costs 100 tokens, spent {_spent(fx)}")
+        allow(fx.verdict("Grep", {"pattern": "x", "path": small, "output_mode": "content"}), "content, small file")
+        allow(fx.verdict("Glob", {"pattern": "*", "path": small}), "Glob with a file path")
+        content = {"pattern": "x", "path": big, "output_mode": "content"}
+        deny(fx.verdict("Grep", content), "content on a big file without head_limit")
+        allow(fx.verdict("Grep", {**content, "head_limit": 20}), "content on a big file, head_limit 20")
+        deny(fx.verdict("Grep", {**content, "head_limit": 0}), "head_limit 0 on a big file")
+        deny(fx.verdict("Grep", {**content, "head_limit": 61}), "head_limit over 60 on a big file")
+        allow(fx.verdict("Grep", {"pattern": "x", "path": big}), "list mode on a big file stays a list")
+        deny(fx.verdict("Grep", {"pattern": "x", "path": fx.path("src", "missing.rs")}), "missing file")
+
+
 def test_budget_accumulates_and_the_crossing_call_is_denied():
     with fixture("on") as fx:
         mid = {"file_path": _sized(fx, "mid.rs", 11000)}  # 2750 tokens
@@ -992,6 +1308,46 @@ def test_observe_mode_still_only_observes_a_big_read():
             raise AssertionError("observe should still flag the big read")
 
 
+# --- notifications -----------------------------------------------------------------------------
+
+NOTIFICATIONS = (
+    "<task-notification>\n<task-id>a176f27f5d0c5b7ca</task-id>\n<status>completed</status>\n</task-notification>",
+    "  \n<task-notification>\n<task-id>x</task-id>\n</task-notification>",
+    "<system-reminder>\nnote\n</system-reminder>\n<task-notification>\n<task-id>x</task-id>",
+    'Another Claude session sent a message:\n<agent-message from="x">hi</agent-message>',
+)
+
+
+def test_notifications_neither_set_nor_clear_manual():
+    with fixture("on") as fx:
+        source = {"file_path": fx.path("core", "src", "lib.rs")}
+        _prompt(fx, "manual: fix the typo")
+        for text in NOTIFICATIONS:
+            _prompt(fx, text)
+            allow(fx.verdict("Read", source), f"manual survives {text[:30]!r}")
+        _prompt(fx, "now something else")
+        deny(fx.verdict("Read", source), "a real prompt still clears it")
+    with fixture("on") as fx:
+        source = {"file_path": fx.path("core", "src", "lib.rs")}
+        for text in NOTIFICATIONS:
+            _prompt(fx, text + "\nmanual: do it")
+            deny(fx.verdict("Read", source), f"a notification never sets manual {text[:30]!r}")
+
+
+def test_notifications_do_not_reset_the_read_budget():
+    with fixture("on") as fx:
+        mid = {"file_path": _sized(fx, "mid.rs", 11000)}
+        allow(fx.verdict("Read", mid), "first")
+        allow(fx.verdict("Read", mid), "second")
+        for text in NOTIFICATIONS:
+            _prompt(fx, text)
+        if _spent(fx) != 5500:
+            raise AssertionError(f"notifications must keep the budget, spent {_spent(fx)}")
+        deny(fx.verdict("Read", mid), "third still crosses 6000")
+        _prompt(fx, "go on")
+        allow(fx.verdict("Read", mid), "a real prompt resets it")
+
+
 TESTS = [
     test_small_read_allowed_large_read_denied,
     test_grep_modes_and_head_limit,
@@ -1037,6 +1393,15 @@ TESTS = [
     test_off_mode_allows_everything,
     test_fail_open_on_internal_error,
     test_probe_writes_payload_keys,
+    test_grep_and_glob_on_a_file_cost_like_a_read,
+    test_git_bash_drive_paths_are_understood_on_windows,
+    test_composition_of_accepted_parts_and_closing_tails,
+    test_broker_runs_cargo_go_node_and_status,
+    test_daemon_script_and_verify_ticket_accepted,
+    test_small_read_only_commands_and_list_agents,
+    test_refusal_says_what_the_root_may_do_itself,
+    test_notifications_neither_set_nor_clear_manual,
+    test_notifications_do_not_reset_the_read_budget,
 ]
 
 
