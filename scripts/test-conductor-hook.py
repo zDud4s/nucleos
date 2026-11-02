@@ -707,6 +707,60 @@ def test_broker_runs_cargo_go_node_and_status():
             deny(fx.verdict("Bash", {"command": command}), repr(command))
 
 
+def test_daemon_script_and_verify_ticket_accepted():
+    with fixture("on") as fx:
+        inside, exe, dev = _land_fixture(fx)
+        _gate_marker(fx)
+        script = fx.path("scripts", "run-daemon.ps1").replace("\\", "/")
+        script_bs = script.replace("/", "\\")
+        for tool, command in (
+            ("PowerShell", f"& '{script_bs}'"),
+            ("PowerShell", f'& "{script}"'),
+            ("PowerShell", f"{script_bs}"),
+            ("PowerShell", "scripts/run-daemon.ps1"),
+            ("PowerShell", ".\\scripts\\run-daemon.ps1"),
+            ("PowerShell", f"pwsh -File {script_bs}"),
+            ("PowerShell", f"powershell -File '{script_bs}'"),
+            ("PowerShell", f"powershell.exe -File {script}"),
+            ("Bash", f"pwsh -File {script}"),
+            ("Bash", f"cd {inside} && pwsh -File {script}"),
+            ("Bash", f"{exe} --verify-ticket 123"),
+            ("Bash", f"{exe} --verify-ticket 123 2>&1 | tail -5"),
+            ("PowerShell", f"& '{exe.replace('/', chr(92))}' --verify-ticket 7"),
+        ):
+            allow(fx.verdict(tool, {"command": command}), f"{tool}: {command!r}")
+        for command in (
+            f"{script} -Foo",
+            f"{script} extra",
+            f"pwsh -File {script} extra",
+            f"pwsh -File {script} -Foo",
+            f"pwsh -Command {script}",
+            f"pwsh -NoProfile -File {script}",
+            f"pwsh {script}",
+            f"pwsh -File {os.path.dirname(fx.cwd).replace(chr(92), '/')}/elsewhere/scripts/run-daemon.ps1",
+            "pwsh -File /tmp/evil/scripts/run-daemon.ps1",
+            "bash -File scripts/run-daemon.ps1",
+            "scripts/run-daemon.ps1; rm x",
+            "scripts/run-daemon.ps1 | cat",
+            "scripts/run-daemon.ps1 && rm x",
+            "scripts/run-daemon.ps1 > out.txt",
+            f"{exe} --verify-ticket abc",
+            f"{exe} --verify-ticket -1",
+            f"{exe} --verify-ticket 1.5",
+            f"{exe} --verify-ticket 12 13",
+            f"{exe} --verify-ticket",
+            f"{exe} --verify-ticket 1; rm x",
+            f"{dev}/other/nucleos-core.exe --verify-ticket 1",
+            f"/tmp/nucleos-core.exe --verify-ticket 1",
+            f"{exe} --print-token",
+            f"{exe} --settings-reset a/b",
+            f"{exe} --settings-rollback a/b 1",
+            f"{exe} --workflow-sync {inside}",
+            f"{exe} --verify-ticket 1 --land",
+        ):
+            deny(fx.verdict("PowerShell", {"command": command}), repr(command))
+
+
 def _git_bash(path):
     """`C:\\x\\y` as Git Bash spells it, `/c/x/y`."""
     path = path.replace("\\", "/")
@@ -1260,6 +1314,7 @@ TESTS = [
     test_git_bash_drive_paths_are_understood_on_windows,
     test_composition_of_accepted_parts_and_closing_tails,
     test_broker_runs_cargo_go_node_and_status,
+    test_daemon_script_and_verify_ticket_accepted,
     test_notifications_neither_set_nor_clear_manual,
     test_notifications_do_not_reset_the_read_budget,
 ]

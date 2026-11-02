@@ -1372,7 +1372,8 @@ CONDUCTOR_GIT_BASH = (
     "c:/program files/git/bin/bash.exe",
     "c:/program files/git/usr/bin/bash.exe",
 )
-CONDUCTOR_GATE_TARGET = re.compile(r"[a-z][a-z0-9_-]*")
+CONDUCTOR_POWERSHELLS = ("pwsh", "pwsh.exe", "powershell", "powershell.exe")
+CONDUCTOR_GATE_TARGET =re.compile(r"[a-z][a-z0-9_-]*")
 # An output redirect at the very end of a command, and nothing else: `> file`, `*> file`
 # (PowerShell), `2>&1`. `>>`, `<`, `2> file` and anything mid-command stay refused.
 CONDUCTOR_REDIRECT_TAIL = re.compile(
@@ -1424,6 +1425,29 @@ def _conductor_strip_redirects(command, state, cwd):
         command = command[: match.start()]
 
 
+def _conductor_project_script(path, name, cwd):
+    """Whether `path` is `scripts/<name>` of a folder at or above `cwd`, not a file of that name elsewhere."""
+    script = _conductor_path(path, cwd)
+    return any(script == _conductor_path(os.path.join(f, "scripts", name), cwd) for f in _ancestors(cwd))
+
+
+def _conductor_daemon_accepts(tokens, cwd):
+    """`<project>/scripts/run-daemon.ps1` and nothing after it, run directly or as `pwsh -File <path>`."""
+    if len(tokens) == 3 and tokens[0].lower() in CONDUCTOR_POWERSHELLS and tokens[1].lower() == "-file":
+        tokens = tokens[2:]
+    return len(tokens) == 1 and _conductor_project_script(tokens[0], "run-daemon.ps1", cwd)
+
+
+def _conductor_verify_accepts(tokens, cwd):
+    """`<dev home>/run/nucleos-core.exe --verify-ticket <integer>`: waits for a verify ticket, nothing else."""
+    return (
+        len(tokens) == 3
+        and tokens[1] == "--verify-ticket"
+        and re.fullmatch(r"[0-9]+", tokens[2]) is not None
+        and _conductor_path(tokens[0], cwd) == _conductor_dev_exe(cwd)
+    )
+
+
 def _conductor_gates_accepts(tokens, cwd):
     """`[bash] <project>/scripts/gates.sh [target]`: this project's own gate script, which the root
     controller runs (the subagent guard in `scripts/heavy_guard.py` leaves it to the root)."""
@@ -1431,11 +1455,7 @@ def _conductor_gates_accepts(tokens, cwd):
         tokens = tokens[1:]
     if not tokens or len(tokens) > 2:
         return False
-    script = _conductor_path(tokens[0], cwd)
-    if not any(
-        script == _conductor_path(os.path.join(folder, "scripts", "gates.sh"), cwd)
-        for folder in _ancestors(cwd)
-    ):
+    if not _conductor_project_script(tokens[0], "gates.sh", cwd):
         return False
     return len(tokens) == 1 or CONDUCTOR_GATE_TARGET.fullmatch(tokens[1]) is not None
 
@@ -1445,11 +1465,7 @@ def _conductor_heavy_accepts(tokens, cwd):
     this project, not a file of that name somewhere an agent may write. A transitional rule of the spec (2.2)."""
     if len(tokens) < 3 or tokens[0].lower() not in ("python", "python.exe", "python3", "py"):
         return False
-    script = _conductor_path(tokens[1], cwd)
-    if not any(
-        script == _conductor_path(os.path.join(folder, "scripts", "heavy.py"), cwd)
-        for folder in _ancestors(cwd)
-    ):
+    if not _conductor_project_script(tokens[1], "heavy.py", cwd):
         return False
     if tokens[2:] == ["status"]:
         return True
@@ -1626,7 +1642,12 @@ def _conductor_part_accepts(part, cwd):
     if tokens[0].lower() == "cd":
         target = None if called else _conductor_cd_target(tokens[1:], cwd)
         return target is not None, target or cwd
-    if _conductor_gates_accepts(tokens, cwd) or _conductor_land_accepts(tokens, cwd):
+    if (
+        _conductor_gates_accepts(tokens, cwd)
+        or _conductor_land_accepts(tokens, cwd)
+        or _conductor_verify_accepts(tokens, cwd)
+        or _conductor_daemon_accepts(tokens, cwd)
+    ):
         return True, cwd
     if called:
         return False, cwd
