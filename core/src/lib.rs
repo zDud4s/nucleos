@@ -84,7 +84,6 @@ pub use nucleos_base::recurrence;
 pub mod remote;
 pub mod repo_trigger;
 pub mod resolver;
-pub mod route_index;
 pub use nucleos_base::router_client;
 pub use nucleos_base::search;
 pub use nucleos_base::secrets;

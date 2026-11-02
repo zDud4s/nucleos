@@ -1,5 +1,7 @@
 mod cli;
 mod http;
+// `route_index` moved up from `nucleos-core` on 2026-11-02: only `http` reads it.
+mod route_index;
 mod startup;
 #[cfg(windows)]
 mod supervisor;
