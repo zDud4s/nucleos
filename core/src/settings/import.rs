@@ -48,6 +48,10 @@ fn to_json<T: Serialize>(value: T) -> Result<Value, String> {
 /// run is proved at startup, by `config::runnable_council`.
 pub fn yaml_to_body(name: &str, text: &str) -> Result<Value, String> {
     match name {
+        "machine" => to_json(
+            serde_yaml::from_str::<config::MachineConfig>(text)
+                .map_err(|error| error.to_string())?,
+        ),
         "email" => to_json(config::parse_email_config(text)?),
         "voice" => to_json(config::parse_voice_config(text)?),
         "calendar" => to_json(config::parse_calendar_config(text)?),

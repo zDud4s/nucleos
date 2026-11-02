@@ -36,6 +36,16 @@ const WEB_SEARCH_KEY: &str = "web-search-api-key";
 /// rather than after a 401 comes back.
 const OPENROUTER_KEY: &str = "openrouter-api-key";
 
+/// The configured role controls shared-machine work, independently of development-instance mode.
+fn starts_channel_sidecar(is_primary_instance: bool, machine: &config::MachineConfig) -> bool {
+    is_primary_instance && machine.role == config::MachineRole::Primary
+}
+
+/// Scheduled routine loops belong to the configured primary machine, not the development instance.
+fn runs_scheduled_routine(machine: &config::MachineConfig) -> bool {
+    machine.role == config::MachineRole::Primary
+}
+
 /// A machine-scoped document from the settings snapshot, or its default when none is stored.
 fn machine_doc<T: settings::Document + Default>() -> T {
     (*settings::get::<T>(&settings::Scope::Machine)).clone()
@@ -256,6 +266,7 @@ async fn main() -> std::process::ExitCode {
     // Still a file: the remote pairing is not a settings document.
     let machine_file = |file: &str| machine_config_root.as_ref().map(|root| root.join(file));
 
+    let machine_config: config::MachineConfig = machine_doc();
     let models_config: config::ModelsConfig = machine_doc();
     // The owner's saved choice (Settings) wins over the file, which is the default of an untouched
     // install; `embed::install` is called again by the settings door when the choice changes.
@@ -879,13 +890,18 @@ async fn main() -> std::process::ExitCode {
         "nucleos-core listening on {}",
         listener.local_addr().unwrap()
     );
-    // Every sidecar below is gated on this, and the reason is not tidiness. Secrets live in
+    // The development-instance switch gates this process's sidecars and remains separate from the
+    // configured machine role. Secrets live in
     // Windows Credential Manager, which is NOT under the data directory — so a secondary instance
     // with its own empty database still loads the real Telegram bot token and the real mail
     // password. Two supervised telegram sidecars poll one account and answer every message twice;
     // two browser or web sidecars fight over the same fixed ports. A second daemon is for
     // exercising this process's own HTTP and MCP surface, and it does that without any of them.
     let sidecars_wanted = is_primary;
+    // Only channel adapters consume shared inboxes. Other sidecars keep their established startup
+    // behaviour on a secondary machine role.
+    let channel_sidecars_wanted = starts_channel_sidecar(sidecars_wanted, &machine_config);
+    let scheduled_routines_wanted = runs_scheduled_routine(&machine_config);
     let sidecar_path = sidecar::binary(sidecar::ECHO);
     if sidecars_wanted {
         tokio::spawn(sidecar::supervise(
@@ -1038,11 +1054,13 @@ async fn main() -> std::process::ExitCode {
     // The v1 Telegram supervisor is gone on purpose: the channel registry launches the v2 adapter
     // (`channels::registry::launch_all`, below). Two supervisors on one bot would both long-poll
     // `getUpdates` and Telegram answers the loser with a 409.
-    tokio::spawn(execution::scheduler::run_scheduler(state.clone()));
-    // Its own loop, not a step inside the scheduler's: a job pass can sit inside `run_gate` for the
-    // whole gate timeout, and sharing a loop would stall every scheduled rule in the daemon behind
-    // one project's test suite.
-    tokio::spawn(execution::job::run_job_loop(state.clone()));
+    if scheduled_routines_wanted {
+        tokio::spawn(execution::scheduler::run_scheduler(state.clone()));
+        // Its own loop, not a step inside the scheduler's: a job pass can sit inside `run_gate` for the
+        // whole gate timeout, and sharing a loop would stall every scheduled rule in the daemon behind
+        // one project's test suite.
+        tokio::spawn(execution::job::run_job_loop(state.clone()));
+    }
     // Holds the machine awake while a run is live (setting `keep_awake_while_working`, on by default).
     tokio::spawn(shutdown::run_keep_awake_loop(
         state.pool.clone(),
@@ -1061,12 +1079,14 @@ async fn main() -> std::process::ExitCode {
     // its own.
     tokio::spawn(team::run_team_loop(state.clone()));
     tokio::spawn(team::run_workspace_gc_loop(state.clone()));
-    // A third loop and not a branch in either of the two above. What DECIDES that a department
-    // starts is a different question from how it runs — the same separation `scheduler.rs` has from
-    // `job.rs` — and it could not have gone in `scheduler_tick` at all: that loop is per project,
-    // and a department has no project, no root and no HEAD.
-    tokio::spawn(team::trigger::run_team_trigger_loop(state.clone()));
-    tokio::spawn(repo_trigger::run_repo_poller(state.clone()));
+    if scheduled_routines_wanted {
+        // A third loop and not a branch in either of the two above. What DECIDES that a department
+        // starts is a different question from how it runs — the same separation `scheduler.rs` has from
+        // `job.rs` — and it could not have gone in `scheduler_tick` at all: that loop is per project,
+        // and a department has no project, no root and no HEAD.
+        tokio::spawn(team::trigger::run_team_trigger_loop(state.clone()));
+        tokio::spawn(repo_trigger::run_repo_poller(state.clone()));
+    }
     tokio::spawn(execution::worktree::run_gc(state.pool.clone()));
     // Plan 2026-10-17 F1: every session in a rostered project gets the `verify` box, the main
     // checkout's and a worktree added by hand included, unless the owner switched it off.
@@ -1159,7 +1179,9 @@ async fn main() -> std::process::ExitCode {
     ));
     // Opens the correction run of a `fix/` branch the gate worker prepared; with `revert_on_red` off
     // for every project there is never one, and a pass reads an empty query.
-    tokio::spawn(verify::postgate_worker::run_correction_loop(state.clone()));
+    if scheduled_routines_wanted {
+        tokio::spawn(verify::postgate_worker::run_correction_loop(state.clone()));
+    }
     tokio::spawn(verify::exec::run_executor(verify_executor));
     startup::rearm_verify_wakes(&state).await;
     tokio::spawn(execution::vcs::run_queue_worker(
@@ -1174,7 +1196,9 @@ async fn main() -> std::process::ExitCode {
     // with: the worker holds a pool and a repository lock, and starting an agent needs an
     // `AppState` and the time an agent takes. The queue escalates and lets go; this picks the
     // conflict up afterwards.
-    tokio::spawn(resolver::run_resolution_loop(state.clone()));
+    if scheduled_routines_wanted {
+        tokio::spawn(resolver::run_resolution_loop(state.clone()));
+    }
     // Only when a local model is already configured, and reusing the triage one rather than adding
     // a key: this reads mail-derived text, which is the text that model was chosen for, and
     // `web.rs` sets the precedent of one local model pinned in one place serving more than one
@@ -1214,14 +1238,16 @@ async fn main() -> std::process::ExitCode {
     // then launch the adapters: that fills the secrets cache `channel_instances_exist` reads.
     // A secondary daemon (a test run) must not import, and above all must not retire, the
     // machine's v1 files.
-    if sidecars_wanted {
+    if channel_sidecars_wanted {
         channels::telegram_switch::run_or_warn(&state).await;
     }
-    channels::registry::launch_all(&state, sidecars_wanted).await;
+    channels::registry::launch_all(&state, channel_sidecars_wanted).await;
     // Channel loops start only when a channel instance exists (a channel with its secrets present).
     // Seeding runs first so the turn watermark and the routing cursors exist before the first
     // discover/route_once.
-    if !channels::registry::all().is_empty() && channels::registry::channel_instances_exist(&state)
+    if channel_sidecars_wanted
+        && !channels::registry::all().is_empty()
+        && channels::registry::channel_instances_exist(&state)
     {
         let cadence = channels::bus::Cadence::default();
         channels::routing::seed_all(&state).await;
@@ -1291,7 +1317,7 @@ async fn main() -> std::process::ExitCode {
                                 &email_config,
                                 &password,
                             );
-                            if sidecars_wanted {
+                            if channel_sidecars_wanted {
                                 tokio::spawn(sidecar::supervise(
                                     sidecar::EMAIL.to_string(),
                                     path,
@@ -1342,6 +1368,38 @@ async fn main() -> std::process::ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_secondary_daemon_starts_no_channel_sidecar() {
+        let machine = config::MachineConfig {
+            name: None,
+            role: config::MachineRole::Secondary,
+        };
+
+        assert!(!starts_channel_sidecar(true, &machine));
+    }
+
+    #[test]
+    fn a_secondary_daemon_runs_no_scheduled_routine() {
+        let machine = config::MachineConfig {
+            name: None,
+            role: config::MachineRole::Secondary,
+        };
+
+        assert!(!runs_scheduled_routine(&machine));
+    }
+
+    #[test]
+    fn a_primary_role_on_a_secondary_instance_starts_no_channel_sidecar_but_runs_scheduled_routines()
+     {
+        let machine = config::MachineConfig {
+            name: None,
+            role: config::MachineRole::Primary,
+        };
+
+        assert!(!starts_channel_sidecar(false, &machine));
+        assert!(runs_scheduled_routine(&machine));
+    }
 
     /// Uma equipa que nunca correu nao se desenha como uma tabela vazia.
     ///

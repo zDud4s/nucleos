@@ -743,6 +743,7 @@ const REMOTE_DENIED_SEGMENTS: &[&str] = &[
     "daemon",
     "fs",
     "hooks",
+    "machine",
     "models",
     "nodes",
     "pricing",
@@ -805,6 +806,10 @@ const REMOTE_AGENT_ONLY_SEGMENTS: &[(&str, &str)] = &[
     ),
     ("context", "context an agent session pulls for its own turn"),
     ("hooks", "the hook endpoints agent sessions call back into"),
+    (
+        "machine",
+        "the daemon role is a control-token-only machine setting",
+    ),
     (
         "models",
         "the model catalogue agent sessions pick from; the shell never calls it",
@@ -3036,6 +3041,22 @@ mod tests {
             &Method::GET,
             "/email/queue"
         ));
+    }
+
+    #[test]
+    fn a_device_session_cannot_read_or_change_the_machine_role() {
+        for method in [Method::GET, Method::PUT] {
+            for level in ALL_LEVELS {
+                assert!(
+                    !remote_device_permits(level, &method, "/machine"),
+                    "{level:?} {method}"
+                );
+                assert!(
+                    !super::remote_device_permits(level, true, &method, "/machine"),
+                    "owner {level:?} {method}"
+                );
+            }
+        }
     }
 
     /// Local callers are unchanged: the control token (no device session) and an Admin API token

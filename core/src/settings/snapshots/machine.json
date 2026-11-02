@@ -1,0 +1,30 @@
+{
+  "$defs": {
+    "MachineRole": {
+      "description": "Whether this daemon owns machine-wide channel and routine supervision.",
+      "enum": [
+        "primary",
+        "secondary"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "A machine-scoped identity and role.\n\nAn absent name is resolved when it is read so an older document needs no migration and keeps\nidentifying this machine by its system hostname.",
+  "properties": {
+    "name": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "role": {
+      "$ref": "#/$defs/MachineRole",
+      "default": "primary"
+    }
+  },
+  "title": "MachineConfig",
+  "type": "object"
+}

@@ -1,5 +1,5 @@
 //! The document kinds the settings store knows: a trait that ties a Rust type to a name and a scope kind,
-//! and the table of the documents: the 13 fixed ones plus one `channels/<id>` row per channel manifest.
+//! and the table of the documents: the 14 fixed ones plus one `channels/<id>` row per channel manifest.
 
 use std::sync::LazyLock;
 
@@ -12,8 +12,8 @@ use super::scope::Kind;
 use crate::channels::registry::ChannelConfig;
 use crate::config::{
     AutopilotRules, BackgroundConfig, BrowserConfig, CalendarConfig, CouncilConfig, DevtimeConfig,
-    EmailConfig, GithubConfig, KeepAwakeConfig, ModelsConfig, VerifyConfig, VoiceConfig, WebConfig,
-    validate_devtime, validate_rules,
+    EmailConfig, GithubConfig, KeepAwakeConfig, MachineConfig, ModelsConfig, VerifyConfig,
+    VoiceConfig, WebConfig, validate_devtime, validate_rules,
 };
 use crate::machine_config as files;
 use crate::models::route_doc::RouterDoc;
@@ -128,6 +128,10 @@ fn of_optional<T: Document + schemars::JsonSchema>(
 
 static DOCUMENTS: LazyLock<Vec<DocType>> = LazyLock::new(|| {
     let mut docs = vec![
+        of::<MachineConfig>(
+            files::MACHINE_FILE,
+            "when the daemon restarts — channel and scheduled-routine supervision are selected at startup",
+        ),
         of::<EmailConfig>(
             files::EMAIL_FILE,
             "when the daemon restarts — the mailbox is polled by a sidecar started with this file's contents",
@@ -213,6 +217,11 @@ impl Document for EmailConfig {
     fn finish(self) -> Result<Self, String> {
         Ok(self.validated())
     }
+}
+
+impl Document for MachineConfig {
+    const NAME: &'static str = "machine";
+    const KIND: Kind = Kind::Machine;
 }
 
 impl Document for VoiceConfig {
@@ -341,16 +350,16 @@ mod tests {
     }
 
     #[test]
-    fn there_are_fifteen_documents_with_unique_names() {
-        // 15 fixed documents plus one `channels/<id>` per manifest.
+    fn there_are_sixteen_documents_with_unique_names() {
+        // 16 fixed documents plus one `channels/<id>` per manifest.
         let channels = crate::channels::registry::MANIFESTS.len();
         let docs = documents();
-        assert_eq!(docs.len(), 15 + channels);
+        assert_eq!(docs.len(), 16 + channels);
         let names: BTreeSet<_> = docs.iter().map(|doc| doc.name).collect();
-        assert_eq!(names.len(), 15 + channels);
+        assert_eq!(names.len(), 16 + channels);
         assert_eq!(
             docs.iter().filter(|doc| doc.kind == Kind::Machine).count(),
-            13 + channels
+            14 + channels
         );
         let project: Vec<_> = docs
             .iter()

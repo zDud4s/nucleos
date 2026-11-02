@@ -159,6 +159,20 @@ pub(super) const ROUTES: &[RouteEntry] = &[
     },
     RouteEntry {
         method: "GET",
+        path: "/machine",
+        purpose: "Get machine.",
+        body: Body::None,
+        handler: "get_machine",
+    },
+    RouteEntry {
+        method: "PUT",
+        path: "/machine",
+        purpose: "Put machine.",
+        body: Body::Shapeless("PutMachine"),
+        handler: "put_machine",
+    },
+    RouteEntry {
+        method: "GET",
         path: "/models/latest",
         purpose: "Get latest models.",
         body: Body::None,

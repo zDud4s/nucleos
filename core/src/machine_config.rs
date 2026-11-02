@@ -50,6 +50,7 @@ pub const DEVTIME_FILE: &str = "devtime.yaml";
 pub const VERIFY_FILE: &str = "verify.yaml";
 pub const KEEP_AWAKE_FILE: &str = "keep_awake.yaml";
 pub const BACKGROUND_FILE: &str = "background.yaml";
+pub const MACHINE_FILE: &str = "machine.yaml";
 
 /* -------------------------------------------------------------- the credentials -- */
 

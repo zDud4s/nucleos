@@ -69,11 +69,13 @@ async fn on_the_roster(state: &AppState, scope: &Scope) -> Result<(), Refused> {
 /// The scope and document a read names, or the refusal that says which part of the path is wrong.
 async fn readable_document(
     state: &AppState,
+    caller: &Caller,
     scope: &str,
     name: &str,
 ) -> Result<(Scope, &'static DocType), Refused> {
     let scope = parse_scope(scope)?;
     on_the_roster(state, &scope).await?;
+    control_only_machine_document(caller, &scope, name)?;
     let doc =
         store::doc_type(name).ok_or_else(|| refusal(StatusCode::NOT_FOUND, "unknown_document"))?;
     if doc.kind != scope.kind() {
@@ -107,10 +109,24 @@ async fn writable_scope(state: &AppState, scope: &str) -> Result<Scope, Refused>
 }
 
 /// A write answers `not_ours` for an unknown name and for a known name at the wrong kind of scope alike.
-fn owned_document(scope: &Scope, name: &str) -> Result<&'static DocType, Refused> {
+fn owned_document(caller: &Caller, scope: &Scope, name: &str) -> Result<&'static DocType, Refused> {
+    control_only_machine_document(caller, scope, name)?;
     store::doc_type(name)
         .filter(|doc| doc.kind == scope.kind())
         .ok_or_else(|| refusal(StatusCode::FORBIDDEN, "not_ours"))
+}
+
+/// The role is a machine-wide control decision. Its settings document stays registered for storage
+/// and startup, but the generic settings door is never another way for an Admin token to change it.
+fn control_only_machine_document(
+    caller: &Caller,
+    scope: &Scope,
+    name: &str,
+) -> Result<(), Refused> {
+    if matches!(scope, Scope::Machine) && name == "machine" && !matches!(caller, Caller::Control) {
+        return Err(refusal(StatusCode::FORBIDDEN, "control_required"));
+    }
+    Ok(())
 }
 
 /// The version of the stored row, readable or not; `None` when there is no row.
@@ -187,6 +203,7 @@ fn refused(error: SettingsError) -> Refused {
 /// `GET /settings[?scope=]`: the documents of one scope, in registry order. Without a scope, the machine's.
 async fn index(
     State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
     Query(query): Query<IndexQuery>,
 ) -> Result<Json<Value>, Refused> {
     let scope = match query.scope.as_deref() {
@@ -199,6 +216,7 @@ async fn index(
     let rows: Vec<Value> = store::documents()
         .iter()
         .filter(|doc| doc.kind == scope.kind())
+        .filter(|doc| control_only_machine_document(&caller, &scope, doc.name).is_ok())
         .map(|doc| {
             let version = stored_version(&snapshot, &scope, doc.name);
             json!({
@@ -222,9 +240,10 @@ async fn index(
 /// not the defaults, so the client cannot edit what is not stored; it carries the version that replaces the row.
 async fn read_document(
     State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
     Path((scope, name)): Path<(String, String)>,
 ) -> Result<Json<Value>, Refused> {
-    let (scope, doc) = readable_document(&state, &scope, &name).await?;
+    let (scope, doc) = readable_document(&state, &caller, &scope, &name).await?;
     let snapshot = store::global().snapshot();
     if let Some(record) = snapshot.unreadable_for(&scope, doc.name) {
         return Err((
@@ -248,9 +267,10 @@ async fn read_document(
 /// `GET /settings/{scope}/{name}/history`: every version, newest first, without the bodies.
 async fn read_history(
     State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
     Path((scope, name)): Path<(String, String)>,
 ) -> Result<Json<Value>, Refused> {
-    let (scope, doc) = readable_document(&state, &scope, &name).await?;
+    let (scope, doc) = readable_document(&state, &caller, &scope, &name).await?;
     let rows = store::history(&state.pool, &scope, doc.name)
         .await
         .map_err(refused)?;
@@ -278,7 +298,7 @@ async fn write_document(
     request: Result<Json<WriteRequest>, JsonRejection>,
 ) -> Result<Json<Value>, Refused> {
     let scope = writable_scope(&state, &scope).await?;
-    let doc = owned_document(&scope, &name)?;
+    let doc = owned_document(&caller, &scope, &name)?;
     let Json(request) = request.map_err(bad_body)?;
     let device = device.map(|Extension(device)| device);
     if device.as_ref().is_some_and(command_change_is_gated) {
@@ -354,7 +374,7 @@ async fn rollback_document(
     request: Result<Json<RollbackRequest>, JsonRejection>,
 ) -> Result<Json<Value>, Refused> {
     let scope = writable_scope(&state, &scope).await?;
-    let doc = owned_document(&scope, &name)?;
+    let doc = owned_document(&caller, &scope, &name)?;
     let Json(request) = request.map_err(bad_body)?;
     let device = device.map(|Extension(device)| device);
     if device.as_ref().is_some_and(command_change_is_gated) {
@@ -1470,6 +1490,28 @@ mod tests {
         ) -> (StatusCode, Value) {
             let uri = format!("/settings/{scope}/{name}/rollback/{to_version}");
             remote_call(state, "POST", &uri, json!({ "version": current })).await
+        }
+
+        #[tokio::test]
+        async fn a_device_cannot_change_the_role_through_the_settings_door() {
+            let (_home, state) = fixture().await;
+
+            let (status, answer) = remote_put(
+                &state,
+                "machine",
+                "machine",
+                json!({ "role": "secondary" }),
+                0,
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::FORBIDDEN, "{answer}");
+            assert_eq!(answer["refusal"], "control_required");
+            assert_eq!(
+                store::get::<crate::config::MachineConfig>(&Scope::Machine).role,
+                crate::config::MachineRole::Primary,
+                "the refused write did not change the stored role"
+            );
         }
 
         async fn seed(state: &AppState, scope: &str, name: &str, body: &Value, expected: i64) {

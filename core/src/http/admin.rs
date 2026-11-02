@@ -4,6 +4,7 @@ use super::*;
 
 pub(super) fn routes() -> Router<AppState> {
     Router::new()
+        .route("/machine", get(get_machine).put(put_machine))
         .route("/sidecars", get(get_sidecars))
         // The update handshake. In no `auth.rs` table on purpose: Control and Admin only, like
         // `/daemon/shutdown`. A run's key must not read the readiness or begin a drain.
@@ -694,10 +695,94 @@ fn require_control(scope: &crate::auth::Scope) -> Result<(), StatusCode> {
     } else {
         tracing::warn!(
             ?scope,
-            "refused a caller other than the control token on /system/autostart"
+            "refused a caller other than the control token on a control-only machine route"
         );
         Err(StatusCode::FORBIDDEN)
     }
+}
+
+#[derive(Serialize)]
+struct MachineView {
+    name: String,
+    role: crate::config::MachineRole,
+}
+
+impl From<crate::config::MachineConfig> for MachineView {
+    fn from(machine: crate::config::MachineConfig) -> Self {
+        Self {
+            name: machine.name(),
+            role: machine.role,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct PutMachine {
+    name: Option<String>,
+    role: Option<crate::config::MachineRole>,
+}
+
+#[derive(Serialize)]
+struct PutMachineView {
+    #[serde(flatten)]
+    machine: MachineView,
+    restart_required: bool,
+}
+
+/// `GET /machine`: the local machine's display name and role.
+async fn get_machine(
+    axum::Extension(scope): axum::Extension<crate::auth::Scope>,
+) -> Result<Json<MachineView>, StatusCode> {
+    require_control(&scope)?;
+    Ok(Json(
+        (*crate::settings::get::<crate::config::MachineConfig>(&crate::settings::Scope::Machine))
+            .clone()
+            .into(),
+    ))
+}
+
+/// `PUT /machine { name?, role? }`: update the local identity or role.
+///
+/// Sidecar and scheduler supervisors are selected once during startup, so changing the role is
+/// durable immediately but takes effect after the daemon restarts.
+async fn put_machine(
+    State(state): State<AppState>,
+    axum::Extension(scope): axum::Extension<crate::auth::Scope>,
+    Json(update): Json<PutMachine>,
+) -> Result<Json<PutMachineView>, StatusCode> {
+    require_control(&scope)?;
+    let name = update.name;
+    let role = update.role;
+    let role_changed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let changed = std::sync::Arc::clone(&role_changed);
+    crate::settings::update::<crate::config::MachineConfig, _>(
+        &state.pool,
+        &crate::settings::Scope::Machine,
+        "control",
+        move |machine| {
+            if let Some(name) = name {
+                machine.name = (!name.trim().is_empty()).then_some(name);
+            }
+            if let Some(role) = role {
+                changed.store(machine.role != role, std::sync::atomic::Ordering::Relaxed);
+                machine.role = role;
+            }
+        },
+    )
+    .await
+    .map_err(|error| {
+        tracing::warn!(%error, "could not store the machine role");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let machine =
+        (*crate::settings::get::<crate::config::MachineConfig>(&crate::settings::Scope::Machine))
+            .clone()
+            .into();
+    Ok(Json(PutMachineView {
+        machine,
+        restart_required: role_changed.load(std::sync::atomic::Ordering::Relaxed),
+    }))
 }
 
 #[derive(Serialize)]
