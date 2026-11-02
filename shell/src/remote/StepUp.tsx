@@ -67,7 +67,7 @@ function decodeDescriptors(list: unknown): PublicKeyCredentialDescriptor[] | und
   return (list as Descriptor[]).map((entry) => ({ ...entry, id: b64urlToBuffer(entry.id) })) as PublicKeyCredentialDescriptor[];
 }
 
-function creationOptions(wire: Record<string, unknown>): PublicKeyCredentialCreationOptions {
+export function creationOptions(wire: Record<string, unknown>): PublicKeyCredentialCreationOptions {
   const user = wire.user as { id: string };
   return {
     ...wire,
@@ -77,7 +77,7 @@ function creationOptions(wire: Record<string, unknown>): PublicKeyCredentialCrea
   } as unknown as PublicKeyCredentialCreationOptions;
 }
 
-function requestOptions(wire: Record<string, unknown>): PublicKeyCredentialRequestOptions {
+export function requestOptions(wire: Record<string, unknown>): PublicKeyCredentialRequestOptions {
   return {
     ...wire,
     challenge: b64urlToBuffer(wire.challenge as string),

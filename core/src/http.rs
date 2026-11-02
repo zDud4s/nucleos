@@ -61,6 +61,7 @@ mod repo;
 mod restart;
 mod run_queue;
 mod settings;
+mod stepup;
 mod tasks;
 mod team;
 mod themes;
@@ -152,6 +153,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(proposals::routes())
         .merge(relay::routes())
         .merge(remote::routes())
+        .merge(stepup::routes())
         .merge(repo::routes())
         .merge(run_queue::routes())
         .merge(settings::routes())

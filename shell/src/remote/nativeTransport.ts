@@ -1,5 +1,6 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
-import type { Transport } from "../data/transport";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import type { StepUpOutcome, Transport } from "../data/transport";
 
 export interface NativeMachine {
   id: string;
@@ -103,6 +104,40 @@ function machineFetch(machine: NativeMachine, origin: string): typeof fetch {
   };
 }
 
+const STEP_UP_POLL_MS = 1_000;
+const STEP_UP_WAIT_MS = 5 * 60_000;
+
+async function nativeStepUp(machine: NativeMachine, origin: string, label: string) {
+  const fetchForMachine = machineFetch(machine, origin);
+  try {
+    const created = await fetchForMachine(`${origin}/api/stepup/ticket`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Nucleos-Csrf": "1" },
+      body: JSON.stringify({ label: label.slice(0, 160) || "Confirm this action" }),
+    });
+    if (!created.ok) throw new Error("ticket_refused");
+    const ticket = (await created.json()) as { ticket?: unknown };
+    if (typeof ticket.ticket !== "string" || ticket.ticket === "") throw new Error("ticket_refused");
+    await openUrl(`${origin}/stepup?ticket=${encodeURIComponent(ticket.ticket)}`);
+    const deadline = Date.now() + STEP_UP_WAIT_MS;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, STEP_UP_POLL_MS));
+      const status = await fetchForMachine(`${origin}/api/stepup/status`);
+      if (!status.ok) break;
+      const body = (await status.json()) as { stepped_up?: unknown };
+      if (body.stepped_up === true) return { kind: "verified" as const };
+    }
+  } catch {
+    // The original grave refusal stays the only useful answer: opening a browser is best effort.
+  }
+  return { kind: "failed" as const, code: "step_up_required", detail: "Passkey confirmation was not completed. Nothing was done." };
+}
+
+/** Part D calls this before a remote machine's grave `begin`, with its human-readable move label. */
+export async function requestNativeStepUp(machine: NativeMachine, label: string): Promise<StepUpOutcome> {
+  return await nativeStepUp(machine, machine.origin.replace(/\/$/, ""), label);
+}
+
 /**
  * The installed shell talks to another gateway without a browser cookie jar and
  * without ever holding its session: every request is made by the host, from the
@@ -123,6 +158,7 @@ export function nativeTransport(machine: NativeMachine): Transport {
     label: origin,
     unauthorizedCode: "session_invalid",
     probeHeaders: {},
+    onStepUp: (action) => requestNativeStepUp(machine, action),
   };
 }
 

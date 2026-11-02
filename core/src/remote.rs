@@ -36,6 +36,8 @@ pub const LAST_SEEN_GRANULARITY: Duration = Duration::seconds(60);
 /// How long a step-up confirmation opens the grave routes (`auth::GRAVE_ROUTES`).
 pub const STEP_UP_WINDOW: Duration = Duration::minutes(5);
 
+pub mod stepup;
+
 /// The machine-config file, under `~/.nucleos`, that arms remote access.
 pub const REMOTE_FILE: &str = "remote.yaml";
 
@@ -1026,5 +1028,115 @@ mod tests {
         add_passkey(&pool, owner.device_id, record, t0())
             .await
             .unwrap();
+    }
+
+    async fn ticket_owner(pool: &SqlitePool, name: &str) -> Paired {
+        let code = create_pairing_code_for(pool, ApiTokenLevel::Admin, true, name, t0())
+            .await
+            .unwrap();
+        let paired = exchange(pool, &code.code, t0()).await.unwrap();
+        passkeys::add_passkey(pool, paired.device_id, r#"{"id":"ticket-key"}"#, t0())
+            .await
+            .unwrap();
+        paired
+    }
+
+    #[tokio::test]
+    async fn a_ticket_can_only_be_made_for_the_device_asking() {
+        let pool = pool().await;
+        let first = ticket_owner(&pool, "first").await;
+        let second = ticket_owner(&pool, "second").await;
+        let caller = authenticate(&pool, &first.session, t0()).await.unwrap();
+        let made = stepup::create(&pool, caller.id, caller.owner, "Move chat", t0())
+            .await
+            .unwrap();
+        assert_eq!(
+            stepup::info(&pool, &made.ticket, t0())
+                .await
+                .unwrap()
+                .device_id,
+            first.device_id
+        );
+        assert_ne!(first.device_id, second.device_id);
+    }
+
+    #[tokio::test]
+    async fn a_ticket_steps_up_only_its_own_device() {
+        let pool = pool().await;
+        let first = ticket_owner(&pool, "first").await;
+        let second = ticket_owner(&pool, "second").await;
+        let made = stepup::create(&pool, first.device_id, true, "Move chat", t0())
+            .await
+            .unwrap();
+        stepup::consume(&pool, &made.ticket, t0()).await.unwrap();
+        assert!(
+            authenticate(&pool, &first.session, t0())
+                .await
+                .unwrap()
+                .stepped_up
+        );
+        assert!(
+            !authenticate(&pool, &second.session, t0())
+                .await
+                .unwrap()
+                .stepped_up
+        );
+    }
+
+    #[tokio::test]
+    async fn a_ticket_works_once() {
+        let pool = pool().await;
+        let owner = ticket_owner(&pool, "owner").await;
+        let made = stepup::create(&pool, owner.device_id, true, "Move chat", t0())
+            .await
+            .unwrap();
+        stepup::consume(&pool, &made.ticket, t0()).await.unwrap();
+        assert!(matches!(
+            stepup::consume(&pool, &made.ticket, t0()).await,
+            Err(stepup::TicketError::Invalid)
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_expired_ticket_is_refused() {
+        let pool = pool().await;
+        let owner = ticket_owner(&pool, "owner").await;
+        let made = stepup::create(&pool, owner.device_id, true, "Move chat", t0())
+            .await
+            .unwrap();
+        assert!(matches!(
+            stepup::info(&pool, &made.ticket, t0() + stepup::TICKET_TTL).await,
+            Err(stepup::TicketError::Invalid)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_ticket_is_not_a_session() {
+        let pool = pool().await;
+        let owner = ticket_owner(&pool, "owner").await;
+        let made = stepup::create(&pool, owner.device_id, true, "Move chat", t0())
+            .await
+            .unwrap();
+        assert!(matches!(
+            authenticate(&pool, &made.ticket, t0()).await,
+            Err(SessionError::Invalid)
+        ));
+    }
+
+    #[test]
+    fn the_consuming_route_is_refused_to_everyone_but_the_gateway() {
+        use axum::http::Method;
+        for level in [
+            ApiTokenLevel::ReadOnly,
+            ApiTokenLevel::RunCreating,
+            ApiTokenLevel::Admin,
+        ] {
+            assert!(!crate::auth::remote_device_permits(
+                level,
+                false,
+                &Method::POST,
+                "/remote/step-up/ticket/consume"
+            ));
+        }
     }
 }

@@ -641,12 +641,16 @@ const REMOTE_GATEWAY_ROUTES: &[(Method, &str)] = &[
     (Method::GET, "/remote/passkeys/{device}"),
     (Method::POST, "/remote/passkeys"),
     (Method::POST, "/remote/step-up"),
+    (Method::GET, "/remote/step-up/ticket/{ticket}"),
+    (Method::POST, "/remote/step-up/ticket/consume"),
 ];
 
 /// Open to every paired device whatever its level: reading itself and logging out.
 const REMOTE_SELF_ROUTES: &[(Method, &str)] = &[
     (Method::GET, "/remote/session"),
     (Method::POST, "/remote/logout"),
+    (Method::POST, "/stepup/ticket"),
+    (Method::GET, "/stepup/status"),
 ];
 
 /// The ONLY first path segments a remote device may reach. Derived from what the phone UI calls:
@@ -673,6 +677,7 @@ const REMOTE_ALLOWED_SEGMENTS: &[&str] = &[
     "proposals",
     "scoreboard",
     "shadow-decisions",
+    "stepup",
     "vcs",
 ];
 
@@ -2766,6 +2771,8 @@ mod tests {
                 "proposals",
                 "scoreboard",
                 "shadow-decisions",
+                // `/stepup/*` only lets an authenticated device make a step-up ticket for itself; the route that consumes a ticket is under `/remote/step-up/` and stays gateway-only.
+                "stepup",
                 "vcs",
             ]
         );

@@ -116,17 +116,28 @@ type passkeyDaemon struct {
 	nextRow      int64
 	stepUps      int
 	seenKey      []string
+	tickets      map[string]ticketState
+	consumed     map[string]bool
 }
 
 func newPasskeyDaemon() *passkeyDaemon {
 	return &passkeyDaemon{
 		sessions: map[string]int64{}, owners: map[int64]bool{}, stepped: map[int64]bool{},
 		windowClosed: map[int64]bool{}, rows: map[int64][]storedPasskey{}, nextRow: 1,
+		tickets: map[string]ticketState{}, consumed: map[string]bool{},
 	}
 }
 
 func (p *passkeyDaemon) addDevice(session string, id int64, owner bool) {
 	p.sessions[session], p.owners[id] = id, owner
+}
+
+func (p *passkeyDaemon) addTicket(ticket string, deviceID int64, label string, code string) {
+	p.tickets[ticket] = ticketState{
+		DeviceID: deviceID, DeviceName: "laptop", Label: label, Code: code,
+		Credentials: append([]storedPasskey{}, p.rows[deviceID]...),
+		CanRegister: p.owners[deviceID] && ((len(p.rows[deviceID]) == 0 && !p.windowClosed[deviceID]) || p.stepped[deviceID]),
+	}
 }
 
 func (p *passkeyDaemon) handler(t *testing.T) http.HandlerFunc {
@@ -157,6 +168,28 @@ func (p *passkeyDaemon) handler(t *testing.T) http.HandlerFunc {
 			t.Errorf("%s carried a device session", path)
 		}
 		switch {
+		case r.Method == "GET" && strings.HasPrefix(path, "/remote/step-up/ticket/"):
+			ticket := strings.TrimPrefix(path, "/remote/step-up/ticket/")
+			state, ok := p.tickets[ticket]
+			if !ok || p.consumed[ticket] {
+				reply(w, http.StatusGone, map[string]string{"refusal": "stepup_ticket_invalid"})
+				return
+			}
+			reply(w, http.StatusOK, state)
+		case r.Method == "POST" && path == "/remote/step-up/ticket/consume":
+			var in struct {
+				Ticket string `json:"ticket"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&in)
+			state, ok := p.tickets[in.Ticket]
+			if !ok || p.consumed[in.Ticket] {
+				reply(w, http.StatusGone, map[string]string{"refusal": "stepup_ticket_invalid"})
+				return
+			}
+			p.consumed[in.Ticket] = true
+			p.stepped[state.DeviceID] = true
+			p.stepUps++
+			reply(w, http.StatusOK, map[string]bool{"stepped_up": true})
 		case r.Method == "GET" && strings.HasPrefix(path, "/remote/passkeys/"):
 			id, _ := strconv.ParseInt(strings.TrimPrefix(path, "/remote/passkeys/"), 10, 64)
 			reply(w, 200, map[string]any{
@@ -495,5 +528,54 @@ func TestPasskeyNeverLogsOrEchoesCredentials(t *testing.T) {
 	_, body := rig.verify(t, sessA, auth, true)
 	if strings.Contains(body, "publicKey") || strings.Contains(body, sessA) {
 		t.Fatalf("the finish answer carries credential or session material: %s", body)
+	}
+}
+
+func TestTheTicketPageDoesNothingBeforeAClick(t *testing.T) {
+	rig := newPasskeyRig(t)
+	rig.daemon.addDevice(sessA, 7, true)
+	rig.daemon.addTicket("ticket-before-click", 7, "Move chat", "123456")
+
+	status, body := rig.gw("GET", "/auth/stepup/info?ticket=ticket-before-click", "", "")
+	if status != http.StatusOK {
+		t.Fatalf("ticket info = %d %s", status, body)
+	}
+	if rig.daemon.consumed["ticket-before-click"] || rig.daemon.stepped[7] || rig.daemon.stepUps != 0 {
+		t.Fatal("loading a ticket page must not start or consume a step-up")
+	}
+}
+
+func TestTheTicketPageShowsTheDeviceActionAndCode(t *testing.T) {
+	rig := newPasskeyRig(t)
+	rig.daemon.addDevice(sessA, 7, true)
+	rig.daemon.addTicket("ticket-details", 7, "Move chat", "123456")
+
+	status, body := rig.gw("GET", "/auth/stepup/info?ticket=ticket-details", "", "")
+	if status != http.StatusOK || !strings.Contains(body, `"device_name":"laptop"`) || !strings.Contains(body, `"label":"Move chat"`) || !strings.Contains(body, `"code":"123456"`) {
+		t.Fatalf("ticket info = %d %s", status, body)
+	}
+}
+
+func TestAnAssertionForAnotherPurposeDoesNotConsumeATicket(t *testing.T) {
+	rig := newPasskeyRig(t)
+	rig.daemon.addDevice(sessA, 7, true)
+	auth := newVirtualAuthenticator(testOrigin)
+	rig.enrol(t, sessA, auth)
+	rig.daemon.addTicket("ticket-purpose", 7, "Move chat", "123456")
+
+	status, body := rig.gw("POST", "/auth/stepup/begin", `{"ticket":"ticket-purpose"}`, "")
+	if status != http.StatusOK {
+		t.Fatalf("ticket begin = %d %s", status, body)
+	}
+	status, options := rig.gw("POST", "/auth/passkey/verify/begin", "", sessA)
+	if status != http.StatusOK {
+		t.Fatalf("ordinary verify begin = %d %s", status, options)
+	}
+	status, body = rig.gw("POST", "/auth/passkey/verify/finish", auth.get(t, options, true), sessA)
+	if status != http.StatusOK {
+		t.Fatalf("ordinary verify finish = %d %s", status, body)
+	}
+	if rig.daemon.consumed["ticket-purpose"] {
+		t.Fatal("an assertion for another ceremony consumed the ticket")
 	}
 }

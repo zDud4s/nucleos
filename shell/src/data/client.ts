@@ -216,7 +216,7 @@ async function withStepUp(
     ) {
       throw error;
     }
-    const outcome = await transport.onStepUp();
+    const outcome = await transport.onStepUp(path);
     if (outcome.kind === "failed") throw new ApiRefusal(403, outcome.code, outcome.detail, error.body);
     return await requestOnce(transport, path, init);
   }

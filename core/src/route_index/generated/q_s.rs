@@ -95,6 +95,20 @@ pub(super) const ROUTES: &[RouteEntry] = &[
         handler: "post_step_up",
     },
     RouteEntry {
+        method: "POST",
+        path: "/remote/step-up/ticket/consume",
+        purpose: "Consume ticket.",
+        body: Body::Shapeless("ConsumeBody"),
+        handler: "consume_ticket",
+    },
+    RouteEntry {
+        method: "GET",
+        path: "/remote/step-up/ticket/{ticket}",
+        purpose: "Ticket info.",
+        body: Body::None,
+        handler: "ticket_info",
+    },
+    RouteEntry {
         method: "GET",
         path: "/route/report",
         purpose: "What the llm-router advised against what launched, for judging shadow -> apply.",
@@ -261,6 +275,20 @@ pub(super) const ROUTES: &[RouteEntry] = &[
         purpose: "Status.",
         body: Body::None,
         handler: "status",
+    },
+    RouteEntry {
+        method: "GET",
+        path: "/stepup/status",
+        purpose: "Stepup status.",
+        body: Body::None,
+        handler: "stepup_status",
+    },
+    RouteEntry {
+        method: "POST",
+        path: "/stepup/ticket",
+        purpose: "Create ticket.",
+        body: Body::Shapeless("TicketBody"),
+        handler: "create_ticket",
     },
     RouteEntry {
         method: "GET",

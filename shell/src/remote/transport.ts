@@ -21,7 +21,7 @@ export const remoteTransport: Transport = {
   },
   // A grave action refused with `step_up_required`: confirm with the passkey, then the client repeats
   // the request once. Only this transport has the hook; the desktop shell is never asked.
-  onStepUp: stepUp,
+  onStepUp: () => stepUp(),
   label: "the remote gateway",
   unauthorizedCode: "session_invalid",
   probeHeaders: { "X-Nucleos-Csrf": "1" },

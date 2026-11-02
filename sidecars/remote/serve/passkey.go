@@ -170,11 +170,17 @@ type passkeyState struct {
 	CanRegister bool            `json:"can_register"`
 }
 
-// passkeyRoute dispatches /auth/passkey/*. It reports false for any other path.
+// passkeyRoute dispatches the browser's passkey and ticket ceremonies. It reports false for any other path.
 func (a *authHandler) passkeyRoute(w http.ResponseWriter, r *http.Request) bool {
 	var h func(http.ResponseWriter, *http.Request)
 	method := http.MethodPost
 	switch r.URL.Path {
+	case "/auth/stepup/info":
+		h, method = a.ticketInfo, http.MethodGet
+	case "/auth/stepup/begin":
+		h = a.ticketBegin
+	case "/auth/stepup/finish":
+		h = a.ticketFinish
 	case "/auth/passkey/status":
 		h, method = a.passkeyStatus, http.MethodGet
 	case "/auth/passkey/register/begin":
@@ -207,6 +213,172 @@ func (a *authHandler) passkeyRoute(w http.ResponseWriter, r *http.Request) bool 
 	}
 	h(w, r)
 	return true
+}
+
+type ticketState struct {
+	DeviceID    int64           `json:"device_id"`
+	DeviceName  string          `json:"device_name"`
+	Label       string          `json:"label"`
+	Code        string          `json:"code"`
+	Credentials []storedPasskey `json:"credentials"`
+	CanRegister bool            `json:"can_register"`
+}
+
+func ticketInvalid(w http.ResponseWriter) {
+	writeJSONError(w, http.StatusGone, "stepup_ticket_invalid")
+}
+
+func (a *authHandler) ticketState(ctx context.Context, w http.ResponseWriter, ticket string) (ticketState, bool) {
+	if ticket == "" {
+		ticketInvalid(w)
+		return ticketState{}, false
+	}
+	status, data, err := a.d.call(ctx, http.MethodGet, "/remote/step-up/ticket/"+url.PathEscape(ticket), nil, "")
+	if err != nil {
+		writeJSONError(w, http.StatusBadGateway, "daemon_unreachable")
+		return ticketState{}, false
+	}
+	if status == http.StatusGone || status == http.StatusNotFound {
+		ticketInvalid(w)
+		return ticketState{}, false
+	}
+	var out ticketState
+	if status != http.StatusOK || json.Unmarshal(data, &out) != nil || out.DeviceID <= 0 {
+		writeJSONError(w, http.StatusBadGateway, "daemon_error")
+		return ticketState{}, false
+	}
+	return out, true
+}
+
+// ticketInfo only reads metadata. It neither starts nor consumes a ceremony, so a prefetched link is inert.
+func (a *authHandler) ticketInfo(w http.ResponseWriter, r *http.Request) {
+	info, ok := a.ticketState(r.Context(), w, r.URL.Query().Get("ticket"))
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"device_name": info.DeviceName, "label": info.Label, "code": info.Code, "registered": len(info.Credentials) > 0, "can_register": info.CanRegister})
+}
+
+func (a *authHandler) ticketBegin(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Ticket string `json:"ticket"`
+	}
+	if json.NewDecoder(http.MaxBytesReader(w, r.Body, passkeyBodyMax)).Decode(&in) != nil {
+		writeJSONError(w, http.StatusBadRequest, "bad_request")
+		return
+	}
+	st, ok := a.ticketState(r.Context(), w, in.Ticket)
+	if !ok {
+		return
+	}
+	dev := callerDevice{id: st.DeviceID, name: st.DeviceName, owner: true}
+	user, _ := userOf(dev, passkeyState{Credentials: st.Credentials, CanRegister: st.CanRegister})
+	if len(user.creds) == 0 {
+		if !st.CanRegister {
+			writeJSONError(w, http.StatusForbidden, refusalPairingWindowClosed)
+			return
+		}
+		exclude := make([]protocol.CredentialDescriptor, 0)
+		creation, session, err := a.wa.BeginRegistration(user, webauthn.WithExclusions(exclude), webauthn.WithAuthenticatorSelection(protocol.AuthenticatorSelection{UserVerification: protocol.VerificationRequired}))
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, "passkey_error")
+			return
+		}
+		a.cer.put(ceremonyKey("ticket-register", in.Ticket), ceremony{session: *session, deviceID: dev.id})
+		writeJSON(w, http.StatusOK, map[string]any{"kind": "register", "publicKey": creation})
+		return
+	}
+	assertion, session, err := a.wa.BeginLogin(user, webauthn.WithUserVerification(protocol.VerificationRequired))
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "passkey_error")
+		return
+	}
+	a.cer.put(ceremonyKey("ticket-verify", in.Ticket), ceremony{session: *session, deviceID: dev.id})
+	writeJSON(w, http.StatusOK, map[string]any{"kind": "verify", "publicKey": assertion})
+}
+
+func (a *authHandler) ticketFinish(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Ticket     string          `json:"ticket"`
+		Credential json.RawMessage `json:"credential"`
+	}
+	if json.NewDecoder(http.MaxBytesReader(w, r.Body, passkeyBodyMax)).Decode(&in) != nil || len(in.Credential) == 0 {
+		writeJSONError(w, http.StatusBadRequest, "bad_request")
+		return
+	}
+	st, ok := a.ticketState(r.Context(), w, in.Ticket)
+	if !ok {
+		return
+	}
+	dev := callerDevice{id: st.DeviceID, name: st.DeviceName, owner: true}
+	verify, hasVerify := a.cer.take(ceremonyKey("ticket-verify", in.Ticket))
+	register, hasRegister := a.cer.take(ceremonyKey("ticket-register", in.Ticket))
+	if (!hasVerify && !hasRegister) || (hasVerify && hasRegister) {
+		writeJSONError(w, http.StatusBadRequest, refusalCeremony)
+		return
+	}
+	if hasVerify {
+		parsed, err := protocol.ParseCredentialRequestResponseBytes(in.Credential)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, refusalPasskey)
+			return
+		}
+		user, rows := userOf(dev, passkeyState{Credentials: st.Credentials})
+		cred, err := a.wa.ValidateLogin(user, verify.session, parsed)
+		row, known := rows[string(cred.ID)]
+		if err != nil || cred.Authenticator.CloneWarning || !known {
+			writeJSONError(w, http.StatusBadRequest, refusalPasskey)
+			return
+		}
+		stored, _ := json.Marshal(cred)
+		update, _ := json.Marshal(map[string]any{"device_id": dev.id, "credential_json": string(stored), "replaces": row})
+		status, data, callErr := a.d.call(r.Context(), http.MethodPost, "/remote/passkeys", update, "")
+		if callErr != nil {
+			writeJSONError(w, http.StatusBadGateway, "daemon_unreachable")
+			return
+		}
+		if status != http.StatusOK && status != http.StatusCreated {
+			a.daemonRefusal(w, status, data)
+			return
+		}
+	} else {
+		parsed, err := protocol.ParseCredentialCreationResponseBytes(in.Credential)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, refusalPasskey)
+			return
+		}
+		cred, err := a.wa.CreateCredential(passkeyUser{id: dev.id, name: dev.name}, register.session, parsed)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, refusalPasskey)
+			return
+		}
+		stored, _ := json.Marshal(cred)
+		add, _ := json.Marshal(map[string]any{"device_id": dev.id, "credential_json": string(stored)})
+		status, data, callErr := a.d.call(r.Context(), http.MethodPost, "/remote/passkeys", add, "")
+		if callErr != nil {
+			writeJSONError(w, http.StatusBadGateway, "daemon_unreachable")
+			return
+		}
+		if status != http.StatusOK && status != http.StatusCreated {
+			a.daemonRefusal(w, status, data)
+			return
+		}
+	}
+	consume, _ := json.Marshal(map[string]any{"ticket": in.Ticket})
+	status, data, err := a.d.call(r.Context(), http.MethodPost, "/remote/step-up/ticket/consume", consume, "")
+	if err != nil {
+		writeJSONError(w, http.StatusBadGateway, "daemon_unreachable")
+		return
+	}
+	if status == http.StatusGone || status == http.StatusNotFound {
+		ticketInvalid(w)
+		return
+	}
+	if status != http.StatusOK {
+		a.daemonRefusal(w, status, data)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"stepped_up": true})
 }
 
 // caller asks the daemon who the cookie is. On any failure it has already answered and says false.
