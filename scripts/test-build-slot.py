@@ -440,6 +440,44 @@ def test_gates_falls_back_when_broker_absent() -> None:
         assert "plain" in result.stdout and "ok   step" in result.stdout, (result.stdout, result.stderr)
 
 
+def test_gates_holds_the_worktree_only_for_rust_areas() -> None:
+    gates = GATES.as_posix()
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        slots = work / "slots"
+        # (a) the predicate itself, sourced.
+        for area, holds in (("core", True), ("tauri", True), ("all", True), ("sidecars", False),
+                            ("shell", False), ("hooks", False), ("security", False), ("broker", False)):
+            result = subprocess.run(
+                [BASH, "-c", f'source "{gates}" || exit 2; gate_holds_worktree {area}'],
+                env=env_for(slots), capture_output=True, text=True, timeout=60,
+            )
+            assert result.returncode == (0 if holds else 1), (area, result.returncode, result.stderr)
+        # (b) end to end, in a temp copy with no shell/node_modules.
+        repo = work / "repo"
+        (repo / "scripts").mkdir(parents=True)
+        copy = repo / "scripts" / "gates.sh"
+        copy.write_bytes(GATES.read_bytes())
+        main, record = fake_main(work)
+        env = env_for(slots, NUCLEOS_HEAVY_MAIN=main.as_posix(), NUCLEOS_HEAVY_PYTHON=Path(sys.executable).as_posix(),
+                      NUCLEOS_HEAVY="1")
+        # The test itself can run inside a held `all` gate.
+        env.pop("NUCLEOS_HEAVY_HELD", None)
+        result = subprocess.run([BASH, copy.as_posix(), "core"], cwd=repo, env=env,
+                                capture_output=True, text=True, timeout=60)
+        assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+        assert record.is_file(), ("core did not go through hold-worktree", result.stdout, result.stderr)
+        argv = record.read_text().split(NL)
+        assert argv[0] == "hold-worktree", argv
+        assert argv[-2].endswith("/scripts/gates.sh") and argv[-1] == "core", argv
+        record.unlink()
+        result = subprocess.run([BASH, copy.as_posix(), "shell"], cwd=repo, env=env,
+                                capture_output=True, text=True, timeout=60)
+        assert not record.exists(), ("shell took a worktree hold", record.read_text() if record.exists() else "")
+        assert result.returncode != 0, (result.returncode, result.stdout, result.stderr)
+        assert "shell/node_modules missing" in result.stdout + result.stderr, (result.stdout, result.stderr)
+
+
 test_a_third_holder_waits_until_a_slot_frees()
 test_a_waiter_gives_up_at_the_timeout()
 test_a_killed_holder_is_reaped_and_a_terminated_one_releases()
@@ -451,4 +489,5 @@ test_gates_wraps_only_the_building_steps()
 test_gates_delegates_to_broker_when_present()
 test_an_old_main_broker_gives_way_to_the_forwarding_one()
 test_gates_falls_back_when_broker_absent()
+test_gates_holds_the_worktree_only_for_rust_areas()
 print("build slot: ok")
