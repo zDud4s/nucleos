@@ -1116,6 +1116,21 @@ def _conductor_manual(payload, state):
     return isinstance(loaded, dict) and loaded.get("manual") is True
 
 
+CONDUCTOR_AUTOMATIC_PROMPTS = ("<task-notification>", "Another Claude session sent a message")
+CONDUCTOR_REMINDER_PREFIX = re.compile(r"(?:<system-reminder>.*?</system-reminder>\s*)+", re.DOTALL)
+
+
+def _conductor_automatic_prompt(prompt):
+    """Whether a UserPromptSubmit prompt is a notification the harness injected, not the owner's."""
+    if not isinstance(prompt, str):
+        return False
+    text = prompt.lstrip()
+    reminder = CONDUCTOR_REMINDER_PREFIX.match(text)
+    if reminder:
+        text = text[reminder.end():]
+    return text.startswith(CONDUCTOR_AUTOMATIC_PROMPTS)
+
+
 def conductor_prompt(payload, state):
     """The owner's escape: `manual:` opens this prompt to manual work, any other prompt closes it.
 
@@ -1128,8 +1143,11 @@ def conductor_prompt(payload, state):
         path = conductor_flag_path(payload.get("session_id"), state)
         if path is None:
             return
-        # A new prompt starts a new read budget. Background-task notifications fire this event too
-        # and cannot be told apart cheaply; they reset it as well, which only errs towards the owner.
+        # Background-task notifications and messages from another session fire this event too, but
+        # the owner did not write them: they neither set nor clear `manual:`, nor reset the budget.
+        if _conductor_automatic_prompt(payload.get("prompt")):
+            return
+        # A new prompt starts a new read budget.
         try:
             budget = _conductor_budget_path(payload.get("session_id"), state)
             if budget is not None and os.path.exists(budget):

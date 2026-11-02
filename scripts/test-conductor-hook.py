@@ -992,6 +992,46 @@ def test_observe_mode_still_only_observes_a_big_read():
             raise AssertionError("observe should still flag the big read")
 
 
+# --- notifications -----------------------------------------------------------------------------
+
+NOTIFICATIONS = (
+    "<task-notification>\n<task-id>a176f27f5d0c5b7ca</task-id>\n<status>completed</status>\n</task-notification>",
+    "  \n<task-notification>\n<task-id>x</task-id>\n</task-notification>",
+    "<system-reminder>\nnote\n</system-reminder>\n<task-notification>\n<task-id>x</task-id>",
+    'Another Claude session sent a message:\n<agent-message from="x">hi</agent-message>',
+)
+
+
+def test_notifications_neither_set_nor_clear_manual():
+    with fixture("on") as fx:
+        source = {"file_path": fx.path("core", "src", "lib.rs")}
+        _prompt(fx, "manual: fix the typo")
+        for text in NOTIFICATIONS:
+            _prompt(fx, text)
+            allow(fx.verdict("Read", source), f"manual survives {text[:30]!r}")
+        _prompt(fx, "now something else")
+        deny(fx.verdict("Read", source), "a real prompt still clears it")
+    with fixture("on") as fx:
+        source = {"file_path": fx.path("core", "src", "lib.rs")}
+        for text in NOTIFICATIONS:
+            _prompt(fx, text + "\nmanual: do it")
+            deny(fx.verdict("Read", source), f"a notification never sets manual {text[:30]!r}")
+
+
+def test_notifications_do_not_reset_the_read_budget():
+    with fixture("on") as fx:
+        mid = {"file_path": _sized(fx, "mid.rs", 11000)}
+        allow(fx.verdict("Read", mid), "first")
+        allow(fx.verdict("Read", mid), "second")
+        for text in NOTIFICATIONS:
+            _prompt(fx, text)
+        if _spent(fx) != 5500:
+            raise AssertionError(f"notifications must keep the budget, spent {_spent(fx)}")
+        deny(fx.verdict("Read", mid), "third still crosses 6000")
+        _prompt(fx, "go on")
+        allow(fx.verdict("Read", mid), "a real prompt resets it")
+
+
 TESTS = [
     test_small_read_allowed_large_read_denied,
     test_grep_modes_and_head_limit,
@@ -1037,6 +1077,8 @@ TESTS = [
     test_off_mode_allows_everything,
     test_fail_open_on_internal_error,
     test_probe_writes_payload_keys,
+    test_notifications_neither_set_nor_clear_manual,
+    test_notifications_do_not_reset_the_read_budget,
 ]
 
 
