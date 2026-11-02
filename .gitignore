@@ -42,6 +42,9 @@
 # And the same directory under the crate, which is where `CARGO_TARGET_DIR` lands when tests are
 # built from `core/` rather than from the root.
 /core/target-test/
+# Builds run from `core/` (e.g. sqlx's test databases under `core/target/sqlx/test-dbs`) land here;
+# the `/target/` above is anchored to the root.
+/core/target/
 # A private target directory an autonomous run creates inside its own worktree when the shared one
 # is locked. Unignored, it is 3.9 GB of build output that `git status` lists file by file, and the
 # worktree GC's preservation commit then overflows its ceiling on every pass, for ever (run-900388,

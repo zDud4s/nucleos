@@ -300,6 +300,27 @@ slot_run() {
   return "$status"
 }
 
+# Whether a gate area holds the worktree for its whole run (`heavy.py hold-worktree`, below). Only
+# the areas that build Rust do: the hold pins the cargo target slot, and holding it for an area that
+# never compiles only queues that area behind whoever else holds the worktree.
+#   core, tauri  run the Rust build/clippy/test steps.
+#   sidecars     runs only gofmt, go vet and go test.
+#   shell        runs tsc -b, vitest and scripts/csp-gate.mjs (vite into its own shell/dist-csp-gate,
+#                no Rust build; the `os error 32` gotcha belongs to the `tauri` area).
+#   hooks        runs hermetic python tests on temp dirs.
+#   security     runs the advisory audit (reads Cargo.lock, builds nothing) and gitleaks.
+#   broker       drives brokers of its own.
+# Their heavy steps still reach the broker one by one (`heavy_run`), which admits them against the
+# machine budget and takes no worktree lock for a non-Rust command. Why it matters: on 2026-11-01 the
+# daemon started core/hooks/shell/sidecars at once in the main checkout, and hooks, shell and
+# sidecars waited ~25 min behind core on an idle machine.
+gate_holds_worktree() {
+  case "$1" in
+    core|tauri|all) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # Sourced rather than run: stop here, with the functions above defined and no gate started. That is
 # how scripts/test-gates-summary.py drives them with fake steps. They live in this file and not in
 # one it sources because the daemon's tamper check (`worktree_scripts` in core/src/gate.rs) compares
@@ -324,8 +345,8 @@ cd "$repo_root"
 # the crate from clean, at a median of 453s against 202s on a slot that had not changed hands
 # (broker log, 2026-10-03..08). Skipped when a session already holds this run (the test selector
 # opens one), when the broker is off, and where there is no broker (CI, a fresh clone).
-# The broker's own tests build nothing and drive brokers of their own, so `broker` never holds one.
-if [ -z "${NUCLEOS_HEAVY_HELD:-}" ] && [ "${NUCLEOS_HEAVY:-}" != 0 ] && [ "$target" != broker ]; then
+# Only the areas that build Rust hold one, see gate_holds_worktree.
+if [ -z "${NUCLEOS_HEAVY_HELD:-}" ] && [ "${NUCLEOS_HEAVY:-}" != 0 ] && gate_holds_worktree "$target"; then
   heavy_main="${NUCLEOS_HEAVY_MAIN:-$(dirname "$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)")}"
   if [ "${OS:-}" = Windows_NT ]; then heavy_py="${NUCLEOS_HEAVY_PYTHON:-python}"; else heavy_py="${NUCLEOS_HEAVY_PYTHON:-python3}"; fi
   if heavy_broker "$heavy_main"; then
