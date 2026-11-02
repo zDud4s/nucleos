@@ -1388,8 +1388,22 @@ CONDUCTOR_MAX_PARTS = 8
 CONDUCTOR_MAX_SLEEP = 60  # seconds a root `sleep` may wait
 # The one pipe allowed, at the very end: a bounded look at the output.
 CONDUCTOR_PIPE_TAIL = re.compile(r"\s*\|\s*(?:tail|head)\s+(?:-n\s+\d+|-\d+)\s*$")
-# The variables that tune a gate or the broker, and no others (not PATH, not RUSTFLAGS).
-CONDUCTOR_ENV_PREFIX = re.compile(r"(?:CARGO_\w*|RUSTC_BOOTSTRAP|RUST_\w*|NUCLEOS_GATE_\w*|NUCLEOS_HEAVY_\w*)=")
+# The variables that tune a gate or the broker, named one by one, and no others (not PATH, not
+# RUSTFLAGS). A prefix family is out: CARGO_BUILD_RUSTC, CARGO_TARGET_<triple>_RUNNER/_LINKER,
+# CARGO_HOME and RUSTC_WRAPPER run or redirect to an arbitrary program, as do NUCLEOS_HEAVY_PYTHON,
+# _MAIN, _GDB and _DIR. Every name below only sets a number, a flag, a level or a target dir.
+CONDUCTOR_ENV_NAMES = (
+    "CARGO_TERM_COLOR", "CARGO_TERM_VERBOSE", "CARGO_TERM_QUIET", "CARGO_TERM_PROGRESS_WHEN",
+    "CARGO_INCREMENTAL", "CARGO_TARGET_DIR", "CARGO_BUILD_JOBS",
+    "RUSTC_BOOTSTRAP",
+    "RUST_BACKTRACE", "RUST_LOG", "RUST_MIN_STACK", "RUST_TEST_THREADS", "RUST_TEST_NOCAPTURE",
+    "NUCLEOS_GATE_KEEP_GOING",
+    "NUCLEOS_HEAVY_ADMISSION", "NUCLEOS_HEAVY_DYNAMIC_MAX_JOBS", "NUCLEOS_HEAVY_CAPACITY",
+    "NUCLEOS_HEAVY_STALL_SECS", "NUCLEOS_HEAVY_WAIT_MAX", "NUCLEOS_HEAVY_POLL_S",
+    "NUCLEOS_HEAVY_LIGHT_RETRY_S", "NUCLEOS_HEAVY_LIGHT_MAX", "NUCLEOS_HEAVY_BIG_MEM_MB",
+    "NUCLEOS_HEAVY_TARGET_SLOTS", "NUCLEOS_HEAVY_PRIO",
+)
+CONDUCTOR_ENV_PREFIX = re.compile(r"(?:" + "|".join(CONDUCTOR_ENV_NAMES) + r")=")
 CONDUCTOR_DEV_HOME_ENV = "NUCLEOS_DEV_HOME"
 CONDUCTOR_DEV_HOME_DEFAULT = "C:/nucleos-dev"
 
