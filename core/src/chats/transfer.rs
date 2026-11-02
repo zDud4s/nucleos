@@ -46,6 +46,8 @@ pub enum Refusal {
     Moved(String),
     /// `finish` or a wait found no freeze for this transfer: it expired or was aborted.
     NotFrozenForThis,
+    /// An import found the chat alive on this machine: it is not a chat that moved away.
+    AlreadyHere,
     Store(sqlx::Error),
 }
 
@@ -58,6 +60,7 @@ impl Refusal {
             Self::NotFrozenForThis => {
                 "this move is no longer in progress (it was aborted or expired)".to_string()
             }
+            Self::AlreadyHere => "this chat already lives on this machine".to_string(),
             Self::Store(error) => format!("could not read the chat: {error}"),
         }
     }
@@ -264,15 +267,49 @@ pub struct CodeCheck {
     pub left_behind: Vec<String>,
 }
 
-/// PART B REPLACES THIS. It answers "fine" without looking: the real check asks whether the chat's
-/// project exists on the destination, whether the branch bundle applies and whether the working
-/// tree conflicts, and lists the ignored files in `left_behind`.
-pub async fn check_code(_pool: &SqlitePool, _chat_id: &str) -> CodeCheck {
-    CodeCheck {
-        ok: true,
-        problem: None,
-        left_behind: Vec::new(),
+/// Whether the chat's code can be bundled here: its folder is a git repository of a project on the
+/// roster, has a commit, is not a shallow clone and has no unresolved merge conflict. The ignored
+/// files that would stay behind are listed. A chat with no folder has no code and moves freely.
+/// Looks only; nothing is frozen or built.
+pub async fn check_code(pool: &SqlitePool, chat_id: &str) -> CodeCheck {
+    let cwd = match crate::chats::cwd_of(pool, chat_id).await {
+        Ok(Some(cwd)) if !cwd.trim().is_empty() => cwd,
+        Ok(_) => {
+            return CodeCheck {
+                ok: true,
+                ..CodeCheck::default()
+            };
+        }
+        Err(error) => {
+            return CodeCheck {
+                ok: false,
+                problem: Some(format!("could not read the chat: {error}")),
+                left_behind: Vec::new(),
+            };
+        }
+    };
+    match crate::chats::transfer_code::probe(pool, std::path::Path::new(&cwd)).await {
+        Ok(probe) => CodeCheck {
+            ok: true,
+            problem: None,
+            left_behind: probe.left_behind,
+        },
+        Err(problem) => CodeCheck {
+            ok: false,
+            problem: Some(problem),
+            left_behind: Vec::new(),
+        },
     }
+}
+
+/// Whether this machine already imported `transfer_id`.
+pub async fn was_imported(pool: &SqlitePool, transfer_id: &str) -> sqlx::Result<bool> {
+    let seen: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM chat_transfers_seen WHERE transfer_id = ?")
+            .bind(transfer_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(seen.is_some())
 }
 
 /// Words for a task that a `now` move ends.
@@ -290,7 +327,14 @@ fn task_line(task: &crate::chats::tasks::ChatTask) -> String {
 }
 
 /// What is knowable without packaging anything. Refuses a chat that is moved or already frozen.
-pub async fn preview(pool: &SqlitePool, chat_id: &str, running: bool) -> Result<Preview, Refusal> {
+/// `parked` is the chat's open questions, read by the caller from the hook store (which lives in
+/// the crate above this one).
+pub async fn preview(
+    pool: &SqlitePool,
+    chat_id: &str,
+    running: bool,
+    parked: &[super::transfer_package::ParkedQuestion],
+) -> Result<Preview, Refusal> {
     match gate_at(pool, chat_id, unix_now()).await? {
         Gate::Moved(to) => return Err(Refusal::Moved(to)),
         Gate::Frozen => return Err(Refusal::AlreadyFrozen),
@@ -313,6 +357,13 @@ pub async fn preview(pool: &SqlitePool, chat_id: &str, running: bool) -> Result<
         if task.status == "running" {
             will_stop.push(task_line(&task));
         }
+    }
+    // A tool call parked on a question is lost with the turn; the destination asks it again.
+    for ask in parked {
+        will_stop.push(format!(
+            "A question about {} is waiting for your answer; it is asked again on the other machine.",
+            ask.tool
+        ));
     }
     let code = check_code(pool, chat_id).await;
     Ok(Preview {
@@ -452,8 +503,8 @@ mod tests {
         .await
         .unwrap();
 
-        let idle = preview(&pool, "c1", false).await.unwrap();
-        let busy = preview(&pool, "c1", true).await.unwrap();
+        let idle = preview(&pool, "c1", false, &[]).await.unwrap();
+        let busy = preview(&pool, "c1", true, &[]).await.unwrap();
 
         assert!(!idle.running && busy.running);
         assert_eq!(idle.will_stop.len(), 1, "{idle:?}");
@@ -463,7 +514,7 @@ mod tests {
         assert!(busy.target_ok);
         freeze_at(&pool, "c1", "t-1", unix_now()).await.unwrap();
         assert!(matches!(
-            preview(&pool, "c1", false).await,
+            preview(&pool, "c1", false, &[]).await,
             Err(Refusal::AlreadyFrozen)
         ));
     }

@@ -207,6 +207,13 @@ pub(super) const ROUTES: &[RouteEntry] = &[
         handler: "create_chat",
     },
     RouteEntry {
+        method: "POST",
+        path: "/assistant/chats/import",
+        purpose: "Post chat import.",
+        body: Body::Shapeless("Package"),
+        handler: "post_chat_import",
+    },
+    RouteEntry {
         method: "DELETE",
         path: "/assistant/chats/{chat_id}",
         purpose: "Delete chat.",
@@ -415,6 +422,13 @@ pub(super) const ROUTES: &[RouteEntry] = &[
         purpose: "Post transfer finish.",
         body: Body::Shapeless("FinishBody"),
         handler: "post_transfer_finish",
+    },
+    RouteEntry {
+        method: "GET",
+        path: "/assistant/chats/{chat_id}/transfer/package",
+        purpose: "Get transfer package.",
+        body: Body::None,
+        handler: "get_transfer_package",
     },
     RouteEntry {
         method: "GET",

@@ -1,0 +1,365 @@
+//! The code half of moving a chat: what the origin sends (`git bundle` of HEAD, `git diff --binary`,
+//! the new non-ignored files) and what the destination does with it (a tree at the same commit, the
+//! diff applied on top, the new files written).
+//!
+//! Built from an allow-list: only files git itself reports as tracked changes or as untracked and not
+//! ignored travel, and a path leaves the `.git` directory and the repository alone. Ignored files are
+//! listed as left behind, never sent. The git calls all go through `git_exec::run_git`.
+
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as B64;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
+
+use crate::execution::git_exec::{CommandResult, OPERATION_TIMEOUT, run_git};
+
+/// One new, untracked and not ignored file.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CodeFile {
+    /// Relative to the repository root, `/`-separated.
+    pub path: String,
+    /// Standard base64 of the bytes.
+    pub data: String,
+}
+
+/// The code of a chat, ready to be recreated.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Code {
+    /// The project (roster id) the chat's directory belongs to; the destination finds its own copy by it.
+    pub project_id: String,
+    pub commit: String,
+    pub branch: Option<String>,
+    /// Base64 of a `git bundle` holding `HEAD`.
+    pub bundle: String,
+    /// Base64 of `git diff --binary HEAD`; empty when the tree is clean.
+    pub diff: String,
+    pub files: Vec<CodeFile>,
+    pub left_behind: Vec<String>,
+}
+
+/// What the origin can say about the code before anything is built or frozen.
+#[derive(Debug)]
+pub struct Probe {
+    pub project_id: String,
+    pub top: PathBuf,
+    pub commit: String,
+    pub branch: Option<String>,
+    pub new_files: Vec<String>,
+    pub left_behind: Vec<String>,
+}
+
+/// Largest single file and largest package of new files that travel.
+const MAX_FILE_BYTES: u64 = 25 * 1024 * 1024;
+const MAX_FILES_BYTES: u64 = 100 * 1024 * 1024;
+
+async fn git(dir: &Path, args: &[&str]) -> Result<CommandResult, String> {
+    let argv: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
+    run_git(dir, &argv, OPERATION_TIMEOUT).await
+}
+
+async fn git_ok(dir: &Path, args: &[&str]) -> Result<String, String> {
+    let result = git(dir, args).await?;
+    if result.succeeded() {
+        Ok(result.stdout)
+    } else {
+        Err(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            result.output_tail.trim()
+        ))
+    }
+}
+
+fn nul_list(text: &str) -> Vec<String> {
+    text.split('\0')
+        .filter(|p| !p.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn deadline() -> std::time::Instant {
+    std::time::Instant::now() + OPERATION_TIMEOUT
+}
+
+/// A scratch file name no other move shares.
+fn scratch(label: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "nucleos-move-{}-{}-{label}",
+        std::process::id(),
+        crate::auth::generate_uuid_v4()
+    ))
+}
+
+/// Looks at the chat's directory and answers why it cannot move, or what would move. Changes nothing.
+pub async fn probe(pool: &sqlx::SqlitePool, cwd: &Path) -> Result<Probe, String> {
+    if !cwd.is_dir() {
+        return Err(format!(
+            "the chat's folder {} is not on this machine",
+            cwd.display()
+        ));
+    }
+    let top = crate::execution::git_exec::toplevel(cwd, deadline())
+        .await
+        .map_err(|_| {
+            format!(
+                "{} is not a git repository, so its code cannot move",
+                cwd.display()
+            )
+        })?;
+    let project_id = crate::execution::vcs::project_for_worktree(pool, &top, deadline())
+        .await
+        .map_err(|_| "this chat's folder belongs to no project of this machine".to_string())?;
+    let commit = git_ok(&top, &["rev-parse", "--verify", "HEAD"])
+        .await
+        .map_err(|_| "the repository has no commit yet, so there is nothing to bundle".to_string())?
+        .trim()
+        .to_owned();
+    if git_ok(&top, &["rev-parse", "--is-shallow-repository"])
+        .await?
+        .trim()
+        == "true"
+    {
+        return Err("the repository is a shallow clone, which cannot be bundled".to_string());
+    }
+    if !git_ok(&top, &["ls-files", "-u", "-z"]).await?.is_empty() {
+        return Err(
+            "the working tree has unresolved merge conflicts; resolve them first".to_string(),
+        );
+    }
+    let branch = git_ok(&top, &["symbolic-ref", "--short", "-q", "HEAD"])
+        .await
+        .ok()
+        .map(|b| b.trim().to_owned())
+        .filter(|b| !b.is_empty());
+    let new_files =
+        nul_list(&git_ok(&top, &["ls-files", "--others", "--exclude-standard", "-z"]).await?)
+            .into_iter()
+            .filter(|p| p != ".git" && !p.starts_with(".git/"))
+            .collect();
+    let left_behind = nul_list(
+        &git_ok(
+            &top,
+            &[
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "--directory",
+                "-z",
+            ],
+        )
+        .await?,
+    );
+    Ok(Probe {
+        project_id,
+        top,
+        commit,
+        branch,
+        new_files,
+        left_behind,
+    })
+}
+
+/// Builds the code half of a package from a probe.
+pub async fn capture(probe: Probe) -> Result<Code, String> {
+    let top = &probe.top;
+    let bundle_path = scratch("out.bundle");
+    let diff_path = scratch("out.diff");
+    let built = async {
+        let bundle_arg = bundle_path.to_string_lossy().into_owned();
+        git_ok(top, &["bundle", "create", "--quiet", &bundle_arg, "HEAD"]).await?;
+        let diff_arg = format!("--output={}", diff_path.to_string_lossy());
+        git_ok(top, &["diff", "--binary", "HEAD", &diff_arg]).await?;
+        let bundle =
+            std::fs::read(&bundle_path).map_err(|e| format!("could not read the bundle: {e}"))?;
+        let diff = std::fs::read(&diff_path).unwrap_or_default();
+        Ok::<_, String>((bundle, diff))
+    }
+    .await;
+    let _ = std::fs::remove_file(&bundle_path);
+    let _ = std::fs::remove_file(&diff_path);
+    let (bundle, diff) = built?;
+
+    let mut files = Vec::new();
+    let mut left_behind = probe.left_behind.clone();
+    let mut total = 0u64;
+    for path in &probe.new_files {
+        if !safe_relative(path) {
+            continue;
+        }
+        let full = top.join(path);
+        let meta = match std::fs::symlink_metadata(&full) {
+            Ok(meta) if meta.is_file() => meta,
+            _ => {
+                left_behind.push(format!("{path} (not a regular file)"));
+                continue;
+            }
+        };
+        total += meta.len();
+        if meta.len() > MAX_FILE_BYTES || total > MAX_FILES_BYTES {
+            return Err(format!(
+                "{path} is too large to move; add it to .gitignore or commit it"
+            ));
+        }
+        let bytes = std::fs::read(&full).map_err(|e| format!("could not read {path}: {e}"))?;
+        files.push(CodeFile {
+            path: path.clone(),
+            data: B64.encode(bytes),
+        });
+    }
+    Ok(Code {
+        project_id: probe.project_id,
+        commit: probe.commit,
+        branch: probe.branch,
+        bundle: B64.encode(bundle),
+        diff: B64.encode(diff),
+        files,
+        left_behind,
+    })
+}
+
+/// A path that stays inside the repository: relative, no `..`, nothing under `.git`.
+fn safe_relative(path: &str) -> bool {
+    let p = Path::new(path);
+    !path.is_empty()
+        && !p.is_absolute()
+        && !path.contains(['\\', ':', '\0'])
+        && p.components().all(
+            |c| matches!(c, std::path::Component::Normal(part) if part.to_str() != Some(".git")),
+        )
+}
+
+/// What the destination checks before it changes anything: the project is on this machine.
+pub async fn destination_root(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+) -> Result<PathBuf, String> {
+    let root: Option<Option<String>> =
+        sqlx::query_scalar("SELECT project_root FROM autopilot_state WHERE project_id = ?")
+            .bind(project_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| format!("could not read the project roster: {e}"))?;
+    match root.flatten().map(PathBuf::from) {
+        Some(root) if root.is_dir() => Ok(root),
+        _ => Err(format!("the project {project_id} is not on this machine")),
+    }
+}
+
+/// Recreates the tree: fetches the commit from the bundle when it is missing, adds a detached
+/// worktree at it, applies the diff and writes the new files. Returns the new directory. On any
+/// failure the half-built tree is removed.
+pub async fn materialize(
+    code: &Code,
+    project_root: &Path,
+    chat_id: &str,
+    transfer_id: &str,
+) -> Result<PathBuf, String> {
+    let bundle = B64
+        .decode(&code.bundle)
+        .map_err(|e| format!("the bundle is damaged: {e}"))?;
+    let diff = B64
+        .decode(&code.diff)
+        .map_err(|e| format!("the diff is damaged: {e}"))?;
+    let mut files = Vec::new();
+    for file in &code.files {
+        if !safe_relative(&file.path) {
+            return Err(format!(
+                "the package names a path outside the project: {}",
+                file.path
+            ));
+        }
+        files.push((
+            &file.path,
+            B64.decode(&file.data)
+                .map_err(|e| format!("{} is damaged: {e}", file.path))?,
+        ));
+    }
+    if code.commit.len() < 7 || !code.commit.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("the package carries no valid commit".to_string());
+    }
+    let have = git(
+        project_root,
+        &["cat-file", "-e", &format!("{}^{{commit}}", code.commit)],
+    )
+    .await?;
+    if !have.succeeded() {
+        let bundle_path = scratch("in.bundle");
+        std::fs::write(&bundle_path, &bundle)
+            .map_err(|e| format!("could not stage the bundle: {e}"))?;
+        let refspec = format!("HEAD:refs/nucleos/moved/{}", code.commit);
+        let fetched = git_ok(
+            project_root,
+            &["fetch", "--quiet", &bundle_path.to_string_lossy(), &refspec],
+        )
+        .await;
+        let _ = std::fs::remove_file(&bundle_path);
+        fetched?;
+    }
+    let safe: String = chat_id
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(16)
+        .collect();
+    let tag: String = transfer_id
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(8)
+        .collect();
+    let tree =
+        crate::execution::worktree::worktree_root(project_root).join(format!("moved-{safe}-{tag}"));
+    if let Some(parent) = tree.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
+    }
+    let built = async {
+        git_ok(
+            project_root,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                &tree.to_string_lossy(),
+                &code.commit,
+            ],
+        )
+        .await?;
+        if !diff.is_empty() {
+            let diff_path = scratch("in.diff");
+            std::fs::write(&diff_path, &diff)
+                .map_err(|e| format!("could not stage the diff: {e}"))?;
+            let applied = git_ok(
+                &tree,
+                &[
+                    "apply",
+                    "--binary",
+                    "--whitespace=nowarn",
+                    &diff_path.to_string_lossy(),
+                ],
+            )
+            .await;
+            let _ = std::fs::remove_file(&diff_path);
+            applied?;
+        }
+        for (path, bytes) in &files {
+            let target = tree.join(path);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
+            }
+            std::fs::write(&target, bytes).map_err(|e| format!("could not write {path}: {e}"))?;
+        }
+        Ok::<_, String>(())
+    }
+    .await;
+    if let Err(error) = built {
+        let _ = git(
+            project_root,
+            &["worktree", "remove", "--force", &tree.to_string_lossy()],
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(&tree);
+        return Err(error);
+    }
+    Ok(tree)
+}

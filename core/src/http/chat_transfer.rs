@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::chats::transfer::{self, Refusal, When};
+use crate::chats::transfer_package as package;
 use serde_json::{Value, json};
 
 pub(super) fn routes() -> Router<AppState> {
@@ -25,6 +26,102 @@ pub(super) fn routes() -> Router<AppState> {
             "/assistant/chats/{chat_id}/transfer/abort",
             post(post_transfer_abort),
         )
+        .route(
+            "/assistant/chats/{chat_id}/transfer/package",
+            get(get_transfer_package),
+        )
+        .route(
+            "/assistant/chats/import",
+            post(post_chat_import).layer(DefaultBodyLimit::max(IMPORT_BODY_LIMIT)),
+        )
+}
+
+/// A package holds a bundle, a diff, new files and a transcript, all base64: well past the default.
+const IMPORT_BODY_LIMIT: usize = 768 * 1024 * 1024;
+
+fn package_failure(failure: package::Failure) -> Failure {
+    match failure {
+        package::Failure::Refused(refusal) => refused(refusal),
+        package::Failure::Problem(problem) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "error": problem })),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+struct TransferQuery {
+    transfer_id: String,
+}
+
+fn required_transfer_id(id: &str) -> Result<(), Failure> {
+    if id.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "transfer_id is required" })),
+        ));
+    }
+    Ok(())
+}
+
+/// The frozen chat as a package: the code, the session, the queue. Needs the standing freeze of
+/// `transfer_id` and confirms it alive.
+async fn get_transfer_package(
+    State(state): State<AppState>,
+    Path(chat_id): Path<String>,
+    Query(query): Query<TransferQuery>,
+) -> Result<Json<package::Package>, Failure> {
+    required_transfer_id(&query.transfer_id)?;
+    let store = crate::sessions::default_root().ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "this machine has no session store" })),
+        )
+    })?;
+    let live = crate::assistant::chat_move::parked_now(&chat_id);
+    package::build(&state.pool, &chat_id, &query.transfer_id, &store, live)
+        .await
+        .map(Json)
+        .map_err(package_failure)
+}
+
+/// Unpacks a package on this machine and starts the interrupted turn. Repeating the same
+/// `transfer_id` answers `already` and changes nothing.
+async fn post_chat_import(
+    State(state): State<AppState>,
+    Query(query): Query<TransferQuery>,
+    Json(body): Json<package::Package>,
+) -> Result<Json<Value>, Failure> {
+    required_transfer_id(&query.transfer_id)?;
+    if body.transfer_id != query.transfer_id {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "the package belongs to another transfer" })),
+        ));
+    }
+    let store = crate::sessions::default_root().ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "this machine has no session store" })),
+        )
+    })?;
+    match package::import(&state.pool, &body, &store)
+        .await
+        .map_err(package_failure)?
+    {
+        package::Imported::Already => Ok(Json(json!({ "already": true }))),
+        package::Imported::Done { cwd, queued } => {
+            if queued > 0 {
+                crate::assistant::resume_queue_after_freeze(&state, &body.chat_id);
+            }
+            Ok(Json(json!({
+                "already": false,
+                "chat_id": body.chat_id,
+                "cwd": cwd.map(|c| c.to_string_lossy().into_owned()),
+                "queued": queued,
+            })))
+        }
+    }
 }
 
 type Failure = (StatusCode, Json<Value>);
@@ -32,9 +129,10 @@ type Failure = (StatusCode, Json<Value>);
 fn refused(refusal: Refusal) -> Failure {
     let status = match refusal {
         Refusal::NoSuchChat => StatusCode::NOT_FOUND,
-        Refusal::AlreadyFrozen | Refusal::Moved(_) | Refusal::NotFrozenForThis => {
-            StatusCode::CONFLICT
-        }
+        Refusal::AlreadyFrozen
+        | Refusal::Moved(_)
+        | Refusal::NotFrozenForThis
+        | Refusal::AlreadyHere => StatusCode::CONFLICT,
         Refusal::Store(ref error) => {
             tracing::warn!(%error, "a chat transfer step failed");
             StatusCode::INTERNAL_SERVER_ERROR
@@ -54,7 +152,8 @@ async fn get_transfer_preview(
     Path(chat_id): Path<String>,
 ) -> Result<Json<transfer::Preview>, Failure> {
     let running = crate::assistant::is_busy(&chat_id);
-    transfer::preview(&state.pool, &chat_id, running)
+    let parked = crate::assistant::chat_move::parked_now(&chat_id);
+    transfer::preview(&state.pool, &chat_id, running, &parked)
         .await
         .map(Json)
         .map_err(refused)
@@ -113,6 +212,7 @@ async fn post_transfer_finish(
     .map_err(refused)?;
     // The session lives on the other machine now; a process kept here would only idle on it.
     crate::assistant::evict_live(&chat_id);
+    package::forget(&chat_id);
     Ok(StatusCode::NO_CONTENT)
 }
 

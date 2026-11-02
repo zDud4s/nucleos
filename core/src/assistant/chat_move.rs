@@ -2,6 +2,19 @@
 //! to stop or restart a turn, and so cannot sit below the assistant (`nucleos-core` cannot see it).
 
 use crate::chats::transfer::{Refusal, When, freeze_at, touch_at, unix_now};
+use crate::chats::transfer_package;
+
+/// The questions the hook store holds for the chat right now. The store lives in this crate, so the
+/// lower `chats` code takes them as a parameter.
+pub fn parked_now(chat_id: &str) -> Vec<transfer_package::ParkedQuestion> {
+    crate::hooks::asks_for(chat_id)
+        .into_iter()
+        .map(|ask| transfer_package::ParkedQuestion {
+            tool: ask.tool,
+            detail: ask.detail,
+        })
+        .collect()
+}
 
 /// What `begin` did.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -27,9 +40,12 @@ pub async fn begin(
 ) -> Result<Begun, Refusal> {
     freeze_at(&state.pool, chat_id, transfer_id, unix_now()).await?;
     let mut cut_turn = None;
+    // A cut forgets the questions a turn had parked; the package still carries them.
+    transfer_package::remember(chat_id, false, parked_now(chat_id));
     match when {
         When::Now => {
             cut_turn = super::cut_turn_for_move(state, chat_id).await;
+            transfer_package::remember(chat_id, cut_turn.is_some(), parked_now(chat_id));
         }
         When::AfterTurn => {
             while !super::wait_for_turn_end(chat_id, WAIT_SLICE).await {
@@ -55,6 +71,7 @@ pub async fn abort_and_resume(
 ) -> sqlx::Result<bool> {
     let lifted = crate::chats::transfer::abort(&state.pool, chat_id, transfer_id).await?;
     if lifted {
+        transfer_package::forget(chat_id);
         super::resume_queue_after_freeze(state, chat_id);
     }
     Ok(lifted)

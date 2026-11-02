@@ -2276,6 +2276,37 @@ mod tests {
             .join("/")
     }
 
+    /// A paired device that has not confirmed afresh cannot take a chat's package, nor push one in.
+    #[tokio::test]
+    async fn a_device_without_step_up_cannot_take_a_package() {
+        let state = test_state("control-token").await;
+        let key = mint_service_token(&state.pool, Service::Remote)
+            .await
+            .unwrap();
+        let owner = pair_owner(&state, chrono::Utc::now()).await;
+        let app = grave_router(state);
+
+        for (method, route) in [
+            ("GET", "/assistant/chats/{chat_id}/transfer/package"),
+            ("POST", "/assistant/chats/import"),
+        ] {
+            assert!(
+                GRAVE_ROUTES
+                    .iter()
+                    .any(|(m, r)| m.as_str() == method && *r == route),
+                "{method} {route} must be a grave route"
+            );
+            let (status, body) =
+                send_with_session(&app, method, &concrete(route), &key, Some(&owner.session)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {route}");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+                serde_json::json!({ "refusal": "step_up_required" }),
+                "{method} {route}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_grave_route_without_step_up_is_refused() {
         let state = test_state("control-token").await;

@@ -3157,6 +3157,27 @@ mod tests {
         let waiting = crate::chats::queued(&state.pool, &chat).await.unwrap();
         assert_eq!(waiting.len(), 1);
         assert_eq!(waiting[0].text, "typed during the freeze");
+
+        // The package half: the queued turn is in the package, taken from the standing freeze.
+        let nowhere = std::env::temp_dir().join("nucleos-no-such-session-store");
+        let package =
+            crate::chats::transfer_package::build(&state.pool, &chat, "t-1", &nowhere, vec![])
+                .await
+                .unwrap();
+        assert_eq!(package.queue.len(), 1);
+        assert_eq!(package.queue[0].text, "typed during the freeze");
+        let other =
+            crate::chats::transfer_package::build(&state.pool, &chat, "t-other", &nowhere, vec![])
+                .await;
+        assert!(
+            matches!(
+                other,
+                Err(crate::chats::transfer_package::Failure::Refused(
+                    crate::chats::transfer::Refusal::NotFrozenForThis
+                ))
+            ),
+            "a package needs the freeze of its own transfer"
+        );
         release_queue(&chat);
     }
 
@@ -3174,7 +3195,7 @@ mod tests {
         .await
         .unwrap();
 
-        let warned = transfer::preview(&state.pool, &chat, is_busy(&chat))
+        let warned = transfer::preview(&state.pool, &chat, is_busy(&chat), &[])
             .await
             .unwrap();
         assert!(warned.running);
