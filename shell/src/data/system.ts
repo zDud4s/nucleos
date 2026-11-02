@@ -39,6 +39,11 @@ export interface QuotaBrakeView {
 
 export interface ProjectSummary {
   project_id: string;
+  /**
+   * The git remote of the project's folder. The daemon's `/projects` does not send it today (only
+   * `/projects/detect` reads it), so absent means no remote: such a project exists only on its machine.
+   */
+  remote?: string | null;
   mode: AutopilotMode;
   /** `null` when the project has no root on disk yet — the promote flow asks for one. */
   project_root: string | null;

@@ -606,6 +606,7 @@ mod tests {
             queue_full: false,
             last_gate: None,
             last_gate_at: None,
+            remote: None,
         }
     }
 

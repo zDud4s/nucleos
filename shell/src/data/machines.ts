@@ -3,6 +3,7 @@ import type { QueryKey } from "@tanstack/react-query";
 import { invoke } from "@tauri-apps/api/core";
 import { isRemote } from "../remote/host";
 import { probeMachine } from "../remote/nativeTransport";
+import { forgetChatLinks } from "./chatLinks";
 import { apiFetch } from "./client";
 import {
   MACHINES_CHANGED,
@@ -140,5 +141,7 @@ export async function forgetMachine(id: MachineId): Promise<void> {
   if (id === "here") return;
   await invoke("machine_forget", { id });
   saveMachines(storedMachines().filter((machine) => machine.id !== id));
+  // Chats linked to the forgotten machine would otherwise keep addressing a machine that is gone.
+  forgetChatLinks(id);
   if (localStorage.getItem(DEFAULT_KEY) === id) localStorage.removeItem(DEFAULT_KEY);
 }

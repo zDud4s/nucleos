@@ -18916,6 +18916,135 @@ mod tests {
         assert_eq!(by_id("rooted")["mode"], "shadow");
     }
 
+    /// **The list carries each project's `origin`, so another machine can recognise the repository.**
+    ///
+    /// Without it the shell never knows two machines hold the same project and offers no other
+    /// machine for it. A folder with no remote, or no git at all, simply has no `remote` key.
+    #[tokio::test]
+    async fn the_project_list_carries_the_git_remote() {
+        let state = test_state().await;
+        let with_remote = tempfile::tempdir().unwrap();
+        let without_remote = tempfile::tempdir().unwrap();
+        let not_git = tempfile::tempdir().unwrap();
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .status()
+                .expect("git runs");
+            assert!(status.success(), "git {args:?}");
+        };
+        git(with_remote.path(), &["init", "-q"]);
+        git(
+            with_remote.path(),
+            &["remote", "add", "origin", "git@example.com:team/app.git"],
+        );
+        git(without_remote.path(), &["init", "-q"]);
+
+        for (id, dir) in [
+            ("remote", &with_remote),
+            ("local", &without_remote),
+            ("plain", &not_git),
+        ] {
+            sqlx::query(
+                "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES (?, 'shadow', ?)",
+            )
+            .bind(id)
+            .bind(dir.path().to_string_lossy().to_string())
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES ('unset', 'shadow')")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/projects")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        let by_id = |id: &str| {
+            rows.iter()
+                .find(|row| row["project_id"] == id)
+                .unwrap()
+                .clone()
+        };
+
+        assert_eq!(by_id("remote")["remote"], "git@example.com:team/app.git");
+        for id in ["local", "plain", "unset"] {
+            assert!(by_id(id).get("remote").is_none(), "{id}");
+        }
+    }
+
+    /// **The list never carries credentials a remote URL may hold.**
+    ///
+    /// `GET /projects` goes to every client, so `https://user:token@host/a/b` leaves it as
+    /// `https://host/a/b`; an scp-style `git@host:a/b` is untouched. (`/projects/detect` is not
+    /// covered: it returns the raw origin.)
+    #[tokio::test]
+    async fn the_project_list_strips_credentials_from_the_remote() {
+        let state = test_state().await;
+        let https = tempfile::tempdir().unwrap();
+        let scp = tempfile::tempdir().unwrap();
+        for (dir, url) in [
+            (&https, "https://user:s3cret@example.com/team/app.git"),
+            (&scp, "git@example.com:team/app.git"),
+        ] {
+            for args in [vec!["init", "-q"], vec!["remote", "add", "origin", url]] {
+                let status = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(dir.path())
+                    .args(&args)
+                    .status()
+                    .expect("git runs");
+                assert!(status.success(), "git {args:?}");
+            }
+        }
+        for (id, dir) in [("https", &https), ("scp", &scp)] {
+            sqlx::query(
+                "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES (?, 'shadow', ?)",
+            )
+            .bind(id)
+            .bind(dir.path().to_string_lossy().to_string())
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/projects")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        let remote_of =
+            |id: &str| rows.iter().find(|row| row["project_id"] == id).unwrap()["remote"].clone();
+        assert_eq!(remote_of("https"), "https://example.com/team/app.git");
+        assert_eq!(remote_of("scp"), "git@example.com:team/app.git");
+        assert!(!String::from_utf8_lossy(&body).contains("s3cret"));
+    }
+
     /// **The way out, end to end, and the refusal names the shell switches on.**
     ///
     /// `project_exit`'s own tests cover what the store does; this covers the two things only the

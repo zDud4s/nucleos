@@ -37,7 +37,7 @@ export const PARITY: ParityEntry[] = [
   { where: "page:projects", status: "same", why: "reads an allowed segment" },
   { where: "page:autopilot", status: "same", why: "reads an allowed segment" },
   { where: "page:waiting", status: "same", why: "an admin device reaches it; a wheel approval only hands over a seat, the live pixels it opens stay host-only on page:web (phase 5)" },
-  { where: "page:runs", status: "same", why: "reads an allowed segment" },
+  { where: "page:runs", status: "same", why: "reads an allowed segment; the run list is this machine's own, a run started on another machine is not listed or followed here" },
   { where: "page:analytics", status: "same", why: "reads an allowed segment" },
   { where: "page:feed", status: "same", why: "reads an allowed segment" },
   { where: "page:brain", status: "same", why: "its settings data calls /config/*, which only an owner device reaches" },

@@ -49,6 +49,8 @@ import {
   useUndoToast,
 } from "../ui";
 import { stillGoing } from "../lib/editor";
+import type { ChatRow } from "../data/chatMachines";
+import { MachineTag } from "./MachinePicker";
 import { BAND_TITLE, inBands } from "../lib/when";
 import {
   applyFilters,
@@ -633,6 +635,7 @@ function SessionRow({
         <span className={said ?"chats-row-title" : "chats-row-title chats-row-unsaid"}>
           {name}
         </span>
+        <MachineTag row={row as Partial<ChatRow>} />
         {row.last_activity !== null && (
           <span className="chats-row-when" aria-hidden="true">
             <RelativeTime at={row.last_activity} />

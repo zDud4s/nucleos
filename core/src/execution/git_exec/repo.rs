@@ -135,24 +135,10 @@ pub async fn toplevel(
     ))
 }
 
-/// Where a repository points and what it last did, for a folder nobody has registered yet.
-///
-/// A sixth sanctioned entry to `run_git`: it computes what is left of the budget before each spawn
-/// and returns without spawning when there is none, which is the property that list protects.
-///
-/// **Both halves are optional and neither absence is an error.** A repository with no `origin` is
-/// ordinary — a local-only project is a project — and one with no commits is a repository somebody
-/// made this morning. The caller is a wizard showing a person what is in a folder, and "there is no
-/// remote" is information rather than a failure to look.
-pub async fn origin_and_head(
-    path: &Path,
-    deadline: std::time::Instant,
-) -> (Option<String>, Option<String>) {
-    let budget = deadline.saturating_duration_since(std::time::Instant::now());
-    if budget.is_zero() {
-        return (None, None);
-    }
-    let remote = run_git(
+/// The URL of `origin`, or `None` for a folder with no such remote, no git, or a read that failed or
+/// ran out of `budget`. One `git` spawn.
+pub async fn origin_url(path: &Path, budget: std::time::Duration) -> Option<String> {
+    run_git(
         path,
         &[
             OsStr::new("remote"),
@@ -171,7 +157,27 @@ pub async fn origin_and_head(
             .next()
             .map(|line| line.trim().to_owned())
     })
-    .filter(|line| !line.is_empty());
+    .filter(|line| !line.is_empty())
+}
+
+/// Where a repository points and what it last did, for a folder nobody has registered yet.
+///
+/// A sixth sanctioned entry to `run_git`: it computes what is left of the budget before each spawn
+/// and returns without spawning when there is none, which is the property that list protects.
+///
+/// **Both halves are optional and neither absence is an error.** A repository with no `origin` is
+/// ordinary — a local-only project is a project — and one with no commits is a repository somebody
+/// made this morning. The caller is a wizard showing a person what is in a folder, and "there is no
+/// remote" is information rather than a failure to look.
+pub async fn origin_and_head(
+    path: &Path,
+    deadline: std::time::Instant,
+) -> (Option<String>, Option<String>) {
+    let budget = deadline.saturating_duration_since(std::time::Instant::now());
+    if budget.is_zero() {
+        return (None, None);
+    }
+    let remote = origin_url(path, budget).await;
 
     let budget = deadline.saturating_duration_since(std::time::Instant::now());
     if budget.is_zero() {

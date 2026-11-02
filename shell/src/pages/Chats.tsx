@@ -89,6 +89,7 @@ import {
   usePostChatTitle,
   useSendMessage,
   useStartConversation,
+  useAllChats,
   useStopTurn,
   useSayNow,
   type Attachment,
@@ -113,6 +114,8 @@ import {
   type Turn,
 } from "../data/chats";
 import { type RelaySent } from "../lib/turns";
+import { chatKey, useChatMachine } from "../data/chatMachines";
+import { MachinePicker, useNewWorkMachine } from "../chats/MachinePicker";
 import { type ChatNotice } from "../data/chats";
 import { usePaletteGroup, usePaletteQuery } from "../ui";
 import {
@@ -200,7 +203,7 @@ export function Chats() {
   const params = useParams({ strict: false }) as { chatId?: string };
   const chatId = params.chatId ?? null;
 
-  const chats = useChats();
+  const chats = useAllChats();
   const transcript = useChatTranscript(chatId);
 
   const rows = chats.data ?? [];
@@ -1155,6 +1158,7 @@ export function greetingFor(hour: number): string {
 function NothingOpen() {
   const navigate = useNavigate();
   const start = useStartConversation();
+  const [machine, setMachine] = useNewWorkMachine();
 
   return (
     <div className="chats-front">
@@ -1162,11 +1166,13 @@ function NothingOpen() {
         <h2 className="chats-front-greeting">
           {greetingFor(new Date().getHours())}
         </h2>
+        <MachinePicker value={machine} onChange={setMachine} />
         <StartBox
           pending={start.isPending}
           onSay={(model, effort, mode, text, images) =>
             start.mutate(
               {
+                machine,
                 model: model ?? undefined,
                 effort: effort ?? undefined,
                 permissionMode: mode,
@@ -1784,7 +1790,10 @@ function Project({
  * The project picker over a conversation that already has a directory: opened by `/project`, and
  * closed once a project is chosen. `NoProject` owns the same dialog for the unrooted case.
  */
-function ChangeProject({
+const REMOTE_PROJECT_NOTE =
+  "This chat runs on another machine, so its project can only be changed there.";
+
+export function ChangeProject({
   chatId,
   picking,
   onPicking,
@@ -1794,6 +1803,18 @@ function ChangeProject({
   onPicking: (open: boolean) => void;
 }) {
   const point = useSetChatProject(chatId);
+  const remote = useChatMachine(chatId) !== "here";
+  // A folder path from this machine means nothing on another one, so the change is not offered.
+  if (remote) {
+    return picking ? (
+      <p className="chats-unrooted-why" role="status">
+        {REMOTE_PROJECT_NOTE}{" "}
+        <Button type="button" variant="ghost" onClick={() => onPicking(false)}>
+          Close
+        </Button>
+      </p>
+    ) : null;
+  }
   return (
     <ProjectPicker
       open={picking}
@@ -2063,14 +2084,23 @@ function NoProject({
 }) {
   const point = useSetChatProject(chatId);
   const held = useHeldMessage(chatId);
+  const remote = useChatMachine(chatId) !== "here";
 
   // Once per opening of the conversation: `ChatDetail` is keyed on the chat, so this mount IS the
   // opening. Not on every render, or "Not now" would be answered by the dialog coming straight back.
   useEffect(() => {
-    onPicking(true);
+    if (!remote) onPicking(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  if (remote) {
+    return (
+      <div className="chats-unrooted" role="status">
+        <FolderOpen className="chats-unrooted-icon" strokeWidth={1.5} aria-hidden="true" />
+        <p className="chats-unrooted-why">{REMOTE_PROJECT_NOTE}</p>
+      </div>
+    );
+  }
   return (
     <>
       {/* The whole of an empty window, centred: the one question this conversation is waiting on,
@@ -4683,7 +4713,7 @@ const TurnBlock = memo(function TurnBlock({
       {live && <LiveAnswer turnId={turn.id} chatId={chatId} since={turn.createdAt} />}
       {!live && <Thought thought={turn.thought} tokens={turn.thoughtTokens} />}
       {!live && <Plan todos={planOf(turn.did)} />}
-      {!live && <WhatItDid did={turn.did} turnId={turn.id} settled />}
+      {!live && <WhatItDid did={turn.did} turnId={turn.id} chatId={chatId} settled />}
       {!live && turn.answer !== null && <AnswerBlock text={turn.answer} />}
       {!live && turn.answer === null && (
         <p className="chats-turn-answer chats-turn-answer-empty">
@@ -4872,7 +4902,7 @@ function LiveAnswer({
       {/* `settled={false}`: the answers are already on this stream — the live route reads it whole
           on every poll — and the database column they would be fetched from is not written until
           the turn ends. */}
-      <WhatItDid did={live.data?.did ?? []} turnId={turnId} settled={false} />
+      <WhatItDid did={live.data?.did ?? []} turnId={turnId} chatId={chatId} settled={false} />
       <p className="chats-turn-live">
         {/* Turning, because the three words below can stand unchanged for two minutes while a
             build runs and a page that never moves is a page that looks stopped. For anybody who
@@ -5168,15 +5198,18 @@ function Plan({ todos }: { todos: Todo[] }) {
 function WhatItDid({
   did,
   turnId,
+  chatId,
   settled,
 }: {
   did: ToolCall[];
   turnId: number;
+  /** The chat the turn belongs to: turn ids repeat across machines. */
+  chatId: string;
   /** Whether the turn has ended. A live turn's answers are not in the database yet. */
   settled: boolean;
 }) {
   const [open, setOpen] = useState<number | null>(null);
-  const tools = useTurnTools(turnId, settled && open !== null);
+  const tools = useTurnTools(turnId, settled && open !== null, chatId);
   // The fetched list when there is one, and what the transcript gave otherwise. Same calls in the
   // same order either way — the daemon reads both from one column.
   const calls = tools.data?.did ?? did;
@@ -5929,7 +5962,7 @@ function Composer({
           // hold lands: the hold re-renders this box at once, and the effect below would otherwise
           // send the line straight back out while the box still believed in a directory.
           flushSync(() => onRefusedRoot?.());
-          void queryClient.invalidateQueries({ queryKey: keys.chats.project(chatId) });
+          void queryClient.invalidateQueries({ queryKey: chatKey(keys.chats.project(chatId), chatId) });
           holdMessage(chatId, { text: line, images: [], command: true }, MAX_PICTURES);
           if (typed) {
             setText("");
