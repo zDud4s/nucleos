@@ -1378,6 +1378,13 @@ CONDUCTOR_REDIRECT_TAIL = re.compile(
     r"\s+(?:2>&1|\*?>\s*(?:\"(?P<dq>[^\"<>&|;`$\r\n]+)\"|'(?P<sq>[^'<>&|;`$\r\n]+)'"
     r"|(?P<bare>[^\s\"'<>&|;`$]+)))\s*$"
 )
+# Parts of a command: `&&` and `;` only. `||`, a lone `&`, a pipe in the middle stay metacharacters.
+CONDUCTOR_JOIN = re.compile(r"\s+&&\s+|\s*;\s*")
+CONDUCTOR_MAX_PARTS = 8
+# The one pipe allowed, at the very end: a bounded look at the output.
+CONDUCTOR_PIPE_TAIL = re.compile(r"\s*\|\s*(?:tail|head)\s+(?:-n\s+\d+|-\d+)\s*$")
+# The variables that tune a gate or the broker, and no others (not PATH, not RUSTFLAGS).
+CONDUCTOR_ENV_PREFIX = re.compile(r"(?:CARGO_\w*|RUSTC_BOOTSTRAP|RUST_\w*|NUCLEOS_GATE_\w*|NUCLEOS_HEAVY_\w*)=")
 CONDUCTOR_DEV_HOME_ENV = "NUCLEOS_DEV_HOME"
 CONDUCTOR_DEV_HOME_DEFAULT = "C:/nucleos-dev"
 
@@ -1397,6 +1404,8 @@ def _conductor_strip_redirects(command, state, cwd):
     """`(command without its trailing output redirects, ok, any redirect seen)`. Not ok when a
     redirect aims outside the scratch folders, so a gate cannot be pointed at a file of the project."""
     redirected = False
+    # Never the folder of the `manual:` flags: a redirect there could forge one.
+    flags = _conductor_path(os.path.join(state.get("tmp_dir") or tempfile.gettempdir(), CONDUCTOR_FLAG_DIR), cwd)
     while True:
         match = CONDUCTOR_REDIRECT_TAIL.search(command)
         if not match:
@@ -1409,7 +1418,7 @@ def _conductor_strip_redirects(command, state, cwd):
                 os.path.isfile(os.path.join(folder, "scripts", "gates.sh")) and _under(resolved, _conductor_path(folder, cwd))
                 for folder in _ancestors(cwd)
             )
-            if in_project or not any(_under(resolved, root) for root in _conductor_log_roots(state, cwd)):
+            if in_project or _under(resolved, flags) or not any(_under(resolved, root) for root in _conductor_log_roots(state, cwd)):
                 return command, False, redirected
         command = command[: match.start()]
 
@@ -1481,14 +1490,21 @@ def _conductor_worktree_path(path, cwd):
     script. The worktrees folder itself, the main checkout and anything outside are not accepted.
     """
     resolved = _conductor_path(path, cwd)
-    for folder in _ancestors(cwd):
-        if os.path.isfile(os.path.join(folder, *WORKFLOW_POINTER)) or os.path.isfile(
-            os.path.join(folder, "scripts", "gates.sh")
-        ):
-            root = _conductor_path(os.path.join(folder, ".claude", "worktrees"), cwd)
-            if resolved != root and _under(resolved, root):
-                return resolved
+    for folder in _conductor_project_folders(cwd):
+        root = _conductor_path(os.path.join(folder, ".claude", "worktrees"), cwd)
+        if resolved != root and _under(resolved, root):
+            return resolved
     return None
+
+
+def _conductor_project_folders(cwd):
+    """Folders at or above `cwd` that show themselves as the project: workflow pointer or gate script."""
+    return [
+        folder
+        for folder in _ancestors(cwd)
+        if os.path.isfile(os.path.join(folder, *WORKFLOW_POINTER))
+        or os.path.isfile(os.path.join(folder, "scripts", "gates.sh"))
+    ]
 
 
 def _conductor_worktree_remove_accepts(args, cwd):
@@ -1537,8 +1553,8 @@ def _conductor_git_accepts(tokens, cwd):
 CONDUCTOR_LAND_TARGET = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
 
 
-def _conductor_land_tokens(part):
-    """The tokens of one `&&` part, or None when it carries a metacharacter or does not parse."""
+def _conductor_part_tokens(part):
+    """The tokens of one `&&` / `;` part, or None when it carries a metacharacter or does not parse."""
     if any(mark in part for mark in CONDUCTOR_METACHARACTERS):
         return None
     try:
@@ -1547,32 +1563,95 @@ def _conductor_land_tokens(part):
         return None
 
 
-def _conductor_land_accepts(command, cwd):
-    """`<dev home>/run/nucleos-core.exe --land [target]`, alone or after exactly one `cd <worktree> &&`.
+def _conductor_dev_exe(cwd):
+    """The daemon binary the dev home stages, `<dev home>/run/nucleos-core.exe`, as comparable text."""
+    dev_home = os.environ.get(CONDUCTOR_DEV_HOME_ENV) or CONDUCTOR_DEV_HOME_DEFAULT
+    return _conductor_path(os.path.join(dev_home, "run", "nucleos-core.exe"), cwd)
 
-    `--land` lands the branch of the cwd, hence the `cd`; its path must lie under the project's
-    worktrees. Every other argument of that program (`--print-token`, `--settings-reset`, ...) is
+
+def _conductor_land_accepts(tokens, cwd):
+    """`<dev home>/run/nucleos-core.exe --land [target]`.
+
+    `--land` lands the branch of the cwd, which a `cd <dir>` part before it may have moved inside the
+    project. Every other argument of that program (`--print-token`, `--settings-reset`, ...) is
     refused. The hook does not check the owner's word: landing still takes the owner's "aterra", and
     the approve/refuse endpoints stay the owner's alone; nothing here reaches them.
     """
-    parts = re.split(r"\s+&&\s+", command.strip())
-    if len(parts) > 2:
-        return False
-    # A leading PowerShell call operator, for the quoted program path; on the last part only.
-    parts[-1] = re.sub(r"^&\s+(?=\S)", "", parts[-1])
-    parsed = [_conductor_land_tokens(part) for part in parts]
-    if any(not tokens for tokens in parsed):
-        return False
-    if len(parsed) == 2:
-        left = parsed[0]
-        if len(left) != 2 or left[0].lower() != "cd" or _conductor_worktree_path(left[1], cwd) is None:
-            return False
-    tokens = parsed[-1]
-    dev_home = os.environ.get(CONDUCTOR_DEV_HOME_ENV) or CONDUCTOR_DEV_HOME_DEFAULT
-    program = _conductor_path(os.path.join(dev_home, "run", "nucleos-core.exe"), cwd)
-    if len(tokens) not in (2, 3) or _conductor_path(tokens[0], cwd) != program or tokens[1] != "--land":
+    if len(tokens) not in (2, 3) or _conductor_path(tokens[0], cwd) != _conductor_dev_exe(cwd) or tokens[1] != "--land":
         return False
     return len(tokens) == 2 or CONDUCTOR_LAND_TARGET.fullmatch(tokens[2]) is not None
+
+
+def _conductor_cd_target(args, cwd):
+    """The folder `cd <dir>` leads to when it lies in the project (its worktrees included), else None."""
+    if len(args) != 1 or args[0].startswith("-"):
+        return None
+    target = _conductor_path(args[0], cwd)
+    if any(_under(target, _conductor_path(folder, cwd)) for folder in _conductor_project_folders(cwd)):
+        return target
+    return None
+
+
+def _conductor_env_prefix_accepts(tokens, cwd):
+    """`NAME=value ... <gates.sh | heavy.py command>`, for the few variables that tune a gate or the broker."""
+    count = 0
+    while count < len(tokens) and CONDUCTOR_ENV_PREFIX.match(tokens[count]):
+        count += 1
+    program = tokens[count:]
+    return count > 0 and bool(program) and (
+        _conductor_gates_accepts(program, cwd) or _conductor_heavy_accepts(program, cwd)
+    )
+
+
+def _conductor_part_accepts(part, cwd):
+    """`(accepted, folder afterwards)` for one `&&` / `;` part; only `cd` moves the folder."""
+    # A PowerShell call operator, for the quoted program path: not for the broker, git or a `cd`.
+    called = re.match(r"&\s+(?=\S)", part)
+    if called:
+        part = part[called.end():]
+    tokens = _conductor_part_tokens(part)
+    if not tokens:
+        return False, cwd
+    if tokens[0].lower() == "cd":
+        target = None if called else _conductor_cd_target(tokens[1:], cwd)
+        return target is not None, target or cwd
+    if _conductor_gates_accepts(tokens, cwd) or _conductor_land_accepts(tokens, cwd):
+        return True, cwd
+    if called:
+        return False, cwd
+    return (
+        _conductor_heavy_accepts(tokens, cwd)
+        or _conductor_env_prefix_accepts(tokens, cwd)
+        or _conductor_git_accepts(tokens, cwd)
+    ), cwd
+
+
+def _conductor_strip_tails(command, state, cwd):
+    """`(command without its closing `| tail -N` / `| head -N` and output redirects, ok)`."""
+    while True:
+        pipe = CONDUCTOR_PIPE_TAIL.search(command)
+        if pipe:
+            command = command[: pipe.start()]
+            continue
+        stripped, ok, redirected = _conductor_strip_redirects(command, state, cwd)
+        if not ok:
+            return command, False
+        if not redirected:
+            return command, True
+        command = stripped
+
+
+def _conductor_command_accepted(command, state, cwd):
+    """Whether every `&&` / `;` part of `command` is accepted on its own, after the tails are cut."""
+    command, ok = _conductor_strip_tails(command.strip(), state, cwd)
+    parts = CONDUCTOR_JOIN.split(command)
+    if not ok or len(parts) > CONDUCTOR_MAX_PARTS:
+        return False
+    for part in parts:
+        accepted, cwd = _conductor_part_accepts(part.strip(), cwd)
+        if not accepted:
+            return False
+    return True
 
 
 def _conductor_command_refusal(command, cwd, state=None):
@@ -1581,28 +1660,7 @@ def _conductor_command_refusal(command, cwd, state=None):
     # The spelling tolerance of `claimed_land_override`, but any mention counts, not only a setting.
     if CONDUCTOR_ENV.lower() in re.sub(r"[\\`'\"+${}]", "", command).lower():
         return CONDUCTOR_ENV_REFUSAL
-    if _conductor_land_accepts(command, cwd):
-        return ""
-    # A trailing log redirect and a leading PowerShell `&` are for the gate script alone.
-    gates_only = False
-    stripped, redirects_ok, redirected = _conductor_strip_redirects(command, state or {}, cwd)
-    if redirects_ok and redirected:
-        command, gates_only = stripped, True
-    call_operator = re.match(r"\s*&\s+(?=\S)", command)
-    if call_operator:
-        command, gates_only = command[call_operator.end():], True
-    if any(mark in command for mark in CONDUCTOR_METACHARACTERS):
-        return CONDUCTOR_REFUSAL
-    try:
-        # Backslashes become slashes first, as in `_verb_in_command`: posix shlex would eat them.
-        tokens = shlex.split(command.replace("\\", "/"), posix=True)
-    except ValueError:
-        return CONDUCTOR_REFUSAL
-    if tokens and _conductor_gates_accepts(tokens, cwd):
-        return ""
-    if tokens and not gates_only and (_conductor_heavy_accepts(tokens, cwd) or _conductor_git_accepts(tokens, cwd)):
-        return ""
-    return CONDUCTOR_REFUSAL
+    return "" if _conductor_command_accepted(command, state or {}, cwd) else CONDUCTOR_REFUSAL
 
 
 def _conductor_refusal(tool, tool_input, state, cwd, session_id=None):

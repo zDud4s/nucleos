@@ -396,13 +396,13 @@ def test_gates_script_refused_when_chained_or_elsewhere():
             "bash /tmp/evil/bash scripts/gates.sh hooks",
             "/tmp/evil/bash scripts/gates.sh hooks",
             "& " + G + " status",
-            G + " status > " + os.path.join(fx.tmp_dir, "x"),
         ):
             deny(fx.verdict("Bash", {"command": command}), repr(command))
 
 
 def test_chained_command_denied():
     with fixture("on") as fx:
+        _gate_marker(fx)
         for command in (
             f"python scripts/heavy.py cargo test && {G} push",
             f"{G} status; rm x",
@@ -432,6 +432,13 @@ def test_git_status_allowed():
         ):
             allow(fx.verdict("Bash", {"command": command}), repr(command))
         deny(fx.verdict("Bash", {"command": f"{G} checkout master"}), "control: checkout")
+
+
+def _gate_marker(fx):
+    """Gives the fixture the gate script a real project holds, so a redirect into it is told from scratch."""
+    os.makedirs(fx.path("scripts"), exist_ok=True)
+    with open(fx.path("scripts", "gates.sh"), "w", encoding="utf-8") as handle:
+        handle.write("#!/usr/bin/env bash\n")
 
 
 def _project(fx):
@@ -495,7 +502,6 @@ def test_worktree_remove_allowed_only_under_the_project_worktrees():
             f"{G} worktree remove",
             f"{G} worktree remove {inside} {inside}",
             f"{G} worktree remove {inside}; rm x",
-            f"{G} worktree remove {inside} && {G} status",
             f"{G} worktree remove {inside} | cat",
         ):
             deny(fx.verdict("Bash", {"command": command}), repr(command))
@@ -542,6 +548,7 @@ def test_land_allowed_from_the_root_session():
 def test_land_refused_when_widened_or_elsewhere():
     with fixture("on") as fx:
         inside, exe, dev = _land_fixture(fx)
+        _gate_marker(fx)
         outside = os.path.join(os.path.dirname(fx.cwd), "elsewhere").replace("\\", "/")
         for command in (
             f"{exe} --print-token",
@@ -559,27 +566,102 @@ def test_land_refused_when_widened_or_elsewhere():
             f"{exe} --land `id`",
             f"{exe} --land\nrm x",
             f"{exe} --land > out.txt",
-            f"{exe} --land 2>&1",
             f"{dev}/other/nucleos-core.exe --land",
             f"{dev}/run/evil.exe --land",
             f"/tmp/nucleos-core.exe --land",
             f"cd {outside} && {exe} --land",
-            f"cd x && {exe} --land",
             f"cd .. && {exe} --land",
-            f"cd .claude/worktrees/../.. && {exe} --land",
-            f"cd {fx.cwd} && {exe} --land".replace("\\", "/"),
-            f"cd {inside} && {G} status",
-            f"cd x && {G} status",
             f"cd {inside} && {exe} --print-token",
-            f"cd {inside} && {exe} --land && {exe} --land",
-            f"cd {inside} && cd {inside} && {exe} --land",
-            f"cd {inside} ; {exe} --land",
             f"cd {inside} || {exe} --land",
-            f"{exe} --land && cd {inside}",
-            f"{G} status && {exe} --land",
             f"rm x && {exe} --land",
         ):
             deny(fx.verdict("Bash", {"command": command}), repr(command))
+
+
+def test_composition_of_accepted_parts_and_closing_tails():
+    with fixture("on") as fx:
+        inside, exe, dev = _land_fixture(fx)
+        _gate_marker(fx)
+        log = f"{dev}/scratch/g.log"
+        for command in (
+            f"cd {inside} && scripts/gates.sh core",
+            f"cd {inside} && {exe} --land",
+            f"cd {fx.cwd} && {exe} --land".replace("\\", "/"),
+            f"cd x && {G} status",
+            f"cd {inside} && cd {inside} && {exe} --land master",
+            f"cd {inside} ; {exe} --land",
+            f"{G} status && {exe} --land",
+            f"{exe} --land && cd {inside}",
+            f"scripts/gates.sh core && {G} status",
+            f"{G} status; {G} log --oneline -3",
+            f"cd .claude/worktrees/feat; python scripts/heavy.py cargo test",
+            f"cd {inside} && {G} status",
+            f"{G} status 2>&1",
+            f"{G} log | tail -n 5",
+            f"{G} log | tail -5",
+            f"{G} log | head -n 3",
+            f"{G} log|head -20",
+            f"{G} log 2>&1 | tail -n 5",
+            f"scripts/gates.sh core > {log} 2>&1 | tail -20",
+            f"scripts/gates.sh core 2>&1 | tail -20",
+            f"{G} log > {log}",
+            f"python scripts/heavy.py cargo test > {log} 2>&1",
+            f"{exe} --land 2>&1",
+            f"{G} status > {os.path.join(fx.tmp_dir, 'x')}",
+            f"cd {inside} && scripts/gates.sh core > {log} 2>&1 | tail -n 40",
+            f"CARGO_BUILD_JOBS=2 python scripts/heavy.py cargo test",
+            f"RUSTC_BOOTSTRAP=1 RUST_BACKTRACE=1 scripts/gates.sh core",
+            f"NUCLEOS_GATE_FOO=1 bash scripts/gates.sh core",
+            f"NUCLEOS_HEAVY_X=1 python scripts/heavy.py --prio 1 cargo check",
+        ):
+            allow(fx.verdict("Bash", {"command": command}), repr(command))
+        allow(fx.verdict("PowerShell", {"command": f"cd {inside} ; & '{exe}' --land *> '{log}'"}), "PowerShell")
+        outside = os.path.join(os.path.dirname(fx.cwd), "elsewhere").replace("\\", "/")
+        flag = fx.flag("sess-1").replace("\\", "/")
+        for command in (
+            f"{G} status | cat",
+            f"{G} log | tail -n 5 | cat",
+            f"{G} log | tail -f x",
+            f"{G} log | tail -n 5 && {G} status",
+            f"{G} log | head -n 5 > out.txt",
+            f"{G} status || true",
+            f"{G} status && {G} status || true",
+            f"{G} status $(id)",
+            f"{G} status `id`",
+            f"{G} status\n{G} log",
+            f"{G} log >> {log}",
+            f"{G} status > out.txt",
+            f"{G} status > {flag}",
+            f"scripts/gates.sh core > {flag}",
+            f"{G} status > {G}",
+            f"{G} status && {G} push",
+            f"{G} status && rm x",
+            f"{G} status; rm x",
+            f"cd {outside} && {G} status",
+            f"cd {outside}/.. && {G} status",
+            f"cd .. && {G} status",
+            f"cd /tmp && {G} status",
+            f"cd && {G} status",
+            f"cd - && {G} status",
+            f"cd {inside} extra && {G} status",
+            f"{G} status &",
+            f"{G} status & {G} log",
+            f"{G} status &&& {G} log",
+            f"{G} status;",
+            f"; {G} status",
+            f"{G} status &&",
+            f"PATH=/tmp/x python scripts/heavy.py cargo test",
+            f"RUSTFLAGS=-Cx scripts/gates.sh core",
+            f"CARGO_BUILD_JOBS=2 {G} status",
+            f"CARGO_BUILD_JOBS=2 {exe} --land",
+            f"CARGO_BUILD_JOBS=2 cd {inside}",
+            f"CARGO_BUILD_JOBS=2",
+            f"CARGO_BUILD_JOBS=2; {G} status",
+            f"cat <<EOF\nx\nEOF",
+            f"scripts/gates.sh core < input.txt",
+        ):
+            deny(fx.verdict("Bash", {"command": command}), repr(command))
+        deny(fx.verdict("PowerShell", {"command": f"cd {inside} ; & {G} status"}), "call operator on git")
 
 
 def _git_bash(path):
@@ -1133,6 +1215,7 @@ TESTS = [
     test_probe_writes_payload_keys,
     test_grep_and_glob_on_a_file_cost_like_a_read,
     test_git_bash_drive_paths_are_understood_on_windows,
+    test_composition_of_accepted_parts_and_closing_tails,
     test_notifications_neither_set_nor_clear_manual,
     test_notifications_do_not_reset_the_read_budget,
 ]
