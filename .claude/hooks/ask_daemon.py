@@ -1019,7 +1019,7 @@ CONDUCTOR_FEED_TIMEOUT_SECONDS = 1
 WORKFLOW_POINTER = (".nucleos", "workflow", "project.json")
 CONDUCTOR_TOOLS = ("Agent", "Task", "Skill", "TodoWrite", "AskUserQuestion", "ExitPlanMode", "ToolSearch",
                    "TaskOutput", "BashOutput", "SendMessage", "LSP", "Monitor", "TaskStop",
-                   "TaskCreate", "TaskList", "TaskGet", "TaskUpdate")
+                   "TaskCreate", "TaskList", "TaskGet", "TaskUpdate", "ListAgents")
 CONDUCTOR_MATERIAL_DIRS = (".ai", ".nucleos")
 CONDUCTOR_METACHARACTERS = (";", "&", "|", "<", ">", "`", "$(", "\n", "\r")
 CONDUCTOR_GIT_READS = ("status", "log", "diff", "show", "rev-parse", "ls-tree", "cat-file")
@@ -1383,6 +1383,7 @@ CONDUCTOR_REDIRECT_TAIL = re.compile(
 # Parts of a command: `&&` and `;` only. `||`, a lone `&`, a pipe in the middle stay metacharacters.
 CONDUCTOR_JOIN = re.compile(r"\s+&&\s+|\s*;\s*")
 CONDUCTOR_MAX_PARTS = 8
+CONDUCTOR_MAX_SLEEP = 60  # seconds a root `sleep` may wait
 # The one pipe allowed, at the very end: a bounded look at the output.
 CONDUCTOR_PIPE_TAIL = re.compile(r"\s*\|\s*(?:tail|head)\s+(?:-n\s+\d+|-\d+)\s*$")
 # The variables that tune a gate or the broker, and no others (not PATH, not RUSTFLAGS).
@@ -1609,6 +1610,21 @@ def _conductor_land_accepts(tokens, cwd):
     return len(tokens) == 2 or CONDUCTOR_LAND_TARGET.fullmatch(tokens[2]) is not None
 
 
+def _conductor_small_accepts(tokens):
+    """The clock and a short wait: `date [+FORMAT]`, `Get-Date [-Format X]`, `sleep N` (N <= 60).
+    By bare name, as git and python above; `date` with anything but a `+FORMAT` would set the clock."""
+    name, args = tokens[0].lower(), tokens[1:]
+    if name == "date":
+        return not args or (len(args) == 1 and args[0].startswith("+"))
+    if name == "get-date":
+        return not args or (len(args) == 2 and args[0].lower() == "-format" and not args[1].startswith("-"))
+    if name in ("sleep", "start-sleep"):
+        if args[:1] and args[0].lower() == "-seconds":
+            args = args[1:]
+        return len(args) == 1 and re.fullmatch(r"[0-9]{1,3}", args[0]) is not None and int(args[0]) <= CONDUCTOR_MAX_SLEEP
+    return False
+
+
 def _conductor_cd_target(args, cwd):
     """The folder `cd <dir>` leads to when it lies in the project (its worktrees included), else None."""
     if len(args) != 1 or args[0].startswith("-"):
@@ -1655,6 +1671,7 @@ def _conductor_part_accepts(part, cwd):
         _conductor_heavy_accepts(tokens, cwd)
         or _conductor_env_prefix_accepts(tokens, cwd)
         or _conductor_git_accepts(tokens, cwd)
+        or _conductor_small_accepts(tokens)
     ), cwd
 
 

@@ -761,6 +761,52 @@ def test_daemon_script_and_verify_ticket_accepted():
             deny(fx.verdict("PowerShell", {"command": command}), repr(command))
 
 
+def test_small_read_only_commands_and_list_agents():
+    with fixture("on") as fx:
+        _gate_marker(fx)
+        allow(fx.verdict("ListAgents", {}), "ListAgents")
+        for tool, command in (
+            ("Bash", "date"),
+            ("Bash", "date +%H:%M"),
+            ("Bash", "date '+%Y-%m-%d %H:%M'"),
+            ("PowerShell", "Get-Date"),
+            ("PowerShell", "get-date -Format 'HH:mm'"),
+            ("Bash", "sleep 5"),
+            ("Bash", "sleep 60"),
+            ("PowerShell", "Start-Sleep 30"),
+            ("PowerShell", "Start-Sleep -Seconds 30"),
+            ("PowerShell", "start-sleep 1"),
+            ("Bash", f"sleep 20 && {G} status"),
+            ("Bash", f"date; {G} log --oneline -3"),
+        ):
+            allow(fx.verdict(tool, {"command": command}), f"{tool}: {command!r}")
+        for command in (
+            "sleep 61",
+            "sleep 600",
+            "sleep",
+            "sleep 5m",
+            "sleep 1.5",
+            "sleep -1",
+            "sleep 5 5",
+            "sleep infinity",
+            "Start-Sleep 61",
+            "Start-Sleep -Milliseconds 5",
+            "Start-Sleep -Seconds 61",
+            "Start-Sleep",
+            "date -s 2020-01-01",
+            "date --set=x",
+            "date +%H > out.txt",
+            "date 010112002020",
+            "date +%H extra",
+            "Get-Date -Foo",
+            "Get-Date -Format x y",
+            "Set-Date x",
+            "sleep 5 &",
+            "sleep 5 | cat",
+        ):
+            deny(fx.verdict("PowerShell", {"command": command}), repr(command))
+
+
 def _git_bash(path):
     """`C:\\x\\y` as Git Bash spells it, `/c/x/y`."""
     path = path.replace("\\", "/")
@@ -1315,6 +1361,7 @@ TESTS = [
     test_composition_of_accepted_parts_and_closing_tails,
     test_broker_runs_cargo_go_node_and_status,
     test_daemon_script_and_verify_ticket_accepted,
+    test_small_read_only_commands_and_list_agents,
     test_notifications_neither_set_nor_clear_manual,
     test_notifications_do_not_reset_the_read_budget,
 ]
