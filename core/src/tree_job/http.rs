@@ -320,6 +320,8 @@ struct TreeBody {
     dirty_owner_files: Option<Vec<String>>,
     /// `hold` (default) or `integration`: whether the driver may land the job into master.
     land: Option<String>,
+    /// The Claude Code session that launched the tree (`work_nodes.launching_session_id` of the root).
+    launching_session_id: Option<String>,
 }
 
 /// The values of `land`, the first one being the default (no tree moves master unless asked).
@@ -390,6 +392,7 @@ async fn post_tree(
         Ok(project_id) => project_id,
         Err(_) => project_of_root(&state, &project_root).await?,
     };
+    let launching_session = body.launching_session_id.clone();
     let land = match body.land.as_deref().map(str::trim) {
         None | Some("") => LAND_MODES[0].to_owned(),
         Some(mode) if LAND_MODES.contains(&mode) => mode.to_owned(),
@@ -439,8 +442,13 @@ async fn post_tree(
     store::save(&state.pool, &job)
         .await
         .map_err(store_refusal)?;
-    sqlx::query("UPDATE work_nodes SET tree_job_id = ? WHERE id = ?")
+    // The Claude Code session that launched the tree, stamped by its hook into the MCP call; a value
+    // that is not a plain session id is dropped, and the root is a root all the same.
+    let launching_session = launching_session
+        .filter(|session| crate::daemon_client::valid_session_id(session));
+    sqlx::query("UPDATE work_nodes SET tree_job_id = ?, launching_session_id = ? WHERE id = ?")
         .bind(&id)
+        .bind(launching_session)
         .bind(&opened.id)
         .execute(&state.pool)
         .await
@@ -1894,6 +1902,38 @@ mod tests {
         assert_eq!(depth, 0);
         assert_eq!(root_id, root_node_id);
         assert_eq!(tree_job_id.as_deref(), Some(JOB));
+    }
+
+    /// The Claude Code session that launched the tree lands on the root node's
+    /// `launching_session_id`; a value that is not a plain session id is dropped.
+    #[tokio::test]
+    async fn post_trees_records_the_launching_session_on_the_root() {
+        let state = test_state().await;
+        let app = app(&state);
+        let mut body = tree_body(JOB);
+        body["launching_session_id"] = json!("sess-9");
+        let response = post(&app, "/trees", body).await;
+        let root = response.1["root_node_id"].as_str().expect("a root").to_owned();
+
+        let mut bad = tree_body("job-bad-session");
+        bad["launching_session_id"] = json!("not a session id!");
+        let bad_response = post(&app, "/trees", bad).await;
+        let bad_root = bad_response.1["root_node_id"].as_str().expect("a root").to_owned();
+
+        let stored = |id: String| {
+            let pool = state.pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT launching_session_id FROM work_nodes WHERE id = ?",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(stored(root).await.as_deref(), Some("sess-9"));
+        assert_eq!(stored(bad_root).await, None);
     }
 
     #[tokio::test]
