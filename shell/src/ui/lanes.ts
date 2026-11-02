@@ -80,6 +80,12 @@ const LANE_OF: Record<string, FeedLane> = {
   job_interrupted: "jobs",
   work_tree_parked: "jobs",
   work_tree_finished: "jobs",
+  work_tree_pending: "jobs",
+  work_tree_conflict: "jobs",
+  work_tree_corrupt: "jobs",
+  work_tree_root_start_failed: "jobs",
+  work_tree_relaunch_skipped: "jobs",
+  spec_audit_unavailable: "machine",
 
   run_retry: "runs",
   run_failed_final: "runs",
