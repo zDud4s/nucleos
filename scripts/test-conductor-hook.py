@@ -807,6 +807,29 @@ def test_small_read_only_commands_and_list_agents():
             deny(fx.verdict("PowerShell", {"command": command}), repr(command))
 
 
+def test_refusal_says_what_the_root_may_do_itself():
+    with fixture("on") as fx:
+        reason = deny(fx.verdict("Bash", {"command": f"{G} push"}), "push")["reason"]
+        if not reason.startswith("This session is a conductor: launch an agent"):
+            raise AssertionError(f"the first sentence must stay, got {reason!r}")
+        for needle in (
+            "scripts/gates.sh",
+            "scripts/heavy.py cargo|go|npx|npm",
+            "read-only git",
+            "--land",
+            "--verify-ticket",
+            "run-daemon.ps1",
+            "Read/Grep/Glob",
+            "3k tokens",
+            "neither the root nor an agent may do",
+            "`manual:`",
+        ):
+            if needle not in reason:
+                raise AssertionError(f"the refusal should mention {needle!r}, got {reason!r}")
+        if reason.count("\n") > 1 or len(reason) > 700:
+            raise AssertionError(f"the refusal should stay compact, got {len(reason)} characters")
+
+
 def _git_bash(path):
     """`C:\\x\\y` as Git Bash spells it, `/c/x/y`."""
     path = path.replace("\\", "/")
@@ -1362,6 +1385,7 @@ TESTS = [
     test_broker_runs_cargo_go_node_and_status,
     test_daemon_script_and_verify_ticket_accepted,
     test_small_read_only_commands_and_list_agents,
+    test_refusal_says_what_the_root_may_do_itself,
     test_notifications_neither_set_nor_clear_manual,
     test_notifications_do_not_reset_the_read_budget,
 ]

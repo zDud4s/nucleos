@@ -1027,8 +1027,10 @@ CONDUCTOR_HEAVY_VALUE_FLAGS = ("--prio", "--agent", "--kind", "--wait-max")
 CONDUCTOR_HEAVY_PROGRAMS = ("cargo", "cargo.exe", "go", "go.exe", "npx", "npx.cmd", "npm", "npm.cmd")
 CONDUCTOR_REFUSAL = (
     "This session is a conductor: launch an agent (`Agent`, `create_run`) or a tree (`tree_launch`) "
-    "instead of doing this by hand. If you are the owner and want manual work, start the prompt "
-    "with `manual:`."
+    "instead of doing this by hand. The root may itself run `scripts/gates.sh`, "
+    "`python scripts/heavy.py cargo|go|npx|npm ...`, read-only git, `nucleos-core.exe --land` / "
+    "`--verify-ticket N`, `scripts/run-daemon.ps1`, and Read/Grep/Glob up to ~3k tokens per call. "
+    "If you are the owner, start the prompt with `manual:` for what neither the root nor an agent may do."
 )
 CONDUCTOR_ENV_REFUSAL = (
     f"{CONDUCTOR_ENV} is for the project's owner at their own terminal, not for an agent. "
