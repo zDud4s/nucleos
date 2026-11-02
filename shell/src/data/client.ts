@@ -1,4 +1,5 @@
 import { DAEMON_URL, TokenReadError, getTransport } from "./transport";
+import { transportFor, type MachineId } from "./machineStore";
 
 /**
  * The núcleo, on loopback (defined with the desktop transport). The desktop
@@ -178,8 +179,8 @@ async function refusalFrom(res: Response): Promise<ApiRefusal> {
  * second 401, or a transport that answers "fail" (the remote session is gone),
  * is a real refusal.
  */
-async function request(path: string, init: RequestInit | undefined): Promise<Response> {
-  const transport = getTransport();
+async function request(path: string, init: RequestInit | undefined, machine: MachineId = "here"): Promise<Response> {
+  const transport = machine === "here" ? getTransport() : transportFor(machine);
   try {
     return await withStepUp(transport, path, init);
   } catch (error) {
@@ -246,7 +247,7 @@ async function requestOnce(
 
   let res: Response;
   try {
-    res = await fetch(`${transport.baseUrl}${path}`, { credentials: transport.credentials, ...init, headers });
+    res = await (transport.fetch ?? fetch)(`${transport.baseUrl}${path}`, { credentials: transport.credentials, ...init, headers });
   } catch (cause) {
     throw new ApiUnavailable("transport", "the daemon did not answer", cause);
   }
@@ -259,8 +260,8 @@ async function requestOnce(
  * An authenticated streaming GET: the body, unread. Refusals arrive as
  * {@link ApiRefusal} through `request`, exactly as for a JSON call.
  */
-export async function openStream(path: string, signal: AbortSignal): Promise<ReadableStream<Uint8Array>> {
-  const res = await request(path, { signal });
+export async function openStream(path: string, signal: AbortSignal, machine: MachineId = "here"): Promise<ReadableStream<Uint8Array>> {
+  const res = await request(path, { signal }, machine);
   if (res.body === null) throw new Error(`the daemon answered ${path} with no body`);
   return res.body;
 }
@@ -277,8 +278,8 @@ export async function openStream(path: string, signal: AbortSignal): Promise<Rea
  * nothing (`POST /autopilot/kill`, `POST /autopilot/attention`) would throw a
  * parse error out of a success. Callers of those type `T` as `void`.
  */
-export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await request(path, init);
+export async function apiFetch<T>(path: string, init?: RequestInit, machine: MachineId = "here"): Promise<T> {
+  const res = await request(path, init, machine);
   if (res.status === 204 || res.status === 205) return undefined as T;
   try {
     return (await res.json()) as T;
@@ -297,8 +298,8 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
  * one endpoint shaped differently cannot tempt a caller into `res.json()` on
  * prose.
  */
-export async function apiText(path: string, init?: RequestInit): Promise<string> {
-  const res = await request(path, init);
+export async function apiText(path: string, init?: RequestInit, machine: MachineId = "here"): Promise<string> {
+  const res = await request(path, init, machine);
   return await res.text();
 }
 
@@ -314,8 +315,8 @@ export async function apiText(path: string, init?: RequestInit): Promise<string>
  * A `Blob` is the one shape a caller can hand to `URL.createObjectURL` or write
  * to disk without either failure mode.
  */
-export async function apiBlob(path: string, init?: RequestInit): Promise<Blob> {
-  const res = await request(path, init);
+export async function apiBlob(path: string, init?: RequestInit, machine: MachineId = "here"): Promise<Blob> {
+  const res = await request(path, init, machine);
   return await res.blob();
 }
 
@@ -325,8 +326,8 @@ export async function apiBlob(path: string, init?: RequestInit): Promise<Blob> {
  * The caller reads `res.body` itself. A 204 is returned, not thrown: it is how
  * the daemon says "nothing to stream", and the caller decides what that means.
  */
-export async function apiStream(path: string, init?: RequestInit): Promise<Response> {
-  return await request(path, init);
+export async function apiStream(path: string, init?: RequestInit, machine: MachineId = "here"): Promise<Response> {
+  return await request(path, init, machine);
 }
 
 /**

@@ -17,6 +17,8 @@ export interface Transport {
   /** Prefix for every path: the daemon URL, or `/api` behind the gateway. */
   baseUrl: string;
   credentials: RequestCredentials;
+  /** Native paired machines use the Tauri HTTP bridge; all other transports use browser fetch. */
+  fetch?: typeof fetch;
   /** The headers that authenticate a request. A rejection means no credential could be had. */
   headers(): Promise<Record<string, string>>;
   /**
