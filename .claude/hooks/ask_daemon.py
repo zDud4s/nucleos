@@ -1168,9 +1168,15 @@ def conductor_prompt(payload, state):
         pass
 
 
+CONDUCTOR_GIT_BASH_DRIVE = re.compile(r"^/([a-zA-Z])/")
+
+
 def _conductor_path(path, cwd):
     """`path` as comparable text. Resolved, so neither `..` nor a link leaves a root unnoticed."""
     path = os.path.expanduser(path)
+    if os.name == "nt":
+        # Git Bash spells `C:/x` as `/c/x`; read as it is, it would be a folder on the current drive.
+        path = CONDUCTOR_GIT_BASH_DRIVE.sub(lambda m: f"{m.group(1).upper()}:/", path, count=1)
     if not os.path.isabs(path):
         path = os.path.join(cwd, path)
     return os.path.normcase(os.path.realpath(path))

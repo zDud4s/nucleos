@@ -582,6 +582,42 @@ def test_land_refused_when_widened_or_elsewhere():
             deny(fx.verdict("Bash", {"command": command}), repr(command))
 
 
+def _git_bash(path):
+    """`C:\\x\\y` as Git Bash spells it, `/c/x/y`."""
+    path = path.replace("\\", "/")
+    return f"/{path[0].lower()}{path[2:]}"
+
+
+def test_git_bash_drive_paths_are_understood_on_windows():
+    if os.name != "nt":
+        return
+    with fixture("on") as fx:
+        inside, exe, dev = _land_fixture(fx)
+        os.makedirs(fx.path("scripts"), exist_ok=True)
+        with open(fx.path("scripts", "gates.sh"), "w", encoding="utf-8") as handle:
+            handle.write("#!/usr/bin/env bash\n")
+        gb_exe, gb_inside, gb_gates = _git_bash(exe), _git_bash(inside), _git_bash(fx.path("scripts", "gates.sh"))
+        for command in (
+            f"scripts/gates.sh core > {_git_bash(dev)}/scratch/g.log 2>&1",
+            f"{gb_exe} --land",
+            f"cd {gb_inside} && {gb_exe} --land",
+            f"cd {gb_inside} && {exe} --land",
+            f"{G} worktree remove {gb_inside}",
+            f"{gb_gates} core",
+            f"bash {gb_gates} core",
+        ):
+            allow(fx.verdict("Bash", {"command": command}), repr(command))
+        for command in (
+            f"scripts/gates.sh core > {_git_bash(fx.path('core', 'src', 'lib.rs'))}",
+            f"scripts/gates.sh core > /tmp/g.log",
+            f"{_git_bash(dev)}/other/nucleos-core.exe --land",
+            f"{G} worktree remove {_git_bash(fx.cwd)}",
+            f"{G} worktree remove {_git_bash(os.path.dirname(fx.cwd))}/elsewhere",
+            f"/z/nowhere/scripts/gates.sh core",
+        ):
+            deny(fx.verdict("Bash", {"command": command}), repr(command))
+
+
 def test_git_commit_with_explicit_paths_allowed():
     with fixture("on") as fx:
         allow(fx.verdict("Bash", {"command": f"{G} add scripts/a.py scripts/b.py"}), "add explicit paths")
@@ -1096,6 +1132,7 @@ TESTS = [
     test_fail_open_on_internal_error,
     test_probe_writes_payload_keys,
     test_grep_and_glob_on_a_file_cost_like_a_read,
+    test_git_bash_drive_paths_are_understood_on_windows,
     test_notifications_neither_set_nor_clear_manual,
     test_notifications_do_not_reset_the_read_budget,
 ]
