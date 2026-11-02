@@ -213,6 +213,16 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     // names, so it is a question put to the reader; a finished root is said once, done or failed.
     work_tree_parked: { tone: "pending", label: "node tree parked" },
     work_tree_finished: { tone: "info", label: "node tree finished" },
+    // The rest of the tree driver's lines (`core/src/tree_job/`): a start admitted once the disk freed,
+    // a branch that conflicts and goes to the resolver (held, as `job_item_conflicted` is), a manifest
+    // that cannot be read, a root run that did not start, and a node left without its relaunch.
+    work_tree_pending: { tone: "info", label: "node tree start admitted" },
+    work_tree_conflict: { tone: "paused", label: "node tree branch did not merge" },
+    work_tree_corrupt: { tone: "danger", label: "node tree unreadable" },
+    work_tree_root_start_failed: { tone: "danger", label: "node tree root did not start" },
+    work_tree_relaunch_skipped: { tone: "info", label: "node relaunch skipped" },
+    // The audit before a spec's tree could not run (`spec_backlog/finish.rs`): the spec went on unaudited, said once.
+    spec_audit_unavailable: { tone: "info", label: "spec audit unavailable" },
     // Runs.
     run_retry: { tone: "info", label: "run retried" },
     run_failed_final: { tone: "danger", label: "run failed for good" },
