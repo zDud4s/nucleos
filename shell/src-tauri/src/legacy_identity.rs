@@ -238,7 +238,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().to_path_buf();
 
-        let report = migrate_in(&[base.clone()], OLD_ID, NEW_ID);
+        let report = migrate_in(std::slice::from_ref(&base), OLD_ID, NEW_ID);
 
         assert!(report.errors.is_empty());
         assert!(!base.join(NEW_ID).exists());
@@ -253,7 +253,7 @@ mod tests {
         // `b/new` is a plain file, so nothing can be copied into it.
         fs::write(base.join(NEW_ID), "not a directory").unwrap();
 
-        let report = migrate_in(&[base.clone()], OLD_ID, NEW_ID);
+        let report = migrate_in(std::slice::from_ref(&base), OLD_ID, NEW_ID);
 
         assert!(!report.errors.is_empty());
         assert!(!marker(&base).exists());
