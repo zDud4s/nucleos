@@ -3491,6 +3491,24 @@ tests:
         );
     }
 
+    /// The post-merge gate's own units (the whole gate, a recheck, a bisection probe) run for up
+    /// to an hour; the probe keeps its shorter bound and every other caller keeps the configured
+    /// timeout (0 = "derive it").
+    #[test]
+    fn postgate_family_units_get_the_long_timeout() {
+        assert_eq!(Caller::Postgate.unit_timeout_ms(), 3_600_000);
+        assert_eq!(Caller::FlakeCheck.unit_timeout_ms(), 3_600_000);
+        assert_eq!(Caller::Bisect.unit_timeout_ms(), 3_600_000);
+        assert_eq!(
+            Caller::Probe.unit_timeout_ms(),
+            i64::try_from(crate::verify::probe::UNIT_TIMEOUT.as_millis()).unwrap()
+        );
+        assert_eq!(Caller::Owner.unit_timeout_ms(), 0);
+        assert_eq!(Caller::Run(1).unit_timeout_ms(), 0);
+        assert_eq!(Caller::Merge(1).unit_timeout_ms(), 0);
+        assert_eq!(Caller::Job(1).unit_timeout_ms(), 0);
+    }
+
     /// `Caller::Probe` runs the named groups whole, never feeds nor reads the cache, never joins another
     /// run, and cannot be asked for by anyone else.
     #[tokio::test]
@@ -4122,6 +4140,49 @@ tests:
         )
         .await;
         assert_eq!(fresh, crate::verify::inherit::Refresh::Fresh);
+        assert_eq!(probe_requests(&f.pool).await, 0);
+    }
+
+    /// An incident whose only red group is the postgate's own `gate_command` unit, last checked
+    /// at the older master commit so a refresh has something to re-prove.
+    async fn seed_gate_command_incident(f: &Fixture) -> i64 {
+        seed_incident(
+            &f.pool,
+            SeedIncident {
+                red_groups: &[crate::verify::postgate_worker::GATE_UNIT],
+                since: Some(&f.c1),
+                checked: Some(&f.c1),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_gate_command_incident_is_not_reproved_and_takes_no_probe_lease() {
+        let f = fixture(Some(&plain_map()), None, false).await;
+        let incident = seed_gate_command_incident(&f).await;
+
+        let refresh = crate::verify::inherit::refresh_master_red(
+            &f.pool,
+            &f.ex,
+            "alpha",
+            Duration::ZERO,
+            chrono::Utc::now(),
+        )
+        .await;
+
+        assert!(
+            matches!(refresh, crate::verify::inherit::Refresh::Unavailable(_)),
+            "{refresh:?}"
+        );
+        let lease: Option<String> =
+            sqlx::query_scalar("SELECT probe_lease_until FROM task_claims WHERE id = ?")
+                .bind(incident)
+                .fetch_one(&f.pool)
+                .await
+                .unwrap();
+        assert_eq!(lease, None, "no probe lease may be left behind");
         assert_eq!(probe_requests(&f.pool).await, 0);
     }
 

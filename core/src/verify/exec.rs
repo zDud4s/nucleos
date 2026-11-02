@@ -55,8 +55,17 @@ fn final_argv(prefix: &[String], argv: &[String]) -> Vec<String> {
     prefix.iter().chain(argv.iter()).cloned().collect()
 }
 
-/// How a finished process maps onto a row's status and exit code.
-fn status_of(outcome: &ArgvOutcome) -> (&'static str, Option<i64>) {
+/// The exit code `scripts/heavy.py` returns when it could not even start the wrapped program.
+/// Keep in step with `EXIT_SPAWN_FAILED` in `scripts/heavy.py`.
+pub const BROKER_SPAWN_FAILED_EXIT: i32 = 71;
+/// The line prefix `scripts/heavy.py` prints before that exit code. Keep in step with
+/// `SPAWN_FAILED_MARKER` in `scripts/heavy.py`.
+const BROKER_SPAWN_FAILED_MARKER: &str = "heavy: spawn failed: ";
+
+/// How a finished process maps onto a row's status and exit code. `via_broker` says the argv
+/// ran behind the heavy-command broker prefix.
+fn status_of(outcome: &ArgvOutcome, via_broker: bool) -> (&'static str, Option<i64>) {
+    let _ = via_broker;
     if outcome.timed_out || outcome.error.is_some() {
         return (
             verify_runs::STATUS_ERRORED,
@@ -448,7 +457,7 @@ async fn run_unit(executor: Arc<Executor>, claimed: Claimed, mut reservation: Re
         Duration::from_millis(timeout_ms),
     )
     .await;
-    let (status, exit_code) = status_of(&outcome);
+    let (status, exit_code) = status_of(&outcome, !executor.config.broker_prefix.is_empty());
     let tail = tail_of(&outcome);
     // The full output is still in `outcome.tail` here; `finish` keeps only 4000 characters of it. The
     // ids are written BEFORE `finish` makes the row terminal: a reader that sees `failed` must already
@@ -761,26 +770,93 @@ mod tests {
     #[test]
     fn status_of_maps_every_outcome() {
         let timed = outcome(None, true, None);
-        assert_eq!(status_of(&timed).0, verify_runs::STATUS_ERRORED);
+        assert_eq!(status_of(&timed, false).0, verify_runs::STATUS_ERRORED);
         assert!(tail_of(&timed).starts_with("timed out after 3s"));
 
         let spawn_failed = outcome(None, false, Some("spawn failed"));
-        assert_eq!(status_of(&spawn_failed).0, verify_runs::STATUS_ERRORED);
+        assert_eq!(status_of(&spawn_failed, false).0, verify_runs::STATUS_ERRORED);
         assert!(tail_of(&spawn_failed).starts_with("spawn failed"));
 
         assert_eq!(
-            status_of(&outcome(Some(0), false, None)),
+            status_of(&outcome(Some(0), false, None), false),
             (verify_runs::STATUS_PASSED, Some(0))
         );
         assert_eq!(
-            status_of(&outcome(Some(2), false, None)),
+            status_of(&outcome(Some(2), false, None), false),
             (verify_runs::STATUS_FAILED, Some(2))
         );
         assert_eq!(
-            status_of(&outcome(None, false, None)),
+            status_of(&outcome(None, false, None), false),
             (verify_runs::STATUS_ERRORED, None)
         );
         assert_eq!(tail_of(&outcome(Some(0), false, None)), "out");
+    }
+
+    /// An `outcome` whose tail is the broker's spawn-failure line.
+    fn spawn_failed_outcome(exit_code: Option<i32>) -> ArgvOutcome {
+        ArgvOutcome {
+            tail: "heavy: spawn failed: git: boom\n".into(),
+            ..outcome(exit_code, false, None)
+        }
+    }
+
+    #[test]
+    fn a_broker_spawn_failure_is_errored_not_failed() {
+        let (status, code) = status_of(&spawn_failed_outcome(Some(BROKER_SPAWN_FAILED_EXIT)), true);
+        assert_eq!(status, verify_runs::STATUS_ERRORED);
+        assert_eq!(code, Some(i64::from(BROKER_SPAWN_FAILED_EXIT)));
+    }
+
+    #[test]
+    fn exit_71_without_the_marker_or_without_a_broker_stays_failed() {
+        // Exit 71 behind the broker, but the tail does not carry the marker: the program itself
+        // exited 71.
+        assert_eq!(
+            status_of(&outcome(Some(BROKER_SPAWN_FAILED_EXIT), false, None), true),
+            (verify_runs::STATUS_FAILED, Some(71))
+        );
+        // The marker and exit 71 without a broker prefix: nothing wrote that marker on purpose.
+        assert_eq!(
+            status_of(&spawn_failed_outcome(Some(BROKER_SPAWN_FAILED_EXIT)), false),
+            (verify_runs::STATUS_FAILED, Some(71))
+        );
+    }
+
+    #[test]
+    fn exit_127_through_the_broker_stays_failed() {
+        // A wrapped program that is not found is the unit's own failure, not the broker's.
+        assert_eq!(
+            status_of(&spawn_failed_outcome(Some(127)), true),
+            (verify_runs::STATUS_FAILED, Some(127))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_broker_that_cannot_start_the_unit_records_errored() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        // A stand-in broker: prints the spawn-failure line and exits 71, whatever follows it.
+        let config = VerifyConfig {
+            capacity: 2,
+            broker_prefix: strings(&[
+                "sh",
+                "-c",
+                "printf 'heavy: spawn failed: git: boom\n'; exit 71",
+                "broker",
+            ]),
+            ..VerifyConfig::default()
+        };
+        let ex = Executor::new(test_pool().await, config, Some(root.path().to_path_buf()));
+        let submitted = ex
+            .submit(request(wt.path(), &["git", "--version"], None, 0))
+            .await
+            .unwrap();
+        assert_eq!(ex.start_ready().await, 1);
+
+        let state = wait_terminal(&ex, submitted.id).await;
+
+        assert_eq!(state.status, verify_runs::STATUS_ERRORED);
+        assert_eq!(state.exit_code, Some(i64::from(BROKER_SPAWN_FAILED_EXIT)));
     }
 
     #[tokio::test]

@@ -322,6 +322,20 @@ impl Step {
     }
 }
 
+/// Whether re-proving an incident takes the whole gate: a `gate_command` among its red groups, or
+/// no handle at all (no guard path and no red group). Stub: the behaviour comes with the GREEN step.
+pub(super) fn needs_whole_gate(guard_paths: &[String], red_groups: &[String]) -> bool {
+    let _ = (guard_paths, red_groups);
+    false
+}
+
+/// Refuses a plan that would run the whole gate (a `Full` step with no files and no groups) for an
+/// incident; a groups proof may plan one. Stub: the behaviour comes with the GREEN step.
+fn refuse_whole_gate(incident: bool, steps: &[Step]) -> Result<(), String> {
+    let _ = (incident, steps);
+    Ok(())
+}
+
 /// What to submit for `what`; `exists` tells whether a repo-relative path is a file at the master head.
 ///
 /// An incident is re-proved by every handle it has: the guard files that still exist (the narrow
@@ -851,6 +865,51 @@ mod tests {
             red_groups: Vec::new(),
         };
         assert_eq!(plan_proof(nothing, |_| false), full);
+    }
+
+    #[test]
+    fn an_incident_needs_the_whole_gate_for_a_gate_command_or_no_handle() {
+        assert!(needs_whole_gate(&names(&["a.rs"]), &names(&["core", GATE_UNIT])));
+        assert!(needs_whole_gate(&[], &names(&[GATE_UNIT])));
+        assert!(needs_whole_gate(&[], &[]), "no handle at all");
+        assert!(!needs_whole_gate(&names(&["a.rs"]), &[]), "a guard path is a handle");
+        assert!(!needs_whole_gate(&[], &names(&["core"])), "a red group is a handle");
+    }
+
+    #[test]
+    fn an_incident_may_not_plan_a_full_step() {
+        let full = vec![Step {
+            scope: ScopeArg::Full,
+            files: None,
+            groups: None,
+        }];
+        assert!(refuse_whole_gate(true, &full).is_err());
+        let mixed = vec![
+            Step {
+                scope: ScopeArg::Own,
+                files: Some(names(&["a.rs"])),
+                groups: None,
+            },
+            full[0].clone(),
+        ];
+        assert!(refuse_whole_gate(true, &mixed).is_err());
+    }
+
+    #[test]
+    fn a_groups_proof_may_plan_a_full_step_or_any_other() {
+        let full = vec![Step {
+            scope: ScopeArg::Full,
+            files: None,
+            groups: None,
+        }];
+        assert_eq!(refuse_whole_gate(false, &full), Ok(()));
+        let own = vec![Step {
+            scope: ScopeArg::Own,
+            files: None,
+            groups: Some(names(&["core"])),
+        }];
+        assert_eq!(refuse_whole_gate(true, &own), Ok(()));
+        assert_eq!(refuse_whole_gate(false, &own), Ok(()));
     }
 
     #[test]
