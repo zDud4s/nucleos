@@ -484,7 +484,10 @@ tests:
 
     #[test]
     fn every_serial_a_filter_names_is_a_nextest_test_group() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .unwrap();
         let map = match crate::tests_map::load(root) {
             crate::tests_map::MapState::Valid(map) => map,
             other => panic!("{}: {other:?}", crate::tests_map::MAP_FILE),
@@ -508,7 +511,10 @@ tests:
     /// but in this repository it means the map fell behind the tree.
     #[test]
     fn this_repository_map_claims_every_tracked_file() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .unwrap();
         let map = match crate::tests_map::load(root) {
             crate::tests_map::MapState::Valid(map) => map,
             other => panic!("{}: {other:?}", crate::tests_map::MAP_FILE),

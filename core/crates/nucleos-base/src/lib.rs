@@ -38,6 +38,7 @@ pub mod secrets;
 pub mod storage;
 pub mod supervise;
 pub mod team_notes;
+pub mod test_select;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testdb;
 pub mod tests_map;

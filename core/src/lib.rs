@@ -103,7 +103,7 @@ pub use nucleos_base::supervise;
 pub mod task_claims;
 pub mod team;
 pub use nucleos_base::team_notes;
-pub mod test_select;
+pub use nucleos_base::test_select;
 pub mod themes;
 #[cfg(any(test, feature = "testkit"))]
 pub use nucleos_base::testdb;
