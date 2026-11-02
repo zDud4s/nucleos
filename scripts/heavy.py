@@ -952,17 +952,31 @@ def release_light(directory: Path) -> None:
 # ------------------------------------------------------------------- worktree lock
 
 
-def worktree_root() -> str:
-    """`git rev-parse --show-toplevel` of the cwd; the cwd itself when git cannot say."""
+def worktree_root(argv: list[str] | None = None) -> str:
+    """`git rev-parse --show-toplevel` of the cwd; the cwd itself when git cannot say.
+
+    A cargo argv carrying `--manifest-path <p>` names the tree it builds, whatever the cwd is
+    (the main checkout checking a `.claude/worktrees/X` tree): the root is then the git
+    toplevel of `<p>`'s directory, else that directory. A relative path resolves against the
+    real cwd."""
+    base = None
     try:
-        out = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, timeout=20)
+        manifests = _flag_values(_cargo_args(argv), "--manifest-path") if argv else []
+        if manifests:
+            d = Path(os.getcwd(), manifests[-1]).parent
+            if d.is_dir():
+                base = str(d)
+    except Exception:
+        base = None
+    try:
+        cmd = ["git"] + (["-C", base] if base else []) + ["rev-parse", "--show-toplevel"]
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
         top = out.stdout.strip()
         if out.returncode == 0 and top:
             return os.path.normpath(top)
     except Exception:
         pass
-    return os.getcwd()
+    return os.path.normpath(base) if base else os.getcwd()
 
 
 def worktree_hash(path: str) -> str:
@@ -2754,20 +2768,20 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
             if kind in ("cargo", "auto") and cargo_argv:
                 # hold-worktree itself leases no slot: nested cargo calls lease their own.
                 pool = (not held and injected_target_dir(
-                    cargo_argv, root or worktree_root(), os.getcwd()) is not None)
+                    cargo_argv, root or worktree_root(argv), os.getcwd()) is not None)
         except Exception:
             pool = False
         wt = None
         if pool:
             try:
-                wt = worktree_root()
+                wt = worktree_root(argv)
             except Exception:
                 pool = False
         if not nested and not in_held and not held and kind in ("cargo", "auto"):
             # A cargo build/test of a crate we can name shares that worktree's target dir
             # state, so it is serialised by the worktree lock as well.
             try:
-                root = worktree_root()
+                root = worktree_root(argv)
                 found = resolve_crate_how(argv, root, os.getcwd())
                 crate, named = found if found else (None, False)
             except Exception:
@@ -2776,7 +2790,7 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
         # a fingerprint (it is still a guess, and test_heavy_queue.py runs such commands
         # side by side expecting them to share the machine budget).
         if (held or opts["kind"] == "cargo" or (crate is not None and named))                 and not nested and not in_held:
-            root = root or worktree_root()
+            root = root or worktree_root(argv)
             lock_hash = worktree_hash(root)
             lrec = dict(rec, worktree=root, start=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                         hold=held)
@@ -2810,7 +2824,7 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
                     # A hit runs at weight 0, but it still touches the worktree's target dir:
                     # it waits for the worktree lock like any other cargo run, then re-checks
                     # the registry, since the holder it waited for may have rebuilt it.
-                    root = root or worktree_root()
+                    root = root or worktree_root(argv)
                     lock_hash = worktree_hash(root)
                     lrec = dict(rec, worktree=root, hold=False,
                                 start=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
