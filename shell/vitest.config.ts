@@ -1,6 +1,15 @@
 import { defineConfig } from "vitest/config";
 import { fileURLToPath } from "node:url";
 
+// Node 25+ ships a built-in Web Storage global. Without `--localstorage-file` its
+// `localStorage` getter warns and returns undefined, and being a global accessor it
+// shadows the happy-dom/jsdom one, so `localStorage.clear()` threw in ~900 tests on
+// Node 26. Turning the built-in off lets the DOM environment define its own storage.
+// Guarded because a node that does not know the flag (< 22.4) refuses to start.
+const webstorageOff = process.allowedNodeEnvironmentFlags.has("--no-experimental-webstorage")
+  ? ["--no-experimental-webstorage"]
+  : [];
+
 export default defineConfig({
   /**
    * The third place the `@/` alias has to be spelled out.
@@ -31,6 +40,7 @@ export default defineConfig({
     // vite 7.3 + Node 24 ("failed to find the current suite" / reading
     // 'config' of undefined). Pinning the pool explicitly sidesteps it.
     pool: "forks",
+    execArgv: webstorageOff,
     // Three times the default. Insurance, and NOT a diagnosis — the difference
     // matters, because the next person to read this should not think the
     // intermittent failure was understood.

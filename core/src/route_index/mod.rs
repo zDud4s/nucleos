@@ -10,12 +10,15 @@ use serde::Deserialize;
 use crate::state::AppState;
 
 mod generated;
+// Only the tests read `hot` today; as a lib module its `pub` hid that, inside the binary it warns.
+#[allow(dead_code)]
 pub mod hot;
 mod search;
 #[cfg(test)]
 mod tests;
 
 pub use generated::{ROUTES, schema_of};
+#[allow(unused_imports)]
 pub use hot::{HotOp, hot_ops, render_prompt_block};
 pub use search::{authority_of, clamp_limit, search};
 
@@ -37,6 +40,8 @@ pub struct RouteEntry {
     pub path: &'static str,
     pub purpose: &'static str,
     pub body: Body,
+    // Written by the generator, read by nothing yet.
+    #[allow(dead_code)]
     pub handler: &'static str,
 }
 

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::search::{escape_like, fts_query};
 use crate::state::AppState;
 
-pub(crate) mod api;
+pub mod api;
 mod create;
 mod handoff;
 mod lifecycle;
