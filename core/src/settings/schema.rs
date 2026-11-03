@@ -30,7 +30,8 @@ mod tests {
 
     /// Compares the schema of `name` with its stored snapshot; `UPDATE_SNAPSHOTS=1` rewrites the snapshot.
     fn assert_schema_snapshot(name: &str) {
-        let schema = schema_of(name);
+        let mut schema = schema_of(name);
+        canonical_hotkeys(&mut schema);
         let path = snapshot_path(name);
         let mut text = serde_json::to_string_pretty(&schema).expect("a schema is JSON");
         text.push('\n');
@@ -51,6 +52,26 @@ mod tests {
             "the schema of {name} changed; review it and rerun with UPDATE_SNAPSHOTS=1"
         );
     }
+
+    /// One snapshot serves every platform, but the voice hotkey defaults do not: macOS adds a
+    /// `Super` to each chord (`config::voice::DEFAULT_HOTKEYS`). Folding the macOS chords back
+    /// to the shorter ones keeps the snapshot platform-independent; elsewhere this is a no-op.
+    #[cfg(target_os = "macos")]
+    fn canonical_hotkeys(value: &mut Value) {
+        match value {
+            Value::String(s) => {
+                if let Some(key) = s.strip_prefix("Ctrl+Alt+Super+") {
+                    *s = format!("Ctrl+Alt+{key}");
+                }
+            }
+            Value::Array(items) => items.iter_mut().for_each(canonical_hotkeys),
+            Value::Object(map) => map.values_mut().for_each(canonical_hotkeys),
+            _ => {}
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn canonical_hotkeys(_value: &mut Value) {}
 
     fn collect_widgets(value: &Value, found: &mut Vec<Value>) {
         match value {
