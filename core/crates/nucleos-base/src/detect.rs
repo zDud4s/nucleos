@@ -605,7 +605,7 @@ fn cargo_groups(root: &Path, tests: &mut Tests, sources: &mut Vec<String>) {
         );
         tests.tools.insert("rustc".into(), Tool::default());
         tests.warm.insert(
-            "CARGO_TARGET_DIR".into(),
+            crate::warm::TARGET_DIR_ENV.into(),
             Warm {
                 dir: "target".into(),
                 seed: Seed::None,
@@ -1068,7 +1068,8 @@ mod tests {
         assert!(core.paths.contains(&"crates/a/".to_string()));
         assert!(map.tests.groups.contains_key("a"));
         assert!(map.tests.tools["cargo"].allow.contains(&"fmt".to_string()));
-        assert_eq!(map.tests.warm["CARGO_TARGET_DIR"].dir, "target");
+        assert_eq!(map.tests.warm["NUCLEOS_TARGET_DIR"].dir, "target");
+        assert!(!map.tests.warm.contains_key("CARGO_TARGET_DIR"));
     }
 
     #[test]

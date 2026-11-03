@@ -27,6 +27,12 @@ const SHARED_PREFIX: &str = "shared:";
 /// 'C:\Users\PC\'`. `scripts/run-daemon.ps1` sets it to the dev home.
 pub const HOME_ENV: &str = "NUCLEOS_WARM_HOME";
 
+/// The variable a Rust project's warm target dir is exported as. Deliberately not `CARGO_TARGET_DIR`:
+/// cargo forwards its environment to rustc and sccache hashes every `CARGO_*` variable into its
+/// key, so a per-worktree path there gives ~0% hits across worktrees. `scripts/gates.sh` reads this
+/// one and passes it to cargo as `--target-dir`.
+pub const TARGET_DIR_ENV: &str = "NUCLEOS_TARGET_DIR";
+
 /// The directory warm state lives under: [`HOME_ENV`] when it names an absolute path, the
 /// machine root otherwise.
 pub fn home(machine_root: &Path) -> PathBuf {
@@ -445,6 +451,26 @@ mod tests {
         );
         assert!(get("CARGO_TARGET_DIR").is_dir());
         assert!(get("npm_config_cache").is_dir());
+    }
+
+    #[test]
+    fn the_target_dir_is_exported_outside_the_cargo_namespace() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let mut w = BTreeMap::new();
+        w.insert(TARGET_DIR_ENV.to_string(), warm("target"));
+        let env = prepare(root.path(), "proj", wt.path(), &w).unwrap();
+        let wt_dir = worktree_dir(root.path(), "proj", wt.path()).unwrap();
+        // The path reaches the child through the non-CARGO_ variable...
+        let (_, dir) = env.iter().find(|(n, _)| n == TARGET_DIR_ENV).unwrap();
+        assert_eq!(dir, &wt_dir.join("target"));
+        // ...and no CARGO_* variable holds a path inside the worktree's warm dir.
+        for (name, value) in &env {
+            assert!(
+                !(name.starts_with("CARGO_") && value.starts_with(&wt_dir)),
+                "{name} would leak the per-worktree path into rustc's env"
+            );
+        }
     }
 
     #[test]

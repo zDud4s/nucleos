@@ -82,7 +82,7 @@ tests:
     npm: { allow: [install, ci, ls, view, outdated] }
     npx: {}
   warm:
-    CARGO_TARGET_DIR: { dir: target }
+    NUCLEOS_TARGET_DIR: { dir: target }
     GOCACHE: { dir: 'shared:gocache' }
   full_sweep: [scripts/gates.sh, scripts/gate-diff.sh, .github/workflows/]
   no_test:
