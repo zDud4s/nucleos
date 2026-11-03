@@ -46,6 +46,7 @@ mod files;
 mod fleet;
 mod git_ops;
 mod hooks;
+mod idempotency;
 mod judging;
 mod knowledge;
 mod map;

@@ -11,7 +11,12 @@ pub(super) fn routes() -> Router<AppState> {
         // answer.
         .route("/feed/timeline", get(get_feed_timeline))
         .route("/feed/seen", get(get_feed_seen).post(post_feed_seen))
-        .route("/runs", get(get_runs).post(runs::create_run_route))
+        .route(
+            "/runs",
+            get(get_runs)
+                .post(runs::create_run_route)
+                .layer(axum::middleware::from_fn(super::idempotency::guard)),
+        )
         // The literal path coexists with `/runs/{id}`; static segments win in matchit.
         .route("/runs/awaiting-approval", get(list_awaiting_approval_runs))
         .route("/runs/{id}", get(get_run))
