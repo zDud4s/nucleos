@@ -114,7 +114,7 @@ import {
   type Turn,
 } from "../data/chats";
 import { type RelaySent } from "../lib/turns";
-import { chatKey, useChatMachine } from "../data/chatMachines";
+import { chatKey, rememberChatMachine, useChatMachine } from "../data/chatMachines";
 import { MachinePicker, useNewWorkMachine } from "../chats/MachinePicker";
 import { type ChatNotice } from "../data/chats";
 import { usePaletteGroup, usePaletteQuery } from "../ui";
@@ -176,6 +176,7 @@ import { holdMessage, takeHeld, useHeldMessage } from "../chats/held";
 import { clearDraft, readDraft, readScroll, saveDraft, saveScroll } from "../chats/drafts";
 import { useChatTabs } from "../chats/tabs";
 import { DAEMON_NAME } from "../copy";
+import { MoveChatDialog } from "./MoveChat";
 
 /** The short label over a turn of the background service. `DAEMON_NAME` is too long for a turn label. */
 const SPEAKER_LABEL = "service";
@@ -980,6 +981,8 @@ function ChatDetail({
   find: { turnId: number; at: number } | null;
 }) {
   const seen = usePostChatSeen();
+  const localRow = useChatRow(chatId);
+  const movedTo = summary?.moved_to ?? localRow?.moved_to ?? null;
   const pickedUp = useIdeConversation(summary?.ide_session_id ?? null);
   const markedSeen = useRef(false);
   const { box, follows, noteScroll, keepUp } = useFollowsItsEnd();
@@ -1048,6 +1051,8 @@ function ChatDetail({
   }, [keepUp, chatId, transcript.data, box, follows]);
 
   const stale = transcript.isError && transcript.data !== undefined;
+
+  if (movedTo !== null) return <MovedChat chatId={chatId} destination={movedTo} />;
 
   return (
     /* No frame and no title. The tab above already names the conversation — a panel captioned
@@ -1135,6 +1140,26 @@ function ChatDetail({
           />
         }
       />
+    </section>
+  );
+}
+
+function MovedChat({ chatId, destination }: { chatId: string; destination: string }) {
+  const navigate = useNavigate();
+  return (
+    <section className="chats-detail-inner">
+      <ErrorNote>
+        This chat was moved to another machine and is read-only here.
+      </ErrorNote>
+      <Button
+        variant="approve"
+        onClick={() => {
+          rememberChatMachine([chatId], destination);
+          void navigate({ to: `/chats/${chatId}` });
+        }}
+      >
+        Open on the destination
+      </Button>
     </section>
   );
 }
@@ -1647,6 +1672,7 @@ function ChatMenu({ chatId }: { chatId: string }) {
   const [helpers, setHelpers] = useState(false);
   const [instructions, setInstructions] = useState(false);
   const [renaming, setRenaming] = useState(false);
+  const [moving, setMoving] = useState(false);
   const row = useChatRow(chatId);
   const helperCount = row?.agents.length ?? 0;
   const instructed = (row?.system_prompt ?? "") !== "";
@@ -1694,6 +1720,7 @@ function ChatMenu({ chatId }: { chatId: string }) {
               {helperCount === 0 ? "none" : `${helperCount}`}
             </span>
           </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => setMoving(true)}>Move chat</DropdownMenuItem>
           <DropdownMenuSeparator />
           {/* Folders and the web live here and nowhere else: the "+" menu only adds to a message. */}
           <DropdownMenuLabel>Limits and access</DropdownMenuLabel>
@@ -1736,6 +1763,7 @@ function ChatMenu({ chatId }: { chatId: string }) {
         open={instructions}
         onOpenChange={setInstructions}
       />
+      <MoveChatDialog chatId={chatId} open={moving} onOpenChange={setMoving} />
     </>
   );
 }

@@ -145,7 +145,7 @@ async function nativeStepUp(machine: NativeMachine, origin: string) {
 }
 
 /** Opens the fixed move-a-chat step-up flow for a paired machine. */
-export async function requestNativeStepUp(machine: NativeMachine): Promise<StepUpOutcome> {
+export async function requestNativeStepUp(machine: NativeMachine, _label = "Move chat"): Promise<StepUpOutcome> {
   return await nativeStepUp(machine, machine.origin.replace(/\/$/, ""));
 }
 

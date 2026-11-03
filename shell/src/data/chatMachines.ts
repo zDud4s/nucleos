@@ -89,7 +89,7 @@ export interface MachineChats {
  */
 export function mergeChats(byMachine: MachineChats[]): ChatRow[] {
   const rows = byMachine.flatMap(({ machine, name, chats, failed }) =>
-    (chats ?? []).map(
+    (chats ?? []).filter((chat) => chat.moved_to == null).map(
       (chat): ChatRow => ({
         ...chat,
         machine,

@@ -150,6 +150,8 @@ export interface ChatSummary {
    * window wide enough to hold what it inherited.
    */
   context_window: number | null;
+  /** The machine this copy was moved to; a present value makes this origin read-only. */
+  moved_to?: string | null;
   /** Whether the conversation compacts itself past the soft limit. Absent from an older daemon: off. */
   auto_compact?: boolean;
   created_at: string;
@@ -201,6 +203,49 @@ export interface ChatSummary {
   group_id?: number | null;
   /** Set on archived conversations only. */
   archived_at?: string | null;
+}
+
+/** `GET /assistant/chats/{chat_id}/transfer/preview`. */
+export interface ChatTransferPreview {
+  will_stop: string[];
+  left_behind: string[];
+  running: boolean;
+  target_ok: boolean;
+  target_problem: string | null;
+}
+
+/** `POST /assistant/chats/{chat_id}/transfer/begin`. */
+export interface ChatTransferBegun {
+  cut_turn: number | null;
+  queued: number;
+}
+
+/** The allow-listed package sent unchanged from the origin to the destination. */
+export interface ChatTransferPackage {
+  transfer_id: string;
+  chat_id: string;
+  chat: { title: string | null; brain: string; created_at: string; model: string | null; effort: string | null; plan_only: boolean };
+  session: { session_id: string; data: string } | null;
+  code: {
+    project_id: string;
+    commit: string;
+    branch: string | null;
+    bundle: string;
+    diff: string;
+    files: { path: string; data: string }[];
+    left_behind: string[];
+  } | null;
+  queue: { text: string; model_text: string | null; origin: string | null; images: string | null }[];
+  parked: { tool: string; detail: string | null }[];
+  interrupted: boolean;
+}
+
+/** `POST /assistant/chats/import?transfer_id=`. */
+export interface ChatTransferImport {
+  already: boolean;
+  chat_id?: string;
+  cwd?: string | null;
+  queued?: number;
 }
 
 /**
@@ -689,6 +734,40 @@ export function useChats() {
     refetchIntervalInBackground: true,
     placeholderData: keepPreviousData,
   });
+}
+
+function transferPath(chatId: string, step: "preview" | "begin" | "package" | "finish" | "abort"): string {
+  return `/assistant/chats/${encodeURIComponent(chatId)}/transfer/${step}`;
+}
+
+/** Read what a move would stop and leave behind before anything is frozen. */
+export async function previewChatTransfer(chatId: string, machine: MachineId = chatMachineOf(chatId)): Promise<ChatTransferPreview> {
+  return await apiFetch<ChatTransferPreview>(transferPath(chatId, "preview"), undefined, machine);
+}
+
+/** Freeze the origin, waiting for the live turn or cutting it as chosen. */
+export async function beginChatTransfer(chatId: string, body: { when: "after_turn" | "now"; transfer_id: string }, machine: MachineId = chatMachineOf(chatId)): Promise<ChatTransferBegun> {
+  return await apiFetch<ChatTransferBegun>(transferPath(chatId, "begin"), { method: "POST", body: JSON.stringify(body) }, machine);
+}
+
+/** Get the frozen origin's package without changing any of its JSON fields. */
+export async function packageChatTransfer(chatId: string, transferId: string, machine: MachineId = chatMachineOf(chatId)): Promise<ChatTransferPackage> {
+  return await apiFetch<ChatTransferPackage>(`${transferPath(chatId, "package")}?transfer_id=${encodeURIComponent(transferId)}`, undefined, machine);
+}
+
+/** Import the package exactly as it arrived from the origin. */
+export async function importChatTransfer(transferId: string, packageBody: ChatTransferPackage, machine: MachineId): Promise<ChatTransferImport> {
+  return await apiFetch<ChatTransferImport>(`/assistant/chats/import?transfer_id=${encodeURIComponent(transferId)}`, { method: "POST", body: JSON.stringify(packageBody) }, machine);
+}
+
+/** Mark the destination live after its import has succeeded. */
+export async function finishChatTransfer(chatId: string, body: { transfer_id: string; to: string }, machine: MachineId = chatMachineOf(chatId)): Promise<void> {
+  await apiFetch<void>(transferPath(chatId, "finish"), { method: "POST", body: JSON.stringify(body) }, machine);
+}
+
+/** Unfreeze an origin after a cancelled or failed move. This route does not require step-up. */
+export async function abortChatTransfer(chatId: string, transferId: string, machine: MachineId = chatMachineOf(chatId)): Promise<void> {
+  await apiFetch<void>(transferPath(chatId, "abort"), { method: "POST", body: JSON.stringify({ transfer_id: transferId }) }, machine);
 }
 
 /**
