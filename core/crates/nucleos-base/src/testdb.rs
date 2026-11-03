@@ -47,18 +47,28 @@ pub async fn fresh_pool() -> sqlx::SqlitePool {
 /// take is built with five).
 ///
 /// `fresh_pool` cannot serve those: a deserialized database is private to the connection that
-/// received it. So the same cached image is written to a file of its own under the temp directory
-/// and opened like `storage::open` opens the real one — WAL, foreign keys on. The file is left
-/// behind when the test ends; files over an hour old are swept by the next process that takes one.
+/// received it. So the cached template file is copied (`fs::copy`: one in-kernel copy, a block
+/// clone where the filesystem has one, and the 2 MB never passes through this process's heap) to a
+/// file of its own under the temp directory and opened like `storage::open` opens the real one —
+/// WAL, foreign keys on.
+///
+/// Cost per call, before: a listing of the whole pool directory (every test is its own process
+/// under nextest, so the once-per-process sweep ran for each one), a 2 MB read of the template
+/// into memory, a 2 MB `fs::write`, and a file left behind for good (2866 of them, ~6 GB). After:
+/// one `stat` on a sweep stamp, a 16-byte read to vet the template, one `fs::copy`, and the
+/// database (+ `-wal`/`-shm`) removed when the pool is dropped. A leftover (a crash, or a Windows
+/// handle still closing) is swept by a later process once the stamp is an hour old, and that sweep
+/// looks at a bounded number of entries.
 pub async fn fresh_shared_pool() -> sqlx::SqlitePool {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static NEXT: AtomicUsize = AtomicUsize::new(0);
-    static SWEEP: std::sync::Once = std::sync::Once::new();
 
-    let schema = MIGRATED_SCHEMA.get_or_init(cached_schema).await;
+    let template = template_file().await;
     let dir = std::env::temp_dir().join("nucleos-testdb-pools");
     std::fs::create_dir_all(&dir).unwrap();
-    SWEEP.call_once(|| sweep_older_than(&dir, std::time::Duration::from_secs(3600)));
+    if sweep_due(&dir.join(SWEEP_STAMP), SWEEP_INTERVAL) {
+        sweep_older_than(&dir, SWEEP_AGE, SWEEP_MAX_ENTRIES);
+    }
     // The pid alone is reused across a long run; the clock keeps a stale `-wal` beside a reused
     // name from being replayed into a new database.
     let nanos = std::time::SystemTime::now()
@@ -69,9 +79,19 @@ pub async fn fresh_shared_pool() -> sqlx::SqlitePool {
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
-    std::fs::write(&path, schema).unwrap();
+    let copied = template.is_some_and(|template| std::fs::copy(template, &path).is_ok());
+    if !copied {
+        std::fs::write(&path, migrated_image().await).unwrap();
+    }
+    // The guard rides in the pool's own `after_connect` closure, which the pool owns, so the files
+    // go when the last clone of the pool is dropped.
+    let guard = std::sync::Arc::new(PoolFiles(path.clone()));
     SqlitePoolOptions::new()
         .max_connections(5)
+        .after_connect(move |_connection, _meta| {
+            let _keep = &guard;
+            Box::pin(async move { Ok(()) })
+        })
         .connect_with(
             SqliteConnectOptions::new()
                 .filename(&path)
@@ -82,21 +102,123 @@ pub async fn fresh_shared_pool() -> sqlx::SqlitePool {
         .unwrap()
 }
 
-fn sweep_older_than(dir: &std::path::Path, age: std::time::Duration) {
+const SWEEP_STAMP: &str = ".sweep-stamp";
+const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+const SWEEP_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
+/// A sweep looks at no more entries than this, so a directory that grew large costs a bounded
+/// amount per sweep and is worked down over several.
+const SWEEP_MAX_ENTRIES: usize = 512;
+/// A template image of another migration hash is kept this long before it is removed.
+const TEMPLATE_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+const TEMPLATE_MAX_ENTRIES: usize = 20_000;
+
+/// Removes a shared test database and its `-wal`/`-shm` when dropped. Best effort.
+struct PoolFiles(std::path::PathBuf);
+
+impl Drop for PoolFiles {
+    fn drop(&mut self) {
+        remove_db_files(&self.0);
+    }
+}
+
+fn remove_db_files(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
+    for suffix in ["-wal", "-shm"] {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        let _ = std::fs::remove_file(std::path::PathBuf::from(name));
+    }
+}
+
+/// True when the sweep stamp is missing or older than `interval`; the stamp is then renewed, so
+/// the check is one `stat` per call and at most one sweep per interval across all processes.
+fn sweep_due(stamp: &std::path::Path, interval: std::time::Duration) -> bool {
+    let fresh = std::fs::metadata(stamp)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|elapsed| elapsed <= interval);
+    if fresh {
+        return false;
+    }
+    let _ = std::fs::write(stamp, b"");
+    true
+}
+
+/// Removes files in `dir` last modified more than `age` ago, looking at no more than
+/// `max_entries` entries.
+fn sweep_older_than(dir: &std::path::Path, age: std::time::Duration, max_entries: usize) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-    for entry in entries.flatten() {
+    for entry in entries.flatten().take(max_entries) {
         let stale = entry
             .metadata()
             .and_then(|meta| meta.modified())
             .ok()
             .and_then(|modified| modified.elapsed().ok())
             .is_some_and(|elapsed| elapsed > age);
+        if stale && entry.file_name() != SWEEP_STAMP {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Removes template images (and half-written staging files) of other migration hashes from `dir`,
+/// keeping `keep` and anything newer than `age`.
+fn remove_stale_templates(
+    dir: &std::path::Path,
+    keep: &std::path::Path,
+    age: std::time::Duration,
+    max_entries: usize,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten().take(max_entries) {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let is_template = name.starts_with("nucleos-testdb-")
+            && (name.ends_with(".sqlite") || name.ends_with(".tmp"));
+        if !is_template || entry.path() == keep {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .ok()
+            .filter(|meta| meta.is_file())
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|elapsed| elapsed > age);
         if stale {
             let _ = std::fs::remove_file(entry.path());
         }
     }
+}
+
+fn has_sqlite_header(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    let mut head = [0u8; 16];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut head))
+        .is_ok()
+        && head == *b"SQLite format 3\0"
+}
+
+/// The template image as a file, built (and left in the temp directory) if no process has yet.
+/// `None` when it cannot be written; the caller then writes the in-memory image instead.
+async fn template_file() -> Option<&'static std::path::Path> {
+    static TEMPLATE: OnceCell<Option<std::path::PathBuf>> = OnceCell::const_new();
+    TEMPLATE
+        .get_or_init(|| async {
+            let path = schema_cache_path();
+            if !has_sqlite_header(&path) {
+                migrated_image().await;
+            }
+            has_sqlite_header(&path).then_some(path)
+        })
+        .await
+        .as_deref()
 }
 
 /// `sweep_older_than` for directories: removes every child directory of `dir` last modified more
@@ -139,6 +261,9 @@ async fn cached_schema() -> Vec<u8> {
         return bytes;
     }
     let bytes = migrated_schema().await;
+    if let Some(dir) = path.parent() {
+        remove_stale_templates(dir, &path, TEMPLATE_AGE, TEMPLATE_MAX_ENTRIES);
+    }
     let staging = path.with_extension(format!("{}.tmp", std::process::id()));
     if std::fs::write(&staging, &bytes).is_ok() && std::fs::rename(&staging, &path).is_err() {
         let _ = std::fs::remove_file(&staging);
@@ -292,6 +417,62 @@ mod fresh_pool_tests {
         assert_eq!(migrations as usize, crate::storage::MIGRATOR.iter().count());
         drop(held);
         pool.close().await;
+    }
+
+    #[test]
+    fn dropping_the_files_guard_removes_the_database_and_its_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["x.sqlite", "x.sqlite-wal", "x.sqlite-shm", "other"] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        drop(super::PoolFiles(dir.path().join("x.sqlite")));
+        assert!(!dir.path().join("x.sqlite").exists());
+        assert!(!dir.path().join("x.sqlite-wal").exists());
+        assert!(!dir.path().join("x.sqlite-shm").exists());
+        assert!(dir.path().join("other").exists());
+    }
+
+    #[test]
+    fn the_sweep_stamp_gates_the_sweep_to_once_per_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let stamp = dir.path().join(super::SWEEP_STAMP);
+        let hour = std::time::Duration::from_secs(3600);
+        assert!(super::sweep_due(&stamp, hour), "no stamp: due");
+        assert!(!super::sweep_due(&stamp, hour), "fresh stamp: not due");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(super::sweep_due(&stamp, std::time::Duration::ZERO));
+    }
+
+    #[test]
+    fn a_file_sweep_looks_at_a_bounded_number_of_entries_and_keeps_the_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..6 {
+            std::fs::write(dir.path().join(format!("f{index}")), b"x").unwrap();
+        }
+        std::fs::write(dir.path().join(super::SWEEP_STAMP), b"").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        super::sweep_older_than(dir.path(), std::time::Duration::ZERO, 3);
+        let left = std::fs::read_dir(dir.path()).unwrap().count();
+        assert!(left >= 4, "at most 3 of 7 entries examined, left {left}");
+        super::sweep_older_than(dir.path(), std::time::Duration::ZERO, 100);
+        assert!(dir.path().join(super::SWEEP_STAMP).exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn stale_templates_of_other_hashes_go_and_the_current_one_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let keep = dir.path().join("nucleos-testdb-aaaa.sqlite");
+        let old = dir.path().join("nucleos-testdb-bbbb.sqlite");
+        let staged = dir.path().join("nucleos-testdb-bbbb.123.tmp");
+        let other = dir.path().join("unrelated.sqlite");
+        for file in [&keep, &old, &staged, &other] {
+            std::fs::write(file, b"x").unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        super::remove_stale_templates(dir.path(), &keep, std::time::Duration::ZERO, 100);
+        assert!(keep.exists() && other.exists());
+        assert!(!old.exists() && !staged.exists());
     }
 
     #[test]
