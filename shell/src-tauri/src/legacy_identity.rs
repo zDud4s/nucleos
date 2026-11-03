@@ -157,7 +157,7 @@ mod tests {
         write(&base.join(OLD_ID).join("a.txt"), "A");
         write(&base.join(OLD_ID).join("sub/deep/b.txt"), "B");
 
-        let report = migrate_in(&[base.clone()], OLD_ID, NEW_ID);
+        let report = migrate_in(std::slice::from_ref(&base), OLD_ID, NEW_ID);
 
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert_eq!(
@@ -176,12 +176,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().to_path_buf();
         write(&base.join(OLD_ID).join("a.txt"), "A");
-        migrate_in(&[base.clone()], OLD_ID, NEW_ID);
+        migrate_in(std::slice::from_ref(&base), OLD_ID, NEW_ID);
 
         // Mutate the new side and add a file to the old side; a no-op must keep both as-is.
         write(&base.join(NEW_ID).join("a.txt"), "changed");
         write(&base.join(OLD_ID).join("late.txt"), "L");
-        migrate_in(&[base.clone()], OLD_ID, NEW_ID);
+        migrate_in(std::slice::from_ref(&base), OLD_ID, NEW_ID);
 
         assert_eq!(
             fs::read_to_string(base.join(NEW_ID).join("a.txt")).unwrap(),
@@ -198,7 +198,7 @@ mod tests {
         write(&base.join(OLD_ID).join("b.txt"), "B");
         write(&base.join(NEW_ID).join("a.txt"), "new");
 
-        migrate_in(&[base.clone()], OLD_ID, NEW_ID);
+        migrate_in(std::slice::from_ref(&base), OLD_ID, NEW_ID);
 
         assert_eq!(
             fs::read_to_string(base.join(NEW_ID).join("a.txt")).unwrap(),
@@ -217,7 +217,7 @@ mod tests {
         write(&base.join(OLD_ID).join("a.txt"), "A");
         write(&base.join(OLD_ID).join("sub/b.txt"), "B");
 
-        migrate_in(&[base.clone()], OLD_ID, NEW_ID);
+        migrate_in(std::slice::from_ref(&base), OLD_ID, NEW_ID);
 
         assert_eq!(
             fs::read_to_string(base.join(OLD_ID).join("a.txt")).unwrap(),
@@ -238,7 +238,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().to_path_buf();
 
-        let report = migrate_in(&[base.clone()], OLD_ID, NEW_ID);
+        let report = migrate_in(std::slice::from_ref(&base), OLD_ID, NEW_ID);
 
         assert!(report.errors.is_empty());
         assert!(!base.join(NEW_ID).exists());
@@ -253,7 +253,7 @@ mod tests {
         // `b/new` is a plain file, so nothing can be copied into it.
         fs::write(base.join(NEW_ID), "not a directory").unwrap();
 
-        let report = migrate_in(&[base.clone()], OLD_ID, NEW_ID);
+        let report = migrate_in(std::slice::from_ref(&base), OLD_ID, NEW_ID);
 
         assert!(!report.errors.is_empty());
         assert!(!marker(&base).exists());
