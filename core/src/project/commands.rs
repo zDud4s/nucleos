@@ -49,9 +49,8 @@ use sqlx::SqlitePool;
 /// minutes, and a ceiling that fired on a slow machine would look like a broken command.
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
-/// The longest name that will be stored. Long enough for a sentence nobody wanted, short enough
-/// that the bar cannot be widened by one row.
-pub const MAX_NAME: usize = 60;
+// Defined in `detect` (nucleos-base cannot see `project`); re-exported so this path keeps working.
+pub use nucleos_base::detect::MAX_NAME;
 
 /// Who may run a command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

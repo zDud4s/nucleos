@@ -40,6 +40,10 @@ use serde::Serialize;
 
 use crate::tests_map::{Group, MAP_FILE, Seed, Tests, TestsMap, Tool, VERSION, Warm};
 
+/// The longest name that will be stored. Long enough for a sentence nobody wanted, short enough
+/// that the bar cannot be widened by one row.
+pub const MAX_NAME: usize = 60;
+
 /// The most of any one file this will read before deciding it has seen enough.
 ///
 /// A `package.json` with a scripts block is a few kilobytes. A file above this is a lockfile, a
@@ -372,7 +376,7 @@ fn make_targets(text: &str) -> Vec<String> {
 /// worse than no suggestion.
 fn usable(name: &str) -> bool {
     !name.is_empty()
-        && name.len() <= crate::project::commands::MAX_NAME
+        && name.len() <= MAX_NAME
         && !name.starts_with('.')
         && !name.contains('%')
         && !name.contains(' ')
@@ -1015,7 +1019,7 @@ mod tests {
     #[test]
     fn nothing_is_proposed_that_could_not_then_be_declared() {
         let temp = folder();
-        let long = "a".repeat(crate::project::commands::MAX_NAME + 1);
+        let long = "a".repeat(MAX_NAME + 1);
         std::fs::write(
             temp.path().join("package.json"),
             format!(
