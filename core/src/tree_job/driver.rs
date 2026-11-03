@@ -707,14 +707,18 @@ async fn red(
     }
 
     let key = format!("{FIX_PREFIX}{run}");
-    // The key being replayed is not a prior link.
+    // The key being replayed is not a prior link. Only fixes after the owner's last answer
+    // (`decision-<id>` launch) count: an answer is a fresh allowance.
     let prior: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM tree_transitions \
-         WHERE node_id = ? AND transition = 'launch' AND key LIKE ? AND key <> ?",
+        "SELECT COUNT(*) FROM tree_launches \
+         WHERE node_id = ? AND key LIKE ? AND key <> ? \
+           AND seq > COALESCE((SELECT MAX(seq) FROM tree_launches \
+                               WHERE node_id = ? AND key LIKE 'decision-%'), 0)",
     )
     .bind(&node)
     .bind(format!("{FIX_PREFIX}%"))
     .bind(&key)
+    .bind(&node)
     .fetch_one(pool)
     .await
     .map_err(|e| e.to_string())?;
@@ -1817,6 +1821,94 @@ mod tests {
                 .await
                 .unwrap();
         assert!(question.contains("boom-3"), "{question:?}");
+    }
+
+    /// Drives `api` through two red gates and two fixes, then a third red gate that parks it on the
+    /// fix-cap question; answers that question and returns the run the answer started.
+    async fn answered_after_the_fix_cap(
+        fx: &Fixture,
+        job: &str,
+        node: &str,
+        gate: &FakeGate,
+    ) -> i64 {
+        fx.seed_job(job, vec![code_branch("api", "building", Some(node))], None)
+            .await;
+        fx.add_node(job, node, "orchestrator").await;
+        fx.run_ended(node, Some("done")).await;
+        fx.save_launch(node).await;
+        for attempt in 1..=2 {
+            fx.tick(job, gate).await;
+            wait_calls(gate, attempt).await;
+            fx.wait_branch_state(job, "api", "red").await;
+            fx.tick(job, gate).await;
+            assert_eq!(fx.branch(job, "api").await.state, "fixing");
+            fx.relaunched_run_reports_done(node).await;
+        }
+        fx.tick(job, gate).await;
+        wait_calls(gate, 3).await;
+        fx.wait_branch_state(job, "api", "red").await;
+        fx.tick(job, gate).await;
+        assert_eq!(fx.branch(job, "api").await.state, "parked");
+        let decision: String = sqlx::query_scalar("SELECT id FROM decisions WHERE node_id = ?")
+            .bind(node)
+            .fetch_one(&fx.state.pool)
+            .await
+            .unwrap();
+        open::answer_and_relaunch(&fx.state, &decision, "carry on", "shell")
+            .await
+            .unwrap()
+            .relaunched
+            .expect("the answer relaunched the node")
+    }
+
+    /// An answered fix-cap park must not park again: the relaunched node's `done` report is gated.
+    #[tokio::test]
+    async fn an_answered_fix_cap_park_gates_the_relaunched_nodes_work() {
+        const JOB: &str = "drv-fix-answered";
+        const NODE: &str = "api-node";
+        let fx = Fixture::new().await;
+        let gate = FakeGate::answering(vec![
+            red("boom-1"),
+            red("boom-2"),
+            red("boom-3"),
+            GateVerdict::Green,
+        ]);
+        answered_after_the_fix_cap(&fx, JOB, NODE, &gate).await;
+        fx.relaunched_run_reports_done(NODE).await;
+
+        fx.tick(JOB, &gate).await;
+
+        wait_calls(&gate, 4).await;
+        fx.wait_branch_state(JOB, "api", "green").await;
+        assert!(
+            fx.open_questions(JOB, NODE).await.is_empty(),
+            "the owner is not asked the same question again"
+        );
+    }
+
+    /// The owner's answer is a fresh allowance of fixes: a red gate after it fixes again.
+    #[tokio::test]
+    async fn an_answer_after_the_fix_cap_gives_a_fresh_fix_allowance() {
+        const JOB: &str = "drv-fix-fresh";
+        const NODE: &str = "api-node";
+        let fx = Fixture::new().await;
+        let gate = FakeGate::answering(vec![
+            red("boom-1"),
+            red("boom-2"),
+            red("boom-3"),
+            red("boom-4"),
+        ]);
+        answered_after_the_fix_cap(&fx, JOB, NODE, &gate).await;
+        fx.relaunched_run_reports_done(NODE).await;
+        fx.tick(JOB, &gate).await;
+        wait_calls(&gate, 4).await;
+        fx.wait_branch_state(JOB, "api", "red").await;
+
+        fx.tick(JOB, &gate).await;
+
+        assert_eq!(fx.branch(JOB, "api").await.state, "fixing");
+        assert_eq!(fx.launches(NODE, "fix-").await, 3);
+        assert!(fx.open_questions(JOB, NODE).await.is_empty());
     }
 
     #[tokio::test]
