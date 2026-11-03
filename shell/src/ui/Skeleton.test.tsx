@@ -32,3 +32,41 @@ describe("Skeleton", () => {
     expect(screen.getByRole("status").querySelectorAll(".ui-skeleton-card").length).toBe(3);
   });
 });
+
+describe("Skeleton shaped variants", () => {
+  it.each(["line", "block", "card", "avatar", "row", "table", "cards"] as const)(
+    "%s is a busy status region with a hidden shape and a label",
+    (variant) => {
+      render(<Skeleton label={`Loading ${variant}`} variant={variant} />);
+      const el = screen.getByRole("status");
+      expect(el.getAttribute("aria-busy")).toBe("true");
+      expect(el.textContent).toContain(`Loading ${variant}`);
+      expect(el.className).toContain(`ui-skeleton-${variant}`);
+      expect(el.querySelector("[aria-hidden='true']")).not.toBeNull();
+    },
+  );
+
+  it("draws count rows", () => {
+    render(<Skeleton label="Loading" variant="row" count={4} />);
+    expect(screen.getByRole("status").querySelectorAll(".ui-skeleton-row").length).toBe(4);
+  });
+
+  it("draws a header plus count table rows of `columns` cells", () => {
+    render(<Skeleton label="Loading" variant="table" count={2} columns={4} />);
+    const el = screen.getByRole("status");
+    const rows = el.querySelectorAll(".ui-skeleton-tr");
+    expect(rows.length).toBe(3);
+    expect(rows[0]!.querySelectorAll(".ui-skeleton-bar").length).toBe(4);
+  });
+
+  it("sizes an avatar and a block", () => {
+    const { container } = render(
+      <>
+        <Skeleton label="a" variant="avatar" size={48} />
+        <Skeleton label="b" variant="block" height="10rem" width="50%" />
+      </>,
+    );
+    expect((container.querySelector("span.ui-skeleton-avatar") as HTMLElement).style.width).toBe("48px");
+    expect((container.querySelector(".ui-skeleton-blockbox") as HTMLElement).style.height).toBe("10rem");
+  });
+});

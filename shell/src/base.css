@@ -157,6 +157,23 @@ a:focus-visible {
   text-decoration: underline;
 }
 
+/* #17 Headings balance their lines; paragraphs avoid a one-word last line. Inside the layer,
+   so any component that sets its own `text-wrap` wins. */
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  text-wrap: balance;
+}
+
+p,
+li,
+blockquote {
+  text-wrap: pretty;
+}
+
 }
 
 /* Unlayered on purpose, and the only four places in this file that are.

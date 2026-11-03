@@ -1,3 +1,4 @@
+import { bindPrefetchClient } from "../lib/prefetch";
 import React from "react";
 import type { Root } from "react-dom/client";
 import { QueryClientProvider, type QueryClient } from "@tanstack/react-query";
@@ -18,6 +19,7 @@ import { createAppRouter, QUICK_CAPTURE_PATH } from "../router";
  */
 export function mountMainWindow(root: Root, queryClient: QueryClient): void {
   installPacing(queryClient);
+  bindPrefetchClient(queryClient);
 
   /**
    * Opened where it was left, and remembered as it moves.

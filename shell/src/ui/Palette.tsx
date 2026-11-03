@@ -16,6 +16,8 @@ import {
   CommandItem,
   CommandList,
 } from "./vendor/command";
+import { fuzzyFilter } from "../lib/fuzzy";
+import { Kbd } from "./Kbd";
 import { useReportOverlay } from "./overlay";
 
 /** One row of the palette. */
@@ -36,6 +38,8 @@ export interface PaletteItem {
   match: string;
   /** Said on the right of the row, and as the row's `title`. */
   hint?: string;
+  /** Keys that trigger this action elsewhere ("G H", "Ctrl+N"); drawn as a Kbd chip, split on spaces. */
+  shortcut?: string;
   /** Listed and not hidden — see `run`. */
   disabled?: boolean;
   /**
@@ -92,9 +96,8 @@ export const SHORTCUT_HINT = shortcutHint(
  * something was decided.
  */
 export function matchItems(items: PaletteItem[], query: string): PaletteItem[] {
-  const needle = query.trim().toLowerCase();
-  if (needle === "") return items;
-  return items.filter((item) => item.match.toLowerCase().includes(needle));
+  /* Fuzzy (#3): subsequence match, ranked best-first; an empty query still returns the same array. */
+  return fuzzyFilter(items, query, (item) => item.match);
 }
 
 interface PaletteContextValue {
@@ -330,6 +333,7 @@ export function PaletteProvider({ children }: PaletteProviderProps) {
                     onSelect={() => select(item)}
                   >
                     {item.label}
+                    {item.shortcut === undefined ? null : <Kbd keys={item.shortcut.split(" ")} />}
                     {item.hint === undefined ? null : (
                       <span className="ui-palette-hint">{item.hint}</span>
                     )}

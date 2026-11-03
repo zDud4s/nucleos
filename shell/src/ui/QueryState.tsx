@@ -3,7 +3,7 @@ import { isApiRefusal } from "../data/client";
 import { isRemote } from "../remote/host";
 import { UnavailableRemotely } from "../remote/UnavailableRemotely";
 import { ErrorNote } from "./ErrorNote";
-import { Skeleton } from "./Skeleton";
+import { Skeleton, type SkeletonVariant } from "./Skeleton";
 import { StaleNote } from "./StaleNote";
 
 /**
@@ -29,6 +29,10 @@ export interface QueryStateProps<T> {
   isEmpty?: (data: T) => boolean;
   /** Text lines of height the skeleton reserves. */
   lines?: number;
+  /** Shape of the skeleton while pending: `"row"`, `"table"`, `"cards"`… Defaults to text lines. */
+  skeleton?: SkeletonVariant;
+  /** How many rows / cards the shaped skeleton draws. */
+  skeletonCount?: number;
   children: (data: T) => ReactNode;
 }
 
@@ -50,7 +54,16 @@ function causeOf(error: unknown): string {
  * - unknown: no data and no failure (a disabled query): a dash, never 0 or idle.
  * - empty: data arrived and holds nothing.
  */
-export function QueryState<T>({ query, label, empty, isEmpty, lines, children }: QueryStateProps<T>) {
+export function QueryState<T>({
+  query,
+  label,
+  empty,
+  isEmpty,
+  lines,
+  skeleton,
+  skeletonCount,
+  children,
+}: QueryStateProps<T>) {
   const { data } = query;
 
   if (data === undefined) {
@@ -65,7 +78,9 @@ export function QueryState<T>({ query, label, empty, isEmpty, lines, children }:
         </ErrorNote>
       );
     }
-    if (query.isPending) return <Skeleton label={`Loading ${label}`} lines={lines} />;
+    if (query.isPending) {
+      return <Skeleton label={`Loading ${label}`} lines={lines} variant={skeleton} count={skeletonCount} />;
+    }
     return (
       <span className="ui-unknown" aria-label={`${label}: unknown`}>
         —
