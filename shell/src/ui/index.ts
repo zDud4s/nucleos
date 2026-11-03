@@ -85,7 +85,17 @@ export { Section, type SectionProps } from "./Section";
 export { SectionTitle, type SectionTitleProps } from "./SectionTitle";
 export { ShareBar, type ShareBarProps, type ShareItem } from "./ShareBar";
 export { SlotPips, type SlotPipsProps } from "./SlotPips";
-export { Skeleton, type SkeletonProps } from "./Skeleton";
+export { Skeleton, type SkeletonProps, type SkeletonVariant } from "./Skeleton";
+export { Image, type ImageProps } from "./Image";
+export { Kbd } from "./Kbd";
+export {
+  movingTowardRect,
+  pointInTriangle,
+  useSafeTriangle,
+  type Point,
+  type RectLike,
+  type SafeTriangleOptions,
+} from "./SafeTriangle";
 export { Sparkline, type SparklineProps } from "./Sparkline";
 export { StaleNote, type StaleNoteProps } from "./StaleNote";
 export { StatCard, type StatCardProps } from "./StatCard";
@@ -126,6 +136,7 @@ export { Tabs, TabsContent, TabsList, TabsTrigger } from "./vendor/tabs";
 
 export { SectionNav, type SectionNavItem, type SectionNavProps } from "./SectionNav";
 export { Disclosure, type DisclosureProps } from "./Disclosure";
+export { useUndoable, type Undoable, type UndoableOptions } from "./useUndoable";
 export { useUndoToast, UNDO_MS, type UndoToast, type UndoToastOptions } from "./useUndoToast";
 
 export { Chip } from "./Chip";

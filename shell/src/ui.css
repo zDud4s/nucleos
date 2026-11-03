@@ -4160,6 +4160,83 @@ ol.ui-well {
   max-width: var(--measure-prose);
 }
 
+/* Shaped variants: bars and blocks that hold the geometry of what is coming. */
+.ui-skeleton-shaped {
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--space-3);
+  max-width: none;
+  background: none;
+  padding: 0;
+}
+.ui-skeleton-bar,
+.ui-skeleton-blockbox,
+span.ui-skeleton-avatar,
+span.ui-skeleton-card {
+  display: block;
+  background: linear-gradient(
+      90deg,
+      transparent 0%,
+      color-mix(in oklab, var(--surface-raised, var(--surface-sunken)) 70%, transparent) 50%,
+      transparent 100%
+    )
+    0 0 / 200% 100% no-repeat,
+    var(--surface-sunken);
+  animation: ui-skeleton-shimmer 1.4s linear infinite;
+}
+.ui-skeleton-bar {
+  height: 0.75rem;
+  width: 100%;
+  border-radius: var(--radius-sm);
+}
+.ui-skeleton-blockbox {
+  width: 100%;
+  height: 6rem;
+  border-radius: var(--radius-md);
+}
+span.ui-skeleton-avatar {
+  flex: none;
+  border-radius: 50%;
+}
+.ui-skeleton-rows,
+.ui-skeleton-table {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.ui-skeleton-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-height: 2rem;
+}
+.ui-skeleton-tr {
+  display: grid;
+  gap: var(--space-4);
+  align-items: center;
+  min-height: 2rem;
+}
+.ui-skeleton-tr-head .ui-skeleton-bar {
+  height: 0.5rem;
+  opacity: 0.7;
+}
+@keyframes ui-skeleton-shimmer {
+  from {
+    background-position: 200% 0;
+  }
+  to {
+    background-position: -200% 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ui-skeleton-bar,
+  .ui-skeleton-blockbox,
+  span.ui-skeleton-avatar,
+  span.ui-skeleton-card {
+    animation: none;
+  }
+}
+
 /* Card-shaped variant: a column of block placeholders instead of one padded line. */
 .ui-skeleton-cards {
   flex-direction: column;
@@ -4174,7 +4251,7 @@ ol.ui-well {
   grid-template-columns: repeat(auto-fill, minmax(14rem, 1fr));
   gap: var(--space-3);
 }
-.ui-skeleton-card {
+span.ui-skeleton-card {
   display: block;
   min-height: 6rem;
   border-radius: var(--radius-md);
@@ -4430,6 +4507,183 @@ ol.ui-well {
 .ui-drawer:focus {
   outline: none;
 }
+
+/* ===================================================== shared polish pass ==
+   Added by the primitives branch of the 20-details UI polish. One block, so a page branch
+   can see everything that is global here. */
+
+/* #4 Kbd chip. */
+.ui-kbd-group {
+  display: inline-flex;
+  gap: 0.2em;
+}
+.ui-kbd {
+  display: inline-block;
+  min-width: 1.4em;
+  padding: 0 0.35em;
+  border: 1px solid var(--border-strong);
+  border-bottom-width: 2px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-sunken);
+  color: var(--text-muted);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: var(--text-xs);
+  line-height: 1.5;
+  text-align: center;
+  white-space: nowrap;
+}
+.ui-tip-box .ui-kbd-group,
+.ui-tip-box > .ui-kbd {
+  margin-inline-start: var(--space-1);
+  vertical-align: baseline;
+}
+
+/* #8 Image: a sized box, a blurred stand-in, and a cross-fade to the real thing. */
+.ui-image {
+  position: relative;
+  display: inline-block;
+  overflow: hidden;
+  border-radius: var(--radius-md);
+  background: var(--surface-sunken);
+}
+.ui-image-circle {
+  border-radius: 50%;
+}
+.ui-image > img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.ui-image-placeholder {
+  position: absolute;
+  inset: 0;
+  filter: blur(12px);
+  transform: scale(1.1);
+}
+.ui-image-full {
+  position: relative;
+  opacity: 0;
+  transition: opacity var(--dur-quick, 160ms) var(--ease, ease-out);
+}
+.ui-image[data-state="loaded"] .ui-image-full {
+  opacity: 1;
+}
+.ui-image[data-state="loaded"] .ui-image-placeholder {
+  visibility: hidden;
+  transition: visibility 0s linear var(--dur-quick, 160ms);
+}
+
+/* #13 Minimum hit area: 32px with a mouse, 44px on touch. The control keeps its look; an
+   invisible pseudo-element grows the target. (`.ui-switch-check` draws its own ::after, and is
+   clicked through its `<label>`, so it is not listed.) */
+.ui-icon-button,
+.ui-tip-mark,
+.ui-switch-seg {
+  position: relative;
+}
+.ui-icon-button::after,
+.ui-tip-mark::after,
+.ui-switch-seg::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: max(100%, 32px);
+  height: max(100%, 32px);
+  translate: -50% -50%;
+}
+@media (pointer: coarse) {
+  .ui-icon-button::after,
+  .ui-tip-mark::after,
+  .ui-switch-seg::after {
+    width: max(100%, 44px);
+    height: max(100%, 44px);
+  }
+}
+
+/* Utility: add `hit-area` to any small control to grow its target to 32px (44px on touch)
+   without changing its look. The element needs no positioning of its own. */
+.hit-area {
+  position: relative;
+}
+.hit-area::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: max(100%, 32px);
+  height: max(100%, 32px);
+  translate: -50% -50%;
+}
+@media (pointer: coarse) {
+  .hit-area::after {
+    width: max(100%, 44px);
+    height: max(100%, 44px);
+  }
+}
+
+/* #14 Safe-area insets on the fixed edges (notch, home indicator, rounded corners). */
+.ui-drawer {
+  height: 100dvh;
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-right: env(safe-area-inset-right, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+.ui-section-nav {
+  padding-left: env(safe-area-inset-left, 0px);
+  padding-right: env(safe-area-inset-right, 0px);
+}
+.ui-undo-toast {
+  margin-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+/* #16 Numbers that change under the reader hold one width. `.tabular` is the utility for
+   anything not covered below. */
+.tabular,
+.ui-meter-text,
+.ui-rows-row,
+.ui-skeleton-table,
+table,
+.ui-stat-value,
+.ui-count {
+  font-variant-numeric: tabular-nums;
+}
+
+/* #18 Squircle corners where the browser can draw them; rounded where it cannot. */
+@supports (corner-shape: squircle) {
+  .ui-modal,
+  .ui-drawer,
+  .ui-image,
+  .ui-skeleton-card,
+  .ui-skeleton-blockbox,
+  .ui-kbd,
+  .ui-icon-button {
+    corner-shape: squircle;
+  }
+}
+
+/* #9 View transitions: a short cross-fade of the whole page between routes. The router only
+   starts a transition when motion is allowed (`canViewTransition`); this also clamps the
+   pseudo-elements for anyone who reaches them another way. */
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation-duration: var(--dur-quick, 160ms);
+  animation-timing-function: var(--ease, ease-out);
+}
+@media (prefers-reduced-motion: reduce) {
+  ::view-transition-group(*),
+  ::view-transition-old(*),
+  ::view-transition-new(*) {
+    animation: none !important;
+  }
+}
+
+/* #11 Interruptible motion — audit result. State changes that can reverse mid-flight (hover,
+   press, open/close of in-page parts) must be `transition`s, which retarget from the current
+   value. Keyframes stay only where they are one-shot or a loop: skeleton shimmer, ring fill,
+   run-pipeline travel, and the modal/drawer enter/exit, which Radix Presence drives through
+   `animationend` and cannot be a transition. New work: reach for `transition` first. */
 
 .ui-drawer-head {
   display: flex;

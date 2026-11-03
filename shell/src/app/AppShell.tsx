@@ -1,11 +1,12 @@
 import { useMemo } from "react";
-import { Outlet, useNavigate } from "@tanstack/react-router";
+import { Outlet, useNavigate, useRouter } from "@tanstack/react-router";
 import { useChats } from "../data/chats";
 import { useOpenCaptures } from "../data/captures";
 import { useHotkeyRegistration } from "../data/hotkeys";
 import { POLL } from "../data/poll";
 import { useProjects, useSystemHealth, wantsAttention } from "../data/system";
 import { useWaitingCount } from "../data/waiting";
+import { useHistoryNavigation } from "../lib/useHistoryNavigation";
 import { unreadTotal } from "../lib/turns";
 import { PaletteProvider, usePaletteGroup, type PaletteGroup } from "../ui";
 import { AttentionHeartbeat } from "./AttentionHeartbeat";
@@ -50,6 +51,9 @@ export function AppShell() {
  * the log with failures nobody can act on.
  */
 function Frame() {
+  // Mouse back/forward buttons and Alt+Left/Right walk the router's memory history (#12).
+  const { history } = useRouter();
+  useHistoryNavigation(history);
   /**
    * Whether anything in the machine wants looking at, for the rail's one dot.
    *
