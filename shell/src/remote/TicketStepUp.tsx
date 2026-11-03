@@ -44,8 +44,8 @@ export function TicketStepUp() {
   if (info === null) return <main className="remote-pairing"><section className="remote-pairing-form"><p>Loading step-up request…</p></section></main>;
   const unavailable = !info.registered && !info.can_register;
   return <main className="remote-pairing"><section className="remote-pairing-form">
-    <h1>Confirm this action</h1><p>Device: {info.device_name}</p><p>Action: {info.label}</p><p>Comparison code: <strong>{info.code}</strong></p>
-    <p>Continue only if this matches what the app shows and you started this request.</p>
+    <h1>Confirm this action</h1><p>Requesting device: {info.device_name}</p><p>Action: {info.label}</p><p>Comparison code: <strong>{info.code}</strong></p>
+    <p>Do not continue unless you started this action on that device just now.</p>
     {unavailable ? <p>Pair again on that machine to get another 15 minutes to register its first passkey.</p> : <button type="button" disabled={busy} onClick={() => void continueStepUp()}>{busy ? "Waiting for the passkey…" : info.registered ? "Confirm with passkey" : "Register and confirm with passkey"}</button>}
   </section></main>;
 }

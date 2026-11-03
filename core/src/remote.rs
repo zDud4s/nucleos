@@ -1047,9 +1047,15 @@ mod tests {
         let first = ticket_owner(&pool, "first").await;
         let second = ticket_owner(&pool, "second").await;
         let caller = authenticate(&pool, &first.session, t0()).await.unwrap();
-        let made = stepup::create(&pool, caller.id, caller.owner, "Move chat", t0())
-            .await
-            .unwrap();
+        let made = stepup::create(
+            &pool,
+            caller.id,
+            caller.owner,
+            stepup::StepUpAction::MoveChat,
+            t0(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             stepup::info(&pool, &made.ticket, t0())
                 .await
@@ -1065,9 +1071,15 @@ mod tests {
         let pool = pool().await;
         let first = ticket_owner(&pool, "first").await;
         let second = ticket_owner(&pool, "second").await;
-        let made = stepup::create(&pool, first.device_id, true, "Move chat", t0())
-            .await
-            .unwrap();
+        let made = stepup::create(
+            &pool,
+            first.device_id,
+            true,
+            stepup::StepUpAction::MoveChat,
+            t0(),
+        )
+        .await
+        .unwrap();
         stepup::consume(&pool, &made.ticket, t0()).await.unwrap();
         assert!(
             authenticate(&pool, &first.session, t0())
@@ -1087,9 +1099,15 @@ mod tests {
     async fn a_ticket_works_once() {
         let pool = pool().await;
         let owner = ticket_owner(&pool, "owner").await;
-        let made = stepup::create(&pool, owner.device_id, true, "Move chat", t0())
-            .await
-            .unwrap();
+        let made = stepup::create(
+            &pool,
+            owner.device_id,
+            true,
+            stepup::StepUpAction::MoveChat,
+            t0(),
+        )
+        .await
+        .unwrap();
         stepup::consume(&pool, &made.ticket, t0()).await.unwrap();
         assert!(matches!(
             stepup::consume(&pool, &made.ticket, t0()).await,
@@ -1098,12 +1116,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_ticket_consumes_only_one_wins() {
+        let pool = pool().await;
+        let owner = ticket_owner(&pool, "owner").await;
+        let made = stepup::create(
+            &pool,
+            owner.device_id,
+            true,
+            stepup::StepUpAction::MoveChat,
+            t0(),
+        )
+        .await
+        .unwrap();
+
+        let (first, second) = tokio::join!(
+            stepup::consume(&pool, &made.ticket, t0()),
+            stepup::consume(&pool, &made.ticket, t0()),
+        );
+        assert!(
+            (first.is_ok() && second.is_err()) || (second.is_ok() && first.is_err()),
+            "exactly one concurrent consume must succeed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_ticket_replaces_an_unconsumed_ticket_for_the_device() {
+        let pool = pool().await;
+        let owner = ticket_owner(&pool, "owner").await;
+        let first = stepup::create(
+            &pool,
+            owner.device_id,
+            true,
+            stepup::StepUpAction::MoveChat,
+            t0(),
+        )
+        .await
+        .unwrap();
+        let second = stepup::create(
+            &pool,
+            owner.device_id,
+            true,
+            stepup::StepUpAction::MoveChat,
+            t0(),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            stepup::info(&pool, &first.ticket, t0()).await,
+            Err(stepup::TicketError::Invalid)
+        ));
+        assert!(stepup::info(&pool, &second.ticket, t0()).await.is_ok());
+    }
+
+    #[tokio::test]
     async fn an_expired_ticket_is_refused() {
         let pool = pool().await;
         let owner = ticket_owner(&pool, "owner").await;
-        let made = stepup::create(&pool, owner.device_id, true, "Move chat", t0())
-            .await
-            .unwrap();
+        let made = stepup::create(
+            &pool,
+            owner.device_id,
+            true,
+            stepup::StepUpAction::MoveChat,
+            t0(),
+        )
+        .await
+        .unwrap();
         assert!(matches!(
             stepup::info(&pool, &made.ticket, t0() + stepup::TICKET_TTL).await,
             Err(stepup::TicketError::Invalid)
@@ -1114,9 +1192,15 @@ mod tests {
     async fn a_ticket_is_not_a_session() {
         let pool = pool().await;
         let owner = ticket_owner(&pool, "owner").await;
-        let made = stepup::create(&pool, owner.device_id, true, "Move chat", t0())
-            .await
-            .unwrap();
+        let made = stepup::create(
+            &pool,
+            owner.device_id,
+            true,
+            stepup::StepUpAction::MoveChat,
+            t0(),
+        )
+        .await
+        .unwrap();
         assert!(matches!(
             authenticate(&pool, &made.ticket, t0()).await,
             Err(SessionError::Invalid)

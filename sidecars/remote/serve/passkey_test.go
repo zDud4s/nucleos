@@ -556,7 +556,7 @@ func TestTheTicketPageShowsTheDeviceActionAndCode(t *testing.T) {
 	}
 }
 
-func TestAnAssertionForAnotherPurposeDoesNotConsumeATicket(t *testing.T) {
+func TestTicketFinishWithAnAssertionFromAnotherCeremonyFails(t *testing.T) {
 	rig := newPasskeyRig(t)
 	rig.daemon.addDevice(sessA, 7, true)
 	auth := newVirtualAuthenticator(testOrigin)
@@ -571,9 +571,9 @@ func TestAnAssertionForAnotherPurposeDoesNotConsumeATicket(t *testing.T) {
 	if status != http.StatusOK {
 		t.Fatalf("ordinary verify begin = %d %s", status, options)
 	}
-	status, body = rig.gw("POST", "/auth/passkey/verify/finish", auth.get(t, options, true), sessA)
-	if status != http.StatusOK {
-		t.Fatalf("ordinary verify finish = %d %s", status, body)
+	status, body = rig.gw("POST", "/auth/stepup/finish", `{"ticket":"ticket-purpose","credential":`+auth.get(t, options, true)+`}`, "")
+	if status != http.StatusBadRequest {
+		t.Fatalf("ticket finish = %d %s", status, body)
 	}
 	if rig.daemon.consumed["ticket-purpose"] {
 		t.Fatal("an assertion for another ceremony consumed the ticket")

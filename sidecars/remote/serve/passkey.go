@@ -325,8 +325,12 @@ func (a *authHandler) ticketFinish(w http.ResponseWriter, r *http.Request) {
 		}
 		user, rows := userOf(dev, passkeyState{Credentials: st.Credentials})
 		cred, err := a.wa.ValidateLogin(user, verify.session, parsed)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, refusalPasskey)
+			return
+		}
 		row, known := rows[string(cred.ID)]
-		if err != nil || cred.Authenticator.CloneWarning || !known {
+		if cred.Authenticator.CloneWarning || !known {
 			writeJSONError(w, http.StatusBadRequest, refusalPasskey)
 			return
 		}

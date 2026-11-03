@@ -1896,6 +1896,7 @@ mod tests {
             .route("/remote/pairing-codes", post(|| async {}))
             .route("/remote/devices", get(|| async {}))
             .route("/remote/devices/{id}", axum::routing::delete(|| async {}))
+            .route("/remote/step-up/ticket/consume", post(|| async {}))
             .route("/daemon/shutdown", post(|| async {}))
             .route("/system/shutdown", post(|| async {}))
             .route("/config/secrets", get(|| async {}))
@@ -3218,6 +3219,73 @@ mod tests {
             denied, expected,
             "REMOTE_DENIED_SEGMENTS must equal REMOTE_OWNER_SEGMENTS plus REMOTE_AGENT_ONLY_SEGMENTS"
         );
+    }
+
+    /// The device-facing step-up segment is deliberately tiny. The gateway-only ticket routes
+    /// live under `/remote/step-up/`, so adding another `/stepup/*` route needs an explicit review.
+    #[test]
+    fn stepup_routes_are_exactly_the_ticket_and_status_routes() {
+        fn walk(dir: &std::path::Path, found: &mut std::collections::BTreeSet<String>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, found);
+                    continue;
+                }
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                if path.extension().is_none_or(|extension| extension != "rs")
+                    || name.contains("conformance")
+                {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).unwrap();
+                let cut = source
+                    .match_indices("#[cfg(test)]")
+                    .find(|(at, attr)| source[at + attr.len()..].trim_start().starts_with("mod "))
+                    .map_or(source.len(), |(at, _)| at);
+                for part in source[..cut].split(".route(").skip(1) {
+                    let Some(literal) = part.trim_start().strip_prefix('"') else {
+                        continue;
+                    };
+                    let Some((route, _)) = literal.split_once('"') else {
+                        continue;
+                    };
+                    if route.starts_with("/stepup/") {
+                        found.insert(route.to_owned());
+                    }
+                }
+            }
+        }
+
+        let mut found = std::collections::BTreeSet::new();
+        walk(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut found,
+        );
+        assert_eq!(
+            found.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["/stepup/status", "/stepup/ticket"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_device_session_is_refused_from_consuming_a_step_up_ticket() {
+        let state = test_state("control-token").await;
+        let key = mint_service_token(&state.pool, Service::Remote)
+            .await
+            .unwrap();
+        let device = pair_owner(&state, chrono::Utc::now()).await;
+        let app = protected_router(state);
+
+        let (status, _) = send_with_session(
+            &app,
+            "POST",
+            "/remote/step-up/ticket/consume",
+            &key,
+            Some(&device.session),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
     /// The three lists are pairwise disjoint, and the hard-deny set (owner decision 2026-10-29)

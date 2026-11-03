@@ -23,7 +23,7 @@ fn ticket_refusal(error: crate::remote::stepup::TicketError) -> axum::response::
     use crate::remote::stepup::TicketError as E;
     match error {
         E::NotOwner => refusal(StatusCode::FORBIDDEN, "not_an_owner").into_response(),
-        E::InvalidLabel => {
+        E::InvalidAction => {
             refusal(StatusCode::BAD_REQUEST, "invalid_stepup_action").into_response()
         }
         E::Invalid => refusal(StatusCode::GONE, "stepup_ticket_invalid").into_response(),
@@ -36,7 +36,7 @@ fn ticket_refusal(error: crate::remote::stepup::TicketError) -> axum::response::
 
 #[derive(Deserialize)]
 struct TicketBody {
-    label: String,
+    action: String,
 }
 
 /// The device identity comes from the session middleware, never from the request body.
@@ -48,11 +48,14 @@ async fn create_ticket(
     let Some(Extension(device)) = device else {
         return refusal(StatusCode::FORBIDDEN, "not_a_remote_device").into_response();
     };
+    let Ok(action) = body.action.parse() else {
+        return ticket_refusal(crate::remote::stepup::TicketError::InvalidAction);
+    };
     match crate::remote::stepup::create(
         &state.pool,
         device.id,
         device.owner,
-        &body.label,
+        action,
         chrono::Utc::now(),
     )
     .await

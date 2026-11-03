@@ -106,15 +106,26 @@ function machineFetch(machine: NativeMachine, origin: string): typeof fetch {
 
 const STEP_UP_POLL_MS = 1_000;
 const STEP_UP_WAIT_MS = 5 * 60_000;
+const MOVE_CHAT_ACTION = "move_chat";
 
-async function nativeStepUp(machine: NativeMachine, origin: string, label: string) {
+async function nativeStepUp(machine: NativeMachine, origin: string) {
   const fetchForMachine = machineFetch(machine, origin);
   try {
+    const status = await fetchForMachine(`${origin}/api/stepup/status`);
+    if (status.ok) {
+      const body = (await status.json()) as { stepped_up?: unknown };
+      if (body.stepped_up === true) return { kind: "verified" as const };
+    }
     const created = await fetchForMachine(`${origin}/api/stepup/ticket`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Nucleos-Csrf": "1" },
-      body: JSON.stringify({ label: label.slice(0, 160) || "Confirm this action" }),
+      body: JSON.stringify({ action: MOVE_CHAT_ACTION }),
     });
+    if (created.status === 400) {
+      const body = (await created.json().catch(() => null)) as { refusal?: unknown } | null;
+      const code = typeof body?.refusal === "string" ? body.refusal : "invalid_stepup_action";
+      return { kind: "failed" as const, code, detail: "The step-up request was refused." };
+    }
     if (!created.ok) throw new Error("ticket_refused");
     const ticket = (await created.json()) as { ticket?: unknown };
     if (typeof ticket.ticket !== "string" || ticket.ticket === "") throw new Error("ticket_refused");
@@ -122,9 +133,9 @@ async function nativeStepUp(machine: NativeMachine, origin: string, label: strin
     const deadline = Date.now() + STEP_UP_WAIT_MS;
     while (Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, STEP_UP_POLL_MS));
-      const status = await fetchForMachine(`${origin}/api/stepup/status`);
-      if (!status.ok) break;
-      const body = (await status.json()) as { stepped_up?: unknown };
+      const polled = await fetchForMachine(`${origin}/api/stepup/status`);
+      if (!polled.ok) break;
+      const body = (await polled.json()) as { stepped_up?: unknown };
       if (body.stepped_up === true) return { kind: "verified" as const };
     }
   } catch {
@@ -133,9 +144,9 @@ async function nativeStepUp(machine: NativeMachine, origin: string, label: strin
   return { kind: "failed" as const, code: "step_up_required", detail: "Passkey confirmation was not completed. Nothing was done." };
 }
 
-/** Part D calls this before a remote machine's grave `begin`, with its human-readable move label. */
-export async function requestNativeStepUp(machine: NativeMachine, label: string): Promise<StepUpOutcome> {
-  return await nativeStepUp(machine, machine.origin.replace(/\/$/, ""), label);
+/** Opens the fixed move-a-chat step-up flow for a paired machine. */
+export async function requestNativeStepUp(machine: NativeMachine): Promise<StepUpOutcome> {
+  return await nativeStepUp(machine, machine.origin.replace(/\/$/, ""));
 }
 
 /**
@@ -158,7 +169,7 @@ export function nativeTransport(machine: NativeMachine): Transport {
     label: origin,
     unauthorizedCode: "session_invalid",
     probeHeaders: {},
-    onStepUp: (action) => requestNativeStepUp(machine, action),
+    onStepUp: () => requestNativeStepUp(machine),
   };
 }
 

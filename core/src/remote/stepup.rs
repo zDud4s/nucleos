@@ -4,17 +4,41 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Duration, Utc};
 use rand::RngExt;
 use serde::Serialize;
-use sqlx::SqlitePool;
+use sqlx::{Sqlite, SqlitePool, Transaction};
 
 use super::{STEP_UP_WINDOW, hash_secret, stamp};
 
 pub const TICKET_TTL: Duration = Duration::minutes(5);
-const LABEL_LIMIT: usize = 160;
+
+/// The fixed set of grave actions a ticket may describe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StepUpAction {
+    MoveChat,
+}
+
+impl StepUpAction {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::MoveChat => "Move a chat",
+        }
+    }
+}
+
+impl std::str::FromStr for StepUpAction {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "move_chat" => Ok(Self::MoveChat),
+            _ => Err(()),
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum TicketError {
     NotOwner,
-    InvalidLabel,
+    InvalidAction,
     Invalid,
     Storage(sqlx::Error),
 }
@@ -56,13 +80,9 @@ pub async fn create(
     pool: &SqlitePool,
     device_id: i64,
     caller_is_owner: bool,
-    label: &str,
+    action: StepUpAction,
     now: DateTime<Utc>,
 ) -> Result<CreatedTicket, TicketError> {
-    let label = label.trim();
-    if label.is_empty() || label.len() > LABEL_LIMIT {
-        return Err(TicketError::InvalidLabel);
-    }
     if !caller_is_owner {
         return Err(TicketError::NotOwner);
     }
@@ -78,6 +98,22 @@ pub async fn create(
     let ticket = fresh_ticket();
     let code = comparison_code();
     let expires_at = stamp(now + TICKET_TTL);
+    let label = action.label();
+    let now_text = stamp(now);
+    let mut tx = pool.begin().await?;
+    // Tickets are short lived. A fresh request replaces this device's unfinished ticket, so a
+    // compromised session cannot accumulate valid prompts and an older browser page goes inert.
+    sqlx::query("DELETE FROM remote_stepup_tickets WHERE expires_at <= ?")
+        .bind(&now_text)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "DELETE FROM remote_stepup_tickets WHERE device_id = ? AND consumed_at IS NULL AND expires_at > ?",
+    )
+    .bind(device_id)
+    .bind(&now_text)
+    .execute(&mut *tx)
+    .await?;
     sqlx::query(
         "INSERT INTO remote_stepup_tickets (ticket_hash, device_id, label, code, created_at, expires_at) \
          VALUES (?, ?, ?, ?, ?, ?)",
@@ -86,10 +122,11 @@ pub async fn create(
     .bind(device_id)
     .bind(label)
     .bind(&code)
-    .bind(stamp(now))
+    .bind(&now_text)
     .bind(&expires_at)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(CreatedTicket {
         ticket,
         device_name,
@@ -153,16 +190,26 @@ pub async fn consume(
     let Some((device_id,)) = id else {
         return Err(TicketError::Invalid);
     };
-    let updated = sqlx::query(
-        "UPDATE remote_devices SET stepup_until = ? WHERE id = ? AND revoked_at IS NULL",
-    )
-    .bind(stamp(now + STEP_UP_WINDOW))
-    .bind(device_id)
-    .execute(&mut *tx)
-    .await?;
-    if updated.rows_affected() != 1 {
+    if !grant_step_up_in_transaction(&mut tx, device_id, now).await? {
         return Err(TicketError::Invalid);
     }
     tx.commit().await?;
     Ok(())
+}
+
+/// This is [`super::grant_step_up`] against an existing transaction, so consuming a ticket and
+/// opening the device window are one atomic operation.
+async fn grant_step_up_in_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
+    device_id: i64,
+    now: DateTime<Utc>,
+) -> Result<bool, sqlx::Error> {
+    let done = sqlx::query(
+        "UPDATE remote_devices SET stepup_until = ? WHERE id = ? AND revoked_at IS NULL",
+    )
+    .bind(stamp(now + STEP_UP_WINDOW))
+    .bind(device_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(done.rows_affected() == 1)
 }
