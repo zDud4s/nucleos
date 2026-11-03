@@ -844,15 +844,23 @@ pub async fn list_owner_decisions_by_status(
     .fetch_one(pool)
     .await?;
     if has_decisions > 0 {
-        let columns = "SELECT id, tree_id, node_id, question, answer, status, at FROM decisions";
         let decisions: Vec<DecisionRow> = match status {
             Some(status) => {
-                sqlx::query_as(&format!("{columns} WHERE status = ?"))
-                    .bind(status)
-                    .fetch_all(pool)
-                    .await?
+                sqlx::query_as(
+                    "SELECT id, tree_id, node_id, question, answer, status, at FROM decisions \
+                     WHERE status = ?",
+                )
+                .bind(status)
+                .fetch_all(pool)
+                .await?
             }
-            None => sqlx::query_as(columns).fetch_all(pool).await?,
+            None => {
+                sqlx::query_as(
+                    "SELECT id, tree_id, node_id, question, answer, status, at FROM decisions",
+                )
+                .fetch_all(pool)
+                .await?
+            }
         };
         rows.extend(decisions.into_iter().map(|row| {
             OwnerDecision {
