@@ -9,6 +9,9 @@ pub mod decisions;
 pub mod docs_paths;
 pub mod driver;
 pub mod engine;
+mod gate;
+#[cfg(test)]
+mod gate_tests;
 pub mod http;
 pub mod landing;
 pub mod model;

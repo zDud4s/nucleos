@@ -324,6 +324,8 @@ the contract, not a snapshot.
 | `tree_job/root.rs` | The root node of a tree job: its worktree on `tree/<id>/root`, and the run that plans the job. |
 | `tree_job/wrap.rs` | Wrapping up a node run that already reported, and starting a branch node again when its run ended with a handoff or died without a report. |
 | `tree_job/decisions.rs` | Parking a branch on a decision for the owner (`park`), resuming it on the answer (`answer`, which only moves state: call `open::answer_and_relaunch` to also start the node again), and the single list of decisions. Both hold the job lock. |
+| `tree_job/gate.rs` | The production gate of a tree branch: at most one verify ticket per branch and HEAD, remembered on the branch and read or awaited by the next gate instead of submitting again. |
+| `tree_job/gate_tests.rs` | Test-only: tests for the per-branch gate ticket dedupe (`gate.rs`). |
 | `conductor/mod.rs` | Conductor: session liveness, context limits, depth guards and resume. Module root; declares the submodules. |
 | `conductor/liveness.rs` | Stub, not implemented yet: session liveness classification. |
 | `conductor/context.rs` | Stub, not implemented yet: context-fill limits and verdicts. |
