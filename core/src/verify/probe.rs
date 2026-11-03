@@ -322,6 +322,25 @@ impl Step {
     }
 }
 
+/// Whether re-proving an incident takes the whole gate: a `gate_command` among its red groups, or
+/// no handle at all (no guard path and no red group).
+pub(super) fn needs_whole_gate(guard_paths: &[String], red_groups: &[String]) -> bool {
+    red_groups.iter().any(|group| group == GATE_UNIT)
+        || (guard_paths.is_empty() && red_groups.is_empty())
+}
+
+/// Refuses a plan that would run the whole gate (a `Full` step with no files and no groups) for an
+/// incident; a groups proof may plan one.
+fn refuse_whole_gate(incident: bool, steps: &[Step]) -> Result<(), String> {
+    if incident && steps.iter().any(|step| step.scope == ScopeArg::Full) {
+        return Err(
+            "an incident whose only handle is the whole gate is proved by the post-merge gate, not by a probe"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// What to submit for `what`; `exists` tells whether a repo-relative path is a file at the master head.
 ///
 /// An incident is re-proved by every handle it has: the guard files that still exist (the narrow
@@ -405,6 +424,9 @@ fn answered(units: &[UnitReport], named: Option<&[String]>) -> bool {
 
 /// Proves `what` on the master head. `Ok` is conclusive: either a unit failed, or every step
 /// measured something and nothing failed. A proof where nothing ran is an `Err`, never a pass.
+///
+/// Invariant: an incident is never re-proved by the whole gate; such a plan is refused before any
+/// unit is submitted (the next post-merge gate closes it).
 pub(super) async fn prove(
     executor: &Arc<Executor>,
     project_id: &str,
@@ -416,7 +438,9 @@ pub(super) async fn prove(
     let head = master_head(&executor.pool, project_id, project_root, deadline).await?;
     let tree = git_exec::prepare_probe_worktree(project_root, &head, deadline).await?;
 
+    let incident = matches!(what, What::Incident { .. });
     let steps = plan_proof(what, |path| tree.join(path).is_file());
+    refuse_whole_gate(incident, &steps)?;
     let mut ticket_ids: Vec<i64> = Vec::new();
     for step in &steps {
         let request = VerifyArgs {
@@ -851,6 +875,60 @@ mod tests {
             red_groups: Vec::new(),
         };
         assert_eq!(plan_proof(nothing, |_| false), full);
+    }
+
+    #[test]
+    fn an_incident_needs_the_whole_gate_for_a_gate_command_or_no_handle() {
+        assert!(needs_whole_gate(
+            &names(&["a.rs"]),
+            &names(&["core", GATE_UNIT])
+        ));
+        assert!(needs_whole_gate(&[], &names(&[GATE_UNIT])));
+        assert!(needs_whole_gate(&[], &[]), "no handle at all");
+        assert!(
+            !needs_whole_gate(&names(&["a.rs"]), &[]),
+            "a guard path is a handle"
+        );
+        assert!(
+            !needs_whole_gate(&[], &names(&["core"])),
+            "a red group is a handle"
+        );
+    }
+
+    #[test]
+    fn an_incident_may_not_plan_a_full_step() {
+        let full = vec![Step {
+            scope: ScopeArg::Full,
+            files: None,
+            groups: None,
+        }];
+        assert!(refuse_whole_gate(true, &full).is_err());
+        let mixed = vec![
+            Step {
+                scope: ScopeArg::Own,
+                files: Some(names(&["a.rs"])),
+                groups: None,
+            },
+            full[0].clone(),
+        ];
+        assert!(refuse_whole_gate(true, &mixed).is_err());
+    }
+
+    #[test]
+    fn a_groups_proof_may_plan_a_full_step_or_any_other() {
+        let full = vec![Step {
+            scope: ScopeArg::Full,
+            files: None,
+            groups: None,
+        }];
+        assert_eq!(refuse_whole_gate(false, &full), Ok(()));
+        let own = vec![Step {
+            scope: ScopeArg::Own,
+            files: None,
+            groups: Some(names(&["core"])),
+        }];
+        assert_eq!(refuse_whole_gate(true, &own), Ok(()));
+        assert_eq!(refuse_whole_gate(false, &own), Ok(()));
     }
 
     #[test]

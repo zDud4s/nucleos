@@ -72,6 +72,8 @@ AGENT_WAIT_MAX_S = 540.0
 CALLER_WAIT_MAX_S = 3600.0
 EXIT_QUEUE_TIMEOUT = 75
 EXIT_STALLED = 76
+EXIT_SPAWN_FAILED = 71  # sysexits EX_OSERR; core/src/verify/exec.rs reads it
+SPAWN_FAILED_MARKER = "heavy: spawn failed: "
 DEFAULT_STALL_S = 600.0
 # The stall watcher's thread dump: this machine's gdb goes first (NUCLEOS_HEAVY_GDB overrides it),
 # deepest processes first, because the stuck one is a test binary under cargo, never cargo.
@@ -2668,6 +2670,13 @@ def broker_run(args: list[str], held: bool = False) -> int:
         time.sleep(_env_float("NUCLEOS_HEAVY_POLL_S", 0.5))
 
 
+def _spawn_failed(argv: list[str], exc: BaseException) -> int:
+    """Report that the wrapped program could not be started; the caller returns the code."""
+    sys.stderr.write(f"{SPAWN_FAILED_MARKER}{argv[0]}: {exc}\n")
+    sys.stderr.flush()
+    return EXIT_SPAWN_FAILED
+
+
 def _broker_attempt(args: list[str], held: bool = False, deadline: float | None = None):
     opts, argv = parse_args(args)
     if not argv:
@@ -2677,7 +2686,10 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
     warm = os.environ.get("NUCLEOS_HEAVY_WARM") == "1"
 
     if os.environ.get("NUCLEOS_HEAVY") == "0":
-        code, _ = run_child(argv, env, None)
+        try:
+            code, _ = run_child(argv, env, None)
+        except OSError as exc:
+            return _spawn_failed(argv, exc)
         return code
 
     row: dict = {}
@@ -3044,7 +3056,10 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
             env.update(stripped)  # the fallback re-runs the original argv: give back the dirs
         had_token = bool(holding)  # _release_all hands it back; the row says what it WAS
         _release_all(directory, lock_hash, holding, lease)
-        code, stats = run_child(argv, env, None)
+        try:
+            code, stats = run_child(argv, env, None)
+        except OSError as exc2:
+            code, stats = _spawn_failed(argv, exc2), _new_stats()
         append_log({
             "v": LOG_VERSION, "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "token": had_token, "nested": nested, "in_held": in_held,
@@ -3075,8 +3090,7 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
                                 progress=directory / "progress" / str(os.getpid()),
                                 yield_check=yield_check, on_test_phase=on_test_phase)
     except OSError as exc:
-        sys.stderr.write(f"heavy: {argv[0]}: {exc}\n")
-        code, stats = 127, _new_stats()
+        code, stats = _spawn_failed(argv, exc), _new_stats()
         row["broker_error"] = f"spawn: {exc}"
     except BaseException:
         _release_all(directory, lock_hash, holding, lease)
