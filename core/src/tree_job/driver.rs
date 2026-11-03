@@ -31,7 +31,7 @@ use super::engine::{apply_transition, branch_node_may_close};
 use super::http::job_lock;
 use super::landing::{
     self, LandingError, MergeSettlement, apply_gate_verdict, check_may_land, check_may_merge,
-    land_job, scope_caller_id, settle_land, settle_merge, submit_merge,
+    land_job, settle_land, settle_merge, submit_merge,
 };
 use super::model::{JOB_TERMINAL_STATE, Manifest};
 use super::open::{FIX_PREFIX, relaunch_node, run_is_live};
@@ -42,7 +42,7 @@ use crate::execution::vcs::{Origin, ResolvedRepo, resolve_repo};
 use crate::gate::GateOutcome;
 use crate::state::AppState;
 use crate::tree_cost::budget::{self as tree_budget, Permit};
-use crate::verify::{ScopeVerdict, gate_job_scope};
+use crate::verify::ScopeVerdict;
 use crate::work_nodes::{self, CLOSE_STATUSES, CloseArgs, NodeLimits};
 
 /// How long the production gate waits for the verify queue.
@@ -126,20 +126,13 @@ fn production_gate(state: &AppState) -> Option<GateFn> {
                 .get(&branch)
                 .and_then(|held| held.worktree.clone())
                 .ok_or_else(|| format!("branch {branch} has no worktree to gate"))?;
-            let verdict = gate_job_scope(
-                &executor,
-                scope_caller_id(&job_id),
-                Path::new(&worktree),
-                GATE_WAIT,
-            )
-            .await;
-            verdict_of(verdict)
+            super::gate::gate_branch(&executor, &pool, &job_id, &branch, &worktree, GATE_WAIT).await
         })
     });
     Some(gate)
 }
 
-fn verdict_of(verdict: ScopeVerdict) -> Result<GateVerdict, String> {
+pub(super) fn verdict_of(verdict: ScopeVerdict) -> Result<GateVerdict, String> {
     match verdict {
         ScopeVerdict::Measured(GateOutcome::Passed) => Ok(GateVerdict::Green),
         ScopeVerdict::Measured(GateOutcome::Failed { output, .. }) => {
