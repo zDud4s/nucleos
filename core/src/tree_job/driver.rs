@@ -656,6 +656,26 @@ fn last_findings(branch: &super::model::Branch) -> String {
     text[start..].to_owned()
 }
 
+/// True when the gate findings name a failed formatter step (`FAIL core: fmt`, `  core: fmt`).
+fn findings_show_fmt_failure(findings: &str) -> bool {
+    findings.lines().any(|line| line.trim().ends_with(": fmt"))
+}
+
+/// The prompt suffix of a gate-fix relaunch; a formatter failure gets the command that fixes it,
+/// because the node rules otherwise forbid every cargo command.
+fn fix_suffix(findings: &str) -> String {
+    let mut suffix =
+        format!("\n\nThe gate failed on your branch with these findings:\n{findings}\n\n");
+    if findings_show_fmt_failure(findings) {
+        suffix.push_str(
+            "The formatter failed: run `cargo fmt -p nucleos-core` (or the crate of the files you changed) from the worktree root \u{2014} do not format by hand and do not run bare `rustfmt` \u{2014} then finish the node again.",
+        );
+    } else {
+        suffix.push_str("Fix them, then finish the node again.");
+    }
+    suffix
+}
+
 async fn red(
     state: &AppState,
     job: &mut TreeJob,
@@ -713,9 +733,7 @@ async fn red(
         parks.push((node.clone(), refusal_question(&node, &reason)));
         return Ok(());
     }
-    let suffix = format!(
-        "\n\nThe gate failed on your branch with these findings:\n{findings}\n\nFix them, then finish the node again."
-    );
+    let suffix = fix_suffix(&findings);
     relaunch_node(state, &node, &run, &key, Some(&suffix)).await?;
     let held = job
         .manifest
@@ -1060,7 +1078,55 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::*;
+
+    #[test]
+    fn a_fmt_finding_adds_the_formatter_hint() {
+        let findings = "gates FAILED:\n  core: fmt\n      Diff in x.rs";
+        let suffix = fix_suffix(findings);
+        assert!(suffix.contains(findings), "{suffix}");
+        assert!(suffix.contains("cargo fmt -p nucleos-core"), "{suffix}");
+        assert!(suffix.contains("bare `rustfmt`"), "{suffix}");
+    }
+
+    #[test]
+    fn other_findings_keep_the_plain_suffix() {
+        let findings = "gates FAILED:\n  core: test\n      assertion failed: fmt output";
+        let suffix = fix_suffix(findings);
+        assert!(!suffix.contains("rustfmt"), "{suffix}");
+        assert!(
+            suffix.ends_with("Fix them, then finish the node again."),
+            "{suffix}"
+        );
+    }
     use crate::execution::git_exec::testkit::{initialize_repo, space_free_tempdir};
+
+    const FIX_TAIL: &str = "Fix them, then finish the node again.";
+    const FIX_HEAD: &str = "\n\nThe gate failed on your branch with these findings:\n";
+
+    #[test]
+    fn fix_suffix_fmt_failure_gets_the_cargo_fmt_hint() {
+        let findings = "gates FAILED:\n  core: fmt\n";
+        let suffix = fix_suffix(findings);
+        assert!(suffix.contains("cargo fmt -p nucleos-core"));
+        assert!(!suffix.contains(FIX_TAIL));
+        assert!(suffix.starts_with(&format!("{FIX_HEAD}{findings}")));
+    }
+
+    #[test]
+    fn fix_suffix_other_failure_keeps_the_generic_tail() {
+        let findings = "FAIL core: clippy\ngates FAILED:\n  core: clippy";
+        let suffix = fix_suffix(findings);
+        assert!(!suffix.contains("cargo fmt"));
+        assert!(suffix.contains(FIX_TAIL));
+        assert!(suffix.starts_with(&format!("{FIX_HEAD}{findings}")));
+    }
+
+    #[test]
+    fn fix_suffix_ignores_a_mid_line_fmt_mention() {
+        let findings = "note: run fmt later\nFAIL core: clippy";
+        assert!(!findings_show_fmt_failure(findings));
+        assert!(fix_suffix(findings).contains(FIX_TAIL));
+    }
     use crate::execution::git_exec::tests::{WorktreeRootEnv, sha_of};
     use crate::execution::git_exec::{GitExecutor, OPERATION_TIMEOUT, repo_key};
     use crate::execution::vcs::{Origin, ResolvedRepo, drain_once};
