@@ -783,6 +783,7 @@ pub async fn list_questions(pool: &SqlitePool, spec_id: &str) -> Result<Vec<Ques
 struct DecisionRow {
     id: String,
     tree_id: Option<String>,
+    node_id: Option<String>,
     question: String,
     answer: Option<String>,
     status: String,
@@ -794,12 +795,31 @@ struct DecisionRow {
 /// ones included, so they are filtered here; the union is here because that view cannot reference
 /// a table that may not exist.
 pub async fn list_owner_decisions(pool: &SqlitePool) -> Result<Vec<OwnerDecision>, StoreError> {
-    let questions: Vec<QuestionRow> = sqlx::query_as(
-        "SELECT id, subject AS spec_id, question, answer, status, created_at, answered_at \
-         FROM owner_decisions WHERE status <> 'closed'",
-    )
-    .fetch_all(pool)
-    .await?;
+    list_owner_decisions_by_status(pool, None).await
+}
+
+/// Same list, optionally narrowed to one status (`open`, `answered`, ...) across both sources.
+/// `None` keeps the unfiltered behaviour: spec questions not closed, every tree decision.
+pub async fn list_owner_decisions_by_status(
+    pool: &SqlitePool,
+    status: Option<&str>,
+) -> Result<Vec<OwnerDecision>, StoreError> {
+    let questions: Vec<QuestionRow> =
+        match status {
+            Some(status) => sqlx::query_as(
+                "SELECT id, subject AS spec_id, question, answer, status, created_at, answered_at \
+                 FROM owner_decisions WHERE status = ?",
+            )
+            .bind(status)
+            .fetch_all(pool)
+            .await?,
+            None => sqlx::query_as(
+                "SELECT id, subject AS spec_id, question, answer, status, created_at, answered_at \
+                 FROM owner_decisions WHERE status <> 'closed'",
+            )
+            .fetch_all(pool)
+            .await?,
+        };
     let mut rows: Vec<OwnerDecision> = questions
         .into_iter()
         .map(|row| OwnerDecision {
@@ -809,8 +829,12 @@ pub async fn list_owner_decisions(pool: &SqlitePool) -> Result<Vec<OwnerDecision
             question: row.question,
             answer: row.answer,
             status: row.status,
+            at: row.created_at.clone(),
             created_at: row.created_at,
             answered_at: row.answered_at,
+            kind: "decision".to_owned(),
+            tree_id: None,
+            node_id: None,
         })
         .collect();
 
@@ -820,19 +844,37 @@ pub async fn list_owner_decisions(pool: &SqlitePool) -> Result<Vec<OwnerDecision
     .fetch_one(pool)
     .await?;
     if has_decisions > 0 {
-        let decisions: Vec<DecisionRow> =
-            sqlx::query_as("SELECT id, tree_id, question, answer, status, at FROM decisions")
-                .fetch_all(pool)
-                .await?;
-        rows.extend(decisions.into_iter().map(|row| OwnerDecision {
-            origin: "tree_decision".to_owned(),
-            id: row.id,
-            subject: row.tree_id.unwrap_or_default(),
-            question: row.question,
-            answer: row.answer,
-            status: row.status,
-            created_at: row.at,
-            answered_at: None,
+        let columns = "SELECT id, tree_id, node_id, question, answer, status, at FROM decisions";
+        let decisions: Vec<DecisionRow> = match status {
+            Some(status) => {
+                sqlx::query_as(&format!("{columns} WHERE status = ?"))
+                    .bind(status)
+                    .fetch_all(pool)
+                    .await?
+            }
+            None => sqlx::query_as(columns).fetch_all(pool).await?,
+        };
+        rows.extend(decisions.into_iter().map(|row| {
+            OwnerDecision {
+                origin: "tree_decision".to_owned(),
+                // `pending-*` rows are disk-wait notices: shown, but not answerable.
+                kind: if row.id.starts_with("pending-") {
+                    "notice"
+                } else {
+                    "decision"
+                }
+                .to_owned(),
+                id: row.id,
+                subject: row.tree_id.clone().unwrap_or_default(),
+                tree_id: row.tree_id,
+                node_id: row.node_id,
+                question: row.question,
+                answer: row.answer,
+                status: row.status,
+                at: row.at.clone(),
+                created_at: row.at,
+                answered_at: None,
+            }
         }));
     }
 
@@ -1590,6 +1632,79 @@ mod tests {
         assert_eq!(rows[3].answer.as_deref(), Some("no"));
         assert_eq!(rows[3].status, "answered");
         assert_eq!(rows[3].answered_at, None);
+    }
+
+    async fn seed_tree_decision(pool: &SqlitePool, id: &str, question: &str, answer: Option<&str>) {
+        let status = if answer.is_some() { "answered" } else { "open" };
+        sqlx::query(
+            "INSERT INTO decisions (id, tree_id, node_id, question, answer, origin, at, status) \
+             VALUES (?, 'tree-9', 'node-9', ?, ?, 'agent', '2026-10-30T09:00:00+00:00', ?)",
+        )
+        .bind(id)
+        .bind(question)
+        .bind(answer)
+        .bind(status)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn status_open_excludes_answered_tree_decisions_and_spec_questions() {
+        let pool = crate::testdb::fresh_pool().await;
+        recreate_decisions(&pool).await;
+        let spec = seed(&pool, None, PATH).await;
+        let open_q = add_question(&pool, &spec.id, "Open?").await.unwrap();
+        let done_q = add_question(&pool, &spec.id, "Done?").await.unwrap();
+        answer_question(&pool, &done_q, "yes").await.unwrap();
+        seed_tree_decision(&pool, "d-open", "Still open?", None).await;
+        seed_tree_decision(&pool, "d-done", "Answered?", Some("yes")).await;
+
+        let open = list_owner_decisions_by_status(&pool, Some("open"))
+            .await
+            .unwrap();
+        let mut ids: Vec<&str> = open.iter().map(|row| row.id.as_str()).collect();
+        ids.sort_unstable();
+        let mut expected = vec![open_q.as_str(), "d-open"];
+        expected.sort_unstable();
+        assert_eq!(ids, expected);
+
+        // No filter: unchanged, the answered rows are still there.
+        let all = list_owner_decisions(&pool).await.unwrap();
+        assert_eq!(all.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn tree_decision_exposes_full_fields_and_kind() {
+        let pool = crate::testdb::fresh_pool().await;
+        recreate_decisions(&pool).await;
+        let long = "x".repeat(5000);
+        seed_tree_decision(&pool, "d-long", &long, None).await;
+        seed_tree_decision(&pool, "pending-disk-1", "Waiting for disk", None).await;
+        let spec = seed(&pool, None, PATH).await;
+        add_question(&pool, &spec.id, "Spec?").await.unwrap();
+
+        let rows = list_owner_decisions(&pool).await.unwrap();
+        let by_id = |id: &str| rows.iter().find(|row| row.id == id).unwrap();
+
+        let decision = by_id("d-long");
+        assert_eq!(decision.question, long);
+        assert_eq!(decision.kind, "decision");
+        assert_eq!(decision.tree_id.as_deref(), Some("tree-9"));
+        assert_eq!(decision.node_id.as_deref(), Some("node-9"));
+        assert_eq!(decision.at, "2026-10-30T09:00:00+00:00");
+        assert_eq!(decision.answer, None);
+
+        let notice = by_id("pending-disk-1");
+        assert_eq!(notice.kind, "notice");
+        assert_eq!(notice.origin, "tree_decision");
+
+        let spec_row = rows
+            .iter()
+            .find(|row| row.origin == "spec_question")
+            .unwrap();
+        assert_eq!(spec_row.kind, "decision");
+        assert_eq!(spec_row.at, spec_row.created_at);
     }
 
     #[tokio::test]
