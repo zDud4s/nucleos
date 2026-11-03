@@ -5,7 +5,7 @@ import {
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
-import { apiFetch, apiText } from "./client";
+import { apiFetch, apiText, withIdempotencyKey, type IdempotentCall } from "./client";
 import type { RunSearchResult } from "./fleet";
 import { keys } from "./keys";
 import { POLL, pollWhile } from "./poll";
@@ -517,8 +517,11 @@ export function useRunStop(id: number, alive: boolean) {
 export function useCreateRun() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (run: NewRun) =>
-      apiFetch<{ id: number }>("/runs", { method: "POST", body: JSON.stringify(run) }),
+    mutationFn: ({ idempotencyKey, ...run }: NewRun & IdempotentCall) =>
+      apiFetch<{ id: number }>(
+        "/runs",
+        withIdempotencyKey({ method: "POST", body: JSON.stringify(run) }, idempotencyKey),
+      ),
     retry: false,
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: keys.runs.all });
