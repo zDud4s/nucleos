@@ -174,7 +174,9 @@ async fn run(store: &Store, req: Request, next: Next) -> Response {
         ),
         Begin::Replay(cached) => replay(cached),
         Begin::Fresh => {
-            let response = next.run(Request::from_parts(parts, Body::from(bytes))).await;
+            let response = next
+                .run(Request::from_parts(parts, Body::from(bytes)))
+                .await;
             if !response.status().is_success() {
                 store.abandon(&slot);
                 return response;
@@ -242,10 +244,12 @@ mod tests {
                     }
                 }),
             )
-            .layer(axum::middleware::from_fn(move |req: Request, next: Next| {
-                let store = store.clone();
-                async move { run(&store, req, next).await }
-            }))
+            .layer(axum::middleware::from_fn(
+                move |req: Request, next: Next| {
+                    let store = store.clone();
+                    async move { run(&store, req, next).await }
+                },
+            ))
     }
 
     async fn send(app: &Router, key: Option<&str>, body: &str) -> (StatusCode, String, bool) {
@@ -312,7 +316,10 @@ mod tests {
     async fn a_malformed_key_is_a_bad_request() {
         let (app, hits, _) = fixture(false);
         let long = "x".repeat(MAX_KEY_LEN + 1);
-        assert_eq!(send(&app, Some(&long), "{}").await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            send(&app, Some(&long), "{}").await.0,
+            StatusCode::BAD_REQUEST
+        );
         assert_eq!(send(&app, Some(""), "{}").await.0, StatusCode::BAD_REQUEST);
         assert_eq!(hits.load(Ordering::SeqCst), 0);
     }
