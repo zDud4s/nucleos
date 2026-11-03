@@ -160,7 +160,10 @@ async fn run(store: &Store, req: Request, next: Next) -> Response {
 
     let (parts, body) = req.into_parts();
     let Ok(bytes) = to_bytes(body, MAX_BODY).await else {
-        return refuse(StatusCode::PAYLOAD_TOO_LARGE, "the request body is too large");
+        return refuse(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "the request body is too large",
+        );
     };
 
     match store.begin(&slot, fingerprint(&bytes), Instant::now()) {
