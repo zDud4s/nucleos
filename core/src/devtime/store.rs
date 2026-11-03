@@ -329,8 +329,12 @@ pub async fn file_state(pool: &SqlitePool, path: &str) -> sqlx::Result<Option<Fi
 
 /// Opens the transaction one chunk's rows and its offset share. Dropping it uncommitted rolls all
 /// of it back.
+///
+/// IMMEDIATE: the write lock is taken up front, waited for under the pool's busy_timeout, instead
+/// of on the chunk's first write, where a deferred transaction that had read first could fail to
+/// upgrade from a read to the write lock in WAL mode.
 pub async fn begin_chunk(pool: &SqlitePool) -> sqlx::Result<Transaction<'_, Sqlite>> {
-    pool.begin().await
+    pool.begin_with("BEGIN IMMEDIATE").await
 }
 
 pub async fn upsert_session(conn: &mut SqliteConnection, row: &SessionRow) -> sqlx::Result<()> {
@@ -929,6 +933,31 @@ mod tests {
 
     async fn test_pool() -> sqlx::SqlitePool {
         crate::testdb::fresh_pool().await
+    }
+
+    #[tokio::test]
+    async fn begin_chunk_takes_the_write_lock_up_front() {
+        use sqlx::Connection;
+        use sqlx::sqlite::SqliteConnectOptions;
+        let db = crate::storage::TempDb::new().await;
+        let tx = begin_chunk(&db.pool).await.unwrap();
+        // A second connection that does not wait: if the chunk transaction already holds the write
+        // lock, taking it must fail as busy. A deferred BEGIN holds nothing yet, so this would pass.
+        let mut other = sqlx::SqliteConnection::connect_with(
+            &SqliteConnectOptions::new()
+                .filename(db.path().join("nucleos.db"))
+                .busy_timeout(std::time::Duration::ZERO),
+        )
+        .await
+        .unwrap();
+        let err = sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut other)
+            .await
+            .expect_err("the chunk transaction must already hold the write lock");
+        assert!(crate::storage::is_busy(&err), "not a busy error: {err}");
+        drop(other);
+        drop(tx);
+        db.close().await;
     }
 
     async fn columns(pool: &sqlx::SqlitePool, table: &str) -> Vec<String> {

@@ -170,6 +170,18 @@ async fn main() {
         .await
         .expect("failed to open local database");
     tracing::info!("nucleos-core database ready at {}", db_path.display());
+    // Devtime ingest writes in long chunks; on a pool of its own it queues on its one connection
+    // instead of pinning the shared pool's, which hooks need within their budget.
+    let devtime_pool = match storage::open_background(&db_path).await {
+        Ok(background) => background,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "devtime: could not open the background pool; ingest shares the main pool"
+            );
+            pool.clone()
+        }
+    };
 
     startup::reconcile_after_restart(&pool).await;
     // After the runs were reconciled and before the server or any loop can call `launch`: it clears
@@ -1154,7 +1166,7 @@ async fn main() {
     // decided (skipped while the `devtime` document is unreadable: its defaults are not the owner's).
     devtime::void_stale_at_startup(&state.pool, &devtime_config.actions, devtime_readable).await;
     tokio::spawn(devtime::run_ingest_loop(
-        state.pool.clone(),
+        devtime_pool,
         devtime_config,
         devtime_projects_dir,
     ));
