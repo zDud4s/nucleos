@@ -263,6 +263,19 @@ impl Executor {
     pub async fn start_ready(self: &Arc<Self>) -> usize {
         let aging_ms = seconds_to_ms(self.config.aging_seconds);
         let mut started = 0;
+        // Units whose asking run ended or is gone fail fast, loudly, before they take a slot.
+        match verify_runs::cancel_orphaned_queued(&self.pool).await {
+            Ok(orphans) => {
+                for (unit, ticket) in orphans {
+                    tracing::warn!(
+                        unit,
+                        ticket,
+                        "verify executor: ended an orphaned queued unit"
+                    );
+                }
+            }
+            Err(error) => tracing::warn!(%error, "verify executor: cannot sweep orphaned units"),
+        }
         loop {
             let queued = match verify_runs::queued(&self.pool).await {
                 Ok(queued) => queued,
