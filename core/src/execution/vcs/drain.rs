@@ -601,7 +601,7 @@ pub async fn sweep_awaiting_gate(pool: &sqlx::SqlitePool) -> u64 {
 /// there is no in-memory set that can disagree with the database about who holds what.
 ///
 /// One consequence worth naming before somebody reads it as a defect: a redundant claim can also
-/// exhaust `busy_timeout` (10s, `storage.rs:69`) against another writer and come back
+/// exhaust `busy_timeout` (`storage::BUSY_TIMEOUT`, 3s) against another writer and come back
 /// `Err(SQLITE_BUSY)` rather than `Ok(None)` — `claim_next`'s own doc comment describes this. It is
 /// still safe, because nothing was claimed and `drain_once` returning `false` ends the loop rather
 /// than spinning, but it surfaces as a `could not claim the next vcs request` warning that is

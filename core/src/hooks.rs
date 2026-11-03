@@ -52,6 +52,16 @@ mod tests {
     use std::time::Duration;
     use tower::ServiceExt;
 
+    #[test]
+    fn pool_acquire_timeout_fits_inside_the_hook_budget() {
+        // A hook that waits for a pooled connection must give up (and fail closed) before the
+        // client's own budget, less the margin kept for the judge, runs out.
+        assert!(
+            crate::storage::POOL_ACQUIRE_TIMEOUT
+                < super::rules::HOOK_BUDGET - super::rules::AFTER_JUDGE_MARGIN
+        );
+    }
+
     async fn test_state() -> AppState {
         crate::project::rules::testing::hold_shared();
         let pool = crate::testdb::fresh_pool().await;

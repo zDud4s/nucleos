@@ -329,9 +329,11 @@ pub async fn dismiss(
 }
 
 /// How many times an owner's answer or dismissal is written before a busy database is reported.
-/// Each attempt already waits the pool's 10s busy_timeout, so two attempts stay under the Telegram
-/// sidecar's 30s client timeout: a retry that outlived the client would save an answer the owner
-/// was told was lost, and the owner's second try would then be a late duplicate.
+/// Each attempt can already wait the pool's `POOL_ACQUIRE_TIMEOUT` (3s) for a connection plus its
+/// `BUSY_TIMEOUT` (3s) for the write lock (`nucleos_base::storage`), so two attempts and the pause
+/// stay well under the Telegram sidecar's 30s client timeout: a retry that outlived the client
+/// would save an answer the owner was told was lost, and the owner's second try would then be a
+/// late duplicate.
 pub const BUSY_ATTEMPTS: u32 = 2;
 
 /// The pause before a retry, so it does not land on the same writer's next statement.
