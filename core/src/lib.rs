@@ -40,7 +40,7 @@ pub mod context_refs;
 pub mod council;
 pub mod daemon_client;
 pub mod data_dir;
-pub mod detect;
+pub use nucleos_base::detect;
 pub mod distill;
 pub mod door;
 pub mod embed;

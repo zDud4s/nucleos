@@ -18,6 +18,7 @@ pub mod browser_client;
 pub mod browser_policy;
 pub mod command_reader;
 pub mod commands;
+pub mod detect;
 pub mod feed;
 pub mod gate;
 pub mod handoff;
