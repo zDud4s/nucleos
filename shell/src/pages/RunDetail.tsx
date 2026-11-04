@@ -1,5 +1,5 @@
 import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { Link, useParams } from "@tanstack/react-router";
+import { Link, useNavigate, useParams } from "@tanstack/react-router";
 import { DAEMON_NAME } from "../copy";
 import { isApiRefusal, type ApiRefusal } from "../data/client";
 import { routeTriple } from "../data/route";
@@ -32,7 +32,9 @@ import {
   RefusalNote,
   RunPipeline,
   Section,
+  usePaletteGroup,
 } from "../ui";
+import { usePageKeys } from "../project/pageKeys";
 import { JudgeOpinionsBlock } from "./AutopilotJudge";
 import { readRunStream, type RunEvent } from "../lib/run-stream";
 import "./runs.css";
@@ -91,6 +93,20 @@ function KnownRun({ id }: { id: number }) {
   const cancel = useCancelRun();
   const release = useReleaseWorktree(id);
   const detail = run.data;
+  // #3/#4: the way out of a run, by key. Cancelling is deliberately not offered here: it is the
+  // hold-to-confirm button in the header, and a palette row or a bare key must not stop a run.
+  const navigate = useNavigate();
+  const toRuns = () => void navigate({ to: "/runs" });
+  const toFleet = () => void navigate({ to: "/fleet" });
+  usePaletteGroup({
+    id: "run-detail-actions",
+    heading: "This run",
+    items: [
+      { id: "run-detail-all", label: "All runs", match: "all runs back list", shortcut: "B", run: toRuns },
+      { id: "run-detail-fleet", label: "Open fleet", match: "open fleet", shortcut: "F", run: toFleet },
+    ],
+  });
+  usePageKeys({ b: toRuns, f: toFleet });
 
   if (detail === undefined) {
     return (

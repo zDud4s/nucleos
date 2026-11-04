@@ -1,6 +1,6 @@
 import { useMemo } from "react";
 import { useConcurrency } from "../data/fleet";
-import { Button, Field, Select, SlotPips, Switch } from "../ui";
+import { Button, Field, Select, SlotPips, Switch, Tip } from "../ui";
 import { useConnection, useFleetStore, useLayoutVersion } from "./hooks";
 import { NO_PROJECT } from "./layout";
 import type { ConnectionState } from "./types";
@@ -54,10 +54,20 @@ export function TopBar({ project, onProject, onlyActive, onOnlyActive, follow, o
       </Field>
       <Switch label="Active only" checked={onlyActive} onChange={onOnlyActive} />
       <span className="fleet-grow" />
-      <Button aria-pressed={follow} onClick={() => onFollow(!follow)}>
-        Follow
-      </Button>
-      <Button onClick={onFit}>Fit</Button>
+      <Tip tip="Keep the newest activity in view" shortcut="L">
+        {({ tipId }) => (
+          <Button aria-pressed={follow} aria-describedby={tipId} onClick={() => onFollow(!follow)}>
+            Follow
+          </Button>
+        )}
+      </Tip>
+      <Tip tip="Fit every node on screen" shortcut="F">
+        {({ tipId }) => (
+          <Button aria-describedby={tipId} onClick={onFit}>
+            Fit
+          </Button>
+        )}
+      </Tip>
       {house !== undefined && (
         <span className="fleet-slots">
           slots

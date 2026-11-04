@@ -1,8 +1,10 @@
 import { useQueryClient } from "@tanstack/react-query";
-import { Link } from "@tanstack/react-router";
+import { Link, useNavigate } from "@tanstack/react-router";
 import type { ReactNode } from "react";
 import { FeedEmbed } from "../app/FeedEmbed";
+import { apiFetch } from "../data/client";
 import { keys } from "../data/keys";
+import { registerPrefetcher } from "../lib/prefetch";
 import {
   isAggregateTimeout,
   useBudget,
@@ -16,7 +18,8 @@ import {
 import { DAEMON_NAME } from "../copy";
 import { plural } from "../lib/plural";
 import { useWaitingCount } from "../data/waiting";
-import { ErrorNote, Meter, PageHeader, Skeleton, StaleNote, StatCard, Term, ceilingShare, usd } from "../ui";
+import { ErrorNote, Meter, PageHeader, Skeleton, StaleNote, StatCard, Term, ceilingShare, usd, usePaletteGroup } from "../ui";
+import { usePageKeys } from "../project/pageKeys";
 
 /**
  * The first screen: what needs you, whether the machine is well, and what it has spent.
@@ -32,7 +35,36 @@ import { ErrorNote, Meter, PageHeader, Skeleton, StaleNote, StatCard, Term, ceil
  * All four queries run at the fast cadence, because all four are answers to
  * "what is the machine doing right now".
  */
+/** Hovering "Home" warms the two readings the cards are built from, under the keys their hooks read. */
+registerPrefetcher("/", (qc) =>
+  Promise.all([
+    qc.prefetchQuery({
+      queryKey: keys.projects.all,
+      queryFn: () => apiFetch<ProjectSummary[]>("/projects"),
+      staleTime: 5_000,
+    }),
+    qc.prefetchQuery({
+      queryKey: keys.autopilot.budget,
+      queryFn: () => apiFetch<BudgetView>("/autopilot/budget"),
+      staleTime: 5_000,
+    }),
+  ]),
+);
+
 export function Home() {
+  // #3/#4: the three places the machine is driven from, one key each. Home itself mutates nothing.
+  const navigate = useNavigate();
+  const go = (to: "/chats" | "/runs" | "/fleet") => () => void navigate({ to });
+  usePaletteGroup({
+    id: "home-actions",
+    heading: "Quick actions",
+    items: [
+      { id: "home-chat", label: "New chat", match: "new chat conversation", shortcut: "N", run: go("/chats") },
+      { id: "home-run", label: "New run", match: "new run start", shortcut: "R", run: go("/runs") },
+      { id: "home-fleet", label: "Open fleet", match: "open fleet", shortcut: "F", run: go("/fleet") },
+    ],
+  });
+  usePageKeys({ n: go("/chats"), r: go("/runs"), f: go("/fleet") });
   const projects = useProjects();
   const waiting = useWaitingCount();
   const budget = useBudget();

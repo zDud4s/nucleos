@@ -148,8 +148,8 @@ describe("SessionColumn", () => {
     expect(onNew).toHaveBeenCalledTimes(1);
     // New group sits beside it, on the same row, and nowhere else.
     expect(screen.getAllByRole("button", { name: "New group" })).toHaveLength(1);
-    expect(screen.getByRole("button", { name: "New group" }).parentElement).toBe(
-      screen.getByRole("button", { name: "New conversation" }).parentElement,
+    expect(screen.getByRole("button", { name: "New group" }).closest(".chats-rail-actions")).toBe(
+      screen.getByRole("button", { name: "New conversation" }).closest(".chats-rail-actions"),
     );
 
     // The group holds its own row, the rest are ungrouped, and each heading carries a count.

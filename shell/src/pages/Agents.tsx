@@ -42,7 +42,10 @@ import {
   Td,
   Teach,
   Th,
+  Tip,
+  usePaletteGroup,
 } from "../ui";
+import { usePageKeys } from "../project/pageKeys";
 import { DAEMON_NAME } from "../copy";
 import { plural } from "../lib/plural";
 import "./agents.css";
@@ -138,15 +141,28 @@ export function Agents() {
       (!chipsOn.includes(NOBODY_USES) || (employmentKnown && unemployed(employmentOf(row.id, departments)))),
   );
 
+  // #3/#4: the palette's "New agent" and the key it prints.
+  const openCreate = () => setCreating(true);
+  usePaletteGroup({
+    id: "agents-actions",
+    heading: "Quick actions",
+    items: [{ id: "agents-new", label: "New agent", match: "new agent create", shortcut: "N", run: openCreate }],
+  });
+  usePageKeys({ n: openCreate }, !creating);
+
   return (
     <>
       <PageHeader
         title="Agents"
         headline={headlineFor(rows, departments, answered, employmentKnown)}
         actions={
-          <Button intent="go" onClick={() => setCreating(true)} aria-haspopup="dialog">
-            New agent
-          </Button>
+          <Tip tip="Add an agent to the catalogue" shortcut="N">
+            {({ tipId }) => (
+              <Button intent="go" onClick={() => setCreating(true)} aria-haspopup="dialog" aria-describedby={tipId}>
+                New agent
+              </Button>
+            )}
+          </Tip>
         }
       />
 
@@ -157,7 +173,7 @@ export function Agents() {
           nobody had read yet — the very thing the console rewrite undid. */}
       {creating && <NewAgentForm onDone={() => setCreating(false)} />}
 
-      {!answered && !agents.isError && <Skeleton label="Reading the catalogue…" lines={3} />}
+      {!answered && !agents.isError && <Skeleton label="Reading the catalogue" variant="row" count={4} />}
 
       {answered && rows.length === 0 && (
         <Teach title="No agent has been hired yet">

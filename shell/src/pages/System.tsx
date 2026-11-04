@@ -1,7 +1,9 @@
 import { useEffect, useState, type ComponentProps, type ReactNode } from "react";
 import { Link, useNavigate, useParams, useSearch } from "@tanstack/react-router";
 import { validateSystemSearch } from "./systemSearch";
-import { isApiRefusal } from "../data/client";
+import { apiFetch, isApiRefusal } from "../data/client";
+import { keys } from "../data/keys";
+import { registerPrefetcher } from "../lib/prefetch";
 import { formatBytes } from "../data/files";
 import { routeTriple, useRouteReport, type RoutePair } from "../data/route";
 import { NotchProviders } from "./NotchProviders";
@@ -83,6 +85,15 @@ import { ChannelsView } from "./ChannelsView";
 import { RestartSidecar } from "../channels/RestartSidecar";
 import { NotificationsView } from "./NotificationsView";
 import "./system.css";
+
+/** Hovering "System" in the sidebar warms the autopilot budget, the first reading on the page. */
+registerPrefetcher("/system", (qc) =>
+  qc.prefetchQuery({
+    queryKey: keys.autopilot.budget,
+    queryFn: () => apiFetch<BudgetView>("/autopilot/budget"),
+    staleTime: 5_000,
+  }),
+);
 import { DAEMON_NAME } from "../copy";
 import { percentText } from "../lib/format";
 import { plural } from "../lib/plural";
@@ -289,7 +300,7 @@ function SpendSummary() {
       {budget.isError && budget.data === undefined && (
         <SystemListError error={budget.error} what="the budget" />
       )}
-      {!budget.isError && budget.data === undefined && <Skeleton label="Reading the budget" />}
+      {!budget.isError && budget.data === undefined && <Skeleton label="Reading the budget" lines={2} />}
       {budget.data !== undefined && budget.data.paused && (
         <Notice tone="paused" role="status">
           Autonomous work is currently held: {budget.data.reason}
@@ -319,7 +330,7 @@ function HealthReadoutPanel({
   return (
     <Panel title="Subsystems">
       {health.data === undefined && !health.isError && (
-        <Skeleton label="Reading the subsystems" />
+        <Skeleton label="Reading the subsystems" variant="row" count={3} />
       )}
       {health.isError && health.data === undefined && (
         <HealthError error={health.error} />
@@ -484,7 +495,7 @@ function SidecarCardsPanel({
   return (
     <Panel title="Sidecars">
       {sidecars.data === undefined && !sidecars.isError && (
-        <Skeleton label="Reading the sidecars" />
+        <Skeleton label="Reading the sidecars" variant="row" count={3} />
       )}
       {sidecars.isError && sidecars.data === undefined && (
         <ErrorNote>
@@ -592,11 +603,11 @@ function ScopedKillsPanel() {
         (scheduled rules, repo triggers, e-mail triage) live on <Link to="/autopilot">Autopilot</Link>.
       </PanelNote>
       {kills.isError && kills.data === undefined && <SystemListError error={kills.error} what="the project brakes" />}
-      {!kills.isError && kills.data === undefined && <Skeleton label="Reading the project brakes" />}
+      {!kills.isError && kills.data === undefined && <Skeleton label="Reading the project brakes" variant="row" count={3} />}
       {projects.isError && projects.data === undefined && (
         <SystemListError error={projects.error} what="the projects" />
       )}
-      {!projects.isError && projects.data === undefined && <Skeleton label="Reading the projects" />}
+      {!projects.isError && projects.data === undefined && <Skeleton label="Reading the projects" variant="row" count={3} />}
       {projects.data !== undefined && projects.data.length > 0 && (
         <ul className="sy-brakes" aria-label="Project brakes">
           {projects.data.map((project) => {
@@ -777,7 +788,7 @@ function BudgetPanel() {
         <SystemListError error={budget.error} what="the budget" />
       )}
       {!budget.isError && budget.data === undefined && (
-        <Skeleton label="Reading the budget" />
+        <Skeleton label="Reading the budget" lines={2} />
       )}
       {budget.data !== undefined && budget.data.paused && (
         <Notice tone="paused" role="status">
@@ -1046,7 +1057,7 @@ function SpacePanel() {
       {storage.isError && space === undefined && (
         <SystemListError error={storage.error} what="the space readout" />
       )}
-      {!storage.isError && space === undefined && <Skeleton label="Reading the space used" />}
+      {!storage.isError && space === undefined && <Skeleton label="Reading the space used" lines={2} />}
       {space !== undefined && (
         <>
           <div className="sy-space-cards">
@@ -1212,7 +1223,7 @@ function BackupsPanel() {
         <SystemListError error={backups.error} what="the backups" />
       )}
       {!backups.isError && backups.data === undefined && (
-        <Skeleton label="Reading the backups" />
+        <Skeleton label="Reading the backups" variant="row" count={3} />
       )}
       {backups.data !== undefined && backups.data.length > 0 && (
         <Rows label="Backups">
@@ -1303,7 +1314,7 @@ function PiiObservations() {
   return (
     <Panel title="PII observations">
       {pii.isError && pii.data === undefined && <SystemListError error={pii.error} what="the PII tally" />}
-      {!pii.isError && pii.data === undefined && <Skeleton label="Reading the PII tally" />}
+      {!pii.isError && pii.data === undefined && <Skeleton label="Reading the PII tally" lines={2} />}
       {pii.data !== undefined && pii.data.length === 0 && <Quiet says="nothing recorded." />}
       {pii.data !== undefined && pii.data.length > 0 && (
         <Table label="PII observations">
@@ -1472,7 +1483,7 @@ function TokensPanel() {
         <SystemListError error={tokens.error} what="the API tokens" />
       )}
       {!tokens.isError && tokens.data === undefined && (
-        <Skeleton label="Reading the tokens" />
+        <Skeleton label="Reading the tokens" variant="row" count={3} />
       )}
       {tokens.data !== undefined && tokens.data.length === 0 && (
         <Quiet says="no token has been minted." />
@@ -1603,7 +1614,7 @@ function EmailConfigPanel() {
         <SystemListError error={email.error} what="the e-mail configuration" />
       )}
       {!email.isError && email.data === undefined && (
-        <Skeleton label="Reading the e-mail configuration" />
+        <Skeleton label="Reading the e-mail configuration" lines={2} />
       )}
       {email.data !== undefined && <EmailConfigFacts config={email.data} />}
     </Panel>
@@ -1667,7 +1678,7 @@ function VoiceConfigPanel() {
         <SystemListError error={voice.error} what="the voice configuration" />
       )}
       {!voice.isError && voice.data === undefined && (
-        <Skeleton label="Reading the voice configuration" />
+        <Skeleton label="Reading the voice configuration" lines={2} />
       )}
       {voice.data !== undefined && <VoiceConfigFacts config={voice.data} />}
     </Panel>
@@ -1716,7 +1727,7 @@ function CalendarConfigPanel() {
         />
       )}
       {!calendar.isError && calendar.data === undefined && (
-        <Skeleton label="Reading the calendar configuration" />
+        <Skeleton label="Reading the calendar configuration" lines={2} />
       )}
       {calendar.data !== undefined && (
         <CalendarConfigFacts config={calendar.data} />
