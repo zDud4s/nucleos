@@ -69,7 +69,12 @@ import {
   Th,
   readState,
   usd,
+  usePaletteGroup,
 } from "../ui";
+import { apiFetch } from "../data/client";
+import { keys } from "../data/keys";
+import { newIdempotencyKey } from "../lib/idempotency";
+import { registerPrefetcher } from "../lib/prefetch";
 import { whereWaiting } from "../data/roster";
 import {
   EASE,
@@ -116,6 +121,11 @@ const SECTIONS = [
   { id: "ap-records", label: "Records and feed" },
 ];
 const SECTION_IDS = SECTIONS.map((section) => section.id);
+
+// Hovering the rail link warms the roster the whole page is built from (#7).
+registerPrefetcher("/autopilot", (qc) =>
+  qc.prefetchQuery({ queryKey: keys.projects.all, queryFn: () => apiFetch<ProjectSummary[]>("/projects"), staleTime: 5_000 }),
+);
 
 /**
  * The section the reader is in: the first group, in page order, whose box crosses the top 40% of
@@ -216,6 +226,30 @@ export function Autopilot() {
   const focused = rows.find((row) => row.project_id === selected);
 
   const stale = projects.isError && projects.data !== undefined;
+
+  // Palette actions (#3/#4): jump to a section, or put a project in focus.
+  const paletteGroup = useMemo(
+    () => ({
+      id: "autopilot",
+      heading: "Autopilot",
+      items: [
+        ...SECTIONS.map((section) => ({
+          id: `autopilot.section.${section.id}`,
+          label: `Go to ${section.label}`,
+          match: `autopilot go to ${section.label}`,
+          run: () => document.getElementById(section.id)?.scrollIntoView({ block: "start" }),
+        })),
+        ...order.map((id) => ({
+          id: `autopilot.project.${id}`,
+          label: `Focus project ${id}`,
+          match: `autopilot focus project ${id}`,
+          run: () => setChosen(id),
+        })),
+      ],
+    }),
+    [order],
+  );
+  usePaletteGroup(paletteGroup);
 
   return (
     <>
@@ -1840,6 +1874,9 @@ function JobsPanel({
   const jobs = useLiveJobs();
   const create = useCreateJob();
   const [prompt, setPrompt] = useState("");
+  // One key per intent (#19): minted on the first click, reused by a retry after a failure, so a
+  // request that did land but whose answer was lost cannot start the job twice. Cleared on success.
+  const intentKey = useRef<string | null>(null);
   const live = jobs.data ?? [];
 
   const target = rows.find((row) => row.project_id === selected);
@@ -1869,7 +1906,11 @@ function JobsPanel({
           className="ap-field-input"
           rows={2}
           value={prompt}
-          onChange={(event) => setPrompt(event.target.value)}
+          onChange={(event) => {
+            // Editing the prompt is a new intent, so it gets a new key.
+            intentKey.current = null;
+            setPrompt(event.target.value);
+          }}
         />
         {/* Said before the click rather than after the 409, and right above the control it
             explains. A project that is off starts nothing, and one whose queue is full defers
@@ -1895,9 +1936,11 @@ function JobsPanel({
           intent="go"
           disabled={blocked || prompt.trim() === "" || create.isPending}
           onClick={() => {
-            if (selected === null) return;
+            if (selected === null || create.isPending) return;
+            intentKey.current ??= newIdempotencyKey();
             create.mutate(
               {
+                idempotencyKey: intentKey.current,
                 project_id: selected,
                 prompt: prompt.trim(),
                 budget_usd: null,
@@ -1908,7 +1951,12 @@ function JobsPanel({
                 // always started.
                 team_id: null,
               },
-              { onSuccess: () => setPrompt("") },
+              {
+                onSuccess: () => {
+                  intentKey.current = null;
+                  setPrompt("");
+                },
+              },
             );
           }}
         >

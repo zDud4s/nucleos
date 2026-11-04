@@ -1,7 +1,10 @@
-import type { ReactNode } from "react";
+import { useMemo, type ReactNode } from "react";
 import { Link, useSearch } from "@tanstack/react-router";
 import { countWaitingDecisions, useActionApprovals, useContactMerges, useExclusionRequests, useOpenTeamActions, useRecruitProposals, useTeamActionProposals, useVcsRequests, useVcsWaiting, useWheelRequests } from "../data/waiting";
-import { PageHeader, Tip } from "../ui";
+import { apiFetch } from "../data/client";
+import { keys } from "../data/keys";
+import { registerPrefetcher } from "../lib/prefetch";
+import { PageHeader, Tip, usePaletteGroup } from "../ui";
 import { type Reading, reading } from "./waiting/reading";
 import { QUEUES, type QueueText } from "./waiting/shared";
 import { WheelRequestSection } from "./waiting/WheelRequests";
@@ -12,6 +15,12 @@ import { ContactMergeSection } from "./waiting/ContactMerges";
 import { ExclusionRequestSection } from "./waiting/ExclusionRequests";
 import { GitQueuePanel } from "./waiting/GitQueue";
 import "./waiting.css";
+
+// Hovering the rail link warms the shared count the page's headline starts from (#7). The
+// per-queue lists are polled by their own hooks, which own their keys and shapes.
+registerPrefetcher("/waiting", (qc) =>
+  qc.prefetchQuery({ queryKey: keys.waiting.count, queryFn: () => apiFetch("/waiting/count"), staleTime: 5_000 }),
+);
 
 /**
  * Waiting — the one place a decision is asked for, whatever asked for it.
@@ -162,6 +171,26 @@ export function Waiting() {
   const filled = ordered
     .filter((section) => has(section.rows))
     .map((section) => ({ queue: section.queue, count: section.rows?.length ?? 0 }));
+
+  // Palette actions (#3/#4): jump to a queue that has something in it. The anchors are the same
+  // ones the index links use, so the move is a scroll and nothing else.
+  const paletteGroup = useMemo(
+    () => {
+      if (filled.length === 0) return null;
+      const items = filled.map(({ queue, count }) => ({
+        id: `waiting.jump.${queue.id}`,
+        label: `Go to ${queue.title}`,
+        match: `waiting go to ${queue.title}`,
+        hint: String(count),
+        run: () => document.getElementById(queue.id)?.scrollIntoView({ block: "start" }),
+      }));
+      return { id: "waiting", heading: "Waiting", items };
+    },
+    // `filled` is rebuilt every render; its content is what matters.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [filled.map((f) => `${f.queue.id}:${f.count}`).join("|")],
+  );
+  usePaletteGroup(paletteGroup);
 
   return (
     <>

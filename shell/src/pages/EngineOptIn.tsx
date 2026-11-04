@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { isApiRefusal } from "../data/client";
 import { useEngineOptIn, useSetEngineOptIn } from "../data/engines";
-import { Button, ErrorNote, Modal, RefusalNote, Switch } from "../ui";
+import { Button, ErrorNote, Modal, RefusalNote, Skeleton, Switch } from "../ui";
 import { DAEMON_NAME } from "../copy";
 
 /**
@@ -28,7 +28,9 @@ export function EngineOptIn({ engine, label }: { engine: string; label: string }
   return (
     <div className="sy-pref">
       <strong>{label}</strong>
-      {reading === undefined ? null : (
+      {reading === undefined ? (
+        state.isPending ? <Skeleton label={`Reading ${label}`} variant="line" width="12rem" /> : null
+      ) : (
         <>
           <Switch
             label={`Use ${label}`}

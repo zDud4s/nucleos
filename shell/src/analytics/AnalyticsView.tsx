@@ -159,7 +159,7 @@ function Readout({ data, failed, missing, updatedAt, global, quota, quotaFailed,
     if (missing && !global) return <Absent label="Analytics" why="No project by that name." />;
     if (failed || missing) return <ErrorNote onRetry={onRetry}>{unreachable("analytics")}</ErrorNote>;
     // Height reserved for the cards and the panel, so the page does not jump when they land.
-    return <Skeleton label="Loading analytics" lines={14} />;
+    return <Skeleton label="Loading analytics" variant="cards" count={6} />;
   }
   return (
     <>
