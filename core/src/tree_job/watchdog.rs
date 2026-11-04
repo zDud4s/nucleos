@@ -264,11 +264,9 @@ async fn check_node(state: &AppState, node_id: &str, job_id: &str) -> Result<(),
             let expired = last_beat(pool, node_id, &run_id)
                 .await
                 .is_some_and(|at| Utc::now() > at + Duration::seconds(LEASE_TTL_SECS));
-            if expired {
-                if let Ok(number) = run_id.parse::<i64>() {
-                    // Ending it makes it a run that died without a report: `wrap` starts the node again.
-                    finalize_termination(state, number, "interrupted").await;
-                }
+            if expired && let Ok(number) = run_id.parse::<i64>() {
+                // Ending it makes it a run that died without a report: `wrap` starts the node again.
+                finalize_termination(state, number, "interrupted").await;
             }
             Ok(())
         }
