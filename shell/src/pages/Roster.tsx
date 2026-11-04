@@ -18,6 +18,8 @@ import { Quiet } from "../ui/Quiet";
 import { RefusalNote } from "../ui/RefusalNote";
 import { SectionTitle } from "../ui/SectionTitle";
 import { Skeleton } from "../ui/Skeleton";
+import { Tip, usePaletteGroup } from "../ui";
+import { usePageKeys } from "../project/pageKeys";
 import { StaleNote } from "../ui/StaleNote";
 import { Teach } from "../ui/Teach";
 import { readState } from "../ui/state-map";
@@ -83,6 +85,16 @@ export function Roster() {
       ? left
       : null;
 
+  // #3/#4: the palette's "New project" and the key it prints.
+  const navigate = useNavigate();
+  const addProject = () => void navigate({ to: "/projects/new" });
+  usePaletteGroup({
+    id: "roster-actions",
+    heading: "Quick actions",
+    items: [{ id: "roster-new", label: "New project", match: "new project add register", shortcut: "N", run: addProject }],
+  });
+  usePageKeys({ n: addProject });
+
   return (
     <>
       <PageHeader
@@ -98,9 +110,13 @@ export function Roster() {
           // A button by look, a link by nature: it goes somewhere, so it stays an `<a href>` the
           // keyboard and a middle-click both understand, and wears the same ghost-go recipe as
           // New agent and New team so the three headers read alike.
-          <Link className="ui-button ui-button-ghost ui-button-go" to="/projects/new">
-            New project
-          </Link>
+          <Tip tip="Register a project" shortcut="N">
+            {({ tipId }) => (
+              <Link className="ui-button ui-button-ghost ui-button-go" to="/projects/new" aria-describedby={tipId}>
+                New project
+              </Link>
+            )}
+          </Tip>
         }
       />
 
@@ -121,7 +137,7 @@ export function Roster() {
         projects.isError ? (
           <RosterError error={projects.error} onRetry={() => void projects.refetch()} />
         ) : (
-          <Skeleton label="Loading the projects" lines={3} />
+          <Skeleton label="Loading the projects" variant="row" count={4} />
         )
       ) : rows.length === 0 ? (
         <Teach

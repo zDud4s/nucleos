@@ -39,7 +39,9 @@ import {
   Th,
   Tip,
   usd,
+  usePaletteGroup,
 } from "../ui";
+import { usePageKeys } from "../project/pageKeys";
 import "./teams.css";
 
 /** Hovering "Teams" in the sidebar warms the departments list under the key `useTeams` reads. */
@@ -121,20 +123,34 @@ export function Teams() {
   const actionsKnown = actions.data !== undefined;
   const readFailed = runs.isError || triggers.isError || actions.isError;
 
+  // #3/#4: the palette's "New team" and the key it prints.
+  const openCreate = () => setCreating(true);
+  usePaletteGroup({
+    id: "teams-actions",
+    heading: "Quick actions",
+    items: [{ id: "teams-new", label: "New team", match: "new team create", shortcut: "N", run: openCreate }],
+  });
+  usePageKeys({ n: openCreate }, !creating);
+
   return (
     <>
       <PageHeader
         title="Teams"
         headline={headlineFor(rows, allRuns, openActions, teams.data !== undefined, runsKnown && actionsKnown)}
         actions={
-          <Button
-            variant="approve"
-            intent="create"
-            onClick={() => setCreating(true)}
-            aria-haspopup="dialog"
-          >
-            New team
-          </Button>
+          <Tip tip="Charter a new team" shortcut="N">
+            {({ tipId }) => (
+              <Button
+                variant="approve"
+                intent="create"
+                onClick={() => setCreating(true)}
+                aria-haspopup="dialog"
+                aria-describedby={tipId}
+              >
+                New team
+              </Button>
+            )}
+          </Tip>
         }
       />
 
@@ -194,7 +210,7 @@ export function Teams() {
       {teams.data === undefined ? (
         // Still reading, or the read failed (the error is drawn above): never "No team yet",
         // which would say the teams are gone about a read that has not finished.
-        teams.isError ? null : <Skeleton label="Loading the teams" lines={4} />
+        teams.isError ? null : <Skeleton label="Loading the teams" variant="row" count={4} />
       ) : rows.length === 0 ? (
         <Teach title="No team yet">
           <p>

@@ -639,3 +639,9 @@
     border-color: CanvasText;
   }
 }
+
+/* #16: counters, durations, costs and figures stand in columns. */
+.fleet-stage,
+.fleet-ln-status {
+  font-variant-numeric: tabular-nums;
+}

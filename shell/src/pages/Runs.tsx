@@ -35,6 +35,8 @@ import {
 import { routeTriple } from "../data/route";
 import { keys } from "../data/keys";
 import { registerPrefetcher } from "../lib/prefetch";
+import { useGuardedAction } from "../lib/useGuardedAction";
+import { usePageKeys } from "../project/pageKeys";
 import { plural } from "../lib/plural";
 import { dayHeading, dayKey } from "../lib/timeline";
 import { useKillSwitch, useProjects, type ProjectSummary } from "../data/system";
@@ -51,6 +53,9 @@ import {
   RefusalNote,
   Section,
   Skeleton,
+  Tip,
+  useUndoable,
+  usePaletteGroup,
   RelativeTime,
   Row,
   Rows,
@@ -197,6 +202,18 @@ export function Runs() {
     setComposing(false);
   }
 
+  // #3/#4: the palette offers the page's two verbs, and the keys it prints are bound here.
+  const openComposer = () => setComposing(true);
+  usePaletteGroup({
+    id: "runs-actions",
+    heading: "Quick actions",
+    items: [
+      { id: "runs-new", label: "New run", match: "new run start", shortcut: "N", run: openComposer },
+      { id: "runs-fleet", label: "Open fleet", match: "open fleet", shortcut: "F", run: () => void navigate({ to: "/fleet" }) },
+    ],
+  });
+  usePageKeys({ n: openComposer, f: () => void navigate({ to: "/fleet" }) }, !composing);
+
   const started = (id: number) => void navigate({ to: `/runs/${id}` });
 
   return (
@@ -209,14 +226,19 @@ export function Runs() {
         // below, which carry their own roles.
         headline={headline(rows, filters, older.more)}
         actions={
-          <Button
-            id={openerId}
-            intent="go"
-            aria-haspopup="dialog"
-            onClick={() => setComposing(true)}
-          >
-            New run
-          </Button>
+          <Tip tip="Describe a job and start it" shortcut="N">
+            {({ tipId }) => (
+              <Button
+                id={openerId}
+                intent="go"
+                aria-haspopup="dialog"
+                aria-describedby={tipId}
+                onClick={() => setComposing(true)}
+              >
+                New run
+              </Button>
+            )}
+          </Tip>
         }
       />
 
@@ -1237,17 +1259,23 @@ function NewRunForm({
 
   const isReal = draft.mode === "real";
 
+  // #19: one press is one intent. A second press while the POST is in flight returns the same
+  // promise instead of starting a second run, and the intent's key rides as `Idempotency-Key` so a
+  // retried request cannot create a twin either.
+  const guard = useGuardedAction((intent) =>
+    create
+      .mutateAsync({ ...body, steerable: draft.steerable, idempotencyKey: intent.key })
+      .then((answer) => {
+        setDraft(EMPTY_DRAFT);
+        onStarted(answer.id);
+      })
+      // The refusal is drawn from `create.error` below; nothing more to do with it here.
+      .catch(() => undefined),
+  );
+
   function start() {
-    if (blank || create.isPending) return;
-    create.mutate(
-      { ...body, steerable: draft.steerable },
-      {
-        onSuccess: (answer) => {
-          setDraft(EMPTY_DRAFT);
-          onStarted(answer.id);
-        },
-      },
-    );
+    if (blank || create.isPending || guard.pending) return;
+    void guard.run();
   }
 
   const describedBy =
@@ -1351,7 +1379,7 @@ function NewRunForm({
               sayAs="starts a real run, acting on the files in the working directory as they are"
               variant="approve"
               intent="go"
-              disabled={blank || create.isPending}
+              disabled={blank || create.isPending || guard.pending}
               describedBy={[describedBy, realId].filter(Boolean).join(" ")}
               onConfirm={start}
             />
@@ -1360,7 +1388,7 @@ function NewRunForm({
               type="submit"
               variant="primary"
               intent="go"
-              disabled={blank || create.isPending}
+              disabled={blank || create.isPending || guard.pending}
               aria-describedby={describedBy}
             >
               Start run
@@ -1476,11 +1504,22 @@ function PresetsList({ onStarted }: { onStarted: (id: number) => void }) {
   const presets = usePresets();
   const run = useRunPreset();
   const remove = useDeletePreset();
-  const saved = presets.data;
+  const undoable = useUndoable();
+  // #5: deleting a preset destroys a name, not work, so it is a delayed commit with Undo rather than
+  // an interlock: the row leaves at once, and the DELETE goes out when the window closes unanswered.
+  const [hidden, setHidden] = useState<ReadonlySet<number>>(new Set());
+  const setHiding = (id: number, hide: boolean) =>
+    setHidden((was) => {
+      const next = new Set(was);
+      if (hide) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+  const saved = presets.data?.filter((preset) => !hidden.has(preset.id));
 
   return (
     <Section label="Start from a preset">
-      {saved === undefined && <Quiet says="reading the saved requests…" />}
+      {saved === undefined && <Skeleton label="Reading the saved requests" variant="row" count={2} />}
       {saved !== undefined && saved.length === 0 && (
         <Quiet says="no saved requests">
           <p>
@@ -1501,7 +1540,18 @@ function PresetsList({ onStarted }: { onStarted: (id: number) => void }) {
                   onSuccess: (answer) => onStarted(answer.id),
                 })
               }
-              onDelete={() => remove.mutate(preset.id)}
+              onDelete={() => {
+                setHiding(preset.id, true);
+                undoable.run({
+                  message: `Deleted preset ${preset.name}`,
+                  onUndo: () => setHiding(preset.id, false),
+                  commit: () =>
+                    remove.mutateAsync(preset.id).catch(() => {
+                      // Refused: the row comes back and the note below says why.
+                      setHiding(preset.id, false);
+                    }),
+                });
+              }}
             />
           ))}
         </Rows>
@@ -1515,6 +1565,7 @@ function PresetsList({ onStarted }: { onStarted: (id: number) => void }) {
           what="that preset could not be deleted"
         />
       )}
+      {undoable.toast}
     </Section>
   );
 }
@@ -1572,12 +1623,9 @@ function PresetRow({
             Run {preset.name}
           </Button>
         )}
-        <ConfirmButton
-          label={`Delete ${preset.name}`}
-          confirmLabel={`Delete ${preset.name} for good`}
-          variant="quiet"
-          onConfirm={onDelete}
-        />
+        <Button variant="quiet" onClick={onDelete}>
+          Delete {preset.name}
+        </Button>
       </div>
     </Row>
   );

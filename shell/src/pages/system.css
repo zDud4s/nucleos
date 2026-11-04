@@ -1124,3 +1124,14 @@ p.sy-notify-pop {
 .sy-notify-kind > .ui-switch-field {
   margin-left: auto;
 }
+
+/* #16: counters, durations, costs and figures stand in columns. */
+.sy-budget-spend,
+.sy-sidecar-when,
+.sy-backup-when,
+.sy-subsystem-counts,
+.sy-token-meta,
+.sy-backup-meta,
+.sy-router-total dd {
+  font-variant-numeric: tabular-nums;
+}

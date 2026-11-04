@@ -4815,3 +4815,30 @@ button.agent-card:hover {
 .chats-log {
   display: contents;
 }
+
+/* #16: counters, durations, costs and figures stand in columns. */
+.chats-turn-elapsed,
+.chats-changes-counts,
+.chats-row-when,
+.chats-turn-foot,
+.agent-card-meta,
+.agent-detail-facts {
+  font-variant-numeric: tabular-nums;
+}
+
+/* #13: `.hit-area` sets `position: relative`; this one is pinned to its picture. */
+.chats-attached-drop.hit-area {
+  position: absolute;
+}
+
+.chats-rail-actions > .chats-rail-tip {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.chats-rail-tip > .chats-rail-new {
+  width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  padding-inline: var(--space-2);
+}
