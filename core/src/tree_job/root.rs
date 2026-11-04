@@ -1,6 +1,9 @@
 //! Tree-job root node handling: the top-level node of a job. `start` gives it a worktree on its own
 //! git branch, `tree/<id>/root` cut from the feature branch, and launches the run that plans the job.
 
+use serde_json::{Value, json};
+
+use super::decisions;
 use super::http::job_lock;
 use super::model::Branch;
 use super::open;
@@ -135,12 +138,168 @@ async fn drop_unopened_root_branch(state: &AppState, job_id: &str) {
     }
 }
 
+/// `manifest.extra` key of a root start that failed: `{ "attempts", "error", "at" }`, plus
+/// `decision_id` once the owner was asked. `start` writes it on a failure and removes it on a
+/// success; `retry_failed_starts` reads it.
+pub(super) const ROOT_START_KEY: &str = "root_start";
+/// Failed starts of a root (the route's own first try included) before the owner is asked.
+const ROOT_START_CAP: u64 = 5;
+
 /// Starts the root run of `job`: the `root` branch, its worktree on `tree/<id>/root`, the root node
 /// bound to it, and one `worktree` run in that worktree under the launch key `root-<id>`. Every step
 /// replays, so calling it again after a failure finishes the missing ones and never starts a second
 /// run. It takes the job lock itself (in `open_branch` and `bind_branch`), so the caller must not
 /// hold it. Answers the run id.
+///
+/// A failure is recorded on the job (`ROOT_START_KEY`), so the sweep starts the root again
+/// (`retry_failed_starts`) instead of leaving an open job that nothing moves.
 pub async fn start(state: &AppState, job: &TreeJob) -> Result<i64, String> {
+    let outcome = start_steps(state, job).await;
+    note_start(state, &job.id, &outcome).await;
+    outcome
+}
+
+/// Records a failed start on the job, one attempt more, or removes the record after a success.
+/// Best effort: a failed write is logged, and the start's own outcome stays the answer.
+async fn note_start(state: &AppState, job_id: &str, outcome: &Result<i64, String>) {
+    edit_start_record(state, job_id, |extra| match outcome {
+        Ok(_) => extra.remove(ROOT_START_KEY).is_some(),
+        Err(error) => {
+            let record = extra
+                .entry(ROOT_START_KEY.to_owned())
+                .or_insert_with(|| json!({}));
+            if !record.is_object() {
+                *record = json!({});
+            }
+            let attempts = record["attempts"].as_u64().unwrap_or(0) + 1;
+            record["attempts"] = json!(attempts);
+            record["error"] = json!(error);
+            record["at"] = json!(chrono::Utc::now().to_rfc3339());
+            true
+        }
+    })
+    .await;
+}
+
+/// Applies `edit` to the job's `manifest.extra` under the job's lock, and writes the job when
+/// `edit` answers that it changed something. Best effort, logged.
+async fn edit_start_record(
+    state: &AppState,
+    job_id: &str,
+    edit: impl FnOnce(&mut std::collections::BTreeMap<String, Value>) -> bool,
+) {
+    let lock = job_lock(job_id);
+    let _guard = lock.lock().await;
+    let mut job = match store::load(&state.pool, job_id).await {
+        Ok(Some(job)) => job,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(job = job_id, %error, "could not read the job to record its root start");
+            return;
+        }
+    };
+    if !edit(&mut job.manifest.extra) {
+        return;
+    }
+    job.updated_at = chrono::Utc::now().to_rfc3339();
+    if let Err(error) = store::update(&state.pool, &job).await {
+        tracing::warn!(job = job_id, %error, "could not record the root start of the job");
+    }
+}
+
+/// Starts again the root of every unfinished job whose start failed (its `ROOT_START_KEY` record).
+/// The sweep calls it every tick, through `wrap::tick`. Past `ROOT_START_CAP` failed attempts the
+/// owner is asked once on the root (`decisions::park_or_ask`), and nothing is tried while that
+/// question is open; its answer is a fresh allowance. A failure on one job is logged and stops no
+/// other.
+pub async fn retry_failed_starts(state: &AppState) {
+    let jobs = match store::list_non_terminal(&state.pool).await {
+        Ok(jobs) => jobs,
+        Err(error) => {
+            tracing::warn!(%error, "could not list the jobs whose root start failed");
+            return;
+        }
+    };
+    for job in jobs {
+        let Some(record) = job.manifest.extra.get(ROOT_START_KEY).cloned() else {
+            continue;
+        };
+        if let Err(error) = retry_failed_start(state, &job, &record).await {
+            tracing::warn!(job = %job.id, %error, "could not retry the root start");
+        }
+    }
+}
+
+async fn retry_failed_start(state: &AppState, job: &TreeJob, record: &Value) -> Result<(), String> {
+    let pool = &state.pool;
+    let run: Option<Option<String>> =
+        sqlx::query_scalar("SELECT run_id FROM work_nodes WHERE id = ?")
+            .bind(&job.root_node_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|error| error.to_string())?;
+    match run {
+        None => return Ok(()),
+        // Started meanwhile (an answer's relaunch, say): the record is stale.
+        Some(Some(_)) => {
+            edit_start_record(state, &job.id, |extra| extra.remove(ROOT_START_KEY).is_some())
+                .await;
+            return Ok(());
+        }
+        Some(None) => {}
+    }
+    if let Some(decision) = record.get("decision_id").and_then(Value::as_str) {
+        let status: Option<String> = sqlx::query_scalar("SELECT status FROM decisions WHERE id = ?")
+            .bind(decision)
+            .fetch_optional(pool)
+            .await
+            .map_err(|error| error.to_string())?;
+        if status.as_deref() == Some(decisions::STATUS_OPEN) {
+            return Ok(());
+        }
+        // Answered: a fresh allowance of attempts.
+        edit_start_record(state, &job.id, |extra| {
+            match extra.get_mut(ROOT_START_KEY).and_then(Value::as_object_mut) {
+                Some(record) => {
+                    record.remove("decision_id");
+                    record.insert("attempts".to_owned(), json!(0));
+                    true
+                }
+                None => false,
+            }
+        })
+        .await;
+    } else {
+        let attempts = record["attempts"].as_u64().unwrap_or(0);
+        if attempts >= ROOT_START_CAP {
+            let error = record["error"].as_str().unwrap_or("unknown");
+            let question = format!(
+                "The root of tree job {} did not start after {attempts} tries (last error: \
+                 {error}). Fix the cause and answer to try again, or say how the job should go on.",
+                job.id
+            );
+            let asked = decisions::park_or_ask(pool, &job.id, &job.root_node_id, &question)
+                .await
+                .map_err(|error| error.to_string())?;
+            if let Some(asked) = asked {
+                edit_start_record(state, &job.id, |extra| {
+                    match extra.get_mut(ROOT_START_KEY).and_then(Value::as_object_mut) {
+                        Some(record) => {
+                            record.insert("decision_id".to_owned(), json!(asked.id));
+                            true
+                        }
+                        None => false,
+                    }
+                })
+                .await;
+            }
+            return Ok(());
+        }
+    }
+    start(state, job).await.map(|_| ())
+}
+
+async fn start_steps(state: &AppState, job: &TreeJob) -> Result<i64, String> {
     let id = job.id.as_str();
     add_root_branch(state, id).await?;
     let config = open::open_config(&job.manifest.project_root).await;
