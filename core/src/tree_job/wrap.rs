@@ -1076,7 +1076,11 @@ mod tests {
 
         tick(&state).await;
 
-        assert_eq!(launches(&state, NODE, "died-").await, 2, "no died link spent");
+        assert_eq!(
+            launches(&state, NODE, "died-").await,
+            2,
+            "no died link spent"
+        );
         assert_eq!(all_launches(&state, NODE).await, 3, "one new launch");
         let (branch, asked) = parked_and_asked(&state).await;
         assert_eq!(branch, "building", "not parked: {asked:?}");
@@ -1093,7 +1097,11 @@ mod tests {
         seed_rate_limited_run(&state, 62, chrono::Duration::seconds(1)).await;
 
         tick(&state).await;
-        assert_eq!(all_launches(&state, NODE).await, 0, "still inside the backoff");
+        assert_eq!(
+            all_launches(&state, NODE).await,
+            0,
+            "still inside the backoff"
+        );
 
         sqlx::query("UPDATE runs SET completed_at = ? WHERE id = 62")
             .bind((chrono::Utc::now() - chrono::Duration::minutes(10)).to_rfc3339())
@@ -1102,7 +1110,11 @@ mod tests {
             .unwrap();
         tick(&state).await;
 
-        assert_eq!(all_launches(&state, NODE).await, 1, "relaunched once it passed");
+        assert_eq!(
+            all_launches(&state, NODE).await,
+            1,
+            "relaunched once it passed"
+        );
         assert_eq!(launches(&state, NODE, "died-").await, 0);
     }
 
@@ -1124,7 +1136,11 @@ mod tests {
         let (branch, asked) = parked_and_asked(&state).await;
         assert_eq!(branch, "parked");
         assert_eq!(asked.len(), 1, "asked once: {asked:?}");
-        assert!(asked[0].to_lowercase().contains("api error"), "{:?}", asked[0]);
+        assert!(
+            asked[0].to_lowercase().contains("api error"),
+            "{:?}",
+            asked[0]
+        );
     }
 
     /// The owner's answer is a fresh allowance, as it is for the fix cap: died links from before
@@ -1152,7 +1168,12 @@ mod tests {
         let state = state().await;
         seed_node(&state, Some("building"), "open", NODE, Some(65)).await;
         seed_launch(&state, NODE).await;
-        for key in ["wrap-old-1", "wrap-old-2", "wrap-old-3", "decision-d-answered"] {
+        for key in [
+            "wrap-old-1",
+            "wrap-old-2",
+            "wrap-old-3",
+            "decision-d-answered",
+        ] {
             prior_link(&state, NODE, key).await;
         }
         seed_run(&state, 65, "interrupted").await;

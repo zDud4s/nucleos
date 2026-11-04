@@ -255,7 +255,10 @@ async fn check_node(state: &AppState, node_id: &str, job_id: &str) -> Result<(),
         None => Ok(()),
         Some(None) => relaunch_orphan(state, job_id, node_id).await,
         Some(Some(run_id)) => {
-            if !run_is_live(pool, &run_id).await.map_err(|e| e.to_string())? {
+            if !run_is_live(pool, &run_id)
+                .await
+                .map_err(|e| e.to_string())?
+            {
                 return Ok(()); // a dead run is `wrap`'s
             }
             let expired = last_beat(pool, node_id, &run_id)
@@ -286,11 +289,9 @@ async fn relaunch_orphan(state: &AppState, job_id: &str, node_id: &str) -> Resul
         .await?
         .map_or(0, |(failures, _, _)| failures);
     let outcome = match latest_launch(pool, node_id).await {
-        Ok(Some(_)) => {
-            relaunch_node(state, node_id, "none", &format!("orphan-{failures}"), None)
-                .await
-                .map(|_| ())
-        }
+        Ok(Some(_)) => relaunch_node(state, node_id, "none", &format!("orphan-{failures}"), None)
+            .await
+            .map(|_| ()),
         Ok(None) => Err("the node has no run and no launch was stored".to_owned()),
         Err(error) => Err(error.to_string()),
     };
@@ -408,7 +409,12 @@ mod tests {
     }
 
     async fn branch_state(state: &AppState) -> String {
-        store::load(&state.pool, JOB).await.unwrap().unwrap().manifest.branches["branch"]
+        store::load(&state.pool, JOB)
+            .await
+            .unwrap()
+            .unwrap()
+            .manifest
+            .branches["branch"]
             .state
             .clone()
     }
@@ -481,11 +487,13 @@ mod tests {
     async fn a_live_run_with_an_expired_lease_is_ended_and_a_fresh_one_is_kept() {
         let state = state().await;
         seed_node(&state, Some(51)).await;
-        sqlx::query("INSERT INTO runs (id, prompt, status, created_at) VALUES (51, 'p', 'running', ?)")
-            .bind(OLD)
-            .execute(&state.pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO runs (id, prompt, status, created_at) VALUES (51, 'p', 'running', ?)",
+        )
+        .bind(OLD)
+        .execute(&state.pool)
+        .await
+        .unwrap();
         beat(&state.pool, NODE).await.unwrap();
 
         sweep(&state).await;
