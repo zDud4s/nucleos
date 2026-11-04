@@ -196,6 +196,18 @@
   with meetings in it bulged, pushing Saturday off the right-hand edge of the
   panel. Nothing in jsdom can see that, because jsdom computes no layout at all.
 */
+/* Day numbers, gutter hours and event clocks hold one width (#16). */
+.calendar-day-number,
+.calendar-week-head-number,
+.calendar-chip-clock,
+.calendar-gutter-hour,
+.calendar-block-clock,
+.calendar-occurrence-clock,
+.calendar-draft-when,
+.calendar-day-more {
+  font-variant-numeric: tabular-nums;
+}
+
 .calendar-weekdays {
   display: grid;
   grid-template-columns: repeat(7, minmax(0, 1fr));

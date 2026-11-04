@@ -1,5 +1,5 @@
 // §spec calendario-local
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import { ChevronLeft, ChevronRight } from "lucide-react";
 import { DaySheet } from "../calendar/DaySheet";
@@ -35,6 +35,8 @@ import {
   Section,
   Skeleton,
   StaleNote,
+  usePaletteGroup,
+  type PaletteGroup,
 } from "../ui";
 import "./calendar.css";
 
@@ -316,6 +318,54 @@ export function Calendar() {
         : new Date(anchor.getFullYear(), anchor.getMonth() + direction, 1),
     );
   }
+
+  // Palette actions (#3/#4). The group is built once; the closures it calls are read off a ref
+  // refreshed each render, so it never re-registers. The key chips are only hints: the listener
+  // below binds them and ignores typing in fields and chorded keys.
+  const actions = useRef({
+    prev: () => step(-1),
+    next: () => step(1),
+    today: () => goTo(view === "week" ? new Date() : startOfMonth(new Date())),
+    month: () => switchTo("month"),
+    week: () => switchTo("week"),
+  });
+  actions.current = {
+    prev: () => step(-1),
+    next: () => step(1),
+    today: () => goTo(view === "week" ? new Date() : startOfMonth(new Date())),
+    month: () => switchTo("month"),
+    week: () => switchTo("week"),
+  };
+  const paletteGroup = useMemo<PaletteGroup>(
+    () => ({
+      id: "calendar",
+      heading: "Calendar",
+      items: [
+        { id: "calendar-today", label: "Go to today", match: "calendar today go to", shortcut: "T", run: () => actions.current.today() },
+        { id: "calendar-prev", label: "Previous period", match: "calendar previous back period", shortcut: "[", run: () => actions.current.prev() },
+        { id: "calendar-next", label: "Next period", match: "calendar next forward period", shortcut: "]", run: () => actions.current.next() },
+        { id: "calendar-month", label: "Month view", match: "calendar month view", shortcut: "M", run: () => actions.current.month() },
+        { id: "calendar-week", label: "Week view", match: "calendar week view", shortcut: "W", run: () => actions.current.week() },
+      ],
+    }),
+    [],
+  );
+  usePaletteGroup(paletteGroup);
+  useEffect(() => {
+    function onKey(event: KeyboardEvent) {
+      if (event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey) return;
+      const target = event.target as HTMLElement | null;
+      if (target !== null && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName))) return;
+      const a = actions.current;
+      if (event.key === "t") a.today();
+      else if (event.key === "[") a.prev();
+      else if (event.key === "]") a.next();
+      else if (event.key === "m") a.month();
+      else if (event.key === "w") a.week();
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   const label =
     view === "week"
