@@ -1,5 +1,5 @@
 import { formatBytes, useFileSearch, type Hit } from "../../data/files";
-import { Button, Count, Panel, Quiet, RelativeTime, Row, Rows, StaleNote } from "../../ui";
+import { Button, Count, Panel, Quiet, RelativeTime, Row, Rows, Skeleton, StaleNote } from "../../ui";
 import { RefusalOrError, SEARCH_SENTENCES } from "./shared";
 
 /* -------------------------------------------------------------- search -- */
@@ -31,7 +31,7 @@ export function SearchResults({
           marks a stale listing — they may no longer be where they say. */}
       {result.isError && result.data !== undefined && <StaleNote dataUpdatedAt={result.dataUpdatedAt} />}
       {result.isError && <RefusalOrError error={result.error} sentences={SEARCH_SENTENCES} what="that search did not go through" />}
-      {!result.isError && result.data === undefined && <p className="fi-loading">Searching…</p>}
+      {!result.isError && result.data === undefined && <Skeleton label="Searching…" variant="row" count={3} />}
       {/* The one-line absence, and `Quiet` rather than `.fi-loading`'s faint:
           here the sentence IS what the panel has to say, and an answer set
           fainter than the labels around it reads as failure rather than as
