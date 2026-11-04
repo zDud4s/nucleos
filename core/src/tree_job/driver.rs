@@ -58,7 +58,8 @@ const FINDINGS_MAX: usize = 3000;
 
 /// What a gate measured for one branch. `Err` from a [`GateFn`] means nothing was measured (see
 /// [`NotMeasured`]), so the branch stays where it was. `retry::apply_gate_answer` records it:
-/// `Green` and `Red` as measured, `NothingRan` as green unmeasured.
+/// `Green` and `Red` as measured, `NothingRan` as green unmeasured, `Inherited` as green with the
+/// base's incident named.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum GateVerdict {
     Green,
@@ -67,6 +68,11 @@ pub(super) enum GateVerdict {
     },
     /// The test map selects no unit for the branch's diff: nothing ran, so nothing could fail.
     NothingRan,
+    /// Red, but every failed test is already red on the base, under the master incident `note`
+    /// names (`verify::inherit::inherited_red`): not the branch's failure, so no fix is spent on it.
+    Inherited {
+        note: String,
+    },
 }
 
 /// Why a gate has no verdict for a branch.
@@ -1857,6 +1863,42 @@ mod tests {
         let last = api.gates.last().expect("the verdict is recorded");
         assert_eq!(last["verdict"], json!("green"));
         assert_eq!(last["unmeasured"], json!(true), "{last}");
+        fx.tick(JOB, &gate).await;
+        assert_eq!(fx.requests().await, 1, "the branch goes on to its merge");
+        assert_eq!(gate.calls().len(), 1);
+        assert_eq!(count_of(&fx, "decisions").await, 0, "nobody was asked");
+    }
+
+    #[tokio::test]
+    async fn an_inherited_red_turns_the_branch_green_without_spending_a_fix() {
+        const JOB: &str = "drv-inherited";
+        const NODE: &str = "api-node";
+        let fx = Fixture::new().await;
+        gated_job(&fx, JOB, NODE).await;
+        let gate = FakeGate::answering(vec![GateVerdict::Inherited {
+            note: "incident #4 (open, nobody has claimed it)".to_owned(),
+        }]);
+
+        fx.tick(JOB, &gate).await;
+        wait_calls(&gate, 1).await;
+        fx.wait_branch_state(JOB, "api", "green").await;
+
+        let api = fx.branch(JOB, "api").await;
+        let last = api.gates.last().expect("the verdict is recorded");
+        assert_eq!(last["verdict"], json!("green"));
+        assert!(
+            last["inherited"].as_str().is_some_and(|note| note.contains("#4")),
+            "{last}"
+        );
+        let fixes: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tree_launches WHERE node_id = ? AND key LIKE ?",
+        )
+        .bind(NODE)
+        .bind(format!("{FIX_PREFIX}%"))
+        .fetch_one(&fx.state.pool)
+        .await
+        .unwrap();
+        assert_eq!(fixes, 0, "no fix is spent on the base's red");
         fx.tick(JOB, &gate).await;
         assert_eq!(fx.requests().await, 1, "the branch goes on to its merge");
         assert_eq!(gate.calls().len(), 1);

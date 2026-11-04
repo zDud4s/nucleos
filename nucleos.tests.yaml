@@ -22,6 +22,9 @@ tests:
         # sidecars and shell groups' path prefixes.
         - paths: [core/src/remote.rs, core/src/http/remote.rs]
           expr: 'test(/^remote::/) | test(/^http::remote::/)'
+        # The model adapters and the routing advice built on them.
+        - paths: [core/src/models.rs, core/src/models/**]
+          expr: 'test(/^models::/)'
     sidecars:
       paths: [sidecars/, scripts/build-sidecars.sh]
       command: bash scripts/gates.sh sidecars

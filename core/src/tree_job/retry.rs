@@ -43,7 +43,9 @@ async fn persist(pool: &SqlitePool, job: &mut TreeJob) -> Result<(), String> {
 
 /// Records what a finished gate task answered for `branch`, under the job's lock (the caller holds
 /// it). Green and red are applied and reset the count of unmeasured gates. `NothingRan` is green
-/// unmeasured: no unit agrees with the diff, so nothing could fail, and the entry says so. A gate
+/// unmeasured: no unit agrees with the diff, so nothing could fail, and the entry says so.
+/// `Inherited` is green too, with the base's incident on the entry: its red is master's, so it is
+/// neither blamed on the branch nor spent from the fix cap. A gate
 /// that ended without measuring counts one; at [`GATE_ATTEMPTS`] the answer is a park, which the
 /// caller asks outside the lock. A ticket still running is never counted. A branch that moved on
 /// while the gate ran (parked, dropped) takes nothing.
@@ -54,7 +56,7 @@ pub(super) async fn apply_gate_answer(
     answer: Result<GateVerdict, NotMeasured>,
 ) -> Result<Option<Park>, String> {
     let scope = match &answer {
-        Ok(GateVerdict::Green | GateVerdict::NothingRan) => {
+        Ok(GateVerdict::Green | GateVerdict::NothingRan | GateVerdict::Inherited { .. }) => {
             ScopeVerdict::Measured(GateOutcome::Passed)
         }
         Ok(GateVerdict::Red { summary }) => ScopeVerdict::Measured(GateOutcome::Failed {
@@ -100,14 +102,19 @@ pub(super) async fn apply_gate_answer(
         answer => {
             held.extra.remove(GATE_FAILURES);
             apply_gate_verdict(held, &scope).map_err(|e| e.to_string())?;
-            if let Ok(GateVerdict::NothingRan) = answer
-                && let Some(entry) = held.gates.last_mut().and_then(Value::as_object_mut)
-            {
-                entry.insert("unmeasured".to_owned(), json!(true));
-                entry.insert(
-                    "reason".to_owned(),
-                    json!("no test unit agrees with the branch's diff, so nothing ran"),
-                );
+            let entry = held.gates.last_mut().and_then(Value::as_object_mut);
+            match (answer, entry) {
+                (Ok(GateVerdict::NothingRan), Some(entry)) => {
+                    entry.insert("unmeasured".to_owned(), json!(true));
+                    entry.insert(
+                        "reason".to_owned(),
+                        json!("no test unit agrees with the branch's diff, so nothing ran"),
+                    );
+                }
+                (Ok(GateVerdict::Inherited { note }), Some(entry)) => {
+                    entry.insert("inherited".to_owned(), json!(note));
+                }
+                _ => {}
             }
         }
     }

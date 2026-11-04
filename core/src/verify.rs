@@ -338,6 +338,30 @@ pub async fn submit(
     Ok(id)
 }
 
+/// The gate of one branch of a tree job: a job's `test`/`scope` request whose groups' `filters`
+/// narrow it, as they narrow a session's own run, so a branch touching one filtered module runs
+/// that module's tests instead of its whole group. The tree's own land still measures every group
+/// whole, so the narrowed run only has to tell the branch's own break early. A narrowed run is no
+/// evidence that a tree is green: it records no measured tree (F3-12). Anything else is refused
+/// before a row exists.
+pub async fn submit_narrowed(
+    executor: &Arc<Executor>,
+    caller: Caller,
+    args: &VerifyArgs,
+) -> Result<i64, VerifyError> {
+    if !matches!(caller, Caller::Job(_))
+        || args.kind != Kind::Test
+        || args.scope != ScopeArg::Scope
+        || args.cover
+    {
+        return Err(VerifyError::BadRequest(
+            "only a tree branch's test/scope gate may be narrowed".into(),
+        ));
+    }
+    let (id, _) = submit_with(executor, caller, args, true).await?;
+    Ok(id)
+}
+
 /// Whether `worktree`'s test map is, right now, the one `project_id`'s root holds
 /// (`job::map_is_trusted`). `false` on any doubt: no root recorded, an unreadable record, a join
 /// error.
@@ -365,6 +389,16 @@ async fn submit_checked(
     executor: &Arc<Executor>,
     caller: Caller,
     args: &VerifyArgs,
+) -> Result<(i64, bool), VerifyError> {
+    submit_with(executor, caller, args, false).await
+}
+
+/// `submit_checked`; `narrow` lets the groups' `filters` narrow a gate (`submit_narrowed`).
+async fn submit_with(
+    executor: &Arc<Executor>,
+    caller: Caller,
+    args: &VerifyArgs,
+    narrow: bool,
 ) -> Result<(i64, bool), VerifyError> {
     let pool = &executor.pool;
     // Naming groups is the daemon's probe alone: refused before any row or git read.
@@ -446,7 +480,8 @@ async fn submit_checked(
             "cover needs the project root's test map in this worktree, unchanged".to_owned(),
         ));
     }
-    let submitted_tree = submitted_tree.filter(|_| map_trusted);
+    // A narrowed run measures part of a group, which vouches for no tree.
+    let submitted_tree = submitted_tree.filter(|_| map_trusted && !narrow);
     if !map_trusted && args.kind == Kind::Test && args.scope == ScopeArg::Scope {
         tracing::info!("verify: the test map is not the root's at submit; no tree is recorded");
     }
@@ -516,10 +551,12 @@ async fn submit_checked(
             &fillable,
             rules.gate_command.as_deref(),
             true,
-            // Filters narrow only a session's own iteration run. A scope run (the daemon's item
-            // and merge gates, the evidence a green run leaves for a tip) and any daemon caller
-            // measure the whole group.
-            args.scope == ScopeArg::Own && matches!(caller, Caller::Owner | Caller::Run(_)),
+            // Filters narrow only a session's own iteration run and a tree branch's gate
+            // (`submit_narrowed`). A scope run (the daemon's item and merge gates, the evidence a
+            // green run leaves for a tip) and any other daemon caller measure the whole group.
+            narrow
+                || (args.scope == ScopeArg::Own
+                    && matches!(caller, Caller::Owner | Caller::Run(_))),
         ),
     };
     let plan = planned.map_err(|error| match error {
@@ -3454,6 +3491,137 @@ tests:
                 .await
                 .unwrap();
         assert_eq!(stored, None, "nothing was written for a daemon caller");
+    }
+
+    // ---- a tree branch's gate: whose red the master incident already holds --------------------
+
+    /// A job's `test`/`scope` ticket over the fixture's last commit, finished.
+    async fn tree_gate_ticket(f: &Fixture) -> Ticket {
+        let request = args(Kind::Test, ScopeArg::Scope, f.repo.path(), None, Some(&f.c1));
+        let id = submit(&f.ex, Caller::Job(1), &request).await.unwrap();
+        let (ticket, _) = finished_with(f, id).await;
+        assert_eq!(
+            ticket.verdict.as_deref(),
+            Some("failed"),
+            "a daemon caller's ticket is not reclassified: {ticket:?}"
+        );
+        ticket
+    }
+
+    #[tokio::test]
+    async fn a_tree_gate_red_whose_tests_the_master_incident_holds_is_inherited() {
+        let f = fixture(Some(&red_map("core", &["a::boom"])), None, true).await;
+        let incident = seed_incident(
+            &f.pool,
+            SeedIncident {
+                red_tests: &["a::boom", "a::bang"],
+                since: Some(&f.c1),
+                checked: Some(&f.c2),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let ticket = tree_gate_ticket(&f).await;
+        let note = inherit::inherited_red(&f.pool, &ticket, chrono::Utc::now()).await;
+        assert!(
+            note.as_deref()
+                .is_some_and(|note| note.contains(&format!("#{incident}"))),
+            "{note:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tree_gate_red_with_a_test_master_does_not_fail_stays_the_branch_s() {
+        let f = fixture(Some(&red_map("core", &["a::boom", "a::mine"])), None, true).await;
+        seed_incident(
+            &f.pool,
+            SeedIncident {
+                red_tests: &["a::boom"],
+                since: Some(&f.c1),
+                checked: Some(&f.c2),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let ticket = tree_gate_ticket(&f).await;
+        assert_eq!(
+            inherit::inherited_red(&f.pool, &ticket, chrono::Utc::now()).await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tree_gate_red_without_a_master_incident_stays_the_branch_s() {
+        let f = fixture(Some(&red_map("core", &["a::boom"])), None, true).await;
+        let ticket = tree_gate_ticket(&f).await;
+        assert_eq!(
+            inherit::inherited_red(&f.pool, &ticket, chrono::Utc::now()).await,
+            None
+        );
+    }
+
+    // ---- a tree branch's gate: narrowed by the group's filters ----------------------------------
+
+    /// `core` with a `select` and one filter over `core/a.rs`, the path the fixture's last commit
+    /// changes.
+    fn filtered_core_map() -> String {
+        map_with(
+            "git --version",
+            "      select: git --version {filter}\n      filters:\n        - paths: [core/a.rs]\n          expr: 'test(/^a::/)'\n",
+        )
+    }
+
+    #[tokio::test]
+    async fn a_tree_branch_gate_runs_the_filter_its_one_path_hits_and_vouches_for_no_tree() {
+        let f = fixture(Some(&filtered_core_map()), None, true).await;
+        let request = args(Kind::Test, ScopeArg::Scope, f.repo.path(), None, Some(&f.c1));
+
+        // Unnarrowed, the same request runs the group whole, as every other gate does.
+        let whole = submit(&f.ex, Caller::Job(1), &request).await.unwrap();
+        let (whole, _) = finished(&f.pool, whole).await;
+        assert_eq!(whole.units[0].argv, ["git", "--version"]);
+
+        let id = submit_narrowed(&f.ex, Caller::Job(1), &request)
+            .await
+            .unwrap();
+        let (ticket, _) = finished(&f.pool, id).await;
+        assert_eq!(ticket.verdict.as_deref(), Some("passed"), "{ticket:?}");
+        assert_eq!(groups(&ticket), [Some("core".to_owned())]);
+        assert_eq!(ticket.units[0].argv, ["git", "--version", "test(/^a::/)"]);
+        // A part of the group is no evidence that the tree is green.
+        assert_nothing_recorded(&f.pool, id).await;
+    }
+
+    #[tokio::test]
+    async fn only_a_job_s_scope_test_may_be_narrowed() {
+        let f = fixture(Some(&filtered_core_map()), None, false).await;
+        let scope = args(Kind::Test, ScopeArg::Scope, f.repo.path(), None, Some(&f.c1));
+        let refused = [
+            (Caller::Owner, scope.clone()),
+            (
+                Caller::Job(1),
+                VerifyArgs {
+                    kind: Kind::Check,
+                    ..scope.clone()
+                },
+            ),
+            (
+                Caller::Job(1),
+                VerifyArgs {
+                    scope: ScopeArg::Own,
+                    ..scope.clone()
+                },
+            ),
+        ];
+        for (caller, request) in refused {
+            let error = submit_narrowed(&f.ex, caller, &request)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, VerifyError::BadRequest(_)), "{error:?}");
+        }
+        assert_eq!(count(&f.pool, "verify_requests").await, 0);
     }
 
     #[test]

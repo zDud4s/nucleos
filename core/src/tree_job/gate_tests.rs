@@ -38,6 +38,8 @@ struct Fake {
     stored: Mutex<Option<Stored>>,
     current: Mutex<Option<Ticket>>,
     submitted: Mutex<Vec<i64>>,
+    /// What `inherited` answers for a red: the base's incident, when the base has the same red.
+    inherited: Mutex<Option<String>>,
 }
 
 impl Fake {
@@ -62,6 +64,9 @@ impl GateIo for Fake {
     }
     async fn wait(&self, _id: i64, _wait: Duration) -> Result<Option<Ticket>, String> {
         Ok(self.current.lock().unwrap().clone())
+    }
+    async fn inherited(&self, _ticket: &Ticket) -> Option<String> {
+        self.inherited.lock().unwrap().clone()
     }
     async fn submit(&self) -> Result<i64, String> {
         let id = 100 + self.submits() as i64;
@@ -91,6 +96,30 @@ async fn a_late_red_verdict_is_recorded_on_the_next_call() {
         "{verdict:?}"
     );
     assert_eq!(fake.submits(), 1);
+}
+
+#[tokio::test]
+async fn a_red_the_base_already_has_is_inherited_not_the_branch_s() {
+    let fake = Fake::default();
+    *fake.inherited.lock().unwrap() = Some("incident #4".to_owned());
+    assert!(gate_at_head(&fake, "h1", WAIT).await.is_err());
+    fake.set(ticket(100, true, Some("failed")));
+    assert_eq!(
+        gate_at_head(&fake, "h1", WAIT).await,
+        Ok(GateVerdict::Inherited {
+            note: "incident #4".to_owned()
+        })
+    );
+    assert_eq!(fake.submits(), 1);
+}
+
+#[tokio::test]
+async fn a_green_is_never_asked_whether_it_is_inherited() {
+    let fake = Fake::default();
+    *fake.inherited.lock().unwrap() = Some("incident #4".to_owned());
+    assert!(gate_at_head(&fake, "h1", WAIT).await.is_err());
+    fake.set(ticket(100, true, Some("passed")));
+    assert_eq!(gate_at_head(&fake, "h1", WAIT).await, Ok(GateVerdict::Green));
 }
 
 #[tokio::test]
@@ -194,6 +223,9 @@ async fn a_ticket_seen_ending_without_measuring_is_forgotten() {
         }
         async fn wait(&self, id: i64, _wait: Duration) -> Result<Option<Ticket>, String> {
             Ok(Some(ticket(id, true, Some("errored"))))
+        }
+        async fn inherited(&self, ticket: &Ticket) -> Option<String> {
+            self.0.inherited(ticket).await
         }
         async fn submit(&self) -> Result<i64, String> {
             self.0.submit().await
