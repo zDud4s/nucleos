@@ -108,13 +108,23 @@ pub async fn latest_launch(
 }
 
 /// Key prefixes of the relaunches that carry a one-off suffix (the wrap, died, fix and resume
-/// relaunches of `wrap`, `driver` and `relaunch_resumed`). Their stored prompts are never a base
-/// for a new suffix, or each relaunch would repeat the sentences of the earlier ones.
+/// relaunches of `wrap`, `driver` and `relaunch_resumed`), or replay the prompt of one (the
+/// transient relaunch of `wrap`, after a run the API refused). Their stored prompts are never a
+/// base for a new suffix, or each relaunch would repeat the sentences of the earlier ones.
 pub(super) const WRAP_PREFIX: &str = "wrap-";
 pub(super) const DIED_PREFIX: &str = "died-";
 pub(super) const FIX_PREFIX: &str = "fix-";
+pub(super) const TRANSIENT_PREFIX: &str = "transient-";
 const RESUME_PREFIX: &str = "resume-";
-const SUFFIXED_KEY_PREFIXES: [&str; 4] = [WRAP_PREFIX, DIED_PREFIX, FIX_PREFIX, RESUME_PREFIX];
+const SUFFIXED_KEY_PREFIXES: [&str; 5] = [
+    WRAP_PREFIX,
+    DIED_PREFIX,
+    FIX_PREFIX,
+    TRANSIENT_PREFIX,
+    RESUME_PREFIX,
+];
+/// Key prefix of the relaunch an owner's answer starts (`relaunch_after_answer`).
+pub(super) const DECISION_PREFIX: &str = "decision-";
 
 /// The launch a suffix is appended to: the latest one that is not itself a suffixed relaunch, i.e.
 /// the original prompt, or the last answer relaunch (whose prompt carries the owner's answers, which
@@ -525,7 +535,7 @@ async fn relaunch_after_answer(
         "{}\n\nYou asked the owner: {}\nThe owner answered: {text}",
         launch.prompt, decision.question
     );
-    let key = format!("decision-{}", decision.id);
+    let key = format!("{DECISION_PREFIX}{}", decision.id);
     match start_again(state, &launch, &key, prompt).await {
         Ok(run_id) => {
             resume_red_as_fixing(pool, node).await;
