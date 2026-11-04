@@ -705,7 +705,10 @@ impl NucleosTools {
                        `project_root` and stores the job. `id` is yours to choose and makes the call \
                        repeatable: launching the same id again answers with the stored job and \
                        opens nothing. `project_id`, `contract` and `dirty_owner_files` are \
-                       optional. Returns {id, root_node_id, state, replayed}."
+                       optional. Returns {id, root_node_id, state, replayed} plus `reason` when \
+                       `state` is \"root_pending\": the root run did NOT start (the reason says \
+                       why, e.g. the disk floor) and the daemon retries it on its own each \
+                       sweep; `tree_status` shows it as `root_start_failure`."
     )]
     pub(super) async fn tree_launch(
         &self,
