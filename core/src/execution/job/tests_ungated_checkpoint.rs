@@ -83,11 +83,7 @@ async fn a_red_last_item_reverts_only_its_own_work_after_ungated_items() {
     let job = load_job(&pool, job_id).await.unwrap();
 
     for ordinal in 0..3 {
-        std::fs::write(
-            checkout.path().join(format!("item{ordinal}.txt")),
-            "done\n",
-        )
-        .unwrap();
+        std::fs::write(checkout.path().join(format!("item{ordinal}.txt")), "done\n").unwrap();
         assert_eq!(gate_item(&state, &job, ordinal, 4).await, Pass::Continued);
         let (status, checkpoint) = item_row(&pool, job_id, ordinal as i64).await;
         assert_eq!(status, "passed", "item {ordinal}");

@@ -696,7 +696,12 @@ pub(super) async fn pass_ungated_with_checkpoint(
         return Pass::Stopped;
     }
     credit_the_briefing(pool, job, ordinal).await;
-    tracing::debug!(job_id = job.id, ordinal, why, "item not gated; checkpointed");
+    tracing::debug!(
+        job_id = job.id,
+        ordinal,
+        why,
+        "item not gated; checkpointed"
+    );
     Pass::Continued
 }
 
