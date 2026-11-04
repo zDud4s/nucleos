@@ -209,8 +209,9 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).trim().to_owned()
     }
 
-    /// A repository on `master` with a zero disk floor, so that a tree worktree is admitted whatever
-    /// the disk holds. The same set-up the prompt test above does inline.
+    /// A repository on `master` with a zero disk floor. The root branch is still charged its 8 GB
+    /// seed cost; what admits it whatever the disk holds is the test build's fixed free disk
+    /// (`open::free_disk_gb`). The same set-up the prompt test above does inline.
     fn tree_repo(container: &tempfile::TempDir) -> PathBuf {
         let repo = container.path().join("repo");
         initialize_repo(&repo);
