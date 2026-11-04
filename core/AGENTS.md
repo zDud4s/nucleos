@@ -158,6 +158,7 @@ the contract, not a snapshot.
 | `http/fleet.rs` | Autopilot state, kill switches, quota and fleet capacity (`/autopilot/*`, `/quota`, `/fleet/*`, `/concurrency`). |
 | `http/git_ops.rs` | Declared git and GitHub operations and land targets (`/projects/{id}/git-ops`, `/github-ops`, `/land-targets`, `/github/*`). |
 | `http/hooks.rs` | Claude Code hook decisions (`/hooks/*`). |
+| `http/idempotency.rs` | `Idempotency-Key` middleware for the routes that start something (`POST /runs`, `POST /jobs`, `POST /assistant/message`): the same key and body replays the first 2xx answer (`Idempotency-Replayed: true`), a different body is 422, a key still running is 409. In-memory, bounded by TTL and capacity; a request without the header is untouched. |
 | `http/judging.rs` | Shadow decisions, judge verdicts and the scoreboard (`/shadow-decisions/*`, `/judge-*`, `/scoreboard`, `/verify/*`). |
 | `http/knowledge.rs` | Jobs, knowledge, owner notes and capture requests (`/jobs/*`, `/knowledge/*`, `/owner-notes/*`, `/capture-requests/*`). |
 | `http/map_flows.rs` | Declared flows of a project, verified against its code (`/projects/{id}/map/flows`). Read-only. |
