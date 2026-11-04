@@ -247,28 +247,8 @@ pub(super) async fn gate_item_with(
     let pool = &state.pool;
     let last = ordinal + 1 == items;
 
-    // Deliberately takes NO checkpoint, where `record_gate`'s green arm does.
-    //
-    // A checkpoint is the commit a gate agreed with, and there was no gate here. Leaving
-    // `checkpoint_sha` NULL makes `footing_for` look further back — past every ungated item, to the
-    // last measured one or to `jobs.head_sha` — so a later red gate takes the whole ungated stretch
-    // with it when it reverts.
-    //
-    // That is the intended reading rather than an oversight: with `gate_after_each_item` off,
-    // nothing has agreed with any of that work, so there is no point in it worth returning to. A
-    // footing minted here would name a commit no gate ever blessed, which is exactly the false
-    // comfort the column exists to avoid.
-    let pass_without_measuring = |why: &'static str| async move {
-        let _ =
-            sqlx::query("UPDATE job_nodes SET status = 'passed' WHERE job_id = ? AND ordinal = ?")
-                .bind(job.id)
-                .bind(ordinal as i64)
-                .execute(pool)
-                .await;
-        credit_the_briefing(pool, job, ordinal).await;
-        tracing::debug!(job_id = job.id, ordinal, why, "item not gated");
-        Pass::Continued
-    };
+    let pass_without_measuring =
+        |why: &'static str| pass_ungated_with_checkpoint(pool, job, ordinal, why);
 
     // `gate_after_each_item: false` buys back the N suite runs, and the final gate runs regardless
     // of it: a job that never measured anything would hand back a partial nobody can trust.
@@ -438,7 +418,7 @@ pub(super) async fn gate_item_with(
 /// arrived in — which is the only property that survives items landing out of ordinal order.
 ///
 /// An item that was WRITTEN into the shared checkout has no merge and no base, and falls back to
-/// [`footing_for`], which walks back through the ordinals to the nearest item a gate agreed with.
+/// [`footing_for`], which walks back through the ordinals to the nearest checkpointed item.
 /// That is still exactly right there, because in a sequential queue the order work reached the
 /// branch IS the order of the ordinals — and it is the only answer available, since nothing recorded
 /// a per-item boundary.
@@ -468,8 +448,10 @@ pub(super) async fn revert_point(
 
 /// The commit an item at `ordinal` falls back to when its own work has to be undone.
 ///
-/// PURE apart from the read. The nearest earlier item that a gate agreed with, or — for the first
-/// item, and for a job whose earlier items were all skipped — the SHA the job was created at.
+/// PURE apart from the read. The nearest earlier item with a checkpoint — one a gate agreed with,
+/// or an ungated one [`pass_ungated_with_checkpoint`] committed so a revert cannot take its work —
+/// or, for the first item and for a job whose earlier items were all skipped, the SHA the job was
+/// created at.
 ///
 /// `None` is the one shape callers must handle rather than paper over: a job created before this
 /// column existed, or one whose `head_sha` could not be read at creation, has no footing at all, and
@@ -636,6 +618,107 @@ pub(super) async fn queue_the_verdict(
     if let Err(error) = crate::distill::enqueue_item_verdict_in(conn, job_id, ordinal).await {
         tracing::warn!(job_id, ordinal, %error, "distill: could not queue an item verdict");
     }
+}
+
+/// Pass an item no gate measured, and checkpoint its work so no later revert can take it.
+///
+/// **This used to take no checkpoint, on purpose, and that lost a night's work.** The reasoning
+/// was that a checkpoint is "the commit a gate agreed with", so with `gate_after_each_item` off
+/// nothing was worth returning to and `footing_for` should walk past the whole ungated stretch.
+/// Job 1 (2026-11-04) showed what that costs: items 0-3 passed unmeasured, the last item's gate
+/// went red past its retries, and the revert reset the branch to `jobs.head_sha`, destroying every
+/// earlier item's finished edits. The owner's rule is that a job never silently loses work, so a
+/// revert must take off the failing item's own changes and nothing more — which needs a footing
+/// per item, gated or not.
+///
+/// The concern behind the old comment is kept, not dropped: the commit is labelled
+/// [`crate::execution::worktree::UNGATED_CHECKPOINT`] instead of "a gate agreed with", and
+/// `gate_status` stays NULL, so neither the history nor the row claims a measurement that never
+/// happened. The final gate still runs and still judges the whole job.
+///
+/// **An item that changed nothing is not `passed`** when the plan named files for it (a code
+/// item): its checkpoint equal to its own footing means its run left the tree exactly as the
+/// previous item did, which is what job 1's run 206 did while saying it could not do the item. An
+/// item run has no structured report to read, and a `completed` run only says the CLI exited, so
+/// the diff is the one honest signal. Such an item is written `failed` (the state a node that did
+/// not deliver already has) and the feed says why. Items with no `files` may be legitimate no-ops
+/// and pass; merged items (`merge_base_sha` set) carry their work on a merge and are not judged
+/// here. A checkpoint that cannot be taken warns and passes the item with NULL, as before.
+pub(super) async fn pass_ungated_with_checkpoint(
+    pool: &SqlitePool,
+    job: &JobRow,
+    ordinal: usize,
+    why: &'static str,
+) -> Pass {
+    let worktree = job_worktree(pool, job.id).await.ok().flatten();
+    let mut checkpoint_sha = None;
+    if let Some((worktree, _)) = &worktree {
+        let message = crate::execution::worktree::UNGATED_CHECKPOINT;
+        match crate::execution::worktree::checkpoint_with_message(worktree, message).await {
+            Ok(sha) => checkpoint_sha = Some(sha),
+            Err(error) => {
+                tracing::warn!(job_id = job.id, ordinal, %error, "could not checkpoint an ungated item");
+            }
+        }
+    }
+    if let Some(sha) = &checkpoint_sha
+        && changed_nothing(pool, job, ordinal, sha).await
+    {
+        let written =
+            sqlx::query("UPDATE job_nodes SET status = 'failed' WHERE job_id = ? AND ordinal = ?")
+                .bind(job.id)
+                .bind(ordinal as i64)
+                .execute(pool)
+                .await;
+        if let Err(error) = written {
+            tracing::warn!(job_id = job.id, ordinal, %error, "could not fail an item that changed nothing");
+            return Pass::Stopped;
+        }
+        credit_the_briefing(pool, job, ordinal).await;
+        let summary = format!(
+            "job {} at item {}: its node finished but changed nothing, so the item was not done",
+            job.id,
+            ordinal + 1
+        );
+        say(pool, job, "job_item_failed", &summary).await;
+        return Pass::Continued;
+    }
+    let written = sqlx::query(
+        "UPDATE job_nodes SET status = 'passed', checkpoint_sha = ? WHERE job_id = ? AND ordinal = ?",
+    )
+    .bind(checkpoint_sha)
+    .bind(job.id)
+    .bind(ordinal as i64)
+    .execute(pool)
+    .await;
+    if let Err(error) = written {
+        tracing::warn!(job_id = job.id, ordinal, %error, "could not record an ungated item");
+        return Pass::Stopped;
+    }
+    credit_the_briefing(pool, job, ordinal).await;
+    tracing::debug!(job_id = job.id, ordinal, why, "item not gated; checkpointed");
+    Pass::Continued
+}
+
+/// True when a sequential code item's checkpoint is its own footing: its run changed nothing.
+async fn changed_nothing(pool: &SqlitePool, job: &JobRow, ordinal: usize, sha: &str) -> bool {
+    let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT files, merge_base_sha FROM job_nodes WHERE job_id = ? AND ordinal = ?",
+    )
+    .bind(job.id)
+    .bind(ordinal as i64)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    let Some((files, None)) = row else {
+        return false;
+    };
+    let names_files = files
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<Vec<String>>(json).ok())
+        .is_some_and(|files| !files.is_empty());
+    names_files && footing_for(pool, job, ordinal).await.as_deref() == Some(sha)
 }
 
 /// Pass the last item whose scoped gate ran nothing over a trusted map, taking a checkpoint.
