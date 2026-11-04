@@ -722,6 +722,11 @@ export const keys = {
     pairing: (channel: string) => ["channels", channel, "pairing"] as const,
   },
 
+  /** The owner decisions inbox -- `GET /decisions?status=open`. */
+  ownerDecisions: {
+    open: ["owner-decisions", "open"] as const,
+  },
+
   /** Settings documents kept in the núcleo's database — `GET /settings…`. */
   settings: {
     all: ["settings"] as const,

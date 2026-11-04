@@ -18,6 +18,7 @@ import { GlobalSearch } from "./GlobalSearch";
 import { DictationProvider } from "./Dictation";
 import { KillSwitchControl } from "./KillSwitchControl";
 import { NotificationsDrawer } from "./NotificationsDrawer";
+import { OwnerDecisionsInbox } from "./OwnerDecisionsInbox";
 import { QuotaNotch } from "./QuotaNotch";
 import { useNotchMode, useSetNotchMode } from "./notch-mode";
 import { useScreenLine } from "./screen-line";
@@ -157,6 +158,7 @@ function Frame() {
             people already know — the drawer is somewhere you choose to go, which
             is a lower claim on the footer than the emergency stop has.
           */}
+          <OwnerDecisionsInbox />
           <UpdateNotice />
           {/*
             The break this footer actually has. Everything above it is somewhere to
