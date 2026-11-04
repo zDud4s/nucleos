@@ -530,4 +530,78 @@ mod tests {
             );
         }
     }
+
+    // ---- a root start that failed ------------------------------------------------------------------
+
+    /// The root node of the job and its run id, if it has one.
+    async fn root_run(state: &AppState) -> (String, Option<String>) {
+        sqlx::query_as(
+            "SELECT n.id, n.run_id FROM work_nodes n \
+             JOIN tree_jobs j ON j.root_node_id = n.id WHERE j.id = ?",
+        )
+        .bind(TREE)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap()
+    }
+
+    /// `(id, question)` of every open decision on `node_id`.
+    async fn open_decisions(state: &AppState, node_id: &str) -> Vec<(String, String)> {
+        sqlx::query_as("SELECT id, question FROM decisions WHERE node_id = ? AND status = 'open'")
+            .bind(node_id)
+            .fetch_all(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    /// `POST /trees` answers 200 when the root cannot start (here: the project root is not there
+    /// yet), and the job stays open. The 60-second sweep starts it once it can, instead of leaving an
+    /// open job with no run that nothing ever moves again.
+    #[tokio::test]
+    async fn a_root_start_that_failed_is_retried_by_the_sweep() {
+        let container = space_free_tempdir("tree-root-retry-");
+        let missing = container.path().join("repo");
+        let (state, _runner) = start_tree(&missing, Some(Duration::from_secs(5))).await;
+        let (_, run) = root_run(&state).await;
+        assert_eq!(run, None, "no repository yet: the start failed");
+
+        tree_repo(&container);
+        crate::tree_job::wrap::tick(&state).await;
+
+        let (_, run) = root_run(&state).await;
+        assert!(run.is_some(), "the sweep started the root");
+    }
+
+    /// A root that keeps failing to start is not retried forever in silence: past a cap the owner
+    /// is asked once, and an answer is a fresh allowance of retries.
+    #[tokio::test]
+    async fn a_root_start_that_keeps_failing_asks_the_owner_once_and_an_answer_retries_it() {
+        let container = space_free_tempdir("tree-root-ask-");
+        let missing = container.path().join("repo");
+        let (state, _runner) = start_tree(&missing, Some(Duration::from_secs(5))).await;
+
+        for _ in 0..10 {
+            crate::tree_job::wrap::tick(&state).await;
+        }
+
+        let (root, run) = root_run(&state).await;
+        assert_eq!(run, None);
+        let asked = open_decisions(&state, &root).await;
+        assert_eq!(asked.len(), 1, "asked once: {asked:?}");
+        let state_of_job: String = sqlx::query_scalar("SELECT state FROM tree_jobs WHERE id = ?")
+            .bind(TREE)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(state_of_job, "open");
+
+        tree_repo(&container);
+        crate::tree_job::open::answer_and_relaunch(&state, &asked[0].0, "it is there now", "shell")
+            .await
+            .unwrap();
+        crate::tree_job::wrap::tick(&state).await;
+
+        let (_, run) = root_run(&state).await;
+        assert!(run.is_some(), "the answer gave the start a fresh try");
+    }
 }

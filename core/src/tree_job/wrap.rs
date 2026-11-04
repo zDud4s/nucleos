@@ -455,9 +455,7 @@ mod tests {
         seed_launch(&state, NODE).await;
         report(&state, NODE, 43, "handoff").await;
         for key in ["wrap-old-1", "wrap-old-2", "wrap-old-3"] {
-            node_run::apply(&state.pool, NODE, "launch", key, "99")
-                .await
-                .unwrap();
+            prior_link(&state, NODE, key).await;
         }
 
         tick(&state).await;
@@ -894,5 +892,184 @@ mod tests {
     /// Every `launch` transition of the node, whatever its key.
     async fn all_launches(state: &AppState, node_id: &str) -> i64 {
         launches(state, node_id, "").await
+    }
+
+    // ---- links that count, and links that do not -------------------------------------------------
+
+    /// An earlier relaunch of the node under `key`, as `store::launch_recovering` leaves one: the
+    /// stored launch (whose `seq` orders it) and its `launch` transition.
+    async fn prior_link(state: &AppState, node_id: &str, key: &str) {
+        open::save_launch(
+            &state.pool,
+            &StoredLaunch {
+                node_id: node_id.to_owned(),
+                key: key.to_owned(),
+                prompt: "original prompt".to_owned(),
+                project_id: None,
+                cwd: None,
+                mode: "shadow".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        node_run::apply(&state.pool, node_id, "launch", key, "99")
+            .await
+            .unwrap();
+    }
+
+    /// The last line of a `claude -p` run the API refused with a 429, as the runner stores it.
+    const RATE_LIMITED_STDOUT: &str = r#"{"type":"result","subtype":"success","is_error":true,"terminal_reason":"api_error","api_error_status":429,"result":"API Error: 429"}"#;
+
+    /// A run that ended `failed` on a 429, `ago` before now.
+    async fn seed_rate_limited_run(state: &AppState, id: i64, ago: chrono::Duration) {
+        let ended = (chrono::Utc::now() - ago).to_rfc3339();
+        sqlx::query(
+            "INSERT INTO runs (id, prompt, status, stdout, created_at, completed_at) \
+             VALUES (?, 'original prompt', 'failed', ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(RATE_LIMITED_STDOUT)
+        .bind(CREATED)
+        .bind(&ended)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+
+    /// The questions of the node's open decisions.
+    async fn open_questions(state: &AppState, node_id: &str) -> Vec<String> {
+        sqlx::query_scalar("SELECT question FROM decisions WHERE node_id = ? AND status = ?")
+            .bind(node_id)
+            .bind(decisions::STATUS_OPEN)
+            .fetch_all(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    /// A 429 says "this subscription, right now", not "the node cannot do its work": its relaunch
+    /// does not spend the died cap that is there for real deaths, so a node whose died cap is
+    /// already spent is still started again.
+    #[tokio::test]
+    async fn a_rate_limited_death_is_relaunched_without_spending_the_died_cap() {
+        let state = state().await;
+        seed_node(&state, Some("building"), "open", NODE, Some(61)).await;
+        seed_launch(&state, NODE).await;
+        prior_link(&state, NODE, "died-old-1").await;
+        prior_link(&state, NODE, "died-old-2").await;
+        seed_rate_limited_run(&state, 61, chrono::Duration::hours(2)).await;
+
+        tick(&state).await;
+
+        assert_eq!(launches(&state, NODE, "died-").await, 2, "no died link spent");
+        assert_eq!(all_launches(&state, NODE).await, 3, "one new launch");
+        let (branch, asked) = parked_and_asked(&state).await;
+        assert_eq!(branch, "building", "not parked: {asked:?}");
+        assert!(asked.is_empty(), "{asked:?}");
+    }
+
+    /// A rate limit lasts a while: the relaunch waits a backoff after the run ended, so the sweep
+    /// does not hammer a limit that has not lifted.
+    #[tokio::test]
+    async fn a_rate_limited_death_waits_for_its_backoff_before_the_relaunch() {
+        let state = state().await;
+        seed_node(&state, Some("building"), "open", NODE, Some(62)).await;
+        seed_launch(&state, NODE).await;
+        seed_rate_limited_run(&state, 62, chrono::Duration::seconds(1)).await;
+
+        tick(&state).await;
+        assert_eq!(all_launches(&state, NODE).await, 0, "still inside the backoff");
+
+        sqlx::query("UPDATE runs SET completed_at = ? WHERE id = 62")
+            .bind((chrono::Utc::now() - chrono::Duration::minutes(10)).to_rfc3339())
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        tick(&state).await;
+
+        assert_eq!(all_launches(&state, NODE).await, 1, "relaunched once it passed");
+        assert_eq!(launches(&state, NODE, "died-").await, 0);
+    }
+
+    /// Still bounded: a node that keeps dying on the limit is parked with a question at last.
+    #[tokio::test]
+    async fn rate_limited_deaths_past_their_own_cap_park_the_branch_with_a_question() {
+        let state = state().await;
+        seed_node(&state, Some("building"), "open", NODE, Some(63)).await;
+        seed_launch(&state, NODE).await;
+        for n in 0..16 {
+            prior_link(&state, NODE, &format!("transient-old-{n}")).await;
+        }
+        seed_rate_limited_run(&state, 63, chrono::Duration::hours(2)).await;
+
+        tick(&state).await;
+        tick(&state).await;
+
+        assert_eq!(all_launches(&state, NODE).await, 16, "nothing new started");
+        let (branch, asked) = parked_and_asked(&state).await;
+        assert_eq!(branch, "parked");
+        assert_eq!(asked.len(), 1, "asked once: {asked:?}");
+        assert!(asked[0].to_lowercase().contains("api error"), "{:?}", asked[0]);
+    }
+
+    /// The owner's answer is a fresh allowance, as it is for the fix cap: died links from before
+    /// the answer (the `decision-` launch) do not count, so the answered node is not parked again
+    /// at its first death.
+    #[tokio::test]
+    async fn an_answer_after_a_died_cap_park_gives_a_fresh_died_allowance() {
+        let state = state().await;
+        seed_node(&state, Some("building"), "open", NODE, Some(64)).await;
+        seed_launch(&state, NODE).await;
+        prior_link(&state, NODE, "died-old-1").await;
+        prior_link(&state, NODE, "died-old-2").await;
+        prior_link(&state, NODE, "decision-d-answered").await;
+        seed_run(&state, 64, "interrupted").await;
+
+        tick(&state).await;
+
+        assert_eq!(launches(&state, NODE, "died-64").await, 1);
+        let (branch, asked) = parked_and_asked(&state).await;
+        assert_eq!(branch, "building", "not parked again: {asked:?}");
+    }
+
+    #[tokio::test]
+    async fn an_answer_after_a_wrap_cap_park_gives_a_fresh_wrap_allowance() {
+        let state = state().await;
+        seed_node(&state, Some("building"), "open", NODE, Some(65)).await;
+        seed_launch(&state, NODE).await;
+        for key in ["wrap-old-1", "wrap-old-2", "wrap-old-3", "decision-d-answered"] {
+            prior_link(&state, NODE, key).await;
+        }
+        seed_run(&state, 65, "interrupted").await;
+        report(&state, NODE, 65, "handoff").await;
+
+        tick(&state).await;
+
+        assert_eq!(launches(&state, NODE, "wrap-65").await, 1);
+        let (branch, asked) = parked_and_asked(&state).await;
+        assert_eq!(branch, "building", "not parked again: {asked:?}");
+    }
+
+    /// A root that tops no branch has nothing to park, but its chain stopping must still reach the
+    /// owner as a question, not only as a feed line: otherwise the job waits forever in silence.
+    #[tokio::test]
+    async fn a_root_without_a_branch_past_its_died_cap_asks_the_owner() {
+        let state = state().await;
+        seed_node(&state, None, "open", "wrap-root", Some(66)).await;
+        seed_run(&state, 66, "interrupted").await;
+        seed_launch(&state, "wrap-root").await;
+        prior_link(&state, "wrap-root", "died-old-1").await;
+        prior_link(&state, "wrap-root", "died-old-2").await;
+
+        tick(&state).await;
+        tick(&state).await;
+
+        assert_eq!(launches(&state, "wrap-root", "died-66").await, 0);
+        let asked = open_questions(&state, "wrap-root").await;
+        assert_eq!(asked.len(), 1, "asked once: {asked:?}");
+        let job = store::load(&state.pool, JOB).await.unwrap().unwrap();
+        assert!(
+            job.manifest.extra.contains_key("root_park"),
+            "the root waits on the decision"
+        );
     }
 }
