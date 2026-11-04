@@ -527,11 +527,48 @@ async fn relaunch_after_answer(
     );
     let key = format!("decision-{}", decision.id);
     match start_again(state, &launch, &key, prompt).await {
-        Ok(run_id) => Some(run_id),
+        Ok(run_id) => {
+            resume_red_as_fixing(pool, node).await;
+            Some(run_id)
+        }
         Err(reason) => {
             note_skipped(pool, &mut skipped, node, reason).await;
             None
         }
+    }
+}
+
+/// A branch an answer returned to `red` is now being fixed by the relaunched node: moving it to
+/// `fixing` makes the driver gate that node's `done` report instead of judging the old red gate
+/// against the fix cap again. Best effort: on failure the branch stays `red`.
+async fn resume_red_as_fixing(pool: &SqlitePool, node: &str) {
+    let linked: Result<Option<Option<String>>, _> =
+        sqlx::query_scalar("SELECT tree_job_id FROM work_nodes WHERE id = ?")
+            .bind(node)
+            .fetch_optional(pool)
+            .await;
+    let Ok(Some(Some(job_id))) = linked else {
+        return;
+    };
+    let lock = super::http::job_lock(&job_id);
+    let _guard = lock.lock().await;
+    let Ok(Some(mut job)) = store::load(pool, &job_id).await else {
+        return;
+    };
+    let Some(branch) = job
+        .manifest
+        .branches
+        .values_mut()
+        .find(|branch| branch.node_id.as_deref() == Some(node) && branch.state == "red")
+    else {
+        return;
+    };
+    if super::engine::apply_transition(branch, "fixing").is_err() {
+        return;
+    }
+    job.updated_at = now();
+    if let Err(error) = store::update(pool, &job).await {
+        tracing::warn!(job = %job_id, node, %error, "could not move the answered branch to fixing");
     }
 }
 
