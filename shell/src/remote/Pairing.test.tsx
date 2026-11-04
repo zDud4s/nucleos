@@ -70,6 +70,44 @@ describe("the pairing gate", () => {
     stop();
   });
 
+  it("marks the code as a one-time code and sends a double submit once", async () => {
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let pairCalls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        if (url === "/auth/session") return json(401, { error: "session_invalid" });
+        if (url === "/auth/pair") {
+          pairCalls += 1;
+          await gate;
+          return json(401, { error: "invalid_code" });
+        }
+        throw new Error(`unexpected fetch ${url}`);
+      }),
+    );
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    let stop = () => {};
+    act(() => {
+      stop = startRemoteApp(root, new QueryClient(), vi.fn());
+    });
+
+    const input = (await screen.findByLabelText("Pairing code")) as HTMLInputElement;
+    expect(input.getAttribute("autocomplete")).toBe("one-time-code");
+    fireEvent.change(input, { target: { value: "abcde fghij" } });
+    const form = screen.getByRole("form", { name: "Pair this browser" });
+    await act(async () => {
+      fireEvent.submit(form);
+      fireEvent.submit(form);
+    });
+    expect(pairCalls).toBe(1);
+    expect((screen.getByRole("button", { name: "Pairing…" }) as HTMLButtonElement).disabled).toBe(true);
+    await act(async () => release());
+    stop();
+  });
+
   it("a session-lost signal returns to the pairing screen", async () => {
     const { queryClient, stop } = setup({ "/auth/session": () => json(200, SESSION) });
     expect(await screen.findByText("the app")).toBeTruthy();

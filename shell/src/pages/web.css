@@ -241,6 +241,11 @@
   text-decoration: none;
 }
 
+.web-row-meta,
+.web-reader-meta {
+  font-variant-numeric: tabular-nums;
+}
+
 .web-row-meta {
   grid-column: 1 / -1;
   display: flex;
