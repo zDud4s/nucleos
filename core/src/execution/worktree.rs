@@ -1864,10 +1864,9 @@ mod tests {
     /// the worktree sits visible for however long passes before something else hides it.
     #[tokio::test(flavor = "current_thread")]
     async fn a_default_worktree_is_invisible_to_the_project_checkout() {
-        let _lock = env_lock();
         let repo = init_space_free_repo();
         let nested_root = simulated_nested_default(repo.path());
-        let _env = WorktreeRootEnv::set(Some(&nested_root));
+        let _env = WorktreeRootOverride::set(repo.path(), &nested_root);
 
         create(repo.path(), Owner::Run(5501))
             .await
@@ -1890,10 +1889,9 @@ mod tests {
     /// write into.
     #[tokio::test(flavor = "current_thread")]
     async fn creation_alone_hides_the_worktree_root_from_git() {
-        let _lock = env_lock();
         let repo = init_space_free_repo();
         let nested_root = simulated_nested_default(repo.path());
-        let _env = WorktreeRootEnv::set(Some(&nested_root));
+        let _env = WorktreeRootOverride::set(repo.path(), &nested_root);
 
         create(repo.path(), Owner::Run(5502))
             .await
@@ -1983,7 +1981,6 @@ mod tests {
     /// before.
     #[tokio::test(flavor = "current_thread")]
     async fn an_orphan_at_the_legacy_sibling_root_is_still_collected() {
-        let _lock = env_lock();
         let pool = test_pool().await;
         let base = space_free_tempdir();
         let repo_path = base.path().join("repo");
@@ -1994,7 +1991,7 @@ mod tests {
         // way to make `orphaned_worktrees` look somewhere OTHER than the legacy sibling location
         // it still uses unmodified — exactly what the eventual default change will do on its own.
         let nested_root = simulated_nested_default(&repo_path);
-        let _env = WorktreeRootEnv::set(Some(&nested_root));
+        let _env = WorktreeRootOverride::set(&repo_path, &nested_root);
 
         let legacy_root = base.path().join("nucleos-worktrees").join("repo");
         let orphan = legacy_root.join("run-77");
@@ -2018,10 +2015,9 @@ mod tests {
     /// unhardened command first, where the canary file appears.
     #[tokio::test(flavor = "current_thread")]
     async fn create_does_not_run_a_command_the_target_repository_names() {
-        let _lock = env_lock();
         let repo = init_repo();
         let root = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let _env = WorktreeRootOverride::set(repo.path(), root.path());
 
         // Forward slashes both ways: git hands the value to a shell, which reads a Windows
         // backslash as an escape rather than a separator.
@@ -2060,10 +2056,9 @@ mod tests {
     /// gets it out. With the conflict in the files it edits and commits, which is all it ever does.
     #[tokio::test(flavor = "current_thread")]
     async fn catching_up_reports_a_clean_merge_and_leaves_a_conflicted_one_staged() {
-        let _lock = env_lock();
         let repo = init_repo();
         let root = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let _env = WorktreeRootOverride::set(repo.path(), root.path());
 
         // Two checkouts off the same commit, each committing a file. Different files merge; the
         // same file does not.
@@ -2145,10 +2140,9 @@ mod tests {
     /// out, on a name only it could ever use.
     #[tokio::test(flavor = "current_thread")]
     async fn an_item_tree_is_created_then_adopted_then_recreated_over_its_orphan_branch() {
-        let _lock = env_lock();
         let repo = init_repo();
         let root = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let _env = WorktreeRootOverride::set(repo.path(), root.path());
 
         // (3) Neither the tree nor the branch is there.
         let first = adopt_or_create_at(repo.path(), Owner::Item(7), None)
@@ -2230,10 +2224,9 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn create_makes_a_worktree_on_its_own_branch_without_touching_the_project() {
-        let _lock = env_lock();
         let repo = init_repo();
         let root = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let _env = WorktreeRootOverride::set(repo.path(), root.path());
         let head_before = git_stdout(repo.path(), &[OsStr::new("rev-parse"), OsStr::new("HEAD")]);
         let status_before = git_stdout(
             repo.path(),
@@ -2286,10 +2279,9 @@ mod tests {
     /// Where the tree was born, asked of git while git is the only thing that knows.
     #[tokio::test(flavor = "current_thread")]
     async fn a_new_worktree_knows_the_commit_it_branched_from() {
-        let _lock = env_lock();
         let repo = init_space_free_repo();
         let root = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let _env = WorktreeRootOverride::set(repo.path(), root.path());
         let head = git_stdout(repo.path(), &[OsStr::new("rev-parse"), OsStr::new("HEAD")]);
 
         let info = create(repo.path(), Owner::Run(1))
@@ -2304,11 +2296,10 @@ mod tests {
     /// — the warning would switch itself off precisely while somebody was working.
     #[tokio::test(flavor = "current_thread")]
     async fn the_base_is_recorded_for_a_run_and_for_a_job_alike() {
-        let _lock = env_lock();
         let pool = test_pool().await;
         let repo = init_space_free_repo();
         let root = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let _env = WorktreeRootOverride::set(repo.path(), root.path());
 
         for owner in [Owner::Run(1), Owner::Job(1)] {
             let info = create(repo.path(), owner).await.expect("create worktree");
@@ -2369,19 +2360,17 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn create_on_a_non_repo_errors() {
-        let _lock = env_lock();
         let not_repo = tempfile::tempdir().expect("create non-repo tempdir");
         let root = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let _env = WorktreeRootOverride::set(not_repo.path(), root.path());
         assert!(create(not_repo.path(), Owner::Run(1)).await.is_err());
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn preserve_commits_uncommitted_work_before_removal() {
-        let _lock = env_lock();
         let repo = init_space_free_repo();
         let root = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let _env = WorktreeRootOverride::set(repo.path(), root.path());
         let info = create(repo.path(), Owner::Run(101))
             .await
             .expect("create worktree");
@@ -2443,11 +2432,10 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn reconcile_preserves_before_collecting_an_orphan() {
-        let _lock = env_lock();
         let pool = test_pool().await;
         let repo = init_space_free_repo();
         let root = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let _env = WorktreeRootOverride::set(repo.path(), root.path());
         sqlx::query(
             "INSERT INTO autopilot_state (project_id, mode, project_root)
              VALUES ('project-a', 'active', ?)",
@@ -2486,10 +2474,9 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn a_clean_worktree_is_removed_without_an_empty_commit() {
-        let _lock = env_lock();
         let repo = init_space_free_repo();
         let root = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let _env = WorktreeRootOverride::set(repo.path(), root.path());
         let info = create(repo.path(), Owner::Run(103))
             .await
             .expect("create worktree");
@@ -2509,11 +2496,10 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn a_failed_preserve_leaves_the_worktree_alone() {
-        let _lock = env_lock();
         let pool = test_pool().await;
         let repo = init_space_free_repo();
         let root = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let _env = WorktreeRootOverride::set(repo.path(), root.path());
         sqlx::query(
             "INSERT INTO autopilot_state (project_id, mode, project_root)
              VALUES ('project-a', 'active', ?)",
@@ -2576,11 +2562,10 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn release_defers_removal_on_a_failed_preserve() {
-        let _lock = env_lock();
         let pool = test_pool().await;
         let repo = init_space_free_repo();
         let root = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let _env = WorktreeRootOverride::set(repo.path(), root.path());
         let run_id = insert_run(
             &pool,
             "awaiting_approval",
@@ -2629,11 +2614,10 @@ mod tests {
     /// leftover directory again. A locked worktree makes `git worktree remove --force` refuse.
     #[tokio::test(flavor = "current_thread")]
     async fn release_keeps_the_row_registered_when_removal_fails() {
-        let _lock = env_lock();
         let pool = test_pool().await;
         let repo = init_space_free_repo();
         let root = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let _env = WorktreeRootOverride::set(repo.path(), root.path());
         let run_id = insert_run(
             &pool,
             "awaiting_approval",
@@ -2680,10 +2664,9 @@ mod tests {
     /// over blocks removal of the worktree rather than trimming the commit.
     #[tokio::test(flavor = "current_thread")]
     async fn a_jobs_handoff_files_stay_out_of_the_preservation_commit() {
-        let _lock = env_lock();
         let repo = init_space_free_repo();
         let root = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let _env = WorktreeRootOverride::set(repo.path(), root.path());
         let info = create(repo.path(), Owner::Job(41))
             .await
             .expect("create the job's worktree");
@@ -2730,10 +2713,9 @@ mod tests {
     /// The footing itself: an item's work becomes a commit, and the caller is told which one.
     #[tokio::test(flavor = "current_thread")]
     async fn a_checkpoint_commits_what_an_item_left_and_answers_with_its_sha() {
-        let _lock = env_lock();
         let repo = init_space_free_repo();
         let root = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let _env = WorktreeRootOverride::set(repo.path(), root.path());
         let info = create(repo.path(), Owner::Job(60))
             .await
             .expect("create the job's worktree");
@@ -2767,10 +2749,9 @@ mod tests {
     /// anything. The property worth having is that the answer is always a commit the tree IS at.
     #[tokio::test(flavor = "current_thread")]
     async fn a_checkpoint_on_a_clean_tree_answers_head_without_committing() {
-        let _lock = env_lock();
         let repo = init_space_free_repo();
         let root = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let _env = WorktreeRootOverride::set(repo.path(), root.path());
         let info = create(repo.path(), Owner::Job(61))
             .await
             .expect("create the job's worktree");
@@ -2791,7 +2772,6 @@ mod tests {
     /// somebody else's repository it would commit THEIR work, on a schedule.
     #[tokio::test(flavor = "current_thread")]
     async fn a_checkpoint_refuses_a_path_that_is_not_a_worktree_root() {
-        let _lock = env_lock();
         let repo = init_space_free_repo();
         let inside = repo.path().join("just-a-directory");
         std::fs::create_dir(&inside).expect("create a plain directory inside the repository");
@@ -2820,10 +2800,9 @@ mod tests {
     /// tree that looks reverted. Which is the defect this change exists to remove, in disguise.
     #[tokio::test(flavor = "current_thread")]
     async fn reverting_takes_back_created_files_and_not_only_modified_ones() {
-        let _lock = env_lock();
         let repo = init_space_free_repo();
         let root = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let _env = WorktreeRootOverride::set(repo.path(), root.path());
         let info = create(repo.path(), Owner::Job(62))
             .await
             .expect("create the job's worktree");
@@ -2866,10 +2845,9 @@ mod tests {
     /// a state it recognises.
     #[tokio::test(flavor = "current_thread")]
     async fn reverting_to_a_revision_that_does_not_exist_fails_and_leaves_the_work_alone() {
-        let _lock = env_lock();
         let repo = init_space_free_repo();
         let root = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let _env = WorktreeRootOverride::set(repo.path(), root.path());
         let info = create(repo.path(), Owner::Job(63))
             .await
             .expect("create the job's worktree");
@@ -2891,10 +2869,9 @@ mod tests {
     /// file, and the same loop that produced two would produce two hundred.
     #[tokio::test(flavor = "current_thread")]
     async fn preparing_the_handoff_twice_writes_one_exclusion() {
-        let _lock = env_lock();
         let repo = init_space_free_repo();
         let root = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let _env = WorktreeRootOverride::set(repo.path(), root.path());
         let info = create(repo.path(), Owner::Job(42))
             .await
             .expect("create the job's worktree");
@@ -2915,7 +2892,6 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn preserve_skips_ignored_paths_and_respects_the_ceiling() {
-        let _lock = env_lock();
         let repo = init_space_free_repo();
         std::fs::write(repo.path().join(".gitignore"), "ignored/\n")
             .expect("write project ignore rule");
@@ -2929,7 +2905,7 @@ mod tests {
             ],
         ));
         let root = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let _env = WorktreeRootOverride::set(repo.path(), root.path());
         let info = create(repo.path(), Owner::Run(105))
             .await
             .expect("create worktree");
@@ -3424,11 +3400,10 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn gc_removes_an_expired_terminal_worktree_and_marks_and_feeds() {
-        let _lock = env_lock();
         let pool = test_pool().await;
         let repo = init_repo();
         let root = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let _env = WorktreeRootOverride::set(repo.path(), root.path());
         let run_id = insert_run(
             &pool,
             "completed",
@@ -3476,11 +3451,10 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn gc_leaves_a_pinned_awaiting_approval_worktree() {
-        let _lock = env_lock();
         let pool = test_pool().await;
         let repo = init_repo();
         let root = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let _env = WorktreeRootOverride::set(repo.path(), root.path());
         let run_id = insert_run(
             &pool,
             "awaiting_approval",
@@ -3511,11 +3485,10 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn gc_keeps_an_unmerged_branch_and_deletes_a_merged_branch() {
-        let _lock = env_lock();
         let pool = test_pool().await;
         let repo = init_repo();
         let root = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let _env = WorktreeRootOverride::set(repo.path(), root.path());
         let unmerged_run_id = insert_run(
             &pool,
             "completed",
@@ -3602,11 +3575,10 @@ mod tests {
     /// a stale directory by hand was enough to start it.
     #[tokio::test(flavor = "current_thread")]
     async fn gc_converges_when_the_directory_is_already_gone() {
-        let _lock = env_lock();
         let pool = test_pool().await;
         let repo = init_repo();
         let root = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let _env = WorktreeRootOverride::set(repo.path(), root.path());
         let run_id = insert_run(
             &pool,
             "completed",
@@ -3668,11 +3640,10 @@ mod tests {
     /// feed hears about a failure once, and again only when what fails changes.
     #[tokio::test(flavor = "current_thread")]
     async fn gc_reports_a_repeated_identical_failure_once() {
-        let _lock = env_lock();
         let pool = test_pool().await;
         let repo = init_space_free_repo();
         let root = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let _env = WorktreeRootOverride::set(repo.path(), root.path());
         let run_id = insert_run(
             &pool,
             "completed",
@@ -3734,11 +3705,10 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn release_discards_a_pinned_worktree() {
-        let _lock = env_lock();
         let pool = test_pool().await;
         let repo = init_repo();
         let root = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let _env = WorktreeRootOverride::set(repo.path(), root.path());
         let run_id = insert_run(
             &pool,
             "awaiting_approval",
@@ -3811,11 +3781,10 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn release_of_a_non_awaiting_run_is_rejected() {
-        let _lock = env_lock();
         let pool = test_pool().await;
         let repo = init_repo();
         let root = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let _env = WorktreeRootOverride::set(repo.path(), root.path());
         let run_id = insert_run(&pool, "running", None, "2026-07-19T00:00:00+00:00").await;
         let info = create_and_record(&pool, repo.path(), run_id).await;
 
@@ -3854,14 +3823,13 @@ mod tests {
     async fn release_never_overwrites_a_status_written_under_it() {
         use std::future::Future;
 
-        let _lock = env_lock();
         // A file-backed pool with room for a second connection: the test writes to the same rows
         // while the release future is mid-flight, which a single-connection pool would deadlock on.
         let db = crate::storage::TempDb::new().await;
         let pool = db.pool.clone();
         let repo = init_repo();
         let root = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let _env = WorktreeRootOverride::set(repo.path(), root.path());
         let run_id = insert_run(
             &pool,
             "awaiting_approval",
@@ -3932,10 +3900,9 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test(flavor = "current_thread")]
     async fn a_real_file_lock_blocks_then_clears() {
-        let _lock = env_lock();
         let repo = init_repo();
         let root = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let _env = WorktreeRootOverride::set(repo.path(), root.path());
         let info = create(repo.path(), Owner::Run(9))
             .await
             .expect("create worktree");
@@ -3963,11 +3930,10 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn orphan_sweep_ignores_a_directory_a_live_row_accounts_for() {
-        let _lock = env_lock();
         let pool = test_pool().await;
         let repo = init_repo();
         let root = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let _env = WorktreeRootOverride::set(repo.path(), root.path());
         let run_id = insert_run(&pool, "running", None, "2026-07-27T00:00:00+00:00").await;
         create_and_record(&pool, repo.path(), run_id).await;
 
@@ -3983,11 +3949,10 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn orphan_sweep_finds_a_directory_no_live_row_explains() {
-        let _lock = env_lock();
         let pool = test_pool().await;
         let repo = init_repo();
         let root = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let _env = WorktreeRootOverride::set(repo.path(), root.path());
 
         // A crash between `git worktree add` and the row INSERT: on disk, unknown to the database.
         let unrecorded = create(repo.path(), Owner::Run(41))
@@ -4012,11 +3977,10 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn an_unaccounted_job_directory_is_sweepable() {
-        let _lock = env_lock();
         let pool = test_pool().await;
         let repo = init_repo();
         let root = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let _env = WorktreeRootOverride::set(repo.path(), root.path());
 
         // Nothing creates a `job-*` worktree yet. The sweeper has to recognise the name *before*
         // the first one exists: a directory it does not recognise is one it never collects, so a
@@ -4048,12 +4012,11 @@ mod tests {
     /// it a sweeper that returned nothing at all would pass this test while collecting everything.
     #[tokio::test]
     async fn the_integration_worktree_is_not_an_orphan() {
-        let _lock = env_lock();
         let pool = test_pool().await;
         let container = space_free_tempdir();
         let project_root = container.path().join("repo");
         let roots = container.path().join("worktrees");
-        let _env = WorktreeRootEnv::set(Some(roots.as_path()));
+        let _env = WorktreeRootOverride::set(&project_root, roots.as_path());
 
         let integration = crate::execution::git_exec::integration_worktree(&project_root);
         std::fs::create_dir_all(&integration).expect("create the integration worktree directory");
@@ -4077,12 +4040,11 @@ mod tests {
     /// variant, no `worktrees` row. The `run-99` directory is the control, as above.
     #[tokio::test]
     async fn the_postgate_worktree_is_not_an_orphan() {
-        let _lock = env_lock();
         let pool = test_pool().await;
         let container = space_free_tempdir();
         let project_root = container.path().join("repo");
         let roots = container.path().join("worktrees");
-        let _env = WorktreeRootEnv::set(Some(roots.as_path()));
+        let _env = WorktreeRootOverride::set(&project_root, roots.as_path());
 
         let postgate = crate::verify::postgate::postgate_worktree(&project_root);
         std::fs::create_dir_all(&postgate).expect("create the postgate worktree directory");
@@ -4119,11 +4081,10 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn orphan_sweep_leaves_a_young_directory_alone() {
-        let _lock = env_lock();
         let pool = test_pool().await;
         let repo = init_repo();
         let root = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let _env = WorktreeRootOverride::set(repo.path(), root.path());
         create(repo.path(), Owner::Run(42))
             .await
             .expect("create worktree");
@@ -4140,11 +4101,10 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn reconcile_collects_orphans_for_every_known_root() {
-        let _lock = env_lock();
         let pool = test_pool().await;
         let repo = init_repo();
         let root = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let _env = WorktreeRootOverride::set(repo.path(), root.path());
         sqlx::query("INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('project-a', 'active', ?)")
             .bind(repo.path().to_string_lossy().as_ref())
             .execute(&pool)
@@ -4167,12 +4127,12 @@ mod tests {
     /// delete it. A's own orphan is the control.
     #[tokio::test(flavor = "current_thread")]
     async fn a_shared_root_sweep_leaves_another_repositorys_tree_alone() {
-        let _lock = env_lock();
         let pool = test_pool().await;
         let repo_a = init_repo();
         let repo_b = init_repo();
         let root = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let _env_a = WorktreeRootOverride::set(repo_a.path(), root.path());
+        let _env_b = WorktreeRootOverride::set(repo_b.path(), root.path());
         sqlx::query("INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('project-a', 'active', ?)")
             .bind(repo_a.path().to_string_lossy().as_ref())
             .execute(&pool)
@@ -4239,10 +4199,9 @@ mod tests {
     /// proves the hook really runs.
     #[tokio::test(flavor = "current_thread")]
     async fn an_item_merge_carries_the_queue_marker_past_the_merge_guard() {
-        let _lock = env_lock();
         let repo = init_repo();
         let root = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let _env = WorktreeRootOverride::set(repo.path(), root.path());
         let hooks = root.path().join("hooks");
         install_pre_merge_commit(
             repo.path(),
@@ -4283,10 +4242,9 @@ mod tests {
     /// the merge half-done for the next one to trip over.
     #[tokio::test(flavor = "current_thread")]
     async fn a_refused_catch_up_leaves_no_merge_in_progress() {
-        let _lock = env_lock();
         let repo = init_repo();
         let root = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let _env = WorktreeRootOverride::set(repo.path(), root.path());
         let hooks = root.path().join("hooks");
         install_pre_merge_commit(repo.path(), &hooks, "exit 1");
 
@@ -4315,10 +4273,9 @@ mod tests {
     /// checkpoint, or the sweep's preservation commit — is re-attached, never `branch -D`'d.
     #[tokio::test(flavor = "current_thread")]
     async fn recreating_an_item_tree_reattaches_a_branch_with_unmerged_work() {
-        let _lock = env_lock();
         let repo = init_repo();
         let root = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let _env = WorktreeRootOverride::set(repo.path(), root.path());
 
         let first = adopt_or_create_at(repo.path(), Owner::Item(8), None)
             .await
@@ -4347,11 +4304,10 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn release_deletes_a_branch_that_carries_no_work() {
-        let _lock = env_lock();
         let pool = test_pool().await;
         let repo = init_repo();
         let root = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let _env = WorktreeRootOverride::set(repo.path(), root.path());
         let run_id = insert_run(
             &pool,
             "awaiting_approval",
@@ -4380,7 +4336,6 @@ mod tests {
     /// repository's unrelated work under the daemon's name.
     #[tokio::test(flavor = "current_thread")]
     async fn preserve_refuses_a_plain_directory_inside_another_repository() {
-        let _lock = env_lock();
         let repo = init_space_free_repo();
         let stray = repo.path().join("run-77");
         std::fs::create_dir_all(&stray).expect("create stray directory");
@@ -4411,10 +4366,9 @@ mod tests {
     /// answer "not a worktree" for the case preservation exists to serve.
     #[tokio::test(flavor = "current_thread")]
     async fn preserve_still_commits_inside_a_real_worktree() {
-        let _lock = env_lock();
         let repo = init_space_free_repo();
         let root = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let _env = WorktreeRootOverride::set(repo.path(), root.path());
         let info = create(repo.path(), Owner::Run(78))
             .await
             .expect("create worktree");
@@ -4435,10 +4389,9 @@ mod tests {
     /// A merge stopped on a conflict has markers in its files; preserving would commit them.
     #[tokio::test(flavor = "current_thread")]
     async fn preserve_refuses_a_worktree_with_a_merge_in_progress() {
-        let _lock = env_lock();
         let repo = init_space_free_repo();
         let root = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let _env = WorktreeRootOverride::set(repo.path(), root.path());
         let info = create(repo.path(), Owner::Run(79))
             .await
             .expect("create worktree");
@@ -4527,7 +4480,6 @@ y
 
     #[test]
     fn is_dangerous_removal_path_rejects_repo_root_filesystem_root_and_home() {
-        let _lock = env_lock();
         let root = space_free_tempdir();
         let repo = root.path().join("repo");
 
@@ -4556,7 +4508,6 @@ y
 
     #[test]
     fn is_dangerous_removal_path_allows_an_ordinary_run_directory() {
-        let _lock = env_lock();
         let root = space_free_tempdir();
         let repo = root.path().join("repo");
         let ordinary = root.path().join("run-1");
@@ -4571,7 +4522,6 @@ y
     /// `FileType::is_symlink`, which is what the guard reads.
     #[test]
     fn is_dangerous_removal_path_rejects_a_linked_worktree_path() {
-        let _lock = env_lock();
         let root = space_free_tempdir();
         let repo = root.path().join("repo");
         let target = root.path().join("real");
@@ -4605,7 +4555,6 @@ y
 
     #[tokio::test(flavor = "current_thread")]
     async fn remove_refuses_a_dangerous_path() {
-        let _lock = env_lock();
         let repo = init_space_free_repo();
 
         // The project root itself. A caller that got this wrong would delete the repository, and
@@ -4626,11 +4575,10 @@ y
     /// the old `Err(_)` arm answered that refusal by deleting the directory anyway.
     #[tokio::test(flavor = "current_thread")]
     async fn orphan_collection_refuses_to_recurse_while_git_still_registers_the_worktree() {
-        let _lock = env_lock();
         let pool = test_pool().await;
         let repo = init_space_free_repo();
         let root = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let _env = WorktreeRootOverride::set(repo.path(), root.path());
         sqlx::query("INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('project-a', 'active', ?)")
             .bind(repo.path().to_string_lossy().as_ref())
             .execute(&pool)
@@ -4668,10 +4616,9 @@ y
     /// afterwards, the row outlives the directory and no later sweep ever sees it again.
     #[tokio::test(flavor = "current_thread")]
     async fn prune_after_a_filesystem_removal_clears_the_registration() {
-        let _lock = env_lock();
         let repo = init_space_free_repo();
         let root = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(root.path()));
+        let _env = WorktreeRootOverride::set(repo.path(), root.path());
         let info = create(repo.path(), Owner::Run(46))
             .await
             .expect("create worktree");
@@ -4737,10 +4684,9 @@ y
     /// it is standing on whatever the person using it is working on.
     #[tokio::test]
     async fn a_worktree_can_be_born_on_a_branch_the_project_is_not_standing_on() {
-        let _lock = env_lock();
         let repo = repo_with_a_conflict();
         let roots = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(roots.path()));
+        let _env = WorktreeRootOverride::set(repo.path(), roots.path());
 
         let info = create_at(repo.path(), Owner::Run(41), Some("feat/x"))
             .await
@@ -4764,10 +4710,9 @@ y
     #[tokio::test]
     async fn a_staged_conflict_commits_with_both_parents_and_the_resolver_does_nothing_to_earn_it()
     {
-        let _lock = env_lock();
         let repo = repo_with_a_conflict();
         let roots = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(roots.path()));
+        let _env = WorktreeRootOverride::set(repo.path(), roots.path());
 
         let info = create_at(repo.path(), Owner::Run(42), Some("master"))
             .await
@@ -4822,7 +4767,6 @@ y
     /// published asks again.
     #[tokio::test]
     async fn a_merge_that_comes_out_clean_is_refused_rather_than_handed_to_an_agent() {
-        let _lock = env_lock();
         let repo = init_space_free_repo();
         let path = repo.path();
         assert!(git_ok(
@@ -4851,7 +4795,7 @@ y
         ));
 
         let roots = space_free_tempdir();
-        let _env = WorktreeRootEnv::set(Some(roots.path()));
+        let _env = WorktreeRootOverride::set(repo.path(), roots.path());
         let info = create_at(path, Owner::Run(43), Some("master"))
             .await
             .expect("create the worktree on the target");
