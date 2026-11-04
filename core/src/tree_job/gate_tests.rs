@@ -119,7 +119,10 @@ async fn a_green_is_never_asked_whether_it_is_inherited() {
     *fake.inherited.lock().unwrap() = Some("incident #4".to_owned());
     assert!(gate_at_head(&fake, "h1", WAIT).await.is_err());
     fake.set(ticket(100, true, Some("passed")));
-    assert_eq!(gate_at_head(&fake, "h1", WAIT).await, Ok(GateVerdict::Green));
+    assert_eq!(
+        gate_at_head(&fake, "h1", WAIT).await,
+        Ok(GateVerdict::Green)
+    );
 }
 
 #[tokio::test]
@@ -162,7 +165,11 @@ async fn a_ticket_that_selected_no_unit_is_a_verdict() {
         gate_at_head(&fake, "h1", WAIT).await,
         Ok(GateVerdict::NothingRan)
     );
-    assert_eq!(fake.submits(), 1, "a ticket that ran nothing is not resubmitted");
+    assert_eq!(
+        fake.submits(),
+        1,
+        "a ticket that ran nothing is not resubmitted"
+    );
 }
 
 #[tokio::test]
@@ -233,7 +240,10 @@ async fn a_ticket_seen_ending_without_measuring_is_forgotten() {
     }
     let fake = EndsAtOnce(Fake::default());
     let verdict = gate_at_head(&fake, "h1", WAIT).await;
-    assert!(matches!(verdict, Err(NotMeasured::Failed(_))), "{verdict:?}");
+    assert!(
+        matches!(verdict, Err(NotMeasured::Failed(_))),
+        "{verdict:?}"
+    );
     assert_eq!(
         *fake.0.stored.lock().unwrap(),
         None,

@@ -30,8 +30,8 @@ use super::decisions;
 use super::engine::{apply_transition, branch_node_may_close};
 use super::http::job_lock;
 use super::landing::{
-    self, LandingError, MergeSettlement, check_may_land, check_may_merge,
-    land_job, settle_land, settle_merge, submit_merge,
+    self, LandingError, MergeSettlement, check_may_land, check_may_merge, land_job, settle_land,
+    settle_merge, submit_merge,
 };
 use super::model::{JOB_TERMINAL_STATE, Manifest};
 use super::open::{FIX_PREFIX, relaunch_node, run_is_live};
@@ -91,8 +91,7 @@ impl From<String> for NotMeasured {
     }
 }
 
-pub(super) type GateFuture =
-    Pin<Box<dyn Future<Output = Result<GateVerdict, NotMeasured>> + Send>>;
+pub(super) type GateFuture = Pin<Box<dyn Future<Output = Result<GateVerdict, NotMeasured>> + Send>>;
 
 /// Runs the gate of one branch: called with `(job id, branch name)`. The driver spawns the future
 /// and never awaits it inside a tick.
@@ -1787,13 +1786,22 @@ mod tests {
     async fn wait_gate_failures(fx: &Fixture, job: &str, name: &str, want: i64) {
         let mut seen = None;
         for _ in 0..300 {
-            seen = fx.branch(job, name).await.extra.get(GATE_FAILURES).and_then(Value::as_i64);
+            seen = fx
+                .branch(job, name)
+                .await
+                .extra
+                .get(GATE_FAILURES)
+                .and_then(Value::as_i64);
             if seen == Some(want) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert_eq!(seen, Some(want), "branch {name} of {job} never counted {want} failure(s)");
+        assert_eq!(
+            seen,
+            Some(want),
+            "branch {name} of {job} never counted {want} failure(s)"
+        );
         tokio::time::sleep(Duration::from_millis(30)).await;
     }
 
@@ -1887,7 +1895,9 @@ mod tests {
         let last = api.gates.last().expect("the verdict is recorded");
         assert_eq!(last["verdict"], json!("green"));
         assert!(
-            last["inherited"].as_str().is_some_and(|note| note.contains("#4")),
+            last["inherited"]
+                .as_str()
+                .is_some_and(|note| note.contains("#4")),
             "{last}"
         );
         let fixes: i64 = sqlx::query_scalar(
@@ -1928,8 +1938,15 @@ mod tests {
 
         let api = fx.branch(JOB, "api").await;
         assert_eq!(api.state, "building", "a running gate is waited on");
-        assert!(!api.extra.contains_key(GATE_FAILURES), "waiting is never counted");
-        assert!(api.gates.is_empty(), "nothing was recorded: {:?}", api.gates);
+        assert!(
+            !api.extra.contains_key(GATE_FAILURES),
+            "waiting is never counted"
+        );
+        assert!(
+            api.gates.is_empty(),
+            "nothing was recorded: {:?}",
+            api.gates
+        );
         assert_eq!(count_of(&fx, "decisions").await, 0, "nobody was asked");
     }
 
@@ -2207,11 +2224,19 @@ mod tests {
 
         let line = "branch api is green but waits on its base storage";
         assert_eq!(feed_lines_naming(&fx, line).await, 1, "announced once");
-        assert_eq!(feed_lines_naming(&fx, "d-1").await, 1, "naming the base's decision");
+        assert_eq!(
+            feed_lines_naming(&fx, "d-1").await,
+            1,
+            "naming the base's decision"
+        );
         let waiting = fx.branch(JOB, "api").await;
         assert_eq!(waiting.state, "green", "the dependent keeps waiting");
         assert_eq!(fx.requests().await, 0, "nothing was queued");
-        assert_eq!(count_of(&fx, "decisions").await, 0, "the base's question is the one asked");
+        assert_eq!(
+            count_of(&fx, "decisions").await,
+            0,
+            "the base's question is the one asked"
+        );
 
         // The base parks again on another question: that wait is announced too, once.
         park_the_base(&fx, JOB, "d-2").await;
@@ -2500,7 +2525,11 @@ mod tests {
 
         let questions = fx.open_questions(JOB, &root).await;
         assert_eq!(questions.len(), 1, "the owner is asked once: {questions:?}");
-        assert!(questions[0].contains("nothing to land"), "{:?}", questions[0]);
+        assert!(
+            questions[0].contains("nothing to land"),
+            "{:?}",
+            questions[0]
+        );
         assert_eq!(
             land_attempts(&fx, JOB).await,
             Some(LAND_ATTEMPTS),

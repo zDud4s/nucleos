@@ -3497,7 +3497,13 @@ tests:
 
     /// A job's `test`/`scope` ticket over the fixture's last commit, finished.
     async fn tree_gate_ticket(f: &Fixture) -> Ticket {
-        let request = args(Kind::Test, ScopeArg::Scope, f.repo.path(), None, Some(&f.c1));
+        let request = args(
+            Kind::Test,
+            ScopeArg::Scope,
+            f.repo.path(),
+            None,
+            Some(&f.c1),
+        );
         let id = submit(&f.ex, Caller::Job(1), &request).await.unwrap();
         let (ticket, _) = finished_with(f, id).await;
         assert_eq!(
@@ -3576,7 +3582,13 @@ tests:
     #[tokio::test]
     async fn a_tree_branch_gate_runs_the_filter_its_one_path_hits_and_vouches_for_no_tree() {
         let f = fixture(Some(&filtered_core_map()), None, true).await;
-        let request = args(Kind::Test, ScopeArg::Scope, f.repo.path(), None, Some(&f.c1));
+        let request = args(
+            Kind::Test,
+            ScopeArg::Scope,
+            f.repo.path(),
+            None,
+            Some(&f.c1),
+        );
 
         // Unnarrowed, the same request runs the group whole, as every other gate does.
         let whole = submit(&f.ex, Caller::Job(1), &request).await.unwrap();
@@ -3597,7 +3609,13 @@ tests:
     #[tokio::test]
     async fn only_a_job_s_scope_test_may_be_narrowed() {
         let f = fixture(Some(&filtered_core_map()), None, false).await;
-        let scope = args(Kind::Test, ScopeArg::Scope, f.repo.path(), None, Some(&f.c1));
+        let scope = args(
+            Kind::Test,
+            ScopeArg::Scope,
+            f.repo.path(),
+            None,
+            Some(&f.c1),
+        );
         let refused = [
             (Caller::Owner, scope.clone()),
             (
@@ -3616,9 +3634,7 @@ tests:
             ),
         ];
         for (caller, request) in refused {
-            let error = submit_narrowed(&f.ex, caller, &request)
-                .await
-                .unwrap_err();
+            let error = submit_narrowed(&f.ex, caller, &request).await.unwrap_err();
             assert!(matches!(error, VerifyError::BadRequest(_)), "{error:?}");
         }
         assert_eq!(count(&f.pool, "verify_requests").await, 0);
