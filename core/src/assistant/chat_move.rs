@@ -39,6 +39,7 @@ pub async fn begin(
     transfer_id: &str,
 ) -> Result<Begun, Refusal> {
     freeze_at(&state.pool, chat_id, transfer_id, unix_now()).await?;
+    transfer_package::forget(chat_id);
     let mut cut_turn = None;
     // A cut forgets the questions a turn had parked; the package still carries them.
     transfer_package::remember(chat_id, false, parked_now(chat_id));
@@ -70,8 +71,8 @@ pub async fn abort_and_resume(
     transfer_id: &str,
 ) -> sqlx::Result<bool> {
     let lifted = crate::chats::transfer::abort(&state.pool, chat_id, transfer_id).await?;
+    transfer_package::forget(chat_id);
     if lifted {
-        transfer_package::forget(chat_id);
         super::resume_queue_after_freeze(state, chat_id);
     }
     Ok(lifted)

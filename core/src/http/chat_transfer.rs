@@ -132,6 +132,7 @@ fn refused(refusal: Refusal) -> Failure {
         Refusal::AlreadyFrozen
         | Refusal::Moved(_)
         | Refusal::NotFrozenForThis
+        | Refusal::OriginChangedAfterExpiry
         | Refusal::AlreadyHere => StatusCode::CONFLICT,
         Refusal::Store(ref error) => {
             tracing::warn!(%error, "a chat transfer step failed");
@@ -187,6 +188,7 @@ async fn post_transfer_begin(
 struct FinishBody {
     transfer_id: String,
     to: String,
+    to_name: Option<String>,
 }
 
 /// The destination has the chat: this copy becomes read-only and points there.
@@ -201,11 +203,13 @@ async fn post_transfer_finish(
             Json(json!({ "error": "transfer_id and to are required" })),
         ));
     }
+    let name = body.to_name.as_deref().unwrap_or(&body.to);
+    let destination = json!({ "id": body.to, "name": name }).to_string();
     transfer::finish_at(
         &state.pool,
         &chat_id,
         &body.transfer_id,
-        &body.to,
+        &destination,
         transfer::unix_now(),
     )
     .await
@@ -227,8 +231,65 @@ async fn post_transfer_abort(
     Path(chat_id): Path<String>,
     Json(body): Json<AbortBody>,
 ) -> Result<StatusCode, Failure> {
+    required_transfer_id(&body.transfer_id)?;
     crate::assistant::chat_move::abort_and_resume(&state, &chat_id, &body.transfer_id)
         .await
         .map_err(store)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn post_transfer_abort_after_expiry_clears_the_remembered_move() {
+        let state = super::super::tests::test_state().await;
+        sqlx::query("INSERT INTO chats (chat_id, brain, created_at) VALUES ('c1', 'cloud', 'now')")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        crate::chats::transfer::freeze_at(&state.pool, "c1", "t-1", 1)
+            .await
+            .unwrap();
+        package::remember("c1", true, vec![]);
+
+        let status = post_transfer_abort(
+            State(state.clone()),
+            Path("c1".to_string()),
+            Json(AbortBody {
+                transfer_id: "t-1".to_string(),
+            }),
+        )
+        .await;
+
+        assert!(matches!(status, Ok(StatusCode::NO_CONTENT)));
+        assert!(
+            package::build(
+                &state.pool,
+                "c1",
+                "t-1",
+                std::path::Path::new("unused"),
+                vec![]
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn post_transfer_abort_rejects_an_empty_transfer_id() {
+        let state = super::super::tests::test_state().await;
+
+        let result = post_transfer_abort(
+            State(state),
+            Path("c1".to_string()),
+            Json(AbortBody {
+                transfer_id: " ".to_string(),
+            }),
+        )
+        .await;
+
+        assert!(matches!(result, Err((StatusCode::BAD_REQUEST, _))));
+    }
 }

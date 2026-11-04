@@ -31,12 +31,35 @@ function message(error: unknown): string {
   return error instanceof Error && error.message !== "" ? error.message : "The move could not be completed.";
 }
 
-async function stepUp(machine: MachineId): Promise<void> {
+export async function stepUpForMove(machine: MachineId): Promise<void> {
   if (machine === "here") return;
   const paired = pairedMachine(machine);
   if (paired === undefined) throw new Error("The destination machine is no longer paired.");
   const outcome = await requestNativeStepUp(paired, "Move chat");
   if (outcome.kind === "failed") throw new Error(outcome.detail);
+}
+
+export async function finishWithRetry(finish: () => Promise<void>, attempts = 3): Promise<void> {
+  let failure: unknown;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      await finish();
+      return;
+    } catch (error) {
+      failure = error;
+      if (attempt + 1 < attempts) await new Promise((resolve) => window.setTimeout(resolve, 250 * (attempt + 1)));
+    }
+  }
+  throw failure;
+}
+
+export async function abortStartedMove(
+  active: { transferId: string } | null,
+  abort: (transferId: string) => Promise<void>,
+): Promise<boolean> {
+  if (active === null) return false;
+  await abort(active.transferId);
+  return true;
 }
 
 /** Runs the frozen half of a move, restoring the origin whenever it cannot finish. */
@@ -53,16 +76,25 @@ export async function finalizeChatMove<T>({
   finish: () => Promise<void>;
   abort: () => Promise<void>;
 }): Promise<T> {
-  let started = false;
+  let began = false;
+  let imported = false;
   try {
+    began = true;
     await begin();
-    started = true;
     const packageBody = await packageChat();
-    const imported = await importChat(packageBody);
-    await finish();
-    return imported;
+    const result = await importChat(packageBody);
+    imported = true;
+    await finishWithRetry(finish);
+    return result;
   } catch (error) {
-    if (started) await abort();
+    if (began && !imported) {
+      try {
+        await abort();
+      } catch (abortError) {
+        const original = message(error);
+        throw new Error(`${original} The original machine could not confirm that the chat was restored: ${message(abortError)}`);
+      }
+    }
     throw error;
   }
 }
@@ -113,7 +145,11 @@ export function MoveChatDialog({
   const [preview, setPreview] = useState<ChatTransferPreview | null>(null);
   const [progress, setProgress] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const begun = useRef<{ transferId: string; done: boolean } | null>(null);
+  const begun = useRef<{ transferId: string; done: boolean; phase: "begin" | "transferring" | "imported" } | null>(null);
+  const pendingFinish = useRef<(() => Promise<void>) | null>(null);
+  const pendingDestination = useRef<MachineId | null>(null);
+  const pendingDestinationName = useRef<string | null>(null);
+  const [closeOutPending, setCloseOutPending] = useState(false);
 
   useEffect(() => {
     if (destination === null || !destinations.some((machine) => machine.id === destination)) {
@@ -123,16 +159,24 @@ export function MoveChatDialog({
 
   const cancel = async () => {
     const active = begun.current;
+    if (active !== null && !active.done && active.phase !== "begin") {
+      setError("The chat has arrived on the destination. Retry completing the origin close-out instead.");
+      return;
+    }
     if (active !== null && !active.done) {
       setProgress("Restoring the chat on its original machine…");
       try {
-        await abortChatTransfer(chatId, active.transferId, source);
+        await abortStartedMove(active, async (transferId) => await abortChatTransfer(chatId, transferId, source));
       } catch {
         setError("The move was cancelled, but the original machine could not confirm that the chat was restored.");
         return;
       }
     }
     begun.current = null;
+    pendingFinish.current = null;
+    pendingDestination.current = null;
+    pendingDestinationName.current = null;
+    setCloseOutPending(false);
     onOpenChange(false);
   };
 
@@ -161,13 +205,17 @@ export function MoveChatDialog({
     setError(null);
     try {
       setProgress("Waiting for passkey confirmation…");
-      await stepUp(source);
-      await stepUp(destination);
+      await stepUpForMove(source);
+      await stepUpForMove(destination);
+      const destinationName = (await apiFetch<{ name: string }>("/machine", undefined, destination)).name;
+      const destinationId = destination === "here" ? `name:${destinationName}` : destination;
       await finalizeChatMove({
         begin: async () => {
           setProgress(when === "after_turn" ? "Waiting for the current turn to finish…" : "Freezing the chat…");
+          begun.current = { transferId, done: false, phase: "begin" };
           await beginChatTransfer(chatId, { when, transfer_id: transferId }, source);
-          begun.current = { transferId, done: false };
+          if (begun.current?.transferId !== transferId) throw new Error("The move was cancelled.");
+          if (begun.current?.transferId === transferId) begun.current.phase = "transferring";
         },
         packageChat: async () => {
           setProgress("Packaging the chat…");
@@ -175,20 +223,59 @@ export function MoveChatDialog({
         },
         importChat: async (packageBody) => {
           setProgress("Importing the chat on the destination…");
-          return await importChatTransfer(transferId, packageBody as Parameters<typeof importChatTransfer>[1], destination);
+          const imported = await importChatTransfer(transferId, packageBody as Parameters<typeof importChatTransfer>[1], destination);
+          if (begun.current?.transferId === transferId) begun.current.phase = "imported";
+          pendingDestination.current = destination;
+          pendingDestinationName.current = destinationName;
+          setCloseOutPending(true);
+          return imported;
         },
         finish: async () => {
           setProgress("Completing the move…");
-          await finishChatTransfer(chatId, { transfer_id: transferId, to: destination }, source);
+          const closeOut = async () => await finishChatTransfer(chatId, { transfer_id: transferId, to: destinationId, to_name: destinationName }, source);
+          pendingFinish.current = closeOut;
+          await closeOut();
         },
         abort: async () => await abortChatTransfer(chatId, transferId, source),
       });
       if (begun.current !== null) begun.current.done = true;
+      begun.current = null;
+      pendingFinish.current = null;
+      pendingDestination.current = null;
+      pendingDestinationName.current = null;
+      setCloseOutPending(false);
       rememberChatMachine([chatId], destination);
       await queryClient.invalidateQueries({ queryKey: keys.chats.all });
       onOpenChange(false);
     } catch (cause) {
+      if (begun.current?.phase === "imported") {
+        setError(`The move is complete on ${pendingDestinationName.current ?? "the destination"}; only close-out on ${sourceView?.name ?? source} is pending. Retry to finish it. ${message(cause)}`);
+      } else {
+        begun.current = null;
+        setError(message(cause));
+      }
+    } finally {
+      setProgress(null);
+    }
+  };
+
+  const retryCloseOut = async () => {
+    const active = begun.current;
+    if (active === null || active.phase !== "imported" || pendingFinish.current === null) return;
+    setError(null);
+    setProgress("Completing the move…");
+    try {
+      await finishWithRetry(pendingFinish.current);
+      active.done = true;
       begun.current = null;
+      pendingFinish.current = null;
+      if (pendingDestination.current !== null) rememberChatMachine([chatId], pendingDestination.current);
+      pendingDestination.current = null;
+      pendingDestinationName.current = null;
+      setCloseOutPending(false);
+      await queryClient.invalidateQueries({ queryKey: keys.chats.all });
+      onOpenChange(false);
+    } catch (cause) {
       setError(message(cause));
     } finally {
       setProgress(null);
@@ -206,9 +293,10 @@ export function MoveChatDialog({
       title="Move chat"
       footer={
         <>
-          <Button variant="ghost" disabled={busy} onClick={() => void cancel()}>
+          <Button variant="ghost" disabled={busy && begun.current?.phase !== "begin" || closeOutPending} onClick={() => void cancel()}>
             Cancel
           </Button>
+          {closeOutPending && <Button variant="approve" disabled={busy} onClick={() => void retryCloseOut()}>Retry</Button>}
           {preview === null ? (
             <Button variant="approve" disabled={busy || destination === null || !originReachable} onClick={() => void inspect()}>
               Review move
@@ -222,7 +310,7 @@ export function MoveChatDialog({
       }
     >
       <div className="chats-helpers">
-        <p>The current turn can finish and the queue will move with this chat.</p>
+        <p>The current turn can finish; messages already queued move with this chat.</p>
         {originProblem !== null && <ErrorNote>{originProblem}</ErrorNote>}
         <label>
           Move to
@@ -249,7 +337,7 @@ export function MoveChatDialog({
 export function TransferNotes({ preview }: { preview: ChatTransferPreview }) {
   return <>
     <h2>Before you move</h2>
-    <p>A running turn can finish first; messages added while it finishes move in the queue.</p>
+    <p>A running turn can finish first. While the move is frozen, new messages are refused until it arrives.</p>
     <h3>What stops</h3>
     {preview.will_stop.length === 0 ? <p>Nothing else will stop.</p> : <ul>{preview.will_stop.map((item) => <li key={item}>{item}</li>)}</ul>}
     <h3>What stays behind</h3>

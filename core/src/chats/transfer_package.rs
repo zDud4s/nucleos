@@ -329,10 +329,11 @@ pub async fn import(
         }
         None => None,
     };
-    // A chat with no folder has no encoded project folder to put its transcript in; the session id
-    // still travels.
-    if let (Some(session), Some(bytes), Some(tree)) = (&package.session, &transcript, &tree) {
-        let folder = store.join(encode_cwd(&tree.to_string_lossy()));
+    if let (Some(session), Some(bytes)) = (&package.session, &transcript) {
+        let folder = tree.as_ref().map_or_else(
+            || store.join("default"),
+            |tree| store.join(encode_cwd(&tree.to_string_lossy())),
+        );
         std::fs::create_dir_all(&folder)
             .and_then(|()| {
                 std::fs::write(folder.join(format!("{}.jsonl", session.session_id)), bytes)
@@ -346,14 +347,15 @@ pub async fn import(
     };
     let session_id = package.session.as_ref().map(|s| s.session_id.clone());
     let mut tx = pool.begin().await?;
-    sqlx::query(
+    let saved = sqlx::query(
         "INSERT INTO chats (chat_id, title, brain, created_at, cwd, ide_session_id, model, effort, plan_only)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(chat_id) DO UPDATE SET
              title = excluded.title, brain = excluded.brain, cwd = excluded.cwd,
              ide_session_id = excluded.ide_session_id, model = excluded.model,
              effort = excluded.effort, plan_only = excluded.plan_only,
-             moved_to = NULL, frozen_for = NULL, frozen_at = NULL, archived_at = NULL",
+             moved_to = NULL, frozen_for = NULL, frozen_at = NULL, archived_at = NULL
+         WHERE chats.moved_to IS NOT NULL",
     )
     .bind(&package.chat_id)
     .bind(&package.chat.title)
@@ -365,7 +367,11 @@ pub async fn import(
     .bind(&package.chat.effort)
     .bind(i64::from(package.chat.plan_only))
     .execute(&mut *tx)
-    .await?;
+    .await?
+    .rows_affected();
+    if saved == 0 {
+        return Err(Refusal::AlreadyHere.into());
+    }
     match &session_id {
         Some(id) => {
             sqlx::query(
@@ -629,6 +635,58 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn a_chat_without_a_folder_carries_its_transcript() {
+        let origin = crate::testdb::fresh_pool().await;
+        let destination = crate::testdb::fresh_pool().await;
+        let store_a = space_free_tempdir("nucleos-move-store-a-");
+        let store_b = space_free_tempdir("nucleos-move-store-b-");
+        a_chat(&origin, "c1", None).await;
+        let source_folder = store_a.path().join("default");
+        std::fs::create_dir_all(&source_folder).unwrap();
+        std::fs::write(source_folder.join("sess-1.jsonl"), b"transcript").unwrap();
+        sqlx::query(
+            "INSERT INTO assistant_sessions (chat_id, session_id, updated_at)
+             VALUES ('c1', 'sess-1', 'now')",
+        )
+        .execute(&origin)
+        .await
+        .unwrap();
+        freeze(&origin, "c1", "t-1").await;
+
+        let package = build(&origin, "c1", "t-1", store_a.path(), vec![])
+            .await
+            .unwrap();
+        import(&destination, &package, store_b.path())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(store_b.path().join("default").join("sess-1.jsonl")).unwrap(),
+            b"transcript"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_import_cannot_overwrite_a_live_destination_chat() {
+        let origin = crate::testdb::fresh_pool().await;
+        let destination = crate::testdb::fresh_pool().await;
+        let store = space_free_tempdir("nucleos-move-store-");
+        a_chat(&origin, "c1", None).await;
+        a_chat(&destination, "c1", None).await;
+        freeze(&origin, "c1", "t-1").await;
+        let package = build(&origin, "c1", "t-1", store.path(), vec![])
+            .await
+            .unwrap();
+
+        let imported = import(&destination, &package, store.path()).await;
+
+        assert!(matches!(
+            imported,
+            Err(Failure::Refused(Refusal::AlreadyHere))
+        ));
     }
 
     #[tokio::test]

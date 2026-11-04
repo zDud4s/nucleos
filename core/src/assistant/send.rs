@@ -66,11 +66,14 @@ async fn send_or_queue_inner(
     // Refused before anything waits: a picture that cannot be sent now cannot be sent from the
     // queue either, and finding that out at the drain is finding it out after the person left.
     check_images(images)?;
-    // A chat that moved to another machine takes no turn here; one being moved takes the message
-    // into the queue below, and the package carries it.
+    // A chat that moved to another machine takes no turn here, and a frozen one must not accept a
+    // queue entry that the package has already passed.
     let gate = crate::chats::transfer::gate(&state.pool, chat_id).await;
     if let crate::chats::transfer::Gate::Moved(to) = &gate {
         return Err(crate::chats::transfer::moved_sentence(to));
+    }
+    if gate == crate::chats::transfer::Gate::Frozen {
+        return Err(crate::chats::transfer::CHAT_FROZEN.to_string());
     }
     // A person sending again is what ends a hold (after Stop, or after a failed send).
     release_queue(chat_id);
@@ -118,11 +121,6 @@ async fn send_or_queue_inner(
         };
         written.map_err(|error| error.to_string())
     };
-    if gate == crate::chats::transfer::Gate::Frozen {
-        // No drain: nothing may start while the chat is frozen. `abort` drains it again.
-        enqueue().await?;
-        return Ok(Sent::Queued);
-    }
     if !waiting.is_empty() {
         enqueue().await?;
         spawn_drain_if_free(state, chat_id);
@@ -134,11 +132,8 @@ async fn send_or_queue_inner(
     .await
     {
         Ok(id) => Ok(Sent::Turn(id)),
-        // The freeze landed between the check above and the slot: the message waits like the rest.
-        Err(refusal) if refusal == crate::chats::transfer::CHAT_FROZEN => {
-            enqueue().await?;
-            Ok(Sent::Queued)
-        }
+        // The freeze landed between the check above and the slot, after packaging may have begun.
+        Err(refusal) if refusal == crate::chats::transfer::CHAT_FROZEN => Err(refusal),
         Err(refusal) if refusal == TURN_IN_PROGRESS => {
             enqueue().await?;
             // The turn may have ended between the refusal and the write; then nobody would drain it.
@@ -3108,7 +3103,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_move_after_the_turn_waits_for_the_turn_and_carries_the_queue() {
+    async fn a_frozen_chat_refuses_new_queue_entries() {
         use crate::chats::transfer::{self, Gate, When};
         let fake = Arc::new(FakeCommandRunner::default());
         let mut state = live_channel_state().await;
@@ -3138,7 +3133,10 @@ mod tests {
         let meanwhile =
             send_or_queue(&state, &chat, "typed during the freeze", &[], Origin::Shell).await;
 
-        assert_eq!(meanwhile, Ok(Sent::Queued));
+        assert_eq!(
+            meanwhile,
+            Err(crate::chats::transfer::CHAT_FROZEN.to_string())
+        );
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert!(!moving.is_finished(), "the move must wait for the turn");
         assert!(is_busy(&chat));
@@ -3149,14 +3147,13 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(begun.cut_turn, None);
-        assert_eq!(begun.queued, 1);
+        assert_eq!(begun.queued, 0);
         assert!(!is_busy(&chat));
         // The turn ending did not start the queued message: it travels instead.
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(assistant_turns_of(&state.pool, &chat).await, 1);
         let waiting = crate::chats::queued(&state.pool, &chat).await.unwrap();
-        assert_eq!(waiting.len(), 1);
-        assert_eq!(waiting[0].text, "typed during the freeze");
+        assert!(waiting.is_empty());
 
         // The package half: the queued turn is in the package, taken from the standing freeze.
         let nowhere = std::env::temp_dir().join("nucleos-no-such-session-store");
@@ -3164,8 +3161,7 @@ mod tests {
             crate::chats::transfer_package::build(&state.pool, &chat, "t-1", &nowhere, vec![])
                 .await
                 .unwrap();
-        assert_eq!(package.queue.len(), 1);
-        assert_eq!(package.queue[0].text, "typed during the freeze");
+        assert!(package.queue.is_empty());
         let other =
             crate::chats::transfer_package::build(&state.pool, &chat, "t-other", &nowhere, vec![])
                 .await;

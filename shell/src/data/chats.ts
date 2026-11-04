@@ -761,7 +761,7 @@ export async function importChatTransfer(transferId: string, packageBody: ChatTr
 }
 
 /** Mark the destination live after its import has succeeded. */
-export async function finishChatTransfer(chatId: string, body: { transfer_id: string; to: string }, machine: MachineId = chatMachineOf(chatId)): Promise<void> {
+export async function finishChatTransfer(chatId: string, body: { transfer_id: string; to: string; to_name?: string }, machine: MachineId = chatMachineOf(chatId)): Promise<void> {
   await apiFetch<void>(transferPath(chatId, "finish"), { method: "POST", body: JSON.stringify(body) }, machine);
 }
 

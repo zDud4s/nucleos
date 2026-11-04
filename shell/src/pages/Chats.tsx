@@ -115,6 +115,7 @@ import {
 } from "../data/chats";
 import { type RelaySent } from "../lib/turns";
 import { chatKey, rememberChatMachine, useChatMachine } from "../data/chatMachines";
+import { useMachines } from "../data/machines";
 import { MachinePicker, useNewWorkMachine } from "../chats/MachinePicker";
 import { type ChatNotice } from "../data/chats";
 import { usePaletteGroup, usePaletteQuery } from "../ui";
@@ -1146,20 +1147,29 @@ function ChatDetail({
 
 function MovedChat({ chatId, destination }: { chatId: string; destination: string }) {
   const navigate = useNavigate();
+  const machines = useMachines();
+  let stored = { id: destination, name: destination };
+  try {
+    const parsed = JSON.parse(destination) as { id?: unknown; name?: unknown };
+    if (typeof parsed.id === "string" && typeof parsed.name === "string") stored = parsed;
+  } catch {
+    // Older origins stored the display value directly.
+  }
+  const target = machines.find((machine) => machine.id === stored.id || machine.name === stored.name);
   return (
     <section className="chats-detail-inner">
       <ErrorNote>
-        This chat was moved to another machine and is read-only here.
+        This chat was moved to {stored.name} and is read-only here.
       </ErrorNote>
-      <Button
+      {target !== undefined && <Button
         variant="approve"
         onClick={() => {
-          rememberChatMachine([chatId], destination);
+          rememberChatMachine([chatId], target.id);
           void navigate({ to: `/chats/${chatId}` });
         }}
       >
         Open on the destination
-      </Button>
+      </Button>}
     </section>
   );
 }

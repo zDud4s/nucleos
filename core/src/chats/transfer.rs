@@ -1,36 +1,57 @@
 //! Moving a chat to another machine in the middle of work: the state of the move on THIS machine.
-//!
+//! Moving a chat to another machine in the middle of work: the state of the move on this machine.
 //! The order, driven by the app: `preview`, the person confirms, `begin` freezes the origin,
 //! `package`, `import` on the destination, `finish` at the origin. A failure before `finish` is an
 //! `abort` and the chat goes on working here. This file is the part that lives in the database
 //! (`chats.moved_to`, `chats.frozen_for`, `chats.frozen_at`, `chat_transfers_seen`, migration 0266)
 //! and the wait `begin` does lives in `assistant/chat_move.rs`; packaging and importing are the next part's.
 //!
-//! A frozen chat refuses to START turns (`assistant::send`): a message typed meanwhile joins the
-//! queue, which travels in the package. A moved chat refuses them with a sentence naming the
-//! destination. A freeze older than [`FREEZE_TTL_SECS`] is read as gone, so an app that vanishes
-//! between `begin` and `finish` cannot trap a chat.
+//! A frozen chat refuses new turns and queue entries (`assistant::send`). A moved chat refuses
+//! them with a sentence naming the destination. A freeze older than [`FREEZE_TTL_SECS`] reads as
+//! gone, while retaining its transfer id so a delayed finish can prove that no newer turn started.
 
 use sqlx::SqlitePool;
+
+#[derive(serde::Deserialize)]
+struct StoredDestination {
+    id: String,
+    name: String,
+}
+
+pub fn destination_id(value: &str) -> String {
+    serde_json::from_str::<StoredDestination>(value)
+        .ok()
+        .map(|destination| destination.id)
+        .unwrap_or_else(|| value.to_string())
+}
+
+pub fn destination_name(value: &str) -> String {
+    serde_json::from_str::<StoredDestination>(value)
+        .ok()
+        .map(|destination| destination.name)
+        .unwrap_or_else(|| value.to_string())
+}
 
 /// How long a freeze lives without being confirmed alive ([`touch`]).
 pub const FREEZE_TTL_SECS: i64 = 15 * 60;
 
-/// What a message typed into a frozen chat is told. It is also the refusal `send_message_inner`
-/// returns, which `send_or_queue` turns into a queued message.
+/// What a message typed into a frozen chat is told.
 pub const CHAT_FROZEN: &str =
-    "this chat is being moved to another machine; the message is waiting and goes with it";
+    "this chat is being moved to another machine; try again after it arrives";
 
 /// What a new turn in a moved chat is told.
 pub fn moved_sentence(to: &str) -> String {
-    format!("This chat was moved to {to}. Continue it there; this copy is read-only.")
+    format!(
+        "This chat was moved to {}. Continue it there; this copy is read-only.",
+        destination_name(to)
+    )
 }
 
 /// Whether a chat may start a turn here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Gate {
     Open,
-    /// A move is in progress; messages queue.
+    /// A move is in progress; no new message may start or join the queue.
     Frozen,
     /// The chat lives on the named machine.
     Moved(String),
@@ -46,6 +67,8 @@ pub enum Refusal {
     Moved(String),
     /// `finish` or a wait found no freeze for this transfer: it expired or was aborted.
     NotFrozenForThis,
+    /// The freeze expired and this machine started a new turn before close-out.
+    OriginChangedAfterExpiry,
     /// An import found the chat alive on this machine: it is not a chat that moved away.
     AlreadyHere,
     Store(sqlx::Error),
@@ -59,6 +82,10 @@ impl Refusal {
             Self::Moved(to) => moved_sentence(to),
             Self::NotFrozenForThis => {
                 "this move is no longer in progress (it was aborted or expired)".to_string()
+            }
+            Self::OriginChangedAfterExpiry => {
+                "this move expired and the origin has started a new turn, so it cannot be closed out"
+                    .to_string()
             }
             Self::AlreadyHere => "this chat already lives on this machine".to_string(),
             Self::Store(error) => format!("could not read the chat: {error}"),
@@ -77,18 +104,12 @@ pub fn unix_now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
-/// Drops a freeze nobody confirmed within [`FREEZE_TTL_SECS`]. Called by every read of the freeze.
-async fn expire(pool: &SqlitePool, chat_id: &str, now: i64) -> sqlx::Result<()> {
-    sqlx::query(
-        "UPDATE chats SET frozen_for = NULL, frozen_at = NULL
-          WHERE chat_id = ? AND frozen_for IS NOT NULL
-            AND (frozen_at IS NULL OR frozen_at <= ?)",
-    )
-    .bind(chat_id)
-    .bind(now - FREEZE_TTL_SECS)
-    .execute(pool)
-    .await?;
-    Ok(())
+/// Whether a freeze is stale enough to stop blocking normal work.
+fn freeze_has_expired(frozen_at: Option<i64>, now: i64) -> bool {
+    match frozen_at {
+        Some(at) => at <= now - FREEZE_TTL_SECS,
+        None => true,
+    }
 }
 
 /// [`gate_at`] on the real clock; a store error reads as open, because refusing every turn of a
@@ -105,15 +126,14 @@ pub async fn gate(pool: &SqlitePool, chat_id: &str) -> Gate {
 
 /// Whether the chat may start a turn at `now`. A chat with no row is open.
 pub async fn gate_at(pool: &SqlitePool, chat_id: &str, now: i64) -> sqlx::Result<Gate> {
-    expire(pool, chat_id, now).await?;
-    let row: Option<(Option<String>, Option<String>)> =
-        sqlx::query_as("SELECT moved_to, frozen_for FROM chats WHERE chat_id = ?")
+    let row: Option<(Option<String>, Option<String>, Option<i64>)> =
+        sqlx::query_as("SELECT moved_to, frozen_for, frozen_at FROM chats WHERE chat_id = ?")
             .bind(chat_id)
             .fetch_optional(pool)
             .await?;
     Ok(match row {
-        Some((Some(to), _)) => Gate::Moved(to),
-        Some((None, Some(_))) => Gate::Frozen,
+        Some((Some(to), _, _)) => Gate::Moved(to),
+        Some((None, Some(_), frozen_at)) if !freeze_has_expired(frozen_at, now) => Gate::Frozen,
         _ => Gate::Open,
     })
 }
@@ -126,16 +146,16 @@ pub async fn freeze_at(
     transfer_id: &str,
     now: i64,
 ) -> Result<(), Refusal> {
-    expire(pool, chat_id, now).await?;
     let changed = sqlx::query(
         "UPDATE chats SET frozen_for = ?, frozen_at = ?
           WHERE chat_id = ? AND moved_to IS NULL
-            AND (frozen_for IS NULL OR frozen_for = ?)",
+            AND (frozen_for IS NULL OR frozen_for = ? OR frozen_at IS NULL OR frozen_at <= ?)",
     )
     .bind(transfer_id)
     .bind(now)
     .bind(chat_id)
     .bind(transfer_id)
+    .bind(now - FREEZE_TTL_SECS)
     .execute(pool)
     .await?
     .rows_affected();
@@ -149,22 +169,25 @@ pub async fn freeze_at(
     })
 }
 
-/// Confirms the freeze of `transfer_id` alive, answering whether it still stands.
+/// Confirms the live freeze of `transfer_id` alive, answering whether it still stands. An expired
+/// freeze remains recorded so a delayed finish can safely close it out when no turn has started.
 pub async fn touch_at(
     pool: &SqlitePool,
     chat_id: &str,
     transfer_id: &str,
     now: i64,
 ) -> sqlx::Result<bool> {
-    expire(pool, chat_id, now).await?;
-    let changed =
-        sqlx::query("UPDATE chats SET frozen_at = ? WHERE chat_id = ? AND frozen_for = ?")
-            .bind(now)
-            .bind(chat_id)
-            .bind(transfer_id)
-            .execute(pool)
-            .await?
-            .rows_affected();
+    let changed = sqlx::query(
+        "UPDATE chats SET frozen_at = ?
+          WHERE chat_id = ? AND frozen_for = ? AND frozen_at > ?",
+    )
+    .bind(now)
+    .bind(chat_id)
+    .bind(transfer_id)
+    .bind(now - FREEZE_TTL_SECS)
+    .execute(pool)
+    .await?
+    .rows_affected();
     Ok(changed == 1)
 }
 
@@ -184,8 +207,8 @@ pub async fn abort(pool: &SqlitePool, chat_id: &str, transfer_id: &str) -> sqlx:
 }
 
 /// Completes the move: the chat now lives at `to`, the freeze ends, and the waiting messages (which
-/// travelled in the package) leave this machine's queue. Needs the freeze of `transfer_id` to
-/// still stand; repeating a finish that already happened for the same `to` is a no-op.
+/// travelled in the package) leave this machine's queue. An expired freeze of the same transfer is
+/// also accepted when no newer turn started here; repeating a finish for the same `to` is a no-op.
 pub async fn finish_at(
     pool: &SqlitePool,
     chat_id: &str,
@@ -193,15 +216,20 @@ pub async fn finish_at(
     to: &str,
     now: i64,
 ) -> Result<(), Refusal> {
-    expire(pool, chat_id, now).await?;
     let mut tx = pool.begin().await?;
     let changed = sqlx::query(
         "UPDATE chats SET moved_to = ?, frozen_for = NULL, frozen_at = NULL
-          WHERE chat_id = ? AND frozen_for = ? AND moved_to IS NULL",
+          WHERE chat_id = ? AND frozen_for = ? AND moved_to IS NULL
+            AND (frozen_at > ? OR NOT EXISTS (
+                SELECT 1 FROM runs
+                 WHERE runs.chat_id = chats.chat_id AND runs.mode = 'assistant'
+                   AND CAST(strftime('%s', runs.created_at) AS INTEGER) > chats.frozen_at
+            ))",
     )
     .bind(to)
     .bind(chat_id)
     .bind(transfer_id)
+    .bind(now - FREEZE_TTL_SECS)
     .execute(&mut *tx)
     .await?
     .rows_affected();
@@ -214,8 +242,20 @@ pub async fn finish_at(
                 .await?;
         return match moved {
             None => Err(Refusal::NoSuchChat),
-            Some(Some(already)) if already == to => Ok(()),
-            _ => Err(Refusal::NotFrozenForThis),
+            Some(Some(already)) if destination_id(&already) == destination_id(to) => Ok(()),
+            Some(Some(_)) => Err(Refusal::NotFrozenForThis),
+            Some(None) => {
+                let frozen_for: Option<String> =
+                    sqlx::query_scalar("SELECT frozen_for FROM chats WHERE chat_id = ?")
+                        .bind(chat_id)
+                        .fetch_one(pool)
+                        .await?;
+                if frozen_for.as_deref() == Some(transfer_id) {
+                    Err(Refusal::OriginChangedAfterExpiry)
+                } else {
+                    Err(Refusal::NotFrozenForThis)
+                }
+            }
         };
     }
     sqlx::query("DELETE FROM chat_queue WHERE chat_id = ?")
@@ -440,8 +480,8 @@ mod tests {
         assert!(!abort(&pool, "c1", "t-1").await.unwrap());
         assert_eq!(gate_at(&pool, "c1", 1_003).await.unwrap(), Gate::Frozen);
 
-        // The app vanished: the freeze expires by itself, read at the 15 minute mark, and a finish
-        // that arrives too late is refused instead of moving a chat nobody confirmed.
+        // The app vanished: the freeze expires by itself, read at the 15 minute mark. A new turn
+        // after that expiry means the old move must not close this now-live origin.
         freeze_at(&pool, "c2", "t-9", 5_000).await.unwrap();
         let just_before = 5_000 + FREEZE_TTL_SECS - 1;
         assert_eq!(
@@ -449,9 +489,16 @@ mod tests {
             Gate::Frozen
         );
         let late = 5_000 + FREEZE_TTL_SECS;
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, chat_id, created_at)
+             VALUES ('new work', 'completed', 'assistant', 'c2', '1970-01-01T01:38:21Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         let finished = finish_at(&pool, "c2", "t-9", "laptop", late).await;
         assert!(
-            matches!(finished, Err(Refusal::NotFrozenForThis)),
+            matches!(finished, Err(Refusal::OriginChangedAfterExpiry)),
             "{finished:?}"
         );
         assert_eq!(gate_at(&pool, "c2", late).await.unwrap(), Gate::Open);
@@ -463,6 +510,22 @@ mod tests {
                 .await
                 .unwrap(),
             Gate::Frozen
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_after_expiry_closes_out_when_no_new_turn_started() {
+        let pool = crate::testdb::fresh_pool().await;
+        a_chat(&pool, "c1").await;
+        freeze_at(&pool, "c1", "t-1", 1_000).await.unwrap();
+
+        finish_at(&pool, "c1", "t-1", "laptop", 1_000 + FREEZE_TTL_SECS)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            gate_at(&pool, "c1", 1_000 + FREEZE_TTL_SECS).await.unwrap(),
+            Gate::Moved("laptop".to_string())
         );
     }
 
