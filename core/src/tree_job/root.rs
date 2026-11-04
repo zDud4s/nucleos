@@ -296,6 +296,10 @@ async fn retry_failed_start(state: &AppState, job: &TreeJob, record: &Value) -> 
             return Ok(());
         }
     }
+    // A refused admission waits out a backoff before the next try (see `watchdog`).
+    if super::watchdog::root_start_waits(record) {
+        return Ok(());
+    }
     start(state, job).await.map(|_| ())
 }
 
