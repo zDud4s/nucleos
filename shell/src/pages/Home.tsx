@@ -2,7 +2,9 @@ import { useQueryClient } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import type { ReactNode } from "react";
 import { FeedEmbed } from "../app/FeedEmbed";
+import { apiFetch } from "../data/client";
 import { keys } from "../data/keys";
+import { registerPrefetcher } from "../lib/prefetch";
 import {
   isAggregateTimeout,
   useBudget,
@@ -32,6 +34,22 @@ import { ErrorNote, Meter, PageHeader, Skeleton, StaleNote, StatCard, Term, ceil
  * All four queries run at the fast cadence, because all four are answers to
  * "what is the machine doing right now".
  */
+/** Hovering "Home" warms the two readings the cards are built from, under the keys their hooks read. */
+registerPrefetcher("/", (qc) =>
+  Promise.all([
+    qc.prefetchQuery({
+      queryKey: keys.projects.all,
+      queryFn: () => apiFetch<ProjectSummary[]>("/projects"),
+      staleTime: 5_000,
+    }),
+    qc.prefetchQuery({
+      queryKey: keys.autopilot.budget,
+      queryFn: () => apiFetch<BudgetView>("/autopilot/budget"),
+      staleTime: 5_000,
+    }),
+  ]),
+);
+
 export function Home() {
   const projects = useProjects();
   const waiting = useWaitingCount();

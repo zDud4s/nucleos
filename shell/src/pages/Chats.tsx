@@ -51,7 +51,8 @@ import {
   SquarePen,
   X,
 } from "lucide-react";
-import { isApiRefusal } from "../data/client";
+import { apiFetch, isApiRefusal } from "../data/client";
+import { registerPrefetcher } from "../lib/prefetch";
 import { SlashCard, sourceLabel } from "../chats/SlashCard";
 import { McpMenuItems } from "../chats/McpPanel";
 import {
@@ -179,6 +180,15 @@ import { DAEMON_NAME } from "../copy";
 const SPEAKER_LABEL = "service";
 
 import "./chats.css";
+
+/** Hovering "Chats" in the sidebar warms the conversation list under the key `useChats` reads. */
+registerPrefetcher("/chats", (qc) =>
+  qc.prefetchQuery({
+    queryKey: keys.chats.all,
+    queryFn: () => apiFetch<ChatSummary[]>("/assistant/chats"),
+    staleTime: 5_000,
+  }),
+);
 
 /**
  * Chats — one master-detail page serving `/chats` and `/chats/$chatId`.

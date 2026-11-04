@@ -3,7 +3,9 @@ import { Link, useNavigate, useRouterState } from "@tanstack/react-router";
 import { ArrowRight } from "lucide-react";
 
 import { DAEMON_NAME } from "../copy";
-import { isApiRefusal } from "../data/client";
+import { apiFetch, isApiRefusal } from "../data/client";
+import { keys } from "../data/keys";
+import { registerPrefetcher } from "../lib/prefetch";
 import { useLiveJobs, useLiveRuns } from "../data/fleet";
 import { folderOf, gateOf, headline, inAttentionOrder, whereWaiting } from "../data/roster";
 import { useProjects, type ProjectSummary } from "../data/system";
@@ -55,6 +57,14 @@ import { plural } from "../lib/plural";
  * somebody who has already opened the one they mean. It lives in the project header's *More
  * actions* menu now (`LeavingDialog`), and the acknowledgement still lands here, because this is where the project is missing from.
  */
+registerPrefetcher("/projects", (qc) =>
+  qc.prefetchQuery({
+    queryKey: keys.projects.all,
+    queryFn: () => apiFetch<ProjectSummary[]>("/projects"),
+    staleTime: 5_000,
+  }),
+);
+
 export function Roster() {
   const projects = useProjects();
   const rows = projects.data ?? [];

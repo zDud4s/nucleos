@@ -1,7 +1,9 @@
 import { useState } from "react";
 import { Link } from "@tanstack/react-router";
 import { DAEMON_NAME } from "../copy";
-import { isApiRefusal } from "../data/client";
+import { apiFetch, isApiRefusal } from "../data/client";
+import { keys } from "../data/keys";
+import { registerPrefetcher } from "../lib/prefetch";
 import { NewDepartment, POWER_LABEL } from "../team/Charter";
 import { RosterMatrix, headcountOf, specialistsOf } from "../team/RosterMatrix";
 import {
@@ -39,6 +41,11 @@ import {
   usd,
 } from "../ui";
 import "./teams.css";
+
+/** Hovering "Teams" in the sidebar warms the departments list under the key `useTeams` reads. */
+registerPrefetcher("/teams", (qc) =>
+  qc.prefetchQuery({ queryKey: keys.teams.list, queryFn: () => apiFetch<TeamView[]>("/teams"), staleTime: 5_000 }),
+);
 import { plural, pluralWord } from "../lib/plural";
 
 const NEW_TEAM_FORM = "new-team-form";

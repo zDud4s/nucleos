@@ -11,11 +11,13 @@ import {
 import { Link, useNavigate, useSearch } from "@tanstack/react-router";
 import { AnimatePresence } from "motion/react";
 import { DAEMON_NAME } from "../copy";
-import { isApiRefusal, type ApiRefusal } from "../data/client";
+import { apiFetch, isApiRefusal, type ApiRefusal } from "../data/client";
 import {
   RUN_MODE_FILTERS,
   RUN_STATUSES,
+  runFilterFields,
   runIsAlive,
+  runsQuery,
   useCreateRun,
   useRunPages,
   useRuns,
@@ -31,6 +33,8 @@ import {
   type Preset,
 } from "../data/presets";
 import { routeTriple } from "../data/route";
+import { keys } from "../data/keys";
+import { registerPrefetcher } from "../lib/prefetch";
 import { plural } from "../lib/plural";
 import { dayHeading, dayKey } from "../lib/timeline";
 import { useKillSwitch, useProjects, type ProjectSummary } from "../data/system";
@@ -59,6 +63,20 @@ import {
   Teach,
 } from "../ui";
 import "./runs.css";
+
+/**
+ * Hovering the sidebar's "Runs" warms the first page of the default list (conversation turns
+ * hidden), under the exact key `useRunPages` reads — the page opens on rows, not on a skeleton.
+ */
+const DEFAULT_RUN_LIST: RunFilters = { group: "chat", chatTurns: "hide" };
+registerPrefetcher("/runs", (qc) =>
+  qc.prefetchInfiniteQuery({
+    queryKey: keys.runs.search({ ...runFilterFields(DEFAULT_RUN_LIST), paged: "older" }),
+    queryFn: () => apiFetch<RunSearchResult[]>(`/runs${runsQuery(DEFAULT_RUN_LIST)}`),
+    initialPageParam: undefined as number | undefined,
+    staleTime: 5_000,
+  }),
+);
 
 /**
  * The run index: what has run, what is running, and the two ways to start one.
@@ -518,7 +536,7 @@ function RunList({
   /** Opens the New run panel; absent while it is already open. */
   onCompose: (() => void) | undefined;
 }) {
-  if (rows === undefined) return <Skeleton label="Loading runs" lines={3} />;
+  if (rows === undefined) return <Skeleton label="Loading runs" variant="row" count={6} />;
 
   if (rows.length === 0) {
     return (

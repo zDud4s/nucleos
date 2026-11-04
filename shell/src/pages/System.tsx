@@ -1,7 +1,9 @@
 import { useEffect, useState, type ComponentProps, type ReactNode } from "react";
 import { Link, useNavigate, useParams, useSearch } from "@tanstack/react-router";
 import { validateSystemSearch } from "./systemSearch";
-import { isApiRefusal } from "../data/client";
+import { apiFetch, isApiRefusal } from "../data/client";
+import { keys } from "../data/keys";
+import { registerPrefetcher } from "../lib/prefetch";
 import { formatBytes } from "../data/files";
 import { routeTriple, useRouteReport, type RoutePair } from "../data/route";
 import { NotchProviders } from "./NotchProviders";
@@ -83,6 +85,15 @@ import { ChannelsView } from "./ChannelsView";
 import { RestartSidecar } from "../channels/RestartSidecar";
 import { NotificationsView } from "./NotificationsView";
 import "./system.css";
+
+/** Hovering "System" in the sidebar warms the autopilot budget, the first reading on the page. */
+registerPrefetcher("/system", (qc) =>
+  qc.prefetchQuery({
+    queryKey: keys.autopilot.budget,
+    queryFn: () => apiFetch<BudgetView>("/autopilot/budget"),
+    staleTime: 5_000,
+  }),
+);
 import { DAEMON_NAME } from "../copy";
 import { percentText } from "../lib/format";
 import { plural } from "../lib/plural";
