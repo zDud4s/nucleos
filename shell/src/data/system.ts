@@ -40,8 +40,8 @@ export interface QuotaBrakeView {
 export interface ProjectSummary {
   project_id: string;
   /**
-   * The git remote of the project's folder. The daemon's `/projects` does not send it today (only
-   * `/projects/detect` reads it), so absent means no remote: such a project exists only on its machine.
+   * The git remote of the project's folder. The daemon's `/projects` sends it; absent remains
+   * compatible with older daemons, and means no remote: such a project exists only on its machine.
    */
   remote?: string | null;
   mode: AutopilotMode;

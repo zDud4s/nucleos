@@ -106,9 +106,7 @@ function machineFetch(machine: NativeMachine, origin: string): typeof fetch {
 
 const STEP_UP_POLL_MS = 1_000;
 const STEP_UP_WAIT_MS = 5 * 60_000;
-const MOVE_CHAT_ACTION = "move_chat";
-
-async function nativeStepUp(machine: NativeMachine, origin: string) {
+async function nativeStepUp(machine: NativeMachine, origin: string, action: string) {
   const fetchForMachine = machineFetch(machine, origin);
   try {
     const status = await fetchForMachine(`${origin}/api/stepup/status`);
@@ -119,7 +117,7 @@ async function nativeStepUp(machine: NativeMachine, origin: string) {
     const created = await fetchForMachine(`${origin}/api/stepup/ticket`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Nucleos-Csrf": "1" },
-      body: JSON.stringify({ action: MOVE_CHAT_ACTION }),
+      body: JSON.stringify({ action }),
     });
     if (created.status === 400) {
       const body = (await created.json().catch(() => null)) as { refusal?: unknown } | null;
@@ -144,9 +142,20 @@ async function nativeStepUp(machine: NativeMachine, origin: string) {
   return { kind: "failed" as const, code: "step_up_required", detail: "Passkey confirmation was not completed. Nothing was done." };
 }
 
-/** Opens the fixed move-a-chat step-up flow for a paired machine. */
-export async function requestNativeStepUp(machine: NativeMachine, _label = "Move chat"): Promise<StepUpOutcome> {
-  return await nativeStepUp(machine, machine.origin.replace(/\/$/, ""));
+/** The grave action ids the daemon accepts for a step-up ticket (core/src/remote/stepup.rs). */
+export type StepUpAction = "move_chat";
+
+/**
+ * The gateway refuses with a bare `step_up_required` and names no action, so the refused path is
+ * mapped here. The only grave routes today are the chat move routes.
+ */
+export function stepUpActionForPath(_path: string): StepUpAction {
+  return "move_chat";
+}
+
+/** Opens a step-up flow for the action the paired gateway refused. */
+export async function requestNativeStepUp(machine: NativeMachine, action: StepUpAction = "move_chat"): Promise<StepUpOutcome> {
+  return await nativeStepUp(machine, machine.origin.replace(/\/$/, ""), action);
 }
 
 /**
@@ -169,7 +178,7 @@ export function nativeTransport(machine: NativeMachine): Transport {
     label: origin,
     unauthorizedCode: "session_invalid",
     probeHeaders: {},
-    onStepUp: () => requestNativeStepUp(machine),
+    onStepUp: (path) => requestNativeStepUp(machine, stepUpActionForPath(path)),
   };
 }
 

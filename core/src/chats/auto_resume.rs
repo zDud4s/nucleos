@@ -14,6 +14,9 @@ pub const AUTO_RESUME_LIMIT: i64 = 3;
 /// What the queued resume says to the model.
 pub const AUTO_RESUME_TEXT: &str = "The daemon restarted and interrupted your previous turn. Continue where you left off. Subagents and background tasks of that process did not survive, so check what actually finished before relying on it.";
 
+/// What a queued continuation says after the chat crossed to another machine mid-turn.
+pub const MOVE_RESUME_TEXT: &str = "This chat was moved to another machine in the middle of your previous turn. Continue the interrupted work, and check what actually finished before relying on it.";
+
 /// What the owner-visible notice says when a resume was queued.
 pub const RESUMING_NOTICE: &str =
     "The daemon restarted during this turn; resuming it automatically.";

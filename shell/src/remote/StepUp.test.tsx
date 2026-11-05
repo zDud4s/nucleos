@@ -75,7 +75,7 @@ function count(paths: string[], key: string): number {
   return paths.filter((p) => p === key).length;
 }
 
-function stubCredentials(impl: { get?: () => Promise<unknown>; create?: () => Promise<unknown> } | undefined) {
+function stubCredentials(impl: { get?: () => Promise<unknown>; create?: (options: unknown) => Promise<unknown> } | undefined) {
   vi.stubGlobal("navigator", { ...navigator, credentials: impl });
 }
 

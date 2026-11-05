@@ -21,9 +21,12 @@ import { chatMachineOf, machinesForProject, mergeChats, rememberChatMachine } fr
 import {
   liveTurnKey,
   useAllChats,
+  useArchiveChat,
   useChatTranscript,
+  useForwardTurn,
   useLiveTurnSnapshot,
   useSendMessage,
+  useSetChatGroup,
   useTurnTools,
   type ChatSummary,
 } from "../data/chats";
@@ -188,6 +191,24 @@ describe("Chats - the list across machines", () => {
     expect(result.current.isError).toBe(false);
   });
 
+  it("a moved remote row does not overwrite the chat's live machine link", async () => {
+    pairTower();
+    rememberChatMachine(["c-9"], "here");
+    const moved = { ...chat("c-9", "2026-10-01T11:00:00Z"), moved_to: "here" };
+    daemon.apiFetch.mockImplementation(async (path: string, _init?: unknown, machine?: string) =>
+      path === "/assistant/chats" ? (machine === "tower" ? [moved] : []) : [],
+    );
+    const client = newClient();
+    const { result } = renderHook(() => useAllChats(), { wrapper: wrapper(client) });
+
+    await waitFor(() => expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats", undefined, "tower"));
+    await waitFor(() => {
+      expect(client.getQueryData(withMachine(keys.chats.all, "tower"))).toEqual([moved]);
+      expect(result.current.data).toEqual([]);
+      expect(chatMachineOf("c-9")).toBe("here");
+    });
+  });
+
   it("a_remote_chats_tool_results_come_from_its_machine", async () => {
     pairTower();
     rememberChatMachine(["c-9"], "tower");
@@ -265,5 +286,45 @@ describe("Chats - the list across machines", () => {
     await waitFor(() =>
       expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/message", expect.objectContaining({ method: "POST" })),
     );
+  });
+
+  it("remote group and forward mutations go to the chat's machine", async () => {
+    pairTower();
+    rememberChatMachine(["c-9"], "tower");
+    daemon.apiFetch.mockResolvedValue({ turn_id: 5 });
+    const client = newClient();
+    const { result } = renderHook(() => ({ group: useSetChatGroup(), forward: useForwardTurn() }), {
+      wrapper: wrapper(client),
+    });
+
+    result.current.group.mutate({ chatId: "c-9", groupId: 4 });
+    result.current.forward.mutate({ toChatId: "c-9", fromTurnId: 3, text: "send this" });
+
+    await waitFor(() =>
+      expect(daemon.apiFetch).toHaveBeenCalledWith(
+        "/assistant/chats/c-9/group",
+        expect.objectContaining({ method: "PUT" }),
+        "tower",
+      ),
+    );
+    expect(daemon.apiFetch).toHaveBeenCalledWith(
+      "/assistant/chats/c-9/forward",
+      expect.objectContaining({ method: "POST" }),
+      "tower",
+    );
+  });
+
+  it("a remote archive invalidates that machine's chat list", async () => {
+    pairTower();
+    rememberChatMachine(["c-9"], "tower");
+    daemon.apiFetch.mockResolvedValue(undefined);
+    const client = newClient();
+    const remoteKey = withMachine(keys.chats.all, "tower");
+    client.setQueryData(remoteKey, [chat("c-9", "2026-10-01T11:00:00Z")]);
+    const { result } = renderHook(() => useArchiveChat(), { wrapper: wrapper(client) });
+
+    result.current.mutate("c-9");
+
+    await waitFor(() => expect(client.getQueryState(remoteKey)?.isInvalidated).toBe(true));
   });
 });

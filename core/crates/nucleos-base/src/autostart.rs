@@ -427,7 +427,7 @@ pub fn set_mode(mode: Mode, password: Option<&str>, exe_path: &Path) -> Result<(
                 .ok_or(SetModeError::PasswordRequired)?;
             let failed = |error: std::io::Error| schtasks_failure(&error.to_string(), "", password);
             let user = windows_user().map_err(failed)?;
-            let xml_path = std::env::temp_dir().join("nucleos-daemon-task.xml");
+            let xml_path = task_xml_temp_path();
             write_utf16_xml(&xml_path, &at_boot_task_xml(exe_path, &user)).map_err(failed)?;
             let output = Command::new("schtasks")
                 .args(at_boot_create_args(&xml_path, &user, password))
@@ -503,7 +503,7 @@ fn element_text<'a>(lower_xml: &'a str, tag: &str) -> Option<&'a str> {
 #[cfg(windows)]
 fn register(exe_path: &Path) -> std::io::Result<()> {
     let xml = task_xml(exe_path);
-    let xml_path = std::env::temp_dir().join("nucleos-daemon-task.xml");
+    let xml_path = task_xml_temp_path();
     write_utf16_xml(&xml_path, &xml)?;
     let status = Command::new("schtasks")
         .args(["/Create", "/TN", TASK_NAME, "/XML"])
@@ -633,6 +633,21 @@ fn write_utf16_xml(path: &Path, xml: &str) -> std::io::Result<()> {
     crate::storage::write_atomic(path, &bytes)
 }
 
+/// A per-registration XML path avoids concurrent registrations overwriting each other's task file.
+#[cfg(any(windows, test))]
+fn task_xml_temp_path() -> PathBuf {
+    static NEXT_TASK_XML_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let serial = NEXT_TASK_XML_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "nucleos-daemon-task-{}-{nonce}-{serial}.xml",
+        std::process::id()
+    ))
+}
+
 /// The LaunchAgent's label, which is also its file name under `~/Library/LaunchAgents`.
 #[cfg(any(target_os = "macos", test))]
 const LAUNCH_AGENT_LABEL: &str = "dev.nucleos.core";
@@ -687,6 +702,7 @@ fn launch_agent_plist(exe: &str, workdir: &str) -> String {
   <key>ProgramArguments</key><array><string>{}</string></array>
   <key>WorkingDirectory</key><string>{}</string>
   <key>RunAtLoad</key><true/>
+  <key>AbandonProcessGroup</key><true/>
 </dict>
 </plist>
 "#,
@@ -711,6 +727,7 @@ ExecStart={}
 WorkingDirectory={}
 Restart=on-failure
 RestartSec=60
+KillMode=process
 
 [Install]
 WantedBy=default.target
@@ -1206,6 +1223,26 @@ mod tests {
     }
 
     #[test]
+    fn task_registration_uses_a_unique_temporary_xml_path() {
+        let first = task_xml_temp_path();
+        let second = task_xml_temp_path();
+
+        assert_ne!(
+            first, second,
+            "concurrent registrations need separate task XML files"
+        );
+        assert_eq!(first.parent(), Some(std::env::temp_dir().as_path()));
+        assert!(
+            first
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(
+                    |name| name.starts_with("nucleos-daemon-task-") && name.ends_with(".xml")
+                )
+        );
+    }
+
+    #[test]
     fn o_xml_da_tarefa_e_escrito_por_inteiro() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("task.xml");
@@ -1264,6 +1301,7 @@ mod tests {
             "<array><string>/opt/n/nucleos-core</string></array>",
             "<key>WorkingDirectory</key><string>/opt/n</string>",
             "<key>RunAtLoad</key><true/>",
+            "<key>AbandonProcessGroup</key><true/>",
         ] {
             assert!(plist.contains(line), "missing {line:?} in {plist}");
         }
@@ -1290,6 +1328,7 @@ mod tests {
             "WorkingDirectory=/home/me/my 100%% $HOME",
             "Restart=on-failure",
             "RestartSec=60",
+            "KillMode=process",
             "StartLimitBurst=3",
             "WantedBy=default.target",
         ] {

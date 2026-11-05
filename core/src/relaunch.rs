@@ -30,8 +30,8 @@ pub const SUPERVISED_VAR: &str = "NUCLEOS_SUPERVISED";
 
 /// How often the relauncher looks for the old daemon.
 const WAIT_POLL: Duration = Duration::from_millis(500);
-/// How many looks before it gives up: one minute, well past the daemon's 10 s exit watchdog.
-const MAX_POLLS: u32 = 120;
+/// How many looks before it gives up: two minutes, well past the daemon's 10 s exit watchdog.
+const MAX_POLLS: u32 = 240;
 
 /// Whether this daemon was launched by `--supervise`. Set once by [`take_supervised_marker`].
 static SUPERVISED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -272,7 +272,9 @@ pub fn dispatch(args: &[OsString]) -> Option<i32> {
             0
         }
         Err(RelaunchError::PidStillAlive) => {
-            note(&format!("daemon {pid} did not exit; not starting another"));
+            note(&format!(
+                "ERROR: daemon {pid} did not exit within 120 seconds; not swapping or starting another"
+            ));
             1
         }
         Err(RelaunchError::Spawn(error)) => {
@@ -449,6 +451,7 @@ mod tests {
     fn a_daemon_that_never_exits_is_not_replaced() {
         let dir = tempfile::tempdir().unwrap();
         let exe = fake_exe(dir.path());
+        std::fs::write(next_path(&exe), "new build").unwrap();
         let spawned = RefCell::new(false);
         let result = relaunch_after(
             &exe,
@@ -463,6 +466,16 @@ mod tests {
         );
         assert!(matches!(result, Err(RelaunchError::PidStillAlive)));
         assert!(!*spawned.borrow());
+        assert_eq!(std::fs::read_to_string(&exe).unwrap(), "old build");
+        assert!(
+            next_path(&exe).exists(),
+            "the staged binary must not be swapped"
+        );
+    }
+
+    #[test]
+    fn the_relauncher_wait_is_bounded_at_120_seconds() {
+        assert_eq!(WAIT_POLL * MAX_POLLS, Duration::from_secs(120));
     }
 
     #[test]

@@ -3168,14 +3168,19 @@ mod tests {
         assert!(waiting.is_empty());
 
         // The package half: the queued turn is in the package, taken from the standing freeze.
-        let nowhere = std::env::temp_dir().join("nucleos-no-such-session-store");
+        // The finished turn left the chat a session, so the package needs its transcript on disk.
+        let store = crate::execution::git_exec::testkit::space_free_tempdir("nucleos-move-frozen-");
+        let project = store.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("fake-session-id.jsonl"), b"{\"line\":1}\n").unwrap();
+        let nowhere = store.path();
         let package =
-            crate::chats::transfer_package::build(&state.pool, &chat, "t-1", &nowhere, vec![])
+            crate::chats::transfer_package::build(&state.pool, &chat, "t-1", nowhere, vec![])
                 .await
                 .unwrap();
         assert!(package.queue.is_empty());
         let other =
-            crate::chats::transfer_package::build(&state.pool, &chat, "t-other", &nowhere, vec![])
+            crate::chats::transfer_package::build(&state.pool, &chat, "t-other", nowhere, vec![])
                 .await;
         assert!(
             matches!(
@@ -3230,6 +3235,38 @@ mod tests {
             transfer::gate(&state.pool, &chat).await,
             transfer::Gate::Frozen
         );
+        release_queue(&chat);
+    }
+
+    #[tokio::test]
+    async fn repeating_move_begin_keeps_the_cut_and_parked_question_for_its_package() {
+        use crate::chats::transfer::When;
+        let (state, chat, turn) = slow_channel_turn().await;
+        crate::hooks::ask_about(&chat, turn, "Bash", Some("confirm deploy".to_owned()));
+
+        crate::assistant::chat_move::begin(&state, &chat, When::Now, "t-repeat")
+            .await
+            .unwrap();
+        crate::assistant::chat_move::begin(&state, &chat, When::Now, "t-repeat")
+            .await
+            .unwrap();
+
+        let store = crate::execution::git_exec::testkit::space_free_tempdir("nucleos-move-repeat-");
+        let package = crate::chats::transfer_package::build(
+            &state.pool,
+            &chat,
+            "t-repeat",
+            store.path(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        assert!(package.interrupted, "the first cut remains remembered");
+        assert_eq!(package.parked.len(), 1);
+        assert_eq!(package.parked[0].tool, "Bash");
+        assert_eq!(package.parked[0].detail.as_deref(), Some("confirm deploy"));
+        crate::chats::transfer_package::forget(&chat);
         release_queue(&chat);
     }
 

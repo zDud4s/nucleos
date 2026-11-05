@@ -26,6 +26,18 @@ pub struct ChatFields {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub plan_only: bool,
+    #[serde(default)]
+    pub denied_tools: Option<String>,
+    #[serde(default)]
+    pub turn_budget_usd: Option<f64>,
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    #[serde(default)]
+    pub agents: Option<String>,
+    #[serde(default)]
+    pub fallback_model: Option<String>,
+    #[serde(default)]
+    pub auto_compact: bool,
 }
 
 /// The CLI session transcript, byte for byte.
@@ -91,6 +103,8 @@ impl From<sqlx::Error> for Failure {
 struct Remembered {
     asks: Vec<ParkedQuestion>,
     cut: bool,
+    /// The transfer that recorded this state, once `claim` has named one.
+    transfer_id: Option<String>,
 }
 
 static REMEMBERED: LazyLock<Mutex<HashMap<String, Remembered>>> = LazyLock::new(Default::default);
@@ -133,6 +147,27 @@ pub fn remember(chat_id: &str, cut: bool, asks: Vec<ParkedQuestion>) {
     entry.cut |= cut;
 }
 
+/// Called by `begin` right after the freeze: makes the remembered state belong to `transfer_id`.
+/// State left by another transfer (one whose freeze expired without an abort) is dropped.
+/// Returns true when the state is fresh, false when a repeat of the same transfer keeps its own.
+pub fn claim(chat_id: &str, transfer_id: &str) -> bool {
+    let mut seen = remembered();
+    if seen
+        .get(chat_id)
+        .is_some_and(|r| r.transfer_id.as_deref() == Some(transfer_id))
+    {
+        return false;
+    }
+    seen.insert(
+        chat_id.to_owned(),
+        Remembered {
+            transfer_id: Some(transfer_id.to_owned()),
+            ..Default::default()
+        },
+    );
+    true
+}
+
 /// Called by `abort`: a move that did not happen leaves nothing behind.
 pub fn forget(chat_id: &str) {
     remembered().remove(chat_id);
@@ -165,6 +200,12 @@ type ChatRow = (
     i64,
     Option<String>,
     Option<String>,
+    Option<String>,
+    Option<f64>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    i64,
 );
 
 /// Builds the package of a frozen chat. Confirms the freeze alive and refuses if it is not standing.
@@ -177,18 +218,30 @@ pub async fn build(
     store: &Path,
     live_asks: Vec<ParkedQuestion>,
 ) -> Result<Package, Failure> {
-    if !transfer::touch_at(pool, chat_id, transfer_id, transfer::unix_now()).await? {
-        return Err(Refusal::NotFrozenForThis.into());
-    }
     let row: Option<ChatRow> = sqlx::query_as(
-        "SELECT title, brain, created_at, model, effort, plan_only, cwd, ide_session_id
+        "SELECT title, brain, created_at, model, effort, plan_only, cwd, ide_session_id,
+                denied_tools, turn_budget_usd, system_prompt, agents, fallback_model, auto_compact
            FROM chats WHERE chat_id = ?",
     )
     .bind(chat_id)
     .fetch_optional(pool)
     .await?;
-    let (title, brain, created_at, model, effort, plan_only, cwd, ide_session) =
-        row.ok_or(Refusal::NoSuchChat)?;
+    let (
+        title,
+        brain,
+        created_at,
+        model,
+        effort,
+        plan_only,
+        cwd,
+        ide_session,
+        denied_tools,
+        turn_budget_usd,
+        system_prompt,
+        agents,
+        fallback_model,
+        auto_compact,
+    ) = row.ok_or(Refusal::NoSuchChat)?;
     let stored: Option<Option<String>> =
         sqlx::query_scalar("SELECT session_id FROM assistant_sessions WHERE chat_id = ?")
             .bind(chat_id)
@@ -205,10 +258,17 @@ pub async fn build(
                     data: B64.encode(bytes),
                 })
             }
-            None => None,
+            None => {
+                return Err(Failure::Problem(format!(
+                    "the session transcript for {id} is missing"
+                )));
+            }
         },
         None => None,
     };
+    if !transfer::touch_at(pool, chat_id, transfer_id, transfer::unix_now()).await? {
+        return Err(Refusal::NotFrozenForThis.into());
+    }
     let code = match cwd.as_deref().filter(|c| !c.trim().is_empty()) {
         Some(cwd) => {
             let probe = transfer_code::probe(pool, Path::new(cwd))
@@ -259,6 +319,12 @@ pub async fn build(
             model,
             effort,
             plan_only: plan_only != 0,
+            denied_tools,
+            turn_budget_usd,
+            system_prompt,
+            agents,
+            fallback_model,
+            auto_compact: auto_compact != 0,
         },
         session,
         code,
@@ -289,7 +355,7 @@ fn reask_text(parked: &[ParkedQuestion]) -> String {
     format!(
         "{} Before the chat moved machines you were waiting for the owner's answer on: {}. \
          Ask for it again before doing it.",
-        super::auto_resume::AUTO_RESUME_TEXT,
+        super::auto_resume::MOVE_RESUME_TEXT,
         list.join("; ")
     )
 }
@@ -382,12 +448,16 @@ pub async fn import(
     let session_id = package.session.as_ref().map(|s| s.session_id.clone());
     let mut tx = pool.begin().await?;
     let saved = sqlx::query(
-        "INSERT INTO chats (chat_id, title, brain, created_at, cwd, ide_session_id, model, effort, plan_only)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "INSERT INTO chats (chat_id, title, brain, created_at, cwd, ide_session_id, model, effort, plan_only,
+                            denied_tools, turn_budget_usd, system_prompt, agents, fallback_model, auto_compact)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(chat_id) DO UPDATE SET
              title = excluded.title, brain = excluded.brain, cwd = excluded.cwd,
              ide_session_id = excluded.ide_session_id, model = excluded.model,
              effort = excluded.effort, plan_only = excluded.plan_only,
+             denied_tools = excluded.denied_tools, turn_budget_usd = excluded.turn_budget_usd,
+             system_prompt = excluded.system_prompt, agents = excluded.agents,
+             fallback_model = excluded.fallback_model, auto_compact = excluded.auto_compact,
              moved_to = NULL, frozen_for = NULL, frozen_at = NULL, archived_at = NULL
          WHERE chats.moved_to IS NOT NULL",
     )
@@ -400,6 +470,12 @@ pub async fn import(
     .bind(&package.chat.model)
     .bind(&package.chat.effort)
     .bind(i64::from(package.chat.plan_only))
+    .bind(&package.chat.denied_tools)
+    .bind(package.chat.turn_budget_usd)
+    .bind(&package.chat.system_prompt)
+    .bind(&package.chat.agents)
+    .bind(&package.chat.fallback_model)
+    .bind(i64::from(package.chat.auto_compact))
     .execute(&mut *tx)
     .await?
     .rows_affected();
@@ -460,7 +536,7 @@ pub async fn import(
         ));
     } else if package.interrupted && waiting.is_empty() {
         waiting.push((
-            super::auto_resume::AUTO_RESUME_TEXT.to_string(),
+            super::auto_resume::MOVE_RESUME_TEXT.to_string(),
             None,
             "shell".to_string(),
             "[]".to_string(),
@@ -527,6 +603,26 @@ mod tests {
                 .await
                 .unwrap()
         }
+    }
+
+    #[test]
+    fn older_package_chat_fields_use_the_current_setting_defaults() {
+        let chat: ChatFields = serde_json::from_value(serde_json::json!({
+            "title": null,
+            "brain": "cloud",
+            "created_at": "2026-01-01T00:00:00Z",
+            "model": null,
+            "effort": null,
+            "plan_only": false
+        }))
+        .unwrap();
+
+        assert_eq!(chat.denied_tools, None);
+        assert_eq!(chat.turn_budget_usd, None);
+        assert_eq!(chat.system_prompt, None);
+        assert_eq!(chat.agents, None);
+        assert_eq!(chat.fallback_model, None);
+        assert!(!chat.auto_compact);
     }
 
     #[tokio::test]
@@ -833,6 +929,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_missing_session_transcript_refuses_without_losing_the_origin_session() {
+        let origin = crate::testdb::fresh_pool().await;
+        let store = space_free_tempdir("nucleos-move-missing-session-");
+        a_chat(&origin, "c-missing-session", None).await;
+        sqlx::query(
+            "INSERT INTO assistant_sessions (chat_id, session_id, updated_at)
+             VALUES ('c-missing-session', 'gone-session', 'now')",
+        )
+        .execute(&origin)
+        .await
+        .unwrap();
+        crate::chats::enqueue(&origin, "c-missing-session", "waiting", "shell", "[]")
+            .await
+            .unwrap();
+        freeze(&origin, "c-missing-session", "t-missing-session").await;
+
+        let result = build(
+            &origin,
+            "c-missing-session",
+            "t-missing-session",
+            store.path(),
+            vec![],
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(Failure::Problem(ref problem)) if problem.contains("gone-session") && problem.contains("missing")),
+            "{result:?}"
+        );
+        let session: String = sqlx::query_scalar(
+            "SELECT session_id FROM assistant_sessions WHERE chat_id = 'c-missing-session'",
+        )
+        .fetch_one(&origin)
+        .await
+        .unwrap();
+        assert_eq!(session, "gone-session");
+        assert_eq!(
+            crate::chats::queued(&origin, "c-missing-session")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn importing_a_chat_preserves_denied_tools_and_turn_budget() {
+        let origin = crate::testdb::fresh_pool().await;
+        let destination = crate::testdb::fresh_pool().await;
+        let store = space_free_tempdir("nucleos-move-chat-settings-");
+        a_chat(&origin, "c-settings", None).await;
+        sqlx::query("INSERT INTO chat_groups (id, name, created_at) VALUES (7, 'local', 'now')")
+            .execute(&origin)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE chats
+             SET denied_tools = '[\"Bash\"]', turn_budget_usd = 1.25, system_prompt = 'portable',
+                 agents = '{\"reviewer\":{}}', fallback_model = 'backup-model', auto_compact = 1,
+                 extra_dirs = '[\"C:/machine-local\"]', group_id = 7
+             WHERE chat_id = 'c-settings'",
+        )
+        .execute(&origin)
+        .await
+        .unwrap();
+        freeze(&origin, "c-settings", "t-settings").await;
+        let package = build(&origin, "c-settings", "t-settings", store.path(), vec![])
+            .await
+            .unwrap();
+
+        import(&destination, &package, store.path()).await.unwrap();
+
+        type Settings = (
+            Option<String>,
+            Option<f64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i64,
+            Option<String>,
+            Option<i64>,
+        );
+        let settings: Settings = sqlx::query_as(
+            "SELECT denied_tools, turn_budget_usd, system_prompt, agents, fallback_model, auto_compact,
+                        extra_dirs, group_id
+                   FROM chats WHERE chat_id = 'c-settings'",
+        )
+        .fetch_one(&destination)
+        .await
+        .unwrap();
+        assert_eq!(settings.0.as_deref(), Some("[\"Bash\"]"));
+        assert_eq!(settings.1, Some(1.25));
+        assert_eq!(settings.2.as_deref(), Some("portable"));
+        assert_eq!(settings.3.as_deref(), Some("{\"reviewer\":{}}"));
+        assert_eq!(settings.4.as_deref(), Some("backup-model"));
+        assert_eq!(settings.5, 1);
+        assert_eq!(settings.6, None);
+        assert_eq!(settings.7, None);
+    }
+
+    #[tokio::test]
     async fn an_import_cannot_overwrite_a_live_destination_chat() {
         let origin = crate::testdb::fresh_pool().await;
         let destination = crate::testdb::fresh_pool().await;
@@ -940,6 +1137,12 @@ mod tests {
                 model: None,
                 effort: None,
                 plan_only: false,
+                denied_tools: None,
+                turn_budget_usd: None,
+                system_prompt: None,
+                agents: None,
+                fallback_model: None,
+                auto_compact: false,
             },
             session: None,
             code: Some(Code {
@@ -970,7 +1173,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_package_never_contains_stored_secrets() {
+    async fn the_package_carries_portable_settings_but_not_machine_local_ones() {
         let (_keep, repo) = init_contained_repo("nucleos-move-secrets-");
         std::fs::write(repo.join(".gitignore"), ".env\n").unwrap();
         assert!(git_ok(&repo, &[OsStr::new("add"), OsStr::new("-A")]));
@@ -987,8 +1190,12 @@ mod tests {
         let pool = crate::testdb::fresh_pool().await;
         roster(&pool, "alpha", &repo).await;
         a_chat(&pool, "c1", Some(&repo.to_string_lossy())).await;
-        // Everything in the chat row outside the allow-list, and the stores around it.
-        sqlx::query("UPDATE chats SET system_prompt = 'SECRET-PROMPT', denied_tools = 'SECRET-DENIED', extra_dirs = 'SECRET-DIRS', agents = 'SECRET-AGENTS' WHERE chat_id = 'c1'")
+        // Per-chat settings travel, but paths and locally-defined groups do not.
+        sqlx::query("INSERT INTO chat_groups (id, name, created_at) VALUES (42, 'local', 'now')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE chats SET system_prompt = 'portable prompt', denied_tools = 'portable-denied', extra_dirs = 'MACHINE-LOCAL-DIRS', agents = 'portable-agents', group_id = 42 WHERE chat_id = 'c1'")
             .execute(&pool)
             .await
             .unwrap();
@@ -1020,15 +1227,25 @@ mod tests {
             ]
         );
         let text = wire.to_string();
-        for secret in [
-            "SECRET-PROMPT",
-            "SECRET-DENIED",
-            "SECRET-DIRS",
-            "SECRET-AGENTS",
-            "SECRET-ENV-VALUE",
-        ] {
+        for secret in ["MACHINE-LOCAL-DIRS", "SECRET-ENV-VALUE"] {
             assert!(!text.contains(secret), "{secret} reached the package");
         }
+        assert!(
+            !text.contains("group_id"),
+            "machine-local groups must not travel"
+        );
+        assert!(
+            text.contains("portable prompt"),
+            "the portable settings travel"
+        );
+        assert!(
+            text.contains("portable-denied"),
+            "the portable settings travel"
+        );
+        assert!(
+            text.contains("portable-agents"),
+            "the portable settings travel"
+        );
         assert!(
             package
                 .code
@@ -1082,7 +1299,7 @@ mod tests {
         assert!(
             waiting[0]
                 .text
-                .starts_with(super::super::auto_resume::AUTO_RESUME_TEXT),
+                .starts_with(super::super::auto_resume::MOVE_RESUME_TEXT),
             "{}",
             waiting[0].text
         );

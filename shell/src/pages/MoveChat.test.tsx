@@ -1,8 +1,9 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { abortChatTransfer, beginChatTransfer, importChatTransfer, packageChatTransfer, previewChatTransfer } from "../data/chats";
+import { abortChatTransfer, beginChatTransfer, finishChatTransfer, importChatTransfer, packageChatTransfer, previewChatTransfer } from "../data/chats";
 import { ApiRefusal, apiFetch } from "../data/client";
+import { keys } from "../data/keys";
 import { pairedMachine, saveMachines } from "../data/machineStore";
 import { requestNativeStepUp } from "../remote/nativeTransport";
 import { MoveChatDialog, TransferNotes, abortStartedMove, finalizeChatMove, finishWithRetry, stepUpForMove, unreachableOriginNotice } from "./MoveChat";
@@ -49,10 +50,35 @@ function renderMoveDialog(onOpenChange = vi.fn()) {
   return onOpenChange;
 }
 
+function renderMoveDialogWithClient(onOpenChange = vi.fn()) {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  render(
+    <QueryClientProvider client={client}>
+      <MoveChatDialog chatId="chat-1" open onOpenChange={onOpenChange} />
+    </QueryClientProvider>,
+  );
+  return { client, onOpenChange };
+}
+
+function prepareMove() {
+  saveMachines([{ id: "tower", origin: "https://tower.example", name: "Tower" }]);
+  vi.mocked(requestNativeStepUp).mockResolvedValue({ kind: "verified" });
+  vi.mocked(apiFetch).mockResolvedValue({ name: "Tower" } as never);
+  vi.mocked(previewChatTransfer).mockResolvedValue({
+    will_stop: [],
+    left_behind: [],
+    running: false,
+    target_ok: true,
+    target_problem: null,
+  });
+  vi.mocked(beginChatTransfer).mockResolvedValue({} as never);
+  vi.mocked(packageChatTransfer).mockResolvedValue({ transfer_id: "transfer-1" } as never);
+}
+
 describe("moving a chat", () => {
   beforeEach(() => {
     // Mock implementations set by one test (a never-settling import, a rejecting import) must not leak into the next.
-    for (const mocked of [abortChatTransfer, beginChatTransfer, importChatTransfer, packageChatTransfer, previewChatTransfer, apiFetch, requestNativeStepUp]) {
+    for (const mocked of [abortChatTransfer, beginChatTransfer, finishChatTransfer, importChatTransfer, packageChatTransfer, previewChatTransfer, apiFetch, requestNativeStepUp]) {
       vi.mocked(mocked).mockReset();
     }
     localStorage.clear();
@@ -200,6 +226,21 @@ describe("moving a chat", () => {
     expect(finish).toHaveBeenCalledOnce();
   });
 
+  it("shows the destination name when close-out finds both copies live", async () => {
+    prepareMove();
+    vi.mocked(importChatTransfer).mockResolvedValue({} as never);
+    vi.mocked(finishChatTransfer).mockRejectedValue(
+      new ApiRefusal(409, "origin_changed_after_expiry", "the origin took a new turn"),
+    );
+    renderMoveDialog();
+
+    await waitFor(() => expect((screen.getByLabelText("Move chat to") as HTMLSelectElement).value).toBe("tower"));
+    fireEvent.click(screen.getByRole("button", { name: "Review move" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Move chat" }));
+
+    expect(await screen.findByText(/now runs on Tower;.*both copies are live/i)).toBeTruthy();
+  });
+
   it("a remote machine asks for step-up and this device does not", async () => {
     localStorage.setItem("nucleos-machines", JSON.stringify([{ id: "tower", origin: "https://tower.example", name: "Tower" }]));
     vi.mocked(requestNativeStepUp).mockResolvedValue({ kind: "verified" });
@@ -279,5 +320,40 @@ describe("moving a chat", () => {
 
     expect(abortChatTransfer).not.toHaveBeenCalled();
     expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("closing an uncertain import clears its review and refreshes the chat list", async () => {
+    prepareMove();
+    vi.mocked(importChatTransfer).mockRejectedValue(new Error("connection dropped"));
+    const { client, onOpenChange } = renderMoveDialogWithClient();
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+
+    await waitFor(() => expect((screen.getByLabelText("Move chat to") as HTMLSelectElement).value).toBe("tower"));
+    fireEvent.click(screen.getByRole("button", { name: "Review move" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Move chat" }));
+    await screen.findByText(/may have completed at the destination/i, {}, { timeout: 4000 });
+    const footerClose = screen.getAllByRole("button", { name: "Close" }).find((button) => button.textContent === "Close");
+    fireEvent.click(footerClose!);
+
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: keys.chats.all });
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+    expect(screen.getByRole("button", { name: "Review move" })).toBeTruthy();
+  });
+
+  it("Escape during an import retry closes like the footer action", async () => {
+    prepareMove();
+    vi.mocked(importChatTransfer).mockRejectedValue(new Error("connection dropped"));
+    const onOpenChange = renderMoveDialog();
+
+    await waitFor(() => expect((screen.getByLabelText("Move chat to") as HTMLSelectElement).value).toBe("tower"));
+    fireEvent.click(screen.getByRole("button", { name: "Review move" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Move chat" }));
+    await screen.findByText(/may have completed at the destination/i, {}, { timeout: 4000 });
+
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+
+    await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
+    expect(abortChatTransfer).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Review move" })).toBeTruthy();
   });
 });

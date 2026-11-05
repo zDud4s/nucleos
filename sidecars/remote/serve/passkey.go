@@ -335,14 +335,8 @@ func (a *authHandler) ticketFinish(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		stored, _ := json.Marshal(cred)
-		update, _ := json.Marshal(map[string]any{"device_id": dev.id, "credential_json": string(stored), "replaces": row})
-		status, data, callErr := a.d.call(r.Context(), http.MethodPost, "/remote/passkeys", update, "")
-		if callErr != nil {
-			writeJSONError(w, http.StatusBadGateway, "daemon_unreachable")
-			return
-		}
-		if status != http.StatusOK && status != http.StatusCreated {
-			a.daemonRefusal(w, status, data)
+		credential, _ := json.Marshal(map[string]any{"device_id": dev.id, "credential_json": string(stored), "replaces": row})
+		if !a.consumeTicketBeforeCredential(w, r, in.Ticket, credential) {
 			return
 		}
 	} else {
@@ -357,32 +351,41 @@ func (a *authHandler) ticketFinish(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		stored, _ := json.Marshal(cred)
-		add, _ := json.Marshal(map[string]any{"device_id": dev.id, "credential_json": string(stored)})
-		status, data, callErr := a.d.call(r.Context(), http.MethodPost, "/remote/passkeys", add, "")
-		if callErr != nil {
-			writeJSONError(w, http.StatusBadGateway, "daemon_unreachable")
-			return
-		}
-		if status != http.StatusOK && status != http.StatusCreated {
-			a.daemonRefusal(w, status, data)
+		credential, _ := json.Marshal(map[string]any{"device_id": dev.id, "credential_json": string(stored)})
+		if !a.consumeTicketBeforeCredential(w, r, in.Ticket, credential) {
 			return
 		}
 	}
-	consume, _ := json.Marshal(map[string]any{"ticket": in.Ticket})
+	writeJSON(w, http.StatusOK, map[string]any{"stepped_up": true})
+}
+
+// consumeTicketBeforeCredential burns the one-time ticket before changing a credential. A failed
+// consume therefore cannot leave a credential change that acquired no step-up.
+func (a *authHandler) consumeTicketBeforeCredential(w http.ResponseWriter, r *http.Request, ticket string, credential []byte) bool {
+	consume, _ := json.Marshal(map[string]any{"ticket": ticket})
 	status, data, err := a.d.call(r.Context(), http.MethodPost, "/remote/step-up/ticket/consume", consume, "")
 	if err != nil {
 		writeJSONError(w, http.StatusBadGateway, "daemon_unreachable")
-		return
+		return false
 	}
 	if status == http.StatusGone || status == http.StatusNotFound {
 		ticketInvalid(w)
-		return
+		return false
 	}
 	if status != http.StatusOK {
 		a.daemonRefusal(w, status, data)
-		return
+		return false
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"stepped_up": true})
+	status, data, err = a.d.call(r.Context(), http.MethodPost, "/remote/passkeys", credential, "")
+	if err != nil {
+		writeJSONError(w, http.StatusBadGateway, "daemon_unreachable")
+		return false
+	}
+	if status != http.StatusOK && status != http.StatusCreated {
+		a.daemonRefusal(w, status, data)
+		return false
+	}
+	return true
 }
 
 // caller asks the daemon who the cookie is. On any failure it has already answered and says false.

@@ -2293,7 +2293,9 @@ mod tests {
         let app = grave_router(state);
 
         for (method, route) in [
+            ("POST", "/assistant/chats/{chat_id}/transfer/begin"),
             ("GET", "/assistant/chats/{chat_id}/transfer/package"),
+            ("POST", "/assistant/chats/{chat_id}/transfer/finish"),
             ("POST", "/assistant/chats/import"),
         ] {
             assert!(

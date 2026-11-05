@@ -41,7 +41,7 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-it("a_native_refusal_asks_for_step_up_in_the_browser_and_retries", async () => {
+it("a native refusal asks for step-up for the action the gateway refused and retries", async () => {
   vi.useFakeTimers();
   openUrl.mockResolvedValue(undefined);
   const paths: string[] = [];
@@ -69,6 +69,28 @@ it("a_native_refusal_asks_for_step_up_in_the_browser_and_retries", async () => {
   expect(openUrl).toHaveBeenCalledWith("https://tower.example/stepup?ticket=one-time-ticket");
   expect(paths).toEqual(["/api/assistant/grave", "/api/stepup/status", "/api/stepup/ticket", "/api/stepup/status", "/api/assistant/grave"]);
   expect(invoke.mock.calls.find(([, args]) => (args as MachineFetch | undefined)?.path === "/api/stepup/ticket")?.[1]).toMatchObject({ body: '{"action":"move_chat"}' });
+});
+
+it("a move requests its step-up ticket with the move_chat action, whatever route was refused", async () => {
+  vi.useFakeTimers();
+  openUrl.mockResolvedValue(undefined);
+  const ticketBodies: (string | null)[] = [];
+  invoke.mockImplementation((command: string, args?: MachineFetch) => {
+    if (command !== "machine_fetch" || args === undefined) return undefined;
+    if (args.path === "/api/stepup/ticket") {
+      ticketBodies.push(args.body);
+      return answer(args, 201, { ticket: "t" });
+    }
+    if (args.path === "/api/stepup/status") return answer(args, 200, { stepped_up: ticketBodies.length > 0 });
+    throw new Error(`unexpected path ${args.path}`);
+  });
+  const { requestNativeStepUp } = await import("./nativeTransport");
+
+  const outcome = requestNativeStepUp({ id: "tower", origin: "https://tower.example" }, "move_chat");
+  await vi.advanceTimersByTimeAsync(1_000);
+
+  await expect(outcome).resolves.toEqual({ kind: "verified" });
+  expect(ticketBodies).toEqual(['{"action":"move_chat"}']);
 });
 
 it("an_existing_step_up_skips_ticket_creation", async () => {

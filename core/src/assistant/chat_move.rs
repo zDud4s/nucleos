@@ -39,10 +39,14 @@ pub async fn begin(
     transfer_id: &str,
 ) -> Result<Begun, Refusal> {
     freeze_at(&state.pool, chat_id, transfer_id, unix_now()).await?;
-    transfer_package::forget(chat_id);
+    // A retry for this transfer sees the same freeze. Its remembered cut and questions are the
+    // only record left after a cut, so they must survive until package or abort resolves it.
+    // State of another transfer (an expired freeze never aborted) is dropped.
+    if transfer_package::claim(chat_id, transfer_id) {
+        transfer_package::remember(chat_id, false, parked_now(chat_id));
+    }
     let mut cut_turn = None;
     // A cut forgets the questions a turn had parked; the package still carries them.
-    transfer_package::remember(chat_id, false, parked_now(chat_id));
     match when {
         When::Now => {
             cut_turn = super::cut_turn_for_move(state, chat_id).await;
@@ -76,4 +80,41 @@ pub async fn abort_and_resume(
         super::resume_queue_after_freeze(state, chat_id);
     }
     Ok(lifted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn begin_with_a_new_transfer_id_drops_state_from_an_expired_transfer() {
+        let state = crate::channels::testkit::state().await;
+        let chat = "telegram:chat-move-expired";
+        sqlx::query("INSERT INTO chats (chat_id, brain, created_at) VALUES (?, 'cloud', ?)")
+            .bind(chat)
+            .bind("2026-01-01T00:00:00Z")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        // What an earlier transfer left behind when its freeze expired without an abort.
+        assert!(transfer_package::claim(chat, "t-old"));
+        transfer_package::remember(
+            chat,
+            true,
+            vec![transfer_package::ParkedQuestion {
+                tool: "Bash".to_owned(),
+                detail: Some("stale question".to_owned()),
+            }],
+        );
+
+        begin(&state, chat, When::AfterTurn, "t-new").await.unwrap();
+
+        let store = crate::execution::git_exec::testkit::space_free_tempdir("nucleos-move-stale-");
+        let package = transfer_package::build(&state.pool, chat, "t-new", store.path(), vec![])
+            .await
+            .unwrap();
+        assert!(!package.interrupted, "the old transfer's cut is forgotten");
+        assert!(package.parked.is_empty(), "{:?}", package.parked);
+        transfer_package::forget(chat);
+    }
 }

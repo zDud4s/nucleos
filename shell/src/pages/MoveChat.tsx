@@ -17,7 +17,7 @@ import { pairedMachine, type MachineId } from "../data/machineStore";
 import { useMachines, withMachine } from "../data/machines";
 import { requestNativeStepUp } from "../remote/nativeTransport";
 import { isRemote } from "../remote/host";
-import { Button, ErrorNote, Modal } from "../ui";
+import { Button, ErrorNote, Modal, Select } from "../ui";
 
 type Project = { project_root: string | null; remote?: string | null };
 type When = "after_turn" | "now";
@@ -35,7 +35,7 @@ export async function stepUpForMove(machine: MachineId): Promise<void> {
   if (machine === "here") return;
   const paired = pairedMachine(machine);
   if (paired === undefined) throw new Error("The destination machine is no longer paired.");
-  const outcome = await requestNativeStepUp(paired, "Move chat");
+  const outcome = await requestNativeStepUp(paired, "move_chat");
   if (outcome.kind === "failed") throw new Error(outcome.detail);
 }
 
@@ -231,7 +231,9 @@ export function MoveChatDialog({
     pendingFinish.current = null;
     pendingDestination.current = null;
     pendingDestinationName.current = null;
+    setPreview(null);
     setRetry(null);
+    void queryClient.invalidateQueries({ queryKey: keys.chats.all });
     onOpenChange(false);
   };
 
@@ -257,14 +259,16 @@ export function MoveChatDialog({
   const move = async () => {
     if (destination === null || preview === null || !preview.target_ok) return;
     const transferId = crypto.randomUUID();
+    let destinationName: string | null = null;
     setError(null);
     try {
       setProgress("Waiting for passkey confirmation…");
       await stepUpForMove(source);
       await stepUpForMove(destination);
-      const destinationName = (await apiFetch<{ name: string }>("/machine", undefined, destination)).name;
-      const destinationId = destination === "here" ? `name:${destinationName}` : destination;
-      const closeOut = async () => await finishChatTransfer(chatId, { transfer_id: transferId, to: destinationId, to_name: destinationName }, source);
+      const namedDestination = (await apiFetch<{ name: string }>("/machine", undefined, destination)).name;
+      destinationName = namedDestination;
+      const destinationId = destination === "here" ? `name:${namedDestination}` : destination;
+      const closeOut = async () => await finishChatTransfer(chatId, { transfer_id: transferId, to: destinationId, to_name: namedDestination }, source);
       pendingFinish.current = closeOut;
       await finalizeChatMove({
         begin: async () => {
@@ -283,7 +287,7 @@ export function MoveChatDialog({
           const importAtDestination = async () => await importChatTransfer(transferId, packageBody as Parameters<typeof importChatTransfer>[1], destination);
           pendingImport.current = importAtDestination;
           pendingDestination.current = destination;
-          pendingDestinationName.current = destinationName;
+          pendingDestinationName.current = namedDestination;
           const imported = await importAtDestination();
           if (begun.current?.transferId === transferId) begun.current.phase = "imported";
           pendingImport.current = null;
@@ -316,7 +320,7 @@ export function MoveChatDialog({
         pendingDestination.current = null;
         pendingDestinationName.current = null;
         setRetry(null);
-        setError(`The chat now runs on ${destinationName}; the origin took a new turn after the freeze expired, so both copies are live. Check the origin copy by hand.`);
+        setError(`The chat now runs on ${destinationName ?? pendingDestinationName.current ?? "the destination"}; the origin took a new turn after the freeze expired, so both copies are live. Check the origin copy by hand.`);
       } else if (begun.current?.phase === "imported") {
         setRetry("finish");
         setError(`The move is complete on ${pendingDestinationName.current ?? "the destination"}; only close-out on ${sourceView?.name ?? source} is pending. Retry to finish it. ${message(cause)}`);
@@ -428,6 +432,7 @@ export function MoveChatDialog({
       open={open}
       onOpenChange={(next) => {
         if (next) onOpenChange(true);
+        else if (retry === "import") closeUnknownImport();
         else void cancel();
       }}
       title="Move chat"
@@ -460,9 +465,9 @@ export function MoveChatDialog({
         {originProblem !== null && <ErrorNote>{originProblem}</ErrorNote>}
         <label>
           Move to
-          <select aria-label="Move chat to" value={destination ?? ""} onChange={(event) => { setDestination(event.target.value); setPreview(null); setError(null); }} disabled={busy || moving}>
+          <Select aria-label="Move chat to" value={destination ?? ""} onChange={(event) => { setDestination(event.target.value); setPreview(null); setError(null); }} disabled={busy || moving}>
             {destinations.map((machine) => <option key={machine.id} value={machine.id} disabled={!machine.reachable}>{machine.name}</option>)}
-          </select>
+          </Select>
         </label>
         {destinations.length === 0 && cwd !== null && <p>No other reachable machine has this chat's project.</p>}
         {preview?.running === true && (

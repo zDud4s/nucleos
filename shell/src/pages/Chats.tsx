@@ -983,7 +983,9 @@ function ChatDetail({
 }) {
   const seen = usePostChatSeen();
   const localRow = useChatRow(chatId);
-  const movedTo = summary?.moved_to ?? localRow?.moved_to ?? null;
+  // The lists drop moved rows, so a chat with no live copy anywhere is found through the pointer map.
+  const pointer = useAllChats().moved.get(chatId);
+  const movedTo = summary?.moved_to ?? localRow?.moved_to ?? pointer ?? null;
   const pickedUp = useIdeConversation(summary?.ide_session_id ?? null);
   const markedSeen = useRef(false);
   const { box, follows, noteScroll, keepUp } = useFollowsItsEnd();
@@ -1151,7 +1153,8 @@ function MovedChat({ chatId, destination }: { chatId: string; destination: strin
   let stored = { id: destination, name: destination };
   try {
     const parsed = JSON.parse(destination) as { id?: unknown; name?: unknown };
-    if (typeof parsed.id === "string" && typeof parsed.name === "string") stored = parsed;
+    const { id, name } = parsed;
+    if (typeof id === "string" && typeof name === "string") stored = { id, name };
   } catch {
     // Older origins stored the display value directly.
   }
@@ -3020,7 +3023,7 @@ function ModelRefusal({ error }: { error: unknown }) {
 
 /** The conversation this control is about, or undefined while the list is still being read. */
 function useChatRow(chatId: string): ChatSummary | undefined {
-  const chats = useChats();
+  const chats = useAllChats();
   return (chats.data ?? []).find((row) => row.chat_id === chatId);
 }
 

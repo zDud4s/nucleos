@@ -34,7 +34,9 @@ pub const GRAVE_ROUTES: &[(Method, &str)] = &[
     (Method::POST, "/channels/{channel}/pairing"),
     // A chat's whole working tree and conversation leave this machine in a package, and one arrives
     // in an import. Native sessions have no step-up of their own yet (task 6.5 part C).
+    (Method::POST, "/assistant/chats/{chat_id}/transfer/begin"),
     (Method::GET, "/assistant/chats/{chat_id}/transfer/package"),
+    (Method::POST, "/assistant/chats/{chat_id}/transfer/finish"),
     (Method::POST, "/assistant/chats/import"),
 ];
 

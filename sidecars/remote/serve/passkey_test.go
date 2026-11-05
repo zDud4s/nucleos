@@ -111,13 +111,14 @@ type passkeyDaemon struct {
 	owners   map[int64]bool
 	stepped  map[int64]bool
 	// windowClosed marks a device paired 15 minutes ago or more (the first-passkey window is over).
-	windowClosed map[int64]bool
-	rows         map[int64][]storedPasskey
-	nextRow      int64
-	stepUps      int
-	seenKey      []string
-	tickets      map[string]ticketState
-	consumed     map[string]bool
+	windowClosed  map[int64]bool
+	rows          map[int64][]storedPasskey
+	nextRow       int64
+	stepUps       int
+	seenKey       []string
+	tickets       map[string]ticketState
+	consumed      map[string]bool
+	rejectConsume bool
 }
 
 func newPasskeyDaemon() *passkeyDaemon {
@@ -182,6 +183,10 @@ func (p *passkeyDaemon) handler(t *testing.T) http.HandlerFunc {
 			}
 			_ = json.NewDecoder(r.Body).Decode(&in)
 			state, ok := p.tickets[in.Ticket]
+			if p.rejectConsume {
+				reply(w, http.StatusGone, map[string]string{"refusal": "stepup_ticket_invalid"})
+				return
+			}
 			if !ok || p.consumed[in.Ticket] {
 				reply(w, http.StatusGone, map[string]string{"refusal": "stepup_ticket_invalid"})
 				return
@@ -577,5 +582,33 @@ func TestTicketFinishWithAnAssertionFromAnotherCeremonyFails(t *testing.T) {
 	}
 	if rig.daemon.consumed["ticket-purpose"] {
 		t.Fatal("an assertion for another ceremony consumed the ticket")
+	}
+}
+
+func TestTicketConsumeFailureDoesNotStoreACredential(t *testing.T) {
+	rig := newPasskeyRig(t)
+	rig.daemon.addDevice(sessA, 7, true)
+	auth := newVirtualAuthenticator(testOrigin)
+	rig.enrol(t, sessA, auth)
+	rig.daemon.addTicket("ticket-consume-first", 7, "Move chat", "123456")
+	before := rig.daemon.rows[7][0].Credential
+
+	status, options := rig.gw("POST", "/auth/stepup/begin", `{"ticket":"ticket-consume-first"}`, "")
+	if status != http.StatusOK {
+		t.Fatalf("ticket begin = %d %s", status, options)
+	}
+	var started struct {
+		PublicKey json.RawMessage `json:"publicKey"`
+	}
+	if err := json.Unmarshal([]byte(options), &started); err != nil {
+		t.Fatalf("ticket begin JSON: %v", err)
+	}
+	rig.daemon.rejectConsume = true
+	status, body := rig.gw("POST", "/auth/stepup/finish", `{"ticket":"ticket-consume-first","credential":`+auth.get(t, string(started.PublicKey), true)+`}`, "")
+	if status != http.StatusGone {
+		t.Fatalf("ticket finish = %d %s", status, body)
+	}
+	if got := rig.daemon.rows[7][0].Credential; got != before {
+		t.Fatal("a failed ticket consume must not replace the credential")
 	}
 }

@@ -4,6 +4,7 @@ import { apiFetch } from "../data/client";
 import { machinesForProject, type ChatRow, type ProjectRef } from "../data/chatMachines";
 import { keys } from "../data/keys";
 import { defaultMachine, useMachines, withMachine, type MachineId } from "../data/machines";
+import { Select } from "../ui";
 
 /** Said whenever work is set to run on the device the person is holding. */
 export const HERE_WARNING = "Runs on this device. It stops when this device sleeps or shuts down.";
@@ -61,8 +62,7 @@ export function MachinePicker({
     <div className="chats-machine">
       <label className="chats-machine-label">
         Runs on{" "}
-        <select
-          className="chats-machine-select"
+        <Select
           aria-label="Where it runs"
           value={value}
           onChange={(event) => onChange(event.target.value)}
@@ -73,7 +73,7 @@ export function MachinePicker({
               {machine.reachable ? "" : machine.needsPairing ? " (pair again)" : " (unreachable)"}
             </option>
           ))}
-        </select>
+        </Select>
       </label>
       {value === "here" && <p className="chats-machine-note">{HERE_WARNING}</p>}
     </div>

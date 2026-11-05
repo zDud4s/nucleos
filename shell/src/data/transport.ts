@@ -43,7 +43,7 @@ export interface Transport {
    * request once more; `failed` ends it with that refusal. Absent on the desktop
    * transport, which is never asked for a passkey.
    */
-  onStepUp?(action: string): Promise<StepUpOutcome>;
+  onStepUp?(path: string): Promise<StepUpOutcome>;
 }
 
 export type StepUpOutcome = { kind: "verified" } | { kind: "failed"; code: string; detail: string };

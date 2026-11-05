@@ -51,11 +51,19 @@ fn machine_doc<T: settings::Document + Default>() -> T {
     (*settings::get::<T>(&settings::Scope::Machine)).clone()
 }
 
-#[tokio::main]
-async fn main() -> std::process::ExitCode {
+fn main() -> std::process::ExitCode {
     // Before anything spawns: reads the supervised marker and keeps it out of every child's
-    // environment (`relaunch::take_supervised_marker`).
+    // environment (`relaunch::take_supervised_marker`). This must happen before Tokio creates
+    // worker threads because environment mutation is process-global.
     relaunch::take_supervised_marker();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build the Tokio runtime")
+        .block_on(daemon_main())
+}
+
+async fn daemon_main() -> std::process::ExitCode {
     http::remember_home();
     // The relauncher a restarted daemon spawns (`relaunch.rs`): first, because it must start
     // nothing but the daemon it relaunches.

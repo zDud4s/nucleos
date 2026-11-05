@@ -50,6 +50,16 @@ const keys = {
   },
 };
 
+/** Refresh every machine's chat-list cache without sweeping chat detail records. */
+function invalidateChatLists(queryClient: QueryClient): Promise<void> {
+  return Promise.all([
+    queryClient.invalidateQueries({ queryKey: keys.chats.all, exact: true }),
+    queryClient.invalidateQueries({
+      predicate: (query) => query.queryKey.length === 2 && query.queryKey[1] === "chats",
+    }),
+  ]).then(() => undefined);
+}
+
 /**
  * Chats, as hooks: the list, one conversation's transcript, and the seven
  * writes a person can make — send a message, open a conversation, rename it,
@@ -813,13 +823,26 @@ export function useAllChats() {
       const chats = remote[index].data;
       if (chats !== undefined)
         rememberChatMachine(
-          chats.map((chat) => chat.chat_id),
+          chats.filter((chat) => chat.moved_to == null).map((chat) => chat.chat_id),
           machine.id,
         );
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [signature]);
-  return { ...here, data };
+  // Rows that only point at a copy elsewhere, kept apart from `data` so the lists never draw them.
+  // A chat with a live copy on some machine is not "moved" from the point of view of anyone opening it.
+  const moved = useMemo((): Map<string, string> => {
+    const live = new Set((data ?? []).map((row) => row.chat_id));
+    const pointers = new Map<string, string>();
+    for (const chats of [here.data, ...remote.map((result) => result.data)]) {
+      for (const chat of chats ?? []) {
+        if (chat.moved_to != null && !live.has(chat.chat_id)) pointers.set(chat.chat_id, chat.moved_to);
+      }
+    }
+    return pointers;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [data, here.data, signature]);
+  return { ...here, data, moved };
 }
 
 /**
@@ -876,9 +899,7 @@ export function useRestoreChat() {
     mutationFn: (chatId: string) =>
       chatFetch<void>(chatId, `/assistant/chats/${encodeURIComponent(chatId)}/restore`, { method: "POST" }),
     retry: false,
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
-    },
+    onSuccess: () => void invalidateChatLists(queryClient),
   });
 }
 
@@ -933,14 +954,12 @@ export function useSetChatGroup() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (v: { chatId: string; groupId: number | null }) =>
-      apiFetch<void>(`/assistant/chats/${encodeURIComponent(v.chatId)}/group`, {
+      chatFetch<void>(v.chatId, `/assistant/chats/${encodeURIComponent(v.chatId)}/group`, {
         method: "PUT",
         body: JSON.stringify({ group_id: v.groupId }),
       }),
     retry: false,
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
-    },
+    onSuccess: () => void invalidateChatLists(queryClient),
   });
 }
 
@@ -960,7 +979,7 @@ export function useSetChatAutoCompact() {
         body: JSON.stringify({ enabled: v.enabled }),
       }),
     retry: false,
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: keys.chats.all, exact: true }),
+    onSuccess: () => invalidateChatLists(queryClient),
   });
 }
 
@@ -1425,14 +1444,15 @@ export function useForwardTurn() {
       fromTurnId: number;
       text: string;
     }) =>
-      apiFetch<{ turn_id?: number; queued?: boolean }>(
+      chatFetch<{ turn_id?: number; queued?: boolean }>(
+        toChatId,
         `/assistant/chats/${encodeURIComponent(toChatId)}/forward`,
         { method: "POST", body: JSON.stringify({ from_turn_id: fromTurnId, text }) },
       ),
     retry: false,
     onSuccess: (_result, { toChatId }) => {
       void queryClient.invalidateQueries({ queryKey: keys.chats.detail(toChatId) });
-      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
+      void invalidateChatLists(queryClient);
     },
   });
 }
@@ -1728,6 +1748,8 @@ function refreshTail(queryClient: QueryClient, chatId: string): void {
     predicate: (query) =>
       !(query.queryKey[1] === detail[1] && query.queryKey[2] === detail[2]),
   });
+  // The other machines' lists sit under a machine-scoped key outside that prefix.
+  void invalidateChatLists(queryClient);
 }
 
 /**
@@ -2347,7 +2369,7 @@ export function usePatchChat() {
       for (const [key, data] of context?.snapshot ?? []) queryClient.setQueryData(key, data);
     },
     onSuccess: (_data, variables) => {
-      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
+      void invalidateChatLists(queryClient);
       void queryClient.invalidateQueries({ queryKey: keys.chats.detail(variables.chatId) });
     },
   });
@@ -2365,7 +2387,7 @@ export function usePostChatTitle() {
       chatFetch<void>(chatId, `/assistant/chats/${encodeURIComponent(chatId)}/title`, { method: "POST" }),
     retry: false,
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
+      void invalidateChatLists(queryClient);
     },
   });
 }
@@ -2382,7 +2404,7 @@ export function usePostChatSeen() {
       chatFetch<void>(chatId, `/assistant/chats/${encodeURIComponent(chatId)}/seen`, { method: "POST" }),
     retry: false,
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
+      void invalidateChatLists(queryClient);
     },
   });
 }
@@ -2420,7 +2442,7 @@ export function useFreshContext() {
       }),
     retry: false,
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
+      void invalidateChatLists(queryClient);
     },
   });
 }
@@ -2455,7 +2477,7 @@ export function useArchiveChat() {
       chatFetch<void>(chatId, `/assistant/chats/${encodeURIComponent(chatId)}`, { method: "DELETE" }),
     retry: false,
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
+      void invalidateChatLists(queryClient);
     },
   });
 }
