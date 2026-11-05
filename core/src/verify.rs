@@ -1276,9 +1276,11 @@ tests:
     /// whose settings snapshot stores `alpha`'s rules when `gate` is given. The worker loop
     /// runs only when `run` is set.
     async fn fixture(map: Option<&str>, gate: Option<&str>, run: bool) -> Fixture {
-        // The executor reads the project's rules from the settings snapshot: hold the shared side of
-        // the rules gate; the tests that publish upgrade to the exclusive side themselves.
-        crate::project::rules::testing::hold_shared();
+        // The executor reads the project's rules from the settings snapshot. A scoped home gives this
+        // thread a snapshot of its own, so the rules gate and the settings `SERIAL` are never taken
+        // and the tests run in parallel. First, so nothing below holds the gate. `tokio::spawn` on
+        // `#[tokio::test]`'s current-thread runtime stays on this thread, where the scope reaches.
+        let machine = crate::project::rules::testing::Home::scoped();
         let repo = tempfile::tempdir().unwrap();
         let root = repo.path();
         std::fs::create_dir_all(root.join("core")).unwrap();
@@ -1297,6 +1299,7 @@ tests:
         let c2 = git_in(root, &["rev-parse", "HEAD"]);
 
         let pool = test_pool().await;
+        unique_task_ids(&pool).await;
         sqlx::query(
             "INSERT INTO autopilot_state (project_id, mode, project_root) \
              VALUES ('alpha', 'active', ?)",
@@ -1306,7 +1309,6 @@ tests:
         .await
         .unwrap();
 
-        let machine = crate::project::rules::testing::Home::new();
         if let Some(gate) = gate {
             crate::project::rules::testing::publish_rules(
                 "alpha",
@@ -1329,6 +1331,25 @@ tests:
             c1,
             c2,
         }
+    }
+
+    /// Starts this pool's `task_claims` ids at a block no other fixture in the process uses. The
+    /// in-process proof single flight (`probe::ACTIVE`) is keyed by task id alone, which is right for
+    /// the one database a daemon has; parallel tests each have a fresh database, and ids restarting
+    /// at 1 would make one test's proof skip because another test's task holds the same id.
+    async fn unique_task_ids(pool: &SqlitePool) {
+        static NEXT_BLOCK: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
+        let block = NEXT_BLOCK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // `sqlite_sequence.name` is not unique, so clear any row before writing the new start.
+        sqlx::query("DELETE FROM sqlite_sequence WHERE name = 'task_claims'")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO sqlite_sequence (name, seq) VALUES ('task_claims', ?)")
+            .bind(block * 1_000_000)
+            .execute(pool)
+            .await
+            .unwrap();
     }
 
     fn path_arg(path: &Path) -> String {
@@ -3554,36 +3575,34 @@ tests:
 
     // ---- case 2 end to end (spec section 5: "Verify") ------------------------------------------------
 
-    /// Probe worktrees go under a space-free temp root, as the postgate worktree tests do; the env override
-    /// is process-wide, hence the lock. Field order is drop order: env first, lock last.
+    /// Probe worktrees go under a space-free temp root, as the postgate worktree tests do. The root
+    /// is a keyed override for this fixture's own project root, so no test blocks another. Field
+    /// order is drop order: the override first, its directory last.
     struct ProbeRoot {
-        _env: crate::execution::git_exec::tests::WorktreeRootEnv,
+        _env: crate::execution::worktree::WorktreeRootOverride,
         _dir: tempfile::TempDir,
-        _lock: std::sync::MutexGuard<'static, ()>,
     }
 
-    fn probe_root() -> ProbeRoot {
-        let lock = crate::execution::worktree::test_env_lock();
+    /// Call it right after `fixture(..).await`, whose repository is the project root the code under
+    /// test hands to `worktree_root` (it is what `autopilot_state.project_root` holds).
+    fn probe_root(f: &Fixture) -> ProbeRoot {
         let dir = crate::execution::git_exec::tests::space_free_tempdir("nucleos-probe-");
-        let env = crate::execution::git_exec::tests::WorktreeRootEnv::set(dir.path());
+        let env = crate::execution::worktree::WorktreeRootOverride::set(f.repo.path(), dir.path());
         ProbeRoot {
             _env: env,
             _dir: dir,
-            _lock: lock,
         }
     }
 
     /// A probe root that cannot hold a worktree: the override names a regular file.
-    fn blocked_probe_root() -> ProbeRoot {
-        let lock = crate::execution::worktree::test_env_lock();
+    fn blocked_probe_root(f: &Fixture) -> ProbeRoot {
         let dir = crate::execution::git_exec::tests::space_free_tempdir("nucleos-probe-");
         let file = dir.path().join("not-a-directory");
         std::fs::write(&file, "x").unwrap();
-        let env = crate::execution::git_exec::tests::WorktreeRootEnv::set(&file);
+        let env = crate::execution::worktree::WorktreeRootOverride::set(f.repo.path(), &file);
         ProbeRoot {
             _env: env,
             _dir: dir,
-            _lock: lock,
         }
     }
 
@@ -3630,8 +3649,8 @@ tests:
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn a_suspect_group_without_an_incident_is_proven_on_master_and_the_incident_opens() {
-        let _root = probe_root();
         let f = fixture(Some(&red_map("py", &["a::boom"])), None, true).await;
+        let _root = probe_root(&f);
         let holder = tempfile::tempdir().unwrap();
         let side = side_touching_core(&f, holder.path(), "side", "fn a() { let _ = 2; }\n");
 
@@ -3664,13 +3683,13 @@ tests:
     #[allow(clippy::await_holding_lock)]
     async fn a_suspect_group_that_passes_on_master_is_the_tasks_failure_and_one_pass_serves_the_next_ticket()
      {
-        let _root = probe_root();
         let f = fixture(
             Some(&scripted_map("py", "test -f flag.txt || exit 1")),
             None,
             true,
         )
         .await;
+        let _root = probe_root(&f);
         let holder = tempfile::tempdir().unwrap();
         let one = side_touching_core(&f, holder.path(), "one", "fn a() { let _ = 2; }\n");
         let two = side_touching_core(&f, holder.path(), "two", "fn a() { let _ = 3; }\n");
@@ -3717,8 +3736,8 @@ tests:
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn two_tickets_with_suspect_groups_share_one_probe() {
-        let _root = probe_root();
         let f = fixture(Some(&red_map("py", &["a::boom"])), None, true).await;
+        let _root = probe_root(&f);
         let holder = tempfile::tempdir().unwrap();
         let one = side_touching_core(&f, holder.path(), "one", "fn a() { let _ = 2; }\n");
         let two = side_touching_core(&f, holder.path(), "two", "fn a() { let _ = 3; }\n");
@@ -3748,8 +3767,8 @@ tests:
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn a_probing_row_with_an_expired_lease_is_taken_over_and_proven_again() {
-        let _root = probe_root();
         let f = fixture(Some(&red_map("py", &["a::boom"])), None, true).await;
+        let _root = probe_root(&f);
         // A verify that crashed two hours ago left its `probing` row behind.
         let stale = match claims::begin_probe(
             &f.pool,
@@ -3785,8 +3804,8 @@ tests:
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn a_probe_that_cannot_run_is_the_tasks_failure_and_is_not_repeated() {
-        let _root = blocked_probe_root(); // the proof tree cannot be created
         let f = fixture(Some(&red_map("py", &["a::boom"])), None, true).await;
+        let _root = blocked_probe_root(&f); // the proof tree cannot be created
         let holder = tempfile::tempdir().unwrap();
         let side = side_touching_core(&f, holder.path(), "side", "fn a() { let _ = 2; }\n");
         let two = side_touching_core(&f, holder.path(), "two", "fn a() { let _ = 3; }\n");
@@ -3861,8 +3880,8 @@ tests:
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn a_land_evidence_read_never_starts_a_probe() {
-        let _root = probe_root();
         let f = fixture(Some(&red_map("py", &["a::boom"])), None, true).await;
+        let _root = probe_root(&f);
         let holder = tempfile::tempdir().unwrap();
         let side = side_touching_core(&f, holder.path(), "side", "fn a() { let _ = 2; }\n");
         let id = submit(&f.ex, Caller::Owner, &scope_with_py(&side))
@@ -3910,13 +3929,13 @@ tests:
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn an_incident_checked_at_an_old_sha_is_reproved_and_closes_when_green() {
-        let _root = probe_root();
         let f = fixture(
             Some(&scripted_map("core", &red_unless_flag(&["a::boom"]))),
             None,
             true,
         )
         .await;
+        let _root = probe_root(&f);
         let holder = tempfile::tempdir().unwrap();
         let side = side_touching_core(&f, holder.path(), "side", "fn a() { let _ = 2; }\n");
         let head = master_gains_flag(&f); // core is green on master now; the session still fails it
@@ -3969,8 +3988,8 @@ tests:
     #[allow(clippy::await_holding_lock)]
     async fn an_incident_still_red_at_head_gets_its_checked_sha_updated_and_the_unit_is_inherited()
     {
-        let _root = probe_root();
         let f = fixture(Some(&red_map("core", &["a::boom"])), None, true).await;
+        let _root = probe_root(&f);
         let holder = tempfile::tempdir().unwrap();
         let side = side_touching_core(&f, holder.path(), "side", "fn a() { let _ = 2; }\n");
         let incident = seed_incident(
@@ -4010,8 +4029,8 @@ tests:
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn two_concurrent_reads_start_one_reprobe() {
-        let _root = probe_root();
         let f = fixture(Some(&red_map("core", &["a::boom"])), None, true).await;
+        let _root = probe_root(&f);
         let holder = tempfile::tempdir().unwrap();
         let one = side_touching_core(&f, holder.path(), "one", "fn a() { let _ = 2; }\n");
         let two = side_touching_core(&f, holder.path(), "two", "fn a() { let _ = 3; }\n");
@@ -4050,8 +4069,8 @@ tests:
     #[allow(clippy::await_holding_lock)]
     async fn a_stale_incident_whose_reproof_cannot_run_still_serves_units_with_ids_once_the_flight_lapses()
      {
-        let _root = blocked_probe_root();
         let f = fixture(Some(&red_map("core", &["a::boom"])), None, true).await;
+        let _root = blocked_probe_root(&f);
         let holder = tempfile::tempdir().unwrap();
         let side = side_touching_core(&f, holder.path(), "side", "fn a() { let _ = 2; }\n");
         let incident = seed_incident(
@@ -4197,8 +4216,8 @@ tests:
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn refresh_closes_an_incident_that_is_green_at_head() {
-        let _root = probe_root();
         let f = fixture(Some(&plain_map()), None, true).await; // core passes on master
+        let _root = probe_root(&f);
         let incident = seed_incident(
             &f.pool,
             SeedIncident {
@@ -4229,10 +4248,10 @@ tests:
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn refresh_reports_still_red_and_in_flight() {
-        let _root = probe_root();
         // `core` fails on master, slowly enough for a zero wait to see the proof still running.
         let slow = format!("sleep 3; {}", failing_script(&["a::boom"]));
         let f = fixture(Some(&scripted_map("core", &slow)), None, true).await;
+        let _root = probe_root(&f);
         let incident = seed_incident(
             &f.pool,
             SeedIncident {
