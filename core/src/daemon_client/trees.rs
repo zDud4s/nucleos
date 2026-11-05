@@ -2,7 +2,7 @@
 use super::*;
 
 impl DaemonClient {
-    /// `POST /trees`: body is `TreeBody` (id, goal, feature_branch, project_root, project_id?, contract?, dirty_owner_files?).
+    /// `POST /trees`: body is `TreeBody` (id, goal, feature_branch, project_root, project_id?, contract?, dirty_owner_files?, land?).
     pub async fn tree_launch(&self, body: &Value) -> Result<Value, String> {
         let response = self
             .request(reqwest::Method::POST, "/trees")

@@ -16,9 +16,38 @@ pub(super) struct TreeLaunchParams {
     pub(super) goal: String,
     pub(super) feature_branch: String,
     pub(super) project_root: String,
+    /// Optional: the daemon finds the project registered with `project_root` when it is omitted.
     pub(super) project_id: Option<String>,
     pub(super) contract: Option<String>,
     pub(super) dirty_owner_files: Option<Vec<String>>,
+    /// `integration` (the default here) lands the finished work into the project's integration
+    /// branch; `hold` leaves it on `feature_branch` for the owner to land.
+    pub(super) land: Option<String>,
+}
+
+/// What `tree_launch` sends when the caller names no landing mode. Owner, 2026-11-04: a tree must
+/// carry the work to the end, so the conductor's tree lands unless asked to hold. Sent explicitly,
+/// because the route's own default stays `hold` (a body that does not say so never moves master).
+pub(super) const TREE_LAUNCH_DEFAULT_LAND: &str = "integration";
+
+impl TreeLaunchParams {
+    /// The `POST /trees` body, with `land` filled in when the caller left it out.
+    pub(super) fn into_body(self) -> serde_json::Value {
+        let land = self
+            .land
+            .filter(|land| !land.trim().is_empty())
+            .unwrap_or_else(|| TREE_LAUNCH_DEFAULT_LAND.to_owned());
+        serde_json::json!({
+            "id": self.id,
+            "goal": self.goal,
+            "feature_branch": self.feature_branch,
+            "project_root": self.project_root,
+            "project_id": self.project_id,
+            "contract": self.contract,
+            "dirty_owner_files": self.dirty_owner_files,
+            "land": land,
+        })
+    }
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]

@@ -162,21 +162,79 @@ impl VerifyRunner for DaemonVerify {
     }
 }
 
-async fn audit_worktree(project_root: &Path, spec: &Spec) -> PathBuf {
-    use crate::execution::worktree as wt;
+/// Where a spec is audited, and what its change list is taken against.
+#[derive(Debug)]
+struct AuditCheckout {
+    path: PathBuf,
+    diff_base: String,
+}
 
-    let branch = derived_branch(&spec.path);
-    let exists = wt::git()
+/// The merge commit a finished tree landed, from its manifest (`settle_land` writes `land_sha`).
+fn landed_merge_of(manifest: &crate::tree_job::model::Manifest) -> Option<String> {
+    manifest
+        .extra
+        .get("land_sha")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|sha| !sha.is_empty())
+        .map(str::to_owned)
+}
+
+/// The merge the spec's current tree landed, if it landed. A tree that cannot be read counts as
+/// not landed: the audit then reads the spec branch or the integration branch.
+async fn landed_merge(pool: &SqlitePool, spec: &Spec) -> Option<String> {
+    let tree_id = spec.tree_id.as_deref()?;
+    let job = crate::tree_job::store::load(pool, tree_id).await.ok()??;
+    landed_merge_of(&job.manifest)
+}
+
+async fn branch_exists(project_root: &Path, branch: &str) -> bool {
+    crate::execution::worktree::git()
         .arg("-C")
         .arg(project_root)
         .args(["rev-parse", "--verify", "--quiet"])
         .arg(format!("refs/heads/{branch}"))
         .output()
         .await
-        .is_ok_and(|output| output.status.success());
-    if !exists {
-        return project_root.to_path_buf();
+        .is_ok_and(|output| output.status.success())
+}
+
+/// Picks what the audit reads. A spec tree lands into the integration branch with a `--no-ff`
+/// merge, and the queue deletes `spec/<stem>` afterwards: landed work is read on the integration
+/// branch, its change list taken from the merge's first parent. Work not landed is read on its
+/// spec branch against the integration branch; with neither, the integration branch is what is
+/// already done. Only a checkout that cannot be made falls back to the project root.
+async fn audit_checkout(
+    project_root: &Path,
+    spec: &Spec,
+    integration_branch: &str,
+    landed: Option<&str>,
+) -> AuditCheckout {
+    let branch = derived_branch(&spec.path);
+    let (target, diff_base) = if let Some(merge) = landed {
+        (integration_branch.to_owned(), format!("{merge}^1"))
+    } else if branch_exists(project_root, &branch).await {
+        (branch, integration_branch.to_owned())
+    } else {
+        (integration_branch.to_owned(), integration_branch.to_owned())
+    };
+    match detached_audit_worktree(project_root, spec, &target).await {
+        Some(path) => AuditCheckout { path, diff_base },
+        None => AuditCheckout {
+            path: project_root.to_path_buf(),
+            diff_base: integration_branch.to_owned(),
+        },
     }
+}
+
+/// The spec's audit worktree, detached at `branch`: made on first use, moved there after.
+async fn detached_audit_worktree(
+    project_root: &Path,
+    spec: &Spec,
+    branch: &str,
+) -> Option<PathBuf> {
+    use crate::execution::worktree as wt;
+
     let root = wt::worktree_root(project_root);
     let short: String = spec.id.chars().take(12).collect();
     let path = root.join(format!("spec-audit-{short}"));
@@ -185,7 +243,7 @@ async fn audit_worktree(project_root: &Path, spec: &Spec) -> PathBuf {
             .arg("-C")
             .arg(&path)
             .args(["checkout", "--quiet", "--detach"])
-            .arg(&branch)
+            .arg(branch)
             .output()
             .await
             .is_ok_and(|output| output.status.success())
@@ -197,16 +255,12 @@ async fn audit_worktree(project_root: &Path, spec: &Spec) -> PathBuf {
                 .arg(project_root)
                 .args(["worktree", "add", "--detach"])
                 .arg(&path)
-                .arg(&branch)
+                .arg(branch)
                 .output()
                 .await
                 .is_ok_and(|output| output.status.success())
     };
-    if ready {
-        path
-    } else {
-        project_root.to_path_buf()
-    }
+    ready.then_some(path)
 }
 
 struct DaemonPreparer<'a> {
@@ -266,12 +320,20 @@ impl DaemonPreparer<'_> {
             .await
             .map_err(|error| error.to_string())?
             .ok_or_else(|| format!("spec {spec_id} not found"))?;
-        let worktree = audit_worktree(&self.project_root, &spec).await;
+        let landed = landed_merge(&self.state.pool, &spec).await;
+        let checkout = audit_checkout(
+            &self.project_root,
+            &spec,
+            &self.integration_branch,
+            landed.as_deref(),
+        )
+        .await;
+        let worktree = checkout.path;
         let reviewer = NoToolsReviewer {
             state: self.state,
             cwd: &cwd,
             worktree: &worktree,
-            integration_branch: &self.integration_branch,
+            diff_base: &checkout.diff_base,
         };
         let verify = DaemonVerify {
             worktree: worktree.clone(),
@@ -330,6 +392,58 @@ impl DaemonLauncher<'_> {
     }
 }
 
+/// The landing mode of every spec tree. Owner, 2026-11-04: "once a spec enters, the tree must
+/// guarantee everything is done until the end" — so the tree lands its work into the project's
+/// integration branch instead of leaving it held on `spec/<stem>`, and a Done audit means the work
+/// is on the integration branch.
+const SPEC_TREE_LANDING: &str = "integration";
+
+/// The `POST /trees` body for one spec tree.
+fn spec_tree_body(request: &TreeRequest) -> Result<serde_json::Value, String> {
+    let project_id = request
+        .project_id
+        .as_deref()
+        .ok_or_else(|| "the spec has no project, and a tree needs one".to_owned())?;
+    Ok(serde_json::json!({
+        "id": request.id,
+        "goal": request.goal,
+        "feature_branch": request.feature_branch,
+        "project_root": request.project_root,
+        "project_id": project_id,
+        "land": SPEC_TREE_LANDING,
+    }))
+}
+
+/// Launches the spec's tree through the daemon's own `POST /trees` route.
+async fn post_spec_tree(state: &AppState, request: &TreeRequest) -> Result<(), String> {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+    let body = spec_tree_body(request)?;
+    let http_request = Request::builder()
+        .method("POST")
+        .uri("/trees")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .map_err(|error| error.to_string())?;
+    let response = crate::tree_job::http::routes()
+        .with_state(state.clone())
+        .oneshot(http_request)
+        .await
+        .map_err(|error| error.to_string())?;
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .map_err(|error| error.to_string())?;
+    if status != StatusCode::OK {
+        return Err(format!(
+            "POST /trees answered {status}: {}",
+            String::from_utf8_lossy(&bytes)
+        ));
+    }
+    Ok(())
+}
+
 /// Marks the spec's tree as launched once the daemon has accepted it, before the wait for its end.
 async fn accepted(pool: &SqlitePool, request: &TreeRequest) -> Result<(), String> {
     store::set_tree_launched(pool, &request.spec_id)
@@ -340,35 +454,7 @@ async fn accepted(pool: &SqlitePool, request: &TreeRequest) -> Result<(), String
 #[async_trait::async_trait]
 impl TreeLauncher for DaemonLauncher<'_> {
     async fn run_tree(&self, request: &TreeRequest) -> Result<TreeOutcome, String> {
-        use axum::body::Body;
-        use axum::http::{Request, StatusCode};
-        use tower::ServiceExt;
-        let project_id = request
-            .project_id
-            .as_deref()
-            .ok_or_else(|| "the spec has no project, and a tree needs one".to_owned())?;
-        let body = serde_json::json!({ "id": request.id, "goal": request.goal, "feature_branch": request.feature_branch, "project_root": request.project_root, "project_id": project_id });
-        let http_request = Request::builder()
-            .method("POST")
-            .uri("/trees")
-            .header("content-type", "application/json")
-            .body(Body::from(body.to_string()))
-            .map_err(|error| error.to_string())?;
-        let response = crate::tree_job::http::routes()
-            .with_state(self.state.clone())
-            .oneshot(http_request)
-            .await
-            .map_err(|error| error.to_string())?;
-        let status = response.status();
-        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
-            .await
-            .map_err(|error| error.to_string())?;
-        if status != StatusCode::OK {
-            return Err(format!(
-                "POST /trees answered {status}: {}",
-                String::from_utf8_lossy(&bytes)
-            ));
-        }
+        post_spec_tree(self.state, request).await?;
         // The tree exists from here on: record it now, so a restart mid-tree is not read as "never launched".
         accepted(&self.state.pool, request).await?;
         self.wait_for_job(&request.id).await
@@ -839,6 +925,217 @@ mod tests {
                 .unwrap()
                 .tree_launched
         );
+    }
+
+    // ---- A spec tree lands, and its audit reads what landed -----------------------------------------
+
+    fn spec_tree_request(id: &str, project_root: &str) -> TreeRequest {
+        TreeRequest {
+            id: id.to_owned(),
+            spec_id: "spec-lands".to_owned(),
+            goal: "Finish the spec".to_owned(),
+            feature_branch: "spec/2026-01-01-lands".to_owned(),
+            project_root: project_root.to_owned(),
+            project_id: Some("proj-lands".to_owned()),
+            round: 1,
+        }
+    }
+
+    /// Owner, 2026-11-04: once a spec enters, its tree carries the work to the end — the body asks
+    /// the daemon to land into the integration branch, never the route's `hold` default.
+    #[test]
+    fn a_spec_tree_is_launched_to_land_into_the_integration_branch() {
+        let body = spec_tree_body(&spec_tree_request("tree-lands", "C:/repo")).unwrap();
+
+        assert_eq!(body["land"], serde_json::json!("integration"));
+        assert_eq!(body["id"], serde_json::json!("tree-lands"));
+        assert_eq!(body["feature_branch"], serde_json::json!("spec/2026-01-01-lands"));
+        assert_eq!(body["project_root"], serde_json::json!("C:/repo"));
+        assert_eq!(body["project_id"], serde_json::json!("proj-lands"));
+    }
+
+    #[test]
+    fn a_spec_tree_without_a_project_is_not_launched() {
+        let mut request = spec_tree_request("tree-no-project", "C:/repo");
+        request.project_id = None;
+
+        assert!(spec_tree_body(&request).is_err());
+    }
+
+    /// Through the real route: the stored job is marked to land, which is what the driver reads.
+    #[tokio::test]
+    async fn a_spec_tree_posted_to_the_daemon_is_stored_to_land() {
+        let (state, _runner) = crate::execution::runs::testkit::test_state_with_runner(
+            Some(Duration::from_secs(5)),
+            Duration::from_secs(600),
+        )
+        .await;
+        let root = std::env::temp_dir().to_string_lossy().replace('\\', "/");
+
+        post_spec_tree(&state, &spec_tree_request("tree-posted", &root))
+            .await
+            .unwrap();
+
+        let job = crate::tree_job::store::load(&state.pool, "tree-posted")
+            .await
+            .unwrap()
+            .expect("the job is stored");
+        assert_eq!(
+            job.manifest.extra.get("landing"),
+            Some(&serde_json::json!("integration"))
+        );
+    }
+
+    #[test]
+    fn the_landed_merge_is_the_manifest_s_land_sha() {
+        let mut manifest = crate::tree_job::model::Manifest::new(
+            "tree-x",
+            "spec/2026-01-01-x",
+            "goal",
+            "C:/repo",
+            &[],
+        );
+        assert_eq!(landed_merge_of(&manifest), None);
+        manifest
+            .extra
+            .insert("land_sha".to_owned(), serde_json::json!("abc123"));
+        assert_eq!(landed_merge_of(&manifest).as_deref(), Some("abc123"));
+    }
+
+    /// A repository with `master` at one commit and the main checkout parked on `elsewhere`, which
+    /// carries a commit of its own, so that reading the main checkout is told apart from reading
+    /// the integration branch.
+    struct AuditRepo {
+        _container: tempfile::TempDir,
+        path: PathBuf,
+    }
+
+    impl AuditRepo {
+        fn new() -> AuditRepo {
+            use crate::execution::git_exec::testkit::{initialize_repo, space_free_tempdir};
+            let container = space_free_tempdir("spec-audit-");
+            let path = container.path().join("repo");
+            initialize_repo(&path);
+            let repo = AuditRepo {
+                _container: container,
+                path,
+            };
+            repo.git(&["checkout", "-B", "master"]);
+            repo.commit("base.txt", "base\n");
+            repo
+        }
+
+        fn git(&self, args: &[&str]) -> String {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&self.path)
+                .args(args)
+                .output()
+                .expect("git should start");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        }
+
+        fn commit(&self, file: &str, text: &str) {
+            std::fs::write(self.path.join(file), text).unwrap();
+            self.git(&["add", file]);
+            self.git(&["commit", "-q", "-m", file]);
+        }
+
+        fn park_elsewhere(&self) {
+            self.git(&["checkout", "-q", "-b", "elsewhere"]);
+            self.commit("noise.txt", "not the integration branch\n");
+        }
+    }
+
+    fn head_of(path: &Path) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    async fn audit_spec(pool: &SqlitePool, name: &str) -> Spec {
+        store::upsert_by_path(
+            pool,
+            Some("proj-audit"),
+            &format!(".ai/specs/2026-01-01-{name}.md"),
+            name,
+            "sha-1",
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn changed_paths(checkout: &AuditCheckout) -> Vec<String> {
+        super::super::review::gather_material(&checkout.path, &checkout.diff_base, &[])
+            .await
+            .files
+            .into_iter()
+            .map(|file| file.path)
+            .collect()
+    }
+
+    /// The landing merged `spec/<stem>` with `--no-ff` and deleted it. The audit reads the
+    /// integration branch, not the owner's checkout, and its change list is what the merge brought.
+    #[tokio::test]
+    async fn after_a_landing_the_audit_reads_the_integration_branch_and_what_landed() {
+        let pool = crate::testdb::fresh_pool().await;
+        let spec = audit_spec(&pool, "landed").await;
+        let repo = AuditRepo::new();
+        let branch = derived_branch(&spec.path);
+        repo.git(&["checkout", "-q", "-b", &branch]);
+        repo.commit("landed.txt", "the spec's work\n");
+        repo.git(&["checkout", "-q", "master"]);
+        repo.git(&["merge", "-q", "--no-ff", "-m", "merge spec", &branch]);
+        let merge = repo.git(&["rev-parse", "HEAD"]);
+        repo.git(&["branch", "-q", "-D", &branch]);
+        repo.park_elsewhere();
+
+        let checkout = audit_checkout(&repo.path, &spec, "master", Some(merge.as_str())).await;
+
+        assert_ne!(checkout.path, repo.path, "the owner's checkout was audited");
+        assert_eq!(head_of(&checkout.path), repo.git(&["rev-parse", "master"]));
+        assert_eq!(changed_paths(&checkout).await, vec!["landed.txt".to_owned()]);
+    }
+
+    /// Unchanged: a spec branch that has not landed is audited against the integration branch.
+    #[tokio::test]
+    async fn before_a_landing_the_audit_reads_the_spec_branch() {
+        let pool = crate::testdb::fresh_pool().await;
+        let spec = audit_spec(&pool, "held").await;
+        let repo = AuditRepo::new();
+        let branch = derived_branch(&spec.path);
+        repo.git(&["checkout", "-q", "-b", &branch]);
+        repo.commit("held.txt", "the spec's work\n");
+        repo.git(&["checkout", "-q", "master"]);
+
+        let checkout = audit_checkout(&repo.path, &spec, "master", None).await;
+
+        assert_eq!(head_of(&checkout.path), repo.git(&["rev-parse", &branch]));
+        assert_eq!(checkout.diff_base, "master");
+        assert_eq!(changed_paths(&checkout).await, vec!["held.txt".to_owned()]);
+    }
+
+    /// No spec branch and nothing landed (the audit before the first tree): the integration
+    /// branch is what is already done, whatever the owner's checkout stands on.
+    #[tokio::test]
+    async fn with_no_spec_branch_the_audit_reads_the_integration_branch() {
+        let pool = crate::testdb::fresh_pool().await;
+        let spec = audit_spec(&pool, "fresh").await;
+        let repo = AuditRepo::new();
+        repo.park_elsewhere();
+
+        let checkout = audit_checkout(&repo.path, &spec, "master", None).await;
+
+        assert_eq!(head_of(&checkout.path), repo.git(&["rev-parse", "master"]));
     }
 
     // ---- Fix C: durable finish intents and the sweeper ---------------------------------------------
