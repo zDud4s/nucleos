@@ -99,14 +99,13 @@ pub(super) async fn reconcile_nodes(state: &AppState, job: &JobRow) -> sqlx::Res
             // A node working in a checkout of its own is put back THERE, to where that checkout
             // began. Resetting the job's branch to the item's `merge_base_sha` instead would
             // rewind every item merged since an earlier merge of this same item.
-            let owns_a_tree: bool = sqlx::query_scalar::<_, Option<i64>>(
-                "SELECT item_id FROM runs WHERE id = ?",
-            )
-            .bind(run_id)
-            .fetch_optional(pool)
-            .await?
-            .flatten()
-            .is_some();
+            let owns_a_tree: bool =
+                sqlx::query_scalar::<_, Option<i64>>("SELECT item_id FROM runs WHERE id = ?")
+                    .bind(run_id)
+                    .fetch_optional(pool)
+                    .await?
+                    .flatten()
+                    .is_some();
             let target = if owns_a_tree {
                 super::gate::revert_target(pool, job.id, run_id).await
             } else {
@@ -119,9 +118,11 @@ pub(super) async fn reconcile_nodes(state: &AppState, job: &JobRow) -> sqlx::Res
                 }
             };
             let put_back = match target {
-                Some((worktree, footing)) => crate::execution::worktree::revert_to(&worktree, &footing)
-                    .await
-                    .is_ok(),
+                Some((worktree, footing)) => {
+                    crate::execution::worktree::revert_to(&worktree, &footing)
+                        .await
+                        .is_ok()
+                }
                 None => false,
             };
             if !put_back {

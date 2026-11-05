@@ -5870,7 +5870,10 @@ mod tests {
         let job = load_job(&pool, job_id).await.unwrap();
         reconcile_nodes(&state, &job).await.unwrap();
 
-        assert_eq!(item_statuses(&pool, job_id).await, vec!["pending", "gate_failed"]);
+        assert_eq!(
+            item_statuses(&pool, job_id).await,
+            vec!["pending", "gate_failed"]
+        );
     }
 
     /// The handoff window. A node's body writes `completed` BEFORE it inserts its context-handoff
@@ -6060,12 +6063,14 @@ mod tests {
         std::fs::write(item_tree.path().join("half.txt"), "half-written").unwrap();
 
         let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
-        sqlx::query("UPDATE jobs SET rule_name = NULL, budget_usd = 25.0, head_sha = ? WHERE id = ?")
-            .bind(&h0)
-            .bind(job_id)
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE jobs SET rule_name = NULL, budget_usd = 25.0, head_sha = ? WHERE id = ?",
+        )
+        .bind(&h0)
+        .bind(job_id)
+        .execute(&pool)
+        .await
+        .unwrap();
         seed_items(&pool, job_id, &["running"]).await;
         seed_worktree(&pool, job_id, job_tree.path()).await;
         let item_id: i64 = sqlx::query_scalar("SELECT id FROM job_nodes WHERE job_id = ?")

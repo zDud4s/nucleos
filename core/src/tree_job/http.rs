@@ -1807,7 +1807,12 @@ mod tests {
         let response = post(&app(&state), "/trees", tree_body(JOB)).await;
 
         assert_first_call(&response);
-        assert_eq!(response.1["state"], json!("root_pending"), "{:?}", response.1);
+        assert_eq!(
+            response.1["state"],
+            json!("root_pending"),
+            "{:?}",
+            response.1
+        );
         assert!(
             response.1["reason"]
                 .as_str()
@@ -1856,7 +1861,12 @@ mod tests {
         let response = post(&app(&state), "/trees", repo_tree_body(JOB, &repo)).await;
 
         assert_first_call(&response);
-        assert_eq!(response.1["state"], json!("root_pending"), "{:?}", response.1);
+        assert_eq!(
+            response.1["state"],
+            json!("root_pending"),
+            "{:?}",
+            response.1
+        );
         assert_eq!(response.1["replayed"], json!(false), "{:?}", response.1);
         assert!(
             pending_reason(&response).contains("floor"),
