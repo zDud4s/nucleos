@@ -3936,6 +3936,28 @@ pub mod tests {
     }
 
     #[tokio::test]
+    async fn approve_resume_records_the_successor_on_the_superseded_run() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (original_run_id, proposal_id, _worktree_path) =
+            seed_resumable_action_approval(&state, Some("sess-a")).await;
+
+        let resume_run_id = resume_approved_run(&state, proposal_id).await.unwrap();
+
+        let successor: Option<i64> =
+            sqlx::query_scalar("SELECT successor_run_id FROM runs WHERE id = ?")
+                .bind(original_run_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            successor,
+            Some(resume_run_id),
+            "a superseded run must name the run that continues it"
+        );
+    }
+
+    #[tokio::test]
     async fn approve_resumes_session_in_same_worktree_and_grants_the_approved_actions_class() {
         let (state, runner) =
             test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
