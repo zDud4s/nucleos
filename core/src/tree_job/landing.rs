@@ -276,7 +276,8 @@ pub fn apply_gate_verdict(
         ),
         ScopeVerdict::Measured(GateOutcome::Failed { exit_code, output }) => (
             GateResult::Red,
-            json!({"at": at, "verdict": "red", "exit": exit_code, "log_tail": tail(output)}),
+            json!({"at": at, "verdict": "red", "exit": exit_code, "log_tail": tail(output),
+                   "failures": super::gate_summary::failure_digest(output)}),
         ),
         undecided => {
             let reason = match undecided {
