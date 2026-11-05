@@ -82,16 +82,33 @@ pub(super) async fn reconcile_nodes(state: &AppState, job: &JobRow) -> sqlx::Res
         // hands the branch to a person with everything still on it.
         if item_status == "failed" && job.commissioned_with_an_allowance() {
             let ordinal = ordinal as usize;
-            let put_back = match (
-                job_worktree(pool, job.id).await,
-                revert_point(pool, job, ordinal).await,
-            ) {
-                (Ok(Some((worktree, _))), Some(footing)) => {
-                    crate::execution::worktree::revert_to(&worktree, &footing)
-                        .await
-                        .is_ok()
+            // A node working in a checkout of its own is put back THERE, to where that checkout
+            // began. Resetting the job's branch to the item's `merge_base_sha` instead would
+            // rewind every item merged since an earlier merge of this same item.
+            let owns_a_tree: bool = sqlx::query_scalar::<_, Option<i64>>(
+                "SELECT item_id FROM runs WHERE id = ?",
+            )
+            .bind(run_id)
+            .fetch_optional(pool)
+            .await?
+            .flatten()
+            .is_some();
+            let target = if owns_a_tree {
+                super::gate::revert_target(pool, job.id, run_id).await
+            } else {
+                match (
+                    job_worktree(pool, job.id).await,
+                    revert_point(pool, job, ordinal).await,
+                ) {
+                    (Ok(Some((worktree, _))), Some(footing)) => Some((worktree, footing)),
+                    _ => None,
                 }
-                _ => false,
+            };
+            let put_back = match target {
+                Some((worktree, footing)) => crate::execution::worktree::revert_to(&worktree, &footing)
+                    .await
+                    .is_ok(),
+                None => false,
             };
             if !put_back {
                 let _ = retire(pool, job.id, STATUS_STOPPED).await;

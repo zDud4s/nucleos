@@ -5989,6 +5989,112 @@ mod tests {
         );
     }
 
+    /// A dead node of a team job works in its OWN checkout. Putting the tree back must act on that
+    /// checkout, not rewind the job's branch to a `merge_base_sha` recorded for an earlier merge of
+    /// the same item, which would silently drop every item merged since.
+    #[tokio::test]
+    async fn a_failed_item_run_in_its_own_tree_does_not_rewind_the_job_branch() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let init = |root: &std::path::Path| {
+            for args in [
+                vec!["init"],
+                vec!["config", "user.email", "test@x"],
+                vec!["config", "user.name", "test"],
+            ] {
+                assert!(git_ok(root, &args));
+            }
+        };
+        let head_of = |root: &std::path::Path| {
+            String::from_utf8(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(root)
+                    .args(["rev-parse", "HEAD"])
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .unwrap()
+            .trim()
+            .to_owned()
+        };
+        let commit = |root: &std::path::Path, file: &str| {
+            std::fs::write(root.join(file), file).unwrap();
+            assert!(git_ok(root, &["add", "-A"]));
+            assert!(git_ok(root, &["commit", "-q", "-m", file]));
+            head_of(root)
+        };
+
+        let job_tree = tempfile::tempdir().unwrap();
+        init(job_tree.path());
+        let h0 = commit(job_tree.path(), "a.txt");
+        let h1 = commit(job_tree.path(), "b.txt");
+        let item_tree = tempfile::tempdir().unwrap();
+        init(item_tree.path());
+        let base = commit(item_tree.path(), "c.txt");
+        std::fs::write(item_tree.path().join("half.txt"), "half-written").unwrap();
+
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
+        sqlx::query("UPDATE jobs SET rule_name = NULL, budget_usd = 25.0, head_sha = ? WHERE id = ?")
+            .bind(&h0)
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_items(&pool, job_id, &["running"]).await;
+        seed_worktree(&pool, job_id, job_tree.path()).await;
+        let item_id: i64 = sqlx::query_scalar("SELECT id FROM job_nodes WHERE job_id = ?")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        crate::execution::worktree::record(
+            &pool,
+            crate::execution::worktree::Owner::Item(item_id),
+            "project-a",
+            &item_tree.path().to_string_lossy(),
+            &item_tree.path().to_string_lossy(),
+            "nucleos/item",
+            Some(&base),
+        )
+        .await
+        .unwrap();
+        // The stale marker an earlier merge of this same item left behind.
+        sqlx::query("UPDATE job_nodes SET merge_base_sha = ? WHERE id = ?")
+            .bind(&h0)
+            .bind(item_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let run_id = seed_node(&pool, job_id, "implement", "timed_out").await;
+        sqlx::query("UPDATE runs SET item_id = ? WHERE id = ?")
+            .bind(item_id)
+            .bind(run_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE job_nodes SET run_id = ? WHERE id = ?")
+            .bind(run_id)
+            .bind(item_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        reconcile_nodes(&state, &job).await.unwrap();
+
+        assert_eq!(
+            head_of(job_tree.path()),
+            h1,
+            "the job branch keeps the items merged since"
+        );
+        assert!(
+            !item_tree.path().join("half.txt").exists(),
+            "the dead node's own tree is the one put back"
+        );
+    }
+
     #[tokio::test]
     async fn a_finished_node_hands_its_item_to_the_gate() {
         let pool = test_pool().await;
