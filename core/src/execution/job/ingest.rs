@@ -222,7 +222,7 @@ pub(super) async fn node_awaiting_approval(pool: &SqlitePool, job_id: i64) -> sq
 const MAX_PLAN_REPLANS_AFTER_INTERRUPTION: i64 = 2;
 
 /// How many times an item whose node ended `interrupted` is run again before the item fails.
-const MAX_ITEM_RERUNS_AFTER_INTERRUPTION: i64 = 2;
+pub(super) const MAX_ITEM_RERUNS_AFTER_INTERRUPTION: i64 = 2;
 
 /// Turns a finished plan node into the job's queue.
 pub(super) async fn ingest_plan(state: &AppState, job: &JobRow) -> sqlx::Result<()> {
