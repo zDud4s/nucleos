@@ -1543,7 +1543,7 @@ mod tests {
         assert_first_call(&response);
         let body = &response.1;
         assert_eq!(body["id"], json!(JOB));
-        assert_eq!(body["state"], json!("open"));
+        assert_eq!(body["state"], json!("root_pending")); // no repository, so the root run cannot start
         let root_node_id = body["root_node_id"].as_str().expect("a root node id");
         let job = loaded(&state.pool, JOB).await;
         assert_eq!(job.root_node_id, root_node_id);
@@ -1616,7 +1616,7 @@ mod tests {
         assert_replayed(&replay);
         assert_eq!(replay.1["id"], json!(JOB));
         assert_eq!(replay.1["root_node_id"], first.1["root_node_id"]);
-        assert_eq!(replay.1["state"], json!("open"));
+        assert_eq!(replay.1["state"], json!("root_pending"));
         assert_eq!(job_rows(&state.pool).await, 1);
         assert_eq!(node_rows(&state.pool).await, 1);
         // A replay must not rewrite the job from the request body.
