@@ -146,7 +146,7 @@ func captionLost(msg *telegram.Message, added []contract.InPart) bool {
 }
 
 // fetchAndUpload returns the part built for the uploaded media, or nil when the media cannot be
-// carried. Only a transient upload failure is an error.
+// carried. Only a transient upload failure is an error; a permanent rejection degrades.
 func fetchAndUpload(ctx context.Context, bot FileBot, up Uploader, fileID string, size int, mime string, build func(string) contract.InPart) (*contract.InPart, error) {
 	if size > maxBotFileBytes {
 		return nil, nil
@@ -161,7 +161,9 @@ func fetchAndUpload(ctx context.Context, bot FileBot, up Uploader, fileID string
 	}
 	mediaID, err := up.Upload(ctx, mime, bytes.NewReader(data))
 	if err != nil {
-		if errors.Is(err, kit.ErrMediaTooLarge) {
+		// A permanent rejection (ErrFatal) would never succeed on retry and would pin the
+		// cursor on this update forever, so the part degrades to unsupported like a too-large one.
+		if errors.Is(err, kit.ErrMediaTooLarge) || errors.Is(err, kit.ErrFatal) {
 			return nil, nil
 		}
 		return nil, err
