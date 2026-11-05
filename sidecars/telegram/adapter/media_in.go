@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"regexp"
 	"strconv"
@@ -152,11 +153,17 @@ func fetchAndUpload(ctx context.Context, bot FileBot, up Uploader, fileID string
 		return nil, nil
 	}
 	path, err := bot.GetFile(fileID)
-	if err != nil || path == "" {
+	if err != nil {
+		return nil, botFileError(err)
+	}
+	if path == "" {
 		return nil, nil
 	}
 	data, err := bot.DownloadFile(path)
-	if err != nil || len(data) >= maxDownloadBytes {
+	if err != nil {
+		return nil, botFileError(err)
+	}
+	if len(data) >= maxDownloadBytes {
 		return nil, nil
 	}
 	mediaID, err := up.Upload(ctx, mime, bytes.NewReader(data))
@@ -170,6 +177,17 @@ func fetchAndUpload(ctx context.Context, bot FileBot, up Uploader, fileID string
 	}
 	part := build(mediaID)
 	return &part, nil
+}
+
+// botFileError keeps a failure that says nothing about the file (transport error, 429, 5xx)
+// retryable, and lets a definitive answer from Telegram degrade the part to unsupported.
+func botFileError(err error) error {
+	var apiErr *telegram.APIError
+	if telegram.IsTransport(err) ||
+		(errors.As(err, &apiErr) && (apiErr.StatusCode == 429 || apiErr.StatusCode >= 500)) {
+		return fmt.Errorf("%w: telegram file fetch: %w", kit.ErrTransient, err)
+	}
+	return nil
 }
 
 func audioPart(mime string, seconds int) func(string) contract.InPart {
