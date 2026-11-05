@@ -62,6 +62,8 @@ mod tests_plan_landing;
 #[cfg(test)]
 mod tests_start_snapshot;
 #[cfg(test)]
+mod tests_ungated_checkpoint;
+#[cfg(test)]
 mod tests_walk_state_parity;
 mod views;
 
