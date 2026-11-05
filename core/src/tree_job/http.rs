@@ -513,15 +513,12 @@ async fn post_branch(
     let free_disk_gb = if layer == DOCS_LAYER {
         0.0
     } else {
-        crate::health::available_space(FsPath::new(&job.manifest.project_root)).map_err(
-            |error| {
-                refuse(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("could not read the free disk space: {error}"),
-                )
-            },
-        )? as f64
-            / BYTES_PER_GB
+        super::open::free_disk_gb(FsPath::new(&job.manifest.project_root)).map_err(|error| {
+            refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("could not read the free disk space: {error}"),
+            )
+        })?
     };
     let sizes = live_sizes_gb(&job.manifest).await;
     let admission = branch_admission(
@@ -567,9 +564,8 @@ pub(super) async fn current_admission(
     let free_disk_gb = if layer == DOCS_LAYER {
         0.0
     } else {
-        crate::health::available_space(FsPath::new(&manifest.project_root))
-            .map_err(|error| format!("could not read the free disk space: {error}"))? as f64
-            / BYTES_PER_GB
+        super::open::free_disk_gb(FsPath::new(&manifest.project_root))
+            .map_err(|error| format!("could not read the free disk space: {error}"))?
     };
     let sizes = live_sizes_gb(manifest).await;
     Ok(branch_admission(
@@ -1648,8 +1644,9 @@ mod tests {
 
     // ----- POST /trees: the root run and the landing mode -----
 
-    /// A temp git repository with one commit on `master` and a zero disk floor, so that the root
-    /// worktree is admitted whatever the disk holds. The layout `open.rs`'s `Checkout` has.
+    /// A temp git repository with one commit on `master` and a zero disk floor. The root branch is
+    /// still charged its 8 GB seed cost; what admits it whatever the disk holds is the test build's
+    /// fixed free disk (`open::free_disk_gb`). The layout `open.rs`'s `Checkout` has.
     struct Repo {
         _container: tempfile::TempDir,
         path: std::path::PathBuf,
@@ -1894,7 +1891,10 @@ mod tests {
         assert_eq!(added["base"], Value::Null);
     }
 
-    /// The one route test that needs the real disk: `FLOOR_GB` free where the tests run.
+    /// A code branch is admitted through the handler's own sources: the project's limits, the live
+    /// sizes and the free disk. The disk is the test build's fixed figure (`open::free_disk_gb`), not
+    /// the volume's: the default `FLOOR_GB` plus the cost is more room than a machine running trees
+    /// keeps, and this test failed on exactly that in daemon gates.
     #[tokio::test]
     async fn post_branch_admits_a_code_branch_through_the_handler_sources() {
         let state = test_state().await;

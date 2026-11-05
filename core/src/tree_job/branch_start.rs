@@ -730,8 +730,9 @@ mod tests {
         (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
     }
 
-    /// A temp git repository with one commit and a zero disk floor, so that a branch worktree is
-    /// admitted whatever the disk holds. The layout `http.rs`'s `Repo` has.
+    /// A temp git repository with one commit and a zero disk floor. A code branch is still charged
+    /// its seed cost; what admits it whatever the disk holds is the test build's fixed free disk
+    /// (`open::free_disk_gb`). The layout `http.rs`'s `Repo` has.
     struct Repo {
         _container: tempfile::TempDir,
         path: std::path::PathBuf,
