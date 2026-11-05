@@ -8651,6 +8651,15 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        // A first interruption now sends the item back to `pending`; this test pins the verdict
+        // of an item that does fail on an interrupted run, i.e. one whose re-run allowance is
+        // spent.
+        sqlx::query("UPDATE job_nodes SET interruptions = ? WHERE job_id = ? AND ordinal = 0")
+            .bind(super::ingest::MAX_ITEM_RERUNS_AFTER_INTERRUPTION)
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
         let job = load_job(&pool, job_id).await.unwrap();
         assert!(matches!(
             reconcile_nodes(&state, &job).await.unwrap(),
