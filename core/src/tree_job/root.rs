@@ -242,18 +242,21 @@ async fn retry_failed_start(state: &AppState, job: &TreeJob, record: &Value) -> 
         None => return Ok(()),
         // Started meanwhile (an answer's relaunch, say): the record is stale.
         Some(Some(_)) => {
-            edit_start_record(state, &job.id, |extra| extra.remove(ROOT_START_KEY).is_some())
-                .await;
+            edit_start_record(state, &job.id, |extra| {
+                extra.remove(ROOT_START_KEY).is_some()
+            })
+            .await;
             return Ok(());
         }
         Some(None) => {}
     }
     if let Some(decision) = record.get("decision_id").and_then(Value::as_str) {
-        let status: Option<String> = sqlx::query_scalar("SELECT status FROM decisions WHERE id = ?")
-            .bind(decision)
-            .fetch_optional(pool)
-            .await
-            .map_err(|error| error.to_string())?;
+        let status: Option<String> =
+            sqlx::query_scalar("SELECT status FROM decisions WHERE id = ?")
+                .bind(decision)
+                .fetch_optional(pool)
+                .await
+                .map_err(|error| error.to_string())?;
         if status.as_deref() == Some(decisions::STATUS_OPEN) {
             return Ok(());
         }
