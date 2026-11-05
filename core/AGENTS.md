@@ -107,6 +107,7 @@ the contract, not a snapshot.
 | `execution/job/tests_walk_state_parity.rs` | Database-level tests of walk state parity with the legacy reading. |
 | `execution/job/tests_agent_nodes.rs` | Database-level tests of agent nodes: the launcher seam and its refusals, a real run's stage and link, landing, output validation and its single retry, parked approvals. |
 | `execution/job/tests_graph_walk.rs` | Database-level tests of the walker as the authority: how a job ends (completed, stuck, unreadable emission), the brakes, loops and pre-upgrade jobs. |
+| `execution/job/tests_ungated_checkpoint.rs` | Database-level tests of the checkpoint of items passed without a gate: a revert takes off only the failing item's edits, and an item that changed nothing is not `passed`. |
 | `execution/job/tests_job_support.rs` | Shared fixtures of the job-engine DB-level tests: graphs, seeded jobs, feed and row readers. |
 | `execution/job/views.rs` | The read side the routes serve: job summaries, the live list and one job's detail. |
 | `presets.rs` | Saved run configurations (create/list/get/update/delete), owning the `run_presets` table and preserving the same launch fields as `runs::CreateRunRequest`; never starts a run itself. |

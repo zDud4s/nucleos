@@ -368,7 +368,16 @@ impl TempDb {
         // Seeded with the migrated image `testdb` caches, so `open` finds every migration applied
         // and only checks them instead of running the chain again.
         std::fs::write(&path, crate::testdb::migrated_image().await).expect("seed database");
-        let pool = open(&path).await.expect("open database");
+        // `open` connects its first connection under the daemon's 3s `POOL_ACQUIRE_TIMEOUT` and
+        // 3s busy_timeout, which is right for the daemon and too tight for a full gate run where
+        // thousands of tests start databases at once: two browser tests died at ~4.7s on this
+        // line. The seeded file is untouched by a failed attempt, so retrying a busy/timed-out
+        // open is safe — an event-driven retry rather than a wider timeout.
+        let pool = retry_busy(4, std::time::Duration::from_millis(100), is_busy, || {
+            open(&path)
+        })
+        .await
+        .expect("open database");
         Self { pool, dir }
     }
 
