@@ -176,6 +176,9 @@ pub(super) async fn node_awaiting_approval(pool: &SqlitePool, job_id: i64) -> sq
     Ok(paused.is_some())
 }
 
+/// How many times a plan node that ended `interrupted` is started again before the job fails.
+const MAX_PLAN_REPLANS_AFTER_INTERRUPTION: i64 = 2;
+
 /// Turns a finished plan node into the job's queue.
 pub(super) async fn ingest_plan(state: &AppState, job: &JobRow) -> sqlx::Result<()> {
     let pool = &state.pool;
@@ -192,16 +195,36 @@ pub(super) async fn ingest_plan(state: &AppState, job: &JobRow) -> sqlx::Result<
         return Ok(());
     }
 
+    // An `interrupted` plan node is the daemon going away (startup recovery marks every live run
+    // so), not the planner failing. Leaving the job alone makes the next decision read "not
+    // planned, nothing planning" and spawn a fresh plan run. The count is read off the `runs`
+    // rows, so it survives a restart and a crash loop cannot re-plan forever.
+    let mut interruptions = 0i64;
+    if run_status == "interrupted" {
+        interruptions = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM runs
+             WHERE job_id = ? AND stage = 'plan' AND status = 'interrupted'",
+        )
+        .bind(job.id)
+        .fetch_one(pool)
+        .await?;
+        if interruptions <= MAX_PLAN_REPLANS_AFTER_INTERRUPTION {
+            return Ok(());
+        }
+    }
+
     if run_status != "completed" {
         finish(pool, job.id, Outcome::Failed).await?;
+        let reason = if interruptions > 0 {
+            format!("its plan node was interrupted {interruptions} times, re-planning gave up")
+        } else {
+            format!("its plan node ended `{run_status}`")
+        };
         say(
             pool,
             job,
             "job_plan_failed",
-            &format!(
-                "job {} could not plan: its plan node ended `{run_status}`",
-                job.id
-            ),
+            &format!("job {} could not plan: {reason}", job.id),
         )
         .await;
         return Ok(());
