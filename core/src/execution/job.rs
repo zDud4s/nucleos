@@ -5849,6 +5849,30 @@ mod tests {
         assert_eq!(item_statuses(&pool, job_id).await, vec!["running"]);
     }
 
+    /// A crash between the claim and the link leaves an item `running` with no run behind it. The
+    /// next pass puts it back to the status it was claimed from instead of waiting on it for ever.
+    #[tokio::test]
+    async fn a_running_item_with_no_run_is_put_back_by_reconcile() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
+        seed_items(&pool, job_id, &["running", "running"]).await;
+        sqlx::query(
+            "UPDATE job_nodes SET gate_attempts = 1 WHERE job_id = ? AND ordinal = (
+                 SELECT MAX(ordinal) FROM job_nodes WHERE job_id = ?)",
+        )
+        .bind(job_id)
+        .bind(job_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        reconcile_nodes(&state, &job).await.unwrap();
+
+        assert_eq!(item_statuses(&pool, job_id).await, vec!["pending", "gate_failed"]);
+    }
+
     /// The handoff window. A node's body writes `completed` BEFORE it inserts its context-handoff
     /// successor and moves the item onto it, so a pass in that gap saw a finished node and called
     /// the item implemented while the successor went on editing the tree. A registration still

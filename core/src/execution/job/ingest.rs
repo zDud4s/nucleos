@@ -20,6 +20,20 @@ pub(super) enum Reconciled {
 pub(super) async fn reconcile_nodes(state: &AppState, job: &JobRow) -> sqlx::Result<Reconciled> {
     let pool = &state.pool;
 
+    // An item claimed `running` whose run was never linked (the daemon died between the claim and
+    // the link) belongs to nobody: passes of a job are serial and this runs at the start of one.
+    // Left alone it reads as a node in flight for ever. It goes back to the status it was claimed
+    // from, the same way `release_item` puts it back.
+    sqlx::query(
+        "UPDATE job_nodes
+         SET status = CASE WHEN gate_attempts > 0 THEN 'gate_failed' ELSE 'pending' END,
+             gate_status = CASE WHEN gate_attempts > 0 THEN 'failed' ELSE gate_status END
+         WHERE job_id = ? AND ordinal IS NOT NULL AND status = 'running' AND run_id IS NULL",
+    )
+    .bind(job.id)
+    .execute(pool)
+    .await?;
+
     // The two statuses excluded here are `node_in_flight`'s, written out because sqlx will not take
     // SQL built at runtime. `a_node_still_in_flight_is_not_reconciled` holds the two in step.
     let landed: Vec<(i64, i64, String)> = sqlx::query_as(

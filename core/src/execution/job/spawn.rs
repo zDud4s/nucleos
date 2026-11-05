@@ -305,7 +305,7 @@ pub(super) async fn spawn_node(
     // `brief::item_verdict` reads the stored verdict before it falls back to the latest run.
     if let Some(ItemClaim { ordinal, held }) = item {
         let claimed = sqlx::query(
-            "UPDATE job_nodes SET status = 'running', gate_status = NULL
+            "UPDATE job_nodes SET status = 'running', gate_status = NULL, run_id = NULL
              WHERE job_id = ? AND ordinal = ? AND status = ?",
         )
         .bind(job.id)
