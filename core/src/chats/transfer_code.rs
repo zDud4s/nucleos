@@ -236,21 +236,34 @@ fn safe_relative(path: &str) -> bool {
     !path.is_empty()
         && !p.is_absolute()
         && !path.contains(['\\', ':', '\0'])
-        && p.components().all(
-            |c| matches!(c, std::path::Component::Normal(part) if !part.eq_ignore_ascii_case(".git")),
-        )
+        && p.components().all(|component| match component {
+            std::path::Component::Normal(part) => {
+                let name = part.to_string_lossy();
+                !part.eq_ignore_ascii_case(".git")
+                    && !name.eq_ignore_ascii_case("git~1")
+                    && !name.ends_with('.')
+                    && !name.ends_with(' ')
+            }
+            _ => false,
+        })
 }
 
 fn diff_changes_symlink(diff: &[u8]) -> bool {
-    String::from_utf8_lossy(diff).lines().any(|line| {
-        matches!(
-            line.trim_end_matches('\r'),
-            "new file mode 120000"
-                | "deleted file mode 120000"
-                | "old mode 120000"
-                | "new mode 120000"
-        )
-    })
+    String::from_utf8_lossy(diff)
+        .split("diff --git ")
+        .any(|section| {
+            let lines: Vec<_> = section
+                .lines()
+                .map(|line| line.trim_end_matches('\r'))
+                .collect();
+            let deletes_symlink = lines.contains(&"deleted file mode 120000");
+            lines.iter().any(|line| {
+                matches!(
+                    *line,
+                    "new file mode 120000" | "old mode 120000" | "new mode 120000"
+                ) || (!deletes_symlink && line.starts_with("index ") && line.ends_with(" 120000"))
+            })
+        })
 }
 
 /// The deterministic tree name shared by import retries and failed-import cleanup.
@@ -499,6 +512,13 @@ mod tests {
         assert!(!safe_relative("nested/.Git/hooks/post-checkout"));
     }
 
+    #[test]
+    fn safe_relative_rejects_windows_aliases_and_trailing_components() {
+        assert!(!safe_relative("nested/GIT~1/config"));
+        assert!(!safe_relative("nested/file."));
+        assert!(!safe_relative("nested/file "));
+    }
+
     #[tokio::test]
     async fn capture_lists_an_unsafe_new_file_as_left_behind() {
         let (_keep, repo) = init_contained_repo("nucleos-move-unsafe-");
@@ -564,6 +584,20 @@ mod tests {
 
         assert!(error.contains("changes a symlink"), "{error}");
         assert!(std::fs::symlink_metadata(tree).is_err());
+    }
+
+    #[test]
+    fn diff_changes_symlink_allows_deleting_a_symlink() {
+        let diff = b"diff --git a/link b/link\ndeleted file mode 120000\nindex 1111111..0000000 120000\n--- a/link\n+++ /dev/null\n@@ -1 +0,0 @@\n-/outside\n";
+
+        assert!(!diff_changes_symlink(diff));
+    }
+
+    #[test]
+    fn diff_changes_symlink_refuses_a_hunk_that_retargets_a_symlink() {
+        let diff = b"diff --git a/link b/link\nindex 1111111..2222222 120000\n--- a/link\n+++ b/link\n@@ -1 +1 @@\n-/old\n+/new\n";
+
+        assert!(diff_changes_symlink(diff));
     }
 
     #[cfg(unix)]

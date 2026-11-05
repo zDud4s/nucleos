@@ -12,7 +12,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use super::transfer::{self, Refusal};
 use super::transfer_code::{self, Code};
@@ -95,10 +95,24 @@ struct Remembered {
 
 static REMEMBERED: LazyLock<Mutex<HashMap<String, Remembered>>> = LazyLock::new(Default::default);
 
+/// Imports for the same transfer must finish in order: a timed-out client can retry while the
+/// first request is still materializing its tree.
+static IMPORT_LOCKS: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+    LazyLock::new(Default::default);
+
 fn remembered() -> std::sync::MutexGuard<'static, HashMap<String, Remembered>> {
     REMEMBERED
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn import_lock(transfer_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    IMPORT_LOCKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(transfer_id.to_owned())
+        .or_default()
+        .clone()
 }
 
 /// Called by `begin` before it cuts anything: keeps the open questions (a cut forgets them) and
@@ -295,6 +309,8 @@ pub async fn import(
             "the package names no transfer or chat".to_string(),
         ));
     }
+    let lock = import_lock(&package.transfer_id);
+    let _guard = lock.lock().await;
     if transfer::was_imported(pool, &package.transfer_id).await? {
         return Ok(Imported::Already);
     }
@@ -388,6 +404,15 @@ pub async fn import(
     .await?
     .rows_affected();
     if saved == 0 {
+        let imported: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM chat_transfers_seen WHERE transfer_id = ?")
+                .bind(&package.transfer_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if imported.is_some() {
+            tx.rollback().await?;
+            return Ok(Imported::Already);
+        }
         return Err(Refusal::AlreadyHere.into());
     }
     match &session_id {
@@ -652,6 +677,78 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_imports_of_the_same_package_leave_one_intact_tree() {
+        let (_keep, repo) = init_contained_repo("nucleos-move-concurrent-source-");
+        std::fs::write(repo.join("seed.txt"), "source content\n").unwrap();
+        assert!(git_ok(&repo, &[OsStr::new("add"), OsStr::new("seed.txt")]));
+        assert!(git_ok(
+            &repo,
+            &[
+                OsStr::new("commit"),
+                OsStr::new("-m"),
+                OsStr::new("add seed")
+            ]
+        ));
+        let destination_parent = space_free_tempdir("nucleos-move-concurrent-destination-");
+        let destination_repo = destination_parent.path().join("destination");
+        std::fs::create_dir_all(&destination_repo).unwrap();
+        assert!(git_ok(&destination_repo, &[OsStr::new("init")]));
+        let origin = crate::testdb::fresh_pool().await;
+        let destination = crate::testdb::fresh_pool().await;
+        let store = space_free_tempdir("nucleos-move-concurrent-store-");
+        roster(&origin, "alpha", &repo).await;
+        roster(&destination, "alpha", &destination_repo).await;
+        a_chat(&origin, "c-concurrent", Some(&repo.to_string_lossy())).await;
+        freeze(&origin, "c-concurrent", "t-concurrent").await;
+        let package = build(
+            &origin,
+            "c-concurrent",
+            "t-concurrent",
+            store.path(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let (first, second) = tokio::join!(
+            import(&destination, &package, store.path()),
+            import(&destination, &package, store.path()),
+        );
+        let results = [first.unwrap(), second.unwrap()];
+        let tree = results
+            .iter()
+            .find_map(|result| match result {
+                Imported::Done {
+                    cwd: Some(tree), ..
+                } => Some(tree.clone()),
+                _ => None,
+            })
+            .expect("one import must materialize the chat tree");
+
+        assert!(
+            results
+                .iter()
+                .any(|result| matches!(result, Imported::Already)),
+            "the second import must observe the completed transfer: {results:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tree.join("seed.txt"))
+                .unwrap()
+                .replace("\r\n", "\n"),
+            "source content\n"
+        );
+        let _ = git_ok(
+            &destination_repo,
+            &[
+                OsStr::new("worktree"),
+                OsStr::new("remove"),
+                OsStr::new("--force"),
+                tree.as_os_str(),
+            ],
         );
     }
 

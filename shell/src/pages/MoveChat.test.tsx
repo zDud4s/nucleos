@@ -1,6 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { abortChatTransfer, beginChatTransfer, importChatTransfer, packageChatTransfer, previewChatTransfer } from "../data/chats";
 import { ApiRefusal, apiFetch } from "../data/client";
 import { pairedMachine, saveMachines } from "../data/machineStore";
@@ -50,6 +50,14 @@ function renderMoveDialog(onOpenChange = vi.fn()) {
 }
 
 describe("moving a chat", () => {
+  beforeEach(() => {
+    // Mock implementations set by one test (a never-settling import, a rejecting import) must not leak into the next.
+    for (const mocked of [abortChatTransfer, beginChatTransfer, importChatTransfer, packageChatTransfer, previewChatTransfer, apiFetch, requestNativeStepUp]) {
+      vi.mocked(mocked).mockReset();
+    }
+    localStorage.clear();
+  });
+
   it("the_dialog_lists_what_stops_and_what_stays_before_confirming", () => {
     render(
       <TransferNotes
@@ -150,6 +158,38 @@ describe("moving a chat", () => {
     expect(abort).not.toHaveBeenCalled();
   });
 
+  it("an unknown import followed by a refusal does not abort the origin", async () => {
+    saveMachines([{ id: "tower", origin: "https://tower.example", name: "Tower" }]);
+    vi.mocked(requestNativeStepUp).mockResolvedValue({ kind: "verified" });
+    vi.mocked(apiFetch).mockResolvedValue({ name: "Tower" } as never);
+    vi.mocked(previewChatTransfer).mockResolvedValue({
+      will_stop: [],
+      left_behind: [],
+      running: false,
+      target_ok: true,
+      target_problem: null,
+    });
+    vi.mocked(beginChatTransfer).mockResolvedValue({} as never);
+    vi.mocked(packageChatTransfer).mockResolvedValue({ transfer_id: "transfer-1" } as never);
+    vi.mocked(importChatTransfer)
+      .mockRejectedValueOnce(new Error("connection dropped"))
+      .mockRejectedValueOnce(new Error("connection dropped"))
+      .mockRejectedValueOnce(new Error("connection dropped"))
+      .mockRejectedValue(new ApiRefusal(409, "already_here", "the destination refused the retry"));
+    const onOpenChange = renderMoveDialog();
+
+    await waitFor(() => expect((screen.getByLabelText("Move chat to") as HTMLSelectElement).value).toBe("tower"));
+    fireEvent.click(screen.getByRole("button", { name: "Review move" }));
+    await screen.findByRole("button", { name: "Move chat" });
+    fireEvent.click(screen.getByRole("button", { name: "Move chat" }));
+    await screen.findByRole("button", { name: "Retry" });
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+    await waitFor(() => expect(importChatTransfer).toHaveBeenCalledTimes(6));
+    expect(abortChatTransfer).not.toHaveBeenCalled();
+    expect(onOpenChange).not.toHaveBeenCalled();
+  });
+
   it("an origin changed after expiry close-out stops retrying", async () => {
     const finish = vi.fn().mockRejectedValue(
       new ApiRefusal(409, "origin_changed_after_expiry", "the origin took a new turn"),
@@ -208,5 +248,36 @@ describe("moving a chat", () => {
     await waitFor(() => expect(screen.getByText(/still being transferred/i)).toBeTruthy());
     expect(abortChatTransfer).not.toHaveBeenCalled();
     expect(onOpenChange).not.toHaveBeenCalled();
+  });
+
+  it("the import retry can close without aborting the origin", async () => {
+    saveMachines([{ id: "tower", origin: "https://tower.example", name: "Tower" }]);
+    vi.mocked(requestNativeStepUp).mockResolvedValue({ kind: "verified" });
+    vi.mocked(apiFetch).mockResolvedValue({ name: "Tower" } as never);
+    vi.mocked(previewChatTransfer).mockResolvedValue({
+      will_stop: [],
+      left_behind: [],
+      running: false,
+      target_ok: true,
+      target_problem: null,
+    });
+    vi.mocked(beginChatTransfer).mockResolvedValue({} as never);
+    vi.mocked(packageChatTransfer).mockResolvedValue({ transfer_id: "transfer-1" } as never);
+    vi.mocked(importChatTransfer).mockRejectedValue(new Error("connection dropped"));
+    const onOpenChange = renderMoveDialog();
+
+    await waitFor(() => expect((screen.getByLabelText("Move chat to") as HTMLSelectElement).value).toBe("tower"));
+    fireEvent.click(screen.getByRole("button", { name: "Review move" }));
+    await screen.findByRole("button", { name: "Move chat" });
+    fireEvent.click(screen.getByRole("button", { name: "Move chat" }));
+    // The modal header also has an icon button labelled "Close", so wait on the import-retry notice instead.
+    await screen.findByText(/may have completed at the destination/i, {}, { timeout: 4000 });
+
+    const footerClose = screen.getAllByRole("button", { name: "Close" }).find((button) => button.textContent === "Close");
+    expect(footerClose).toBeDefined();
+    fireEvent.click(footerClose!);
+
+    expect(abortChatTransfer).not.toHaveBeenCalled();
+    expect(onOpenChange).toHaveBeenCalledWith(false);
   });
 });

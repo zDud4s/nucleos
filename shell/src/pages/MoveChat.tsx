@@ -69,14 +69,20 @@ function isOriginChangedAfterExpiry(error: unknown): boolean {
   return isApiRefusal(error) && error.code === "origin_changed_after_expiry";
 }
 
-async function importWithRetry<T>(importChat: () => Promise<T>, attempts = 3): Promise<T> {
+async function importWithRetry<T>(
+  importChat: () => Promise<T>,
+  attempts = 3,
+  outcomeAlreadyUnknown = false,
+): Promise<T> {
   let failure: unknown;
+  let outcomeUnknown = outcomeAlreadyUnknown;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     try {
       return await importChat();
     } catch (error) {
       failure = error;
-      if (isDefiniteImportRefusal(error)) throw error;
+      if (isDefiniteImportRefusal(error) && !outcomeUnknown) throw error;
+      outcomeUnknown ||= !isDefiniteImportRefusal(error);
       if (attempt + 1 < attempts) await new Promise((resolve) => window.setTimeout(resolve, 250 * (attempt + 1)));
     }
   }
@@ -210,6 +216,16 @@ export function MoveChatDialog({
         return;
       }
     }
+    begun.current = null;
+    pendingImport.current = null;
+    pendingFinish.current = null;
+    pendingDestination.current = null;
+    pendingDestinationName.current = null;
+    setRetry(null);
+    onOpenChange(false);
+  };
+
+  const closeUnknownImport = () => {
     begun.current = null;
     pendingImport.current = null;
     pendingFinish.current = null;
@@ -357,7 +373,7 @@ export function MoveChatDialog({
     setError(null);
     setProgress("Checking whether the chat arrived on the destination…");
     try {
-      await importWithRetry(importAgain);
+      await importWithRetry(importAgain, 3, true);
       active.phase = "imported";
       pendingImport.current = null;
       pendingDestination.current = destination;
@@ -417,9 +433,15 @@ export function MoveChatDialog({
       title="Move chat"
       footer={
         <>
-          <Button variant="ghost" disabled={(busy && begun.current?.phase !== "begin") || retry === "finish"} onClick={() => void cancel()}>
-            Cancel
-          </Button>
+          {retry === "import" ? (
+            <Button variant="ghost" disabled={busy} onClick={closeUnknownImport}>
+              Close
+            </Button>
+          ) : (
+            <Button variant="ghost" disabled={(busy && begun.current?.phase !== "begin") || retry === "finish"} onClick={() => void cancel()}>
+              Cancel
+            </Button>
+          )}
           {retry !== null && <Button variant="approve" disabled={busy} onClick={() => void (retry === "import" ? retryImport() : retryCloseOut())}>Retry</Button>}
           {preview === null ? (
             <Button variant="approve" disabled={busy || moving || destination === null || !originReachable} onClick={() => void inspect()}>
@@ -452,6 +474,7 @@ export function MoveChatDialog({
         )}
         {preview !== null && <TransferNotes preview={preview} />}
         {progress !== null && <p role="status">{progress}</p>}
+        {retry === "import" && <p>The move may have completed at the destination. Close this dialog and check both machines before continuing.</p>}
         {error !== null && <ErrorNote>{error}</ErrorNote>}
       </div>
     </Modal>
