@@ -110,3 +110,66 @@ async fn an_unreadable_plan_file_fails_the_plan_node_with_the_io_reason() {
         "{told:?}"
     );
 }
+
+/// A restart marks every live run `interrupted`; that is the daemon going away, not the planner
+/// failing, so the job must stay alive and its plan node be started again.
+#[tokio::test]
+async fn an_interrupted_plan_node_is_replanned_not_failed() {
+    let pool = test_pool().await;
+    let state = test_state(pool.clone()).await;
+    let worktree = tempfile::tempdir().unwrap();
+    let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
+    seed_worktree(&pool, job_id, worktree.path()).await;
+    seed_node(&pool, job_id, "plan", "interrupted").await;
+
+    let job = load_job(&pool, job_id).await.unwrap();
+    reconcile_nodes(&state, &job).await.unwrap();
+
+    assert_eq!(job_status(&pool, job_id).await, "running");
+    let view = load_view(&pool, job_id).await.unwrap();
+    assert_eq!(next_step(&view), Next::SpawnPlan);
+}
+
+/// The count lives in the `runs` rows, so a crash loop cannot re-plan forever: two interruptions
+/// are re-planned, the third fails the job and the reason names them.
+#[tokio::test]
+async fn a_plan_node_interrupted_three_times_fails_the_job_naming_the_interruptions() {
+    let pool = test_pool().await;
+    let state = test_state(pool.clone()).await;
+    let worktree = tempfile::tempdir().unwrap();
+    let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
+    seed_worktree(&pool, job_id, worktree.path()).await;
+    for _ in 0..3 {
+        seed_node(&pool, job_id, "plan", "interrupted").await;
+    }
+
+    let job = load_job(&pool, job_id).await.unwrap();
+    reconcile_nodes(&state, &job).await.unwrap();
+
+    assert_eq!(job_status(&pool, job_id).await, "failed");
+    let told: Vec<(String, String)> = sqlx::query_as("SELECT kind, summary FROM feed")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert!(
+        told.iter()
+            .any(|(kind, line)| kind == "job_plan_failed" && line.contains("interrupted 3 times")),
+        "{told:?}"
+    );
+}
+
+/// Only an interruption is retried: a plan node that failed on its own still ends the job.
+#[tokio::test]
+async fn a_plan_node_that_failed_by_itself_is_not_replanned() {
+    let pool = test_pool().await;
+    let state = test_state(pool.clone()).await;
+    let worktree = tempfile::tempdir().unwrap();
+    let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
+    seed_worktree(&pool, job_id, worktree.path()).await;
+    seed_node(&pool, job_id, "plan", "failed").await;
+
+    let job = load_job(&pool, job_id).await.unwrap();
+    reconcile_nodes(&state, &job).await.unwrap();
+
+    assert_eq!(job_status(&pool, job_id).await, "failed");
+}
