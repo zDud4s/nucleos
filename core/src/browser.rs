@@ -2854,7 +2854,10 @@ mod tests {
     /// Like `shell_acks_the_open`, but reports whether an open was queued instead of panicking, so a
     /// scope that is not embedded fails on an assertion.
     async fn shell_acks_if_queued(runtime: &BrowserRuntime) -> bool {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        // Same budget as `shell_acks_the_open`: the open reaches the queue only after a DB write and
+        // a sidecar round-trip, which a loaded gate run can stretch past 2s. The deadline is spent
+        // only when nothing is queued at all, so a wide one costs nothing on the passing path.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             if let Some(request) = runtime.embedded.poll().pop() {
                 runtime.embedded.ack(&request.request_id, "n0nce").await;
