@@ -139,7 +139,13 @@ fn refused(refusal: Refusal) -> Failure {
             StatusCode::INTERNAL_SERVER_ERROR
         }
     };
-    (status, Json(json!({ "error": refusal.message() })))
+    let body = match refusal {
+        Refusal::OriginChangedAfterExpiry => {
+            json!({ "refusal": "origin_changed_after_expiry", "detail": refusal.message() })
+        }
+        _ => json!({ "error": refusal.message() }),
+    };
+    (status, Json(body))
 }
 
 fn store(error: sqlx::Error) -> Failure {
@@ -242,6 +248,17 @@ async fn post_transfer_abort(
 mod tests {
     use super::*;
 
+    #[test]
+    fn origin_changed_after_expiry_is_named_for_the_dialog() {
+        let (status, Json(body)) = refused(Refusal::OriginChangedAfterExpiry);
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body["refusal"].as_str(),
+            Some("origin_changed_after_expiry")
+        );
+    }
+
     #[tokio::test]
     async fn post_transfer_abort_after_expiry_clears_the_remembered_move() {
         let state = super::super::tests::test_state().await;
@@ -264,17 +281,7 @@ mod tests {
         .await;
 
         assert!(matches!(status, Ok(StatusCode::NO_CONTENT)));
-        assert!(
-            package::build(
-                &state.pool,
-                "c1",
-                "t-1",
-                std::path::Path::new("unused"),
-                vec![]
-            )
-            .await
-            .is_err()
-        );
+        assert!(!package::is_remembered("c1"));
     }
 
     #[tokio::test]

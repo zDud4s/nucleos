@@ -1,10 +1,53 @@
-import { render, screen } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
-import { pairedMachine } from "../data/machineStore";
+import { abortChatTransfer, beginChatTransfer, importChatTransfer, packageChatTransfer, previewChatTransfer } from "../data/chats";
+import { ApiRefusal, apiFetch } from "../data/client";
+import { pairedMachine, saveMachines } from "../data/machineStore";
 import { requestNativeStepUp } from "../remote/nativeTransport";
-import { TransferNotes, abortStartedMove, finalizeChatMove, stepUpForMove, unreachableOriginNotice } from "./MoveChat";
+import { MoveChatDialog, TransferNotes, abortStartedMove, finalizeChatMove, finishWithRetry, stepUpForMove, unreachableOriginNotice } from "./MoveChat";
 
 vi.mock("../remote/nativeTransport", () => ({ requestNativeStepUp: vi.fn() }));
+
+vi.mock("../data/client", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../data/client")>();
+  return { ...actual, apiFetch: vi.fn() };
+});
+
+vi.mock("../data/chats", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../data/chats")>();
+  return {
+    ...actual,
+    abortChatTransfer: vi.fn(),
+    beginChatTransfer: vi.fn(),
+    finishChatTransfer: vi.fn(),
+    importChatTransfer: vi.fn(),
+    packageChatTransfer: vi.fn(),
+    previewChatTransfer: vi.fn(),
+    useChatProject: vi.fn(() => ({ data: { cwd: null } })),
+  };
+});
+
+vi.mock("../data/machines", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../data/machines")>();
+  return {
+    ...actual,
+    useMachines: vi.fn(() => [
+      { id: "here", name: "This device", reachable: true },
+      { id: "tower", name: "Tower", reachable: true },
+    ]),
+  };
+});
+
+function renderMoveDialog(onOpenChange = vi.fn()) {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  render(
+    <QueryClientProvider client={client}>
+      <MoveChatDialog chatId="chat-1" open onOpenChange={onOpenChange} />
+    </QueryClientProvider>,
+  );
+  return onOpenChange;
+}
 
 describe("moving a chat", () => {
   it("the_dialog_lists_what_stops_and_what_stays_before_confirming", () => {
@@ -89,6 +132,34 @@ describe("moving a chat", () => {
     expect(abort).not.toHaveBeenCalled();
   });
 
+  it("an unknown import response retries the same transfer and never calls abort", async () => {
+    const importChat = vi.fn()
+      .mockRejectedValueOnce(new Error("connection dropped"))
+      .mockResolvedValue({ already: true });
+    const abort = vi.fn();
+
+    await finalizeChatMove({
+      begin: vi.fn().mockResolvedValue(undefined),
+      packageChat: vi.fn().mockResolvedValue({ transfer_id: "transfer-1" }),
+      importChat,
+      finish: vi.fn().mockResolvedValue(undefined),
+      abort,
+    });
+
+    expect(importChat).toHaveBeenCalledTimes(2);
+    expect(abort).not.toHaveBeenCalled();
+  });
+
+  it("an origin changed after expiry close-out stops retrying", async () => {
+    const finish = vi.fn().mockRejectedValue(
+      new ApiRefusal(409, "origin_changed_after_expiry", "the origin took a new turn"),
+    );
+
+    await expect(finishWithRetry(finish)).rejects.toBeInstanceOf(ApiRefusal);
+
+    expect(finish).toHaveBeenCalledOnce();
+  });
+
   it("a remote machine asks for step-up and this device does not", async () => {
     localStorage.setItem("nucleos-machines", JSON.stringify([{ id: "tower", origin: "https://tower.example", name: "Tower" }]));
     vi.mocked(requestNativeStepUp).mockResolvedValue({ kind: "verified" });
@@ -107,5 +178,35 @@ describe("moving a chat", () => {
     await expect(abortStartedMove(null, abort)).resolves.toBe(false);
 
     expect(abort).not.toHaveBeenCalled();
+  });
+
+  it("Escape during transferring does not abort the move", async () => {
+    saveMachines([{ id: "tower", origin: "https://tower.example", name: "Tower" }]);
+    vi.mocked(requestNativeStepUp).mockResolvedValue({ kind: "verified" });
+    vi.mocked(apiFetch).mockResolvedValue({ name: "Tower" } as never);
+    vi.mocked(previewChatTransfer).mockResolvedValue({
+      will_stop: [],
+      left_behind: [],
+      running: false,
+      target_ok: true,
+      target_problem: null,
+    });
+    vi.mocked(beginChatTransfer).mockResolvedValue({} as never);
+    vi.mocked(packageChatTransfer).mockResolvedValue({ transfer_id: "transfer-1" } as never);
+    vi.mocked(importChatTransfer).mockImplementation(() => new Promise(() => {}));
+    const onOpenChange = renderMoveDialog();
+
+    await waitFor(() => expect((screen.getByLabelText("Move chat to") as HTMLSelectElement).value).toBe("tower"));
+    fireEvent.click(screen.getByRole("button", { name: "Review move" }));
+    await screen.findByRole("button", { name: "Move chat" });
+    fireEvent.click(screen.getByRole("button", { name: "Move chat" }));
+    await waitFor(() => expect(beginChatTransfer).toHaveBeenCalledOnce());
+    await waitFor(() => expect(importChatTransfer).toHaveBeenCalledOnce());
+
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+
+    await waitFor(() => expect(screen.getByText(/still being transferred/i)).toBeTruthy());
+    expect(abortChatTransfer).not.toHaveBeenCalled();
+    expect(onOpenChange).not.toHaveBeenCalled();
   });
 });

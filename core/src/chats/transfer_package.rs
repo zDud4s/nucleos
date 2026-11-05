@@ -124,6 +124,12 @@ pub fn forget(chat_id: &str) {
     remembered().remove(chat_id);
 }
 
+/// Read-only accessor: whether `remember` holds an entry for the chat. Public (not `cfg(test)`)
+/// because the daemon crate's tests call it across the crate boundary.
+pub fn is_remembered(chat_id: &str) -> bool {
+    remembered().contains_key(chat_id)
+}
+
 /// The CLI keys a project's transcripts by its directory with every non-alphanumeric character
 /// turned into `-`.
 pub fn encode_cwd(path: &str) -> String {
@@ -322,18 +328,30 @@ pub async fn import(
                 .await
                 .map_err(Failure::Problem)?;
             Some(
-                transfer_code::materialize(code, &root, &package.chat_id, &package.transfer_id)
-                    .await
-                    .map_err(Failure::Problem)?,
+                transfer_code::materialize(
+                    pool,
+                    code,
+                    &root,
+                    &package.chat_id,
+                    &package.transfer_id,
+                )
+                .await
+                .map_err(Failure::Problem)?,
             )
         }
         None => None,
     };
     if let (Some(session), Some(bytes)) = (&package.session, &transcript) {
-        let folder = tree.as_ref().map_or_else(
-            || store.join("default"),
-            |tree| store.join(encode_cwd(&tree.to_string_lossy())),
-        );
+        // A cwd-less turn leaves the CLI child in the daemon's own working directory. The CLI
+        // hashes that inherited directory just as it hashes an explicit chat folder, so its
+        // transcript must land under that encoded directory for `--resume` to find it.
+        let resume_cwd = match tree.as_ref() {
+            Some(tree) => tree.clone(),
+            None => std::env::current_dir().map_err(|e| {
+                Failure::Problem(format!("could not read the daemon working directory: {e}"))
+            })?,
+        };
+        let folder = store.join(encode_cwd(&resume_cwd.to_string_lossy()));
         std::fs::create_dir_all(&folder)
             .and_then(|()| {
                 std::fs::write(folder.join(format!("{}.jsonl", session.session_id)), bytes)
@@ -638,6 +656,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn import_removes_an_unreferenced_leftover_tree() {
+        let (_keep, repo) = init_contained_repo("nucleos-move-leftover-source-");
+        // `init_contained_repo` already made the seed commit.
+        let dest_parent = space_free_tempdir("nucleos-move-leftover-destination-");
+        let dest_repo = dest_parent.path().join("dest");
+        std::fs::create_dir_all(&dest_repo).unwrap();
+        assert!(git_ok(&dest_repo, &[OsStr::new("init")]));
+        let origin = crate::testdb::fresh_pool().await;
+        let destination = crate::testdb::fresh_pool().await;
+        let store = space_free_tempdir("nucleos-move-leftover-store-");
+        roster(&origin, "alpha", &repo).await;
+        roster(&destination, "alpha", &dest_repo).await;
+        a_chat(&origin, "c-leftover", Some(&repo.to_string_lossy())).await;
+        freeze(&origin, "c-leftover", "t-leftover").await;
+        let package = build(&origin, "c-leftover", "t-leftover", store.path(), vec![])
+            .await
+            .unwrap();
+        let code = package.code.as_ref().unwrap();
+
+        let leftover =
+            transfer_code::materialize(&destination, code, &dest_repo, "c-leftover", "t-leftover")
+                .await
+                .unwrap();
+        assert!(leftover.is_dir());
+
+        let imported = import(&destination, &package, store.path()).await.unwrap();
+
+        assert!(matches!(
+            imported,
+            Imported::Done {
+                cwd: Some(ref cwd),
+                ..
+            } if cwd == &leftover
+        ));
+        let _ = git_ok(
+            &dest_repo,
+            &[
+                OsStr::new("worktree"),
+                OsStr::new("remove"),
+                OsStr::new("--force"),
+                leftover.as_os_str(),
+            ],
+        );
+    }
+
+    #[tokio::test]
     async fn a_chat_without_a_folder_carries_its_transcript() {
         let origin = crate::testdb::fresh_pool().await;
         let destination = crate::testdb::fresh_pool().await;
@@ -663,10 +727,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            std::fs::read(store_b.path().join("default").join("sess-1.jsonl")).unwrap(),
-            b"transcript"
-        );
+        let resume_cwd = std::env::current_dir().unwrap();
+        let resume_path = store_b
+            .path()
+            .join(encode_cwd(&resume_cwd.to_string_lossy()))
+            .join("sess-1.jsonl");
+        assert_eq!(std::fs::read(resume_path).unwrap(), b"transcript");
     }
 
     #[tokio::test]

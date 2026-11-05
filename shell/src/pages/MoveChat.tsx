@@ -47,10 +47,40 @@ export async function finishWithRetry(finish: () => Promise<void>, attempts = 3)
       return;
     } catch (error) {
       failure = error;
+      if (isOriginChangedAfterExpiry(error)) throw error;
       if (attempt + 1 < attempts) await new Promise((resolve) => window.setTimeout(resolve, 250 * (attempt + 1)));
     }
   }
   throw failure;
+}
+
+class ImportResponseUnknownError extends Error {
+  constructor(readonly responseError: unknown) {
+    super(message(responseError));
+    this.name = "ImportResponseUnknownError";
+  }
+}
+
+function isDefiniteImportRefusal(error: unknown): boolean {
+  return isApiRefusal(error) && error.status >= 400 && error.status < 500;
+}
+
+function isOriginChangedAfterExpiry(error: unknown): boolean {
+  return isApiRefusal(error) && error.code === "origin_changed_after_expiry";
+}
+
+async function importWithRetry<T>(importChat: () => Promise<T>, attempts = 3): Promise<T> {
+  let failure: unknown;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      return await importChat();
+    } catch (error) {
+      failure = error;
+      if (isDefiniteImportRefusal(error)) throw error;
+      if (attempt + 1 < attempts) await new Promise((resolve) => window.setTimeout(resolve, 250 * (attempt + 1)));
+    }
+  }
+  throw new ImportResponseUnknownError(failure);
 }
 
 export async function abortStartedMove(
@@ -82,7 +112,10 @@ export async function finalizeChatMove<T>({
     began = true;
     await begin();
     const packageBody = await packageChat();
-    const result = await importChat(packageBody);
+    const result = await importWithRetry(() => importChat(packageBody)).catch((error: unknown) => {
+      if (error instanceof ImportResponseUnknownError) imported = true;
+      throw error;
+    });
     imported = true;
     await finishWithRetry(finish);
     return result;
@@ -146,10 +179,11 @@ export function MoveChatDialog({
   const [progress, setProgress] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const begun = useRef<{ transferId: string; done: boolean; phase: "begin" | "transferring" | "imported" } | null>(null);
+  const pendingImport = useRef<(() => Promise<unknown>) | null>(null);
   const pendingFinish = useRef<(() => Promise<void>) | null>(null);
   const pendingDestination = useRef<MachineId | null>(null);
   const pendingDestinationName = useRef<string | null>(null);
-  const [closeOutPending, setCloseOutPending] = useState(false);
+  const [retry, setRetry] = useState<"import" | "finish" | null>(null);
 
   useEffect(() => {
     if (destination === null || !destinations.some((machine) => machine.id === destination)) {
@@ -159,7 +193,11 @@ export function MoveChatDialog({
 
   const cancel = async () => {
     const active = begun.current;
-    if (active !== null && !active.done && active.phase !== "begin") {
+    if (active !== null && !active.done && active.phase === "transferring") {
+      setError("The chat is still being transferred. Keep this dialog open until the destination replies.");
+      return;
+    }
+    if (active !== null && !active.done && active.phase === "imported") {
       setError("The chat has arrived on the destination. Retry completing the origin close-out instead.");
       return;
     }
@@ -173,10 +211,11 @@ export function MoveChatDialog({
       }
     }
     begun.current = null;
+    pendingImport.current = null;
     pendingFinish.current = null;
     pendingDestination.current = null;
     pendingDestinationName.current = null;
-    setCloseOutPending(false);
+    setRetry(null);
     onOpenChange(false);
   };
 
@@ -209,6 +248,8 @@ export function MoveChatDialog({
       await stepUpForMove(destination);
       const destinationName = (await apiFetch<{ name: string }>("/machine", undefined, destination)).name;
       const destinationId = destination === "here" ? `name:${destinationName}` : destination;
+      const closeOut = async () => await finishChatTransfer(chatId, { transfer_id: transferId, to: destinationId, to_name: destinationName }, source);
+      pendingFinish.current = closeOut;
       await finalizeChatMove({
         begin: async () => {
           setProgress(when === "after_turn" ? "Waiting for the current turn to finish…" : "Freezing the chat…");
@@ -223,35 +264,50 @@ export function MoveChatDialog({
         },
         importChat: async (packageBody) => {
           setProgress("Importing the chat on the destination…");
-          const imported = await importChatTransfer(transferId, packageBody as Parameters<typeof importChatTransfer>[1], destination);
-          if (begun.current?.transferId === transferId) begun.current.phase = "imported";
+          const importAtDestination = async () => await importChatTransfer(transferId, packageBody as Parameters<typeof importChatTransfer>[1], destination);
+          pendingImport.current = importAtDestination;
           pendingDestination.current = destination;
           pendingDestinationName.current = destinationName;
-          setCloseOutPending(true);
+          const imported = await importAtDestination();
+          if (begun.current?.transferId === transferId) begun.current.phase = "imported";
+          pendingImport.current = null;
           return imported;
         },
         finish: async () => {
           setProgress("Completing the move…");
-          const closeOut = async () => await finishChatTransfer(chatId, { transfer_id: transferId, to: destinationId, to_name: destinationName }, source);
-          pendingFinish.current = closeOut;
           await closeOut();
         },
         abort: async () => await abortChatTransfer(chatId, transferId, source),
       });
       if (begun.current !== null) begun.current.done = true;
       begun.current = null;
+      pendingImport.current = null;
       pendingFinish.current = null;
       pendingDestination.current = null;
       pendingDestinationName.current = null;
-      setCloseOutPending(false);
+      setRetry(null);
       rememberChatMachine([chatId], destination);
       await queryClient.invalidateQueries({ queryKey: keys.chats.all });
       onOpenChange(false);
     } catch (cause) {
-      if (begun.current?.phase === "imported") {
+      if (cause instanceof ImportResponseUnknownError) {
+        setRetry("import");
+        setError(`The move may have completed on ${pendingDestinationName.current ?? "the destination"}. Retry checks the same transfer before the origin is changed. ${message(cause.responseError)}`);
+      } else if (isOriginChangedAfterExpiry(cause)) {
+        begun.current = null;
+        pendingImport.current = null;
+        pendingFinish.current = null;
+        pendingDestination.current = null;
+        pendingDestinationName.current = null;
+        setRetry(null);
+        setError(`The chat now runs on ${destinationName}; the origin took a new turn after the freeze expired, so both copies are live. Check the origin copy by hand.`);
+      } else if (begun.current?.phase === "imported") {
+        setRetry("finish");
         setError(`The move is complete on ${pendingDestinationName.current ?? "the destination"}; only close-out on ${sourceView?.name ?? source} is pending. Retry to finish it. ${message(cause)}`);
       } else {
         begun.current = null;
+        pendingImport.current = null;
+        pendingFinish.current = null;
         setError(message(cause));
       }
     } finally {
@@ -268,21 +324,89 @@ export function MoveChatDialog({
       await finishWithRetry(pendingFinish.current);
       active.done = true;
       begun.current = null;
+      pendingImport.current = null;
       pendingFinish.current = null;
       if (pendingDestination.current !== null) rememberChatMachine([chatId], pendingDestination.current);
       pendingDestination.current = null;
       pendingDestinationName.current = null;
-      setCloseOutPending(false);
+      setRetry(null);
       await queryClient.invalidateQueries({ queryKey: keys.chats.all });
       onOpenChange(false);
     } catch (cause) {
-      setError(message(cause));
+      if (isOriginChangedAfterExpiry(cause)) {
+        begun.current = null;
+        pendingImport.current = null;
+        pendingFinish.current = null;
+        pendingDestination.current = null;
+        pendingDestinationName.current = null;
+        setRetry(null);
+        setError(`The chat now runs at the destination; the origin took a new turn after the freeze expired, so both copies are live. Check the origin copy by hand.`);
+      } else {
+        setError(message(cause));
+      }
+    } finally {
+      setProgress(null);
+    }
+  };
+
+  const retryImport = async () => {
+    const active = begun.current;
+    const importAgain = pendingImport.current;
+    const finish = pendingFinish.current;
+    if (active === null || active.phase !== "transferring" || importAgain === null || finish === null) return;
+    setError(null);
+    setProgress("Checking whether the chat arrived on the destination…");
+    try {
+      await importWithRetry(importAgain);
+      active.phase = "imported";
+      pendingImport.current = null;
+      pendingDestination.current = destination;
+      pendingDestinationName.current = pendingDestinationName.current ?? machines.find((machine) => machine.id === destination)?.name ?? null;
+      setRetry("finish");
+      await finishWithRetry(finish);
+      active.done = true;
+      begun.current = null;
+      pendingFinish.current = null;
+      if (pendingDestination.current !== null) rememberChatMachine([chatId], pendingDestination.current);
+      pendingDestination.current = null;
+      pendingDestinationName.current = null;
+      setRetry(null);
+      await queryClient.invalidateQueries({ queryKey: keys.chats.all });
+      onOpenChange(false);
+    } catch (cause) {
+      if (cause instanceof ImportResponseUnknownError) {
+        setRetry("import");
+        setError(`The move may have completed on the destination. Retry checks the same transfer before the origin is changed. ${message(cause.responseError)}`);
+      } else if (isOriginChangedAfterExpiry(cause)) {
+        begun.current = null;
+        pendingImport.current = null;
+        pendingFinish.current = null;
+        pendingDestination.current = null;
+        pendingDestinationName.current = null;
+        setRetry(null);
+        setError("The chat now runs at the destination; the origin took a new turn after the freeze expired, so both copies are live. Check the origin copy by hand.");
+      } else if (isDefiniteImportRefusal(cause)) {
+        try {
+          await abortChatTransfer(chatId, active.transferId, source);
+          begun.current = null;
+          pendingImport.current = null;
+          pendingFinish.current = null;
+          setRetry(null);
+          setError(`The destination refused the import and the original chat was restored. ${message(cause)}`);
+        } catch (abortError) {
+          setError(`${message(cause)} The original machine could not confirm that the chat was restored: ${message(abortError)}`);
+        }
+      } else {
+        setRetry("finish");
+        setError(`The move is complete on the destination; only origin close-out is pending. Retry to finish it. ${message(cause)}`);
+      }
     } finally {
       setProgress(null);
     }
   };
 
   const busy = progress !== null;
+  const moving = begun.current !== null && !begun.current.done;
   return (
     <Modal
       open={open}
@@ -293,16 +417,16 @@ export function MoveChatDialog({
       title="Move chat"
       footer={
         <>
-          <Button variant="ghost" disabled={busy && begun.current?.phase !== "begin" || closeOutPending} onClick={() => void cancel()}>
+          <Button variant="ghost" disabled={(busy && begun.current?.phase !== "begin") || retry === "finish"} onClick={() => void cancel()}>
             Cancel
           </Button>
-          {closeOutPending && <Button variant="approve" disabled={busy} onClick={() => void retryCloseOut()}>Retry</Button>}
+          {retry !== null && <Button variant="approve" disabled={busy} onClick={() => void (retry === "import" ? retryImport() : retryCloseOut())}>Retry</Button>}
           {preview === null ? (
-            <Button variant="approve" disabled={busy || destination === null || !originReachable} onClick={() => void inspect()}>
+            <Button variant="approve" disabled={busy || moving || destination === null || !originReachable} onClick={() => void inspect()}>
               Review move
             </Button>
           ) : (
-            <Button variant="approve" disabled={busy || !preview.target_ok} onClick={() => void move()}>
+            <Button variant="approve" disabled={busy || moving || !preview.target_ok} onClick={() => void move()}>
               Move chat
             </Button>
           )}
@@ -314,7 +438,7 @@ export function MoveChatDialog({
         {originProblem !== null && <ErrorNote>{originProblem}</ErrorNote>}
         <label>
           Move to
-          <select aria-label="Move chat to" value={destination ?? ""} onChange={(event) => { setDestination(event.target.value); setPreview(null); setError(null); }} disabled={busy}>
+          <select aria-label="Move chat to" value={destination ?? ""} onChange={(event) => { setDestination(event.target.value); setPreview(null); setError(null); }} disabled={busy || moving}>
             {destinations.map((machine) => <option key={machine.id} value={machine.id} disabled={!machine.reachable}>{machine.name}</option>)}
           </select>
         </label>

@@ -10,10 +10,21 @@ vi.mock("../remote/host", async (original) => ({
   ...(await original<typeof import("../remote/host")>()),
   isRemote: remote.isRemote,
 }));
-vi.mock("../remote/PathPicker", () => ({
-  PathPicker: ({ open, onSelect }: { open: boolean; onSelect: (path: string) => void }) =>
-    open ? <button type="button" onClick={() => onSelect("C:\\Projects\\picked")}>Select tower folder</button> : null,
-}));
+/* Portalled like the real picker (a Modal): the wizard's own modal hides its siblings from the a11y tree. */
+vi.mock("../remote/PathPicker", async () => {
+  const { createPortal } = await import("react-dom");
+  return {
+    PathPicker: ({ open, onSelect }: { open: boolean; onSelect: (path: string) => void }) =>
+      open
+        ? createPortal(
+            <button type="button" onClick={() => onSelect("C:\\Projects\\picked")}>
+              Select tower folder
+            </button>,
+            document.body,
+          )
+        : null,
+  };
+});
 const daemon = vi.hoisted(() => ({ apiFetch: vi.fn(), apiText: vi.fn(), probeHealth: vi.fn() }));
 vi.mock("../data/client", async (original) => ({
   ...(await original<typeof import("../data/client")>()),

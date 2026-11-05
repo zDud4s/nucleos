@@ -1692,12 +1692,24 @@ mod tests {
 
     async fn settled(pool: &SqlitePool, id: i64) {
         for _ in 0..500 {
-            let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
-                .bind(id)
-                .fetch_one(pool)
-                .await
-                .unwrap();
-            if status != "running" {
+            let row: (String, Option<String>) =
+                sqlx::query_as("SELECT status, chat_id FROM runs WHERE id = ?")
+                    .bind(id)
+                    .fetch_one(pool)
+                    .await
+                    .unwrap();
+            if row.0 != "running" {
+                // The row settles before the turn drops its chat slot, so a next send straight
+                // after this returns can still see "a turn is already in progress". Wait for the
+                // slot too, bounded and silent: a test may hold the slot itself on purpose.
+                if let Some(chat) = row.1 {
+                    for _ in 0..100 {
+                        if !is_busy(&chat) {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }
                 return;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
