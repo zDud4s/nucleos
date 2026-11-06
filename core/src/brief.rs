@@ -2438,7 +2438,11 @@ mod tests {
         record(&pool, second, None, &[scored(knowledge, true)]).await?;
 
         assert_eq!(sweep(&pool).await?, 2, "one credit per unit, not per hop");
-        assert_eq!(sweep(&pool).await?, 0, "a credited unit is never credited again");
+        assert_eq!(
+            sweep(&pool).await?,
+            0,
+            "a credited unit is never credited again"
+        );
         let counts = counters(&pool, knowledge).await?;
         assert_eq!((counts.0, counts.1), (2, 2));
         Ok(())
