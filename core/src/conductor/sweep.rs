@@ -54,59 +54,10 @@ pub async fn tick(
 ) -> sqlx::Result<SweepReport> {
     let mut report = SweepReport::default();
     for observed in observed {
-        let verdict = classify(&observed.observation, limits, now);
-        let Some(kind) = feed_kind(verdict) else {
-            continue;
-        };
-        let (subject, run_id, node_id, daemon) = match &observed.kind {
-            SubjectKind::External { session_id } => {
-                (format!("session:{session_id}"), None, None, false)
-            }
-            SubjectKind::DaemonRun { run_id, node_id } => (
-                Subject::Run(*run_id).key(),
-                Some(*run_id),
-                node_id.clone(),
-                true,
-            ),
-        };
-        let episode = observed
-            .observation
-            .started_at
-            .iter()
-            .chain(observed.observation.last_transcript_write.iter())
-            .cloned()
-            .max();
-        if insert_feed(state, kind, &subject, run_id, &summary(kind), now, episode).await? {
-            report.reported.push((kind.to_owned(), subject));
-        }
-        if daemon
-            && matches!(
-                verdict,
-                Veredicto::SilentSinceStart | Veredicto::Stalled | Veredicto::Dead
-            )
-        {
-            let run_id = run_id.expect("daemon runs have ids");
-            if matches!(verdict, Veredicto::Dead) {
-                sqlx::query("UPDATE runs SET status = 'cancelled', completed_at = ? WHERE id = ? AND status = 'running'")
-                    .bind(now.to_rfc3339()).bind(run_id).execute(&state.pool).await?;
-            } else {
-                finalize_termination(state, run_id, "cancelled").await;
-            }
-            report.cancelled.push(run_id);
-            if let Some(node_id) = node_id {
-                let tree_job: Option<Option<String>> =
-                    sqlx::query_scalar("SELECT tree_job_id FROM work_nodes WHERE id = ?")
-                        .bind(&node_id)
-                        .fetch_optional(&state.pool)
-                        .await?;
-                if tree_job.flatten().is_none() {
-                    sqlx::query("UPDATE work_nodes SET status = 'failed', summary = ?, closed_at = ?, updated_at = ? WHERE id = ? AND status = 'running'")
-                        .bind(format!("Liveness sweep: {}", kind.replace("session_", "")))
-                        .bind(now.to_rfc3339()).bind(now.to_rfc3339()).bind(&node_id)
-                        .execute(&state.pool).await?;
-                    report.marked_nodes.push(node_id);
-                }
-            }
+        // One failing subject (a locked database, say) must not leave the rest of the tick undone:
+        // the stalled runs after it still need cancelling.
+        if let Err(error) = sweep_one(state, observed, limits, now, &mut report).await {
+            tracing::warn!(%error, "liveness sweep could not handle one subject");
         }
     }
     // Before `terminal_feed`, so a node reaped here has its failure announced in this same tick.
@@ -116,9 +67,78 @@ pub async fn tick(
     // Both ticks log their own failures and return nothing, so neither can fail the sweep.
     crate::tree_job::wrap::tick(state).await;
     crate::tree_job::driver::tick(state).await;
-    continue_handoffs(state, now, &mut report).await?;
-    terminal_feed(state, now, &mut report).await?;
+    if let Err(error) = continue_handoffs(state, now, &mut report).await {
+        tracing::warn!(%error, "liveness sweep could not continue the handed-off nodes");
+    }
+    if let Err(error) = terminal_feed(state, now, &mut report).await {
+        tracing::warn!(%error, "liveness sweep could not announce the terminal nodes");
+    }
     Ok(report)
+}
+
+/// One observed subject of `tick`: classify it, report it and, for a dead daemon run, cancel it.
+async fn sweep_one(
+    state: &AppState,
+    observed: &Observed,
+    limits: &Limits,
+    now: DateTime<Utc>,
+    report: &mut SweepReport,
+) -> sqlx::Result<()> {
+    let verdict = classify(&observed.observation, limits, now);
+    let Some(kind) = feed_kind(verdict) else {
+        return Ok(());
+    };
+    let (subject, run_id, node_id, daemon) = match &observed.kind {
+        SubjectKind::External { session_id } => {
+            (format!("session:{session_id}"), None, None, false)
+        }
+        SubjectKind::DaemonRun { run_id, node_id } => (
+            Subject::Run(*run_id).key(),
+            Some(*run_id),
+            node_id.clone(),
+            true,
+        ),
+    };
+    let episode = observed
+        .observation
+        .started_at
+        .iter()
+        .chain(observed.observation.last_transcript_write.iter())
+        .cloned()
+        .max();
+    if insert_feed(state, kind, &subject, run_id, &summary(kind), now, episode).await? {
+        report.reported.push((kind.to_owned(), subject));
+    }
+    if daemon
+        && matches!(
+            verdict,
+            Veredicto::SilentSinceStart | Veredicto::Stalled | Veredicto::Dead
+        )
+    {
+        let run_id = run_id.expect("daemon runs have ids");
+        if matches!(verdict, Veredicto::Dead) {
+            sqlx::query("UPDATE runs SET status = 'cancelled', completed_at = ? WHERE id = ? AND status = 'running'")
+                .bind(now.to_rfc3339()).bind(run_id).execute(&state.pool).await?;
+        } else {
+            finalize_termination(state, run_id, "cancelled").await;
+        }
+        report.cancelled.push(run_id);
+        if let Some(node_id) = node_id {
+            let tree_job: Option<Option<String>> =
+                sqlx::query_scalar("SELECT tree_job_id FROM work_nodes WHERE id = ?")
+                    .bind(&node_id)
+                    .fetch_optional(&state.pool)
+                    .await?;
+            if tree_job.flatten().is_none() {
+                sqlx::query("UPDATE work_nodes SET status = 'failed', summary = ?, closed_at = ?, updated_at = ? WHERE id = ? AND status = 'running'")
+                    .bind(format!("Liveness sweep: {}", kind.replace("session_", "")))
+                    .bind(now.to_rfc3339()).bind(now.to_rfc3339()).bind(&node_id)
+                    .execute(&state.pool).await?;
+                report.marked_nodes.push(node_id);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Continues every handed-off tree node that needs it. A node without a tree job belongs to an
