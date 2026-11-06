@@ -19,6 +19,7 @@ pub mod node_run;
 pub mod open;
 mod relaunch;
 pub mod report;
+mod retry;
 pub mod root;
 pub mod store;
 pub mod wrap;

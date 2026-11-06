@@ -30,8 +30,8 @@ use super::decisions;
 use super::engine::{apply_transition, branch_node_may_close};
 use super::http::job_lock;
 use super::landing::{
-    self, LandingError, MergeSettlement, apply_gate_verdict, check_may_land, check_may_merge,
-    land_job, settle_land, settle_merge, submit_merge,
+    self, LandingError, MergeSettlement, check_may_land, check_may_merge, land_job, settle_land,
+    settle_merge, submit_merge,
 };
 use super::model::{JOB_TERMINAL_STATE, Manifest};
 use super::open::{FIX_PREFIX, relaunch_node, run_is_live};
@@ -52,28 +52,53 @@ const FIX_CAP: i64 = 2;
 /// Merge requests of one branch that the conflict resolver is given before the owner is asked.
 const CONFLICT_ATTEMPTS: i64 = 2;
 /// How long a conflict may wait for a resolver run before the owner is asked instead.
-const RESOLVER_GRACE: Duration = Duration::from_secs(15 * 60);
+pub(super) const RESOLVER_GRACE: Duration = Duration::from_secs(15 * 60);
 /// Longest tail of the gate's findings that goes into a relaunch prompt.
 const FINDINGS_MAX: usize = 3000;
 
-/// What a gate measured for one branch. `Err` from a [`GateFn`] means nothing was measured (the
-/// scope gate's undecided outcomes), so the branch stays where it was. The driver maps it back onto
-/// a `ScopeVerdict` and applies it with `landing::apply_gate_verdict`: `Passed` is `Green`,
-/// `Failed { output }` is `Red` with the output as `summary`, anything else is `Err`.
+/// What a gate measured for one branch. `Err` from a [`GateFn`] means nothing was measured (see
+/// [`NotMeasured`]), so the branch stays where it was. `retry::apply_gate_answer` records it:
+/// `Green` and `Red` as measured, `NothingRan` as green unmeasured, `Inherited` as green with the
+/// base's incident named.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum GateVerdict {
     Green,
-    Red { summary: String },
+    Red {
+        summary: String,
+    },
+    /// The test map selects no unit for the branch's diff: nothing ran, so nothing could fail.
+    NothingRan,
+    /// Red, but every failed test is already red on the base, under the master incident `note`
+    /// names (`verify::inherit::inherited_red`): not the branch's failure, so no fix is spent on it.
+    Inherited {
+        note: String,
+    },
 }
 
-pub(super) type GateFuture = Pin<Box<dyn Future<Output = Result<GateVerdict, String>> + Send>>;
+/// Why a gate has no verdict for a branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum NotMeasured {
+    /// The ticket is still running and a later tick reads it. Waiting is never counted.
+    Running(String),
+    /// The gate ended without measuring anything: the ticket errored or vanished, the submission
+    /// was refused, the worktree could not be read. Counted against `retry::GATE_ATTEMPTS`.
+    Failed(String),
+}
+
+impl From<String> for NotMeasured {
+    fn from(reason: String) -> Self {
+        NotMeasured::Failed(reason)
+    }
+}
+
+pub(super) type GateFuture = Pin<Box<dyn Future<Output = Result<GateVerdict, NotMeasured>> + Send>>;
 
 /// Runs the gate of one branch: called with `(job id, branch name)`. The driver spawns the future
 /// and never awaits it inside a tick.
 pub(super) type GateFn = Arc<dyn Fn(String, String) -> GateFuture + Send + Sync>;
 
 /// A branch to park after the job's lock is released: `(node id, question)`.
-type Park = (String, String);
+pub(super) type Park = (String, String);
 
 /// One pass over every unfinished job. A failure on one job is logged and never stops the others.
 pub async fn tick(state: &AppState) {
@@ -132,19 +157,17 @@ fn production_gate(state: &AppState) -> Option<GateFn> {
     Some(gate)
 }
 
-pub(super) fn verdict_of(verdict: ScopeVerdict) -> Result<GateVerdict, String> {
+pub(super) fn verdict_of(verdict: ScopeVerdict) -> Result<GateVerdict, NotMeasured> {
     match verdict {
         ScopeVerdict::Measured(GateOutcome::Passed) => Ok(GateVerdict::Green),
         ScopeVerdict::Measured(GateOutcome::Failed { output, .. }) => {
             Ok(GateVerdict::Red { summary: output })
         }
-        ScopeVerdict::Measured(GateOutcome::Errored { reason }) => Err(reason),
-        ScopeVerdict::NothingRan => {
-            Err("no test unit agrees with the branch's diff, so nothing was measured".to_owned())
-        }
-        ScopeVerdict::Unavailable => {
-            Err("the scope gate could not be submitted, so nothing was measured".to_owned())
-        }
+        ScopeVerdict::Measured(GateOutcome::Errored { reason }) => Err(NotMeasured::Failed(reason)),
+        ScopeVerdict::NothingRan => Ok(GateVerdict::NothingRan),
+        ScopeVerdict::Unavailable => Err(NotMeasured::Failed(
+            "the scope gate could not be submitted, so nothing was measured".to_owned(),
+        )),
     }
 }
 
@@ -331,7 +354,7 @@ async fn pass(
     }
 
     root_step(pool, &job, parks).await?;
-    landing_step(state, &mut job).await
+    landing_step(state, &mut job, parks).await
 }
 
 /// A root whose run is over and reported `blocked` or `failed` has nobody else to ask: the owner is
@@ -584,48 +607,34 @@ fn spawn_gate(state: &AppState, gate: &GateFn, job_id: &str, branch: &str) {
     });
 }
 
+/// Records the gate task's answer under the job's lock, then asks the park it may call for
+/// outside it (`park` takes the lock itself).
 async fn record_verdict(
     state: &AppState,
     job_id: &str,
     branch: &str,
-    verdict: Result<GateVerdict, String>,
+    verdict: Result<GateVerdict, NotMeasured>,
 ) {
-    let scope = match verdict {
-        Ok(GateVerdict::Green) => ScopeVerdict::Measured(GateOutcome::Passed),
-        Ok(GateVerdict::Red { summary }) => ScopeVerdict::Measured(GateOutcome::Failed {
-            exit_code: 1,
-            output: summary,
-        }),
-        Err(reason) => {
-            tracing::warn!(job = job_id, branch, %reason, "the gate measured nothing");
-            return;
+    if let Err(NotMeasured::Running(reason) | NotMeasured::Failed(reason)) = &verdict {
+        tracing::warn!(job = job_id, branch, %reason, "the gate measured nothing");
+    }
+    let applied = {
+        let lock = job_lock(job_id);
+        let _guard = lock.lock().await;
+        super::retry::apply_gate_answer(&state.pool, job_id, branch, verdict).await
+    };
+    match applied {
+        Ok(Some((node, question))) => {
+            if let Err(error) = decisions::park_or_ask(&state.pool, job_id, &node, &question).await
+            {
+                tracing::warn!(job = job_id, branch, %error, "could not park the ungated branch");
+            }
         }
-    };
-    let lock = job_lock(job_id);
-    let _guard = lock.lock().await;
-    if let Err(error) = apply_verdict(&state.pool, job_id, branch, &scope).await {
-        tracing::warn!(job = job_id, branch, %error, "could not record the gate verdict");
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(job = job_id, branch, %error, "could not record the gate verdict")
+        }
     }
-}
-
-async fn apply_verdict(
-    pool: &SqlitePool,
-    job_id: &str,
-    branch: &str,
-    scope: &ScopeVerdict,
-) -> Result<(), String> {
-    let Some(mut job) = store::load(pool, job_id).await.map_err(|e| e.to_string())? else {
-        return Ok(());
-    };
-    let Some(held) = job.manifest.branches.get_mut(branch) else {
-        return Ok(());
-    };
-    // The job may have moved on (parked, dropped) while the gate ran: then the verdict is stale.
-    if !matches!(held.state.as_str(), "building" | "fixing" | "reviewing") {
-        return Ok(());
-    }
-    apply_gate_verdict(held, scope).map_err(|e| e.to_string())?;
-    persist(pool, &mut job).await
 }
 
 // ---- red: fix, then park -----------------------------------------------------------------------
@@ -915,9 +924,10 @@ async fn merge(
         return Ok(());
     }
 
-    // Not mergeable yet (its base waits, a finding is open): nothing to do this pass.
+    // Not mergeable yet (its base waits, a finding is open): a base that is parked or dropped is
+    // said once; anything else waits silently for this pass.
     if check_may_merge(&job.manifest, name).is_err() {
-        return Ok(());
+        return super::retry::note_blocked_base(pool, job, name, parks).await;
     }
     let repo = repo_of(pool, job).await?;
     submit_merge(pool, &repo, job, name, Origin::Daemon)
@@ -986,7 +996,11 @@ fn is_empty_tree(manifest: &Manifest) -> bool {
             })
 }
 
-async fn landing_step(state: &AppState, job: &mut TreeJob) -> Result<(), String> {
+async fn landing_step(
+    state: &AppState,
+    job: &mut TreeJob,
+    parks: &mut Vec<Park>,
+) -> Result<(), String> {
     let pool = &state.pool;
     if job
         .manifest
@@ -998,10 +1012,10 @@ async fn landing_step(state: &AppState, job: &mut TreeJob) -> Result<(), String>
         let settled = settle_land(pool, job, Duration::ZERO)
             .await
             .map_err(|e| e.to_string())?;
-        if let landing::LandSettlement::NotLanded { reason } = settled {
+        if let landing::LandSettlement::NotLanded { reason } = &settled {
             tracing::warn!(job = %job.id, %reason, "the queue did not land the job");
         }
-        return Ok(());
+        return super::retry::after_settle(pool, job, settled, parks).await;
     }
     if !root_is_done(pool, &job.root_node_id).await? {
         return Ok(());
@@ -1028,6 +1042,10 @@ async fn landing_step(state: &AppState, job: &mut TreeJob) -> Result<(), String>
     if !integration {
         return finish_held(pool, job).await;
     }
+    // Past the allowance of failed landings the owner decides; an answer is a fresh one.
+    if !super::retry::land_allowed(pool, job, parks).await? {
+        return Ok(());
+    }
     let repo = repo_of(pool, job).await?;
     match land_job(
         pool,
@@ -1040,9 +1058,9 @@ async fn landing_step(state: &AppState, job: &mut TreeJob) -> Result<(), String>
     {
         Ok(_) => Ok(()),
         Err(LandingError::LandRefused(reason)) => {
-            // `land_job` recorded it as `land_refusal`; the job stays open.
+            // `land_job` recorded it as `land_refusal`; the job stays open and the refusal counts.
             tracing::warn!(job = %job.id, %reason, "the landing was refused");
-            Ok(())
+            super::retry::count_land_attempt(pool, job, &reason, parks).await
         }
         Err(error) => Err(error.to_string()),
     }
@@ -1133,6 +1151,9 @@ mod tests {
     use crate::tree_job::model::{Branch, Manifest};
     use crate::tree_job::node_run;
     use crate::tree_job::open::{self, StoredLaunch};
+    use crate::tree_job::retry::{
+        GATE_ATTEMPTS, GATE_FAILURES, LAND_ATTEMPTS, LAND_ATTEMPTS_KEY, LAND_ESCALATED_SINCE,
+    };
     use crate::tree_job::store::{self, TreeJob};
     use crate::work_nodes;
 
@@ -1230,12 +1251,18 @@ mod tests {
     #[derive(Clone)]
     struct FakeGate {
         calls: Arc<Mutex<Vec<(String, String)>>>,
-        script: Arc<Mutex<VecDeque<GateVerdict>>>,
+        script: Arc<Mutex<VecDeque<Result<GateVerdict, NotMeasured>>>>,
         release: Option<Arc<Notify>>,
     }
 
     impl FakeGate {
         fn answering(script: Vec<GateVerdict>) -> FakeGate {
+            FakeGate::scripted(script.into_iter().map(Ok).collect())
+        }
+
+        /// A gate that also answers "nothing measured". Once the script runs out it answers that
+        /// its ticket is still running, which the driver only waits on.
+        fn scripted(script: Vec<Result<GateVerdict, NotMeasured>>) -> FakeGate {
             FakeGate {
                 calls: Arc::default(),
                 script: Arc::new(Mutex::new(script.into())),
@@ -1264,7 +1291,9 @@ mod tests {
                         release.notified().await;
                     }
                     let next = fake.script.lock().unwrap().pop_front();
-                    next.ok_or_else(|| "the gate script ran out".to_owned())
+                    next.unwrap_or_else(|| {
+                        Err(NotMeasured::Running("the gate script ran out".to_owned()))
+                    })
                 })
             })
         }
@@ -1752,6 +1781,175 @@ mod tests {
         assert_eq!(gate.calls().len(), 1);
     }
 
+    /// Waits for the spawned gate to count `want` gates in a row that measured nothing, then lets
+    /// its task finish.
+    async fn wait_gate_failures(fx: &Fixture, job: &str, name: &str, want: i64) {
+        let mut seen = None;
+        for _ in 0..300 {
+            seen = fx
+                .branch(job, name)
+                .await
+                .extra
+                .get(GATE_FAILURES)
+                .and_then(Value::as_i64);
+            if seen == Some(want) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            seen,
+            Some(want),
+            "branch {name} of {job} never counted {want} failure(s)"
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+
+    /// A branch at work with a `done` report, gated on every tick.
+    async fn gated_job(fx: &Fixture, job: &str, node: &str) {
+        fx.seed_job(job, vec![code_branch("api", "building", Some(node))], None)
+            .await;
+        fx.add_node(job, node, "orchestrator").await;
+        fx.run_ended(node, Some("done")).await;
+    }
+
+    #[tokio::test]
+    async fn a_gate_that_keeps_measuring_nothing_parks_after_the_cap() {
+        const JOB: &str = "drv-unmeasured";
+        const NODE: &str = "api-node";
+        let fx = Fixture::new().await;
+        gated_job(&fx, JOB, NODE).await;
+        let unavailable = || {
+            Err(NotMeasured::Failed(
+                "the scope gate could not be submitted: queue-down".to_owned(),
+            ))
+        };
+        let gate = FakeGate::scripted(vec![unavailable(), unavailable(), unavailable()]);
+
+        for attempt in 1..GATE_ATTEMPTS {
+            fx.tick(JOB, &gate).await;
+            wait_calls(&gate, attempt as usize).await;
+            wait_gate_failures(&fx, JOB, "api", attempt).await;
+            assert_eq!(fx.branch(JOB, "api").await.state, "building");
+            assert!(fx.open_questions(JOB, NODE).await.is_empty());
+        }
+        fx.tick(JOB, &gate).await;
+        wait_calls(&gate, GATE_ATTEMPTS as usize).await;
+        fx.wait_branch_state(JOB, "api", "parked").await;
+
+        let questions = fx.open_questions(JOB, NODE).await;
+        assert_eq!(questions.len(), 1, "the owner is asked once: {questions:?}");
+        assert!(questions[0].contains("queue-down"), "{:?}", questions[0]);
+        let parked = fx.branch(JOB, "api").await;
+        assert!(
+            !parked.extra.contains_key(GATE_FAILURES),
+            "an answer starts a fresh count"
+        );
+        fx.tick(JOB, &gate).await;
+        fx.tick(JOB, &gate).await;
+        assert_eq!(
+            gate.calls().len(),
+            GATE_ATTEMPTS as usize,
+            "a parked branch is not gated again"
+        );
+        assert_eq!(fx.open_questions(JOB, NODE).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_gate_that_selects_no_unit_turns_the_branch_green_unmeasured() {
+        const JOB: &str = "drv-nothing-ran";
+        const NODE: &str = "api-node";
+        let fx = Fixture::new().await;
+        gated_job(&fx, JOB, NODE).await;
+        let gate = FakeGate::answering(vec![GateVerdict::NothingRan]);
+
+        fx.tick(JOB, &gate).await;
+        wait_calls(&gate, 1).await;
+        fx.wait_branch_state(JOB, "api", "green").await;
+
+        let api = fx.branch(JOB, "api").await;
+        let last = api.gates.last().expect("the verdict is recorded");
+        assert_eq!(last["verdict"], json!("green"));
+        assert_eq!(last["unmeasured"], json!(true), "{last}");
+        fx.tick(JOB, &gate).await;
+        assert_eq!(fx.requests().await, 1, "the branch goes on to its merge");
+        assert_eq!(gate.calls().len(), 1);
+        assert_eq!(count_of(&fx, "decisions").await, 0, "nobody was asked");
+    }
+
+    #[tokio::test]
+    async fn an_inherited_red_turns_the_branch_green_without_spending_a_fix() {
+        const JOB: &str = "drv-inherited";
+        const NODE: &str = "api-node";
+        let fx = Fixture::new().await;
+        gated_job(&fx, JOB, NODE).await;
+        let gate = FakeGate::answering(vec![GateVerdict::Inherited {
+            note: "incident #4 (open, nobody has claimed it)".to_owned(),
+        }]);
+
+        fx.tick(JOB, &gate).await;
+        wait_calls(&gate, 1).await;
+        fx.wait_branch_state(JOB, "api", "green").await;
+
+        let api = fx.branch(JOB, "api").await;
+        let last = api.gates.last().expect("the verdict is recorded");
+        assert_eq!(last["verdict"], json!("green"));
+        assert!(
+            last["inherited"]
+                .as_str()
+                .is_some_and(|note| note.contains("#4")),
+            "{last}"
+        );
+        let fixes: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tree_launches WHERE node_id = ? AND key LIKE ?",
+        )
+        .bind(NODE)
+        .bind(format!("{FIX_PREFIX}%"))
+        .fetch_one(&fx.state.pool)
+        .await
+        .unwrap();
+        assert_eq!(fixes, 0, "no fix is spent on the base's red");
+        fx.tick(JOB, &gate).await;
+        assert_eq!(fx.requests().await, 1, "the branch goes on to its merge");
+        assert_eq!(gate.calls().len(), 1);
+        assert_eq!(count_of(&fx, "decisions").await, 0, "nobody was asked");
+    }
+
+    #[tokio::test]
+    async fn a_gate_still_running_keeps_waiting_without_counting() {
+        const JOB: &str = "drv-gate-running";
+        const NODE: &str = "api-node";
+        let fx = Fixture::new().await;
+        gated_job(&fx, JOB, NODE).await;
+        let running = || {
+            Err(NotMeasured::Running(
+                "scope verification ticket 7 is still running".to_owned(),
+            ))
+        };
+        let attempts = GATE_ATTEMPTS as usize + 2;
+        let gate = FakeGate::scripted((0..attempts).map(|_| running()).collect());
+
+        for attempt in 1..=attempts {
+            fx.tick(JOB, &gate).await;
+            wait_calls(&gate, attempt).await;
+            // Lets the gate's task end, so the next tick may start another.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let api = fx.branch(JOB, "api").await;
+        assert_eq!(api.state, "building", "a running gate is waited on");
+        assert!(
+            !api.extra.contains_key(GATE_FAILURES),
+            "waiting is never counted"
+        );
+        assert!(
+            api.gates.is_empty(),
+            "nothing was recorded: {:?}",
+            api.gates
+        );
+        assert_eq!(count_of(&fx, "decisions").await, 0, "nobody was asked");
+    }
+
     #[tokio::test]
     async fn a_red_gate_relaunches_with_the_findings_twice_and_then_parks() {
         const JOB: &str = "drv-fix";
@@ -1985,6 +2183,93 @@ mod tests {
             &["cat-file", "-e", "feat/tree:storage.txt"]
         ));
         assert!(git_in(&fx.repo, &["cat-file", "-e", "feat/tree:api.txt"]));
+        assert_eq!(
+            feed_lines_naming(&fx, "waits on its base").await,
+            0,
+            "a base still on its way is not announced"
+        );
+    }
+
+    /// Parks `storage` on decision `decision`, from green.
+    async fn park_the_base(fx: &Fixture, job: &str, decision: &str) {
+        let mut stored = fx.job(job).await;
+        let base = stored
+            .manifest
+            .branches
+            .get_mut("storage")
+            .expect("the base is in the manifest");
+        base.state = "parked".to_owned();
+        base.park = Some(json!({ "prev_state": "green", "decision_id": decision }));
+        store::update(&fx.state.pool, &stored).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_green_branch_on_a_parked_base_is_announced_once() {
+        const JOB: &str = "drv-base-parked";
+        let fx = Fixture::new().await;
+        let mut dependent = code_branch("api", "green", None);
+        dependent.base = Some("storage".to_owned());
+        fx.seed_job(
+            JOB,
+            vec![dependent, code_branch("storage", "green", None)],
+            None,
+        )
+        .await;
+        park_the_base(&fx, JOB, "d-1").await;
+        let gate = FakeGate::answering(vec![]);
+
+        for _ in 0..3 {
+            fx.tick(JOB, &gate).await;
+        }
+
+        let line = "branch api is green but waits on its base storage";
+        assert_eq!(feed_lines_naming(&fx, line).await, 1, "announced once");
+        assert_eq!(
+            feed_lines_naming(&fx, "d-1").await,
+            1,
+            "naming the base's decision"
+        );
+        let waiting = fx.branch(JOB, "api").await;
+        assert_eq!(waiting.state, "green", "the dependent keeps waiting");
+        assert_eq!(fx.requests().await, 0, "nothing was queued");
+        assert_eq!(
+            count_of(&fx, "decisions").await,
+            0,
+            "the base's question is the one asked"
+        );
+
+        // The base parks again on another question: that wait is announced too, once.
+        park_the_base(&fx, JOB, "d-2").await;
+        fx.tick(JOB, &gate).await;
+        fx.tick(JOB, &gate).await;
+        assert_eq!(feed_lines_naming(&fx, line).await, 2);
+    }
+
+    #[tokio::test]
+    async fn a_green_branch_on_a_dropped_base_parks_once() {
+        const JOB: &str = "drv-base-dropped";
+        const NODE: &str = "api-node";
+        let fx = Fixture::new().await;
+        let mut dependent = code_branch("api", "green", Some(NODE));
+        dependent.base = Some("storage".to_owned());
+        fx.seed_job(
+            JOB,
+            vec![dependent, code_branch("storage", "dropped", None)],
+            None,
+        )
+        .await;
+        fx.add_node(JOB, NODE, "orchestrator").await;
+        let gate = FakeGate::answering(vec![]);
+
+        for _ in 0..3 {
+            fx.tick(JOB, &gate).await;
+        }
+
+        assert_eq!(fx.branch(JOB, "api").await.state, "parked");
+        let questions = fx.open_questions(JOB, NODE).await;
+        assert_eq!(questions.len(), 1, "the owner is asked once: {questions:?}");
+        assert!(questions[0].contains("dropped"), "{:?}", questions[0]);
+        assert_eq!(fx.requests().await, 0, "nothing was queued");
     }
 
     // ---- landing ---------------------------------------------------------------------------------
@@ -2203,6 +2488,206 @@ mod tests {
         assert_eq!(stored.manifest.state, "open");
         assert_eq!(fx.requests().await, 0);
         assert!(fx.open_jobs().await.contains(&JOB.to_owned()));
+    }
+
+    /// The `count` of the job's `land_attempts`.
+    async fn land_attempts(fx: &Fixture, job: &str) -> Option<i64> {
+        fx.job(job)
+            .await
+            .manifest
+            .extra
+            .get(LAND_ATTEMPTS_KEY)
+            .and_then(|attempts| attempts.get("count"))
+            .and_then(Value::as_i64)
+    }
+
+    #[tokio::test]
+    async fn a_land_refusal_parks_after_the_cap() {
+        const JOB: &str = "drv-refusal-cap";
+        let fx = Fixture::new().await;
+        // `feat/tree` is `master`, so every landing is refused as nothing to land.
+        assert!(git_in(&fx.repo, &["checkout", "-q", "master"]));
+        assert!(git_in(&fx.repo, &["branch", "-f", "feat/tree", "master"]));
+        fx.seed_job(JOB, vec![merged_branch("api", None)], Some("integration"))
+            .await;
+        fx.root_done(JOB).await;
+        let gate = FakeGate::answering(vec![]);
+        let root = root_node_of(JOB);
+
+        for attempt in 1..LAND_ATTEMPTS {
+            fx.tick(JOB, &gate).await;
+            assert_eq!(land_attempts(&fx, JOB).await, Some(attempt));
+            assert!(fx.open_questions(JOB, &root).await.is_empty());
+        }
+        for _ in 0..4 {
+            fx.tick(JOB, &gate).await;
+        }
+
+        let questions = fx.open_questions(JOB, &root).await;
+        assert_eq!(questions.len(), 1, "the owner is asked once: {questions:?}");
+        assert!(
+            questions[0].contains("nothing to land"),
+            "{:?}",
+            questions[0]
+        );
+        assert_eq!(
+            land_attempts(&fx, JOB).await,
+            Some(LAND_ATTEMPTS),
+            "no landing is tried past the cap"
+        );
+        let stored = fx.job(JOB).await;
+        assert_eq!(stored.state, "open");
+        assert_eq!(fx.requests().await, 0);
+
+        // The owner's answer gives the landing a fresh allowance.
+        let decision: String = sqlx::query_scalar(
+            "SELECT id FROM decisions WHERE tree_id = ? AND node_id = ? AND status = ?",
+        )
+        .bind(JOB)
+        .bind(&root)
+        .bind(decisions::STATUS_OPEN)
+        .fetch_one(&fx.state.pool)
+        .await
+        .unwrap();
+        decisions::answer(&fx.state.pool, &decision, "try once more", "shell")
+            .await
+            .unwrap();
+        fx.tick(JOB, &gate).await;
+        assert_eq!(
+            land_attempts(&fx, JOB).await,
+            Some(1),
+            "an answered cap starts a fresh count"
+        );
+    }
+
+    /// An integration job whose landing the queue admits: `api` merged, the root done.
+    async fn landable_job(fx: &Fixture, job: &str) {
+        assert!(git_in(&fx.repo, &["checkout", "-q", "master"]));
+        fx.seed_job(job, vec![merged_branch("api", None)], Some("integration"))
+            .await;
+        fx.root_done(job).await;
+    }
+
+    /// Ends the job's queued landing as `status` with `reason`, as the queue would.
+    async fn end_the_landing(fx: &Fixture, job: &str, status: &str, reason: &str) {
+        let id = fx
+            .job(job)
+            .await
+            .manifest
+            .extra
+            .get("land_id")
+            .and_then(Value::as_i64)
+            .expect("a landing is queued");
+        sqlx::query(
+            "UPDATE vcs_requests SET status = ?, failure_reason = ?, finished_at = ? WHERE id = ?",
+        )
+        .bind(status)
+        .bind(reason)
+        .bind(STAMP)
+        .bind(id)
+        .execute(&fx.state.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failed_land_parks_after_the_cap() {
+        const JOB: &str = "drv-land-fails";
+        let fx = Fixture::new().await;
+        landable_job(&fx, JOB).await;
+        let gate = FakeGate::answering(vec![]);
+        let root = root_node_of(JOB);
+
+        for attempt in 1..=LAND_ATTEMPTS {
+            fx.tick(JOB, &gate).await;
+            assert_eq!(fx.requests().await, attempt, "landing {attempt} is queued");
+            end_the_landing(&fx, JOB, "failed", &format!("hook-refused-{attempt}")).await;
+            fx.tick(JOB, &gate).await;
+            assert_eq!(land_attempts(&fx, JOB).await, Some(attempt));
+            if attempt < LAND_ATTEMPTS {
+                assert!(fx.open_questions(JOB, &root).await.is_empty());
+            }
+        }
+        for _ in 0..3 {
+            fx.tick(JOB, &gate).await;
+        }
+
+        let questions = fx.open_questions(JOB, &root).await;
+        assert_eq!(questions.len(), 1, "the owner is asked once: {questions:?}");
+        assert!(
+            questions[0].contains(&format!("hook-refused-{LAND_ATTEMPTS}")),
+            "the question carries the last failure: {:?}",
+            questions[0]
+        );
+        assert_eq!(
+            fx.requests().await,
+            LAND_ATTEMPTS,
+            "no landing is queued past the cap"
+        );
+        let stored = fx.job(JOB).await;
+        assert_eq!(stored.state, "open");
+        assert!(!stored.manifest.extra.contains_key("land_id"));
+    }
+
+    #[tokio::test]
+    async fn an_escalated_land_no_resolver_picks_up_parks_after_the_grace() {
+        const JOB: &str = "drv-land-escalated";
+        let fx = Fixture::new().await;
+        landable_job(&fx, JOB).await;
+        let gate = FakeGate::answering(vec![]);
+        let root = root_node_of(JOB);
+        fx.tick(JOB, &gate).await;
+        end_the_landing(&fx, JOB, "escalated", "the landing conflicts").await;
+
+        fx.tick(JOB, &gate).await;
+        fx.tick(JOB, &gate).await;
+
+        let waiting = fx.job(JOB).await;
+        assert!(
+            waiting.manifest.extra.contains_key("land_id"),
+            "the resolver owns the escalated request"
+        );
+        let since = waiting.manifest.extra[LAND_ESCALATED_SINCE]
+            .as_str()
+            .expect("the wait for the resolver is stamped")
+            .to_owned();
+        assert!(fx.open_questions(JOB, &root).await.is_empty());
+        assert_eq!(fx.requests().await, 1);
+
+        // Nobody picked the request up for longer than the grace.
+        let mut stored = fx.job(JOB).await;
+        let aged = (chrono::Utc::now() - chrono::Duration::minutes(16)).to_rfc3339();
+        assert_ne!(aged, since);
+        stored
+            .manifest
+            .extra
+            .insert(LAND_ESCALATED_SINCE.to_owned(), json!(aged));
+        store::update(&fx.state.pool, &stored).await.unwrap();
+        for _ in 0..3 {
+            fx.tick(JOB, &gate).await;
+        }
+
+        let questions = fx.open_questions(JOB, &root).await;
+        assert_eq!(questions.len(), 1, "the owner is asked once: {questions:?}");
+        assert!(
+            questions[0].to_lowercase().contains("resolver"),
+            "{:?}",
+            questions[0]
+        );
+        let settled: Vec<Option<String>> =
+            sqlx::query_scalar("SELECT settled_reason FROM vcs_requests")
+                .fetch_all(&fx.state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            settled,
+            [Some("tree-merge".to_owned())],
+            "the request is claimed so a late resolver never spends on it"
+        );
+        assert_eq!(fx.requests().await, 1, "no further landing was queued");
+        let parked = fx.job(JOB).await;
+        assert!(!parked.manifest.extra.contains_key("land_id"));
+        assert_eq!(parked.state, "open");
     }
 
     // ---- restart, connections, gates -------------------------------------------------------------
