@@ -462,7 +462,9 @@ pub(super) async fn revive_orphan(
         .values()
         .find(|branch| branch.node_id.as_deref() == Some(node_id))
         .ok_or_else(|| {
-            ReviveError::NotFound(format!("node {node_id} tops no branch of tree job {job_id}"))
+            ReviveError::NotFound(format!(
+                "node {node_id} tops no branch of tree job {job_id}"
+            ))
         })?;
     if !REVIVABLE_STATES.contains(&branch.state.as_str()) {
         return Err(ReviveError::Refused(format!(

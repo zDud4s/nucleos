@@ -740,13 +740,14 @@ async fn relaunch(
     use crate::tree_job::relaunch::{ReviveError, revive_orphan};
 
     let replayed = stored_result(state, node, "launch", key).await?.is_some();
-    let run_id = revive_orphan(state, id, node, key, prompt)
-        .await
-        .map_err(|error| match error {
-            ReviveError::NotFound(text) => refuse(StatusCode::NOT_FOUND, text),
-            ReviveError::Refused(text) => refuse(StatusCode::CONFLICT, text),
-            ReviveError::Failed(text) => refuse(StatusCode::INTERNAL_SERVER_ERROR, text),
-        })?;
+    let run_id =
+        revive_orphan(state, id, node, key, prompt)
+            .await
+            .map_err(|error| match error {
+                ReviveError::NotFound(text) => refuse(StatusCode::NOT_FOUND, text),
+                ReviveError::Refused(text) => refuse(StatusCode::CONFLICT, text),
+                ReviveError::Failed(text) => refuse(StatusCode::INTERNAL_SERVER_ERROR, text),
+            })?;
     Ok(Json(
         json!({ "result": run_id.to_string(), "replayed": replayed }),
     ))
@@ -2969,9 +2970,19 @@ mod tests {
         let app = app(&state);
 
         let first = launched_run(
-            &post(&app, &transition_uri(JOB, NODE), relaunch_body("revive-1", None)).await,
+            &post(
+                &app,
+                &transition_uri(JOB, NODE),
+                relaunch_body("revive-1", None),
+            )
+            .await,
         );
-        let replay = post(&app, &transition_uri(JOB, NODE), relaunch_body("revive-1", None)).await;
+        let replay = post(
+            &app,
+            &transition_uri(JOB, NODE),
+            relaunch_body("revive-1", None),
+        )
+        .await;
 
         assert_eq!(launched_run(&replay), first);
         assert_eq!(replay.1["replayed"], json!(true));
@@ -2981,7 +2992,14 @@ mod tests {
     #[tokio::test]
     async fn relaunch_refuses_every_other_branch_state_and_creates_no_run() {
         for refused in [
-            "dropped", "parked", "merged", "queued", "open", "gating", "green", "red",
+            "dropped",
+            "parked",
+            "merged",
+            "queued",
+            "open",
+            "gating",
+            "green",
+            "red",
             "reviewing",
         ] {
             let state = test_state().await;
