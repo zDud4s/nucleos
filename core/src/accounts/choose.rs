@@ -757,8 +757,10 @@ mod tests {
         let now = Utc::now();
         let b = candidate("fake:b", &[("30d", 0.1, DAY)], now);
         let c = candidate("fake:c", &[("30d", 0.5, 20 * DAY)], now);
-        let mut session = SessionView::default();
-        session.choice = AccountChoice::Account(AccountId("fake:gone".into()));
+        let session = SessionView {
+            choice: AccountChoice::Account(AccountId("fake:gone".into())),
+            ..SessionView::default()
+        };
         let decision = pick(&[b, c], &session, SessionPortability::NotPortable, now);
         assert_eq!(account_of(&decision), "fake:b");
     }
@@ -766,8 +768,10 @@ mod tests {
     #[test]
     fn a_provider_choice_for_another_provider_has_no_candidate() {
         let now = Utc::now();
-        let mut session = SessionView::default();
-        session.choice = AccountChoice::Provider("otherco".into());
+        let session = SessionView {
+            choice: AccountChoice::Provider("otherco".into()),
+            ..SessionView::default()
+        };
         let a = candidate("fake:a", &[("30d", 0.1, DAY)], now);
         assert!(matches!(
             pick(&[a], &session, SessionPortability::NotPortable, now),
