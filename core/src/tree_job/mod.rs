@@ -21,5 +21,6 @@ mod relaunch;
 pub mod report;
 mod retry;
 pub mod root;
+pub mod root_pending;
 pub mod store;
 pub mod wrap;

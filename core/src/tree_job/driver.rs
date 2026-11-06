@@ -191,6 +191,10 @@ async fn advance(state: &AppState, job_id: &str, gate: Option<GateFn>) {
     if let Err(error) = retry_pending_starts(state, job_id).await {
         tracing::warn!(job = job_id, %error, "tree driver could not retry the pending starts");
     }
+    // A root run the disk or git refused at launch: marked on the job, retried here every sweep.
+    if let Err(error) = super::root_pending::retry(state, job_id).await {
+        tracing::warn!(job = job_id, %error, "tree driver could not retry the root start");
+    }
 }
 
 // ---- pending starts: a start the disk refused ----------------------------------------------------
