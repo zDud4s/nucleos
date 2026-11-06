@@ -15,6 +15,12 @@ pub const SPAWN_GRACE_SECS: i64 = 60;
 pub const TERMINAL_LOOKBACK_HOURS: i64 = 24;
 /// The feed kind written when a handoff chain stops; `tree_job::wrap` reads it too.
 pub(crate) const CONTINUATION_STOPPED: &str = "node_continuation_stopped";
+/// A handed-off node whose continuation was refused for a reason that will not go away by itself.
+pub(crate) const CONTINUATION_REFUSED: &str = "node_continuation_refused";
+
+fn refusal_summary(reason: &str) -> String {
+    format!("A handed-off node could not be continued, so its tree is waiting: {reason}")
+}
 
 /// A source which can be warned, and daemon runs which can also be stopped.
 #[derive(Debug, Clone)]
@@ -176,6 +182,28 @@ async fn continue_handoffs(
                     report
                         .reported
                         .push((CONTINUATION_STOPPED.to_owned(), subject));
+                }
+            }
+            // A refusal that asking again will not change (the tree's budget, a guard): without a
+            // feed line the tree sits waiting and only a warn every minute says why.
+            Err(ContinuationError::Budget(reason) | ContinuationError::Refused(reason)) => {
+                tracing::warn!(node = %node_id, %reason, "the handed-off node cannot be continued");
+                let subject = format!("node:{node_id}");
+                let summary = refusal_summary(&reason);
+                if insert_feed(
+                    state,
+                    CONTINUATION_REFUSED,
+                    &subject,
+                    None,
+                    &summary,
+                    now,
+                    None,
+                )
+                .await?
+                {
+                    report
+                        .reported
+                        .push((CONTINUATION_REFUSED.to_owned(), subject));
                 }
             }
             Err(error) => {
@@ -1343,6 +1371,46 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(siblings, 0);
+    }
+
+    #[tokio::test]
+    async fn a_refused_continuation_reaches_the_feed_once() {
+        let state = runner_state().await;
+        let now = Utc::now();
+        let run = seed_run(&state, "interrupted", now - minutes(5)).await;
+        seed_node(&state, "refused-parent", "orchestrator", "running", None).await;
+        seed_node(&state, "refused-node", "orchestrator", "running", Some(run)).await;
+        sqlx::query("UPDATE work_nodes SET parent_id = 'refused-parent' WHERE id = 'refused-node'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        seed_branch_job(
+            &state,
+            "sweep-refused",
+            None,
+            "C:/Projects/nucleos",
+            "building",
+            None,
+        )
+        .await;
+        bind_to_job(&state, "refused-node", "sweep-refused").await;
+        // No launch is stored, so the continuation is refused and asking again changes nothing.
+        sqlx::query("UPDATE work_nodes SET status = 'handoff' WHERE id = 'refused-node'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let mut report = SweepReport::default();
+        continue_handoffs(&state, now, &mut report).await.unwrap();
+        continue_handoffs(&state, now, &mut report).await.unwrap();
+
+        let lines: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM feed WHERE kind = ? AND subject = ?")
+            .bind(CONTINUATION_REFUSED)
+            .bind("node:refused-node")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(lines, 1, "reported once, not every tick");
     }
 
     /// A green branch is merged by the driver, and the sweep has to call it: nothing else in the
