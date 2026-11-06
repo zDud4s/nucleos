@@ -370,7 +370,7 @@ the contract, not a snapshot.
 | `quota.rs` | How much of each assistant's usage limit the owner has burned: the `quota_readings` table, the fidelity ladder, the `quota` state vocabulary and `GET /quota`. Deliberately NOT part of `budget.rs`, which counts dollars out of this daemon's own rows and fails in the opposite direction. Also the warning: a `quota_warning` feed line when a measured, current window crosses one of `WARN_AT_PERCENT`, claimed once per threshold per window instance in `quota_warnings`. It also owns the quota brake: it reads on every consultation, warns through the live path, and fails open when quota state is missing, stale, or unmeasured. |
 | `accounts/mod.rs` | The LLM account pool: several logins per provider, picked per chat turn or run launch. Declares the submodules and the shared ids (`AccountId`, `AccountChoice`, `AccountPick`). |
 | `accounts/settings.rs` | `AccountPoolDoc`, the machine settings document `account_pool.yaml` for the pool's knobs. |
-| `accounts/store.rs` | The `accounts` table (migration 0273): list, insert, rename, state changes. |
+| `accounts/store.rs` | The `accounts` table (migration 0274): list, insert, rename, state changes. |
 | `accounts/provider.rs` | The `ProviderAdapter` trait (C4): how one provider is logged into, launched with an account's credentials and how its failures are classified. |
 | `accounts/adapters/mod.rs` | Adapter registry; the `fake` adapter is built only for tests and the `testkit` feature. Provider literals live only under `accounts/adapters/`. |
 | `accounts/adapters/claude.rs` | The Claude adapter. |
