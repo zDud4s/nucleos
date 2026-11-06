@@ -329,6 +329,8 @@ the contract, not a snapshot.
 | `tree_job/gate.rs` | The production gate of a tree branch: at most one verify ticket per branch and HEAD, remembered on the branch and read or awaited by the next gate instead of submitting again. |
 | `tree_job/gate_tests.rs` | Test-only: tests for the per-branch gate ticket dedupe (`gate.rs`). |
 | `tree_job/retry.rs` | Bounded retries of the tree driver: a gate that keeps measuring nothing, a landing that keeps failing or waits on a resolver nobody runs, and a green branch that waits on a base that will not merge. Each has an allowance persisted in the manifest; past it the owner is asked once. |
+| `tree_job/rescue.rs` | One bounded autonomous rescue before the driver asks the owner: a node that ended `blocked`/`failed`, or a gate still red past the fix cap, is started once more with the failure evidence in its prompt (key `rescue-<run>`, one per node since the owner's last answer). |
+| `tree_job/final_verify.rs` | What the driver does with the queue's whole-tree verify at the landing tip: a red merge gate asks the owner at once, with the failing tests, instead of repeating the landing. |
 | `conductor/mod.rs` | Conductor: session liveness, context limits, depth guards and resume. Module root; declares the submodules. |
 | `conductor/liveness.rs` | Stub, not implemented yet: session liveness classification. |
 | `conductor/context.rs` | Stub, not implemented yet: context-fill limits and verdicts. |
