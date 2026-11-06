@@ -124,6 +124,20 @@ pub(super) const ROUTES: &[RouteEntry] = &[
     },
     RouteEntry {
         method: "GET",
+        path: "/engines/agy",
+        purpose: "Read.",
+        body: Body::None,
+        handler: "read",
+    },
+    RouteEntry {
+        method: "PUT",
+        path: "/engines/agy",
+        purpose: "Write.",
+        body: Body::Shapeless("WriteRequest"),
+        handler: "write",
+    },
+    RouteEntry {
+        method: "GET",
         path: "/feed",
         purpose: "Get feed.",
         body: Body::None,
