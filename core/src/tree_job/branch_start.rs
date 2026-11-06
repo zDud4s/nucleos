@@ -866,6 +866,71 @@ mod tests {
         );
     }
 
+    fn dependent_body(caller: &str) -> Value {
+        json!({
+            "name": "later",
+            "goal": "Write the later notes",
+            "owned_paths": [".ai/later/**"],
+            "prompt": "Write the later notes.",
+            "layer": "docs",
+            "base": "notes",
+            "node_id": caller,
+        })
+    }
+
+    /// A branch whose base has not merged cannot open yet, and the root that asked for it reports
+    /// and stops (it cannot wait). The start is remembered so that the driver replays it once the
+    /// base merges; without that the branch stays `queued` for ever and blocks the landing.
+    #[tokio::test]
+    async fn a_start_whose_base_is_not_merged_is_remembered_not_lost() {
+        let (state, app, caller, _repo) = tree().await;
+        let (status, first) = post(&app, &uri(), body(&caller)).await;
+        assert_eq!(status, StatusCode::OK, "{first:?}");
+        let nodes = count(&state, "work_nodes").await;
+        let runs = count(&state, "runs").await;
+
+        let (status, waiting) = post(&app, &uri(), dependent_body(&caller)).await;
+
+        assert_eq!(status, StatusCode::OK, "{waiting:?}");
+        assert_eq!(waiting["waiting_for"], "notes", "{waiting:?}");
+        assert_eq!(count(&state, "work_nodes").await, nodes, "no node yet");
+        assert_eq!(count(&state, "runs").await, runs, "no run yet");
+        let job = crate::tree_job::store::load(&state.pool, TREE)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.manifest.branches["later"].state, "queued");
+        let record = &job.manifest.extra["pending_starts"]["later"];
+        assert_eq!(record["waits_for_base"], "notes", "{record:?}");
+        assert_eq!(record["prompt"], "Write the later notes.");
+        assert!(record["decision_id"].is_null(), "no owner question: {record:?}");
+    }
+
+    /// The replay the driver makes once the base merged starts the branch from the stored record.
+    #[tokio::test]
+    async fn a_remembered_start_runs_once_its_base_has_merged() {
+        let (state, app, caller, _repo) = tree().await;
+        post(&app, &uri(), body(&caller)).await;
+        post(&app, &uri(), dependent_body(&caller)).await;
+        let mut job = crate::tree_job::store::load(&state.pool, TREE)
+            .await
+            .unwrap()
+            .unwrap();
+        job.manifest.branches.get_mut("notes").unwrap().state = "merged".to_owned();
+        crate::tree_job::store::update(&state.pool, &job).await.unwrap();
+        let record = job.manifest.extra["pending_starts"]["later"].clone();
+        let runs = count(&state, "runs").await;
+
+        start_pending(&state, TREE, "later", &record).await.unwrap();
+
+        assert_eq!(count(&state, "runs").await, runs + 1);
+        let job = crate::tree_job::store::load(&state.pool, TREE)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(job.manifest.branches["later"].node_id.is_some());
+    }
+
     #[tokio::test]
     async fn branch_start_called_twice_makes_one_branch_one_node_one_run() {
         let (state, app, caller, _repo) = tree().await;
