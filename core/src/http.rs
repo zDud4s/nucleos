@@ -30,6 +30,7 @@ use crate::notify_policy;
 use crate::presets;
 use crate::state::AppState;
 
+mod accounts;
 mod admin;
 mod agents;
 mod analytics;
@@ -121,6 +122,7 @@ pub fn build_router(state: AppState) -> Router {
                 crate::integrations::webhook::WEBHOOK_BODY_LIMIT,
             )),
         )
+        .merge(accounts::routes())
         .merge(admin::routes())
         .merge(agents::routes())
         .merge(analytics::routes())

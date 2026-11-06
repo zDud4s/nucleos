@@ -17,6 +17,7 @@
 #![allow(clippy::new_without_default, clippy::should_implement_trait)]
 
 pub use nucleos_base::agent;
+pub mod accounts;
 pub mod agents;
 pub mod assistant_types;
 pub mod assistants;

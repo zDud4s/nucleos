@@ -792,6 +792,14 @@ async fn main() {
         ),
     );
 
+    accounts::startup::start(
+        pool.clone(),
+        Some(quota::client::QuotaClient::new(
+            sidecar::QUOTA_ADDR,
+            quota_sidecar_token.clone(),
+        )),
+        data_dir.clone(),
+    );
     let state = AppState {
         startup_config: (),
         token: Token(token_value),

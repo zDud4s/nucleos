@@ -1,5 +1,5 @@
 //! The document kinds the settings store knows: a trait that ties a Rust type to a name and a scope kind,
-//! and the table of the documents: the 13 fixed ones plus one `channels/<id>` row per channel manifest.
+//! and the table of the documents: the 15 fixed ones plus one `channels/<id>` row per channel manifest.
 
 use std::sync::LazyLock;
 
@@ -155,6 +155,10 @@ static DOCUMENTS: LazyLock<Vec<DocType>> = LazyLock::new(|| {
         of::<AgyDoc>(
             files::AGY_FILE,
             "a chat reads the switch at once; the router drops agy at once but only gains it when the daemon restarts; a primary_runner of agy takes effect when the daemon restarts",
+        ),
+        of::<crate::accounts::settings::AccountPoolDoc>(
+            "account_pool.yaml",
+            "at once for the next chat turn or run launch",
         ),
         of::<ModelsConfig>(
             crate::config::MODELS_CONFIG_FILE,
@@ -331,15 +335,15 @@ mod tests {
 
     #[test]
     fn there_are_thirteen_documents_with_unique_names() {
-        // 14 fixed documents plus one `channels/<id>` per manifest.
+        // 15 fixed documents plus one `channels/<id>` per manifest.
         let channels = crate::channels::registry::MANIFESTS.len();
         let docs = documents();
-        assert_eq!(docs.len(), 14 + channels);
+        assert_eq!(docs.len(), 15 + channels);
         let names: BTreeSet<_> = docs.iter().map(|doc| doc.name).collect();
-        assert_eq!(names.len(), 14 + channels);
+        assert_eq!(names.len(), 15 + channels);
         assert_eq!(
             docs.iter().filter(|doc| doc.kind == Kind::Machine).count(),
-            12 + channels
+            13 + channels
         );
         let project: Vec<_> = docs
             .iter()
