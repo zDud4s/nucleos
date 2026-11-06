@@ -3,7 +3,7 @@
 //! The order, driven by the app: `preview`, the person confirms, `begin` freezes the origin,
 //! `package`, `import` on the destination, `finish` at the origin. A failure before `finish` is an
 //! `abort` and the chat goes on working here. This file is the part that lives in the database
-//! (`chats.moved_to`, `chats.frozen_for`, `chats.frozen_at`, `chat_transfers_seen`, migration 0266)
+//! (`chats.moved_to`, `chats.frozen_for`, `chats.frozen_at`, `chat_transfers_seen`, migration 0279)
 //! and the wait `begin` does lives in `assistant/chat_move.rs`; packaging and importing are the next part's.
 //!
 //! A frozen chat refuses new turns and queue entries (`assistant::send`). A moved chat refuses

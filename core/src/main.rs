@@ -1,3 +1,4 @@
+mod background;
 mod cli;
 mod http;
 // `route_index` moved up from `nucleos-core` on 2026-11-02: only `http` reads it.
@@ -1084,26 +1085,7 @@ async fn daemon_main() -> std::process::ExitCode {
 
         // Retention. Hourly rather than on a timer tied to reads: a cache that is never read again
         // must still empty, or "30 days" means "30 days after the last time anyone looked".
-        let retention_state = state.clone();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3600));
-            loop {
-                ticker.tick().await;
-                match integrations::web::prune(
-                    &retention_state.pool,
-                    retention_state.web.retain_pages_days,
-                    chrono::Utc::now(),
-                )
-                .await
-                {
-                    Ok(0) => {}
-                    Ok(pruned) => tracing::info!(pruned, "web: pages past the retention window"),
-                    // Best-effort, like the activity feed: a failed sweep is a full disk later, not
-                    // a reason to take the daemon down now.
-                    Err(error) => tracing::warn!(%error, "web: retention sweep failed"),
-                }
-            }
-        });
+        background::spawn_web_retention_loop(state.clone());
     }
     // The v1 Telegram supervisor is gone on purpose: the channel registry launches the v2 adapter
     // (`channels::registry::launch_all`, below). Two supervisors on one bot would both long-poll
@@ -1133,32 +1115,7 @@ async fn daemon_main() -> std::process::ExitCode {
     if scheduled_routines_wanted {
         tokio::spawn(execution::scheduler::run_scheduler(state.clone()));
     }
-    tokio::spawn({
-        let state = state.clone();
-        async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
-            loop {
-                ticker.tick().await;
-                match conductor::sweep::daemon_observations(&state).await {
-                    Ok(observed) => {
-                        if let Err(error) = conductor::sweep::tick(
-                            &state,
-                            &observed,
-                            &conductor::liveness::Limits::default(),
-                            chrono::Utc::now(),
-                        )
-                        .await
-                        {
-                            tracing::warn!(%error, "conductor liveness sweep failed");
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "could not collect conductor observations")
-                    }
-                }
-            }
-        }
-    });
+    background::spawn_conductor_liveness_loop(state.clone());
     if scheduled_routines_wanted {
         // Its own loop, not a step inside the scheduler's: a job pass can sit inside `run_gate` for the
         // whole gate timeout, and sharing a loop would stall every scheduled rule in the daemon behind
