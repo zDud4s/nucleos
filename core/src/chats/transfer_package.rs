@@ -120,13 +120,55 @@ fn remembered() -> std::sync::MutexGuard<'static, HashMap<String, Remembered>> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn import_lock(transfer_id: &str) -> Arc<tokio::sync::Mutex<()>> {
-    IMPORT_LOCKS
+struct ImportLock {
+    transfer_id: String,
+    mutex: Option<Arc<tokio::sync::Mutex<()>>>,
+}
+
+impl ImportLock {
+    fn mutex(&self) -> &tokio::sync::Mutex<()> {
+        self.mutex
+            .as_deref()
+            .expect("an import lock is available until its drop guard runs")
+    }
+}
+
+impl Drop for ImportLock {
+    fn drop(&mut self) {
+        let mut locks = IMPORT_LOCKS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Holding the map lock while dropping this caller's reference prevents a new importer
+        // from racing the sole-map-reference check below.
+        drop(self.mutex.take());
+        if locks
+            .get(&self.transfer_id)
+            .is_some_and(|lock| Arc::strong_count(lock) == 1)
+        {
+            locks.remove(&self.transfer_id);
+        }
+    }
+}
+
+fn import_lock(transfer_id: &str) -> ImportLock {
+    let mutex = IMPORT_LOCKS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .entry(transfer_id.to_owned())
         .or_default()
-        .clone()
+        .clone();
+    ImportLock {
+        transfer_id: transfer_id.to_owned(),
+        mutex: Some(mutex),
+    }
+}
+
+#[cfg(test)]
+fn import_lock_exists(transfer_id: &str) -> bool {
+    IMPORT_LOCKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains_key(transfer_id)
 }
 
 /// Called by `begin` before it cuts anything: keeps the open questions (a cut forgets them) and
@@ -376,6 +418,15 @@ pub async fn import(
         ));
     }
     let lock = import_lock(&package.transfer_id);
+    import_locked(pool, package, store, lock.mutex()).await
+}
+
+async fn import_locked(
+    pool: &SqlitePool,
+    package: &Package,
+    store: &Path,
+    lock: &tokio::sync::Mutex<()>,
+) -> Result<Imported, Failure> {
     let _guard = lock.lock().await;
     if transfer::was_imported(pool, &package.transfer_id).await? {
         return Ok(Imported::Already);
@@ -773,6 +824,28 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_completed_import_removes_its_transfer_lock() {
+        let origin = crate::testdb::fresh_pool().await;
+        let destination = crate::testdb::fresh_pool().await;
+        let store = space_free_tempdir("nucleos-move-lock-cleanup-");
+        let transfer_id = "t-import-lock-cleanup";
+        a_chat(&origin, "c-lock-cleanup", None).await;
+        freeze(&origin, "c-lock-cleanup", transfer_id).await;
+        let package = build(&origin, "c-lock-cleanup", transfer_id, store.path(), vec![])
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            import(&destination, &package, store.path()).await,
+            Ok(Imported::Done { .. })
+        ));
+        assert!(
+            !import_lock_exists(transfer_id),
+            "a completed import must not retain its transfer lock"
         );
     }
 

@@ -727,7 +727,6 @@ ExecStart={}
 WorkingDirectory={}
 Restart=on-failure
 RestartSec=60
-KillMode=process
 
 [Install]
 WantedBy=default.target
@@ -1318,7 +1317,7 @@ mod tests {
     /// systemd splits `ExecStart=` on whitespace unless a word is quoted, and expands `%` specifiers
     /// and `$` variables, so an unquoted path with a space, a `%` or a `$` in it runs something else.
     #[test]
-    fn a_user_unit_quotes_a_path_with_spaces_percent_and_dollar() {
+    fn a_user_unit_quotes_a_path_with_spaces_percent_and_dollar_and_keeps_the_default_kill_mode() {
         let unit = systemd_unit(
             "/home/me/my 100% $HOME/nucleos-core",
             "/home/me/my 100% $HOME",
@@ -1328,7 +1327,6 @@ mod tests {
             "WorkingDirectory=/home/me/my 100%% $HOME",
             "Restart=on-failure",
             "RestartSec=60",
-            "KillMode=process",
             "StartLimitBurst=3",
             "WantedBy=default.target",
         ] {
@@ -1337,6 +1335,10 @@ mod tests {
                 "missing {line:?} in {unit}"
             );
         }
+        assert!(
+            !unit.contains("KillMode="),
+            "the default control-group kill mode must remain in effect: {unit}"
+        );
         assert_eq!(systemd_quote(r#"a\b"c"#), r#""a\\b\"c""#);
     }
 

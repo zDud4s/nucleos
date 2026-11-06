@@ -276,7 +276,7 @@ pub fn materialized_tree(project_root: &Path, chat_id: &str, transfer_id: &str) 
     let tag: String = transfer_id
         .chars()
         .filter(char::is_ascii_alphanumeric)
-        .take(8)
+        .take(16)
         .collect();
     crate::execution::worktree::worktree_root(project_root).join(format!("moved-{safe}-{tag}"))
 }
@@ -398,6 +398,21 @@ pub async fn materialize(
     }
     let tree = materialized_tree(project_root, chat_id, transfer_id);
     remove_unreferenced_tree(pool, project_root, chat_id, transfer_id).await?;
+    match std::fs::symlink_metadata(&tree) {
+        Ok(_) => {
+            return Err(format!(
+                "cannot materialize the transferred chat: conflicting worktree path already exists: {}",
+                tree.display()
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "could not inspect conflicting worktree path {}: {error}",
+                tree.display()
+            ));
+        }
+    }
     let have = git(
         project_root,
         &["cat-file", "-e", &format!("{}^{{commit}}", code.commit)],
@@ -519,6 +534,19 @@ mod tests {
         assert!(!safe_relative("nested/file "));
     }
 
+    #[test]
+    fn materialized_tree_uses_a_stable_sixteen_character_transfer_tag() {
+        let root = Path::new("/projects/alpha");
+        let transfer_id = "0123456789abcdef-fedc-ba98-76543210";
+        let first = materialized_tree(root, "chat", transfer_id);
+
+        assert_eq!(first, materialized_tree(root, "chat", transfer_id));
+        assert_eq!(
+            first.file_name().and_then(|name| name.to_str()),
+            Some("moved-chat-0123456789abcdef")
+        );
+    }
+
     #[tokio::test]
     async fn capture_lists_an_unsafe_new_file_as_left_behind() {
         let (_keep, repo) = init_contained_repo("nucleos-move-unsafe-");
@@ -586,6 +614,36 @@ mod tests {
         assert!(std::fs::symlink_metadata(tree).is_err());
     }
 
+    #[tokio::test]
+    async fn materialize_names_an_existing_conflicting_worktree_path() {
+        let (_keep, repo) = init_contained_repo("nucleos-move-conflicting-tree-");
+        let pool = crate::testdb::fresh_pool().await;
+        let tree = materialized_tree(&repo, "chat", "0123456789abcdef-other-transfer");
+        std::fs::create_dir_all(&tree).unwrap();
+        sqlx::query(
+            "INSERT INTO chats (chat_id, title, brain, created_at, cwd) VALUES (?, 'work', 'cloud', 'now', ?)",
+        )
+        .bind("existing-chat")
+        .bind(tree.to_string_lossy().into_owned())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let error = materialize(
+            &pool,
+            &code(head(&repo).await),
+            &repo,
+            "chat",
+            "0123456789abcdef-other-transfer",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("conflicting worktree path"), "{error}");
+        let tree_text = tree.to_string_lossy();
+        assert!(error.contains(tree_text.as_ref()), "{error}");
+    }
+
     #[test]
     fn diff_changes_symlink_allows_deleting_a_symlink() {
         let diff = b"diff --git a/link b/link\ndeleted file mode 120000\nindex 1111111..0000000 120000\n--- a/link\n+++ /dev/null\n@@ -1 +0,0 @@\n-/outside\n";
@@ -616,7 +674,9 @@ mod tests {
         let outside = space_free_tempdir("nucleos-move-outside-");
         if let Err(error) = link_dir(outside.path(), &repo.join("linked")) {
             // Windows refuses symlinks without Developer Mode (os error 1314).
-            eprintln!("skipped: this platform refuses to create symlinks: {error}");
+            eprintln!(
+                "skipped: could not create a directory symlink (Windows Developer Mode may be disabled): {error}"
+            );
             return;
         }
         let mut package = code(head(&repo).await);

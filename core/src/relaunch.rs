@@ -9,9 +9,9 @@
 //! and then exits. That process waits for the pid to be gone, swaps a staged
 //! executable in, starts the daemon again and leaves. Both paths call [`swap_staged`].
 //!
-//! UNTESTED: a daemon under a systemd unit with the default `KillMode=control-group` has its
-//! relauncher killed with the cgroup, `setsid` or not. The unit needs `KillMode=process` or a
-//! supervisor of its own.
+//! Under a systemd unit, the relauncher enters a transient user scope when `systemd-run` is
+//! available. That escapes the service cgroup while the unit keeps its default behavior of
+//! stopping the daemon's sidecars with it.
 //!
 //! Waiting for the pid, pausing and spawning are injected, so the tests need no real process.
 
@@ -312,6 +312,33 @@ fn note(line: &str) {
 
 /// Spawns the relauncher for this daemon: the same executable and the same arguments after the
 /// flag and this pid. The working directory and environment are inherited.
+fn relaunch_command(
+    exe: &Path,
+    args: &[OsString],
+    under_systemd: bool,
+    systemd_run_available: bool,
+) -> (PathBuf, Vec<OsString>) {
+    if under_systemd && systemd_run_available {
+        let mut command_args = vec![
+            OsString::from("--user"),
+            OsString::from("--scope"),
+            OsString::from("--collect"),
+            OsString::from("--"),
+            exe.as_os_str().to_owned(),
+        ];
+        command_args.extend_from_slice(args);
+        (PathBuf::from("systemd-run"), command_args)
+    } else {
+        (exe.to_path_buf(), args.to_vec())
+    }
+}
+
+fn systemd_run_on_path() -> bool {
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|path| path.join("systemd-run").is_file())
+    })
+}
+
 fn spawn_relauncher() -> std::io::Result<()> {
     let exe = std::env::current_exe()?;
     let mut args = vec![
@@ -319,7 +346,13 @@ fn spawn_relauncher() -> std::io::Result<()> {
         OsString::from(std::process::id().to_string()),
     ];
     args.extend(std::env::args_os().skip(1));
-    spawn_detached(&exe, &args)
+    let (program, command_args) = relaunch_command(
+        &exe,
+        &args,
+        std::env::var_os("INVOCATION_ID").is_some(),
+        systemd_run_on_path(),
+    );
+    spawn_detached(&program, &command_args)
 }
 
 /// Starts `exe` outside this process's session and job, with no console and no inherited stdio, so
@@ -445,6 +478,41 @@ mod tests {
                 format!("spawn {} {args:?}", exe.display()),
             ]
         );
+    }
+
+    #[test]
+    fn relauncher_uses_a_systemd_scope_when_available() {
+        let exe = Path::new("/opt/nucleos/nucleos-core");
+        let args = os(&["--relaunch-after", "42", "--serve", "localhost"]);
+
+        let (program, command_args) = relaunch_command(exe, &args, true, true);
+
+        assert_eq!(program, PathBuf::from("systemd-run"));
+        assert_eq!(
+            command_args,
+            os(&[
+                "--user",
+                "--scope",
+                "--collect",
+                "--",
+                "/opt/nucleos/nucleos-core",
+                "--relaunch-after",
+                "42",
+                "--serve",
+                "localhost",
+            ])
+        );
+    }
+
+    #[test]
+    fn relauncher_stays_detached_when_systemd_scope_is_unavailable() {
+        let exe = Path::new("/opt/nucleos/nucleos-core");
+        let args = os(&["--relaunch-after", "42"]);
+
+        let (program, command_args) = relaunch_command(exe, &args, true, false);
+
+        assert_eq!(program, exe);
+        assert_eq!(command_args, args);
     }
 
     #[test]
