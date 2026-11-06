@@ -3012,6 +3012,28 @@ mod tests {
         );
     }
 
+    /// Win32 strips trailing dots and spaces from a component and ignores an NTFS stream suffix, so
+    /// these spellings write the guarded file while looking like some other name.
+    #[test]
+    fn windows_path_aliases_of_a_guarded_file_are_still_guarded() {
+        for (path, class) in [
+            (".claude/settings.json.", "self-governing-file"),
+            (".claude/settings.json::$DATA", "self-governing-file"),
+            (".claude./hooks/x.py", "self-governing-file"),
+            (".githooks/pre-commit ", "executes-on-next-command"),
+        ] {
+            assert_classification(
+                classify(
+                    "Write",
+                    &json!({"file_path": path}),
+                    Some(Path::new(r"C:\work\repo")),
+                ),
+                "pending_approval",
+                class,
+            );
+        }
+    }
+
     #[test]
     fn self_governing_file_overrides_ordinary_edit_allow() {
         assert_classification(
