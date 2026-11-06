@@ -266,7 +266,19 @@ async fn check_node(state: &AppState, node_id: &str, job_id: &str) -> Result<(),
                 .is_some_and(|at| Utc::now() > at + Duration::seconds(LEASE_TTL_SECS));
             if expired && let Ok(number) = run_id.parse::<i64>() {
                 // Ending it makes it a run that died without a report: `wrap` starts the node again.
-                finalize_termination(state, number, "interrupted").await;
+                // With no task handle in this process (a run left from before a restart) the
+                // termination is a no-op, so the row is closed directly: first writer wins.
+                if !finalize_termination(state, number, "interrupted").await {
+                    sqlx::query(
+                        "UPDATE runs SET status = 'interrupted', completed_at = ? \
+                         WHERE id = ? AND status IN ('running', 'awaiting_approval')",
+                    )
+                    .bind(Utc::now().to_rfc3339())
+                    .bind(number)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                }
             }
             Ok(())
         }
