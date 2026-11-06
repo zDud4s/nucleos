@@ -412,10 +412,11 @@ pub async fn cancel_request(pool: &sqlx::SqlitePool, id: i64) -> Result<(), Dism
         }
         _ => return Err(DismissError::NotOpen),
     };
-    let cancelled = sqlx::query(&format!(
+    // `guard` is one of the two fixed literals above, never caller input.
+    let cancelled = sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE vcs_requests SET status = 'cancelled', finished_at = ?, failure_reason = ?
           WHERE id = ? AND {guard} AND started_at IS ?"
-    ))
+    )))
     .bind(chrono::Utc::now().to_rfc3339())
     .bind(OWNER_CANCELLED_REASON)
     .bind(id)
