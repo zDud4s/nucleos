@@ -236,6 +236,13 @@ async fn retry_pending_start(
     if work_nodes::get(pool, caller).await.is_err() {
         return drop_pending_start(pool, &job.id, name).await;
     }
+    // A start waiting for its base replays only once that base has merged.
+    let waits_for_base = record["waits_for_base"].as_str();
+    if let Some(base) = waits_for_base
+        && base_still_unmerged(&job.manifest, base)
+    {
+        return Ok(());
+    }
     // A branch already added by an earlier, half-finished replay needs no admission: the replay
     // only finishes its remaining steps.
     if !job.manifest.branches.contains_key(name) {
@@ -253,6 +260,28 @@ async fn retry_pending_start(
         }
     }
     super::branch_start::start_pending(state, &job.id, name, record).await?;
+
+    if waits_for_base.is_some() {
+        // No owner question was ever asked for it: the record is consumed and the start announced.
+        drop_pending_start(pool, &job.id, name).await?;
+        let line = format!(
+            "{}: branch {name} started automatically, its base is merged",
+            job.goal
+        );
+        if let Err(error) = crate::feed::append(
+            pool,
+            job.project_id.as_deref(),
+            "work_tree_pending",
+            &line,
+            None,
+            None,
+        )
+        .await
+        {
+            tracing::warn!(job = %job.id, %error, "could not announce a started branch");
+        }
+        return Ok(());
+    }
 
     // Start, then answer, then drop the record: a crash between any two repeats safely. A record
     // with no id may still have a decision (a crash between the ask and the id): the id is fixed.
@@ -288,6 +317,15 @@ async fn retry_pending_start(
         tracing::warn!(job = %job.id, %error, "could not announce an admitted pending start");
     }
     Ok(())
+}
+
+/// PURE: whether `base` is a branch of the tree that has not merged. A base the tree does not know
+/// does not hold a start back (as in `open_branch`).
+fn base_still_unmerged(manifest: &Manifest, base: &str) -> bool {
+    manifest
+        .branches
+        .get(base)
+        .is_some_and(|branch| branch.state != "merged")
 }
 
 /// Removes the pending record of `name` under the job's lock, from a fresh read of the manifest.

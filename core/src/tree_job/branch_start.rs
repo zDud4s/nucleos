@@ -267,6 +267,22 @@ struct PendingStart<'a> {
     paths: &'a [String],
     layer: &'a str,
     base: Option<&'a str>,
+    /// Set when the start waits for this base branch to merge rather than for the disk.
+    waits_for_base: Option<&'a str>,
+}
+
+/// The base a queued branch waits on: named, in the tree and not merged yet. The same test
+/// `open_branch` applies before it refuses with `BaseNotMerged`.
+fn unmerged_base<'m>(
+    manifest: &'m super::model::Manifest,
+    branch: &'m super::model::Branch,
+) -> Option<&'m str> {
+    let base = branch.base.as_deref()?;
+    manifest
+        .branches
+        .get(base)
+        .is_some_and(|base_branch| base_branch.state != "merged")
+        .then_some(base)
 }
 
 /// Stores a start the disk alone refused under `manifest.extra["pending_starts"][name]` and asks
@@ -310,6 +326,7 @@ async fn remember_pending_start(
         "paths": pending.paths,
         "layer": pending.layer,
         "base": pending.base,
+        "waits_for_base": pending.waits_for_base,
     });
     let slot = job
         .manifest
@@ -325,6 +342,10 @@ async fn remember_pending_start(
     job.updated_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
     if let Err(error) = store::update(&state.pool, &job).await {
         tracing::warn!(%error, job = job_id, branch = name, "could not record a pending start");
+        return;
+    }
+    // A start that waits for its base asks nobody: the driver replays it when the base merges.
+    if pending.waits_for_base.is_some() {
         return;
     }
     // Then the ask, then the id into the record. Both failures are healed by the next pass.
@@ -598,6 +619,7 @@ async fn post_branch_start(
                     paths: &paths,
                     layer: &layer,
                     base: base.as_deref(),
+                    waits_for_base: None,
                 };
                 remember_pending_start(&state, &id, &name, &pending).await;
             }
@@ -617,6 +639,29 @@ async fn post_branch_start(
         .get(&name)
         .cloned()
         .ok_or_else(|| refuse(StatusCode::NOT_FOUND, format!("branch {name} not found")))?;
+    // A base that has not merged keeps the branch from opening, and the root that asked cannot wait
+    // for it. The start is remembered whole and the driver replays it once the base merges; an
+    // error here would leave a queued branch nobody ever opens, blocking the landing for ever.
+    if branch.state == "queued"
+        && let Some(base) = unmerged_base(&job.manifest, &branch)
+    {
+        let pending = PendingStart {
+            caller: &caller,
+            goal: &goal,
+            prompt: &prompt,
+            paths: &paths,
+            layer: &layer,
+            base: Some(base),
+            waits_for_base: Some(base),
+        };
+        remember_pending_start(&state, &id, &name, &pending).await;
+        return Ok(Json(json!({
+            "branch": name,
+            "queued": true,
+            "waiting_for": base,
+            "replayed": false,
+        })));
+    }
     let worktree = if branch.state == "queued" {
         let opened = call(
             open::routes(),
