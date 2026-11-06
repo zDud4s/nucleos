@@ -129,6 +129,13 @@ async fn continue_handoffs(
     now: DateTime<Utc>,
     report: &mut SweepReport,
 ) -> sqlx::Result<()> {
+    // A halted daemon starts nothing; a failed read is treated as halted.
+    if crate::governance::autopilot::kill_switch_engaged(&state.pool)
+        .await
+        .unwrap_or(true)
+    {
+        return Ok(());
+    }
     for node_id in awaiting_continuation(&state.pool).await? {
         match continue_node(state, &node_id).await {
             Ok(_) | Err(ContinuationError::WorkOver) => {}
@@ -1273,6 +1280,49 @@ mod tests {
             launch_rows(&state, "branch-node", &format!("wrap-{run}")).await,
             1
         );
+    }
+
+    /// With the kill switch engaged the sweep must not relaunch a handed-off node.
+    #[tokio::test]
+    async fn continue_handoffs_does_nothing_while_the_kill_switch_is_engaged() {
+        let state = runner_state().await;
+        let now = Utc::now();
+        let run = seed_run(&state, "interrupted", now - minutes(5)).await;
+        seed_node(&state, "halted-parent", "orchestrator", "running", None).await;
+        seed_node(&state, "halted-node", "orchestrator", "running", Some(run)).await;
+        sqlx::query("UPDATE work_nodes SET parent_id = 'halted-parent' WHERE id = 'halted-node'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        seed_branch_job(
+            &state,
+            "sweep-halted",
+            None,
+            "C:/Projects/nucleos",
+            "building",
+            None,
+        )
+        .await;
+        bind_to_job(&state, "halted-node", "sweep-halted").await;
+        store_first_launch(&state, "halted-node").await;
+        sqlx::query("UPDATE work_nodes SET status = 'handoff' WHERE id = 'halted-node'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        crate::governance::autopilot::set_kill_switch(&state.pool, true)
+            .await
+            .unwrap();
+
+        let mut report = SweepReport::default();
+        continue_handoffs(&state, now, &mut report).await.unwrap();
+
+        let siblings: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM work_nodes WHERE continues_node_id = 'halted-node'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(siblings, 0);
     }
 
     /// A green branch is merged by the driver, and the sweep has to call it: nothing else in the
