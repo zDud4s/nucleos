@@ -111,10 +111,17 @@ type Reader struct {
 	maxLineBytes  int
 }
 
-// New builds a Reader over ~/.codex/sessions.
+// New builds a Reader for the default account, over <home>/.codex/sessions. Kept for callers that
+// have no account list (the pre-pool behaviour).
 func New(home string) *Reader {
+	return NewForDir(filepath.Join(home, ".codex"))
+}
+
+// NewForDir builds a Reader over one account's Codex home (the directory CODEX_HOME names), reading
+// <codexHome>/sessions. Never assumes the global CODEX_HOME or ~/.codex.
+func NewForDir(codexHome string) *Reader {
 	return &Reader{
-		sessions:      filepath.Join(home, ".codex", "sessions"),
+		sessions:      filepath.Join(codexHome, "sessions"),
 		scanBufferCap: defaultScanBufferCap,
 		maxLineBytes:  defaultMaxLineBytes,
 	}

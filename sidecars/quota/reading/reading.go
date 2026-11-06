@@ -47,6 +47,10 @@ type Window struct {
 
 // Provider is everything known about one assistant's quota right now.
 type Provider struct {
+	// AccountID names the pool account this reading belongs to. Empty only on the legacy
+	// per-provider readings sent when the núcleo has pushed no account list.
+	AccountID string `json:"account_id,omitempty"`
+	// Name is the engine ("claude", "codex") for an account reading.
 	Name     string    `json:"provider"`
 	Fidelity Fidelity  `json:"fidelity"`
 	ReadAt   time.Time `json:"read_at"`
