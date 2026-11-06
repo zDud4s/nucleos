@@ -23,6 +23,14 @@ a busy mutex is contention, not a bug, and is answered with exit 75.
 Exit 76: the command's process tree used no CPU for NUCLEOS_HEAVY_STALL_SECS (default 600, 0 = off),
 so it deadlocked or waited on something and was killed: do not re-run it blindly, read the thread
 dump named on stderr.
+Disk pressure (dynamic mode only, Windows only via PDH; elsewhere there is no signal and no
+gating): while something is held and a physical disk of the target dir or cwd is at least
+NUCLEOS_HEAVY_DISK_BUSY_PCT busy (default 90, 0 = off), the head of the queue waits (rule
+`disk`, shown on the 30 s stderr line and as `disk:` in `status`). Optionally also needs a queue
+length of NUCLEOS_HEAVY_DISK_QUEUE (default off). A sample takes NUCLEOS_HEAVY_DISK_WINDOW_S
+(default 1.0) and is cached NUCLEOS_HEAVY_DISK_CACHE_S (default 3) in `disk.json`. The head is
+still admitted when nothing is held; the light lane is not gated. NUCLEOS_HEAVY_FAKE_DISK is a
+JSON test hook (e.g. {"busy_pct": 97}). Each run's telemetry also records `write_mb`.
 
 Standard library only. Never `os.kill(pid, 0)` on Windows: CPython maps it to
 TerminateProcess.
@@ -705,6 +713,38 @@ def _queue_order(items: list[tuple[Path, dict]], state: Path | None = None
         eff.get(it[0].name, _int_prio(it[1].get("prio"))), _epoch_ns(it[0])))
 
 
+def _disk_sample(hc, directory: Path) -> dict | None:
+    """The disk-pressure signal for dynamic admission (hc.disk_probe, cached in
+    `directory/disk.json`), sampled for the drives of the target dir root and the cwd. None on
+    any failure. Call it OUTSIDE the Mutex: a fresh sample blocks for its window.
+
+    Also None, without sampling, when `directory/held` has no entry (or does not exist): with
+    nothing held `dynamic_fit` admits the head "alone" and never reads the disk signal, so a
+    cold cache would only cost a blocking sample for nothing. The check is a lock-free scandir;
+    a stray tmp or dead-pid file there only costs one extra sample, and a scandir error falls
+    through to sampling."""
+    held = directory / "held"
+    try:
+        with os.scandir(held) as it:
+            if next(it, None) is None:
+                return None
+    except FileNotFoundError:
+        return None
+    except OSError:
+        pass
+    try:
+        return hc.disk_probe(directory, [_td_root(), Path.cwd()])
+    except Exception:
+        return None
+
+
+def _wait_line(waited_s: float, position: int, hold: float | None) -> str:
+    """The 30 s stderr line of a queued request; `hold` is the disk busy % while the head is
+    held by the disk rule, else None."""
+    why = f"; disk busy {hold:.0f}%" if hold is not None else ""
+    return f"heavy: waiting {int(waited_s)}s, position {position} in the queue{why}\n"
+
+
 def acquire_token(directory: Path, rec: dict, wait_cap: float,
                   arrival_ns: int | None = None, light=None) -> tuple[bool, float]:
     """Queue, wait for the head position and room, then hold. Returns (admitted, waited_s).
@@ -738,6 +778,7 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
     admitted = False
     light_retry = _env_float("NUCLEOS_HEAVY_LIGHT_RETRY_S", 2.0)
     last_light = None
+    hold = None  # disk busy % while the head is held by the disk rule, else None
     try:
         with Mutex(directory):
             queue_dir.mkdir(parents=True, exist_ok=True)
@@ -755,6 +796,7 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
             # previous poll: the others cannot be admitted, so they would only add probe load.
             probed = dyn and last_pos <= 1
             pr = hc.dynamic_probe() if probed else None
+            dk = _disk_sample(hc, directory) if probed else None
             with Mutex(directory):
                 order = _queue_order(_entries(queue_dir), directory)
                 held_ents = _entries(held_dir)
@@ -762,6 +804,10 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
                 held = sum(int(r.get("weight") or 1) for r in held_recs)
                 names = [f.name for f, _ in order]
                 position = names.index(qfile.name) + 1 if qfile.name in names else 0
+                if position != 1:
+                    # Only the head is held by the disk rule; a head that dropped off position 1
+                    # must not keep showing the disk reason on the wait line.
+                    hold = None
                 if position == 0:
                     # Our own entry vanished (state wiped): put it back and carry on.
                     qfile.parent.mkdir(parents=True, exist_ok=True)
@@ -783,9 +829,13 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
                             except (OSError, ValueError):
                                 since = float("inf")
                             fit, adm = hc.dynamic_fit(len(held_recs), pr, since,
-                                                      hc.dynamic_max_jobs(pr), static_fit)
+                                                      hc.dynamic_max_jobs(pr), static_fit,
+                                                      disk=dk)
                         except Exception:
                             fit, adm = static_fit, None
+                        # Why the head is waiting, for the 30 s stderr line below.
+                        hold = (adm.get("disk_busy_pct")
+                                if (not fit and adm and adm.get("rule") == "disk") else None)
                         if fit and adm:
                             rec["adm"] = adm
                     if fit:
@@ -818,8 +868,7 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
                 return False, now - t0
             if now - last_report >= 30:
                 last_report = now
-                sys.stderr.write(
-                    f"heavy: waiting {int(now - t0)}s, position {position} in the queue\n")
+                sys.stderr.write(_wait_line(now - t0, position, hold))
             time.sleep(poll)
     finally:
         if queued:
@@ -909,7 +958,8 @@ def try_light_lane(directory: Path, rec: dict, argv: list[str], verdict, kind: s
     """Start a proven-small class without a token while the budget is full. On True the run
     is registered in `light/<pid>` (counted against NUCLEOS_HEAVY_LIGHT_MAX, reaped like any
     holder) and the caller must `release_light` when it ends. Never raises: any doubt is False,
-    which leaves the request in the ordinary queue."""
+    which leaves the request in the ordinary queue. The light lane is not disk-gated: it only
+    runs proven-small, non-build classes, which write little."""
     try:
         if warm or kind == "cargo" or _is_cargo(argv):
             return False
@@ -3284,6 +3334,28 @@ def cmd_status() -> int:
     print(f"held: {len(held)}  weight: {sum(int(r.get('weight') or 1) for _, r in held)}")
     for f, rec in held:
         print(_line(rec, f"age={_age(f)}"))
+    try:
+        # Read the cached sample only; status never samples the disk itself.
+        hc = _cost_mod()
+        thr = hc.disk_threshold()
+        gate = "gating on" if thr > 0 else "gating off"
+        try:
+            dk = json.loads((d / "disk.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            dk = None
+        if isinstance(dk, dict) and isinstance(dk.get("busy_pct"), (int, float)):
+            q = dk.get("queue")
+            qtxt = f" queue {q}" if isinstance(q, (int, float)) else ""
+            ts = dk.get("ts")
+            ago = (f" (sample {max(0, int(time.time() - ts))}s ago)"
+                   if isinstance(ts, (int, float)) else "")
+            print(f"disk: busy {dk['busy_pct']:.0f}%{qtxt}{ago}  threshold {thr:.0f}% ({gate})")
+        elif thr > 0:
+            print(f"disk: no sample  threshold {thr:.0f}%")
+        else:
+            print(f"disk: no sample  threshold 0% ({gate})")
+    except Exception as exc:
+        print(f"disk: unreadable ({exc})")
     light_runs = _entries(d / "light", reap=False)
     print(f"light: {len(light_runs)}")
     for f, rec in light_runs:
