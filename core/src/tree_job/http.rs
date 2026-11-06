@@ -1896,7 +1896,7 @@ mod tests {
         assert_eq!(job.state, "open");
         assert_eq!(run_rows(&state.pool).await, 0);
         assert!(
-            job.manifest.branches.get("root").is_none(),
+            !job.manifest.branches.contains_key("root"),
             "a refused start left a root branch"
         );
         assert!(
@@ -1921,7 +1921,7 @@ mod tests {
         assert_eq!(run_rows(&state.pool).await, 0);
         let job = loaded(&state.pool, JOB).await;
         assert!(
-            job.manifest.branches.get("root").is_none(),
+            !job.manifest.branches.contains_key("root"),
             "the replay opened a root branch"
         );
     }
