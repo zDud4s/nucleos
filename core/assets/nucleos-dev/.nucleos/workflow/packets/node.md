@@ -44,6 +44,7 @@ Subtree verify: <!-- `nodes.subtree_verify` (true | false), as resolved for this
 
 ### all
 - No subagent runs `cargo` (build, test, check, clippy or fmt). Put the exact command in your report under `Commands for the root`; the root runs it.
+- One exception: after you edit Rust, you may run `cargo fmt -p <crate>` (no other flags, from the worktree root, no `cd`, no pipes) so the gate's `cargo fmt --check` passes. Every other cargo command stays the root's. Never run bare `rustfmt` and never hand-format to satisfy the gate.
 - Run no other build or test tool either (compilers, package managers, test runners).
 - Make no commit, merge, stash or push.
 - The contract file is read-only. A gap in it means: stop and return `Outcome: contract_request` with the options. Never decide it yourself.

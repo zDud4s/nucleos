@@ -347,9 +347,9 @@ impl Outcome {
 /// and so no `SQLITE_BUSY_SNAPSHOT`. Put a `SELECT` ahead of the claim in here and the argument
 /// stops holding: the transaction becomes a reader that must upgrade, and an upgrade can fail
 /// outright rather than losing cleanly. A loser that instead exhausts `busy_timeout`
-/// (`storage.rs:69`) returns `Err(SQLITE_BUSY)` rather than `Ok(None)` — safe, since it claims
-/// nothing, but it is a return shape the pre-transaction code could not produce, and the critical
-/// section it waits on is one `serde_json::from_str` plus a commit.
+/// (`storage::BUSY_TIMEOUT`) returns `Err(SQLITE_BUSY)` rather than `Ok(None)` — safe, since it
+/// claims nothing, but it is a return shape the pre-transaction code could not produce, and the
+/// critical section it waits on is one `serde_json::from_str` plus a commit.
 pub async fn claim_next(
     pool: &sqlx::SqlitePool,
     repo_key: &str,

@@ -3,7 +3,7 @@
 //! A route that starts slow work (a finish, an extraction, an audit) checks what it can before it
 //! answers: a refusal is a 4xx with `{"error": ..}`, and only a request that can run is a 202.
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -283,10 +283,16 @@ async fn post_finish(State(state): State<AppState>, Json(request): Json<FinishRe
     (StatusCode::ACCEPTED, Json(json!({ "accepted": true })))
 }
 
+#[derive(Deserialize)]
+struct DecisionsQuery {
+    status: Option<String>,
+}
+
 async fn get_decisions(
     State(state): State<AppState>,
+    Query(query): Query<DecisionsQuery>,
 ) -> Result<Json<Vec<crate::spec_backlog::model::OwnerDecision>>, StatusCode> {
-    store::list_owner_decisions(&state.pool)
+    store::list_owner_decisions_by_status(&state.pool, query.status.as_deref())
         .await
         .map(Json)
         .map_err(|error| {
@@ -444,6 +450,62 @@ mod tests {
         assert!(decisions.as_array().unwrap().iter().any(|decision| {
             decision["id"] == "question-1" && decision["question"] == "Which budget?"
         }));
+    }
+
+    #[tokio::test]
+    async fn decisions_route_status_filter_and_tree_fields() {
+        let state = state().await;
+        for (id, answer, status) in [
+            ("d-http-open", None, "open"),
+            ("d-http-done", Some("ok"), "answered"),
+            ("pending-http-1", None, "open"),
+        ] {
+            sqlx::query(
+                "INSERT INTO decisions (id, tree_id, node_id, question, answer, origin, at, status) \
+                 VALUES (?, 'tree-h', 'node-h', 'Full question text?', ?, 'agent', \
+                 '2026-10-30T09:00:00+00:00', ?)",
+            )
+            .bind(id)
+            .bind(answer)
+            .bind(status)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+
+        let (_, all) = request(&app(&state), "GET", "/decisions", Value::Null).await;
+        let ids = |v: &Value| -> Vec<String> {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|d| d["id"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        assert!(ids(&all).contains(&"d-http-done".to_owned()));
+
+        let (status, open) =
+            request(&app(&state), "GET", "/decisions?status=open", Value::Null).await;
+        assert_eq!(status, StatusCode::OK);
+        let open_ids = ids(&open);
+        assert!(open_ids.contains(&"d-http-open".to_owned()));
+        assert!(!open_ids.contains(&"d-http-done".to_owned()));
+
+        let row = |id: &str| {
+            open.as_array()
+                .unwrap()
+                .iter()
+                .find(|d| d["id"] == id)
+                .unwrap()
+                .clone()
+        };
+        let decision = row("d-http-open");
+        assert_eq!(decision["kind"], "decision");
+        assert_eq!(decision["tree_id"], "tree-h");
+        assert_eq!(decision["node_id"], "node-h");
+        assert_eq!(decision["question"], "Full question text?");
+        assert_eq!(decision["at"], "2026-10-30T09:00:00+00:00");
+        assert!(decision["answer"].is_null());
+        assert_eq!(row("pending-http-1")["kind"], "notice");
     }
 
     /// A spec that is not waiting on the owner, so answering never reopens it and no run starts.

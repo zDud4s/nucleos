@@ -42,6 +42,8 @@
 # And the same directory under the crate, which is where `CARGO_TARGET_DIR` lands when tests are
 # built from `core/` rather than from the root.
 /core/target-test/
+# Throwaway repos and worktrees tests create under core/ (space_free_tempdir); a killed test leaves them behind.
+/core/nucleos-*/
 # Builds run from `core/` (e.g. sqlx's test databases under `core/target/sqlx/test-dbs`) land here;
 # the `/target/` above is anchored to the root.
 /core/target/

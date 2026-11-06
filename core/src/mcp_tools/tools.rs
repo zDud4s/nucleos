@@ -704,34 +704,18 @@ impl NucleosTools {
         description = "Launch a tree job: opens a root work node for `goal` on `feature_branch` in \
                        `project_root` and stores the job. `id` is yours to choose and makes the call \
                        repeatable: launching the same id again answers with the stored job and \
-                       opens nothing. `project_id`, `contract` and `dirty_owner_files` are \
-                       optional. Returns {id, root_node_id, state, replayed}."
+                       opens nothing. `project_id` is optional: without it the daemon uses the \
+                       project registered with `project_root`. `land` is `integration` (default: \
+                       the finished tree lands its work into the project's integration branch) \
+                       or `hold` (the work stays on `feature_branch` for the owner to land). \
+                       `contract` and `dirty_owner_files` are optional. Returns {id, \
+                       root_node_id, state, replayed}."
     )]
     pub(super) async fn tree_launch(
         &self,
-        Parameters(TreeLaunchParams {
-            id,
-            goal,
-            feature_branch,
-            project_root,
-            project_id,
-            contract,
-            dirty_owner_files,
-        }): Parameters<TreeLaunchParams>,
+        Parameters(params): Parameters<TreeLaunchParams>,
     ) -> String {
-        json_result(
-            self.client
-                .tree_launch(&serde_json::json!({
-                    "id": id,
-                    "goal": goal,
-                    "feature_branch": feature_branch,
-                    "project_root": project_root,
-                    "project_id": project_id,
-                    "contract": contract,
-                    "dirty_owner_files": dirty_owner_files,
-                }))
-                .await,
-        )
+        json_result(self.client.tree_launch(&params.into_body()).await)
     }
 
     #[tool(

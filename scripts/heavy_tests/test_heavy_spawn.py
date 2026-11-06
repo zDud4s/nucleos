@@ -77,5 +77,47 @@ class SpawnTests(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class SpawnFailureTests(unittest.TestCase):
+    """A program the broker cannot start is the broker's failure, not the program's.
+
+    The broker exits 71 and prints `heavy: spawn failed: ` first, so the verify executor can
+    record the unit as errored instead of failed. Today it exits 127 with no marker.
+    """
+
+    def _run_broker(
+        self, *command: str, env_override: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess:
+        tmp = tempfile.mkdtemp(prefix="heavy-spawn-")
+        try:
+            env = dict(os.environ)
+            for k in ("NUCLEOS_HEAVY", "NUCLEOS_HEAVY_TOKEN", "NUCLEOS_HEAVY_HELD",
+                      "NUCLEOS_HEAVY_PRIO", "NUCLEOS_HEAVY_MAIN"):
+                env.pop(k, None)
+            env["NUCLEOS_HEAVY_DIR"] = str(Path(tmp) / "state")
+            env["NUCLEOS_HEAVY_LOCAL"] = "1"
+            env.update(env_override or {})
+            return subprocess.run(
+                [sys.executable, str(HEAVY), "--prio", "1", "--agent", "main", "--", *command],
+                env=env, capture_output=True, text=True, timeout=60, cwd=str(ROOT),
+            )
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_a_missing_program_exits_71_with_the_spawn_failed_marker(self) -> None:
+        proc = self._run_broker("nucleos-definitely-not-a-program-xyz", "--version")
+        self.assertEqual(proc.returncode, 71, proc.stdout + proc.stderr)
+        self.assertIn("heavy: spawn failed: ", proc.stdout + proc.stderr)
+
+    def test_the_unbrokered_path_also_exits_71_with_the_marker(self) -> None:
+        # NUCLEOS_HEAVY=0 bypasses the broker; a missing program must still be reported
+        # as the broker's failure (71 plus the marker), not as the program's own 127.
+        proc = self._run_broker(
+            "nucleos-definitely-not-a-program-xyz", "--version",
+            env_override={"NUCLEOS_HEAVY": "0"},
+        )
+        self.assertEqual(proc.returncode, 71, proc.stdout + proc.stderr)
+        self.assertIn("heavy: spawn failed: ", proc.stdout + proc.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

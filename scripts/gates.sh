@@ -42,7 +42,7 @@ trap 'rm -rf "$captures"' EXIT
 
 run() {
   # run <label> <dir> <command...>
-  local label="$1" dir="$2" capture=/dev/null status
+  local label="$1" dir="$2" capture=/dev/null status started
   shift 2
   [ -n "$captures" ] && capture="$captures/step"
   printf '\n=== %s ===\n' "$label"
@@ -69,6 +69,7 @@ run() {
   elif [ "$1" = go ]; then
     case "$2" in test|vet) set -- heavy_run "$@" ;; esac
   fi
+  started="$SECONDS"
   ( cd "$dir" && "$@" ) 2>&1 | tee "$capture"
   status="${PIPESTATUS[0]}"
   if [ "$status" -eq 0 ]; then
@@ -76,6 +77,35 @@ run() {
   else
     printf 'FAIL %s\n' "$label"
     failures="$failures  $label"$'\n'"$(kept_lines "$capture")"$'\n'
+  fi
+  # Measurement hook: how long each step took, so a slow gate can be pinned on a step.
+  printf 'elapsed %s: %ss\n' "$label" "$((SECONDS - started))"
+}
+
+# Per-run knobs for the cargo steps. All optional; unset leaves the command as it always was.
+#   NUCLEOS_TARGET_DIR          the verify executor's warm target dir (`warm:` in nucleos.tests.yaml).
+#                               Passed as `--target-dir`, NOT as CARGO_TARGET_DIR: cargo hands its
+#                               environment to rustc and sccache hashes every CARGO_* variable into
+#                               its key, so a per-worktree path in the env means ~0% hits across
+#                               worktrees (see scripts/heavy.py `with_target_dir`).
+#   NUCLEOS_GATE_JOBS           cargo `-j` (build parallelism).
+#   NUCLEOS_GATE_TEST_THREADS   `--test-threads` for nextest / the libtest binaries.
+# gate_build_args sets `gate_args` (flags for a compiling subcommand), gate_threads sets `gate_tt`.
+gate_build_args() {
+  gate_args=()
+  [ -n "${NUCLEOS_TARGET_DIR:-}" ] && gate_args+=(--target-dir "$NUCLEOS_TARGET_DIR")
+  [ -n "${NUCLEOS_GATE_JOBS:-}" ] && gate_args+=(-j "$NUCLEOS_GATE_JOBS")
+  return 0
+}
+
+gate_threads() {
+  # gate_threads <nextest|libtest>
+  gate_tt=()
+  [ -z "${NUCLEOS_GATE_TEST_THREADS:-}" ] && return 0
+  if [ "$1" = nextest ]; then
+    gate_tt=(--test-threads "$NUCLEOS_GATE_TEST_THREADS")
+  else
+    gate_tt=(-- --test-threads "$NUCLEOS_GATE_TEST_THREADS")
   fi
 }
 
@@ -380,7 +410,9 @@ gofmt_gate() {
 
 if [ "$target" = core ] || [ "$target" = all ]; then
   run "core: fmt"    . cargo fmt --all -- --check
-  run "core: clippy" . cargo clippy --all-targets -- -D warnings
+  # `cargo fmt` compiles nothing and takes no --target-dir, so it needs no flag.
+  gate_build_args
+  run "core: clippy" . cargo clippy ${gate_args[@]+"${gate_args[@]}"} --all-targets -- -D warnings
   # Every target (lib, bin, tests/): `--lib` alone would skip the binary's http.rs tests. And every
   # workspace crate under core/: `-p nucleos-core` alone would skip the modules moved down to
   # core/crates/nucleos-base, the ones moved up to core/crates/nucleos-app, and the daemon binary
@@ -392,9 +424,11 @@ if [ "$target" = core ] || [ "$target" = all ]; then
   # waits for its slowest test. `--no-fail-fast` keeps `cargo test`'s report of every failure.
   # Without nextest (CI, a fresh machine) the gate is what it was.
   if cargo nextest --version >/dev/null 2>&1; then
-    run "core: test"   . cargo nextest run -p nucleos-base -p nucleos-core -p nucleos-app -p nucleos-daemon --no-fail-fast
+    gate_threads nextest
+    run "core: test"   . cargo nextest run ${gate_args[@]+"${gate_args[@]}"} -p nucleos-base -p nucleos-core -p nucleos-app -p nucleos-daemon --no-fail-fast ${gate_tt[@]+"${gate_tt[@]}"}
   else
-    run "core: test"   . cargo test -p nucleos-base -p nucleos-core -p nucleos-app -p nucleos-daemon
+    gate_threads libtest
+    run "core: test"   . cargo test ${gate_args[@]+"${gate_args[@]}"} -p nucleos-base -p nucleos-core -p nucleos-app -p nucleos-daemon ${gate_tt[@]+"${gate_tt[@]}"}
   fi
 fi
 

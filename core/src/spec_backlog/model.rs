@@ -178,6 +178,14 @@ pub struct OwnerDecision {
     pub status: String,
     pub created_at: String,
     pub answered_at: Option<String>,
+    /// `decision` (answerable) or `notice` (informational, e.g. a `pending-` disk-wait row).
+    pub kind: String,
+    /// The tree of a tree decision; `None` for a spec question.
+    pub tree_id: Option<String>,
+    /// The node of a tree decision; `None` for a spec question.
+    pub node_id: Option<String>,
+    /// When the row was raised (same instant as `created_at`).
+    pub at: String,
 }
 
 #[cfg(test)]

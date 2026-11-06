@@ -93,6 +93,13 @@ static GLOBAL: LazyLock<RwLock<Settings>> = LazyLock::new(|| RwLock::new(Setting
 
 /// The daemon's handle. Empty until [`init`] loads it, so a reader before startup sees defaults.
 pub fn global() -> Settings {
+    // A test's thread-scoped handle wins over the process one; a release build compiles none of this.
+    #[cfg(any(test, feature = "testkit"))]
+    {
+        if let Some(scoped) = testing::scoped() {
+            return scoped;
+        }
+    }
     GLOBAL
         .read()
         .unwrap_or_else(PoisonError::into_inner)
@@ -178,13 +185,56 @@ pub async fn delete(
 /// Swapping the process handle in a test. The guard holds a static lock for its whole life, so two tests that
 /// read `settings::get` can never see each other's snapshot; it is `!Send`, which is fine on the current-thread
 /// runtime `#[tokio::test]` uses.
+///
+/// `scope` is the other way in: a handle only this thread sees, with no lock and no process handle involved.
 #[cfg(any(test, feature = "testkit"))]
 pub mod testing {
+    use std::cell::RefCell;
     use std::sync::{Mutex, MutexGuard, PoisonError};
 
     use super::{Settings, set_global};
 
     static SERIAL: Mutex<()> = Mutex::new(());
+
+    thread_local! {
+        static SCOPED: RefCell<Option<Settings>> = const { RefCell::new(None) };
+    }
+
+    /// This thread's own handle, if it has one. Only this thread: code on a `spawn_blocking` or
+    /// `std::thread::spawn` thread reads the process handle.
+    pub(super) fn scoped() -> Option<Settings> {
+        SCOPED.with(|cell| cell.borrow().clone())
+    }
+
+    /// Whether this thread reads a handle of its own rather than the process one.
+    pub fn in_scope() -> bool {
+        SCOPED.with(|cell| cell.borrow().is_some())
+    }
+
+    /// Replaces this thread's own handle. Only meaningful under a live [`Scoped`].
+    pub fn swap_scoped(settings: Settings) {
+        SCOPED.with(|cell| *cell.borrow_mut() = Some(settings));
+    }
+
+    /// Puts back what this thread read before [`scope`]. On drop rather than at the thread's end, so the scope is
+    /// exactly as long as the guard that a fixture keeps.
+    pub struct Scoped {
+        previous: Option<Settings>,
+    }
+
+    /// Make `settings` what this thread reads until the returned guard drops.
+    pub fn scope(settings: Settings) -> Scoped {
+        Scoped {
+            previous: SCOPED.with(|cell| cell.borrow_mut().replace(settings)),
+        }
+    }
+
+    impl Drop for Scoped {
+        fn drop(&mut self) {
+            let previous = self.previous.take();
+            SCOPED.with(|cell| *cell.borrow_mut() = previous);
+        }
+    }
 
     pub struct Installed {
         previous: Option<Settings>,

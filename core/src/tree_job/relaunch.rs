@@ -108,13 +108,23 @@ pub async fn latest_launch(
 }
 
 /// Key prefixes of the relaunches that carry a one-off suffix (the wrap, died, fix and resume
-/// relaunches of `wrap`, `driver` and `relaunch_resumed`). Their stored prompts are never a base
-/// for a new suffix, or each relaunch would repeat the sentences of the earlier ones.
+/// relaunches of `wrap`, `driver` and `relaunch_resumed`), or replay the prompt of one (the
+/// transient relaunch of `wrap`, after a run the API refused). Their stored prompts are never a
+/// base for a new suffix, or each relaunch would repeat the sentences of the earlier ones.
 pub(super) const WRAP_PREFIX: &str = "wrap-";
 pub(super) const DIED_PREFIX: &str = "died-";
 pub(super) const FIX_PREFIX: &str = "fix-";
+pub(super) const TRANSIENT_PREFIX: &str = "transient-";
 const RESUME_PREFIX: &str = "resume-";
-const SUFFIXED_KEY_PREFIXES: [&str; 4] = [WRAP_PREFIX, DIED_PREFIX, FIX_PREFIX, RESUME_PREFIX];
+const SUFFIXED_KEY_PREFIXES: [&str; 5] = [
+    WRAP_PREFIX,
+    DIED_PREFIX,
+    FIX_PREFIX,
+    TRANSIENT_PREFIX,
+    RESUME_PREFIX,
+];
+/// Key prefix of the relaunch an owner's answer starts (`relaunch_after_answer`).
+pub(super) const DECISION_PREFIX: &str = "decision-";
 
 /// The launch a suffix is appended to: the latest one that is not itself a suffixed relaunch, i.e.
 /// the original prompt, or the last answer relaunch (whose prompt carries the owner's answers, which
@@ -525,13 +535,50 @@ async fn relaunch_after_answer(
         "{}\n\nYou asked the owner: {}\nThe owner answered: {text}",
         launch.prompt, decision.question
     );
-    let key = format!("decision-{}", decision.id);
+    let key = format!("{DECISION_PREFIX}{}", decision.id);
     match start_again(state, &launch, &key, prompt).await {
-        Ok(run_id) => Some(run_id),
+        Ok(run_id) => {
+            resume_red_as_fixing(pool, node).await;
+            Some(run_id)
+        }
         Err(reason) => {
             note_skipped(pool, &mut skipped, node, reason).await;
             None
         }
+    }
+}
+
+/// A branch an answer returned to `red` is now being fixed by the relaunched node: moving it to
+/// `fixing` makes the driver gate that node's `done` report instead of judging the old red gate
+/// against the fix cap again. Best effort: on failure the branch stays `red`.
+async fn resume_red_as_fixing(pool: &SqlitePool, node: &str) {
+    let linked: Result<Option<Option<String>>, _> =
+        sqlx::query_scalar("SELECT tree_job_id FROM work_nodes WHERE id = ?")
+            .bind(node)
+            .fetch_optional(pool)
+            .await;
+    let Ok(Some(Some(job_id))) = linked else {
+        return;
+    };
+    let lock = super::http::job_lock(&job_id);
+    let _guard = lock.lock().await;
+    let Ok(Some(mut job)) = store::load(pool, &job_id).await else {
+        return;
+    };
+    let Some(branch) = job
+        .manifest
+        .branches
+        .values_mut()
+        .find(|branch| branch.node_id.as_deref() == Some(node) && branch.state == "red")
+    else {
+        return;
+    };
+    if super::engine::apply_transition(branch, "fixing").is_err() {
+        return;
+    }
+    job.updated_at = now();
+    if let Err(error) = store::update(pool, &job).await {
+        tracing::warn!(job = %job_id, node, %error, "could not move the answered branch to fixing");
     }
 }
 

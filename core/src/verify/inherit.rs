@@ -601,6 +601,69 @@ async fn contains(
     Some(found)
 }
 
+/// A tree branch's gate (`tree_job::gate`): the note naming the live `master-red` incident when
+/// every failed unit of the done, failed `ticket` printed test ids that incident already holds and
+/// the verified HEAD contains the commit the red was proven since (`decide`, matched by ids only).
+/// Such a red is the base's, not the branch's. No proof is started and nothing is stored: a unit
+/// without ids, an errored unit, no incident (or one being proved) and an unreadable ancestry all
+/// answer `None`, so the red stays the branch's own.
+pub async fn inherited_red(
+    pool: &SqlitePool,
+    ticket: &Ticket,
+    now: DateTime<Utc>,
+) -> Option<String> {
+    let units = &ticket.units;
+    if !ticket.done
+        || ticket.verdict.as_deref() != Some("failed")
+        || units
+            .iter()
+            .any(|unit| matches!(unit.status.as_str(), "errored" | "unknown"))
+    {
+        return None;
+    }
+    let failed: Vec<&UnitReport> = units
+        .iter()
+        .filter(|unit| unit.status == verify_runs::STATUS_FAILED)
+        .collect();
+    let row = store::live_by_key(pool, &ticket.project_id, &TaskKey::master_red(), now)
+        .await
+        .inspect_err(|error| tracing::warn!(%error, "verify: cannot read the master incident"))
+        .ok()??;
+    if !matches!(row.status, Status::Open | Status::Claimed) {
+        return None;
+    }
+    let incident = Incident::from_row(&row, true);
+    let branch_has = match incident.red_since_sha.as_deref() {
+        Some(since) => {
+            let deadline = Instant::now() + GIT_BUDGET;
+            let mut memo = Classification::default();
+            Some(contains(&mut memo, Path::new(&ticket.worktree), since, deadline).await?)
+        }
+        None => None,
+    };
+    let mut classes = Vec::with_capacity(failed.len());
+    for unit in failed {
+        let ids = unit.failed_tests.as_ref().filter(|ids| !ids.is_empty())?;
+        let failures = Failures {
+            tests: ids.iter().cloned().collect(),
+            files: BTreeSet::new(),
+        };
+        let facts = Facts {
+            group: unit.group.as_deref().unwrap_or(GATE_UNIT),
+            failed: Some(&failures),
+            suspect: false,
+        };
+        classes.push(decide(&facts, Some(&incident), branch_has));
+    }
+    if !only_inherited(&classes) {
+        return None;
+    }
+    Some(format!(
+        "every failed test is already red on master: incident #{} ({})",
+        incident.task_id, incident.holder
+    ))
+}
+
 /// Which failed units are in a group the session's diff did not select (case 2's "suspect").
 /// No usable map makes nobody suspect (a settled answer). `None` means a read failed (budget,
 /// missing worktree, base or diff error): the caller must neither cache nor finalise on it.
@@ -715,6 +778,14 @@ pub(super) async fn ensure_fresh(
         .is_some_and(|until| until > crate::execution::wave::stamp(now).as_str());
     if flying {
         return Ok(Freshness::InFlight { started: false });
+    }
+    // An incident whose only handle is the whole gate is closed by the next post-merge gate on the
+    // new head (postgate `finish_green`), never by a probe: no lease, no request.
+    if probe::needs_whole_gate(
+        &incident.guard_paths,
+        &detail_strings(&incident.detail, "red_groups"),
+    ) {
+        return Ok(Freshness::GaveUp);
     }
     let Some(executor) = executor.filter(|_| !already_tried) else {
         return Ok(Freshness::GaveUp);

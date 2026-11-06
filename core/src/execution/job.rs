@@ -62,6 +62,8 @@ mod tests_plan_landing;
 #[cfg(test)]
 mod tests_start_snapshot;
 #[cfg(test)]
+mod tests_ungated_checkpoint;
+#[cfg(test)]
 mod tests_walk_state_parity;
 mod views;
 
@@ -8646,6 +8648,15 @@ mod tests {
         }
         sqlx::query("UPDATE runs SET status = 'interrupted', exit_code = NULL WHERE id = ?")
             .bind(run_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // A first interruption now sends the item back to `pending`; this test pins the verdict
+        // of an item that does fail on an interrupted run, i.e. one whose re-run allowance is
+        // spent.
+        sqlx::query("UPDATE job_nodes SET interruptions = ? WHERE job_id = ? AND ordinal = 0")
+            .bind(super::ingest::MAX_ITEM_RERUNS_AFTER_INTERRUPTION)
+            .bind(job_id)
             .execute(&pool)
             .await
             .unwrap();

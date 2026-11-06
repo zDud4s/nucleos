@@ -72,6 +72,8 @@ AGENT_WAIT_MAX_S = 540.0
 CALLER_WAIT_MAX_S = 3600.0
 EXIT_QUEUE_TIMEOUT = 75
 EXIT_STALLED = 76
+EXIT_SPAWN_FAILED = 71  # sysexits EX_OSERR; core/src/verify/exec.rs reads it
+SPAWN_FAILED_MARKER = "heavy: spawn failed: "
 DEFAULT_STALL_S = 600.0
 # The stall watcher's thread dump: this machine's gdb goes first (NUCLEOS_HEAVY_GDB overrides it),
 # deepest processes first, because the stuck one is a test binary under cargo, never cargo.
@@ -952,17 +954,31 @@ def release_light(directory: Path) -> None:
 # ------------------------------------------------------------------- worktree lock
 
 
-def worktree_root() -> str:
-    """`git rev-parse --show-toplevel` of the cwd; the cwd itself when git cannot say."""
+def worktree_root(argv: list[str] | None = None) -> str:
+    """`git rev-parse --show-toplevel` of the cwd; the cwd itself when git cannot say.
+
+    A cargo argv carrying `--manifest-path <p>` names the tree it builds, whatever the cwd is
+    (the main checkout checking a `.claude/worktrees/X` tree): the root is then the git
+    toplevel of `<p>`'s directory, else that directory. A relative path resolves against the
+    real cwd."""
+    base = None
     try:
-        out = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, timeout=20)
+        manifests = _flag_values(_cargo_args(argv), "--manifest-path") if argv else []
+        if manifests:
+            d = Path(os.getcwd(), manifests[-1]).parent
+            if d.is_dir():
+                base = str(d)
+    except Exception:
+        base = None
+    try:
+        cmd = ["git"] + (["-C", base] if base else []) + ["rev-parse", "--show-toplevel"]
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
         top = out.stdout.strip()
         if out.returncode == 0 and top:
             return os.path.normpath(top)
     except Exception:
         pass
-    return os.getcwd()
+    return os.path.normpath(base) if base else os.getcwd()
 
 
 def worktree_hash(path: str) -> str:
@@ -2654,6 +2670,13 @@ def broker_run(args: list[str], held: bool = False) -> int:
         time.sleep(_env_float("NUCLEOS_HEAVY_POLL_S", 0.5))
 
 
+def _spawn_failed(argv: list[str], exc: BaseException) -> int:
+    """Report that the wrapped program could not be started; the caller returns the code."""
+    sys.stderr.write(f"{SPAWN_FAILED_MARKER}{argv[0]}: {exc}\n")
+    sys.stderr.flush()
+    return EXIT_SPAWN_FAILED
+
+
 def _broker_attempt(args: list[str], held: bool = False, deadline: float | None = None):
     opts, argv = parse_args(args)
     if not argv:
@@ -2663,7 +2686,10 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
     warm = os.environ.get("NUCLEOS_HEAVY_WARM") == "1"
 
     if os.environ.get("NUCLEOS_HEAVY") == "0":
-        code, _ = run_child(argv, env, None)
+        try:
+            code, _ = run_child(argv, env, None)
+        except OSError as exc:
+            return _spawn_failed(argv, exc)
         return code
 
     row: dict = {}
@@ -2754,20 +2780,20 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
             if kind in ("cargo", "auto") and cargo_argv:
                 # hold-worktree itself leases no slot: nested cargo calls lease their own.
                 pool = (not held and injected_target_dir(
-                    cargo_argv, root or worktree_root(), os.getcwd()) is not None)
+                    cargo_argv, root or worktree_root(argv), os.getcwd()) is not None)
         except Exception:
             pool = False
         wt = None
         if pool:
             try:
-                wt = worktree_root()
+                wt = worktree_root(argv)
             except Exception:
                 pool = False
         if not nested and not in_held and not held and kind in ("cargo", "auto"):
             # A cargo build/test of a crate we can name shares that worktree's target dir
             # state, so it is serialised by the worktree lock as well.
             try:
-                root = worktree_root()
+                root = worktree_root(argv)
                 found = resolve_crate_how(argv, root, os.getcwd())
                 crate, named = found if found else (None, False)
             except Exception:
@@ -2776,7 +2802,7 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
         # a fingerprint (it is still a guess, and test_heavy_queue.py runs such commands
         # side by side expecting them to share the machine budget).
         if (held or opts["kind"] == "cargo" or (crate is not None and named))                 and not nested and not in_held:
-            root = root or worktree_root()
+            root = root or worktree_root(argv)
             lock_hash = worktree_hash(root)
             lrec = dict(rec, worktree=root, start=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                         hold=held)
@@ -2810,7 +2836,7 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
                     # A hit runs at weight 0, but it still touches the worktree's target dir:
                     # it waits for the worktree lock like any other cargo run, then re-checks
                     # the registry, since the holder it waited for may have rebuilt it.
-                    root = root or worktree_root()
+                    root = root or worktree_root(argv)
                     lock_hash = worktree_hash(root)
                     lrec = dict(rec, worktree=root, hold=False,
                                 start=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
@@ -3030,7 +3056,10 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
             env.update(stripped)  # the fallback re-runs the original argv: give back the dirs
         had_token = bool(holding)  # _release_all hands it back; the row says what it WAS
         _release_all(directory, lock_hash, holding, lease)
-        code, stats = run_child(argv, env, None)
+        try:
+            code, stats = run_child(argv, env, None)
+        except OSError as exc2:
+            code, stats = _spawn_failed(argv, exc2), _new_stats()
         append_log({
             "v": LOG_VERSION, "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "token": had_token, "nested": nested, "in_held": in_held,
@@ -3061,8 +3090,7 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
                                 progress=directory / "progress" / str(os.getpid()),
                                 yield_check=yield_check, on_test_phase=on_test_phase)
     except OSError as exc:
-        sys.stderr.write(f"heavy: {argv[0]}: {exc}\n")
-        code, stats = 127, _new_stats()
+        code, stats = _spawn_failed(argv, exc), _new_stats()
         row["broker_error"] = f"spawn: {exc}"
     except BaseException:
         _release_all(directory, lock_hash, holding, lease)

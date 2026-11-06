@@ -21,6 +21,12 @@ pub const STAGED_PROMPT_FILE: &str = "prompt.md";
 /// The effort levels `--effort` accepts.
 const VALID_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
+/// The level a catalogue id can carry, e.g. `gemini-3.8-flash-high`.
+const LEVEL_SUFFIXES: [&str; 3] = ["-low", "-medium", "-high"];
+
+/// The `finished_reason` agy reports when `--print-timeout` expired.
+const PRINT_TIMEOUT_REASON: &str = "print_timeout";
+
 /// How much of a malformed stdout a failure message echoes.
 const ECHO_LIMIT: usize = 500;
 
@@ -149,6 +155,15 @@ pub fn build_args(request: &RunRequest, options: &Options) -> Result<Vec<String>
 
     let model = options.model.strip_prefix("agy/").unwrap_or(&options.model);
     let effort = request.effort.as_ref().or(options.effort.as_ref());
+    // A level in the id can conflict with `--effort`, so an explicit effort goes on the stem. What
+    // the stem does not offer agy refuses itself, by name, so no table of its levels is kept here.
+    let model = match effort {
+        Some(_) => LEVEL_SUFFIXES
+            .iter()
+            .find_map(|suffix| model.strip_suffix(suffix))
+            .unwrap_or(model),
+        None => model,
+    };
     if let Some(effort) = effort
         && !VALID_EFFORTS.contains(&effort.as_str())
     {
@@ -195,9 +210,10 @@ pub fn build_args(request: &RunRequest, options: &Options) -> Result<Vec<String>
         args.extend(["--conversation".to_string(), conversation.clone()]);
     }
     if let Some(deadline) = request.progress_timeout {
-        // Whole seconds, rounded up and never zero: zero would read as "no limit" or "now".
+        // Whole seconds, rounded up and never zero: zero would read as "no limit" or "now". The flag
+        // is a Go duration, so the unit is required.
         let secs = deadline.as_secs() + u64::from(deadline.subsec_nanos() > 0);
-        args.extend(["--print-timeout".to_string(), secs.max(1).to_string()]);
+        args.extend(["--print-timeout".to_string(), format!("{}s", secs.max(1))]);
     }
     add_dirs.extend(request.add_dirs.iter().map(|dir| dir.display().to_string()));
     for dir in add_dirs {
@@ -218,6 +234,9 @@ fn first_bytes(text: &str) -> &str {
 /// What a successful agy reply carries.
 struct AgyReply {
     response: String,
+    /// Absent on a turn that completed; agy sets it when the turn was cut short, and still reports
+    /// status `SUCCESS` with the partial response when `--print-timeout` expired.
+    finished_reason: Option<String>,
     conversation_id: Option<String>,
     num_turns: Option<i64>,
     input_tokens: Option<i64>,
@@ -240,13 +259,24 @@ fn parse_reply(stdout: &str) -> Result<AgyReply, String> {
         .and_then(|status| status.as_str())
         .ok_or_else(malformed)?;
     if status != "SUCCESS" {
-        return Err(format!("agy returned status {status}"));
+        return Err(match value.get("error").and_then(|error| error.as_str()) {
+            Some(error) if !error.is_empty() => format!("agy returned status {status}: {error}"),
+            _ => format!("agy returned status {status}"),
+        });
     }
     let response = value
         .get("response")
         .and_then(|response| response.as_str())
         .ok_or_else(malformed)?
         .to_string();
+    let finished_reason = value
+        .get("finished_reason")
+        .and_then(|reason| reason.as_str())
+        .filter(|reason| !reason.is_empty())
+        .map(str::to_string);
+    if finished_reason.is_none() && response.trim().is_empty() {
+        return Err("agy returned an empty reply".to_string());
+    }
     let usage = value.get("usage");
     let count = |name: &str| usage.and_then(|u| u.get(name)).and_then(|n| n.as_i64());
     let output = match (count("output_tokens"), count("thinking_tokens")) {
@@ -255,9 +285,11 @@ fn parse_reply(stdout: &str) -> Result<AgyReply, String> {
     };
     Ok(AgyReply {
         response,
+        finished_reason,
         conversation_id: value
             .get("conversation_id")
             .and_then(|id| id.as_str())
+            .filter(|id| !id.is_empty())
             .map(str::to_string),
         num_turns: value.get("num_turns").and_then(|turns| turns.as_i64()),
         input_tokens: count("input_tokens"),
@@ -397,6 +429,9 @@ impl CommandRunner for AgyCliRunner {
         let mut stderr_str = stderr_task.await.unwrap_or_default();
         let mut exit_code = status.and_then(|status| status.code()).unwrap_or(-1);
         let mut reply = None;
+        // On `--conversation` agy's counts are the whole conversation's so far, not this run's, and
+        // the run does not know the previous totals: unknown, rather than summed into a ledger.
+        let resumed = request.resume_session_id.is_some();
         if let Some(deadline) = progress_timeout_elapsed {
             note(
                 &mut stderr_str,
@@ -423,8 +458,23 @@ impl CommandRunner for AgyCliRunner {
                     note(&mut stderr_str, format!("{why}\n"));
                     exit_code = 1;
                 }
+                Ok(AgyReply {
+                    finished_reason: Some(reason),
+                    ..
+                }) => {
+                    note(
+                        &mut stderr_str,
+                        format!("agy stopped the turn early: finished_reason {reason}\n"),
+                    );
+                    exit_code = if reason == PRINT_TIMEOUT_REASON {
+                        PROGRESS_TIMEOUT_EXIT_CODE
+                    } else {
+                        1
+                    };
+                }
                 Ok(parsed) => {
-                    if let (Some(turns), Some(ceiling)) = (parsed.num_turns, request.max_turns)
+                    if !resumed
+                        && let (Some(turns), Some(ceiling)) = (parsed.num_turns, request.max_turns)
                         && over_turn_ceiling(turns, Some(ceiling))
                     {
                         note(
@@ -442,10 +492,10 @@ impl CommandRunner for AgyCliRunner {
 
         // One synthesised `result` line, so `extract_reply` reads this runner like every other.
         let mut out = stdout_acc;
-        let mut session_id = request
-            .session_id
-            .clone()
-            .or_else(|| request.resume_session_id.clone());
+        // Never `request.session_id`: the daemon mints that id for a first turn, and agy has no flag
+        // to create a conversation under a chosen id, so it would name a conversation agy never made.
+        // A failed resume keeps the real conversation; a failed first turn has none.
+        let mut session_id = request.resume_session_id.clone();
         let (mut input_tokens, mut output_tokens, mut cache_read_tokens, mut num_turns) =
             (None, None, None, None);
         if let Some(parsed) = reply {
@@ -461,10 +511,12 @@ impl CommandRunner for AgyCliRunner {
                 }
                 out = format!("{line}\n");
             }
-            input_tokens = parsed.input_tokens;
-            output_tokens = parsed.output_tokens;
-            cache_read_tokens = parsed.cache_read_tokens;
-            num_turns = parsed.num_turns;
+            if !resumed {
+                input_tokens = parsed.input_tokens;
+                output_tokens = parsed.output_tokens;
+                cache_read_tokens = parsed.cache_read_tokens;
+                num_turns = parsed.num_turns;
+            }
         }
 
         Ok(RunOutcome {
@@ -718,13 +770,14 @@ mod tests {
         let args = build_args(&request("p"), &options()).unwrap();
         assert!(!has(&args, "--conversation"), "{args:?}");
 
-        // The run's silence deadline reaches the CLI as its own print timeout, in seconds.
+        // The run's silence deadline reaches the CLI as its own print timeout. The flag is a Go
+        // duration: real agy 1.4.12 exits 2 on a bare `120` ("missing unit in duration").
         let mut asked = request("p");
         asked.progress_timeout = Some(std::time::Duration::from_secs(120));
         let args = build_args(&asked, &options()).unwrap();
         assert_eq!(
             pair(&args, "--print-timeout").as_deref(),
-            Some("120"),
+            Some("120s"),
             "{args:?}"
         );
     }
@@ -793,6 +846,37 @@ mod tests {
         assert!(build_args(&request("p"), &configured).is_err());
         let args = build_args(&request("p"), &options()).unwrap();
         assert!(!has(&args, "--effort"), "{args:?}");
+    }
+
+    #[test]
+    fn effort_on_a_levelled_model_id_goes_on_its_stem() {
+        // Real agy refuses `--model gemini-3.8-flash-low --effort high` as a conflict and takes
+        // `--model gemini-3.8-flash --effort high`.
+        for (model, effort, stem) in [
+            ("agy/gemini-3.8-flash-high", "low", "gemini-3.8-flash"),
+            ("gemini-3.8-flash-low", "high", "gemini-3.8-flash"),
+            ("gemini-3.8-flash-medium", "medium", "gemini-3.8-flash"),
+            ("gpt-oss-120b-medium", "medium", "gpt-oss-120b"),
+            // No level in the id: nothing to take off, and agy itself answers for what it refuses.
+            ("claude-sonnet-4-6", "low", "claude-sonnet-4-6"),
+        ] {
+            let mut asked = request("p");
+            asked.effort = Some(effort.to_string());
+            let mut levelled = options();
+            levelled.model = model.to_string();
+            let args = build_args(&asked, &levelled).unwrap();
+            assert_eq!(pair(&args, "--model").as_deref(), Some(stem), "{args:?}");
+            assert_eq!(pair(&args, "--effort").as_deref(), Some(effort), "{args:?}");
+        }
+        // No effort asked: the id goes as chosen, its level being the choice.
+        let mut levelled = options();
+        levelled.model = "agy/gemini-3.8-flash-low".to_string();
+        let args = build_args(&request("p"), &levelled).unwrap();
+        assert_eq!(
+            pair(&args, "--model").as_deref(),
+            Some("gemini-3.8-flash-low"),
+            "{args:?}"
+        );
     }
 
     // ---- 24: long prompts -------------------------------------------------------------------
@@ -1171,6 +1255,152 @@ mod tests {
                 outcome.stderr
             );
         }
+    }
+
+    #[test]
+    fn fake_agy_print_timeout_reply_is_a_progress_timeout_not_an_answer() {
+        // Real agy 1.4.12 on `--print-timeout` expiring: exit 0, status SUCCESS, partial response.
+        let body = serde_json::json!({
+            "conversation_id": "conv-t",
+            "status": "SUCCESS",
+            "response": "half an ans",
+            "num_turns": 1,
+            "usage": { "input_tokens": 0, "output_tokens": 0 },
+            "finished_reason": "print_timeout"
+        })
+        .to_string();
+        let fake = FakeAgy::new(&body, 0, false);
+
+        let outcome = fake.run(request("hi"));
+
+        assert_eq!(
+            outcome.exit_code, PROGRESS_TIMEOUT_EXIT_CODE,
+            "{}",
+            outcome.stderr
+        );
+        assert!(
+            outcome.stderr.contains("print_timeout"),
+            "{}",
+            outcome.stderr
+        );
+        assert_eq!(extract_reply(&outcome.stdout), None);
+    }
+
+    #[test]
+    fn fake_agy_any_other_finished_reason_fails_closed_naming_it() {
+        let body = serde_json::json!({
+            "conversation_id": "conv-r",
+            "status": "SUCCESS",
+            "response": "cut short",
+            "finished_reason": "max_tokens"
+        })
+        .to_string();
+        let fake = FakeAgy::new(&body, 0, false);
+        let outcome = fake.run(request("hi"));
+        assert_ne!(outcome.exit_code, 0, "{}", outcome.stderr);
+        assert!(outcome.stderr.contains("max_tokens"), "{}", outcome.stderr);
+        assert_eq!(extract_reply(&outcome.stdout), None);
+    }
+
+    #[test]
+    fn fake_agy_empty_response_is_no_answer() {
+        for response in ["", " \n"] {
+            let fake = FakeAgy::new(&success_json(response), 0, false);
+            let outcome = fake.run(request("hi"));
+            assert_ne!(outcome.exit_code, 0, "{response:?}");
+            assert!(outcome.stderr.contains("empty"), "{}", outcome.stderr);
+        }
+    }
+
+    #[test]
+    fn fake_agy_error_status_shows_the_error_it_carried() {
+        let body = serde_json::json!({
+            "conversation_id": "",
+            "status": "ERROR",
+            "response": "",
+            "error": "invalid model selection"
+        })
+        .to_string();
+        let fake = FakeAgy::new(&body, 0, false);
+        let outcome = fake.run(request("hi"));
+        assert_ne!(outcome.exit_code, 0);
+        assert!(
+            outcome
+                .stderr
+                .contains("agy returned status ERROR: invalid model selection"),
+            "{}",
+            outcome.stderr
+        );
+    }
+
+    /// What agy printed for a first turn that failed: status ERROR and no conversation.
+    fn error_without_conversation() -> String {
+        serde_json::json!({
+            "conversation_id": "",
+            "status": "ERROR",
+            "response": "",
+            "error": "invalid model selection"
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn fake_agy_failed_first_turn_does_not_report_the_minted_session_id() {
+        let fake = FakeAgy::new(&error_without_conversation(), 1, false);
+        let mut asked = request("hi");
+        asked.session_id = Some("minted".to_string());
+
+        let (outcome, mut session_rx, _) = fake.run_with_channels(asked);
+
+        assert_ne!(outcome.exit_code, 0);
+        assert_eq!(outcome.session_id, None);
+        assert!(session_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn fake_agy_failed_resume_keeps_the_conversation_it_resumed() {
+        let fake = FakeAgy::new(&error_without_conversation(), 1, false);
+        let mut asked = request("hi");
+        asked.session_id = Some("minted".to_string());
+        asked.resume_session_id = Some("conv-1".to_string());
+
+        let outcome = fake.run(asked);
+
+        assert_ne!(outcome.exit_code, 0);
+        assert_eq!(outcome.session_id.as_deref(), Some("conv-1"));
+    }
+
+    #[test]
+    fn fake_agy_successful_first_turn_reports_agys_conversation_not_the_minted_id() {
+        let fake = FakeAgy::new(&success_json("hello"), 0, false);
+        let mut asked = request("hi");
+        asked.session_id = Some("minted".to_string());
+
+        let outcome = fake.run(asked);
+
+        assert_eq!(outcome.exit_code, 0, "{}", outcome.stderr);
+        assert_eq!(outcome.session_id.as_deref(), Some("conv-1"));
+    }
+
+    #[test]
+    fn fake_agy_resumed_run_does_not_report_the_conversations_totals_as_its_own() {
+        // Real agy on `--conversation` reports the whole conversation so far: three turns of one
+        // conversation measured num_turns 1, 2, 3 and input_tokens 8616, 18230, 28842.
+        let fake = FakeAgy::new(&success_json("again"), 0, false);
+        let mut asked = request("hi");
+        asked.resume_session_id = Some("conv-1".to_string());
+        // Two conversation turns so far must not read as this run reaching a ceiling of one.
+        asked.max_turns = Some(1);
+
+        let outcome = fake.run(asked);
+
+        assert_eq!(outcome.exit_code, 0, "{}", outcome.stderr);
+        assert_eq!(extract_reply(&outcome.stdout).as_deref(), Some("again"));
+        assert_eq!(outcome.session_id.as_deref(), Some("conv-1"));
+        assert_eq!(outcome.input_tokens, None);
+        assert_eq!(outcome.output_tokens, None);
+        assert_eq!(outcome.cache_read_tokens, None);
+        assert_eq!(outcome.num_turns, None);
     }
 
     #[test]

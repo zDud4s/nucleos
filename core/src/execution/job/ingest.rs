@@ -51,6 +51,41 @@ pub(super) async fn reconcile_nodes(state: &AppState, job: &JobRow) -> sqlx::Res
             continue;
         }
 
+        // **An `interrupted` item node is the daemon going away, not the item failing**, so the item
+        // goes back to `pending` for a fresh run on the tree exactly as it stands: no revert (the
+        // edits are the node's own half-finished work, which the new run continues) and no failure.
+        // The count is a column on the item, so it survives a restart and a crash loop cannot
+        // re-run an item forever. Past the cap the arms below take it as any dead node.
+        let mut interruptions = 0i64;
+        if run_status == "interrupted" {
+            interruptions = sqlx::query_scalar(
+                "SELECT interruptions FROM job_nodes WHERE job_id = ? AND ordinal = ?",
+            )
+            .bind(job.id)
+            .bind(ordinal)
+            .fetch_one(pool)
+            .await?;
+            if interruptions < MAX_ITEM_RERUNS_AFTER_INTERRUPTION {
+                // `AND status = 'running'` for the reason the write below gives.
+                sqlx::query(
+                    "UPDATE job_nodes SET status = 'pending', interruptions = interruptions + 1
+                     WHERE job_id = ? AND ordinal = ? AND status = 'running'",
+                )
+                .bind(job.id)
+                .bind(ordinal)
+                .execute(pool)
+                .await?;
+                tracing::info!(
+                    job_id = job.id,
+                    ordinal,
+                    interruptions = interruptions + 1,
+                    "an interrupted item node is run again"
+                );
+                continue;
+            }
+            interruptions += 1;
+        }
+
         // Only `completed` is done. `timed_out`, `cancelled` and `interrupted` all leave a tree
         // holding edits no gate has measured, and calling any of them finished would let the next
         // item build on top of them — so all three stop the chain.
@@ -128,9 +163,16 @@ pub(super) async fn reconcile_nodes(state: &AppState, job: &JobRow) -> sqlx::Res
                     job,
                     "job_item_failed",
                     &format!(
-                        "job {} stopped at item {}: its node ended `{run_status}`",
+                        "job {} stopped at item {}: {}",
                         job.id,
-                        ordinal + 1
+                        ordinal + 1,
+                        if interruptions > 0 {
+                            format!(
+                                "its node was interrupted {interruptions} times, running it again gave up"
+                            )
+                        } else {
+                            format!("its node ended `{run_status}`")
+                        }
                     ),
                 )
                 .await;
@@ -176,6 +218,12 @@ pub(super) async fn node_awaiting_approval(pool: &SqlitePool, job_id: i64) -> sq
     Ok(paused.is_some())
 }
 
+/// How many times a plan node that ended `interrupted` is started again before the job fails.
+const MAX_PLAN_REPLANS_AFTER_INTERRUPTION: i64 = 2;
+
+/// How many times an item whose node ended `interrupted` is run again before the item fails.
+pub(super) const MAX_ITEM_RERUNS_AFTER_INTERRUPTION: i64 = 2;
+
 /// Turns a finished plan node into the job's queue.
 pub(super) async fn ingest_plan(state: &AppState, job: &JobRow) -> sqlx::Result<()> {
     let pool = &state.pool;
@@ -192,16 +240,36 @@ pub(super) async fn ingest_plan(state: &AppState, job: &JobRow) -> sqlx::Result<
         return Ok(());
     }
 
+    // An `interrupted` plan node is the daemon going away (startup recovery marks every live run
+    // so), not the planner failing. Leaving the job alone makes the next decision read "not
+    // planned, nothing planning" and spawn a fresh plan run. The count is read off the `runs`
+    // rows, so it survives a restart and a crash loop cannot re-plan forever.
+    let mut interruptions = 0i64;
+    if run_status == "interrupted" {
+        interruptions = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM runs
+             WHERE job_id = ? AND stage = 'plan' AND status = 'interrupted'",
+        )
+        .bind(job.id)
+        .fetch_one(pool)
+        .await?;
+        if interruptions <= MAX_PLAN_REPLANS_AFTER_INTERRUPTION {
+            return Ok(());
+        }
+    }
+
     if run_status != "completed" {
         finish(pool, job.id, Outcome::Failed).await?;
+        let reason = if interruptions > 0 {
+            format!("its plan node was interrupted {interruptions} times, re-planning gave up")
+        } else {
+            format!("its plan node ended `{run_status}`")
+        };
         say(
             pool,
             job,
             "job_plan_failed",
-            &format!(
-                "job {} could not plan: its plan node ended `{run_status}`",
-                job.id
-            ),
+            &format!("job {} could not plan: {reason}", job.id),
         )
         .await;
         return Ok(());

@@ -262,6 +262,7 @@ class PromptGoalFile(CliCase):
 
 class Prompt(CliCase):
     NO_CARGO = "No subagent runs `cargo`"
+    FMT_EXCEPTION = "run `cargo fmt -p <crate>`"
 
     def setUp(self):
         super().setUp()
@@ -279,6 +280,7 @@ class Prompt(CliCase):
         for kind, own in expected.items():
             text = self.prompt(f"n-{kind}", kind)["prompt"]
             self.assertIn(self.NO_CARGO, text, kind)
+            self.assertIn(self.FMT_EXCEPTION, text, kind)
             self.assertIn("Make no commit, merge, stash or push", text, kind)
             self.assertIn(own, text, kind)
             others = [rule for k, rule in expected.items() if k != kind]

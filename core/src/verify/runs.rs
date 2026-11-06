@@ -449,6 +449,39 @@ pub async fn cancel_queued(
     Ok(result.rows_affected())
 }
 
+/// Ends every `queued` unit whose ticket was asked for by a run that no longer exists or that
+/// stopped without finishing (`ENDED_RUN_STATUSES`), so it fails fast with a reason instead of
+/// waiting for a reader that is gone. A ticket with a `pending` wake is kept: that wake is the
+/// path that delivers its verdict to the run. Tickets of other callers (owner, job, merge,
+/// post-merge gate) are never touched. Returns `(unit id, ticket id)` of each unit ended, so the
+/// caller can log it: nothing here ends silently.
+pub async fn cancel_orphaned_queued(pool: &SqlitePool) -> sqlx::Result<Vec<(i64, i64)>> {
+    let ended = crate::execution::runs::ENDED_RUN_STATUSES;
+    let placeholders = vec!["?"; ended.len()].join(", ");
+    let sql = format!(
+        "UPDATE verify_runs SET status = 'errored', finished_at = ?, \
+         output_tail = 'orphaned: the run that asked for this verification (run ' || \
+         CAST(substr((SELECT caller FROM verify_requests WHERE id = verify_runs.origin_id), 5) \
+         AS INTEGER) || ') has ended or no longer exists, so nobody can read the result' \
+         WHERE status = 'queued' AND origin = ? AND origin_id IN ( \
+           SELECT q.id FROM verify_requests q WHERE q.caller LIKE 'run:%' \
+           AND NOT EXISTS (SELECT 1 FROM verify_wakes w WHERE w.ticket_id = q.id \
+                           AND w.state = 'pending') \
+           AND NOT EXISTS (SELECT 1 FROM runs r \
+                           WHERE r.id = CAST(substr(q.caller, 5) AS INTEGER) \
+                           AND r.status NOT IN ({placeholders}))) \
+         RETURNING id, origin_id"
+    );
+    // Audited: `sql` only interpolates a run of `?` placeholders; every value is bound.
+    let mut query = sqlx::query_as::<_, (i64, i64)>(sqlx::AssertSqlSafe(sql))
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(ORIGIN_VERIFY);
+    for status in ended {
+        query = query.bind(*status);
+    }
+    query.fetch_all(pool).await
+}
+
 /// One row as a reader sees it.
 pub async fn get(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<State>> {
     // The tuple is the `SELECT`'s own shape and lives only until the `map` below builds `State`;
@@ -968,6 +1001,84 @@ mod tests {
         assert_eq!(status_of(finished).await, STATUS_PASSED);
         assert_eq!(status_of(other_ticket).await, STATUS_QUEUED);
         assert_eq!(status_of(other_origin).await, STATUS_QUEUED);
+    }
+
+    async fn seed_owner_run(pool: &SqlitePool, status: &str) -> i64 {
+        sqlx::query(
+            "INSERT INTO runs (project_id, cwd, prompt, status, mode, created_at) \
+             VALUES ('proj', '/wt', 'p', ?, 'worktree', '2026-11-03T00:00:00Z')",
+        )
+        .bind(status)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    async fn seed_ticket_unit(pool: &SqlitePool, caller: &str, argv: &str) -> (i64, i64) {
+        let ticket = sqlx::query(
+            "INSERT INTO verify_requests (project_id, worktree, kind, scope, priority, caller, \
+             created_at) VALUES ('proj', 'w', 'test', 'own', 0, ?, '2026-11-03T00:00:00Z')",
+        )
+        .bind(caller)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let mut r = request(None, 1);
+        r.origin = ORIGIN_VERIFY.to_owned();
+        r.origin_id = Some(ticket);
+        r.argv = vec![argv.to_owned()];
+        let unit = enqueue(pool, &r, 100).await.unwrap().id;
+        (ticket, unit)
+    }
+
+    #[tokio::test]
+    async fn a_queued_unit_of_an_ended_or_missing_run_fails_fast_with_a_reason() {
+        let pool = test_pool().await;
+        let ended = seed_owner_run(&pool, "failed").await;
+        let live = seed_owner_run(&pool, "running").await;
+        let woken = seed_owner_run(&pool, "cancelled").await;
+        let (t_ended, u_ended) = seed_ticket_unit(&pool, &format!("run:{ended}"), "a").await;
+        let (_, u_live) = seed_ticket_unit(&pool, &format!("run:{live}"), "b").await;
+        let (_, u_gone) = seed_ticket_unit(&pool, "run:99999", "c").await;
+        let (_, u_owner) = seed_ticket_unit(&pool, "owner", "d").await;
+        let (t_woken, u_woken) = seed_ticket_unit(&pool, &format!("run:{woken}"), "e").await;
+        sqlx::query(
+            "INSERT INTO verify_wakes (ticket_id, run_id, root_run_id, state, created_at) \
+             VALUES (?, ?, ?, 'pending', '2026-11-03T00:00:00Z')",
+        )
+        .bind(t_woken)
+        .bind(woken)
+        .bind(woken)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let orphaned = cancel_orphaned_queued(&pool).await.unwrap();
+
+        let mut got: Vec<(i64, i64)> = orphaned.clone();
+        got.sort_unstable();
+        assert_eq!(
+            got.len(),
+            2,
+            "only the ended and the missing run: {orphaned:?}"
+        );
+        assert!(got.contains(&(u_ended, t_ended)));
+        let state = get(&pool, u_ended).await.unwrap().unwrap();
+        assert_eq!(state.status, STATUS_ERRORED);
+        let tail = state.output_tail.unwrap();
+        assert!(
+            tail.contains("orphaned") && tail.contains(&format!("run {ended}")),
+            "{tail}"
+        );
+        assert_eq!(
+            get(&pool, u_gone).await.unwrap().unwrap().status,
+            STATUS_ERRORED
+        );
+        for id in [u_live, u_owner, u_woken] {
+            assert_eq!(get(&pool, id).await.unwrap().unwrap().status, STATUS_QUEUED);
+        }
     }
 
     #[test]

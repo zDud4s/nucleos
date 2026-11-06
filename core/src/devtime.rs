@@ -48,11 +48,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
-/// The most bytes one transaction covers.
-const CHUNK_BYTES: u64 = 8 * 1024 * 1024;
+/// The most bytes one transaction covers. This bounds how long one chunk holds the write lock.
+const CHUNK_BYTES: u64 = 1024 * 1024;
 /// A chunk's write transaction held this long is logged with its size: the other writers wait
-/// behind it for up to the pool's busy timeout, so this is the number that says whether
-/// CHUNK_BYTES needs to shrink.
+/// behind it for up to the shared pool's `storage::BUSY_TIMEOUT` (3s), so this is the number that
+/// says whether CHUNK_BYTES needs to shrink.
 const SLOW_CHUNK: Duration = Duration::from_secs(1);
 /// How far into a transcript the first record carrying a `cwd` is looked for.
 const CWD_SCAN_BYTES: u64 = 1024 * 1024;
@@ -1146,6 +1146,11 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     const ROOT: &str = "C:/fixture/proj";
+
+    #[test]
+    fn a_chunk_is_at_most_one_mebibyte() {
+        const { assert!(CHUNK_BYTES <= 1024 * 1024) };
+    }
 
     /// A due pending row of each action: `inject` with no finding of the rule (a `miss`), `propose`
     /// in shadow with no reappearance (a `miss`), plus one `inject` row whose window is still open.

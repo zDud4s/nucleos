@@ -75,7 +75,9 @@ prompt block is the single source; if they differ, the prompt wins.
   file belongs to the piece that declares it.
 - **Only leaves edit, and only in their own files.** An orchestrator that touches a file is reverted
   and its node fails.
-- **No cargo, no commit, no merge, no stash, no push.** List the exact commands you would have run
+- **No cargo, no commit, no merge, no stash, no push.** One exception: a leaf that edited Rust runs
+  `cargo fmt -p <crate>` from the worktree root (no other flags, no `cd`), never bare `rustfmt` or
+  hand-formatting. List the exact commands you would have run
   under `## Commands for the root`; the controller runs them. The controller commits for you.
 - **Partition by report.** If your prompt says you do not launch children, return `Outcome: split`
   with each child's piece (goal, files, line hints, contract sections, budget) in `## What was done`

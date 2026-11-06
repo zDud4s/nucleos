@@ -332,6 +332,24 @@ fn title_of(goal: &str) -> String {
     line.chars().take(80).collect()
 }
 
+/// The project registered with `root`; a root no project has is the caller's to fix (400).
+async fn project_of_root(state: &AppState, root: &str) -> Result<String, Refusal> {
+    match crate::spec_backlog::finish::project_id_for_root(&state.pool, root).await {
+        Ok(Some(project_id)) => Ok(project_id),
+        Ok(None) => Err(refuse(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "project_id is required: no project is registered with the root {root}; \
+                 name a project_id or register the project"
+            ),
+        )),
+        Err(error) => Err(refuse(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not look the project of {root} up: {error}"),
+        )),
+    }
+}
+
 /// `POST /trees`: opens a root node, stores the job and links the two. A repeated id answers with
 /// the stored job and opens nothing.
 async fn post_tree(
@@ -344,8 +362,12 @@ async fn post_tree(
     let feature_branch = required("feature_branch", body.feature_branch)?;
     let project_root = required("project_root", body.project_root)?;
     // A job without a project would answer 422 at every node close, so it is refused here, where
-    // the owner can still fix it.
-    let project_id = required("project_id", body.project_id)?;
+    // the owner can still fix it. A body that names only the root gets its project the way
+    // `spec_finish` finds one: by the root the project is registered with.
+    let project_id = match required("project_id", body.project_id) {
+        Ok(project_id) => project_id,
+        Err(_) => project_of_root(&state, &project_root).await?,
+    };
     let land = match body.land.as_deref().map(str::trim) {
         None | Some("") => LAND_MODES[0].to_owned(),
         Some(mode) if LAND_MODES.contains(&mode) => mode.to_owned(),
@@ -513,15 +535,12 @@ async fn post_branch(
     let free_disk_gb = if layer == DOCS_LAYER {
         0.0
     } else {
-        crate::health::available_space(FsPath::new(&job.manifest.project_root)).map_err(
-            |error| {
-                refuse(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("could not read the free disk space: {error}"),
-                )
-            },
-        )? as f64
-            / BYTES_PER_GB
+        super::open::free_disk_gb(FsPath::new(&job.manifest.project_root)).map_err(|error| {
+            refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("could not read the free disk space: {error}"),
+            )
+        })?
     };
     let sizes = live_sizes_gb(&job.manifest).await;
     let admission = branch_admission(
@@ -567,9 +586,8 @@ pub(super) async fn current_admission(
     let free_disk_gb = if layer == DOCS_LAYER {
         0.0
     } else {
-        crate::health::available_space(FsPath::new(&manifest.project_root))
-            .map_err(|error| format!("could not read the free disk space: {error}"))? as f64
-            / BYTES_PER_GB
+        super::open::free_disk_gb(FsPath::new(&manifest.project_root))
+            .map_err(|error| format!("could not read the free disk space: {error}"))?
     };
     let sizes = live_sizes_gb(manifest).await;
     Ok(branch_admission(
@@ -1648,8 +1666,9 @@ mod tests {
 
     // ----- POST /trees: the root run and the landing mode -----
 
-    /// A temp git repository with one commit on `master` and a zero disk floor, so that the root
-    /// worktree is admitted whatever the disk holds. The layout `open.rs`'s `Checkout` has.
+    /// A temp git repository with one commit on `master` and a zero disk floor. The root branch is
+    /// still charged its 8 GB seed cost; what admits it whatever the disk holds is the test build's
+    /// fixed free disk (`open::free_disk_gb`). The layout `open.rs`'s `Checkout` has.
     struct Repo {
         _container: tempfile::TempDir,
         path: std::path::PathBuf,
@@ -1842,6 +1861,80 @@ mod tests {
         assert_eq!(node_rows(&state.pool).await, 0);
     }
 
+    // ----- POST /trees: the project resolved from its root -----
+
+    /// Registers `project_id` with `root` in the roster `spec_finish` resolves roots against.
+    async fn register_project(pool: &SqlitePool, project_id: &str, root: &str) {
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root, integration_branch)
+             VALUES (?, 'active', ?, 'master')",
+        )
+        .bind(project_id)
+        .bind(root)
+        .execute(pool)
+        .await
+        .expect("seed the project's roster row");
+    }
+
+    /// `tree_launch` with only `project_root` is the conductor's everyday call: the daemon finds the
+    /// project the same way `spec_finish` does, separators and a trailing slash notwithstanding.
+    #[tokio::test]
+    async fn post_tree_resolves_the_project_id_from_the_project_root() {
+        let state = test_state().await;
+        let registered = format!("{}/", project_root().replace('/', "\\"));
+        register_project(&state.pool, "project-by-root", &registered).await;
+        let app = app(&state);
+
+        for blank in [None, Some(Value::Null), Some(json!("  "))] {
+            let id = format!("job-by-root-{}", job_rows(&state.pool).await);
+            let mut body = tree_body(&id);
+            match blank {
+                None => {
+                    body.as_object_mut().unwrap().remove("project_id");
+                }
+                Some(value) => body["project_id"] = value,
+            }
+
+            assert_first_call(&post(&app, "/trees", body).await);
+
+            assert_eq!(
+                loaded(&state.pool, &id).await.project_id.as_deref(),
+                Some("project-by-root")
+            );
+        }
+    }
+
+    /// A project named in the body wins over the roster: the root is only a fallback.
+    #[tokio::test]
+    async fn post_tree_keeps_a_named_project_id_over_the_root() {
+        let state = test_state().await;
+        register_project(&state.pool, "project-by-root", &project_root()).await;
+
+        assert_first_call(&post(&app(&state), "/trees", tree_body(JOB)).await);
+
+        assert_eq!(
+            loaded(&state.pool, JOB).await.project_id.as_deref(),
+            Some("project-0")
+        );
+    }
+
+    /// No project_id and a root no project has: refused before anything is opened, and the
+    /// refusal names the root so the caller sees which one is unknown.
+    #[tokio::test]
+    async fn post_tree_refuses_an_unknown_root_without_a_project_id_with_400() {
+        let state = test_state().await;
+        register_project(&state.pool, "elsewhere", "Z:/some/other/root").await;
+        let mut body = tree_body(JOB);
+        body.as_object_mut().unwrap().remove("project_id");
+
+        let response = post(&app(&state), "/trees", body).await;
+
+        assert_error_naming(&response, StatusCode::BAD_REQUEST, &project_root());
+        assert_error_naming(&response, StatusCode::BAD_REQUEST, "project_id");
+        assert_eq!(job_rows(&state.pool).await, 0);
+        assert_eq!(node_rows(&state.pool).await, 0);
+    }
+
     // ----- GET /trees/{id} -----
 
     #[tokio::test]
@@ -1894,7 +1987,10 @@ mod tests {
         assert_eq!(added["base"], Value::Null);
     }
 
-    /// The one route test that needs the real disk: `FLOOR_GB` free where the tests run.
+    /// A code branch is admitted through the handler's own sources: the project's limits, the live
+    /// sizes and the free disk. The disk is the test build's fixed figure (`open::free_disk_gb`), not
+    /// the volume's: the default `FLOOR_GB` plus the cost is more room than a machine running trees
+    /// keeps, and this test failed on exactly that in daemon gates.
     #[tokio::test]
     async fn post_branch_admits_a_code_branch_through_the_handler_sources() {
         let state = test_state().await;

@@ -62,8 +62,8 @@ pub fn write_atomic(dest: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
 }
 
 /// How much of the database each connection maps into memory. Mapped pages live in the OS file
-/// cache, shared by every connection, so this costs address space rather than five copies of RAM —
-/// and a scan of an already-read table stops being thousands of `ReadFile` calls.
+/// cache, shared by every connection, so this costs address space rather than RAM per connection
+/// — and a scan of an already-read table stops being thousands of `ReadFile` calls.
 const MMAP_SIZE_BYTES: i64 = 256 * 1024 * 1024;
 
 /// Each connection's private page cache. SQLite's default is 2 MiB, which no hot table here fits.
@@ -76,36 +76,80 @@ const CACHE_SIZE_KIB: i64 = 16 * 1024;
 /// daemon runs.
 pub const WAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
 
-pub async fn open(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
-    if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent).map_err(sqlx::Error::Io)?;
-    }
-    let options = SqliteConnectOptions::new()
+/// How many connections the shared pool (the one `open` returns) may hold. In WAL mode readers run
+/// concurrently with each other and with the single writer, and measured bursts of hooks, handlers
+/// and background tasks exceed five at once. Twelve connections times the 16 MiB `CACHE_SIZE_KIB`
+/// page cache is 192 MiB in the worst case (208 MiB with the [`open_background`] connection); the
+/// mmap region is shared and costs no extra RAM.
+pub const POOL_MAX_CONNECTIONS: u32 = 12;
+
+/// How long a caller of the shared pool waits for a free connection before getting
+/// `sqlx::Error::PoolTimedOut`. Kept below the hook budget (`HOOK_BUDGET` 5 s minus
+/// `AFTER_JUDGE_MARGIN` 1 s), so a hook starved of a connection gets an error that the pretool
+/// fail-closed path turns into a logged deny inside the budget, instead of the client timing out.
+/// The bound is per acquire: a hook that makes several sequential pool calls, or that acquires and
+/// then waits [`BUSY_TIMEOUT`] for the write lock, can still exceed the budget.
+pub const POOL_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How long a connection of the shared pool waits for SQLite's write lock before SQLITE_BUSY.
+/// Stated rather than inherited: every fail-closed gate in this daemon turns a database error into
+/// a refusal, so how long a writer waits before becoming one is a decision made here. It is short
+/// because a writer waiting on the lock pins a pool connection the whole time, and long waits are
+/// what starve the pool; with devtime ingest off the shared pool its transactions are short.
+pub const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The busy_timeout of the background pool ([`open_background`]). Longer than [`BUSY_TIMEOUT`]
+/// because nobody waits on that pool: a slow lock there delays a background ingest, not a hook.
+pub const BACKGROUND_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The connect options every pool on the daemon's database shares; only the busy_timeout differs.
+fn connect_options(db_path: &Path, busy_timeout: std::time::Duration) -> SqliteConnectOptions {
+    SqliteConnectOptions::new()
         .filename(db_path)
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
-        // Stated rather than inherited. Every fail-closed gate in this daemon turns a database
-        // error into a refusal, so how long a writer waits before becoming one is a decision worth
-        // making here instead of depending on whichever default sqlx happens to ship.
-        .busy_timeout(std::time::Duration::from_secs(10))
+        .busy_timeout(busy_timeout)
         // SQLite disables foreign keys per connection unless asked. The schema declares them
         // (`worktrees.run_id`, `action_grants.proposal_id`, ...), so without this they were
         // documentation: an orphaned row was free to exist and nothing said so.
         .foreign_keys(true)
         .pragma("mmap_size", MMAP_SIZE_BYTES.to_string())
         .pragma("cache_size", (-CACHE_SIZE_KIB).to_string())
-        .pragma("journal_size_limit", WAL_SIZE_LIMIT_BYTES.to_string());
+        .pragma("journal_size_limit", WAL_SIZE_LIMIT_BYTES.to_string())
+}
+
+/// Opens the shared pool on the daemon's database and runs the migrations.
+pub async fn open(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent).map_err(sqlx::Error::Io)?;
+    }
     let pool = SqlitePoolOptions::new()
-        .max_connections(5)
-        .connect_with(options)
+        .max_connections(POOL_MAX_CONNECTIONS)
+        .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
+        .connect_with(connect_options(db_path, BUSY_TIMEOUT))
         .await?;
     crate::storage::MIGRATOR.run(&pool).await?;
     Ok(pool)
 }
 
-/// Whether `error` is SQLite's "database is locked" (SQLITE_BUSY, any extended code such as
-/// BUSY_SNAPSHOT): another writer held the lock past busy_timeout, and the same write may pass now.
+/// Opens a single-connection pool for long background writers (devtime ingest), so their
+/// transactions queue on their own connection instead of pinning the shared pool's. It runs no
+/// migrations: [`open`] must already have run on the same `db_path`.
+pub async fn open_background(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
+    SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(connect_options(db_path, BACKGROUND_BUSY_TIMEOUT))
+        .await
+}
+
+/// Whether `error` is transient and the same write may pass if tried again: SQLite's "database is
+/// locked" (SQLITE_BUSY, any extended code such as BUSY_SNAPSHOT: another writer held the lock past
+/// busy_timeout), or `sqlx::Error::PoolTimedOut` (every pooled connection was busy for the whole
+/// acquire timeout), so that [`settle_write`] retries instead of losing a terminal write.
 pub fn is_busy(error: &sqlx::Error) -> bool {
+    if matches!(error, sqlx::Error::PoolTimedOut) {
+        return true;
+    }
     error
         .as_database_error()
         .and_then(|db| db.code())
@@ -138,9 +182,11 @@ where
 }
 
 /// How many times a write that ends something is tried while the database is busy. Each attempt
-/// already waits the pool's 10s busy_timeout, so the worst case is about 31s. Nothing that settles
-/// a run has an HTTP client waiting on it (they all run on background tasks), which is why this is
-/// more generous than the owner-facing `capture::BUSY_ATTEMPTS`. Never use it in a handler.
+/// already waits up to the pool's 3s acquire timeout plus its 3s busy_timeout (about 6s), so with
+/// two [`SETTLE_PAUSE`]s of 500ms between the three attempts the worst case is about 19s. Nothing
+/// that settles a run has an HTTP client waiting on it (they all run on background tasks), which is
+/// why this is more generous than the owner-facing `capture::BUSY_ATTEMPTS`. Never use it in a
+/// handler.
 pub const SETTLE_ATTEMPTS: u32 = 3;
 
 /// The pause between two attempts of [`settle_write`].
@@ -378,6 +424,52 @@ mod tests {
             std::sync::Arc::new(tokio::sync::Mutex::new(holder)),
             other,
         )
+    }
+
+    async fn busy_timeout_ms(pool: &SqlitePool) -> i64 {
+        sqlx::query_scalar::<_, i64>("PRAGMA busy_timeout")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn open_sets_the_shared_pool_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = open(&dir.path().join("t.db")).await.unwrap();
+        assert_eq!(pool.options().get_max_connections(), POOL_MAX_CONNECTIONS);
+        assert_eq!(pool.options().get_acquire_timeout(), POOL_ACQUIRE_TIMEOUT);
+        assert_eq!(
+            busy_timeout_ms(&pool).await,
+            BUSY_TIMEOUT.as_millis() as i64
+        );
+        // Closed before the directory drops: SQLite holds the file open on Windows.
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn open_background_is_one_connection_with_a_long_busy_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let shared = open(&path).await.unwrap();
+        let background = open_background(&path).await.unwrap();
+        assert_eq!(background.options().get_max_connections(), 1);
+        assert_eq!(
+            busy_timeout_ms(&background).await,
+            BACKGROUND_BUSY_TIMEOUT.as_millis() as i64
+        );
+        // The migrations `open` ran are visible through the background pool.
+        sqlx::query("SELECT COUNT(*) FROM runs")
+            .fetch_one(&background)
+            .await
+            .unwrap();
+        background.close().await;
+        shared.close().await;
+    }
+
+    #[test]
+    fn is_busy_counts_a_pool_timeout() {
+        assert!(is_busy(&sqlx::Error::PoolTimedOut));
     }
 
     #[tokio::test]

@@ -9,6 +9,9 @@ pub mod decisions;
 pub mod docs_paths;
 pub mod driver;
 pub mod engine;
+mod gate;
+#[cfg(test)]
+mod gate_tests;
 pub mod http;
 pub mod landing;
 pub mod model;
@@ -16,6 +19,7 @@ pub mod node_run;
 pub mod open;
 mod relaunch;
 pub mod report;
+mod retry;
 pub mod root;
 pub mod store;
 pub mod wrap;

@@ -239,5 +239,39 @@ class TimeoutLogTests(unittest.TestCase):
         self.assertNotIn("waited_on gate", cp.stdout)
 
 
+
+class WorktreeRootManifestPathTests(unittest.TestCase):
+    """`--manifest-path` names the tree a cargo run builds, whatever the cwd is."""
+
+    def setUp(self) -> None:
+        self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="heavy-mp-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.a, self.b = (os.path.join(self.tmp, n) for n in ("a", "b"))
+        for d in (self.a, self.b):
+            os.makedirs(os.path.join(d, "sub"))
+            subprocess.run(["git", "init", "-q", d], check=True)
+        self.heavy = load_heavy()
+        old = os.getcwd()
+        os.chdir(self.a)
+        self.addCleanup(os.chdir, old)
+
+    def _same(self, got: str, want: str) -> bool:
+        return os.path.normcase(os.path.realpath(got)) == os.path.normcase(os.path.realpath(want))
+
+    def test_flag_selects_other_repo(self) -> None:
+        mp = os.path.join(self.b, "sub", "Cargo.toml")
+        for argv in (["cargo", "check", "--manifest-path", mp, "-p", "foo"],
+                     ["cargo", "check", f"--manifest-path={mp}", "-p", "foo"]):
+            self.assertTrue(self._same(self.heavy.worktree_root(argv), self.b), argv)
+
+    def test_relative_flag_resolves_against_cwd(self) -> None:
+        argv = ["cargo", "check", "--manifest-path", os.path.join("..", "b", "Cargo.toml")]
+        self.assertTrue(self._same(self.heavy.worktree_root(argv), self.b))
+
+    def test_without_flag_is_cwd_repo(self) -> None:
+        self.assertTrue(self._same(self.heavy.worktree_root(), self.a))
+        self.assertTrue(self._same(self.heavy.worktree_root(["cargo", "check", "-p", "foo"]), self.a))
+
+
 if __name__ == "__main__":
     unittest.main()
