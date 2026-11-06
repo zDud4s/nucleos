@@ -3315,6 +3315,32 @@ mod tests {
         );
     }
 
+    /// Boot after a restart must handle both land states: the `running` row is released as
+    /// `interrupted` and a `queued` request behind it stays `queued`, so the worker claims it once
+    /// the slot is free instead of the repository staying jammed.
+    #[tokio::test]
+    async fn boot_reconcile_releases_running_and_leaves_queued_claimable() {
+        let pool = test_pool().await;
+        let running = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+        claim_next(&pool, "alpha").await.unwrap();
+        let queued = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+        assert_eq!(status_of(&pool, queued).await, "queued");
+
+        assert_eq!(reconcile_interrupted(&pool).await.unwrap(), 1);
+
+        assert_eq!(status_of(&pool, running).await, "interrupted");
+        assert_eq!(status_of(&pool, queued).await, "queued");
+        let claimed = claim_next(&pool, "alpha").await.unwrap();
+        assert!(
+            claimed.is_some(),
+            "the queued request must be claimable after boot"
+        );
+    }
+
     /// The reconcile and a late `finish` have to compose, not merely each be correct.
     ///
     /// `finish`'s `AND status = 'running'` guard was written for this exact collision — a worker
