@@ -352,7 +352,9 @@ async fn launch_once(state: &AppState) -> Option<i64> {
     {
         // Said once per tick at info: a silent skip looked like the resolver being broken when
         // conflicts sat unattempted behind an engaged switch.
-        tracing::info!("resolver: kill switch engaged (or unreadable); no conflict resolution started");
+        tracing::info!(
+            "resolver: kill switch engaged (or unreadable); no conflict resolution started"
+        );
         return None;
     }
     // A resolution costs an agent, so it is spend, and spend is what the budget governs.
@@ -1334,11 +1336,13 @@ mod tests {
                 .await
                 .unwrap();
         }
-        sqlx::query("UPDATE vcs_requests SET settled_at = 'now', settled_reason = 'dismissed' WHERE id = ?")
-            .bind(settled)
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE vcs_requests SET settled_at = 'now', settled_reason = 'dismissed' WHERE id = ?",
+        )
+        .bind(settled)
+        .execute(&pool)
+        .await
+        .unwrap();
         sqlx::query("UPDATE vcs_requests SET resolution_attempts = ? WHERE id = ?")
             .bind(MAX_RESOLUTION_ATTEMPTS)
             .bind(capped)
@@ -1355,7 +1359,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(free, vec![cancelled, interrupted]);
-        let next = next_conflict(&pool).await.unwrap().expect("a released conflict");
+        let next = next_conflict(&pool)
+            .await
+            .unwrap()
+            .expect("a released conflict");
         assert_eq!(next.id, cancelled);
     }
 
