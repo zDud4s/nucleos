@@ -11,6 +11,7 @@ use sqlx::SqlitePool;
 
 use super::decisions::{ROOT_PARK_KEY, STATUS_OPEN};
 use super::driver::{GateVerdict, NotMeasured, Park, RESOLVER_GRACE};
+use super::final_verify::is_gate_red;
 use super::landing::{LandSettlement, apply_gate_verdict, claim_land};
 use super::store::{self, TreeJob};
 use crate::gate::GateOutcome;
@@ -135,6 +136,12 @@ fn land_record(job: &TreeJob) -> serde_json::Map<String, Value> {
 }
 
 fn land_question(count: i64, reason: &str) -> String {
+    if is_gate_red(reason) {
+        return format!(
+            "The final verify of the tree is red at the tip being landed, so nothing was published; {reason}
+Fix the integrated branch, then answer to let the landing try again."
+        );
+    }
     format!(
         "The landing of the tree did not go through after {count} attempt(s); last reason: {reason}. Answer to let it try again."
     )
@@ -148,11 +155,17 @@ pub(super) async fn count_land_attempt(
     reason: &str,
     parks: &mut Vec<Park>,
 ) -> Result<(), String> {
-    let count = land_record(job)
-        .get("count")
-        .and_then(Value::as_i64)
-        .unwrap_or(0)
-        + 1;
+    // A red final verify is about a tip that has not changed: trying again repeats it, so the
+    // allowance is spent at once and the owner is asked.
+    let count = if is_gate_red(reason) {
+        LAND_ATTEMPTS
+    } else {
+        land_record(job)
+            .get("count")
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+            + 1
+    };
     set_land_record(job, count, reason);
     persist(pool, job).await?;
     if count >= LAND_ATTEMPTS {
