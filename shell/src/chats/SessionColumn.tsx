@@ -565,16 +565,19 @@ function ArchivedSection() {
           Archived conversations{archived.data !== undefined && open ? ` (${list.length})` : ""}
         </span>
       </summary>
-      {open && archived.isError && <ErrorNote>archived conversations could not be read</ErrorNote>}
+      {open && archived.failedMachines.map((machine) => (
+        <ErrorNote key={machine.id}>{machine.name} could not be reached.</ErrorNote>
+      ))}
       {open && archived.data !== undefined && list.length === 0 && (
         <Quiet compact says="Nothing archived." />
       )}
       {open && list.length > 0 && (
         <ul className="chats-list" aria-label="Archived conversations">
           {list.map((chat) => (
-            <li key={chat.chat_id} className="chats-row chats-session-archived">
+            <li key={`${chat.machine}:${chat.chat_id}`} className="chats-row chats-session-archived">
               <StateDot dot={null} />
               <span className="chats-row-title">{sessionTitle(chat)}</span>
+              <MachineTag row={chat} />
               <button
                 type="button"
                 className="chats-session-restore"

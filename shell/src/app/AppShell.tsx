@@ -1,6 +1,6 @@
 import { useMemo } from "react";
 import { Outlet, useNavigate } from "@tanstack/react-router";
-import { useChats } from "../data/chats";
+import { useAllChats } from "../data/chats";
 import { useOpenCaptures } from "../data/captures";
 import { useHotkeyRegistration } from "../data/hotkeys";
 import { POLL } from "../data/poll";
@@ -79,7 +79,7 @@ function Frame() {
    * above, read through `unreadTotal` rather than a bare `.length` because a
    * chat's badge is `waiting`, not a row count.
    */
-  const chats = useChats();
+  const chats = useAllChats();
   /** Open capture requests, the Brain badge — absent until the list has answered once. */
   const captures = useOpenCaptures();
   /**

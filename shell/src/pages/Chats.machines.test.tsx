@@ -22,9 +22,11 @@ import {
   liveTurnKey,
   useAllChats,
   useArchiveChat,
+  useArchivedChats,
   useChatTranscript,
   useForwardTurn,
   useLiveTurnSnapshot,
+  useRestoreChat,
   useSendMessage,
   useSetChatGroup,
   useTurnTools,
@@ -221,6 +223,35 @@ describe("Chats - the list across machines", () => {
     // The same bare turn id for a local chat is its own record, fetched from this machine.
     renderHook(() => useTurnTools(5, true, "c-1"), { wrapper: wrapper(client) });
     await waitFor(() => expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/turns/5/tools"));
+  });
+
+  it("lists archived chats from a remote machine and restores them there", async () => {
+    pairTower();
+    daemon.apiFetch.mockImplementation(async (path: string, _init?: unknown, machine?: string) => {
+      if (path === "/assistant/chats?archived=true") {
+        return machine === "tower" ? [chat("archived-remote", "2026-10-01T11:00:00Z")] : [];
+      }
+      return undefined;
+    });
+    const client = newClient();
+    const archived = renderHook(() => useArchivedChats(true), { wrapper: wrapper(client) });
+
+    await waitFor(() => {
+      expect(archived.result.current.data).toEqual([
+        expect.objectContaining({ chat_id: "archived-remote", machine: "tower", machineName: "Tower" }),
+      ]);
+    });
+    expect(chatMachineOf("archived-remote")).toBe("tower");
+
+    const restore = renderHook(() => useRestoreChat(), { wrapper: wrapper(client) });
+    restore.result.current.mutate("archived-remote");
+    await waitFor(() =>
+      expect(daemon.apiFetch).toHaveBeenCalledWith(
+        "/assistant/chats/archived-remote/restore",
+        expect.objectContaining({ method: "POST" }),
+        "tower",
+      ),
+    );
   });
 
   it("the_same_turn_id_on_two_machines_does_not_share_a_live_entry", () => {

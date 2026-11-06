@@ -54,8 +54,11 @@ const keys = {
 function invalidateChatLists(queryClient: QueryClient): Promise<void> {
   return Promise.all([
     queryClient.invalidateQueries({ queryKey: keys.chats.all, exact: true }),
+    queryClient.invalidateQueries({ queryKey: keys.chats.archived, exact: true }),
     queryClient.invalidateQueries({
-      predicate: (query) => query.queryKey.length === 2 && query.queryKey[1] === "chats",
+      predicate: (query) =>
+        (query.queryKey.length === 2 && query.queryKey[1] === "chats") ||
+        (query.queryKey.length === 3 && query.queryKey[1] === "chats" && query.queryKey[2] === "archived"),
     }),
   ]).then(() => undefined);
 }
@@ -844,7 +847,18 @@ export function useAllChats() {
     return pointers;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [data, here.data, signature]);
-  return { ...here, data, moved };
+  const answeredMachines = useMemo(
+    () => [
+      ...(here.data !== undefined && !here.isError ? (["here"] as MachineId[]) : []),
+      ...others
+        .filter((_, index) => remote[index].data !== undefined && !remote[index].isError)
+        .map((machine) => machine.id),
+    ],
+    // `signature` represents every remote result; the query-result array itself is new on each render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [here.data, here.isError, signature],
+  );
+  return { ...here, data, moved, answeredMachines };
 }
 
 /**
@@ -893,13 +907,51 @@ export function useModelGroups(chatId?: string) {
   });
 }
 
-/** Archived conversations, listed only while `enabled` (the section is open). */
+/** Archived conversations across every paired machine, read only while the section is open. */
 export function useArchivedChats(enabled: boolean) {
-  return useQuery({
-    queryKey: keys.chats.archived,
-    queryFn: () => apiFetch<ChatSummary[]>("/assistant/chats?archived=true"),
-    enabled,
+  const machines = useMachines();
+  const archived = useQueries({
+    queries: machines.map((machine) => ({
+      queryKey: machineKey(keys.chats.archived, machine.id),
+      queryFn: () =>
+        machine.id === "here"
+          ? apiFetch<ChatSummary[]>("/assistant/chats?archived=true")
+          : apiFetch<ChatSummary[]>("/assistant/chats?archived=true", undefined, machine.id),
+      enabled,
+    })),
   });
+  const signature = archived
+    .map((result, index) => `${machines[index].id}:${result.dataUpdatedAt}:${result.isError}`)
+    .join("|");
+  const machineSignature = machines.map((machine) => `${machine.id}:${machine.name}`).join("|");
+  const data = useMemo((): ChatRow[] | undefined => {
+    const sources = machines.map((machine, index) => ({
+      machine: machine.id,
+      name: machines.length > 1 ? machine.name : undefined,
+      chats: archived[index].data,
+      failed: archived[index].isError,
+    }));
+    if (sources.every((source) => source.chats === undefined)) return undefined;
+    return mergeChats(sources);
+    // `signature` represents every query result; the query-result array itself is new on each render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [signature, machineSignature]);
+  useEffect(() => {
+    machines.forEach((machine, index) => {
+      const chats = archived[index].data;
+      if (machine.id !== "here" && chats !== undefined && !archived[index].isError) {
+        rememberChatMachine(chats.map((chat) => chat.chat_id), machine.id);
+      }
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [signature, machineSignature]);
+  const failedMachines = machines.filter((_, index) => archived[index].isError);
+  return {
+    data,
+    isError: failedMachines.length > 0,
+    isPending: archived.some((result) => result.isPending),
+    failedMachines,
+  };
 }
 
 /** Return an archived conversation to the list. */
