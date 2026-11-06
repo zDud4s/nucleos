@@ -523,11 +523,12 @@ pub(super) fn spawn_run(
                 let pool = pool.clone();
                 tokio::spawn(async move {
                     if let Some(session_id) = session_rx.recv().await {
-                        if let Err(error) = sqlx::query("UPDATE runs SET session_id = ? WHERE id = ?")
-                            .bind(&session_id)
-                            .bind(id)
-                            .execute(&pool)
-                            .await
+                        if let Err(error) =
+                            sqlx::query("UPDATE runs SET session_id = ? WHERE id = ?")
+                                .bind(&session_id)
+                                .bind(id)
+                                .execute(&pool)
+                                .await
                         {
                             tracing::warn!(run_id = id, %error, "could not persist the run's session id");
                         }

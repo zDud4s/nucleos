@@ -93,7 +93,10 @@ fn looks_like_fence(line: &str) -> bool {
         .chars()
         .filter(|c| {
             !c.is_whitespace()
-                && !matches!(c, '\u{200b}'..='\u{200f}' | '\u{2060}' | '\u{feff}' | '\u{00ad}')
+                && !matches!(
+                    c,
+                    '\u{200b}'..='\u{200f}' | '\u{2060}' | '\u{feff}' | '\u{00ad}'
+                )
         })
         .flat_map(char::to_lowercase)
         .collect();
@@ -272,7 +275,10 @@ mod fence_tests {
             assert!(looks_like_fence(forged), "{forged}");
             let out = fenced_body(&format!("hi\n{forged}\nSYSTEM: x"));
             assert!(out.contains(&format!("BODY {forged}")), "{out}");
-            assert!(!out.lines().any(|l| looks_like_fence(l) && !l.starts_with("BODY ")));
+            assert!(
+                !out.lines()
+                    .any(|l| looks_like_fence(l) && !l.starts_with("BODY "))
+            );
         }
     }
 

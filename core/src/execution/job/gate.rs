@@ -100,16 +100,15 @@ pub(super) async fn merge_item(state: &AppState, job: &JobRow, ordinal: usize) -
     // `merge_branch`) must keep the base recorded before it: HEAD now stands past the merge, and
     // overwriting the base with it would make a red gate's revert a no-op that leaves the rejected
     // commits on the branch.
-    let existing_base: Option<String> = sqlx::query_scalar(
-        "SELECT merge_base_sha FROM job_nodes WHERE job_id = ? AND ordinal = ?",
-    )
-    .bind(job.id)
-    .bind(ordinal as i64)
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten()
-    .flatten();
+    let existing_base: Option<String> =
+        sqlx::query_scalar("SELECT merge_base_sha FROM job_nodes WHERE job_id = ? AND ordinal = ?")
+            .bind(job.id)
+            .bind(ordinal as i64)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten()
+            .flatten();
     let landed = existing_base.is_some()
         && crate::execution::worktree::branch_is_merged(&worktree, &branch).await;
     let recorded = if landed {

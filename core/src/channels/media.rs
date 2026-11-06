@@ -709,15 +709,39 @@ mod tests {
     #[tokio::test]
     async fn a_channel_over_its_media_quota_stores_nothing_more() {
         let (state, _dir) = state_with_root().await;
-        store_with_quota(&state, "fake", "application/pdf", &[1u8; 10], Utc::now(), 25)
-            .await
-            .unwrap();
-        store_with_quota(&state, "fake", "application/pdf", &[1u8; 10], Utc::now(), 25)
-            .await
-            .unwrap();
-        let result =
-            store_with_quota(&state, "fake", "application/pdf", &[1u8; 10], Utc::now(), 25).await;
-        assert!(matches!(result, Err(MediaError::QuotaExceeded)), "{result:?}");
+        store_with_quota(
+            &state,
+            "fake",
+            "application/pdf",
+            &[1u8; 10],
+            Utc::now(),
+            25,
+        )
+        .await
+        .unwrap();
+        store_with_quota(
+            &state,
+            "fake",
+            "application/pdf",
+            &[1u8; 10],
+            Utc::now(),
+            25,
+        )
+        .await
+        .unwrap();
+        let result = store_with_quota(
+            &state,
+            "fake",
+            "application/pdf",
+            &[1u8; 10],
+            Utc::now(),
+            25,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(MediaError::QuotaExceeded)),
+            "{result:?}"
+        );
         let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM channel_media")
             .fetch_one(&state.pool)
             .await

@@ -750,24 +750,48 @@ mod tests {
             .unwrap();
         let bad = wrong(&minted.code);
         for _ in 0..10 {
-            let outcome = pair(&st, "telegram", &bad, &private("x"), &who("stranger"), now())
-                .await
-                .unwrap();
+            let outcome = pair(
+                &st,
+                "telegram",
+                &bad,
+                &private("x"),
+                &who("stranger"),
+                now(),
+            )
+            .await
+            .unwrap();
             assert_eq!(outcome, PairOutcome::Refused);
         }
         let attempts: i64 = sqlx::query_scalar("SELECT attempts FROM channel_pairing_codes")
             .fetch_one(&st.pool)
             .await
             .unwrap();
-        assert_eq!(attempts, 3, "only the first three guesses of one sender count");
+        assert_eq!(
+            attempts, 3,
+            "only the first three guesses of one sender count"
+        );
         // The stranger is locked out even with the right code; the owner still pairs.
-        let outcome = pair(&st, "telegram", &minted.code, &private("x"), &who("stranger"), now())
-            .await
-            .unwrap();
+        let outcome = pair(
+            &st,
+            "telegram",
+            &minted.code,
+            &private("x"),
+            &who("stranger"),
+            now(),
+        )
+        .await
+        .unwrap();
         assert_eq!(outcome, PairOutcome::Refused);
-        let outcome = pair(&st, "telegram", &minted.code, &private("c9"), &who("owner"), now())
-            .await
-            .unwrap();
+        let outcome = pair(
+            &st,
+            "telegram",
+            &minted.code,
+            &private("c9"),
+            &who("owner"),
+            now(),
+        )
+        .await
+        .unwrap();
         assert_eq!(outcome, PairOutcome::Paired { home: true });
     }
 

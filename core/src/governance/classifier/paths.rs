@@ -276,7 +276,9 @@ pub(super) fn normalize_path(path: &str, cwd: Option<&Path>) -> String {
         let component = match component {
             "." | ".." => component,
             _ => {
-                let named = component.split_once("::").map_or(component, |(name, _)| name);
+                let named = component
+                    .split_once("::")
+                    .map_or(component, |(name, _)| name);
                 named.trim_end_matches(['.', ' '])
             }
         };

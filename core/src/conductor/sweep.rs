@@ -1404,12 +1404,13 @@ mod tests {
         continue_handoffs(&state, now, &mut report).await.unwrap();
         continue_handoffs(&state, now, &mut report).await.unwrap();
 
-        let lines: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM feed WHERE kind = ? AND subject = ?")
-            .bind(CONTINUATION_REFUSED)
-            .bind("node:refused-node")
-            .fetch_one(&state.pool)
-            .await
-            .unwrap();
+        let lines: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM feed WHERE kind = ? AND subject = ?")
+                .bind(CONTINUATION_REFUSED)
+                .bind("node:refused-node")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
         assert_eq!(lines, 1, "reported once, not every tick");
     }
 
