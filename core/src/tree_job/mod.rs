@@ -20,5 +20,6 @@ pub mod open;
 mod relaunch;
 pub mod report;
 pub mod root;
+mod root_disk;
 pub mod store;
 pub mod wrap;
