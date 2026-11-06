@@ -110,6 +110,11 @@ async fn post_media(
     match store(&state, channel, &mime, &bytes, Utc::now()).await {
         Ok(media_id) => Json(MediaCreated { media_id }).into_response(),
         Err(MediaError::TooLarge) => too_large(limit),
+        Err(MediaError::QuotaExceeded) => refusal(
+            StatusCode::INSUFFICIENT_STORAGE,
+            "media_quota_exceeded",
+            Some("this channel holds too much unpruned media".to_string()),
+        ),
         Err(MediaError::NoFilesRoot) => refusal(
             StatusCode::SERVICE_UNAVAILABLE,
             "no_files_root",
@@ -173,6 +178,8 @@ const ID_RANDOM_LEN: usize = 24;
 pub enum MediaError {
     NoFilesRoot,
     TooLarge,
+    /// The channel already holds `CHANNEL_MEDIA_QUOTA_BYTES` of unpruned media.
+    QuotaExceeded,
     UnknownMedia,
     WrongChannel,
     Io(std::io::Error),
@@ -227,6 +234,10 @@ fn path_error(error: crate::files::PathError) -> MediaError {
     MediaError::Io(std::io::Error::other(format!("{error:?}")))
 }
 
+/// Most media bytes one channel may hold between prunes (7 days). Media is stored before the
+/// sender is admitted, so without a ceiling a stranger could fill the disk with 20 MiB uploads.
+pub const CHANNEL_MEDIA_QUOTA_BYTES: i64 = 1024 * 1024 * 1024;
+
 /// Writes the bytes under `channels/<channel>/` and records the id. The size limit is the
 /// channel's manifest limit and is checked before anything touches the disk.
 pub async fn store(
@@ -236,11 +247,30 @@ pub async fn store(
     bytes: &[u8],
     now: DateTime<Utc>,
 ) -> Result<String, MediaError> {
+    store_with_quota(state, channel, mime, bytes, now, CHANNEL_MEDIA_QUOTA_BYTES).await
+}
+
+async fn store_with_quota(
+    state: &AppState,
+    channel: &'static str,
+    mime: &str,
+    bytes: &[u8],
+    now: DateTime<Utc>,
+    quota: i64,
+) -> Result<String, MediaError> {
     let manifest = registry::by_id(channel).ok_or(MediaError::WrongChannel)?;
     if bytes.len() > manifest.max_media_bytes {
         return Err(MediaError::TooLarge);
     }
     let root = state.files_root.clone().ok_or(MediaError::NoFilesRoot)?;
+    let held: i64 =
+        sqlx::query_scalar("SELECT COALESCE(SUM(bytes), 0) FROM channel_media WHERE channel = ?")
+            .bind(channel)
+            .fetch_one(&state.pool)
+            .await?;
+    if held.saturating_add(bytes.len() as i64) > quota {
+        return Err(MediaError::QuotaExceeded);
+    }
 
     let id = generate();
     let folder = format!("{MEDIA_FOLDER}/{channel}");
@@ -674,6 +704,25 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(a, b);
+    }
+
+    #[tokio::test]
+    async fn a_channel_over_its_media_quota_stores_nothing_more() {
+        let (state, _dir) = state_with_root().await;
+        store_with_quota(&state, "fake", "application/pdf", &[1u8; 10], Utc::now(), 25)
+            .await
+            .unwrap();
+        store_with_quota(&state, "fake", "application/pdf", &[1u8; 10], Utc::now(), 25)
+            .await
+            .unwrap();
+        let result =
+            store_with_quota(&state, "fake", "application/pdf", &[1u8; 10], Utc::now(), 25).await;
+        assert!(matches!(result, Err(MediaError::QuotaExceeded)), "{result:?}");
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM channel_media")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 2);
     }
 
     #[tokio::test]
