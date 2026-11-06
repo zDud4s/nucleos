@@ -191,17 +191,32 @@ pub async fn timed_gate(
 
 /// The worktree's HEAD, or `None` when it is not a repository or git did not answer in time.
 async fn head_sha(worktree: &Path) -> Option<String> {
-    let args = [
-        std::ffi::OsStr::new("rev-parse"),
-        std::ffi::OsStr::new("HEAD"),
-    ];
-    let result = crate::execution::git_exec::run_git(worktree, &args, SHA_TIMEOUT)
+    let mut command = crate::execution::worktree::git();
+    command
+        .arg("-C")
+        .arg(worktree)
+        .args(["rev-parse", "HEAD"])
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    // The unit measures the checkout at `worktree`: a GIT_DIR inherited from the environment the
+    // daemon (or a gate) runs in must not point rev-parse at some other repository.
+    for var in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_COMMON_DIR",
+    ] {
+        command.env_remove(var);
+    }
+    let output = tokio::time::timeout(SHA_TIMEOUT, command.output())
         .await
+        .ok()?
         .ok()?;
-    if result.exit_code != Some(0) {
+    if !output.status.success() {
         return None;
     }
-    let sha = result.stdout.trim();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let sha = stdout.trim();
     (!sha.is_empty()).then(|| sha.to_owned())
 }
 
