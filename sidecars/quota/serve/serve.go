@@ -34,6 +34,10 @@ type Response struct {
 	// shows the age of a reading, and a caller that cannot tell a cache hit from a fresh call
 	// cannot do that honestly.
 	Cached bool `json:"cached"`
+	// Accounts holds one reading per account once the núcleo has pushed an account list (PUT
+	// /accounts), in the list's order, each with account_id set. Providers is then empty: the
+	// legacy default-dir readings are not repeated beside the per-account ones.
+	Accounts []reading.Provider `json:"accounts"`
 }
 
 // Readers are the per-provider sources. An interface pair rather than concrete types so the tests
@@ -44,6 +48,9 @@ type Readers struct {
 	// Gemini answers false when there is no subscription to report on, and the provider is left
 	// out of the answer rather than drawn dashed (package gemini). Nil reads as never present.
 	Gemini func(ctx context.Context, now time.Time) (reading.Provider, bool)
+	// Account reads one pool account from its engine and config directory. Nil reads every account
+	// as Unmeasured.
+	Account func(ctx context.Context, a Account, now time.Time) reading.Provider
 }
 
 // Live builds the real readers from config.
@@ -51,13 +58,19 @@ func Live(cfg config.Config, home string) Readers {
 	c := claude.New(cfg.FetchTimeout, home)
 	x := codex.New(home)
 	g := gemini.New(cfg.FetchTimeout, home)
-	return Readers{Claude: c.Read, Codex: x.Read, Gemini: g.Read}
+	return Readers{Claude: c.Read, Codex: x.Read, Gemini: g.Read, Account: liveAccount(cfg)}
 }
 
 type cache struct {
 	mu     sync.Mutex
 	at     time.Time
 	answer []reading.Provider
+	// accountAnswer is the per-account half of the held answer; valid while answer is non-nil.
+	accountAnswer []reading.Provider
+	// accounts is the list the núcleo last pushed. accountsSet tells "never pushed" (legacy
+	// behaviour: default account per provider) from "pushed an empty list" (no accounts at all).
+	accounts    []Account
+	accountsSet bool
 	// ttl is the window the held answer is good for. Kept alongside the answer because it differs
 	// by outcome: a failed read is retried sooner than a good one is refreshed.
 	ttl time.Duration
@@ -68,6 +81,7 @@ func Serve(cfg config.Config, readers Readers) error {
 	c := &cache{}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/quota", authorized(cfg.DaemonToken, quotaHandler(cfg, readers, c, time.Now)))
+	mux.HandleFunc("/accounts", authorized(cfg.DaemonToken, accountsHandler(c)))
 
 	server := &http.Server{
 		Addr:              cfg.Addr,
@@ -95,31 +109,40 @@ func quotaHandler(
 		defer c.mu.Unlock()
 
 		if c.answer != nil && at.Sub(c.at) < c.ttl {
-			writeJSON(w, Response{Providers: c.answer, Cached: true})
+			writeJSON(w, Response{Providers: c.answer, Accounts: c.accountAnswer, Cached: true})
 			return
 		}
 
-		read := []reading.Provider{readers.Claude(r.Context(), at), readers.Codex(at)}
-		if readers.Gemini != nil {
-			if p, present := readers.Gemini(r.Context(), at); present {
-				read = append(read, p)
+		read := []reading.Provider{}
+		var accounts []reading.Provider
+		if c.accountsSet {
+			accounts = onTheWire(readAccounts(r.Context(), readers, c.accounts, at))
+		} else {
+			read = append(read, readers.Claude(r.Context(), at), readers.Codex(at))
+			if readers.Gemini != nil {
+				if p, present := readers.Gemini(r.Context(), at); present {
+					read = append(read, p)
+				}
 			}
 		}
 		providers := onTheWire(read)
+		if accounts == nil {
+			accounts = []reading.Provider{}
+		}
 
 		// The shorter TTL wins whenever anything failed: a provider that is down should be retried
 		// on the error cadence even while the other one is happily cached. Holding a bad answer for
 		// a full minute is how a transient 502 becomes a minute of dashed rings.
 		ttl := cfg.SuccessTTL
-		for _, p := range providers {
+		for _, p := range append(append([]reading.Provider{}, providers...), accounts...) {
 			if p.Fidelity == reading.Unmeasured {
 				ttl = cfg.ErrorTTL
 				break
 			}
 		}
 
-		c.at, c.answer, c.ttl = at, providers, ttl
-		writeJSON(w, Response{Providers: providers, Cached: false})
+		c.at, c.answer, c.accountAnswer, c.ttl = at, providers, accounts, ttl
+		writeJSON(w, Response{Providers: providers, Accounts: accounts, Cached: false})
 	}
 }
 

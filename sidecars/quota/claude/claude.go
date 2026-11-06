@@ -79,18 +79,25 @@ type usageResponse struct {
 // Reader fetches the quota. One per process; safe to reuse.
 type Reader struct {
 	client *http.Client
-	// home is the directory holding `.claude`. A field rather than a call to os.UserHomeDir so the
-	// tests can point it somewhere with a fixture in it.
-	home string
+	// dir is the account's Claude config directory (the one CLAUDE_CONFIG_DIR names), holding
+	// `.credentials.json`. Never assumed to be ~/.claude: one Reader exists per account. A field so
+	// the tests can point it somewhere with a fixture in it.
+	dir string
 	// endpoint is Endpoint in every build. A field only so the tests can aim this at an httptest
 	// server: the alternative is a suite that either reaches the real vendor or never exercises the
 	// parser at all, and the parser is where the interesting mistakes live.
 	endpoint string
 }
 
-// New builds a Reader bounded by timeout.
+// New builds a Reader for the default account, whose config directory is <home>/.claude. Kept for
+// callers that have no account list (the pre-pool behaviour).
 func New(timeout time.Duration, home string) *Reader {
-	return &Reader{client: &http.Client{Timeout: timeout}, home: home, endpoint: Endpoint}
+	return NewForDir(timeout, filepath.Join(home, ".claude"))
+}
+
+// NewForDir builds a Reader bounded by timeout over one account's config directory.
+func NewForDir(timeout time.Duration, configDir string) *Reader {
+	return &Reader{client: &http.Client{Timeout: timeout}, dir: configDir, endpoint: Endpoint}
 }
 
 // Read returns this provider's current quota, or an Unmeasured reading explaining why not.
@@ -177,7 +184,7 @@ func severity(body *usageResponse) string {
 // indistinguishable at the call site from the vendor revoking access. Checking the clock first
 // turns a confusing error into "log in again".
 func (r *Reader) credential(now time.Time) (token, tier string, err error) {
-	path := filepath.Join(r.home, ".claude", ".credentials.json")
+	path := filepath.Join(r.dir, ".credentials.json")
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
