@@ -805,11 +805,7 @@ pub(super) async fn post_vcs_request_cancel(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, StatusCode> {
-    owner_decision_status(
-        id,
-        "cancelling",
-        vcs::cancel_request(&state.pool, id).await,
-    )
+    owner_decision_status(id, "cancelling", vcs::cancel_request(&state.pool, id).await)
 }
 
 pub(super) fn owner_decision_status(
