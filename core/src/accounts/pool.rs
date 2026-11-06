@@ -397,7 +397,10 @@ mod tests {
             "{counts:?}"
         );
         drop(held);
-        assert!(ids.iter().all(|id| pool.live_sessions(&AccountId((*id).into())) == 0));
+        assert!(
+            ids.iter()
+                .all(|id| pool.live_sessions(&AccountId((*id).into())) == 0)
+        );
     }
 
     #[test]
@@ -438,7 +441,10 @@ mod tests {
         assert!(matches!(&first.0, Decision::Use { account, .. } if *account == a));
         drop(first);
         let adapter = FakeAdapter::new("fake", "fakeco");
-        assert!(pool.note_failure(&adapter, &a, "", "all fine", now).is_none());
+        assert!(
+            pool.note_failure(&adapter, &a, "", "all fine", now)
+                .is_none()
+        );
         let hit = pool
             .note_failure(&adapter, &a, "", "FAKE_LIMIT 1h", now)
             .expect("a limit error");

@@ -270,7 +270,10 @@ pub fn choose_account(input: &ChooseInput<'_>) -> Decision {
         }
         AccountChoice::Provider(provider) if provider != input.provider => {
             return Decision::NoCandidate {
-                why: format!("the choice names provider `{provider}`, not `{}`", input.provider),
+                why: format!(
+                    "the choice names provider `{provider}`, not `{}`",
+                    input.provider
+                ),
             };
         }
         _ => {}
@@ -329,7 +332,11 @@ fn choose_auto(input: &ChooseInput<'_>, scored: &[Scored<'_>]) -> Decision {
             .collect();
         best(&others).map(|(c, _)| c.account.id.clone())
     };
-    let Some(cur) = scored.iter().copied().find(|(c, _)| &c.account.id == current) else {
+    let Some(cur) = scored
+        .iter()
+        .copied()
+        .find(|(c, _)| &c.account.id == current)
+    else {
         // The session's account cannot take work any more (paused, needs login, removed).
         return if movable {
             Decision::Use {
@@ -378,8 +385,13 @@ fn choose_auto(input: &ChooseInput<'_>, scored: &[Scored<'_>]) -> Decision {
     if cur.1.at_risk {
         // Leaving a doomed account is worth any cache; but not for another doomed one, unless the
         // provider has said the current one is out and the other has not.
-        let better_exit = !top.1.at_risk || (cur_limit && exhausted_window(top.0, weights, input.now).is_none());
-        return if better_exit { go } else { stay(Reason::LeastBadAllAtRisk) };
+        let better_exit =
+            !top.1.at_risk || (cur_limit && exhausted_window(top.0, weights, input.now).is_none());
+        return if better_exit {
+            go
+        } else {
+            stay(Reason::LeastBadAllAtRisk)
+        };
     }
     let ttl = input
         .session
@@ -387,10 +399,7 @@ fn choose_auto(input: &ChooseInput<'_>, scored: &[Scored<'_>]) -> Decision {
         .or(input.cache_model.map(|m| m.ttl))
         .unwrap_or(Duration::from_secs(weights.default_cache_ttl_secs));
     let mut threshold = match input.session.previous.as_ref() {
-        Some((prev, at))
-            if *prev == top.0.account.id
-                && now_within(input.now, *at, ttl) =>
-        {
+        Some((prev, at)) if *prev == top.0.account.id && now_within(input.now, *at, ttl) => {
             weights.hysteresis
         }
         _ => 0.0,
@@ -528,7 +537,12 @@ mod tests {
     }
 
     fn new_session(candidates: &[Candidate], now: DateTime<Utc>) -> Decision {
-        pick(candidates, &SessionView::default(), SessionPortability::NotPortable, now)
+        pick(
+            candidates,
+            &SessionView::default(),
+            SessionPortability::NotPortable,
+            now,
+        )
     }
 
     fn account_of(decision: &Decision) -> &str {
@@ -557,7 +571,10 @@ mod tests {
         // A: more used, but resets in 2 days of 30; B: less used, resets in 24 days.
         let a = candidate("fake:a", &[("30d", 0.6, 2 * DAY)], now);
         let b = candidate("fake:b", &[("30d", 0.2, 24 * DAY)], now);
-        assert_eq!(account_of(&new_session(&[b.clone(), a.clone()], now)), "fake:a");
+        assert_eq!(
+            account_of(&new_session(&[b.clone(), a.clone()], now)),
+            "fake:a"
+        );
         assert_eq!(account_of(&new_session(&[a, b], now)), "fake:a");
     }
 
@@ -575,11 +592,19 @@ mod tests {
         // A would score best by urgency but is over the threshold.
         let a = candidate("fake:a", &[("30d", 0.96, DAY)], now);
         let b = candidate("fake:b", &[("30d", 0.5, 29 * DAY)], now);
-        assert_eq!(account_of(&new_session(&[a.clone(), b.clone()], now)), "fake:b");
+        assert_eq!(
+            account_of(&new_session(&[a.clone(), b.clone()], now)),
+            "fake:b"
+        );
         // A reported exhausted by a failed launch: at risk until its reset.
         let mut marked = candidate("fake:a", &[("30d", 0.1, DAY)], now);
-        marked.exhausted.push(("1h".into(), Some(now + chrono::Duration::hours(1))));
-        assert_eq!(account_of(&new_session(&[marked.clone(), b.clone()], now)), "fake:b");
+        marked
+            .exhausted
+            .push(("1h".into(), Some(now + chrono::Duration::hours(1))));
+        assert_eq!(
+            account_of(&new_session(&[marked.clone(), b.clone()], now)),
+            "fake:b"
+        );
         // Once the reset has passed the mark no longer holds.
         let later = now + chrono::Duration::hours(2);
         assert!(!score(&marked, &Weights::default(), later).at_risk);
@@ -598,7 +623,10 @@ mod tests {
         assert_eq!(account_of(&decision), "fake:b");
         assert!(matches!(
             decision,
-            Decision::Use { reason: Reason::LeastBadAllAtRisk, .. }
+            Decision::Use {
+                reason: Reason::LeastBadAllAtRisk,
+                ..
+            }
         ));
     }
 
@@ -628,8 +656,14 @@ mod tests {
         let mut b = candidate("fake:b", &[("30d", 0.0, DAY)], now);
         b.account.state = AccountState::NeedsLogin;
         let c = candidate("fake:c", &[("30d", 0.9, 29 * DAY)], now);
-        assert_eq!(account_of(&new_session(&[a.clone(), b.clone(), c], now)), "fake:c");
-        assert!(matches!(new_session(&[a, b], now), Decision::NoCandidate { .. }));
+        assert_eq!(
+            account_of(&new_session(&[a.clone(), b.clone(), c], now)),
+            "fake:c"
+        );
+        assert!(matches!(
+            new_session(&[a, b], now),
+            Decision::NoCandidate { .. }
+        ));
     }
 
     #[test]
@@ -638,12 +672,18 @@ mod tests {
         let only = candidate("fake:a", &[("1h", 0.99, 600)], now);
         assert!(matches!(
             new_session(&[only], now),
-            Decision::Use { reason: Reason::OnlyAccount, .. }
+            Decision::Use {
+                reason: Reason::OnlyAccount,
+                ..
+            }
         ));
         let unmeasured = candidate("fake:a", &[], now);
         assert!(matches!(
             new_session(&[unmeasured], now),
-            Decision::Use { reason: Reason::OnlyAccount, .. }
+            Decision::Use {
+                reason: Reason::OnlyAccount,
+                ..
+            }
         ));
     }
 
@@ -654,7 +694,12 @@ mod tests {
         let b = candidate("fake:b", &[("30d", 0.1, DAY)], now);
         let mut session = on("fake:a");
         session.choice = AccountChoice::Account(AccountId("fake:a".into()));
-        let decision = pick(&[a.clone(), b.clone()], &session, SessionPortability::Portable, now);
+        let decision = pick(
+            &[a.clone(), b.clone()],
+            &session,
+            SessionPortability::Portable,
+            now,
+        );
         assert_eq!(
             decision,
             Decision::Use {
@@ -666,7 +711,12 @@ mod tests {
         // Exhausted: blocked, with the best alternative named, never swapped.
         let mut out = a.clone();
         out.exhausted.push(("1h".into(), None));
-        let decision = pick(&[out, b.clone()], &session, SessionPortability::Portable, now);
+        let decision = pick(
+            &[out, b.clone()],
+            &session,
+            SessionPortability::Portable,
+            now,
+        );
         assert_eq!(
             decision,
             Decision::PinnedBlocked {
@@ -680,14 +730,25 @@ mod tests {
         let mut paused = a.clone();
         paused.account.state = AccountState::Paused;
         assert!(matches!(
-            pick(&[paused, b.clone()], &session, SessionPortability::Portable, now),
-            Decision::PinnedBlocked { why: BlockReason::Paused, .. }
+            pick(
+                &[paused, b.clone()],
+                &session,
+                SessionPortability::Portable,
+                now
+            ),
+            Decision::PinnedBlocked {
+                why: BlockReason::Paused,
+                ..
+            }
         ));
         let mut login = a;
         login.account.state = AccountState::NeedsLogin;
         assert!(matches!(
             pick(&[login, b], &session, SessionPortability::Portable, now),
-            Decision::PinnedBlocked { why: BlockReason::NeedsLogin, .. }
+            Decision::PinnedBlocked {
+                why: BlockReason::NeedsLogin,
+                ..
+            }
         ));
     }
 
@@ -719,7 +780,12 @@ mod tests {
         let now = Utc::now();
         let a = candidate("fake:a", &[("30d", 0.9, 29 * DAY)], now);
         let b = candidate("fake:b", &[("30d", 0.1, DAY)], now);
-        let stays = pick(&[a.clone(), b.clone()], &on("fake:a"), SessionPortability::NotPortable, now);
+        let stays = pick(
+            &[a.clone(), b.clone()],
+            &on("fake:a"),
+            SessionPortability::NotPortable,
+            now,
+        );
         assert!(matches!(
             stays,
             Decision::Use { reason: Reason::StayedNotPortable, ref account, .. } if account.as_str() == "fake:a"
@@ -727,7 +793,12 @@ mod tests {
         let mut out = a;
         out.exhausted.push(("30d".into(), None));
         assert_eq!(
-            pick(&[out, b], &on("fake:a"), SessionPortability::NotPortable, now),
+            pick(
+                &[out, b],
+                &on("fake:a"),
+                SessionPortability::NotPortable,
+                now
+            ),
             Decision::SessionStuck {
                 current: AccountId("fake:a".into()),
                 alternative: Some(AccountId("fake:b".into())),
@@ -735,7 +806,12 @@ mod tests {
         );
     }
 
-    fn warm(mut session: SessionView, now: DateTime<Utc>, age_secs: i64, tokens: i64) -> SessionView {
+    fn warm(
+        mut session: SessionView,
+        now: DateTime<Utc>,
+        age_secs: i64,
+        tokens: i64,
+    ) -> SessionView {
         session.last_cache_write_at = Some(now - chrono::Duration::seconds(age_secs));
         session.cached_tokens = Some(tokens);
         session
@@ -747,7 +823,12 @@ mod tests {
         let a = candidate("fake:a", &[("30d", 0.3, 20 * DAY)], now);
         let b = candidate("fake:b", &[("30d", 0.1, 2 * DAY)], now);
         let big = warm(on("fake:a"), now, 10, 2_000_000);
-        let decision = pick(&[a.clone(), b.clone()], &big, SessionPortability::Portable, now);
+        let decision = pick(
+            &[a.clone(), b.clone()],
+            &big,
+            SessionPortability::Portable,
+            now,
+        );
         assert!(matches!(
             decision,
             Decision::Use { reason: Reason::StayedForCache, ref account, switched_from: None } if account.as_str() == "fake:a"
@@ -755,7 +836,12 @@ mod tests {
         // Unknown size counts as high.
         let mut unknown = on("fake:a");
         unknown.last_cache_write_at = Some(now - chrono::Duration::seconds(10));
-        let decision = pick(&[a.clone(), b.clone()], &unknown, SessionPortability::Portable, now);
+        let decision = pick(
+            &[a.clone(), b.clone()],
+            &unknown,
+            SessionPortability::Portable,
+            now,
+        );
         assert_eq!(account_of(&decision), "fake:a");
         // The account is at risk: leave whatever the cache.
         let risky = candidate("fake:a", &[("30d", 0.96, 20 * DAY)], now);
@@ -780,8 +866,16 @@ mod tests {
         let a = candidate("fake:a", &[("30d", 0.30, 10 * DAY)], now);
         let b = candidate("fake:b", &[("30d", 0.31, 10 * DAY)], now);
         let mut session = warm(on("fake:b"), now, 60, 1_000);
-        session.previous = Some((AccountId("fake:a".into()), now - chrono::Duration::seconds(60)));
-        let decision = pick(&[a.clone(), b.clone()], &session, SessionPortability::Portable, now);
+        session.previous = Some((
+            AccountId("fake:a".into()),
+            now - chrono::Duration::seconds(60),
+        ));
+        let decision = pick(
+            &[a.clone(), b.clone()],
+            &session,
+            SessionPortability::Portable,
+            now,
+        );
         assert_eq!(account_of(&decision), "fake:b");
         // A is much better: the gain pays for the switch back.
         let a_better = candidate("fake:a", &[("30d", 0.05, DAY)], now);
@@ -797,7 +891,12 @@ mod tests {
         let now = Utc::now();
         let b = candidate("fake:b", &[("30d", 0.1, DAY)], now);
         let c = candidate("fake:c", &[("30d", 0.5, 20 * DAY)], now);
-        let moved = pick(&[b.clone(), c.clone()], &on("fake:a"), SessionPortability::SharedStore, now);
+        let moved = pick(
+            &[b.clone(), c.clone()],
+            &on("fake:a"),
+            SessionPortability::SharedStore,
+            now,
+        );
         assert!(matches!(
             moved,
             Decision::Use { ref account, switched_from: Some(_), .. } if account.as_str() == "fake:b"
@@ -825,7 +924,10 @@ mod tests {
         };
         assert!(matches!(
             choose_account(&input),
-            Decision::Use { reason: Reason::StayedNotPortable, .. }
+            Decision::Use {
+                reason: Reason::StayedNotPortable,
+                ..
+            }
         ));
     }
 
@@ -834,7 +936,10 @@ mod tests {
         let now = Utc::now();
         let a = candidate("fake:a", &[], now);
         let mut b = candidate("fake:b", &[], now);
-        assert_eq!(account_of(&new_session(&[b.clone(), a.clone()], now)), "fake:a");
+        assert_eq!(
+            account_of(&new_session(&[b.clone(), a.clone()], now)),
+            "fake:a"
+        );
         let mut busy_a = a;
         busy_a.live_sessions = 1;
         b.live_sessions = 0;

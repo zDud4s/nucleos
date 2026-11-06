@@ -96,13 +96,19 @@ mod tests {
         let a = candidate("fake:a", &[("1h", 0.97, 600)], now);
         let b = candidate("fake:b", &[("30d", 0.96, DAY)], now);
         let v = view(vec![a.clone(), b.clone()]);
-        assert_eq!(engines_without_headroom(&v, &w, now), vec!["fake".to_owned()]);
+        assert_eq!(
+            engines_without_headroom(&v, &w, now),
+            vec!["fake".to_owned()]
+        );
         assert!(providers_with_headroom(&v, &w, now).is_empty());
         // One account with room is enough.
         let roomy = candidate("fake:b", &[("30d", 0.2, DAY)], now);
         let v = view(vec![a, roomy]);
         assert!(engines_without_headroom(&v, &w, now).is_empty());
-        assert_eq!(providers_with_headroom(&v, &w, now), vec!["fakeco".to_owned()]);
+        assert_eq!(
+            providers_with_headroom(&v, &w, now),
+            vec!["fakeco".to_owned()]
+        );
     }
 
     #[test]

@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 
 use super::choose::SessionView;
 use super::pool::Candidate;
-use super::provider::{CacheModel, CONSERVATIVE_TTL};
+use super::provider::{CONSERVATIVE_TTL, CacheModel};
 
 /// Cost of moving a session, in window-fraction units of the destination.
 #[derive(Debug, Clone, Copy, PartialEq)]
