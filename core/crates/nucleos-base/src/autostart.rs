@@ -652,11 +652,11 @@ mod tests {
 
     #[test]
     fn a_denied_registration_explains_how_to_get_unblocked() {
-        let msg = register_failure_message(Some(1), "ERRO: Acesso negado.", "Acesso negado");
+        let msg = register_failure_message(Some(1), "ERRO: Acesso negado.");
         assert!(msg.contains("Acesso negado"));
         assert!(msg.contains("NucleOS Daemon"));
         assert!(msg.contains("elevated"), "{msg}");
-        let other = register_failure_message(Some(1), "boom", "boom");
+        let other = register_failure_message(Some(1), "boom");
         assert!(other.contains("boom") && !other.contains("elevated"));
     }
 
