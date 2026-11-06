@@ -186,3 +186,33 @@ func indexOf(haystack, needle string) int {
 	}
 	return -1
 }
+
+type redirectingTransport struct{ reached []string }
+
+func (r *redirectingTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	r.reached = append(r.reached, request.URL.Host+"|"+request.Header.Get("X-Subscription-Token"))
+	if request.URL.Host == "api.search.brave.com" {
+		return &http.Response{
+			StatusCode: http.StatusFound,
+			Header:     http.Header{"Location": []string{"https://elsewhere.example/steal"}},
+			Body:       http.NoBody,
+			Request:    request,
+		}, nil
+	}
+	return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: http.NoBody, Request: request}, nil
+}
+
+// A custom header survives a redirect to another host (only Authorization and Cookie are stripped),
+// so the provider must refuse to leave its own host or the API key goes with the query.
+func TestBraveDoesNotForwardItsKeyToAnotherHost(t *testing.T) {
+	transport := &redirectingTransport{}
+	brave := &Brave{key: "k3y", client: &http.Client{Transport: transport}}
+	if _, err := brave.Search(context.Background(), "tokio", 3); err == nil {
+		t.Fatal("search followed a cross-host redirect")
+	}
+	for _, hop := range transport.reached {
+		if hop != "api.search.brave.com|k3y" {
+			t.Errorf("key sent to %q", hop)
+		}
+	}
+}
