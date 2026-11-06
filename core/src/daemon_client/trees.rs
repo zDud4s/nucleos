@@ -24,6 +24,18 @@ impl DaemonClient {
         json_or_refusal(response, &format!("reading tree job {id}")).await
     }
 
+    /// `POST /trees/{id}/abandon`: body is `{reason, force?}`.
+    pub async fn tree_abandon(&self, id: &str, body: &Value) -> Result<Value, String> {
+        let path = format!("/trees/{}/abandon", super::nodes::encode_segment(id));
+        let response = self
+            .request(reqwest::Method::POST, &path)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        json_or_refusal(response, &format!("abandoning tree job {id}")).await
+    }
+
     /// `POST /trees/{id}/branch_start`: body is `{name, goal, owned_paths, prompt, layer?, base?, node_id}`.
     pub async fn tree_branch_start(&self, id: &str, body: &Value) -> Result<Value, String> {
         let path = format!("/trees/{}/branch_start", super::nodes::encode_segment(id));

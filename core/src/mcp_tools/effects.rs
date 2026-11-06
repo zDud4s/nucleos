@@ -350,6 +350,8 @@ pub(super) const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     ("task_done", ToolEffect::WritesOwn),
     ("task_list", ToolEffect::ReadsOwn),
     ("task_release", ToolEffect::WritesOwn),
+    // `Acts`: it ends a tree job and drops its queued branches; nothing already merged is touched.
+    ("tree_abandon", ToolEffect::Acts),
     // `Acts`: it adds a branch, makes its worktree and starts a paid run in it.
     ("tree_branch_start", ToolEffect::Acts),
     ("tree_launch", ToolEffect::Acts),

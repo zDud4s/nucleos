@@ -761,6 +761,23 @@ impl NucleosTools {
     }
 
     #[tool(
+        description = "Abandon a stuck tree job: it ends as finished/abandoned, its queued \
+                       branches and pending starts are dropped with your reason. Merged work, \
+                       worktrees, branches and master are left alone. The daemon answers 409 while \
+                       branches are at work, unless `force` is true."
+    )]
+    pub(super) async fn tree_abandon(
+        &self,
+        Parameters(TreeAbandonParams { id, reason, force }): Parameters<TreeAbandonParams>,
+    ) -> String {
+        json_result(
+            self.client
+                .tree_abandon(&id, &serde_json::json!({ "reason": reason, "force": force }))
+                .await,
+        )
+    }
+
+    #[tool(
         description = "Read one tree job by the id it was launched with: its state, root node \
                        and progress."
     )]

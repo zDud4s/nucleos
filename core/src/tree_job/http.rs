@@ -56,6 +56,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/trees", post(post_tree))
         .route("/trees/{id}", get(get_tree))
+        .route("/trees/{id}/abandon", post(post_abandon))
         .route("/trees/{id}/branches", post(post_branch))
         .route("/trees/{id}/nodes/{node}/transition", post(post_transition))
         .merge(super::branch_start::routes())
@@ -458,6 +459,96 @@ async fn get_tree(
         "created_at": job.created_at,
         "updated_at": job.updated_at,
         "manifest": manifest,
+    })))
+}
+
+// ----- POST /trees/{id}/abandon -----
+
+#[derive(Debug, Deserialize)]
+struct AbandonBody {
+    reason: Option<String>,
+    force: Option<bool>,
+}
+
+/// Ends a stuck job: the job becomes `finished` with `finish.status = "abandoned"` (no new column,
+/// the terminal state is the existing one), queued branches and pending starts are dropped with
+/// the reason. Merged branches stay merged, no worktree or git branch is touched, and a branch at
+/// work refuses the call with 409 unless `force` is true (it is then left as it is).
+async fn post_abandon(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    body: Result<Json<AbandonBody>, JsonRejection>,
+) -> Result<Json<Value>, Refusal> {
+    let Json(body) = body.map_err(bad_body)?;
+    let reason = required("reason", body.reason)?;
+    let force = body.force.unwrap_or(false);
+
+    let lock = job_lock(&id);
+    let _guard = lock.lock().await;
+    let mut job = load_job(&state, &id).await?;
+
+    if job.state == JOB_TERMINAL_STATE {
+        let finish = job.manifest.extra.get("finish");
+        if finish.is_some_and(|finish| finish["status"] == json!("abandoned")) {
+            return Ok(Json(json!({
+                "id": id, "state": job.state, "finish": finish, "replayed": true,
+            })));
+        }
+        return Err(refuse(
+            StatusCode::CONFLICT,
+            format!("tree job {id} is already finished"),
+        ));
+    }
+    let live: Vec<String> = job
+        .manifest
+        .branches
+        .values()
+        .filter(|branch| LIVE_STATES.contains(&branch.state.as_str()))
+        .map(|branch| branch.name.clone())
+        .collect();
+    if !live.is_empty() && !force {
+        return Err(refuse(
+            StatusCode::CONFLICT,
+            format!(
+                "tree job {id} has live branches ({}); pass force to abandon anyway",
+                live.join(", ")
+            ),
+        ));
+    }
+
+    let at = now();
+    let mut dropped = Vec::new();
+    for branch in job.manifest.branches.values_mut() {
+        if branch.state == "queued" {
+            branch.state = "dropped".to_owned();
+            branch.extra.insert("drop_reason".to_owned(), json!(reason));
+            branch.extra.insert("dropped_at".to_owned(), json!(at));
+            dropped.push(branch.name.clone());
+        }
+    }
+    let pending: Vec<String> = job
+        .manifest
+        .extra
+        .remove("pending_starts")
+        .and_then(|value| value.as_object().map(|map| map.keys().cloned().collect()))
+        .unwrap_or_default();
+    if !pending.is_empty() {
+        // The records are consumed: a later refusal is a new question.
+        let next = super::branch_start::current_generation(&job.manifest.extra) + 1;
+        job.manifest
+            .extra
+            .insert(super::branch_start::GENERATION_KEY.to_owned(), json!(next));
+    }
+    let finish = json!({ "status": "abandoned", "reason": reason, "at": at, "forced": force });
+    job.manifest.extra.insert("finish".to_owned(), finish.clone());
+    job.manifest.state = JOB_TERMINAL_STATE.to_owned();
+    job.state = JOB_TERMINAL_STATE.to_owned();
+    job.updated_at = at;
+    store::update(&state.pool, &job).await.map_err(store_refusal)?;
+    Ok(Json(json!({
+        "id": id, "state": job.state, "finish": finish,
+        "dropped_branches": dropped, "dropped_pending_starts": pending,
+        "live_branches_left": live,
     })))
 }
 
@@ -2230,6 +2321,91 @@ mod tests {
         .await;
 
         assert_error(&response, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn abandon_finishes_the_job_drops_queued_branches_and_pending_starts() {
+        let state = test_state().await;
+        let app = app(&state);
+        let branches = vec![
+            branch("waiting", "queued", CORE, &[CODE_PATH], None),
+            branch("landed", "merged", CORE, &[OTHER_CODE_PATH], None),
+        ];
+        seed_job(&state.pool, JOB, "open", branches, &[]).await;
+        let mut job = loaded(&state.pool, JOB).await;
+        job.manifest.extra.insert(
+            "pending_starts".to_owned(),
+            json!({ "later": { "caller": "n", "layer": "code" } }),
+        );
+        store::update(&state.pool, &job).await.unwrap();
+
+        let (status, body) = post(
+            &app,
+            &format!("/trees/{JOB}/abandon"),
+            json!({ "reason": "stuck" }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert_eq!(body["dropped_branches"], json!(["waiting"]));
+        assert_eq!(body["dropped_pending_starts"], json!(["later"]));
+        let job = loaded(&state.pool, JOB).await;
+        assert_eq!(job.state, "finished");
+        assert_eq!(job.manifest.state, "finished");
+        assert_eq!(job.manifest.extra["finish"]["status"], json!("abandoned"));
+        assert_eq!(job.manifest.extra["finish"]["reason"], json!("stuck"));
+        assert!(!job.manifest.extra.contains_key("pending_starts"));
+        assert_eq!(job.manifest.branches["waiting"].state, "dropped");
+        assert_eq!(
+            job.manifest.branches["waiting"].extra["drop_reason"],
+            json!("stuck")
+        );
+        assert_eq!(job.manifest.branches["landed"].state, "merged");
+
+        let (again, replay) = post(
+            &app,
+            &format!("/trees/{JOB}/abandon"),
+            json!({ "reason": "stuck" }),
+        )
+        .await;
+        assert_eq!(again, StatusCode::OK);
+        assert_eq!(replay["replayed"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn abandon_with_live_branches_is_409_unless_forced() {
+        let state = test_state().await;
+        let app = app(&state);
+        let branches = vec![
+            branch("busy", "building", CORE, &[CODE_PATH], None),
+            branch("fixer", "fixing", CORE, &[OTHER_CODE_PATH], None),
+        ];
+        seed_job(&state.pool, JOB, "open", branches, &[]).await;
+        let uri = format!("/trees/{JOB}/abandon");
+
+        let (status, body) = post(&app, &uri, json!({ "reason": "stuck" })).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body:?}");
+        assert!(body["error"].as_str().unwrap().contains("busy"));
+        assert_eq!(loaded(&state.pool, JOB).await.state, "open");
+
+        let (status, body) = post(&app, &uri, json!({ "reason": "stuck", "force": true })).await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        let job = loaded(&state.pool, JOB).await;
+        assert_eq!(job.state, "finished");
+        assert_eq!(job.manifest.extra["finish"]["forced"], json!(true));
+        assert_eq!(job.manifest.branches["busy"].state, "building");
+    }
+
+    #[tokio::test]
+    async fn abandon_needs_a_reason_and_a_known_job() {
+        let state = test_state().await;
+        let app = app(&state);
+        seed_job(&state.pool, JOB, "open", Vec::new(), &[]).await;
+
+        let (status, _) = post(&app, &format!("/trees/{JOB}/abandon"), json!({})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = post(&app, "/trees/nope/abandon", json!({ "reason": "x" })).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

@@ -55,6 +55,17 @@ pub(super) struct TreeIdParams {
     pub(super) id: String,
 }
 
+/// The body of `POST /trees/{id}/abandon`, with the job id lifted out into the path.
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub(super) struct TreeAbandonParams {
+    /// The tree job to abandon.
+    pub(super) id: String,
+    /// Why the job is abandoned: a short sentence, kept on the job and on every branch it drops.
+    pub(super) reason: String,
+    /// Abandon even though branches are at work; they are left as they are. Absent is false.
+    pub(super) force: Option<bool>,
+}
+
 /// The body of `POST /trees/{id}/branch_start`, with the job id lifted out into the path.
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 pub(super) struct TreeBranchStartParams {

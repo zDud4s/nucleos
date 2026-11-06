@@ -239,6 +239,13 @@ async fn retry_pending_start(
     // A start waiting for its base replays only once that base has merged.
     let waits_for_base = record["waits_for_base"].as_str();
     if let Some(base) = waits_for_base
+        && base_is_gone(&job.manifest, base)
+    {
+        // The base was dropped (or left the tree): it will never merge, so the waiting branch is
+        // dropped with the base named, instead of staying queued behind a start nobody retries.
+        return drop_waiting_branch(pool, &job.id, name, base).await;
+    }
+    if let Some(base) = waits_for_base
         && base_still_unmerged(&job.manifest, base)
     {
         return Ok(());
@@ -326,6 +333,53 @@ fn base_still_unmerged(manifest: &Manifest, base: &str) -> bool {
         .branches
         .get(base)
         .is_some_and(|branch| branch.state != "merged")
+}
+
+/// The base a pending start waits for was dropped, or is no longer in the tree.
+fn base_is_gone(manifest: &Manifest, base: &str) -> bool {
+    manifest
+        .branches
+        .get(base)
+        .is_none_or(|branch| branch.state == "dropped")
+}
+
+/// Drops the branch `name` that waits for the dropped base `base`, and its pending record, in one
+/// write under the job's lock. A branch that was never added only loses its record.
+async fn drop_waiting_branch(
+    pool: &SqlitePool,
+    job_id: &str,
+    name: &str,
+    base: &str,
+) -> Result<(), String> {
+    let lock = job_lock(job_id);
+    let _guard = lock.lock().await;
+    let Some(mut job) = store::load(pool, job_id).await.map_err(|e| e.to_string())? else {
+        return Ok(());
+    };
+    let reason = format!("base branch {base} was dropped");
+    if let Some(branch) = job.manifest.branches.get_mut(name)
+        && branch.state == "queued"
+    {
+        branch.state = "dropped".to_owned();
+        branch.extra.insert("drop_reason".to_owned(), json!(reason));
+        branch.extra.insert("dropped_at".to_owned(), json!(now()));
+    }
+    if let Some(pending) = job
+        .manifest
+        .extra
+        .get_mut("pending_starts")
+        .and_then(Value::as_object_mut)
+    {
+        pending.remove(name);
+        if pending.is_empty() {
+            job.manifest.extra.remove("pending_starts");
+        }
+    }
+    let next = super::branch_start::current_generation(&job.manifest.extra) + 1;
+    job.manifest
+        .extra
+        .insert(super::branch_start::GENERATION_KEY.to_owned(), json!(next));
+    persist(pool, &mut job).await
 }
 
 /// Removes the pending record of `name` under the job's lock, from a fresh read of the manifest.
@@ -3454,6 +3508,38 @@ mod tests {
         );
         assert!(fx.open_questions(JOB, &root_node_of(JOB)).await.is_empty());
         assert_ne!(fx.branch(JOB, "late").await.state, "parked");
+    }
+
+    #[tokio::test]
+    async fn a_pending_start_whose_base_was_dropped_drops_the_waiting_branch_naming_the_base() {
+        const JOB: &str = "drv-pending-dropped-base";
+        let fx = Fixture::new().await;
+        fx.seed_job(JOB, Vec::new(), None).await;
+        let mut stored = fx.job(JOB).await;
+        let mut base = crate::tree_job::model::Branch::new("base", &[], "code", None);
+        base.state = "dropped".to_owned();
+        let late = crate::tree_job::model::Branch::new(PENDING_NAME, &[], "code", Some("base"));
+        stored.manifest.branches.insert("base".to_owned(), base);
+        stored.manifest.branches.insert(PENDING_NAME.to_owned(), late);
+        stored.manifest.extra.insert(
+            "pending_starts".to_owned(),
+            json!({ PENDING_NAME: {
+                "caller": root_node_of(JOB),
+                "layer": "code",
+                "base": "base",
+                "waits_for_base": "base",
+            }}),
+        );
+        store::update(&fx.state.pool, &stored).await.unwrap();
+
+        fx.tick(JOB, &FakeGate::answering(vec![])).await;
+
+        let stored = fx.job(JOB).await;
+        let waiting = &stored.manifest.branches[PENDING_NAME];
+        assert_eq!(waiting.state, "dropped");
+        let reason = waiting.extra["drop_reason"].as_str().unwrap();
+        assert!(reason.contains("base"), "{reason}");
+        assert!(pending_starts(&stored).get(PENDING_NAME).is_none());
     }
 
     #[tokio::test]
