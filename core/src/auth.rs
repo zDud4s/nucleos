@@ -1749,6 +1749,7 @@ mod tests {
             .route("/vcs/requests/{id}/wait", get(|| async {}))
             .route("/vcs/requests/{id}/approve", post(|| async {}))
             .route("/vcs/requests/{id}/refuse", post(|| async {}))
+            .route("/vcs/requests/{id}/cancel", post(|| async {}))
             .route("/shadow-decisions", get(|| async {}))
             .route("/shadow-decisions/{id}/verdict", post(|| async {}))
             .route("/scoreboard", get(|| async {}))
@@ -3910,7 +3911,11 @@ mod tests {
         let app = protected_router(state);
 
         for token in [&reader, &team] {
-            for path in ["/vcs/requests/7/approve", "/vcs/requests/7/refuse"] {
+            for path in [
+                "/vcs/requests/7/approve",
+                "/vcs/requests/7/refuse",
+                "/vcs/requests/7/cancel",
+            ] {
                 assert_eq!(
                     status_of(&app, "POST", path, token).await,
                     StatusCode::FORBIDDEN,
@@ -3918,7 +3923,11 @@ mod tests {
                 );
             }
         }
-        for path in ["/vcs/requests/{id}/approve", "/vcs/requests/{id}/refuse"] {
+        for path in [
+            "/vcs/requests/{id}/approve",
+            "/vcs/requests/{id}/refuse",
+            "/vcs/requests/{id}/cancel",
+        ] {
             assert!(
                 !route_is_listed(READ_ONLY_ROUTES, &Method::POST, path)
                     && !route_is_listed(RUN_CREATING_ROUTES, &Method::POST, path)

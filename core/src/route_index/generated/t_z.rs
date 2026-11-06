@@ -369,6 +369,13 @@ pub(super) const ROUTES: &[RouteEntry] = &[
     },
     RouteEntry {
         method: "POST",
+        path: "/vcs/requests/{id}/cancel",
+        purpose: "Post vcs request cancel.",
+        body: Body::None,
+        handler: "post_vcs_request_cancel",
+    },
+    RouteEntry {
+        method: "POST",
         path: "/vcs/requests/{id}/dismiss",
         purpose: "Post vcs request dismiss.",
         body: Body::None,
