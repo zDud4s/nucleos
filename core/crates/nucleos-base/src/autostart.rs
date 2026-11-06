@@ -502,19 +502,31 @@ fn element_text<'a>(lower_xml: &'a str, tag: &str) -> Option<&'a str> {
 
 #[cfg(windows)]
 fn register(exe_path: &Path) -> std::io::Result<()> {
-    let xml = task_xml(exe_path);
+    // Without a user id the task means "any user logs on", which only an admin may create.
+    let Ok(user) = windows_user() else {
+        tracing::warn!("no USERNAME in the environment; autostart is not registered");
+        return Ok(());
+    };
+    let xml = task_xml(exe_path, &user);
     let xml_path = task_xml_temp_path();
     write_utf16_xml(&xml_path, &xml)?;
-    let status = Command::new("schtasks")
+    let output = Command::new("schtasks")
         .args(["/Create", "/TN", TASK_NAME, "/XML"])
         .arg(&xml_path)
         .arg("/F")
-        .status()?;
+        .stdin(std::process::Stdio::null())
+        .output();
     let _ = std::fs::remove_file(&xml_path);
-    if status.success() {
+    let output = output?;
+    if output.status.success() {
         Ok(())
     } else {
-        Err(std::io::Error::other("schtasks /create failed"))
+        // Keep schtasks' own words: they say why (e.g. access denied), and the caller logs them.
+        Err(std::io::Error::other(format!(
+            "schtasks /create failed: {} {}",
+            String::from_utf8_lossy(&output.stderr).trim(),
+            String::from_utf8_lossy(&output.stdout).trim()
+        )))
     }
 }
 
@@ -562,12 +574,17 @@ fn conhost_path() -> String {
     r"C:\Windows\System32\conhost.exe".to_string()
 }
 
+/// PURE: the login task, bound to `user` (`DOMAIN\name`). A `LogonTrigger` and a `Principal` with
+/// no `UserId` mean "any user", and registering that needs admin rights.
 #[cfg(any(windows, test))]
-fn task_xml(exe_path: &Path) -> String {
+fn task_xml(exe_path: &Path, user: &str) -> String {
+    let user = xml_escape(user);
     task_document(
         exe_path,
-        "<LogonTrigger>\n      <Enabled>true</Enabled>\n    </LogonTrigger>",
-        "<LogonType>InteractiveToken</LogonType>",
+        &format!(
+            "<LogonTrigger>\n      <Enabled>true</Enabled>\n      <UserId>{user}</UserId>\n    </LogonTrigger>"
+        ),
+        &format!("<UserId>{user}</UserId>\n      <LogonType>InteractiveToken</LogonType>"),
     )
 }
 
@@ -996,6 +1013,24 @@ pub fn set_mode(mode: Mode, _password: Option<&str>, exe_path: &Path) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The login task for a fixed user, so the XML is the same on every host.
+    fn task_xml(exe: &Path) -> String {
+        super::task_xml(exe, r"PC\me")
+    }
+
+    #[test]
+    fn the_login_task_names_the_user_in_trigger_and_principal_escaped() {
+        let xml = super::task_xml(Path::new(r"C:\Apps\nucleos-core.exe"), r"A&B\Dev <1>");
+        let id = r"<UserId>A&amp;B\Dev &lt;1&gt;</UserId>";
+        assert_eq!(xml.matches(id).count(), 2, "{xml}");
+        let between = |open: &str, close: &str| {
+            let start = xml.find(open).unwrap();
+            &xml[start..start + xml[start..].find(close).unwrap()]
+        };
+        assert!(between("<LogonTrigger>", "</LogonTrigger>").contains(id), "{xml}");
+        assert!(between("<Principal ", "</Principal>").contains(id), "{xml}");
+    }
 
     #[cfg(windows)]
     #[test]
