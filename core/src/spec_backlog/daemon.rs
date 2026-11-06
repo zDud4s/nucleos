@@ -949,10 +949,7 @@ mod tests {
 
         assert_eq!(body["land"], serde_json::json!("integration"));
         assert_eq!(body["id"], serde_json::json!("tree-lands"));
-        assert_eq!(
-            body["feature_branch"],
-            serde_json::json!("spec/2026-01-01-lands")
-        );
+        assert_eq!(body["feature_branch"], serde_json::json!("spec/2026-01-01-lands"));
         assert_eq!(body["project_root"], serde_json::json!("C:/repo"));
         assert_eq!(body["project_id"], serde_json::json!("proj-lands"));
     }
@@ -1106,10 +1103,7 @@ mod tests {
 
         assert_ne!(checkout.path, repo.path, "the owner's checkout was audited");
         assert_eq!(head_of(&checkout.path), repo.git(&["rev-parse", "master"]));
-        assert_eq!(
-            changed_paths(&checkout).await,
-            vec!["landed.txt".to_owned()]
-        );
+        assert_eq!(changed_paths(&checkout).await, vec!["landed.txt".to_owned()]);
     }
 
     /// Unchanged: a spec branch that has not landed is audited against the integration branch.
