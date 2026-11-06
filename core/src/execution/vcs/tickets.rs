@@ -391,6 +391,52 @@ pub async fn refuse_for_owner(pool: &sqlx::SqlitePool, id: i64) -> Result<(), Di
     .await?;
     owner_decided(pool, id, refused.rows_affected()).await
 }
+/// The `failure_reason` `cancel_request` records.
+pub const OWNER_CANCELLED_REASON: &str = "cancelled by the owner";
+/// The owner cancels a request: `cancelled`, terminal. Allowed for a `queued` row, and for a
+/// `running` row whose executor is gone (no live drain owns it); a row a drain is executing right
+/// now is refused with `NotOpen`, since git is mid-operation. 404/409 as for `dismiss`.
+pub async fn cancel_request(pool: &sqlx::SqlitePool, id: i64) -> Result<(), DismissError> {
+    let row: Option<(String, Option<String>, String)> =
+        sqlx::query_as("SELECT status, started_at, project_id FROM vcs_requests WHERE id = ?")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+    let Some((status, started_at, project_id)) = row else {
+        return Err(DismissError::NotFound);
+    };
+    let guard = match status.as_str() {
+        "queued" => "status = 'queued'",
+        "running" if !started_at.as_deref().is_some_and(|at| is_in_flight(id, at)) => {
+            "status = 'running'"
+        }
+        _ => return Err(DismissError::NotOpen),
+    };
+    let cancelled = sqlx::query(&format!(
+        "UPDATE vcs_requests SET status = 'cancelled', finished_at = ?, failure_reason = ?
+          WHERE id = ? AND {guard} AND started_at IS ?"
+    ))
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(OWNER_CANCELLED_REASON)
+    .bind(id)
+    .bind(started_at)
+    .execute(pool)
+    .await?;
+    let changed = cancelled.rows_affected();
+    if changed == 1 {
+        let _ = crate::feed::append(
+            pool,
+            Some(project_id.as_str()),
+            "vcs_request_cancelled",
+            &format!("vcs request {id} cancelled by the owner"),
+            None,
+            Some(&crate::feed::Subject::Vcs(id)),
+        )
+        .await;
+        wake_worker();
+    }
+    owner_decided(pool, id, changed).await
+}
 pub(super) async fn owner_decided(
     pool: &sqlx::SqlitePool,
     id: i64,

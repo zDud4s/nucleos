@@ -21,6 +21,14 @@ pub trait VcsExecutor: Send + Sync {
     /// of this call — it is the answer. A conflicted merge is a `Failed` the queue must record
     /// against the row, not a failure to have asked.
     async fn execute(&self, request: &ClaimedRequest) -> Outcome;
+
+    /// The sha the target branch sits at if `request` has already landed (a merge whose source is an
+    /// ancestor of its target), else `None`. Read-only; the stranded-row reconcile asks it about a
+    /// `running` row whose executor is gone, to tell a merge that finished from one that never ran.
+    /// The default answers `None`, which re-queues, and re-running a merge is harmless.
+    async fn landed_sha(&self, _request: &ClaimedRequest) -> Option<String> {
+        None
+    }
 }
 /// Polls an `Unpin` future (the executor's boxed one) under `catch_unwind`, so a panic comes back as a value instead of unwinding the
 /// caller. `AssertUnwindSafe` is sound here because the wrapped future is dropped on a panic and
@@ -231,6 +239,9 @@ pub async fn drain_once(
         }
     }
     let id = claimed.id;
+    // Registered for as long as this drain owns the row, so the stranded-row reconcile and the
+    // cancel route can tell a row whose executor is gone from one that is merely slow.
+    let _in_flight = InFlight::enter(pool, id).await;
     // Spec 2026-10-22 task-claims §3 Land: the claim may have changed between admission and now, so
     // the merge is judged again. Refused before the executor is entered, so nothing is published.
     // Only a merge into the integration branch (`claimed.integration_branch`, resolved just above)
@@ -332,17 +343,7 @@ pub async fn drain_once(
     // The terminal write now rides a transaction so a land's distillation cause is queued with it.
     // `finish` still goes FIRST, which keeps the deferred-begin write-first argument above, and the
     // queueing is best effort: its failure is logged and never fails or rolls back the write.
-    let finished = async {
-        let mut tx = pool.begin().await?;
-        finish(&mut *tx, id, outcome.clone()).await?;
-        if matches!(outcome, Outcome::Succeeded { .. })
-            && let Err(error) = crate::distill::enqueue_landed_in(&mut tx, id).await
-        {
-            tracing::warn!(request_id = id, %error, "distill: could not queue a landed job");
-        }
-        tx.commit().await
-    }
-    .await;
+    let finished = write_terminal(pool, id, &outcome, TERMINAL_WRITE_BACKOFF).await;
     match finished {
         // Spec §6.4's fifth step, and spec §2.1's whole argument for this pillar having no view of
         // its own: every transition writes to `feed.rs`, which the shell already shows. Without this
@@ -443,11 +444,96 @@ pub async fn drain_once(
             repo_key = %repo_key,
             ?outcome,
             %error,
-            "could not record how a vcs request ended; it stays running until the daemon restarts"
+            "could not record how a vcs request ended; the stranded-row reconcile settles it from git"
         ),
     }
     true
 }
+/// Pauses between attempts at the terminal write: a pool timeout is transient, and the row it
+/// strands jams the repository until something reconciles it.
+pub(super) const TERMINAL_WRITE_BACKOFF: &[std::time::Duration] = &[
+    std::time::Duration::from_millis(200),
+    std::time::Duration::from_secs(1),
+    std::time::Duration::from_secs(3),
+];
+
+/// Writes the terminal status of request `id`, retrying a failed write after each `backoff` pause.
+///
+/// `RowNotFound` is not retried: it means the row is no longer `running` (a reconcile took it), and
+/// no number of attempts changes that. Every attempt is its own transaction, so a failed one leaves
+/// nothing half-written.
+pub(super) async fn write_terminal(
+    pool: &sqlx::SqlitePool,
+    id: i64,
+    outcome: &Outcome,
+    backoff: &[std::time::Duration],
+) -> sqlx::Result<()> {
+    let mut pauses = backoff.iter();
+    loop {
+        let attempt = async {
+            let mut tx = pool.begin().await?;
+            finish(&mut *tx, id, outcome.clone()).await?;
+            if matches!(outcome, Outcome::Succeeded { .. })
+                && let Err(error) = crate::distill::enqueue_landed_in(&mut tx, id).await
+            {
+                tracing::warn!(request_id = id, %error, "distill: could not queue a landed job");
+            }
+            tx.commit().await
+        }
+        .await;
+        match attempt {
+            Err(error) if !matches!(error, sqlx::Error::RowNotFound) => match pauses.next() {
+                Some(pause) => {
+                    tracing::warn!(request_id = id, %error, "vcs: terminal write failed; retrying");
+                    tokio::time::sleep(*pause).await;
+                }
+                None => return Err(error),
+            },
+            other => return other,
+        }
+    }
+}
+
+/// `(request id, started_at)` of every row a live drain currently owns. Keyed on `started_at` too
+/// because test pools reuse ids.
+static IN_FLIGHT: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<(i64, String)>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Holds a request in [`IN_FLIGHT`] until dropped, including when the drain future is dropped.
+pub(super) struct InFlight(Option<(i64, String)>);
+
+impl InFlight {
+    async fn enter(pool: &sqlx::SqlitePool, id: i64) -> Self {
+        let started: Option<Option<String>> =
+            sqlx::query_scalar("SELECT started_at FROM vcs_requests WHERE id = ?")
+                .bind(id)
+                .fetch_optional(pool)
+                .await
+                .unwrap_or(None);
+        let Some(Some(started)) = started else {
+            return Self(None);
+        };
+        IN_FLIGHT.lock().unwrap().insert((id, started.clone()));
+        Self(Some((id, started)))
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        if let Some(key) = self.0.take() {
+            IN_FLIGHT.lock().unwrap().remove(&key);
+        }
+    }
+}
+
+/// Whether a live drain owns the `running` row `id` that was started at `started_at`.
+pub(super) fn is_in_flight(id: i64, started_at: &str) -> bool {
+    IN_FLIGHT
+        .lock()
+        .unwrap()
+        .contains(&(id, started_at.to_owned()))
+}
+
 /// The worker's safety net: how long it sleeps when nothing wakes it.
 ///
 /// Every path that makes a request `queued` calls [`wake_worker`], so in the normal case the worker
@@ -618,6 +704,13 @@ pub async fn run_queue_worker(pool: sqlx::SqlitePool, executor: std::sync::Arc<d
         // At start and on every tick: parked pushes survive a restart and a missed wake, and the
         // query below only sees `queued`. Before it, so a row released here drains in this pass.
         sweep_awaiting_gate(&pool).await;
+        // A `running` row whose drain is gone would otherwise hold its repository's only slot
+        // until a restart.
+        if let Err(error) =
+            reconcile_stranded_running(&pool, executor.as_ref(), STRANDED_GRACE).await
+        {
+            tracing::warn!(%error, "vcs: could not reconcile stranded running requests");
+        }
         let repositories: Vec<String> = match sqlx::query_scalar(
             "SELECT DISTINCT repo_key FROM vcs_requests WHERE status = 'queued'",
         )
