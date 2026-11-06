@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::{DateTime, Duration, Utc};
 
-use super::choose::{Decision, SessionView};
-use super::provider::{CacheModel, LimitHit, SessionPortability};
+use super::choose::{ChooseInput, Decision, SessionView, choose_account};
+use super::provider::{CacheModel, LimitHit, ProviderAdapter, SessionPortability};
 use super::settings::AccountPoolDoc;
 use super::{Account, AccountId};
 
@@ -62,6 +62,7 @@ pub struct PoolView {
     pub candidates: Vec<Candidate>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub enum Holder {
     Run(i64),
     Chat(String),
@@ -223,6 +224,53 @@ impl PoolState {
     /// deciding; a reservation is only ever made through the pool that owns it.
     pub fn reserve(self: &Arc<Self>, account: &AccountId, holder: Holder) -> Reservation {
         let mut inner = self.lock();
+        self.reserve_locked(&mut inner, account, holder)
+    }
+
+    /// Snapshot, decision and reservation under ONE lock (B6): two concurrent launches never both
+    /// see the same room, because the second one sees the first one's reservation. Only
+    /// `Decision::Use` reserves; every other decision hands back no reservation.
+    pub fn decide_and_reserve(
+        self: &Arc<Self>,
+        req: &PickRequest,
+        doc: &AccountPoolDoc,
+        now: DateTime<Utc>,
+    ) -> (Decision, Option<Reservation>) {
+        let mut inner = self.lock();
+        let candidates: Vec<Candidate> = inner
+            .candidates
+            .iter()
+            .filter(|c| c.account.engine == req.engine && c.account.provider == req.provider)
+            .map(|c| Candidate {
+                live_sessions: Self::count(&inner, &c.account.id),
+                ..c.clone()
+            })
+            .collect();
+        let decision = choose_account(&ChooseInput {
+            provider: &req.provider,
+            candidates: &candidates,
+            session: &req.session,
+            weights: &doc.weights,
+            portability: req.portability,
+            mid_switch_enabled: doc.mid_switch.get(&req.engine).copied().unwrap_or(true),
+            cache_model: req.cache_model,
+            now,
+        });
+        let reservation = match &decision {
+            Decision::Use { account, .. } => {
+                Some(self.reserve_locked(&mut inner, account, req.holder.clone()))
+            }
+            _ => None,
+        };
+        (decision, reservation)
+    }
+
+    fn reserve_locked(
+        self: &Arc<Self>,
+        inner: &mut Inner,
+        account: &AccountId,
+        holder: Holder,
+    ) -> Reservation {
         inner.next_ticket += 1;
         let ticket = inner.next_ticket;
         inner.held.push((ticket, account.clone()));
@@ -234,14 +282,19 @@ impl PoolState {
         }
     }
 
-    /// Snapshot, decision and reservation under one lock. W0: no decision, so today's launch.
-    pub fn decide_and_reserve(
-        self: &Arc<Self>,
-        _req: &PickRequest,
-        _doc: &AccountPoolDoc,
-        _now: DateTime<Utc>,
-    ) -> (Decision, Option<Reservation>) {
-        (Decision::Default, None)
+    /// §11: a failed launch of `account`. When the adapter reads the output as a limit error the
+    /// window is marked exhausted until its reset, so the next pick skips it.
+    pub fn note_failure(
+        &self,
+        adapter: &dyn ProviderAdapter,
+        account: &AccountId,
+        stdout: &str,
+        stderr: &str,
+        now: DateTime<Utc>,
+    ) -> Option<LimitHit> {
+        let hit = adapter.classify_failure(stdout, stderr)?;
+        self.mark_exhausted(account, &hit, now);
+        Some(hit)
     }
 }
 
@@ -299,6 +352,99 @@ mod tests {
             pool.decide_and_reserve(&req, &AccountPoolDoc::default(), Utc::now());
         assert_eq!(decision, Decision::Default);
         assert!(reservation.is_none());
+    }
+
+    fn request(holder: Holder) -> PickRequest {
+        PickRequest {
+            engine: "fake".into(),
+            provider: "fakeco".into(),
+            session: SessionView::default(),
+            holder,
+            portability: SessionPortability::NotPortable,
+            cache_model: None,
+        }
+    }
+
+    #[test]
+    fn p3_concurrent_new_sessions_on_equal_accounts_spread_by_at_most_one() {
+        let pool = PoolState::new();
+        let ids = ["fake:a", "fake:b", "fake:c"];
+        pool.set_accounts(ids.iter().map(|id| account(id)).collect());
+        let now = Utc::now();
+        let doc = AccountPoolDoc::default();
+        let held: Vec<Reservation> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|n| {
+                    let pool = &pool;
+                    let doc = &doc;
+                    scope.spawn(move || {
+                        let (decision, reservation) =
+                            pool.decide_and_reserve(&request(Holder::Run(n)), doc, now);
+                        assert!(matches!(decision, Decision::Use { .. }));
+                        reservation.expect("a Use decision reserves")
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let counts: Vec<u32> = ids
+            .iter()
+            .map(|id| pool.live_sessions(&AccountId((*id).into())))
+            .collect();
+        assert_eq!(counts.iter().sum::<u32>(), 8);
+        assert!(
+            counts.iter().max().unwrap() - counts.iter().min().unwrap() <= 1,
+            "{counts:?}"
+        );
+        drop(held);
+        assert!(ids.iter().all(|id| pool.live_sessions(&AccountId((*id).into())) == 0));
+    }
+
+    #[test]
+    fn only_a_use_decision_reserves_and_other_engines_are_not_considered() {
+        let pool = PoolState::new();
+        let mut other = account("other:1");
+        other.engine = "other".into();
+        pool.set_accounts(vec![other]);
+        let doc = AccountPoolDoc::default();
+        let (decision, reservation) =
+            pool.decide_and_reserve(&request(Holder::Chat("c".into())), &doc, Utc::now());
+        assert_eq!(decision, Decision::Default);
+        assert!(reservation.is_none());
+        let mut paused = account("fake:p");
+        paused.state = crate::accounts::AccountState::Paused;
+        pool.set_accounts(vec![paused]);
+        let (decision, reservation) =
+            pool.decide_and_reserve(&request(Holder::Chat("c".into())), &doc, Utc::now());
+        assert!(matches!(decision, Decision::NoCandidate { .. }));
+        assert!(reservation.is_none());
+    }
+
+    #[test]
+    fn a_limit_error_marks_the_account_out_until_its_reset() {
+        use crate::accounts::adapters::fake::FakeAdapter;
+        use crate::accounts::choose::test_support::usage;
+
+        let pool = PoolState::new();
+        pool.set_accounts(vec![account("fake:a"), account("fake:b")]);
+        let now = Utc::now();
+        pool.set_usage(vec![
+            usage("fake:a", &[("1h", 0.1, 1800)], now),
+            usage("fake:b", &[("1h", 0.5, 1800)], now),
+        ]);
+        let doc = AccountPoolDoc::default();
+        let a = AccountId("fake:a".into());
+        let first = pool.decide_and_reserve(&request(Holder::Run(1)), &doc, now);
+        assert!(matches!(&first.0, Decision::Use { account, .. } if *account == a));
+        drop(first);
+        let adapter = FakeAdapter::new("fake", "fakeco");
+        assert!(pool.note_failure(&adapter, &a, "", "all fine", now).is_none());
+        let hit = pool
+            .note_failure(&adapter, &a, "", "FAKE_LIMIT 1h", now)
+            .expect("a limit error");
+        assert_eq!(hit.window.as_deref(), Some("1h"));
+        let (decision, _held) = pool.decide_and_reserve(&request(Holder::Run(2)), &doc, now);
+        assert!(matches!(&decision, Decision::Use { account, .. } if account.as_str() == "fake:b"));
     }
 
     #[test]
