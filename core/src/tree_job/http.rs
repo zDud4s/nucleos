@@ -662,6 +662,9 @@ async fn post_transition(
     if transition == "launch" {
         return launch(&state, &id, &node, &key, body).await;
     }
+    if transition == "relaunch" {
+        return relaunch(&state, &id, &node, &key, body.prompt.as_deref()).await;
+    }
     if !BRANCH_STATES.contains(&transition.as_str()) && transition != "done" {
         return Err(refuse(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -721,6 +724,31 @@ async fn post_transition(
         .map_err(run_refusal)?;
     Ok(Json(
         json!({ "result": applied.result, "replayed": applied.replayed }),
+    ))
+}
+
+/// The `relaunch` transition: starts again the agent of a fixing or building branch whose node has
+/// no live run, from the node's stored launch (worktree cwd, mode, project), plus the optional
+/// prompt of the owner. Any other branch state is a 409 and starts nothing.
+async fn relaunch(
+    state: &AppState,
+    id: &str,
+    node: &str,
+    key: &str,
+    prompt: Option<&str>,
+) -> Result<Json<Value>, Refusal> {
+    use crate::tree_job::relaunch::{ReviveError, revive_orphan};
+
+    let replayed = stored_result(state, node, "launch", key).await?.is_some();
+    let run_id = revive_orphan(state, id, node, key, prompt)
+        .await
+        .map_err(|error| match error {
+            ReviveError::NotFound(text) => refuse(StatusCode::NOT_FOUND, text),
+            ReviveError::Refused(text) => refuse(StatusCode::CONFLICT, text),
+            ReviveError::Failed(text) => refuse(StatusCode::INTERNAL_SERVER_ERROR, text),
+        })?;
+    Ok(Json(
+        json!({ "result": run_id.to_string(), "replayed": replayed }),
     ))
 }
 
@@ -2872,6 +2900,122 @@ mod tests {
 
         assert_eq!(direct.unwrap(), routed);
         assert_eq!(run_rows(&state.pool).await, 1);
+    }
+
+    // ----- relaunch -----
+
+    fn relaunch_body(key: &str, prompt: Option<&str>) -> Value {
+        json!({ "transition": "relaunch", "key": key, "prompt": prompt })
+    }
+
+    /// The launch the branch was first started with, as `branch_start` stores it.
+    async fn store_base_launch(pool: &SqlitePool) {
+        crate::tree_job::open::save_launch(
+            pool,
+            &crate::tree_job::open::StoredLaunch {
+                node_id: NODE.to_owned(),
+                key: "branch-api".to_owned(),
+                prompt: "the node packet".to_owned(),
+                project_id: None,
+                cwd: None,
+                mode: "shadow".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn stored_prompt(pool: &SqlitePool, key: &str) -> String {
+        sqlx::query_scalar("SELECT prompt FROM tree_launches WHERE node_id = ? AND key = ?")
+            .bind(NODE)
+            .bind(key)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn relaunch_restarts_a_working_branch_from_its_stored_launch() {
+        for working in ["fixing", "building"] {
+            let state = test_state().await;
+            seed_one_branch(&state.pool, working).await;
+            store_base_launch(&state.pool).await;
+
+            let response = post(
+                &app(&state),
+                &transition_uri(JOB, NODE),
+                relaunch_body("revive-1", Some("carry on with the tests")),
+            )
+            .await;
+
+            let run_id = launched_run(&response);
+            assert_eq!(run_rows(&state.pool).await, 1, "{working}");
+            assert_eq!(
+                node_run_id(&state.pool, NODE).await,
+                Some(run_id.to_string())
+            );
+            let prompt = stored_prompt(&state.pool, "revive-1").await;
+            assert!(prompt.starts_with("the node packet"), "{prompt}");
+            assert!(prompt.contains("carry on with the tests"), "{prompt}");
+            assert_eq!(branch_state(&state.pool, JOB, BRANCH).await, working);
+        }
+    }
+
+    #[tokio::test]
+    async fn relaunch_is_idempotent_per_key() {
+        let state = test_state().await;
+        seed_one_branch(&state.pool, "fixing").await;
+        store_base_launch(&state.pool).await;
+        let app = app(&state);
+
+        let first = launched_run(
+            &post(&app, &transition_uri(JOB, NODE), relaunch_body("revive-1", None)).await,
+        );
+        let replay = post(&app, &transition_uri(JOB, NODE), relaunch_body("revive-1", None)).await;
+
+        assert_eq!(launched_run(&replay), first);
+        assert_eq!(replay.1["replayed"], json!(true));
+        assert_eq!(run_rows(&state.pool).await, 1);
+    }
+
+    #[tokio::test]
+    async fn relaunch_refuses_every_other_branch_state_and_creates_no_run() {
+        for refused in [
+            "dropped", "parked", "merged", "queued", "open", "gating", "green", "red",
+            "reviewing",
+        ] {
+            let state = test_state().await;
+            seed_one_branch(&state.pool, refused).await;
+            store_base_launch(&state.pool).await;
+
+            let response = post(
+                &app(&state),
+                &transition_uri(JOB, NODE),
+                relaunch_body("revive-1", None),
+            )
+            .await;
+
+            assert_error(&response, StatusCode::CONFLICT);
+            assert_eq!(run_rows(&state.pool).await, 0, "{refused}");
+            assert_eq!(node_run_id(&state.pool, NODE).await, None, "{refused}");
+            assert_eq!(transition_rows(&state.pool).await, 0, "{refused}");
+        }
+    }
+
+    #[tokio::test]
+    async fn relaunch_without_a_stored_launch_fails_and_creates_no_run() {
+        let state = test_state().await;
+        seed_one_branch(&state.pool, "fixing").await;
+
+        let response = post(
+            &app(&state),
+            &transition_uri(JOB, NODE),
+            relaunch_body("revive-1", None),
+        )
+        .await;
+
+        assert!(response.0.is_server_error(), "{response:?}");
+        assert_eq!(run_rows(&state.pool).await, 0);
     }
 
     // ----- concurrency -----
