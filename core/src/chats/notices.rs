@@ -348,7 +348,8 @@ mod tests {
         assert_eq!(told.len(), 1);
         assert_eq!(told[0].kind, KIND_RESTART);
         assert_eq!(told[0].from_run_id, turn);
-        assert_eq!(told[0].body, RESTART_NOTICE);
+        // Below the resume limit the notice says the turn is resuming (`chats::auto_resume`).
+        assert_eq!(told[0].body, crate::chats::auto_resume::RESUMING_NOTICE);
 
         let notices: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_notices")
             .fetch_one(&pool)

@@ -1,11 +1,12 @@
 import {
   keepPreviousData,
   useMutation,
+  useQueries,
   useQuery,
   useQueryClient,
   type QueryClient,
 } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   anyTurnLive,
   merge,
@@ -17,10 +18,47 @@ import {
   type Turn,
 } from "../lib/turns";
 import { apiFetch, apiText } from "./client";
-import { keys } from "./keys";
+import {
+  chatFetch,
+  chatKey,
+  chatMachineOf,
+  machineKey,
+  mergeChats,
+  rememberChatMachine,
+  useChatLinks,
+  type ChatRow,
+} from "./chatMachines";
+import { keys as baseKeys } from "./keys";
+import { useMachines, type MachineId } from "./machines";
 import { backoffDelay } from "./liveRecords";
 import { streamLiveTurn } from "./liveStream";
 import { POLL, backgroundCadence } from "./poll";
+
+/**
+ * The cache keys of everything scoped to one chat go through the machine that chat lives on
+ * (`withMachine`), so the same id on two machines never shares an entry. For a chat on this
+ * machine the key is the historical one. Shadowing `keys` here makes every use in this file agree.
+ */
+const keys = {
+  ...baseKeys,
+  chats: {
+    ...baseKeys.chats,
+    detail: (chatId: string) => chatKey(baseKeys.chats.detail(chatId), chatId),
+    project: (chatId: string) => chatKey(baseKeys.chats.project(chatId), chatId),
+    tasks: (chatId: string) => chatKey(baseKeys.chats.tasks(chatId), chatId),
+    diff: (chatId: string) => chatKey(baseKeys.chats.diff(chatId), chatId),
+  },
+};
+
+/** Refresh every machine's chat-list cache without sweeping chat detail records. */
+function invalidateChatLists(queryClient: QueryClient): Promise<void> {
+  return Promise.all([
+    queryClient.invalidateQueries({ queryKey: keys.chats.all, exact: true }),
+    queryClient.invalidateQueries({
+      predicate: (query) => query.queryKey.length === 2 && query.queryKey[1] === "chats",
+    }),
+  ]).then(() => undefined);
+}
 
 /**
  * Chats, as hooks: the list, one conversation's transcript, and the seven
@@ -122,6 +160,8 @@ export interface ChatSummary {
    * window wide enough to hold what it inherited.
    */
   context_window: number | null;
+  /** The machine this copy was moved to; a present value makes this origin read-only. */
+  moved_to?: string | null;
   /** Whether the conversation compacts itself past the soft limit. Absent from an older daemon: off. */
   auto_compact?: boolean;
   /** The engine reports no context reading, so it cannot compact itself. Absent from an older daemon: it can. */
@@ -175,6 +215,49 @@ export interface ChatSummary {
   group_id?: number | null;
   /** Set on archived conversations only. */
   archived_at?: string | null;
+}
+
+/** `GET /assistant/chats/{chat_id}/transfer/preview`. */
+export interface ChatTransferPreview {
+  will_stop: string[];
+  left_behind: string[];
+  running: boolean;
+  target_ok: boolean;
+  target_problem: string | null;
+}
+
+/** `POST /assistant/chats/{chat_id}/transfer/begin`. */
+export interface ChatTransferBegun {
+  cut_turn: number | null;
+  queued: number;
+}
+
+/** The allow-listed package sent unchanged from the origin to the destination. */
+export interface ChatTransferPackage {
+  transfer_id: string;
+  chat_id: string;
+  chat: { title: string | null; brain: string; created_at: string; model: string | null; effort: string | null; plan_only: boolean };
+  session: { session_id: string; data: string } | null;
+  code: {
+    project_id: string;
+    commit: string;
+    branch: string | null;
+    bundle: string;
+    diff: string;
+    files: { path: string; data: string }[];
+    left_behind: string[];
+  } | null;
+  queue: { text: string; model_text: string | null; origin: string | null; images: string | null }[];
+  parked: { tool: string; detail: string | null }[];
+  interrupted: boolean;
+}
+
+/** `POST /assistant/chats/import?transfer_id=`. */
+export interface ChatTransferImport {
+  already: boolean;
+  chat_id?: string;
+  cwd?: string | null;
+  queued?: number;
 }
 
 /**
@@ -665,6 +748,105 @@ export function useChats() {
   });
 }
 
+function transferPath(chatId: string, step: "preview" | "begin" | "package" | "finish" | "abort"): string {
+  return `/assistant/chats/${encodeURIComponent(chatId)}/transfer/${step}`;
+}
+
+/** Read what a move would stop and leave behind before anything is frozen. */
+export async function previewChatTransfer(chatId: string, machine: MachineId = chatMachineOf(chatId)): Promise<ChatTransferPreview> {
+  return await apiFetch<ChatTransferPreview>(transferPath(chatId, "preview"), undefined, machine);
+}
+
+/** Freeze the origin, waiting for the live turn or cutting it as chosen. */
+export async function beginChatTransfer(chatId: string, body: { when: "after_turn" | "now"; transfer_id: string }, machine: MachineId = chatMachineOf(chatId)): Promise<ChatTransferBegun> {
+  return await apiFetch<ChatTransferBegun>(transferPath(chatId, "begin"), { method: "POST", body: JSON.stringify(body) }, machine);
+}
+
+/** Get the frozen origin's package without changing any of its JSON fields. */
+export async function packageChatTransfer(chatId: string, transferId: string, machine: MachineId = chatMachineOf(chatId)): Promise<ChatTransferPackage> {
+  return await apiFetch<ChatTransferPackage>(`${transferPath(chatId, "package")}?transfer_id=${encodeURIComponent(transferId)}`, undefined, machine);
+}
+
+/** Import the package exactly as it arrived from the origin. */
+export async function importChatTransfer(transferId: string, packageBody: ChatTransferPackage, machine: MachineId): Promise<ChatTransferImport> {
+  return await apiFetch<ChatTransferImport>(`/assistant/chats/import?transfer_id=${encodeURIComponent(transferId)}`, { method: "POST", body: JSON.stringify(packageBody) }, machine);
+}
+
+/** Mark the destination live after its import has succeeded. */
+export async function finishChatTransfer(chatId: string, body: { transfer_id: string; to: string; to_name?: string }, machine: MachineId = chatMachineOf(chatId)): Promise<void> {
+  await apiFetch<void>(transferPath(chatId, "finish"), { method: "POST", body: JSON.stringify(body) }, machine);
+}
+
+/** Unfreeze an origin after a cancelled or failed move. This route does not require step-up. */
+export async function abortChatTransfer(chatId: string, transferId: string, machine: MachineId = chatMachineOf(chatId)): Promise<void> {
+  await apiFetch<void>(transferPath(chatId, "abort"), { method: "POST", body: JSON.stringify({ transfer_id: transferId }) }, machine);
+}
+
+/**
+ * The list across every machine this device can reach: this machine's own list (unchanged, so every
+ * existing consumer of `useChats` keeps working) merged with each paired machine's. A machine that
+ * does not answer keeps its last rows, marked unreachable, and the others carry on. Also records
+ * which machine each remote chat lives on, so opening one after a reload reaches the right machine.
+ */
+export function useAllChats() {
+  const machines = useMachines();
+  const here = useChats();
+  const others = machines.filter((machine) => machine.id !== "here");
+  const remote = useQueries({
+    queries: others.map((machine) => ({
+      queryKey: machineKey(keys.chats.all, machine.id),
+      queryFn: () => apiFetch<ChatSummary[]>("/assistant/chats", undefined, machine.id),
+      refetchInterval: backgroundCadence(POLL.fast),
+      refetchIntervalInBackground: true,
+      placeholderData: keepPreviousData,
+    })),
+  });
+  const signature = remote
+    .map((result, index) => `${others[index].id}:${result.dataUpdatedAt}:${result.isError}`)
+    .join("|");
+  const named = others.length > 0;
+  const data = useMemo((): ChatRow[] | undefined => {
+    const sources = [
+      { machine: "here", name: "This device", chats: here.data, failed: here.isError },
+      ...others.map((machine, index) => ({
+        machine: machine.id,
+        name: machine.name,
+        chats: remote[index].data,
+        failed: remote[index].isError,
+      })),
+    ].map((source) => (named ? source : { ...source, name: undefined }));
+    if (sources.every((source) => source.chats === undefined)) return undefined;
+    return mergeChats(sources);
+    // `signature` stands for the remote results: the array itself is new on every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [here.data, here.isError, signature, named]);
+  useEffect(() => {
+    others.forEach((machine, index) => {
+      const chats = remote[index].data;
+      if (chats !== undefined)
+        rememberChatMachine(
+          chats.filter((chat) => chat.moved_to == null).map((chat) => chat.chat_id),
+          machine.id,
+        );
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [signature]);
+  // Rows that only point at a copy elsewhere, kept apart from `data` so the lists never draw them.
+  // A chat with a live copy on some machine is not "moved" from the point of view of anyone opening it.
+  const moved = useMemo((): Map<string, string> => {
+    const live = new Set((data ?? []).map((row) => row.chat_id));
+    const pointers = new Map<string, string>();
+    for (const chats of [here.data, ...remote.map((result) => result.data)]) {
+      for (const chat of chats ?? []) {
+        if (chat.moved_to != null && !live.has(chat.chat_id)) pointers.set(chat.chat_id, chat.moved_to);
+      }
+    }
+    return pointers;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [data, here.data, signature]);
+  return { ...here, data, moved };
+}
+
 /**
  * The models a conversation may be moved to.
  *
@@ -679,19 +861,16 @@ export function useAssistantModels(chatId?: string, scope?: "chat") {
   // yet, which carries the agy and Gemini API rows the daemon-wide menu leaves out.
   const newChat = chatId === undefined && scope === "chat";
   return useQuery({
-    queryKey: chatId !== undefined
-      ? keys.chats.modelsFor(chatId)
-      : newChat
-        ? keys.chats.modelsNewChat
-        : keys.chats.models,
+    queryKey:
+      chatId !== undefined
+        ? chatKey(keys.chats.modelsFor(chatId), chatId)
+        : newChat
+          ? keys.chats.modelsNewChat
+          : keys.chats.models,
     queryFn: () =>
-      apiFetch<AssistantModels>(
-        chatId !== undefined
-          ? `/assistant/models?chat=${encodeURIComponent(chatId)}`
-          : newChat
-            ? "/assistant/models?scope=chat"
-            : "/assistant/models",
-      ),
+      chatId !== undefined
+        ? chatFetch<AssistantModels>(chatId, `/assistant/models?chat=${encodeURIComponent(chatId)}`)
+        : apiFetch<AssistantModels>(newChat ? "/assistant/models?scope=chat" : "/assistant/models"),
     staleTime: 60 * 60 * 1000,
   });
 }
@@ -704,11 +883,11 @@ export function useAssistantModels(chatId?: string, scope?: "chat") {
  */
 export function useModelGroups(chatId?: string) {
   return useQuery({
-    queryKey: chatId === undefined ? keys.chats.modelGroups : keys.chats.modelGroupsFor(chatId),
+    queryKey: chatId === undefined ? keys.chats.modelGroups : chatKey(keys.chats.modelGroupsFor(chatId), chatId),
     queryFn: () =>
-      apiFetch<ModelGroups>(
-        `/assistant/models/groups${chatId === undefined ? "" : `?chat=${encodeURIComponent(chatId)}`}`,
-      ),
+      chatId === undefined
+        ? apiFetch<ModelGroups>("/assistant/models/groups")
+        : chatFetch<ModelGroups>(chatId, `/assistant/models/groups?chat=${encodeURIComponent(chatId)}`),
     staleTime: 60 * 60 * 1000,
     retry: false,
   });
@@ -728,11 +907,9 @@ export function useRestoreChat() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (chatId: string) =>
-      apiFetch<void>(`/assistant/chats/${encodeURIComponent(chatId)}/restore`, { method: "POST" }),
+      chatFetch<void>(chatId, `/assistant/chats/${encodeURIComponent(chatId)}/restore`, { method: "POST" }),
     retry: false,
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
-    },
+    onSuccess: () => void invalidateChatLists(queryClient),
   });
 }
 
@@ -787,14 +964,12 @@ export function useSetChatGroup() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (v: { chatId: string; groupId: number | null }) =>
-      apiFetch<void>(`/assistant/chats/${encodeURIComponent(v.chatId)}/group`, {
+      chatFetch<void>(v.chatId, `/assistant/chats/${encodeURIComponent(v.chatId)}/group`, {
         method: "PUT",
         body: JSON.stringify({ group_id: v.groupId }),
       }),
     retry: false,
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
-    },
+    onSuccess: () => void invalidateChatLists(queryClient),
   });
 }
 
@@ -809,12 +984,12 @@ export function useSetChatAutoCompact() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (v: { chatId: string; enabled: boolean }) =>
-      apiFetch<void>(`/assistant/chats/${encodeURIComponent(v.chatId)}/auto-compact`, {
+      chatFetch<void>(v.chatId, `/assistant/chats/${encodeURIComponent(v.chatId)}/auto-compact`, {
         method: "PUT",
         body: JSON.stringify({ enabled: v.enabled }),
       }),
     retry: false,
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: keys.chats.all, exact: true }),
+    onSuccess: () => invalidateChatLists(queryClient),
   });
 }
 
@@ -870,6 +1045,8 @@ export const CHAT_OPEN_HEADER = "X-Nucleos-Chat-Open";
  * conversation so it keeps the conversation's process warm.
  */
 export function useChatTranscript(chatId: string | null) {
+  // Re-render when the chat's machine becomes known (a chat opened by URL, before the list arrives).
+  useChatLinks();
   const queryKey = keys.chats.detail(chatId ?? "");
   return useQuery({
     queryKey,
@@ -882,7 +1059,8 @@ export function useChatTranscript(chatId: string | null) {
       let incremental =
         watermark !== null && !invalidated && Date.now() - lastFull < TRANSCRIPT_FULL_READ_MS;
       const open = { headers: { [CHAT_OPEN_HEADER]: "1" } };
-      const first = await apiFetch<TranscriptRead | undefined>(
+      const first = await chatFetch<TranscriptRead | undefined>(
+        chatId ?? "",
         incremental ? `${path}?after=${watermark}` : path,
         open,
       );
@@ -894,7 +1072,7 @@ export function useChatTranscript(chatId: string | null) {
         // throwing on it would leave the page on its last read until the next full one, and a
         // turn that landed meanwhile would not be drawn.
         incremental = false;
-        read = await apiFetch<TranscriptRead>(path, open);
+        read = await chatFetch<TranscriptRead>(chatId ?? "", path, open);
       } else {
         read = first as TranscriptRead;
       }
@@ -976,7 +1154,8 @@ export function useOlderTurns(chatId: string) {
       // Nothing held means nothing to be above. The button is not drawn in that state either;
       // this is the guard that makes that a fact rather than a convention.
       if (oldest === undefined) return { turns: [] as Turn[], more: false };
-      const read = await apiFetch<{ turns: AssistantTurnRow[]; more?: boolean }>(
+      const read = await chatFetch<{ turns: AssistantTurnRow[]; more?: boolean }>(
+        chatId,
         `/assistant/chats/${encodeURIComponent(chatId)}?before=${oldest}`,
       );
       return { turns: read.turns.map(turnFromRow), more: read.more ?? false };
@@ -1002,10 +1181,15 @@ export function useOlderTurns(chatId: string) {
  * Never polled and never stale. A settled turn's tool answers are a record of something that has
  * already happened; there is no version of them that arrives later.
  */
-export function useTurnTools(turnId: number, enabled: boolean) {
+export function useTurnTools(turnId: number, enabled: boolean, chatId?: string) {
+  useChatLinks();
   return useQuery({
-    queryKey: keys.chats.turnTools(turnId),
-    queryFn: () => apiFetch<{ did: ToolCall[] }>(`/assistant/turns/${turnId}/tools`),
+    // Turn ids are small integers per machine, so a remote chat's turn is keyed and fetched on its own machine.
+    queryKey: chatId === undefined ? keys.chats.turnTools(turnId) : chatKey(keys.chats.turnTools(turnId), chatId),
+    queryFn: () =>
+      chatId === undefined
+        ? apiFetch<{ did: ToolCall[] }>(`/assistant/turns/${turnId}/tools`)
+        : chatFetch<{ did: ToolCall[] }>(chatId, `/assistant/turns/${turnId}/tools`),
     enabled,
     staleTime: Infinity,
   });
@@ -1234,7 +1418,8 @@ export function useRelayChain(chatId: string, turnId: number, enabled: boolean) 
   return useQuery({
     queryKey: keys.chats.relayChain(chatId, turnId),
     queryFn: () =>
-      apiFetch<{ chain: ChainStep[] }>(
+      chatFetch<{ chain: ChainStep[] }>(
+        chatId,
         `/assistant/chats/${encodeURIComponent(chatId)}/turns/${turnId}/chain`,
       ),
     enabled,
@@ -1269,14 +1454,15 @@ export function useForwardTurn() {
       fromTurnId: number;
       text: string;
     }) =>
-      apiFetch<{ turn_id?: number; queued?: boolean }>(
+      chatFetch<{ turn_id?: number; queued?: boolean }>(
+        toChatId,
         `/assistant/chats/${encodeURIComponent(toChatId)}/forward`,
         { method: "POST", body: JSON.stringify({ from_turn_id: fromTurnId, text }) },
       ),
     retry: false,
     onSuccess: (_result, { toChatId }) => {
       void queryClient.invalidateQueries({ queryKey: keys.chats.detail(toChatId) });
-      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
+      void invalidateChatLists(queryClient);
     },
   });
 }
@@ -1285,7 +1471,7 @@ export function useChatProject(chatId: string) {
   return useQuery({
     queryKey: keys.chats.project(chatId),
     queryFn: () =>
-      apiFetch<ChatProject>(`/assistant/chats/${encodeURIComponent(chatId)}/project`),
+      chatFetch<ChatProject>(chatId, `/assistant/chats/${encodeURIComponent(chatId)}/project`),
   });
 }
 
@@ -1312,7 +1498,8 @@ export function useChatTasks(chatId: string, enabled: boolean, live: boolean) {
   return useQuery({
     queryKey: keys.chats.tasks(chatId),
     queryFn: async () =>
-      (await apiFetch<ChatTask[] | undefined>(`/assistant/chats/${encodeURIComponent(chatId)}/tasks`)) ?? [],
+      (await chatFetch<ChatTask[] | undefined>(chatId, `/assistant/chats/${encodeURIComponent(chatId)}/tasks`)) ??
+      [],
     enabled,
     refetchInterval: (query) =>
       live || (query.state.data ?? []).some((t) => t.status === "running") ? POLL.fast : false,
@@ -1358,7 +1545,11 @@ export function useIdeConversation(sessionId: string | null, watch = false) {
 export function useChatDiff(chatId: string, enabled: boolean) {
   return useQuery({
     queryKey: keys.chats.diff(chatId),
-    queryFn: () => apiText(`/assistant/chats/${encodeURIComponent(chatId)}/diff`),
+    queryFn: () => {
+      const path = `/assistant/chats/${encodeURIComponent(chatId)}/diff`;
+      const machine = chatMachineOf(chatId);
+      return machine === "here" ? apiText(path) : apiText(path, undefined, machine);
+    },
     enabled,
     staleTime: 0,
   });
@@ -1383,7 +1574,7 @@ export function useSendMessage(chatId: string) {
       // window would rather their words were kept than be told no and handed back an empty box —
       // a channel sidecar, which gives up on a turn after a timeout, would rather be refused,
       // and so it does not ask.
-      apiFetch<{ turn_id?: number; queued?: boolean }>("/assistant/message", {
+      chatFetch<{ turn_id?: number; queued?: boolean }>(chatId, "/assistant/message", {
         method: "POST",
         body: JSON.stringify({ chat_id: chatId, text, images, wait_if_busy: true }),
       }),
@@ -1432,7 +1623,7 @@ export function useSendMessage(chatId: string) {
 
 /** Run a slash command in a conversation: the daemon parses `text` and answers with a card, a prompt or a control. */
 export function postChatCommand(chatId: string, text: string): Promise<CommandResult> {
-  return apiFetch<CommandResult>(`/assistant/chats/${encodeURIComponent(chatId)}/command`, {
+  return chatFetch<CommandResult>(chatId, `/assistant/chats/${encodeURIComponent(chatId)}/command`, {
     method: "POST",
     body: JSON.stringify({ text }),
   });
@@ -1567,6 +1758,8 @@ function refreshTail(queryClient: QueryClient, chatId: string): void {
     predicate: (query) =>
       !(query.queryKey[1] === detail[1] && query.queryKey[2] === detail[2]),
   });
+  // The other machines' lists sit under a machine-scoped key outside that prefix.
+  void invalidateChatLists(queryClient);
 }
 
 /**
@@ -1595,7 +1788,10 @@ export function useStartConversation() {
       images,
       continueSession,
       holdFirstMessage,
+      machine = "here",
     }: {
+      /** Where the conversation runs. It is linked to that machine before anything else is sent. */
+      machine?: MachineId;
       model?: string;
       effort?: string;
       text: string;
@@ -1632,7 +1828,7 @@ export function useStartConversation() {
       // There is no conversation to PATCH until this returns, and correcting one a
       // round trip later is visible — and wrong if the second call fails. It also
       // carries the brain, which the daemon derives from the choice.
-      const opened = await apiFetch<{ chat_id: string }>("/assistant/chats", {
+      const opening = {
         method: "POST",
         body: JSON.stringify({
           model,
@@ -1640,9 +1836,16 @@ export function useStartConversation() {
           permission_mode: permissionMode,
           continue_session: continueSession,
         }),
-      });
+      };
+      const opened =
+        machine === "here"
+          ? await apiFetch<{ chat_id: string }>("/assistant/chats", opening)
+          : await apiFetch<{ chat_id: string }>("/assistant/chats", opening, machine);
+      // Linked before the first message and before the caller navigates: everything after this
+      // reads the link, so the words cannot be sent to a different machine than the chat is on.
+      rememberChatMachine([opened.chat_id], machine);
       if (holdFirstMessage === true) return opened;
-      await apiFetch<{ turn_id?: number; queued?: boolean }>("/assistant/message", {
+      await chatFetch<{ turn_id?: number; queued?: boolean }>(opened.chat_id, "/assistant/message", {
         method: "POST",
         body: JSON.stringify({
           chat_id: opened.chat_id,
@@ -1654,8 +1857,11 @@ export function useStartConversation() {
       return opened;
     },
     retry: false,
-    onSuccess: () => {
+    onSuccess: (_opened, variables) => {
       void queryClient.invalidateQueries({ queryKey: keys.chats.all });
+      if (variables.machine !== undefined && variables.machine !== "here") {
+        void queryClient.invalidateQueries({ queryKey: machineKey(keys.chats.all, variables.machine) });
+      }
     },
   });
 }
@@ -1665,6 +1871,11 @@ export function useStartConversation() {
    opens a conversation that way any more. Both doors work the same: you say something, and saying
    it is what opens one. `useStartConversation` is that, and its `continueSession` is the only part
    of this that survived. */
+
+/** A turn's live record, scoped to its chat's machine: turn ids repeat across machines. */
+export function liveTurnKey(turnId: number, chatId?: string) {
+  return chatId === undefined ? keys.chats.live(turnId) : chatKey(keys.chats.live(turnId), chatId);
+}
 
 /**
  * A turn while it is still being written.
@@ -1690,6 +1901,8 @@ export function useLiveTurn(
   const queryClient = useQueryClient();
   const wantStream = options.stream === true && alive;
   const chatId = options.chatId;
+  useChatLinks();
+  const liveKey = liveTurnKey(turnId, chatId);
   const [mode, setMode] = useState<"stream" | "poll">("stream");
 
   useEffect(() => {
@@ -1703,7 +1916,9 @@ export function useLiveTurn(
       for (let attempt = 0; !signal.aborted; attempt += 1) {
         const outcome = await streamLiveTurn(turnId, {
           signal,
-          onLive: (live) => queryClient.setQueryData(keys.chats.live(turnId), live),
+          onLive: (live) => queryClient.setQueryData(liveTurnKey(turnId, chatId), live),
+          // Read at each attempt: the stream must follow the chat's machine, never this one's.
+          ...(chatId === undefined ? {} : { machine: chatMachineOf(chatId) }),
         });
         if (signal.aborted) return;
         if (outcome === "ended") {
@@ -1729,8 +1944,11 @@ export function useLiveTurn(
   }, [turnId, wantStream, queryClient, chatId]);
 
   return useQuery({
-    queryKey: keys.chats.live(turnId),
-    queryFn: () => apiFetch<LiveTurn | undefined>(`/assistant/${turnId}/live`),
+    queryKey: liveKey,
+    queryFn: () =>
+      chatId === undefined
+        ? apiFetch<LiveTurn | undefined>(`/assistant/${turnId}/live`)
+        : chatFetch<LiveTurn | undefined>(chatId, `/assistant/${turnId}/live`),
     enabled: alive && (!wantStream || mode === "poll"),
     refetchInterval: POLL.turn,
   });
@@ -1742,9 +1960,10 @@ export function useLiveTurn(
  * For a reader that only wants to show what `useLiveTurn` (mounted elsewhere) has already written —
  * `enabled: false` means no fetch and no poll, so a second observer costs nothing.
  */
-export function useLiveTurnSnapshot(turnId: number): LiveTurn | undefined {
+export function useLiveTurnSnapshot(turnId: number, chatId?: string): LiveTurn | undefined {
+  useChatLinks();
   return useQuery({
-    queryKey: keys.chats.live(turnId),
+    queryKey: liveTurnKey(turnId, chatId),
     queryFn: () => apiFetch<LiveTurn | undefined>(`/assistant/${turnId}/live`),
     enabled: false,
   }).data;
@@ -1764,7 +1983,8 @@ export function useChatFiles(chatId: string, query: string | null) {
   return useQuery({
     queryKey: keys.chats.files(chatId, query ?? ""),
     queryFn: () =>
-      apiFetch<Mentions>(
+      chatFetch<Mentions>(
+        chatId,
         `/assistant/chats/${encodeURIComponent(chatId)}/files?q=${encodeURIComponent(query ?? "")}`,
       ),
     enabled: query !== null,
@@ -1808,7 +2028,8 @@ export function useChatCommands(chatId: string, query: string | null) {
   return useQuery({
     queryKey: keys.chats.commands(chatId, query ?? ""),
     queryFn: () =>
-      apiFetch<{ commands: Command[] }>(
+      chatFetch<{ commands: Command[] }>(
+        chatId,
         `/assistant/chats/${encodeURIComponent(chatId)}/commands?q=${encodeURIComponent(query ?? "")}`,
       ),
     enabled: query !== null,
@@ -1832,7 +2053,8 @@ export function useDropQueued(chatId: string) {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (queuedId: number) =>
-      apiFetch<void>(
+      chatFetch<void>(
+        chatId,
         `/assistant/chats/${encodeURIComponent(chatId)}/queue/${queuedId}`,
         { method: "DELETE" },
       ),
@@ -1855,7 +2077,7 @@ export function useSetChatProject(chatId: string) {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (cwd: string) =>
-      apiFetch<void>(`/assistant/chats/${encodeURIComponent(chatId)}`, {
+      chatFetch<void>(chatId, `/assistant/chats/${encodeURIComponent(chatId)}`, {
         method: "PATCH",
         body: JSON.stringify({ cwd }),
       }),
@@ -1882,7 +2104,7 @@ export function useSetPermissionMode(chatId: string) {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (mode: PermissionMode) =>
-      apiFetch<void>(`/assistant/chats/${encodeURIComponent(chatId)}`, {
+      chatFetch<void>(chatId, `/assistant/chats/${encodeURIComponent(chatId)}`, {
         method: "PATCH",
         body: JSON.stringify({ permission_mode: mode }),
       }),
@@ -1920,7 +2142,7 @@ export function useWireChatTools(chatId: string) {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: () =>
-      apiFetch<void>(`/assistant/chats/${encodeURIComponent(chatId)}/tools`, { method: "POST" }),
+      chatFetch<void>(chatId, `/assistant/chats/${encodeURIComponent(chatId)}/tools`, { method: "POST" }),
     retry: false,
     onSettled: () => {
       void queryClient.invalidateQueries({ queryKey: keys.chats.project(chatId) });
@@ -1938,7 +2160,7 @@ export function useSeedChatWorkflow(chatId: string) {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: () =>
-      apiFetch<void>(`/assistant/chats/${encodeURIComponent(chatId)}/workflow`, {
+      chatFetch<void>(chatId, `/assistant/chats/${encodeURIComponent(chatId)}/workflow`, {
         method: "POST",
         body: JSON.stringify({ confirm: true }),
       }),
@@ -1952,8 +2174,8 @@ export function useSeedChatWorkflow(chatId: string) {
 /**
  * Say whether a held tool call may go ahead.
  *
- * There is a turn waiting on this answer, and a window of about forty-five
- * seconds before the daemon refuses on its own — so the transcript is
+ * There is a turn waiting on this answer, which stands as long as its CLI lives
+ * and is refused by the daemon only when that window closes — so the transcript is
  * invalidated at once rather than on the next poll, and a 404 (the question
  * timed out, or the turn moved on) is not worth showing: the refetch that
  * follows says so by the question no longer being there.
@@ -1962,7 +2184,7 @@ export function useAnswerAsk(chatId: string) {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: ({ id, allow }: { id: string; allow: boolean }) =>
-      apiFetch<void>(`/assistant/asks/${encodeURIComponent(id)}`, {
+      chatFetch<void>(chatId, `/assistant/asks/${encodeURIComponent(id)}`, {
         method: "POST",
         body: JSON.stringify({ allow }),
       }),
@@ -1993,7 +2215,8 @@ export function useStopTask(chatId: string) {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (taskId: string) =>
-      apiFetch<{ stopped: string }>(
+      chatFetch<{ stopped: string }>(
+        chatId,
         `/assistant/chats/${encodeURIComponent(chatId)}/tasks/${encodeURIComponent(taskId)}/stop`,
         { method: "POST" },
       ),
@@ -2009,7 +2232,7 @@ export function useStopTurn(chatId: string) {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (turnId: number) =>
-      apiFetch<{ stopped: string }>(`/assistant/turns/${turnId}/stop`, { method: "POST" }),
+      chatFetch<{ stopped: string }>(chatId, `/assistant/turns/${turnId}/stop`, { method: "POST" }),
     retry: false,
     onSettled: () => refreshTail(queryClient, chatId),
   });
@@ -2025,7 +2248,13 @@ export function useStopTurn(chatId: string) {
 export function useKillTurn(chatId: string) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (turnId: number) => apiText(`/runs/${turnId}/cancel`, { method: "POST" }),
+    mutationFn: (turnId: number) => {
+      const machine = chatMachineOf(chatId);
+      const init = { method: "POST" };
+      return machine === "here"
+        ? apiText(`/runs/${turnId}/cancel`, init)
+        : apiText(`/runs/${turnId}/cancel`, init, machine);
+    },
     retry: false,
     onSettled: () => refreshTail(queryClient, chatId),
   });
@@ -2042,7 +2271,8 @@ export function useSayNow(chatId: string) {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (text: string) =>
-      apiFetch<{ said_now?: boolean; turn_id?: number; queued?: boolean }>(
+      chatFetch<{ said_now?: boolean; turn_id?: number; queued?: boolean }>(
+        chatId,
         `/assistant/chats/${encodeURIComponent(chatId)}/say-now`,
         { method: "POST", body: JSON.stringify({ text }) },
       ),
@@ -2101,7 +2331,7 @@ export function usePatchChat() {
       system_prompt,
       denied_tools,
     }: ChatPatch) =>
-      apiFetch<void>(`/assistant/chats/${encodeURIComponent(chatId)}`, {
+      chatFetch<void>(chatId, `/assistant/chats/${encodeURIComponent(chatId)}`, {
         method: "PATCH",
         // `undefined` fields are dropped here and `null` fields are kept, which is
         // exactly the difference the daemon reads: absent leaves a value alone,
@@ -2149,7 +2379,7 @@ export function usePatchChat() {
       for (const [key, data] of context?.snapshot ?? []) queryClient.setQueryData(key, data);
     },
     onSuccess: (_data, variables) => {
-      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
+      void invalidateChatLists(queryClient);
       void queryClient.invalidateQueries({ queryKey: keys.chats.detail(variables.chatId) });
     },
   });
@@ -2164,10 +2394,10 @@ export function usePostChatTitle() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (chatId: string) =>
-      apiFetch<void>(`/assistant/chats/${encodeURIComponent(chatId)}/title`, { method: "POST" }),
+      chatFetch<void>(chatId, `/assistant/chats/${encodeURIComponent(chatId)}/title`, { method: "POST" }),
     retry: false,
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
+      void invalidateChatLists(queryClient);
     },
   });
 }
@@ -2181,10 +2411,10 @@ export function usePostChatSeen() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (chatId: string) =>
-      apiFetch<void>(`/assistant/chats/${encodeURIComponent(chatId)}/seen`, { method: "POST" }),
+      chatFetch<void>(chatId, `/assistant/chats/${encodeURIComponent(chatId)}/seen`, { method: "POST" }),
     retry: false,
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
+      void invalidateChatLists(queryClient);
     },
   });
 }
@@ -2217,12 +2447,12 @@ export function useFreshContext() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (chatId: string) =>
-      apiFetch<void>(`/assistant/chats/${encodeURIComponent(chatId)}/fresh-context`, {
+      chatFetch<void>(chatId, `/assistant/chats/${encodeURIComponent(chatId)}/fresh-context`, {
         method: "POST",
       }),
     retry: false,
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
+      void invalidateChatLists(queryClient);
     },
   });
 }
@@ -2237,7 +2467,7 @@ export function useClearContext() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (chatId: string) =>
-      apiFetch<void>(`/assistant/chats/${encodeURIComponent(chatId)}/clear`, { method: "POST" }),
+      chatFetch<void>(chatId, `/assistant/chats/${encodeURIComponent(chatId)}/clear`, { method: "POST" }),
     retry: false,
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: keys.chats.all });
@@ -2254,10 +2484,10 @@ export function useArchiveChat() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (chatId: string) =>
-      apiFetch<void>(`/assistant/chats/${encodeURIComponent(chatId)}`, { method: "DELETE" }),
+      chatFetch<void>(chatId, `/assistant/chats/${encodeURIComponent(chatId)}`, { method: "DELETE" }),
     retry: false,
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
+      void invalidateChatLists(queryClient);
     },
   });
 }

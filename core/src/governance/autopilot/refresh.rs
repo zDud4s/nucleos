@@ -4,7 +4,10 @@
 
 use std::path::Path;
 
-use super::{HOOK_SCRIPT, classifier_hook_is_wired, wire_classifier_hook_keeping_script};
+use super::{
+    HOOK_SCRIPT, HOOK_SOURCE, classifier_hook_is_wired, wire_classifier_hook,
+    wire_classifier_hook_keeping_script,
+};
 
 /// Re-wires `dir` if its own `settings.json` already names this daemon's hook, and says whether it
 /// did. Never the door that first wires a project: that stays somebody's decision, as does a project
@@ -18,6 +21,58 @@ pub fn refresh_wired_hooks(dir: &Path) -> Result<bool, String> {
     }
     wire_classifier_hook_keeping_script(dir)?;
     Ok(true)
+}
+
+/// Brings every project this daemon has wired up to the current hook: the script and the timeouts.
+///
+/// Run at boot. A project wired before a change keeps its old script and its old `timeout` until
+/// something rewrites them, and a project nobody opens again would keep a hook the CLI cuts off at
+/// an hour while the daemon waits a month. Only projects `classifier_hook_is_wired` already
+/// recognises are touched, so a project that never had the hook, or switched hooks off, gains
+/// nothing. Returns how many were rewritten; one that cannot be is logged and skipped.
+pub async fn rewire_wired_projects(pool: &sqlx::SqlitePool) -> sqlx::Result<usize> {
+    let roots = sqlx::query_scalar::<_, String>(
+        "SELECT project_root FROM autopilot_state WHERE project_root IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+    let rewired = tokio::task::spawn_blocking(move || {
+        let mut rewired = 0;
+        for root in roots {
+            let dir = Path::new(&root);
+            let behind =
+                classifier_hook_timeout_is_short(dir) || classifier_hook_script_is_stale(dir);
+            if !classifier_hook_is_wired(dir) || !behind {
+                continue;
+            }
+            match wire_classifier_hook(dir) {
+                Ok(()) => rewired += 1,
+                Err(error) => tracing::warn!("could not rewire the hook in {root}: {error}"),
+            }
+        }
+        rewired
+    })
+    .await
+    .unwrap_or(0);
+    Ok(rewired)
+}
+
+/// Whether `dir` was wired before the current hook timeout, so it needs wiring again. A settings
+/// file this cannot read counts as no: `wire_hook` would refuse it anyway. Asking first is what
+/// keeps a current folder untouched: rewriting the script while a hook of another conversation is
+/// reading it would break that hook, and a project tracking these files would show a diff.
+pub fn classifier_hook_timeout_is_short(dir: &Path) -> bool {
+    std::fs::read_to_string(dir.join(".claude").join("settings.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .is_some_and(|settings| super::hook_timeout::a_timeout_is_short(&settings))
+}
+
+/// Whether the script in `dir` is not the one this daemon ships. Only boot asks this, when no CLI
+/// of this daemon is reading the script; a turn asks only about the timeout, since a worktree may
+/// check out a copy of its own and that would be rewritten on every turn.
+fn classifier_hook_script_is_stale(dir: &Path) -> bool {
+    std::fs::read_to_string(dir.join(HOOK_SCRIPT)).map_or(true, |script| script != HOOK_SOURCE)
 }
 
 #[cfg(test)]
