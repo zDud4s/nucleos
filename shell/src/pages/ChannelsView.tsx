@@ -7,7 +7,7 @@ import "./channels.css";
 
 /** One sentence per routing problem; `ok` has none, so nothing is drawn for it. */
 const ROUTING: Record<Exclude<RoutingState, "ok">, string> = {
-  no_primary: "There is no primary channel: notifications have nowhere to be sent by default.",
+  no_primary: "There is no primary channel: notifications have nowhere to be sent by default, so a parked question or a long turn shows only in the app.",
   primary_not_configured: "The primary channel is not configured yet: finish its setup first.",
   primary_without_home: "The primary channel has no home conversation: pair it or pick a home.",
 };

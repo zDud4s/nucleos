@@ -15,7 +15,7 @@ import { ConversationChord } from "./ConversationChord";
 import { DesktopNotifier } from "./DesktopNotifier";
 import { OverlayProvider } from "../ui/overlay";
 import { GlobalSearch } from "./GlobalSearch";
-import { DictationProvider } from "./Dictation";
+import { DictationProvider, PageDictationShortcuts } from "./Dictation";
 import { KillSwitchControl } from "./KillSwitchControl";
 import { NotificationsDrawer } from "./NotificationsDrawer";
 import { OwnerDecisionsInbox } from "./OwnerDecisionsInbox";
@@ -112,6 +112,7 @@ function Frame() {
         <DesktopNotifier />
         <BrowserBridge />
         <ConversationChord />
+        <PageDictationShortcuts />
         <Destinations />
         <GlobalSearch />
         <Sidebar

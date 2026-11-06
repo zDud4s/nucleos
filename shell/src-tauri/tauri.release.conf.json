@@ -1,6 +1,12 @@
 {
+  "build": {
+    "beforeBuildCommand": "npm run build && npm run build:remote"
+  },
   "bundle": {
     "createUpdaterArtifacts": true,
+    "resources": {
+      "../dist-remote": "dist-remote"
+    },
     "externalBin": [
       "binaries/nucleos-core",
       "binaries/browser-sidecar",

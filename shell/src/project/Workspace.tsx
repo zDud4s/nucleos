@@ -5,7 +5,7 @@ import { AnalyticsView } from "../analytics/AnalyticsView";
 import { useConcurrency } from "../data/fleet";
 import { useProjects } from "../data/system";
 import { useProjectWorkflows } from "../data/workflows";
-import { openInVscode } from "../lib/vscode";
+import { editorRemoteNote, openInVscode } from "../lib/vscode";
 import { Button, Count, CopyButton, ErrorNote, PageHeader, QuietTips, StateBadge, Tip } from "../ui";
 import {
   DropdownMenu,
@@ -403,7 +403,9 @@ export function Workspace() {
       />
 
       {editorFailed ? (
-        <ErrorNote>Could not open VS Code: nothing on this machine answers vscode://.</ErrorNote>
+        <ErrorNote>
+          {editorRemoteNote() ?? "Could not open VS Code: nothing on this machine answers vscode://."}
+        </ErrorNote>
       ) : null}
 
       {projects.isError && projects.data === undefined ? (

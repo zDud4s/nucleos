@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "`~/.nucleos/keep_awake.yaml`: whether the machine is kept from idle-sleeping while a run is live.",
+  "properties": {
+    "keep_awake_while_working": {
+      "default": true,
+      "description": "On by default. Only the automatic idle sleep is held off; closing the lid still obeys the\nsystem.",
+      "type": "boolean"
+    }
+  },
+  "title": "KeepAwakeConfig",
+  "type": "object"
+}

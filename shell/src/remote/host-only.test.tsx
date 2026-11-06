@@ -20,7 +20,7 @@ import { DictationProvider, useDictation } from "../app/Dictation";
 import { findUpdate } from "../data/updater";
 import { openFile } from "../data/files";
 import { desktopTransport, setTransport } from "../data/transport";
-import { openInVscode } from "../lib/vscode";
+import { editorAvailable, editorRemoteNote, openInVscode } from "../lib/vscode";
 import { isHostOnlyError, isRemote } from "./host";
 import { remoteTransport } from "./transport";
 import { UnavailableRemotely } from "./UnavailableRemotely";
@@ -51,8 +51,9 @@ describe("host-only features, remotely", () => {
     expect(isHostOnlyError(new Error("x"))).toBe(false);
   });
 
-  it("dictation, folder dialog, updater and open-in-VS-Code are inert when remote", async () => {
-    // Dictation: pressing the button reaches no host command and records no outcome.
+  it("dictation (needs a microphone API), folder dialog, updater and open-in-VS-Code do not reach the host when remote", async () => {
+    // Dictation: pressing the button reaches no host command; with no microphone API (jsdom, like a
+    // plain-HTTP page) it says why instead of staying silent.
     let press: ((memo: boolean) => Promise<void>) | undefined;
     let outcome: unknown = "unset";
     function Probe() {
@@ -66,21 +67,34 @@ describe("host-only features, remotely", () => {
         <Probe />
       </DictationProvider>,
     );
-    invoke.mockClear();
     await act(async () => {
       await press!(false);
     });
-    expect(invoke).not.toHaveBeenCalledWith("voice_hotkey", expect.anything());
-    expect(outcome).toBeNull();
+    expect(invoke).not.toHaveBeenCalled();
+    expect(outcome).toEqual({ kind: "mic-error", reason: "unsupported" });
 
     // Updater: nothing offered, nothing asked of the host.
     await expect(findUpdate()).resolves.toBeNull();
 
-    // Open on disk (the native file/folder surface): an explicit message, never a host call.
-    await expect(openFile("a/b.txt")).rejects.toThrow("only available on the host machine");
+    // Open on disk downloads remotely (see adapters.test.ts); a program is still never opened.
+    await expect(openFile("a/run.exe")).rejects.toThrow("a program is never run");
 
-    // VS Code: resolves without opening anything.
-    await expect(openInVscode("/home/x/a.rs", 3)).resolves.toBeUndefined();
+    // VS Code: says it cannot, and opens nothing.
+    await expect(openInVscode("/home/x/a.rs", 3)).rejects.toThrow("main machine only");
     expect(openUrl).not.toHaveBeenCalled();
+  });
+
+  it("open_in_vscode_says_it_cannot_from_the_browser", async () => {
+    const error = await openInVscode("/home/x/a.rs", null).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(isHostOnlyError(error)).toBe(true);
+    expect((error as Error).message).toBe("VS Code opens on the main machine only, not from this browser.");
+    expect(editorAvailable()).toBe(false);
+    expect(editorRemoteNote()).toBe((error as Error).message);
+    setTransport(desktopTransport);
+    expect(editorAvailable()).toBe(true);
+    expect(editorRemoteNote()).toBeNull();
   });
 });
