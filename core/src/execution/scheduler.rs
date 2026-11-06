@@ -340,14 +340,17 @@ pub async fn scheduler_tick(state: &AppState, now: DateTime<Utc>) {
     match crate::quota::permits_new_run(state, now).await {
         crate::governance::budget::BudgetDecision::Pause { reason, source, .. } => {
             if source == crate::quota::PAUSE_SOURCE {
-                let _ = sqlx::query(
+                if let Err(error) = sqlx::query(
                     "UPDATE autopilot_global
                      SET quota_hold_started_at = ?, quota_hold_ended_at = NULL
                      WHERE quota_hold_started_at IS NULL OR quota_hold_ended_at IS NOT NULL",
                 )
                 .bind(now.to_rfc3339())
                 .execute(&state.pool)
-                .await;
+                .await
+                {
+                    tracing::warn!(%error, "could not record the start of the quota hold");
+                }
                 tracing::info!(reason = %reason, "quota exhausted; scheduler paused this tick");
             } else {
                 tracing::info!(reason = %reason, "budget exhausted; scheduler paused this tick");
@@ -355,13 +358,16 @@ pub async fn scheduler_tick(state: &AppState, now: DateTime<Utc>) {
             return;
         }
         crate::governance::budget::BudgetDecision::Allow => {
-            let _ = sqlx::query(
+            if let Err(error) = sqlx::query(
                 "UPDATE autopilot_global SET quota_hold_ended_at = ?
                  WHERE quota_hold_started_at IS NOT NULL AND quota_hold_ended_at IS NULL",
             )
             .bind(now.to_rfc3339())
             .execute(&state.pool)
-            .await;
+            .await
+            {
+                tracing::warn!(%error, "could not record the end of the quota hold");
+            }
         }
     }
 
