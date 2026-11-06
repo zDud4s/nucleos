@@ -322,6 +322,7 @@ the contract, not a snapshot.
 | `tree_job/branch_start.rs` | `POST /trees/{id}/branch_start`, the whole start of one branch in a single idempotent call for the `tree_branch_start` tool: add, open, node, bind, launch. |
 | `tree_job/driver.rs` | The tree-job driver tick: advances every unfinished job one step per pass (gate a reported branch, fix a red one, queue or settle a merge, close finished nodes, land). |
 | `tree_job/root.rs` | The root node of a tree job: its worktree on `tree/<id>/root`, and the run that plans the job. |
+| `tree_job/root_disk.rs` | What the root start does with a refusal the disk alone caused: parse the figures out of the error, retry, and after `DISK_START_CAP` refusals ask the owner once with the GB needed. No database. |
 | `tree_job/wrap.rs` | Wrapping up a node run that already reported, and starting a branch node again when its run ended with a handoff or died without a report. |
 | `tree_job/decisions.rs` | Parking a branch on a decision for the owner (`park`), resuming it on the answer (`answer`, which only moves state: call `open::answer_and_relaunch` to also start the node again), and the single list of decisions. Both hold the job lock. |
 | `tree_job/gate.rs` | The production gate of a tree branch: at most one verify ticket per branch and HEAD, remembered on the branch and read or awaited by the next gate instead of submitting again. |
