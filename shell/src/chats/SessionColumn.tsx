@@ -26,14 +26,13 @@ import {
 import {
   useArchiveChat,
   useArchivedChats,
-  useChatGroups,
+  useAllChatGroups,
   useCreateChatGroup,
   useDeleteChatGroup,
   useIdeSessions,
   useRenameChatGroup,
   useRestoreChat,
   useSetChatGroup,
-  type ChatGroup,
   type ChatSummary,
   type IdeSession,
 } from "../data/chats";
@@ -49,12 +48,11 @@ import {
   useUndoToast,
 } from "../ui";
 import { stillGoing } from "../lib/editor";
-import type { ChatRow } from "../data/chatMachines";
+import { byMergedGroup, groupOfRow, type ChatRow, type MergedGroup } from "../data/chatMachines";
 import { MachineTag } from "./MachinePicker";
 import { BAND_TITLE, inBands } from "../lib/when";
 import {
   applyFilters,
-  byGroup,
   countSessions,
   dotFor,
   type Dot,
@@ -196,8 +194,8 @@ export function SessionColumn({
 }: SessionColumnProps) {
   // Watched, because one of these may be being typed into in the editor while it is on screen here.
   const sessions = useIdeSessions(true, true);
-  const groupsQuery = useChatGroups();
-  const groups: ChatGroup[] = Array.isArray(groupsQuery.data) ? groupsQuery.data : [];
+  const groupsQuery = useAllChatGroups();
+  const groups: MergedGroup[] = groupsQuery.data;
   const createGroup = useCreateChatGroup();
 
   const [statuses, setStatuses] = useState<Set<SessionStatus>>(new Set());
@@ -219,7 +217,7 @@ export function SessionColumn({
   const counts = countSessions(lit, openTabs);
   const filtering = statuses.size > 0 || tabStates.size > 0 || query.trim() !== "";
   const shown = applyFilters(lit, { statuses, tabs: tabStates, query }, openTabs);
-  const split = byGroup(shown, groups);
+  const split = byMergedGroup(shown, groups);
 
   const needle = query.trim().toLowerCase();
   const fromEditor = sessions.data ?? [];
@@ -426,10 +424,13 @@ export function SessionColumn({
           </Teach>
         )}
         {sessions.isError && <ErrorNote>Your editor sessions could not be read</ErrorNote>}
+        {groupsQuery.failedMachines.map((machine) => (
+          <ErrorNote key={machine.id}>{`${machine.name} could not be reached: its groups may be missing.`}</ErrorNote>
+        ))}
 
         {split.groups.map(({ group, rows: inGroup }) =>
           filtering && inGroup.length === 0 ? null : (
-            <GroupSection key={group.id} group={group} count={inGroup.length}>
+            <GroupSection key={group.key} group={group} count={inGroup.length}>
               <ul className="chats-list" aria-label={group.name}>
                 {inGroup.map((chat) =>
                   renderRow({ kind: "chat", at: chat.last_activity, chat }),
@@ -472,12 +473,15 @@ function GroupSection({
   count,
   children,
 }: {
-  group: ChatGroup;
+  group: MergedGroup;
   count: number;
   children: ReactNode;
 }) {
   const rename = useRenameChatGroup();
   const remove = useDeleteChatGroup();
+  // Rename and delete still act on this machine's group only; changing a remote group comes with
+  // the write side, so a group that lives only elsewhere offers no menu.
+  const hereId = group.ids.here;
   const [renaming, setRenaming] = useState(false);
   const [name, setName] = useState(group.name);
 
@@ -494,8 +498,8 @@ function GroupSection({
             onChange={(event) => setName(event.target.value)}
             onKeyDown={(event) => {
               event.stopPropagation();
-              if (event.key === "Enter" && name.trim() !== "") {
-                rename.mutate({ id: group.id, name: name.trim() });
+              if (event.key === "Enter" && name.trim() !== "" && hereId !== undefined) {
+                rename.mutate({ id: hereId, name: name.trim() });
                 setRenaming(false);
               }
               if (event.key === "Escape") {
@@ -507,6 +511,7 @@ function GroupSection({
         ) : (
           <span className="chats-group-name-text">{`${group.name} (${count})`}</span>
         )}
+        {hereId !== undefined && (
         <DropdownMenu>
           <DropdownMenuTrigger
             className="chats-meta-more chats-group-more"
@@ -532,11 +537,12 @@ function GroupSection({
                 label="Delete group"
                 confirmLabel="Keep holding to delete"
                 variant="quiet"
-                onConfirm={() => remove.mutate(group.id)}
+                onConfirm={() => remove.mutate(hereId)}
               />
             </div>
           </DropdownMenuContent>
         </DropdownMenu>
+        )}
       </summary>
       {children}
     </details>
@@ -609,7 +615,7 @@ function SessionRow({
   active: boolean;
   live: boolean;
   tabOpen: boolean;
-  groups: ChatGroup[];
+  groups: MergedGroup[];
   /** See `openingAChat`. Pressing a row is one of the three ways a conversation gets opened. */
   onOpen: () => void;
   /** Archives the conversation and opens the column's undo window; the column owns both because the row unmounts. */
@@ -621,6 +627,7 @@ function SessionRow({
   const said = row.title !== null || row.first_message !== null;
   const dot = dotFor(row, tabOpen);
   const name = sessionTitle(row);
+  const machine = (row as Partial<ChatRow>).machine ?? "here";
 
   return (
     <li className={active ? "chats-row chats-row-active" : "chats-row"}>
@@ -683,17 +690,19 @@ function SessionRow({
             <DropdownMenuSubTrigger>Move to group</DropdownMenuSubTrigger>
             <DropdownMenuSubContent>
               <DropdownMenuRadioGroup
-                value={row.group_id == null ? "none" : String(row.group_id)}
-                onValueChange={(value) =>
-                  setGroup.mutate({
-                    chatId: row.chat_id,
-                    groupId: value === "none" ? null : Number(value),
-                  })
-                }
+                value={groupOfRow(row, groups)?.key ?? "none"}
+                onValueChange={(value) => {
+                  // The id sent is the one THIS chat's machine gave the group, never a foreign one.
+                  const groupId = value === "none" ? null : groups.find((g) => g.key === value)?.ids[machine];
+                  if (groupId === undefined) return;
+                  setGroup.mutate({ chatId: row.chat_id, groupId });
+                }}
               >
                 <DropdownMenuRadioItem value="none">Ungrouped</DropdownMenuRadioItem>
-                {groups.map((group) => (
-                  <DropdownMenuRadioItem key={group.id} value={String(group.id)}>
+                {groups
+                  .filter((group) => group.ids[machine] !== undefined)
+                  .map((group) => (
+                  <DropdownMenuRadioItem key={group.key} value={group.key}>
                     {group.name}
                   </DropdownMenuRadioItem>
                 ))}

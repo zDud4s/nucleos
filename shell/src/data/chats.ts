@@ -24,9 +24,11 @@ import {
   chatMachineOf,
   machineKey,
   mergeChats,
+  mergeGroups,
   rememberChatMachine,
   useChatLinks,
   type ChatRow,
+  type MergedGroup,
 } from "./chatMachines";
 import { keys as baseKeys } from "./keys";
 import { useMachines, type MachineId } from "./machines";
@@ -970,6 +972,42 @@ export function useChatGroups() {
     queryKey: keys.chats.groups,
     queryFn: () => apiFetch<ChatGroup[]>("/assistant/chat-groups"),
   });
+}
+
+/**
+ * The groups of every machine this device can reach, merged by name (see `mergeGroups`). Each
+ * machine's groups are cached on their own key; one that does not answer keeps its last groups and
+ * is listed in `failedMachines`, and never hides the others.
+ */
+export function useAllChatGroups() {
+  const machines = useMachines();
+  const results = useQueries({
+    queries: machines.map((machine) => ({
+      queryKey: machineKey(keys.chats.groups, machine.id),
+      queryFn: () =>
+        machine.id === "here"
+          ? apiFetch<ChatGroup[]>("/assistant/chat-groups")
+          : apiFetch<ChatGroup[]>("/assistant/chat-groups", undefined, machine.id),
+      placeholderData: keepPreviousData,
+    })),
+  });
+  const signature = results
+    .map((result, index) => `${machines[index].id}:${result.dataUpdatedAt}:${result.isError}`)
+    .join("|");
+  const data = useMemo(
+    (): MergedGroup[] =>
+      mergeGroups(
+        machines.map((machine, index) => ({
+          machine: machine.id,
+          groups: Array.isArray(results[index].data) ? results[index].data : undefined,
+        })),
+      ),
+    // `signature` represents every query result; the query-result array itself is new on each render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [signature],
+  );
+  const failedMachines = machines.filter((machine, index) => machine.id !== "here" && results[index].isError);
+  return { data, failedMachines, isError: results[0]?.isError ?? false };
 }
 
 export function useCreateChatGroup() {

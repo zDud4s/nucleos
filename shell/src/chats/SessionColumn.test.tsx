@@ -11,6 +11,10 @@ import {
 } from "@tanstack/react-router";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+vi.mock("../remote/nativeTransport", () => ({
+  probeMachine: vi.fn(async () => "ok"),
+  nativeTransport: vi.fn(),
+}));
 
 const daemon = vi.hoisted(() => ({
   apiFetch: vi.fn(),
@@ -26,6 +30,7 @@ vi.mock("../data/client", async (original) => ({
 import { SessionColumn } from "./SessionColumn";
 import { createAppQueryClient } from "../app/queryClient";
 import type { ChatGroup, ChatSummary } from "../data/chats";
+import { rememberChatMachine } from "../data/chatMachines";
 
 function chat(overrides: Partial<ChatSummary>): ChatSummary {
   return {
@@ -100,12 +105,14 @@ beforeEach(() => {
   localStorage.clear();
 });
 
-async function renderColumn(props: { onNew?: () => void; openTabs?: string[] } = {}) {
+async function renderColumn(
+  props: { onNew?: () => void; openTabs?: string[]; rows?: ChatSummary[] } = {},
+) {
   const queryClient = createAppQueryClient();
   const rootRoute = createRootRoute({ component: () => <Outlet /> });
   const component = () => (
     <SessionColumn
-      rows={ROWS}
+      rows={props.rows ?? ROWS}
       answered
       selected="c-done"
       selectedLive={false}
@@ -277,5 +284,100 @@ describe("SessionColumn", () => {
     await renderColumn();
     await screen.findByText("busy one");
     expect(screen.queryByText("typed in the editor")).toBeNull();
+  });
+});
+
+describe("SessionColumn - groups across paired machines", () => {
+  // The same group id (3) names different groups on the two machines, on purpose.
+  const HERE_GROUPS: ChatGroup[] = [
+    { id: 3, name: "Work", position: 0, created_at: "2026-08-18T09:00:00Z" },
+    { id: 8, name: "Local only", position: 1, created_at: "2026-08-18T09:00:00Z" },
+  ];
+  const TOWER_GROUPS: ChatGroup[] = [
+    { id: 5, name: "work", position: 0, created_at: "2026-08-18T09:00:00Z" },
+    { id: 3, name: "Tower only", position: 1, created_at: "2026-08-18T09:00:00Z" },
+  ];
+  const remoteRow = (id: string, title: string, group: number | null): ChatSummary =>
+    ({
+      ...chat({ chat_id: id, title, group_id: group }),
+      machine: "tower",
+      machineName: "Tower",
+      unreachable: false,
+    }) as ChatSummary;
+  const ALL_ROWS: ChatSummary[] = [
+    chat({ chat_id: "l-1", title: "local work chat", group_id: 3 }),
+    remoteRow("t-1", "tower work chat", 5),
+    remoteRow("t-2", "tower only chat", 3),
+  ];
+
+  function serve(towerGroups: () => ChatGroup[]) {
+    daemon.apiFetch.mockImplementation(
+      async (path: string, init?: { method?: string; body?: unknown }, machine?: string) => {
+        const method = init?.method ?? "GET";
+        if (method !== "GET") {
+          posts.push({ path, method, body: typeof init?.body === "string" ? JSON.parse(init.body) : init?.body });
+          return undefined;
+        }
+        if (path === "/assistant/chat-groups") return machine === "tower" ? towerGroups() : HERE_GROUPS;
+        return [];
+      },
+    );
+  }
+
+  beforeEach(() => {
+    localStorage.setItem("nucleos-machines", JSON.stringify([{ id: "tower", name: "Tower", origin: "https://tower.example" }]));
+    rememberChatMachine(["t-1", "t-2"], "tower");
+  });
+
+  it("lists a remote group and files its chats by that machine's own ids", async () => {
+    serve(() => TOWER_GROUPS);
+    await renderColumn({ rows: ALL_ROWS, openTabs: [] });
+    const only = (await screen.findByText("Tower only (1)")).closest("details") as HTMLElement;
+    // Tower group 3 holds the tower chat, not the local chat that sits in local group 3.
+    expect(within(only).getByText("tower only chat")).toBeDefined();
+    expect(within(only).queryByText("local work chat")).toBeNull();
+  });
+
+  it("merges groups of the same name into one holding both machines' chats", async () => {
+    serve(() => TOWER_GROUPS);
+    await renderColumn({ rows: ALL_ROWS, openTabs: [] });
+    const work = (await screen.findByText("Work (2)")).closest("details") as HTMLElement;
+    expect(within(work).getByText("local work chat")).toBeDefined();
+    expect(within(work).getByText("tower work chat")).toBeDefined();
+    // One group, not two.
+    expect(screen.queryByText("work (1)")).toBeNull();
+  });
+
+  it("keeps local groups and says which machine did not answer", async () => {
+    serve(() => {
+      throw new Error("offline");
+    });
+    await renderColumn({ rows: ALL_ROWS, openTabs: [] });
+    expect(await screen.findByText("Work (1)")).toBeDefined();
+    expect(await screen.findByText(/Tower could not be reached/)).toBeDefined();
+    // The tower's chats are not in any group the tower could not name; they are not lost either.
+    expect(screen.getByText("tower work chat")).toBeDefined();
+  });
+
+  it("moves a remote chat in a merged group on its own machine, with that machine's id", async () => {
+    serve(() => TOWER_GROUPS);
+    await renderColumn({ rows: ALL_ROWS, openTabs: [] });
+    // Wait for the groups: the row moves out of "Ungrouped" when they land, and a menu open
+    // on the old row would be lost with it.
+    await screen.findByText("Tower only (1)");
+    openMenu(await screen.findByRole("button", { name: "Session actions for tower only chat" }));
+    const trigger = await screen.findByText("Move to group");
+    fireEvent.pointerMove(trigger, { pointerType: "mouse" });
+    fireEvent.click(trigger);
+    // A group only this machine has is not offered to a chat on the tower.
+    expect(screen.queryByRole("menuitemradio", { name: "Local only" })).toBeNull();
+    fireEvent.click(await screen.findByRole("menuitemradio", { name: "Work" }));
+    await waitFor(() =>
+      expect(daemon.apiFetch).toHaveBeenCalledWith(
+        "/assistant/chats/t-2/group",
+        { method: "PUT", body: JSON.stringify({ group_id: 5 }) },
+        "tower",
+      ),
+    );
   });
 });

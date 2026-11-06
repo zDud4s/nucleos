@@ -8,7 +8,7 @@ import {
   writeChatLinks,
 } from "./chatLinks";
 import { apiFetch } from "./client";
-import type { ChatSummary } from "./chats";
+import type { ChatGroup, ChatSummary } from "./chats";
 import { withMachine, type MachineId } from "./machines";
 
 /**
@@ -103,6 +103,72 @@ export function mergeChats(byMachine: MachineChats[]): ChatRow[] {
     .map((row, index) => ({ row, index }))
     .sort((a, b) => (b.row.last_activity ?? "").localeCompare(a.row.last_activity ?? "") || a.index - b.index)
     .map(({ row }) => row);
+}
+
+export interface MachineGroups {
+  machine: MachineId;
+  groups: ChatGroup[] | undefined;
+}
+
+/**
+ * One group as the list draws it: every machine's group of that name, folded into one. A group id
+ * only means something to the machine that made it, so the ids stay apart, keyed by machine.
+ */
+export interface MergedGroup {
+  /** The normalised name (trimmed, lowercase): what makes two machines' groups one group. */
+  key: string;
+  /** The name as the first machine to list it spells it. */
+  name: string;
+  /** This group's id on each machine that has one. */
+  ids: Partial<Record<MachineId, number>>;
+}
+
+/**
+ * Groups from every machine, merged by case-insensitive name. Order follows the machines as given
+ * (this one first), then each machine's own `position`. A machine with no groups read adds none.
+ */
+export function mergeGroups(byMachine: MachineGroups[]): MergedGroup[] {
+  const merged = new Map<string, MergedGroup>();
+  for (const { machine, groups } of byMachine) {
+    const ordered = [...(groups ?? [])].sort((a, b) => a.position - b.position);
+    for (const group of ordered) {
+      const key = group.name.trim().toLowerCase();
+      const known = merged.get(key);
+      if (known === undefined) merged.set(key, { key, name: group.name, ids: { [machine]: group.id } });
+      else if (known.ids[machine] === undefined) known.ids[machine] = group.id;
+    }
+  }
+  return [...merged.values()];
+}
+
+/** The machine a row lives on; a row nobody tagged is on this one. */
+function rowMachine(row: ChatSummary): MachineId {
+  return (row as Partial<ChatRow>).machine ?? "here";
+}
+
+/** The merged group a row is in, matched on its own machine's id; `undefined` when ungrouped or unknown. */
+export function groupOfRow(row: ChatSummary, groups: MergedGroup[]): MergedGroup | undefined {
+  if (row.group_id == null) return undefined;
+  const machine = rowMachine(row);
+  return groups.find((group) => group.ids[machine] === row.group_id);
+}
+
+/**
+ * Rows cut by merged group. A `group_id` is compared only with the id the SAME machine gave that
+ * group, so group 3 on the tower never lands in group 3 here. An unknown id is ungrouped, not lost.
+ */
+export function byMergedGroup(
+  rows: ChatSummary[],
+  groups: MergedGroup[],
+): { groups: { group: MergedGroup; rows: ChatSummary[] }[]; ungrouped: ChatSummary[] } {
+  const placed = rows.map((row) => ({ row, group: groupOfRow(row, groups) }));
+  return {
+    groups: groups.map((group) => ({
+      group,
+      rows: placed.filter((entry) => entry.group === group).map((entry) => entry.row),
+    })),
+    ungrouped: placed.filter((entry) => entry.group === undefined).map((entry) => entry.row),
+  };
 }
 
 /** A project as the picker sees it: where it was found and its git remote, if it has one. */
