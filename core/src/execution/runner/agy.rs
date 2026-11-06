@@ -1016,6 +1016,7 @@ mod tests {
     fn agy_never_receives_the_daemon_token() {
         let fake = FakeAgy::new(&success_json("ok"), 0, false);
         // The variable is also inherited from the daemon's own environment.
+        let before = std::env::var_os("NUCLEOS_DAEMON_TOKEN");
         unsafe { std::env::set_var("NUCLEOS_DAEMON_TOKEN", "inherited-secret") };
         let mut asked = request("hi");
         asked.env = vec![
@@ -1026,7 +1027,11 @@ mod tests {
             ("NUCLEOS_AGY_TEST_MARKER".to_string(), "kept".to_string()),
         ];
         let outcome = fake.run(asked);
-        unsafe { std::env::remove_var("NUCLEOS_DAEMON_TOKEN") };
+        // Put back what a daemon run inherited, rather than leaving the rest of the process without it.
+        match before {
+            Some(value) => unsafe { std::env::set_var("NUCLEOS_DAEMON_TOKEN", value) },
+            None => unsafe { std::env::remove_var("NUCLEOS_DAEMON_TOKEN") },
+        }
 
         assert_eq!(outcome.exit_code, 0, "{}", outcome.stderr);
         let env = fake.recorded_env();
