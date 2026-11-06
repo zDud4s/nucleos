@@ -4045,6 +4045,95 @@ mod tests {
         assert_eq!(status, "implemented");
     }
 
+    /// A merge that landed but was never marked is entered again on the next pass. The base it
+    /// recorded BEFORE the merge must survive that: overwritten with the post-merge HEAD, a red
+    /// gate's revert would reset to where the branch already stands and keep the rejected commits.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_second_pass_over_a_landed_merge_keeps_the_base_recorded_before_it() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let (_container, repo) = walkable_repo("nucleos-job-merge-rebase-", "git --version");
+        let trees = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(trees.path());
+        let pool = test_pool().await;
+        let job_id = seed_job_in(&pool, "nucleos", "running", &repo.to_string_lossy(), None)
+            .await
+            .unwrap();
+        let job_tree = crate::execution::worktree::create(
+            &repo,
+            crate::execution::worktree::Owner::Job(job_id),
+        )
+        .await
+        .expect("the job's checkout");
+        crate::execution::worktree::record(
+            &pool,
+            crate::execution::worktree::Owner::Job(job_id),
+            "nucleos",
+            &repo.to_string_lossy(),
+            &job_tree.path.to_string_lossy(),
+            &job_tree.branch,
+            job_tree.base_sha.as_deref(),
+        )
+        .await
+        .unwrap();
+        seed_items(&pool, job_id, &["implemented"]).await;
+        let item_id: i64 = sqlx::query_scalar("SELECT id FROM job_nodes WHERE job_id = ?")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let before = crate::execution::worktree::head_sha(&job_tree.path)
+            .await
+            .unwrap();
+        let tree = crate::execution::worktree::adopt_or_create_at(
+            &repo,
+            crate::execution::worktree::Owner::Item(item_id),
+            Some(&before),
+        )
+        .await
+        .expect("the item's checkout");
+        crate::execution::worktree::record(
+            &pool,
+            crate::execution::worktree::Owner::Item(item_id),
+            "project-a",
+            &repo.to_string_lossy(),
+            &tree.path.to_string_lossy(),
+            &tree.branch,
+            tree.base_sha.as_deref(),
+        )
+        .await
+        .expect("record the item's checkout");
+        std::fs::write(tree.path.join("work.txt"), "work\n").expect("write the item's work");
+
+        sqlx::query(
+            "CREATE TRIGGER refuse_item_status BEFORE UPDATE OF status ON job_nodes
+             BEGIN SELECT RAISE(ABORT, 'status writes refused'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let state = test_state(pool.clone()).await;
+        let state = with_home(state, &_container);
+        assert_eq!(
+            merge_item(&state, &load_job(&pool, job_id).await.unwrap(), 0).await,
+            Pass::Stopped
+        );
+        sqlx::query("DROP TRIGGER refuse_item_status")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            merge_item(&state, &load_job(&pool, job_id).await.unwrap(), 0).await,
+            Pass::Continued
+        );
+        let base: Option<String> =
+            sqlx::query_scalar("SELECT merge_base_sha FROM job_nodes WHERE id = ?")
+                .bind(item_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(base.as_deref(), Some(before.as_str()));
+    }
+
     /// **The proof of this slice: undoing a red merge takes back that merge and nothing else.**
     ///
     /// Two items with checkouts of their own. A lands and is kept; B lands and is rejected. The
