@@ -117,4 +117,58 @@ mod tests {
         assert!(package.parked.is_empty(), "{:?}", package.parked);
         transfer_package::forget(chat);
     }
+
+    /// A chat that arrives without its transcript has no session, so the first send takes the
+    /// rotation path, which reads the imported exchanges back and replays them in front of the
+    /// new message. No handover is needed for that.
+    #[tokio::test]
+    async fn the_first_send_after_a_transcriptless_import_replays_the_imported_exchanges() {
+        let state = crate::channels::testkit::state().await;
+        let chat = "imported-no-transcript";
+        let row = |n: u32, untrusted: i64| {
+            serde_json::json!({
+                "prompt": format!("question {n}"), "stdout": format!("answer {n}"), "stderr": null,
+                "status": "completed", "exit_code": 0, "cost_usd": 0.1, "answered_by": null,
+                "session_id": "gone", "created_at": format!("2026-02-01T00:00:{n:02}.000Z"),
+                "completed_at": format!("2026-02-01T00:00:{n:02}.500Z"), "model": null,
+                "cache_ttl": null, "context_fill": null, "tools_used": null, "thought": null,
+                "thought_tokens": null, "compacted": 0, "origin": null,
+                "read_untrusted": untrusted, "input_tokens": null, "output_tokens": null,
+                "cache_read_tokens": null, "cache_creation_tokens": null, "num_turns": null,
+            })
+        };
+        // Exchange 2 read third-party text: the barrier floors the replay above it.
+        let package: transfer_package::Package = serde_json::from_value(serde_json::json!({
+            "transfer_id": "t-replay", "chat_id": chat,
+            "chat": {"title": null, "brain": "cloud", "created_at": "2026-01-01T00:00:00Z",
+                     "model": null, "effort": null, "plan_only": false},
+            "session": null, "code": null, "queue": [], "parked": [], "interrupted": false,
+            "history": [row(1, 0), row(2, 1), row(3, 0), row(4, 0)],
+        }))
+        .unwrap();
+        transfer_package::import(
+            &state.pool,
+            &package,
+            std::path::Path::new("unused"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(crate::assistant::get_session(&state.pool, chat).await.unwrap(), None);
+        let (handoff, older, tail) = super::compaction::replay_window(&state.pool, chat)
+            .await
+            .unwrap();
+        assert!(handoff.is_none() && older.is_empty());
+        assert_eq!(
+            tail,
+            vec![
+                ("question 3".to_owned(), "answer 3".to_owned()),
+                ("question 4".to_owned(), "answer 4".to_owned()),
+            ]
+        );
+        let sent = super::send::replayed_after(None, &tail, "and now?");
+        let at = |needle: &str| sent.find(needle).unwrap_or_else(|| panic!("{needle} in {sent}"));
+        assert!(at("you: question 3") < at("you: question 4") && at("you: question 4") < at("and now?"));
+        assert!(!sent.contains("question 2"), "the untrusted barrier floors the replay");
+    }
 }

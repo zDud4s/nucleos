@@ -75,6 +75,7 @@ pub async fn finished_runs(
            FROM runs
           WHERE completed_at IS NOT NULL AND completed_at >= ?1 AND completed_at < ?2
             AND (?3 IS NULL OR project_id = ?3)
+            AND imported_at IS NULL
           ORDER BY completed_at, id",
     )
     .bind(from)
@@ -388,5 +389,59 @@ mod tests {
         assert!(priced[1].estimated);
         assert!((priced[2].usd - 3.0).abs() < 1e-9);
         assert!(priced[2].estimated);
+    }
+
+    #[tokio::test]
+    async fn imported_rows_are_not_spend_or_work_done_here() {
+        use nucleos_core::chats::{transfer, transfer_package};
+        use std::path::Path;
+
+        let origin = crate::testdb::fresh_pool().await;
+        let destination = crate::testdb::fresh_pool().await;
+        sqlx::query("INSERT INTO chats (chat_id, title, brain, created_at) VALUES ('c1', 'work', 'cloud', '2026-01-01T00:00:00Z')")
+            .execute(&origin)
+            .await
+            .unwrap();
+        // Completed "now", so the analytics window below holds it.
+        let now = chrono::Utc::now();
+        let stamp = now.to_rfc3339();
+        sqlx::query(
+            "INSERT INTO runs (chat_id, mode, prompt, stdout, status, cost_usd, created_at, completed_at)
+             VALUES ('c1', 'assistant', 'q', 'a', 'completed', 2.5, ?1, ?1)",
+        )
+        .bind(&stamp)
+        .execute(&origin)
+        .await
+        .unwrap();
+        let from = (now - chrono::Duration::days(1)).format("%Y-%m-%d").to_string();
+        let to = (now + chrono::Duration::days(1)).format("%Y-%m-%d").to_string();
+        assert_eq!(
+            finished_runs(&origin, None, &from, &to)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "a run made here counts"
+        );
+
+        transfer::freeze_at(&origin, "c1", "t-1", transfer::unix_now())
+            .await
+            .unwrap();
+        let package = transfer_package::build(&origin, "c1", "t-1", Path::new("unused"), vec![])
+            .await
+            .unwrap();
+        transfer_package::import(&destination, &package, Path::new("unused"))
+            .await
+            .unwrap();
+        let finished = finished_runs(&destination, None, &from, &to)
+            .await
+            .unwrap();
+        assert!(finished.is_empty(), "{finished:?}");
+        // The chat's own total keeps what the conversation cost, wherever it was spent.
+        let total: f64 = sqlx::query_scalar("SELECT SUM(cost_usd) FROM runs WHERE chat_id = 'c1'")
+            .fetch_one(&destination)
+            .await
+            .unwrap();
+        assert_eq!(total, 2.5);
     }
 }
