@@ -638,6 +638,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn head_sha_reads_the_scratch_repository_whatever_git_dir_the_process_carries() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            // The gate runs this suite from inside a git-driven environment: whatever GIT_* it
+            // exports must not point these commands away from the scratch repository.
+            let mut command = std::process::Command::new("git");
+            command.args(args).current_dir(dir.path());
+            for var in [
+                "GIT_DIR",
+                "GIT_WORK_TREE",
+                "GIT_INDEX_FILE",
+                "GIT_COMMON_DIR",
+            ] {
+                command.env_remove(var);
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=",
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "x",
+        ]);
+        let sha = head_sha(dir.path()).await;
+        assert_eq!(sha.map(|s| s.len()), Some(40));
+    }
+
+    #[tokio::test]
     async fn a_passing_gate_is_recorded_with_its_duration() {
         let pool = test_pool().await;
         let dir = tempfile::tempdir().unwrap();
