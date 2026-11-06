@@ -1280,6 +1280,94 @@ export function useSaid(query: string) {
   });
 }
 
+/** How long a paired machine gets to answer a search before the others are shown without it. */
+export const REMOTE_SEARCH_TIMEOUT_MS = 4_000;
+/** Typing pauses this long before a paired machine is asked; this machine answers at once. */
+export const REMOTE_SEARCH_DEBOUNCE_MS = 250;
+/** The most hits one search lists, the same ceiling the daemon applies to its own answer. */
+export const SAID_LIMIT = 40;
+
+/** A search hit and the machine it was found on. */
+export type SaidHitFrom = SaidHit & { machine: MachineId; machineName: string };
+
+/** Run `call` with an abort signal that fires, and a rejection that follows, after `ms`. */
+function withDeadline<T>(call: (signal: AbortSignal) => Promise<T>, ms: number): Promise<T> {
+  const controller = new AbortController();
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      controller.abort();
+      reject(new Error("the machine did not answer in time"));
+    }, ms);
+    call(controller.signal).then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+/** Link a hit's chat to the machine it was found on; call before navigating to it. */
+export function linkSaidHit(hit: Pick<SaidHitFrom, "chat_id" | "machine">): void {
+  if (hit.machine !== "here") rememberChatMachine([hit.chat_id], hit.machine);
+}
+
+/**
+ * {@link useSaid} across every paired machine. This machine is asked at once, the others after a
+ * short pause in typing and with a deadline; whichever answers is listed, newest first, and a
+ * machine that errors or times out is reported in `failedMachines` instead of being cached as
+ * "no hits". Every hit remembers the machine it came from.
+ */
+export function useSaidAll(query: string) {
+  const machines = useMachines();
+  const trimmed = query.trim();
+  const [settled, setSettled] = useState(trimmed);
+  useEffect(() => {
+    const timer = setTimeout(() => setSettled(trimmed), REMOTE_SEARCH_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [trimmed]);
+  const results = useQueries({
+    queries: machines.map((machine) => {
+      const local = machine.id === "here";
+      const asked = local ? trimmed : settled;
+      const path = `/assistant/search?q=${encodeURIComponent(asked)}`;
+      return {
+        queryKey: machineKey(keys.chats.said(asked), machine.id),
+        queryFn: () =>
+          local
+            ? apiFetch<SaidHit[]>(path)
+            : withDeadline((signal) => apiFetch<SaidHit[]>(path, { signal }, machine.id), REMOTE_SEARCH_TIMEOUT_MS),
+        enabled: asked.length >= 2,
+        staleTime: 30_000,
+        retry: false,
+      };
+    }),
+  });
+  // While the debounce has not caught up, a remote result belongs to the text before this one:
+  // it is not shown beside this machine's hits for the new text.
+  const caughtUp = settled === trimmed;
+  const usable = (machine: { id: string }, index: number) =>
+    machine.id === "here" || caughtUp ? results[index] : undefined;
+  const signature = `${caughtUp}|${results.map((result, index) => `${machines[index].id}:${result.dataUpdatedAt}:${result.isError}`).join("|")}`;
+  const data = useMemo((): SaidHitFrom[] | undefined => {
+    const shown = machines.map((machine, index) => usable(machine, index));
+    if (trimmed.length < 2 || shown.every((result) => result?.data === undefined)) return undefined;
+    const hits = machines.flatMap((machine, index) =>
+      (shown[index]?.data ?? []).map((hit) => ({ ...hit, machine: machine.id, machineName: machine.name })),
+    );
+    return hits.sort((a, b) => b.created_at.localeCompare(a.created_at)).slice(0, SAID_LIMIT);
+    // `signature` stands for the results: the array itself is new on every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [signature, trimmed, machines]);
+  const failedMachines =
+    trimmed.length < 2 ? [] : machines.filter((machine, index) => usable(machine, index)?.isError === true);
+  return { data, failedMachines, isError: failedMachines.length > 0 };
+}
+
 /**
  * Whether this machine has a model that can answer a conversation.
  *

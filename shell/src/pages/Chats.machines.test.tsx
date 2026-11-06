@@ -32,7 +32,7 @@ import {
   useTurnTools,
   type ChatSummary,
 } from "../data/chats";
-import { ChangeProject } from "./Chats";
+import { ChangeProject, ForwardPanel } from "./Chats";
 import { keys } from "../data/keys";
 import { forgetMachine, withMachine } from "../data/machines";
 
@@ -343,6 +343,26 @@ describe("Chats - the list across machines", () => {
       expect.objectContaining({ method: "POST" }),
       "tower",
     );
+  });
+
+  it("forward_targets_are_limited_to_the_source_chats_machine", async () => {
+    pairTower();
+    rememberChatMachine(["t-src"], "tower");
+    daemon.apiFetch.mockImplementation(async (path: string, _init?: unknown, machine?: string) => {
+      if (path !== "/assistant/chats") return [];
+      return machine === "tower"
+        ? [chat("t-src", "2026-10-01T11:00:00Z"), chat("t-other", "2026-10-01T10:00:00Z")]
+        : [chat("h-1", "2026-10-01T09:00:00Z")];
+    });
+    render(<ForwardPanel chatId="t-src" turn={{ id: 3 } as never} text="hi" onText={() => {}} onSent={() => {}} />, {
+      wrapper: wrapper(newClient()),
+    });
+    expect(await screen.findByRole("button", { name: "t-other" })).toBeTruthy();
+    // Wait for this machine's list too, so its absence is a decision and not a slow answer.
+    await waitFor(() => expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats"));
+    await waitFor(() => expect(chatMachineOf("t-other")).toBe("tower"));
+    expect(screen.queryByRole("button", { name: "h-1" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "t-src" })).toBeNull();
   });
 
   it("a remote archive invalidates that machine's chat list", async () => {

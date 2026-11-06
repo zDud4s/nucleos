@@ -62,7 +62,6 @@ import {
   useAssistantModels,
   useModelGroups,
   useChatTranscript,
-  useChats,
   useIdeConversation,
   useIdeSessions,
   useSetChatProject,
@@ -101,9 +100,10 @@ import {
   useFreshContext,
   useSetChatAutoCompact,
   useOlderTurns,
-  useSaid,
+  linkSaidHit,
+  useSaidAll,
   useTurnTools,
-  type SaidHit,
+  type SaidHitFrom,
   type Command,
   type Exchange,
   type Ask,
@@ -114,7 +114,7 @@ import {
   type Turn,
 } from "../data/chats";
 import { type RelaySent } from "../lib/turns";
-import { chatKey, rememberChatMachine, useChatMachine } from "../data/chatMachines";
+import { chatKey, chatMachineOf, rememberChatMachine, useChatMachine } from "../data/chatMachines";
 import { useMachines } from "../data/machines";
 import { MachinePicker, useNewWorkMachine } from "../chats/MachinePicker";
 import { type ChatNotice } from "../data/chats";
@@ -298,7 +298,7 @@ export function Chats() {
   };
   const unseen = rows.reduce((total, row) => total + row.waiting, 0);
   const query = usePaletteQuery();
-  const said = useSaid(query);
+  const said = useSaidAll(query);
   const needle = query.trim().toLowerCase();
 
   // Matched here rather than by cmdk, and `shouldFilter={false}` below is the other half of that.
@@ -311,6 +311,7 @@ export function Chats() {
     return `${name} ${row.cwd ?? ""}`.toLowerCase().includes(needle);
   });
   const hits = said.data ?? [];
+  const silent = said.failedMachines;
 
   usePaletteGroup({
     id: ["chats", "named"].join("-"),
@@ -333,22 +334,34 @@ export function Chats() {
     }),
   });
   usePaletteGroup(
-    hits.length === 0
+    hits.length === 0 && silent.length === 0
       ? null
       : {
           id: "chats-said",
           heading: "Said in a conversation",
           prematched: true,
-          items: hits.map((hit) => ({
-            id: `said-${hit.turn_id}`,
-            label: <SaidRow hit={hit} />,
-            match: hit.excerpt,
-            run: () => {
-              openingAChat();
-              void navigate({ to: `/chats/${hit.chat_id}` });
-              setFound({ chatId: hit.chat_id, turnId: hit.turn_id, at: Date.now() });
-            },
-          })),
+          items: [
+            ...hits.map((hit) => ({
+              id: `said-${hit.machine}-${hit.turn_id}`,
+              label: <SaidRow hit={hit} />,
+              match: hit.excerpt,
+              run: () => {
+                // Before navigating, so the turn jump and the transcript read reach the right machine.
+                linkSaidHit(hit);
+                openingAChat();
+                void navigate({ to: `/chats/${hit.chat_id}` });
+                setFound({ chatId: hit.chat_id, turnId: hit.turn_id, at: Date.now() });
+              },
+            })),
+            ...silent.map((machine) => ({
+              id: `said-silent-${machine.id}`,
+              label: <span className="chats-palette-said-text">{machine.name} did not answer</span>,
+              match: `${machine.name} did not answer`,
+              // Informational: listed, but not something to choose.
+              disabled: true,
+              run: () => {},
+            })),
+          ],
         },
   );
 
@@ -536,7 +549,7 @@ function ListError({ error }: { error: unknown }) {
 }
 
 /** One search hit: whose half it was, what it said, and which conversation it was said in. */
-function SaidRow({ hit }: { hit: SaidHit }) {
+function SaidRow({ hit }: { hit: SaidHitFrom }) {
   return (
     <span className="chats-palette-said">
       <span className="chats-palette-said-head">
@@ -5637,7 +5650,7 @@ function ForwardTurn({ chatId, turn }: { chatId: string; turn: Turn }) {
  * subscribed to only while a panel is open: every settled turn used to subscribe from the moment it
  * was drawn, hundreds of subscriptions on a long transcript, to fill a menu nobody had opened.
  */
-function ForwardPanel({
+export function ForwardPanel({
   chatId,
   turn,
   text,
@@ -5650,9 +5663,11 @@ function ForwardPanel({
   onText: (text: string) => void;
   onSent: () => void;
 }) {
-  const chats = useChats();
+  const chats = useAllChats();
   const forward = useForwardTurn();
-  const elsewhere = (chats.data ?? []).filter((row) => row.chat_id !== chatId);
+  // Forward needs the source turn in the target's own database, so only chats on the source's machine.
+  const sourceMachine = chatMachineOf(chatId);
+  const elsewhere = (chats.data ?? []).filter((row) => row.chat_id !== chatId && row.machine === sourceMachine);
 
   return (
     <>
