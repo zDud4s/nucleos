@@ -915,7 +915,7 @@ mod tests {
         json!({
             "name": "later",
             "goal": "Write the later notes",
-            "owned_paths": [".ai/later/**"],
+            "owned_paths": [".ai/plans/**"],
             "prompt": "Write the later notes.",
             "layer": "docs",
             "base": "notes",
