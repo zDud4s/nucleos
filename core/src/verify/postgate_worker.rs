@@ -1238,6 +1238,7 @@ mod tests {
         let env = crate::execution::worktree::WorktreeRootOverride::set(&root, roots.path());
 
         let pool = crate::testdb::fresh_pool().await;
+        crate::verify::unique_task_ids(&pool).await;
         sqlx::query(
             "INSERT INTO autopilot_state (project_id, mode, project_root) \
              VALUES ('alpha', 'active', ?)",
