@@ -7718,7 +7718,14 @@ mod tests {
         rotation::test_nodes::give_root(&chat_id, "root-1");
 
         let id = send_and_settle(&state, &chat_id, "olá").await;
-        let (status, _) = settled_turn(&state.pool, id).await;
+        // Read the row directly: `send_and_settle` already waited for the turn, and `settled_turn`
+        // would wait again for the chat's slot, which the automatic compaction that follows the turn
+        // takes. Under load that compaction can hold it past the helper's one-second budget.
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
         assert_eq!(status, "completed");
 
         assert_eq!(rotation_rows(&state.pool, &chat_id).await, 0);
