@@ -26,6 +26,7 @@ pub mod render;
 pub mod runs;
 pub mod store;
 
+mod live;
 mod resolve;
 mod scope_gate;
 pub(crate) mod wake;

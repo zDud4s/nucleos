@@ -542,7 +542,7 @@ mod tests {
         state
             .run_handles
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(turn, task.abort_handle());
         assert!(!queue_is_held(&chat));
 

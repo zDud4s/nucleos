@@ -11,6 +11,10 @@ import {
 } from "@tanstack/react-router";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+vi.mock("../remote/nativeTransport", () => ({
+  probeMachine: vi.fn(async () => "ok"),
+  nativeTransport: vi.fn(),
+}));
 
 const daemon = vi.hoisted(() => ({
   apiFetch: vi.fn(),
@@ -26,6 +30,7 @@ vi.mock("../data/client", async (original) => ({
 import { SessionColumn } from "./SessionColumn";
 import { createAppQueryClient } from "../app/queryClient";
 import type { ChatGroup, ChatSummary } from "../data/chats";
+import { rememberChatMachine } from "../data/chatMachines";
 
 function chat(overrides: Partial<ChatSummary>): ChatSummary {
   return {
@@ -100,12 +105,14 @@ beforeEach(() => {
   localStorage.clear();
 });
 
-async function renderColumn(props: { onNew?: () => void; openTabs?: string[] } = {}) {
+async function renderColumn(
+  props: { onNew?: () => void; openTabs?: string[]; rows?: ChatSummary[] } = {},
+) {
   const queryClient = createAppQueryClient();
   const rootRoute = createRootRoute({ component: () => <Outlet /> });
   const component = () => (
     <SessionColumn
-      rows={ROWS}
+      rows={props.rows ?? ROWS}
       answered
       selected="c-done"
       selectedLive={false}
@@ -277,5 +284,294 @@ describe("SessionColumn", () => {
     await renderColumn();
     await screen.findByText("busy one");
     expect(screen.queryByText("typed in the editor")).toBeNull();
+  });
+});
+
+describe("SessionColumn - groups across paired machines", () => {
+  // The same group id (3) names different groups on the two machines, on purpose.
+  const HERE_GROUPS: ChatGroup[] = [
+    { id: 3, name: "Work", position: 0, created_at: "2026-08-18T09:00:00Z" },
+    { id: 8, name: "Local only", position: 1, created_at: "2026-08-18T09:00:00Z" },
+  ];
+  const TOWER_GROUPS: ChatGroup[] = [
+    { id: 5, name: "work", position: 0, created_at: "2026-08-18T09:00:00Z" },
+    { id: 3, name: "Tower only", position: 1, created_at: "2026-08-18T09:00:00Z" },
+  ];
+  const remoteRow = (id: string, title: string, group: number | null): ChatSummary =>
+    ({
+      ...chat({ chat_id: id, title, group_id: group }),
+      machine: "tower",
+      machineName: "Tower",
+      unreachable: false,
+    }) as ChatSummary;
+  const ALL_ROWS: ChatSummary[] = [
+    chat({ chat_id: "l-1", title: "local work chat", group_id: 3 }),
+    remoteRow("t-1", "tower work chat", 5),
+    remoteRow("t-2", "tower only chat", 3),
+  ];
+
+  /** What a write does: fail as an offline machine's would, or never answer. */
+  type WritePolicy = (method: string, path: string, machine: string) => "fail" | "hang" | undefined;
+  /** `refuse` names a machine whose group writes fail, or decides per write. */
+  function serve(towerGroups: () => ChatGroup[] | Promise<ChatGroup[]>, refuse?: string | WritePolicy) {
+    daemon.apiFetch.mockImplementation(
+      async (path: string, init?: { method?: string; body?: unknown }, machine?: string) => {
+        const method = init?.method ?? "GET";
+        if (method !== "GET") {
+          const verdict =
+            typeof refuse === "function"
+              ? refuse(method, path, machine ?? "here")
+              : refuse !== undefined && (machine ?? "here") === refuse
+                ? "fail"
+                : undefined;
+          if (verdict === "hang") return new Promise(() => undefined);
+          if (verdict === "fail") throw new Error("offline");
+          posts.push({ path, method, body: typeof init?.body === "string" ? JSON.parse(init.body) : init?.body });
+          // A group made on a machine gets that machine's next id.
+          if (method === "POST" && path === "/assistant/chat-groups") return { id: 41, name: "created" };
+          return undefined;
+        }
+        if (path === "/assistant/chat-groups") return machine === "tower" ? towerGroups() : HERE_GROUPS;
+        return [];
+      },
+    );
+  }
+
+  beforeEach(() => {
+    localStorage.setItem("nucleos-machines", JSON.stringify([{ id: "tower", name: "Tower", origin: "https://tower.example" }]));
+    rememberChatMachine(["t-1", "t-2"], "tower");
+  });
+
+  it("lists a remote group and files its chats by that machine's own ids", async () => {
+    serve(() => TOWER_GROUPS);
+    await renderColumn({ rows: ALL_ROWS, openTabs: [] });
+    const only = (await screen.findByText("Tower only (1)")).closest("details") as HTMLElement;
+    // Tower group 3 holds the tower chat, not the local chat that sits in local group 3.
+    expect(within(only).getByText("tower only chat")).toBeDefined();
+    expect(within(only).queryByText("local work chat")).toBeNull();
+  });
+
+  it("merges groups of the same name into one holding both machines' chats", async () => {
+    serve(() => TOWER_GROUPS);
+    await renderColumn({ rows: ALL_ROWS, openTabs: [] });
+    const work = (await screen.findByText("Work (2)")).closest("details") as HTMLElement;
+    expect(within(work).getByText("local work chat")).toBeDefined();
+    expect(within(work).getByText("tower work chat")).toBeDefined();
+    // One group, not two.
+    expect(screen.queryByText("work (1)")).toBeNull();
+  });
+
+  it("keeps local groups and says which machine did not answer", async () => {
+    serve(() => {
+      throw new Error("offline");
+    });
+    await renderColumn({ rows: ALL_ROWS, openTabs: [] });
+    expect(await screen.findByText("Work (1)")).toBeDefined();
+    expect(await screen.findByText(/Tower could not be reached/)).toBeDefined();
+    // The tower's chats are not in any group the tower could not name; they are not lost either.
+    expect(screen.getByText("tower work chat")).toBeDefined();
+  });
+
+  it("moves a remote chat in a merged group on its own machine, with that machine's id", async () => {
+    serve(() => TOWER_GROUPS);
+    await renderColumn({ rows: ALL_ROWS, openTabs: [] });
+    // Wait for the groups: the row moves out of "Ungrouped" when they land, and a menu open
+    // on the old row would be lost with it.
+    await screen.findByText("Tower only (1)");
+    openMenu(await screen.findByRole("button", { name: "Session actions for tower only chat" }));
+    const trigger = await screen.findByText("Move to group");
+    fireEvent.pointerMove(trigger, { pointerType: "mouse" });
+    fireEvent.click(trigger);
+    // A group only this machine has is offered too: moving there creates it on the tower.
+    expect(await screen.findByRole("menuitemradio", { name: "Local only" })).toBeDefined();
+    fireEvent.click(await screen.findByRole("menuitemradio", { name: "Work" }));
+    await waitFor(() =>
+      expect(daemon.apiFetch).toHaveBeenCalledWith(
+        "/assistant/chats/t-2/group",
+        { method: "PUT", body: JSON.stringify({ group_id: 5 }) },
+        "tower",
+      ),
+    );
+    // Tower already has "work", so nothing was created.
+    expect(posts.some((post) => post.path === "/assistant/chat-groups")).toBe(false);
+  });
+
+  /** The arguments of every write call of one method and path, as `[init, machine]`. */
+  const writes = (method: string, path: string) =>
+    daemon.apiFetch.mock.calls
+      .filter(([p, init]) => p === path && (init as { method?: string } | undefined)?.method === method)
+      .map(([, init, machine]) => {
+        const body = (init as { body?: unknown }).body;
+        return { body: typeof body === "string" ? JSON.parse(body) : undefined, machine };
+      });
+
+  it("moving into a group the chat's machine lacks creates it there, then moves with the new id", async () => {
+    serve(() => TOWER_GROUPS);
+    await renderColumn({ rows: ALL_ROWS, openTabs: [] });
+    await screen.findByText("Tower only (1)");
+    openMenu(await screen.findByRole("button", { name: "Session actions for tower only chat" }));
+    const trigger = await screen.findByText("Move to group");
+    fireEvent.pointerMove(trigger, { pointerType: "mouse" });
+    fireEvent.click(trigger);
+    fireEvent.click(await screen.findByRole("menuitemradio", { name: "Local only" }));
+    await waitFor(() => expect(writes("PUT", "/assistant/chats/t-2/group")).toHaveLength(1));
+    // POST on the tower, then PUT on the tower carrying the id the tower returned (41), not here's 8.
+    expect(writes("POST", "/assistant/chat-groups")).toEqual([{ body: { name: "Local only" }, machine: "tower" }]);
+    expect(writes("PUT", "/assistant/chats/t-2/group")).toEqual([{ body: { group_id: 41 }, machine: "tower" }]);
+    const order = daemon.apiFetch.mock.calls.map(([p, init]) => `${(init as { method?: string } | undefined)?.method}:${p}`);
+    expect(order.indexOf("POST:/assistant/chat-groups")).toBeLessThan(order.indexOf("PUT:/assistant/chats/t-2/group"));
+  });
+
+  /** Open "Move to group" on the tower chat t-2 and pick the named group. */
+  async function moveTowerChatTo(group: string) {
+    openMenu(await screen.findByRole("button", { name: "Session actions for tower only chat" }));
+    const trigger = await screen.findByText("Move to group");
+    fireEvent.pointerMove(trigger, { pointerType: "mouse" });
+    fireEvent.click(trigger);
+    fireEvent.click(await screen.findByRole("menuitemradio", { name: group }));
+  }
+
+  it("says so when the move's group write fails after the group was created, and keeps the old group", async () => {
+    serve(() => TOWER_GROUPS, (method, path) => (method === "PUT" && path.endsWith("/group") ? "fail" : undefined));
+    await renderColumn({ rows: ALL_ROWS, openTabs: [] });
+    await screen.findByText("Tower only (1)");
+    await moveTowerChatTo("Local only");
+    expect(await screen.findByText(/Could not move "tower only chat" to its group on Tower/)).toBeDefined();
+    // The group was created, the move was refused: the chat is still in its old group.
+    expect(writes("POST", "/assistant/chat-groups")).toHaveLength(1);
+    const only = screen.getByText("Tower only (1)").closest("details") as HTMLElement;
+    expect(within(only).getByText("tower only chat")).toBeDefined();
+  });
+
+  it("says so when creating the group fails, and sends no move", async () => {
+    serve(() => TOWER_GROUPS, (method, path) => (method === "POST" && path === "/assistant/chat-groups" ? "fail" : undefined));
+    await renderColumn({ rows: ALL_ROWS, openTabs: [] });
+    await screen.findByText("Tower only (1)");
+    await moveTowerChatTo("Local only");
+    expect(await screen.findByText(/Could not move "tower only chat" to its group on Tower/)).toBeDefined();
+    expect(writes("PUT", "/assistant/chats/t-2/group")).toHaveLength(0);
+  });
+
+  it("refuses to create a group on a machine whose groups are not loaded, and sends nothing", async () => {
+    // The tower's group list never answers: it may already hold "Local only", so no twin is made.
+    serve(() => new Promise<ChatGroup[]>(() => undefined));
+    await renderColumn({ rows: ALL_ROWS, openTabs: [] });
+    await screen.findByText("Work (1)");
+    await moveTowerChatTo("Local only");
+    expect(await screen.findByText(/Groups on Tower are not loaded yet/)).toBeDefined();
+    expect(posts).toHaveLength(0);
+  });
+
+  it("ignores a second pick while a move is still in flight", async () => {
+    serve(() => TOWER_GROUPS, (method, path) => (method === "POST" && path === "/assistant/chat-groups" ? "hang" : undefined));
+    await renderColumn({ rows: ALL_ROWS, openTabs: [] });
+    await screen.findByText("Tower only (1)");
+    await moveTowerChatTo("Local only");
+    await waitFor(() => expect(daemon.apiFetch.mock.calls.some(([p, init]) => p === "/assistant/chat-groups" && (init as { method?: string } | undefined)?.method === "POST")).toBe(true));
+    openMenu(await screen.findByRole("button", { name: "Session actions for tower only chat" }));
+    const trigger = await screen.findByText("Move to group");
+    fireEvent.pointerMove(trigger, { pointerType: "mouse" });
+    fireEvent.click(trigger);
+    const item = await screen.findByRole("menuitemradio", { name: "Local only" });
+    expect(item.getAttribute("aria-disabled")).toBe("true");
+    fireEvent.click(item);
+    expect(daemon.apiFetch.mock.calls.filter(([p, init]) => p === "/assistant/chat-groups" && (init as { method?: string } | undefined)?.method === "POST")).toHaveLength(1);
+  });
+
+  it("says a machine applied a rename to only some of its same-named groups", async () => {
+    serve(
+      () => [
+        { id: 5, name: "work", position: 0, created_at: "2026-08-18T09:00:00Z" },
+        { id: 6, name: "Work ", position: 1, created_at: "2026-08-18T09:00:00Z" },
+      ],
+      (method, path) => (method === "PATCH" && path.endsWith("/6") ? "fail" : undefined),
+    );
+    await renderColumn({ rows: ALL_ROWS, openTabs: [] });
+    await screen.findByText("Work (2)");
+    await renameWork();
+    expect(await screen.findByText(/Tower applied the change to only some of its groups named "Work"/)).toBeDefined();
+  });
+
+  it("clears an earlier failure note when a later rename succeeds", async () => {
+    let towerDown = true;
+    serve(() => TOWER_GROUPS, (_method, _path, machine) => (machine === "tower" && towerDown ? "fail" : undefined));
+    await renderColumn({ rows: ALL_ROWS, openTabs: [] });
+    await screen.findByText("Work (2)");
+    await renameWork();
+    expect(await screen.findByText(/Tower did not apply the change to/)).toBeDefined();
+    towerDown = false;
+    await renameWork();
+    await waitFor(() => expect(screen.queryByText(/did not apply the change to/)).toBeNull());
+  });
+
+  async function renameWork() {
+    openMenu(await screen.findByRole("button", { name: "Group actions for Work" }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Rename" }));
+    const input = await screen.findByRole("textbox", { name: "Rename group" });
+    fireEvent.change(input, { target: { value: "Office" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+  }
+
+  it("renames a merged group on every machine that holds it, each by its own id", async () => {
+    serve(() => TOWER_GROUPS);
+    await renderColumn({ rows: ALL_ROWS, openTabs: [] });
+    await screen.findByText("Work (2)");
+    await renameWork();
+    await waitFor(() => expect(daemon.apiFetch.mock.calls.filter(([, init]) => (init as { method?: string } | undefined)?.method === "PATCH")).toHaveLength(2));
+    expect(writes("PATCH", "/assistant/chat-groups/3")).toEqual([{ body: { name: "Office" }, machine: undefined }]);
+    expect(writes("PATCH", "/assistant/chat-groups/5")).toEqual([{ body: { name: "Office" }, machine: "tower" }]);
+  });
+
+  it("deletes a merged group on every machine that holds it, each by its own id", async () => {
+    serve(() => TOWER_GROUPS);
+    await renderColumn({ rows: ALL_ROWS, openTabs: [] });
+    await screen.findByText("Work (2)");
+    openMenu(await screen.findByRole("button", { name: "Group actions for Work" }));
+    // Press and hold: the control confirms when the hold completes.
+    fireEvent.pointerDown(await screen.findByRole("button", { name: "Delete group" }), {
+      button: 0,
+      isPrimary: true,
+      pointerId: 1,
+    });
+    await waitFor(
+      () => {
+        expect(writes("DELETE", "/assistant/chat-groups/5")).toEqual([{ machine: "tower" }]);
+        expect(writes("DELETE", "/assistant/chat-groups/3")).toHaveLength(1);
+      },
+      { timeout: 4000 },
+    );
+  }, 10_000);
+
+  it("reports the machine that refused a rename while the others still apply it", async () => {
+    serve(() => TOWER_GROUPS, "tower");
+    await renderColumn({ rows: ALL_ROWS, openTabs: [] });
+    await screen.findByText("Work (2)");
+    await renameWork();
+    // This machine renamed it; the tower refused and is named in the note.
+    await waitFor(() => expect(posts).toContainEqual({ path: "/assistant/chat-groups/3", method: "PATCH", body: { name: "Office" } }));
+    expect(await screen.findByText(/Tower did not apply the change to/)).toBeDefined();
+  });
+
+  it("refreshes the remote machine's group list after a write", async () => {
+    serve(() => TOWER_GROUPS);
+    await renderColumn({ rows: ALL_ROWS, openTabs: [] });
+    await screen.findByText("Work (2)");
+    const towerReads = () =>
+      daemon.apiFetch.mock.calls.filter(([p, init, m]) => p === "/assistant/chat-groups" && init === undefined && m === "tower").length;
+    const before = towerReads();
+    await renameWork();
+    await waitFor(() => expect(towerReads()).toBeGreaterThan(before));
+  });
+
+  it("keeps the chats of two same-named groups on one machine grouped", async () => {
+    // "work" and "Work " differ only by case and spacing: both fold into one group, neither id is lost.
+    serve(() => [
+      { id: 5, name: "work", position: 0, created_at: "2026-08-18T09:00:00Z" },
+      { id: 6, name: "Work ", position: 1, created_at: "2026-08-18T09:00:00Z" },
+    ]);
+    await renderColumn({ rows: [remoteRow("t-1", "in first", 5), remoteRow("t-2", "in second", 6)], openTabs: [] });
+    const work = (await screen.findByText("Work (2)")).closest("details") as HTMLElement;
+    expect(within(work).getByText("in first")).toBeDefined();
+    expect(within(work).getByText("in second")).toBeDefined();
   });
 });

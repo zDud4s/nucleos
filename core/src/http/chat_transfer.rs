@@ -111,6 +111,15 @@ async fn post_chat_import(
     {
         package::Imported::Already => Ok(Json(json!({ "already": true }))),
         package::Imported::Done { cwd, queued } => {
+            if body.session.is_none() {
+                // Sessionless arrival: the import already dropped the stored session, this also
+                // clears a stale in-memory untrusted-read notice so it does not follow the chat.
+                if let Err(error) =
+                    crate::assistant::forget_session(&state.pool, &body.chat_id).await
+                {
+                    tracing::warn!(%error, chat_id = %body.chat_id, "could not reset the imported chat's session");
+                }
+            }
             if queued > 0 {
                 crate::assistant::resume_queue_after_freeze(&state, &body.chat_id);
             }
@@ -195,6 +204,28 @@ struct FinishBody {
     transfer_id: String,
     to: String,
     to_name: Option<String>,
+    /// The destination's stable machine id, when it reports one. `to` stays the caller's alias
+    /// (or `name:...` for this machine) and is the fallback for peers that predate the id.
+    #[serde(default)]
+    to_machine_id: Option<String>,
+}
+
+/// The `moved_to` value: the destination's stable machine id when known, else the alias in `to`.
+fn destination_value(body: &FinishBody) -> String {
+    let name = body.to_name.as_deref().unwrap_or(&body.to);
+    let id = body
+        .to_machine_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| {
+            !id.is_empty()
+                && id.len() <= 64
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+        .unwrap_or(&body.to);
+    json!({ "id": id, "name": name }).to_string()
 }
 
 /// The destination has the chat: this copy becomes read-only and points there.
@@ -209,8 +240,7 @@ async fn post_transfer_finish(
             Json(json!({ "error": "transfer_id and to are required" })),
         ));
     }
-    let name = body.to_name.as_deref().unwrap_or(&body.to);
-    let destination = json!({ "id": body.to, "name": name }).to_string();
+    let destination = destination_value(&body);
     transfer::finish_at(
         &state.pool,
         &chat_id,
@@ -282,6 +312,83 @@ mod tests {
 
         assert!(matches!(status, Ok(StatusCode::NO_CONTENT)));
         assert!(!package::is_remembered("c1"));
+    }
+
+    fn finish_body(to_machine_id: Option<&str>) -> FinishBody {
+        FinishBody {
+            transfer_id: "t-1".to_string(),
+            to: "alias-1".to_string(),
+            to_name: Some("Tower".to_string()),
+            to_machine_id: to_machine_id.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn the_move_destination_is_the_stable_machine_id_with_the_alias_as_fallback() {
+        let with_id = destination_value(&finish_body(Some("2f1c0000-0000-4000-8000-000000000001")));
+        assert_eq!(
+            crate::chats::transfer::destination_id(&with_id),
+            "2f1c0000-0000-4000-8000-000000000001"
+        );
+        assert_eq!(crate::chats::transfer::destination_name(&with_id), "Tower");
+
+        // An older peer reports no id, or a blank one: the alias is what gets recorded.
+        for missing in [None, Some(""), Some("  ")] {
+            let value = destination_value(&finish_body(missing));
+            assert_eq!(crate::chats::transfer::destination_id(&value), "alias-1");
+        }
+    }
+
+    #[test]
+    fn an_overlong_or_odd_machine_id_is_ignored_in_favour_of_the_alias() {
+        let too_long = "a".repeat(65);
+        for bad in [
+            too_long.as_str(),
+            "has space",
+            "uu/id",
+            "id\n1",
+            "caf\u{e9}",
+        ] {
+            let value = destination_value(&finish_body(Some(bad)));
+            assert_eq!(
+                crate::chats::transfer::destination_id(&value),
+                "alias-1",
+                "{bad:?}"
+            );
+        }
+        let at_limit = "a".repeat(64);
+        let value = destination_value(&finish_body(Some(&at_limit)));
+        assert_eq!(crate::chats::transfer::destination_id(&value), at_limit);
+    }
+
+    #[tokio::test]
+    async fn finish_records_the_machine_id_as_the_destination() {
+        let state = super::super::tests::test_state().await;
+        sqlx::query("INSERT INTO chats (chat_id, brain, created_at) VALUES ('c2', 'cloud', 'now')")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        crate::chats::transfer::freeze_at(&state.pool, "c2", "t-1", 1)
+            .await
+            .unwrap();
+
+        let result = post_transfer_finish(
+            State(state.clone()),
+            Path("c2".to_string()),
+            Json(finish_body(Some("machine-uuid"))),
+        )
+        .await;
+
+        assert!(matches!(result, Ok(StatusCode::NO_CONTENT)));
+        let moved_to: String =
+            sqlx::query_scalar("SELECT moved_to FROM chats WHERE chat_id = 'c2'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            crate::chats::transfer::destination_id(&moved_to),
+            "machine-uuid"
+        );
     }
 
     #[tokio::test]

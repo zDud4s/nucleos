@@ -4,6 +4,12 @@
 //! No vault content, control token, device session, API key or settings document is a field, so none
 //! can be packaged by accident. The session transcript is copied as it is and never rewritten.
 //!
+//! The chat's run history (`history`, see `transfer_history`) is on the list too: prompt, reply, error
+//! and cost of each past exchange. It is the same text the transcript already carries, so it adds
+//! nothing the transcript does not expose, and it is shipped unredacted for the same reason the
+//! transcript is: a redacted screen would disagree with what the resumed model remembers. Local ids,
+//! projects, jobs, relays, accounts and attached images stay home.
+//!
 //! The origin builds it with [`build`] while the chat is frozen; the destination unpacks it with
 //! [`import`], which a repeat of the same `transfer_id` leaves unchanged.
 
@@ -76,6 +82,12 @@ pub struct Package {
     pub parked: Vec<ParkedQuestion>,
     /// A turn was cut or a question was parked: the destination continues the work.
     pub interrupted: bool,
+    /// The chat's past exchanges, oldest first. Empty for a package from a daemon that predates it.
+    #[serde(default)]
+    pub history: Vec<super::transfer_history::RunRow>,
+    /// Older exchanges were left out to keep the package within its cap.
+    #[serde(default)]
+    pub history_truncated: bool,
 }
 
 /// Why packaging or importing stopped.
@@ -301,9 +313,9 @@ pub async fn build(
                 })
             }
             None => {
-                return Err(Failure::Problem(format!(
-                    "the session transcript for {id} is missing"
-                )));
+                // The history rows still travel, and the destination replays them to a fresh session.
+                tracing::warn!(chat_id, session_id = %id, "the session transcript is missing; moving the chat without it");
+                None
             }
         },
         None => None,
@@ -351,6 +363,7 @@ pub async fn build(
         }
     }
     let interrupted = cut || !parked.is_empty();
+    let history = super::transfer_history::collect_history(pool, chat_id).await?;
     Ok(Package {
         transfer_id: transfer_id.to_owned(),
         chat_id: chat_id.to_owned(),
@@ -373,6 +386,8 @@ pub async fn build(
         queue,
         parked,
         interrupted,
+        history: history.rows,
+        history_truncated: history.truncated,
     })
 }
 
@@ -561,6 +576,21 @@ async fn import_locked(
                 .execute(&mut *tx)
                 .await?;
         }
+    }
+    let newest =
+        super::transfer_history::insert_history(&mut tx, &package.chat_id, &package.history)
+            .await?;
+    // The reader saw these answers on the origin: they are history here, not unread. The package
+    // carries no origin marker (its ids mean nothing here), so everything inserted counts as seen.
+    if let Some(newest) = newest {
+        sqlx::query(
+            "UPDATE chats SET last_seen_turn_id = MAX(COALESCE(last_seen_turn_id, 0), ?)
+              WHERE chat_id = ?",
+        )
+        .bind(newest)
+        .bind(&package.chat_id)
+        .execute(&mut *tx)
+        .await?;
     }
     sqlx::query("DELETE FROM chat_queue WHERE chat_id = ?")
         .bind(&package.chat_id)
@@ -1002,7 +1032,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_missing_session_transcript_refuses_without_losing_the_origin_session() {
+    async fn a_missing_session_transcript_travels_without_a_session_and_keeps_the_origin_session() {
         let origin = crate::testdb::fresh_pool().await;
         let store = space_free_tempdir("nucleos-move-missing-session-");
         a_chat(&origin, "c-missing-session", None).await;
@@ -1018,19 +1048,18 @@ mod tests {
             .unwrap();
         freeze(&origin, "c-missing-session", "t-missing-session").await;
 
-        let result = build(
+        let package = build(
             &origin,
             "c-missing-session",
             "t-missing-session",
             store.path(),
             vec![],
         )
-        .await;
+        .await
+        .expect("a missing transcript must not refuse the build");
 
-        assert!(
-            matches!(result, Err(Failure::Problem(ref problem)) if problem.contains("gone-session") && problem.contains("missing")),
-            "{result:?}"
-        );
+        // No session travels: the destination replays the history instead.
+        assert!(package.session.is_none(), "{package:?}");
         let session: String = sqlx::query_scalar(
             "SELECT session_id FROM assistant_sessions WHERE chat_id = 'c-missing-session'",
         )
@@ -1230,6 +1259,8 @@ mod tests {
             queue: vec![],
             parked: vec![],
             interrupted: false,
+            history: vec![],
+            history_truncated: false,
         };
         let refused = import(&destination, &package, Path::new("unused")).await;
         assert!(
@@ -1292,6 +1323,8 @@ mod tests {
                 "chat",
                 "chat_id",
                 "code",
+                "history",
+                "history_truncated",
                 "interrupted",
                 "parked",
                 "queue",

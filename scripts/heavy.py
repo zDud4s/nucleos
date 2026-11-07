@@ -1070,6 +1070,32 @@ def _read_lock(lock: Path) -> dict | None:
     return rec
 
 
+def _reap_dead_locks_held(directory: Path) -> list[str]:
+    """Remove every worktree lock whose holder is dead; returns their hashes. Call under the
+    Mutex. A gate killed on timeout dies hard (its process tree is terminated), so its release
+    path never runs and the lock would otherwise wait for the throttled sweep."""
+    wt = directory / "wt"
+    try:
+        locks = sorted(wt.glob("*.lock"))
+    except OSError:
+        return []
+    reaped = []
+    for lock in locks:
+        _read_lock(lock)
+        if not lock.exists():
+            reaped.append(lock.name[: -len(".lock")])
+    return reaped
+
+
+def reap_dead_locks(directory: Path, timeout: float = 2.0) -> list[str]:
+    """`_reap_dead_locks_held` under the Mutex; [] when the Mutex stays busy."""
+    try:
+        with Mutex(Path(directory), timeout):
+            return _reap_dead_locks_held(Path(directory))
+    except (TimeoutError, OSError):
+        return []
+
+
 def acquire_lock(directory: Path, h: str, rec: dict, wait_cap: float,
                  fail_on_hold: bool = False, *,
                  why: dict | None = None) -> tuple[bool, float, int]:
@@ -1089,6 +1115,7 @@ def acquire_lock(directory: Path, h: str, rec: dict, wait_cap: float,
     wfile = wdir / f"{rec['prio']}-{arrival}-{me}"
     mine = (int(rec["prio"]), arrival)
     queued = False
+    queued_reaped = False
     last_report = t0
     last_holder = None
     est = None
@@ -1114,6 +1141,9 @@ def acquire_lock(directory: Path, h: str, rec: dict, wait_cap: float,
                     est = _holder_estimate(directory, peek)
             with Mutex(directory):
                 wdir.mkdir(parents=True, exist_ok=True)
+                if not queued_reaped:
+                    _reap_dead_locks_held(directory)
+                    queued_reaped = True
                 holder = _read_lock(lock)
                 if holder is not None and holder.get("pid") == me:
                     # Handed over by the previous holder on its release.
@@ -3361,6 +3391,7 @@ def cmd_status() -> int:
     for f, rec in light_runs:
         print(f"  pid={rec.get('pid')} cls={rec.get('cls')} age={_age(f)}")
     wt = d / "wt"
+    reaped = reap_dead_locks(d) if wt.is_dir() else []
     locks = sorted(wt.glob("*.lock")) if wt.is_dir() else []
     lock_lines: list[str] = []
     dead = 0
@@ -3379,6 +3410,8 @@ def cmd_status() -> int:
         for f, wrec in waiting:
             lock_lines.append(_line(wrec, f"  waiting prio={_wkey(f)[0]} age={_age(f)}"))
     print(f"worktree locks: {len(locks)} (dead: {dead})")
+    if reaped:
+        print(f"reaped dead locks: {len(reaped)} ({', '.join(reaped)})")
     for text in lock_lines:
         print(text)
     try:

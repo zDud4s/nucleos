@@ -1,6 +1,6 @@
 module nucleos/sidecars/echo
 
-go 1.26.1
+go 1.26
 
 // Pinned, not left to whatever the machine has. The `go` line above is a language floor and says
 // nothing about which stdlib gets compiled in, and the stdlib is where a sidecar's exposure lives.

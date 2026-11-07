@@ -1329,6 +1329,12 @@ pub async fn merge_branch(worktree_path: &Path, branch: &str) -> io::Result<bool
     Ok(false)
 }
 
+/// Whether `branch` is already reachable from the checkout's HEAD, i.e. a merge of it has landed.
+/// A failure to answer is `false`.
+pub async fn branch_is_merged(worktree_path: &Path, branch: &str) -> bool {
+    is_ancestor(worktree_path, branch, "HEAD").await
+}
+
 pub async fn revert_to(worktree_path: &Path, sha: &str) -> io::Result<()> {
     let reset = git()
         .arg("-C")

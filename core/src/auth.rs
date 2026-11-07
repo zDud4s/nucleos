@@ -845,8 +845,10 @@ const REMOTE_AGENT_ONLY_SEGMENTS: &[(&str, &str)] = &[
 ];
 
 mod remote;
+#[cfg(test)]
+use remote::REMOTE_DEVICE_REFUSED_ROUTES;
+use remote::REMOTE_GATEWAY_ROUTES;
 pub use remote::{DEVICE_SESSION_HEADER, RemoteDevice, remote_device_permits};
-use remote::{REMOTE_DEVICE_REFUSED_ROUTES, REMOTE_GATEWAY_ROUTES};
 mod grave;
 pub use grave::{GRAVE_ROUTES, is_grave};
 
@@ -2824,6 +2826,18 @@ mod tests {
         ("POST", "/assistant/chats"),
         ("GET", "/assistant/chats/{chat_id}"),
         ("POST", "/assistant/chats/{chat_id}/relay"),
+        // Lists across paired machines: the shell reads and edits a remote machine's chat lists,
+        // groups and search, and forwards a message to a chat there.
+        ("GET", "/assistant/search"),
+        ("POST", "/assistant/message"),
+        ("POST", "/assistant/chats/{chat_id}/forward"),
+        ("GET", "/assistant/chat-groups"),
+        ("POST", "/assistant/chat-groups"),
+        ("PATCH", "/assistant/chat-groups/{group_id}"),
+        ("DELETE", "/assistant/chat-groups/{group_id}"),
+        ("PUT", "/assistant/chats/{chat_id}/group"),
+        ("POST", "/assistant/chats/{chat_id}/restore"),
+        ("GET", "/notifications/pending"),
         ("GET", "/files"),
         ("GET", "/files/download"),
         ("POST", "/files/folder"),

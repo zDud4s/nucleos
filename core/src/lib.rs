@@ -62,6 +62,7 @@ pub mod knowledge;
 pub mod loadout;
 pub use nucleos_base::logging;
 pub mod machine_config;
+pub mod machine_id;
 // Only `map::intent` stays in the library (`distill` asks a model through it); the rest of `map`
 // compiles in `nucleos-app`, whose `map.rs` re-exports this one.
 pub mod map {

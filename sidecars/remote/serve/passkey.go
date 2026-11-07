@@ -38,8 +38,11 @@ const (
 	// ceremonyTTL is how long a challenge lives, and the timeout the browser is told.
 	ceremonyTTL = 5 * time.Minute
 	// maxCeremonies bounds the memory a flood of begin calls can take.
-	maxCeremonies = 256
-	passkeyLimit  = 30
+	maxCeremonies          = 256
+	passkeyDeviceLimit     = 20
+	passkeyGlobalLimit     = 120
+	passkeyFailLimit       = 8
+	maxCeremoniesPerDevice = 8
 )
 
 // refusalPairingWindowClosed: the first passkey is only registered within 15 minutes of the
@@ -89,13 +92,27 @@ func (s *ceremonyStore) put(key string, c ceremony) {
 			delete(s.m, k)
 		}
 	}
-	if len(s.m) >= maxCeremonies {
-		if _, replaces := s.m[key]; !replaces {
-			// Full of live ceremonies: drop an arbitrary one rather than refuse a person.
-			for k := range s.m {
-				delete(s.m, k)
-				break
+	if _, replaces := s.m[key]; !replaces {
+		count := 0
+		var oldest string
+		var oldestExpiry time.Time
+		for k, v := range s.m {
+			if v.deviceID != c.deviceID {
+				continue
 			}
+			count++
+			if oldest == "" || v.expires.Before(oldestExpiry) {
+				oldest, oldestExpiry = k, v.expires
+			}
+		}
+		if count >= maxCeremoniesPerDevice {
+			delete(s.m, oldest)
+		}
+	}
+	if len(s.m) >= maxCeremonies {
+		for k := range s.m {
+			delete(s.m, k)
+			break
 		}
 	}
 	c.expires = now.Add(ceremonyTTL)
@@ -202,13 +219,7 @@ func (a *authHandler) passkeyRoute(w http.ResponseWriter, r *http.Request) bool 
 		writeJSONError(w, http.StatusServiceUnavailable, "passkeys_unavailable")
 		return true
 	}
-	if ok, wait := a.plim.allow(); !ok {
-		secs := int((wait + time.Second - 1) / time.Second)
-		if secs < 1 {
-			secs = 1
-		}
-		w.Header().Set("Retry-After", fmt.Sprint(secs))
-		writeJSONError(w, http.StatusTooManyRequests, "slow_down")
+	if !a.globalAllowed(w, r.URL.Path) {
 		return true
 	}
 	h(w, r)
@@ -245,6 +256,9 @@ func (a *authHandler) ticketState(ctx context.Context, w http.ResponseWriter, ti
 	var out ticketState
 	if status != http.StatusOK || json.Unmarshal(data, &out) != nil || out.DeviceID <= 0 {
 		writeJSONError(w, http.StatusBadGateway, "daemon_error")
+		return ticketState{}, false
+	}
+	if !a.deviceAllowed(w, out.DeviceID, "/auth/stepup") {
 		return ticketState{}, false
 	}
 	return out, true
@@ -311,6 +325,12 @@ func (a *authHandler) ticketFinish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dev := callerDevice{id: st.DeviceID, name: st.DeviceName, owner: true}
+	failed := true
+	defer func() {
+		if failed {
+			a.finishFailure(dev.id)
+		}
+	}()
 	verify, hasVerify := a.cer.take(ceremonyKey("ticket-verify", in.Ticket))
 	register, hasRegister := a.cer.take(ceremonyKey("ticket-register", in.Ticket))
 	if (!hasVerify && !hasRegister) || (hasVerify && hasRegister) {
@@ -356,6 +376,8 @@ func (a *authHandler) ticketFinish(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	a.finishSuccess(dev.id)
+	failed = false
 	writeJSON(w, http.StatusOK, map[string]any{"stepped_up": true})
 }
 
@@ -415,6 +437,9 @@ func (a *authHandler) caller(w http.ResponseWriter, r *http.Request) (callerDevi
 	}
 	if status != http.StatusOK || json.Unmarshal(data, &info) != nil || info.DeviceID <= 0 {
 		writeJSONError(w, http.StatusBadGateway, "daemon_error")
+		return callerDevice{}, false
+	}
+	if !a.deviceAllowed(w, info.DeviceID, r.URL.Path) {
 		return callerDevice{}, false
 	}
 	return callerDevice{secret: secret, id: info.DeviceID, name: info.Name, owner: info.Owner}, true
@@ -560,6 +585,12 @@ func (a *authHandler) registerFinish(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	failed := true
+	defer func() {
+		if failed {
+			a.finishFailure(dev.id)
+		}
+	}()
 	body, c, ok := a.readCeremony(w, r, "register", dev)
 	if !ok {
 		return
@@ -585,6 +616,8 @@ func (a *authHandler) registerFinish(w http.ResponseWriter, r *http.Request) {
 		a.daemonRefusal(w, status, data)
 		return
 	}
+	a.finishSuccess(dev.id)
+	failed = false
 	writeJSON(w, http.StatusOK, map[string]any{"registered": true})
 }
 
@@ -616,6 +649,12 @@ func (a *authHandler) verifyFinish(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	failed := true
+	defer func() {
+		if failed {
+			a.finishFailure(dev.id)
+		}
+	}()
 	body, c, ok := a.readCeremony(w, r, "verify", dev)
 	if !ok {
 		return
@@ -668,5 +707,7 @@ func (a *authHandler) verifyFinish(w http.ResponseWriter, r *http.Request) {
 		Seconds int `json:"window_seconds"`
 	}
 	_ = json.Unmarshal(bytes.TrimSpace(data), &out)
+	a.finishSuccess(dev.id)
+	failed = false
 	writeJSON(w, http.StatusOK, map[string]any{"stepped_up": true, "window_seconds": out.Seconds})
 }

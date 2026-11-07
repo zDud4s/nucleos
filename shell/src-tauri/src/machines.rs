@@ -21,6 +21,9 @@ pub struct MachinePair {
     id: String,
     origin: String,
     name: String,
+    /// The peer's stable machine id, read from its pairing answer. `None` for an older peer that
+    /// does not report one; the local `id` (the alias) then stays the only key.
+    machine_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -31,6 +34,8 @@ struct PairRequest<'a> {
 #[derive(Deserialize)]
 struct PairResponse {
     name: Option<String>,
+    #[serde(default)]
+    machine_id: Option<String>,
 }
 
 /// What the vault keeps per machine: the canonical origin travels with the session,
@@ -183,10 +188,12 @@ async fn pair_with(vault: &dyn Vault, origin: &str, code: &str) -> Result<Machin
         .name
         .filter(|name| !name.trim().is_empty())
         .unwrap_or_else(|| origin.to_owned());
+    let machine_id = pair.machine_id.filter(|id| !id.trim().is_empty());
     Ok(MachinePair {
         id,
         origin: origin.to_owned(),
         name,
+        machine_id,
     })
 }
 
@@ -459,6 +466,22 @@ mod tests {
             "__Host-nucleos_session=abc123; Path=/; Secure; HttpOnly",
         ]);
         assert_eq!(session_from_headers(&headers).as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn the_pairing_record_keeps_the_peers_machine_id_and_none_for_an_old_peer() {
+        let with_id = serve_once("HTTP/1.1 200 OK\r\nSet-Cookie: __Host-nucleos_session=abc; Path=/\r\nContent-Length: 35\r\nConnection: close\r\n\r\n{\"name\":\"Tower\",\"machine_id\":\"m-1\"}");
+        let paired =
+            tauri::async_runtime::block_on(pair_with(&MemVault::default(), &with_id, "ABCDE"))
+                .unwrap();
+        assert_eq!(paired.machine_id.as_deref(), Some("m-1"));
+        assert_eq!(paired.name, "Tower");
+
+        let old_peer = serve_once("HTTP/1.1 200 OK\r\nSet-Cookie: __Host-nucleos_session=abc; Path=/\r\nContent-Length: 14\r\nConnection: close\r\n\r\n{\"name\":\"Old\"}");
+        let paired =
+            tauri::async_runtime::block_on(pair_with(&MemVault::default(), &old_peer, "ABCDE"))
+                .unwrap();
+        assert_eq!(paired.machine_id, None);
     }
 
     #[test]

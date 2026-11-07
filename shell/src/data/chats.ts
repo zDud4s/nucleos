@@ -22,11 +22,15 @@ import {
   chatFetch,
   chatKey,
   chatMachineOf,
+  groupIdOn,
   machineKey,
   mergeChats,
+  mergeGroups,
   rememberChatMachine,
   useChatLinks,
   type ChatRow,
+  type GroupIds,
+  type MergedGroup,
 } from "./chatMachines";
 import { keys as baseKeys } from "./keys";
 import { useMachines, type MachineId } from "./machines";
@@ -54,8 +58,11 @@ const keys = {
 function invalidateChatLists(queryClient: QueryClient): Promise<void> {
   return Promise.all([
     queryClient.invalidateQueries({ queryKey: keys.chats.all, exact: true }),
+    queryClient.invalidateQueries({ queryKey: keys.chats.archived, exact: true }),
     queryClient.invalidateQueries({
-      predicate: (query) => query.queryKey.length === 2 && query.queryKey[1] === "chats",
+      predicate: (query) =>
+        (query.queryKey.length === 2 && query.queryKey[1] === "chats") ||
+        (query.queryKey.length === 3 && query.queryKey[1] === "chats" && query.queryKey[2] === "archived"),
     }),
   ]).then(() => undefined);
 }
@@ -773,7 +780,7 @@ export async function importChatTransfer(transferId: string, packageBody: ChatTr
 }
 
 /** Mark the destination live after its import has succeeded. */
-export async function finishChatTransfer(chatId: string, body: { transfer_id: string; to: string; to_name?: string }, machine: MachineId = chatMachineOf(chatId)): Promise<void> {
+export async function finishChatTransfer(chatId: string, body: { transfer_id: string; to: string; to_name?: string; to_machine_id?: string }, machine: MachineId = chatMachineOf(chatId)): Promise<void> {
   await apiFetch<void>(transferPath(chatId, "finish"), { method: "POST", body: JSON.stringify(body) }, machine);
 }
 
@@ -844,7 +851,18 @@ export function useAllChats() {
     return pointers;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [data, here.data, signature]);
-  return { ...here, data, moved };
+  const answeredMachines = useMemo(
+    () => [
+      ...(here.data !== undefined && !here.isError ? (["here"] as MachineId[]) : []),
+      ...others
+        .filter((_, index) => remote[index].data !== undefined && !remote[index].isError)
+        .map((machine) => machine.id),
+    ],
+    // `signature` represents every remote result; the query-result array itself is new on each render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [here.data, here.isError, signature],
+  );
+  return { ...here, data, moved, answeredMachines };
 }
 
 /**
@@ -893,13 +911,51 @@ export function useModelGroups(chatId?: string) {
   });
 }
 
-/** Archived conversations, listed only while `enabled` (the section is open). */
+/** Archived conversations across every paired machine, read only while the section is open. */
 export function useArchivedChats(enabled: boolean) {
-  return useQuery({
-    queryKey: keys.chats.archived,
-    queryFn: () => apiFetch<ChatSummary[]>("/assistant/chats?archived=true"),
-    enabled,
+  const machines = useMachines();
+  const archived = useQueries({
+    queries: machines.map((machine) => ({
+      queryKey: machineKey(keys.chats.archived, machine.id),
+      queryFn: () =>
+        machine.id === "here"
+          ? apiFetch<ChatSummary[]>("/assistant/chats?archived=true")
+          : apiFetch<ChatSummary[]>("/assistant/chats?archived=true", undefined, machine.id),
+      enabled,
+    })),
   });
+  const signature = archived
+    .map((result, index) => `${machines[index].id}:${result.dataUpdatedAt}:${result.isError}`)
+    .join("|");
+  const machineSignature = machines.map((machine) => `${machine.id}:${machine.name}`).join("|");
+  const data = useMemo((): ChatRow[] | undefined => {
+    const sources = machines.map((machine, index) => ({
+      machine: machine.id,
+      name: machines.length > 1 ? machine.name : undefined,
+      chats: archived[index].data,
+      failed: archived[index].isError,
+    }));
+    if (sources.every((source) => source.chats === undefined)) return undefined;
+    return mergeChats(sources);
+    // `signature` represents every query result; the query-result array itself is new on each render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [signature, machineSignature]);
+  useEffect(() => {
+    machines.forEach((machine, index) => {
+      const chats = archived[index].data;
+      if (machine.id !== "here" && chats !== undefined && !archived[index].isError) {
+        rememberChatMachine(chats.map((chat) => chat.chat_id), machine.id);
+      }
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [signature, machineSignature]);
+  const failedMachines = machines.filter((_, index) => archived[index].isError);
+  return {
+    data,
+    isError: failedMachines.length > 0,
+    isPending: archived.some((result) => result.isPending),
+    failedMachines,
+  };
 }
 
 /** Return an archived conversation to the list. */
@@ -920,42 +976,159 @@ export function useChatGroups() {
   });
 }
 
+/**
+ * The groups of every machine this device can reach, merged by name (see `mergeGroups`). Each
+ * machine's groups are cached on their own key; one that does not answer keeps its last groups and
+ * is listed in `failedMachines`, and never hides the others.
+ */
+export function useAllChatGroups() {
+  const machines = useMachines();
+  const results = useQueries({
+    queries: machines.map((machine) => ({
+      queryKey: machineKey(keys.chats.groups, machine.id),
+      queryFn: () =>
+        machine.id === "here"
+          ? apiFetch<ChatGroup[]>("/assistant/chat-groups")
+          : apiFetch<ChatGroup[]>("/assistant/chat-groups", undefined, machine.id),
+      placeholderData: keepPreviousData,
+    })),
+  });
+  const signature = results
+    .map((result, index) => `${machines[index].id}:${result.dataUpdatedAt}:${result.isError}`)
+    .join("|");
+  const data = useMemo(
+    (): MergedGroup[] =>
+      mergeGroups(
+        machines.map((machine, index) => ({
+          machine: machine.id,
+          groups: Array.isArray(results[index].data) ? results[index].data : undefined,
+        })),
+      ),
+    // `signature` represents every query result; the query-result array itself is new on each render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [signature],
+  );
+  const failedMachines = machines.filter((machine, index) => machine.id !== "here" && results[index].isError);
+  // Machines whose group list was really read: a loading, errored or placeholder list says nothing
+  // about whether a group of some name exists there.
+  const loaded = machines
+    .filter((_, index) => results[index].isSuccess && !results[index].isPlaceholderData)
+    .map((machine) => machine.id);
+  return { data, failedMachines, machines, loaded };
+}
+
+/** `apiFetch` to one machine; this machine's call is the unchanged two-argument one. */
+function machineFetch<T>(machine: MachineId, path: string, init?: RequestInit): Promise<T> {
+  if (machine !== "here") return apiFetch<T>(path, init, machine);
+  return init === undefined ? apiFetch<T>(path) : apiFetch<T>(path, init);
+}
+
+/**
+ * Refresh the group lists of every machine and the chat lists that carry `group_id`. A remote
+ * machine's groups sit under `[machine, "chats", "groups"]`, outside `keys.chats.all`, so they are
+ * named here: the prefix invalidation would not reach them.
+ */
+function invalidateGroups(queryClient: QueryClient): Promise<void> {
+  return Promise.all([
+    queryClient.invalidateQueries({ queryKey: keys.chats.groups }),
+    queryClient.invalidateQueries({
+      predicate: (query) =>
+        query.queryKey.length === 3 && query.queryKey[1] === "chats" && query.queryKey[2] === "groups",
+    }),
+    invalidateChatLists(queryClient),
+  ]).then(() => undefined);
+}
+
+/** The outcome of a change applied on several machines: those that refused it keep the old state. */
+export interface GroupFanOut {
+  failed: MachineId[];
+  /** Machines that applied the change to some of their groups of that name but not all. */
+  partial: MachineId[];
+}
+
+/**
+ * Run one request per (machine, group id); a machine that fails is listed, the others still apply.
+ * A machine where only some ids failed is `partial` as well as `failed`.
+ */
+async function fanOut(ids: GroupIds, run: (machine: MachineId, id: number) => Promise<unknown>): Promise<GroupFanOut> {
+  const jobs = (Object.entries(ids) as [MachineId, number[]][]).map(async ([machine, list]) => {
+    const settled = await Promise.allSettled(list.map((id) => run(machine, id)));
+    const rejected = settled.filter((entry) => entry.status === "rejected").length;
+    return { machine, rejected, all: settled.length };
+  });
+  const results = await Promise.all(jobs);
+  return {
+    failed: results.filter((r) => r.rejected > 0).map((r) => r.machine),
+    partial: results.filter((r) => r.rejected > 0 && r.rejected < r.all).map((r) => r.machine),
+  };
+}
+
+/** A new group is made on this machine only; another machine gets it when a chat there is moved in. */
 export function useCreateChatGroup() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (name: string) =>
       apiFetch<ChatGroup>("/assistant/chat-groups", { method: "POST", body: JSON.stringify({ name }) }),
     retry: false,
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
-    },
+    onSuccess: () => invalidateGroups(queryClient),
   });
 }
 
+/** Rename a merged group on every machine that holds it, each by its own id. */
 export function useRenameChatGroup() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (v: { id: number; name: string }) =>
-      apiFetch<ChatGroup>(`/assistant/chat-groups/${v.id}`, {
-        method: "PATCH",
-        body: JSON.stringify({ name: v.name }),
-      }),
+    mutationFn: (v: { ids: GroupIds; name: string }) =>
+      fanOut(v.ids, (machine, id) =>
+        machineFetch<ChatGroup>(machine, `/assistant/chat-groups/${id}`, {
+          method: "PATCH",
+          body: JSON.stringify({ name: v.name }),
+        }),
+      ),
     retry: false,
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
-    },
+    // Settled and not success: machines that applied the change must show it even if another did not.
+    onSettled: () => invalidateGroups(queryClient),
   });
 }
 
-/** Deleting a group ungroups its conversations; it never archives them. */
+/** Deleting a group ungroups its conversations; it never archives them. Applies on every machine that holds it. */
 export function useDeleteChatGroup() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (id: number) => apiFetch<void>(`/assistant/chat-groups/${id}`, { method: "DELETE" }),
+    mutationFn: (ids: GroupIds) =>
+      fanOut(ids, (machine, id) => machineFetch<void>(machine, `/assistant/chat-groups/${id}`, { method: "DELETE" })),
     retry: false,
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
+    onSettled: () => invalidateGroups(queryClient),
+  });
+}
+
+/**
+ * Put a conversation in a merged group, or `null` to ungroup it. The group id is the one the chat's
+ * own machine gave it; when that machine has no group of that name yet, it is created there first.
+ */
+export function useMoveChatToGroup() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (v: { chatId: string; group: MergedGroup | null }) => {
+      let groupId: number | null = null;
+      if (v.group !== null) {
+        const known = groupIdOn(v.group, chatMachineOf(v.chatId));
+        groupId =
+          known ??
+          (
+            await chatFetch<ChatGroup>(v.chatId, "/assistant/chat-groups", {
+              method: "POST",
+              body: JSON.stringify({ name: v.group.name }),
+            })
+          ).id;
+      }
+      await chatFetch<void>(v.chatId, `/assistant/chats/${encodeURIComponent(v.chatId)}/group`, {
+        method: "PUT",
+        body: JSON.stringify({ group_id: groupId }),
+      });
     },
+    retry: false,
+    onSettled: () => invalidateGroups(queryClient),
   });
 }
 
@@ -1228,6 +1401,94 @@ export function useSaid(query: string) {
   });
 }
 
+/** How long a paired machine gets to answer a search before the others are shown without it. */
+export const REMOTE_SEARCH_TIMEOUT_MS = 4_000;
+/** Typing pauses this long before a paired machine is asked; this machine answers at once. */
+export const REMOTE_SEARCH_DEBOUNCE_MS = 250;
+/** The most hits one search lists, the same ceiling the daemon applies to its own answer. */
+export const SAID_LIMIT = 40;
+
+/** A search hit and the machine it was found on. */
+export type SaidHitFrom = SaidHit & { machine: MachineId; machineName: string };
+
+/** Run `call` with an abort signal that fires, and a rejection that follows, after `ms`. */
+function withDeadline<T>(call: (signal: AbortSignal) => Promise<T>, ms: number): Promise<T> {
+  const controller = new AbortController();
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      controller.abort();
+      reject(new Error("the machine did not answer in time"));
+    }, ms);
+    call(controller.signal).then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+/** Link a hit's chat to the machine it was found on; call before navigating to it. */
+export function linkSaidHit(hit: Pick<SaidHitFrom, "chat_id" | "machine">): void {
+  if (hit.machine !== "here") rememberChatMachine([hit.chat_id], hit.machine);
+}
+
+/**
+ * {@link useSaid} across every paired machine. This machine is asked at once, the others after a
+ * short pause in typing and with a deadline; whichever answers is listed, newest first, and a
+ * machine that errors or times out is reported in `failedMachines` instead of being cached as
+ * "no hits". Every hit remembers the machine it came from.
+ */
+export function useSaidAll(query: string) {
+  const machines = useMachines();
+  const trimmed = query.trim();
+  const [settled, setSettled] = useState(trimmed);
+  useEffect(() => {
+    const timer = setTimeout(() => setSettled(trimmed), REMOTE_SEARCH_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [trimmed]);
+  const results = useQueries({
+    queries: machines.map((machine) => {
+      const local = machine.id === "here";
+      const asked = local ? trimmed : settled;
+      const path = `/assistant/search?q=${encodeURIComponent(asked)}`;
+      return {
+        queryKey: machineKey(keys.chats.said(asked), machine.id),
+        queryFn: () =>
+          local
+            ? apiFetch<SaidHit[]>(path)
+            : withDeadline((signal) => apiFetch<SaidHit[]>(path, { signal }, machine.id), REMOTE_SEARCH_TIMEOUT_MS),
+        enabled: asked.length >= 2,
+        staleTime: 30_000,
+        retry: false,
+      };
+    }),
+  });
+  // While the debounce has not caught up, a remote result belongs to the text before this one:
+  // it is not shown beside this machine's hits for the new text.
+  const caughtUp = settled === trimmed;
+  const usable = (machine: { id: string }, index: number) =>
+    machine.id === "here" || caughtUp ? results[index] : undefined;
+  const signature = `${caughtUp}|${results.map((result, index) => `${machines[index].id}:${result.dataUpdatedAt}:${result.isError}`).join("|")}`;
+  const data = useMemo((): SaidHitFrom[] | undefined => {
+    const shown = machines.map((machine, index) => usable(machine, index));
+    if (trimmed.length < 2 || shown.every((result) => result?.data === undefined)) return undefined;
+    const hits = machines.flatMap((machine, index) =>
+      (shown[index]?.data ?? []).map((hit) => ({ ...hit, machine: machine.id, machineName: machine.name })),
+    );
+    return hits.sort((a, b) => b.created_at.localeCompare(a.created_at)).slice(0, SAID_LIMIT);
+    // `signature` stands for the results: the array itself is new on every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [signature, trimmed, machines]);
+  const failedMachines =
+    trimmed.length < 2 ? [] : machines.filter((machine, index) => usable(machine, index)?.isError === true);
+  return { data, failedMachines, isError: failedMachines.length > 0 };
+}
+
 /**
  * Whether this machine has a model that can answer a conversation.
  *
@@ -1462,6 +1723,32 @@ export function useForwardTurn() {
     retry: false,
     onSuccess: (_result, { toChatId }) => {
       void queryClient.invalidateQueries({ queryKey: keys.chats.detail(toChatId) });
+      void invalidateChatLists(queryClient);
+    },
+  });
+}
+
+/**
+ * Hands words to a conversation on ANOTHER machine, as a plain message from the person.
+ *
+ * A relay needs the source turn in the destination's own database, which a turn on a different
+ * machine is not, and the daemons do not talk to each other. So the shell, which already holds the
+ * text, sends it to the destination as an ordinary message under a header saying where it came
+ * from. No agent hop is involved, hence no relay chain, cycle or depth to guard, and nothing is
+ * recorded on the source. Not optimistic: the destination may be busy or gone, and a bubble drawn
+ * for a message that never left would be a lie.
+ */
+export function useForwardAsMessage() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ toChatId, text }: { toChatId: string; text: string }) =>
+      chatFetch<{ turn_id?: number; queued?: boolean }>(toChatId, "/assistant/message", {
+        method: "POST",
+        body: JSON.stringify({ chat_id: toChatId, text, images: [], wait_if_busy: true }),
+      }),
+    retry: false,
+    onSuccess: (_result, { toChatId }) => {
+      void queryClient.invalidateQueries({ queryKey: chatKey(keys.chats.detail(toChatId), toChatId) });
       void invalidateChatLists(queryClient);
     },
   });

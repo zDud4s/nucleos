@@ -62,7 +62,6 @@ import {
   useAssistantModels,
   useModelGroups,
   useChatTranscript,
-  useChats,
   useIdeConversation,
   useIdeSessions,
   useSetChatProject,
@@ -77,6 +76,7 @@ import {
   useChatFiles,
   useChatProject,
   useDropQueued,
+  useForwardAsMessage,
   useForwardTurn,
   useLiveTurn,
   useRelayChain,
@@ -101,9 +101,10 @@ import {
   useFreshContext,
   useSetChatAutoCompact,
   useOlderTurns,
-  useSaid,
+  linkSaidHit,
+  useSaidAll,
   useTurnTools,
-  type SaidHit,
+  type SaidHitFrom,
   type Command,
   type Exchange,
   type Ask,
@@ -114,7 +115,7 @@ import {
   type Turn,
 } from "../data/chats";
 import { type RelaySent } from "../lib/turns";
-import { chatKey, rememberChatMachine, useChatMachine } from "../data/chatMachines";
+import { chatKey, chatMachineOf, rememberChatMachine, useChatMachine } from "../data/chatMachines";
 import { useMachines } from "../data/machines";
 import { MachinePicker, useNewWorkMachine } from "../chats/MachinePicker";
 import { type ChatNotice } from "../data/chats";
@@ -298,7 +299,7 @@ export function Chats() {
   };
   const unseen = rows.reduce((total, row) => total + row.waiting, 0);
   const query = usePaletteQuery();
-  const said = useSaid(query);
+  const said = useSaidAll(query);
   const needle = query.trim().toLowerCase();
 
   // Matched here rather than by cmdk, and `shouldFilter={false}` below is the other half of that.
@@ -311,6 +312,7 @@ export function Chats() {
     return `${name} ${row.cwd ?? ""}`.toLowerCase().includes(needle);
   });
   const hits = said.data ?? [];
+  const silent = said.failedMachines;
 
   usePaletteGroup({
     id: ["chats", "named"].join("-"),
@@ -333,22 +335,34 @@ export function Chats() {
     }),
   });
   usePaletteGroup(
-    hits.length === 0
+    hits.length === 0 && silent.length === 0
       ? null
       : {
           id: "chats-said",
           heading: "Said in a conversation",
           prematched: true,
-          items: hits.map((hit) => ({
-            id: `said-${hit.turn_id}`,
-            label: <SaidRow hit={hit} />,
-            match: hit.excerpt,
-            run: () => {
-              openingAChat();
-              void navigate({ to: `/chats/${hit.chat_id}` });
-              setFound({ chatId: hit.chat_id, turnId: hit.turn_id, at: Date.now() });
-            },
-          })),
+          items: [
+            ...hits.map((hit) => ({
+              id: `said-${hit.machine}-${hit.turn_id}`,
+              label: <SaidRow hit={hit} />,
+              match: hit.excerpt,
+              run: () => {
+                // Before navigating, so the turn jump and the transcript read reach the right machine.
+                linkSaidHit(hit);
+                openingAChat();
+                void navigate({ to: `/chats/${hit.chat_id}` });
+                setFound({ chatId: hit.chat_id, turnId: hit.turn_id, at: Date.now() });
+              },
+            })),
+            ...silent.map((machine) => ({
+              id: `said-silent-${machine.id}`,
+              label: <span className="chats-palette-said-text">{machine.name} is not reachable</span>,
+              match: `${machine.name} is not reachable`,
+              // Informational: listed, but not something to choose.
+              disabled: true,
+              run: () => {},
+            })),
+          ],
         },
   );
 
@@ -536,7 +550,7 @@ function ListError({ error }: { error: unknown }) {
 }
 
 /** One search hit: whose half it was, what it said, and which conversation it was said in. */
-function SaidRow({ hit }: { hit: SaidHit }) {
+function SaidRow({ hit }: { hit: SaidHitFrom }) {
   return (
     <span className="chats-palette-said">
       <span className="chats-palette-said-head">
@@ -1159,7 +1173,11 @@ function MovedChat({ chatId, destination }: { chatId: string; destination: strin
   } catch {
     // Older origins stored the display value directly.
   }
-  const target = machines.find((machine) => machine.id === stored.id || machine.name === stored.name);
+  // The stored id is the destination's stable machine id; the alias and name matches cover
+  // pointers written before that id existed.
+  const target =
+    machines.find((machine) => machine.machine_id !== undefined && machine.machine_id === stored.id) ??
+    machines.find((machine) => machine.id === stored.id || machine.name === stored.name);
   return (
     <section className="chats-detail-inner">
       <ErrorNote>
@@ -5637,7 +5655,7 @@ function ForwardTurn({ chatId, turn }: { chatId: string; turn: Turn }) {
  * subscribed to only while a panel is open: every settled turn used to subscribe from the moment it
  * was drawn, hundreds of subscriptions on a long transcript, to fill a menu nobody had opened.
  */
-function ForwardPanel({
+export function ForwardPanel({
   chatId,
   turn,
   text,
@@ -5650,9 +5668,21 @@ function ForwardPanel({
   onText: (text: string) => void;
   onSent: () => void;
 }) {
-  const chats = useChats();
+  const chats = useAllChats();
   const forward = useForwardTurn();
-  const elsewhere = (chats.data ?? []).filter((row) => row.chat_id !== chatId);
+  // Forward needs the source turn in the target's own database, so only chats on the source's machine.
+  const sourceMachine = chatMachineOf(chatId);
+  const elsewhere = (chats.data ?? []).filter((row) => row.chat_id !== chatId && row.machine === sourceMachine);
+  // Chats on any other machine cannot be handed the turn (the daemons do not talk to each other), so
+  // they get its text as a plain message under a header saying where it came from. A machine that
+  // is not answering is left out: the message would not arrive and there is no queue to keep it in.
+  const asMessage = useForwardAsMessage();
+  const source = (chats.data ?? []).find((row) => row.chat_id === chatId);
+  // Title and machine name are untrusted text: collapse every whitespace run (newlines included) so
+  // they cannot fake extra header lines.
+  const oneLine = (value: string) => value.replace(/\s+/g, " ").trim();
+  const sourceLabel = `${oneLine(source?.title ?? source?.first_message ?? "a conversation")} on ${oneLine(source?.machineName ?? "This device")}`;
+  const otherMachines = (chats.data ?? []).filter((row) => row.machine !== sourceMachine && !row.unreachable);
 
   return (
     <>
@@ -5667,7 +5697,7 @@ function ForwardPanel({
             value={text}
             onChange={(event) => onText(event.target.value)}
           />
-          {elsewhere.length === 0 && (
+          {elsewhere.length === 0 && otherMachines.length === 0 && (
             <Quiet compact says="there is no other conversation to hand this to." />
           )}
           <ul className="chats-forward-targets" aria-label="Hand it to">
@@ -5689,6 +5719,40 @@ function ForwardPanel({
               </li>
             ))}
           </ul>
+          {otherMachines.length > 0 && (
+            <>
+              <p className="chats-forward-label">
+                On another machine. It is sent as a message, not handed over: the other side sees your
+                words under a note of where they came from.
+              </p>
+              <ul className="chats-forward-targets" aria-label="Send as a message to">
+                {otherMachines.map((row) => (
+                  <li key={row.chat_id}>
+                    <button
+                      type="button"
+                      className="chats-forward-target"
+                      disabled={asMessage.isPending || text.trim() === ""}
+                      onClick={() => {
+                        asMessage.mutate(
+                          { toChatId: row.chat_id, text: `Forwarded from ${sourceLabel}:\n\n${text}` },
+                          { onSuccess: onSent },
+                        );
+                      }}
+                    >
+                      {`${row.title ?? row.first_message ?? "New conversation"} on ${row.machineName ?? "This device"}`}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+              {asMessage.isError && (
+                <p className="chats-forward-refused" role="status">
+                  {isApiRefusal(asMessage.error)
+                    ? (MESSAGE_SENTENCES[asMessage.error.code] ?? asMessage.error.code)
+                    : "could not send the message"}
+                </p>
+              )}
+            </>
+          )}
           {/* The daemon's own word for why, not a sentence this side invented: `relay_cycle`,
               `relay_too_deep`, `owner_away`. A refusal shown as "something went wrong" is one
               nobody can act on, and each of these has a different answer. */}
