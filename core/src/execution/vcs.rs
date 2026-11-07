@@ -707,6 +707,162 @@ mod tests {
     /// A payload `Op::from_stored` accepts, for rows written straight to the table.
     const MERGE_ARGS: &str = r#"{"op":"merge","source":"feat/x","target":"master"}"#;
 
+    async fn age(pool: &sqlx::SqlitePool, id: i64) {
+        sqlx::query("UPDATE vcs_requests SET started_at = '2026-08-02T00:00:00Z' WHERE id = ?")
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// Defect 3: a restart interrupts a `running` land request and leaves a `queued` one claimable.
+    #[tokio::test]
+    async fn boot_reconcile_interrupts_running_and_keeps_queued_claimable() {
+        let pool = test_pool().await;
+        let running = insert(&pool, "alpha", "running", MERGE_ARGS).await.unwrap();
+        age(&pool, running).await;
+        let queued = insert(&pool, "beta", "queued", MERGE_ARGS).await.unwrap();
+
+        assert_eq!(reconcile_interrupted(&pool).await.unwrap(), 1);
+
+        assert_eq!(status_of(&pool, running).await, "interrupted");
+        assert_eq!(status_of(&pool, queued).await, "queued");
+        let claimed = claim_next(&pool, "beta").await.unwrap().unwrap();
+        assert_eq!(claimed.id, queued);
+    }
+
+    #[tokio::test]
+    async fn a_failed_terminal_write_is_retried_until_it_lands() {
+        let pool = test_pool().await;
+        let id = insert(&pool, "alpha", "running", MERGE_ARGS).await.unwrap();
+        age(&pool, id).await;
+        sqlx::query(
+            "CREATE TRIGGER block_update BEFORE UPDATE ON vcs_requests
+             BEGIN SELECT RAISE(ABORT, 'pool timeout'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let outcome = Outcome::Succeeded {
+            sha: Some("abc123".into()),
+            output_tail: String::new(),
+        };
+        let backoff = [std::time::Duration::from_millis(40); 50];
+        let unblock = async {
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            sqlx::query("DROP TRIGGER block_update")
+                .execute(&pool)
+                .await
+                .unwrap();
+        };
+        let (written, ()) = tokio::join!(write_terminal(&pool, id, &outcome, &backoff), unblock);
+
+        written.unwrap();
+        assert_eq!(status_of(&pool, id).await, "succeeded");
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_terminal_write_backoff_returns_the_error() {
+        let pool = test_pool().await;
+        let id = insert(&pool, "alpha", "running", MERGE_ARGS).await.unwrap();
+        sqlx::query(
+            "CREATE TRIGGER block_update BEFORE UPDATE ON vcs_requests
+             BEGIN SELECT RAISE(ABORT, 'pool timeout'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let outcome = Outcome::Succeeded {
+            sha: None,
+            output_tail: String::new(),
+        };
+        let backoff = [std::time::Duration::from_millis(1); 2];
+
+        assert!(write_terminal(&pool, id, &outcome, &backoff).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_stranded_merge_that_already_landed_is_marked_succeeded() {
+        let pool = test_pool().await;
+        let id = insert(&pool, "alpha", "running", MERGE_ARGS).await.unwrap();
+        age(&pool, id).await;
+        let executor = FakeVcsExecutor::succeeding_with("x").already_landed_at("deadbeef");
+
+        let settled = reconcile_stranded_running(&pool, &executor, std::time::Duration::ZERO)
+            .await
+            .unwrap();
+
+        assert_eq!(settled, 1);
+        assert_eq!(status_of(&pool, id).await, "succeeded");
+        let sha: Option<String> =
+            sqlx::query_scalar("SELECT result_sha FROM vcs_requests WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(sha.as_deref(), Some("deadbeef"));
+    }
+
+    #[tokio::test]
+    async fn a_stranded_merge_that_did_not_land_is_requeued_and_claimable() {
+        let pool = test_pool().await;
+        let id = insert(&pool, "alpha", "running", MERGE_ARGS).await.unwrap();
+        age(&pool, id).await;
+        let executor = FakeVcsExecutor::succeeding_with("x");
+
+        reconcile_stranded_running(&pool, &executor, std::time::Duration::ZERO)
+            .await
+            .unwrap();
+
+        assert_eq!(status_of(&pool, id).await, "queued");
+        assert_eq!(claim_next(&pool, "alpha").await.unwrap().unwrap().id, id);
+    }
+
+    #[tokio::test]
+    async fn a_running_row_inside_the_grace_is_left_alone() {
+        let pool = test_pool().await;
+        let id = insert(&pool, "alpha", "running", MERGE_ARGS).await.unwrap();
+        sqlx::query("UPDATE vcs_requests SET started_at = ? WHERE id = ?")
+            .bind(chrono::Utc::now().to_rfc3339())
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let executor = FakeVcsExecutor::succeeding_with("x");
+
+        let settled = reconcile_stranded_running(&pool, &executor, STRANDED_GRACE)
+            .await
+            .unwrap();
+
+        assert_eq!(settled, 0);
+        assert_eq!(status_of(&pool, id).await, "running");
+    }
+
+    #[tokio::test]
+    async fn cancel_request_cancels_queued_and_orphaned_running_rows_only() {
+        let pool = test_pool().await;
+        let queued = insert(&pool, "alpha", "queued", MERGE_ARGS).await.unwrap();
+        let running = insert(&pool, "beta", "running", MERGE_ARGS).await.unwrap();
+        age(&pool, running).await;
+        let done = insert(&pool, "gamma", "succeeded", MERGE_ARGS)
+            .await
+            .unwrap();
+
+        cancel_request(&pool, queued).await.unwrap();
+        cancel_request(&pool, running).await.unwrap();
+
+        assert_eq!(status_of(&pool, queued).await, "cancelled");
+        assert_eq!(status_of(&pool, running).await, "cancelled");
+        assert!(matches!(
+            cancel_request(&pool, done).await,
+            Err(DismissError::NotOpen)
+        ));
+        assert!(matches!(
+            cancel_request(&pool, 9999).await,
+            Err(DismissError::NotFound)
+        ));
+    }
+
     /// The one place that knows the column list. `args` is a parameter because the rows worth
     /// writing by hand are exactly the ones `submit` cannot produce — a payload that will not
     /// parse, or a status no caller can reach yet.
@@ -3156,6 +3312,32 @@ mod tests {
         assert!(
             finished_at.is_some(),
             "an interrupted request is terminal and must record when"
+        );
+    }
+
+    /// Boot after a restart must handle both land states: the `running` row is released as
+    /// `interrupted` and a `queued` request behind it stays `queued`, so the worker claims it once
+    /// the slot is free instead of the repository staying jammed.
+    #[tokio::test]
+    async fn boot_reconcile_releases_running_and_leaves_queued_claimable() {
+        let pool = test_pool().await;
+        let running = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+        claim_next(&pool, "alpha").await.unwrap();
+        let queued = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+        assert_eq!(status_of(&pool, queued).await, "queued");
+
+        assert_eq!(reconcile_interrupted(&pool).await.unwrap(), 1);
+
+        assert_eq!(status_of(&pool, running).await, "interrupted");
+        assert_eq!(status_of(&pool, queued).await, "queued");
+        let claimed = claim_next(&pool, "alpha").await.unwrap();
+        assert!(
+            claimed.is_some(),
+            "the queued request must be claimable after boot"
         );
     }
 

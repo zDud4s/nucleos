@@ -42,6 +42,139 @@ pub async fn reconcile_interrupted(pool: &sqlx::SqlitePool) -> sqlx::Result<u64>
     }
     Ok(reconciled.len() as u64)
 }
+/// How long a `running` row must have been running before the worker treats an absent executor as
+/// gone rather than not yet registered.
+pub(super) const STRANDED_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Settles `running` rows no live drain owns, and returns how many it settled.
+///
+/// A drain whose terminal write failed (or that was dropped) leaves its row `running`, and the
+/// partial unique index then refuses every later request for that repository until a restart. This
+/// is the same release, done while the daemon is up. A row counts as stranded when it is not in
+/// the in-flight registry and `started_at` is older than `grace`.
+///
+/// - A `merge` whose source `executor.landed_sha` reports as already in the target: `succeeded`
+///   with that sha.
+/// - A `merge` that has not landed: back to `queued` (re-running a merge is harmless).
+/// - Any other operation: `interrupted`, as at startup; re-running a tag or push is not idempotent.
+///
+/// Every update is guarded on `status = 'running' AND started_at = <seen>`, so a row that moved
+/// since the read is left alone.
+pub async fn reconcile_stranded_running(
+    pool: &sqlx::SqlitePool,
+    executor: &dyn VcsExecutor,
+    grace: std::time::Duration,
+) -> sqlx::Result<u64> {
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(
+        i64,
+        String,
+        String,
+        String,
+        String,
+        String,
+        bool,
+        Option<i64>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT id, op, args, project_id, project_root, started_at, from_resolution, run_id,
+                approved_map_blob
+           FROM vcs_requests WHERE status = 'running' AND started_at IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+    let now = chrono::Utc::now();
+    let mut settled = 0;
+    for (id, op, args, project_id, project_root, started_at, from_resolution, run_id, blob) in rows
+    {
+        let old_enough = chrono::DateTime::parse_from_rfc3339(&started_at)
+            .map(|at| {
+                (now - at.with_timezone(&chrono::Utc))
+                    .to_std()
+                    .is_ok_and(|age| age >= grace)
+            })
+            .unwrap_or(true);
+        if !old_enough || is_in_flight(id, &started_at) {
+            continue;
+        }
+        let parsed = Op::from_stored(&op, &args);
+        let landed = match &parsed {
+            Ok(op @ Op::Merge { .. }) => {
+                let request = ClaimedRequest {
+                    id,
+                    op: op.clone(),
+                    project_id: project_id.clone(),
+                    project_root,
+                    from_resolution,
+                    run_id,
+                    approved_map_blob: blob,
+                    integration_branch: None,
+                };
+                Some(executor.landed_sha(&request).await)
+            }
+            _ => None,
+        };
+        let finished_at = chrono::Utc::now().to_rfc3339();
+        let (changed, what) = match landed {
+            Some(Some(sha)) => (
+                sqlx::query(
+                    "UPDATE vcs_requests SET status = 'succeeded', result_sha = ?, finished_at = ?
+                      WHERE id = ? AND status = 'running' AND started_at = ?",
+                )
+                .bind(&sha)
+                .bind(&finished_at)
+                .bind(id)
+                .bind(&started_at)
+                .execute(pool)
+                .await?
+                .rows_affected(),
+                format!("vcs request {id} succeeded: it had already landed at {sha}"),
+            ),
+            Some(None) => (
+                sqlx::query(
+                    "UPDATE vcs_requests SET status = 'queued', started_at = NULL
+                      WHERE id = ? AND status = 'running' AND started_at = ?",
+                )
+                .bind(id)
+                .bind(&started_at)
+                .execute(pool)
+                .await?
+                .rows_affected(),
+                format!("vcs request {id} re-queued: its executor was gone and it had not landed"),
+            ),
+            None => (
+                sqlx::query(
+                    "UPDATE vcs_requests SET status = 'interrupted', finished_at = ?,
+                            failure_reason = 'its executor was gone before it recorded an outcome'
+                      WHERE id = ? AND status = 'running' AND started_at = ?",
+                )
+                .bind(&finished_at)
+                .bind(id)
+                .bind(&started_at)
+                .execute(pool)
+                .await?
+                .rows_affected(),
+                format!("vcs request {id} interrupted: its executor was gone"),
+            ),
+        };
+        if changed == 1 {
+            settled += 1;
+            let _ = crate::feed::append(
+                pool,
+                Some(project_id.as_str()),
+                "vcs_request_reconciled",
+                &what,
+                run_id,
+                Some(&crate::feed::Subject::Vcs(id)),
+            )
+            .await;
+        }
+    }
+    if settled > 0 {
+        wake_worker();
+    }
+    Ok(settled)
+}
 /// Cancels every request run `run_id` asked for that has not started, and returns how many.
 ///
 /// **`running` is deliberately excluded.** Spec §7: an operation already in flight finishes. A merge

@@ -66,6 +66,7 @@ the contract, not a snapshot.
 | `execution/runner/claude_args.rs` | The Claude CLI's argument list: built-in tools, subagents, `cli_args` and the denied tools. |
 | `execution/runner/codex.rs` | The Codex CLI backend: its arguments, MCP overrides, staged images, usage and `CodexCliRunner`. Parent of `execution/runner/codex/`. |
 | `execution/runner/codex/mcp.rs` | The Codex CLI's MCP surface: `codex_mcp_overrides`, the registry servers' environment (`codex_mcp_env` and its denylist), and the deny matcher, deny hook and disabled features of an `McpOnly` turn. Re-exported from `codex`. |
+| `execution/runner/cli_pids.rs` | What the liveness sweep may ask the OS about a run: which process its CLI is and when the current attempt began (process-global, keyed by run id). |
 | `execution/runner/command.rs` | The `CommandRunner` trait every model backend implements, and the prompt helpers they share. |
 | `execution/runner/fake.rs` | The test double for `CommandRunner`, built only for tests and the testkit feature. |
 | `execution/runner/live.rs` | The live view of a turn read off its stream: tool calls, the plan, details and `live_from_stream`. |
@@ -349,6 +350,7 @@ the contract, not a snapshot.
 | `tree_job/driver.rs` | The tree-job driver tick: advances every unfinished job one step per pass (gate a reported branch, fix a red one, queue or settle a merge, close finished nodes, land). |
 | `tree_job/root.rs` | The root node of a tree job: its worktree on `tree/<id>/root`, and the run that plans the job. |
 | `tree_job/wrap.rs` | Wrapping up a node run that already reported, and starting a branch node again when its run ended with a handoff or died without a report. |
+| `tree_job/watchdog.rs` | Keeps a running node from being left without a session: starts a branch node that has no run from its stored launch, ends a live run whose lease (last sign of life) expired so `wrap` relaunches it, backs off failed relaunches (60 s doubling to 30 min, table `node_watchdog`), and after 2 failures in a row parks the branch with an owner decision. Also gates the root start retry after an admission refusal. |
 | `tree_job/decisions.rs` | Parking a branch on a decision for the owner (`park`), resuming it on the answer (`answer`, which only moves state: call `open::answer_and_relaunch` to also start the node again), and the single list of decisions. Both hold the job lock. |
 | `tree_job/gate.rs` | The production gate of a tree branch: at most one verify ticket per branch and HEAD, remembered on the branch and read or awaited by the next gate instead of submitting again. |
 | `tree_job/gate_tests.rs` | Test-only: tests for the per-branch gate ticket dedupe (`gate.rs`). |
