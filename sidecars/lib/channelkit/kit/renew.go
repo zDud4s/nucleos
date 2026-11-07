@@ -120,7 +120,7 @@ func (l *Lease) finish(lost chan struct{}) {
 func (l *Lease) renewOnce() bool {
 	c := l.r.client
 	path := c.channelPath("/outbox/" + strconv.FormatUint(l.id, 10) + "/renew")
-	body, status, err := c.do(l.ctx, http.MethodPost, path, nil, "")
+	body, status, err := c.doBounded(l.ctx, http.MethodPost, path, nil, "")
 	if err != nil {
 		return true
 	}

@@ -56,7 +56,7 @@ cat > "$target/pre-commit" <<'HOOK_EOF'
 # working material -- memory, decisions, plans, specs -- is created, never inherited, so it is
 # caught by exactly this filter. See CLAUDE.md.
 forbidden_re='^(\.ai|\.claude|\.agents)/'
-bad="$(git diff --cached --name-only --diff-filter=A | grep -E "$forbidden_re")"
+bad="$(git -c core.quotePath=false diff --cached --name-only --diff-filter=A | grep -E "$forbidden_re")"
 
 if [ -n "$bad" ]; then
   echo "commit blocked: NEW file(s) under .ai/, .claude/, or .agents/ (must stay untracked):" >&2
@@ -69,7 +69,7 @@ fi
 # the agent's working material is per-developer state and never enters git. Same rule
 # as .ai/ above — these are the copies that ended up under docs/. See CLAUDE.md.
 local_only_re='^docs/(plans|specs|spikes|notes)/'
-local_bad="$(git diff --cached --name-only | grep -E "$local_only_re")"
+local_bad="$(git -c core.quotePath=false diff --cached --name-only | grep -E "$local_only_re")"
 
 if [ -n "$local_bad" ]; then
   echo "commit blocked: staged plan/spec/spike/note file(s) (must stay untracked):" >&2
@@ -92,7 +92,7 @@ knowledge_re='(^|/)(memory|decisions)(-archive)?\.md$'
 entry_re='^[[:space:]]*[-*][[:space:]]+([0-9]{4}-[0-9]{2}-[0-9]{2}|Date:[[:space:]]*[0-9])'
 dirty=''
 
-for f in $(git diff --cached --name-only --diff-filter=ACMR | grep -iE "$knowledge_re"); do
+for f in $(git -c core.quotePath=false diff --cached --name-only --diff-filter=ACMR | grep -iE "$knowledge_re"); do
   if git show ":$f" 2>/dev/null | grep -qE "$entry_re"; then
     dirty="$dirty$f
 "
@@ -207,7 +207,12 @@ if [ -z "$core" ]; then
   echo "post-checkout: no staged nucleos-core found; this worktree has no workflow until the daemon syncs it (nucleos-core --workflow-sync \"$tree\")" >&2
   exit 0
 fi
-if ! "$core" --workflow-sync "$tree" >/dev/null; then
+# Bounded, so a wedged daemon cannot hang `git worktree add` (and whatever script or agent runs it).
+bound=""
+if command -v timeout >/dev/null 2>&1; then
+  bound="timeout 60"
+fi
+if ! $bound "$core" --workflow-sync "$tree" >/dev/null; then
   echo "post-checkout: the workflow sync of this worktree did not happen; re-run: \"$core\" --workflow-sync \"$tree\"" >&2
 fi
 exit 0
