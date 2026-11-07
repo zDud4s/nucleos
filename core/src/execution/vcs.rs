@@ -3471,25 +3471,44 @@ mod tests {
     /// Follows `logging.rs`'s own test rather than `init()`, which installs a *global* subscriber and
     /// would panic the moment a second test did the same; `set_default` is scoped and thread-local,
     /// which is sound here because `#[tokio::test]`'s default runtime polls on the thread that set
-    /// it. The writer is the non-blocking one, so the guard has to be dropped before reading back.
+    /// it.
+    ///
+    /// The writer is a synchronous in-memory buffer, not `tracing_appender::non_blocking`: dropping
+    /// that one's guard waits only ~1s for its worker thread to flush, so under heavy load the file
+    /// was read back empty with the line still in flight. A synchronous writer has nothing to race.
     ///
     /// Worth the machinery for exactly one reason: on the refused-write path the log line is not
     /// commentary, it is the only place the outcome still exists.
     async fn logged_during<F: std::future::Future>(body: F) -> String {
-        let dir = tempfile::tempdir().unwrap();
-        let (writer, flush_on_drop) = tracing_appender::non_blocking(
-            tracing_appender::rolling::daily(dir.path(), "test.log"),
-        );
+        #[derive(Clone, Default)]
+        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+            type Writer = Buf;
+            fn make_writer(&'a self) -> Buf {
+                self.clone()
+            }
+        }
+
+        let buf = Buf::default();
         {
-            let subscriber = tracing_subscriber::fmt().with_writer(writer).finish();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(buf.clone())
+                .with_ansi(false)
+                .finish();
             let _scope = tracing::subscriber::set_default(subscriber);
             body.await;
         }
-        drop(flush_on_drop);
-        std::fs::read_dir(dir.path())
-            .unwrap()
-            .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
-            .collect()
+        let bytes = buf.0.lock().unwrap().clone();
+        String::from_utf8_lossy(&bytes).into_owned()
     }
 
     /// The outcome of a merge the row refuses has nowhere else to go.
@@ -4416,10 +4435,10 @@ mod tests {
 
         let executor = FakeVcsExecutor::succeeding_slowly("abc123", Duration::from_millis(20));
         let started = std::time::Instant::now();
-        // The deadline is two orders of magnitude past how long the operation actually takes: what
+        // The deadline is orders of magnitude past how long the operation actually takes: what
         // this proves is that `wait_for` returns once the row finishes, not that it merely survives
         // to a deadline that happens to still be far away.
-        let (ticket, drained) = tokio::join!(wait_for(&pool, id, Duration::from_secs(30)), async {
+        let (ticket, drained) = tokio::join!(wait_for(&pool, id, Duration::from_secs(600)), async {
             // A head start so `wait_for`'s first read sees "queued", not "running" — the loop, not
             // a lucky initial read, is what has to notice the finish.
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -4430,13 +4449,12 @@ mod tests {
         let ticket = ticket.unwrap();
         assert_eq!(ticket.status, "succeeded");
         assert_eq!(ticket.result_sha.as_deref(), Some("abc123"));
-        // A 6x margin under the 30s deadline: the operation itself finishes around 25ms in and the
-        // poll interval catches it shortly after. Seconds, not 500ms: under a full suite on a
-        // loaded machine this took 650ms and then 1.19s with nothing wrong (2026-10-15), the same
-        // lesson the `failed` test above learned on 2026-09-13. A wait held to its deadline would
-        // still take 30s, so 5s keeps the test's whole point.
+        // The deadline is ten minutes and the bound is half of it: the operation takes ~25ms of
+        // work, but under a loaded machine the wait itself has been seen at 11.9s (2026-11-07), so
+        // no absolute number near the real cost is safe. A wait held to its deadline would take the
+        // full 600s, so anything well under that keeps the test's whole point.
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            started.elapsed() < Duration::from_secs(300),
             "wait_for must return once the request finishes, not hold the caller to the full \
              deadline: took {:?}",
             started.elapsed()
