@@ -1728,6 +1728,32 @@ export function useForwardTurn() {
   });
 }
 
+/**
+ * Hands words to a conversation on ANOTHER machine, as a plain message from the person.
+ *
+ * A relay needs the source turn in the destination's own database, which a turn on a different
+ * machine is not, and the daemons do not talk to each other. So the shell, which already holds the
+ * text, sends it to the destination as an ordinary message under a header saying where it came
+ * from. No agent hop is involved, hence no relay chain, cycle or depth to guard, and nothing is
+ * recorded on the source. Not optimistic: the destination may be busy or gone, and a bubble drawn
+ * for a message that never left would be a lie.
+ */
+export function useForwardAsMessage() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ toChatId, text }: { toChatId: string; text: string }) =>
+      chatFetch<{ turn_id?: number; queued?: boolean }>(toChatId, "/assistant/message", {
+        method: "POST",
+        body: JSON.stringify({ chat_id: toChatId, text, images: [], wait_if_busy: true }),
+      }),
+    retry: false,
+    onSuccess: (_result, { toChatId }) => {
+      void queryClient.invalidateQueries({ queryKey: chatKey(keys.chats.detail(toChatId), toChatId) });
+      void invalidateChatLists(queryClient);
+    },
+  });
+}
+
 export function useChatProject(chatId: string) {
   return useQuery({
     queryKey: keys.chats.project(chatId),

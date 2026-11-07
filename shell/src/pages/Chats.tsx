@@ -76,6 +76,7 @@ import {
   useChatFiles,
   useChatProject,
   useDropQueued,
+  useForwardAsMessage,
   useForwardTurn,
   useLiveTurn,
   useRelayChain,
@@ -5668,6 +5669,16 @@ export function ForwardPanel({
   // Forward needs the source turn in the target's own database, so only chats on the source's machine.
   const sourceMachine = chatMachineOf(chatId);
   const elsewhere = (chats.data ?? []).filter((row) => row.chat_id !== chatId && row.machine === sourceMachine);
+  // Chats on any other machine cannot be handed the turn (the daemons do not talk to each other), so
+  // they get its text as a plain message under a header saying where it came from. A machine that
+  // is not answering is left out: the message would not arrive and there is no queue to keep it in.
+  const asMessage = useForwardAsMessage();
+  const source = (chats.data ?? []).find((row) => row.chat_id === chatId);
+  // Title and machine name are untrusted text: collapse every whitespace run (newlines included) so
+  // they cannot fake extra header lines.
+  const oneLine = (value: string) => value.replace(/\s+/g, " ").trim();
+  const sourceLabel = `${oneLine(source?.title ?? source?.first_message ?? "a conversation")} on ${oneLine(source?.machineName ?? "This device")}`;
+  const otherMachines = (chats.data ?? []).filter((row) => row.machine !== sourceMachine && !row.unreachable);
 
   return (
     <>
@@ -5682,7 +5693,7 @@ export function ForwardPanel({
             value={text}
             onChange={(event) => onText(event.target.value)}
           />
-          {elsewhere.length === 0 && (
+          {elsewhere.length === 0 && otherMachines.length === 0 && (
             <Quiet compact says="there is no other conversation to hand this to." />
           )}
           <ul className="chats-forward-targets" aria-label="Hand it to">
@@ -5704,6 +5715,40 @@ export function ForwardPanel({
               </li>
             ))}
           </ul>
+          {otherMachines.length > 0 && (
+            <>
+              <p className="chats-forward-label">
+                On another machine. It is sent as a message, not handed over: the other side sees your
+                words under a note of where they came from.
+              </p>
+              <ul className="chats-forward-targets" aria-label="Send as a message to">
+                {otherMachines.map((row) => (
+                  <li key={row.chat_id}>
+                    <button
+                      type="button"
+                      className="chats-forward-target"
+                      disabled={asMessage.isPending || text.trim() === ""}
+                      onClick={() => {
+                        asMessage.mutate(
+                          { toChatId: row.chat_id, text: `Forwarded from ${sourceLabel}:\n\n${text}` },
+                          { onSuccess: onSent },
+                        );
+                      }}
+                    >
+                      {`${row.title ?? row.first_message ?? "New conversation"} on ${row.machineName ?? "This device"}`}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+              {asMessage.isError && (
+                <p className="chats-forward-refused" role="status">
+                  {isApiRefusal(asMessage.error)
+                    ? (MESSAGE_SENTENCES[asMessage.error.code] ?? asMessage.error.code)
+                    : "could not send the message"}
+                </p>
+              )}
+            </>
+          )}
           {/* The daemon's own word for why, not a sentence this side invented: `relay_cycle`,
               `relay_too_deep`, `owner_away`. A refusal shown as "something went wrong" is one
               nobody can act on, and each of these has a different answer. */}
