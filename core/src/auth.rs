@@ -845,8 +845,10 @@ const REMOTE_AGENT_ONLY_SEGMENTS: &[(&str, &str)] = &[
 ];
 
 mod remote;
+#[cfg(test)]
+use remote::REMOTE_DEVICE_REFUSED_ROUTES;
+use remote::REMOTE_GATEWAY_ROUTES;
 pub use remote::{DEVICE_SESSION_HEADER, RemoteDevice, remote_device_permits};
-use remote::{REMOTE_DEVICE_REFUSED_ROUTES, REMOTE_GATEWAY_ROUTES};
 mod grave;
 pub use grave::{GRAVE_ROUTES, is_grave};
 
