@@ -8361,6 +8361,8 @@ tests:
             .await
             .unwrap();
         let mut feed_kind = None;
+        // The row lands after a git worktree add plus the gate command; a loaded gate run stretches
+        // that far past a second. Cost on the passing path is nil (breaks on the first row).
         let hang_guard = std::time::Instant::now() + Duration::from_secs(60);
         while std::time::Instant::now() < hang_guard {
             feed_kind = sqlx::query_scalar::<_, String>(
