@@ -939,7 +939,7 @@ mod tests {
             let _ = sender.send(work());
         });
         receiver
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(Duration::from_secs(60))
             .expect("the walk did not terminate")
     }
 

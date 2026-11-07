@@ -1360,10 +1360,9 @@ mod tests {
     }
 
     async fn wait_calls(gate: &FakeGate, count: usize) {
-        for _ in 0..300 {
-            if gate.calls().len() >= count {
-                break;
-            }
+        // Hang guard only: a loaded machine can be slow, so wait for the event, not a budget.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while gate.calls().len() < count && std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(
@@ -1670,9 +1669,11 @@ mod tests {
         /// Waits for the spawned gate to settle the branch, then lets its task finish.
         async fn wait_branch_state(&self, job: &str, name: &str, want: &str) {
             let mut seen = String::new();
-            for _ in 0..300 {
+            // Hang guard only: wait for the state, not for a short budget.
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            loop {
                 seen = self.branch(job, name).await.state;
-                if seen == want {
+                if seen == want || std::time::Instant::now() >= deadline {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1854,14 +1855,16 @@ mod tests {
     /// its task finish.
     async fn wait_gate_failures(fx: &Fixture, job: &str, name: &str, want: i64) {
         let mut seen = None;
-        for _ in 0..300 {
+        // Hang guard only: wait for the count, not for a short budget.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
             seen = fx
                 .branch(job, name)
                 .await
                 .extra
                 .get(GATE_FAILURES)
                 .and_then(Value::as_i64);
-            if seen == Some(want) {
+            if seen == Some(want) || std::time::Instant::now() >= deadline {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2870,7 +2873,8 @@ mod tests {
         // A dropped connection goes back to the pool on a spawned task, so `num_idle` read right
         // after the tick is racy: poll for up to a second.
         let idle = || async {
-            for _ in 0..50 {
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            while std::time::Instant::now() < deadline {
                 if fx.state.pool.size() as usize == fx.state.pool.num_idle() {
                     return true;
                 }

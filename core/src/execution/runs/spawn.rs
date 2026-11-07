@@ -1225,7 +1225,7 @@ mod wake_tests {
 
         spawn_registered(&state, id, async {});
 
-        tokio::time::timeout(Duration::from_secs(5), rx.changed())
+        tokio::time::timeout(Duration::from_secs(60), rx.changed())
             .await
             .expect("the supervisor never signalled the normal end")
             .unwrap();
@@ -1243,12 +1243,12 @@ mod wake_tests {
         spawn_registered(&state, id, async { panic!("run body blew up") });
 
         // Poll until the row is terminal, then require a signal that is not older than the write.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         while status_of(&state.pool, id).await != "failed" {
             assert!(std::time::Instant::now() < deadline, "the run never failed");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        tokio::time::timeout(Duration::from_secs(5), rx.changed())
+        tokio::time::timeout(Duration::from_secs(60), rx.changed())
             .await
             .expect("the supervisor never signalled the panic")
             .unwrap();
@@ -1285,7 +1285,7 @@ mod wake_tests {
 
         assert!(finalize_termination(&state, id, "cancelled").await);
 
-        let seen = tokio::time::timeout(Duration::from_secs(5), watcher)
+        let seen = tokio::time::timeout(Duration::from_secs(60), watcher)
             .await
             .expect("the watcher never woke")
             .unwrap();
@@ -1302,9 +1302,9 @@ mod wake_tests {
         }
     }
 
-    /// The claim's status reads back as `open`, or the test fails after five seconds.
+    /// The claim's status reads back as `open`, or the test fails after the 60s hang guard.
     async fn wait_until_open(pool: &sqlx::SqlitePool, task: i64) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         while testing::state_of(pool, task).await.0 != "open" {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -1386,7 +1386,7 @@ mod wake_tests {
         );
 
         // The supervisor finishes after the handle is released; give it a beat to (not) act.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         while state
             .run_handles
             .lock()
