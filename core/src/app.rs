@@ -49,6 +49,7 @@ pub mod channels {
     pub mod fake;
     pub mod ingest;
     pub mod media;
+    pub mod owner_notice;
     #[cfg(test)]
     mod port_tests_commands;
     #[cfg(test)]

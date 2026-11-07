@@ -1161,9 +1161,13 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    /// Long enough for a `git --version` unit on a loaded machine, short enough to bound a test.
+    /// How long a gate may show no progress before it is called hung. Each step is real work (git
+    /// subprocesses, worktrees, SQLite) and the module's ~40 tests run in parallel, so on a loaded
+    /// machine starvation stretches a step by several times; `tick_until` returns the moment the
+    /// step shows up.
     const WAIT: Duration = Duration::from_secs(30);
-    /// The most a gate that keeps moving is waited for.
+    /// The most a gate that keeps moving is waited for. An upper bound on a hung test, not an
+    /// expectation.
     const WAIT_CAP: Duration = Duration::from_secs(300);
 
     /// Runs git in `dir`, asserts it succeeded, and returns its trimmed stdout.
@@ -1240,6 +1244,7 @@ mod tests {
         let env = crate::execution::worktree::WorktreeRootOverride::set(&root, roots.path());
 
         let pool = crate::testdb::fresh_pool().await;
+        crate::verify::unique_task_ids(&pool).await;
         sqlx::query(
             "INSERT INTO autopilot_state (project_id, mode, project_root) \
              VALUES ('alpha', 'active', ?)",

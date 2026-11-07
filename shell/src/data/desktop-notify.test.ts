@@ -7,7 +7,7 @@ import {
   type NotifySeen,
 } from "./desktop-notify";
 import { policyAllows, type FeedEntry, type NotifyPolicy } from "./feed";
-import type { ChatSummary } from "./chats";
+import type { ChatRow } from "./chatMachines";
 import type { Proposal } from "./system";
 
 const OPEN: NotifyPolicy = { families: [], kinds: [] };
@@ -20,8 +20,8 @@ function line(id: number, kind: string, over: Partial<FeedEntry> = {}): FeedEntr
   return { id, kind, summary: `${kind} happened`, run_id: null, project_id: null, subject: null, created_at: "", ...over };
 }
 
-function chat(id: string, waiting: number, over: Partial<ChatSummary> = {}): ChatSummary {
-  return { chat_id: id, title: `Chat ${id}`, waiting, archived_at: null, ...over } as ChatSummary;
+function chat(id: string, waiting: number, over: Partial<ChatRow> = {}): ChatRow {
+  return { chat_id: id, title: `Chat ${id}`, waiting, archived_at: null, machine: "here", unreachable: false, ...over } as ChatRow;
 }
 
 /** Inputs for a window that is behind another one, with nothing in the three lists unless given. */
@@ -153,6 +153,74 @@ describe("the desktop notifier's decision", () => {
     expect(out.toasts[0]).toMatchObject({ title: "Plan the move: answered", to: "/chats/a" });
   });
 
+  it("keeps seen counts separate for the same chat id on two machines", () => {
+    const seen = seeded({
+      chats: [
+        chat("shared", 0),
+        chat("shared", 1, { machine: "tower", machineName: "Tower" }),
+      ],
+      chatMachines: ["here", "tower"],
+    });
+
+    const out = toastsFor(
+      inputs({
+        chats: [
+          chat("shared", 0),
+          chat("shared", 2, { machine: "tower", machineName: "Tower" }),
+        ],
+        chatMachines: ["here", "tower"],
+        seen,
+      }),
+    );
+
+    expect(out.toasts).toEqual([
+      expect.objectContaining({ key: "tower:shared:2", body: "A new answer is waiting on Tower." }),
+    ]);
+  });
+
+  it("seeds a newly answered machine without replaying its unread conversations", () => {
+    const seen = seeded({ chats: [chat("local", 0)], chatMachines: ["here"] });
+    const firstTowerRead = toastsFor(
+      inputs({
+        chats: [
+          chat("local", 0),
+          chat("remote", 4, { machine: "tower", machineName: "Tower" }),
+        ],
+        chatMachines: ["here", "tower"],
+        seen,
+      }),
+    );
+    expect(firstTowerRead.toasts).toEqual([]);
+
+    const next = toastsFor(
+      inputs({
+        chats: [
+          chat("local", 0),
+          chat("remote", 5, { machine: "tower", machineName: "Tower" }),
+        ],
+        chatMachines: ["here", "tower"],
+        seen: firstTowerRead.seen,
+      }),
+    );
+    expect(next.toasts).toEqual([expect.objectContaining({ key: "tower:remote:5" })]);
+  });
+
+  it("does not announce stale rows from an unreachable machine", () => {
+    const seen = seeded({
+      chats: [chat("remote", 1, { machine: "tower", machineName: "Tower" })],
+      chatMachines: ["tower"],
+    });
+    const unavailable = toastsFor(
+      inputs({
+        chats: [chat("remote", 4, { machine: "tower", machineName: "Tower", unreachable: true })],
+        seen,
+      }),
+    );
+
+    expect(unavailable.toasts).toEqual([]);
+    expect(unavailable.seen.chats?.get("tower:remote")).toBe(1);
+  });
+
   it("opening a conversation lowers its count without making a toast, and the next answer still does", () => {
     const seen = seeded({ chats: [chat("a", 3)] });
     const read = toastsFor(inputs({ chats: [chat("a", 0)], seen }));
@@ -160,6 +228,15 @@ describe("the desktop notifier's decision", () => {
 
     const next = toastsFor(inputs({ chats: [chat("a", 1)], seen: read.seen }));
     expect(next.toasts).toHaveLength(1);
+  });
+
+  it("two rises in the same chat make toasts with different keys", () => {
+    const seen = seeded({ chats: [chat("a", 0)] });
+    const first = toastsFor(inputs({ chats: [chat("a", 1)], seen }));
+    const second = toastsFor(inputs({ chats: [chat("a", 2)], seen: first.seen }));
+    expect(first.toasts).toHaveLength(1);
+    expect(second.toasts).toHaveLength(1);
+    expect(first.toasts[0].key).not.toBe(second.toasts[0].key);
   });
 
   it("cuts a long body at 140 characters", () => {

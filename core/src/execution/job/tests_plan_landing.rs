@@ -173,3 +173,111 @@ async fn a_plan_node_that_failed_by_itself_is_not_replanned() {
 
     assert_eq!(job_status(&pool, job_id).await, "failed");
 }
+
+/// Seeds one `running` item whose node run ended `status`, the way a restart leaves it.
+async fn seed_item_with_node(pool: &sqlx::SqlitePool, job_id: i64, status: &str) -> i64 {
+    sqlx::query(
+        "INSERT INTO job_nodes (job_id, node_id, ordinal, description, status)
+         VALUES (?, 'implement', 0, 'an item', 'running')",
+    )
+    .bind(job_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    point_item_at_new_node(pool, job_id, status).await
+}
+
+/// Adds another node run to item 0 and points the item at it, as a fresh spawn does.
+async fn point_item_at_new_node(pool: &sqlx::SqlitePool, job_id: i64, status: &str) -> i64 {
+    let run_id = seed_node(pool, job_id, "implement", status).await;
+    sqlx::query("UPDATE job_nodes SET run_id = ? WHERE job_id = ? AND ordinal = 0")
+        .bind(run_id)
+        .bind(job_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    run_id
+}
+
+async fn item_row(pool: &sqlx::SqlitePool, job_id: i64) -> (String, i64) {
+    sqlx::query_as("SELECT status, interruptions FROM job_nodes WHERE job_id = ? AND ordinal = 0")
+        .bind(job_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// A restart mid-item is the daemon going away, not the item failing: the item goes back to
+/// `pending` so the queue gives it a fresh run, and the job carries on.
+#[tokio::test]
+async fn an_item_whose_node_was_interrupted_goes_back_to_pending() {
+    let pool = test_pool().await;
+    let state = test_state(pool.clone()).await;
+    let worktree = tempfile::tempdir().unwrap();
+    let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
+    seed_worktree(&pool, job_id, worktree.path()).await;
+    seed_item_with_node(&pool, job_id, "interrupted").await;
+
+    let job = load_job(&pool, job_id).await.unwrap();
+    reconcile_nodes(&state, &job).await.unwrap();
+
+    assert_eq!(item_row(&pool, job_id).await, ("pending".to_owned(), 1));
+    assert_eq!(job_status(&pool, job_id).await, "running");
+    let view = load_view(&pool, job_id).await.unwrap();
+    assert_eq!(view.items[0].state, ItemState::Pending);
+}
+
+/// The count is durable: two interruptions are re-run, the third fails the item and the reason
+/// names them, so a crash loop cannot re-run an item forever.
+#[tokio::test]
+async fn an_item_interrupted_three_times_fails_naming_the_interruptions() {
+    let pool = test_pool().await;
+    let state = test_state(pool.clone()).await;
+    let worktree = tempfile::tempdir().unwrap();
+    let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
+    seed_worktree(&pool, job_id, worktree.path()).await;
+    seed_item_with_node(&pool, job_id, "interrupted").await;
+
+    for round in 1..=2 {
+        let job = load_job(&pool, job_id).await.unwrap();
+        reconcile_nodes(&state, &job).await.unwrap();
+        assert_eq!(item_row(&pool, job_id).await, ("pending".to_owned(), round));
+        // The next pass claims it and starts a node, which the next restart interrupts again.
+        sqlx::query("UPDATE job_nodes SET status = 'running' WHERE job_id = ?")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        point_item_at_new_node(&pool, job_id, "interrupted").await;
+    }
+
+    let job = load_job(&pool, job_id).await.unwrap();
+    reconcile_nodes(&state, &job).await.unwrap();
+
+    assert_eq!(item_row(&pool, job_id).await.0, "failed");
+    let told: Vec<(String, String)> = sqlx::query_as("SELECT kind, summary FROM feed")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert!(
+        told.iter()
+            .any(|(kind, line)| kind == "job_item_failed" && line.contains("interrupted 3 times")),
+        "{told:?}"
+    );
+}
+
+/// Only an interruption is re-run: a node that failed on its own still fails its item.
+#[tokio::test]
+async fn an_item_whose_node_failed_by_itself_is_not_run_again() {
+    let pool = test_pool().await;
+    let state = test_state(pool.clone()).await;
+    let worktree = tempfile::tempdir().unwrap();
+    let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
+    seed_worktree(&pool, job_id, worktree.path()).await;
+    seed_item_with_node(&pool, job_id, "failed").await;
+
+    let job = load_job(&pool, job_id).await.unwrap();
+    reconcile_nodes(&state, &job).await.unwrap();
+
+    assert_eq!(item_row(&pool, job_id).await, ("failed".to_owned(), 0));
+}

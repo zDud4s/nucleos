@@ -1338,6 +1338,7 @@ mod tests {
             queue_full: false,
             last_gate: None,
             last_gate_at: None,
+            remote: None,
         }
     }
 
@@ -1412,6 +1413,7 @@ mod tests {
             queue_full: false,
             last_gate: None,
             last_gate_at: None,
+            remote: None,
         }];
 
         let body = resolve_run_request(&projects, "active-project", "do the work").unwrap();
@@ -1968,6 +1970,7 @@ mod tests {
             queue_full: false,
             last_gate: None,
             last_gate_at: None,
+            remote: None,
         }];
 
         let body = resolve_run_request(&projects, "shadow-project", "inspect the work").unwrap();
@@ -1994,6 +1997,7 @@ mod tests {
             queue_full: false,
             last_gate: None,
             last_gate_at: None,
+            remote: None,
         }];
 
         assert!(resolve_run_request(&projects, "off-project", "do the work").is_err());
@@ -2017,6 +2021,7 @@ mod tests {
             queue_full: false,
             last_gate: None,
             last_gate_at: None,
+            remote: None,
         }];
 
         assert!(resolve_run_request(&projects, "unknown-project", "do the work").is_err());
@@ -2040,6 +2045,7 @@ mod tests {
             queue_full: false,
             last_gate: None,
             last_gate_at: None,
+            remote: None,
         }];
 
         assert!(resolve_run_request(&projects, "rootless-project", "do the work").is_err());
