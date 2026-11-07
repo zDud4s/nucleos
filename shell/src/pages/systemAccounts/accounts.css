@@ -1,0 +1,14 @@
+.ac-page { display: flex; flex-direction: column; gap: var(--space-4); }
+.ac-default { display: flex; gap: var(--space-2); align-items: center; }
+.ac-table { width: 100%; border-collapse: collapse; }
+.ac-table th, .ac-table td { text-align: left; padding: var(--space-2); vertical-align: top; }
+.ac-bar { display: flex; gap: var(--space-2); align-items: center; min-width: 7rem; }
+.ac-bar-track { flex: 1; height: 6px; background: var(--surface-2, rgba(128, 128, 128, 0.2)); border-radius: 3px; overflow: hidden; }
+.ac-bar-track.ac-stale { opacity: 0.5; }
+.ac-bar-fill { height: 100%; background: var(--accent, currentColor); }
+.ac-menu { position: relative; }
+.ac-menu-list { position: absolute; right: 0; z-index: 2; display: flex; flex-direction: column; background: var(--surface-1, Canvas); padding: var(--space-2); }
+.ac-disabled { opacity: 0.55; }
+.ac-error { color: var(--danger, crimson); }
+.ac-add, .ac-login { display: flex; flex-wrap: wrap; gap: var(--space-2); align-items: flex-end; }
+.ac-login { flex-direction: column; align-items: flex-start; }

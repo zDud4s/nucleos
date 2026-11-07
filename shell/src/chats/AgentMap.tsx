@@ -9,6 +9,7 @@ import { Button } from "../ui/Button";
 import { Quiet } from "../ui/Quiet";
 import { tokenCount } from "../ui/readings";
 import { cacheState, leftText } from "./cache";
+import { AccountChip } from "./AccountChip";
 
 /** A Task or Agent call is a subagent; nothing else spawns a child conversation. */
 export function isSubagent(call: ToolCall): boolean {
@@ -532,7 +533,7 @@ export function ChatChips({
   const base = useMemo(() => groupAgents(merged), [merged]);
   const tasks = useChatTasks(chatId, base.total > 0, live);
   const groups = useMemo(() => groupAgents(merged, tasks.data), [merged, tasks.data]);
-  if (merged === undefined || (cache === null && groups.total === 0)) return null;
+  if (merged === undefined || (cache === null && groups.total === 0)) return <AccountChip chatId={chatId} />;
 
   const cacheTitle =
     "Prompt cache: while it is warm, the next message re-reads the conversation at a fraction of the cost. " +
@@ -542,6 +543,7 @@ export function ChatChips({
   const shown = groups.running > 0 ? groups.running : groups.total;
   return (
     <>
+      <AccountChip chatId={chatId} />
       {cache !== null && (
         <span className={cache.kind === "cold" ? "chats-chip chats-chip-muted" : "chats-chip"} title={cacheTitle}>
           <span aria-hidden="true">⏱</span>{" "}
