@@ -76,15 +76,27 @@ async fn post_pair(State(state): State<AppState>, Json(body): Json<PairBody>) ->
         return refusal(StatusCode::UNAUTHORIZED, "invalid_code").into_response();
     }
     match crate::remote::exchange(&state.pool, code, chrono::Utc::now()).await {
-        Ok(paired) => Json(serde_json::json!({
+        Ok(paired) => {
+            // The pairing client records the machine's stable id next to its alias; a failed
+            // read must not fail a pairing that already burned its code, so it reports no id.
+            let machine_id = match crate::machine_id::get_or_create(&state.pool).await {
+                Ok(id) => Some(id),
+                Err(error) => {
+                    tracing::warn!(%error, "could not read the machine id for a pairing answer");
+                    None
+                }
+            };
+            Json(serde_json::json!({
             "session": paired.session,
             "device_id": paired.device_id,
+            "machine_id": machine_id,
             "name": paired.name,
             "access_level": paired.access_level,
             "owner": paired.owner,
             "expires_at": paired.expires_at,
-        }))
-        .into_response(),
+            }))
+            .into_response()
+        }
         Err(crate::remote::ExchangeError::Invalid) => {
             refusal(StatusCode::UNAUTHORIZED, "invalid_code").into_response()
         }
@@ -1147,6 +1159,7 @@ mod tests {
         )
         .await
         .unwrap();
+        let pool = state.pool.clone();
         let app = router(state);
 
         let (status, text) = send(
@@ -1166,6 +1179,11 @@ mod tests {
         assert_eq!(paired["access_level"], "run-creating");
         assert!(paired["device_id"].is_i64());
         assert!(paired["expires_at"].is_string());
+        // The gateway's answer carries this install's stable id for the pairing record.
+        assert_eq!(
+            paired["machine_id"],
+            crate::machine_id::get_or_create(&pool).await.unwrap()
+        );
 
         // The secret works as a session, and the same code does not pair twice.
         let (status, text) = send(&app, "GET", "/remote/session", &key, Some(&session), None).await;

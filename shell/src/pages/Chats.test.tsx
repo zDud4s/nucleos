@@ -2201,6 +2201,25 @@ describe("Chats - what a conversation is told, and what it may not touch", () =>
     expect(screen.queryByRole("list", { name: "Transcript" })).toBeNull();
   });
 
+  it("offers to open a chat moved to a machine identified by its stable id", async () => {
+    // The display name differs on purpose: only the machine id can match.
+    saveMachines([{ id: "tower", origin: "https://tower.example", name: "Tower", machine_id: "m-uuid-1" }]);
+    const origin = {
+      ...chatSummary({ chat_id: "c-7" }),
+      moved_to: JSON.stringify({ id: "m-uuid-1", name: "Renamed elsewhere" }),
+    };
+    const localFetch = chatsFetch([origin], { "c-7": [] });
+    const remoteFetch = chatsFetch([], {});
+    daemon.apiFetch.mockImplementation((path: string, init?: RequestInit, machine?: string) =>
+      (machine === "tower" ? remoteFetch : localFetch)(path, init),
+    );
+
+    await renderChats("/chats/c-7");
+
+    expect(await screen.findByText(/This chat was moved to Renamed elsewhere/)).toBeTruthy();
+    expect(await screen.findByRole("button", { name: "Open on the destination" })).toBeTruthy();
+  });
+
   it("asks for a fresh context in one click, and for a clear in two", async () => {
     daemon.apiFetch.mockImplementation(
       chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] }),

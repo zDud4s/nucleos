@@ -12683,6 +12683,19 @@ mod tests {
         json_body(response).await
     }
 
+    #[tokio::test]
+    async fn get_machine_reports_a_stable_machine_id_beside_name_and_role() {
+        let state = test_state().await;
+        let first = get_json(&state, "/machine").await;
+        let second = get_json(&state, "/machine").await;
+
+        let id = first["machine_id"].as_str().expect("a machine_id string");
+        assert_eq!(id.len(), 36, "{id}");
+        assert_eq!(first["machine_id"], second["machine_id"]);
+        assert!(first["name"].is_string());
+        assert!(first["role"].is_string());
+    }
+
     /// One settled assistant turn, with whatever it asked, answered and ran.
     async fn seed_turn(
         state: &AppState,
