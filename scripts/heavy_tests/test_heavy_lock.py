@@ -31,6 +31,11 @@ import os, pathlib, sys, time
 
 d = pathlib.Path(os.environ["SLEEPER_DIR"])
 tag = sys.argv[-1]
+# heavy.py itself calls `cargo metadata` / `cargo clean` through this launcher when a target
+# slot changes owner; those are not the command under test and must return at once (else
+# `--format-version 1` became a "1" sleeper that blocked the slot handoff for minutes).
+if "metadata" in sys.argv[1:] or "clean" in sys.argv[1:]:
+    sys.exit(0)
 # order.txt and .token first, the .start marker last: tests treat the marker as "started" and
 # then read the other marks, so the marker must not be visible before what it vouches for.
 with open(d / "order.txt", "a") as f:
@@ -216,7 +221,9 @@ class LockTests(unittest.TestCase):
         return sorted(h.iterdir()) if h.exists() else []
 
     def assert_started(self, tag: str) -> None:
-        self.assertTrue(wait_for(lambda: self.started(tag)), f"{tag} never started")
+        # Backstop, not an expectation: success returns at once. A fixed 30 s clock only measured
+        # machine load (the full suite runs ~1200-1650 s under a busy broker).
+        self.assertTrue(wait_for(lambda: self.started(tag), 300), f"{tag} never started")
 
     def assert_stays_waiting(self, tag: str, secs: float = 1.2) -> None:
         time.sleep(secs)
