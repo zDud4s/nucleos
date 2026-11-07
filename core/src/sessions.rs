@@ -242,6 +242,12 @@ fn path_of(root: &Path, session_id: &str) -> Option<(PathBuf, std::time::SystemT
     None
 }
 
+/// Where one session's transcript lives under `root`, or `None` when this machine has none. For
+/// moving a chat: the file is copied as it is, never parsed.
+pub fn transcript_path(root: &Path, session_id: &str) -> Option<PathBuf> {
+    path_of(root, session_id).map(|(path, _)| path)
+}
+
 /// Every `<project>/<session>.jsonl` under the root, with its modification time.
 ///
 /// Two levels deep exactly, and not a recursive walk: the CLI's layout is one directory per project

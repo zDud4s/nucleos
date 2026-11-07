@@ -12,6 +12,10 @@ import (
 	"time"
 )
 
+// hangGuard only keeps a broken watcher from hanging the suite; every assertion waits on an event, so
+// a saturated machine slows the test down without failing it.
+const hangGuard = time.Minute
+
 // askedFor answers getenv the way the environment of a daemon-supervised sidecar does.
 func askedFor(key string) string {
 	if key == lifelineVar {
@@ -47,7 +51,7 @@ func TestCuttingTheLifelineShutsDown(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(hangGuard):
 		t.Fatal("nothing is reading the lifeline")
 	}
 	select {
@@ -58,8 +62,8 @@ func TestCuttingTheLifelineShutsDown(t *testing.T) {
 	w.Close() // the daemon dying, as the kernel reports it
 	select {
 	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("still running five seconds after the line was cut")
+	case <-time.After(hangGuard):
+		t.Fatal("still running the hang guard after the line was cut")
 	}
 }
 
@@ -72,8 +76,8 @@ func TestABrokenLifelineAlsoShutsDown(t *testing.T) {
 	w.CloseWithError(errors.New("the pipe broke")) // a read that fails rather than ends
 	select {
 	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("still running five seconds after the line broke")
+	case <-time.After(hangGuard):
+		t.Fatal("still running the hang guard after the line broke")
 	}
 }
 

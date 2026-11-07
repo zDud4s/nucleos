@@ -140,7 +140,24 @@ func (i Install) Download(ctx context.Context, fetcher Fetcher) error {
 		return fmt.Errorf("%w: got %s, want %s", ErrDigestMismatch, got, i.Pin.Sha256)
 	}
 
-	return i.extractZip(staged, size)
+	// Extract beside the final directory and rename it into place: a crash mid-extraction leaves
+	// only the .partial directory, never an Dir() that Present() would take for a whole install.
+	partial := i.Dir() + ".partial"
+	if err := os.RemoveAll(partial); err != nil {
+		return fmt.Errorf("clearing %s: %w", partial, err)
+	}
+	if err := i.extractInto(partial, staged, size); err != nil {
+		os.RemoveAll(partial)
+		return err
+	}
+	// Whatever sits at Dir() is by now a leftover of an interrupted older extraction.
+	if err := os.RemoveAll(i.Dir()); err != nil {
+		return fmt.Errorf("clearing %s: %w", i.Dir(), err)
+	}
+	if err := os.Rename(partial, i.Dir()); err != nil {
+		return fmt.Errorf("installing chromium: %w", err)
+	}
+	return nil
 }
 
 // extract unpacks an archive already held in memory.
@@ -149,11 +166,14 @@ func (i Install) extract(archive []byte) error {
 }
 
 func (i Install) extractZip(source io.ReaderAt, size int64) error {
+	return i.extractInto(i.Dir(), source, size)
+}
+
+func (i Install) extractInto(dir string, source io.ReaderAt, size int64) error {
 	reader, err := zip.NewReader(source, size)
 	if err != nil {
 		return fmt.Errorf("opening chromium archive: %w", err)
 	}
-	dir := i.Dir()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("creating %s: %w", dir, err)
 	}

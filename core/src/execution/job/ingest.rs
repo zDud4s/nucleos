@@ -20,6 +20,20 @@ pub(super) enum Reconciled {
 pub(super) async fn reconcile_nodes(state: &AppState, job: &JobRow) -> sqlx::Result<Reconciled> {
     let pool = &state.pool;
 
+    // An item claimed `running` whose run was never linked (the daemon died between the claim and
+    // the link) belongs to nobody: passes of a job are serial and this runs at the start of one.
+    // Left alone it reads as a node in flight for ever. It goes back to the status it was claimed
+    // from, the same way `release_item` puts it back.
+    sqlx::query(
+        "UPDATE job_nodes
+         SET status = CASE WHEN gate_attempts > 0 THEN 'gate_failed' ELSE 'pending' END,
+             gate_status = CASE WHEN gate_attempts > 0 THEN 'failed' ELSE gate_status END
+         WHERE job_id = ? AND ordinal IS NOT NULL AND status = 'running' AND run_id IS NULL",
+    )
+    .bind(job.id)
+    .execute(pool)
+    .await?;
+
     // The two statuses excluded here are `node_in_flight`'s, written out because sqlx will not take
     // SQL built at runtime. `a_node_still_in_flight_is_not_reconciled` holds the two in step.
     let landed: Vec<(i64, i64, String)> = sqlx::query_as(
@@ -49,6 +63,41 @@ pub(super) async fn reconcile_nodes(state: &AppState, job: &JobRow) -> sqlx::Res
             .contains_key(&run_id)
         {
             continue;
+        }
+
+        // **An `interrupted` item node is the daemon going away, not the item failing**, so the item
+        // goes back to `pending` for a fresh run on the tree exactly as it stands: no revert (the
+        // edits are the node's own half-finished work, which the new run continues) and no failure.
+        // The count is a column on the item, so it survives a restart and a crash loop cannot
+        // re-run an item forever. Past the cap the arms below take it as any dead node.
+        let mut interruptions = 0i64;
+        if run_status == "interrupted" {
+            interruptions = sqlx::query_scalar(
+                "SELECT interruptions FROM job_nodes WHERE job_id = ? AND ordinal = ?",
+            )
+            .bind(job.id)
+            .bind(ordinal)
+            .fetch_one(pool)
+            .await?;
+            if interruptions < MAX_ITEM_RERUNS_AFTER_INTERRUPTION {
+                // `AND status = 'running'` for the reason the write below gives.
+                sqlx::query(
+                    "UPDATE job_nodes SET status = 'pending', interruptions = interruptions + 1
+                     WHERE job_id = ? AND ordinal = ? AND status = 'running'",
+                )
+                .bind(job.id)
+                .bind(ordinal)
+                .execute(pool)
+                .await?;
+                tracing::info!(
+                    job_id = job.id,
+                    ordinal,
+                    interruptions = interruptions + 1,
+                    "an interrupted item node is run again"
+                );
+                continue;
+            }
+            interruptions += 1;
         }
 
         // Only `completed` is done. `timed_out`, `cancelled` and `interrupted` all leave a tree
@@ -82,16 +131,34 @@ pub(super) async fn reconcile_nodes(state: &AppState, job: &JobRow) -> sqlx::Res
         // hands the branch to a person with everything still on it.
         if item_status == "failed" && job.commissioned_with_an_allowance() {
             let ordinal = ordinal as usize;
-            let put_back = match (
-                job_worktree(pool, job.id).await,
-                revert_point(pool, job, ordinal).await,
-            ) {
-                (Ok(Some((worktree, _))), Some(footing)) => {
+            // A node working in a checkout of its own is put back THERE, to where that checkout
+            // began. Resetting the job's branch to the item's `merge_base_sha` instead would
+            // rewind every item merged since an earlier merge of this same item.
+            let owns_a_tree: bool =
+                sqlx::query_scalar::<_, Option<i64>>("SELECT item_id FROM runs WHERE id = ?")
+                    .bind(run_id)
+                    .fetch_optional(pool)
+                    .await?
+                    .flatten()
+                    .is_some();
+            let target = if owns_a_tree {
+                super::gate::revert_target(pool, job.id, run_id).await
+            } else {
+                match (
+                    job_worktree(pool, job.id).await,
+                    revert_point(pool, job, ordinal).await,
+                ) {
+                    (Ok(Some((worktree, _))), Some(footing)) => Some((worktree, footing)),
+                    _ => None,
+                }
+            };
+            let put_back = match target {
+                Some((worktree, footing)) => {
                     crate::execution::worktree::revert_to(&worktree, &footing)
                         .await
                         .is_ok()
                 }
-                _ => false,
+                None => false,
             };
             if !put_back {
                 let _ = retire(pool, job.id, STATUS_STOPPED).await;
@@ -128,9 +195,16 @@ pub(super) async fn reconcile_nodes(state: &AppState, job: &JobRow) -> sqlx::Res
                     job,
                     "job_item_failed",
                     &format!(
-                        "job {} stopped at item {}: its node ended `{run_status}`",
+                        "job {} stopped at item {}: {}",
                         job.id,
-                        ordinal + 1
+                        ordinal + 1,
+                        if interruptions > 0 {
+                            format!(
+                                "its node was interrupted {interruptions} times, running it again gave up"
+                            )
+                        } else {
+                            format!("its node ended `{run_status}`")
+                        }
                     ),
                 )
                 .await;
@@ -178,6 +252,9 @@ pub(super) async fn node_awaiting_approval(pool: &SqlitePool, job_id: i64) -> sq
 
 /// How many times a plan node that ended `interrupted` is started again before the job fails.
 const MAX_PLAN_REPLANS_AFTER_INTERRUPTION: i64 = 2;
+
+/// How many times an item whose node ended `interrupted` is run again before the item fails.
+pub(super) const MAX_ITEM_RERUNS_AFTER_INTERRUPTION: i64 = 2;
 
 /// Turns a finished plan node into the job's queue.
 pub(super) async fn ingest_plan(state: &AppState, job: &JobRow) -> sqlx::Result<()> {

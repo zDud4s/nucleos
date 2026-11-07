@@ -39,6 +39,11 @@ export interface QuotaBrakeView {
 
 export interface ProjectSummary {
   project_id: string;
+  /**
+   * The git remote of the project's folder. The daemon's `/projects` sends it; absent remains
+   * compatible with older daemons, and means no remote: such a project exists only on its machine.
+   */
+  remote?: string | null;
   mode: AutopilotMode;
   /** `null` when the project has no root on disk yet — the promote flow asks for one. */
   project_root: string | null;
@@ -617,6 +622,47 @@ export function useStageCompaction() {
     retry: false,
     onSettled: () => {
       void queryClient.invalidateQueries({ queryKey: keys.system.storage });
+    },
+  });
+}
+
+/** When the daemon starts by itself: with the owner's login, or with the machine. */
+export type AutostartMode = "at-login" | "at-boot";
+
+/** `GET /system/autostart` — the current mode and what this platform can do. */
+export interface AutostartView {
+  mode: AutostartMode;
+  at_boot: boolean;
+  /** Whether switching to `at-boot` needs the account's password (Windows). */
+  needs_password: boolean;
+  /** Why `at_boot` is false, in the daemon's words. */
+  why_not: string | null;
+}
+
+/** No poll: the mode changes when the owner changes it, and a form must not move under their hands. */
+export function useAutostart() {
+  return useQuery({
+    queryKey: keys.system.autostart,
+    queryFn: () => apiFetch<AutostartView>("/system/autostart"),
+  });
+}
+
+/**
+ * `PUT /system/autostart`. The password goes in this one request and is never written to the
+ * query cache; react-query keeps a mutation's variables until `reset()`, so the panel resets it
+ * as soon as the call settles. A refusal carries the system tool's own words in its `detail`.
+ */
+export function useSetAutostart() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (change: { mode: AutostartMode; password?: string }) =>
+      apiFetch<AutostartView>("/system/autostart", {
+        method: "PUT",
+        body: JSON.stringify(change),
+      }),
+    retry: false,
+    onSuccess: (data) => {
+      queryClient.setQueryData<AutostartView>(keys.system.autostart, data);
     },
   });
 }

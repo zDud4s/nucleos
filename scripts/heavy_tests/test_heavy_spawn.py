@@ -29,9 +29,10 @@ class SpawnTests(unittest.TestCase):
             shim_dir.mkdir()
             (shim_dir / "shim.cmd").write_text("@echo shim-ok %*\r\n", encoding="utf-8")
             env = dict(os.environ)
-            for k in ("NUCLEOS_HEAVY", "NUCLEOS_HEAVY_TOKEN", "NUCLEOS_HEAVY_HELD",
-                      "NUCLEOS_HEAVY_PRIO", "NUCLEOS_HEAVY_MAIN"):
-                env.pop(k, None)
+            # Strip every inherited NUCLEOS_HEAVY* variable (the shell may export any of them).
+            for k in list(env):
+                if k.startswith("NUCLEOS_HEAVY"):
+                    env.pop(k)
             env["NUCLEOS_HEAVY_DIR"] = str(Path(tmp) / "state")
             env["PATH"] = str(shim_dir) + os.pathsep + env.get("PATH", "")
             proc = subprocess.run(
@@ -61,9 +62,10 @@ class SpawnTests(unittest.TestCase):
                 encoding="utf-8",
             )
             env = dict(os.environ)
-            for k in ("NUCLEOS_HEAVY", "NUCLEOS_HEAVY_TOKEN", "NUCLEOS_HEAVY_HELD",
-                      "NUCLEOS_HEAVY_PRIO", "NUCLEOS_HEAVY_MAIN"):
-                env.pop(k, None)
+            # Strip every inherited NUCLEOS_HEAVY* variable (the shell may export any of them).
+            for k in list(env):
+                if k.startswith("NUCLEOS_HEAVY"):
+                    env.pop(k)
             env["NUCLEOS_HEAVY_DIR"] = str(Path(tmp) / "state")
             env["NUCLEOS_HEAVY_LOCAL"] = "1"
             proc = subprocess.run(
@@ -90,9 +92,10 @@ class SpawnFailureTests(unittest.TestCase):
         tmp = tempfile.mkdtemp(prefix="heavy-spawn-")
         try:
             env = dict(os.environ)
-            for k in ("NUCLEOS_HEAVY", "NUCLEOS_HEAVY_TOKEN", "NUCLEOS_HEAVY_HELD",
-                      "NUCLEOS_HEAVY_PRIO", "NUCLEOS_HEAVY_MAIN"):
-                env.pop(k, None)
+            # Strip every inherited NUCLEOS_HEAVY* variable (the shell may export any of them).
+            for k in list(env):
+                if k.startswith("NUCLEOS_HEAVY"):
+                    env.pop(k)
             env["NUCLEOS_HEAVY_DIR"] = str(Path(tmp) / "state")
             env["NUCLEOS_HEAVY_LOCAL"] = "1"
             env.update(env_override or {})

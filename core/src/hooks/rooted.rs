@@ -426,6 +426,14 @@ pub(super) async fn rooted_decision(
                 snapshot,
             },
         );
+        // Told to the owner after a minute if nobody answered; its own task, because this call has
+        // 5 s and a failure to notify must not touch the question.
+        crate::channels::owner_notice::spawn_ask_notice(
+            state.clone(),
+            chat_id.clone(),
+            ask_id.clone(),
+            payload.tool_name.clone(),
+        );
         // **`auto` only.** Not `manual`, where a rung called Manual whose answer comes from a model
         // is a rung that lies; not `accept_edits`, one line above for the same reason; not `bypass`,
         // which is the rung of asking nobody; and not `plan`, whose restraint already comes from the

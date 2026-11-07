@@ -2,6 +2,7 @@ import { useState, type FormEvent } from "react";
 import { Button } from "../ui/Button";
 import { ErrorNote } from "../ui/ErrorNote";
 import { Field } from "../ui/Field";
+import { PasskeyEnrol } from "./StepUp";
 import { pair, type RemoteSession } from "./session";
 
 export function defaultDeviceName(): string {
@@ -22,6 +23,8 @@ export function Pairing({ onPaired }: { onPaired: (session: RemoteSession) => vo
   const [deviceName, setDeviceName] = useState(defaultDeviceName);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // An owner goes on to register a passkey before the app opens; anyone else goes straight in.
+  const [enrolling, setEnrolling] = useState<RemoteSession | null>(null);
 
   async function submit(event: FormEvent) {
     event.preventDefault();
@@ -32,7 +35,8 @@ export function Pairing({ onPaired }: { onPaired: (session: RemoteSession) => vo
     setBusy(false);
     switch (result.kind) {
       case "ok":
-        onPaired(result.session);
+        if (result.session.owner) setEnrolling(result.session);
+        else onPaired(result.session);
         return;
       case "invalid_code":
         setError("That code was not accepted. Check it against the one on the desktop, or generate a new one.");
@@ -49,6 +53,8 @@ export function Pairing({ onPaired }: { onPaired: (session: RemoteSession) => vo
         return;
     }
   }
+
+  if (enrolling !== null) return <PasskeyEnrol onDone={() => onPaired(enrolling)} />;
 
   return (
     <main className="remote-pairing">

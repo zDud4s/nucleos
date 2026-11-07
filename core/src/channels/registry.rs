@@ -200,7 +200,15 @@ struct PresenceInner {
     drops: HashMap<&'static str, (u64, u64)>,
     /// Cache of the required secrets still missing, per channel (`set_secrets_present`).
     missing: HashMap<&'static str, Vec<&'static str>>,
+    /// Wrong `/pair` guesses per `(channel, sender)` with the time of the first one in the window.
+    pair_failures: HashMap<(&'static str, String), (u32, DateTime<Utc>)>,
 }
+
+/// Wrong guesses one sender may make inside `SENDER_PAIR_WINDOW` before its guesses stop counting.
+pub const SENDER_PAIR_LIMIT: u32 = 3;
+const SENDER_PAIR_WINDOW_MINUTES: i64 = 10;
+/// Senders remembered at once; past it the map is reset rather than grown.
+const SENDER_PAIR_TRACKED: usize = 1024;
 
 /// What the hub knows about each adapter's connection. Memory only: a row per long-poll would be
 /// the hub's biggest source of idle writes. Every method takes a short `Mutex` and does no I/O.
@@ -246,6 +254,49 @@ impl Presence {
 
     pub fn drop_unknown_sender(&self, channel: &'static str) {
         self.lock().drops.entry(channel).or_default().0 += 1;
+    }
+
+    /// Whether this sender has used up its wrong guesses. A locked sender is refused without
+    /// touching the code's own attempt counter, so a stranger cannot exhaust the owner's code.
+    pub fn sender_pair_locked(
+        &self,
+        channel: &'static str,
+        sender: &str,
+        now: DateTime<Utc>,
+    ) -> bool {
+        self.lock()
+            .pair_failures
+            .get(&(channel, sender.to_string()))
+            .is_some_and(|(count, since)| {
+                *count >= SENDER_PAIR_LIMIT
+                    && now - *since < chrono::Duration::minutes(SENDER_PAIR_WINDOW_MINUTES)
+            })
+    }
+
+    pub fn note_sender_pair_failure(
+        &self,
+        channel: &'static str,
+        sender: &str,
+        now: DateTime<Utc>,
+    ) {
+        let mut inner = self.lock();
+        if inner.pair_failures.len() >= SENDER_PAIR_TRACKED {
+            inner.pair_failures.clear();
+        }
+        let entry = inner
+            .pair_failures
+            .entry((channel, sender.to_string()))
+            .or_insert((0, now));
+        if now - entry.1 >= chrono::Duration::minutes(SENDER_PAIR_WINDOW_MINUTES) {
+            *entry = (0, now);
+        }
+        entry.0 += 1;
+    }
+
+    pub fn clear_sender_pair_failures(&self, channel: &'static str, sender: &str) {
+        self.lock()
+            .pair_failures
+            .remove(&(channel, sender.to_string()));
     }
 
     pub fn drop_pairing_failure(&self, channel: &'static str) {

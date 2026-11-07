@@ -301,3 +301,29 @@ func TestTheStagedArchiveIsRemovedOnSuccessAndOnDigestFailure(t *testing.T) {
 		t.Errorf("staged archive left after a digest failure: %v", left)
 	}
 }
+
+// TestAFailedExtractionLeavesNothingPresent. Extraction used to write straight into Dir(), so an
+// archive that failed after chrome.exe was written left an install Present() took for whole.
+func TestAFailedExtractionLeavesNothingPresent(t *testing.T) {
+	var buf bytes.Buffer
+	writer := zip.NewWriter(&buf)
+	for _, name := range []string{"chrome-win/chrome.exe", "../escape.dll"} {
+		file, err := writer.Create(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		file.Write([]byte("x"))
+	}
+	writer.Close()
+	sum := sha256.Sum256(buf.Bytes())
+	install := installInto(t, hex.EncodeToString(sum[:]))
+	if err := install.Download(context.Background(), &fakeFetcher{body: buf.Bytes()}); err == nil {
+		t.Fatal("an archive with a traversal entry was accepted")
+	}
+	if install.Present() {
+		t.Fatal("a half-extracted install is reported present")
+	}
+	if _, err := os.Stat(install.Dir() + ".partial"); err == nil {
+		t.Fatal("the partial directory was left behind")
+	}
+}
