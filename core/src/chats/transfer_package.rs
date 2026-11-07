@@ -577,7 +577,21 @@ async fn import_locked(
                 .await?;
         }
     }
-    super::transfer_history::insert_history(&mut tx, &package.chat_id, &package.history).await?;
+    let newest =
+        super::transfer_history::insert_history(&mut tx, &package.chat_id, &package.history)
+            .await?;
+    // The reader saw these answers on the origin: they are history here, not unread. The package
+    // carries no origin marker (its ids mean nothing here), so everything inserted counts as seen.
+    if let Some(newest) = newest {
+        sqlx::query(
+            "UPDATE chats SET last_seen_turn_id = MAX(COALESCE(last_seen_turn_id, 0), ?)
+              WHERE chat_id = ?",
+        )
+        .bind(newest)
+        .bind(&package.chat_id)
+        .execute(&mut *tx)
+        .await?;
+    }
     sqlx::query("DELETE FROM chat_queue WHERE chat_id = ?")
         .bind(&package.chat_id)
         .execute(&mut *tx)
@@ -1018,7 +1032,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_missing_session_transcript_refuses_without_losing_the_origin_session() {
+    async fn a_missing_session_transcript_travels_without_a_session_and_keeps_the_origin_session() {
         let origin = crate::testdb::fresh_pool().await;
         let store = space_free_tempdir("nucleos-move-missing-session-");
         a_chat(&origin, "c-missing-session", None).await;
@@ -1034,19 +1048,18 @@ mod tests {
             .unwrap();
         freeze(&origin, "c-missing-session", "t-missing-session").await;
 
-        let result = build(
+        let package = build(
             &origin,
             "c-missing-session",
             "t-missing-session",
             store.path(),
             vec![],
         )
-        .await;
+        .await
+        .expect("a missing transcript must not refuse the build");
 
-        assert!(
-            matches!(result, Err(Failure::Problem(ref problem)) if problem.contains("gone-session") && problem.contains("missing")),
-            "{result:?}"
-        );
+        // No session travels: the destination replays the history instead.
+        assert!(package.session.is_none(), "{package:?}");
         let session: String = sqlx::query_scalar(
             "SELECT session_id FROM assistant_sessions WHERE chat_id = 'c-missing-session'",
         )
@@ -1310,6 +1323,8 @@ mod tests {
                 "chat",
                 "chat_id",
                 "code",
+                "history",
+                "history_truncated",
                 "interrupted",
                 "parked",
                 "queue",

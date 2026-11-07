@@ -413,8 +413,12 @@ mod tests {
         .execute(&origin)
         .await
         .unwrap();
-        let from = (now - chrono::Duration::days(1)).format("%Y-%m-%d").to_string();
-        let to = (now + chrono::Duration::days(1)).format("%Y-%m-%d").to_string();
+        let from = (now - chrono::Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
+        let to = (now + chrono::Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
         assert_eq!(
             finished_runs(&origin, None, &from, &to)
                 .await
@@ -433,9 +437,7 @@ mod tests {
         transfer_package::import(&destination, &package, Path::new("unused"))
             .await
             .unwrap();
-        let finished = finished_runs(&destination, None, &from, &to)
-            .await
-            .unwrap();
+        let finished = finished_runs(&destination, None, &from, &to).await.unwrap();
         assert!(finished.is_empty(), "{finished:?}");
         // The chat's own total keeps what the conversation cost, wherever it was spent.
         let total: f64 = sqlx::query_scalar("SELECT SUM(cost_usd) FROM runs WHERE chat_id = 'c1'")

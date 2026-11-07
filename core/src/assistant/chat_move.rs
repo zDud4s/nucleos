@@ -146,16 +146,17 @@ mod tests {
             "history": [row(1, 0), row(2, 1), row(3, 0), row(4, 0)],
         }))
         .unwrap();
-        transfer_package::import(
-            &state.pool,
-            &package,
-            std::path::Path::new("unused"),
-        )
-        .await
-        .unwrap();
+        transfer_package::import(&state.pool, &package, std::path::Path::new("unused"))
+            .await
+            .unwrap();
 
-        assert_eq!(crate::assistant::get_session(&state.pool, chat).await.unwrap(), None);
-        let (handoff, older, tail) = super::compaction::replay_window(&state.pool, chat)
+        assert_eq!(
+            crate::assistant::get_session(&state.pool, chat)
+                .await
+                .unwrap(),
+            None
+        );
+        let (handoff, older, tail) = crate::assistant::compaction::replay_window(&state.pool, chat)
             .await
             .unwrap();
         assert!(handoff.is_none() && older.is_empty());
@@ -166,9 +167,17 @@ mod tests {
                 ("question 4".to_owned(), "answer 4".to_owned()),
             ]
         );
-        let sent = super::send::replayed_after(None, &tail, "and now?");
-        let at = |needle: &str| sent.find(needle).unwrap_or_else(|| panic!("{needle} in {sent}"));
-        assert!(at("you: question 3") < at("you: question 4") && at("you: question 4") < at("and now?"));
-        assert!(!sent.contains("question 2"), "the untrusted barrier floors the replay");
+        let sent = crate::assistant::send::replayed_after(None, &tail, "and now?");
+        let at = |needle: &str| {
+            sent.find(needle)
+                .unwrap_or_else(|| panic!("{needle} in {sent}"))
+        };
+        assert!(
+            at("you: question 3") < at("you: question 4") && at("you: question 4") < at("and now?")
+        );
+        assert!(
+            !sent.contains("question 2"),
+            "the untrusted barrier floors the replay"
+        );
     }
 }

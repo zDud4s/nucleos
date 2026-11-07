@@ -8,7 +8,13 @@
 //!
 //! The history is capped ([`HISTORY_MAX_BYTES`], [`HISTORY_MAX_ROWS`]): the newest rows win and
 //! `history_truncated` says older ones were left out. Imported rows get `imported_at`, which every
-//! reader of spend or work done here filters on (`imported_at IS NULL`).
+//! reader of spend or work done here filters on (`imported_at IS NULL`). Imported rows count as read
+//! (`last_seen_turn_id` advances) and never as live (`completed_at` is set).
+//!
+//! Known gap: the `/compact` floor is not carried, so a sessionless arrival after a compaction at
+//! the origin replays text the compaction had folded, with no handoff summary.
+//! Distillation (`distill::chats`) deliberately keeps imported rows: it reads conversation content,
+//! and the destination's memory has not seen it.
 
 use sqlx::{SqliteConnection, SqlitePool};
 
@@ -18,9 +24,10 @@ pub const HISTORY_MAX_BYTES: usize = 4 * 1024 * 1024;
 /// The most rows the history may carry.
 pub const HISTORY_MAX_ROWS: usize = 500;
 
-/// A row that alone exceeds the byte cap is clipped to this many characters per text column
-/// (the tail kept) rather than dropped, so the newest exchange always travels.
-const CLIP_CHARS: usize = 64 * 1024;
+/// A row that alone exceeds the byte cap is clipped to this many bytes per text column
+/// (the tail kept, on a character boundary) rather than dropped, so the newest exchange always
+/// travels. `tools_used` is JSON and cannot be cut mid-way, so an oversized one is dropped.
+const CLIP_BYTES: usize = 64 * 1024;
 
 /// One past exchange. See the module comment for what is left out and why.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
@@ -58,6 +65,9 @@ impl RunRow {
             + self.stdout.as_ref().map_or(0, String::len)
             + self.stderr.as_ref().map_or(0, String::len)
             + self.thought.as_ref().map_or(0, String::len)
+            + self.tools_used.as_ref().map_or(0, String::len)
+            + self.origin.as_ref().map_or(0, String::len)
+            + self.answered_by.as_ref().map_or(0, String::len)
     }
 }
 
@@ -86,6 +96,9 @@ async fn collect(
         "SELECT id, length(CAST(prompt AS BLOB)) + length(CAST(COALESCE(stdout, '') AS BLOB))
                 + length(CAST(COALESCE(stderr, '') AS BLOB))
                 + length(CAST(COALESCE(thought, '') AS BLOB))
+                + length(CAST(COALESCE(tools_used, '') AS BLOB))
+                + length(CAST(COALESCE(origin, '') AS BLOB))
+                + length(CAST(COALESCE(answered_by, '') AS BLOB))
            FROM runs
           WHERE chat_id = ? AND mode = 'assistant'
             AND id > COALESCE((SELECT cleared_after_run_id FROM chats WHERE chat_id = ?), 0)
@@ -104,9 +117,10 @@ async fn collect(
     let mut truncated = false;
     for (index, (id, size)) in sizes.iter().enumerate() {
         let size = usize::try_from(*size).unwrap_or(0);
-        // An oversized row will be clipped to about four columns of `CLIP_CHARS`.
+        // An oversized row will be clipped to four text columns of `CLIP_BYTES` (`tools_used` is
+        // dropped); the slack covers the small `origin` and `answered_by` columns.
         let counted = if size > max_bytes {
-            size.min(4 * CLIP_CHARS)
+            size.min(4 * CLIP_BYTES + 1024)
         } else {
             size
         };
@@ -143,13 +157,23 @@ async fn collect(
     Ok(History { rows, truncated })
 }
 
-/// The last `CLIP_CHARS` characters of `text`.
+/// The last `CLIP_BYTES` bytes of `text`, starting on a character boundary.
 fn tail(text: &str) -> String {
-    let count = text.chars().count();
-    text.chars().skip(count.saturating_sub(CLIP_CHARS)).collect()
+    let mut start = text.len().saturating_sub(CLIP_BYTES);
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    text[start..].to_string()
 }
 
 fn clip(row: &mut RunRow) {
+    if row
+        .tools_used
+        .as_ref()
+        .is_some_and(|t| t.len() > CLIP_BYTES)
+    {
+        row.tools_used = None;
+    }
     row.prompt = tail(&row.prompt);
     for field in [&mut row.stdout, &mut row.stderr, &mut row.thought] {
         if let Some(text) = field {
@@ -169,15 +193,25 @@ fn landed_status(status: &str) -> &str {
 /// Inserts `rows` (oldest first) as the chat's runs on this machine, inside the import transaction.
 /// New local ids grow with the order; project, job, relay and account columns stay NULL. A row the
 /// chat already holds (same `created_at` and `prompt`, left by another transfer of the same chat)
-/// is skipped.
+/// is skipped. Only the newest [`HISTORY_MAX_ROWS`] rows are taken, whatever the package carries.
+///
+/// A row that lands `interrupted` gets a `completed_at` (its own, else the import time), so no reader
+/// of "`completed_at IS NULL` means live" counts it. Returns the highest local id inserted, if any.
 pub async fn insert_history(
     tx: &mut SqliteConnection,
     chat_id: &str,
     rows: &[RunRow],
-) -> sqlx::Result<()> {
+) -> sqlx::Result<Option<i64>> {
     let imported_at = chrono::Utc::now().to_rfc3339();
+    let rows = &rows[rows.len().saturating_sub(HISTORY_MAX_ROWS)..];
+    let mut newest = None;
     for row in rows {
-        sqlx::query(
+        let status = landed_status(&row.status);
+        let completed_at = match (&row.completed_at, status) {
+            (None, "interrupted") => Some(imported_at.clone()),
+            (other, _) => other.clone(),
+        };
+        let done = sqlx::query(
             "INSERT INTO runs (chat_id, mode, prompt, stdout, stderr, status, exit_code, cost_usd,
                                answered_by, session_id, created_at, completed_at, model, cache_ttl,
                                context_fill, tools_used, thought, thought_tokens, compacted, origin,
@@ -193,13 +227,13 @@ pub async fn insert_history(
         .bind(&row.prompt)
         .bind(&row.stdout)
         .bind(&row.stderr)
-        .bind(landed_status(&row.status))
+        .bind(status)
         .bind(row.exit_code)
         .bind(row.cost_usd)
         .bind(&row.answered_by)
         .bind(&row.session_id)
         .bind(&row.created_at)
-        .bind(&row.completed_at)
+        .bind(&completed_at)
         .bind(&row.model)
         .bind(&row.cache_ttl)
         .bind(row.context_fill)
@@ -220,8 +254,11 @@ pub async fn insert_history(
         .bind(&row.prompt)
         .execute(&mut *tx)
         .await?;
+        if done.rows_affected() > 0 {
+            newest = Some(done.last_insert_rowid());
+        }
     }
-    Ok(())
+    Ok(newest)
 }
 
 #[cfg(test)]
@@ -396,7 +433,7 @@ mod tests {
         assert_eq!(history.rows.len(), 1);
         assert!(!history.truncated);
         let stdout = history.rows[0].stdout.as_deref().unwrap();
-        assert_eq!(stdout.chars().count(), CLIP_CHARS);
+        assert_eq!(stdout.len(), CLIP_BYTES);
         assert!(stdout.ends_with("END"), "the tail is kept");
     }
 
@@ -529,6 +566,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_imported_formerly_running_row_is_not_live_and_nothing_lands_unread() {
+        let origin = crate::testdb::fresh_pool().await;
+        let destination = crate::testdb::fresh_pool().await;
+        a_chat(&origin, "c1").await;
+        a_run(&origin, "c1", 1, "completed", "a", false).await;
+        let live = a_run(&origin, "c1", 2, "running", "", false).await;
+        sqlx::query("UPDATE runs SET completed_at = NULL WHERE id = ?")
+            .bind(live)
+            .execute(&origin)
+            .await
+            .unwrap();
+        let package = moved_package(&origin, "c1", "t-1").await;
+        import(&destination, &package, Path::new("unused"))
+            .await
+            .unwrap();
+
+        // The analytics `in_flight` count is `completed_at IS NULL`.
+        let live_here: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM runs WHERE completed_at IS NULL")
+                .fetch_one(&destination)
+                .await
+                .unwrap();
+        assert_eq!(live_here, 0);
+
+        let waiting = |pool: SqlitePool| async move {
+            crate::chats::list(&pool)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|c| c.chat_id == "c1")
+                .unwrap()
+                .waiting
+        };
+        assert_eq!(waiting(destination.clone()).await, 0);
+        a_run(&destination, "c1", 9, "completed", "new here", false).await;
+        assert_eq!(waiting(destination.clone()).await, 1);
+    }
+
+    #[tokio::test]
+    async fn import_takes_only_the_newest_rows_up_to_the_cap() {
+        let destination = crate::testdb::fresh_pool().await;
+        let row = |n: usize| RunRow {
+            prompt: format!("p{n}"),
+            stdout: None,
+            stderr: None,
+            status: "completed".into(),
+            exit_code: None,
+            cost_usd: None,
+            answered_by: None,
+            session_id: None,
+            created_at: format!("2026-02-01T00:00:00.{n:06}Z"),
+            completed_at: None,
+            model: None,
+            cache_ttl: None,
+            context_fill: None,
+            tools_used: None,
+            thought: None,
+            thought_tokens: None,
+            compacted: 0,
+            origin: None,
+            read_untrusted: 0,
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            num_turns: None,
+        };
+        let rows: Vec<RunRow> = (0..HISTORY_MAX_ROWS + 3).map(row).collect();
+        let package = bare("c1", "t-1", rows);
+        import(&destination, &package, Path::new("unused"))
+            .await
+            .unwrap();
+        let landed = texts(&destination, "c1").await;
+        assert_eq!(landed.len(), HISTORY_MAX_ROWS);
+        assert_eq!(landed[0].1, "p3");
+    }
+
+    #[tokio::test]
+    async fn tools_used_counts_toward_the_cap_and_multibyte_clips_by_bytes() {
+        let pool = crate::testdb::fresh_pool().await;
+        a_chat(&pool, "c1").await;
+        let first = a_run(&pool, "c1", 1, "completed", "a", false).await;
+        a_run(&pool, "c1", 2, "completed", "b", false).await;
+        sqlx::query("UPDATE runs SET tools_used = ? WHERE id = ?")
+            .bind("t".repeat(400))
+            .bind(first)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Each row is about 20 bytes of text; the 400-byte tools_used alone breaks a 200 budget.
+        let history = collect(&pool, "c1", 200, 500).await.unwrap();
+        assert!(history.truncated);
+        assert_eq!(history.rows.len(), 1);
+
+        let emoji = "\u{1F600}".repeat(100_000);
+        let mut row = collect_history(&pool, "c1").await.unwrap().rows.remove(0);
+        row.stdout = Some(emoji);
+        clip(&mut row);
+        let stdout = row.stdout.unwrap();
+        assert!(stdout.len() <= CLIP_BYTES);
+        assert!(stdout.chars().all(|c| c == '\u{1F600}'));
+    }
+
+    #[tokio::test]
     async fn a_missing_transcript_builds_a_sessionless_package_that_keeps_its_history() {
         let origin = crate::testdb::fresh_pool().await;
         a_chat(&origin, "c1").await;
@@ -537,7 +678,8 @@ mod tests {
             .execute(&origin)
             .await
             .unwrap();
-        let empty_store = crate::execution::git_exec::testkit::space_free_tempdir("nucleos-no-transcript-");
+        let empty_store =
+            crate::execution::git_exec::testkit::space_free_tempdir("nucleos-no-transcript-");
         transfer::freeze_at(&origin, "c1", "t-1", transfer::unix_now())
             .await
             .unwrap();
