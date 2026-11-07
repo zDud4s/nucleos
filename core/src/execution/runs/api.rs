@@ -41,6 +41,11 @@ pub struct CreateRunRequest {
     // is its snake_case spelling.
     #[schemars(with = "Option<String>")]
     pub permission_mode: Option<crate::chats::PermissionMode>,
+    /// Which account pool entry this run may use: `auto`, `provider:<p>` or `account:<id>`.
+    /// Absent leaves the column NULL, which reads as the settings default. A spelling that does
+    /// not parse fails the request.
+    #[serde(default)]
+    pub account_choice: Option<String>,
 }
 
 pub(super) fn default_run_mode() -> String {
@@ -478,6 +483,9 @@ pub struct RunStatusResponse {
     pub advised_effort: Option<String>,
     /// A JSON array of `model[@effort]`, as TEXT: handed over as the column holds it, not parsed.
     pub route_failed: Option<String>,
+    /// The pool account this run launched under; `null` before the launch picks one, and for any
+    /// run that ran as today (no accounts).
+    pub account_id: Option<String>,
 }
 
 impl RunStatusResponse {
@@ -582,6 +590,22 @@ pub async fn create_run(
     // answers `Off` for a missing row. That is the right answer rather than an accident: an
     // unattended run against a project with no autopilot state is one that no mode, budget or
     // scoped stop can pace.
+    // A spelling outside `auto` | `provider:<p>` | `account:<id>` fails the request, like
+    // `permission_mode`: a typo must not quietly become "the default account".
+    let parsed = req
+        .account_choice
+        .as_deref()
+        .map(str::parse::<crate::accounts::AccountChoice>);
+    let account_choice = match parsed {
+        None => None,
+        Some(Ok(choice)) => Some(choice),
+        Some(Err(_)) => {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "account_choice must be `auto`, `provider:<name>` or `account:<id>`".to_owned(),
+            ));
+        }
+    };
     if runs_unattended(&req.mode)
         && let Some(project) = req.project_id.as_deref()
     {
@@ -636,6 +660,7 @@ pub async fn create_run(
                 steerable: req.steerable,
                 provisioning: None,
                 permission_mode: req.permission_mode,
+                account_choice,
             },
         )
         .await
@@ -747,7 +772,7 @@ pub async fn get_run(
                 stdout, stderr, session_id, cost_usd, input_tokens, output_tokens, cache_read_tokens,
                 num_turns, context_fill, steerable, successor_run_id, chat_id, cache_creation_tokens,
                 authored_prompt_chars, model, effort, runner, route_mode, route_decision_id,
-                advised_runner, advised_model, advised_effort, route_failed
+                advised_runner, advised_model, advised_effort, route_failed, account_id
          FROM runs WHERE id = ?",
     )
     .bind(id)
