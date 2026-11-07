@@ -1541,13 +1541,6 @@ ol.ui-well {
   color: var(--text-faint);
 }
 
-.ui-copy-once-copied {
-  margin: 0;
-  font-size: var(--text-xs);
-  font-weight: var(--weight-medium);
-  color: var(--tone-active-fg);
-}
-
 /* -------------------------------------------------------------- statcard -- */
 
 .ui-stat {
@@ -3933,6 +3926,107 @@ ol.ui-well {
 }
 .ui-undo-toast-message {
   flex: 1 1 auto;
+}
+
+/* ----------------------------------------------------------------- toast -- */
+.ui-toaster {
+  position: fixed;
+  right: var(--space-4);
+  bottom: var(--space-4);
+  z-index: var(--z-toast);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: var(--space-2);
+  pointer-events: none;
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+.ui-toast {
+  pointer-events: auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.375rem;
+  width: max-content;
+  max-width: min(22.5rem, calc(100vw - 2rem));
+  padding: 0.75rem 0.875rem;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  background: var(--surface-raised);
+  color: var(--text);
+  box-shadow: var(--shadow-md);
+  font-size: var(--text-sm);
+  animation: ui-toast-in 160ms ease-out;
+}
+.ui-toast-body {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  min-width: 0;
+}
+.ui-toast-icon {
+  flex: none;
+  width: 1rem;
+  height: 1.25rem;
+  color: var(--text-muted);
+}
+.ui-toast-error .ui-toast-icon { color: var(--tone-danger-fg); }
+.ui-toast-success .ui-toast-icon { color: var(--tone-active-fg); }
+.ui-toast-info .ui-toast-icon { color: var(--tone-info-fg); }
+.ui-toast-loading .ui-toast-icon { animation: ui-toast-spin 1s linear infinite; }
+.ui-toast-text {
+  display: flex;
+  flex-direction: column;
+  gap: 0.125rem;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.ui-toast-title { font-weight: 500; }
+.ui-toast-title::first-letter { text-transform: uppercase; }
+.ui-toast-description { color: var(--text-muted); }
+.ui-toast-action {
+  align-self: flex-start;
+  margin-top: 0.25rem;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+.ui-toast-close {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.25rem;
+  height: 1.25rem;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm, 4px);
+  background: none;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.ui-toast-close:hover { color: var(--text); }
+.ui-toast-close svg { width: 0.875rem; height: 0.875rem; }
+/* A failed read with nothing to show: the footprint stays, the words go to the toast. */
+.ui-error-placeholder {
+  display: flex;
+  align-items: center;
+  color: var(--text-faint);
+}
+@keyframes ui-toast-in {
+  from { opacity: 0; transform: translateY(0.5rem); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes ui-toast-spin {
+  to { transform: rotate(360deg); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ui-toast { animation: none; }
+  .ui-toast-loading .ui-toast-icon { animation: none; }
 }
 
 /* ------------------------------------------------------------------ chip -- */

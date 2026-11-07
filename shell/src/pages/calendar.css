@@ -47,12 +47,6 @@
   gap: var(--space-4);
 }
 
-.calendar-outcome {
-  margin: var(--space-3) 0 0;
-  font-size: var(--text-sm);
-  color: var(--tone-active-fg);
-}
-
 /* The tone that marks a proposal or a moved occurrence is colour, and colour
    is not a label — so both grids say the word to a screen reader and to nobody
    else. That is `.sr-only` from `base.css`, which is this recipe exactly and is
@@ -932,11 +926,6 @@
 .calendar-move input:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 1px;
-}
-
-/* The outcome and any refusal span the footer under both lines. */
-.calendar-draft > .calendar-outcome {
-  margin: 0;
 }
 
 @media (prefers-reduced-motion: reduce) {

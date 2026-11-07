@@ -212,7 +212,7 @@ describe("Fleet", () => {
     const { pipe } = await open(snapshot([a]));
     await screen.findByRole("article", { name: /^alpha/ });
     await act(async () => pipe.send({ t: "node", node: { ...a, state: "idle" } }));
-    const region = document.querySelector("[aria-live='polite']")!;
+    const region = document.querySelector("[aria-live='polite']:not(.ui-toaster)")!;
     expect(region.textContent).toBe("alpha is waiting for you");
   });
 

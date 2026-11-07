@@ -310,7 +310,7 @@ describe("DevtimeSection", () => {
     await waitFor(() =>
       expect(within(row).getByRole("button", { name: "Not rework" }).getAttribute("aria-pressed")).toBe("false"),
     );
-    expect(within(row).getByText("The mark was not saved.")).toBeTruthy();
+    expect(screen.getByText("The mark was not saved.")).toBeTruthy();
   });
 
   it("keeps a successful mark and sends it once", async () => {

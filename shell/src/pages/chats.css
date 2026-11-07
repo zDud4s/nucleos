@@ -2737,16 +2737,6 @@
   outline: none;
 }
 
-/* Why the daemon would refuse this one, said in place rather than as a single
-   "no" about the whole set — which is all a bare 400 could tell anybody. The
-   pending tone on purpose: it is the one that asks a person for something, and
-   this asks rather than reports a fault. */
-.chats-helper-why {
-  margin: 0;
-  color: var(--tone-pending-fg);
-  font-size: var(--text-xs);
-}
-
 /**
  * Send, as the arrow it has been in every chat box for a decade.
  *
@@ -3890,16 +3880,6 @@
   cursor: default;
 }
 
-.chats-forward-refused {
-  margin: 0;
-  font-size: var(--text-xs);
-  color: var(--text-faint);
-}
-
-.chats-forward-refused {
-  color: var(--tone-danger-fg);
-}
-
 /* -------------------------------------------------- what a department said -- */
 
 /* A message, not a turn. No avatar column, no cost, no status chip: a notice has
@@ -4771,14 +4751,6 @@ button.agent-card:hover {
   line-height: var(--leading-snug);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-}
-
-.agent-stop-error {
-  flex-basis: 100%;
-  margin: 0;
-  color: var(--tone-danger-fg);
-  font-size: var(--text-xs);
-  text-align: right;
 }
 
 .agent-io-failed {

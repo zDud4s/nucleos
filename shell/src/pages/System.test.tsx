@@ -415,10 +415,28 @@ async function settingPanel(area: string): Promise<HTMLElement> {
 }
 
 function rowFor(list: HTMLElement, name: string): HTMLElement {
-  const row = within(list).getByText(name).closest("li");
+  const row = within(list).getByText(name).closest("li, tr");
   if (row === null) throw new Error(`no row for ${name}`);
   return row as HTMLElement;
 }
+
+/**
+ * The Details button of the panel with this heading opens a drawer with a table of everything the
+ * panel summarises; the table is the one place a row's own controls live.
+ */
+async function openDetails(heading: string, tableName: string): Promise<HTMLElement> {
+  const panel = (await screen.findByRole("heading", { level: 2, name: heading })).closest("section") as HTMLElement;
+  // The card header's link comes first; Subsystems rows carry their own "Details" after it.
+  const button = (await within(panel).findAllByRole("button", { name: "Details" }))[0];
+  await waitFor(() => {
+    expect((button as HTMLButtonElement).disabled).toBe(false);
+  });
+  fireEvent.click(button);
+  return screen.findByRole("table", { name: tableName });
+}
+
+const openSubsystems = () => openDetails("Subsystems", "All subsystems");
+const openBrakes = () => openDetails("Project brakes", "All project brakes");
 
 /* ---------------------------------------------------------------- health -- */
 
@@ -472,19 +490,15 @@ describe("System - health readout", () => {
 
     await renderSystem();
 
-    const list = await screen.findByRole("list", { name: "Subsystems" });
+    // The attention table lists the not-ok ones (down first), capped at three slots.
+    const strip = await screen.findByRole("list", { name: "Subsystems" });
+    expect(within(strip).getAllByRole("listitem")).toHaveLength(3);
+    expect(within(strip).getByText("+3 more")).toBeDefined();
+    const expectedOrder = world.readout.subsystems.map((subsystem) => subsystem.name).sort();
 
-    // Down comes first, then degraded, with daemon order preserved inside each group.
-    const names = within(list)
-      .getAllByRole("listitem")
-      .map((row) => row.querySelector(".sy-subsystem-name")?.textContent);
-    const expectedOrder = [
-      ...world.readout.subsystems.filter((subsystem) => subsystem.status === "down"),
-      ...world.readout.subsystems.filter((subsystem) => subsystem.status === "degraded"),
-      ...world.readout.subsystems.filter(
-        (subsystem) => subsystem.status !== "down" && subsystem.status !== "degraded",
-      ),
-    ].map((subsystem) => subsystem.name);
+    // The drawer's table lists the same names in the same order, with reasons.
+    const list = await openSubsystems();
+    const names = Array.from(list.querySelectorAll("tbody .sy-dtable-mono")).map((cell) => cell.textContent);
     expect(names).toEqual(expectedOrder);
 
     // Reasons render for the rows that have one.
@@ -503,6 +517,23 @@ describe("System - health readout", () => {
     // boundary.
     const emailSidecar = rowFor(list, "email_sidecar");
     expect(emailSidecar.textContent).toMatch(/down/i);
+  });
+
+  it.each([0, 1, 3, 10])("keeps exactly three attention slots with %i not-ok subsystems", async (n) => {
+    const bad = Array.from({ length: n }, (_, i) => ({ name: `bad_${String(i)}`, status: "down" as const }));
+    daemon.apiFetch.mockImplementation(
+      systemFetch(
+        systemWorld({ readout: { status: "ok", subsystems: [{ name: "ok_one", status: "ok" as const }, ...bad] } }),
+      ),
+    );
+    await renderSystem();
+    const list = await screen.findByRole("list", { name: "Subsystems" });
+    expect(within(list).getAllByRole("listitem", { hidden: true })).toHaveLength(3);
+    expect(within(list).queryAllByText("All subsystems ok")).toHaveLength(n === 0 ? 1 : 0);
+    if (n > 3) {
+      expect(within(list).getByText(`+${String(n - 2)} more`)).toBeDefined();
+      expect(within(list).queryByText("bad_2")).toBeNull();
+    }
   });
 
   it("renders an aggregate timeout as one collapsed readout, not nine missing subsystems", async () => {
@@ -549,7 +580,7 @@ describe("System - health readout", () => {
 
     await renderSystem();
 
-    const list = await screen.findByRole("list", { name: "Subsystems" });
+    const list = await openSubsystems();
     const restarts = within(list).getAllByRole("button", { name: "Restart" });
     expect(restarts).toHaveLength(1);
     expect(rowFor(list, "browser_sidecar").textContent).toContain("Restart");
@@ -572,7 +603,7 @@ describe("System - health readout", () => {
 
     await renderSystem();
 
-    const list = await screen.findByRole("list", { name: "Subsystems" });
+    const list = await openSubsystems();
     // The tally sits inside the row it belongs to, and only that row carries one.
     expect(rowFor(list, "distiller").textContent).toContain("pending 3");
     expect(rowFor(list, "sqlite_pool").textContent).not.toContain("pending");
@@ -597,7 +628,7 @@ describe("System - health readout", () => {
 
     await renderSystem();
 
-    const list = await screen.findByRole("list", { name: "Subsystems" });
+    const list = await openSubsystems();
     fireEvent.click(within(list).getByRole("button", { name: "Restart" }));
     await afterDwell();
     fireEvent.click(
@@ -628,14 +659,15 @@ describe("System - health readout", () => {
 
     await renderSystem();
 
-    const list = await screen.findByRole("list", { name: "Subsystems" });
+    const list = await openSubsystems();
     fireEvent.click(within(list).getByRole("button", { name: "Restart" }));
     await afterDwell();
     fireEvent.click(
       await within(list).findByRole("button", { name: "Start it again" }),
     );
 
-    expect(await within(list).findByText(/nothing is supervising it/)).toBeDefined();
+    // The refusal surfaces as a toast, not in the row.
+    expect(await screen.findByText(/nothing is supervising it/)).toBeDefined();
   });
 });
 
@@ -771,7 +803,7 @@ describe("System - unsaved limits", () => {
     daemon.apiFetch.mockImplementation(systemFetch(systemWorld()));
     await renderSystemAt("/system/limits");
 
-    const input = await screen.findByLabelText("Window limit (USD)");
+    const input = await screen.findByLabelText("Window limit");
     const unload = () => {
       const event = new Event("beforeunload", { cancelable: true });
       window.dispatchEvent(event);
@@ -807,7 +839,7 @@ describe("System - project brakes", () => {
 
     await renderSystem();
 
-    const list = await screen.findByRole("list", { name: "Project brakes" });
+    const list = await openBrakes();
     const alphaRow = rowFor(list, "alpha");
 
     fireEvent.click(within(alphaRow).getByRole("button", { name: "Hold alpha" }));
@@ -865,7 +897,7 @@ describe("System - budget", () => {
 
     await renderSystemAt("/system/limits");
 
-    const windowInput = await screen.findByLabelText("Window limit (USD)");
+    const windowInput = await screen.findByLabelText("Window limit");
     fireEvent.change(windowInput, { target: { value: "" } });
 
     fireEvent.click(screen.getByRole("button", { name: "Save budget" }));
@@ -943,7 +975,7 @@ describe("System - budget", () => {
 
       await renderSystemAt("/system/limits");
 
-      const windowInput = await screen.findByLabelText("Window limit (USD)");
+      const windowInput = await screen.findByLabelText("Window limit");
       fireEvent.change(windowInput, { target: { value: garbage } });
 
       fireEvent.click(screen.getByRole("button", { name: "Save budget" }));
@@ -979,7 +1011,7 @@ describe("System - budget", () => {
 
     await renderSystemAt("/system/limits");
 
-    const hourlyInput = await screen.findByLabelText("Hourly limit (USD)");
+    const hourlyInput = await screen.findByLabelText("Hourly limit");
     fireEvent.change(hourlyInput, { target: { value: "abc" } });
 
     fireEvent.click(screen.getByRole("button", { name: "Save budget" }));
@@ -1015,8 +1047,8 @@ describe("System - quota brake", () => {
     const block = quotaBrake.closest("section");
     if (block === null) throw new Error("no quota brake block");
     const enabled = within(block).getByRole("switch", { name: "Enable quota brake" }) as HTMLInputElement;
-    const fiveHour = within(block).getByLabelText("Pause above 5h usage (%)") as HTMLInputElement;
-    const sevenDay = within(block).getByLabelText("Pause above 7d usage (%)") as HTMLInputElement;
+    const fiveHour = within(block).getByLabelText("Pause above 5h usage") as HTMLInputElement;
+    const sevenDay = within(block).getByLabelText("Pause above 7d usage") as HTMLInputElement;
     expect(enabled.checked).toBe(false);
     expect(fiveHour.value).toBe("85");
     expect(sevenDay.value).toBe("90");
@@ -1048,7 +1080,8 @@ describe("System - quota brake", () => {
     await afterDwell();
     fireEvent.click(within(block).getByRole("button", { name: "Save these three settings" }));
 
-    expect(await within(block).findByRole("alert")).toBeDefined();
+    // The refusal is an error toast now, outside the block.
+    expect(await screen.findByRole("alert")).toBeDefined();
     expect(quotaBrakePosts()).toHaveLength(1);
   });
 });
@@ -1260,7 +1293,7 @@ describe("System - backups", () => {
     fireEvent.click(within(row).getByRole("button", { name: "Restore on next start" }));
 
     expect(
-      await within(row).findByText(
+      await screen.findByText(
         "a restore is already staged, or that snapshot name is taken: only one can be pending",
       ),
     ).toBeDefined();
@@ -1496,7 +1529,7 @@ describe("System - this machine's settings", () => {
 
     // The refusal carries no `field` (see `machineSeeds`), so the words are asserted on the panel and not on
     // the input: where they land when a refusal does name a field is the form's optional path, not this page's.
-    expect(await within(panel).findByText(/did not find expected node content/)).toBeDefined();
+    expect(await screen.findByText(/did not find expected node content/)).toBeDefined();
     expect(within(panel).queryByText(/^saved /)).toBeNull();
     expect(world.settings.writes).toEqual([]);
   });
@@ -1554,14 +1587,15 @@ describe("System - a settings document that does not read", () => {
 
     await renderSystemAt("/system/settings");
 
-    const panel = await settingPanel("email");
-    expect(await within(panel).findByText(/does not read: did not find expected ',' or '\]' at line 2/)).toBeDefined();
+    await settingPanel("email");
+    expect(await screen.findByText(/does not read: did not find expected ',' or '\]' at line 2/)).toBeDefined();
 
     // A healthy document beside it carries no such note.
     await openSetting("web");
     const web = await settingPanel("web");
     expect(await within(web).findByLabelText("Host")).toBeDefined();
-    expect(within(web).queryByText(/does not read/)).toBeNull();
+    // Only the unreadable document raised the note.
+    expect(screen.queryAllByText(/does not read/)).toHaveLength(1);
   });
 });
 
@@ -1634,7 +1668,7 @@ describe("System - map-authored readings", () => {
     const world = systemWorld({ projects: [project({ project_id: "alpha" })] });
     daemon.apiFetch.mockImplementation(systemFetch(world));
     await renderSystem();
-    const alphaRow = rowFor(await screen.findByRole("list", { name: "Project brakes" }), "alpha");
+    const alphaRow = rowFor(await openBrakes(), "alpha");
     const released = within(alphaRow).getByText("released");
     expect(released.className).toContain("ui-badge-off");
     expect(released.className).not.toContain("ui-badge-active");
@@ -1731,7 +1765,7 @@ describe("System - the channel search param", () => {
   it("ignores the param on another tab", async () => {
     serveChannels();
     await renderSystemAt("/system/limits?channel=x");
-    await screen.findByLabelText("Window limit (USD)");
+    await screen.findByLabelText("Window limit");
     expect(requested().some((path) => path.startsWith("/notifications/policy"))).toBe(false);
   });
 });

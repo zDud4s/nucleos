@@ -248,6 +248,7 @@
   --z-cover: 5; /* covers its container, and nothing beyond it. */
   --z-overlay: 20; /* over the page: the drawer, a context menu. */
   --z-top: 50; /* over everything, an overlay included. */
+  --z-toast: 60; /* over a modal's scrim: a toast must stay readable and clickable while one is open. */
 
   /* ----------------------------------------------------------- opacity -- */
   /* Disabled was 0.45 on a button and 0.5 on a tab — the same state, dimmed by

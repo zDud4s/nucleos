@@ -72,10 +72,21 @@ export function QueryState<T>({
       if (isRemote() && isApiRefusal(query.error) && query.error.status === 403) {
         return <UnavailableRemotely feature="This page" />;
       }
+      // The words go to a toast (one per label and cause); the page keeps a quiet
+      // placeholder the size of the skeleton it replaces, so nothing moves.
       return (
-        <ErrorNote onRetry={() => void query.refetch()}>
-          Could not load {label}: {causeOf(query.error)}
-        </ErrorNote>
+        <>
+          <ErrorNote onRetry={() => void query.refetch()}>
+            Could not load {label}: {causeOf(query.error)}
+          </ErrorNote>
+          <div
+            className="ui-error-placeholder"
+            style={{ minHeight: skeleton ? "6rem" : `${(lines ?? 1) * 1.5}rem` }}
+            aria-label={`${label}: unavailable`}
+          >
+            —
+          </div>
+        </>
       );
     }
     if (query.isPending) {

@@ -121,7 +121,6 @@ describe("OnItsOwn", () => {
 
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toMatch(/gate_before_publish is on and no gate command is set/);
-    expect(within(alert).getByText("gate_before_publish").tagName).toBe("CODE");
-    expect(within(alert).getByRole("link", { name: "Set a gate command" })).toBeDefined();
+    expect(within(alert).getByRole("button", { name: "Set a gate command" })).toBeDefined();
   });
 });

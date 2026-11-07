@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { act, render, screen } from "@testing-library/react";
+import { toastManager } from "./toast";
 import { RefusalNote } from "./RefusalNote";
 import { ApiRefusal } from "../data/client";
 import { ErrorNote } from "./ErrorNote";
@@ -68,24 +69,24 @@ describe("RefusalNote", () => {
     // answered, and it answered no.
     expect(screen.queryByRole("alert")).toBeNull();
     expect(screen.getByRole("status")).toBeDefined();
-    expect(screen.getByRole("status").className).toContain("ui-note-refusal");
-    expect(screen.getByRole("status").className).not.toContain("ui-note-error");
+    expect(screen.getByRole("status").className).toContain("ui-toast-info");
+    expect(screen.getByRole("status").className).not.toContain("ui-toast-error");
   });
 
   it("reads differently from a transport error side by side", () => {
-    const { container } = render(
+    render(
       <div>
         <RefusalNote refusal={new ApiRefusal(423, "kill_switch", "kill_switch")} />
         <ErrorNote>the service is unreachable</ErrorNote>
       </div>,
     );
 
-    const notes = Array.from(container.querySelectorAll(".ui-note"));
-    expect(notes).toHaveLength(2);
-    // Two roles, two classes: the distinction is carried semantically and
+    // Two roles, two toast types: the distinction is carried semantically and
     // visually, not by wording alone.
-    expect(notes.map((n) => n.getAttribute("role"))).toEqual(["status", "alert"]);
-    expect(notes[0].className).not.toBe(notes[1].className);
+    const toasts = Array.from(document.querySelectorAll(".ui-toast"));
+    expect(toasts).toHaveLength(2);
+    expect(toasts.map((n) => n.getAttribute("role"))).toEqual(["status", "alert"]);
+    expect(toasts[0].className).not.toBe(toasts[1].className);
   });
 
   it("no_gemini_key and no_openrouter_key read as sentences; warning_not_acknowledged shows the daemon's detail", () => {
@@ -93,6 +94,7 @@ describe("RefusalNote", () => {
     expect(screen.getByRole("status").textContent ?? "").toMatch(/gemini api key/i);
     expect(screen.getByRole("status").textContent ?? "").not.toMatch(/refused this/i);
     gemini.unmount();
+    act(() => toastManager.clear());
 
     const router = render(
       <RefusalNote refusal={new ApiRefusal(503, "no_openrouter_key", "no_openrouter_key")} />,
@@ -100,6 +102,7 @@ describe("RefusalNote", () => {
     expect(screen.getByRole("status").textContent ?? "").toMatch(/openrouter/i);
     expect(screen.getByRole("status").textContent ?? "").not.toMatch(/refused this/i);
     router.unmount();
+    act(() => toastManager.clear());
 
     // No page sentence for this code: the daemon's warning text must reach the screen.
     const warning = "agy runs unattended with your Google account; read this before enabling it";

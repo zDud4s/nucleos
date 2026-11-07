@@ -1,6 +1,7 @@
 import { bindPrefetchClient } from "../lib/prefetch";
 import React from "react";
 import type { Root } from "react-dom/client";
+import { ToastProvider } from "../ui/toast";
 import { QueryClientProvider, type QueryClient } from "@tanstack/react-query";
 import { RouterProvider } from "@tanstack/react-router";
 import { MotionConfig } from "motion/react";
@@ -41,7 +42,9 @@ export function mountMainWindow(root: Root, queryClient: QueryClient): void {
       <QueryClientProvider client={queryClient}>
         {/* WAAPI ignores the CSS reduced-motion clamp, so `motion` is asked to honour it here. */}
         <MotionConfig reducedMotion="user" transition={transition}>
-          <RouterProvider router={router} />
+          <ToastProvider>
+            <RouterProvider router={router} />
+          </ToastProvider>
         </MotionConfig>
       </QueryClientProvider>
     </React.StrictMode>,

@@ -124,7 +124,7 @@ import { chatKey, chatMachineOf, rememberChatMachine, useChatMachine } from "../
 import { useMachines } from "../data/machines";
 import { MachinePicker, useNewWorkMachine } from "../chats/MachinePicker";
 import { type ChatNotice } from "../data/chats";
-import { Image, Skeleton, useUndoable, usePaletteGroup, usePaletteQuery } from "../ui";
+import { Image, Skeleton, toastManager, useUndoable, usePaletteGroup, usePaletteQuery } from "../ui";
 import {
   anyTurnLive,
   marksBetween,
@@ -3811,6 +3811,14 @@ function ChatHelpers({
     whyHelperIsRefused(helper, draft, knownTools),
   );
   const ready = refusals.every((why) => why === null);
+  // Why a helper would be refused is said once as a toast when the reason appears or changes.
+  const refusalKey = JSON.stringify(refusals);
+  useEffect(() => {
+    (JSON.parse(refusalKey) as (string | null)[]).forEach((why, at) => {
+      if (why !== null)
+        toastManager.add({ type: "info", title: "A helper would be refused", description: why, dedupeKey: `helper-why:${at}:${why}` });
+    });
+  }, [refusalKey]);
 
   const change = (at: number, patched: Partial<HelperDraft>) =>
     setDraft((current) =>
@@ -3974,11 +3982,6 @@ function ChatHelpers({
                   Remove
                 </Button>
               </div>
-              {refusals[index] !== null && (
-                <p className="chats-helper-why" role="alert">
-                  {refusals[index]}
-                </p>
-              )}
             </li>
           ))}
         </ul>
@@ -5764,7 +5767,20 @@ export function ForwardPanel({
                   onClick={() => {
                     forward.mutate(
                       { toChatId: row.chat_id, fromTurnId: turn.id, text },
-                      { onSuccess: onSent },
+                      {
+                        onSuccess: onSent,
+                        // The daemon's own word for why (`relay_cycle`, `relay_too_deep`,
+                        // `owner_away`): each has a different answer.
+                        onError: (error) =>
+                          toastManager.add({
+                            type: "error",
+                            title: "Could not hand it over",
+                            description: isApiRefusal(error)
+                              ? (MESSAGE_SENTENCES[error.code] ?? error.code)
+                              : "The conversation was not handed over.",
+                            dedupeKey: `forward:${isApiRefusal(error) ? error.code : "other"}`,
+                          }),
+                      },
                     );
                   }}
                 >
@@ -5789,7 +5805,18 @@ export function ForwardPanel({
                       onClick={() => {
                         asMessage.mutate(
                           { toChatId: row.chat_id, text: `Forwarded from ${sourceLabel}:\n\n${text}` },
-                          { onSuccess: onSent },
+                          {
+                            onSuccess: onSent,
+                            onError: (error) =>
+                              toastManager.add({
+                                type: "error",
+                                title: "Could not send the message",
+                                description: isApiRefusal(error)
+                                  ? (MESSAGE_SENTENCES[error.code] ?? error.code)
+                                  : "The message was not sent.",
+                                dedupeKey: `forward-msg:${isApiRefusal(error) ? error.code : "other"}`,
+                              }),
+                          },
                         );
                       }}
                     >
@@ -5798,24 +5825,7 @@ export function ForwardPanel({
                   </li>
                 ))}
               </ul>
-              {asMessage.isError && (
-                <p className="chats-forward-refused" role="status">
-                  {isApiRefusal(asMessage.error)
-                    ? (MESSAGE_SENTENCES[asMessage.error.code] ?? asMessage.error.code)
-                    : "could not send the message"}
-                </p>
-              )}
             </>
-          )}
-          {/* The daemon's own word for why, not a sentence this side invented: `relay_cycle`,
-              `relay_too_deep`, `owner_away`. A refusal shown as "something went wrong" is one
-              nobody can act on, and each of these has a different answer. */}
-          {forward.isError && (
-            <p className="chats-forward-refused" role="status">
-              {isApiRefusal(forward.error)
-                ? (MESSAGE_SENTENCES[forward.error.code] ?? forward.error.code)
-                : "could not hand it over"}
-            </p>
           )}
         </div>
       )}

@@ -54,6 +54,7 @@ import {
   Badge,
   Button,
   Callout,
+  Drawer,
   ConfirmButton,
   CopyButton,
   CopyOnce,
@@ -78,6 +79,7 @@ import {
   Td,
   Th,
   Meter,
+  toastManager,
 } from "../ui";
 import { RemoteDevices } from "../system/RemoteDevices";
 import { Autostart } from "../system/Autostart";
@@ -324,13 +326,60 @@ function SpendSummary() {
   );
 }
 
+/** How a subsystem's detail reads in the strip tooltip and the drawer: the reason, then its tallies. */
+function subsystemDetail(row: SubsystemReadout): string {
+  const tallies = subsystemCounts(row)
+    .filter((count) => !count.instant)
+    .map((count) => `${count.label} ${String(count.value)}`);
+  const parts = [row.reason === undefined ? null : `reason: ${row.reason}`, ...tallies];
+  return parts.filter((part) => part !== null).join(" · ");
+}
+
+/** The first instant a subsystem keeps (a `*_unix` tally), as an ISO time; null when it keeps none. */
+function subsystemSince(row: SubsystemReadout): string | null {
+  const instant = subsystemCounts(row).find((count) => count.instant);
+  return instant === undefined ? null : new Date(instant.value * 1000).toISOString();
+}
+
+/** The names that fit the one attention line, and how many are left for "+N more". */
+function attentionNames<T>(items: readonly T[], shown: number): { head: T[]; more: number } {
+  return { head: items.slice(0, shown), more: Math.max(0, items.length - shown) };
+}
+
 function HealthReadoutPanel({
   health,
 }: {
   health: ReturnType<typeof useSystemHealth>;
 }) {
+  const [open, setOpen] = useState(false);
+  const ready = health.data !== undefined && !isAggregateTimeout(health.data);
+  const rows =
+    health.data !== undefined && !isAggregateTimeout(health.data)
+      ? [...health.data.subsystems].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+      : [];
+  const count = (status: SubsystemReadout["status"]) => rows.filter((row) => row.status === status).length;
+  const attention = rows.filter((row) => row.status !== "ok").sort(bySubsystemHealth);
+  // Always three slots, so the card is as tall for none as for ten.
+  const slots: (SubsystemReadout | "ok" | "more" | "empty")[] =
+    attention.length === 0
+      ? ["ok", "empty", "empty"]
+      : attention.length > 3
+        ? [attention[0], attention[1], "more"]
+        : [...attention, ...Array<"empty">(3 - attention.length).fill("empty")];
+  const stats: { label: string; value: number; tone?: string }[] = [
+    { label: "Subsystems", value: rows.length },
+    { label: "Ok", value: count("ok") },
+    { label: "Degraded", value: count("degraded"), tone: count("degraded") > 0 ? "sy-stat-warn" : undefined },
+    { label: "Down", value: count("down"), tone: count("down") > 0 ? "sy-stat-danger" : undefined },
+    { label: "Disabled", value: count("disabled"), tone: count("disabled") > 0 ? "sy-stat-warn" : undefined },
+  ];
+  const aside = ready ? (
+    <Button variant="quiet" aria-expanded={open} onClick={() => { setOpen(true); }}>
+      Details
+    </Button>
+  ) : undefined;
   return (
-    <Panel title="Subsystems">
+    <Panel title="Subsystems" aside={aside}>
       {health.data === undefined && !health.isError && (
         <Skeleton label="Reading the subsystems" variant="row" count={3} />
       )}
@@ -343,12 +392,86 @@ function HealthReadoutPanel({
           subsystem was reached. That is not the same as all of them being down.
         </Notice>
       )}
-      {health.data !== undefined && !isAggregateTimeout(health.data) && (
-        <ul className="sy-subsystems" aria-label="Subsystems">
-          {[...health.data.subsystems].sort(bySubsystemHealth).map((row) => (
-            <SubsystemRow key={row.name} row={row} />
-          ))}
-        </ul>
+      {ready && (
+        <>
+          <dl className="sy-router-totals sy-stats">
+            {stats.map((stat) => (
+              <div key={stat.label} className="sy-router-total">
+                <dt>{stat.label}</dt>
+                <dd className={stat.tone}>{stat.value}</dd>
+              </div>
+            ))}
+          </dl>
+          <Rows label="Subsystems" className="sy-attn">
+            {slots.map((slot, index) =>
+              slot === "empty" ? (
+                <li key={`empty-${String(index)}`} className="ui-rows-row ui-rows-row-dense sy-attn-row" aria-hidden="true" />
+              ) : slot === "ok" ? (
+                <Row key="ok" dense className="sy-attn-row">
+                  <span className="sy-attn-ok">All subsystems ok</span>
+                </Row>
+              ) : slot === "more" ? (
+                <Row key="more" dense className="sy-attn-row">
+                  <span className="sy-attn-more">+{attention.length - 2} more</span>
+                  <span className="sy-attn-tools">
+                    <Button variant="quiet" onClick={() => { setOpen(true); }}>Details</Button>
+                  </span>
+                </Row>
+              ) : (
+                <Row key={slot.name} dense className="sy-attn-row">
+                  <span className="sy-sidecar-name" title={slot.name}>{slot.name}</span>
+                  <span className="sy-sidecar-state">
+                    <StateBadge domain="pillar" state={slot.status} />
+                  </span>
+                  <span className="sy-attn-detail" title={subsystemDetail(slot)}>{subsystemDetail(slot)}</span>
+                  <span className="sy-attn-tools">
+                    <Button variant="quiet" aria-label={`Details for ${slot.name}`} onClick={() => { setOpen(true); }}>Details</Button>
+                  </span>
+                </Row>
+              ),
+            )}
+          </Rows>
+        </>
+      )}
+      {open && ready && (
+        <Drawer title="Subsystems" onClose={() => { setOpen(false); }}>
+          <table className="sy-dtable" aria-label="All subsystems">
+            <colgroup>
+              <col className="sy-dcol-name" />
+              <col className="sy-dcol-state" />
+              <col />
+              <col className="sy-dcol-since" />
+            </colgroup>
+            <thead>
+              <tr>
+                <th scope="col">Name</th>
+                <th scope="col">State</th>
+                <th scope="col">Detail</th>
+                <th scope="col">Since</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row) => {
+                const key = sidecarKeyOf(row.name);
+                const detail = subsystemDetail(row);
+                const since = subsystemSince(row);
+                return (
+                  <tr key={row.name}>
+                    <td className="sy-dtable-mono" title={row.name}>{row.name}</td>
+                    <td><StateBadge domain="pillar" state={row.status} /></td>
+                    <td>
+                      <span className="sy-dtable-detail">
+                        <span className="sy-dtable-clip" title={detail}>{detail}</span>
+                        {key !== null && row.status === "down" && <RestartSidecar name={key} />}
+                      </span>
+                    </td>
+                    <td className="sy-dtable-num">{since === null ? "" : <RelativeTime at={since} />}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </Drawer>
       )}
     </Panel>
   );
@@ -437,44 +560,6 @@ function RouterReportPanel() {
   );
 }
 
-function SubsystemRow({ row }: { row: SubsystemReadout }) {
-  const key = sidecarKeyOf(row.name);
-  const counts = subsystemCounts(row);
-  return (
-    <li className="sy-subsystem">
-      <div className="sy-subsystem-head">
-        <span className="sy-subsystem-name">{row.name}</span>
-        <StateBadge domain="pillar" state={row.status} />
-      </div>
-      {/* Always drawn, empty or not, so every tile is the same two lines tall. */}
-      <div className="sy-subsystem-foot">
-        <span className="sy-meta sy-subsystem-reason">
-          {row.reason !== undefined && <>reason: {row.reason}</>}
-        </span>
-        {counts.length > 0 && (
-          <span className="sy-meta sy-subsystem-counts">
-            {counts.map((count) => (
-              <span key={count.name}>
-                {count.label}{" "}
-                {count.instant ? (
-                  <RelativeTime at={new Date(count.value * 1000).toISOString()} />
-                ) : (
-                  count.value
-                )}
-              </span>
-            ))}
-          </span>
-        )}
-        {key !== null && row.status === "down" && (
-          <div className="sy-subsystem-action">
-            <RestartSidecar name={key} />
-          </div>
-        )}
-      </div>
-    </li>
-  );
-}
-
 function HealthError({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
   return (
@@ -521,29 +606,33 @@ function SidecarCard({ sidecar }: { sidecar: SidecarState }) {
   const [wide, setWide] = useState(false);
   return (
     <Row dense className="sy-sidecar-row">
-      <div className="sy-sidecar-head">
-        <span className="sy-sidecar-name">{sidecar.name}</span>
+      {/* Every cell is drawn for every row (an empty one when there is nothing to say), so the
+          grid tracks give each column one x position whatever the row holds. */}
+      <span className="sy-sidecar-name" title={sidecar.name}>{sidecar.name}</span>
+      <span className="sy-sidecar-state">
         <StateBadge domain="sidecar" state={sidecar.state} />
-      </div>
+      </span>
       <dl className="sy-sidecar-facts">
-        {sidecar.started_at !== null && (
-          <div className="sy-fact">
-            <dt>started</dt>
-            <dd>
-              <RelativeTime at={sidecar.started_at} />
-            </dd>
-          </div>
-        )}
+        <div className="sy-fact">
+          {sidecar.started_at !== null && (
+            <>
+              <dt>started</dt>
+              <dd>
+                <RelativeTime at={sidecar.started_at} />
+              </dd>
+            </>
+          )}
+        </div>
         <div className="sy-fact">
           <dt>restarts</dt>
           <dd>{sidecar.restarts}</dd>
         </div>
       </dl>
-      {/* The third column: what the sidecar last said, and the failure above it when
-          there is one — each one clipped line, the whole text in the tooltip. */}
+      {/* What the sidecar last said, and the failure above it when there is one — each one
+          clipped line, the whole text in the tooltip. */}
       <div className={wide ? "sy-sidecar-out sy-sidecar-out-wide" : "sy-sidecar-out"}>
         {sidecar.last_failure !== null && (
-          <p className="sy-sidecar-failure" role="alert">
+          <p className="sy-sidecar-failure" role="alert" title={sidecar.last_failure}>
             {sidecar.last_failure}
             {sidecar.last_failure_at !== null && (
               <span className="sy-sidecar-when">
@@ -564,8 +653,11 @@ function SidecarCard({ sidecar }: { sidecar: SidecarState }) {
             )}
           </p>
         )}
+      </div>
+      {/* The last column, right-aligned: the buttons stand at one edge on every row. */}
+      <span className="sy-sidecar-tools">
         {(sidecar.last_failure !== null || sidecar.last_line !== null) && (
-          <span className="sy-sidecar-tools">
+          <>
             <Button variant="quiet" aria-expanded={wide} onClick={() => { setWide(!wide); }}>
               {wide ? "Show less" : "Show all"}
             </Button>
@@ -573,9 +665,9 @@ function SidecarCard({ sidecar }: { sidecar: SidecarState }) {
               value={[sidecar.last_failure, sidecar.last_line].filter((t) => t !== null).join("\n")}
               label={`Copy ${sidecar.name} output`}
             />
-          </span>
+          </>
         )}
-      </div>
+      </span>
     </Row>
   );
 }
@@ -595,57 +687,107 @@ function ScopedKillsPanel() {
   const projects = useProjects();
   const kills = useScopedKills();
   const setKill = useSetScopedKill();
-  const noProjects = projects.data !== undefined && projects.data.length === 0;
+  const [open, setOpen] = useState(false);
+  const list = projects.data ?? [];
+  const engagedOf = (id: string) => scopeEngaged(kills.data, "project", id);
+  const braked = list
+    .filter((p) => engagedOf(p.project_id))
+    .sort((a, b) => (a.project_id < b.project_id ? -1 : a.project_id > b.project_id ? 1 : 0));
+  const attention = attentionNames(braked, 3);
+  const loaded = projects.data !== undefined;
+  // Always drawn, disabled when there is nothing to list, so the header is one height for 0 projects too.
+  const aside = (
+    <Button variant="quiet" aria-expanded={open} disabled={!loaded || list.length === 0} onClick={() => { setOpen(true); }}>
+      Details
+    </Button>
+  );
 
   return (
-    <Panel title="Project brakes">
-      <PanelNote empty={noProjects} says="no project is registered.">
+    <Panel title="Project brakes" aside={aside}>
+      <p className="sy-note">
         A project brake holds what that project would START; it stops nothing already running. An
         absent row means the daemon was never told, which reads as released. The trigger brakes
         (scheduled rules, repo triggers, e-mail triage) live on <Link to="/autopilot">Autopilot</Link>.
-      </PanelNote>
+      </p>
       {kills.isError && kills.data === undefined && <SystemListError error={kills.error} what="the project brakes" />}
-      {!kills.isError && kills.data === undefined && <Skeleton label="Reading the project brakes" variant="row" count={3} />}
+      {!kills.isError && kills.data === undefined && <Skeleton label="Reading the project brakes" variant="row" count={1} />}
       {projects.isError && projects.data === undefined && (
         <SystemListError error={projects.error} what="the projects" />
       )}
-      {!projects.isError && projects.data === undefined && <Skeleton label="Reading the projects" variant="row" count={3} />}
-      {projects.data !== undefined && projects.data.length > 0 && (
-        <ul className="sy-brakes" aria-label="Project brakes">
-          {projects.data.map((project) => {
-            const engaged = scopeEngaged(
-              kills.data,
-              "project",
-              project.project_id,
-            );
-            return (
-              <li className="sy-brake" key={project.project_id}>
-                <span className="sy-project-brake-name" title={project.project_id}>
-                  {project.project_id}
-                </span>
-                <StateBadge domain="brake" state={engaged ? "held" : "released"} />
-                <Button
-                  variant="ghost"
-                  intent={engaged ? "go" : "stop"}
-                  /* The tile already names the project; the button says only the verb. */
-                  aria-label={
-                    engaged ? `Release ${project.project_id}` : `Hold ${project.project_id}`
-                  }
-                  disabled={kills.data === undefined || setKill.isPending}
-                  onClick={() =>
-                    setKill.mutate({
-                      scope_type: "project",
-                      scope_id: project.project_id,
-                      engaged: !engaged,
-                    })
-                  }
-                >
-                  {engaged ? "Release" : "Hold"}
-                </Button>
-              </li>
-            );
-          })}
-        </ul>
+      {!projects.isError && projects.data === undefined && <Skeleton label="Reading the projects" variant="row" count={1} />}
+      {loaded && (
+        <div className="sy-glance" aria-label="Project brakes">
+          <p className="sy-glance-summary">
+            <span>{list.length} {list.length === 1 ? "project" : "projects"}</span>
+            {list.length > 0 && (
+              <span className="sy-count sy-count-active">{list.length - braked.length} running</span>
+            )}
+            {braked.length > 0 && <span className="sy-count sy-count-danger">{braked.length} braked</span>}
+          </p>
+          <p className="sy-attention">
+            {list.length === 0 ? (
+              <span className="sy-attention-ok">No project is registered</span>
+            ) : attention.head.length === 0 ? (
+              <span className="sy-attention-ok">No project braked</span>
+            ) : (
+              <>
+                {attention.head.map((project) => (
+                  <span key={project.project_id} className="sy-attention-item" title={project.project_id}>
+                    <span className="sy-dot sy-tone-danger" aria-hidden="true" />
+                    {project.project_id}
+                  </span>
+                ))}
+                {attention.more > 0 && <span className="sy-attention-more">+{attention.more} more</span>}
+              </>
+            )}
+          </p>
+        </div>
+      )}
+      {open && loaded && (
+        <Drawer title="Project brakes" onClose={() => { setOpen(false); }}>
+          <table className="sy-dtable" aria-label="All project brakes">
+            <colgroup>
+              <col />
+              <col className="sy-dcol-state" />
+              <col className="sy-dcol-action" />
+            </colgroup>
+            <thead>
+              <tr>
+                <th scope="col">Project</th>
+                <th scope="col">State</th>
+                <th scope="col" className="sy-dtable-action">Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              {list.map((project) => {
+                const engaged = engagedOf(project.project_id);
+                return (
+                  <tr key={project.project_id}>
+                    <td className="sy-dtable-mono" title={project.project_id}>{project.project_id}</td>
+                    <td><StateBadge domain="brake" state={engaged ? "held" : "released"} /></td>
+                    <td className="sy-dtable-action">
+                      <Button
+                        variant="ghost"
+                        intent={engaged ? "go" : "stop"}
+                        aria-label={engaged ? `Release ${project.project_id}` : `Hold ${project.project_id}`}
+                        disabled={kills.data === undefined || setKill.isPending}
+                        onClick={() =>
+                          setKill.mutate({
+                            scope_type: "project",
+                            scope_id: project.project_id,
+                            engaged: !engaged,
+                          })
+                        }
+                      >
+                        {engaged ? "Release" : "Hold"}
+                      </Button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </Drawer>
       )}
       {setKill.isError && (
         <ErrorNote>
@@ -654,6 +796,28 @@ function ScopedKillsPanel() {
       )}
     </Panel>
   );
+}
+
+/** The info cell of one spend-limit row: "$4.10 of $5.00" over a meter, or spent and no ceiling. */
+function SpendCells({ spent, ceiling, what }: { spent: number; ceiling: number | null; what: string }) {
+  return (
+    <span className="sy-limit-info">
+      {ceiling === null ? (
+        <span className="sy-limit-none">{formatUsd(spent)} spent · no ceiling</span>
+      ) : (
+        <>
+          <span className="sy-limit-now">
+            {formatUsd(spent)} of {formatUsd(ceiling)}
+          </span>
+          <Meter label={what} value={spent} ceiling={ceiling} tone="quantity" format={formatUsd} head={false} />
+        </>
+      )}
+    </span>
+  );
+}
+
+function formatUsd(value: number): string {
+  return `$${value.toFixed(2)}`;
 }
 
 function bySubsystemHealth(
@@ -748,8 +912,6 @@ function BudgetPanel() {
   const [badCeilings, setBadCeilings] = useState<string[]>([]);
   const [quotaBrakeForm, setQuotaBrakeForm] = useState<QuotaBrakeFormState | null>(null);
   const [badQuotaBrake, setBadQuotaBrake] = useState(false);
-  const [budgetSaved, setBudgetSaved] = useState(false);
-  const [quotaSaved, setQuotaSaved] = useState(false);
 
   useEffect(() => {
     if (budget.data !== undefined && form === null) {
@@ -797,24 +959,13 @@ function BudgetPanel() {
           Autonomous work is currently held: {budget.data.reason}
         </Notice>
       )}
-      {budget.data !== undefined && (
-        <dl className="sy-budget-spend">
-          <div className="sy-fact">
-            <dt>window spend</dt>
-            <dd>${budget.data.window_spend_usd.toFixed(2)}</dd>
-          </div>
-          <div className="sy-fact">
-            <dt>hourly spend</dt>
-            <dd>${budget.data.hourly_spend_usd.toFixed(2)}</dd>
-          </div>
-        </dl>
-      )}
       <div className="sy-budget-groups">
         {form !== null && (
           <section className="sy-budget-group">
             <h3 className="sy-budget-heading">Spend limits</h3>
             <div className="sy-budget-fields">
-              <Field label="Window limit (USD)">
+              <div className="sy-limit-row sy-unit-usd">
+              <Field label="Window limit">
                 <input
                   type="text"
                   inputMode="decimal"
@@ -824,11 +975,34 @@ function BudgetPanel() {
                   aria-describedby={badCeilings.length > 0 ? "sy-budget-error" : undefined}
                   onChange={(event) => {
                     setForm({ ...form, windowLimit: event.target.value });
-                    setBudgetSaved(false);
                     setBadCeilings([]);
                   }}
                 />
               </Field>
+              {budget.data !== undefined && (
+                <SpendCells spent={budget.data.window_spend_usd} ceiling={budget.data.limit_usd} what="Window spend" />
+              )}
+              </div>
+              <div className="sy-limit-row sy-unit-usd">
+              <Field label="Hourly limit">
+                <input
+                  type="text"
+                  inputMode="decimal"
+                  placeholder="no ceiling"
+                  value={form.hourlyLimit}
+                  aria-invalid={badCeilings.includes("the hourly limit") ? true : undefined}
+                  aria-describedby={badCeilings.length > 0 ? "sy-budget-error" : undefined}
+                  onChange={(event) => {
+                    setForm({ ...form, hourlyLimit: event.target.value });
+                    setBadCeilings([]);
+                  }}
+                />
+              </Field>
+              {budget.data !== undefined && (
+                <SpendCells spent={budget.data.hourly_spend_usd} ceiling={budget.data.hourly_limit_usd} what="Hourly spend" />
+              )}
+              </div>
+              <div className="sy-limit-row">
               <Field label="Period">
                 <Select
                   value={form.period}
@@ -846,22 +1020,12 @@ function BudgetPanel() {
                   ))}
                 </Select>
               </Field>
-              <Field label="Hourly limit (USD)">
-                <input
-                  type="text"
-                  inputMode="decimal"
-                  placeholder="no ceiling"
-                  value={form.hourlyLimit}
-                  aria-invalid={badCeilings.includes("the hourly limit") ? true : undefined}
-                  aria-describedby={badCeilings.length > 0 ? "sy-budget-error" : undefined}
-                  onChange={(event) => {
-                    setForm({ ...form, hourlyLimit: event.target.value });
-                    setBudgetSaved(false);
-                    setBadCeilings([]);
-                  }}
-                />
-              </Field>
-              <Field label="Per-run reserve (USD)">
+              </div>
+            </div>
+            <h3 className="sy-budget-heading sy-budget-heading-next">Run costs</h3>
+            <div className="sy-budget-fields">
+              <div className="sy-limit-row sy-unit-usd">
+              <Field label="Per-run reserve">
                 <input
                   type="text"
                   inputMode="decimal"
@@ -871,7 +1035,9 @@ function BudgetPanel() {
                   }
                 />
               </Field>
-              <Field label="Time cost per hour (USD)">
+              </div>
+              <div className="sy-limit-row sy-unit-usd">
+              <Field label="Time cost per hour">
                 <input
                   type="text"
                   inputMode="decimal"
@@ -881,10 +1047,9 @@ function BudgetPanel() {
                   }
                 />
               </Field>
-              <Field
-                label="Relay chain limit (USD)"
-                helper="What one chain of conversations handing work to each other may spend."
-              >
+              </div>
+              <div className="sy-limit-row sy-unit-usd">
+              <Field label="Relay chain limit">
                 <input
                   type="text"
                   inputMode="decimal"
@@ -894,7 +1059,13 @@ function BudgetPanel() {
                   }
                 />
               </Field>
+              </div>
             </div>
+            <div className="sy-group-foot">
+            <p className="sy-field-hint">
+              The relay chain limit is what one chain of conversations handing work to each other may
+              spend.
+            </p>
             <div className="sy-save-row">
             <ConfirmButton
               label="Save budget"
@@ -920,10 +1091,10 @@ function BudgetPanel() {
                   time_cost_per_hour_usd: parseAmount(form.timeCost),
                   relay_chain_limit_usd: parseAmount(form.relayChainLimit),
                 };
-                setBudget.mutate(change, { onSuccess: () => { setBudgetSaved(true); } });
+                setBudget.mutate(change, { onSuccess: () => toastManager.add({ type: "success", title: "Budget saved" }) });
               }}
             />
-            <p className="sy-save-status" role="status">{budgetSaved ? "Saved" : null}</p>
+            </div>
             </div>
             {badCeilings.length > 0 && (
               <div id="sy-budget-error">
@@ -943,16 +1114,18 @@ function BudgetPanel() {
         {quotaBrakeForm !== null && quotaBrake.data !== undefined && (
           <section className="sy-budget-group">
             <h3 className="sy-budget-heading">Quota brake</h3>
-            <Switch
-              label="Enable quota brake"
-              checked={quotaBrakeForm.enabled}
-              onChange={(next) => {
-                setQuotaBrakeForm({ ...quotaBrakeForm, enabled: next });
-                setQuotaSaved(false);
-              }}
-            />
             <div className="sy-budget-fields">
-              <Field label="Pause above 5h usage (%)">
+              <div className="sy-limit-row sy-limit-switch">
+                <Switch
+                  label="Enable quota brake"
+                  checked={quotaBrakeForm.enabled}
+                  onChange={(next) => {
+                    setQuotaBrakeForm({ ...quotaBrakeForm, enabled: next });
+                  }}
+                />
+              </div>
+              <div className="sy-limit-row sy-unit-pct">
+              <Field label="Pause above 5h usage">
                 <input
                   type="text"
                   inputMode="numeric"
@@ -961,12 +1134,13 @@ function BudgetPanel() {
                   aria-describedby={badQuotaBrake ? "sy-quota-error" : undefined}
                   onChange={(event) => {
                     setQuotaBrakeForm({ ...quotaBrakeForm, fiveHour: event.target.value });
-                    setQuotaSaved(false);
                     setBadQuotaBrake(false);
                   }}
                 />
               </Field>
-              <Field label="Pause above 7d usage (%)">
+              </div>
+              <div className="sy-limit-row sy-unit-pct">
+              <Field label="Pause above 7d usage">
                 <input
                   type="text"
                   inputMode="numeric"
@@ -975,12 +1149,13 @@ function BudgetPanel() {
                   aria-describedby={badQuotaBrake ? "sy-quota-error" : undefined}
                   onChange={(event) => {
                     setQuotaBrakeForm({ ...quotaBrakeForm, sevenDay: event.target.value });
-                    setQuotaSaved(false);
                     setBadQuotaBrake(false);
                   }}
                 />
               </Field>
+              </div>
             </div>
+            <div className="sy-group-foot">
             <p className="sy-field-hint">
               When {quotaBrake.data.provider}'s usage passes either level, new autonomous work
               waits until the window resets. Only {quotaBrake.data.provider}'s windows count.
@@ -1005,11 +1180,11 @@ function BudgetPanel() {
                     pause_above_percent_5h: fiveHour,
                     pause_above_percent_7d: sevenDay,
                   },
-                  { onSuccess: () => { setQuotaSaved(true); } },
+                  { onSuccess: () => toastManager.add({ type: "success", title: "Quota brake saved" }) },
                 );
               }}
             />
-            <p className="sy-save-status" role="status">{quotaSaved ? "Saved" : null}</p>
+            </div>
             </div>
             {badQuotaBrake && (
               <div id="sy-quota-error">
@@ -1067,15 +1242,6 @@ function SpacePanel() {
               label="Database"
               value={formatBytes(space.db_bytes)}
               detail={`${formatBytes(space.wal_bytes)} write-ahead log`}
-              bar={
-                <Meter
-                  label="Reclaimable"
-                  value={space.reclaimable_bytes}
-                  ceiling={space.db_bytes}
-                  tone="quantity"
-                  format={formatBytes}
-                />
-              }
             />
             <StatCard
               label="Backups"
@@ -1091,6 +1257,16 @@ function SpacePanel() {
               label="Logs"
               value={space.logs_bytes === null ? undefined : formatBytes(space.logs_bytes)}
               unread={unmeasured}
+            />
+          </div>
+          {/* The reclaimable share of the database, full width under the four figures. */}
+          <div className="sy-space-meter">
+            <Meter
+              label="Reclaimable"
+              value={space.reclaimable_bytes}
+              ceiling={space.db_bytes}
+              tone="quantity"
+              format={formatBytes}
             />
           </div>
           <p className="sy-space-notes">
@@ -1493,11 +1669,13 @@ function TokensPanel() {
         <Quiet says="no token has been minted." />
       )}
       {tokens.data !== undefined && tokens.data.length > 0 && (
-        <Rows label="API tokens">
-          {tokens.data.map((token) => (
-            <TokenRow key={token.name} token={token} />
-          ))}
-        </Rows>
+        <div className="sy-list-scroll" tabIndex={0}>
+          <Rows label="API tokens">
+            {tokens.data.map((token) => (
+              <TokenRow key={token.name} token={token} />
+            ))}
+          </Rows>
+        </div>
       )}
     </Panel>
   );
@@ -1803,11 +1981,23 @@ function PanelNote({ empty, says, children }: { empty: boolean; says: string; ch
   return <p className="sy-note">{children}</p>;
 }
 
+/**
+ * A failed read with nothing to show. The words go to a toast; the footprint stays, as a quiet
+ * placeholder of the height the skeleton had, so the section neither collapses nor jumps.
+ */
 function SystemListError({ error, what }: { error: unknown; what: string }) {
-  if (isApiRefusal(error)) return <RefusalNote refusal={error} />;
   return (
-    <ErrorNote>
-      the {DAEMON_NAME} is not responding: nothing is known about {what}
-    </ErrorNote>
+    <>
+      {isApiRefusal(error) ? (
+        <RefusalNote refusal={error} />
+      ) : (
+        <ErrorNote>
+          the {DAEMON_NAME} is not responding: nothing is known about {what}
+        </ErrorNote>
+      )}
+      <div className="ui-error-placeholder sy-list-error" aria-label={`${what}: unavailable`}>
+        —
+      </div>
+    </>
   );
 }

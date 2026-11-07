@@ -544,7 +544,8 @@ describe("development time", () => {
     await choose("Development time");
     expect(await screen.findByRole("region", { name: "Development time" })).toBeTruthy();
     // Spec 3.3: the Summary is unmounted, so its failure note is not drawn under another section.
-    expect(screen.queryByText("Could not read analytics: the background service may be stopped.")).toBeNull();
+    // (Its error toast is a notification, not part of the section, and may still be on screen.)
+    expect(screen.queryByRole("region", { name: "Summary" })).toBeNull();
     expect(asked().some((path) => path.startsWith("/analytics/devtime?days=30"))).toBe(true);
   });
 

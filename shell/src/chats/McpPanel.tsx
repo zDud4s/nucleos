@@ -9,6 +9,7 @@ import {
   type McpImportReport,
   type McpServerRow,
 } from "../data/mcp";
+import { toastManager } from "../ui/toast";
 import {
   DropdownMenuCheckboxItem,
   DropdownMenuItem,
@@ -26,6 +27,14 @@ function errorText(error: unknown): string {
   if (error instanceof ApiRefusal) return error.detail || error.code;
   return error instanceof Error ? error.message : String(error);
 }
+
+/** A failed switch or import is said as a toast, not as a line that moves the card. */
+function failed(title: string) {
+  return (error: unknown) =>
+    toastManager.add({ type: "error", title, description: errorText(error), dedupeKey: `mcp:${title}:${errorText(error)}` });
+}
+const switchFailed = failed("Could not switch the MCP server");
+const importFailed = failed("Could not import MCP servers");
 
 /** What one server row says after its name: why it will not run, or a note about it. */
 function rowWhy(server: McpServerRow): string | null {
@@ -46,6 +55,7 @@ export function McpCardBody({ chatId, data }: { chatId: string; data: McpCardDat
         onSuccess: (next) => {
           if (next !== undefined) setCurrent(next);
         },
+        onError: switchFailed,
       },
     );
 
@@ -87,11 +97,9 @@ export function McpCardBody({ chatId, data }: { chatId: string; data: McpCardDat
       </ul>
       {current.servers.length === 0 && <p>No MCP servers in the registry</p>}
       {current.hint != null && <p>{current.hint}</p>}
-      {set.isError && <p role="alert">{errorText(set.error)}</p>}
-      <button type="button" disabled={importer.isPending} onClick={() => importer.mutate()}>
+      <button type="button" disabled={importer.isPending} onClick={() => importer.mutate(undefined, { onError: importFailed })}>
         Import
       </button>
-      {importer.isError && <p role="alert">{errorText(importer.error)}</p>}
       {importer.data !== undefined && <McpImportBody data={importer.data} />}
     </div>
   );
@@ -152,7 +160,7 @@ export function McpMenuItems({ chatId }: { chatId: string }) {
             disabled={disabled}
             title={server.command}
             onSelect={(event) => event.preventDefault()}
-            onCheckedChange={(on) => set.mutate({ name: server.name, on: on === true })}
+            onCheckedChange={(on) => set.mutate({ name: server.name, on: on === true }, { onError: switchFailed })}
           >
             {server.name}
             {why != null && <span className="chats-tool-why">{why}</span>}
@@ -162,25 +170,15 @@ export function McpMenuItems({ chatId }: { chatId: string }) {
       {data.hint != null && (
         <DropdownMenuLabel className="chats-tool-why">{data.hint}</DropdownMenuLabel>
       )}
-      {set.isError && (
-        <DropdownMenuLabel role="alert" className="chats-tool-why">
-          {errorText(set.error)}
-        </DropdownMenuLabel>
-      )}
       <DropdownMenuItem
         disabled={importer.isPending}
         onSelect={(event) => {
           event.preventDefault();
-          importer.mutate();
+          importer.mutate(undefined, { onError: importFailed });
         }}
       >
         Import
       </DropdownMenuItem>
-      {importer.isError && (
-        <DropdownMenuLabel role="alert" className="chats-tool-why">
-          {errorText(importer.error)}
-        </DropdownMenuLabel>
-      )}
     </>
   );
 }

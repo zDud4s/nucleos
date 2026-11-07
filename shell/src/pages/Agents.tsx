@@ -43,6 +43,7 @@ import {
   Teach,
   Th,
   Tip,
+  toastManager,
   usePaletteGroup,
 } from "../ui";
 import { usePageKeys } from "../project/pageKeys";
@@ -848,7 +849,6 @@ function AgentEditor({
 }) {
   const [draft, setDraft] = useState<AgentDraft>(() => draftFromAgent(agent));
   const [tab, setTab] = useState<EditorTab>("definition");
-  const [saved, setSaved] = useState(false);
   const update = useUpdateAgent();
   const del = useDeleteAgent();
   const valid = draftIsValid(draft);
@@ -856,7 +856,6 @@ function AgentEditor({
   const dirty = JSON.stringify(draft) !== JSON.stringify(draftFromAgent(agent));
 
   function patch(next: Partial<AgentDraft>) {
-    setSaved(false);
     setDraft((current) => ({ ...current, ...next }));
   }
 
@@ -874,13 +873,11 @@ function AgentEditor({
             <span className="agents-save-status" role="status">
               {update.isPending
                 ? "Saving…"
-                : saved
-                  ? "Saved"
-                  : !valid
-                    ? invalidReason(draft)
-                    : dirty
-                      ? "Unsaved changes"
-                      : ""}
+                : !valid
+                  ? invalidReason(draft)
+                  : dirty
+                    ? "Unsaved changes"
+                    : ""}
             </span>
             <Button variant="ghost" onClick={onClose}>
               Cancel
@@ -917,16 +914,15 @@ function AgentEditor({
                 {DAEMON_NAME} stored rather than what you typed — trimmed, and a blank model
                 turned back into the engine's default — and the row above changes
                 under you, which is the acknowledgement that a form closing itself
-                used to be standing in for. The footer says "Saved" as well, because
+                used to be standing in for. A "saved" toast says so as well, because
                 that row sits behind the overlay.
               */
-              setSaved(false);
               update.mutate(
                 { id: agent.id, request: requestFromDraft(draft) },
                 {
                   onSuccess: (savedAgent) => {
                     setDraft(draftFromAgent(savedAgent));
-                    setSaved(true);
+                    toastManager.add({ type: "success", title: "Agent saved", description: savedAgent.name });
                   },
                 },
               );

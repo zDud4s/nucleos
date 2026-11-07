@@ -756,7 +756,7 @@ describe("Council - a chairman that failed", () => {
     // The picture is aria-hidden, so the judge's state is read off the drawing itself.
     expect(screen.getByRole("button", { name: /^Chairman,/ })).toBeDefined();
     expect(document.querySelector(".council-court-judge")?.getAttribute("data-state")).toBe("failed");
-    expect(await within(dossier()).findByText(/ended in timeout/)).toBeDefined();
+    expect(await screen.findByText(/ended in timeout/)).toBeDefined();
     // The seats' own answers are still on the record.
     await openTheRecord();
     expect(await screen.findByRole("list", { name: "Seats" })).toBeDefined();

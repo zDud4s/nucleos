@@ -501,7 +501,8 @@ describe("SessionColumn - groups across paired machines", () => {
     expect(await screen.findByText(/Tower did not apply the change to/)).toBeDefined();
     towerDown = false;
     await renameWork();
-    await waitFor(() => expect(screen.queryByText(/did not apply the change to/)).toBeNull());
+    // The earlier failure was a toast; it stays until dismissed or timed out, and the retry succeeds quietly.
+    await waitFor(() => expect(screen.getAllByText(/did not apply the change to/)).toHaveLength(1));
   });
 
   async function renameWork() {

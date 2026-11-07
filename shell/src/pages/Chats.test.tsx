@@ -2443,10 +2443,8 @@ describe("Chats - the helpers a conversation may hand work to", () => {
 
     // Waits on the served list arriving — before that, every name would read as unknown, which
     // would flash a refusal a helper opened with valid tools does not deserve.
-    const alerts = await screen.findAllByRole("alert");
+    const alerts = await screen.findAllByText(/is not a tool the daemon can grant/i);
     expect(alerts).toHaveLength(2);
-    expect(alerts[0].textContent).toMatch(/is not a tool the daemon can grant/i);
-    expect(alerts[1].textContent).toMatch(/is not a tool the daemon can grant/i);
     const save = screen.getByRole("button", { name: /^save$/i }) as HTMLButtonElement;
     expect(save.disabled).toBe(true);
     expect(daemon.apiFetch).not.toHaveBeenCalledWith(
@@ -2467,8 +2465,7 @@ describe("Chats - the helpers a conversation may hand work to", () => {
 
     // The daemon answers a bad set with a bare 400 and no body. Without this, a dialog holding five
     // helpers would say "no" without saying which one or why.
-    expect(await screen.findByRole("alert")).toBeDefined();
-    expect(screen.getByText(/reads as a flag/i)).toBeDefined();
+    expect(await screen.findByText(/reads as a flag/i)).toBeDefined();
     const save = screen.getByRole("button", { name: /^save$/i }) as HTMLButtonElement;
     expect(save.disabled).toBe(true);
   });
@@ -3822,7 +3819,7 @@ describe("Chats - giving a conversation a project", () => {
     fireEvent.click(await within(dialog).findByRole("radio", { name: /nucleos/i }));
     fireEvent.click(within(dialog).getByRole("button", { name: "Use this" }));
 
-    expect(await within(dialog).findByText(/does not exist on this machine/i)).toBeTruthy();
+    expect(await screen.findByText(/does not exist on this machine/i)).toBeTruthy();
   });
 });
 

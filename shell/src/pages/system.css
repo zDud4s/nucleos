@@ -119,18 +119,6 @@
 
 /* Two grids of `<dt>/<dd>` facts, at the two widths the page needs — 13rem
    where the values are hosts and paths, 10rem where they are money. */
-.sy-sidecar-facts,
-.sy-budget-spend {
-  display: grid;
-  gap: var(--space-2) var(--space-3);
-  grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
-  margin: 0;
-}
-
-.sy-budget-spend {
-  grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
-  margin-bottom: var(--space-3);
-}
 
 .sy-fact dd {
   margin: var(--space-1) 0 0;
@@ -149,85 +137,128 @@
 
 /* ------------------------------------------------------------------ health == */
 
-/**
- * The subsystem readout, as a grid of tiles rather than a column of rows.
- *
- * Thirteen full-width rows put a name, a badge and a mostly empty reason track
- * across 1100px each — a screen of whitespace to say "all healthy". Tiles let
- * the eye find the one that is not green in a single look, and the sort (down,
- * then degraded, then the rest) still puts trouble in the top-left corner.
- */
-.sy-subsystems {
+/* -------------------------------------------------- glance: summary, strip, slot == */
+
+/* The shape Subsystems and Project brakes share: one summary line, (a strip), one reserved
+   attention line. Every part has a fixed height, so no count of rows ever moves the page. */
+.sy-glance {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(17rem, 1fr));
-  gap: var(--space-2);
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.sy-subsystem {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  min-width: 0;
-  padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface-sunken);
-}
-
-.sy-subsystem-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
   gap: var(--space-2);
   min-width: 0;
 }
 
-.sy-subsystem-head .sy-subsystem-name {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-/* The second line: the reason on the left, Restart on the right. A fixed
-   height, so a tile with a Restart in it is exactly as tall as one without. */
-/* A subsystem's named tallies, drawn beside its reason; they wrap rather than
-   widen the tile. */
-.sy-subsystem-counts {
+.sy-glance-summary {
   display: flex;
   flex-wrap: wrap;
-  gap: var(--space-2);
-  min-width: 0;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-3);
+  margin: 0;
+  min-height: 1.5rem;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
 }
 
-.sy-subsystem-foot {
+.sy-count {
+  font-weight: var(--weight-medium, 500);
+}
+
+.sy-count-active { color: var(--tone-active-fg); }
+.sy-count-paused { color: var(--tone-paused-fg); }
+.sy-count-danger { color: var(--tone-danger-fg); }
+.sy-count-off { color: var(--tone-off-fg); }
+
+/* The reserved line: the same height whether it says "all healthy" or names three culprits. */
+.sy-attention {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: var(--space-2);
-  min-width: 0;
-  min-height: var(--hit-min);
+  gap: var(--space-3);
+  height: 1.5rem;
+  margin: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  font-size: var(--text-sm);
 }
 
-.sy-subsystem-reason {
+.sy-attention-ok,
+.sy-attention-more {
+  color: var(--text-muted);
+}
+
+.sy-attention-item {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
+  font-family: var(--font-mono);
 }
 
-/* What a press says back (asked, refused) stacks under the button and grows the
-   tile while it is there — the whole grid row grows with it, so the tiles stay
-   one size. */
-.sy-subsystem-action {
+.sy-attention-more {
+  flex: none;
+}
+
+/* The details drawer: a table on fixed column tracks, clipped cells, tabular numbers. */
+.ui-drawer:has(.sy-dtable) {
+  width: min(44rem, 100vw);
+}
+
+.sy-dtable {
+  width: 100%;
+  table-layout: fixed;
+  border-collapse: collapse;
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+}
+
+.sy-dtable th,
+.sy-dtable td {
+  padding: var(--space-2) var(--space-3);
+  text-align: left;
+  vertical-align: middle;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border-bottom: 1px solid var(--border);
+}
+
+.sy-dtable th {
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium, 500);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.sy-dcol-name { width: 11rem; }
+.sy-dcol-state { width: 7rem; }
+.sy-dcol-since { width: 6rem; }
+.sy-dcol-action { width: 6rem; }
+
+.sy-dtable .sy-dtable-mono {
+  font-family: var(--font-mono);
+  color: var(--text);
+}
+
+.sy-dtable .sy-dtable-num,
+.sy-dtable .sy-dtable-action {
+  text-align: right;
+}
+
+.sy-dtable-detail {
   display: flex;
-  flex-direction: column;
-  flex: 0 1 auto;
-  align-items: flex-end;
-  gap: var(--space-1);
+  align-items: center;
+  gap: var(--space-2);
   min-width: 0;
+}
+
+.sy-dtable-clip {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-muted);
 }
 
 /* --------------------------------------------------------------- sidecars == */
@@ -238,46 +269,62 @@
    wider than a healthy one. */
 .ui-rows-row.sy-sidecar-row {
   display: grid;
-  grid-template-columns: minmax(0, 9rem) minmax(0, 13rem) minmax(0, 1fr);
-  align-items: baseline;
+  /* name | state | started | restarts | last output | tools. Fixed tracks for everything but the
+     output, so every row puts every column at the same x. */
+  grid-template-columns:
+    minmax(0, 7rem) 6.5rem minmax(0, 11rem) minmax(0, 7rem) minmax(0, 1fr) 11rem;
+  align-items: center;
   column-gap: var(--space-4);
 }
 
-/* Every cell may shrink below its content, so nothing pushes the tools out of the card. */
 .ui-rows-row.sy-sidecar-row > * {
   min-width: 0;
 }
 
-/* Narrow window: the output drops under name and facts and takes the full row. */
+/* The facts list dissolves into the row's grid; its two cells become columns. */
+.sy-sidecar-facts {
+  display: contents;
+}
+
+.sy-sidecar-state {
+  display: flex;
+  align-items: center;
+}
+
+/* Narrow window: the output and the tools drop under the four short columns. */
 @media (max-width: 64rem) {
   .ui-rows-row.sy-sidecar-row {
-    grid-template-columns: minmax(0, 9rem) minmax(0, 1fr);
+    grid-template-columns: minmax(0, 7rem) 6.5rem minmax(0, 1fr) minmax(0, 1fr);
     row-gap: var(--space-1);
   }
 
   .ui-rows-row.sy-sidecar-row > .sy-sidecar-out {
     grid-column: 1 / -1;
   }
+
+  .ui-rows-row.sy-sidecar-row > .sy-sidecar-tools {
+    grid-column: 1 / -1;
+    justify-self: end;
+  }
 }
 
 .sy-sidecar-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-family: var(--font-display);
   font-size: var(--text-sm);
   font-weight: var(--weight-semibold);
   color: var(--text);
 }
 
-.sy-sidecar-facts {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-1) var(--space-4);
-  margin: 0;
-}
-
 .sy-sidecar-facts .sy-fact {
   display: flex;
   align-items: baseline;
-  gap: var(--space-1);
+  gap: var(--space-2);
+  min-width: 0;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
 }
 
 .sy-sidecar-facts .sy-fact dd {
@@ -311,8 +358,10 @@
 
 .sy-sidecar-tools {
   display: flex;
-  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
   gap: var(--space-2);
+  min-width: 0;
 }
 
 /* The daemon's own words, so mono like the line under it — in the danger
@@ -325,45 +374,6 @@
 
 .sy-sidecar-when {
   color: var(--text-faint);
-}
-
-/* ---------------------------------------------------------- project brakes == */
-
-/* Tiles, like the subsystems: forty projects as full-width rows was a page of
-   one name at the left edge and one button at the right. */
-.sy-brakes {
-  display: grid;
-  /* min(15rem, 100%) lets a single track shrink below 15rem in a narrow panel,
-     so the grid never pushes the card wider than its column. */
-  grid-template-columns: repeat(auto-fill, minmax(min(15rem, 100%), 1fr));
-  gap: var(--space-2);
-  min-width: 0;
-  max-width: 100%;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.sy-brake {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-2);
-  min-width: 0;
-  padding: var(--space-1) var(--space-1) var(--space-1) var(--space-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--surface-sunken);
-}
-
-.sy-brake .sy-project-brake-name {
-  /* A small basis so the badge and button stay on the name's line until the
-     tile is truly narrow; the name ellipsizes before anything wraps. */
-  flex: 1 1 6rem;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 /* The router report: its totals as label-above-value pairs, then a compact pairs
@@ -389,6 +399,50 @@
   font-size: var(--text-sm);
   font-variant-numeric: tabular-nums;
   color: var(--text);
+}
+
+/* Subsystems: five equal stat columns (the router's label-above-value pairs), the value toned
+   only when it is non-zero and not ok. */
+.sy-router-totals.sy-stats {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  margin-bottom: var(--space-2);
+}
+
+.sy-stats dd.sy-stat-warn { color: var(--tone-paused-fg); }
+.sy-stats dd.sy-stat-danger { color: var(--tone-danger-fg); }
+
+/* The attention table: exactly three slots of one fixed height, in the sidecar rows' language. */
+.ui-rows-row.sy-attn-row {
+  display: grid;
+  grid-template-columns: minmax(0, 11rem) 6.5rem minmax(0, 1fr) 11rem;
+  align-items: center;
+  column-gap: var(--space-4);
+  height: 2.5rem;
+  box-sizing: border-box;
+}
+
+.ui-rows-row.sy-attn-row > * {
+  min-width: 0;
+}
+
+.sy-attn-detail {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.sy-attn-ok,
+.sy-attn-more {
+  grid-column: 1 / 4;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.sy-attn-tools {
+  display: flex;
+  justify-content: flex-end;
 }
 
 /* Project brakes and the budget share a row when the page is wide enough. */
@@ -433,50 +487,221 @@
   gap: var(--space-3);
 }
 
-.sy-save-row > .sy-save-status {
-  margin: 0;
-}
-
-.sy-save-status {
-  font-size: var(--text-sm);
-  color: var(--text-muted);
-}
-
-/* Spend limits and the quota brake, side by side, each a two-column grid of
-   fields — a single 24rem column of seven boxes left most of the panel empty. */
+/* Limits: a settings form. Every row is label (1fr) | info | control (10rem); the control column
+   is pinned to the card's right content edge, and the group footer's Save button ends on it. */
 .sy-budget-groups {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
-  gap: var(--space-4) var(--space-5);
+  --sy-limit-tracks: minmax(0, 1fr) minmax(0, 16rem) 10rem;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-6);
 }
 
 .sy-budget-group {
   display: flex;
   flex-direction: column;
-  align-items: flex-start;
-  gap: var(--space-3);
+  align-items: stretch;
+  gap: var(--space-2);
   min-width: 0;
 }
 
 .sy-budget-heading {
   margin: 0;
+  padding-bottom: var(--space-2);
+  border-bottom: 1px solid var(--border);
   font-size: var(--text-sm);
   font-weight: var(--weight-semibold);
   color: var(--text);
 }
 
+.sy-budget-heading-next {
+  margin-top: var(--space-4);
+}
+
 .sy-budget-fields {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: var(--space-3);
+  display: flex;
+  flex-direction: column;
   width: 100%;
 }
 
-/* `Field` gives its control a 14rem floor; two columns in a 16rem group are narrower than that. */
-.sy-budget-fields .ui-field input,
-.sy-budget-fields .ui-field .ui-select {
+.sy-limit-row {
+  position: relative;
+  display: grid;
+  grid-template-columns: var(--sy-limit-tracks);
+  align-items: center;
+  column-gap: var(--space-4);
+  min-height: 2.75rem;
+  padding: var(--space-1) 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.sy-limit-row > .ui-field {
+  display: contents;
+}
+
+.sy-limit-row .ui-field-label {
+  grid-column: 1;
+  grid-row: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-regular);
+  letter-spacing: normal;
+  text-transform: none;
+  color: var(--text);
+}
+
+.sy-limit-row .ui-field input,
+.sy-limit-row .ui-field .ui-select {
+  grid-column: 3;
+  grid-row: 1;
+  box-sizing: border-box;
   min-width: 0;
   width: 100%;
+  padding: var(--space-1) var(--space-2);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.sy-limit-row .ui-field .ui-select {
+  text-align-last: right;
+}
+
+/* Unit adornments sit inside the input's box, in the control column. */
+.sy-unit-usd::before,
+.sy-unit-pct::after {
+  grid-column: 3;
+  grid-row: 1;
+  z-index: 1;
+  pointer-events: none;
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+.sy-unit-usd::before {
+  content: "$";
+  justify-self: start;
+  margin-left: var(--space-2);
+}
+
+.sy-unit-pct::after {
+  content: "%";
+  justify-self: end;
+  margin-right: var(--space-2);
+}
+
+.sy-limit-row.sy-unit-usd .ui-field input {
+  padding-left: var(--space-5);
+}
+
+.sy-limit-row.sy-unit-pct .ui-field input {
+  padding-right: var(--space-5);
+}
+
+/* The info cell: spent and usage in one, on the spend rows only. */
+.sy-limit-info {
+  grid-column: 2;
+  grid-row: 1;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.sy-limit-now,
+.sy-limit-none {
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+}
+
+.sy-limit-info .ui-gauge {
+  margin: 0;
+  width: 100%;
+}
+
+/* The quota brake switch is a row like the rest: label left, switch on the control edge. */
+.sy-limit-switch .ui-switch-field {
+  display: contents;
+}
+
+.sy-limit-switch .ui-switch-label {
+  grid-column: 1;
+  grid-row: 1;
+  color: var(--text);
+}
+
+.sy-limit-switch .ui-switch-check {
+  grid-column: 3;
+  grid-row: 1;
+  justify-self: end;
+}
+
+/* Group footer: the footnote on the left, Save ending on the control column's right edge. */
+.sy-group-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding-top: var(--space-2);
+}
+
+.sy-group-foot > .sy-field-hint {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+.sy-group-foot > .sy-save-row {
+  flex: none;
+  flex-wrap: nowrap;
+  justify-content: flex-end;
+}
+
+.sy-group-foot .ui-confirm {
+  display: block;
+  flex: none;
+  width: 15rem;
+}
+
+.sy-group-foot .ui-confirm > button {
+  width: 100%;
+}
+
+/* Both labels share one cell (the armed one is reserved, hidden); if either wraps, the button grows. */
+.sy-group-foot .ui-confirm-stack > * {
+  white-space: nowrap;
+}
+
+@media (max-width: 40rem) {
+  .sy-budget-groups {
+    --sy-limit-tracks: minmax(0, 1fr) 10rem;
+  }
+
+  .sy-limit-row .ui-field input,
+  .sy-limit-row .ui-field .ui-select,
+  .sy-unit-usd::before,
+  .sy-unit-pct::after,
+  .sy-limit-switch .ui-switch-check {
+    grid-column: 2;
+  }
+
+  .sy-limit-info {
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
+
+  .sy-group-foot {
+    flex-wrap: wrap;
+  }
+}
+
+/* A failed read keeps the height its skeleton had. */
+.sy-list-error {
+  min-height: 3rem;
 }
 
 .sy-field {
@@ -514,17 +739,41 @@
   min-width: 0;
 }
 
-/* Two columns: four cards in a row left each one narrower than "420.0 MB" at the figure's size. */
+/* The four figures as one compact row of small cards, not four giant numerals: the panel is a
+   readout, and the figures only need to be findable. */
 .sy-space-cards {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: var(--space-3);
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--space-2);
 }
 
 @media (max-width: 40rem) {
   .sy-space-cards {
-    grid-template-columns: minmax(0, 1fr);
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
+}
+
+.sy-space-cards .ui-stat {
+  height: 100%;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-md);
+  box-shadow: none;
+  background: var(--surface-sunken);
+}
+
+.sy-space-cards .ui-stat-value {
+  font-size: var(--text-md);
+  letter-spacing: normal;
+  font-variant-numeric: tabular-nums;
+}
+
+.sy-space-cards .ui-stat-label,
+.sy-space-cards .ui-stat-detail {
+  font-size: var(--text-xs);
+}
+
+.sy-space-meter {
+  margin-top: var(--space-3);
 }
 
 .sy-space-notes {
@@ -565,7 +814,7 @@
    control. What a restore says back takes the full width under it. */
 .ui-rows-row.sy-backup-row {
   display: grid;
-  grid-template-columns: 7rem minmax(0, 1fr) 5rem 7.5rem auto;
+  grid-template-columns: 5rem minmax(0, 1fr) 5rem 8rem 10.5rem;
   align-items: center;
   column-gap: var(--space-4);
 }
@@ -584,6 +833,15 @@
 }
 
 /* Room for the armed ring, which is drawn outside the button. */
+.sy-backup-meta {
+  white-space: nowrap;
+}
+
+/* The size column: figures right-aligned so the units stand in one line. */
+.ui-rows-row.sy-backup-row > .sy-backup-meta:nth-of-type(3) {
+  text-align: right;
+}
+
 .sy-backup-action {
   justify-self: end;
   padding-inline-end: 3px;
@@ -1126,7 +1384,6 @@ p.sy-notify-pop {
 }
 
 /* #16: counters, durations, costs and figures stand in columns. */
-.sy-budget-spend,
 .sy-sidecar-when,
 .sy-backup-when,
 .sy-subsystem-counts,
@@ -1134,4 +1391,44 @@ p.sy-notify-pop {
 .sy-backup-meta,
 .sy-router-total dd {
   font-variant-numeric: tabular-nums;
+}
+
+/* ---------------------------------------------- tokens tab: bounded lists, level controls == */
+
+/* A list that can grow (tokens, paired devices) scrolls inside a bounded region instead of
+   stretching the page: five rows are in view, the rest are a scroll away. */
+.sy-list-scroll {
+  max-block-size: 15rem;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+.sy-token-row .sy-token-meta {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* Name, level and the button share one control height, so their bottoms and their labels line up. */
+.sy-mint-form {
+  align-items: flex-end;
+}
+
+.sy-mint-form input,
+.sy-mint-form select,
+.sy-mint-form .ui-switch,
+.sy-mint-form > button {
+  box-sizing: border-box;
+  min-block-size: 2.5rem;
+}
+
+.sy-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.sy-note > button {
+  margin-top: var(--space-2);
 }
