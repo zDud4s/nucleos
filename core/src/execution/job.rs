@@ -4046,6 +4046,95 @@ mod tests {
         assert_eq!(status, "implemented");
     }
 
+    /// A merge that landed but was never marked is entered again on the next pass. The base it
+    /// recorded BEFORE the merge must survive that: overwritten with the post-merge HEAD, a red
+    /// gate's revert would reset to where the branch already stands and keep the rejected commits.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_second_pass_over_a_landed_merge_keeps_the_base_recorded_before_it() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let (_container, repo) = walkable_repo("nucleos-job-merge-rebase-", "git --version");
+        let trees = tempfile::tempdir().expect("worktree root");
+        let _env = WorktreeRootEnv::set(trees.path());
+        let pool = test_pool().await;
+        let job_id = seed_job_in(&pool, "nucleos", "running", &repo.to_string_lossy(), None)
+            .await
+            .unwrap();
+        let job_tree = crate::execution::worktree::create(
+            &repo,
+            crate::execution::worktree::Owner::Job(job_id),
+        )
+        .await
+        .expect("the job's checkout");
+        crate::execution::worktree::record(
+            &pool,
+            crate::execution::worktree::Owner::Job(job_id),
+            "nucleos",
+            &repo.to_string_lossy(),
+            &job_tree.path.to_string_lossy(),
+            &job_tree.branch,
+            job_tree.base_sha.as_deref(),
+        )
+        .await
+        .unwrap();
+        seed_items(&pool, job_id, &["implemented"]).await;
+        let item_id: i64 = sqlx::query_scalar("SELECT id FROM job_nodes WHERE job_id = ?")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let before = crate::execution::worktree::head_sha(&job_tree.path)
+            .await
+            .unwrap();
+        let tree = crate::execution::worktree::adopt_or_create_at(
+            &repo,
+            crate::execution::worktree::Owner::Item(item_id),
+            Some(&before),
+        )
+        .await
+        .expect("the item's checkout");
+        crate::execution::worktree::record(
+            &pool,
+            crate::execution::worktree::Owner::Item(item_id),
+            "project-a",
+            &repo.to_string_lossy(),
+            &tree.path.to_string_lossy(),
+            &tree.branch,
+            tree.base_sha.as_deref(),
+        )
+        .await
+        .expect("record the item's checkout");
+        std::fs::write(tree.path.join("work.txt"), "work\n").expect("write the item's work");
+
+        sqlx::query(
+            "CREATE TRIGGER refuse_item_status BEFORE UPDATE OF status ON job_nodes
+             BEGIN SELECT RAISE(ABORT, 'status writes refused'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let state = test_state(pool.clone()).await;
+        let state = with_home(state, &_container);
+        assert_eq!(
+            merge_item(&state, &load_job(&pool, job_id).await.unwrap(), 0).await,
+            Pass::Stopped
+        );
+        sqlx::query("DROP TRIGGER refuse_item_status")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            merge_item(&state, &load_job(&pool, job_id).await.unwrap(), 0).await,
+            Pass::Continued
+        );
+        let base: Option<String> =
+            sqlx::query_scalar("SELECT merge_base_sha FROM job_nodes WHERE id = ?")
+                .bind(item_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(base.as_deref(), Some(before.as_str()));
+    }
+
     /// **The proof of this slice: undoing a red merge takes back that merge and nothing else.**
     ///
     /// Two items with checkouts of their own. A lands and is kept; B lands and is rejected. The
@@ -5852,6 +5941,33 @@ mod tests {
         assert_eq!(item_statuses(&pool, job_id).await, vec!["running"]);
     }
 
+    /// A crash between the claim and the link leaves an item `running` with no run behind it. The
+    /// next pass puts it back to the status it was claimed from instead of waiting on it for ever.
+    #[tokio::test]
+    async fn a_running_item_with_no_run_is_put_back_by_reconcile() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
+        seed_items(&pool, job_id, &["running", "running"]).await;
+        sqlx::query(
+            "UPDATE job_nodes SET gate_attempts = 1 WHERE job_id = ? AND ordinal = (
+                 SELECT MAX(ordinal) FROM job_nodes WHERE job_id = ?)",
+        )
+        .bind(job_id)
+        .bind(job_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        reconcile_nodes(&state, &job).await.unwrap();
+
+        assert_eq!(
+            item_statuses(&pool, job_id).await,
+            vec!["pending", "gate_failed"]
+        );
+    }
+
     /// The handoff window. A node's body writes `completed` BEFORE it inserts its context-handoff
     /// successor and moves the item onto it, so a pass in that gap saw a finished node and called
     /// the item implemented while the successor went on editing the tree. A registration still
@@ -5873,7 +5989,7 @@ mod tests {
         state
             .run_handles
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(run_id, task.abort_handle());
 
         let job = load_job(&pool, job_id).await.unwrap();
@@ -5885,7 +6001,11 @@ mod tests {
         );
 
         // And once the task is gone, the same row is the ending it says it is.
-        state.run_handles.lock().unwrap().remove(&run_id);
+        state
+            .run_handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&run_id);
         task.abort();
         reconcile_nodes(&state, &job).await.unwrap();
         assert_eq!(item_statuses(&pool, job_id).await, vec!["implemented"]);
@@ -5989,6 +6109,114 @@ mod tests {
             feed_kinds(&pool)
                 .await
                 .contains(&"job_item_failed".to_owned())
+        );
+    }
+
+    /// A dead node of a team job works in its OWN checkout. Putting the tree back must act on that
+    /// checkout, not rewind the job's branch to a `merge_base_sha` recorded for an earlier merge of
+    /// the same item, which would silently drop every item merged since.
+    #[tokio::test]
+    async fn a_failed_item_run_in_its_own_tree_does_not_rewind_the_job_branch() {
+        let pool = test_pool().await;
+        let state = test_state(pool.clone()).await;
+        let init = |root: &std::path::Path| {
+            for args in [
+                vec!["init"],
+                vec!["config", "user.email", "test@x"],
+                vec!["config", "user.name", "test"],
+            ] {
+                assert!(git_ok(root, &args));
+            }
+        };
+        let head_of = |root: &std::path::Path| {
+            String::from_utf8(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(root)
+                    .args(["rev-parse", "HEAD"])
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .unwrap()
+            .trim()
+            .to_owned()
+        };
+        let commit = |root: &std::path::Path, file: &str| {
+            std::fs::write(root.join(file), file).unwrap();
+            assert!(git_ok(root, &["add", "-A"]));
+            assert!(git_ok(root, &["commit", "-q", "-m", file]));
+            head_of(root)
+        };
+
+        let job_tree = tempfile::tempdir().unwrap();
+        init(job_tree.path());
+        let h0 = commit(job_tree.path(), "a.txt");
+        let h1 = commit(job_tree.path(), "b.txt");
+        let item_tree = tempfile::tempdir().unwrap();
+        init(item_tree.path());
+        let base = commit(item_tree.path(), "c.txt");
+        std::fs::write(item_tree.path().join("half.txt"), "half-written").unwrap();
+
+        let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
+        sqlx::query(
+            "UPDATE jobs SET rule_name = NULL, budget_usd = 25.0, head_sha = ? WHERE id = ?",
+        )
+        .bind(&h0)
+        .bind(job_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        seed_items(&pool, job_id, &["running"]).await;
+        seed_worktree(&pool, job_id, job_tree.path()).await;
+        let item_id: i64 = sqlx::query_scalar("SELECT id FROM job_nodes WHERE job_id = ?")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        crate::execution::worktree::record(
+            &pool,
+            crate::execution::worktree::Owner::Item(item_id),
+            "project-a",
+            &item_tree.path().to_string_lossy(),
+            &item_tree.path().to_string_lossy(),
+            "nucleos/item",
+            Some(&base),
+        )
+        .await
+        .unwrap();
+        // The stale marker an earlier merge of this same item left behind.
+        sqlx::query("UPDATE job_nodes SET merge_base_sha = ? WHERE id = ?")
+            .bind(&h0)
+            .bind(item_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let run_id = seed_node(&pool, job_id, "implement", "timed_out").await;
+        sqlx::query("UPDATE runs SET item_id = ? WHERE id = ?")
+            .bind(item_id)
+            .bind(run_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE job_nodes SET run_id = ? WHERE id = ?")
+            .bind(run_id)
+            .bind(item_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let job = load_job(&pool, job_id).await.unwrap();
+        reconcile_nodes(&state, &job).await.unwrap();
+
+        assert_eq!(
+            head_of(job_tree.path()),
+            h1,
+            "the job branch keeps the items merged since"
+        );
+        assert!(
+            !item_tree.path().join("half.txt").exists(),
+            "the dead node's own tree is the one put back"
         );
     }
 
@@ -7679,7 +7907,7 @@ mod tests {
         state
             .run_handles
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(run_id, task.abort_handle());
         let started = Utc::now() - MAX_JOB_LIFETIME - chrono::Duration::minutes(1);
         sqlx::query("UPDATE jobs SET created_at = ? WHERE id = ?")
@@ -7702,7 +7930,11 @@ mod tests {
             "the node outlived the job the ceiling retired"
         );
         assert!(
-            !state.run_handles.lock().unwrap().contains_key(&run_id),
+            !state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&run_id),
             "the node's task was never stopped"
         );
         assert_eq!(item_statuses(&pool, job_id).await, vec![STATUS_CANCELLED]);

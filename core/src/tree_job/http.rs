@@ -314,6 +314,15 @@ struct TreeBody {
 const LAND_MODES: [&str; 2] = ["hold", "integration"];
 
 fn summary(job: &TreeJob, replayed: bool) -> Value {
+    if let Some(reason) = crate::tree_job::root_pending::reason_of(job) {
+        return json!({
+            "id": job.id,
+            "root_node_id": job.root_node_id,
+            "state": "root_pending",
+            "reason": reason,
+            "replayed": replayed,
+        });
+    }
     json!({
         "id": job.id,
         "root_node_id": job.root_node_id,
@@ -351,7 +360,8 @@ async fn project_of_root(state: &AppState, root: &str) -> Result<String, Refusal
 }
 
 /// `POST /trees`: opens a root node, stores the job and links the two. A repeated id answers with
-/// the stored job and opens nothing.
+/// the stored job and opens nothing. A root run that cannot start (the disk floor, git) answers
+/// `state: "root_pending"` with the `reason`; the job stays open and the driver retries the start.
 async fn post_tree(
     State(state): State<AppState>,
     body: Result<Json<TreeBody>, JsonRejection>,
@@ -425,9 +435,9 @@ async fn post_tree(
         .map_err(db_refusal)?;
     // `start` takes the job lock in `open_branch` and `bind_branch`, and the mutex is not reentrant.
     drop(guard);
-    // A root that cannot start never fails the request: the job exists and stays open, and the feed
-    // says why.
-    if let Err(reason) = crate::tree_job::root::start(&state, &job).await {
+    // A root that cannot start never fails the request: the job exists and stays open, the answer
+    // is `root_pending` with the reason, the feed says why, and the driver retries each sweep.
+    if let Err(reason) = crate::tree_job::root_pending::start(&state, &job).await {
         tracing::warn!(job = %job.id, %reason, "tree job root run did not start");
         let line = format!(
             "tree job {} is open but its root run did not start: {reason}",
@@ -435,6 +445,9 @@ async fn post_tree(
         );
         let _ =
             crate::feed::append(&state.pool, None, ROOT_START_FAILED_KIND, &line, None, None).await;
+        // Reload so the answer carries the marker `root_pending::start` stored.
+        let stored = store::load(&state.pool, &id).await.ok().flatten();
+        return Ok(Json(summary(stored.as_ref().unwrap_or(&job), false)));
     }
     Ok(Json(summary(&job, false)))
 }
@@ -454,6 +467,7 @@ async fn get_tree(
         "feature_branch": job.feature_branch,
         "goal": job.goal,
         "state": job.state,
+        "root_start_failure": crate::tree_job::root_pending::reason_of(&job),
         "contract": job.contract,
         "created_at": job.created_at,
         "updated_at": job.updated_at,
@@ -662,6 +676,9 @@ async fn post_transition(
     if transition == "launch" {
         return launch(&state, &id, &node, &key, body).await;
     }
+    if transition == "relaunch" {
+        return relaunch(&state, &id, &node, &key, body.prompt.as_deref()).await;
+    }
     if !BRANCH_STATES.contains(&transition.as_str()) && transition != "done" {
         return Err(refuse(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -721,6 +738,32 @@ async fn post_transition(
         .map_err(run_refusal)?;
     Ok(Json(
         json!({ "result": applied.result, "replayed": applied.replayed }),
+    ))
+}
+
+/// The `relaunch` transition: starts again the agent of a fixing or building branch whose node has
+/// no live run, from the node's stored launch (worktree cwd, mode, project), plus the optional
+/// prompt of the owner. Any other branch state is a 409 and starts nothing.
+async fn relaunch(
+    state: &AppState,
+    id: &str,
+    node: &str,
+    key: &str,
+    prompt: Option<&str>,
+) -> Result<Json<Value>, Refusal> {
+    use crate::tree_job::relaunch::{ReviveError, revive_orphan};
+
+    let replayed = stored_result(state, node, "launch", key).await?.is_some();
+    let run_id =
+        revive_orphan(state, id, node, key, prompt)
+            .await
+            .map_err(|error| match error {
+                ReviveError::NotFound(text) => refuse(StatusCode::NOT_FOUND, text),
+                ReviveError::Refused(text) => refuse(StatusCode::CONFLICT, text),
+                ReviveError::Failed(text) => refuse(StatusCode::INTERNAL_SERVER_ERROR, text),
+            })?;
+    Ok(Json(
+        json!({ "result": run_id.to_string(), "replayed": replayed }),
     ))
 }
 
@@ -1547,7 +1590,7 @@ mod tests {
         assert_first_call(&response);
         let body = &response.1;
         assert_eq!(body["id"], json!(JOB));
-        assert_eq!(body["state"], json!("open"));
+        assert_eq!(body["state"], json!("root_pending")); // no repository, so the root run cannot start
         let root_node_id = body["root_node_id"].as_str().expect("a root node id");
         let job = loaded(&state.pool, JOB).await;
         assert_eq!(job.root_node_id, root_node_id);
@@ -1620,7 +1663,7 @@ mod tests {
         assert_replayed(&replay);
         assert_eq!(replay.1["id"], json!(JOB));
         assert_eq!(replay.1["root_node_id"], first.1["root_node_id"]);
-        assert_eq!(replay.1["state"], json!("open"));
+        assert_eq!(replay.1["state"], json!("root_pending"));
         assert_eq!(job_rows(&state.pool).await, 1);
         assert_eq!(node_rows(&state.pool).await, 1);
         // A replay must not rewrite the job from the request body.
@@ -1812,6 +1855,19 @@ mod tests {
         let response = post(&app(&state), "/trees", tree_body(JOB)).await;
 
         assert_first_call(&response);
+        assert_eq!(
+            response.1["state"],
+            json!("root_pending"),
+            "{:?}",
+            response.1
+        );
+        assert!(
+            response.1["reason"]
+                .as_str()
+                .is_some_and(|reason| !reason.is_empty()),
+            "the pending answer carries no reason: {:?}",
+            response.1
+        );
         let job = loaded(&state.pool, JOB).await;
         assert_eq!(job.state, "open");
         assert_eq!(run_rows(&state.pool).await, 0);
@@ -1819,6 +1875,159 @@ mod tests {
         assert!(
             !feed_lines_naming(&state.pool, JOB).await.is_empty(),
             "the failed start left no feed line naming the job"
+        );
+    }
+
+    /// Rewrites the project's disk floor, which is what admission of the root worktree reads.
+    fn set_floor(repo: &Repo, gb: u64) {
+        std::fs::write(
+            repo.path.join(".nucleos/workflow/speed.yaml"),
+            format!("tree:\n  floor_gb: {gb}\n"),
+        )
+        .unwrap();
+    }
+
+    /// A repository whose floor no disk can meet, so the root worktree is refused.
+    fn refusing_repo() -> Repo {
+        let repo = Repo::new();
+        set_floor(&repo, 1_000_000_000);
+        repo
+    }
+
+    fn pending_reason(response: &(StatusCode, Value)) -> String {
+        response.1["reason"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no reason in {:?}", response.1))
+            .to_owned()
+    }
+
+    #[tokio::test]
+    async fn post_tree_admission_refused_answers_root_pending_with_the_reason() {
+        let state = test_state().await;
+        let repo = refusing_repo();
+
+        let response = post(&app(&state), "/trees", repo_tree_body(JOB, &repo)).await;
+
+        assert_first_call(&response);
+        assert_eq!(
+            response.1["state"],
+            json!("root_pending"),
+            "{:?}",
+            response.1
+        );
+        assert_eq!(response.1["replayed"], json!(false), "{:?}", response.1);
+        assert!(
+            pending_reason(&response).contains("floor"),
+            "the reason does not name the floor: {:?}",
+            response.1
+        );
+        let job = loaded(&state.pool, JOB).await;
+        assert_eq!(job.state, "open");
+        assert_eq!(run_rows(&state.pool).await, 0);
+        assert!(
+            !job.manifest.branches.contains_key("root"),
+            "a refused start left a root branch"
+        );
+        assert!(
+            !feed_lines_naming(&state.pool, JOB).await.is_empty(),
+            "the refused start left no feed line naming the job"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_tree_replay_of_a_root_pending_job_keeps_the_reason_and_opens_no_second_root() {
+        let state = test_state().await;
+        let app = app(&state);
+        let repo = refusing_repo();
+        let first = post(&app, "/trees", repo_tree_body(JOB, &repo)).await;
+        assert_first_call(&first);
+
+        let replay = post(&app, "/trees", repo_tree_body(JOB, &repo)).await;
+
+        assert_replayed(&replay);
+        assert_eq!(replay.1["state"], json!("root_pending"), "{:?}", replay.1);
+        assert_eq!(pending_reason(&replay), pending_reason(&first));
+        assert_eq!(run_rows(&state.pool).await, 0);
+        let job = loaded(&state.pool, JOB).await;
+        assert!(
+            !job.manifest.branches.contains_key("root"),
+            "the replay opened a root branch"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_tree_shows_why_the_root_has_not_started() {
+        let state = test_state().await;
+        let app = app(&state);
+        let repo = refusing_repo();
+        let first = post(&app, "/trees", repo_tree_body(JOB, &repo)).await;
+        assert_first_call(&first);
+
+        let (status, body) = get(&app, &format!("/trees/{JOB}")).await;
+
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert!(
+            body["root_start_failure"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("floor")),
+            "root_start_failure does not say why: {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn driver_retries_a_root_pending_job_once_the_disk_admits_it() {
+        let state = test_state().await;
+        let app = app(&state);
+        let repo = refusing_repo();
+        let first = post(&app, "/trees", repo_tree_body(JOB, &repo)).await;
+        assert_first_call(&first);
+
+        // Still refused: the retry starts nothing and the job stays pending.
+        crate::tree_job::driver::advance_job(&state, JOB).await;
+        assert_eq!(run_rows(&state.pool).await, 0);
+        let (_, still) = get(&app, &format!("/trees/{JOB}")).await;
+        assert!(
+            still["root_start_failure"].is_string(),
+            "the job left the pending state while still refused: {still:?}"
+        );
+
+        // The floor is lowered: the next retry starts the root exactly once.
+        set_floor(&repo, 0);
+        crate::tree_job::driver::advance_job(&state, JOB).await;
+
+        assert_eq!(run_rows(&state.pool).await, 1);
+        let job = loaded(&state.pool, JOB).await;
+        let root_branch = job.manifest.branches.get("root").expect("a root branch");
+        assert_eq!(
+            root_branch.node_id.as_deref(),
+            Some(job.root_node_id.as_str())
+        );
+        let run_id = node_run_id(&state.pool, &job.root_node_id)
+            .await
+            .expect("the root node links its run");
+        assert_eq!(
+            stored_launch_result(&state.pool, &job.root_node_id, "root-job-1")
+                .await
+                .as_deref(),
+            Some(run_id.as_str())
+        );
+        let (_, started) = get(&app, &format!("/trees/{JOB}")).await;
+        assert!(
+            started["root_start_failure"].is_null(),
+            "root_start_failure survived a successful start: {started:?}"
+        );
+        let replay = post(&app, "/trees", repo_tree_body(JOB, &repo)).await;
+        assert_replayed(&replay);
+        assert_eq!(replay.1["state"], json!("open"), "{:?}", replay.1);
+
+        // A further pass starts no second run.
+        crate::tree_job::driver::advance_job(&state, JOB).await;
+        assert_eq!(run_rows(&state.pool).await, 1);
+        assert_eq!(
+            repo.git(&["worktree", "list", "--porcelain"])
+                .matches("worktree ")
+                .count(),
+            2
         );
     }
 
@@ -2872,6 +3081,139 @@ mod tests {
 
         assert_eq!(direct.unwrap(), routed);
         assert_eq!(run_rows(&state.pool).await, 1);
+    }
+
+    // ----- relaunch -----
+
+    fn relaunch_body(key: &str, prompt: Option<&str>) -> Value {
+        json!({ "transition": "relaunch", "key": key, "prompt": prompt })
+    }
+
+    /// The launch the branch was first started with, as `branch_start` stores it.
+    async fn store_base_launch(pool: &SqlitePool) {
+        crate::tree_job::open::save_launch(
+            pool,
+            &crate::tree_job::open::StoredLaunch {
+                node_id: NODE.to_owned(),
+                key: "branch-api".to_owned(),
+                prompt: "the node packet".to_owned(),
+                project_id: None,
+                cwd: None,
+                mode: "shadow".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn stored_prompt(pool: &SqlitePool, key: &str) -> String {
+        sqlx::query_scalar("SELECT prompt FROM tree_launches WHERE node_id = ? AND key = ?")
+            .bind(NODE)
+            .bind(key)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn relaunch_restarts_a_working_branch_from_its_stored_launch() {
+        for working in ["fixing", "building"] {
+            let state = test_state().await;
+            seed_one_branch(&state.pool, working).await;
+            store_base_launch(&state.pool).await;
+
+            let response = post(
+                &app(&state),
+                &transition_uri(JOB, NODE),
+                relaunch_body("revive-1", Some("carry on with the tests")),
+            )
+            .await;
+
+            let run_id = launched_run(&response);
+            assert_eq!(run_rows(&state.pool).await, 1, "{working}");
+            assert_eq!(
+                node_run_id(&state.pool, NODE).await,
+                Some(run_id.to_string())
+            );
+            let prompt = stored_prompt(&state.pool, "revive-1").await;
+            assert!(prompt.starts_with("the node packet"), "{prompt}");
+            assert!(prompt.contains("carry on with the tests"), "{prompt}");
+            assert_eq!(branch_state(&state.pool, JOB, BRANCH).await, working);
+        }
+    }
+
+    #[tokio::test]
+    async fn relaunch_is_idempotent_per_key() {
+        let state = test_state().await;
+        seed_one_branch(&state.pool, "fixing").await;
+        store_base_launch(&state.pool).await;
+        let app = app(&state);
+
+        let first = launched_run(
+            &post(
+                &app,
+                &transition_uri(JOB, NODE),
+                relaunch_body("revive-1", None),
+            )
+            .await,
+        );
+        let replay = post(
+            &app,
+            &transition_uri(JOB, NODE),
+            relaunch_body("revive-1", None),
+        )
+        .await;
+
+        assert_eq!(launched_run(&replay), first);
+        assert_eq!(replay.1["replayed"], json!(true));
+        assert_eq!(run_rows(&state.pool).await, 1);
+    }
+
+    #[tokio::test]
+    async fn relaunch_refuses_every_other_branch_state_and_creates_no_run() {
+        for refused in [
+            "dropped",
+            "parked",
+            "merged",
+            "queued",
+            "open",
+            "gating",
+            "green",
+            "red",
+            "reviewing",
+        ] {
+            let state = test_state().await;
+            seed_one_branch(&state.pool, refused).await;
+            store_base_launch(&state.pool).await;
+
+            let response = post(
+                &app(&state),
+                &transition_uri(JOB, NODE),
+                relaunch_body("revive-1", None),
+            )
+            .await;
+
+            assert_error(&response, StatusCode::CONFLICT);
+            assert_eq!(run_rows(&state.pool).await, 0, "{refused}");
+            assert_eq!(node_run_id(&state.pool, NODE).await, None, "{refused}");
+            assert_eq!(transition_rows(&state.pool).await, 0, "{refused}");
+        }
+    }
+
+    #[tokio::test]
+    async fn relaunch_without_a_stored_launch_fails_and_creates_no_run() {
+        let state = test_state().await;
+        seed_one_branch(&state.pool, "fixing").await;
+
+        let response = post(
+            &app(&state),
+            &transition_uri(JOB, NODE),
+            relaunch_body("revive-1", None),
+        )
+        .await;
+
+        assert!(response.0.is_server_error(), "{response:?}");
+        assert_eq!(run_rows(&state.pool).await, 0);
     }
 
     // ----- concurrency -----

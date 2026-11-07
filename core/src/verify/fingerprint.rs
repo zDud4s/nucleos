@@ -88,7 +88,7 @@ impl std::io::Write for HashWriter<'_> {
 /// Each path is followed by a marker saying what it is, so a file that became a symlink or a
 /// directory changes the hash: `-` missing, `l<target>` symlink, `d` directory or gitlink,
 /// `f<size>` then the bytes for a file.
-pub fn hash_files(worktree: &Path, paths: &[String]) -> String {
+pub fn hash_files(worktree: &Path, paths: &[String]) -> Result<String, String> {
     let mut hasher = Sha256::new();
     for path in paths {
         hasher.update(path.as_bytes());
@@ -106,16 +106,24 @@ pub fn hash_files(worktree: &Path, paths: &[String]) -> String {
             Ok(meta) if meta.is_dir() => hasher.update(b"d"),
             Ok(meta) => {
                 hasher.update(format!("f{}", meta.len()).as_bytes());
-                // A file that vanishes or cannot be read mid-hash contributes what was read; the
-                // size marker above still pins what it was when listed.
-                if let Ok(mut file) = std::fs::File::open(&full) {
-                    let _ = std::io::copy(&mut file, &mut HashWriter(&mut hasher));
+                // A file that vanished since it was listed contributes only its size marker. One
+                // that EXISTS but cannot be read (locked by an editor or a scanner) has no
+                // fingerprint at all: hashing its size alone would give two same-length contents
+                // the same key, and a cached green would be reused for the changed one.
+                match std::fs::File::open(&full) {
+                    Ok(mut file) => {
+                        if let Err(error) = std::io::copy(&mut file, &mut HashWriter(&mut hasher)) {
+                            return Err(format!("could not read {path}: {error}"));
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(format!("could not open {path}: {error}")),
                 }
             }
         }
         hasher.update(b"\0");
     }
-    hex(hasher)
+    Ok(hex(hasher))
 }
 
 /// A `reads` entry as a git pathspec: a glob stays a glob, anything else is a literal path with
@@ -190,7 +198,7 @@ pub async fn content_hash(
     let root = worktree.to_path_buf();
     tokio::task::spawn_blocking(move || hash_files(&root, &files))
         .await
-        .map_err(|error| format!("hashing the files panicked: {error}"))
+        .map_err(|error| format!("hashing the files panicked: {error}"))?
 }
 
 /// The group's fingerprint from an already computed content hash; the environment comes from the
@@ -225,6 +233,34 @@ pub fn gate_fingerprint_from(command: &str, content: &str) -> String {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    /// A file held open with no sharing (an editor, a scanner) cannot be read; it must make the
+    /// hash fail rather than fall back to a size-only fingerprint.
+    #[cfg(windows)]
+    #[test]
+    fn hash_files_errors_on_an_unreadable_file() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "one").unwrap();
+        let _held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(dir.path().join("a.rs"))
+            .unwrap();
+        let result = hash_files(dir.path(), &["a.rs".to_string()]);
+        assert!(result.is_err(), "{result:?}");
+    }
+
+    #[test]
+    fn hash_files_still_hashes_readable_and_vanished_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "one").unwrap();
+        let both = hash_files(dir.path(), &["a.rs".to_string(), "gone.rs".to_string()]).unwrap();
+        std::fs::write(dir.path().join("a.rs"), "two").unwrap();
+        let changed = hash_files(dir.path(), &["a.rs".to_string(), "gone.rs".to_string()]).unwrap();
+        assert_ne!(both, changed);
+    }
 
     fn group() -> Group {
         Group {

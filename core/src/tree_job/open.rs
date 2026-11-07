@@ -252,6 +252,8 @@ impl From<sqlx::Error> for OpenError {
 /// Runs `git -C <root> <args>` and answers its trimmed stdout, or its stderr as the error.
 async fn git(root: &str, args: &[&str]) -> Result<String, String> {
     let output = tokio::process::Command::new("git")
+        // A repo-local `core.fsmonitor` would run a command on any call that reads the index.
+        .args(["-c", "core.fsmonitor="])
         .arg("-C")
         .arg(root)
         .args(args)
@@ -491,6 +493,20 @@ pub async fn open_branch(
         .unwrap_or_else(|| job.manifest.feature_branch.clone());
     if feature == config.base_branch {
         return Err(OpenError::OverIntegration(feature));
+    }
+    // The name goes to git as a positional argument (`git branch <feature> <base>`): a leading `-`
+    // would be read as an option (`-D` deletes the integration branch), so it never gets there.
+    if feature.starts_with('-')
+        || git(
+            &job.manifest.project_root,
+            &["check-ref-format", "--branch", &feature],
+        )
+        .await
+        .is_err()
+    {
+        return Err(OpenError::BadName(format!(
+            "the feature branch name {feature:?} is not a valid git branch name"
+        )));
     }
     let sizes = live_sizes_gb(&job.manifest).await;
     let book = admission_book();
@@ -1619,6 +1635,26 @@ mod tests {
         assert!(matches!(error, OpenError::OverIntegration(_)), "{error:?}");
         checkout.assert_nothing_made();
         assert_still_queued(&pool, BRANCH).await;
+    }
+
+    /// A feature name that git would read as an option or reject as a ref is refused before any
+    /// git command takes it as an argument: `-D` would have deleted the integration branch.
+    #[tokio::test]
+    async fn open_refuses_a_feature_branch_git_would_read_as_an_option() {
+        for bad in ["-D", "a..b"] {
+            let pool = crate::testdb::fresh_pool().await;
+            let checkout = Checkout::new();
+            let job = job_of(TREE, &checkout.root(), bad, vec![code(BRANCH, "queued")]);
+            store::save(&pool, &job).await.unwrap();
+
+            let error = open_branch(&pool, TREE, BRANCH, &checkout.config())
+                .await
+                .unwrap_err();
+
+            assert!(matches!(error, OpenError::BadName(_)), "{bad}: {error:?}");
+            checkout.assert_nothing_made();
+            assert_still_queued(&pool, BRANCH).await;
+        }
     }
 
     /// A docs branch works in the feature checkout: nothing is allocated, so neither the disk nor

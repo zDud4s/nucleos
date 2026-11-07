@@ -192,6 +192,10 @@ async fn advance(state: &AppState, job_id: &str, gate: Option<GateFn>) {
     if let Err(error) = retry_pending_starts(state, job_id).await {
         tracing::warn!(job = job_id, %error, "tree driver could not retry the pending starts");
     }
+    // A root run the disk or git refused at launch: marked on the job, retried here every sweep.
+    if let Err(error) = super::root_pending::retry(state, job_id).await {
+        tracing::warn!(job = job_id, %error, "tree driver could not retry the root start");
+    }
 }
 
 // ---- pending starts: a start the disk refused ----------------------------------------------------
@@ -592,6 +596,8 @@ async fn has_diff(job: &TreeJob, branch: &super::model::Branch) -> Result<bool, 
 /// Runs `git -C <root> <args>` and answers its trimmed stdout, or its stderr as the error.
 async fn git(root: &str, args: &[&str]) -> Result<String, String> {
     let output = tokio::process::Command::new("git")
+        // A repo-local `core.fsmonitor` would run a command on any call that reads the index.
+        .args(["-c", "core.fsmonitor="])
         .arg("-C")
         .arg(root)
         .args(args)

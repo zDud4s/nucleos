@@ -88,6 +88,9 @@ if ([string]::IsNullOrEmpty($TargetDir)) {
         Push-Location $RepoRoot
         try {
             $TargetDir = (cargo metadata --format-version 1 --no-deps | ConvertFrom-Json).target_directory
+            if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrEmpty($TargetDir)) {
+                Fail 2 "could not resolve the cargo target dir (cargo metadata failed); pass -TargetDir or set CARGO_TARGET_DIR"
+            }
         }
         finally { Pop-Location }
     }
