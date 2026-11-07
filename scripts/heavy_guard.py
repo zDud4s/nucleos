@@ -46,8 +46,15 @@ _CARGO_CMD = re.compile(
     + _CARGO_NAME + r"(?![\w\-/\\.])")
 
 
+# The quoted value of a curl body flag is data, never a command: `-d '{"note":"x; cargo test"}'`.
+_DATA_BODY = re.compile(
+    r"""(?<=\s)(?:-d|--data(?:-raw|-binary|-ascii|-urlencode)?|--json)(?:\s+|=)"""
+    r"""(?:'[^']*'|"(?:\\.|[^"\\])*")""")
+
+
 def _runs_cargo(command, posix):
     """True when `command` names cargo/rustc/rustfmt as a program."""
+    command = _DATA_BODY.sub(" -d X", command)
     try:
         _load_classify().split_segments(command, posix)
     except ValueError:
