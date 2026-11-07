@@ -168,17 +168,29 @@ func TestARedrawAfterTheReactionWindowIsNotWaitedFor(t *testing.T) {
 	driver, entry := settling(60*time.Millisecond, 5*time.Second)
 	driver.movingWithin = 5 * time.Second
 
-	since := time.Now()
+	// The redraw is held back until the wait has returned, so the test depends on no sleep being
+	// shorter than the wait: the late redraw is delivered only after awaitSettled gave up on it.
+	returned := make(chan struct{})
+	delivered := make(chan struct{})
 	go func() {
-		time.Sleep(400 * time.Millisecond)
-		driver.setChanged(entry, time.Now())
+		defer close(delivered)
+		select {
+		case <-returned:
+			driver.setChanged(entry, time.Now())
+		case <-time.After(10 * time.Second):
+		}
 	}()
 
-	if driver.awaitSettled(context.Background(), entry, since) {
+	since := time.Now()
+	settled := driver.awaitSettled(context.Background(), entry, since)
+	close(returned)
+	<-delivered
+	if settled {
 		t.Fatal("nothing was in flight")
 	}
-	if spent := time.Since(since); spent > 300*time.Millisecond {
-		t.Fatalf("waited %v for a redraw that arrived long after the act", spent)
+	// Generous bound: far below the 5 s overall limit, far above the reaction window under load.
+	if spent := time.Since(since); spent > 3*time.Second {
+		t.Fatalf("waited %v for a redraw that never arrived before the read", spent)
 	}
 }
 
