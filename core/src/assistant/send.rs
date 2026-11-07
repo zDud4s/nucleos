@@ -1694,8 +1694,11 @@ mod tests {
 
     /// The prompts of a chat's assistant turns, oldest first, polled until there are `at_least`.
     async fn prompts_of(pool: &SqlitePool, chat: &str, at_least: usize) -> Vec<String> {
+        // Polls the observable state (the run rows) until it holds; the deadline is only a hang
+        // guard, generous because a loaded machine can starve the spawned send for many seconds.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         let mut asked = Vec::new();
-        for _ in 0..200 {
+        while std::time::Instant::now() < deadline {
             asked = sqlx::query_scalar(
                 "SELECT prompt FROM runs WHERE chat_id = ? AND mode = 'assistant' ORDER BY id",
             )
