@@ -376,6 +376,9 @@ pub async fn daemon_observations(state: &AppState) -> sqlx::Result<Vec<Observed>
             Some(false)
         };
         let tail = state.run_tails.lock().unwrap().get(&id).cloned();
+        // The post-run gate writes nothing to the transcript either; its marker is a bounded wait
+        // of the same kind as an open tool call.
+        let gate_until = crate::execution::runner::cli_pids::gate_in_flight_until(id);
         let (last_transcript_write, tool_in_flight_until) =
             tail.as_ref().map_or((None, None), |tail| {
                 let text = tail.lock().unwrap().clone();
@@ -397,7 +400,7 @@ pub async fn daemon_observations(state: &AppState) -> sqlx::Result<Vec<Observed>
                 status: (status == "running").then_some(SubjectStatus::Busy),
                 started_at,
                 last_transcript_write,
-                tool_in_flight_until,
+                tool_in_flight_until: tool_in_flight_until.max(gate_until),
                 running_children,
                 ..Default::default()
             },
@@ -951,6 +954,75 @@ mod tests {
     }
 
     // ----- daemon runs -----
+
+    /// A live run that published one line and then went quiet, observed through the real
+    /// `daemon_observations` with an optional gate marker begun at `gate_began`. Returns the
+    /// observations, a moment 11 minutes after the write, and the marker's guard.
+    async fn idle_run_observed(
+        state: &AppState,
+        id: i64,
+        gate_began: Option<DateTime<Utc>>,
+    ) -> (
+        Vec<Observed>,
+        DateTime<Utc>,
+        Option<crate::execution::runner::cli_pids::GateInFlight>,
+    ) {
+        seed_live_run_with_id(state, id, Utc::now() - minutes(1)).await;
+        seed_node(state, &format!("n{id}"), "leaf", "running", Some(id)).await;
+        crate::execution::runner::cli_pids::begin_attempt(id);
+        let gate = gate_began.map(|at| crate::execution::runner::cli_pids::begin_gate_at(id, at));
+        publish_tail(
+            state,
+            id,
+            "{\"type\":\"assistant\"}
+",
+        );
+        let observed = daemon_observations(state).await.unwrap();
+        (observed, Utc::now() + minutes(11), gate)
+    }
+
+    #[tokio::test]
+    async fn idle_run_with_gate_in_flight_is_not_cancelled() {
+        let state = state().await;
+        let id = 880_021;
+        let (observed, later, _gate) = idle_run_observed(&state, id, Some(Utc::now())).await;
+
+        let report = tick(&state, &observed, &limits(), later).await.unwrap();
+
+        assert!(report.cancelled.is_empty());
+        assert_eq!(run_status(&state, id).await, "running");
+        assert!(has_handle(&state, id));
+        assert_eq!(rows(&state, "session_stalled", &run_key(id)).await, 0);
+        crate::execution::runner::cli_pids::forget(id);
+    }
+
+    #[tokio::test]
+    async fn idle_run_without_a_gate_marker_is_cancelled_as_stalled() {
+        let state = state().await;
+        let id = 880_022;
+        let (observed, later, _) = idle_run_observed(&state, id, None).await;
+
+        let report = tick(&state, &observed, &limits(), later).await.unwrap();
+
+        assert_eq!(report.cancelled, [id]);
+        assert_eq!(run_status(&state, id).await, "cancelled");
+        assert_eq!(rows(&state, "session_stalled", &run_key(id)).await, 1);
+        crate::execution::runner::cli_pids::forget(id);
+    }
+
+    #[tokio::test]
+    async fn a_gate_marker_older_than_the_gate_timeout_no_longer_protects_the_run() {
+        let state = state().await;
+        let id = 880_023;
+        let (observed, later, _gate) =
+            idle_run_observed(&state, id, Some(Utc::now() - minutes(60))).await;
+
+        let report = tick(&state, &observed, &limits(), later).await.unwrap();
+
+        assert_eq!(report.cancelled, [id]);
+        assert_eq!(rows(&state, "session_stalled", &run_key(id)).await, 1);
+        crate::execution::runner::cli_pids::forget(id);
+    }
 
     #[tokio::test]
     async fn daemon_run_stalled_is_cancelled_and_node_marked() {

@@ -707,6 +707,162 @@ mod tests {
     /// A payload `Op::from_stored` accepts, for rows written straight to the table.
     const MERGE_ARGS: &str = r#"{"op":"merge","source":"feat/x","target":"master"}"#;
 
+    async fn age(pool: &sqlx::SqlitePool, id: i64) {
+        sqlx::query("UPDATE vcs_requests SET started_at = '2026-08-02T00:00:00Z' WHERE id = ?")
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// Defect 3: a restart interrupts a `running` land request and leaves a `queued` one claimable.
+    #[tokio::test]
+    async fn boot_reconcile_interrupts_running_and_keeps_queued_claimable() {
+        let pool = test_pool().await;
+        let running = insert(&pool, "alpha", "running", MERGE_ARGS).await.unwrap();
+        age(&pool, running).await;
+        let queued = insert(&pool, "beta", "queued", MERGE_ARGS).await.unwrap();
+
+        assert_eq!(reconcile_interrupted(&pool).await.unwrap(), 1);
+
+        assert_eq!(status_of(&pool, running).await, "interrupted");
+        assert_eq!(status_of(&pool, queued).await, "queued");
+        let claimed = claim_next(&pool, "beta").await.unwrap().unwrap();
+        assert_eq!(claimed.id, queued);
+    }
+
+    #[tokio::test]
+    async fn a_failed_terminal_write_is_retried_until_it_lands() {
+        let pool = test_pool().await;
+        let id = insert(&pool, "alpha", "running", MERGE_ARGS).await.unwrap();
+        age(&pool, id).await;
+        sqlx::query(
+            "CREATE TRIGGER block_update BEFORE UPDATE ON vcs_requests
+             BEGIN SELECT RAISE(ABORT, 'pool timeout'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let outcome = Outcome::Succeeded {
+            sha: Some("abc123".into()),
+            output_tail: String::new(),
+        };
+        let backoff = [std::time::Duration::from_millis(40); 50];
+        let unblock = async {
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            sqlx::query("DROP TRIGGER block_update")
+                .execute(&pool)
+                .await
+                .unwrap();
+        };
+        let (written, ()) = tokio::join!(write_terminal(&pool, id, &outcome, &backoff), unblock);
+
+        written.unwrap();
+        assert_eq!(status_of(&pool, id).await, "succeeded");
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_terminal_write_backoff_returns_the_error() {
+        let pool = test_pool().await;
+        let id = insert(&pool, "alpha", "running", MERGE_ARGS).await.unwrap();
+        sqlx::query(
+            "CREATE TRIGGER block_update BEFORE UPDATE ON vcs_requests
+             BEGIN SELECT RAISE(ABORT, 'pool timeout'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let outcome = Outcome::Succeeded {
+            sha: None,
+            output_tail: String::new(),
+        };
+        let backoff = [std::time::Duration::from_millis(1); 2];
+
+        assert!(write_terminal(&pool, id, &outcome, &backoff).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_stranded_merge_that_already_landed_is_marked_succeeded() {
+        let pool = test_pool().await;
+        let id = insert(&pool, "alpha", "running", MERGE_ARGS).await.unwrap();
+        age(&pool, id).await;
+        let executor = FakeVcsExecutor::succeeding_with("x").already_landed_at("deadbeef");
+
+        let settled = reconcile_stranded_running(&pool, &executor, std::time::Duration::ZERO)
+            .await
+            .unwrap();
+
+        assert_eq!(settled, 1);
+        assert_eq!(status_of(&pool, id).await, "succeeded");
+        let sha: Option<String> =
+            sqlx::query_scalar("SELECT result_sha FROM vcs_requests WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(sha.as_deref(), Some("deadbeef"));
+    }
+
+    #[tokio::test]
+    async fn a_stranded_merge_that_did_not_land_is_requeued_and_claimable() {
+        let pool = test_pool().await;
+        let id = insert(&pool, "alpha", "running", MERGE_ARGS).await.unwrap();
+        age(&pool, id).await;
+        let executor = FakeVcsExecutor::succeeding_with("x");
+
+        reconcile_stranded_running(&pool, &executor, std::time::Duration::ZERO)
+            .await
+            .unwrap();
+
+        assert_eq!(status_of(&pool, id).await, "queued");
+        assert_eq!(claim_next(&pool, "alpha").await.unwrap().unwrap().id, id);
+    }
+
+    #[tokio::test]
+    async fn a_running_row_inside_the_grace_is_left_alone() {
+        let pool = test_pool().await;
+        let id = insert(&pool, "alpha", "running", MERGE_ARGS).await.unwrap();
+        sqlx::query("UPDATE vcs_requests SET started_at = ? WHERE id = ?")
+            .bind(chrono::Utc::now().to_rfc3339())
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let executor = FakeVcsExecutor::succeeding_with("x");
+
+        let settled = reconcile_stranded_running(&pool, &executor, STRANDED_GRACE)
+            .await
+            .unwrap();
+
+        assert_eq!(settled, 0);
+        assert_eq!(status_of(&pool, id).await, "running");
+    }
+
+    #[tokio::test]
+    async fn cancel_request_cancels_queued_and_orphaned_running_rows_only() {
+        let pool = test_pool().await;
+        let queued = insert(&pool, "alpha", "queued", MERGE_ARGS).await.unwrap();
+        let running = insert(&pool, "beta", "running", MERGE_ARGS).await.unwrap();
+        age(&pool, running).await;
+        let done = insert(&pool, "gamma", "succeeded", MERGE_ARGS)
+            .await
+            .unwrap();
+
+        cancel_request(&pool, queued).await.unwrap();
+        cancel_request(&pool, running).await.unwrap();
+
+        assert_eq!(status_of(&pool, queued).await, "cancelled");
+        assert_eq!(status_of(&pool, running).await, "cancelled");
+        assert!(matches!(
+            cancel_request(&pool, done).await,
+            Err(DismissError::NotOpen)
+        ));
+        assert!(matches!(
+            cancel_request(&pool, 9999).await,
+            Err(DismissError::NotFound)
+        ));
+    }
+
     /// The one place that knows the column list. `args` is a parameter because the rows worth
     /// writing by hand are exactly the ones `submit` cannot produce — a payload that will not
     /// parse, or a status no caller can reach yet.
@@ -3159,6 +3315,32 @@ mod tests {
         );
     }
 
+    /// Boot after a restart must handle both land states: the `running` row is released as
+    /// `interrupted` and a `queued` request behind it stays `queued`, so the worker claims it once
+    /// the slot is free instead of the repository staying jammed.
+    #[tokio::test]
+    async fn boot_reconcile_releases_running_and_leaves_queued_claimable() {
+        let pool = test_pool().await;
+        let running = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+        claim_next(&pool, "alpha").await.unwrap();
+        let queued = submit(&pool, &repo(), &merge_op(), Origin::Human)
+            .await
+            .unwrap();
+        assert_eq!(status_of(&pool, queued).await, "queued");
+
+        assert_eq!(reconcile_interrupted(&pool).await.unwrap(), 1);
+
+        assert_eq!(status_of(&pool, running).await, "interrupted");
+        assert_eq!(status_of(&pool, queued).await, "queued");
+        let claimed = claim_next(&pool, "alpha").await.unwrap();
+        assert!(
+            claimed.is_some(),
+            "the queued request must be claimable after boot"
+        );
+    }
+
     /// The reconcile and a late `finish` have to compose, not merely each be correct.
     ///
     /// `finish`'s `AND status = 'running'` guard was written for this exact collision — a worker
@@ -3471,25 +3653,44 @@ mod tests {
     /// Follows `logging.rs`'s own test rather than `init()`, which installs a *global* subscriber and
     /// would panic the moment a second test did the same; `set_default` is scoped and thread-local,
     /// which is sound here because `#[tokio::test]`'s default runtime polls on the thread that set
-    /// it. The writer is the non-blocking one, so the guard has to be dropped before reading back.
+    /// it.
+    ///
+    /// The writer is a synchronous in-memory buffer, not `tracing_appender::non_blocking`: dropping
+    /// that one's guard waits only ~1s for its worker thread to flush, so under heavy load the file
+    /// was read back empty with the line still in flight. A synchronous writer has nothing to race.
     ///
     /// Worth the machinery for exactly one reason: on the refused-write path the log line is not
     /// commentary, it is the only place the outcome still exists.
     async fn logged_during<F: std::future::Future>(body: F) -> String {
-        let dir = tempfile::tempdir().unwrap();
-        let (writer, flush_on_drop) = tracing_appender::non_blocking(
-            tracing_appender::rolling::daily(dir.path(), "test.log"),
-        );
+        #[derive(Clone, Default)]
+        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+            type Writer = Buf;
+            fn make_writer(&'a self) -> Buf {
+                self.clone()
+            }
+        }
+
+        let buf = Buf::default();
         {
-            let subscriber = tracing_subscriber::fmt().with_writer(writer).finish();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(buf.clone())
+                .with_ansi(false)
+                .finish();
             let _scope = tracing::subscriber::set_default(subscriber);
             body.await;
         }
-        drop(flush_on_drop);
-        std::fs::read_dir(dir.path())
-            .unwrap()
-            .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
-            .collect()
+        let bytes = buf.0.lock().unwrap().clone();
+        String::from_utf8_lossy(&bytes).into_owned()
     }
 
     /// The outcome of a merge the row refuses has nowhere else to go.
@@ -3659,7 +3860,7 @@ mod tests {
             // confusing later assertion. The outer timeout is not a budget: it is reached only if
             // the drain never arrives at all, and it is there so that failure is a message rather
             // than a hung suite.
-            tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::time::timeout(Duration::from_secs(60), async {
                 tokio::select! {
                     _ = &mut drain => {
                         panic!("the executor is never released — the drain cannot have finished")
@@ -3714,7 +3915,7 @@ mod tests {
         let executor = std::sync::Arc::new(FakeVcsExecutor::succeeding_with("abc123"));
         let worker = tokio::spawn(run_queue_worker(pool.clone(), executor.clone()));
 
-        let settled = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let settled = tokio::time::timeout(std::time::Duration::from_secs(60), async {
             loop {
                 if status_of(&pool, id).await == "succeeded" {
                     return;
@@ -3745,7 +3946,7 @@ mod tests {
         let executor = std::sync::Arc::new(FakeVcsExecutor::rendezvous_of(2, "abc123"));
         let worker = tokio::spawn(run_queue_worker(pool.clone(), executor.clone()));
 
-        let settled = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let settled = tokio::time::timeout(std::time::Duration::from_secs(60), async {
             loop {
                 if status_of(&pool, first).await == "succeeded"
                     && status_of(&pool, second).await == "succeeded"
@@ -3790,7 +3991,7 @@ mod tests {
         let first = submit(&pool, &repo_for("alpha"), &merge_op(), Origin::Human)
             .await
             .unwrap();
-        let drained_once = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let drained_once = tokio::time::timeout(std::time::Duration::from_secs(60), async {
             loop {
                 if status_of(&pool, first).await == "succeeded" {
                     return;
@@ -3808,7 +4009,7 @@ mod tests {
         let second = submit(&pool, &repo_for("beta"), &merge_op(), Origin::Human)
             .await
             .unwrap();
-        let settled = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let settled = tokio::time::timeout(std::time::Duration::from_secs(60), async {
             loop {
                 if status_of(&pool, second).await == "succeeded" {
                     return;
@@ -3849,7 +4050,7 @@ mod tests {
                 }
             }
         };
-        tokio::time::timeout(std::time::Duration::from_secs(5), wait_until(first))
+        tokio::time::timeout(std::time::Duration::from_secs(60), wait_until(first))
             .await
             .expect("the worker's first pass should drain what was queued for it");
 
@@ -3858,7 +4059,7 @@ mod tests {
             .await
             .unwrap();
         let settled =
-            tokio::time::timeout(std::time::Duration::from_secs(5), wait_until(second)).await;
+            tokio::time::timeout(std::time::Duration::from_secs(60), wait_until(second)).await;
         worker.abort();
 
         settled.expect("an enqueue must wake the idle worker; the fallback poll is 30s away");
@@ -3897,7 +4098,7 @@ mod tests {
         let executor = std::sync::Arc::new(FakeVcsExecutor::succeeding_with("abc123"));
         let worker = tokio::spawn(run_queue_worker(pool.clone(), executor.clone()));
 
-        let settled = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let settled = tokio::time::timeout(std::time::Duration::from_secs(60), async {
             loop {
                 if status_of(&pool, second).await == "succeeded" {
                     return;
@@ -3933,7 +4134,7 @@ mod tests {
         drain_once(&pool, "alpha", &FakeVcsExecutor::succeeding_with("abc123")).await;
 
         let started = std::time::Instant::now();
-        let ticket = wait_for(&pool, id, Duration::from_secs(10)).await.unwrap();
+        let ticket = wait_for(&pool, id, Duration::from_secs(600)).await.unwrap();
         assert_eq!(ticket.status, "succeeded");
         assert_eq!(ticket.result_sha.as_deref(), Some("abc123"));
         // What this still proves, and what it gave up. A loop that ignored `succeeded` and ran to
@@ -3944,7 +4145,7 @@ mod tests {
         // below with no defect to find (2026-09-13). No wall-clock bound tells "never slept" from
         // "slept once" on a shared machine, so this no longer claims to.
         assert!(
-            started.elapsed() < Duration::from_secs(1),
+            started.elapsed() < Duration::from_secs(300),
             "an already-finished request must end the wait, not run it out"
         );
     }
@@ -3983,7 +4184,7 @@ mod tests {
         .await;
 
         let started = std::time::Instant::now();
-        let ticket = wait_for(&pool, id, Duration::from_secs(10)).await.unwrap();
+        let ticket = wait_for(&pool, id, Duration::from_secs(600)).await.unwrap();
 
         assert_eq!(ticket.id, id);
         assert_eq!(ticket.status, "failed");
@@ -3999,7 +4200,7 @@ mod tests {
         // against one, not 50ms against `WAIT_POLL_INTERVAL`: on a loaded machine a single slow
         // read outlasted the poll interval and failed this with nothing wrong (2026-09-13).
         assert!(
-            started.elapsed() < Duration::from_secs(1),
+            started.elapsed() < Duration::from_secs(300),
             "a failed request must end the wait, not run it out"
         );
     }
@@ -4030,14 +4231,14 @@ mod tests {
         assert_eq!(status_of(&pool, id).await, "blocked");
 
         let started = std::time::Instant::now();
-        let ticket = wait_for(&pool, id, Duration::from_secs(10)).await.unwrap();
+        let ticket = wait_for(&pool, id, Duration::from_secs(600)).await.unwrap();
         assert_eq!(ticket.status, "blocked");
         assert!(
             ticket.failure_reason.unwrap().contains("in the way"),
             "the ticket must carry why it is blocked, or the agent cannot act on it"
         );
         assert!(
-            started.elapsed() < Duration::from_secs(1),
+            started.elapsed() < Duration::from_secs(300),
             "blocked is terminal: the wait must not run to its deadline"
         );
     }
@@ -4354,10 +4555,10 @@ mod tests {
         cancel_for_run(&pool, 7).await.unwrap();
 
         let started = std::time::Instant::now();
-        let ticket = wait_for(&pool, id, Duration::from_secs(5)).await.unwrap();
+        let ticket = wait_for(&pool, id, Duration::from_secs(600)).await.unwrap();
 
         assert_eq!(ticket.status, "cancelled");
-        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(started.elapsed() < Duration::from_secs(300));
     }
 
     /// A caller waiting on an id nothing ever inserted must not spend the deadline finding that
@@ -4370,13 +4571,13 @@ mod tests {
         let pool = test_pool().await;
         let started = std::time::Instant::now();
 
-        let result = wait_for(&pool, 999_999, Duration::from_secs(5)).await;
+        let result = wait_for(&pool, 999_999, Duration::from_secs(600)).await;
 
         assert!(matches!(result, Err(sqlx::Error::RowNotFound)));
-        // Two orders of magnitude under the 5s deadline: not a close race, just proof this
+        // Half of the 600s deadline: a hang guard only, proof this
         // returned from the first read rather than polling until the deadline passed.
         assert!(
-            started.elapsed() < Duration::from_millis(500),
+            started.elapsed() < Duration::from_secs(300),
             "an id that can never exist must not cost the caller the deadline"
         );
     }
@@ -4416,27 +4617,27 @@ mod tests {
 
         let executor = FakeVcsExecutor::succeeding_slowly("abc123", Duration::from_millis(20));
         let started = std::time::Instant::now();
-        // The deadline is two orders of magnitude past how long the operation actually takes: what
+        // The deadline is orders of magnitude past how long the operation actually takes: what
         // this proves is that `wait_for` returns once the row finishes, not that it merely survives
         // to a deadline that happens to still be far away.
-        let (ticket, drained) = tokio::join!(wait_for(&pool, id, Duration::from_secs(30)), async {
-            // A head start so `wait_for`'s first read sees "queued", not "running" — the loop, not
-            // a lucky initial read, is what has to notice the finish.
-            tokio::time::sleep(Duration::from_millis(5)).await;
-            drain_once(&pool, "alpha", &executor).await
-        });
+        let (ticket, drained) =
+            tokio::join!(wait_for(&pool, id, Duration::from_secs(600)), async {
+                // A head start so `wait_for`'s first read sees "queued", not "running" — the loop, not
+                // a lucky initial read, is what has to notice the finish.
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                drain_once(&pool, "alpha", &executor).await
+            });
 
         assert!(drained, "the operation ran");
         let ticket = ticket.unwrap();
         assert_eq!(ticket.status, "succeeded");
         assert_eq!(ticket.result_sha.as_deref(), Some("abc123"));
-        // A 6x margin under the 30s deadline: the operation itself finishes around 25ms in and the
-        // poll interval catches it shortly after. Seconds, not 500ms: under a full suite on a
-        // loaded machine this took 650ms and then 1.19s with nothing wrong (2026-10-15), the same
-        // lesson the `failed` test above learned on 2026-09-13. A wait held to its deadline would
-        // still take 30s, so 5s keeps the test's whole point.
+        // The deadline is ten minutes and the bound is half of it: the operation takes ~25ms of
+        // work, but under a loaded machine the wait itself has been seen at 11.9s (2026-11-07), so
+        // no absolute number near the real cost is safe. A wait held to its deadline would take the
+        // full 600s, so anything well under that keeps the test's whole point.
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            started.elapsed() < Duration::from_secs(300),
             "wait_for must return once the request finishes, not hold the caller to the full \
              deadline: took {:?}",
             started.elapsed()

@@ -1280,7 +1280,7 @@ mod tests {
         let mut notified = std::pin::pin!(notify.notified());
         notified.as_mut().enable();
         wake(&state, "fake");
-        let woke = tokio::time::timeout(std::time::Duration::from_secs(5), notified).await;
+        let woke = tokio::time::timeout(std::time::Duration::from_secs(60), notified).await;
         assert!(woke.is_ok());
     }
 

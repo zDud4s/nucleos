@@ -505,17 +505,64 @@ fn register(exe_path: &Path) -> std::io::Result<()> {
     let xml = task_xml(exe_path);
     let xml_path = task_xml_temp_path();
     write_utf16_xml(&xml_path, &xml)?;
-    let status = Command::new("schtasks")
+    let output = Command::new("schtasks")
         .args(["/Create", "/TN", TASK_NAME, "/XML"])
         .arg(&xml_path)
         .arg("/F")
-        .status()?;
+        .output();
     let _ = std::fs::remove_file(&xml_path);
-    if status.success() {
+    let output = output?;
+    if output.status.success() {
         Ok(())
     } else {
-        Err(std::io::Error::other("schtasks /create failed"))
+        // schtasks prints its reason on stderr in the console code page; lossy keeps the ASCII.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(std::io::Error::other(register_failure_message(
+            output.status.code(),
+            stderr.trim(),
+        )))
     }
+}
+
+/// PURE: the error for a failed `schtasks /Create`: the cause schtasks gave and, for a denial,
+/// what to do about it. The old text ("schtasks /create failed") hid the reason, so an unelevated
+/// "Acesso negado" looked like a random failure.
+#[cfg(any(windows, test))]
+fn register_failure_message(code: Option<i32>, stderr: &str) -> String {
+    let lower = stderr.to_lowercase();
+    let denied = lower.contains("acesso negado") || lower.contains("access is denied");
+    let code = code.map_or_else(|| "none".to_string(), |c| c.to_string());
+    let mut msg = format!(
+        "schtasks /Create for the \"NucleOS Daemon\" logon task failed (exit {code}): {stderr}"
+    );
+    if denied {
+        msg.push_str(
+            " -- access denied: an existing task of that name was probably created from an \
+             elevated shell and cannot be replaced unelevated. Delete it once from an elevated \
+             prompt (schtasks /Delete /TN \"NucleOS Daemon\" /F); the daemon then re-registers it \
+             for the current user without elevation.",
+        );
+    }
+    msg
+}
+
+/// PURE: `DOMAIN\name` from the two environment values, `name` alone without a domain, `None`
+/// when the name is missing or blank.
+#[cfg(any(windows, test))]
+fn user_id_from(domain: Option<&str>, name: Option<&str>) -> Option<String> {
+    let name = name.map(str::trim).filter(|n| !n.is_empty())?;
+    match domain.map(str::trim).filter(|d| !d.is_empty()) {
+        Some(domain) => Some(format!("{domain}\\{name}")),
+        None => Some(name.to_string()),
+    }
+}
+
+#[cfg(windows)]
+fn current_user_id() -> Option<String> {
+    user_id_from(
+        std::env::var("USERDOMAIN").ok().as_deref(),
+        std::env::var("USERNAME").ok().as_deref(),
+    )
 }
 
 /// The directory the daemon runs from. A dev build lives at `<repo_root>/target/{debug,release}/`
@@ -562,12 +609,32 @@ fn conhost_path() -> String {
     r"C:\Windows\System32\conhost.exe".to_string()
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 fn task_xml(exe_path: &Path) -> String {
+    task_xml_for(exe_path, current_user_id().as_deref())
+}
+
+/// Test-only stand-in off Windows, where there is no current user to name.
+#[cfg(all(test, not(windows)))]
+fn task_xml(exe_path: &Path) -> String {
+    task_xml_for(exe_path, None)
+}
+
+/// The task document for `user` (`DOMAIN\name`), written on the logon trigger AND the principal:
+/// a trigger without `<UserId>` fires for every user's logon, which Task Scheduler only lets an
+/// administrator register. The run level stays `LeastPrivilege`, never SYSTEM or highest.
+#[cfg(any(windows, test))]
+fn task_xml_for(exe_path: &Path, user: Option<&str>) -> String {
+    let user_line = user
+        .map(|u| format!("\n      <UserId>{}</UserId>", xml_escape(u)))
+        .unwrap_or_default();
+    let user_tag = user
+        .map(|u| format!("<UserId>{}</UserId>\n      ", xml_escape(u)))
+        .unwrap_or_default();
     task_document(
         exe_path,
-        "<LogonTrigger>\n      <Enabled>true</Enabled>\n    </LogonTrigger>",
-        "<LogonType>InteractiveToken</LogonType>",
+        &format!("<LogonTrigger>\n      <Enabled>true</Enabled>{user_line}\n    </LogonTrigger>"),
+        &format!("{user_tag}<LogonType>InteractiveToken</LogonType>"),
     )
 }
 
@@ -1024,6 +1091,55 @@ mod tests {
         assert!(xml.contains("<Hidden>true</Hidden>"));
         assert!(!xml.contains("RestartOnFailure"));
         assert!(!xml.contains("<Count>"));
+    }
+
+    /// A logon trigger with no `<UserId>` fires for ANY user's logon, and Task Scheduler only lets an
+    /// administrator register that ("Acesso negado" unelevated). Scoping trigger and principal to
+    /// the current user is what makes the unelevated registration succeed.
+    #[test]
+    fn the_task_is_scoped_to_one_user_so_an_unelevated_registration_is_allowed() {
+        let xml = task_xml_for(Path::new(r"C:\x\nucleos-core.exe"), Some(r"PC\Paulo"));
+        assert!(xml.contains(
+            "<LogonTrigger>\n      <Enabled>true</Enabled>\n      <UserId>PC\\Paulo</UserId>"
+        ));
+        assert!(xml.contains("<Principal id=\"Author\">\n      <UserId>PC\\Paulo</UserId>"));
+        assert!(xml.contains("<RunLevel>LeastPrivilege</RunLevel>"));
+        assert!(!xml.contains("HighestAvailable"));
+        assert!(!xml.contains("S-1-5-18") && !xml.to_lowercase().contains("system</userid>"));
+    }
+
+    #[test]
+    fn a_user_name_with_xml_syntax_is_escaped() {
+        let xml = task_xml_for(Path::new(r"C:\x\nucleos-core.exe"), Some(r"A&B\o<n>e"));
+        assert!(xml.contains(r"<UserId>A&amp;B\o&lt;n&gt;e</UserId>"));
+    }
+
+    #[test]
+    fn without_a_known_user_the_task_has_no_user_element() {
+        let xml = task_xml_for(Path::new(r"C:\x\nucleos-core.exe"), None);
+        assert!(!xml.contains("<UserId>"));
+        assert!(xml.contains("<LogonTrigger>"));
+    }
+
+    #[test]
+    fn current_user_joins_domain_and_name_and_ignores_blanks() {
+        assert_eq!(
+            user_id_from(Some("PC"), Some("Paulo")).as_deref(),
+            Some(r"PC\Paulo")
+        );
+        assert_eq!(user_id_from(None, Some("Paulo")).as_deref(), Some("Paulo"));
+        assert_eq!(user_id_from(Some("PC"), Some("  ")), None);
+        assert_eq!(user_id_from(Some("PC"), None), None);
+    }
+
+    #[test]
+    fn a_denied_registration_explains_how_to_get_unblocked() {
+        let msg = register_failure_message(Some(1), "ERRO: Acesso negado.");
+        assert!(msg.contains("Acesso negado"));
+        assert!(msg.contains("NucleOS Daemon"));
+        assert!(msg.contains("elevated"), "{msg}");
+        let other = register_failure_message(Some(1), "boom");
+        assert!(other.contains("boom") && !other.contains("elevated"));
     }
 
     #[test]

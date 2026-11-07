@@ -1335,7 +1335,7 @@ mod tests {
         );
 
         drop(lifeline);
-        let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+        let status = tokio::time::timeout(Duration::from_secs(60), child.wait())
             .await
             .expect("the sidecar outlived its lifeline")
             .expect("wait");

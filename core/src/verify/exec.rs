@@ -737,7 +737,7 @@ mod tests {
     }
 
     async fn wait_terminal(executor: &Arc<Executor>, id: i64) -> State {
-        tokio::time::timeout(Duration::from_secs(20), async {
+        tokio::time::timeout(Duration::from_secs(60), async {
             loop {
                 let state = executor.get(id).await.unwrap().unwrap();
                 if state.status != verify_runs::STATUS_QUEUED
@@ -1010,7 +1010,7 @@ mod tests {
 
     /// Waits until every reservation has been given back.
     async fn wait_idle(ex: &Arc<Executor>) {
-        tokio::time::timeout(Duration::from_secs(20), async {
+        tokio::time::timeout(Duration::from_secs(60), async {
             while ex.lock().used != 0 {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }

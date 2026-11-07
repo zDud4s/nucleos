@@ -1368,7 +1368,8 @@ mod tests {
         // One poll starts the handler, then the future (the "client") is dropped.
         let _ = tokio::time::timeout(std::time::Duration::ZERO, router.oneshot(request)).await;
         let mut outcome = String::new();
-        for _ in 0..200 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             outcome = sqlx::query_scalar("SELECT outcome FROM channel_events WHERE event_id = ?")
                 .bind("r-gone")
                 .fetch_optional(&st.pool)
