@@ -948,7 +948,10 @@ mod tests {
         let record = &job.manifest.extra["pending_starts"]["later"];
         assert_eq!(record["waits_for_base"], "notes", "{record:?}");
         assert_eq!(record["prompt"], "Write the later notes.");
-        assert!(record["decision_id"].is_null(), "no owner question: {record:?}");
+        assert!(
+            record["decision_id"].is_null(),
+            "no owner question: {record:?}"
+        );
     }
 
     /// The replay the driver makes once the base merged starts the branch from the stored record.
@@ -962,7 +965,9 @@ mod tests {
             .unwrap()
             .unwrap();
         job.manifest.branches.get_mut("notes").unwrap().state = "merged".to_owned();
-        crate::tree_job::store::update(&state.pool, &job).await.unwrap();
+        crate::tree_job::store::update(&state.pool, &job)
+            .await
+            .unwrap();
         let record = job.manifest.extra["pending_starts"]["later"].clone();
         let runs = count(&state, "runs").await;
 
