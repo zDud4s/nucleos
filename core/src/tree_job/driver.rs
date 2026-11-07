@@ -3520,7 +3520,10 @@ mod tests {
         base.state = "dropped".to_owned();
         let late = crate::tree_job::model::Branch::new(PENDING_NAME, &[], "code", Some("base"));
         stored.manifest.branches.insert("base".to_owned(), base);
-        stored.manifest.branches.insert(PENDING_NAME.to_owned(), late);
+        stored
+            .manifest
+            .branches
+            .insert(PENDING_NAME.to_owned(), late);
         stored.manifest.extra.insert(
             "pending_starts".to_owned(),
             json!({ PENDING_NAME: {

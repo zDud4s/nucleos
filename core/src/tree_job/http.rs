@@ -540,11 +540,15 @@ async fn post_abandon(
             .insert(super::branch_start::GENERATION_KEY.to_owned(), json!(next));
     }
     let finish = json!({ "status": "abandoned", "reason": reason, "at": at, "forced": force });
-    job.manifest.extra.insert("finish".to_owned(), finish.clone());
+    job.manifest
+        .extra
+        .insert("finish".to_owned(), finish.clone());
     job.manifest.state = JOB_TERMINAL_STATE.to_owned();
     job.state = JOB_TERMINAL_STATE.to_owned();
     job.updated_at = at;
-    store::update(&state.pool, &job).await.map_err(store_refusal)?;
+    store::update(&state.pool, &job)
+        .await
+        .map_err(store_refusal)?;
     Ok(Json(json!({
         "id": id, "state": job.state, "finish": finish,
         "dropped_branches": dropped, "dropped_pending_starts": pending,

@@ -772,7 +772,10 @@ impl NucleosTools {
     ) -> String {
         json_result(
             self.client
-                .tree_abandon(&id, &serde_json::json!({ "reason": reason, "force": force }))
+                .tree_abandon(
+                    &id,
+                    &serde_json::json!({ "reason": reason, "force": force }),
+                )
                 .await,
         )
     }
