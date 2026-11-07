@@ -418,7 +418,9 @@ async fn root_step(pool: &SqlitePool, job: &TreeJob, parks: &mut Vec<Park>) -> R
     let report = node_report(pool, root).await?;
     if let (false, Some(outcome @ ("blocked" | "failed"))) = (report.live, report.result.as_deref())
     {
-        parks.push((root.clone(), stopped_question(root, None, outcome)));
+        let question = stopped_question(root, None, outcome)
+            + &super::gate_summary::reason_suffix(pool, root).await;
+        parks.push((root.clone(), question));
     }
     Ok(())
 }
@@ -525,7 +527,9 @@ async fn at_work(
                     return Ok(());
                 }
             }
-            parks.push((node.clone(), stopped_question(&node, Some(name), outcome)));
+            let question = stopped_question(&node, Some(name), outcome)
+                + &super::gate_summary::reason_suffix(pool, &node).await;
+            parks.push((node.clone(), question));
             return Ok(());
         }
         _ => return Ok(()),
@@ -704,21 +708,18 @@ async fn record_verdict(
 
 /// The findings of the last red gate of the branch.
 fn last_findings(branch: &super::model::Branch) -> String {
-    let text = branch
+    let entry = branch
         .gates
         .iter()
         .rev()
-        .find(|entry| entry.get("verdict").and_then(Value::as_str) == Some("red"))
+        .find(|entry| entry.get("verdict").and_then(Value::as_str) == Some("red"));
+    let text = entry
         .and_then(|entry| entry.get("log_tail").and_then(Value::as_str))
         .unwrap_or("the gate failed without output");
-    if text.len() <= FINDINGS_MAX {
-        return text.to_owned();
-    }
-    let mut start = text.len() - FINDINGS_MAX;
-    while !text.is_char_boundary(start) {
-        start += 1;
-    }
-    text[start..].to_owned()
+    let failures = entry
+        .and_then(|entry| entry.get("failures").and_then(Value::as_str))
+        .unwrap_or("");
+    super::gate_summary::findings(failures, text, FINDINGS_MAX)
 }
 
 /// True when the gate findings name a failed formatter step (`FAIL core: fmt`, `  core: fmt`).

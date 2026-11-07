@@ -11,6 +11,7 @@ pub mod driver;
 pub mod engine;
 mod final_verify;
 mod gate;
+mod gate_summary;
 #[cfg(test)]
 mod gate_tests;
 pub mod http;
