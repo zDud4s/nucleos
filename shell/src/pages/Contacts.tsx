@@ -1,6 +1,7 @@
 // §spec correspondent-contacts
 import { useId, useState, type ReactNode } from "react";
-import { isApiRefusal, type ApiRefusal } from "../data/client";
+import { isApiRefusal } from "../data/client";
+import { daemonProse } from "../team/prose";
 import {
   mergeVerdictsConflict,
   useContactMerges,
@@ -307,7 +308,7 @@ function MergeSideView({ side, role }: { side: MergeSide; role: string }) {
  *
  * The 409 is the one worth writing for: `reject_merge` and `approve_merge`
  * both guard on the pair's own standing decisions disagreeing, and the
- * daemon's own sentence names which two — see `daemonProse` below, which is
+ * daemon's own sentence names which two — see `daemonProse` (imported from `team/prose`), which is
  * what lets that exact wording through instead of this generic fallback.
  */
 const IDENTITY_SENTENCES: Record<string, string> = {
@@ -316,19 +317,6 @@ const IDENTITY_SENTENCES: Record<string, string> = {
   unprocessable: `the ${DAEMON_NAME} found nothing usable in this suggestion to act on`,
   internal: `the ${DAEMON_NAME} failed while recording the decision: nothing changed`,
 };
-
-/**
- * The daemon's own sentence, when it really sent one — `RunDetail.tsx`'s
- * pattern: a refusal under four words is a status word repeated, not prose
- * written on purpose, so only a longer one is trusted over this page's own
- * copy.
- */
-function daemonProse(refusal: ApiRefusal): Record<string, string> {
-  const detail = refusal.detail.trim();
-  if (detail === "" || detail === refusal.code) return {};
-  if (detail.split(/\s+/).length < 4) return {};
-  return { [refusal.code]: detail };
-}
 
 function DecisionNotes({
   outcome,

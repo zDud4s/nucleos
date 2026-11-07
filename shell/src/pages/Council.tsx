@@ -2,7 +2,8 @@ import { useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "@tanstack/react-router";
 import { canTakeASeat, useAgents } from "../data/agents";
 import { useAssistantModels } from "../data/chats";
-import { isApiRefusal, type ApiRefusal } from "../data/client";
+import { isApiRefusal } from "../data/client";
+import { daemonProse } from "../team/prose";
 import {
   useCancelCouncil,
   useCouncil,
@@ -131,21 +132,6 @@ function ListError({ error, onRetry }: { error: unknown; onRetry: () => void }) 
   return (
     <ErrorNote onRetry={onRetry}>Could not reach the {DAEMON_NAME}: nothing is known about the councils</ErrorNote>
   );
-}
-
-/**
- * The daemon's own sentence, when it really sent one.
- *
- * `client.ts` falls back to `statusText` for a refusal with an empty body, so a
- * bare status arrives carrying only the status word — four words is the floor
- * between that and a sentence the daemon wrote on purpose, such as the budget
- * refusal naming the limit and the spend.
- */
-function daemonProse(refusal: ApiRefusal): Record<string, string> {
-  const detail = refusal.detail.trim();
-  if (detail === "" || detail === refusal.code) return {};
-  if (detail.split(/\s+/).length < 4) return {};
-  return { [refusal.code]: detail };
 }
 
 /* ------------------------------------------------------------- convene -- */

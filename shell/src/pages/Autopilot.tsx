@@ -15,6 +15,7 @@ import { FeedEmbed } from "../app/FeedEmbed";
 import { DAEMON_NAME } from "../copy";
 import { plural } from "../lib/plural";
 import { isApiRefusal, type ApiRefusal } from "../data/client";
+import { daemonProse } from "../team/prose";
 import {
   READINESS_MIN_AGREE_PERCENT,
   READINESS_MIN_REVIEWED,
@@ -304,21 +305,6 @@ function RosterError({ error }: { error: unknown }) {
       Could not reach the {DAEMON_NAME}: nothing is known about the roster.
     </ErrorNote>
   );
-}
-
-/**
- * The daemon's own sentence, when it really sent one.
- *
- * `client.ts` falls back to `statusText` for a refusal with an empty body, so a
- * bare 422 arrives carrying the words "Unprocessable Entity" — the code spelled
- * with capital letters, explaining nothing. Four words is the line between a
- * status word and a sentence somebody wrote on purpose.
- */
-function daemonProse(refusal: ApiRefusal): Record<string, string> {
-  const detail = refusal.detail.trim();
-  if (detail === "" || detail === refusal.code) return {};
-  if (detail.split(/\s+/).length < 4) return {};
-  return { [refusal.code]: detail };
 }
 
 /* ---------------------------------------------------------------- banners -- */
