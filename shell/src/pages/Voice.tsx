@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
-import { useDictation, type CaptureOutcome, type Delivery } from "../app/Dictation";
+import { keepFocus, useDictation, type CaptureOutcome, type Delivery } from "../app/Dictation";
 import { isApiRefusal, type ApiRefusal } from "../data/client";
 import { useVoiceConversation, type ConversationView } from "../data/conversation";
 import { useHotkeyRegistration } from "../data/hotkeys";
@@ -661,7 +661,7 @@ function CaptureButtons({
         <div className="voice-capture-buttons">
           {/* Secondary on purpose: "Start talking" is the room's one primary action. These two are the
               other ways to capture speech, and the hint below says how they differ. */}
-          <Button disabled={pending} onClick={() => onPress(false)}>
+          <Button disabled={pending} onMouseDown={keepFocus} onClick={() => onPress(false)}>
             Start dictation
             {hotkey !== "" && (
               <kbd aria-hidden="true" className="voice-kbd">
@@ -669,7 +669,7 @@ function CaptureButtons({
               </kbd>
             )}
           </Button>
-          <Button disabled={pending} onClick={() => onPress(true)}>
+          <Button disabled={pending} onMouseDown={keepFocus} onClick={() => onPress(true)}>
             Start memo
             {memoHotkey !== "" && (
               <kbd aria-hidden="true" className="voice-kbd">
@@ -688,6 +688,7 @@ function CaptureButtons({
       <Button
         intent="stop"
         disabled={pending || phase === "transcribing"}
+        onMouseDown={keepFocus}
         onClick={() => onPress(activeKind === "memo")}
       >
         {phase === "recording" ? `Stop ${activeKind ?? "capture"}` : "Transcribing…"}
@@ -726,6 +727,20 @@ function CaptureOutcomeNote({ outcome }: { outcome: CaptureOutcome | null }) {
     );
   }
   if (outcome.kind === "mic-error") {
+    if (outcome.reason === "unsupported") {
+      return (
+        <ErrorNote>
+          this browser cannot open the microphone here: it needs a secure (HTTPS) connection
+        </ErrorNote>
+      );
+    }
+    if (outcome.reason === "denied") {
+      return (
+        <ErrorNote>
+          the microphone is blocked: allow it for this site in the browser, then try again
+        </ErrorNote>
+      );
+    }
     return <ErrorNote>the microphone could not be opened</ErrorNote>;
   }
   return <CaptureRefusal error={outcome.error} />;
@@ -742,7 +757,7 @@ function DeliveryNote({ delivery }: { delivery: Delivery | null }) {
   if (delivery.pasted) {
     return (
       <p className="voice-delivery" role="status">
-        pasted into the window you dictated into
+        {delivery.note ?? "pasted into the window you dictated into"}
       </p>
     );
   }

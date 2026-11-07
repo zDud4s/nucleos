@@ -36,6 +36,7 @@ impl Drop for Registration {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&self.id);
+        crate::execution::runner::cli_pids::forget(self.id);
     }
 }
 
@@ -545,6 +546,9 @@ pub(super) fn spawn_run(
             if let Ok(mut map) = run_tails.lock() {
                 map.insert(id, std::sync::Arc::clone(&transcript));
             }
+            // The liveness sweep measures silence from here, not from the run's `created_at`: a
+            // retry is a fresh CLI with an empty transcript and must not inherit the earlier age.
+            crate::execution::runner::cli_pids::begin_attempt(id);
             let context_fill = std::sync::Arc::new(std::sync::Mutex::new(None));
             // Held for this attempt only: a retry starts a fresh CLI on a fresh context, so the
             // previous attempt's mirror has nothing left to say. Dropping the guard at the end of

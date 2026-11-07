@@ -907,6 +907,31 @@ pub async fn settle_land(
     }
 }
 
+/// Gives up on an escalated landing nobody resolved: an unclaimed row is claimed (as a tree branch
+/// merge claims its conflict), so a late resolver never spends on it, and a dead landing drops its
+/// id. `Pending` when a resolution claimed it first or is still running; a success finishes the job
+/// as `settle_land` does.
+pub async fn claim_land(
+    pool: &SqlitePool,
+    job: &mut TreeJob,
+) -> Result<LandSettlement, LandingError> {
+    let Some(id) = job.manifest.extra.get("land_id").and_then(Value::as_i64) else {
+        return Ok(LandSettlement::Pending);
+    };
+    match settle_request(pool, id, Duration::ZERO, true).await? {
+        RequestEnd::Failed { reason, .. } => {
+            job.manifest
+                .extra
+                .insert("land_failure".to_owned(), json!(reason));
+            job.manifest.extra.remove("land_id");
+            persist(pool, job).await?;
+            Ok(LandSettlement::NotLanded { reason })
+        }
+        RequestEnd::Pending => Ok(LandSettlement::Pending),
+        RequestEnd::Succeeded(_) => settle_land(pool, job, Duration::ZERO).await,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // A process-wide guard held across awaits on purpose: it serialises mutation of the shared

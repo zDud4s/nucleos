@@ -1,5 +1,5 @@
 //! The document kinds the settings store knows: a trait that ties a Rust type to a name and a scope kind,
-//! and the table of the documents: the 13 fixed ones plus one `channels/<id>` row per channel manifest.
+//! and the table of the documents: the 18 fixed ones plus one `channels/<id>` row per channel manifest.
 
 use std::sync::LazyLock;
 
@@ -11,9 +11,9 @@ use super::decode::{self, Erased, Prepared};
 use super::scope::Kind;
 use crate::channels::registry::ChannelConfig;
 use crate::config::{
-    AutopilotRules, BrowserConfig, CalendarConfig, CouncilConfig, DevtimeConfig, EmailConfig,
-    GithubConfig, ModelsConfig, VerifyConfig, VoiceConfig, WebConfig, validate_devtime,
-    validate_rules,
+    AutopilotRules, BackgroundConfig, BrowserConfig, CalendarConfig, CouncilConfig, DevtimeConfig,
+    EmailConfig, GithubConfig, KeepAwakeConfig, MachineConfig, ModelsConfig, VerifyConfig,
+    VoiceConfig, WebConfig, validate_devtime, validate_rules,
 };
 use crate::engines::agy::AgyDoc;
 use crate::machine_config as files;
@@ -129,6 +129,10 @@ fn of_optional<T: Document + schemars::JsonSchema>(
 
 static DOCUMENTS: LazyLock<Vec<DocType>> = LazyLock::new(|| {
     let mut docs = vec![
+        of::<MachineConfig>(
+            files::MACHINE_FILE,
+            "when the daemon restarts — channel and scheduled-routine supervision are selected at startup",
+        ),
         of::<EmailConfig>(
             files::EMAIL_FILE,
             "when the daemon restarts — the mailbox is polled by a sidecar started with this file's contents",
@@ -156,6 +160,10 @@ static DOCUMENTS: LazyLock<Vec<DocType>> = LazyLock::new(|| {
             files::AGY_FILE,
             "a chat reads the switch at once; the router drops agy at once but only gains it when the daemon restarts; a primary_runner of agy takes effect when the daemon restarts",
         ),
+        of::<crate::accounts::settings::AccountPoolDoc>(
+            "account_pool.yaml",
+            "at once for the next chat turn or run launch",
+        ),
         of::<ModelsConfig>(
             crate::config::MODELS_CONFIG_FILE,
             "the model picker refreshes at once; the routes themselves are built at startup and move when the daemon restarts",
@@ -164,6 +172,8 @@ static DOCUMENTS: LazyLock<Vec<DocType>> = LazyLock::new(|| {
             files::VERIFY_FILE,
             "on the next command for switching admission off and for its weights; everything else, including switching it on from off, when the daemon restarts",
         ),
+        of::<KeepAwakeConfig>(files::KEEP_AWAKE_FILE, "when the daemon restarts"),
+        of::<BackgroundConfig>(files::BACKGROUND_FILE, "when the daemon restarts"),
         of::<DevtimeConfig>(
             files::DEVTIME_FILE,
             "when the daemon restarts — except that on a save or a reset the actions.* settings apply from the next ingest cycle, and the pending actions decided under other actions.* thresholds are voided at once (those the owner marked stay)",
@@ -216,6 +226,11 @@ impl Document for EmailConfig {
     fn finish(self) -> Result<Self, String> {
         Ok(self.validated())
     }
+}
+
+impl Document for MachineConfig {
+    const NAME: &'static str = "machine";
+    const KIND: Kind = Kind::Machine;
 }
 
 impl Document for VoiceConfig {
@@ -288,6 +303,20 @@ impl Document for VerifyConfig {
     }
 }
 
+impl Document for KeepAwakeConfig {
+    const NAME: &'static str = "keep_awake";
+    const KIND: Kind = Kind::Machine;
+}
+
+impl Document for BackgroundConfig {
+    const NAME: &'static str = "background";
+    const KIND: Kind = Kind::Machine;
+    fn finish(self) -> Result<Self, String> {
+        self.check()?;
+        Ok(self)
+    }
+}
+
 impl Document for DevtimeConfig {
     const NAME: &'static str = "devtime";
     const KIND: Kind = Kind::Machine;
@@ -330,16 +359,16 @@ mod tests {
     }
 
     #[test]
-    fn there_are_thirteen_documents_with_unique_names() {
-        // 14 fixed documents plus one `channels/<id>` per manifest.
+    fn there_are_eighteen_documents_with_unique_names() {
+        // 18 fixed documents plus one `channels/<id>` per manifest.
         let channels = crate::channels::registry::MANIFESTS.len();
         let docs = documents();
-        assert_eq!(docs.len(), 14 + channels);
+        assert_eq!(docs.len(), 18 + channels);
         let names: BTreeSet<_> = docs.iter().map(|doc| doc.name).collect();
-        assert_eq!(names.len(), 14 + channels);
+        assert_eq!(names.len(), 18 + channels);
         assert_eq!(
             docs.iter().filter(|doc| doc.kind == Kind::Machine).count(),
-            12 + channels
+            16 + channels
         );
         let project: Vec<_> = docs
             .iter()
@@ -428,6 +457,12 @@ mod tests {
             (doc.load)(&body.to_string()).expect("a stored row with an extra key still loads");
         let config = loaded.downcast::<VerifyConfig>().expect("a VerifyConfig");
         assert_eq!(config.capacity, 3);
+    }
+
+    #[test]
+    fn zero_hours_of_background_silence_is_refused() {
+        assert!(prepared_text("background", &json!({"background_silence_hours": 0})).is_err());
+        assert!(prepared_text("background", &json!({"background_silence_hours": 1})).is_ok());
     }
 
     #[test]

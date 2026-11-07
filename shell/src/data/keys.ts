@@ -680,6 +680,8 @@ export const keys = {
     backups: ["system", "backups"] as const,
     /** `GET /system/storage` — what the database file and the folders beside it occupy. */
     storage: ["system", "storage"] as const,
+    /** `GET /system/autostart` — when the daemon starts on its own, and what this platform allows. */
+    autostart: ["system", "autostart"] as const,
     tokens: ["system", "tokens"] as const,
     /** `GET /engines/<engine>` — the opt-in state of one CLI engine. */
     engine: (engine: string) => ["system", "engine", engine] as const,

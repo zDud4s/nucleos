@@ -482,6 +482,31 @@ tests:
             .collect()
     }
 
+    /// The live case (2026-11-04): a tree branch whose only change was this file ran the whole
+    /// core suite as its gate. With filters on (a tree branch's gate) it runs its module alone.
+    #[test]
+    fn the_repository_s_map_narrows_a_model_adapter_change_to_its_module() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .unwrap();
+        let map = match crate::tests_map::load(root) {
+            crate::tests_map::MapState::Valid(map) => map,
+            other => panic!("{}: {other:?}", crate::tests_map::MAP_FILE),
+        };
+        let changed = ["core/src/models/openai_compatible.rs"];
+        let selection = select(&map, &paths(&changed), &all_fillable(&changed), true);
+        assert!(!selection.full);
+        assert_eq!(selection.units.len(), 1, "{:?}", selection.units);
+        assert_eq!(selection.units[0].group, "core");
+        assert_eq!(
+            selection.units[0].argv.last().map(String::as_str),
+            Some("test(/^models::/)"),
+            "{:?}",
+            selection.units[0].argv
+        );
+    }
+
     #[test]
     fn every_serial_a_filter_names_is_a_nextest_test_group() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))

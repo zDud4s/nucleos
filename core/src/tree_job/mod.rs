@@ -9,6 +9,7 @@ pub mod decisions;
 pub mod docs_paths;
 pub mod driver;
 pub mod engine;
+mod final_verify;
 mod gate;
 mod gate_summary;
 #[cfg(test)]
@@ -20,6 +21,8 @@ pub mod node_run;
 pub mod open;
 mod relaunch;
 pub mod report;
+mod rescue;
+mod retry;
 pub mod root;
 pub mod store;
 pub mod wrap;

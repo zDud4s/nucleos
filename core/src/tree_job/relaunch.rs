@@ -114,12 +114,14 @@ pub async fn latest_launch(
 pub(super) const WRAP_PREFIX: &str = "wrap-";
 pub(super) const DIED_PREFIX: &str = "died-";
 pub(super) const FIX_PREFIX: &str = "fix-";
+pub(super) const RESCUE_PREFIX: &str = "rescue-";
 pub(super) const TRANSIENT_PREFIX: &str = "transient-";
 const RESUME_PREFIX: &str = "resume-";
-const SUFFIXED_KEY_PREFIXES: [&str; 5] = [
+const SUFFIXED_KEY_PREFIXES: [&str; 6] = [
     WRAP_PREFIX,
     DIED_PREFIX,
     FIX_PREFIX,
+    RESCUE_PREFIX,
     TRANSIENT_PREFIX,
     RESUME_PREFIX,
 ];
