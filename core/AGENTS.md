@@ -350,6 +350,7 @@ the contract, not a snapshot.
 | `tree_job/wrap.rs` | Wrapping up a node run that already reported, and starting a branch node again when its run ended with a handoff or died without a report. |
 | `tree_job/decisions.rs` | Parking a branch on a decision for the owner (`park`), resuming it on the answer (`answer`, which only moves state: call `open::answer_and_relaunch` to also start the node again), and the single list of decisions. Both hold the job lock. |
 | `tree_job/gate.rs` | The production gate of a tree branch: at most one verify ticket per branch and HEAD, remembered on the branch and read or awaited by the next gate instead of submitting again. |
+| `tree_job/gate_summary.rs` | What the owner's inbox shows about a stopped branch: the failing lines of a gate log (taken from the whole log, not its tail) and the reason a node gave for stopping (taken from its report). |
 | `tree_job/gate_tests.rs` | Test-only: tests for the per-branch gate ticket dedupe (`gate.rs`). |
 | `tree_job/retry.rs` | Bounded retries of the tree driver: a gate that keeps measuring nothing, a landing that keeps failing or waits on a resolver nobody runs, and a green branch that waits on a base that will not merge. Each has an allowance persisted in the manifest; past it the owner is asked once. |
 | `tree_job/root_pending.rs` | A tree job whose root run has not started yet: the `root_start` marker in `manifest.extra` that `POST /trees` leaves when the start is refused, and the driver retry that clears it. |
