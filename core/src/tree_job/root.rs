@@ -242,18 +242,21 @@ async fn retry_failed_start(state: &AppState, job: &TreeJob, record: &Value) -> 
         None => return Ok(()),
         // Started meanwhile (an answer's relaunch, say): the record is stale.
         Some(Some(_)) => {
-            edit_start_record(state, &job.id, |extra| extra.remove(ROOT_START_KEY).is_some())
-                .await;
+            edit_start_record(state, &job.id, |extra| {
+                extra.remove(ROOT_START_KEY).is_some()
+            })
+            .await;
             return Ok(());
         }
         Some(None) => {}
     }
     if let Some(decision) = record.get("decision_id").and_then(Value::as_str) {
-        let status: Option<String> = sqlx::query_scalar("SELECT status FROM decisions WHERE id = ?")
-            .bind(decision)
-            .fetch_optional(pool)
-            .await
-            .map_err(|error| error.to_string())?;
+        let status: Option<String> =
+            sqlx::query_scalar("SELECT status FROM decisions WHERE id = ?")
+                .bind(decision)
+                .fetch_optional(pool)
+                .await
+                .map_err(|error| error.to_string())?;
         if status.as_deref() == Some(decisions::STATUS_OPEN) {
             return Ok(());
         }
@@ -295,6 +298,10 @@ async fn retry_failed_start(state: &AppState, job: &TreeJob, record: &Value) -> 
             }
             return Ok(());
         }
+    }
+    // A refused admission waits out a backoff before the next try (see `watchdog`).
+    if super::watchdog::root_start_waits(record) {
+        return Ok(());
     }
     start(state, job).await.map(|_| ())
 }
@@ -716,6 +723,25 @@ mod tests {
     /// `POST /trees` answers 200 when the root cannot start (here: the project root is not there
     /// yet), and the job stays open. The 60-second sweep starts it once it can, instead of leaving an
     /// open job with no run that nothing ever moves again.
+    /// Moves a recorded root-start failure back in time, past any admission backoff, so the next
+    /// sweep may retry it at once.
+    async fn age_start_record(state: &AppState) {
+        super::edit_start_record(state, TREE, |extra| {
+            match extra
+                .get_mut(super::ROOT_START_KEY)
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                Some(record) => {
+                    let old = chrono::Utc::now() - chrono::Duration::hours(2);
+                    record.insert("at".to_owned(), json!(old.to_rfc3339()));
+                    true
+                }
+                None => false,
+            }
+        })
+        .await;
+    }
+
     #[tokio::test]
     async fn a_root_start_that_failed_is_retried_by_the_sweep() {
         let container = space_free_tempdir("tree-root-retry-");
@@ -725,6 +751,7 @@ mod tests {
         assert_eq!(run, None, "no repository yet: the start failed");
 
         tree_repo(&container);
+        age_start_record(&state).await;
         crate::tree_job::wrap::tick(&state).await;
 
         let (_, run) = root_run(&state).await;
@@ -740,6 +767,7 @@ mod tests {
         let (state, _runner) = start_tree(&missing, Some(Duration::from_secs(5))).await;
 
         for _ in 0..10 {
+            age_start_record(&state).await;
             crate::tree_job::wrap::tick(&state).await;
         }
 
@@ -758,6 +786,7 @@ mod tests {
         crate::tree_job::open::answer_and_relaunch(&state, &asked[0].0, "it is there now", "shell")
             .await
             .unwrap();
+        age_start_record(&state).await;
         crate::tree_job::wrap::tick(&state).await;
 
         let (_, run) = root_run(&state).await;

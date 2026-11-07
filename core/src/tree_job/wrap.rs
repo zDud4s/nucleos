@@ -80,6 +80,7 @@ type NodeRow = (String, String, Option<String>, Option<String>);
 /// to call again at any time: every relaunch is keyed by the run it follows.
 pub async fn tick(state: &AppState) {
     wrap_running_nodes(state).await;
+    super::watchdog::sweep(state).await;
     super::root::retry_failed_starts(state).await;
 }
 
@@ -105,12 +106,24 @@ async fn wrap_running_nodes(state: &AppState) {
         if handled >= MAX_NODES_PER_TICK {
             break;
         }
+        // A relaunch that failed waits out its backoff (see `watchdog`).
+        if super::watchdog::backing_off(&state.pool, &node_id).await {
+            continue;
+        }
         match wrap_node(state, &node_id, &job_id, run_id, handoff).await {
             Ok(false) => {}
-            Ok(true) => handled += 1,
+            Ok(true) => {
+                handled += 1;
+                super::watchdog::record_success(&state.pool, &node_id).await;
+            }
             Err(error) => {
                 handled += 1;
                 tracing::warn!(node = %node_id, %error, "tree wrap-up failed for the node");
+                if let Err(error) =
+                    super::watchdog::record_failure(&state.pool, &job_id, &node_id, &error).await
+                {
+                    tracing::warn!(node = %node_id, %error, "watchdog could not record the failure");
+                }
             }
         }
     }
@@ -1063,7 +1076,11 @@ mod tests {
 
         tick(&state).await;
 
-        assert_eq!(launches(&state, NODE, "died-").await, 2, "no died link spent");
+        assert_eq!(
+            launches(&state, NODE, "died-").await,
+            2,
+            "no died link spent"
+        );
         assert_eq!(all_launches(&state, NODE).await, 3, "one new launch");
         let (branch, asked) = parked_and_asked(&state).await;
         assert_eq!(branch, "building", "not parked: {asked:?}");
@@ -1080,7 +1097,11 @@ mod tests {
         seed_rate_limited_run(&state, 62, chrono::Duration::seconds(1)).await;
 
         tick(&state).await;
-        assert_eq!(all_launches(&state, NODE).await, 0, "still inside the backoff");
+        assert_eq!(
+            all_launches(&state, NODE).await,
+            0,
+            "still inside the backoff"
+        );
 
         sqlx::query("UPDATE runs SET completed_at = ? WHERE id = 62")
             .bind((chrono::Utc::now() - chrono::Duration::minutes(10)).to_rfc3339())
@@ -1089,7 +1110,11 @@ mod tests {
             .unwrap();
         tick(&state).await;
 
-        assert_eq!(all_launches(&state, NODE).await, 1, "relaunched once it passed");
+        assert_eq!(
+            all_launches(&state, NODE).await,
+            1,
+            "relaunched once it passed"
+        );
         assert_eq!(launches(&state, NODE, "died-").await, 0);
     }
 
@@ -1111,7 +1136,11 @@ mod tests {
         let (branch, asked) = parked_and_asked(&state).await;
         assert_eq!(branch, "parked");
         assert_eq!(asked.len(), 1, "asked once: {asked:?}");
-        assert!(asked[0].to_lowercase().contains("api error"), "{:?}", asked[0]);
+        assert!(
+            asked[0].to_lowercase().contains("api error"),
+            "{:?}",
+            asked[0]
+        );
     }
 
     /// The owner's answer is a fresh allowance, as it is for the fix cap: died links from before
@@ -1139,7 +1168,12 @@ mod tests {
         let state = state().await;
         seed_node(&state, Some("building"), "open", NODE, Some(65)).await;
         seed_launch(&state, NODE).await;
-        for key in ["wrap-old-1", "wrap-old-2", "wrap-old-3", "decision-d-answered"] {
+        for key in [
+            "wrap-old-1",
+            "wrap-old-2",
+            "wrap-old-3",
+            "decision-d-answered",
+        ] {
             prior_link(&state, NODE, key).await;
         }
         seed_run(&state, 65, "interrupted").await;

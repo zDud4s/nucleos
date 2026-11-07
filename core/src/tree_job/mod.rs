@@ -21,4 +21,5 @@ mod relaunch;
 pub mod report;
 pub mod root;
 pub mod store;
+pub mod watchdog;
 pub mod wrap;
