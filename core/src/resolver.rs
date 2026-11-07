@@ -42,10 +42,66 @@ pub async fn run_resolution_loop(state: AppState) {
     loop {
         interval.tick().await;
         cancel_settled(&state).await;
+        release_unfinished(&state.pool).await;
         launch_once(&state).await;
         land_finished(&state.pool, &mut refused).await;
         record_discards(&state.pool).await;
         settle_moot(&state.pool).await;
+    }
+}
+
+/// Total resolution runs one conflict may be given, the first included. An attempt that ended
+/// without a verdict is retried until this many have been spent; after that the row stays
+/// escalated for a person, as it always did.
+const MAX_RESOLUTION_ATTEMPTS: i64 = 3;
+
+/// Frees escalated conflicts whose resolution run ended without a verdict, so `next_conflict`
+/// mints a fresh attempt.
+///
+/// **Only `cancelled` and `interrupted`.** Those are runs that were stopped — a restart, a cancel —
+/// before the agent said anything. A run that finished, failed or gave up had its attempt, and
+/// that stays a person's. A row somebody settled (`settled_at`), one a later success already
+/// settled, or one no longer `escalated` is left alone, and `MAX_RESOLUTION_ATTEMPTS` bounds the
+/// loop. The count is `resolution_attempts`, bumped by the claim in `create_run_with`.
+/// Returns how many rows were released.
+async fn release_unfinished(pool: &sqlx::SqlitePool) -> u64 {
+    let released = sqlx::query(
+        "UPDATE vcs_requests
+            SET resolution_run_id = NULL
+          WHERE status = 'escalated'
+            AND op = 'merge'
+            AND from_resolution = 0
+            AND settled_at IS NULL
+            AND resolution_run_id IS NOT NULL
+            AND resolution_attempts < ?
+            AND resolution_run_id IN (
+                SELECT id FROM runs WHERE status IN ('cancelled', 'interrupted')
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM vcs_requests AS settled
+                 WHERE settled.project_id = vcs_requests.project_id
+                   AND settled.args = vcs_requests.args
+                   AND settled.status = 'succeeded'
+                   AND settled.id > vcs_requests.id
+            )",
+    )
+    .bind(MAX_RESOLUTION_ATTEMPTS)
+    .execute(pool)
+    .await;
+    match released {
+        Ok(done) => {
+            if done.rows_affected() > 0 {
+                tracing::info!(
+                    released = done.rows_affected(),
+                    "resolver: releasing conflicts whose resolution ended without a verdict for a fresh attempt"
+                );
+            }
+            done.rows_affected()
+        }
+        Err(error) => {
+            tracing::warn!(%error, "resolver: could not release unfinished resolutions");
+            0
+        }
     }
 }
 
@@ -294,6 +350,11 @@ async fn launch_once(state: &AppState) -> Option<i64> {
         .await
         .unwrap_or(true)
     {
+        // Said once per tick at info: a silent skip looked like the resolver being broken when
+        // conflicts sat unattempted behind an engaged switch.
+        tracing::info!(
+            "resolver: kill switch engaged (or unreadable); no conflict resolution started"
+        );
         return None;
     }
     // A resolution costs an agent, so it is spend, and spend is what the budget governs.
@@ -1248,6 +1309,72 @@ mod tests {
         .await
         .expect("publish it");
         id
+    }
+
+    /// A resolution run that was cancelled or interrupted gets a fresh attempt, up to the cap; one
+    /// that finished, a settled row, and a row at the cap are left alone.
+    #[tokio::test]
+    async fn an_attempt_without_a_verdict_is_released_for_a_fresh_one() {
+        let pool = test_pool().await;
+        let cancelled = escalated_merge_of(&pool, "feat/c", false).await;
+        let interrupted = escalated_merge_of(&pool, "feat/i", false).await;
+        let failed = escalated_merge_of(&pool, "feat/f", false).await;
+        let settled = escalated_merge_of(&pool, "feat/s", false).await;
+        let capped = escalated_merge_of(&pool, "feat/k", false).await;
+        for (req, run, status) in [
+            (cancelled, 1, "cancelled"),
+            (interrupted, 2, "interrupted"),
+            (failed, 3, "failed"),
+            (settled, 4, "cancelled"),
+            (capped, 5, "cancelled"),
+        ] {
+            insert_run(&pool, run, status).await;
+            resolving(&pool, req, run).await;
+            sqlx::query("UPDATE vcs_requests SET resolution_attempts = 1 WHERE id = ?")
+                .bind(req)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "UPDATE vcs_requests SET settled_at = 'now', settled_reason = 'dismissed' WHERE id = ?",
+        )
+        .bind(settled)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE vcs_requests SET resolution_attempts = ? WHERE id = ?")
+            .bind(MAX_RESOLUTION_ATTEMPTS)
+            .bind(capped)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(release_unfinished(&pool).await, 2);
+
+        let free: Vec<i64> = sqlx::query_scalar(
+            "SELECT id FROM vcs_requests WHERE resolution_run_id IS NULL ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(free, vec![cancelled, interrupted]);
+        let next = next_conflict(&pool)
+            .await
+            .unwrap()
+            .expect("a released conflict");
+        assert_eq!(next.id, cancelled);
+    }
+
+    /// A cancelled attempt whose merge a later request already published is not retried.
+    #[tokio::test]
+    async fn a_cancelled_attempt_on_a_settled_merge_is_not_retried() {
+        let pool = test_pool().await;
+        let req = escalated_merge_of(&pool, "feat/done", false).await;
+        insert_run(&pool, 1, "cancelled").await;
+        resolving(&pool, req, 1).await;
+        succeeded_merge_of(&pool, "feat/done", false).await;
+        assert_eq!(release_unfinished(&pool).await, 0);
     }
 
     /// The three exclusions, each of which prevents a different runaway.

@@ -628,19 +628,6 @@ fn route_is_listed_as(
         .any(|(allowed, pattern)| allowed == method && path_matches(pattern, path, target))
 }
 
-/// The header the remote gateway forwards a browser's session secret in. Never logged.
-pub const DEVICE_SESSION_HEADER: &str = "x-nucleos-device-session";
-
-/// What the gateway's key reaches on its own, with no device session: the pairing exchange, which
-/// is the one call made before a browser has a session.
-const REMOTE_GATEWAY_ROUTES: &[(Method, &str)] = &[(Method::POST, "/remote/pair")];
-
-/// Open to every paired device whatever its level: reading itself and logging out.
-const REMOTE_SELF_ROUTES: &[(Method, &str)] = &[
-    (Method::GET, "/remote/session"),
-    (Method::POST, "/remote/logout"),
-];
-
 /// The ONLY first path segments a remote device may reach. Derived from what the phone UI calls:
 /// the read tables' families (status, health, projects, runs, ...) plus the run-launching ones
 /// (`jobs`, `presets`), and the VCS queue (`vcs`, owner's call 2026-10-28). Everything else is refused to read-only and run-creating devices; an
@@ -665,6 +652,7 @@ const REMOTE_ALLOWED_SEGMENTS: &[&str] = &[
     "proposals",
     "scoreboard",
     "shadow-decisions",
+    "stepup",
     "vcs",
 ];
 
@@ -677,11 +665,16 @@ const REMOTE_ALLOWED_SEGMENTS: &[&str] = &[
 const REMOTE_ADMIN_SEGMENTS: &[&str] = &[
     "agents",
     "assistant",
+    // Admin-only on a paired device: no route is read-only or run-creating, and a future GET must
+    // not open it to lower levels by accident.
+    "backlog",
     "calendar",
     "capture-requests",
     "contacts",
     "context-refs",
     "council",
+    // Admin-only on a paired device (work-decision queue).
+    "decisions",
     "distill",
     "email",
     "engines",
@@ -697,6 +690,8 @@ const REMOTE_ADMIN_SEGMENTS: &[&str] = &[
     "pii",
     "quota",
     "settings",
+    // Admin-only on a paired device (scan, extraction, audit and dependency work).
+    "specs",
     "team-actions",
     "team-runs",
     "team-triggers",
@@ -725,7 +720,6 @@ const REMOTE_ADMIN_SEGMENTS: &[&str] = &[
 const REMOTE_DENIED_SEGMENTS: &[&str] = &[
     "admission",
     "api-tokens",
-    "backlog",
     "backup",
     "backups",
     "browser",
@@ -737,15 +731,15 @@ const REMOTE_DENIED_SEGMENTS: &[&str] = &[
     "context",
     "cost",
     "daemon",
-    "decisions",
+    "fs",
     "hooks",
+    "machine",
     "models",
     "nodes",
     "pricing",
     "remote",
     "routes",
     "sidecars",
-    "specs",
     "system",
     "tasks",
     "team-files",
@@ -760,69 +754,103 @@ const REMOTE_DENIED_SEGMENTS: &[&str] = &[
     "workflow",
 ];
 
-/// Routes inside admin segments that no device reaches, whatever its level. `POST
-/// /assistant/browser-agents` starts a browser on the host, the host-only surface the `browser`
-/// deny covers (listing linked browser conversations, `GET`, stays open). `/email/incoming` and
-/// `/email/cursor` are the email sidecar's ingestion surface, not a working surface: a device
-/// reaching them could inject forged inbound mail into triage.
-const REMOTE_DEVICE_REFUSED_ROUTES: &[(Method, &str)] = &[
-    (Method::POST, CHAT_BROWSER_AGENT_ROUTE),
-    (Method::POST, "/email/incoming"),
-    (Method::GET, "/email/cursor"),
+/// First path segments an OWNER device reaches on top of the Admin ones: the owner's own laptop
+/// doing what only the host did until now (secrets and machine settings under `config`, backups,
+/// sidecars, the shutdown/restart/update handshake, messaging identity pairing, remote device
+/// management, minting API tokens, the live browser). Every one of them is also in
+/// [`REMOTE_DENIED_SEGMENTS`], which stays the list for the non-owner levels. The agent-only
+/// families (`tasks`, `hooks`, `admission`, `verify`, ...) are in neither list for an owner: an
+/// owner is the person, never an agent. Graded as the Admin token, like the admin segments.
+const REMOTE_OWNER_SEGMENTS: &[&str] = &[
+    "api-tokens",
+    "backups",
+    "backup",
+    "config",
+    "daemon",
+    "fs",
+    "sidecars",
+    "system",
+    "remote",
+    "channels",
+    "browser",
 ];
 
-/// What a request carried by a paired remote device may reach. Matched against the route template.
-///
-/// 1. [`REMOTE_SELF_ROUTES`] are open to every level.
-/// 2. A first segment in [`REMOTE_ALLOWED_SEGMENTS`] is graded as the API token of the same level
-///    (`grants`): read-only gets `READ_ONLY_ROUTES`, run-creating adds `RUN_CREATING_ROUTES`,
-///    admin gets everything under the segment.
-/// 3. A first segment in [`REMOTE_ADMIN_SEGMENTS`] is reachable only by an Admin device, graded as
-///    the Admin token (owner decision 2026-10-29: the owner working from another machine).
-/// 4. Anything else is refused, whatever the level: the hard-deny set in
-///    [`REMOTE_DENIED_SEGMENTS`] (shutdown/update, machine settings and secrets, backups,
-///    credential minting, sidecar control, messaging identity pairing, the remote owner surface,
-///    host-only live browser pixels) and any unlisted family.
-///
-/// A few routes inside admin segments stay refused: see [`REMOTE_DEVICE_REFUSED_ROUTES`].
-pub fn remote_device_permits(level: ApiTokenLevel, method: &Method, route: &str) -> bool {
-    if REMOTE_SELF_ROUTES
-        .iter()
-        .any(|(allowed, pattern)| allowed == method && *pattern == route)
-    {
-        return true;
-    }
-    if REMOTE_DEVICE_REFUSED_ROUTES
-        .iter()
-        .any(|(refused, pattern)| refused == method && *pattern == route)
-    {
-        return false;
-    }
-    let first = route
-        .trim_start_matches('/')
-        .split('/')
-        .next()
-        .unwrap_or("");
-    if REMOTE_ALLOWED_SEGMENTS.contains(&first) {
-        return grants(&Scope::ApiToken(level), method, route, Target::Route);
-    }
-    if level == ApiTokenLevel::Admin && REMOTE_ADMIN_SEGMENTS.contains(&first) {
-        return grants(
-            &Scope::ApiToken(ApiTokenLevel::Admin),
-            method,
-            route,
-            Target::Route,
-        );
-    }
-    false
-}
+/// First path segments no device reaches at any level, owner included, each with the reason. An
+/// owner is the person; these belong to agent sessions or to the host's own plumbing. Together with
+/// [`REMOTE_OWNER_SEGMENTS`] they make up [`REMOTE_DENIED_SEGMENTS`] exactly (the guard test pins
+/// that), so a segment can only be refused with a written reason. `chats`, `routes` and
+/// `team-recruits` are not agent surfaces; they are listed here because the shell never calls them
+/// over the API, which is the same "no device has a use for it" answer.
+#[cfg_attr(not(test), allow(dead_code))]
+const REMOTE_AGENT_ONLY_SEGMENTS: &[(&str, &str)] = &[
+    (
+        "admission",
+        "the admission gate agent sessions are checked against",
+    ),
+    (
+        "capture-digests",
+        "digests an agent session writes about its own capture",
+    ),
+    (
+        "chats",
+        "only a shell page route; the chat API is `assistant`",
+    ),
+    ("context", "context an agent session pulls for its own turn"),
+    (
+        "conductor",
+        "liveness reports and resume control for agent sessions",
+    ),
+    (
+        "cost",
+        "tree-budget coordination and cache accounting for agent work",
+    ),
+    ("hooks", "the hook endpoints agent sessions call back into"),
+    (
+        "machine",
+        "the daemon role is a control-token-only machine setting",
+    ),
+    (
+        "models",
+        "the model catalogue agent sessions pick from; the shell never calls it",
+    ),
+    ("nodes", "node registration of agent runtimes"),
+    ("pricing", "price tables the host's cost accounting reads"),
+    ("routes", "the route index searched by agent sessions"),
+    ("tasks", "the claim board agent sessions coordinate through"),
+    ("team-files", "files agents of a team exchange"),
+    ("team-notes", "notes agents of a team exchange"),
+    ("team-pressure", "pressure signals between agents of a team"),
+    (
+        "team-recruits",
+        "agent recruiting inside a team; the shell never calls it",
+    ),
+    ("team-reports", "reports agents of a team file"),
+    (
+        "trees",
+        "node-tree RPC that agent sessions use to coordinate work",
+    ),
+    ("v1", "the agent-facing versioned API"),
+    (
+        "verify",
+        "the verification endpoints an agent session calls",
+    ),
+    (
+        "webhooks",
+        "inbound webhooks from external services, not a device surface",
+    ),
+    (
+        "workflow",
+        "the workflow phase endpoints an agent session calls",
+    ),
+];
 
-/// Request extension set when the caller is a paired remote device: which one. Handlers that need
-/// to know (logout) read this instead of trusting a body.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RemoteDevice {
-    pub id: i64,
-}
+mod remote;
+#[cfg(test)]
+use remote::REMOTE_DEVICE_REFUSED_ROUTES;
+use remote::REMOTE_GATEWAY_ROUTES;
+pub use remote::{DEVICE_SESSION_HEADER, RemoteDevice, remote_device_permits};
+mod grave;
+pub use grave::{GRAVE_ROUTES, is_grave};
 
 fn is_param(segment: &str) -> bool {
     segment.starts_with('{') && segment.ends_with('}')
@@ -1494,7 +1522,11 @@ pub async fn require_token(
         match crate::remote::authenticate(&state.pool, secret, chrono::Utc::now()).await {
             Ok(found) => {
                 scope = Scope::ApiToken(found.level);
-                device = Some(RemoteDevice { id: found.id });
+                device = Some(RemoteDevice {
+                    id: found.id,
+                    owner: found.owner,
+                    stepped_up: found.stepped_up,
+                });
             }
             Err(_) => return Ok(session_invalid()),
         }
@@ -1508,12 +1540,16 @@ pub async fn require_token(
     // no template and falls back to its path — it is headed for a 404 either way.
     let mut allowed = match (req.extensions().get::<MatchedPath>(), &device) {
         // A paired device is graded by its own function: the deny list sits in front of `grants`.
-        (Some(matched), Some(_)) => match &scope {
-            Scope::ApiToken(level) => remote_device_permits(*level, req.method(), matched.as_str()),
+        (Some(matched), Some(found)) => match &scope {
+            Scope::ApiToken(level) => {
+                remote_device_permits(*level, found.owner, req.method(), matched.as_str())
+            }
             _ => false,
         },
-        (None, Some(_)) => match &scope {
-            Scope::ApiToken(level) => remote_device_permits(*level, req.method(), req.uri().path()),
+        (None, Some(found)) => match &scope {
+            Scope::ApiToken(level) => {
+                remote_device_permits(*level, found.owner, req.method(), req.uri().path())
+            }
             _ => false,
         },
         (Some(matched), None) => permits_route(&scope, req.method(), matched.as_str()),
@@ -1602,6 +1638,28 @@ pub async fn require_token(
             "refused a request outside the caller's scope"
         );
         return Err(StatusCode::FORBIDDEN);
+    }
+    // A grave action needs a live step-up from the device. Only a device is asked: every other
+    // caller has `device == None` and passes untouched. Graded after the reach check, so a route
+    // the device may not reach at all stays a bodiless 403.
+    if let Some(found) = &device
+        && !found.stepped_up
+        && is_grave(
+            req.method(),
+            route.as_deref().unwrap_or_else(|| req.uri().path()),
+        )
+    {
+        tracing::warn!(
+            device = found.id,
+            method = %req.method(),
+            path = %req.uri().path(),
+            "refused a grave action without a fresh step-up"
+        );
+        return Ok((
+            StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({ "refusal": "step_up_required" })),
+        )
+            .into_response());
     }
 
     // Any admitted request of a channel key is a sign of life for that adapter, not only the
@@ -1824,6 +1882,7 @@ mod tests {
             .route("/remote/pairing-codes", post(|| async {}))
             .route("/remote/devices", get(|| async {}))
             .route("/remote/devices/{id}", axum::routing::delete(|| async {}))
+            .route("/remote/step-up/ticket/consume", post(|| async {}))
             .route("/daemon/shutdown", post(|| async {}))
             .route("/system/shutdown", post(|| async {}))
             .route("/config/secrets", get(|| async {}))
@@ -1980,6 +2039,478 @@ mod tests {
         ApiTokenLevel::RunCreating,
         ApiTokenLevel::Admin,
     ];
+
+    /// The tests below this line grade an ordinary (non-owner) device unless they say otherwise;
+    /// this shadows the glob-imported function with the owner flag fixed to false.
+    fn remote_device_permits(level: ApiTokenLevel, method: &Method, route: &str) -> bool {
+        super::remote_device_permits(level, false, method, route)
+    }
+
+    fn owner_permits(method: &Method, route: &str) -> bool {
+        super::remote_device_permits(ApiTokenLevel::Admin, true, method, route)
+    }
+
+    /// Route templates under each owner segment, taken from `REMOTE_OWNER_ONLY` and the restart
+    /// route added later.
+    const OWNER_ROUTES: &[(&str, &str)] = &[
+        ("POST", "/daemon/shutdown"),
+        ("POST", "/daemon/update"),
+        ("POST", "/system/shutdown"),
+        ("POST", "/system/restart"),
+        ("GET", "/system/update-readiness"),
+        ("GET", "/system/autostart"),
+        ("GET", "/api-tokens"),
+        ("DELETE", "/api-tokens/{name}"),
+        ("GET", "/config/secrets"),
+        ("DELETE", "/config/secrets/{key}"),
+        ("POST", "/backup"),
+        ("GET", "/backups"),
+        ("POST", "/backups/{name}/restore"),
+        ("POST", "/sidecars/{name}/restart"),
+        ("GET", "/fs/dirs"),
+        ("POST", "/channels/{channel}/pairing"),
+        ("GET", "/browser/sessions/{id}/live"),
+        ("POST", "/remote/pairing-codes"),
+        ("GET", "/remote/devices"),
+        ("DELETE", "/remote/devices/{id}"),
+    ];
+
+    #[test]
+    fn owner_device_reaches_every_owner_segment() {
+        for segment in REMOTE_OWNER_SEGMENTS {
+            assert!(
+                REMOTE_DENIED_SEGMENTS.contains(segment),
+                "{segment} is an owner segment and must stay denied to the other levels"
+            );
+            assert!(
+                OWNER_ROUTES
+                    .iter()
+                    .any(|(_, route)| route.trim_start_matches('/').starts_with(segment)),
+                "no route below covers the owner segment {segment}"
+            );
+        }
+        for (method, route) in OWNER_ROUTES {
+            let method = Method::from_bytes(method.as_bytes()).unwrap();
+            assert!(owner_permits(&method, route), "owner {method} {route}");
+        }
+        // The owner still reaches the admin and allow-listed working surfaces.
+        for (method, route) in REMOTE_ADMIN_WORKING_ROUTES {
+            let method = Method::from_bytes(method.as_bytes()).unwrap();
+            assert!(owner_permits(&method, route), "owner {method} {route}");
+        }
+        assert!(owner_permits(&Method::GET, "/status"));
+    }
+
+    #[test]
+    fn no_device_reaches_a_gateway_only_route() {
+        for (method, route) in REMOTE_GATEWAY_ROUTES {
+            assert!(!owner_permits(method, route), "owner {method} {route}");
+            for level in ALL_LEVELS {
+                assert!(
+                    !remote_device_permits(level, method, route),
+                    "{level:?} {method} {route}"
+                );
+            }
+        }
+        // Next to them the owner still manages devices and codes.
+        assert!(owner_permits(&Method::GET, "/remote/devices"));
+        assert!(owner_permits(&Method::POST, "/remote/pairing-codes"));
+    }
+
+    #[test]
+    fn admin_device_is_still_refused_the_owner_segments() {
+        for (method, route) in OWNER_ROUTES {
+            let method = Method::from_bytes(method.as_bytes()).unwrap();
+            for level in ALL_LEVELS {
+                assert!(
+                    !remote_device_permits(level, &method, route),
+                    "{level:?} {method} {route}"
+                );
+            }
+            // The flag is meaningless below Admin: it never lifts a lower level.
+            for level in [ApiTokenLevel::ReadOnly, ApiTokenLevel::RunCreating] {
+                assert!(
+                    !super::remote_device_permits(level, true, &method, route),
+                    "{level:?} with the owner flag {method} {route}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fs_dirs_is_refused_to_an_admin_device() {
+        let route = "/fs/dirs";
+
+        assert!(owner_permits(&Method::GET, route));
+        for level in ALL_LEVELS {
+            assert!(
+                !remote_device_permits(level, &Method::GET, route),
+                "{level:?} must not browse the tower"
+            );
+        }
+        for scope in [Scope::Run(7), Scope::Service(Service::Remote)] {
+            assert!(
+                !permits(&scope, &Method::GET, route),
+                "{scope:?} must not browse the tower"
+            );
+        }
+    }
+
+    #[test]
+    fn owner_device_is_refused_agent_only_segments() {
+        for segment in REMOTE_DENIED_SEGMENTS {
+            if REMOTE_OWNER_SEGMENTS.contains(segment) {
+                continue;
+            }
+            for route in [format!("/{segment}"), format!("/{segment}/{{id}}")] {
+                for method in [Method::GET, Method::POST, Method::PUT, Method::DELETE] {
+                    assert!(!owner_permits(&method, &route), "owner {method} {route}");
+                }
+            }
+        }
+        for route in ["/hooks", "/tasks/{id}/claim", "/brand-new-family/x", "/"] {
+            assert!(!owner_permits(&Method::GET, route), "owner GET {route}");
+            assert!(!owner_permits(&Method::POST, route), "owner POST {route}");
+        }
+    }
+
+    #[test]
+    fn owner_device_is_not_refused_the_device_refused_routes() {
+        for (method, route) in REMOTE_DEVICE_REFUSED_ROUTES {
+            assert!(owner_permits(method, route), "owner {method} {route}");
+            assert!(
+                !remote_device_permits(ApiTokenLevel::Admin, method, route),
+                "admin {method} {route}"
+            );
+        }
+    }
+
+    /// Through the real middleware: a stored owner device reaches an owner route, an admin device
+    /// paired the ordinary way does not.
+    #[tokio::test]
+    async fn the_gate_admits_an_owner_session_and_not_an_admin_one() {
+        let state = test_state("expected-token").await;
+        let key = mint_service_token(&state.pool, Service::Remote)
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        let admin = pair_device(&state, ApiTokenLevel::Admin, now).await;
+        let created = crate::remote::create_pairing_code_for(
+            &state.pool,
+            ApiTokenLevel::Admin,
+            true,
+            "laptop",
+            now,
+        )
+        .await
+        .unwrap();
+        let owner = crate::remote::exchange(&state.pool, &created.code, now)
+            .await
+            .ok()
+            .unwrap();
+        // `/daemon/shutdown` is a grave route: the owner needs a live step-up to get through it.
+        assert!(
+            crate::remote::grant_step_up(&state.pool, owner.device_id, now)
+                .await
+                .unwrap()
+        );
+        let app = protected_router(state);
+
+        let (status, _) =
+            send_with_session(&app, "POST", "/daemon/shutdown", &key, Some(&admin.session)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) =
+            send_with_session(&app, "POST", "/daemon/shutdown", &key, Some(&owner.session)).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// An owner device paired the ordinary way (a code minted with the owner flag).
+    async fn pair_owner(
+        state: &AppState,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> crate::remote::Paired {
+        let created = crate::remote::create_pairing_code_for(
+            &state.pool,
+            ApiTokenLevel::Admin,
+            true,
+            "laptop",
+            now,
+        )
+        .await
+        .unwrap();
+        crate::remote::exchange(&state.pool, &created.code, now)
+            .await
+            .ok()
+            .unwrap()
+    }
+
+    /// Every entry of `GRAVE_ROUTES` mounted behind the gate, plus one owner route that is not
+    /// grave. `{param}` segments are filled with a literal when a request is built.
+    fn grave_router(state: AppState) -> Router {
+        let mut router = Router::new().route("/sidecars/{name}/restart", post(|| async {}));
+        for (method, route) in GRAVE_ROUTES {
+            let filter = axum::routing::MethodFilter::try_from(method.clone()).unwrap();
+            router = router.route(route, axum::routing::on(filter, || async {}));
+        }
+        router
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                require_token,
+            ))
+            .with_state(state)
+    }
+
+    fn concrete(route: &str) -> String {
+        route
+            .split('/')
+            .map(|part| if is_param(part) { "1" } else { part })
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    /// A paired device that has not confirmed afresh cannot take a chat's package, nor push one in.
+    #[tokio::test]
+    async fn a_device_without_step_up_cannot_take_a_package() {
+        let state = test_state("control-token").await;
+        let key = mint_service_token(&state.pool, Service::Remote)
+            .await
+            .unwrap();
+        let owner = pair_owner(&state, chrono::Utc::now()).await;
+        let app = grave_router(state);
+
+        for (method, route) in [
+            ("POST", "/assistant/chats/{chat_id}/transfer/begin"),
+            ("GET", "/assistant/chats/{chat_id}/transfer/package"),
+            ("POST", "/assistant/chats/{chat_id}/transfer/finish"),
+            ("POST", "/assistant/chats/import"),
+        ] {
+            assert!(
+                GRAVE_ROUTES
+                    .iter()
+                    .any(|(m, r)| m.as_str() == method && *r == route),
+                "{method} {route} must be a grave route"
+            );
+            let (status, body) =
+                send_with_session(&app, method, &concrete(route), &key, Some(&owner.session)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {route}");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+                serde_json::json!({ "refusal": "step_up_required" }),
+                "{method} {route}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_grave_route_without_step_up_is_refused() {
+        let state = test_state("control-token").await;
+        let key = mint_service_token(&state.pool, Service::Remote)
+            .await
+            .unwrap();
+        let owner = pair_owner(&state, chrono::Utc::now()).await;
+        let app = grave_router(state);
+
+        for (method, route) in GRAVE_ROUTES {
+            let (status, body) = send_with_session(
+                &app,
+                method.as_str(),
+                &concrete(route),
+                &key,
+                Some(&owner.session),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {route}");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+                serde_json::json!({ "refusal": "step_up_required" }),
+                "{method} {route}"
+            );
+        }
+        // A route that is not grave is not asked for the step-up.
+        let (status, _) = send_with_session(
+            &app,
+            "POST",
+            "/sidecars/echo/restart",
+            &key,
+            Some(&owner.session),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn step_up_opens_every_grave_route_for_five_minutes() {
+        let state = test_state("control-token").await;
+        let key = mint_service_token(&state.pool, Service::Remote)
+            .await
+            .unwrap();
+        let owner = pair_owner(&state, chrono::Utc::now()).await;
+        assert!(
+            crate::remote::grant_step_up(&state.pool, owner.device_id, chrono::Utc::now())
+                .await
+                .unwrap()
+        );
+        let (until,): (String,) =
+            sqlx::query_as("SELECT stepup_until FROM remote_devices WHERE id = ?")
+                .bind(owner.device_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        let until = chrono::DateTime::parse_from_rfc3339(&until).unwrap();
+        let ahead = until.with_timezone(&chrono::Utc) - chrono::Utc::now();
+        assert!(
+            ahead > chrono::Duration::minutes(4) && ahead <= crate::remote::STEP_UP_WINDOW,
+            "the window is five minutes, got {ahead}"
+        );
+        let app = grave_router(state);
+
+        for (method, route) in GRAVE_ROUTES {
+            let (status, body) = send_with_session(
+                &app,
+                method.as_str(),
+                &concrete(route),
+                &key,
+                Some(&owner.session),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{method} {route}: {body}");
+        }
+    }
+
+    /// Past, malformed and implausibly distant `stepup_until` values all read as "not stepped up".
+    #[tokio::test]
+    async fn step_up_expires() {
+        let state = test_state("control-token").await;
+        let key = mint_service_token(&state.pool, Service::Remote)
+            .await
+            .unwrap();
+        let owner = pair_owner(&state, chrono::Utc::now()).await;
+        let app = grave_router(state.clone());
+        let now = chrono::Utc::now();
+
+        let stamps = [
+            (now - chrono::Duration::seconds(1)).to_rfc3339(),
+            (now - chrono::Duration::days(1)).to_rfc3339(),
+            (now + chrono::Duration::days(365)).to_rfc3339(),
+            "not a date".to_owned(),
+            String::new(),
+        ];
+        for stamp in stamps {
+            sqlx::query("UPDATE remote_devices SET stepup_until = ? WHERE id = ?")
+                .bind(&stamp)
+                .bind(owner.device_id)
+                .execute(&state.pool)
+                .await
+                .unwrap();
+            let (status, body) =
+                send_with_session(&app, "POST", "/daemon/shutdown", &key, Some(&owner.session))
+                    .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{stamp:?}");
+            assert!(body.contains("step_up_required"), "{stamp:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_new_session_does_not_inherit_step_up() {
+        let state = test_state("control-token").await;
+        let key = mint_service_token(&state.pool, Service::Remote)
+            .await
+            .unwrap();
+        let now = chrono::Utc::now();
+        let first = pair_owner(&state, now).await;
+        crate::remote::grant_step_up(&state.pool, first.device_id, now)
+            .await
+            .unwrap();
+        // Logging in again is a new pairing: a new row, a new session, nothing carried over.
+        let second = pair_owner(&state, now).await;
+        assert_ne!(first.device_id, second.device_id);
+        let app = grave_router(state);
+
+        let (status, _) =
+            send_with_session(&app, "POST", "/daemon/shutdown", &key, Some(&first.session)).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, body) = send_with_session(
+            &app,
+            "POST",
+            "/daemon/shutdown",
+            &key,
+            Some(&second.session),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.contains("step_up_required"));
+    }
+
+    #[tokio::test]
+    async fn the_desktop_shell_is_never_asked_for_step_up() {
+        let state = test_state("control-token").await;
+        let app = grave_router(state);
+
+        for (method, route) in GRAVE_ROUTES {
+            let (status, body) = send_with_session(
+                &app,
+                method.as_str(),
+                &concrete(route),
+                "control-token",
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{method} {route}: {body}");
+        }
+    }
+
+    /// Every entry names a route the daemon really registers, with that method: the table cannot
+    /// drift into protecting a path nobody serves while the real one is left open. Read from the
+    /// production source the way `every_route_prefix_is_classified_for_remote_devices` reads it.
+    #[test]
+    fn every_grave_route_is_a_registered_route() {
+        fn walk(dir: &std::path::Path, found: &mut Vec<(String, String)>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, found);
+                    continue;
+                }
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                if path.extension().is_none_or(|e| e != "rs") || name.contains("conformance") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).unwrap();
+                let cut = source
+                    .match_indices("#[cfg(test)]")
+                    .find(|(at, attr)| source[at + attr.len()..].trim_start().starts_with("mod "))
+                    .map_or(source.len(), |(at, _)| at);
+                for part in source[..cut].split(".route(").skip(1) {
+                    let Some(literal) = part.trim_start().strip_prefix('"') else {
+                        continue;
+                    };
+                    let Some((route, rest)) = literal.split_once('"') else {
+                        continue;
+                    };
+                    // The handlers of this route: up to the next `.route(` (cut by the split) and
+                    // no further than the end of the function that builds the router.
+                    let handlers = rest.split("\n}").next().unwrap_or(rest);
+                    found.push((route.to_owned(), handlers.to_owned()));
+                }
+            }
+        }
+
+        let mut found = Vec::new();
+        walk(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut found,
+        );
+        assert!(found.len() > 50, "the route scan found too little");
+        for (method, route) in GRAVE_ROUTES {
+            let call = format!("{}(", method.as_str().to_ascii_lowercase());
+            assert!(
+                found
+                    .iter()
+                    .any(|(path, handlers)| path == route && handlers.contains(&call)),
+                "{method} {route} is in GRAVE_ROUTES but no `.route(\"{route}\", ..{call}..)` registers it"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn remote_key_alone_reaches_only_the_pairing_exchange() {
@@ -2141,6 +2672,8 @@ mod tests {
         ("POST", "/daemon/shutdown"),
         ("POST", "/system/shutdown"),
         ("POST", "/system/storage/compact"),
+        ("GET", "/system/autostart"),
+        ("PUT", "/system/autostart"),
         ("GET", "/api-tokens"),
         ("POST", "/api-tokens"),
         ("DELETE", "/api-tokens/some-token"),
@@ -2227,6 +2760,8 @@ mod tests {
                 "proposals",
                 "scoreboard",
                 "shadow-decisions",
+                // `/stepup/*` only lets an authenticated device make a step-up ticket for itself; the route that consumes a ticket is under `/remote/step-up/` and stays gateway-only.
+                "stepup",
                 "vcs",
             ]
         );
@@ -2292,6 +2827,18 @@ mod tests {
         ("POST", "/assistant/chats"),
         ("GET", "/assistant/chats/{chat_id}"),
         ("POST", "/assistant/chats/{chat_id}/relay"),
+        // Lists across paired machines: the shell reads and edits a remote machine's chat lists,
+        // groups and search, and forwards a message to a chat there.
+        ("GET", "/assistant/search"),
+        ("POST", "/assistant/message"),
+        ("POST", "/assistant/chats/{chat_id}/forward"),
+        ("GET", "/assistant/chat-groups"),
+        ("POST", "/assistant/chat-groups"),
+        ("PATCH", "/assistant/chat-groups/{group_id}"),
+        ("DELETE", "/assistant/chat-groups/{group_id}"),
+        ("PUT", "/assistant/chats/{chat_id}/group"),
+        ("POST", "/assistant/chats/{chat_id}/restore"),
+        ("GET", "/notifications/pending"),
         ("GET", "/files"),
         ("GET", "/files/download"),
         ("POST", "/files/folder"),
@@ -2318,7 +2865,10 @@ mod tests {
             ("POST", "/daemon/shutdown"),
             ("POST", "/daemon/update"),
             ("POST", "/system/shutdown"),
+            ("POST", "/system/restart"),
             ("POST", "/system/storage/compact"),
+            ("GET", "/system/autostart"),
+            ("PUT", "/system/autostart"),
             ("GET", "/config/secrets"),
             ("DELETE", "/config/secrets/{key}"),
             ("GET", "/api-tokens"),
@@ -2532,6 +3082,22 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn a_device_session_cannot_read_or_change_the_machine_role() {
+        for method in [Method::GET, Method::PUT] {
+            for level in ALL_LEVELS {
+                assert!(
+                    !remote_device_permits(level, &method, "/machine"),
+                    "{level:?} {method}"
+                );
+                assert!(
+                    !super::remote_device_permits(level, true, &method, "/machine"),
+                    "owner {level:?} {method}"
+                );
+            }
+        }
+    }
+
     /// Local callers are unchanged: the control token (no device session) and an Admin API token
     /// still reach the routes a device is refused.
     #[tokio::test]
@@ -2610,24 +3176,116 @@ mod tests {
             .filter(|segment| {
                 !REMOTE_ALLOWED_SEGMENTS.contains(&segment.as_str())
                     && !REMOTE_ADMIN_SEGMENTS.contains(&segment.as_str())
-                    && !REMOTE_DENIED_SEGMENTS.contains(&segment.as_str())
+                    && !REMOTE_OWNER_SEGMENTS.contains(&segment.as_str())
+                    && !REMOTE_AGENT_ONLY_SEGMENTS
+                        .iter()
+                        .any(|(s, _)| *s == segment.as_str())
             })
             .collect();
         assert!(
             unclassified.is_empty(),
-            "route prefixes in none of REMOTE_ALLOWED_SEGMENTS, REMOTE_ADMIN_SEGMENTS, REMOTE_DENIED_SEGMENTS: {unclassified:?}"
+            "route prefixes in none of REMOTE_ALLOWED_SEGMENTS, REMOTE_ADMIN_SEGMENTS, REMOTE_OWNER_SEGMENTS, REMOTE_AGENT_ONLY_SEGMENTS: {unclassified:?}"
         );
         for segment in found.iter() {
             let hits = [
                 REMOTE_ALLOWED_SEGMENTS.contains(&segment.as_str()),
                 REMOTE_ADMIN_SEGMENTS.contains(&segment.as_str()),
-                REMOTE_DENIED_SEGMENTS.contains(&segment.as_str()),
+                REMOTE_OWNER_SEGMENTS.contains(&segment.as_str()),
+                REMOTE_AGENT_ONLY_SEGMENTS
+                    .iter()
+                    .any(|(s, _)| *s == segment.as_str()),
             ]
             .iter()
             .filter(|hit| **hit)
             .count();
             assert_eq!(hits, 1, "{segment} must be in exactly one list");
         }
+        for (segment, reason) in REMOTE_AGENT_ONLY_SEGMENTS {
+            assert!(
+                !reason.trim().is_empty(),
+                "{segment} is agent-only without a reason"
+            );
+        }
+        // REMOTE_DENIED_SEGMENTS (the non-owner refusal list) is exactly OWNER + AGENT_ONLY.
+        let mut denied: Vec<&str> = REMOTE_DENIED_SEGMENTS.to_vec();
+        let mut expected: Vec<&str> = REMOTE_OWNER_SEGMENTS
+            .iter()
+            .copied()
+            .chain(REMOTE_AGENT_ONLY_SEGMENTS.iter().map(|(s, _)| *s))
+            .collect();
+        denied.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(
+            denied, expected,
+            "REMOTE_DENIED_SEGMENTS must equal REMOTE_OWNER_SEGMENTS plus REMOTE_AGENT_ONLY_SEGMENTS"
+        );
+    }
+
+    /// The device-facing step-up segment is deliberately tiny. The gateway-only ticket routes
+    /// live under `/remote/step-up/`, so adding another `/stepup/*` route needs an explicit review.
+    #[test]
+    fn stepup_routes_are_exactly_the_ticket_and_status_routes() {
+        fn walk(dir: &std::path::Path, found: &mut std::collections::BTreeSet<String>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, found);
+                    continue;
+                }
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                if path.extension().is_none_or(|extension| extension != "rs")
+                    || name.contains("conformance")
+                {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).unwrap();
+                let cut = source
+                    .match_indices("#[cfg(test)]")
+                    .find(|(at, attr)| source[at + attr.len()..].trim_start().starts_with("mod "))
+                    .map_or(source.len(), |(at, _)| at);
+                for part in source[..cut].split(".route(").skip(1) {
+                    let Some(literal) = part.trim_start().strip_prefix('"') else {
+                        continue;
+                    };
+                    let Some((route, _)) = literal.split_once('"') else {
+                        continue;
+                    };
+                    if route.starts_with("/stepup/") {
+                        found.insert(route.to_owned());
+                    }
+                }
+            }
+        }
+
+        let mut found = std::collections::BTreeSet::new();
+        walk(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut found,
+        );
+        assert_eq!(
+            found.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["/stepup/status", "/stepup/ticket"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_device_session_is_refused_from_consuming_a_step_up_ticket() {
+        let state = test_state("control-token").await;
+        let key = mint_service_token(&state.pool, Service::Remote)
+            .await
+            .unwrap();
+        let device = pair_owner(&state, chrono::Utc::now()).await;
+        let app = protected_router(state);
+
+        let (status, _) = send_with_session(
+            &app,
+            "POST",
+            "/remote/step-up/ticket/consume",
+            &key,
+            Some(&device.session),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
     /// The three lists are pairwise disjoint, and the hard-deny set (owner decision 2026-10-29)
@@ -4925,8 +5583,8 @@ mod tests {
     }
 
     /// The live view of a browser session is pixels of a page the agent is driving, so it is the
-    /// owner's to watch and nobody else's. Safe today by being in no table; this is what says no to
-    /// filing it beside the other `/browser/...` reads (spec browser-ao-vivo).
+    /// owner's to watch and nobody else's. It stays out of ordinary scope tables, while an owner
+    /// device reaches it through the explicit `browser` owner segment.
     #[test]
     fn the_live_view_is_in_no_scope_table() {
         const LIVE_ROUTE: &str = "/browser/sessions/{id}/live";
@@ -4956,6 +5614,18 @@ mod tests {
             assert!(
                 permits(&scope, &Method::GET, "/browser/sessions/7/live"),
                 "{scope:?} is the owner and may watch"
+            );
+        }
+
+        assert!(owner_permits(&Method::GET, LIVE_ROUTE));
+        for level in [
+            ApiTokenLevel::ReadOnly,
+            ApiTokenLevel::RunCreating,
+            ApiTokenLevel::Admin,
+        ] {
+            assert!(
+                !remote_device_permits(level, &Method::GET, LIVE_ROUTE),
+                "a non-owner {level:?} device must not watch the live browser"
             );
         }
     }

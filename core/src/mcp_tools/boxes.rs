@@ -384,6 +384,52 @@ pub fn worktree_for_call(served: &McpBox, asked: Option<&str>) -> Result<Option<
     }
 }
 
+/// The branch prefix the tree driver gives every branch of a tree job (`tree/<job>/<name>`).
+const TREE_BRANCH_PREFIX: &str = "refs/heads/tree/";
+
+/// The branch checked out in a worktree, read from `.git` and its HEAD without running git.
+/// `None` when it cannot be read or HEAD is detached.
+fn checked_out_branch(worktree: &str) -> Option<String> {
+    let root = std::path::Path::new(worktree);
+    let dot_git = root.join(".git");
+    let gitdir = if dot_git.is_dir() {
+        dot_git
+    } else {
+        let pointer = std::fs::read_to_string(&dot_git).ok()?;
+        let target = pointer.trim().strip_prefix("gitdir:")?.trim();
+        let target = std::path::Path::new(target);
+        if target.is_absolute() {
+            target.to_path_buf()
+        } else {
+            root.join(target)
+        }
+    };
+    let head = std::fs::read_to_string(gitdir.join("HEAD")).ok()?;
+    head.trim()
+        .strip_prefix("ref:")
+        .map(|r| r.trim().to_owned())
+}
+
+/// Why `verify` is refused here, when it is.
+///
+/// In a daemon-driven tree only the controller gates: a leaf that calls `verify` and ends its turn
+/// to wait for the ticket is counted by the driver as "ended without finishing" and its branch is
+/// parked after two such ends. The tree run's box is the worktree box (it cannot be told apart by
+/// its launch arguments), so the worktree it is bound to is what says it is a tree node: the
+/// driver puts every tree branch on a `tree/…` branch. Pure but for the file reads.
+pub fn tree_leaf_verify_refusal(served: &McpBox) -> Option<String> {
+    let McpBox::Worktree(own) = served else {
+        return None;
+    };
+    let branch = checked_out_branch(own)?;
+    branch.starts_with(TREE_BRANCH_PREFIX).then(|| {
+        "verify is not available to a node of a tree: the tree's controller gates the branch \
+         after you finish. Do not run tests or checks either. Write your handoff and close the \
+         node with node_close in this same turn; do not end your turn waiting for a ticket."
+            .to_owned()
+    })
+}
+
 /// What a `verify_status` answer becomes in this box. The worktree box reads only tickets of its
 /// own worktree: a ticket of another worktree, or one that names none, is refused with the same
 /// words as a ticket that does not exist, so the refusal does not reveal that it does. The other
@@ -488,5 +534,63 @@ mod tests {
     #[test]
     fn the_worktree_box_serves_tree_branch_start() {
         assert!(WORKTREE_BOX_TOOLS.contains(&"tree_branch_start"));
+    }
+
+    /// A worktree whose `.git` file points at a gitdir with the given HEAD.
+    fn linked_worktree(head: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let gitdir = dir.path().join("admin");
+        std::fs::create_dir_all(&gitdir).unwrap();
+        std::fs::write(gitdir.join("HEAD"), head).unwrap();
+        let tree = dir.path().join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(
+            tree.join(".git"),
+            format!("gitdir: {}\n", gitdir.to_string_lossy()),
+        )
+        .unwrap();
+        dir
+    }
+
+    /// A tree branch's leaf never verifies: only the controller gates. The worktree box of a node
+    /// run on a `tree/…` branch refuses `verify` with a sentence that tells it to close instead.
+    #[test]
+    fn verify_is_refused_in_the_worktree_of_a_tree_branch() {
+        let dir = linked_worktree("ref: refs/heads/tree/job-1/api\n");
+        let own = dir.path().join("tree").to_string_lossy().into_owned();
+        let refusal = tree_leaf_verify_refusal(&McpBox::Worktree(own))
+            .expect("a tree branch worktree refuses verify");
+        assert!(refusal.contains("node_close"), "{refusal}");
+        assert!(refusal.contains("controller"), "{refusal}");
+    }
+
+    #[test]
+    fn verify_is_allowed_in_an_ordinary_worktree_and_in_the_other_boxes() {
+        let dir = linked_worktree("ref: refs/heads/feat/thing\n");
+        let own = dir.path().join("tree").to_string_lossy().into_owned();
+        assert_eq!(tree_leaf_verify_refusal(&McpBox::Worktree(own)), None);
+        let detached = linked_worktree("0123456789abcdef0123456789abcdef01234567\n");
+        let own = detached.path().join("tree").to_string_lossy().into_owned();
+        assert_eq!(tree_leaf_verify_refusal(&McpBox::Worktree(own)), None);
+        assert_eq!(
+            tree_leaf_verify_refusal(&McpBox::Worktree("/no/such/dir".to_owned())),
+            None
+        );
+        assert_eq!(tree_leaf_verify_refusal(&McpBox::All), None);
+        assert_eq!(tree_leaf_verify_refusal(&McpBox::JobNode(1)), None);
+    }
+
+    /// A plain checkout (`.git` is a directory) is read through its own HEAD.
+    #[test]
+    fn a_plain_checkout_on_a_tree_branch_is_recognised_too() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::write(
+            dir.path().join(".git").join("HEAD"),
+            "ref: refs/heads/tree/x/root\n",
+        )
+        .unwrap();
+        let own = dir.path().to_string_lossy().into_owned();
+        assert!(tree_leaf_verify_refusal(&McpBox::Worktree(own)).is_some());
     }
 }

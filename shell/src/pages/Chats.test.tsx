@@ -87,6 +87,8 @@ import type { AssistantTurnRow, ToolCall } from "../lib/turns";
 import { daemonFetch, daemonState, renderApp } from "../test/harness";
 import { resetHeld } from "../chats/held";
 import type { ProjectSummary } from "../data/system";
+import { saveMachines } from "../data/machineStore";
+import { chatMachineOf } from "../data/chatMachines";
 
 beforeEach(() => {
   daemon.apiFetch.mockReset();
@@ -2158,6 +2160,45 @@ describe("Chats - what a conversation is told, and what it may not touch", () =>
         body: JSON.stringify({ denied_tools: ["Bash"] }),
       });
     });
+  });
+
+  it("a remote chat keeps its denied tools and does not point back to its moved origin", async () => {
+    saveMachines([{ id: "tower", origin: "https://tower.example", name: "Tower" }]);
+    const remote = chatSummary({ chat_id: "c-9", denied_tools: ["Bash", "Edit"] });
+    const origin = { ...remote, moved_to: "tower" };
+    const localFetch = chatsFetch([origin], { "c-9": [turnRow({ id: 1 })] });
+    const remoteFetch = chatsFetch([remote], { "c-9": [turnRow({ id: 1 })] });
+    daemon.apiFetch.mockImplementation((path: string, init?: RequestInit, machine?: string) =>
+      (machine === "tower" ? remoteFetch : localFetch)(path, init),
+    );
+
+    await renderChats("/chats/c-9");
+    await screen.findByRole("list", { name: "Transcript" });
+    expect(screen.queryByRole("button", { name: "Open on the destination" })).toBeNull();
+
+    await openConversationSettings();
+    const trigger = await screen.findByRole("menuitem", { name: /cannot use/i });
+    fireEvent.pointerDown(trigger, { pointerType: "mouse", button: 0 });
+    fireEvent.click(trigger);
+
+    const bash = await screen.findByRole("menuitemcheckbox", { name: "Bash" });
+    expect(bash.getAttribute("aria-checked")).toBe("true");
+    expect(screen.getByRole("menuitemcheckbox", { name: "Edit" }).getAttribute("aria-checked")).toBe("true");
+  });
+
+  it("shows the moved pointer when no machine holds a live copy but one reports moved_to", async () => {
+    saveMachines([{ id: "tower", origin: "https://tower.example", name: "Tower" }]);
+    const origin = { ...chatSummary({ chat_id: "c-8" }), moved_to: "tower" };
+    const localFetch = chatsFetch([origin], { "c-8": [] });
+    const remoteFetch = chatsFetch([], {});
+    daemon.apiFetch.mockImplementation((path: string, init?: RequestInit, machine?: string) =>
+      (machine === "tower" ? remoteFetch : localFetch)(path, init),
+    );
+
+    await renderChats("/chats/c-8");
+
+    expect(await screen.findByText(/This chat was moved to tower and is read-only here\./)).toBeTruthy();
+    expect(screen.queryByRole("list", { name: "Transcript" })).toBeNull();
   });
 
   it("asks for a fresh context in one click, and for a clear in two", async () => {
@@ -6614,6 +6655,53 @@ describe("Chats - finding something that was said", () => {
       expect(screen.queryByPlaceholderText("Carry on where you left off…")).toBeNull();
     });
     expect(await screen.findByRole("list", { name: "Transcript" })).toBeTruthy();
+  });
+
+  it("links a hit found on another machine to it before opening the conversation", async () => {
+    saveMachines([{ id: "tower", origin: "https://tower.example", name: "Tower" }]);
+    const localFetch = chatsFetch([chatSummary({ chat_id: "c-1" })], { "c-1": [] });
+    // The tower's chat list stays empty, so only the hit itself can tell the page where c-77 lives.
+    const remoteFetch = chatsFetch([], {
+      "c-77": [turnRow({ id: 7, asked: "why?", answer: "a leap of faith on the tower" })],
+    });
+    daemon.apiFetch.mockImplementation((path: string, init?: RequestInit, machine?: string) =>
+      (machine === "tower" ? remoteFetch : localFetch)(path, init),
+    );
+    await renderChats("/chats/c-1");
+    await screen.findByRole("list", { name: "Conversations" });
+
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    const palette = await screen.findByRole("dialog", { name: "Go to anything" });
+    fireEvent.change(within(palette).getByRole("combobox"), { target: { value: "leap" } });
+    expect(chatMachineOf("c-77")).toBe("here");
+
+    fireEvent.click(await within(palette).findByText(/a leap of faith on the tower/));
+
+    expect(chatMachineOf("c-77")).toBe("tower");
+  });
+
+  it("says which machine did not answer, in a row that cannot be chosen", async () => {
+    saveMachines([{ id: "tower", origin: "https://tower.example", name: "Tower" }]);
+    const localFetch = chatsFetch([chatSummary({ chat_id: "c-1" })], {
+      "c-1": [turnRow({ id: 1, asked: "why?", answer: "a leap of faith here" })],
+    });
+    daemon.apiFetch.mockImplementation((path: string, init?: RequestInit, machine?: string) => {
+      if (machine === "tower" && path.startsWith("/assistant/search")) {
+        return Promise.reject(new Error("offline"));
+      }
+      return (machine === "tower" ? chatsFetch([], {}) : localFetch)(path, init);
+    });
+    await renderChats("/chats/c-1");
+    await screen.findByRole("list", { name: "Conversations" });
+
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    const palette = await screen.findByRole("dialog", { name: "Go to anything" });
+    fireEvent.change(within(palette).getByRole("combobox"), { target: { value: "leap" } });
+
+    const silent = await within(palette).findByText("Tower is not reachable");
+    expect(silent.closest("[cmdk-item]")?.getAttribute("aria-disabled")).toBe("true");
+    // The machine that did answer is still listed.
+    expect(within(palette).getByText(/a leap of faith here/)).toBeDefined();
   });
 });
 

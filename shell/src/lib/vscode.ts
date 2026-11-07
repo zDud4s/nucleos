@@ -85,7 +85,28 @@ export function vscodeUrl(absolutePath: string, line: number | null): string {
  * different sentences, and neither of them is a stack trace.
  */
 export function openInVscode(absolutePath: string, line: number | null): Promise<void> {
-  // VS Code runs on the host machine, not beside a browser tab: inert remotely.
-  if (isRemote()) return Promise.resolve();
+  // VS Code runs on the host machine, not beside a browser tab. Resolving here made every call
+  // site look as if it had worked, so it refuses in words and the callers' own `.catch` shows them.
+  if (isRemote()) {
+    const refusal = new Error(EDITOR_REMOTE_SENTENCE);
+    refusal.name = "HostOnlyError";
+    return Promise.reject(refusal);
+  }
   return openUrl(vscodeUrl(absolutePath, line));
+}
+
+/** What a person on another device is told when an editor button is pressed. */
+export const EDITOR_REMOTE_SENTENCE = "VS Code opens on the main machine only, not from this browser.";
+
+/** Whether an editor button can do anything here; call sites with no failure note hide it when not. */
+export function editorAvailable(): boolean {
+  return !isRemote();
+}
+
+/**
+ * The sentence for a failed open when the cause is that this is a remote device, else null so the
+ * caller keeps its own (installed? allowed?) wording, which would mislead on a browser.
+ */
+export function editorRemoteNote(): string | null {
+  return isRemote() ? EDITOR_REMOTE_SENTENCE : null;
 }

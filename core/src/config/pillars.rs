@@ -280,6 +280,71 @@ pub fn load_verify_config(path: &Path) -> VerifyConfig {
     }
 }
 
+/// `~/.nucleos/keep_awake.yaml`: whether the machine is kept from idle-sleeping while a run is live.
+#[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct KeepAwakeConfig {
+    /// On by default. Only the automatic idle sleep is held off; closing the lid still obeys the
+    /// system.
+    pub keep_awake_while_working: bool,
+}
+
+impl Default for KeepAwakeConfig {
+    fn default() -> Self {
+        Self {
+            keep_awake_while_working: true,
+        }
+    }
+}
+
+/// `~/.nucleos/background.yaml`: how long a chat's background task may say nothing before its
+/// process stops being kept alive for it.
+#[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct BackgroundConfig {
+    /// Hours of silence, 24 by default. Counted from the task's last report, never from a client's
+    /// poll, so work left running overnight is not cut off because nobody was connected.
+    pub background_silence_hours: u64,
+}
+
+impl Default for BackgroundConfig {
+    fn default() -> Self {
+        Self {
+            background_silence_hours: 24,
+        }
+    }
+}
+
+impl BackgroundConfig {
+    /// Zero hours is refused: it would retire every process with a task running the moment it fell
+    /// silent.
+    pub fn check(&self) -> Result<(), String> {
+        if self.background_silence_hours == 0 {
+            return Err("background_silence_hours must be at least 1".to_owned());
+        }
+        Ok(())
+    }
+}
+
+/// A blank legacy `keep_awake.yaml` means the defaults, as the old reader did.
+pub fn parse_keep_awake_config(contents: &str) -> Result<KeepAwakeConfig, String> {
+    if contents.trim().is_empty() {
+        return Ok(KeepAwakeConfig::default());
+    }
+    serde_yaml::from_str(contents).map_err(|error| error.to_string())
+}
+
+/// A blank legacy `background.yaml` means the defaults; zero hours is refused here as at the PUT.
+pub fn parse_background_config(contents: &str) -> Result<BackgroundConfig, String> {
+    if contents.trim().is_empty() {
+        return Ok(BackgroundConfig::default());
+    }
+    let config: BackgroundConfig =
+        serde_yaml::from_str(contents).map_err(|error| error.to_string())?;
+    config.check()?;
+    Ok(config)
+}
+
 /// `~/.nucleos/web.yaml`. The web pillar's settings, including the one list in this system that decides
 /// what counts as trustworthy.
 #[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq, Eq)]
