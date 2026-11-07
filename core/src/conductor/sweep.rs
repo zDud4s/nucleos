@@ -971,8 +971,12 @@ mod tests {
         seed_node(state, &format!("n{id}"), "leaf", "running", Some(id)).await;
         crate::execution::runner::cli_pids::begin_attempt(id);
         let gate = gate_began.map(|at| crate::execution::runner::cli_pids::begin_gate_at(id, at));
-        publish_tail(state, id, "{\"type\":\"assistant\"}
-");
+        publish_tail(
+            state,
+            id,
+            "{\"type\":\"assistant\"}
+",
+        );
         let observed = daemon_observations(state).await.unwrap();
         (observed, Utc::now() + minutes(11), gate)
     }
