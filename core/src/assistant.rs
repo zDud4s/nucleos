@@ -2205,13 +2205,13 @@ mod tests {
         // The handle is released by the guard the task captured, so an empty map is proof the turn
         // reached the end — its terminal write included — rather than proof that time passed.
         for _ in 0..500 {
-            if !state.run_handles.lock().unwrap().contains_key(&id) {
+            if !state.run_handles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(&id) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(
-            !state.run_handles.lock().unwrap().contains_key(&id),
+            !state.run_handles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(&id),
             "the turn never finished"
         );
 
@@ -5913,7 +5913,7 @@ mod tests {
     /// measuring a race instead of the stop.
     async fn the_turn_has_its_handle(state: &AppState, id: i64) {
         for _ in 0..300 {
-            if state.run_handles.lock().unwrap().contains_key(&id) {
+            if state.run_handles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(&id) {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -7087,7 +7087,7 @@ mod tests {
         }
         assert!(second_row.is_some(), "what waited never started");
         assert!(
-            !state.run_handles.lock().unwrap().contains_key(&first),
+            !state.run_handles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(&first),
             "the finished turn was still registered when what waited began"
         );
     }

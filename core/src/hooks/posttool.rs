@@ -50,7 +50,7 @@ pub async fn posttooluse_outcome(
     // before trusting anything derived from it: the hook's environment sits inside the same
     // cooperative trust model as the token, so the daemon never blindly trusts a run_id it did not
     // itself hand out. A stray outcome naming a finished or unknown run has nothing to complete.
-    if !state.run_handles.lock().unwrap().contains_key(&run_id) {
+    if !state.run_handles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(&run_id) {
         return StatusCode::OK;
     }
 

@@ -100,7 +100,7 @@ where
         tails: state.run_tails.clone(),
         id,
     };
-    let mut handles = state.run_handles.lock().unwrap();
+    let mut handles = state.run_handles.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let join = tokio::spawn(async move {
         let _registration = registration;
         body.await;
@@ -1376,7 +1376,7 @@ mod wake_tests {
 
         // The supervisor finishes after the handle is released; give it a beat to (not) act.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while state.run_handles.lock().unwrap().contains_key(&id) {
+        while state.run_handles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(&id) {
             assert!(std::time::Instant::now() < deadline, "the run never ended");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

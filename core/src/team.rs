@@ -5702,7 +5702,7 @@ mod tests {
         spawn_agent(&state, &run, &agent, run_id, session_id, "find it".into()).await;
 
         assert!(
-            !state.run_handles.lock().unwrap().contains_key(&run_id),
+            !state.run_handles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(&run_id),
             "the node of a cancelled run is still registered, and still running"
         );
         let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")

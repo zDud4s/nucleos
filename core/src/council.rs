@@ -1313,12 +1313,12 @@ mod tests {
 
         // Wait for both seats to be in flight, so the cancel has something to terminate.
         for _ in 0..300 {
-            if state.run_handles.lock().unwrap().len() == 2 {
+            if state.run_handles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len() == 2 {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        assert_eq!(state.run_handles.lock().unwrap().len(), 2);
+        assert_eq!(state.run_handles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len(), 2);
 
         assert!(cancel(&state, &id).await.unwrap());
         let row = settled(&state, &id).await;
@@ -1353,7 +1353,7 @@ mod tests {
             statuses.iter().all(|status| status == "cancelled"),
             "{statuses:?}"
         );
-        assert!(state.run_handles.lock().unwrap().is_empty());
+        assert!(state.run_handles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty());
     }
 
     /// Every prompt the council sent, in order.
@@ -3988,7 +3988,7 @@ mod tests {
         // the run id on the step is what `cancel` terminates by.
         for _ in 0..300 {
             let steps = steps_for(&state, &id).await;
-            if state.run_handles.lock().unwrap().len() == 2
+            if state.run_handles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len() == 2
                 && steps.len() == 2
                 && steps.iter().all(|step| step.run_id.is_some())
             {
