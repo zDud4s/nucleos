@@ -114,7 +114,9 @@ async fn post_chat_import(
             if body.session.is_none() {
                 // Sessionless arrival: the import already dropped the stored session, this also
                 // clears a stale in-memory untrusted-read notice so it does not follow the chat.
-                if let Err(error) = crate::assistant::forget_session(&state.pool, &body.chat_id).await {
+                if let Err(error) =
+                    crate::assistant::forget_session(&state.pool, &body.chat_id).await
+                {
                     tracing::warn!(%error, chat_id = %body.chat_id, "could not reset the imported chat's session");
                 }
             }
