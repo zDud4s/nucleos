@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClientProvider } from "@tanstack/react-query";
 import { RouterProvider } from "@tanstack/react-router";
@@ -16,6 +16,12 @@ vi.mock("./data/client", async (original) => ({
   ...(await original<typeof import("./data/client")>()),
   ...daemon,
 }));
+
+// Warm the lazy Brain chunk (it pulls in d3-force) before any test runs, so the
+// redirect test below does not pay the cold import inside its own timeout.
+beforeAll(async () => {
+  await import("./pages/Brain");
+}, 60_000);
 
 beforeEach(() => {
   daemon.apiFetch.mockReset();
