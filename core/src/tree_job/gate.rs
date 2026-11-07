@@ -269,5 +269,38 @@ pub(super) async fn gate_branch(
         branch,
         worktree,
     };
-    gate_at_head(&io, &head, wait).await
+    let verdict = gate_at_head(&io, &head, wait).await?;
+    // A later gate may have moved the branch to another HEAD while this one waited; its ticket is
+    // then the one remembered, and this verdict describes a tree that is gone. Discarded as "still
+    // running" (logged by the caller, no state change, nothing counted): the newer gate answers.
+    let stored = io.stored().await?;
+    if is_stale(stored.as_ref(), &head) {
+        return Err(NotMeasured::Running(format!(
+            "the verdict measured HEAD {head}, but the branch's gate has since moved to {}; discarded",
+            stored.map(|s| s.head).unwrap_or_default()
+        )));
+    }
+    Ok(verdict)
+}
+
+/// Whether a verdict measured at `head` is stale against the remembered gate ticket: one is
+/// remembered, and for another HEAD. No ticket remembered means nothing newer is known.
+fn is_stale(stored: Option<&Stored>, head: &str) -> bool {
+    stored.is_some_and(|stored| stored.head != head)
+}
+
+#[cfg(test)]
+mod stale_tests {
+    use super::*;
+
+    #[test]
+    fn a_verdict_for_another_head_than_the_remembered_ticket_is_stale() {
+        let stored = Stored {
+            ticket: 7,
+            head: "bbb".to_owned(),
+        };
+        assert!(is_stale(Some(&stored), "aaa"));
+        assert!(!is_stale(Some(&stored), "bbb"));
+        assert!(!is_stale(None, "aaa"));
+    }
 }
