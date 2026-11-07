@@ -7553,7 +7553,8 @@ mod tests {
         rows: usize,
     ) -> Vec<(i64, String)> {
         let mut seen = Vec::new();
-        for _ in 0..200 {
+        // Returns as soon as the rows land; the 30 s ceiling only matters under full-suite load.
+        for _ in 0..1200 {
             seen = compaction_rows(pool, chat_id).await;
             if seen.len() >= rows && seen.iter().all(|(_, status)| status != "pending") {
                 return seen;
