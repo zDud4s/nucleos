@@ -59,7 +59,9 @@ class DeadLockReapTests(unittest.TestCase):
 
     def status(self) -> str:
         env = dict(os.environ)
-        env.pop("NUCLEOS_HEAVY", None)
+        for k in list(env):
+            if k.startswith("NUCLEOS_HEAVY"):
+                env.pop(k)
         env["NUCLEOS_HEAVY_DIR"] = str(self.state)
         cp = subprocess.run([sys.executable, str(HEAVY), "status"], env=env,
                             capture_output=True, text=True, timeout=60, cwd=str(self.cwd))

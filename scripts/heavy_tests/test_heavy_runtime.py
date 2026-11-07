@@ -39,9 +39,10 @@ def load_heavy():
 
 def clean_env(state_dir: str | None, **extra: str) -> dict:
     env = dict(os.environ)
-    for k in ("NUCLEOS_HEAVY", "NUCLEOS_HEAVY_TOKEN", "NUCLEOS_HEAVY_HELD",
-              "NUCLEOS_HEAVY_PRIO", "NUCLEOS_HEAVY_DIR", "NUCLEOS_HEAVY_MAIN"):
-        env.pop(k, None)
+    # Strip every inherited NUCLEOS_HEAVY* variable (the shell may export any of them).
+    for k in list(env):
+        if k.startswith("NUCLEOS_HEAVY"):
+            env.pop(k)
     if state_dir is not None:
         env["NUCLEOS_HEAVY_DIR"] = state_dir
     env.update(extra)
