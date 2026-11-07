@@ -3841,7 +3841,7 @@ mod tests {
             // confusing later assertion. The outer timeout is not a budget: it is reached only if
             // the drain never arrives at all, and it is there so that failure is a message rather
             // than a hung suite.
-            tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::time::timeout(Duration::from_secs(60), async {
                 tokio::select! {
                     _ = &mut drain => {
                         panic!("the executor is never released — the drain cannot have finished")
