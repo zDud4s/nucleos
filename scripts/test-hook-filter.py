@@ -949,6 +949,28 @@ def _special_of(printed):
         return None
 
 
+def run_ask_wait_cases():
+    """The wait on a question lasts as long as the daemon holds it, not the old fifty seconds."""
+    seen = []
+
+    def urlopen(_request, timeout=None):
+        seen.append(timeout)
+        return _Reply({"decision": "allow", "reason": "you allowed this"})
+
+    with mock.patch.object(hook.urllib.request, "urlopen", side_effect=urlopen):
+        answered = hook.wait_for_answer("http://127.0.0.1:1", "tok", 7)
+    window = 30 * 24 * 3600 - 3600
+    good = (
+        answered.get("decision") == "allow"
+        and seen
+        and window < seen[0] < 30 * 24 * 3600
+    )
+    return [(
+        "the wait on a question outlasts the daemon's window and stays under the hook timeout",
+        _verdict(bool(good), f"timeout {seen!r}"),
+    )]
+
+
 def run_rewrite_cases():
     """A run's allow forwards the daemon's `updated_input` as `updatedInput`; nothing else does."""
     cases = []
@@ -1710,6 +1732,7 @@ def main() -> int:
         + interactive_follow_up_cases()
         + verify_hint_cases()
         + run_rewrite_cases()
+        + run_ask_wait_cases()
         + admit_cases()
         + one_source_cases()
         + session_start_cases()

@@ -372,6 +372,7 @@ impl CommandRunner for AgyCliRunner {
         let mut child = cmd.spawn()?;
         // Declared after the child so it drops first; see `TreeKiller`.
         let mut tree_killer = child.id().map(TreeKiller::new);
+        let _cli_pid = super::cli_pids::register(&request.env, child.id());
 
         let stdout = child.stdout.take().expect("stdout piped above");
         let stderr = child.stderr.take().expect("stderr piped above");

@@ -267,6 +267,14 @@ export function LiveView({
               end("Session closed.");
               return;
             }
+            if (error.status === 401) {
+              end("Your session has ended. Sign in again.");
+              return;
+            }
+            if (error.status === 403) {
+              end("This device may not watch the browser.");
+              return;
+            }
           }
         }
         if (signal.aborted) return;

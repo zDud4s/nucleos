@@ -199,6 +199,49 @@ fn taskkill_tree(pid: u32) {
         .status();
 }
 
+/// Whether a process with this pid is running right now. Reports and touches nothing.
+///
+/// For a caller that holds a pid it recorded while the process's `Child` was alive, and wants to ask
+/// afterwards whether that process is still there before declaring its owner dead. A pid can be
+/// reissued once the process is gone, so a `true` is "something holds this pid", which is the safe
+/// direction for that question: it can only keep a run alive, never end one.
+#[cfg(windows)]
+pub fn pid_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // `STILL_ACTIVE`, the exit code a running process reports.
+    const STILL_ACTIVE: u32 = 259;
+    if pid == 0 {
+        return false;
+    }
+    // SAFETY: the handle is checked before use and closed on every path out.
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return false;
+        }
+        let mut code: u32 = 0;
+        let queried = GetExitCodeProcess(process, &mut code);
+        CloseHandle(process);
+        queried != 0 && code == STILL_ACTIVE
+    }
+}
+
+/// See the Windows twin above. `kill(pid, 0)` delivers nothing; EPERM means it exists but is not ours.
+#[cfg(unix)]
+pub fn pid_alive(pid: u32) -> bool {
+    let Some(pid) = libc::pid_t::try_from(pid).ok().filter(|pid| *pid > 0) else {
+        return false;
+    };
+    // SAFETY: `kill` with signal 0 reads two integers and touches no memory of this process.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
 /// Sends `signal` to the process group `pid` leads, and to nothing else.
 ///
 /// `killpg(2)` and not the `kill` program, and the reason was measured rather than reasoned: Ubuntu
@@ -503,6 +546,19 @@ mod tests {
     fn a_group_that_does_not_exist_is_an_error() {
         let error = signal_group(i32::MAX as u32, 0).expect_err("no such group can exist");
         assert_eq!(error.raw_os_error(), Some(libc::ESRCH), "got: {error}");
+    }
+
+    /// The test process is alive and pid 0 never is; a reaped child's pid stops answering.
+    #[tokio::test]
+    async fn pid_alive_tracks_a_process_until_it_is_reaped() {
+        assert!(pid_alive(std::process::id()));
+        assert!(!pid_alive(0));
+        let mut child = long_sleep().spawn().expect("`sleep` must be on PATH");
+        let pid = child.id().expect("a running child has a pid");
+        assert!(pid_alive(pid));
+        child.kill().await.expect("kill the sleeper");
+        child.wait().await.expect("reap the sleeper");
+        assert!(!pid_alive(pid));
     }
 
     /// Refused before the syscall: `killpg(0, _)` is the caller's own group (the test runner here, the

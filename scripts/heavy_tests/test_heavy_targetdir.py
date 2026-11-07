@@ -170,11 +170,8 @@ class TargetDirTests(unittest.TestCase):
     def env(self, **extra: str) -> dict:
         env = dict(os.environ)
         for k in list(env):
-            if (k in ("NUCLEOS_HEAVY", "NUCLEOS_HEAVY_TOKEN", "NUCLEOS_HEAVY_HELD",
-                      "NUCLEOS_HEAVY_PRIO", "NUCLEOS_HEAVY_WAIT_MAX", "NUCLEOS_HEAVY_MAIN",
-                      "NUCLEOS_HEAVY_TARGET", "NUCLEOS_HEAVY_TARGET_SLOTS", "RUSTFLAGS",
-                      "CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR")
-                    or k.startswith(("CARGO_PROFILE_", "CARGO_FEATURES", "FAKE_"))):
+            if (k in ("RUSTFLAGS", "CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR")
+                    or k.startswith(("NUCLEOS_HEAVY", "CARGO_PROFILE_", "CARGO_FEATURES", "FAKE_"))):
                 env.pop(k)
         env.update(
             NUCLEOS_HEAVY_DIR=str(self.state),

@@ -2,6 +2,9 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+// The remote build aliases the plugin to its browser adapter; do the same for the toast under test.
+vi.mock("@tauri-apps/plugin-notification", () => import("./adapters/notification"));
+
 const SRC = join(__dirname, "..");
 
 const ADAPTERS: Record<string, string> = {
@@ -120,6 +123,165 @@ describe("remote adapters", () => {
       await expect(notification.isPermissionGranted()).resolves.toBe(true);
       notification.sendNotification({ title: "hi", body: "b" });
       expect(shown).toHaveBeenCalledWith("hi", { body: "b" });
+    });
+  });
+
+  describe("task 5.3: notifications, dropped files, downloads", () => {
+    afterEach(async () => {
+      vi.unstubAllGlobals();
+      const { desktopTransport, setTransport } = await import("../data/transport");
+      setTransport(desktopTransport);
+    });
+
+    async function goRemote() {
+      const { setTransport } = await import("../data/transport");
+      const { remoteTransport } = await import("./transport");
+      setTransport(remoteTransport);
+    }
+
+    it("the_remote_build_asks_for_notification_permission_from_a_gesture", async () => {
+      await goRemote();
+      const toast = await import("../app/desktop-toast");
+      const note = { key: "k", title: "Approval waiting", body: "b", to: "/waiting" };
+      const request = vi.fn(async () => "granted");
+      const shown = vi.fn();
+      const Api = Object.assign(shown, { permission: "default", requestPermission: request });
+      vi.stubGlobal("Notification", Api);
+
+      // On load and on a toast: never asks, never shows, never fails.
+      expect(toast.browserNotificationState()).toBe("default");
+      await expect(toast.sendDesktopToast(note)).resolves.toBeUndefined();
+      expect(request).not.toHaveBeenCalled();
+      expect(shown).not.toHaveBeenCalled();
+
+      // From the click: asks exactly once.
+      await expect(toast.askBrowserNotifications()).resolves.toBe("granted");
+      expect(request).toHaveBeenCalledTimes(1);
+
+      // Granted: the next toast shows.
+      Api.permission = "granted";
+      await toast.sendDesktopToast(note);
+      expect(shown).toHaveBeenCalledWith("Approval waiting", { body: "b" });
+
+      // Denied or unsupported: no error, nothing shown.
+      shown.mockClear();
+      Api.permission = "denied";
+      await expect(toast.sendDesktopToast(note)).resolves.toBeUndefined();
+      expect(shown).not.toHaveBeenCalled();
+      vi.stubGlobal("Notification", undefined);
+      expect(toast.browserNotificationState()).toBe("unsupported");
+      await expect(toast.sendDesktopToast(note)).resolves.toBeUndefined();
+      await expect(toast.askBrowserNotifications()).resolves.toBe("denied");
+    });
+
+    it("a_dropped_file_is_read_with_the_browser_file_api", async () => {
+      const files = await import("../data/files");
+      const bytes = new Uint8Array([1, 2, 3]).buffer;
+      const good = { name: "a.txt", size: 3, arrayBuffer: async () => bytes } as unknown as File;
+      const locked = {
+        name: "b.txt",
+        size: 9,
+        arrayBuffer: async () => {
+          throw new DOMException("gone", "NotFoundError");
+        },
+      } as unknown as File;
+      const transfer: import("../data/files").DropTransfer = {
+        items: [
+          { kind: "file", getAsFile: () => good },
+          { kind: "file", getAsFile: () => locked },
+          { kind: "file", getAsFile: () => null, webkitGetAsEntry: () => ({ isDirectory: true, name: "Docs" }) },
+          { kind: "string", getAsFile: () => null },
+        ],
+      };
+      const [a, b, folder, ...rest] = files.browserDropFiles(transfer);
+      expect(rest).toEqual([]);
+      expect([a?.name, a?.size, b?.name, folder?.name]).toEqual(["a.txt", 3, "b.txt", "Docs"]);
+      await expect(a!.read()).resolves.toBe(bytes);
+      await expect(b!.read()).rejects.toThrow("the browser could not read this file");
+      await expect(folder!.read()).rejects.toThrow("a folder cannot be sent from a browser");
+
+      // No items API: the plain file list is read the same way.
+      expect(files.browserDropFiles({ files: [good] }).map((f) => f.name)).toEqual(["a.txt"]);
+
+      // Only a remote device takes the DOM drop; the desktop keeps the host's events.
+      expect(files.browserDropsApply()).toBe(false);
+      await goRemote();
+      expect(files.browserDropsApply()).toBe(true);
+    });
+
+    it("open_on_disk_downloads_in_the_browser", async () => {
+      await goRemote();
+      const files = await import("../data/files");
+      const fetchMock = vi.fn(async () => new Response(new Blob(["hello"]), { status: 200 }));
+      vi.stubGlobal("fetch", fetchMock);
+      const clicked: Array<{ name: string; href: string }> = [];
+      const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (this: HTMLAnchorElement) {
+        clicked.push({ name: this.download, href: this.getAttribute("href") ?? "" });
+      });
+
+      await files.openFile("Docs/guia final.pdf");
+
+      // A native download: no fetch, no Blob in memory; the browser streams the anchor's URL to disk.
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(clicked).toEqual([{ name: "guia final.pdf", href: "/api/files/download?path=Docs%2Fguia%20final.pdf" }]);
+
+      // A program is still never run from the files folder.
+      await expect(files.openFile("Docs/setup.exe")).rejects.toThrow("a program is never run");
+      expect(clicked).toHaveLength(1);
+      click.mockRestore();
+    });
+
+    it("a_notification_click_focuses_the_tab_and_follows_its_route", async () => {
+      await goRemote();
+      const notification = await import("./adapters/notification");
+      const made: Array<{ onclick: (() => void) | null; close: () => void }> = [];
+      const Granted = Object.assign(
+        function () {
+          const n = { onclick: null as (() => void) | null, close: vi.fn() };
+          made.push(n);
+          return n;
+        },
+        { permission: "granted", requestPermission: vi.fn(async () => "granted") },
+      );
+      vi.stubGlobal("Notification", Granted);
+      const focus = vi.spyOn(window, "focus").mockImplementation(() => {});
+      const assign = vi.fn();
+      vi.stubGlobal("location", { ...window.location, assign });
+
+      notification.sendNotification({ title: "t", to: "/waiting" });
+      made[0]?.onclick?.();
+      expect(focus).toHaveBeenCalledTimes(1);
+      expect(assign).toHaveBeenCalledWith("/waiting");
+
+      // A route that leaves the app is never followed; the tab is still focused.
+      notification.sendNotification({ title: "t", to: "//evil.example/x" });
+      made[1]?.onclick?.();
+      notification.sendNotification({ title: "t" });
+      made[2]?.onclick?.();
+      expect(assign).toHaveBeenCalledTimes(1);
+      expect(focus).toHaveBeenCalledTimes(3);
+      focus.mockRestore();
+    });
+
+    it("a_file_dropped_outside_a_drop_zone_does_not_leave_the_app", async () => {
+      await goRemote();
+      const { installDropGuard } = await import("./drop-guard");
+      const remove = installDropGuard();
+      for (const type of ["dragover", "drop"]) {
+        const event = new Event(type, { cancelable: true, bubbles: true });
+        document.body.dispatchEvent(event);
+        expect(event.defaultPrevented).toBe(true);
+      }
+      // A handler lower down still runs: the guard only prevents the default, it stops nothing.
+      const seen = vi.fn();
+      document.body.addEventListener("drop", seen);
+      document.body.dispatchEvent(new Event("drop", { cancelable: true, bubbles: true }));
+      expect(seen).toHaveBeenCalledTimes(1);
+      document.body.removeEventListener("drop", seen);
+      remove();
+      const after = new Event("drop", { cancelable: true, bubbles: true });
+      document.body.dispatchEvent(after);
+      expect(after.defaultPrevented).toBe(false);
     });
   });
 });

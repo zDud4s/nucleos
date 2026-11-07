@@ -1,7 +1,9 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { clearWebDraft } from "./Web";
 import { requestFocus, resetBrowserStore } from "../data/browser-store";
+import { desktopTransport, setTransport } from "../data/transport";
+import { remoteTransport } from "../remote/transport";
 import { daemonFetch, daemonState, renderApp } from "../test/harness";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
@@ -24,6 +26,10 @@ beforeEach(() => {
   daemon.apiFetch.mockImplementation(daemonFetch(daemonState()));
 });
 
+afterEach(() => {
+  setTransport(desktopTransport);
+});
+
 // The page hands its panel toggles to the browser, which draws them at the end of its address row.
 vi.mock("./BrowserPage", () => ({
   BrowserPage: ({ actions }: { actions?: import("react").ReactNode }) => (
@@ -40,6 +46,48 @@ const archiveToggle = () => screen.getByRole("button", { name: "Archive" });
 const agentToggle = () => screen.getByRole("button", { name: "Agent" });
 
 describe("the Web page split", () => {
+  it("web_archive_works_or_explains_itself_remotely", async () => {
+    setTransport(remoteTransport);
+    daemon.apiFetch.mockImplementation(async (path: string) => {
+      if (path === "/web/pages/42") {
+        return {
+          id: 42,
+          requested_url: "https://example.test/article",
+          final_url: "https://example.test/article",
+          host: "example.test",
+          title: "Stored page",
+          byline: null,
+          content_md: "Archive content reaches the laptop.",
+          extract_status: "article",
+          trust_at_fetch: "raw",
+          trust_rule: "public",
+          bytes: 1024,
+          fetched_at: "2026-10-31T12:00:00Z",
+        };
+      }
+      if (path === "/web/pages") {
+        return [
+          {
+            id: 42,
+            final_url: "https://example.test/article",
+            host: "example.test",
+            title: "Stored page",
+            snippet: "Archive content",
+            trust_at_fetch: "raw",
+            fetched_at: "2026-10-31T12:00:00Z",
+          },
+        ];
+      }
+      return undefined;
+    });
+
+    await renderApp({ initialPath: "/web/pages/42" });
+
+    expect(await screen.findByRole("heading", { level: 2, name: "Stored page" })).toBeDefined();
+    expect(screen.getByText("Archive content reaches the laptop.")).toBeDefined();
+    expect(daemon.apiFetch).toHaveBeenCalledWith("/web/pages/42");
+  });
+
   it("is the browser alone: a title for assistive technology, no header band, no panel", async () => {
     await renderApp({ initialPath: "/web" });
 
