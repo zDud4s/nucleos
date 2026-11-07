@@ -78,7 +78,25 @@ pub(super) async fn apply_gate_answer(
     }
     let mut park = None;
     match answer {
+        // The machine was too busy to measure: wait with backoff, spend nothing, ask nobody.
+        Err(NotMeasured::Failed(reason)) if is_load_reason(&reason) => {
+            let waits = held
+                .extra
+                .get(GATE_LOAD_WAITS)
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            let delay = load_backoff(waits);
+            let until = Utc::now()
+                + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::minutes(10));
+            held.extra.insert(GATE_LOAD_WAITS.to_owned(), json!(waits + 1));
+            held.extra.insert(
+                GATE_BACKOFF_UNTIL.to_owned(),
+                json!(until.to_rfc3339_opts(SecondsFormat::Secs, false)),
+            );
+            held.extra.insert(GATE_LOAD_REASON.to_owned(), json!(reason));
+        }
         Err(NotMeasured::Failed(reason)) => {
+            clear_load_wait(&mut held.extra);
             let count = held
                 .extra
                 .get(GATE_FAILURES)
@@ -101,6 +119,7 @@ pub(super) async fn apply_gate_answer(
             }
         }
         answer => {
+            clear_load_wait(&mut held.extra);
             held.extra.remove(GATE_FAILURES);
             apply_gate_verdict(held, &scope).map_err(|e| e.to_string())?;
             let entry = held.gates.last_mut().and_then(Value::as_object_mut);
