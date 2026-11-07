@@ -1,7 +1,15 @@
 import { useEffect, useId, useRef } from "react";
 import { TRASH_RETENTION_DAYS, fileName, parentPath, trashDaysLeft, useTrash, type Trashed } from "../../data/files";
-import { Button, Count, Quiet, RelativeTime, Row, Rows, StaleNote } from "../../ui";
+import { Button, Count, Quiet, RelativeTime, Row, Rows, Skeleton, StaleNote } from "../../ui";
 import { RefusalOrError, TRASH_SENTENCES, onEscape, type Undo } from "./shared";
+
+/*
+ * Why this file does not use the shared `useUndoable`: that hook DELAYS the real action and
+ * hides the item meanwhile. A file delete here is already reversible on the server (it goes to
+ * the trash and `Restore` brings it back), and a move is undone by moving back, so both run
+ * at once and the undo note below stays up for as long as it is useful (and answers Ctrl+Z).
+ * A window that expires would make a still-valid undo disappear.
+ */
 
 /* -------------------------------------------------------------- delete -- */
 
@@ -194,7 +202,7 @@ export function RecentlyDeleted({
       {trash.isError && items === undefined && (
         <RefusalOrError error={trash.error} sentences={TRASH_SENTENCES} what="nothing is known about the trash" />
       )}
-      {!trash.isError && items === undefined && <p className="fi-loading">reading the trash…</p>}
+      {!trash.isError && items === undefined && <Skeleton label="Reading the trash…" variant="row" count={2} />}
       {items !== undefined && items.length === 0 && <Quiet says="nothing deleted recently." />}
       {items !== undefined && items.length > 0 && (
         <Rows label="Recently deleted">

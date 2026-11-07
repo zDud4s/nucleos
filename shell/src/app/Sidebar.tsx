@@ -7,6 +7,7 @@ import { Quiet } from "../ui/Quiet";
 import { readState } from "../ui/state-map";
 import { DAEMON_NAME } from "../copy";
 import mark from "../assets/brand/mark.png";
+import { prefetchHandlers } from "../lib/prefetch";
 
 /**
  * Where the icon-collapse lives between sessions.
@@ -743,6 +744,7 @@ export function Sidebar({ badges, projects, systemAlert, besideSystem, children 
       <Link
         to={entry.path}
         data-nav-path={entry.path}
+        {...prefetchHandlers(entry.path)}
         className={classes.join(" ")}
         aria-current={active ? "page" : undefined}
         /*

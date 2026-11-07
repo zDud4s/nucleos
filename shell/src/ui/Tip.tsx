@@ -6,6 +6,7 @@ import {
   type KeyboardEvent,
   type ReactNode,
 } from "react";
+import { Kbd } from "./Kbd";
 
 /** What a render-prop trigger is handed, so it can wire its own control to the tip. */
 export interface TipState {
@@ -30,6 +31,8 @@ export interface TipProps {
   children?: ReactNode | ((state: TipState) => ReactNode);
   /** The accessible name of the ⓘ mark. Used only when there are no `children`. */
   name?: string;
+  /** A keyboard shortcut for what the trigger does ("⌘K", or ["Ctrl","K"]); drawn as a Kbd chip in the tip. */
+  shortcut?: string | string[];
   /** Keep the tip in the document while closed, for a description that is always read. */
   persist?: boolean;
   /** Extra class for the root. */
@@ -48,7 +51,7 @@ export interface TipProps {
  * The tip's text is in the document only while it shows (a closed one costs no DOM and no
  * pixels) unless `persist` keeps it there, hidden.
  */
-export function Tip({ tip, children, name, persist, className }: TipProps) {
+export function Tip({ tip, children, name, shortcut, persist, className }: TipProps) {
   const tipId = useId();
   const [root, setRoot] = useState<HTMLSpanElement | null>(null);
   const [hover, setHover] = useState(false);
@@ -136,7 +139,15 @@ export function Tip({ tip, children, name, persist, className }: TipProps) {
     >
       {trigger}
       <span className="ui-tip-pop" id={tipId} role="tooltip" hidden={!open}>
-        {open || persist === true ? <span className="ui-tip-box">{tip}</span> : null}
+        {open || persist === true ? <span className="ui-tip-box">
+            {tip}
+            {shortcut === undefined ? null : (
+              <>
+                {" "}
+                {typeof shortcut === "string" ? <Kbd>{shortcut}</Kbd> : <Kbd keys={shortcut} />}
+              </>
+            )}
+          </span> : null}
       </span>
     </span>
   );

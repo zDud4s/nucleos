@@ -1,7 +1,20 @@
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import { AnalyticsView } from "../analytics/AnalyticsView";
-import { DEFAULT_DAYS, validateAnalyticsSearch } from "../data/analytics";
+import { apiFetch } from "../data/client";
+import { keys } from "../data/keys";
+import { DEFAULT_DAYS, analyticsPath, validateAnalyticsSearch } from "../data/analytics";
+import { registerPrefetcher } from "../lib/prefetch";
 import { PageHeader } from "../ui";
+
+// Hovering the rail link warms the default window's report (#7). Same key and path as
+// `useAnalytics(undefined, DEFAULT_DAYS)`, so the page paints from the cache on arrival.
+registerPrefetcher("/analytics", (qc) =>
+  qc.prefetchQuery({
+    queryKey: keys.analytics.global(DEFAULT_DAYS),
+    queryFn: () => apiFetch(analyticsPath(undefined, DEFAULT_DAYS)),
+    staleTime: 30_000,
+  }),
+);
 
 /**
  * Trends across every project (spec analytics-fundacao §9). The window is in the address

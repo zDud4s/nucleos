@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
@@ -789,6 +789,40 @@ describe("Runs - New run", () => {
     expect(start.disabled).toBe(true);
   });
 
+  it("a double click on Start run posts once, with an idempotency key", async () => {
+    const answer = runsFetch(world());
+    let release!: () => void;
+    const slow = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === "/runs" && init?.method === "POST") {
+        await slow;
+        return { id: 93 };
+      }
+      return await answer(path, init);
+    });
+
+    await renderRuns();
+    await openNewRun();
+    fireEvent.change(screen.getByLabelText("Prompt"), { target: { value: "tidy the imports" } });
+    const start = screen.getByRole("button", { name: "Start run" });
+    fireEvent.click(start);
+    fireEvent.click(start);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const posts = daemon.apiFetch.mock.calls.filter(
+      ([path, init]) => path === "/runs" && (init as RequestInit | undefined)?.method === "POST",
+    );
+    expect(posts).toHaveLength(1);
+    expect(new Headers((posts[0]?.[1] as RequestInit).headers).get("Idempotency-Key")).toBeTruthy();
+
+    await act(async () => {
+      release();
+      await slow;
+    });
+  });
+
   it("starts in shadow, the mode that cannot act, unless somebody chooses otherwise", async () => {
     const answer = runsFetch(world());
     daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
@@ -1080,6 +1114,50 @@ describe("Runs - presets", () => {
     expect(remove.className).toContain("ui-button-quiet");
     expect(remove.className).not.toContain("ui-button-danger");
   });
+
+  it("deleting a preset hides it at once and Undo brings it back without a request", async () => {
+    const answer = runsFetch(world({ presets: [preset({ id: 3, name: "nightly" })] }));
+    const deletes: string[] = [];
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === "/presets/3" && init?.method === "DELETE") {
+        deletes.push(path);
+        return undefined;
+      }
+      return await answer(path, init);
+    });
+
+    await renderRuns();
+    await openNewRun();
+    fireEvent.click(await screen.findByRole("button", { name: "Delete nightly" }));
+
+    expect(await screen.findByText("Deleted preset nightly")).toBeDefined();
+    expect(screen.queryByRole("button", { name: "Delete nightly" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /^undo$/i }));
+
+    expect(await screen.findByRole("button", { name: "Delete nightly" })).toBeDefined();
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(deletes).toEqual([]);
+  });
+
+  it("a deleted preset is only removed on the daemon once the Undo window closes", async () => {
+    const answer = runsFetch(world({ presets: [preset({ id: 3, name: "nightly" })] }));
+    const deletes: string[] = [];
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === "/presets/3" && init?.method === "DELETE") {
+        deletes.push(path);
+        return undefined;
+      }
+      return await answer(path, init);
+    });
+
+    await renderRuns();
+    await openNewRun();
+    fireEvent.click(await screen.findByRole("button", { name: "Delete nightly" }));
+    await screen.findByText("Deleted preset nightly");
+    expect(deletes).toEqual([]);
+
+    await waitFor(() => expect(deletes).toEqual(["/presets/3"]), { timeout: 9000 });
+  }, 15000);
 
   describe("router trail", () => {
     // The router's report across all runs moved to System -> Health; what stays

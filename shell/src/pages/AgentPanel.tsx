@@ -19,7 +19,8 @@ import { useProjects } from "../data/system";
 import { ComposerBox } from "../chats/ComposerBox";
 import { MessageList, type ListedMessage } from "../chats/MessageList";
 import type { Turn } from "../lib/turns";
-import { Button, ErrorNote, Select } from "../ui";
+import { newIdempotencyKey } from "../lib/idempotency";
+import { Button, ErrorNote, Select, Skeleton } from "../ui";
 import "./agent-panel.css";
 
 const PLACEHOLDER = "Message the agent…";
@@ -132,7 +133,7 @@ export function AgentPanel() {
   if (sessionPending) {
     return (
       <section className="agent-panel" aria-label="Agent">
-        <p className="agent-panel-note">Loading the conversation of this tab…</p>
+        <Skeleton label="Loading the conversation of this tab" variant="row" count={3} />
       </section>
     );
   }
@@ -202,7 +203,7 @@ export function AgentPanel() {
     }
     const view = viewKey;
     send.mutate(
-      { text: words, images: [] },
+      { text: words, images: [], idempotencyKey: newIdempotencyKey() },
       {
         // A refused send gives the words back rather than losing them.
         onError: (e: unknown) => {

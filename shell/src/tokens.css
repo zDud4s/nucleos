@@ -432,3 +432,14 @@
     --scroll-fade-r: 0px;
   }
 }
+
+/* #18 Squircle corners: the same radius tokens, a smoother curve. `.squircle` is the utility for
+   anything not already covered in ui.css. Unsupported browsers ignore the whole block. */
+@supports (corner-shape: squircle) {
+  :root {
+    --corner-shape: squircle;
+  }
+  .squircle {
+    corner-shape: squircle;
+  }
+}

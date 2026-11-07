@@ -2,7 +2,9 @@ import { useState, type ReactNode } from "react";
 import { Link } from "@tanstack/react-router";
 import { Paperclip } from "lucide-react";
 import { DAEMON_NAME } from "../copy";
-import { isApiRefusal } from "../data/client";
+import { apiFetch, isApiRefusal } from "../data/client";
+import { keys } from "../data/keys";
+import { registerPrefetcher } from "../lib/prefetch";
 import {
   awaitingYouCount,
   MAIL_QUEUE_LIMIT,
@@ -570,3 +572,8 @@ function SkippedAbsence() {
     </Panel>
   );
 }
+
+// Warm the unfiltered queue when the sidebar link is hovered (#7).
+registerPrefetcher("/mail", (qc) =>
+  qc.prefetchQuery({ queryKey: keys.mail.queue(undefined), queryFn: () => apiFetch<QueuedEmail[]>("/email/queue"), staleTime: 5_000 }),
+);

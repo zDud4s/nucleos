@@ -30,7 +30,9 @@ import {
   StatCard,
   StateBadge,
   money,
+  usePaletteGroup,
 } from "../ui";
+import { usePageKeys } from "../project/pageKeys";
 import "./teams.css";
 
 /**
@@ -55,6 +57,19 @@ export function TeamRunDetail() {
   const cancel = useCancelTeamRun();
   const del = useDeleteTeamRun();
 
+  // #3/#4: the way out of a team run, by key. Cancelling and deleting stay hold-to-confirm buttons.
+  const toTeams = () => void navigate({ to: "/teams" });
+  const toFleet = () => void navigate({ to: "/fleet" });
+  usePaletteGroup({
+    id: "team-run-actions",
+    heading: "This team run",
+    items: [
+      { id: "team-run-all", label: "All teams", match: "all teams back list", shortcut: "B", run: toTeams },
+      { id: "team-run-fleet", label: "Open fleet", match: "open fleet", shortcut: "F", run: toFleet },
+    ],
+  });
+  usePageKeys({ b: toTeams, f: toFleet });
+
   if (detail === undefined) {
     return (
       <>
@@ -63,7 +78,7 @@ export function TeamRunDetail() {
         {run.isError ? (
           <DetailError error={run.error} onRetry={() => void run.refetch()} />
         ) : (
-          <Skeleton label="Loading the run" lines={4} />
+          <Skeleton label="Loading the run" variant="cards" count={2} />
         )}
       </>
     );

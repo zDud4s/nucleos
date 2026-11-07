@@ -229,6 +229,26 @@ describe("BrowserPage", () => {
     expect(screen.getByRole("img", { name: "Secure connection" })).toBeTruthy();
   });
 
+  it("steps the tab history on the mouse side buttons and Alt+Arrow without reaching the shell", async () => {
+    const shellSaw = vi.fn();
+    window.addEventListener("mouseup", shellSaw);
+    render(<BrowserPage />);
+    const tabId = await openTab();
+    emit("tab-state", state(tabId, { canGoBack: true, canGoForward: true }));
+    const toolbar = screen.getByRole("button", { name: "Back" });
+    fireEvent.mouseUp(toolbar, { button: 3 });
+    await waitFor(() => expect(calls("browser_tab_back")).toEqual([{ tabId }]));
+    fireEvent.mouseUp(toolbar, { button: 4 });
+    await waitFor(() => expect(calls("browser_tab_forward")).toEqual([{ tabId }]));
+    fireEvent.keyDown(toolbar, { key: "ArrowLeft", altKey: true });
+    await waitFor(() => expect(calls("browser_tab_back")).toHaveLength(2));
+    // The address field keeps Alt+Arrow for its caret.
+    fireEvent.keyDown(screen.getByRole("textbox", { name: "Address" }), { key: "ArrowLeft", altKey: true });
+    expect(calls("browser_tab_back")).toHaveLength(2);
+    expect(shellSaw).not.toHaveBeenCalled();
+    window.removeEventListener("mouseup", shellSaw);
+  });
+
   it("hides every webview while an overlay is open", async () => {
     mocks.overlay.open = true;
     const { rerender } = render(<BrowserPage />);
