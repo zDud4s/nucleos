@@ -193,10 +193,7 @@ impl Logins {
                 "an account named `{label}` already exists for {engine}"
             ));
         }
-        let id = AccountId(format!(
-            "{engine}:{:08x}",
-            rand::rng().random::<u32>()
-        ));
+        let id = AccountId(format!("{engine}:{:08x}", rand::rng().random::<u32>()));
         let dir = account_dir(data_dir, &id);
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
         let account = Account {
@@ -243,9 +240,9 @@ impl Logins {
             let mut entries = shared.lock();
             entries.retain(|_, e| e.finished.is_none_or(|at| at.elapsed() < KEEP_FINISHED));
             // One login per engine at a time: Codex's callback port would clash.
-            let busy = entries.values().any(|e| {
-                e.view.engine == account.engine && !e.view.phase.is_terminal()
-            });
+            let busy = entries
+                .values()
+                .any(|e| e.view.engine == account.engine && !e.view.phase.is_terminal());
             if busy {
                 return Err(format!(
                     "a login for {} is already in progress",
@@ -253,9 +250,9 @@ impl Logins {
                 ));
             }
         }
-        let command = adapter.login_command(&account).ok_or_else(|| {
-            format!("login is not supported for engine `{}`", account.engine)
-        })?;
+        let command = adapter
+            .login_command(&account)
+            .ok_or_else(|| format!("login is not supported for engine `{}`", account.engine))?;
         let login_id = format!("login_{:016x}", rand::rng().random::<u64>());
         let mut view = LoginView {
             login_id: login_id.clone(),
@@ -736,14 +733,21 @@ mod tests {
             store::get(&db, &account_id).await.unwrap().is_none(),
             "no row before the login ends"
         );
-        let after = logins.submit_code(&started.login_id, " 123-456 ").await.unwrap();
+        let after = logins
+            .submit_code(&started.login_id, " 123-456 ")
+            .await
+            .unwrap();
         assert_eq!(after.phase, LoginPhase::Verifying);
         reach(&logins, &started.login_id, LoginPhase::Done).await;
         let stored = store::get(&db, &account_id).await.unwrap().unwrap();
         assert_eq!(stored.label, "work");
         assert_eq!(stored.state, AccountState::Active);
         assert_eq!(stored.provider, "fakeco");
-        assert!(account_dir(data.path(), &account_id).join("fake-auth.json").exists());
+        assert!(
+            account_dir(data.path(), &account_id)
+                .join("fake-auth.json")
+                .exists()
+        );
     }
 
     #[tokio::test]
@@ -851,7 +855,12 @@ mod tests {
             store::get(&db, &id).await.unwrap().unwrap().state,
             AccountState::Active
         );
-        assert!(working.start_relogin(&db, &AccountId("fake:ffffffff".into())).await.is_err());
+        assert!(
+            working
+                .start_relogin(&db, &AccountId("fake:ffffffff".into()))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -904,8 +913,16 @@ mod tests {
         }
         let db = pool().await;
         let data = data_dir();
-        let logins = Logins::with(lookup, scripted(vec![]), Duration::ZERO, Duration::from_secs(5));
-        let view = logins.start_new(&db, data.path(), "tty", "x").await.unwrap();
+        let logins = Logins::with(
+            lookup,
+            scripted(vec![]),
+            Duration::ZERO,
+            Duration::from_secs(5),
+        );
+        let view = logins
+            .start_new(&db, data.path(), "tty", "x")
+            .await
+            .unwrap();
         assert_eq!(view.phase, LoginPhase::Failed);
         assert!(view.message.unwrap().contains("terminal"));
         assert!(!account_dir(data.path(), &AccountId(view.account_id)).exists());
@@ -933,7 +950,12 @@ mod tests {
             .unwrap();
         reach(&waiting, &started.login_id, LoginPhase::AwaitingCode).await;
         assert!(waiting.submit_code(&started.login_id, "  ").await.is_err());
-        assert!(waiting.submit_code(&started.login_id, "a\nb").await.is_err());
+        assert!(
+            waiting
+                .submit_code(&started.login_id, "a\nb")
+                .await
+                .is_err()
+        );
         waiting.cancel(&started.login_id).await;
     }
 
@@ -942,8 +964,18 @@ mod tests {
         let db = pool().await;
         let data = data_dir();
         let logins = scripted_logins(vec![Step::Hang]);
-        assert!(logins.start_new(&db, data.path(), "local", "x").await.is_err());
-        assert!(logins.start_new(&db, data.path(), "fake", "  ").await.is_err());
+        assert!(
+            logins
+                .start_new(&db, data.path(), "local", "x")
+                .await
+                .is_err()
+        );
+        assert!(
+            logins
+                .start_new(&db, data.path(), "fake", "  ")
+                .await
+                .is_err()
+        );
         let first = logins
             .start_new(&db, data.path(), "fake", "work")
             .await
