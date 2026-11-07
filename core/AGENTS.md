@@ -64,6 +64,7 @@ the contract, not a snapshot.
 | `execution/runner/claude_args.rs` | The Claude CLI's argument list: built-in tools, subagents, `cli_args` and the denied tools. |
 | `execution/runner/codex.rs` | The Codex CLI backend: its arguments, MCP overrides, staged images, usage and `CodexCliRunner`. Parent of `execution/runner/codex/`. |
 | `execution/runner/codex/mcp.rs` | The Codex CLI's MCP surface: `codex_mcp_overrides`, the registry servers' environment (`codex_mcp_env` and its denylist), and the deny matcher, deny hook and disabled features of an `McpOnly` turn. Re-exported from `codex`. |
+| `execution/runner/cli_pids.rs` | What the liveness sweep may ask the OS about a run: which process its CLI is and when the current attempt began. Process-global, as the runner is spawned without `AppState`. |
 | `execution/runner/command.rs` | The `CommandRunner` trait every model backend implements, and the prompt helpers they share. |
 | `execution/runner/fake.rs` | The test double for `CommandRunner`, built only for tests and the testkit feature. |
 | `execution/runner/live.rs` | The live view of a turn read off its stream: tool calls, the plan, details and `live_from_stream`. |
