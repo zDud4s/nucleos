@@ -207,7 +207,12 @@ if [ -z "$core" ]; then
   echo "post-checkout: no staged nucleos-core found; this worktree has no workflow until the daemon syncs it (nucleos-core --workflow-sync \"$tree\")" >&2
   exit 0
 fi
-if ! "$core" --workflow-sync "$tree" >/dev/null; then
+# Bounded, so a wedged daemon cannot hang `git worktree add` (and whatever script or agent runs it).
+bound=""
+if command -v timeout >/dev/null 2>&1; then
+  bound="timeout 60"
+fi
+if ! $bound "$core" --workflow-sync "$tree" >/dev/null; then
   echo "post-checkout: the workflow sync of this worktree did not happen; re-run: \"$core\" --workflow-sync \"$tree\"" >&2
 fi
 exit 0
