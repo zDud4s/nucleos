@@ -95,7 +95,7 @@ export function Council() {
         id: "council.new",
         label: "New council",
         match: "new council convene ask question",
-        run: () => void navigate({ to: "/council" }),
+        run: (): void => { void navigate({ to: "/council" }); },
       },
       ...(councils.data ?? [])
         .filter((row) => councilIsAlive(row.status))
@@ -105,7 +105,7 @@ export function Council() {
           label: `Open: ${row.question.slice(0, 60)}`,
           match: `open deliberating ${row.question}`,
           hint: "deliberating",
-          run: () => void navigate({ to: `/council/${row.id}` }),
+          run: (): void => { void navigate({ to: `/council/${row.id}` }); },
         })),
     ] }),
     [councils.data, navigate],
