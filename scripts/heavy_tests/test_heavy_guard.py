@@ -332,6 +332,30 @@ class HeavyGuardTests(unittest.TestCase):
         ui = self.rewritten(self.decide(bash("cargo test the_name")))
         self.assertIn("--prio 1 --agent main", ui["command"])
 
+    def test_cargo_word_inside_curl_data_body_is_not_a_run(self):
+        # Defect 2026-11-07: a curl answering a decision, with "cargo" only inside the -d body.
+        body = '{"decision":"allow","note":"x; cargo test is for the controller"}'
+        for cmd in (
+            f"curl -s -X POST http://127.0.0.1:1/decision -d '{body}'",
+            f"curl -s http://127.0.0.1:1/d --data-raw '{body}'",
+            "curl -s http://x/d -d '{\"n\":\"line\ncargo test\"}'",
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(self.decide(bash(cmd, agent_id="a1")), cmd)
+        for cmd in (
+            f"curl -s http://x/d -d '{body}' && cargo build",
+            "cargo build",
+            "cd x && cargo test",
+            "FOO=1 cargo check",
+            "env cargo test",
+            "(cargo test)",
+            "echo x | cargo test",
+            "$(cargo test)",
+            "python scripts/heavy.py cargo test",
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(self.decide(bash(cmd, agent_id="a1")), cmd)
+
 
 if __name__ == "__main__":
     unittest.main()

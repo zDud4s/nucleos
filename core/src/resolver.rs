@@ -2663,7 +2663,17 @@ mod tests {
         rooted_at(&pool, merge, &repo).await;
         rooted_at(&pool, rebase, &repo).await;
 
-        settle_moot(&pool).await;
+        // A git error or timeout leaves a row alone by design and the next sweep retries it, so a
+        // loaded machine may need more than one pass; the bound is only a hang guard.
+        let hang_guard = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            settle_moot(&pool).await;
+            let merge_done = settlement_of(&pool, merge).await.0.is_some();
+            let rebase_done = settlement_of(&pool, rebase).await.0.is_some();
+            if (merge_done && rebase_done) || std::time::Instant::now() >= hang_guard {
+                break;
+            }
+        }
 
         for id in [merge, rebase] {
             let (at, reason) = settlement_of(&pool, id).await;

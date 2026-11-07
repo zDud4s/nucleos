@@ -351,12 +351,12 @@ pub async fn submit_narrowed(
     args: &VerifyArgs,
 ) -> Result<i64, VerifyError> {
     if !matches!(caller, Caller::Job(_))
-        || args.kind != Kind::Test
+        || !matches!(args.kind, Kind::Test | Kind::Check)
         || args.scope != ScopeArg::Scope
         || args.cover
     {
         return Err(VerifyError::BadRequest(
-            "only a tree branch's test/scope gate may be narrowed".into(),
+            "only a tree branch's test or check scope gate may be narrowed".into(),
         ));
     }
     let (id, _) = submit_with(executor, caller, args, true).await?;
@@ -3690,13 +3690,6 @@ tests:
         );
         let refused = [
             (Caller::Owner, scope.clone()),
-            (
-                Caller::Job(1),
-                VerifyArgs {
-                    kind: Kind::Check,
-                    ..scope.clone()
-                },
-            ),
             (
                 Caller::Job(1),
                 VerifyArgs {

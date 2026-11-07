@@ -3557,7 +3557,8 @@ mod tests {
         )
         .await;
 
-        for _ in 0..80 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
                 .bind(run_id)
                 .fetch_one(&state.pool)
@@ -3715,7 +3716,8 @@ mod tests {
         )
         .await;
 
-        for _ in 0..80 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
                 .bind(run_id)
                 .fetch_one(&state.pool)
@@ -3957,7 +3959,8 @@ mod tests {
         state: &AppState,
         run_id: i64,
     ) -> (String, Option<String>, Option<String>) {
-        for _ in 0..80 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             let row: (String, Option<String>, Option<String>) =
                 sqlx::query_as("SELECT status, stdout, stderr FROM runs WHERE id = ?")
                     .bind(run_id)
@@ -4727,9 +4730,16 @@ mod tests {
         // A second pass finds nothing still running, so nothing is reported twice.
         ingest_landed_items(&state, &run).await.unwrap();
 
+        // The two expected reports (hang guard), then a short silence for any extra one.
         let mut reports = Vec::new();
+        while reports.len() < 2 {
+            match tokio::time::timeout(std::time::Duration::from_secs(60), received.recv()).await {
+                Ok(Some(report)) => reports.push(report),
+                _ => break,
+            }
+        }
         while let Ok(Some(report)) =
-            tokio::time::timeout(std::time::Duration::from_millis(500), received.recv()).await
+            tokio::time::timeout(std::time::Duration::from_millis(300), received.recv()).await
         {
             reports.push(report);
         }

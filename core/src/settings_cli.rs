@@ -313,7 +313,7 @@ mod tests {
     /// A data directory whose database holds `verify` at version 2 (capacity 2, then capacity 3).
     async fn seeded_dir() -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
-        let pool = crate::storage::open(&data_dir::db_path(dir.path()))
+        let pool = crate::storage::open_for_test(&data_dir::db_path(dir.path()))
             .await
             .expect("open");
         let handle = Settings::new();

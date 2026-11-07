@@ -1747,7 +1747,7 @@ mod tests {
     async fn wait_for_command_result(
         state: &AppState,
     ) -> (Option<String>, Option<i64>, Option<String>) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         loop {
             let row: (Option<String>, Option<i64>, Option<String>, Option<String>) =
                 sqlx::query_as(

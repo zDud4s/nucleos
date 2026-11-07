@@ -29,6 +29,9 @@ use crate::verify::{Caller, VerifyArgs, scope_outcome};
 /// The key of `Branch.extra` that holds the ticket of the branch's gate.
 const KEY: &str = "gate_ticket";
 
+/// The key of `Branch.extra` that holds the ticket of the branch's build check, same shape.
+const CHECK_KEY: &str = "gate_check_ticket";
+
 /// The ticket a branch's gate submitted, and the HEAD it measures.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Stored {
@@ -80,7 +83,12 @@ pub(super) async fn gate_at_head(
         match io.read(stored.ticket).await? {
             Some(ticket) if !ticket.done => id = Some(stored.ticket),
             Some(ticket) => match verdict_from(io, &ticket).await {
-                Ok(verdict) => return Ok(verdict),
+                Ok(verdict) => {
+                    if matches!(verdict, GateVerdict::Red { .. }) {
+                        io.remember(None).await?;
+                    }
+                    return Ok(verdict);
+                }
                 // It ended without measuring: only now is a fresh unit allowed.
                 Err(NotMeasured::Failed(reason) | NotMeasured::Running(reason)) => {
                     ended = Some(reason);
@@ -125,14 +133,36 @@ pub(super) async fn gate_at_head(
         )));
     }
     let verdict = verdict_from(io, &ticket).await;
-    if verdict.is_err() {
-        // Answered as `Failed` now, so a later call must not find it and report it again.
+    if matches!(verdict, Err(_) | Ok(GateVerdict::Red { .. })) {
+        // Answered now, so a later call must not find it and report it again. A red is forgotten
+        // too: a re-gate of the same HEAD (after a decision answer, a rescue or a load backoff)
+        // measures afresh instead of re-reading a verdict that may have been the machine's.
         io.remember(None).await?;
     }
     verdict
 }
 
+/// Gates a branch's HEAD in two steps: its build (`check`, the groups' clippy over all targets)
+/// first, its tests only once that is not red. Leaves may not run cargo, so a test helper that no
+/// longer compiles used to reach the gate unseen; here it is a red carrying the compiler's output,
+/// before any test unit is spent on it. A `NothingRan` check (no group selected) goes on to the tests.
+pub(super) async fn gate_compiled_then_tested(
+    check: &impl GateIo,
+    test: &impl GateIo,
+    head: &str,
+    wait: Duration,
+) -> Result<GateVerdict, NotMeasured> {
+    match gate_at_head(check, head, wait).await? {
+        GateVerdict::Green | GateVerdict::NothingRan => gate_at_head(test, head, wait).await,
+        red => Ok(red),
+    }
+}
+
 struct VerifyIo<'a> {
+    /// The key of `Branch.extra` that holds this step's ticket.
+    key: &'static str,
+    /// `Kind::Check` for the build step, `Kind::Test` for the tests.
+    kind: Kind,
     executor: &'a Arc<Executor>,
     pool: &'a sqlx::SqlitePool,
     job_id: &'a str,
@@ -151,7 +181,7 @@ impl GateIo for VerifyIo<'_> {
                     .branches
                     .get(self.branch)?
                     .extra
-                    .get(KEY)
+                    .get(self.key)
                     .cloned()
             })
             .and_then(|value| {
@@ -177,12 +207,12 @@ impl GateIo for VerifyIo<'_> {
         match stored {
             Some(stored) => {
                 held.extra.insert(
-                    KEY.to_owned(),
+                    self.key.to_owned(),
                     json!({ "ticket": stored.ticket, "head": stored.head }),
                 );
             }
             None => {
-                held.extra.remove(KEY);
+                held.extra.remove(self.key);
             }
         }
         store::update(self.pool, &job)
@@ -210,7 +240,7 @@ impl GateIo for VerifyIo<'_> {
 
     async fn submit(&self) -> Result<i64, String> {
         let args = VerifyArgs {
-            kind: Kind::Test,
+            kind: self.kind,
             scope: ScopeArg::Scope,
             worktree: Some(self.worktree.to_owned()),
             files: None,
@@ -262,12 +292,20 @@ pub(super) async fn gate_branch(
     wait: Duration,
 ) -> Result<GateVerdict, NotMeasured> {
     let head = head_of(worktree).await?;
-    let io = VerifyIo {
+    let io = |key, kind| VerifyIo {
+        key,
+        kind,
         executor,
         pool,
         job_id,
         branch,
         worktree,
     };
-    gate_at_head(&io, &head, wait).await
+    gate_compiled_then_tested(
+        &io(CHECK_KEY, Kind::Check),
+        &io(KEY, Kind::Test),
+        &head,
+        wait,
+    )
+    .await
 }

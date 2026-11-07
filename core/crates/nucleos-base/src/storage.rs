@@ -120,16 +120,36 @@ fn connect_options(db_path: &Path, busy_timeout: std::time::Duration) -> SqliteC
 
 /// Opens the shared pool on the daemon's database and runs the migrations.
 pub async fn open(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
+    open_with_acquire_timeout(db_path, POOL_ACQUIRE_TIMEOUT).await
+}
+
+/// [`open`] with a chosen pool acquire timeout, so the pool settings live in one place.
+async fn open_with_acquire_timeout(
+    db_path: &Path,
+    acquire_timeout: std::time::Duration,
+) -> Result<SqlitePool, sqlx::Error> {
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent).map_err(sqlx::Error::Io)?;
     }
     let pool = SqlitePoolOptions::new()
         .max_connections(POOL_MAX_CONNECTIONS)
-        .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
+        .acquire_timeout(acquire_timeout)
         .connect_with(connect_options(db_path, BUSY_TIMEOUT))
         .await?;
     crate::storage::MIGRATOR.run(&pool).await?;
     Ok(pool)
+}
+
+/// Acquire timeout of the pools tests open: a hang guard, not the daemon's 3s bound. A private
+/// test database that waits longer than 3s for its first connection is on a saturated disk
+/// (parallel gates), not short of connections, so the production bound only produced flakes.
+#[cfg(any(test, feature = "testkit"))]
+pub const TEST_POOL_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// [`open`] for a fresh private test database, with [`TEST_POOL_ACQUIRE_TIMEOUT`].
+#[cfg(any(test, feature = "testkit"))]
+pub async fn open_for_test(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
+    open_with_acquire_timeout(db_path, TEST_POOL_ACQUIRE_TIMEOUT).await
 }
 
 /// Opens a single-connection pool for long background writers (devtime ingest), so their
