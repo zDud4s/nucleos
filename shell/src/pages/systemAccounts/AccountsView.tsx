@@ -56,7 +56,7 @@ export function readingText(account: PoolAccount, now: number = Date.now()): str
   return `${usage.source}, ${minutes < 1 ? "just now" : minutes < 60 ? `${minutes} min ago` : `${Math.round(minutes / 60)} h ago`}`;
 }
 
-const STATE_TONE = { active: "ok", paused: "pending", needs_login: "alert" } as const;
+const STATE_TONE = { active: "active", paused: "pending", needs_login: "danger" } as const;
 
 function AccountRow({ account, onLogin }: { account: PoolAccount; onLogin: (view: LoginView) => void }) {
   const { rename, pause, resume, remove } = useAccountActions();
@@ -110,7 +110,7 @@ function AccountRow({ account, onLogin }: { account: PoolAccount; onLogin: (view
         {confirm !== null ? (
           <div role="alert" className="ac-confirm">
             {confirm} live session{confirm === 1 ? "" : "s"} use this account.{" "}
-            <Button intent="danger" onClick={() => tryRemove(true)}>Remove anyway</Button>
+            <Button intent="stop" onClick={() => tryRemove(true)}>Remove anyway</Button>
             <Button onClick={() => setConfirm(null)}>Keep</Button>
           </div>
         ) : null}
@@ -143,7 +143,7 @@ function AccountRow({ account, onLogin }: { account: PoolAccount; onLogin: (view
               <Button role="menuitem" onClick={() => { pause.mutate(account.id, { onError: fail }); close(); }}>Pause</Button>
             )}
             {account.is_default ? null : (
-              <Button role="menuitem" intent="danger" onClick={() => { tryRemove(false); close(); }}>Remove</Button>
+              <Button role="menuitem" intent="stop" onClick={() => { tryRemove(false); close(); }}>Remove</Button>
             )}
           </div>
         ) : null}
