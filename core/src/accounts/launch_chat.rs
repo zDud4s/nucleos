@@ -34,7 +34,10 @@ pub fn effective_choice(own: Option<AccountChoice>, default: &AccountChoice) -> 
 /// The env of a launch on `account`: the adapter's, plus the marker that names the account.
 fn env_for(adapter: &dyn ProviderAdapter, account: &Account) -> Vec<(String, String)> {
     let mut env = adapter.account_env(account);
-    env.push((ACCOUNT_ENV_MARKER.to_owned(), account.id.as_str().to_owned()));
+    env.push((
+        ACCOUNT_ENV_MARKER.to_owned(),
+        account.id.as_str().to_owned(),
+    ));
     env
 }
 
@@ -248,7 +251,6 @@ pub async fn note_limit_and_announce(
 #[allow(clippy::too_many_arguments)]
 pub async fn after_chat_turn(
     db: &SqlitePool,
-    pool: &Arc<PoolState>,
     chat_id: &str,
     account: &AccountId,
     engine: &str,
@@ -320,7 +322,11 @@ mod tests {
     fn pool_of(ids: &[&str], now: DateTime<Utc>) -> Arc<PoolState> {
         let pool = PoolState::new();
         pool.set_accounts(ids.iter().map(|id| account(id)).collect());
-        pool.set_usage(ids.iter().map(|id| usage(id, &[("1h", 0.1, 600)], now)).collect());
+        pool.set_usage(
+            ids.iter()
+                .map(|id| usage(id, &[("1h", 0.1, 600)], now))
+                .collect(),
+        );
         pool
     }
 
@@ -396,7 +402,10 @@ mod tests {
             usage("fake:b", &[("1h", 0.0, 600)], now),
         ]);
         let adapter = adapter();
-        assert_eq!(adapter.session_portability(), SessionPortability::NotPortable);
+        assert_eq!(
+            adapter.session_portability(),
+            SessionPortability::NotPortable
+        );
         let pick = pick_with(
             &pool,
             &adapter,
@@ -431,7 +440,10 @@ mod tests {
     fn auto_defers_to_the_default_choice() {
         let default = AccountChoice::Provider("fakeco".into());
         assert_eq!(effective_choice(None, &default), default);
-        assert_eq!(effective_choice(Some(AccountChoice::Auto), &default), default);
+        assert_eq!(
+            effective_choice(Some(AccountChoice::Auto), &default),
+            default
+        );
         let pinned = AccountChoice::Account(AccountId("fake:a".into()));
         assert_eq!(effective_choice(Some(pinned.clone()), &default), pinned);
     }

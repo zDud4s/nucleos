@@ -1097,7 +1097,6 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
         if let (Some(account), Ok(Ok(o))) = (pooled.as_ref(), &result) {
             crate::accounts::launch_chat::after_chat_turn(
                 &pool,
-                &crate::accounts::pool::PoolState::global(),
                 &turn.slot.chat_id,
                 account,
                 cli,

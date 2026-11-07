@@ -4355,7 +4355,10 @@ pub mod tests {
                 .unwrap()
             }
         };
-        assert_eq!(stored(pinned.0.id).await.as_deref(), Some("provider:anthropic"));
+        assert_eq!(
+            stored(pinned.0.id).await.as_deref(),
+            Some("provider:anthropic")
+        );
         assert_eq!(stored(plain.0.id).await, None);
     }
 

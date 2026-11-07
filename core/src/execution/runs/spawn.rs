@@ -1189,16 +1189,19 @@ async fn account_for_launch(
         return Ok((None, env));
     }
     // The router writes `runs.runner` when it decides; an unrouted run runs the active one.
-    let engine: String = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT runner FROM runs WHERE id = ?",
-    )
-    .bind(id)
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten()
-    .flatten()
-    .unwrap_or_else(|| crate::config::models_config_now().active_runner().to_owned());
+    let engine: String =
+        sqlx::query_scalar::<_, Option<String>>("SELECT runner FROM runs WHERE id = ?")
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten()
+            .flatten()
+            .unwrap_or_else(|| {
+                crate::config::models_config_now()
+                    .active_runner()
+                    .to_owned()
+            });
     let mut pick = crate::accounts::launch_chat::pick_for_run_launch(
         pool,
         &accounts,
@@ -1256,7 +1259,13 @@ async fn account_for_launch(
     }
     let mut env = env;
     env.extend(std::mem::take(&mut pick.env));
-    Ok((Some(HeldAccount { engine, reservation }), env))
+    Ok((
+        Some(HeldAccount {
+            engine,
+            reservation,
+        }),
+        env,
+    ))
 }
 
 /// Retires a run that failed somewhere in worktree provisioning, and says so in the feed.

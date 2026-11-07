@@ -30,6 +30,7 @@ pub fn restrict_for_choice(choice: &AccountChoice, accounts: &[Account]) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::accounts::AccountId;
     use crate::accounts::choose::test_support::account;
 
     fn on(id: &str, engine: &str, provider: &str) -> Account {
