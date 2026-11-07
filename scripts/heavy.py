@@ -1497,6 +1497,7 @@ def _pump(src, dst, stats: dict, show_bar: bool = True) -> None:
     chunks, not lines: cargo's bar is redrawn with `\r` and no `\n` for minutes at a time.
     With `show_bar` false the bar's segments are noted and not forwarded."""
     prog = stats.setdefault("progress", {})
+    tap = stats.get("tap")
     read = getattr(src, "read1", None) or src.read
     buf = b""
     try:
@@ -1504,6 +1505,8 @@ def _pump(src, dst, stats: dict, show_bar: bool = True) -> None:
             chunk = read(65536)
             segs, buf = _segments(buf + chunk, eof=not chunk)
             for seg in segs:
+                if tap is not None:
+                    tap(seg)
                 if _COMPILING.match(seg):
                     stats["compiled"] = True
                 if b"test result: FAILED" in seg:
@@ -1790,7 +1793,7 @@ def _watch_phase(stats: dict, cb, stop: threading.Event) -> None:
 
 def run_child(argv: list[str], env: dict | None, job, low: bool = False,
               progress: Path | None = None, yield_check=None,
-              on_test_phase=None) -> tuple[int, dict]:
+              on_test_phase=None, tap=None) -> tuple[int, dict]:
     """Run argv, streaming stdout/stderr through; return (exit, stats). `low` runs it at
     below-normal CPU priority (Windows) with no console window of its own. With `progress`,
     that file holds, while it runs, the CPU its tree has used and what the output says about
@@ -1799,6 +1802,8 @@ def run_child(argv: list[str], env: dict | None, job, low: bool = False,
     path, a child whose tree stops using CPU is killed and the exit is EXIT_STALLED (see
     _watch_stall): the exit comes from here because the killed tree's own says nothing."""
     stats = _new_stats()
+    if tap is not None:
+        stats["tap"] = tap  # called with every output segment (heavy_failfirst)
     # CreateProcess finds only `.exe` without an extension, so `npm`/`npx` (`.cmd` shims)
     # failed with WinError 2: resolve argv[0] through PATH and PATHEXT the way a shell would.
     if argv and not os.path.dirname(argv[0]):
@@ -3088,6 +3093,8 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
                 run_argv = moved[0]
                 for k in moved[1]:
                     stripped[k] = env.pop(k)
+        ff = _failfirst_plan(argv, run_argv, directory)
+        run_argv = ff.run_argv
         eff_td = None
         if kind in ("cargo", "auto") and _is_cargo(argv):
             eff_td = (inject or os.environ.get("CARGO_TARGET_DIR")
@@ -3168,7 +3175,8 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
                     drop_at.append(time.time() - t_run)
         code, stats = run_child(run_argv, env, job, low=warm,
                                 progress=directory / "progress" / str(os.getpid()),
-                                yield_check=yield_check, on_test_phase=on_test_phase)
+                                yield_check=yield_check, on_test_phase=on_test_phase,
+                                tap=ff.tap)
     except OSError as exc:
         code, stats = _spawn_failed(argv, exc), _new_stats()
         row["broker_error"] = f"spawn: {exc}"
@@ -3186,6 +3194,8 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
         "argv0": argv[0], "argv": _log_argv(argv),
         "end": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     })
+    ff.finish(code, bool(stats.get("compile_error")),
+              stalled or preempted or code == EXIT_SPAWN_FAILED)
     if drop_at:
         row["weight_drop_s"] = round(drop_at[0], 3)
     if preempted:
@@ -3222,6 +3232,29 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
     except Exception:
         pass
     return _PREEMPTED if preempted else code
+
+
+class _NoFailFirst:
+    """Stand-in when heavy_failfirst cannot be loaded: the run is untouched."""
+    tap = None
+
+    def __init__(self, run_argv: list[str]) -> None:
+        self.run_argv = run_argv
+
+    def finish(self, *_a, **_k) -> None:
+        pass
+
+
+def _failfirst_plan(argv: list[str], run_argv: list[str], directory: Path):
+    """Failed-first re-runs (scripts/heavy_failfirst.py): a test command that failed before in
+    this worktree runs only its failed tests, and says so on stderr. Fail-open."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import heavy_failfirst  # type: ignore
+
+        return heavy_failfirst.prepare(argv, run_argv, directory, os.getcwd())
+    except Exception:
+        return _NoFailFirst(run_argv)
 
 
 def _record_fingerprint(directory: Path, fp, root: str, code: int, stats: dict) -> None:

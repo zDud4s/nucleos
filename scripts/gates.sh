@@ -387,6 +387,11 @@ if [ "${BASH_SOURCE[0]}" != "$0" ]; then
   return 0
 fi
 
+# A gate is the full suite by definition (the pre-land gate above all): tell the broker not to
+# narrow any test command it runs to the previously failed tests (scripts/heavy_failfirst.py).
+# Failures are still recorded, so a plain re-run of the same command outside a gate benefits.
+export NUCLEOS_HEAVY_FULL=1
+
 target="${1:-all}"
 case "$target" in
   core|sidecars|shell|tauri|hooks|security|broker|all) ;;
