@@ -6698,7 +6698,7 @@ describe("Chats - finding something that was said", () => {
     const palette = await screen.findByRole("dialog", { name: "Go to anything" });
     fireEvent.change(within(palette).getByRole("combobox"), { target: { value: "leap" } });
 
-    const silent = await within(palette).findByText("Tower did not answer");
+    const silent = await within(palette).findByText("Tower is not reachable");
     expect(silent.closest("[cmdk-item]")?.getAttribute("aria-disabled")).toBe("true");
     // The machine that did answer is still listed.
     expect(within(palette).getByText(/a leap of faith here/)).toBeDefined();

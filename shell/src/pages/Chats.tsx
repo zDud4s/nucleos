@@ -355,8 +355,8 @@ export function Chats() {
             })),
             ...silent.map((machine) => ({
               id: `said-silent-${machine.id}`,
-              label: <span className="chats-palette-said-text">{machine.name} did not answer</span>,
-              match: `${machine.name} did not answer`,
+              label: <span className="chats-palette-said-text">{machine.name} is not reachable</span>,
+              match: `${machine.name} is not reachable`,
               // Informational: listed, but not something to choose.
               disabled: true,
               run: () => {},
