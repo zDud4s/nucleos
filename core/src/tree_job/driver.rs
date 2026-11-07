@@ -36,6 +36,7 @@ use super::landing::{
 use super::model::{JOB_TERMINAL_STATE, Manifest};
 use super::open::{FIX_PREFIX, relaunch_node, run_is_live};
 use super::relaunch::{budget_refusal, refusal_question};
+use super::rescue;
 use super::store::{self, TreeJob};
 use crate::execution::git_exec::OPERATION_TIMEOUT;
 use crate::execution::vcs::{Origin, ResolvedRepo, resolve_repo};
@@ -239,6 +240,13 @@ async fn retry_pending_start(
     if work_nodes::get(pool, caller).await.is_err() {
         return drop_pending_start(pool, &job.id, name).await;
     }
+    // A start waiting for its base replays only once that base has merged.
+    let waits_for_base = record["waits_for_base"].as_str();
+    if let Some(base) = waits_for_base
+        && base_still_unmerged(&job.manifest, base)
+    {
+        return Ok(());
+    }
     // A branch already added by an earlier, half-finished replay needs no admission: the replay
     // only finishes its remaining steps.
     if !job.manifest.branches.contains_key(name) {
@@ -256,6 +264,28 @@ async fn retry_pending_start(
         }
     }
     super::branch_start::start_pending(state, &job.id, name, record).await?;
+
+    if waits_for_base.is_some() {
+        // No owner question was ever asked for it: the record is consumed and the start announced.
+        drop_pending_start(pool, &job.id, name).await?;
+        let line = format!(
+            "{}: branch {name} started automatically, its base is merged",
+            job.goal
+        );
+        if let Err(error) = crate::feed::append(
+            pool,
+            job.project_id.as_deref(),
+            "work_tree_pending",
+            &line,
+            None,
+            None,
+        )
+        .await
+        {
+            tracing::warn!(job = %job.id, %error, "could not announce a started branch");
+        }
+        return Ok(());
+    }
 
     // Start, then answer, then drop the record: a crash between any two repeats safely. A record
     // with no id may still have a decision (a crash between the ask and the id): the id is fixed.
@@ -291,6 +321,15 @@ async fn retry_pending_start(
         tracing::warn!(job = %job.id, %error, "could not announce an admitted pending start");
     }
     Ok(())
+}
+
+/// PURE: whether `base` is a branch of the tree that has not merged. A base the tree does not know
+/// does not hold a start back (as in `open_branch`).
+fn base_still_unmerged(manifest: &Manifest, base: &str) -> bool {
+    manifest
+        .branches
+        .get(base)
+        .is_some_and(|branch| branch.state != "merged")
 }
 
 /// Removes the pending record of `name` under the job's lock, from a fresh read of the manifest.
@@ -475,6 +514,14 @@ async fn at_work(
     match report.result.as_deref() {
         Some("done") => {}
         Some(outcome @ ("blocked" | "failed")) => {
+            // One rescue run with the failure in its prompt, then the owner is asked.
+            if let Some(run) = &report.run_id {
+                let handoff = rescue::handoff_text(pool, &node).await;
+                let suffix = rescue::stopped_suffix(outcome, handoff.as_deref());
+                if rescue::attempt(state, &node, run, &suffix).await? {
+                    return Ok(());
+                }
+            }
             parks.push((node.clone(), stopped_question(&node, Some(name), outcome)));
             return Ok(());
         }
@@ -729,6 +776,17 @@ async fn red(
     .await
     .map_err(|e| e.to_string())?;
     if prior >= FIX_CAP {
+        // The last automatic try: a rescue run, and only if that fails too the owner is asked.
+        let suffix = rescue::red_suffix(&fix_suffix(&findings));
+        if rescue::attempt(state, &node, &run, &suffix).await? {
+            let held = job
+                .manifest
+                .branches
+                .get_mut(name)
+                .ok_or("branch vanished")?;
+            apply_transition(held, "fixing").map_err(|e| e.to_string())?;
+            return persist(pool, job).await;
+        }
         parks.push((
             node,
             format!(
@@ -1006,16 +1064,12 @@ async fn landing_step(
     parks: &mut Vec<Park>,
 ) -> Result<(), String> {
     let pool = &state.pool;
-    if job
-        .manifest
-        .extra
-        .get("land_id")
-        .and_then(Value::as_i64)
-        .is_some()
-    {
+    if let Some(request) = job.manifest.extra.get("land_id").and_then(Value::as_i64) {
         let settled = settle_land(pool, job, Duration::ZERO)
             .await
             .map_err(|e| e.to_string())?;
+        // A red final verify carries its failing tests into the record and the question.
+        let settled = super::final_verify::with_failing_tests(pool, job, request, settled).await;
         if let landing::LandSettlement::NotLanded { reason } = &settled {
             tracing::warn!(job = %job.id, %reason, "the queue did not land the job");
         }
@@ -1482,13 +1536,18 @@ mod tests {
 
         /// The node's agent, started again by the driver, ends and reports `done`.
         async fn relaunched_run_reports_done(&self, node: &str) {
+            self.relaunched_run_reports(node, "done").await;
+        }
+
+        /// The node's agent, started again by the driver, ends and reports `result`.
+        async fn relaunched_run_reports(&self, node: &str, result: &str) {
             let run = self.current_run(node).await;
             sqlx::query("UPDATE runs SET status = 'interrupted' WHERE id = ?")
                 .bind(run)
                 .execute(&self.state.pool)
                 .await
                 .unwrap();
-            node_run::apply(&self.state.pool, node, "report", &run.to_string(), "done")
+            node_run::apply(&self.state.pool, node, "report", &run.to_string(), result)
                 .await
                 .unwrap();
         }
@@ -1522,11 +1581,15 @@ mod tests {
         }
 
         async fn save_launch(&self, node: &str) {
+            self.save_launch_keyed(node, "initial").await;
+        }
+
+        async fn save_launch_keyed(&self, node: &str, key: &str) {
             open::save_launch(
                 &self.state.pool,
                 &StoredLaunch {
                     node_id: node.to_owned(),
-                    key: "initial".to_owned(),
+                    key: key.to_owned(),
                     prompt: "build the api".to_owned(),
                     project_id: None,
                     cwd: None,
@@ -1955,7 +2018,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_red_gate_relaunches_with_the_findings_twice_and_then_parks() {
+    async fn a_red_gate_relaunches_twice_then_rescues_once_and_then_parks() {
         const JOB: &str = "drv-fix";
         const NODE: &str = "api-node";
         let fx = Fixture::new().await;
@@ -1968,6 +2031,7 @@ mod tests {
             red("first failure: boom-1"),
             red("second failure: boom-2"),
             red("third failure: boom-3"),
+            red("fourth failure: boom-4"),
         ]);
 
         for (attempt, finding) in [(1, "boom-1"), (2, "boom-2")] {
@@ -1987,8 +2051,25 @@ mod tests {
             fx.relaunched_run_reports_done(NODE).await;
         }
 
+        // The third red is past the cap: one rescue run with the failure in its prompt, no park.
         fx.tick(JOB, &gate).await;
         wait_calls(&gate, 3).await;
+        fx.wait_branch_state(JOB, "api", "red").await;
+        fx.tick(JOB, &gate).await;
+
+        assert_eq!(fx.branch(JOB, "api").await.state, "fixing");
+        assert_eq!(fx.launches(NODE, "rescue-").await, 1);
+        assert!(fx.open_questions(JOB, NODE).await.is_empty());
+        let prompt = fx.prompt_of(fx.current_run(NODE).await).await;
+        assert!(
+            prompt.contains("boom-3"),
+            "the rescue carries the failure: {prompt:?}"
+        );
+        fx.relaunched_run_reports_done(NODE).await;
+
+        // The rescue's work is red too: now the owner is asked, and no second rescue starts.
+        fx.tick(JOB, &gate).await;
+        wait_calls(&gate, 4).await;
         fx.wait_branch_state(JOB, "api", "red").await;
         fx.tick(JOB, &gate).await;
 
@@ -1998,7 +2079,8 @@ mod tests {
             2,
             "the cap is two relaunches"
         );
-        assert_eq!(gate.calls().len(), 3);
+        assert_eq!(fx.launches(NODE, "rescue-").await, 1, "one rescue only");
+        assert_eq!(gate.calls().len(), 4);
         let open: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM decisions WHERE tree_id = ? AND node_id = ? AND status = ?",
         )
@@ -2015,7 +2097,7 @@ mod tests {
                 .fetch_one(&fx.state.pool)
                 .await
                 .unwrap();
-        assert!(question.contains("boom-3"), "{question:?}");
+        assert!(question.contains("boom-4"), "{question:?}");
     }
 
     /// Drives `api` through two red gates and two fixes, then a third red gate that parks it on the
@@ -2039,8 +2121,15 @@ mod tests {
             assert_eq!(fx.branch(job, "api").await.state, "fixing");
             fx.relaunched_run_reports_done(node).await;
         }
+        // The third red gets its one rescue; the fourth parks.
         fx.tick(job, gate).await;
         wait_calls(gate, 3).await;
+        fx.wait_branch_state(job, "api", "red").await;
+        fx.tick(job, gate).await;
+        assert_eq!(fx.branch(job, "api").await.state, "fixing");
+        fx.relaunched_run_reports_done(node).await;
+        fx.tick(job, gate).await;
+        wait_calls(gate, 4).await;
         fx.wait_branch_state(job, "api", "red").await;
         fx.tick(job, gate).await;
         assert_eq!(fx.branch(job, "api").await.state, "parked");
@@ -2066,6 +2155,7 @@ mod tests {
             red("boom-1"),
             red("boom-2"),
             red("boom-3"),
+            red("boom-3b"),
             GateVerdict::Green,
         ]);
         answered_after_the_fix_cap(&fx, JOB, NODE, &gate).await;
@@ -2073,7 +2163,7 @@ mod tests {
 
         fx.tick(JOB, &gate).await;
 
-        wait_calls(&gate, 4).await;
+        wait_calls(&gate, 5).await;
         fx.wait_branch_state(JOB, "api", "green").await;
         assert!(
             fx.open_questions(JOB, NODE).await.is_empty(),
@@ -2091,12 +2181,13 @@ mod tests {
             red("boom-1"),
             red("boom-2"),
             red("boom-3"),
+            red("boom-3b"),
             red("boom-4"),
         ]);
         answered_after_the_fix_cap(&fx, JOB, NODE, &gate).await;
         fx.relaunched_run_reports_done(NODE).await;
         fx.tick(JOB, &gate).await;
-        wait_calls(&gate, 4).await;
+        wait_calls(&gate, 5).await;
         fx.wait_branch_state(JOB, "api", "red").await;
 
         fx.tick(JOB, &gate).await;
@@ -2879,6 +2970,13 @@ mod tests {
 
     /// A job with one branch `api` at work behind `api-node`, whose run ended with `outcome`.
     async fn job_whose_branch_reported(fx: &Fixture, job: &str, outcome: &str) {
+        stopped_job(fx, job, outcome).await;
+        // The one rescue is already spent, so the branch parks as it did before rescues existed.
+        fx.save_launch_keyed("api-node", "rescue-0").await;
+    }
+
+    /// `job_whose_branch_reported` with its rescue still unspent.
+    async fn stopped_job(fx: &Fixture, job: &str, outcome: &str) {
         fx.seed_job(
             job,
             vec![code_branch("api", "building", Some("api-node"))],
@@ -2888,6 +2986,123 @@ mod tests {
         fx.add_node(job, "api-node", "orchestrator").await;
         fx.save_launch("api-node").await;
         fx.run_ended("api-node", Some(outcome)).await;
+    }
+
+    #[tokio::test]
+    async fn a_blocked_branch_gets_one_rescue_run_before_the_owner_is_asked() {
+        const JOB: &str = "drv-rescue-blocked";
+        let fx = Fixture::new().await;
+        stopped_job(&fx, JOB, "blocked").await;
+        let gate = FakeGate::answering(vec![]);
+
+        fx.tick(JOB, &gate).await;
+
+        assert_eq!(fx.launches("api-node", "rescue-").await, 1);
+        assert!(fx.open_questions(JOB, "api-node").await.is_empty());
+        assert_eq!(fx.branch(JOB, "api").await.state, "building");
+        let prompt = fx.prompt_of(fx.current_run("api-node").await).await;
+        assert!(prompt.contains("ended blocked"), "{prompt:?}");
+        assert!(prompt.contains("# handoff"), "the last handoff: {prompt:?}");
+
+        // The rescue run is still live: nothing more happens.
+        sqlx::query("UPDATE runs SET status = 'running' WHERE id = ?")
+            .bind(fx.current_run("api-node").await)
+            .execute(&fx.state.pool)
+            .await
+            .unwrap();
+        fx.tick(JOB, &gate).await;
+        assert_eq!(fx.launches("api-node", "rescue-").await, 1);
+
+        // It ends failed too: the owner is asked, once, and no second rescue starts.
+        fx.relaunched_run_reports("api-node", "failed").await;
+        for _ in 0..3 {
+            fx.tick(JOB, &gate).await;
+        }
+        assert_eq!(fx.launches("api-node", "rescue-").await, 1);
+        assert_eq!(fx.open_questions(JOB, "api-node").await.len(), 1);
+        assert_eq!(fx.branch(JOB, "api").await.state, "parked");
+    }
+
+    #[tokio::test]
+    async fn an_owner_answer_gives_the_rescue_a_fresh_allowance() {
+        const JOB: &str = "drv-rescue-fresh";
+        let fx = Fixture::new().await;
+        stopped_job(&fx, JOB, "failed").await;
+        let gate = FakeGate::answering(vec![]);
+        fx.tick(JOB, &gate).await;
+        fx.relaunched_run_reports("api-node", "failed").await;
+        fx.tick(JOB, &gate).await;
+        let decision: String = sqlx::query_scalar("SELECT id FROM decisions WHERE node_id = ?")
+            .bind("api-node")
+            .fetch_one(&fx.state.pool)
+            .await
+            .unwrap();
+        open::answer_and_relaunch(&fx.state, &decision, "try again", "shell")
+            .await
+            .unwrap();
+        fx.relaunched_run_reports("api-node", "blocked").await;
+
+        fx.tick(JOB, &gate).await;
+
+        assert_eq!(fx.launches("api-node", "rescue-").await, 2);
+        assert!(fx.open_questions(JOB, "api-node").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_land_the_final_verify_refused_asks_at_once_with_the_failing_tests() {
+        const JOB: &str = "drv-land-red";
+        let fx = Fixture::new().await;
+        landable_job(&fx, JOB).await;
+        let gate = FakeGate::answering(vec![]);
+        let root = root_node_of(JOB);
+
+        fx.tick(JOB, &gate).await;
+        end_the_landing(
+            &fx,
+            JOB,
+            "failed",
+            "the merge does not pass this project's gate, so nothing was published.",
+        )
+        .await;
+        let id = fx.job(JOB).await.manifest.extra["land_id"]
+            .as_i64()
+            .unwrap();
+        sqlx::query("UPDATE vcs_requests SET output_tail = ? WHERE id = ?")
+            .bind("FAIL core: tests::boom")
+            .bind(id)
+            .execute(&fx.state.pool)
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            fx.tick(JOB, &gate).await;
+        }
+
+        assert_eq!(land_attempts(&fx, JOB).await, Some(LAND_ATTEMPTS));
+        let questions = fx.open_questions(JOB, &root).await;
+        assert_eq!(questions.len(), 1, "{questions:?}");
+        assert!(questions[0].contains("tests::boom"), "{:?}", questions[0]);
+        assert_eq!(fx.requests().await, 1, "the same tip is not landed again");
+    }
+
+    #[tokio::test]
+    async fn a_land_that_errored_stays_a_counted_attempt() {
+        const JOB: &str = "drv-land-errored";
+        let fx = Fixture::new().await;
+        landable_job(&fx, JOB).await;
+        let gate = FakeGate::answering(vec![]);
+
+        fx.tick(JOB, &gate).await;
+        end_the_landing(
+            &fx,
+            JOB,
+            "failed",
+            "the merge could not be measured, so nothing was published: timeout",
+        )
+        .await;
+        fx.tick(JOB, &gate).await;
+
+        assert_eq!(land_attempts(&fx, JOB).await, Some(1));
+        assert!(fx.open_questions(JOB, &root_node_of(JOB)).await.is_empty());
     }
 
     #[tokio::test]

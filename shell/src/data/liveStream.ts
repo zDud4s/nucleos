@@ -50,10 +50,21 @@ export function sseFrames(buffer: string): { events: SseEvent[]; rest: string } 
  */
 export async function streamLiveTurn(
   turnId: number,
-  { signal, onLive }: { signal: AbortSignal; onLive: (state: LiveTurn) => void },
+  {
+    signal,
+    onLive,
+    machine = "here",
+  }: {
+    signal: AbortSignal;
+    onLive: (state: LiveTurn) => void;
+    /** The machine whose turn this is; a stream read from another machine would be a different turn. */
+    machine?: string;
+  },
 ): Promise<"ended" | "failed"> {
   try {
-    const res = await apiStream(`/assistant/${turnId}/live/stream`, { signal });
+    const path = `/assistant/${turnId}/live/stream`;
+    const res =
+      machine === "here" ? await apiStream(path, { signal }) : await apiStream(path, { signal }, machine);
     if (res.status === 204 || res.body === null || res.body === undefined) return "failed";
     const reader = res.body.getReader();
     const decoder = new TextDecoder("utf-8");

@@ -26,6 +26,7 @@ pub mod render;
 pub mod runs;
 pub mod store;
 
+mod live;
 mod resolve;
 mod scope_gate;
 pub(crate) mod wake;
@@ -1224,6 +1225,27 @@ async fn mark_seen(pool: &SqlitePool, caller: Caller, ticket: &Ticket) {
     }
 }
 
+/// Starts this pool's `task_claims` ids at a block no other fixture in the process uses. The
+/// in-process proof single flight (`probe::ACTIVE`) is process-wide and keyed by task id alone,
+/// which is right for the one database a daemon has; parallel tests each have a fresh database, and
+/// ids restarting at 1 would make one test's proof skip because another test's task holds the
+/// same id.
+#[cfg(test)]
+pub(crate) async fn unique_task_ids(pool: &SqlitePool) {
+    static NEXT_BLOCK: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
+    let block = NEXT_BLOCK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // `sqlite_sequence.name` is not unique, so clear any row before writing the new start.
+    sqlx::query("DELETE FROM sqlite_sequence WHERE name = 'task_claims'")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO sqlite_sequence (name, seq) VALUES ('task_claims', ?)")
+        .bind(block * 1_000_000)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1336,7 +1358,7 @@ tests:
         let c2 = git_in(root, &["rev-parse", "HEAD"]);
 
         let pool = test_pool().await;
-        unique_task_ids(&pool).await;
+        super::unique_task_ids(&pool).await;
         sqlx::query(
             "INSERT INTO autopilot_state (project_id, mode, project_root) \
              VALUES ('alpha', 'active', ?)",
@@ -1368,25 +1390,6 @@ tests:
             c1,
             c2,
         }
-    }
-
-    /// Starts this pool's `task_claims` ids at a block no other fixture in the process uses. The
-    /// in-process proof single flight (`probe::ACTIVE`) is keyed by task id alone, which is right for
-    /// the one database a daemon has; parallel tests each have a fresh database, and ids restarting
-    /// at 1 would make one test's proof skip because another test's task holds the same id.
-    async fn unique_task_ids(pool: &SqlitePool) {
-        static NEXT_BLOCK: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
-        let block = NEXT_BLOCK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // `sqlite_sequence.name` is not unique, so clear any row before writing the new start.
-        sqlx::query("DELETE FROM sqlite_sequence WHERE name = 'task_claims'")
-            .execute(pool)
-            .await
-            .unwrap();
-        sqlx::query("INSERT INTO sqlite_sequence (name, seq) VALUES ('task_claims', ?)")
-            .bind(block * 1_000_000)
-            .execute(pool)
-            .await
-            .unwrap();
     }
 
     fn path_arg(path: &Path) -> String {

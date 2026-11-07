@@ -421,6 +421,42 @@ async fn land() {
     }
 }
 
+// `nucleos-core --restart [--force] [--timeout-secs N]`: restart the daemon once running work has
+// settled. A thin client of `POST /system/restart` for the reason `--land` is one; the parsing and
+// the follow live in `restart_cli` and are tested there. It never starts a daemon.
+async fn restart() -> bool {
+    use std::io::Write;
+    let args: Vec<String> = std::env::args().collect();
+    let run_id = std::env::var("NUCLEOS_RUN_ID").ok();
+    let Some(call) = restart_cli::invocation(&args, run_id.as_deref()) else {
+        return false;
+    };
+    let call = call.unwrap_or_else(|reason| {
+        eprintln!("not restarted: {reason}\n\n{}", restart_cli::USAGE);
+        std::process::exit(restart_cli::EXIT_USAGE);
+    });
+    let token = match secrets::load_secret(TOKEN_KEY) {
+        Ok(Some(token)) => token,
+        _ => {
+            eprintln!("not restarted: no daemon token stored yet — start the daemon once");
+            std::process::exit(1);
+        }
+    };
+    let outcome = restart_cli::run(
+        &daemon_client::daemon_url(),
+        &token,
+        &call,
+        restart_cli::POLL,
+        restart_cli::FORCE_GRACE,
+    )
+    .await;
+    print!("{}", outcome.stdout);
+    eprint!("{}", outcome.stderr);
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    std::process::exit(outcome.code);
+}
+
 // `nucleos-core --verify`, run from inside a worktree: "verify this, with cover."
 //
 // A subcommand for the reason `--land` is one: the token lives in Credential Manager and the
@@ -917,6 +953,9 @@ pub(super) async fn run_subcommand() -> bool {
     }
     if std::env::args().any(|a| is_land_flag(&a)) {
         land().await;
+        return true;
+    }
+    if restart().await {
         return true;
     }
     if verify().await {

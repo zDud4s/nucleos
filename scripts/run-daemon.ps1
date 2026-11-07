@@ -32,12 +32,18 @@
 # the new exe, and a later run sweeps the *.old-* files nothing holds any more. If a rename fails,
 # it falls back to the exit-3 refusal.
 #
+# -Stage: for a daemon that is already running. Builds, then copies the fresh nucleos-core.exe to
+# <RunDir>\nucleos-core.next.exe and stops; the running daemon, its sidecars and its remote shell
+# are left alone, and nothing refuses because they are held. The next restart that settles
+# (`nucleos-core --restart`, or the restart button) swaps that file in before it relaunches
+# (core/src/relaunch.rs). Only the daemon exe is staged: sidecars and dist-remote need a full run.
+#
 # Exit codes: 2 bad arguments, 3 the daemon is already running (or the port is taken),
 # 4 build output missing; a build failure exits with the build's own code; otherwise the
 # daemon's exit code (0 under -NoStart).
 #
 # Usage: powershell -File scripts/run-daemon.ps1 [-RunDir D] [-TargetDir T] [-BuildProfile debug|release]
-#        [-Port N] [-NoBuild] [-NoStart] [daemon args...]
+#        [-Port N] [-NoBuild] [-NoStart] [-Stage] [daemon args...]
 param(
     [string]$RunDir,
     [string]$TargetDir,
@@ -45,6 +51,7 @@ param(
     [int]$Port = 0,
     [switch]$NoBuild,
     [switch]$NoStart,
+    [switch]$Stage,
     [Parameter(ValueFromRemainingArguments = $true)][string[]]$DaemonArgs
 )
 
@@ -100,7 +107,7 @@ if ($Port -eq 0) {
 $held = @()
 $moveAside = @()   # held files that only --mcp-tools servers hold: renamed at stage time
 $toolPids = @()
-if (Test-Path -LiteralPath $RunDir) {
+if ((Test-Path -LiteralPath $RunDir) -and -not $Stage) {
     # Images moved aside by an earlier run: delete the ones nothing holds any more, quietly.
     foreach ($old in @(Get-ChildItem -LiteralPath $RunDir -File -Filter '*.exe.old-*' -ErrorAction SilentlyContinue)) {
         try { Remove-Item -LiteralPath $old.FullName -Force -ErrorAction Stop } catch { }
@@ -145,7 +152,7 @@ if ($held.Count -gt 0) {
     }
 }
 # --- 2e. is something already answering on the port? -----------------------------------------
-if (-not $NoStart) {
+if (-not $NoStart -and -not $Stage) {
     $answers = $false
     $client = New-Object Net.Sockets.TcpClient
     try {
@@ -190,6 +197,19 @@ if (-not $NoBuild) {
 $core = Join-Path $out 'nucleos-core.exe'
 if (-not (Test-Path -LiteralPath $core)) {
     Fail 4 "build output missing: $core (build first, or drop -NoBuild)"
+}
+if ($Stage) {
+    # Beside the running exe, under the name the relauncher looks for; the daemon stays up.
+    if (-not (Test-Path -LiteralPath $RunDir)) {
+        Fail 2 "-Stage needs the run dir of a running daemon, and $RunDir does not exist (run without -Stage first)"
+    }
+    # Copy to a temp name, then move onto the real one: a restart that swaps at that moment sees
+    # either no staged file or a whole one, never a half-copied exe.
+    $tmpNext = Join-Path $RunDir 'nucleos-core.next.exe.tmp'
+    Copy-Item -LiteralPath $core -Destination $tmpNext -Force
+    Move-Item -LiteralPath $tmpNext -Destination (Join-Path $RunDir 'nucleos-core.next.exe') -Force
+    Write-Output "staged nucleos-core.next.exe into $RunDir; the daemon swaps it in at its next restart"
+    exit 0
 }
 if ($moveAside.Count -gt 0) {
     $suffix = ".old-" + (Get-Date -Format 'yyyyMMdd-HHmmss') + "-$PID"

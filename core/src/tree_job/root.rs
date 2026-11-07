@@ -30,7 +30,9 @@ prompt, layer?, base?, node_id}: `name` is a short branch name (letters, digits,
 lists the paths that part may write, `layer` and `base` are optional (`base` names a branch that \
 must merge first), and `node_id` is your own Node ID. Each call creates the branch, its worktree \
 and its agent, and starts it. Opening the same branch twice is safe. Each started part must pass \
-the gate on its own, so a part that needs another part's code must name that branch as `base`.
+the gate on its own, so a part that needs another part's code must name that branch as `base`. \
+Open every part now, later ones too: a part whose base has not merged answers `queued` with \
+`waiting_for`, and the daemon starts it by itself once the base merges. Leave no part for later.
 
 You cannot wait for your branches, and you never merge, land or push anything: the daemon gates \
 and merges each branch when its agent reports, then lands the job. When every part is opened, \

@@ -434,6 +434,9 @@ impl NucleosTools {
             task_id,
         }): Parameters<VerifyParams>,
     ) -> String {
+        if let Some(refusal) = tree_leaf_verify_refusal(&self.served) {
+            return json_result::<serde_json::Value>(Err(refusal));
+        }
         let worktree = match worktree_for_call(&self.served, worktree.as_deref()) {
             Ok(worktree) => worktree,
             Err(error) => return json_result::<serde_json::Value>(Err(error)),

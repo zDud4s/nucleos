@@ -4,7 +4,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // same mock instance — `vi.mock` is lifted above the imports, and a plain
 // `const` declared here would not exist yet when the factory runs.
 const invoke = vi.hoisted(() => vi.fn());
-vi.mock("@tauri-apps/api/core", () => ({ invoke }));
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke,
+  Channel: class {
+    onmessage: (message: unknown) => void = () => undefined;
+  },
+}));
 
 type ClientModule = typeof import("./client");
 
@@ -315,5 +320,67 @@ describe("probeDaemonVersion", () => {
 
     fetchMock.mockResolvedValue({ ok: true, status: 200, headers: new Headers() } as unknown as Response);
     await expect(probeDaemonVersion()).resolves.toBeNull();
+  });
+});
+
+describe("machine addressing", () => {
+  /** Answers `machine_fetch` with a JSON body streamed down the channel, like the Rust side does. */
+  function rustFetchAnswering(body: unknown) {
+    return async (command: string, args?: Record<string, unknown>) => {
+      if (command !== "machine_fetch") return undefined;
+      const channel = args?.onChunk as { onmessage: (message: unknown) => void };
+      channel.onmessage({ event: "chunk", data: [...new TextEncoder().encode(JSON.stringify(body))] });
+      channel.onmessage({ event: "end" });
+      return { status: 200, headers: [["content-type", "application/json"]] };
+    };
+  }
+
+  it("a_request_for_a_paired_machine_goes_through_the_native_transport", async () => {
+    vi.resetModules();
+    localStorage.setItem(
+      "nucleos-machines",
+      JSON.stringify([{ id: "tower", origin: "https://tower.example", name: "Tower" }]),
+    );
+    invoke.mockImplementation(rustFetchAnswering(["remote"]));
+    const { apiFetch } = await import("./client");
+
+    await expect(apiFetch<string[]>("/projects", undefined, "tower")).resolves.toEqual(["remote"]);
+
+    expect(invoke).toHaveBeenCalledWith("machine_fetch", expect.objectContaining({ id: "tower", method: "GET", path: "/api/projects" }));
+  });
+
+  it("the_native_transport_goes_through_the_rust_fetch_and_never_holds_a_session", async () => {
+    vi.resetModules();
+    localStorage.setItem(
+      "nucleos-machines",
+      JSON.stringify([{ id: "tower", origin: "https://tower.example", name: "Tower" }]),
+    );
+    invoke.mockImplementation(rustFetchAnswering([]));
+    const { apiFetch } = await import("./client");
+
+    await apiFetch("/runs/1/cancel", { method: "POST", body: "{}" }, "tower");
+
+    const call = invoke.mock.calls.find(([command]) => command === "machine_fetch") as [string, Record<string, unknown>];
+    expect(call[1]).toMatchObject({ id: "tower", method: "POST", path: "/api/runs/1/cancel", body: "{}" });
+    expect(typeof call[1].requestId).toBe("string");
+    const sent = Object.keys(call[1].headers as Record<string, string>).map((name) => name.toLowerCase());
+    expect(sent).not.toContain("cookie");
+    expect(sent).not.toContain("origin");
+    expect(invoke).not.toHaveBeenCalledWith("machine_session", expect.anything());
+  });
+
+  it("a_call_naming_no_machine_is_unchanged", async () => {
+    const { apiFetch } = await freshClient();
+    fetchMock.mockResolvedValue(jsonResponse(200, ["local"]));
+
+    await expect(apiFetch<string[]>("/projects")).resolves.toEqual(["local"]);
+
+    expect(fetchMock.mock.calls[0][0]).toBe("http://127.0.0.1:8791/projects");
+  });
+
+  it("the_same_chat_id_on_two_machines_does_not_share_a_cache_entry", async () => {
+    const { withMachine } = await import("./machines");
+
+    expect(withMachine(["chat", "same-id"], "here")).not.toEqual(withMachine(["chat", "same-id"], "tower"));
   });
 });
