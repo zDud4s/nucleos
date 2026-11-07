@@ -23,6 +23,20 @@ describe("prefetch registry", () => {
     prefetchRoute("/brain");
     expect(fn).toHaveBeenCalledTimes(1);
   });
+  it("first hover runs a prefetcher that the loader registers, exactly once", async () => {
+    const qc = new QueryClient();
+    bindPrefetchClient(qc);
+    const fn = vi.fn();
+    const load = vi.fn(async () => {
+      registerPrefetcher("/lazy", fn); // like a page module does on import
+    });
+    registerRouteLoader("/lazy", load);
+    prefetchRoute("/lazy");
+    prefetchRoute("/lazy"); // while the loader is still pending
+    await vi.waitFor(() => expect(fn).toHaveBeenCalledTimes(1));
+    expect(fn).toHaveBeenCalledWith(qc);
+    expect(load).toHaveBeenCalledTimes(1);
+  });
   it("swallows prefetcher failures", () => {
     bindPrefetchClient(new QueryClient());
     registerPrefetcher("/x", () => {

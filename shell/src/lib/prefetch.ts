@@ -17,6 +17,7 @@ type Prefetcher = (qc: QueryClient) => unknown;
 const loaders = new Map<string, Loader>();
 const prefetchers = new Map<string, Set<Prefetcher>>();
 const done = new Set<string>();
+const pending = new Map<string, Promise<void>>();
 let client: QueryClient | null = null;
 
 export function bindPrefetchClient(qc: QueryClient | null): void {
@@ -37,10 +38,33 @@ export function registerPrefetcher(path: string, fn: Prefetcher): () => void {
 
 /** Warm `path` (chunk + data). Safe to call repeatedly: the chunk is fetched once; prefetchers re-run only if new. */
 export function prefetchRoute(path: string): void {
+  if (pending.has(path)) return; // the first call's chain will run the prefetchers
   if (!done.has(path)) {
     done.add(path);
-    void loaders.get(path)?.().catch(() => done.delete(path));
+    const load = loaders.get(path);
+    if (load) {
+      // Loading the chunk is what registers the page's prefetchers, so wait for it
+      // before running them; otherwise the first hover would find none.
+      const chain = new Promise<unknown>((resolve) => {
+        try {
+          resolve(load());
+        } catch {
+          resolve(Promise.reject(new Error("loader failed")));
+        }
+      })
+        .catch(() => void done.delete(path))
+        .then(() => {
+          pending.delete(path);
+          runPrefetchers(path);
+        });
+      pending.set(path, chain);
+      return;
+    }
   }
+  runPrefetchers(path);
+}
+
+function runPrefetchers(path: string): void {
   const qc = client;
   if (qc === null) return;
   for (const fn of prefetchers.get(path) ?? []) {
@@ -62,5 +86,6 @@ export function resetPrefetch(): void {
   loaders.clear();
   prefetchers.clear();
   done.clear();
+  pending.clear();
   client = null;
 }
