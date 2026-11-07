@@ -112,7 +112,6 @@ async fn collect(
     .await?;
 
     let mut used = 0usize;
-    let mut kept = 0usize;
     let mut oldest = None;
     let mut truncated = false;
     for (index, (id, size)) in sizes.iter().enumerate() {
@@ -124,12 +123,11 @@ async fn collect(
         } else {
             size
         };
-        if index >= max_rows || (kept > 0 && used + counted > max_bytes) {
+        if index >= max_rows || (index > 0 && used + counted > max_bytes) {
             truncated = true;
             break;
         }
         used += counted;
-        kept += 1;
         oldest = Some(*id);
     }
     let Some(oldest) = oldest else {
@@ -175,10 +173,11 @@ fn clip(row: &mut RunRow) {
         row.tools_used = None;
     }
     row.prompt = tail(&row.prompt);
-    for field in [&mut row.stdout, &mut row.stderr, &mut row.thought] {
-        if let Some(text) = field {
-            *text = tail(text);
-        }
+    for text in [&mut row.stdout, &mut row.stderr, &mut row.thought]
+        .into_iter()
+        .flatten()
+    {
+        *text = tail(text);
     }
 }
 
@@ -363,14 +362,15 @@ mod tests {
         assert_eq!(prompts, ["question 1", "question 2", "question 3"]);
         assert!(imported.windows(2).all(|w| w[0].0 < w[1].0));
         assert!(imported[0].0 > 5, "ids are local: {imported:?}");
-        let (project, job, relay, mode, stamped, cost): (
+        type RunExtras = (
             Option<String>,
             Option<i64>,
             Option<i64>,
             String,
             Option<String>,
             Option<f64>,
-        ) = sqlx::query_as(
+        );
+        let (project, job, relay, mode, stamped, cost): RunExtras = sqlx::query_as(
             "SELECT project_id, job_id, from_relay_id, mode, imported_at, cost_usd
                FROM runs WHERE chat_id = 'c1' ORDER BY id LIMIT 1",
         )
