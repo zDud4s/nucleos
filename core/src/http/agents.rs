@@ -611,6 +611,7 @@ pub(super) async fn run_preset(
             // not become a way to obtain a listening run that its author never asked for.
             steerable: false,
             permission_mode: None,
+            account_choice: None,
         }),
     )
     .await

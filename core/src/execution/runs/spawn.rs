@@ -707,14 +707,16 @@ pub(super) fn spawn_run(
                     if o.exit_code != 0
                         && let Some(held) = account.as_ref()
                     {
-                        crate::accounts::launch_chat::note_limit(
-                            &crate::accounts::pool::PoolState::global(),
+                        crate::accounts::launch_chat::note_limit_and_announce(
+                            &pool,
+                            feed_project_id.as_deref(),
                             &held.engine,
                             held.reservation.account(),
                             &o.stdout,
                             &o.stderr,
                             chrono::Utc::now(),
-                        );
+                        )
+                        .await;
                     }
                     // Read from the same stream everything else came from, and kept here because
                     // here is where an agent run ends. `assistant.rs` does the equivalent in its

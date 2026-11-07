@@ -191,6 +191,59 @@ pub fn note_limit(
     pool.note_failure(adapter_for(engine)?, account, stdout, stderr, now)
 }
 
+/// Account + window pairs already announced, with the time their notice is good until.
+static ANNOUNCED: std::sync::Mutex<Vec<(String, String, DateTime<Utc>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// How long a notice with no known reset time holds off a repeat.
+const NOTICE_FALLBACK: chrono::Duration = chrono::Duration::hours(5);
+
+/// True once per account per window: the first hit of a window says so, the rest stay quiet
+/// until the window resets.
+fn limit_notice_due(account: &AccountId, hit: &LimitHit, now: DateTime<Utc>) -> bool {
+    let window = hit.window.clone().unwrap_or_default();
+    let until = hit.resets_at.unwrap_or(now + NOTICE_FALLBACK);
+    let Ok(mut seen) = ANNOUNCED.lock() else {
+        return false;
+    };
+    seen.retain(|(_, _, until)| *until > now);
+    if seen
+        .iter()
+        .any(|(id, w, _)| id == account.as_str() && *w == window)
+    {
+        return false;
+    }
+    seen.push((account.as_str().to_owned(), window, until));
+    true
+}
+
+/// `note_limit`, plus one feed row (`LIMIT_HIT_KIND`) the first time an account's window is
+/// found exhausted. Returns the hit like `note_limit`.
+pub async fn note_limit_and_announce(
+    db: &SqlitePool,
+    project_id: Option<&str>,
+    engine: &str,
+    account: &AccountId,
+    stdout: &str,
+    stderr: &str,
+    now: DateTime<Utc>,
+) -> Option<LimitHit> {
+    let hit = note_limit(&PoolState::global(), engine, account, stdout, stderr, now)?;
+    if limit_notice_due(account, &hit, now) {
+        let window = hit.window.as_deref().unwrap_or("a usage window");
+        let summary = format!(
+            "Account {} ({engine}) hit its limit on {window}; new work goes to other accounts",
+            account.as_str()
+        );
+        if let Err(error) =
+            crate::feed::append(db, project_id, super::LIMIT_HIT_KIND, &summary, None, None).await
+        {
+            tracing::warn!(%error, "could not write the account limit notice");
+        }
+    }
+    Some(hit)
+}
+
 /// Records the turn's cache usage and classifies its output for a limit hit.
 #[allow(clippy::too_many_arguments)]
 pub async fn after_chat_turn(
@@ -221,7 +274,8 @@ pub async fn after_chat_turn(
     {
         tracing::warn!(%error, chat_id, "could not record a turn's cache write");
     }
-    if let Some(hit) = note_limit(pool, engine, account, stdout, stderr, now) {
+    if let Some(hit) = note_limit_and_announce(db, None, engine, account, stdout, stderr, now).await
+    {
         tracing::info!(chat_id, account = account.as_str(), window = ?hit.window, "account limit hit");
     }
 }
@@ -276,6 +330,25 @@ mod tests {
             choice,
             ..SessionView::default()
         }
+    }
+
+    #[test]
+    fn a_limit_notice_is_due_once_per_account_and_window() {
+        let now = Utc::now();
+        let id = AccountId("notice-test:1".into());
+        let hit = LimitHit {
+            window: Some("5h".into()),
+            resets_at: Some(now + chrono::Duration::hours(1)),
+        };
+        assert!(limit_notice_due(&id, &hit, now));
+        assert!(!limit_notice_due(&id, &hit, now));
+        let other = LimitHit {
+            window: Some("7d".into()),
+            ..hit.clone()
+        };
+        assert!(limit_notice_due(&id, &other, now));
+        let later = now + chrono::Duration::hours(2);
+        assert!(limit_notice_due(&id, &hit, later), "the window reset");
     }
 
     #[test]
