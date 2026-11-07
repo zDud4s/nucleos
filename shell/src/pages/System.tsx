@@ -82,6 +82,7 @@ import { MachineSettings } from "./MachineSettings";
 import { ChannelsView } from "./ChannelsView";
 import { RestartSidecar } from "../channels/RestartSidecar";
 import { NotificationsView } from "./NotificationsView";
+import { AccountsView } from "./systemAccounts/AccountsView";
 import "./system.css";
 import { DAEMON_NAME } from "../copy";
 import { percentText } from "../lib/format";
@@ -113,8 +114,8 @@ import { plural } from "../lib/plural";
  * the sidecar obeys, so nothing on this page decides anything by itself.
  */
 
-/** The seven tabs, in the order they read. */
-const VIEWS = ["health", "limits", "backups", "tokens", "channels", "notifications", "settings"] as const;
+/** The eight tabs, in the order they read. */
+const VIEWS = ["health", "limits", "backups", "tokens", "channels", "notifications", "accounts", "settings"] as const;
 export type SystemView = (typeof VIEWS)[number];
 
 const VIEW_LABEL: Record<SystemView, string> = {
@@ -124,6 +125,7 @@ const VIEW_LABEL: Record<SystemView, string> = {
   tokens: "Tokens",
   channels: "Channels",
   notifications: "Notifications",
+  accounts: "Accounts",
   // The slug stays `settings`; only the word changed, because "System" inside the page
   // called System named nothing.
   settings: "Machine",
@@ -164,6 +166,7 @@ export function System() {
         {view === "backups" && <BackupsView />}
         {view === "tokens" && <TokensView />}
         {view === "channels" && <ChannelsView />}
+        {view === "accounts" && <AccountsView />}
         {view === "notifications" && (
           <NotificationsView
             channel={channel}
