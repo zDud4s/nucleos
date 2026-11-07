@@ -596,6 +596,8 @@ async fn has_diff(job: &TreeJob, branch: &super::model::Branch) -> Result<bool, 
 /// Runs `git -C <root> <args>` and answers its trimmed stdout, or its stderr as the error.
 async fn git(root: &str, args: &[&str]) -> Result<String, String> {
     let output = tokio::process::Command::new("git")
+        // A repo-local `core.fsmonitor` would run a command on any call that reads the index.
+        .args(["-c", "core.fsmonitor="])
         .arg("-C")
         .arg(root)
         .args(args)

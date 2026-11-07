@@ -233,6 +233,8 @@ async fn head_of(worktree: &str) -> Result<String, String> {
         .await
         .map_err(|e| e.to_string())?;
     let output = tokio::process::Command::new("git")
+        // A repo-local `core.fsmonitor` would run a command on any call that reads the index.
+        .args(["-c", "core.fsmonitor="])
         .arg("-C")
         .arg(worktree)
         .args(["rev-parse", "HEAD"])
