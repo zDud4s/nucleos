@@ -227,6 +227,9 @@ pub fn front_with(
                 .map(|row| (row.id, row.efforts)),
         )
         .collect();
+    // Design §8: the router is only offered the providers whose pool still has an account out of
+    // risk. `others` above keeps every engine, so an explicit pin still reaches a blocked one.
+    let alternates = keep_unblocked(alternates, &engines_without_headroom_now());
     let router = Arc::new(
         Router::new(config, primary_available, alternates).with_model_efforts(model_efforts),
     );
@@ -239,6 +242,30 @@ pub fn front_with(
         router: Some(router),
         engines: Some(engines),
     })
+}
+
+/// Engines whose provider pool has no account out of risk right now. Empty with an empty pool
+/// (P7: the list is then exactly today's).
+fn engines_without_headroom_now() -> Vec<String> {
+    let view = crate::accounts::pool::PoolState::global().view();
+    if view.candidates.is_empty() {
+        return Vec::new();
+    }
+    let weights = crate::accounts::settings::current().weights.clone();
+    crate::accounts::inter::engines_without_headroom(&view, &weights, chrono::Utc::now())
+}
+
+/// `alternates` without the runners (and so their model globs) named in `blocked`. The runner
+/// list sent to the router is never emptied by this: when every alternate is blocked the primary
+/// alone remains, and the quota brake decides as it always did.
+fn keep_unblocked(alternates: Vec<Available>, blocked: &[String]) -> Vec<Available> {
+    if blocked.is_empty() {
+        return alternates;
+    }
+    alternates
+        .into_iter()
+        .filter(|available| !blocked.iter().any(|name| name == available.kind.as_str()))
+        .collect()
 }
 
 /// The globs a runner's routed runs may use: the router file's own list for it when it names one,
@@ -431,6 +458,42 @@ mod tests {
         let models = crate::config::ModelsConfig::default();
         let allowed = allowed_models(&models, &RouterConfig::off(), RunnerKind::for_test("zed"));
         assert!(allowed.iter().all(|id| !id.is_empty()), "{allowed:?}");
+    }
+
+    fn offered(kind: RunnerKind) -> Available {
+        Available {
+            kind,
+            runner: codex_runner("m".to_owned(), "read-only", None),
+            default_model: "m".to_owned(),
+            models: vec!["m*".to_owned()],
+        }
+    }
+
+    #[test]
+    fn keep_unblocked_with_nothing_blocked_is_the_list_unchanged() {
+        let kept = keep_unblocked(vec![offered(RunnerKind::Codex)], &[]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].models, vec!["m*".to_owned()]);
+    }
+
+    #[test]
+    fn keep_unblocked_drops_a_blocked_runner_with_its_models() {
+        let alternates = vec![offered(RunnerKind::Codex), offered(RunnerKind::Agy)];
+        let kept = keep_unblocked(alternates, &["codex".to_owned()]);
+        let kinds: Vec<RunnerKind> = kept.iter().map(|a| a.kind).collect();
+        assert_eq!(kinds, vec![RunnerKind::Agy]);
+    }
+
+    #[test]
+    fn keep_unblocked_may_leave_no_alternate_but_the_primary_stays_with_the_router() {
+        let kept = keep_unblocked(vec![offered(RunnerKind::Codex)], &["codex".to_owned()]);
+        assert!(kept.is_empty());
+    }
+
+    #[test]
+    fn an_empty_pool_blocks_no_engine() {
+        // The global pool is empty in this process unless a test loads accounts into it.
+        assert!(engines_without_headroom_now().is_empty());
     }
 
     #[test]
