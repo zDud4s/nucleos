@@ -307,6 +307,9 @@ pub fn conversation_area(root: &Path) -> Area {
             .map(Path::new),
     );
     if let Ok(mut areas) = AREAS.lock() {
+        // Expired entries go on every insert, so the map holds at most the roots asked for within
+        // one TTL instead of every root the daemon has ever seen.
+        areas.retain(|_, (at, _)| at.elapsed() < AREA_TTL);
         areas.insert(key, (Instant::now(), area.clone()));
     }
     area
