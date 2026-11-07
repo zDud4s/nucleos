@@ -3936,6 +3936,28 @@ pub mod tests {
     }
 
     #[tokio::test]
+    async fn approve_resume_records_the_successor_on_the_superseded_run() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (original_run_id, proposal_id, _worktree_path) =
+            seed_resumable_action_approval(&state, Some("sess-a")).await;
+
+        let resume_run_id = resume_approved_run(&state, proposal_id).await.unwrap();
+
+        let successor: Option<i64> =
+            sqlx::query_scalar("SELECT successor_run_id FROM runs WHERE id = ?")
+                .bind(original_run_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            successor,
+            Some(resume_run_id),
+            "a superseded run must name the run that continues it"
+        );
+    }
+
+    #[tokio::test]
     async fn approve_resumes_session_in_same_worktree_and_grants_the_approved_actions_class() {
         let (state, runner) =
             test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
@@ -4486,10 +4508,25 @@ pub mod tests {
         let mirror = std::sync::Arc::new(std::sync::Mutex::new(None));
 
         let _guard = mirror_context_fill(&pool, 44001, std::sync::Arc::clone(&mirror));
+        // Polled rather than slept: a fixed wait fails on a loaded machine whose periodic task is
+        // late, and costs three seconds of wall time on an idle one.
+        async fn wait_for_fill(pool: &sqlx::SqlitePool, fill: i64) {
+            for _ in 0..500 {
+                let seen: Option<i64> =
+                    sqlx::query_scalar("SELECT context_fill FROM runs WHERE id = 44001")
+                        .fetch_one(pool)
+                        .await
+                        .unwrap();
+                if seen == Some(fill) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
         *mirror.lock().unwrap() = Some(190_000);
-        tokio::time::sleep(CONTEXT_FILL_PERSIST_INTERVAL * 3).await;
+        wait_for_fill(&pool, 190_000).await;
         *mirror.lock().unwrap() = Some(40_000); // it compacted
-        tokio::time::sleep(CONTEXT_FILL_PERSIST_INTERVAL * 3).await;
+        wait_for_fill(&pool, 40_000).await;
 
         let (fill, peak): (Option<i64>, Option<i64>) =
             sqlx::query_as("SELECT context_fill, context_peak FROM runs WHERE id = ?")
@@ -8981,13 +9018,22 @@ tests:
         spawn_registered(&state, id, async { panic!("run body blew up") });
 
         for _ in 0..100 {
-            if !state.run_handles.lock().unwrap().contains_key(&id) {
+            if !state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&id)
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(
-            !state.run_handles.lock().unwrap().contains_key(&id),
+            !state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&id),
             "a dead run must not stay registered as in-flight"
         );
     }
@@ -9359,13 +9405,22 @@ tests:
         // The handle is released by the guard the task captured, so an empty map is proof the body
         // reached the end — its terminal write included — rather than proof that time passed.
         for _ in 0..500 {
-            if !state.run_handles.lock().unwrap().contains_key(&id) {
+            if !state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&id)
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(
-            !state.run_handles.lock().unwrap().contains_key(&id),
+            !state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&id),
             "the run body never finished"
         );
 
@@ -9423,13 +9478,22 @@ tests:
 
         // Wait for the body to wake up, lose the CAS race, and finish.
         for _ in 0..500 {
-            if !state.run_handles.lock().unwrap().contains_key(&id) {
+            if !state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&id)
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(
-            !state.run_handles.lock().unwrap().contains_key(&id),
+            !state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&id),
             "the run body never finished"
         );
 

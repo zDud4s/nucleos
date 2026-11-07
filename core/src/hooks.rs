@@ -395,7 +395,7 @@ mod tests {
         state
             .run_handles
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(run_id, task.abort_handle());
 
         run_id
@@ -443,7 +443,11 @@ mod tests {
             assert_eq!(decision.decision, "deny", "{resolve}");
             assert_eq!(decision.reason, A_PERSON_DECLINED_THIS);
             assert!(
-                state.run_handles.lock().unwrap().contains_key(&run_id),
+                state
+                    .run_handles
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains_key(&run_id),
                 "not parked"
             );
             let (proposals, denials): (i64, i64) = sqlx::query_as(
@@ -706,7 +710,13 @@ mod tests {
             "deny"
         );
 
-        assert!(state.run_handles.lock().unwrap().contains_key(&run_id));
+        assert!(
+            state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&run_id)
+        );
         let kind: String = sqlx::query_scalar("SELECT kind FROM feed ORDER BY id DESC LIMIT 1")
             .fetch_one(&state.pool)
             .await
@@ -740,7 +750,13 @@ mod tests {
                 "deny"
             );
 
-            assert!(state.run_handles.lock().unwrap().contains_key(&run_id));
+            assert!(
+                state
+                    .run_handles
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains_key(&run_id)
+            );
             assert_eq!(
                 count_rows(&state.pool, "SELECT COUNT(*) FROM judge_corrections").await,
                 0,
@@ -779,7 +795,11 @@ mod tests {
         );
 
         assert!(
-            state.run_handles.lock().unwrap().contains_key(&run_id),
+            state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&run_id),
             "never stopped by the judge"
         );
         assert!(judge.asked_keys().is_empty(), "never asked (D2/S1)");
@@ -820,7 +840,13 @@ mod tests {
             (decision.decision.as_str(), decision.reason.as_str()),
             ("deny", crate::execution::runs::CONTINUING_WITHOUT_IT)
         );
-        assert!(state.run_handles.lock().unwrap().contains_key(&run_id));
+        assert!(
+            state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&run_id)
+        );
         let (denials, refused): (i64, i64) = sqlx::query_as(
             "SELECT (SELECT denials FROM runs WHERE id = ?1),
                     (SELECT COUNT(*) FROM proposals WHERE run_id = ?1 AND kind = 'refused-action')",
@@ -1009,8 +1035,8 @@ mod tests {
             ("needed", 0.1),
             ("avoidable", 0.95),
         ];
-        let judge = VerdictJudge::answering_keys_slowly(Duration::from_millis(1500), &keys);
-        let state = judged_state(judge).await;
+        let judge = VerdictJudge::answering_keys_slowly(Duration::from_millis(300), &keys);
+        let state = judged_state(judge.clone()).await;
         let run_id = resolving_run(&state, "enforce").await;
         sqlx::query("UPDATE runs SET judge = 'enforce' WHERE id = ?")
             .bind(run_id)
@@ -1018,15 +1044,12 @@ mod tests {
             .await
             .unwrap();
         let app = test_router(state.clone());
-        let started = std::time::Instant::now();
 
         let decision = decide(&app, &bash(run_id, PARKED)).await;
 
-        assert!(
-            started.elapsed() < Duration::from_millis(2900),
-            "{:?}",
-            started.elapsed()
-        );
+        // Overlap, not elapsed time: serial calls would never have two in flight, and the count
+        // does not move with the load on the machine.
+        assert_eq!(judge.max_concurrent_calls(), 2);
         assert_eq!(
             decision.reason,
             crate::execution::runs::CONTINUING_WITHOUT_IT
@@ -1057,7 +1080,11 @@ mod tests {
 
         assert_eq!(resolution_rows(&state.pool, 1).await[0].2, "moot");
         assert!(
-            state.run_handles.lock().unwrap().contains_key(&run_id),
+            state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&run_id),
             "an off-task opinion that came too late to matter stops nothing"
         );
     }
@@ -1138,7 +1165,11 @@ mod tests {
 
         assert_eq!(decision.decision, "deny");
         assert!(
-            state.run_handles.lock().unwrap().contains_key(&run_id),
+            state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&run_id),
             "observe never stops a run"
         );
         let rows = resolution_rows(&state.pool, 1).await;
@@ -1325,7 +1356,11 @@ mod tests {
                 .starts_with("judge jev-latest p=0.95 ≥ 0.85 (in_scope 0.97, safe 0.95)")
         );
         assert!(
-            state.run_handles.lock().unwrap().contains_key(&run_id),
+            state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&run_id),
             "nothing paused"
         );
         let (judge, _, final_decision, enforced, _) = verdict_rows(&state.pool, 1).await.remove(0);
@@ -2110,7 +2145,11 @@ mod tests {
     async fn note_finding_is_refused_to_a_job_run_that_is_not_in_flight() {
         let state = test_state().await;
         let (_job_id, run_id) = in_flight_job_node(&state).await;
-        state.run_handles.lock().unwrap().remove(&run_id);
+        state
+            .run_handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&run_id);
         let app = test_router(state);
         let verdict = decide(
             &app,
@@ -2900,7 +2939,10 @@ mod tests {
         for _ in 0..DENIAL_LIMIT {
             assert_eq!(decide_as(&app, &my_key, &probe).await.decision, "deny");
         }
-        let handles = state.run_handles.lock().unwrap();
+        let handles = state
+            .run_handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(
             !handles.contains_key(&mine),
             "the prober's own run is stopped"
@@ -2926,7 +2968,11 @@ mod tests {
         for attempt in 1..DENIAL_LIMIT {
             assert_eq!(decide(&app, &body).await.decision, "deny");
             assert!(
-                state.run_handles.lock().unwrap().contains_key(&run_id),
+                state
+                    .run_handles
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains_key(&run_id),
                 "attempt {attempt} is within the allowance and must not stop the run"
             );
         }
@@ -2934,7 +2980,13 @@ mod tests {
         // The one that spends it. The action is still denied — being stopped is on top of the
         // refusal, never instead of it.
         assert_eq!(decide(&app, &body).await.decision, "deny");
-        assert!(!state.run_handles.lock().unwrap().contains_key(&run_id));
+        assert!(
+            !state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&run_id)
+        );
 
         let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
             .bind(run_id)
@@ -2988,7 +3040,11 @@ mod tests {
             decision.reason
         );
         assert!(
-            state.run_handles.lock().unwrap().contains_key(&run_id),
+            state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&run_id),
             "a refusal that names the queue must not also stop the run"
         );
         assert!(
@@ -3030,7 +3086,11 @@ mod tests {
         }
 
         assert!(
-            !state.run_handles.lock().unwrap().contains_key(&run_id),
+            !state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&run_id),
             "a run told {DENIAL_LIMIT} times where its work went, that asks again, is not obeying"
         );
     }
@@ -3050,8 +3110,20 @@ mod tests {
             decide(&app, &body).await;
         }
 
-        assert!(!state.run_handles.lock().unwrap().contains_key(&spender));
-        assert!(state.run_handles.lock().unwrap().contains_key(&bystander));
+        assert!(
+            !state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&spender)
+        );
+        assert!(
+            state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&bystander)
+        );
         let untouched: i64 = sqlx::query_scalar("SELECT denials FROM runs WHERE id = ?")
             .bind(bystander)
             .fetch_one(&state.pool)
@@ -3076,7 +3148,11 @@ mod tests {
         }
 
         assert!(
-            state.run_handles.lock().unwrap().contains_key(&run_id),
+            state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&run_id),
             "a shadow run must survive doing exactly what shadow mode expects of it"
         );
     }
@@ -3573,7 +3649,11 @@ mod tests {
         let decision = decide(&app, &asking(silent)).await;
         assert_eq!(decision.decision, "allow");
 
-        state.run_handles.lock().unwrap().remove(&refusing);
+        state
+            .run_handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&refusing);
         let decision = decide(&app, &asking(refusing)).await;
         assert_eq!(decision.decision, "deny");
         assert_eq!(decision.reason, "this project denies this command");
@@ -3830,7 +3910,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status, "awaiting_approval");
-        assert!(!state.run_handles.lock().unwrap().contains_key(&run_id));
+        assert!(
+            !state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&run_id)
+        );
     }
 
     /// The trap in spec §7's cancellation sweep, made a test rather than a comment. `pause_for_approval`
@@ -3905,7 +3991,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status, "awaiting_approval");
-        assert!(!state.run_handles.lock().unwrap().contains_key(&run_id));
+        assert!(
+            !state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&run_id)
+        );
     }
 
     /// Terminating the run kills the CLI whose hook script owns the very connection this handler is
@@ -3945,7 +4037,13 @@ mod tests {
         // proposal recorded) before the next poll; the handler then completes, which is not a
         // failure. Only completing while the run is still in flight is. Seen on a loaded Windows CI
         // runner, where asserting on the poll first failed on the benign case.
-        let in_flight = || state.run_handles.lock().unwrap().contains_key(&run_id);
+        let in_flight = || {
+            state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&run_id)
+        };
         for _ in 0..10_000 {
             if !in_flight() {
                 terminated = true;
@@ -4015,7 +4113,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status, "running");
-        assert!(state.run_handles.lock().unwrap().contains_key(&run_id));
+        assert!(
+            state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&run_id)
+        );
     }
 
     #[tokio::test]
@@ -4055,7 +4159,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status, "running");
-        assert!(state.run_handles.lock().unwrap().contains_key(&run_id));
+        assert!(
+            state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&run_id)
+        );
     }
 
     #[tokio::test]
@@ -4093,7 +4203,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status, "running");
-        assert!(state.run_handles.lock().unwrap().contains_key(&run_id));
+        assert!(
+            state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&run_id)
+        );
     }
 
     #[tokio::test]
@@ -4131,7 +4247,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status, "awaiting_approval");
-        assert!(!state.run_handles.lock().unwrap().contains_key(&run_id));
+        assert!(
+            !state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&run_id)
+        );
     }
 
     #[tokio::test]
@@ -4195,7 +4317,13 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(status, "awaiting_approval");
-        assert!(state.run_handles.lock().unwrap().contains_key(&run_id));
+        assert!(
+            state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&run_id)
+        );
     }
 
     #[tokio::test]
@@ -4951,9 +5079,17 @@ mod tests {
             .unwrap();
         // The abort handle moves with the row, or the run stops being in flight and `cwd` — which
         // rides behind that check — stops reaching the classifier.
-        let handle = state.run_handles.lock().unwrap().remove(&created);
+        let handle = state
+            .run_handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&created);
         if let Some(handle) = handle {
-            state.run_handles.lock().unwrap().insert(run_id, handle);
+            state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(run_id, handle);
         }
         let chat_id = chat_of_run(&state.pool, run_id).await.unwrap();
         crate::chats::set_permission_mode(&state.pool, &chat_id, permission)
@@ -5448,7 +5584,11 @@ mod tests {
             .execute(&state.pool)
             .await
             .unwrap();
-        state.run_handles.lock().unwrap().remove(&launcher);
+        state
+            .run_handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&launcher);
         sqlx::query(
             "INSERT INTO runs (prompt, status, mode, chat_id, read_untrusted, created_at)
              SELECT 'later', 'completed', 'assistant', chat_id, 1, '2026-01-01T00:00:00Z'
@@ -6500,7 +6640,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status, "running");
-        assert!(state.run_handles.lock().unwrap().contains_key(&run_id));
+        assert!(
+            state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&run_id)
+        );
         assert!(
             proposals::list_pending(&state.pool)
                 .await
@@ -6996,7 +7142,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status, "running");
-        assert!(state.run_handles.lock().unwrap().contains_key(&run_id));
+        assert!(
+            state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&run_id)
+        );
         assert!(
             proposals::list_pending(&state.pool)
                 .await
@@ -7254,7 +7406,11 @@ mod tests {
                 .unwrap();
             assert_eq!(status, "running", "{command}");
             assert!(
-                state.run_handles.lock().unwrap().contains_key(&run_id),
+                state
+                    .run_handles
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains_key(&run_id),
                 "{command}"
             );
         }
@@ -7373,7 +7529,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status, "running");
-        assert!(state.run_handles.lock().unwrap().contains_key(&run_id));
+        assert!(
+            state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&run_id)
+        );
 
         let consumed_at: Option<String> =
             sqlx::query_scalar("SELECT consumed_at FROM action_grants WHERE run_id = ?")
@@ -7688,7 +7850,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status, "running");
-        assert!(state.run_handles.lock().unwrap().contains_key(&run_id));
+        assert!(
+            state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&run_id)
+        );
     }
 
     /// No declaration preserves the old question exactly. In particular, merely recognising a

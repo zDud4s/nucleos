@@ -431,7 +431,7 @@ mod wake_tests {
         state
             .run_handles
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(run_id, task.abort_handle());
         // Make recording the proposal fail, so the pause is rolled back.
         sqlx::query("DROP TABLE proposal_events")

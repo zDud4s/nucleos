@@ -137,11 +137,12 @@ pub async fn get_request(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Requ
     else {
         return Ok(None);
     };
+    let id: i64 = row.try_get("id")?;
     let unclaimed: String = row.try_get("unclaimed")?;
     let plan: String = row.try_get("plan")?;
     let inherited: String = row.try_get("inherited_task_ids")?;
     Ok(Some(RequestRow {
-        id: row.try_get("id")?,
+        id,
         project_id: row.try_get("project_id")?,
         worktree: row.try_get("worktree")?,
         kind: row.try_get("kind")?,
@@ -151,13 +152,22 @@ pub async fn get_request(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Requ
         caller: row.try_get("caller")?,
         note: row.try_get("note")?,
         // A column that does not parse is an empty list rather than a ticket nobody can read.
-        unclaimed: serde_json::from_str(&unclaimed).unwrap_or_default(),
-        plan: serde_json::from_str(&plan).unwrap_or_default(),
+        unclaimed: lenient_list(&unclaimed, id, "unclaimed"),
+        plan: lenient_list(&plan, id, "plan"),
         created_at: row.try_get("created_at")?,
-        inherited_task_ids: serde_json::from_str(&inherited).unwrap_or_default(),
+        inherited_task_ids: lenient_list(&inherited, id, "inherited_task_ids"),
         classification: row.try_get("classification")?,
         probe_outcome: row.try_get("probe_outcome")?,
     }))
+}
+
+/// A JSON column read as a list. One that does not parse is an empty list rather than a ticket
+/// nobody can read, but the loss is logged so a corrupt column does not go unseen.
+fn lenient_list<T: serde::de::DeserializeOwned + Default>(text: &str, id: i64, column: &str) -> T {
+    serde_json::from_str(text).unwrap_or_else(|error| {
+        tracing::warn!(request_id = id, column, %error, "a verify ticket column did not parse; read as empty");
+        T::default()
+    })
 }
 
 /// Stores the final classification and the incidents it inherited (the close notice joins on them).
