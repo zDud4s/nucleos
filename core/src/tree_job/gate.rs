@@ -186,27 +186,6 @@ fn is_stale(stored: Option<&Stored>, head: &str) -> bool {
     stored.is_some_and(|stored| stored.head != head)
 }
 
-#[cfg(test)]
-mod stale_tests {
-    use super::*;
-
-    #[test]
-    fn a_verdict_for_another_head_than_the_remembered_ticket_is_stale() {
-        let stored = Stored {
-            ticket: 7,
-            head: "bbb".to_owned(),
-        };
-        assert!(is_stale(Some(&stored), "aaa"));
-        assert!(!is_stale(Some(&stored), "bbb"));
-    }
-
-    #[test]
-    fn a_forgotten_ticket_is_not_stale() {
-        // A red verdict forgets its ticket (`remember(None)`); it must still be applied.
-        assert!(!is_stale(None, "aaa"));
-    }
-}
-
 struct VerifyIo<'a> {
     /// The key of `Branch.extra` that holds this step's ticket.
     key: &'static str,
@@ -357,4 +336,25 @@ pub(super) async fn gate_branch(
         wait,
     )
     .await
+}
+
+#[cfg(test)]
+mod stale_tests {
+    use super::*;
+
+    #[test]
+    fn a_verdict_for_another_head_than_the_remembered_ticket_is_stale() {
+        let stored = Stored {
+            ticket: 7,
+            head: "bbb".to_owned(),
+        };
+        assert!(is_stale(Some(&stored), "aaa"));
+        assert!(!is_stale(Some(&stored), "bbb"));
+    }
+
+    #[test]
+    fn a_forgotten_ticket_is_not_stale() {
+        // A red verdict forgets its ticket (`remember(None)`); it must still be applied.
+        assert!(!is_stale(None, "aaa"));
+    }
 }
