@@ -19,7 +19,10 @@ async fn check_exists(state: &AppState, choice: &AccountChoice) -> Result<(), Re
             if accounts.iter().any(|a| &a.provider == provider) {
                 Ok(())
             } else {
-                Err(refusal(StatusCode::UNPROCESSABLE_ENTITY, "unknown_provider"))
+                Err(refusal(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "unknown_provider",
+                ))
             }
         }
         AccountChoice::Account(id) => match store::get(&state.pool, id).await.map_err(internal)? {

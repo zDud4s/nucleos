@@ -117,7 +117,9 @@ async fn start_account(
     let view = Logins::global()
         .start_new(&state.pool, &data_dir, &body.engine, &body.label)
         .await
-        .map_err(|detail| refusal_with_detail(StatusCode::UNPROCESSABLE_ENTITY, "login_refused", detail))?;
+        .map_err(|detail| {
+            refusal_with_detail(StatusCode::UNPROCESSABLE_ENTITY, "login_refused", detail)
+        })?;
     Ok((StatusCode::ACCEPTED, Json(view)))
 }
 

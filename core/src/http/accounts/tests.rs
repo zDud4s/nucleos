@@ -19,7 +19,12 @@ async fn fixture() -> (Home, AppState) {
     (home, state)
 }
 
-async fn call(state: &AppState, method: &str, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
+async fn call(
+    state: &AppState,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
     workflow_call(state.clone(), method, uri, body).await
 }
 
@@ -43,7 +48,10 @@ async fn the_list_carries_the_migrated_defaults_without_the_credential_locator()
     let (status, answer) = call(&state, "GET", "/accounts", None).await;
     assert_eq!(status, StatusCode::OK, "{answer}");
     let accounts = answer["accounts"].as_array().unwrap();
-    let claude = accounts.iter().find(|a| a["id"] == "default:claude").unwrap();
+    let claude = accounts
+        .iter()
+        .find(|a| a["id"] == "default:claude")
+        .unwrap();
     assert_eq!(claude["provider"], "anthropic");
     assert_eq!(claude["state"], "active");
     assert_eq!(claude["is_default"], true);
@@ -81,9 +89,12 @@ async fn starting_a_login_for_an_engine_outside_the_pool_is_refused() {
 #[tokio::test]
 async fn rename_changes_the_label_and_refuses_a_taken_or_bad_one() {
     let (_home, state) = fixture().await;
-    store::insert(&state.pool, &extra("00000001", "work", AccountState::Active))
-        .await
-        .unwrap();
+    store::insert(
+        &state.pool,
+        &extra("00000001", "work", AccountState::Active),
+    )
+    .await
+    .unwrap();
     let uri = "/accounts/claude:00000001/rename";
     let (status, answer) = call(&state, "POST", uri, Some(json!({ "label": " home " }))).await;
     assert_eq!(status, StatusCode::OK, "{answer}");
@@ -109,18 +120,33 @@ async fn rename_changes_the_label_and_refuses_a_taken_or_bad_one() {
 #[tokio::test]
 async fn pause_and_resume_move_between_active_and_paused_but_not_out_of_needs_login() {
     let (_home, state) = fixture().await;
-    store::insert(&state.pool, &extra("00000001", "work", AccountState::Active))
-        .await
-        .unwrap();
-    store::insert(&state.pool, &extra("00000002", "old", AccountState::NeedsLogin))
-        .await
-        .unwrap();
+    store::insert(
+        &state.pool,
+        &extra("00000001", "work", AccountState::Active),
+    )
+    .await
+    .unwrap();
+    store::insert(
+        &state.pool,
+        &extra("00000002", "old", AccountState::NeedsLogin),
+    )
+    .await
+    .unwrap();
     let (status, answer) = call(&state, "POST", "/accounts/claude:00000001/pause", None).await;
-    assert_eq!((status, &answer["state"]), (StatusCode::OK, &json!("paused")));
+    assert_eq!(
+        (status, &answer["state"]),
+        (StatusCode::OK, &json!("paused"))
+    );
     let (status, answer) = call(&state, "POST", "/accounts/claude:00000001/pause", None).await;
-    assert_eq!((status, &answer["state"]), (StatusCode::OK, &json!("paused")));
+    assert_eq!(
+        (status, &answer["state"]),
+        (StatusCode::OK, &json!("paused"))
+    );
     let (status, answer) = call(&state, "POST", "/accounts/claude:00000001/resume", None).await;
-    assert_eq!((status, &answer["state"]), (StatusCode::OK, &json!("active")));
+    assert_eq!(
+        (status, &answer["state"]),
+        (StatusCode::OK, &json!("active"))
+    );
 
     let (status, answer) = call(&state, "POST", "/accounts/claude:00000002/resume", None).await;
     assert_eq!(status, StatusCode::CONFLICT, "{answer}");
@@ -132,11 +158,17 @@ async fn pause_and_resume_move_between_active_and_paused_but_not_out_of_needs_lo
 #[tokio::test]
 async fn the_default_choice_is_read_written_and_checked_against_the_accounts() {
     let (_home, state) = fixture().await;
-    store::insert(&state.pool, &extra("00000001", "work", AccountState::Active))
-        .await
-        .unwrap();
+    store::insert(
+        &state.pool,
+        &extra("00000001", "work", AccountState::Active),
+    )
+    .await
+    .unwrap();
     let (status, answer) = call(&state, "GET", "/account-pool/default", None).await;
-    assert_eq!((status, &answer["choice"]), (StatusCode::OK, &json!("auto")));
+    assert_eq!(
+        (status, &answer["choice"]),
+        (StatusCode::OK, &json!("auto"))
+    );
 
     for (choice, expected) in [
         ("account:claude:00000001", StatusCode::OK),
@@ -155,15 +187,21 @@ async fn the_default_choice_is_read_written_and_checked_against_the_accounts() {
         assert_eq!(status, expected, "{choice}: {answer}");
     }
     let (_, answer) = call(&state, "GET", "/account-pool/default", None).await;
-    assert_eq!(answer["choice"], "provider:anthropic", "a refused write changes nothing");
+    assert_eq!(
+        answer["choice"], "provider:anthropic",
+        "a refused write changes nothing"
+    );
 }
 
 #[tokio::test]
 async fn a_chat_is_pinned_and_unpinned_and_unknown_targets_are_refused() {
     let (_home, state) = fixture().await;
-    store::insert(&state.pool, &extra("00000001", "work", AccountState::Active))
-        .await
-        .unwrap();
+    store::insert(
+        &state.pool,
+        &extra("00000001", "work", AccountState::Active),
+    )
+    .await
+    .unwrap();
     let chat = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
         .await
         .unwrap();
@@ -171,17 +209,38 @@ async fn a_chat_is_pinned_and_unpinned_and_unknown_targets_are_refused() {
 
     let (status, answer) = call(&state, "GET", &uri, None).await;
     assert_eq!(status, StatusCode::OK, "{answer}");
-    assert_eq!((&answer["choice"], &answer["inherited"]), (&json!("auto"), &json!(true)));
+    assert_eq!(
+        (&answer["choice"], &answer["inherited"]),
+        (&json!("auto"), &json!(true))
+    );
 
-    let (status, answer) = call(&state, "PUT", &uri, Some(json!({ "choice": "account:claude:00000001" }))).await;
+    let (status, answer) = call(
+        &state,
+        "PUT",
+        &uri,
+        Some(json!({ "choice": "account:claude:00000001" })),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{answer}");
     let (_, answer) = call(&state, "GET", &uri, None).await;
     assert_eq!(answer["choice"], "account:claude:00000001");
     assert_eq!(answer["inherited"], false);
 
-    let (status, _) = call(&state, "PUT", &uri, Some(json!({ "choice": "account:claude:ffffffff" }))).await;
+    let (status, _) = call(
+        &state,
+        "PUT",
+        &uri,
+        Some(json!({ "choice": "account:claude:ffffffff" })),
+    )
+    .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    let (status, _) = call(&state, "PUT", "/assistant/chats/nope/account", Some(json!({ "choice": "auto" }))).await;
+    let (status, _) = call(
+        &state,
+        "PUT",
+        "/assistant/chats/nope/account",
+        Some(json!({ "choice": "auto" })),
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     let (status, _) = call(&state, "PUT", &uri, Some(json!({ "choice": "auto" }))).await;
     assert_eq!(status, StatusCode::OK);
@@ -192,14 +251,23 @@ async fn a_chat_is_pinned_and_unpinned_and_unknown_targets_are_refused() {
 #[tokio::test]
 async fn removing_an_account_unpins_its_chats_resets_the_default_and_tells_the_feed() {
     let (_home, state) = fixture().await;
-    store::insert(&state.pool, &extra("00000001", "work", AccountState::Active))
-        .await
-        .unwrap();
+    store::insert(
+        &state.pool,
+        &extra("00000001", "work", AccountState::Active),
+    )
+    .await
+    .unwrap();
     let chat = crate::chats::create(&state.pool, crate::chats::Brain::Cloud, None)
         .await
         .unwrap();
     let pinned = json!({ "choice": "account:claude:00000001" });
-    call(&state, "PUT", &format!("/assistant/chats/{chat}/account"), Some(pinned.clone())).await;
+    call(
+        &state,
+        "PUT",
+        &format!("/assistant/chats/{chat}/account"),
+        Some(pinned.clone()),
+    )
+    .await;
     call(&state, "PUT", "/account-pool/default", Some(pinned)).await;
 
     let (status, answer) = call(&state, "DELETE", "/accounts/default:claude", None).await;
@@ -211,7 +279,13 @@ async fn removing_an_account_unpins_its_chats_resets_the_default_and_tells_the_f
     assert_eq!(answer["unpinned_chats"], 1);
     assert_eq!(answer["default_reset"], true);
 
-    let (_, answer) = call(&state, "GET", &format!("/assistant/chats/{chat}/account"), None).await;
+    let (_, answer) = call(
+        &state,
+        "GET",
+        &format!("/assistant/chats/{chat}/account"),
+        None,
+    )
+    .await;
     assert_eq!(answer["choice"], "auto");
     let (_, answer) = call(&state, "GET", "/account-pool/default", None).await;
     assert_eq!(answer["choice"], "auto");
@@ -234,16 +308,28 @@ async fn removing_an_account_unpins_its_chats_resets_the_default_and_tells_the_f
 #[tokio::test]
 async fn an_account_with_live_sessions_is_removed_only_when_forced() {
     let (_home, state) = fixture().await;
-    store::insert(&state.pool, &extra("00000003", "busy", AccountState::Active))
-        .await
-        .unwrap();
+    store::insert(
+        &state.pool,
+        &extra("00000003", "busy", AccountState::Active),
+    )
+    .await
+    .unwrap();
     let id = AccountId("claude:00000003".into());
     let reservation = PoolState::global().reserve(&id, Holder::Chat("live-chat".into()));
 
     let (status, answer) = call(&state, "DELETE", "/accounts/claude:00000003", None).await;
     assert_eq!(status, StatusCode::CONFLICT, "{answer}");
-    assert_eq!((&answer["refusal"], &answer["live_sessions"]), (&json!("live_sessions"), &json!(1)));
-    let (status, _) = call(&state, "DELETE", "/accounts/claude:00000003?force=true", None).await;
+    assert_eq!(
+        (&answer["refusal"], &answer["live_sessions"]),
+        (&json!("live_sessions"), &json!(1))
+    );
+    let (status, _) = call(
+        &state,
+        "DELETE",
+        "/accounts/claude:00000003?force=true",
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     drop(reservation);
 }
@@ -258,7 +344,10 @@ async fn only_the_directory_nucleos_made_is_deleted_with_the_account() {
 
     account.credential_locator = Some(theirs.path().to_string_lossy().into_owned());
     remove_owned_dir(data.path(), &account).await;
-    assert!(ours.exists() && theirs.path().exists(), "a foreign locator deletes nothing");
+    assert!(
+        ours.exists() && theirs.path().exists(),
+        "a foreign locator deletes nothing"
+    );
 
     account.credential_locator = Some(ours.to_string_lossy().into_owned());
     remove_owned_dir(data.path(), &account).await;

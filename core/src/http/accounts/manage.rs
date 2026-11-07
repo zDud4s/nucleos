@@ -6,7 +6,9 @@ use std::path::Path as FsPath;
 use super::*;
 use crate::accounts::login::clean_label;
 use crate::accounts::pool::PoolState;
-use crate::accounts::{AccountChoice, AccountId, AccountState, UNPINNED_KIND, account_dir, startup};
+use crate::accounts::{
+    AccountChoice, AccountId, AccountState, UNPINNED_KIND, account_dir, startup,
+};
 
 async fn account_or_404(state: &AppState, id: &str) -> Result<Account, Refused> {
     store::get(&state.pool, &AccountId(id.to_owned()))
@@ -31,8 +33,9 @@ pub(super) async fn rename_account(
     Path(id): Path<String>,
     Json(body): Json<Rename>,
 ) -> Result<Json<Value>, Refused> {
-    let label = clean_label(&body.label)
-        .map_err(|detail| refusal_with_detail(StatusCode::UNPROCESSABLE_ENTITY, "bad_label", detail))?;
+    let label = clean_label(&body.label).map_err(|detail| {
+        refusal_with_detail(StatusCode::UNPROCESSABLE_ENTITY, "bad_label", detail)
+    })?;
     match store::rename(&state.pool, &AccountId(id.clone()), &label).await {
         Ok(true) => {}
         Ok(false) => return Err(refusal(StatusCode::NOT_FOUND, "no_such_account")),
@@ -145,7 +148,11 @@ pub(super) async fn remove_account(
             account.label,
             account.engine,
             unpinned.len(),
-            if default_reset { " and the default" } else { "" },
+            if default_reset {
+                " and the default"
+            } else {
+                ""
+            },
         );
         if let Err(error) =
             crate::feed::append(&state.pool, None, UNPINNED_KIND, &summary, None, None).await
