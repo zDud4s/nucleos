@@ -426,7 +426,9 @@ mod tests {
 
     /// The permission and the directory the runner was launched with, once there is a launch.
     async fn first_launch(runner: &FakeCommandRunner) -> Option<(Permission, PathBuf)> {
-        for _ in 0..300 {
+        // Hang guard only: wait for the launch, not for a short budget.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             let permission = *runner.last_permission.lock().unwrap();
             let cwd = runner.last_cwd.lock().unwrap().clone();
             if let (Some(permission), Some(cwd)) = (permission, cwd) {

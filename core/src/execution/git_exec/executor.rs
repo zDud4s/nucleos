@@ -53,6 +53,24 @@ impl MergeGate {
 
 #[async_trait::async_trait]
 impl crate::execution::vcs::VcsExecutor for GitExecutor {
+    async fn landed_sha(&self, request: &crate::execution::vcs::ClaimedRequest) -> Option<String> {
+        let crate::execution::vcs::Op::Merge { source, target } = &request.op else {
+            return None;
+        };
+        let root = Path::new(&request.project_root);
+        let deadline = std::time::Instant::now() + self.timeout;
+        let source_ref = format!("refs/heads/{}", source.as_str());
+        let target_ref = format!("refs/heads/{}", target.as_str());
+        // A source that no longer resolves is an error from `is_ancestor` and reads as "not landed".
+        if !is_ancestor(root, &source_ref, &target_ref, deadline)
+            .await
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        revision(root, &target_ref, deadline).await.ok()
+    }
+
     async fn execute(&self, request: &crate::execution::vcs::ClaimedRequest) -> Outcome {
         let project_root = Path::new(&request.project_root);
         // The budget starts here, once. Every git command inside the operation spends from it.

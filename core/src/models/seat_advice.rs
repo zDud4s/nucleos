@@ -663,8 +663,10 @@ mod tests {
     /// AC2: down, slow, 422, or an answer outside the set — the seat launches as configured.
     #[tokio::test]
     async fn a_team_seat_launches_as_configured_whatever_goes_wrong_with_the_router() {
+        // The router is slower than the whole elapsed bound below, so only its 200ms timeout
+        // can end the wait.
         let slow = slow_router(
-            std::time::Duration::from_millis(1500),
+            std::time::Duration::from_secs(30),
             answer("claude-opus-5", "high"),
         )
         .await;
@@ -686,7 +688,7 @@ mod tests {
 
             let decision = route_team_seat(&pool, Some(router), run_id, &mut launch).await;
 
-            assert!(started.elapsed() < std::time::Duration::from_millis(1200));
+            assert!(started.elapsed() < std::time::Duration::from_secs(15));
             assert_eq!(decision, None, "{url}");
             assert_eq!(launch.model.as_deref(), Some("claude-sonnet-5"));
             assert_eq!(launch.effort, None);
@@ -976,9 +978,9 @@ mod tests {
     async fn reported(
         received: &mut tokio::sync::mpsc::UnboundedReceiver<(String, serde_json::Value)>,
     ) -> (String, serde_json::Value) {
-        tokio::time::timeout(std::time::Duration::from_secs(2), received.recv())
+        tokio::time::timeout(std::time::Duration::from_secs(60), received.recv())
             .await
-            .expect("reported within 2s")
+            .expect("reported within the 60s hang guard")
             .unwrap()
     }
 

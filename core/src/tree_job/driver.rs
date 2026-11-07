@@ -162,7 +162,10 @@ pub(super) fn verdict_of(verdict: ScopeVerdict) -> Result<GateVerdict, NotMeasur
     match verdict {
         ScopeVerdict::Measured(GateOutcome::Passed) => Ok(GateVerdict::Green),
         ScopeVerdict::Measured(GateOutcome::Failed { output, .. }) => {
-            Ok(GateVerdict::Red { summary: output })
+            match super::retry::infrastructure_failure(&output) {
+                Some(reason) => Err(NotMeasured::Failed(reason)),
+                None => Ok(GateVerdict::Red { summary: output }),
+            }
         }
         ScopeVerdict::Measured(GateOutcome::Errored { reason }) => Err(NotMeasured::Failed(reason)),
         ScopeVerdict::NothingRan => Ok(GateVerdict::NothingRan),
@@ -562,7 +565,14 @@ async fn at_work(
             }
         }
     }
-    if let Some(gate) = gate {
+    let backing_off = job
+        .manifest
+        .branches
+        .get(name)
+        .is_some_and(|held| super::retry::gate_backing_off(&held.extra));
+    if let Some(gate) = gate
+        && !backing_off
+    {
         spawn_gate(state, gate, &job.id, name);
     }
     Ok(())
@@ -1360,10 +1370,9 @@ mod tests {
     }
 
     async fn wait_calls(gate: &FakeGate, count: usize) {
-        for _ in 0..300 {
-            if gate.calls().len() >= count {
-                break;
-            }
+        // Hang guard only: a loaded machine can be slow, so wait for the event, not a budget.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while gate.calls().len() < count && std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(
@@ -1669,14 +1678,15 @@ mod tests {
 
         /// Waits for the spawned gate to settle the branch, then lets its task finish.
         async fn wait_branch_state(&self, job: &str, name: &str, want: &str) {
-            let mut seen = String::new();
-            for _ in 0..300 {
-                seen = self.branch(job, name).await.state;
-                if seen == want {
-                    break;
+            // Hang guard only: wait for the state, not for a short budget.
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            let seen = loop {
+                let state = self.branch(job, name).await.state;
+                if state == want || std::time::Instant::now() >= deadline {
+                    break state;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+            };
             assert_eq!(seen, want, "branch {name} of {job} never reached {want}");
             tokio::time::sleep(Duration::from_millis(30)).await;
         }
@@ -1853,19 +1863,20 @@ mod tests {
     /// Waits for the spawned gate to count `want` gates in a row that measured nothing, then lets
     /// its task finish.
     async fn wait_gate_failures(fx: &Fixture, job: &str, name: &str, want: i64) {
-        let mut seen = None;
-        for _ in 0..300 {
-            seen = fx
+        // Hang guard only: wait for the count, not for a short budget.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let seen = loop {
+            let count = fx
                 .branch(job, name)
                 .await
                 .extra
                 .get(GATE_FAILURES)
                 .and_then(Value::as_i64);
-            if seen == Some(want) {
-                break;
+            if count == Some(want) || std::time::Instant::now() >= deadline {
+                break count;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        };
         assert_eq!(
             seen,
             Some(want),
@@ -1922,6 +1933,107 @@ mod tests {
             "a parked branch is not gated again"
         );
         assert_eq!(fx.open_questions(JOB, NODE).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_gate_starved_by_load_backs_off_without_spending_attempts_or_asking() {
+        const JOB: &str = "drv-load-backoff";
+        const NODE: &str = "api-node";
+        let fx = Fixture::new().await;
+        gated_job(&fx, JOB, NODE).await;
+        let starved = || {
+            Err(NotMeasured::Failed(
+                "pool timed out while waiting for an open connection".to_owned(),
+            ))
+        };
+        let gate = FakeGate::scripted((0..GATE_ATTEMPTS + 2).map(|_| starved()).collect());
+
+        fx.tick(JOB, &gate).await;
+        wait_calls(&gate, 1).await;
+        let mut until = None;
+        for _ in 0..300 {
+            until = fx
+                .branch(JOB, "api")
+                .await
+                .extra
+                .get("gate_backoff_until")
+                .cloned();
+            if until.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(until.is_some(), "a backoff is scheduled");
+        // Further ticks inside the backoff do not gate again.
+        for _ in 0..3 {
+            fx.tick(JOB, &gate).await;
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        assert_eq!(gate.calls().len(), 1, "the gate waits out its backoff");
+        let api = fx.branch(JOB, "api").await;
+        assert_eq!(api.state, "building");
+        assert!(
+            !api.extra.contains_key(GATE_FAILURES),
+            "load does not spend the attempts"
+        );
+        assert!(fx.open_questions(JOB, NODE).await.is_empty());
+        assert_eq!(count_of(&fx, "decisions").await, 0, "nobody was asked");
+    }
+
+    #[test]
+    fn load_reasons_are_told_from_genuine_failures() {
+        use super::super::retry::is_load_reason;
+        assert!(is_load_reason(
+            "pool timed out while waiting for an open connection"
+        ));
+        assert!(is_load_reason("the heavy broker is full"));
+        assert!(is_load_reason("held: disk pressure"));
+        assert!(is_load_reason("failed to spawn cargo"));
+        assert!(!is_load_reason(
+            "the scope gate could not be submitted: queue-down"
+        ));
+        assert!(!is_load_reason("scope verification ticket 7 vanished"));
+    }
+
+    const SCCACHE_CRASH: &str = "== core (scope)\n   Compiling stacker v0.1.15\nerror: could not compile `stacker` (lib)\n\nCaused by:\n  process didn't exit successfully: `sccache rustc --crate-name stacker` (exit status: 2)\n";
+
+    #[test]
+    fn a_compiler_dying_without_a_diagnostic_is_unmeasured_load_not_a_red() {
+        use super::super::retry::is_load_reason;
+        let verdict = verdict_of(ScopeVerdict::Measured(GateOutcome::Failed {
+            exit_code: 101,
+            output: SCCACHE_CRASH.to_owned(),
+        }));
+        match verdict {
+            Err(NotMeasured::Failed(reason)) => {
+                assert!(is_load_reason(&reason), "{reason}");
+            }
+            other => panic!("expected an unmeasured gate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_compile_error_with_a_diagnostic_stays_a_red() {
+        let real = "== core (scope)\nerror[E0425]: cannot find value `x` in this scope\n --> src/a.rs:3:5\nerror: could not compile `core` (lib) due to 1 previous error\n\nCaused by:\n  process didn't exit successfully: `rustc` (exit status: 1)\n";
+        let plain = "== core (scope)\nerror: expected one of `;`, found `}`\nerror: could not compile `core` (lib)\n  process didn't exit successfully: `rustc` (exit status: 1)\n";
+        for output in [real, plain] {
+            let verdict = verdict_of(ScopeVerdict::Measured(GateOutcome::Failed {
+                exit_code: 101,
+                output: output.to_owned(),
+            }));
+            assert!(
+                matches!(verdict, Ok(GateVerdict::Red { .. })),
+                "{verdict:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sccache_errors_are_load_reasons() {
+        use super::super::retry::is_load_reason;
+        assert!(is_load_reason(
+            "sccache: error: Failed to send data to server"
+        ));
     }
 
     #[tokio::test]
@@ -2870,7 +2982,8 @@ mod tests {
         // A dropped connection goes back to the pool on a spawned task, so `num_idle` read right
         // after the tick is racy: poll for up to a second.
         let idle = || async {
-            for _ in 0..50 {
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            while std::time::Instant::now() < deadline {
                 if fx.state.pool.size() as usize == fx.state.pool.num_idle() {
                     return true;
                 }

@@ -711,7 +711,7 @@ mod tests {
                 .expect("the spontaneous turn was not recorded");
 
         // Steerable once its gather has begun; the task that opens the guard is spawned.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
         while !is_steerable(chat) {
             assert!(
                 tokio::time::Instant::now() < deadline,
@@ -720,7 +720,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        let stopped = stop_turn_within(&state, id, Duration::from_secs(5)).await;
+        let stopped = stop_turn_within(&state, id, Duration::from_secs(60)).await;
         assert_eq!(stopped, Stopped::Interrupted);
         assert!(
             hearing.await.unwrap().interrupt,

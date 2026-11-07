@@ -46,6 +46,7 @@ pub(super) fn routes() -> Router<AppState> {
         .route("/vcs/requests/{id}/dismiss", post(post_vcs_request_dismiss))
         .route("/vcs/requests/{id}/approve", post(post_vcs_request_approve))
         .route("/vcs/requests/{id}/refuse", post(post_vcs_request_refuse))
+        .route("/vcs/requests/{id}/cancel", post(post_vcs_request_cancel))
         // The catalogue `POST /projects/{id}/git-ops` validates against, read out loud — the git
         // twin of the route above.
         //
@@ -796,6 +797,15 @@ pub(super) async fn post_vcs_request_refuse(
     Path(id): Path<i64>,
 ) -> Result<StatusCode, StatusCode> {
     owner_decision_status(id, "refusing", vcs::refuse_for_owner(&state.pool, id).await)
+}
+
+/// The owner cancels a queued request, or a running one whose executor is gone: 204, 404 for an
+/// unknown id, 409 for one that cannot be cancelled. Admin-only by default-deny, like `/refuse`.
+pub(super) async fn post_vcs_request_cancel(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, StatusCode> {
+    owner_decision_status(id, "cancelling", vcs::cancel_request(&state.pool, id).await)
 }
 
 pub(super) fn owner_decision_status(
