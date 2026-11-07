@@ -270,6 +270,18 @@ pub(super) fn normalize_path(path: &str, cwd: Option<&Path>) -> String {
 
     let mut components: Vec<&str> = Vec::new();
     for component in combined.split('/') {
+        // What Win32 resolves, not what was typed: it drops an NTFS stream suffix (`x::$DATA`) and
+        // the trailing dots and spaces of a component (`settings.json.`), so those spellings reach
+        // the guarded file. Widening only: it can make a path match a guard it would have missed.
+        let component = match component {
+            "." | ".." => component,
+            _ => {
+                let named = component
+                    .split_once("::")
+                    .map_or(component, |(name, _)| name);
+                named.trim_end_matches(['.', ' '])
+            }
+        };
         match component {
             "" | "." => {}
             ".." => {

@@ -20562,7 +20562,7 @@ mod tests {
         state
             .run_handles
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(run_id, task.abort_handle());
 
         let (messages_tx, messages_rx) = tokio::sync::mpsc::unbounded_channel();

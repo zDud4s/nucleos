@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -52,7 +53,20 @@ func SaveOffset(path string, offset int64) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("create offset directory: %w", err)
 	}
-	if err := os.WriteFile(path, []byte(strconv.FormatInt(offset, 10)), 0o600); err != nil {
+	// Write to a sibling temp file and rename over the target: a crash mid-write must never leave
+	// a truncated file, which LoadOffset would read as 0 and replay the whole backlog.
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp*")
+	if err != nil {
+		return fmt.Errorf("write update offset: %w", err)
+	}
+	_, werr := tmp.WriteString(strconv.FormatInt(offset, 10))
+	cerr := tmp.Close()
+	if err := errors.Join(werr, cerr); err != nil {
+		_ = os.Remove(tmp.Name())
+		return fmt.Errorf("write update offset: %w", err)
+	}
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		_ = os.Remove(tmp.Name())
 		return fmt.Errorf("write update offset: %w", err)
 	}
 	return nil

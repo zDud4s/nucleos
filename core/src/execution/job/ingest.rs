@@ -20,6 +20,20 @@ pub(super) enum Reconciled {
 pub(super) async fn reconcile_nodes(state: &AppState, job: &JobRow) -> sqlx::Result<Reconciled> {
     let pool = &state.pool;
 
+    // An item claimed `running` whose run was never linked (the daemon died between the claim and
+    // the link) belongs to nobody: passes of a job are serial and this runs at the start of one.
+    // Left alone it reads as a node in flight for ever. It goes back to the status it was claimed
+    // from, the same way `release_item` puts it back.
+    sqlx::query(
+        "UPDATE job_nodes
+         SET status = CASE WHEN gate_attempts > 0 THEN 'gate_failed' ELSE 'pending' END,
+             gate_status = CASE WHEN gate_attempts > 0 THEN 'failed' ELSE gate_status END
+         WHERE job_id = ? AND ordinal IS NOT NULL AND status = 'running' AND run_id IS NULL",
+    )
+    .bind(job.id)
+    .execute(pool)
+    .await?;
+
     // The two statuses excluded here are `node_in_flight`'s, written out because sqlx will not take
     // SQL built at runtime. `a_node_still_in_flight_is_not_reconciled` holds the two in step.
     let landed: Vec<(i64, i64, String)> = sqlx::query_as(
@@ -117,16 +131,34 @@ pub(super) async fn reconcile_nodes(state: &AppState, job: &JobRow) -> sqlx::Res
         // hands the branch to a person with everything still on it.
         if item_status == "failed" && job.commissioned_with_an_allowance() {
             let ordinal = ordinal as usize;
-            let put_back = match (
-                job_worktree(pool, job.id).await,
-                revert_point(pool, job, ordinal).await,
-            ) {
-                (Ok(Some((worktree, _))), Some(footing)) => {
+            // A node working in a checkout of its own is put back THERE, to where that checkout
+            // began. Resetting the job's branch to the item's `merge_base_sha` instead would
+            // rewind every item merged since an earlier merge of this same item.
+            let owns_a_tree: bool =
+                sqlx::query_scalar::<_, Option<i64>>("SELECT item_id FROM runs WHERE id = ?")
+                    .bind(run_id)
+                    .fetch_optional(pool)
+                    .await?
+                    .flatten()
+                    .is_some();
+            let target = if owns_a_tree {
+                super::gate::revert_target(pool, job.id, run_id).await
+            } else {
+                match (
+                    job_worktree(pool, job.id).await,
+                    revert_point(pool, job, ordinal).await,
+                ) {
+                    (Ok(Some((worktree, _))), Some(footing)) => Some((worktree, footing)),
+                    _ => None,
+                }
+            };
+            let put_back = match target {
+                Some((worktree, footing)) => {
                     crate::execution::worktree::revert_to(&worktree, &footing)
                         .await
                         .is_ok()
                 }
-                _ => false,
+                None => false,
             };
             if !put_back {
                 let _ = retire(pool, job.id, STATUS_STOPPED).await;

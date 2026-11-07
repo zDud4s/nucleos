@@ -366,7 +366,8 @@ describe("Charter - the drift guard", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Save" }));
 
     const guard = await screen.findByRole("alert", { name: "Changed while you were editing" });
-    expect(document.activeElement).toBe(guard);
+    // Focus moves in a passive effect, which can land after the alert is already queryable.
+    await waitFor(() => expect(document.activeElement).toBe(guard));
 
     fireEvent.click(within(guard).getByRole("button", { name: "Keep editing" }));
     expect(screen.queryByRole("alert", { name: "Changed while you were editing" })).toBeNull();
