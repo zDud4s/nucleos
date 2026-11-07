@@ -694,7 +694,58 @@
   white-space: nowrap;
 }
 
+/* Limits loading skeleton: the loaded form's own classes, bars in the slots. */
+.sy-skel-label {
+  grid-column: 1;
+  width: 40%;
+}
+
+.sy-skel-control {
+  grid-column: 3;
+  height: 1.75rem;
+}
+
+.sy-skel-text {
+  color: transparent;
+  background: var(--surface-raised, var(--surface-sunken));
+  border-radius: var(--radius-sm);
+  user-select: none;
+}
+
+.sy-skel-save {
+  position: relative;
+  width: 15rem;
+}
+
+.sy-skel-ghost {
+  visibility: hidden;
+}
+
+.sy-skel-save-bar {
+  position: absolute;
+  inset: 0;
+  height: auto;
+  border-radius: var(--radius-md);
+}
+
+.sy-skel-save .ui-confirm {
+  display: block;
+  width: 15rem;
+}
+
+.sy-skel-save .ui-confirm > button {
+  width: 100%;
+}
+
+.sy-skel-save .ui-confirm-stack > * {
+  white-space: nowrap;
+}
+
 @media (max-width: 40rem) {
+  .sy-skel-control {
+    grid-column: 2;
+  }
+
   .sy-budget-groups {
     --sy-limit-tracks: minmax(0, 1fr) 10rem;
   }

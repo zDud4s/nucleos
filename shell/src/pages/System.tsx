@@ -957,15 +957,13 @@ function BudgetPanel() {
       {budget.isError && budget.data === undefined && (
         <SystemListError error={budget.error} what="the budget" />
       )}
-      {!budget.isError && budget.data === undefined && (
-        <Skeleton label="Reading the budget" variant="row" count={9} height="2.75rem" />
-      )}
       {budget.data !== undefined && budget.data.paused && (
         <Notice tone="paused" role="status">
           Autonomous work is currently held: {budget.data.reason}
         </Notice>
       )}
       <div className="sy-budget-groups">
+        {form === null && !budget.isError && <LimitsSkeletonSpend />}
         {form !== null && (
           <section className="sy-budget-group">
             <h3 className="sy-budget-heading">Spend limits</h3>
@@ -1202,6 +1200,7 @@ function BudgetPanel() {
             )}
           </section>
         )}
+        {quotaBrakeForm === null && (form === null ? !budget.isError : !quotaBrake.isError) && <LimitsSkeletonQuota />}
       </div>
     </Panel>
   );
@@ -2007,5 +2006,76 @@ function SystemListError({ error, what }: { error: unknown; what: string }) {
         —
       </div>
     </>
+  );
+}
+
+/** One ruled row of the loaded Limits form: a label bar and a control bar on its tracks. */
+function LimitsSkeletonRow() {
+  return (
+    <div className="sy-limit-row sy-skel-row" aria-hidden="true">
+      <span className="ui-skeleton-bar sy-skel-label" />
+      <span className="ui-skeleton-bar sy-skel-control" />
+    </div>
+  );
+}
+
+/** The group footer of the loaded form: footnote lines and the Save button, in the same slots. */
+function LimitsSkeletonFoot({ hint, save }: { hint: string; save: string }) {
+  return (
+    <div className="sy-group-foot" aria-hidden="true">
+      <p className="sy-field-hint sy-skel-text">{hint}</p>
+      <div className="sy-save-row">
+        <div className="sy-skel-save">
+          <div className="sy-skel-ghost">
+            <ConfirmButton label={save} confirmLabel={save} variant="ghost" disabled onConfirm={() => {}} />
+          </div>
+          <span className="ui-skeleton-bar sy-skel-save-bar" />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** Spend limits and Run costs, with the real headings, while the budget is read. */
+function LimitsSkeletonSpend() {
+  return (
+    <section className="sy-budget-group" role="status" aria-busy="true">
+      <span className="sr-only">Reading the budget</span>
+      <h3 aria-hidden="true" className="sy-budget-heading">Spend limits</h3>
+      <div className="sy-budget-fields">
+        <LimitsSkeletonRow />
+        <LimitsSkeletonRow />
+        <LimitsSkeletonRow />
+      </div>
+      <h3 aria-hidden="true" className="sy-budget-heading sy-budget-heading-next">Run costs</h3>
+      <div className="sy-budget-fields">
+        <LimitsSkeletonRow />
+        <LimitsSkeletonRow />
+        <LimitsSkeletonRow />
+      </div>
+      <LimitsSkeletonFoot
+        hint="The relay chain limit is what one chain of conversations handing work to each other may spend."
+        save="Send these six fields"
+      />
+    </section>
+  );
+}
+
+/** Quota brake, with its real heading, while the brake is read. */
+function LimitsSkeletonQuota() {
+  return (
+    <section className="sy-budget-group" role="status" aria-busy="true">
+      <span className="sr-only">Reading the quota brake</span>
+      <h3 aria-hidden="true" className="sy-budget-heading">Quota brake</h3>
+      <div className="sy-budget-fields">
+        <LimitsSkeletonRow />
+        <LimitsSkeletonRow />
+        <LimitsSkeletonRow />
+      </div>
+      <LimitsSkeletonFoot
+        hint="When the provider's usage passes either level, new autonomous work waits until the window resets. Only the provider's windows count."
+        save="Save these three settings"
+      />
+    </section>
   );
 }
