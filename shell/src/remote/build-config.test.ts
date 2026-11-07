@@ -43,4 +43,20 @@ describe("the remote build", () => {
     expect(used.size).toBeGreaterThan(0);
     for (const specifier of used) expect(aliases, specifier).toContain(specifier);
   });
+  it("the_release_bundle_ships_the_remote_page", () => {
+    const release = JSON.parse(
+      fs.readFileSync(path.join(shellRoot, "src-tauri", "tauri.release.conf.json"), "utf8"),
+    ) as { build?: { beforeBuildCommand?: string }; bundle: { resources?: Record<string, string> } };
+    const pkg = JSON.parse(fs.readFileSync(path.join(shellRoot, "package.json"), "utf8")) as {
+      scripts: Record<string, string>;
+    };
+
+    // The gateway looks for `dist-remote` beside the daemon; the bundle has to carry it there.
+    expect(release.bundle.resources).toEqual({ "../dist-remote": "dist-remote" });
+    // Replacing the build command drops the base config's `npm run build`, so it is repeated.
+    const command = release.build?.beforeBuildCommand ?? "";
+    expect(command).toContain("npm run build");
+    expect(command).toContain("npm run build:remote");
+    expect(pkg.scripts["build:remote"]).toContain("remote.vite.config.mjs");
+  });
 });

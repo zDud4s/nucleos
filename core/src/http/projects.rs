@@ -105,7 +105,7 @@ pub(super) async fn get_projects(
        a disconnected network share is a `stat` that blocks for as long as the OS feels like. One
        such project would stall the executor thread this future is on, for every caller.
     */
-    tokio::task::spawn_blocking(move || {
+    let mut entries = tokio::task::spawn_blocking(move || {
         summaries
             .into_iter()
             .map(|summary| RosterEntry {
@@ -118,8 +118,100 @@ pub(super) async fn get_projects(
             .collect::<Vec<_>>()
     })
     .await
-    .map(Json)
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // The git remote, so another machine can tell it holds the same repository. A failed read leaves
+    // `None`; it never fails the list.
+    let lookups: Vec<_> = entries
+        .iter()
+        .map(
+            |entry| match (&entry.summary.project_root, entry.root_exists) {
+                (Some(root), Some(true)) => {
+                    let root = root.clone();
+                    Some(tokio::spawn(async move { roster_origin(&root).await }))
+                }
+                _ => None,
+            },
+        )
+        .collect();
+    for (entry, lookup) in entries.iter_mut().zip(lookups) {
+        if let Some(lookup) = lookup {
+            entry.summary.remote = lookup.await.ok().flatten();
+        }
+    }
+    Ok(Json(entries))
+}
+
+/// How long a folder's `origin` is trusted before `git` is asked again. The roster is polled every
+/// three seconds and a remote changes about never, so an hour of git per project would be waste.
+const ROSTER_ORIGIN_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+/// A project whose repository is slow to answer must not hold the list for long.
+const ROSTER_ORIGIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+type OriginCache = std::collections::HashMap<String, (std::time::Instant, Option<String>)>;
+static ROSTER_ORIGINS: std::sync::LazyLock<std::sync::Mutex<OriginCache>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(OriginCache::new()));
+
+/// A remote URL without the credentials it may carry, because the roster goes to every client.
+///
+/// Only a `scheme://` URL is touched: its authority (up to the first `/`, `?` or `#`) loses
+/// everything up to its last `@`, whatever the scheme, since a bare token in the user slot is a
+/// credential too. An scp-style `git@host:a/b` has no `://` and is returned as it is.
+fn strip_credentials(remote: &str) -> String {
+    let Some((scheme, rest)) = remote.split_once("://") else {
+        return remote.to_owned();
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    match rest[..authority_end].rfind('@') {
+        Some(at) => format!("{scheme}://{}", &rest[at + 1..]),
+        None => remote.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_credentials;
+
+    #[test]
+    fn credentials_leave_only_the_authority_of_a_scheme_url() {
+        for (given, wanted) in [
+            ("https://user:tok@host/a/b", "https://host/a/b"),
+            ("ssh://git@host/a/b", "ssh://host/a/b"),
+            ("git@host:a/b", "git@host:a/b"),
+            ("https://host/a@b", "https://host/a@b"),
+        ] {
+            assert_eq!(strip_credentials(given), wanted);
+        }
+    }
+}
+
+/// A project folder's `origin` URL, through the same read `GET /projects/detect` uses
+/// (`git_exec::origin_url`), cached per folder. A folder with no `.git` costs a `stat`, not a spawn;
+/// a repository costs one `git` spawn per minute.
+pub(super) async fn roster_origin(root: &str) -> Option<String> {
+    if let Some((_, found)) = ROSTER_ORIGINS
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(root).cloned())
+        .filter(|(at, _)| at.elapsed() < ROSTER_ORIGIN_TTL)
+    {
+        return found;
+    }
+    let path = std::path::Path::new(root);
+    let found = if tokio::fs::try_exists(path.join(".git"))
+        .await
+        .unwrap_or(false)
+    {
+        crate::execution::git_exec::origin_url(path, ROSTER_ORIGIN_BUDGET)
+            .await
+            .map(|url| strip_credentials(&url))
+    } else {
+        None
+    };
+    if let Ok(mut cache) = ROSTER_ORIGINS.lock() {
+        cache.insert(root.to_owned(), (std::time::Instant::now(), found.clone()));
+    }
+    found
 }
 
 /// Whether the history goes with the roster row.

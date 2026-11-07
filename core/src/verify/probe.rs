@@ -194,7 +194,13 @@ impl ActiveGuard {
         let mut active = ACTIVE
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        active.insert(task_id).then_some(ActiveGuard(task_id))
+        // Not `then_some`: it builds the guard eagerly, and on a failed insert that guard drops here,
+        // while `active` is still held; its `Drop` locks `ACTIVE` again and the thread deadlocks.
+        if active.insert(task_id) {
+            Some(ActiveGuard(task_id))
+        } else {
+            None
+        }
     }
 }
 
@@ -686,6 +692,22 @@ async fn run_reprobe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_second_enter_for_a_held_task_returns_none_without_deadlocking() {
+        let id = i64::MAX - 7; // no other test uses this id
+        let first = ActiveGuard::enter(id);
+        assert!(first.is_some());
+        assert!(
+            ActiveGuard::enter(id).is_none(),
+            "a second entry while the first guard is held"
+        );
+        drop(first);
+        assert!(
+            ActiveGuard::enter(id).is_some(),
+            "free again once the first guard is dropped"
+        );
+    }
 
     #[test]
     fn a_pass_is_remembered_per_project_sha_and_group_until_it_expires() {

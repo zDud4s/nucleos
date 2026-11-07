@@ -8,7 +8,10 @@ vi.mock("../data/client", async (original) => ({
   ...(await original<typeof import("../data/client")>()),
   ...daemon,
 }));
-vi.mock("../lib/vscode", () => ({ openInVscode: vi.fn(() => Promise.resolve()) }));
+vi.mock("../lib/vscode", () => ({
+  openInVscode: vi.fn(() => Promise.resolve()),
+  editorRemoteNote: () => null,
+}));
 
 import { StatesView } from "./StatesView";
 import { ModeMap } from "./ModeMap";

@@ -545,6 +545,9 @@ mod tests {
         let landed = {
             // Scoped and thread-local: sound because `#[tokio::test]` polls on this thread.
             let _scope = tracing::subscriber::set_default(subscriber);
+            // Callsites cache their interest per process: another test's subscriber (or none) may
+            // have registered the ERROR callsite as "never", so recompute it for this scope.
+            tracing::callsite::rebuild_interest_cache();
             settle_write("test row", 42, || {
                 calls += 1;
                 let other = other.clone();

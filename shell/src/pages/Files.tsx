@@ -4,7 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { useQueryClient } from "@tanstack/react-query";
 import { isApiRefusal } from "../data/client";
 import { keys } from "../data/keys";
-import { MAX_UPLOAD_BYTES, diskPath, downloadFile, dropTargetFolder, fileName, formatBytes, joinPath, openFile, parentPath, readFolder, runsOnOpen, sortEntries, useCreateFolder, useDelete, useFileSearch, useFolder, useMove, useRestore, useTrash, useUpload, type DeleteRequest, type Dropped, type Entry, type Hit, type SortColumn, type SortDirection, type Trashed } from "../data/files";
+import { MAX_UPLOAD_BYTES, browserDropFiles, browserDropsApply, diskPath, downloadFile, dropTargetFolder, fileName, formatBytes, joinPath, openFile, parentPath, readFolder, runsOnOpen, sortEntries, useCreateFolder, useDelete, useFileSearch, useFolder, useMove, useRestore, useTrash, useUpload, type DeleteRequest, type Dropped, type Entry, type Hit, type SortColumn, type SortDirection, type Trashed } from "../data/files";
 import { Button, ErrorNote, Field, PageHeader } from "../ui";
 import { type ClashChoice, DELETE_SENTENCES, DOWNLOAD_SENTENCES, MOVE_SENTENCES, type MoveDone, type PathFailure, type PendingBatch, RESTORE_SENTENCES, RefusalOrError, UPLOAD_SENTENCES, type Undo, type UploadItem, type UploadProgress, type UploadRefusal, type UploadReport, type UploadSaved, describeUploadFailure, readHintRetired, storeHintRetired, useNarrow } from "./files/shared";
 import { DRAG_THRESHOLD_PX, Dismissable, FailureNotes, FilesUnavailableTeach, type FocusAfter, ghostTransform, moveRefusal, pageHeadline, swallowClick } from "./files/pageParts";
@@ -870,6 +870,31 @@ export function Files() {
           ref={setBody}
           className={narrow ? "fi-body fi-body-narrow" : "fi-body"}
           onDragOver={(event) => event.preventDefault()}
+          // A browser has no host drop event: the drop reaches the page itself, and the File API
+          // reads it. On the desktop the host's own events do all of this, so these stay inert.
+          onDragEnter={(event) => {
+            // Only a file drag offers an upload; dragged text or a link does not.
+            if (browserDropsApply() && Array.from(event.dataTransfer?.types ?? []).includes("Files")) {
+              setDragActive(true);
+            }
+          }}
+          onDragLeave={(event) => {
+            if (browserDropsApply() && !event.currentTarget.contains(event.relatedTarget as Node | null)) {
+              setDragActive(false);
+            }
+          }}
+          onDrop={(event) => {
+            if (!browserDropsApply()) return;
+            event.preventDefault();
+            setDragActive(false);
+            const dropped = browserDropFiles(event.dataTransfer);
+            if (dropped.length === 0) return;
+            void beginUpload(
+              "drop",
+              false,
+              dropped.map((file) => ({ folder: path, name: file.name, size: file.size, read: file.read })),
+            );
+          }}
         >
           {dragActive && (
             <div className="fi-drop-overlay" role="status">

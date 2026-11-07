@@ -204,6 +204,26 @@ describe("LiveView", () => {
     }
   });
 
+  it("live_view_reconnects_after_the_gateway_cuts_the_stream", async () => {
+    const second = openPipe();
+    // The gateway closes a capped response without an E record. The last frame must stay mounted
+    // through the short reconnect gap, then the new stream replaces it normally.
+    daemon.openStream.mockResolvedValueOnce(streamOf(frame(1, 2, 3))).mockResolvedValueOnce(second.stream);
+
+    render(<LiveView sessionId={7} />);
+    await settle();
+    expect(screen.getByAltText("live view of session 7").getAttribute("src")).toBe("blob:live-1");
+    expect(screen.getByText(/Connection lost, reconnecting/)).toBeDefined();
+
+    await settle(1000);
+    expect(daemon.openStream).toHaveBeenCalledTimes(2);
+    expect(screen.getByAltText("live view of session 7").getAttribute("src")).toBe("blob:live-1");
+
+    second.send(frame(4, 5, 6));
+    await settle();
+    expect(screen.getByAltText("live view of session 7").getAttribute("src")).toBe("blob:live-2");
+  });
+
   it("a 409 shows the refusal detail and does not reconnect", async () => {
     daemon.openStream.mockRejectedValue(new ApiRefusal(409, "conflict", "the agent has let go of the wheel"));
 
@@ -213,6 +233,28 @@ describe("LiveView", () => {
     expect(screen.getByText(/the agent has let go of the wheel/)).toBeDefined();
     await settle(120_000);
     expect(daemon.openStream).toHaveBeenCalledTimes(1);
+  });
+
+  it("live_view_stops_retrying_when_the_device_is_refused", async () => {
+    daemon.openStream.mockRejectedValue(new ApiRefusal(403, "forbidden", "device refused"));
+
+    render(<LiveView sessionId={7} />);
+    await settle();
+
+    expect(screen.getByText("This device may not watch the browser.")).toBeDefined();
+    await settle(120_000);
+    expect(daemon.openStream).toHaveBeenCalledTimes(1);
+  });
+
+  it("live_view_keeps_reconnecting_after_a_thrown_fetch", async () => {
+    daemon.openStream.mockRejectedValue(new Error("network unavailable"));
+
+    render(<LiveView sessionId={7} />);
+    await settle();
+
+    expect(screen.getByText(/Connection lost, reconnecting/)).toBeDefined();
+    await settle(1000);
+    expect(daemon.openStream).toHaveBeenCalledTimes(2);
   });
 
   it("stops streaming while the window is hidden", async () => {

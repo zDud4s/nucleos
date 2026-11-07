@@ -7,6 +7,7 @@ use std::sync::{LazyLock, Mutex};
 use crate::execution::runner::extract_reply;
 
 mod chat_key;
+pub mod chat_move;
 pub mod compaction;
 pub mod rotation;
 pub mod slash;
@@ -209,6 +210,39 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;
+
+    /// A turn parked on a question for far longer than its ceiling is still waiting, not timed out.
+    #[tokio::test(start_paused = true)]
+    async fn a_turn_parked_on_a_question_does_not_spend_its_ceiling() {
+        let chat_id = a_chat("parked");
+        let id = crate::hooks::ask_about(&chat_id, 9_200_001, "Bash", None);
+
+        let served = within_ceiling(
+            &chat_id,
+            Duration::from_secs(5),
+            tokio::time::sleep(Duration::from_secs(60)),
+        )
+        .await;
+
+        assert!(served.is_ok(), "a parked turn must outlive its ceiling");
+        assert!(crate::hooks::ask_is_open(&id));
+        crate::hooks::forget_asks_for_chat(&chat_id);
+    }
+
+    /// With no question standing the ceiling is the ceiling it always was.
+    #[tokio::test(start_paused = true)]
+    async fn a_turn_not_parked_still_hits_its_ceiling() {
+        let chat_id = a_chat("unparked");
+
+        let served = within_ceiling(
+            &chat_id,
+            Duration::from_secs(5),
+            tokio::time::sleep(Duration::from_secs(60)),
+        )
+        .await;
+
+        assert!(served.is_err());
+    }
 
     /// A chat id no other test in this process is using.
     ///
@@ -7684,7 +7718,14 @@ mod tests {
         rotation::test_nodes::give_root(&chat_id, "root-1");
 
         let id = send_and_settle(&state, &chat_id, "olá").await;
-        let (status, _) = settled_turn(&state.pool, id).await;
+        // Read the row directly: `send_and_settle` already waited for the turn, and `settled_turn`
+        // would wait again for the chat's slot, which the automatic compaction that follows the turn
+        // takes. Under load that compaction can hold it past the helper's one-second budget.
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
         assert_eq!(status, "completed");
 
         assert_eq!(rotation_rows(&state.pool, &chat_id).await, 0);

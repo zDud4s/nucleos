@@ -42,14 +42,20 @@ function moduleSource(path: string): string {
   }
   return files
     .map((file) => readFileSync(file, "utf8"))
-    .map((source) => source.slice(0, cutAtTestModule(source)))
+    .map((source) => withoutTestModule(source))
     .join("\n");
 }
 
-function cutAtTestModule(source: string): number {
+function withoutTestModule(source: string): string {
   // An inline module only: `#[cfg(test)] mod x;` declares a file and leaves the code after it in scope.
-  const at = source.search(/^#\[cfg\(test\)\]\r?\nmod \w+ \{/m);
-  return at === -1 ? source.length : at;
+  // The module ends at its closing brace in column 0, and what follows it is production code too
+  // (`http/projects.rs` writes `project_onboarded` below its small test module).
+  const opening = /^#\[cfg\(test\)\]\r?\nmod \w+ \{/m.exec(source);
+  if (opening === null) return source;
+  const closing = /^\}/m.exec(source.slice(opening.index + opening[0].length));
+  if (closing === null) return source.slice(0, opening.index);
+  const end = opening.index + opening[0].length + closing.index + 1;
+  return source.slice(0, opening.index) + source.slice(end);
 }
 
 function argumentAt(source: string, open: number, position: number): string | null {
@@ -145,10 +151,10 @@ function writtenFeedKinds(): { kinds: Set<string>; files: number; unresolved: st
   // A writer may name another module's constant by path (`crate::land::RESOLUTION_FAILED_KIND`),
   // so every module's constants are read before any call is resolved.
   const byModule = new Map(
-    files.map(({ name, source }) => [modulePath(name), stringConstants(source.slice(0, cutAtTestModule(source)))]),
+    files.map(({ name, source }) => [modulePath(name), stringConstants(withoutTestModule(source))]),
   );
   for (const { name, source } of files) {
-    const body = source.slice(0, cutAtTestModule(source));
+    const body = withoutTestModule(source);
     const constants = stringConstants(body);
     for (const writer of WRITERS) {
       const call = new RegExp(`(?<![A-Za-z0-9_])${writer.name}\\s*\\(`, "g");
