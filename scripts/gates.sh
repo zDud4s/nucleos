@@ -463,6 +463,18 @@ if [ "$target" = shell ] || [ "$target" = all ]; then
     # `tsc -b`, not `tsc --noEmit`: the project uses references, and `-b --noEmit` is rejected
     # outright ("referenced project may not disable emit").
     run "shell: typecheck" shell npx tsc -b
+    # Cap vitest's fork count for the gate. Its default is cores-1 (31 forks on a 32-core box) and
+    # every test file starts a fresh fork. Beside cargo builds that oversubscribes the CPU until a
+    # fork cannot report "started" within vitest's hard-coded 60s START_TIMEOUT (in its cli-api
+    # chunk, not a config option), which surfaces as "[vitest-pool]: Failed to start forks worker"
+    # although every test passes. A quarter of the cores, clamped to 2..8, avoids that.
+    # VITEST_MAX_WORKERS is vitest's own override; an exported value wins. Local `npm test` keeps
+    # the default.
+    if [ -z "${VITEST_MAX_WORKERS:-}" ]; then
+      cores="$(nproc 2>/dev/null || echo "${NUMBER_OF_PROCESSORS:-4}")"
+      w=$((cores / 4)); [ "$w" -lt 2 ] && w=2; [ "$w" -gt 8 ] && w=8
+      export VITEST_MAX_WORKERS="$w"
+    fi
     run "shell: test"      shell npm test
     # The one property no test runner can check, because a Content-Security-Policy is enforced by
     # the engine and jsdom does not enforce one. It matters here more than it would elsewhere:
