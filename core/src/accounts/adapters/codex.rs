@@ -125,6 +125,9 @@ mod tests {
                 .iter()
                 .all(|c| !c.starts_with(&link))
         );
-        assert!(a.session_store_link(&account(None), Path::new("/s")).is_none());
+        assert!(
+            a.session_store_link(&account(None), Path::new("/s"))
+                .is_none()
+        );
     }
 }
