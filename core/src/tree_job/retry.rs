@@ -3,6 +3,7 @@
 //! not merge. Each of these used to repeat on every tick without end and without a word; here each
 //! has an allowance persisted in the manifest, and past it the owner is asked once.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use chrono::{SecondsFormat, Utc};
@@ -30,6 +31,50 @@ pub(super) const LAND_ATTEMPTS_KEY: &str = "land_attempts";
 pub(super) const LAND_ESCALATED_SINCE: &str = "land_escalated_since";
 /// The key of `Branch.extra` naming the base's park decision a green dependent was announced for.
 pub(super) const BASE_WAIT_KEY: &str = "base_wait_noted";
+
+/// The key of `Branch.extra` counting gates in a row that ended unmeasured because of load.
+pub(super) const GATE_LOAD_WAITS: &str = "gate_load_waits";
+/// The key of `Branch.extra` stamping (RFC 3339) until when the branch's gate waits.
+pub(super) const GATE_BACKOFF_UNTIL: &str = "gate_backoff_until";
+/// The key of `Branch.extra` with the last load reason, for whoever reads the manifest.
+pub(super) const GATE_LOAD_REASON: &str = "gate_load_reason";
+
+/// Whether a reason for an unmeasured gate says the machine was too busy, not that the gate is broken.
+pub(super) fn is_load_reason(reason: &str) -> bool {
+    let reason = reason.to_ascii_lowercase();
+    [
+        "pool timed out",
+        "broker is full",
+        "broker full",
+        "disk pressure",
+        "disk-pressure",
+        "failed to spawn",
+        "spawn failure",
+    ]
+    .iter()
+    .any(|marker| reason.contains(marker))
+}
+
+/// How long a gate starved by load waits after `waits` earlier waits: 30 s doubling, capped at 10 min.
+pub(super) fn load_backoff(waits: i64) -> Duration {
+    let exp = u32::try_from(waits.clamp(0, 5)).unwrap_or(5);
+    Duration::from_secs((30u64 << exp).min(600))
+}
+
+fn clear_load_wait(extra: &mut BTreeMap<String, Value>) {
+    extra.remove(GATE_LOAD_WAITS);
+    extra.remove(GATE_BACKOFF_UNTIL);
+    extra.remove(GATE_LOAD_REASON);
+}
+
+/// Whether the branch's gate is still inside a load backoff.
+pub(super) fn gate_backing_off(extra: &BTreeMap<String, Value>) -> bool {
+    extra
+        .get(GATE_BACKOFF_UNTIL)
+        .and_then(Value::as_str)
+        .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+        .is_some_and(|until| until > Utc::now())
+}
 
 fn now() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Secs, false)
