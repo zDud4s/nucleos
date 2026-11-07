@@ -11,6 +11,8 @@ export interface Machine {
   id: string;
   origin: string;
   name: string;
+  /** The peer's stable machine id from pairing time; absent or null for an older peer. */
+  machine_id?: string | null;
 }
 
 export const MACHINES_KEY = "nucleos-machines";

@@ -24,6 +24,8 @@ export interface MachineView {
   reachable: boolean;
   /** The machine answered but no longer accepts this device's session: pair again. */
   needsPairing: boolean;
+  /** The peer's stable machine id, when pairing recorded one. */
+  machine_id?: string;
 }
 
 const DEFAULT_KEY = "nucleos-default-machine";
@@ -41,7 +43,7 @@ export function withMachine(key: QueryKey, machine: MachineId): QueryKey {
 }
 
 function ownMachineList(): MachineView[] {
-  return isRemote() ? [HERE] : [HERE, ...storedMachines().map(({ id, name }) => ({ id, name, reachable: false, needsPairing: false }))];
+  return isRemote() ? [HERE] : [HERE, ...storedMachines().map(({ id, name, machine_id }) => ({ id, name, reachable: false, needsPairing: false, ...(machine_id ? { machine_id } : {}) }))];
 }
 
 /**
@@ -81,6 +83,7 @@ export function useMachines(): MachineView[] {
             name: machine.name,
             reachable: byId.get(machine.id) === "ok",
             needsPairing: byId.get(machine.id) === "needs-pairing",
+            ...(machine.machine_id ? { machine_id: machine.machine_id } : {}),
           })),
         ]);
       } finally {
@@ -117,7 +120,7 @@ export async function addMachine(origin: string, code: string): Promise<MachineI
   }
   // Rust canonicalizes the origin and derives the id from it; what it returns is what is stored.
   const paired = await invoke<Machine>("machine_pair", { origin, code });
-  const machine: Machine = { id: paired.id, origin: paired.origin, name: paired.name };
+  const machine: Machine = { id: paired.id, origin: paired.origin, name: paired.name, ...(paired.machine_id ? { machine_id: paired.machine_id } : {}) };
   saveMachines([...storedMachines().filter((entry) => entry.id !== machine.id), machine]);
   localStorage.setItem(DEFAULT_KEY, machine.id);
   let role: MachineRoleResult;
