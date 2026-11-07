@@ -108,10 +108,10 @@ class HygieneTests(unittest.TestCase):
     def test_status_marks_a_lock_whose_pid_is_gone_dead(self) -> None:
         lock = self.plant_lock(HASH, dead_pid(), None)
         out = self.status()
-        self.assertIn("worktree locks: 1 (dead: 1)", out)
-        self.assertIn(f"lock={HASH}", out)
-        self.assertIn("state=dead", out)
-        self.assertTrue(lock.exists(), "status must not delete anything")
+        # Status reclaims a dead holder's lock at once and reports it.
+        self.assertIn("worktree locks: 0 (dead: 0)", out)
+        self.assertIn(f"reaped dead locks: 1 ({HASH})", out)
+        self.assertFalse(lock.exists())
 
     # 2
     def test_status_marks_a_reused_pid_dead(self) -> None:
@@ -120,9 +120,8 @@ class HygieneTests(unittest.TestCase):
             self.skipTest("creation time unreadable here")
         lock = self.plant_lock(HASH, os.getpid(), real + 10_000_000)
         out = self.status()
-        self.assertIn("worktree locks: 1 (dead: 1)", out)
-        self.assertIn("state=dead", out)
-        self.assertTrue(lock.exists(), "status must not delete anything")
+        self.assertIn("reaped dead locks: 1", out)
+        self.assertFalse(lock.exists())
 
     # 3
     def test_status_marks_a_live_holder_live(self) -> None:
