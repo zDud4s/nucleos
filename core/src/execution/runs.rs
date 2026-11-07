@@ -9520,8 +9520,7 @@ tests:
         // The fake runner holds each run for far longer than this test can take, so the two slots
         // are still occupied when the third create arrives. A short delay here made that a race:
         // under load the first runs finished and freed their slots before the third create.
-        let state =
-            test_state_with(Some(Duration::from_secs(300)), Duration::from_secs(600)).await;
+        let state = test_state_with(Some(Duration::from_secs(300)), Duration::from_secs(600)).await;
         advance_run_ids_past(&state.pool, 10_000).await;
         let project_root = repo.to_string_lossy().into_owned();
         // The house ceiling out of the way, so this measures the per-project one.
