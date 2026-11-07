@@ -12,6 +12,7 @@ import {
   type NotifyPolicy,
   type NotifyRule,
 } from "../data/feed";
+import { askBrowserNotifications, browserNotificationState } from "../app/desktop-toast";
 import { useChannels } from "../data/channels";
 import { useDesktopNotify } from "../data/desktop-notify-pref";
 import {
@@ -394,6 +395,7 @@ function ChannelScopeSelector({
  */
 function DesktopSwitch() {
   const [on, setOn] = useDesktopNotify();
+  const [browser, setBrowser] = useState(browserNotificationState);
   return (
     <Panel title="Desktop notifications">
       <Switch
@@ -401,6 +403,24 @@ function DesktopSwitch() {
         checked={on}
         onChange={setOn}
       />
+      {browser === "default" && (
+        // Permission is asked here, from a click, and nowhere else: a browser ignores or punishes a
+        // prompt that nobody asked for.
+        <Button onClick={() => void askBrowserNotifications().then(setBrowser)}>
+          Allow notifications in this browser
+        </Button>
+      )}
+      {browser === "denied" && (
+        <p className="sy-note">
+          This browser blocks notifications for this site. The prompt on screen and your channels
+          still tell you; allow them in the browser&rsquo;s site settings to get these too.
+        </p>
+      )}
+      {browser !== "unsupported" && (
+        <p className="sy-note">
+          They appear only while this tab is open. With no tab open, your channels carry the notice.
+        </p>
+      )}
       <p className="sy-note sy-notify-lead">
         Waiting approvals, conversations that answered, and the feed lines the choices below allow
         (the same ones your channels get).

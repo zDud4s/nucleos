@@ -11,6 +11,7 @@ pub mod dictation;
 /// What a drop onto the window means, and the only paths this process will read because of one.
 pub mod drop;
 mod legacy_identity;
+mod machines;
 /// Where the quota notch is drawn: inside the main window, or in a floating window of its own.
 pub mod notch;
 /// The small always-on-top window the capture chord opens, to take one note from anywhere.
@@ -271,6 +272,10 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_daemon_token,
+            machines::machine_pair,
+            machines::machine_fetch,
+            machines::machine_fetch_cancel,
+            machines::machine_forget,
             daemon::updates_enabled,
             daemon::install_kind,
             dictation::voice_hotkey,

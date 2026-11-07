@@ -24,6 +24,7 @@ import {
 } from "../data/browser";
 import { useSeatNonce } from "../data/seat";
 import { isWindows } from "../lib/platform";
+import { isRemote } from "../remote/host";
 import { useProjects } from "../data/system";
 import { LiveView } from "./LiveView";
 import {
@@ -74,7 +75,9 @@ export function Browser({ embedded = false }: { embedded?: boolean } = {}) {
   const sessions = useBrowserSessions();
   const health = useBrowserHealth();
   // On Windows the embedded browser replaces the sessions list and "Open real window".
-  const windows = isWindows();
+  // Windows hides this list on the desktop because a native WebView takes its place. A laptop
+  // browser has no such child window, even when the laptop itself runs Windows.
+  const windows = isWindows() && !isRemote();
   const [chainDialogue, setChainDialogue] = useState<{ sessionId: number; chain: string[] } | null>(null);
 
   // The bar leads, as the archive's does: opening a window is what this tab is opened for, and an

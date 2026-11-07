@@ -28,6 +28,7 @@ const ALLOWED = new Map<string, { literals: number; tables?: string[]; reason: s
   ["pages/Feed.tsx", { literals: 2, tables: ["readFeedKind"], reason: "the ignorance device for an unknown feed kind — the same posture as StateBadge, in the slice that owns feed kinds — and the `voice` origin marker: an origin is an identifier the voice supervisor stamps on a line, not a lifecycle state, and no núcleo state machine writes it (Chip is a toggle, state-map has no origin domain)." }],
   ["pages/RunDetail.tsx", { literals: 1, reason: "the llm-router mode a run was routed under (shadow or apply) is machine configuration read off the run, not a lifecycle state of the run." }],
   ["pages/System.tsx", { literals: 1, reason: "a token's authority level is an identifier off the wire, not a lifecycle state." }],
+  ["system/Autostart.tsx", { literals: 2, reason: "whether the daemon starts with the machine is a machine setting read off the wire, not a lifecycle state of anything." }],
   ["system/RemoteDevices.tsx", { literals: 1, reason: "a remote device's access level is an identifier off the wire, like an API token's; revocation is shown as text, not as a tone." }],
   ["team/Decisions.tsx", { literals: 1, reason: "`granted: nobody decides` is a sentence about an absent proposal, not a state of one." }],
 ]);

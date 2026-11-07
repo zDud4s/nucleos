@@ -124,6 +124,20 @@ pub(super) const ROUTES: &[RouteEntry] = &[
     },
     RouteEntry {
         method: "GET",
+        path: "/engines/agy",
+        purpose: "Read.",
+        body: Body::None,
+        handler: "read",
+    },
+    RouteEntry {
+        method: "PUT",
+        path: "/engines/agy",
+        purpose: "Write.",
+        body: Body::Shapeless("WriteRequest"),
+        handler: "write",
+    },
+    RouteEntry {
+        method: "GET",
         path: "/feed",
         purpose: "Get feed.",
         body: Body::None,
@@ -268,6 +282,13 @@ pub(super) const ROUTES: &[RouteEntry] = &[
         purpose: "Post pin.",
         body: Body::None,
         handler: "post_pin",
+    },
+    RouteEntry {
+        method: "GET",
+        path: "/fs/dirs",
+        purpose: "Lists directories on the tower for the remote path picker.",
+        body: Body::None,
+        handler: "get_dirs",
     },
     RouteEntry {
         method: "GET",
