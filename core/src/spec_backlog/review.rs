@@ -275,9 +275,12 @@ fn parse_reviews(text: &str) -> Result<Vec<CriterionReview>, String> {
 pub(super) struct NoToolsReviewer<'a> {
     pub(super) state: &'a AppState,
     pub(super) cwd: &'a str,
-    /// The checkout of the spec's feature branch, whose files are embedded in the prompt.
+    /// The checkout the spec is audited on (its feature branch, or the integration branch once
+    /// the work landed), whose files are embedded in the prompt.
     pub(super) worktree: &'a Path,
-    pub(super) integration_branch: &'a str,
+    /// The revision the changed-file list is taken against (`<diff_base>...HEAD`): the integration
+    /// branch for a feature branch, the landing merge's first parent for landed work.
+    pub(super) diff_base: &'a str,
 }
 
 #[async_trait::async_trait]
@@ -292,7 +295,7 @@ impl ReviewerRunner for NoToolsReviewer<'_> {
         criteria: &[Criterion],
         answers: &[Question],
     ) -> Result<ReviewerAnswer, String> {
-        let material = gather_material(self.worktree, self.integration_branch, criteria).await;
+        let material = gather_material(self.worktree, self.diff_base, criteria).await;
         let prompt = review_prompt(spec, criteria, &material, answers);
         let request = no_tools_run_request(&prompt, spec.project_id.as_deref(), Some(self.cwd));
         let (run_id, text) = run_no_tools(self.state, request).await?;

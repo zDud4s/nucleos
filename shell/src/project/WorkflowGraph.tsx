@@ -11,7 +11,7 @@ import {
   type GraphNode,
   type WorkflowGraph as Graph,
 } from "../data/workflow-graph";
-import { openInVscode } from "../lib/vscode";
+import { editorAvailable, openInVscode } from "../lib/vscode";
 import { Button, ErrorNote, Quiet, RefusalNote, Well } from "../ui";
 
 /**
@@ -455,6 +455,10 @@ function Inspector({
         {node.fields.find((field) => field.name === "body") === undefined ? (
           <p className="text-xs text-text-muted">
             This node has no instructions file: there is nothing to open.
+          </p>
+        ) : !editorAvailable() ? (
+          <p className="text-xs text-text-muted">
+            The instructions are edited in VS Code, which opens on the main machine only.
           </p>
         ) : ejected || source === "project" ? (
           <Button

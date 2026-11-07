@@ -8,6 +8,7 @@ import {
 import { apiFetch, apiText } from "./client";
 import type { RunSearchResult } from "./fleet";
 import { keys } from "./keys";
+import type { MachineId } from "./machineStore";
 import { POLL, pollWhile } from "./poll";
 
 /**
@@ -517,8 +518,14 @@ export function useRunStop(id: number, alive: boolean) {
 export function useCreateRun() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (run: NewRun) =>
-      apiFetch<{ id: number }>("/runs", { method: "POST", body: JSON.stringify(run) }),
+    // `machine` names where the run executes; it is never part of the body. Only creation is
+    // machine-aware: a run created elsewhere is listed and opened by the machine that runs it.
+    mutationFn: ({ machine, ...run }: NewRun & { machine?: MachineId }) => {
+      const init = { method: "POST", body: JSON.stringify(run) };
+      return machine === undefined || machine === "here"
+        ? apiFetch<{ id: number }>("/runs", init)
+        : apiFetch<{ id: number }>("/runs", init, machine);
+    },
     retry: false,
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: keys.runs.all });

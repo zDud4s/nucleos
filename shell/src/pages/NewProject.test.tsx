@@ -5,6 +5,26 @@ import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 const tauri = vi.hoisted(() => ({ isTauri: vi.fn(() => false), pickFolder: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(), isTauri: tauri.isTauri }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: tauri.pickFolder }));
+const remote = vi.hoisted(() => ({ isRemote: vi.fn(() => false) }));
+vi.mock("../remote/host", async (original) => ({
+  ...(await original<typeof import("../remote/host")>()),
+  isRemote: remote.isRemote,
+}));
+/* Portalled like the real picker (a Modal): the wizard's own modal hides its siblings from the a11y tree. */
+vi.mock("../remote/PathPicker", async () => {
+  const { createPortal } = await import("react-dom");
+  return {
+    PathPicker: ({ open, onSelect }: { open: boolean; onSelect: (path: string) => void }) =>
+      open
+        ? createPortal(
+            <button type="button" onClick={() => onSelect("C:\\Projects\\picked")}>
+              Select tower folder
+            </button>,
+            document.body,
+          )
+        : null,
+  };
+});
 const daemon = vi.hoisted(() => ({ apiFetch: vi.fn(), apiText: vi.fn(), probeHealth: vi.fn() }));
 vi.mock("../data/client", async (original) => ({
   ...(await original<typeof import("../data/client")>()),
@@ -488,6 +508,21 @@ describe("adding a project", () => {
       expect(await screen.findByDisplayValue("picked")).toBeTruthy();
     } finally {
       tauri.isTauri.mockReturnValue(false);
+    }
+  });
+
+  it("new_project_fills_the_path_field_from_the_picker", async () => {
+    remote.isRemote.mockReturnValue(true);
+    try {
+      await openWizard({ detected: detected({ root: "C:\\Projects\\picked" }) });
+      fireEvent.click(await screen.findByRole("button", { name: "Browse…" }));
+      fireEvent.click(screen.getByRole("button", { name: "Select tower folder" }));
+
+      await waitFor(() =>
+        expect((screen.getByLabelText("Folder") as HTMLInputElement).value).toBe("C:\\Projects\\picked"),
+      );
+    } finally {
+      remote.isRemote.mockReturnValue(false);
     }
   });
 

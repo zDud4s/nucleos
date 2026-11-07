@@ -143,10 +143,11 @@ pub fn mark_open(chat_id: &str) {
     relock(&SEEN_CHATS).insert(chat_id.to_owned(), std::time::Instant::now());
 }
 
-/// Whether a visible view polled this chat within [`OPEN_WINDOW`].
-pub fn chat_is_open(chat_id: &str) -> bool {
-    let seen = relock(&SEEN_CHATS).get(chat_id).copied();
-    is_open(seen, std::time::Instant::now())
+/// Whether a visible view has polled this chat since the reaper last forgot polls, for the tests of
+/// the route that records it. Production reads `SEEN_CHATS` through the reaper and `make_room`.
+#[cfg(any(test, feature = "testkit"))]
+pub fn was_marked_open(chat_id: &str) -> bool {
+    relock(&SEEN_CHATS).contains_key(chat_id)
 }
 
 pub(super) fn is_open(seen: Option<std::time::Instant>, now: std::time::Instant) -> bool {
@@ -541,7 +542,7 @@ mod tests {
         state
             .run_handles
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(turn, task.abort_handle());
         assert!(!queue_is_held(&chat));
 

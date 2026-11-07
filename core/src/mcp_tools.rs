@@ -3120,6 +3120,51 @@ mod tests {
         assert_eq!(tool_effect("tree_launch"), ToolEffect::Acts);
     }
 
+    /// The `tree_launch` arguments as the client sends them, `land` left to the caller.
+    fn tree_launch_args(land: Option<&str>) -> TreeLaunchParams {
+        let mut args = serde_json::json!({
+            "id": "tree-1",
+            "goal": "Ship it",
+            "feature_branch": "feat/tree",
+            "project_root": "C:/repo",
+        });
+        if let Some(land) = land {
+            args["land"] = serde_json::json!(land);
+        }
+        serde_json::from_value(args).expect("the arguments deserialise")
+    }
+
+    /// Owner, 2026-11-04: a tree launched from the MCP tool lands into the integration branch unless
+    /// the caller asks to hold it, and the daemon is told so explicitly (its own default is `hold`).
+    #[test]
+    fn tree_launch_forwards_land_and_defaults_it_to_integration() {
+        assert_eq!(
+            tree_launch_args(None).into_body()["land"],
+            serde_json::json!("integration")
+        );
+        for land in ["hold", "integration"] {
+            assert_eq!(
+                tree_launch_args(Some(land)).into_body()["land"],
+                serde_json::json!(land)
+            );
+        }
+        // An unknown value reaches the daemon untouched, which refuses it with the list of modes.
+        assert_eq!(
+            tree_launch_args(Some("master")).into_body()["land"],
+            serde_json::json!("master")
+        );
+    }
+
+    /// Only `project_root` is sent when no `project_id` is given: the daemon resolves the project.
+    #[test]
+    fn tree_launch_body_carries_every_field_of_the_daemon_route() {
+        let body = tree_launch_args(None).into_body();
+        for field in ["id", "goal", "feature_branch", "project_root"] {
+            assert!(body[field].is_string(), "{field} missing from {body}");
+        }
+        assert!(body["project_id"].is_null(), "{body}");
+    }
+
     #[test]
     fn tree_status_is_reads_own() {
         assert_eq!(tool_effect("tree_status"), ToolEffect::ReadsOwn);

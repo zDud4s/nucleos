@@ -2404,6 +2404,50 @@ mod tests {
         Ok(())
     }
 
+    /// Two units in one approval-resume chain share a tail but are different units: the sweep
+    /// credits each of them exactly once, and a second pass credits nothing. Pins that the
+    /// recursive tail pick in `sweep_at_most` yields one row per unit however long the chain.
+    #[tokio::test]
+    async fn units_sharing_a_chain_tail_are_each_credited_once_by_the_sweep() -> sqlx::Result<()> {
+        let pool = test_pool().await;
+        let first = seed_run(&pool, "superseded", None, None, None).await?;
+        let second = seed_run(&pool, "superseded", None, None, None).await?;
+        let tail = seed_run(&pool, "completed", Some(0), Some("passed"), None).await?;
+        for (origin, resume) in [(first, second), (second, tail)] {
+            let proposal = sqlx::query(
+                "INSERT INTO proposals (kind, status, run_id, reasoning, created_at)
+                 VALUES ('action-approval', 'approved', ?, 'r', ?)",
+            )
+            .bind(origin)
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(&pool)
+            .await?
+            .last_insert_rowid();
+            sqlx::query(
+                "INSERT INTO action_grants (run_id, tool_name, proposal_id, created_at)
+                 VALUES (?, 'Bash', ?, ?)",
+            )
+            .bind(resume)
+            .bind(proposal)
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(&pool)
+            .await?;
+        }
+        let knowledge = seed(&pool, "machine", None, "shared").await?;
+        record(&pool, first, None, &[scored(knowledge, true)]).await?;
+        record(&pool, second, None, &[scored(knowledge, true)]).await?;
+
+        assert_eq!(sweep(&pool).await?, 2, "one credit per unit, not per hop");
+        assert_eq!(
+            sweep(&pool).await?,
+            0,
+            "a credited unit is never credited again"
+        );
+        let counts = counters(&pool, knowledge).await?;
+        assert_eq!((counts.0, counts.1), (2, 2));
+        Ok(())
+    }
+
     /// `credit_run` follows a handoff or an approval resume to the run that owns the verdict and
     /// credits nothing while that run is live. A unit it cannot yet credit is never stamped, so
     /// one that took a slot would take it again on every pass until its chain ended.

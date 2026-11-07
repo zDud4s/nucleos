@@ -30,7 +30,9 @@ prompt, layer?, base?, node_id}: `name` is a short branch name (letters, digits,
 lists the paths that part may write, `layer` and `base` are optional (`base` names a branch that \
 must merge first), and `node_id` is your own Node ID. Each call creates the branch, its worktree \
 and its agent, and starts it. Opening the same branch twice is safe. Each started part must pass \
-the gate on its own, so a part that needs another part's code must name that branch as `base`.
+the gate on its own, so a part that needs another part's code must name that branch as `base`. \
+Open every part now, later ones too: a part whose base has not merged answers `queued` with \
+`waiting_for`, and the daemon starts it by itself once the base merges. Leave no part for later.
 
 You cannot wait for your branches, and you never merge, land or push anything: the daemon gates \
 and merges each branch when its agent reports, then lands the job. When every part is opened, \
@@ -375,8 +377,9 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).trim().to_owned()
     }
 
-    /// A repository on `master` with a zero disk floor, so that a tree worktree is admitted whatever
-    /// the disk holds. The same set-up the prompt test above does inline.
+    /// A repository on `master` with a zero disk floor. The root branch is still charged its 8 GB
+    /// seed cost; what admits it whatever the disk holds is the test build's fixed free disk
+    /// (`open::free_disk_gb`). The same set-up the prompt test above does inline.
     fn tree_repo(container: &tempfile::TempDir) -> PathBuf {
         let repo = container.path().join("repo");
         initialize_repo(&repo);

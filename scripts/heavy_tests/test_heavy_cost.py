@@ -85,7 +85,8 @@ class Measure(unittest.TestCase):
         self.assertIsNone(got["peak_mem_mb"])
         empty = c.measure_fields({}, 0, None)
         self.assertEqual(
-            empty, {"peak_mem_mb": None, "cores_avg": None, "cores_p90": None}
+            empty,
+            {"peak_mem_mb": None, "write_mb": None, "cores_avg": None, "cores_p90": None},
         )
 
 

@@ -336,6 +336,52 @@ func TestSSEPassthroughIsNotBuffered(t *testing.T) {
 	}
 }
 
+func TestBinaryLiveStreamPassesThroughWithoutBuffering(t *testing.T) {
+	// LiveView reads framed JPEG bytes, not SSE. This proves the proxy applies the same immediate
+	// flush to its chunked octet stream, so a frame is visible before the daemon ends the response.
+	release := make(chan struct{})
+	wire := []byte{'F', 0, 0, 0, 3, 1, 2, 3}
+	d := g2Daemon(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/browser/sessions/7/live" {
+			t.Errorf("path = %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write(wire)
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	})
+	gw := g2Gateway(t, g2Config(d.URL))
+	defer close(release)
+
+	resp := g2Do(t, gw, "GET", "/api/browser/sessions/7/live", "", g2Cookie(g2Session))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if resp.Header.Get("Content-Type") != "application/octet-stream" {
+		t.Fatalf("content type = %q", resp.Header.Get("Content-Type"))
+	}
+	if resp.Header.Get("X-Accel-Buffering") != "no" {
+		t.Fatalf("X-Accel-Buffering = %q", resp.Header.Get("X-Accel-Buffering"))
+	}
+	first := make(chan []byte, 1)
+	go func() {
+		got := make([]byte, len(wire))
+		_, _ = io.ReadFull(resp.Body, got)
+		first <- got
+	}()
+	select {
+	case got := <-first:
+		if string(got) != string(wire) {
+			t.Fatalf("frame = %v, want %v", got, wire)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first binary frame did not reach the client while the daemon stream was open")
+	}
+}
+
 func TestStreamIsCutAtTheLifetimeCap(t *testing.T) {
 	d := g2Daemon(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

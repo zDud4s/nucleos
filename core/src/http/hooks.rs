@@ -71,7 +71,7 @@ pub(super) async fn post_ask_wait(
         }),
         None => Json(crate::hooks::Decision {
             decision: "deny".to_owned(),
-            reason: "nobody answered for this in time".to_owned(),
+            reason: "nobody answered for this while the session lived".to_owned(),
         }),
     }
 }
@@ -125,7 +125,12 @@ pub(super) async fn post_admit(
         crate::auth::Scope::Run(id) => id,
         _ => body.run_id,
     };
-    if !state.run_handles.lock().unwrap().contains_key(&run_id) {
+    if !state
+        .run_handles
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains_key(&run_id)
+    {
         return Json(AdmitAnswer::none());
     }
     let Some(book) = crate::execution::admission::installed() else {
@@ -361,7 +366,7 @@ mod tests {
         state
             .run_handles
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(run_id, tokio::spawn(async {}).abort_handle());
         let admit = |tool_use_id: &'static str| {
             post_admit(

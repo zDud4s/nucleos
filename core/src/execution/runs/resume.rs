@@ -892,6 +892,13 @@ pub(super) async fn continue_paused_run(
         return Err(sqlx::Error::RowNotFound.into());
     }
     let resume_id = result.last_insert_rowid();
+    // The paused run names its continuation, so every reader that walks `successor_run_id` (the
+    // lineage walk, the brief's chain end) follows an approval the same way it follows a handoff.
+    sqlx::query("UPDATE runs SET successor_run_id = ? WHERE id = ?")
+        .bind(resume_id)
+        .bind(original_run_id)
+        .execute(&mut *tx)
+        .await?;
     // The hand-over is a no-op for a job's tree, and must be: the job owns it, and moving ownership
     // to this one node would let the GC collect it the moment that node finished — with the rest of
     // the queue still to run in it. Filtering on `owner_kind = 'run'` is what makes that so.

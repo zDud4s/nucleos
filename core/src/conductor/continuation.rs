@@ -231,6 +231,7 @@ async fn open_sibling(
     let links = OpenLinks {
         tree_job_id: tree_job,
         continues_node_id: Some(&source.id),
+        ..OpenLinks::default()
     };
     let limits = limits_for(pool, source.project_id.as_deref()).await;
     match work_nodes::open_linked(pool, source.project_id.as_deref(), &limits, &args, links).await {

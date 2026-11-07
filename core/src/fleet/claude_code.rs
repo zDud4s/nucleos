@@ -796,6 +796,7 @@ impl ClaudeCode {
             "SELECT id, session_id, status, cwd, created_at, completed_at FROM runs \
              WHERE session_id IS NOT NULL AND session_id <> '' AND session_id <> 'shared' \
              AND (runner IS NULL OR runner = 'claude') \
+             AND imported_at IS NULL \
              AND (status IN ('running', 'awaiting_approval') \
                   OR julianday(COALESCE(completed_at, created_at)) >= julianday(?)) \
              ORDER BY id DESC",

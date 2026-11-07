@@ -252,6 +252,8 @@ impl From<sqlx::Error> for OpenError {
 /// Runs `git -C <root> <args>` and answers its trimmed stdout, or its stderr as the error.
 async fn git(root: &str, args: &[&str]) -> Result<String, String> {
     let output = tokio::process::Command::new("git")
+        // A repo-local `core.fsmonitor` would run a command on any call that reads the index.
+        .args(["-c", "core.fsmonitor="])
         .arg("-C")
         .arg(root)
         .args(args)
@@ -491,6 +493,20 @@ pub async fn open_branch(
         .unwrap_or_else(|| job.manifest.feature_branch.clone());
     if feature == config.base_branch {
         return Err(OpenError::OverIntegration(feature));
+    }
+    // The name goes to git as a positional argument (`git branch <feature> <base>`): a leading `-`
+    // would be read as an option (`-D` deletes the integration branch), so it never gets there.
+    if feature.starts_with('-')
+        || git(
+            &job.manifest.project_root,
+            &["check-ref-format", "--branch", &feature],
+        )
+        .await
+        .is_err()
+    {
+        return Err(OpenError::BadName(format!(
+            "the feature branch name {feature:?} is not a valid git branch name"
+        )));
     }
     let sizes = live_sizes_gb(&job.manifest).await;
     let book = admission_book();
@@ -820,13 +836,33 @@ async fn project_tree_config(root: &str) -> (String, Vec<String>) {
     (base, links)
 }
 
+/// The free disk, in GB, on the volume holding `project_root`: the one figure every tree admission
+/// (the open, the branch route, the driver's retry) measures the machine with.
+///
+/// **A test build does not measure the machine.** A code layer is charged its seed cost (8 GB)
+/// against this figure, so a fixture that opens a code branch passed only while the volume had that
+/// much room — and the room is exactly what a daemon running trees eats: every tree worktree's warm
+/// target is ~8 GB, and on 2026-11-04 the daemon's own admissions read 12.7 GB free at 15:16 and
+/// 7.7 GB at 16:52 while the gates it ran in tree worktrees failed the same ten `tree_job` tests
+/// every time, and a hand-made worktree on a quieter disk passed them all. So a test build answers
+/// `testing::TEST_FREE_DISK_GB`, a figure no fixture's seed cost reaches and no refusal test's
+/// cost (`1e12` and up) fits under; a test that means to read the real volume opts in with
+/// `testing::RealDisk`.
+pub(super) fn free_disk_gb(project_root: &Path) -> std::io::Result<f64> {
+    #[cfg(test)]
+    {
+        if !testing::reads_real_disk() {
+            return Ok(testing::TEST_FREE_DISK_GB);
+        }
+    }
+    crate::health::available_space(project_root).map(|bytes| bytes as f64 / BYTES_PER_GB)
+}
+
 /// The `OpenConfig` the open route builds for a project: `speed.yaml`'s integration branch and
 /// links, the tree limits and the free disk. Shared with the root start.
 pub(super) async fn open_config(root: &str) -> OpenConfig {
     let (floor_gb, max_live_branches) = tree_limits(root);
-    let free_disk_gb = crate::health::available_space(Path::new(root))
-        .map(|bytes| bytes as f64 / BYTES_PER_GB)
-        .unwrap_or(0.0);
+    let free_disk_gb = free_disk_gb(Path::new(root)).unwrap_or(0.0);
     let (base_branch, links) = project_tree_config(root).await;
     OpenConfig {
         dev_home: dev_home(),
@@ -934,6 +970,41 @@ async fn post_bind(
     })))
 }
 
+/// Test-only control over [`free_disk_gb`].
+#[cfg(test)]
+pub(super) mod testing {
+    use std::cell::Cell;
+
+    /// What a test build's tree admissions see as free: a terabyte.
+    pub const TEST_FREE_DISK_GB: f64 = 1024.0;
+
+    thread_local! {
+        static REAL_DISK: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(in crate::tree_job) fn reads_real_disk() -> bool {
+        REAL_DISK.with(Cell::get)
+    }
+
+    /// Makes [`super::free_disk_gb`] read the real volume on this thread until dropped. Per
+    /// thread, so that a parallel libtest run keeps every other test on the fixed figure; a
+    /// `#[tokio::test]` runs its handlers on its own thread, where this reaches.
+    pub struct RealDisk(());
+
+    impl RealDisk {
+        pub fn on() -> Self {
+            REAL_DISK.with(|real| real.set(true));
+            Self(())
+        }
+    }
+
+    impl Drop for RealDisk {
+        fn drop(&mut self) {
+            REAL_DISK.with(|real| real.set(false));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
@@ -957,6 +1028,27 @@ mod tests {
     use crate::tree_job::model::{Branch, Manifest};
     use crate::tree_job::node_run;
     use crate::tree_job::store::{self, StoreError, TreeJob};
+
+    /// A test build's tree admissions never measure the machine: the volume a daemon running trees
+    /// shares with the tests was 7.7 GB free on 2026-11-04, under the seed cost of one code branch.
+    #[test]
+    fn a_test_build_reads_the_fixed_free_disk_and_not_the_volume() {
+        let gb = free_disk_gb(&std::env::temp_dir()).expect("the fixed figure always answers");
+        assert_eq!(gb, testing::TEST_FREE_DISK_GB);
+        assert!(gb > crate::tree_job::budget::SEED_COST_GB);
+    }
+
+    /// The release reading behind the seam is a real volume's, and the opt-in ends with its guard.
+    #[test]
+    fn real_disk_reads_the_volume_until_dropped() {
+        {
+            let _real = testing::RealDisk::on();
+            let gb = free_disk_gb(&std::env::temp_dir()).expect("the temp dir's volume answers");
+            assert!(gb > 0.0, "a mounted volume has some room: {gb}");
+            assert!(testing::reads_real_disk());
+        }
+        assert!(!testing::reads_real_disk());
+    }
 
     const CREATED: &str = "2026-10-30T10:00:00+00:00";
     const TREE: &str = "job-1";
@@ -1543,6 +1635,26 @@ mod tests {
         assert!(matches!(error, OpenError::OverIntegration(_)), "{error:?}");
         checkout.assert_nothing_made();
         assert_still_queued(&pool, BRANCH).await;
+    }
+
+    /// A feature name that git would read as an option or reject as a ref is refused before any
+    /// git command takes it as an argument: `-D` would have deleted the integration branch.
+    #[tokio::test]
+    async fn open_refuses_a_feature_branch_git_would_read_as_an_option() {
+        for bad in ["-D", "a..b"] {
+            let pool = crate::testdb::fresh_pool().await;
+            let checkout = Checkout::new();
+            let job = job_of(TREE, &checkout.root(), bad, vec![code(BRANCH, "queued")]);
+            store::save(&pool, &job).await.unwrap();
+
+            let error = open_branch(&pool, TREE, BRANCH, &checkout.config())
+                .await
+                .unwrap_err();
+
+            assert!(matches!(error, OpenError::BadName(_)), "{bad}: {error:?}");
+            checkout.assert_nothing_made();
+            assert_still_queued(&pool, BRANCH).await;
+        }
     }
 
     /// A docs branch works in the feature checkout: nothing is allocated, so neither the disk nor

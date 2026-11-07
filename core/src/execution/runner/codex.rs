@@ -584,6 +584,7 @@ impl CommandRunner for CodexCliRunner {
         // see `TreeKiller`. `codex` supervises its own tools, so terminating just the parent orphans
         // a build still holding locks inside the worktree the run was supposed to release.
         let mut tree_killer = child.id().map(TreeKiller::new);
+        let _cli_pid = super::cli_pids::register(&request.env, child.id());
 
         let stdout = child.stdout.take().expect("stdout piped above");
         let stderr = child.stderr.take().expect("stderr piped above");

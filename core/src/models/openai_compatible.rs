@@ -213,6 +213,7 @@ impl OpenAiCompatibleChat {
 /// that 200 for success and hand the loop a message built from nothing; this reads the BODY instead,
 /// so the `Err` it returns carries OpenRouter's own stated reason rather than a generic
 /// "no choices" that tells nobody what to fix.
+#[cfg(test)]
 fn assistant_message(response: &Value) -> std::io::Result<Value> {
     assistant_message_of(response, "OpenRouter")
 }

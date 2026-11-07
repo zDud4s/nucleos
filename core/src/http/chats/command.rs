@@ -1234,7 +1234,7 @@ mod tests {
         state
             .run_handles
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(turn, task.abort_handle());
 
         let (status, body) = command(&state, "b-stop-running-interrupts", "/stop").await;
@@ -1265,7 +1265,7 @@ mod tests {
         state
             .run_handles
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(turn, task.abort_handle());
 
         let (status, body) = command(&state, chat, "/stop").await;

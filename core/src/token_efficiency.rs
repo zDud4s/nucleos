@@ -503,6 +503,7 @@ const SELECT_BASELINE_TOTALS: &str = "SELECT MAX(total) FROM ( \
               COALESCE(session_id, 'run:' || id) AS session_key \
          FROM runs \
         WHERE mode = ? AND project_id IS ? AND id <> ? \
+          AND imported_at IS NULL \
           AND (session_id IS NULL OR session_id <> ?) \
           AND completed_at IS NOT NULL AND completed_at >= ? \
           AND input_tokens IS NOT NULL AND cache_read_tokens IS NOT NULL \

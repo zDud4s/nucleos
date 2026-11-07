@@ -1203,6 +1203,15 @@ pub async fn preserve_uncommitted(worktree_path: &Path, byte_ceiling: u64) -> io
 /// whole change exists to abolish. If a ceiling is ever wanted here it has to come with an answer to
 /// "and then what does the next item revert to", and today there is none.
 pub async fn checkpoint(worktree_path: &Path) -> io::Result<String> {
+    checkpoint_with_message(worktree_path, "nucleos: checkpoint a gate agreed with").await
+}
+
+/// The subject of a checkpoint taken over an item no gate measured (`gate_after_each_item` off).
+pub const UNGATED_CHECKPOINT: &str = "nucleos: checkpoint an item no gate measured";
+
+/// [`checkpoint`] with the commit subject chosen by the caller, so the history says whether a gate
+/// agreed with the commit or it only keeps an unmeasured item's work safe from a later revert.
+pub async fn checkpoint_with_message(worktree_path: &Path, message: &str) -> io::Result<String> {
     if !is_worktree_root(worktree_path).await {
         // Same door `preserve_uncommitted` keeps shut: a plain directory inside somebody else's
         // repository would have its `add -A` land on THAT repository's work.
@@ -1252,7 +1261,7 @@ pub async fn checkpoint(worktree_path: &Path) -> io::Result<String> {
             .arg("commit")
             .arg("--no-verify")
             .arg("-m")
-            .arg("nucleos: checkpoint a gate agreed with")
+            .arg(message)
             .output()
             .await?;
         if !commit.status.success() {
@@ -1318,6 +1327,12 @@ pub async fn merge_branch(worktree_path: &Path, branch: &str) -> io::Result<bool
         .output()
         .await;
     Ok(false)
+}
+
+/// Whether `branch` is already reachable from the checkout's HEAD, i.e. a merge of it has landed.
+/// A failure to answer is `false`.
+pub async fn branch_is_merged(worktree_path: &Path, branch: &str) -> bool {
+    is_ancestor(worktree_path, branch, "HEAD").await
 }
 
 pub async fn revert_to(worktree_path: &Path, sha: &str) -> io::Result<()> {

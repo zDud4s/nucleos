@@ -82,6 +82,15 @@ describe("runsOnOpen", () => {
     }
   });
 
+  it("catches macro Office files, add-ins and macOS/Linux launchers", () => {
+    for (const name of ["x.xll", "a.docm", "b.xlsm", "c.command", "d.sh", "e.app", "f.dmg", "g.desktop", "h.workflow"]) {
+      expect(runsOnOpen(name)).toBe(true);
+    }
+    expect(runsOnOpen("evil.sh.")).toBe(true);
+    expect(runsOnOpen("photo.png")).toBe(false);
+    expect(runsOnOpen("notes.txt")).toBe(false);
+  });
+
   it("leaves documents, and names with no extension, alone", () => {
     expect(runsOnOpen("report.pdf")).toBe(false);
     expect(runsOnOpen("Makefile")).toBe(false);

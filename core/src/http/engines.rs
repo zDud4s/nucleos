@@ -32,7 +32,9 @@ struct WriteRequest {
     acknowledged: bool,
 }
 
-/// `GET /engines/agy`: the state, the warning to show and whether the binary resolves, on or off.
+/// Whether the agy engine is open, plus the warning text and version to acknowledge and whether the binary resolves.
+///
+/// `GET /engines/agy`. `enabled` is the gate (`agy::enabled()`), not the raw stored field.
 async fn read() -> Json<Value> {
     let doc = store::get::<AgyDoc>(&Scope::Machine);
     Json(json!({
@@ -46,6 +48,8 @@ async fn read() -> Json<Value> {
     }))
 }
 
+/// Opens or closes the agy engine, storing the acknowledged warning version when it opens.
+///
 /// `PUT /engines/agy`: the kill switch first, as for every write. Enabling stores the current warning version
 /// and needs `acknowledged: true`; disabling needs nothing. A chat reads the switch at once; a
 /// `primary_runner: agy` was built at startup and changes when the daemon restarts.

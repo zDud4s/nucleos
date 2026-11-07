@@ -108,9 +108,18 @@ fn the_module_map_matches_the_files_on_disk() {
     // and it is a different guard against a different lie: not "which checkout may skip" but "which
     // checkout is this binary even looking at".
 
-    let mapped_files = fs::read_to_string(&map_path)
-        .expect("the module map should be readable")
+    // Only the `## Module map` section counts: a table row elsewhere in the file (a later section, a
+    // changelog) must not be able to vouch for a file that has no row in the map itself.
+    let whole = fs::read_to_string(&map_path).expect("the module map should be readable");
+    let mut in_map = false;
+    let mapped_files = whole
         .lines()
+        .filter(|line| {
+            if let Some(heading) = line.strip_prefix("## ") {
+                in_map = heading.starts_with("Module map");
+            }
+            in_map
+        })
         .filter_map(|line| {
             let field = line.strip_prefix("| `")?.split_once("` |")?.0;
             field.ends_with(".rs").then_some(field.to_owned())
