@@ -167,6 +167,95 @@ async fn migrated_schema() -> Vec<u8> {
     bytes
 }
 
+/// How long a test is willing to wait for something that moves through real processes (git, a
+/// spawned unit): bounded by silence, not by the wall clock.
+///
+/// A fixed deadline measures the machine as much as the code: under load the same gate takes three
+/// times as long and a 30 s budget fails with nothing wrong. Here the clock restarts whenever the
+/// progress marker the caller reads (a status column, a step) changes, so only a wait that stopped
+/// moving for `idle` fails, and `cap` bounds a wait that moves for ever.
+pub struct Patience {
+    idle: std::time::Duration,
+    cap: std::time::Duration,
+    started: std::time::Instant,
+    last_change: std::time::Instant,
+    last: Option<String>,
+}
+
+impl Patience {
+    pub fn new(idle: std::time::Duration, cap: std::time::Duration) -> Self {
+        Self::starting_at(idle, cap, std::time::Instant::now())
+    }
+
+    fn starting_at(
+        idle: std::time::Duration,
+        cap: std::time::Duration,
+        now: std::time::Instant,
+    ) -> Self {
+        Self {
+            idle,
+            cap,
+            started: now,
+            last_change: now,
+            last: None,
+        }
+    }
+
+    /// Whether the wait must give up, given the progress marker as of now.
+    pub fn expired(&mut self, progress: &str) -> bool {
+        self.expired_at(std::time::Instant::now(), progress)
+    }
+
+    fn expired_at(&mut self, now: std::time::Instant, progress: &str) -> bool {
+        if self.last.as_deref() != Some(progress) {
+            self.last = Some(progress.to_owned());
+            self.last_change = now;
+        }
+        now.duration_since(self.started) >= self.cap
+            || now.duration_since(self.last_change) >= self.idle
+    }
+
+    /// The last marker seen, for the failure message.
+    pub fn last(&self) -> &str {
+        self.last.as_deref().unwrap_or("")
+    }
+}
+
+#[cfg(test)]
+mod patience_tests {
+    use super::Patience;
+    use std::time::{Duration, Instant};
+
+    const S: fn(u64) -> Duration = Duration::from_secs;
+
+    #[test]
+    fn a_wait_that_keeps_moving_outlives_the_idle_budget() {
+        let t0 = Instant::now();
+        let mut p = Patience::starting_at(S(30), S(600), t0);
+        assert!(!p.expired_at(t0 + S(25), "queued"));
+        assert!(!p.expired_at(t0 + S(50), "running"));
+        assert!(!p.expired_at(t0 + S(75), "done"));
+    }
+
+    #[test]
+    fn a_wait_that_stops_moving_expires_after_the_idle_budget() {
+        let t0 = Instant::now();
+        let mut p = Patience::starting_at(S(30), S(600), t0);
+        assert!(!p.expired_at(t0 + S(10), "queued"));
+        assert!(!p.expired_at(t0 + S(39), "queued"));
+        assert!(p.expired_at(t0 + S(40), "queued"));
+        assert_eq!(p.last(), "queued");
+    }
+
+    #[test]
+    fn the_cap_bounds_a_wait_that_never_stops_moving() {
+        let t0 = Instant::now();
+        let mut p = Patience::starting_at(S(30), S(100), t0);
+        assert!(!p.expired_at(t0 + S(90), "a"));
+        assert!(p.expired_at(t0 + S(100), "b"));
+    }
+}
+
 async fn empty_memory_pool() -> sqlx::SqlitePool {
     SqlitePoolOptions::new()
         .max_connections(1)

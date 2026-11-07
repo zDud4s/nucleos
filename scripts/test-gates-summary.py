@@ -75,7 +75,11 @@ def drive(steps: str, workdir: Path, keep_going: bool = True) -> tuple[int, str]
         stderr=subprocess.STDOUT,
         env=dict(os.environ, NUCLEOS_DEV_HOME=(workdir / "dev").as_posix(), TMPDIR=scratch.as_posix(),
                  NUCLEOS_GATE_KEEP_GOING="1" if keep_going else "0"),
-        timeout=120,
+        # Only a hung bash should hit this. Each drive forks bash, tee, tail and awk per step, and
+        # Git-for-Windows fork emulation under a loaded gate machine stretched 120s into a
+        # TimeoutExpired on steps that finish in a second when idle; there is no event to wait on
+        # for a subprocess, so the bound is wide rather than tight.
+        timeout=int(os.environ.get("GATES_SUMMARY_TIMEOUT", "600")),
     )
     left = list(scratch.iterdir())
     assert not left, f"captures left behind in TMPDIR: {left}"

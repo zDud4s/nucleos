@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClientProvider } from "@tanstack/react-query";
 import { RouterProvider } from "@tanstack/react-router";
@@ -16,6 +16,14 @@ vi.mock("./data/client", async (original) => ({
   ...(await original<typeof import("./data/client")>()),
   ...daemon,
 }));
+
+// The lazy pages in `router.tsx` pull their whole module graph through vite's
+// transform on first import. Under full-suite load that cold import, not the
+// render, is what outran `findByRole`'s timeout. Import them once, here, with a
+// budget of their own: `lazy()` then resolves from the module cache.
+beforeAll(async () => {
+  await Promise.all([import("./pages/Brain"), import("./pages/Fleet")]);
+}, 120_000);
 
 beforeEach(() => {
   daemon.apiFetch.mockReset();
@@ -48,9 +56,8 @@ describe("the app router", () => {
     const { router } = await renderApp({ initialPath: "/learned" });
 
     await waitFor(() => expect(router.state.location.pathname).toBe("/brain"));
-    // Wait for the lazy Brain chunk too, so its heavy import drains here rather
-    // than running on into the next test. A cold lazy page import can exceed the
-    // 3 s default under full-suite load.
+    // Wait for the lazy Brain chunk too, so it settles here rather than running
+    // on into the next test. Its module is preloaded in `beforeAll`.
     expect(await screen.findByRole("heading", { level: 1, name: "Brain" }, { timeout: 10_000 })).toBeDefined();
   });
 

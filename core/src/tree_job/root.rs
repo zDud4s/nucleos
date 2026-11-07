@@ -276,13 +276,9 @@ async fn retry_failed_start(state: &AppState, job: &TreeJob, record: &Value) -> 
         .await;
     } else {
         let attempts = record["attempts"].as_u64().unwrap_or(0);
-        if attempts >= ROOT_START_CAP {
-            let error = record["error"].as_str().unwrap_or("unknown");
-            let question = format!(
-                "The root of tree job {} did not start after {attempts} tries (last error: \
-                 {error}). Fix the cause and answer to try again, or say how the job should go on.",
-                job.id
-            );
+        let error = record["error"].as_str().unwrap_or("unknown");
+        if attempts >= super::root_disk::start_cap(error, ROOT_START_CAP) {
+            let question = super::root_disk::question(&job.id, attempts, error);
             let asked = decisions::park_or_ask(pool, &job.id, &job.root_node_id, &question)
                 .await
                 .map_err(|error| error.to_string())?;
