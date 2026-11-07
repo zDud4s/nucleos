@@ -514,6 +514,20 @@ pub(super) fn spawn_run(
             }
             return;
         }
+        // The account this launch runs under. With no accounts (or an engine outside the pool)
+        // this is today's launch: no env, no reservation, no write.
+        let (account, env) = match account_for_launch(
+            &pool,
+            id,
+            resume_session_id.as_deref(),
+            env,
+            feed_project_id.as_deref(),
+        )
+        .await
+        {
+            Ok(launch) => launch,
+            Err(()) => return,
+        };
         let mut attempt: u32 = 1;
         loop {
             // A fresh session channel per attempt: persist session_id the instant the runner parses it
@@ -689,6 +703,19 @@ pub(super) fn spawn_run(
                             "failed"
                         };
                     let context_fill = observed_context_fill(&context_fill, &o.stdout);
+                    // A limit error marks the account's window exhausted, so the next pick skips it.
+                    if o.exit_code != 0
+                        && let Some(held) = account.as_ref()
+                    {
+                        crate::accounts::launch_chat::note_limit(
+                            &crate::accounts::pool::PoolState::global(),
+                            &held.engine,
+                            held.reservation.account(),
+                            &o.stdout,
+                            &o.stderr,
+                            chrono::Utc::now(),
+                        );
+                    }
                     // Read from the same stream everything else came from, and kept here because
                     // here is where an agent run ends. `assistant.rs` does the equivalent in its
                     // own terminal write; the difference is that an agent never passes through
@@ -1137,6 +1164,97 @@ pub(super) fn spawn_run(
             }
         }
     });
+}
+
+/// The account slot a run holds until its task ends, and the engine it was picked for.
+struct HeldAccount {
+    engine: String,
+    reservation: crate::accounts::pool::Reservation,
+}
+
+/// Picks the run's account and records it. `Err(())` means the run was failed here because its
+/// pinned account cannot take work: a pin is never replaced silently (R1/R2). Any other outcome
+/// without an account launches as today.
+async fn account_for_launch(
+    pool: &sqlx::SqlitePool,
+    id: i64,
+    resume_session_id: Option<&str>,
+    env: Vec<(String, String)>,
+    feed_project_id: Option<&str>,
+) -> Result<(Option<HeldAccount>, Vec<(String, String)>), ()> {
+    let accounts = crate::accounts::pool::PoolState::global();
+    if accounts.view().candidates.is_empty() {
+        return Ok((None, env));
+    }
+    // The router writes `runs.runner` when it decides; an unrouted run runs the active one.
+    let engine: String = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT runner FROM runs WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .flatten()
+    .unwrap_or_else(|| crate::config::models_config_now().active_runner().to_owned());
+    let mut pick = crate::accounts::launch_chat::pick_for_run_launch(
+        pool,
+        &accounts,
+        id,
+        &engine,
+        resume_session_id,
+        chrono::Utc::now(),
+    )
+    .await;
+    if let Some(decision) = pick.blocked.take() {
+        use crate::accounts::choose::Decision;
+        // A pinned account that cannot run, or a session stuck on an exhausted one, ends the run
+        // with the reason. No candidate at all falls back to today's launch.
+        let reason = match decision {
+            Decision::PinnedBlocked { pinned, why, .. } => Some(format!(
+                "the pinned account {} cannot take this run ({why:?})",
+                pinned.as_str()
+            )),
+            Decision::SessionStuck { current, .. } => Some(format!(
+                "the account {} holding this session is at its limit",
+                current.as_str()
+            )),
+            _ => None,
+        };
+        if let Some(reason) = reason {
+            let failed = sqlx::query(
+                "UPDATE runs SET status = 'failed', stderr = ?, completed_at = ?, attempt = 1 WHERE id = ? AND status = 'running'",
+            )
+            .bind(&reason)
+            .bind(chrono::Utc::now().to_rfc3339())
+            .bind(id)
+            .execute(pool)
+            .await;
+            warn_on_terminal_write_err(&failed, id, "failed");
+            if matches!(&failed, Ok(result) if result.rows_affected() == 1) {
+                let _ = crate::feed::append(
+                    pool,
+                    feed_project_id,
+                    "run_failed_final",
+                    &format!("run {id} could not start: {reason}"),
+                    Some(id),
+                    Some(&crate::feed::run_subject(pool, id).await),
+                )
+                .await;
+            }
+            return Err(());
+        }
+    }
+    let (Some(account_id), Some(reservation)) = (pick.account_id.take(), pick.reservation.take())
+    else {
+        return Ok((None, env));
+    };
+    if let Err(error) = crate::accounts::store::record_run_account(pool, id, &account_id).await {
+        tracing::warn!(run_id = id, %error, "could not record the account a run launched under");
+    }
+    let mut env = env;
+    env.extend(std::mem::take(&mut pick.env));
+    Ok((Some(HeldAccount { engine, reservation }), env))
 }
 
 /// Retires a run that failed somewhere in worktree provisioning, and says so in the feed.
