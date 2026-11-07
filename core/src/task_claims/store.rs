@@ -445,7 +445,17 @@ pub async fn claim(
                 delete_task(&mut tx, row.id).await?;
                 insert_open(&mut tx, project_id, &new, now).await?
             } else {
-                if row.status != Status::Probing {
+                // What the claimer knows goes on a row it can take or already holds. A row live
+                // under ANOTHER holder is lost to this claimer, and the loser's paths must not
+                // widen the winner's guard.
+                let adopts = match (row.status, row.holder()) {
+                    (Status::Probing, _) => false,
+                    (Status::Claimed, Some(current)) if !current.same_owner(holder) => {
+                        !is_live_on(&mut tx, &row, now).await?
+                    }
+                    _ => true,
+                };
+                if adopts {
                     // Adopting the row: what the claimer knows goes on top of it; the title stays.
                     let detail = merge_detail(&row.detail, &new.detail).to_string();
                     let guard = encode_list(&union(&row.guard_paths, &new.guard_paths));
@@ -1781,6 +1791,32 @@ mod tests {
             "the claimed incident now guards the claimer's paths"
         );
         assert_eq!(guarded[0].id, won.id);
+    }
+
+    #[tokio::test]
+    async fn a_losing_claim_does_not_widen_the_winners_guard() {
+        let pool = test_pool().await;
+        let mut first = task("topic:contested");
+        first.guard_paths = vec!["core/src/a".into()];
+        first.detail = serde_json::json!({"who": "a"});
+        let ClaimOutcome::Won { task: won, .. } =
+            claim(&pool, "p", first, &session("a"), t0()).await.unwrap()
+        else {
+            panic!("expected a win")
+        };
+
+        let mut second = task("topic:contested");
+        second.guard_paths = vec!["web/src/b".into()];
+        second.detail = serde_json::json!({"who": "b", "extra": 1});
+        let lost = claim(&pool, "p", second, &session("b"), t0() + secs(5))
+            .await
+            .unwrap();
+        assert!(matches!(lost, ClaimOutcome::Lost { .. }), "{lost:?}");
+
+        let stored = row(&pool, won.id).await;
+        assert_eq!(stored.guard_paths, vec!["core/src/a".to_owned()]);
+        assert_eq!(stored.detail["who"], "a");
+        assert!(stored.detail.get("extra").is_none());
     }
 
     #[tokio::test]

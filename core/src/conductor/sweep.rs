@@ -15,6 +15,12 @@ pub const SPAWN_GRACE_SECS: i64 = 60;
 pub const TERMINAL_LOOKBACK_HOURS: i64 = 24;
 /// The feed kind written when a handoff chain stops; `tree_job::wrap` reads it too.
 pub(crate) const CONTINUATION_STOPPED: &str = "node_continuation_stopped";
+/// A handed-off node whose continuation was refused for a reason that will not go away by itself.
+pub(crate) const CONTINUATION_REFUSED: &str = "node_continuation_refused";
+
+fn refusal_summary(reason: &str) -> String {
+    format!("A handed-off node could not be continued, so its tree is waiting: {reason}")
+}
 
 /// A source which can be warned, and daemon runs which can also be stopped.
 #[derive(Debug, Clone)]
@@ -54,64 +60,10 @@ pub async fn tick(
 ) -> sqlx::Result<SweepReport> {
     let mut report = SweepReport::default();
     for observed in observed {
-        let verdict = classify(&observed.observation, limits, now);
-        let Some(kind) = feed_kind(verdict) else {
-            continue;
-        };
-        let (subject, run_id, node_id, daemon) = match &observed.kind {
-            SubjectKind::External { session_id } => {
-                (format!("session:{session_id}"), None, None, false)
-            }
-            SubjectKind::DaemonRun { run_id, node_id } => (
-                Subject::Run(*run_id).key(),
-                Some(*run_id),
-                node_id.clone(),
-                true,
-            ),
-        };
-        let episode = observed
-            .observation
-            .started_at
-            .iter()
-            .chain(observed.observation.last_transcript_write.iter())
-            .cloned()
-            .max();
-        if insert_feed(state, kind, &subject, run_id, &summary(kind), now, episode).await? {
-            report.reported.push((kind.to_owned(), subject));
-        }
-        if daemon
-            && matches!(
-                verdict,
-                Veredicto::SilentSinceStart | Veredicto::Stalled | Veredicto::Dead
-            )
-        {
-            let run_id = run_id.expect("daemon runs have ids");
-            if matches!(verdict, Veredicto::Dead) {
-                // Through the terminator first: it aborts the task (and with it the CLI tree) if a
-                // handle turned up since the observation. Dead is only declared with no live pid,
-                // so the bare write below is for the handle-less row the terminator cannot reach.
-                if !finalize_termination(state, run_id, "cancelled").await {
-                    sqlx::query("UPDATE runs SET status = 'cancelled', completed_at = ? WHERE id = ? AND status = 'running'")
-                        .bind(now.to_rfc3339()).bind(run_id).execute(&state.pool).await?;
-                }
-            } else {
-                finalize_termination(state, run_id, "cancelled").await;
-            }
-            report.cancelled.push(run_id);
-            if let Some(node_id) = node_id {
-                let tree_job: Option<Option<String>> =
-                    sqlx::query_scalar("SELECT tree_job_id FROM work_nodes WHERE id = ?")
-                        .bind(&node_id)
-                        .fetch_optional(&state.pool)
-                        .await?;
-                if tree_job.flatten().is_none() {
-                    sqlx::query("UPDATE work_nodes SET status = 'failed', summary = ?, closed_at = ?, updated_at = ? WHERE id = ? AND status = 'running'")
-                        .bind(format!("Liveness sweep: {}", kind.replace("session_", "")))
-                        .bind(now.to_rfc3339()).bind(now.to_rfc3339()).bind(&node_id)
-                        .execute(&state.pool).await?;
-                    report.marked_nodes.push(node_id);
-                }
-            }
+        // One failing subject (a locked database, say) must not leave the rest of the tick undone:
+        // the stalled runs after it still need cancelling.
+        if let Err(error) = sweep_one(state, observed, limits, now, &mut report).await {
+            tracing::warn!(%error, "liveness sweep could not handle one observed run or session");
         }
     }
     // Before `terminal_feed`, so a node reaped here has its failure announced in this same tick.
@@ -121,9 +73,83 @@ pub async fn tick(
     // Both ticks log their own failures and return nothing, so neither can fail the sweep.
     crate::tree_job::wrap::tick(state).await;
     crate::tree_job::driver::tick(state).await;
-    continue_handoffs(state, now, &mut report).await?;
-    terminal_feed(state, now, &mut report).await?;
+    if let Err(error) = continue_handoffs(state, now, &mut report).await {
+        tracing::warn!(%error, "liveness sweep could not continue the handed-off nodes");
+    }
+    if let Err(error) = terminal_feed(state, now, &mut report).await {
+        tracing::warn!(%error, "liveness sweep could not announce the terminal nodes");
+    }
     Ok(report)
+}
+
+/// One observed subject of `tick`: classify it, report it and, for a dead daemon run, cancel it.
+async fn sweep_one(
+    state: &AppState,
+    observed: &Observed,
+    limits: &Limits,
+    now: DateTime<Utc>,
+    report: &mut SweepReport,
+) -> sqlx::Result<()> {
+    let verdict = classify(&observed.observation, limits, now);
+    let Some(kind) = feed_kind(verdict) else {
+        return Ok(());
+    };
+    let (subject, run_id, node_id, daemon) = match &observed.kind {
+        SubjectKind::External { session_id } => {
+            (format!("session:{session_id}"), None, None, false)
+        }
+        SubjectKind::DaemonRun { run_id, node_id } => (
+            Subject::Run(*run_id).key(),
+            Some(*run_id),
+            node_id.clone(),
+            true,
+        ),
+    };
+    let episode = observed
+        .observation
+        .started_at
+        .iter()
+        .chain(observed.observation.last_transcript_write.iter())
+        .cloned()
+        .max();
+    if insert_feed(state, kind, &subject, run_id, &summary(kind), now, episode).await? {
+        report.reported.push((kind.to_owned(), subject));
+    }
+    if daemon
+        && matches!(
+            verdict,
+            Veredicto::SilentSinceStart | Veredicto::Stalled | Veredicto::Dead
+        )
+    {
+        let run_id = run_id.expect("daemon runs have ids");
+        if matches!(verdict, Veredicto::Dead) {
+            // Through the terminator first: it aborts the task (and with it the CLI tree) if a
+            // handle turned up since the observation. Dead is only declared with no live pid,
+            // so the bare write below is for the handle-less row the terminator cannot reach.
+            if !finalize_termination(state, run_id, "cancelled").await {
+                sqlx::query("UPDATE runs SET status = 'cancelled', completed_at = ? WHERE id = ? AND status = 'running'")
+                    .bind(now.to_rfc3339()).bind(run_id).execute(&state.pool).await?;
+            }
+        } else {
+            finalize_termination(state, run_id, "cancelled").await;
+        }
+        report.cancelled.push(run_id);
+        if let Some(node_id) = node_id {
+            let tree_job: Option<Option<String>> =
+                sqlx::query_scalar("SELECT tree_job_id FROM work_nodes WHERE id = ?")
+                    .bind(&node_id)
+                    .fetch_optional(&state.pool)
+                    .await?;
+            if tree_job.flatten().is_none() {
+                sqlx::query("UPDATE work_nodes SET status = 'failed', summary = ?, closed_at = ?, updated_at = ? WHERE id = ? AND status = 'running'")
+                    .bind(format!("Liveness sweep: {}", kind.replace("session_", "")))
+                    .bind(now.to_rfc3339()).bind(now.to_rfc3339()).bind(&node_id)
+                    .execute(&state.pool).await?;
+                report.marked_nodes.push(node_id);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Continues every handed-off tree node that needs it. A node without a tree job belongs to an
@@ -134,6 +160,13 @@ async fn continue_handoffs(
     now: DateTime<Utc>,
     report: &mut SweepReport,
 ) -> sqlx::Result<()> {
+    // A halted daemon starts nothing; a failed read is treated as halted.
+    if crate::governance::autopilot::kill_switch_engaged(&state.pool)
+        .await
+        .unwrap_or(true)
+    {
+        return Ok(());
+    }
     for node_id in awaiting_continuation(&state.pool).await? {
         match continue_node(state, &node_id).await {
             Ok(_) | Err(ContinuationError::WorkOver) => {}
@@ -154,6 +187,28 @@ async fn continue_handoffs(
                     report
                         .reported
                         .push((CONTINUATION_STOPPED.to_owned(), subject));
+                }
+            }
+            // A refusal that asking again will not change (the tree's budget, a guard): without a
+            // feed line the tree sits waiting and only a warn every minute says why.
+            Err(ContinuationError::Budget(reason) | ContinuationError::Refused(reason)) => {
+                tracing::warn!(node = %node_id, %reason, "the handed-off node cannot be continued");
+                let subject = format!("node:{node_id}");
+                let summary = refusal_summary(&reason);
+                if insert_feed(
+                    state,
+                    CONTINUATION_REFUSED,
+                    &subject,
+                    None,
+                    &summary,
+                    now,
+                    None,
+                )
+                .await?
+                {
+                    report
+                        .reported
+                        .push((CONTINUATION_REFUSED.to_owned(), subject));
                 }
             }
             Err(error) => {
@@ -303,7 +358,11 @@ pub async fn daemon_observations(state: &AppState) -> sqlx::Result<Vec<Observed>
             (Some(created), Some(attempt)) => Some(created.max(attempt)),
             (created, attempt) => created.or(attempt),
         };
-        let alive = state.run_handles.lock().unwrap().contains_key(&id);
+        let alive = state
+            .run_handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&id);
         // The task handle is the daemon's bookkeeping; the CLI is a child process that can outlive
         // it. Only a process the OS no longer has is proof of death.
         let cli_running = crate::execution::runner::cli_pids::pid_of(id)
@@ -635,7 +694,11 @@ mod tests {
     }
 
     fn has_handle(state: &AppState, id: i64) -> bool {
-        state.run_handles.lock().unwrap().contains_key(&id)
+        state
+            .run_handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&id)
     }
 
     fn publish_tail(state: &AppState, id: i64, text: &str) -> Arc<Mutex<String>> {
@@ -1294,6 +1357,90 @@ mod tests {
             launch_rows(&state, "branch-node", &format!("wrap-{run}")).await,
             1
         );
+    }
+
+    /// With the kill switch engaged the sweep must not relaunch a handed-off node.
+    #[tokio::test]
+    async fn continue_handoffs_does_nothing_while_the_kill_switch_is_engaged() {
+        let state = runner_state().await;
+        let now = Utc::now();
+        let run = seed_run(&state, "interrupted", now - minutes(5)).await;
+        seed_node(&state, "halted-parent", "orchestrator", "running", None).await;
+        seed_node(&state, "halted-node", "orchestrator", "running", Some(run)).await;
+        sqlx::query("UPDATE work_nodes SET parent_id = 'halted-parent' WHERE id = 'halted-node'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        seed_branch_job(
+            &state,
+            "sweep-halted",
+            None,
+            "C:/Projects/nucleos",
+            "building",
+            None,
+        )
+        .await;
+        bind_to_job(&state, "halted-node", "sweep-halted").await;
+        store_first_launch(&state, "halted-node").await;
+        sqlx::query("UPDATE work_nodes SET status = 'handoff' WHERE id = 'halted-node'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        crate::governance::autopilot::set_kill_switch(&state.pool, true)
+            .await
+            .unwrap();
+
+        let mut report = SweepReport::default();
+        continue_handoffs(&state, now, &mut report).await.unwrap();
+
+        let siblings: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM work_nodes WHERE continues_node_id = 'halted-node'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(siblings, 0);
+    }
+
+    #[tokio::test]
+    async fn a_refused_continuation_reaches_the_feed_once() {
+        let state = runner_state().await;
+        let now = Utc::now();
+        let run = seed_run(&state, "interrupted", now - minutes(5)).await;
+        seed_node(&state, "refused-parent", "orchestrator", "running", None).await;
+        seed_node(&state, "refused-node", "orchestrator", "running", Some(run)).await;
+        sqlx::query("UPDATE work_nodes SET parent_id = 'refused-parent' WHERE id = 'refused-node'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        seed_branch_job(
+            &state,
+            "sweep-refused",
+            None,
+            "C:/Projects/nucleos",
+            "building",
+            None,
+        )
+        .await;
+        bind_to_job(&state, "refused-node", "sweep-refused").await;
+        // No launch is stored, so the continuation is refused and asking again changes nothing.
+        sqlx::query("UPDATE work_nodes SET status = 'handoff' WHERE id = 'refused-node'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let mut report = SweepReport::default();
+        continue_handoffs(&state, now, &mut report).await.unwrap();
+        continue_handoffs(&state, now, &mut report).await.unwrap();
+
+        let lines: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM feed WHERE kind = ? AND subject = ?")
+                .bind(CONTINUATION_REFUSED)
+                .bind("node:refused-node")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(lines, 1, "reported once, not every tick");
     }
 
     /// A green branch is merged by the driver, and the sweep has to call it: nothing else in the

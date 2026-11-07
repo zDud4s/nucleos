@@ -58,9 +58,11 @@ const MAX_RESOLUTION_ATTEMPTS: i64 = 3;
 /// Frees escalated conflicts whose resolution run ended without a verdict, so `next_conflict`
 /// mints a fresh attempt.
 ///
-/// **Only `cancelled` and `interrupted`.** Those are runs that were stopped — a restart, a cancel —
-/// before the agent said anything. A run that finished, failed or gave up had its attempt, and
-/// that stays a person's. A row somebody settled (`settled_at`), one a later success already
+/// **Only `cancelled` and `interrupted`, plus a `completed` run whose gate `errored`.** The first two
+/// were stopped — a restart, a cancel — before the agent said anything; an errored gate is
+/// infrastructure (a pool timeout) rather than a verdict on the resolution, so the work is redone
+/// instead of refused for good by `land_finished`. A run that finished with a failed gate, failed or
+/// gave up had its attempt, and that stays a person's. A row somebody settled (`settled_at`), one a later success already
 /// settled, or one no longer `escalated` is left alone, and `MAX_RESOLUTION_ATTEMPTS` bounds the
 /// loop. The count is `resolution_attempts`, bumped by the claim in `create_run_with`.
 /// Returns how many rows were released.
@@ -75,7 +77,10 @@ async fn release_unfinished(pool: &sqlx::SqlitePool) -> u64 {
             AND resolution_run_id IS NOT NULL
             AND resolution_attempts < ?
             AND resolution_run_id IN (
-                SELECT id FROM runs WHERE status IN ('cancelled', 'interrupted')
+                SELECT id FROM runs
+                 WHERE status IN ('cancelled', 'interrupted')
+                    OR (status = 'completed' AND gate_status = 'errored'
+                        AND successor_run_id IS NULL)
             )
             AND NOT EXISTS (
                 SELECT 1 FROM vcs_requests AS settled
@@ -2141,10 +2146,11 @@ mod tests {
     }
 
     /// `completed` says the agent stopped, not that the project's gate passed, and the queue's land
-    /// builds nothing: a resolution whose gate failed is announced once and never handed over.
+    /// builds nothing: a resolution whose gate failed (real reds) is announced once and never
+    /// handed over, and never retried either.
     #[tokio::test]
-    async fn a_resolution_whose_gate_did_not_pass_is_never_handed_over() {
-        for status in ["failed", "errored"] {
+    async fn a_failed_resolution_gate_is_still_refused() {
+        for status in ["failed"] {
             let pool = test_pool().await;
             let scenario = resolution_scenario(
                 &pool,
@@ -2179,6 +2185,67 @@ mod tests {
             assert_eq!(summaries.len(), 1, "announced once, not every tick");
             assert!(summaries[0].contains(status), "{}", summaries[0]);
         }
+    }
+
+    /// An `errored` gate is infrastructure (a pool timeout, an unreadable config), not a verdict on
+    /// the resolution: the run is released for a fresh attempt instead of being refused for good.
+    #[tokio::test]
+    async fn an_errored_resolution_gate_is_retried_not_refused() {
+        let pool = test_pool().await;
+        let scenario = resolution_scenario(
+            &pool,
+            "nucleos-resolver-errored-",
+            "completed",
+            Progress::Committed,
+        )
+        .await;
+        gate(&pool, "errored").await;
+        sqlx::query("UPDATE vcs_requests SET resolution_attempts = 1 WHERE id = ?")
+            .bind(scenario.request)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // The loop's own order: release, then land.
+        assert_eq!(release_unfinished(&pool).await, 1);
+        land_finished(&pool, &mut Default::default()).await;
+
+        assert!(admitted_resolutions(&pool, &scenario).await.is_empty());
+        assert!(resolution_failed_summaries(&pool).await.is_empty());
+        let next = next_conflict(&pool)
+            .await
+            .unwrap()
+            .expect("the released conflict is minted a fresh attempt");
+        assert_eq!(next.id, scenario.request);
+    }
+
+    /// Retrying is bounded: once the attempts are spent an errored gate is refused and announced
+    /// like any other, so nothing ends silently.
+    #[tokio::test]
+    async fn an_errored_gate_past_the_attempt_cap_reports_failure() {
+        let pool = test_pool().await;
+        let scenario = resolution_scenario(
+            &pool,
+            "nucleos-resolver-errored-cap-",
+            "completed",
+            Progress::Committed,
+        )
+        .await;
+        gate(&pool, "errored").await;
+        sqlx::query("UPDATE vcs_requests SET resolution_attempts = ? WHERE id = ?")
+            .bind(MAX_RESOLUTION_ATTEMPTS)
+            .bind(scenario.request)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(release_unfinished(&pool).await, 0);
+        land_finished(&pool, &mut Default::default()).await;
+
+        assert!(admitted_resolutions(&pool, &scenario).await.is_empty());
+        let summaries = resolution_failed_summaries(&pool).await;
+        assert_eq!(summaries.len(), 1, "{summaries:?}");
+        assert!(summaries[0].contains("errored"), "{}", summaries[0]);
     }
 
     /// A resolution run that ended without a merge the queue could land used to vanish: not handed

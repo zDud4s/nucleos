@@ -45,7 +45,12 @@ pub(super) async fn filter_rewrite(
     tool_name: &str,
     tool_input: &Value,
 ) -> Option<Value> {
-    if !state.run_handles.lock().ok()?.contains_key(&run_id) {
+    if !state
+        .run_handles
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains_key(&run_id)
+    {
         return None;
     }
     let project_id: Option<String> =
@@ -164,7 +169,11 @@ pub(super) async fn pretooluse_decision_from(
     // Validate run_id against runs actually in flight before trusting anything derived from it (spec
     // §3.4 — the hook's environment sits inside the same cooperative trust model as the token, so the
     // core never blindly trusts what the hook sends).
-    let is_in_flight = state.run_handles.lock().unwrap().contains_key(&run_id);
+    let is_in_flight = state
+        .run_handles
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains_key(&run_id);
 
     // `mode` is resolved for EVERY request, in flight or not, because it decides WHICH set of rules
     // applies — and a run that has left `run_handles` is exactly when defaulting to `real` is most
@@ -1452,7 +1461,7 @@ mod tests {
         state
             .run_handles
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(run_id, task.abort_handle());
         run_id
     }
@@ -1780,7 +1789,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status, "running");
-        assert!(state.run_handles.lock().unwrap().contains_key(&run_id));
+        assert!(
+            state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&run_id)
+        );
     }
 
     /// A command that writes a file by redirection: unrecognized by the classifier, so a
@@ -1831,7 +1846,13 @@ mod tests {
         assert_ne!(status, "awaiting_approval");
         assert_eq!(status, "running");
         assert_eq!(approvals, 0);
-        assert!(state.run_handles.lock().unwrap().contains_key(&run_id));
+        assert!(
+            state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&run_id)
+        );
     }
 
     /// Regression guard: a docs branch may write a declared file in an allowed docs directory.

@@ -114,6 +114,8 @@ tests:
     # Smoke-tests an installed Linux .deb/.rpm inside a clean container; only the release workflow
     # runs it, on real release assets.
     - scripts/smoke-bundle.sh
+    # Dependabot's own config, read by GitHub, not by any test or gate.
+    - .github/dependabot.yml
     - docs/
     - design/
     - .githooks/

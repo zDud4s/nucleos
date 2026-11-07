@@ -431,6 +431,12 @@ const RUNS_ON_OPEN = new Set([
   "appx", "appxbundle", "msix", "msixbundle", "application", "gadget", "inf", "ins", "isp", "jnlp",
   "msu", "mst", "scf", "sct", "ws", "wsc", "chm", "ps1xml", "ps2", "psc1", "psc2", "psd1", "pyw",
   "settingcontent-ms", "library-ms", "search-ms",
+  // Office types that run code or fetch it (macro-enabled files, add-ins, query files).
+  "xll", "wll", "diagcab", "xbap", "iqy", "slk", "vsto", "docm", "xlsm", "pptm", "dotm", "xltm",
+  "potm", "ppam", "xlam",
+  // macOS and Linux launchers.
+  "command", "terminal", "app", "desktop", "sh", "pkg", "dmg", "workflow", "action", "run", "bash",
+  "zsh", "appimage", "deb", "rpm",
 ]);
 
 /** Whether opening this name would run it rather than show it. */
