@@ -4508,10 +4508,25 @@ pub mod tests {
         let mirror = std::sync::Arc::new(std::sync::Mutex::new(None));
 
         let _guard = mirror_context_fill(&pool, 44001, std::sync::Arc::clone(&mirror));
+        // Polled rather than slept: a fixed wait fails on a loaded machine whose periodic task is
+        // late, and costs three seconds of wall time on an idle one.
+        async fn wait_for_fill(pool: &sqlx::SqlitePool, fill: i64) {
+            for _ in 0..500 {
+                let seen: Option<i64> =
+                    sqlx::query_scalar("SELECT context_fill FROM runs WHERE id = 44001")
+                        .fetch_one(pool)
+                        .await
+                        .unwrap();
+                if seen == Some(fill) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
         *mirror.lock().unwrap() = Some(190_000);
-        tokio::time::sleep(CONTEXT_FILL_PERSIST_INTERVAL * 3).await;
+        wait_for_fill(&pool, 190_000).await;
         *mirror.lock().unwrap() = Some(40_000); // it compacted
-        tokio::time::sleep(CONTEXT_FILL_PERSIST_INTERVAL * 3).await;
+        wait_for_fill(&pool, 40_000).await;
 
         let (fill, peak): (Option<i64>, Option<i64>) =
             sqlx::query_as("SELECT context_fill, context_peak FROM runs WHERE id = ?")
