@@ -415,6 +415,103 @@ pub(super) async fn relaunch_node(
     }
 }
 
+// ----- revive an orphaned working branch -----
+
+/// The branch states in which an agent is expected to be running, so a node with none is orphaned.
+const REVIVABLE_STATES: [&str; 2] = ["fixing", "building"];
+
+/// Why [`revive_orphan`] started nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ReviveError {
+    /// The node or its tree job does not exist, or the node tops no branch.
+    NotFound(String),
+    /// The branch is not in a state that may be revived, or its node still has a live run.
+    Refused(String),
+    /// Reading or starting failed.
+    Failed(String),
+}
+
+impl std::fmt::Display for ReviveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (Self::NotFound(text) | Self::Refused(text) | Self::Failed(text)) = self;
+        f.write_str(text)
+    }
+}
+
+/// Starts again the agent of a branch that is working (`fixing` or `building`) but whose node has
+/// no live run, by the path the driver uses: the node's base launch (the node packet, with its
+/// worktree cwd, mode and project) plus the owner's optional `owner_prompt`, under `key`. A
+/// dropped, parked, done or any other branch is refused and creates no run. The key replays: a
+/// second call with the same key returns the first run, even once that run is live.
+pub(super) async fn revive_orphan(
+    state: &AppState,
+    job_id: &str,
+    node_id: &str,
+    key: &str,
+    owner_prompt: Option<&str>,
+) -> Result<i64, ReviveError> {
+    let pool = &state.pool;
+    let failed = |error: sqlx::Error| ReviveError::Failed(error.to_string());
+    let job = store::load(pool, job_id)
+        .await
+        .map_err(|error| ReviveError::Failed(error.to_string()))?
+        .ok_or_else(|| ReviveError::NotFound(format!("tree job {job_id} not found")))?;
+    let branch = job
+        .manifest
+        .branches
+        .values()
+        .find(|branch| branch.node_id.as_deref() == Some(node_id))
+        .ok_or_else(|| {
+            ReviveError::NotFound(format!(
+                "node {node_id} tops no branch of tree job {job_id}"
+            ))
+        })?;
+    if !REVIVABLE_STATES.contains(&branch.state.as_str()) {
+        return Err(ReviveError::Refused(format!(
+            "branch {} is {}; only a fixing or building branch is started again",
+            branch.name, branch.state
+        )));
+    }
+
+    let replayed: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT result FROM tree_transitions WHERE node_id = ? AND transition = ? AND key = ?",
+    )
+    .bind(node_id)
+    .bind(super::node_run::LAUNCH)
+    .bind(key)
+    .fetch_optional(pool)
+    .await
+    .map_err(failed)?;
+    let replay = replayed.flatten().is_some_and(|result| !result.is_empty());
+    if !replay {
+        let run: Option<Option<String>> =
+            sqlx::query_scalar("SELECT run_id FROM work_nodes WHERE id = ?")
+                .bind(node_id)
+                .fetch_optional(pool)
+                .await
+                .map_err(failed)?;
+        if let Some(run_id) = run.flatten()
+            && run_is_live(pool, &run_id).await.map_err(failed)?
+        {
+            return Err(ReviveError::Refused(format!(
+                "node {node_id} still has a live run ({run_id})"
+            )));
+        }
+    }
+
+    let launch = base_launch(pool, node_id)
+        .await
+        .map_err(failed)?
+        .ok_or_else(|| ReviveError::Failed("no launch was stored to start it from".to_owned()))?;
+    let prompt = match owner_prompt.map(str::trim).filter(|text| !text.is_empty()) {
+        Some(text) => format!("{}\n\nThe owner says: {text}", launch.prompt),
+        None => launch.prompt.clone(),
+    };
+    start_again(state, &launch, key, prompt)
+        .await
+        .map_err(ReviveError::Failed)
+}
+
 // ----- answer and relaunch -----
 
 #[derive(Debug, Clone, PartialEq, Eq)]
