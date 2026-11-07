@@ -1009,8 +1009,8 @@ mod tests {
             ("needed", 0.1),
             ("avoidable", 0.95),
         ];
-        let judge = VerdictJudge::answering_keys_slowly(Duration::from_millis(1500), &keys);
-        let state = judged_state(judge).await;
+        let judge = VerdictJudge::answering_keys_slowly(Duration::from_millis(300), &keys);
+        let state = judged_state(judge.clone()).await;
         let run_id = resolving_run(&state, "enforce").await;
         sqlx::query("UPDATE runs SET judge = 'enforce' WHERE id = ?")
             .bind(run_id)
@@ -1018,15 +1018,12 @@ mod tests {
             .await
             .unwrap();
         let app = test_router(state.clone());
-        let started = std::time::Instant::now();
 
         let decision = decide(&app, &bash(run_id, PARKED)).await;
 
-        assert!(
-            started.elapsed() < Duration::from_millis(2900),
-            "{:?}",
-            started.elapsed()
-        );
+        // Overlap, not elapsed time: serial calls would never have two in flight, and the count
+        // does not move with the load on the machine.
+        assert_eq!(judge.max_concurrent_calls(), 2);
         assert_eq!(
             decision.reason,
             crate::execution::runs::CONTINUING_WITHOUT_IT

@@ -250,6 +250,21 @@ pub struct ScriptedJudge {
     pub last_state: std::sync::Mutex<Option<String>>,
     /// Spec B: the keys of each call, in order - how a test proves a question was NOT asked.
     asked: std::sync::Mutex<Vec<Vec<&'static str>>>,
+    /// Calls inside `ask` right now, and the most there ever were at once: how a test proves two
+    /// questions overlapped without measuring wall-clock time.
+    in_flight: std::sync::atomic::AtomicUsize,
+    max_in_flight: std::sync::atomic::AtomicUsize,
+}
+
+/// Counts one call as in flight until it is dropped, whether `ask` returns or is cancelled.
+#[cfg(any(test, feature = "testkit"))]
+struct InFlight<'a>(&'a std::sync::atomic::AtomicUsize);
+
+#[cfg(any(test, feature = "testkit"))]
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 #[cfg(any(test, feature = "testkit"))]
@@ -264,6 +279,8 @@ impl ScriptedJudge {
             calls: Default::default(),
             last_state: Default::default(),
             asked: Default::default(),
+            in_flight: Default::default(),
+            max_in_flight: Default::default(),
         })
     }
 
@@ -292,6 +309,11 @@ impl ScriptedJudge {
         self.calls.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// The most calls that were inside `ask` at the same moment.
+    pub fn max_concurrent_calls(&self) -> usize {
+        self.max_in_flight.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     pub fn asked_keys(&self) -> Vec<Vec<&'static str>> {
         self.asked.lock().unwrap().clone()
     }
@@ -306,6 +328,10 @@ impl Judge for ScriptedJudge {
 
     async fn ask(&self, state: &str, questions: &[Question]) -> Result<Answers, JudgeError> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let now = self.in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let _in_flight = InFlight(&self.in_flight);
+        self.max_in_flight
+            .fetch_max(now, std::sync::atomic::Ordering::SeqCst);
         *self.last_state.lock().unwrap() = Some(state.to_owned());
         self.asked
             .lock()
