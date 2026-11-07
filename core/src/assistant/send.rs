@@ -1694,10 +1694,9 @@ mod tests {
 
     /// The prompts of a chat's assistant turns, oldest first, polled until there are `at_least`.
     async fn prompts_of(pool: &SqlitePool, chat: &str, at_least: usize) -> Vec<String> {
-        // Polls the observable state (the run rows) until it holds; the deadline is only a hang
-        // guard, generous because a loaded machine can starve the spawned send for many seconds.
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         let mut asked = Vec::new();
+        // Hang guard only: a loaded machine can starve the task for a long while.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while std::time::Instant::now() < deadline {
             asked = sqlx::query_scalar(
                 "SELECT prompt FROM runs WHERE chat_id = ? AND mode = 'assistant' ORDER BY id",
@@ -1728,7 +1727,9 @@ mod tests {
     /// again right after the status flips can still meet "a turn is already in progress". The chat
     /// is read off the row, so no call site can forget to wait for it.
     async fn settled(pool: &SqlitePool, id: i64) {
-        for _ in 0..500 {
+        // Hang guard only: a loaded machine can starve the task for a long while.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             let row: (String, Option<String>) =
                 sqlx::query_as("SELECT status, chat_id FROM runs WHERE id = ?")
                     .bind(id)
@@ -1740,7 +1741,9 @@ mod tests {
                 // after this returns can still see "a turn is already in progress". Wait for the
                 // slot too, bounded and silent: a test may hold the slot itself on purpose.
                 if let Some(chat) = row.1 {
-                    for _ in 0..100 {
+                    // Hang guard only: a loaded machine can starve the task for a long while.
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                    while std::time::Instant::now() < deadline {
                         if !is_busy(&chat) {
                             break;
                         }
@@ -2443,7 +2446,9 @@ mod tests {
         let turn = send_message(&state, &chat, "slow one", Origin::Shell)
             .await
             .unwrap();
-        for _ in 0..300 {
+        // Hang guard only: a loaded machine can starve the task for a long while.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             if state
                 .run_handles
                 .lock()
@@ -2515,7 +2520,9 @@ mod tests {
         let turn = send_message(&state, &chat, "slow one", Origin::Shell)
             .await
             .unwrap();
-        for _ in 0..300 {
+        // Hang guard only: a loaded machine can starve the task for a long while.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             if state
                 .run_handles
                 .lock()
@@ -3008,7 +3015,9 @@ mod tests {
     async fn last_user_message_seen(
         seen: &Arc<std::sync::Mutex<Vec<Vec<serde_json::Value>>>>,
     ) -> Option<String> {
-        for _ in 0..200 {
+        // Hang guard only: a loaded machine can starve the task for a long while.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             if let Some(first) = seen.lock().unwrap().first() {
                 return first
                     .iter()
@@ -3112,7 +3121,9 @@ mod tests {
         );
         assert_eq!(asked[1], typed, "runs.prompt stays typed after a drain");
         let mut handed = String::new();
-        for _ in 0..200 {
+        // Hang guard only: a loaded machine can starve the task for a long while.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             handed = fake.last_prompt.lock().unwrap().clone().unwrap_or_default();
             if handed.contains(model_text) {
                 break;
@@ -3336,7 +3347,9 @@ mod tests {
             .unwrap();
 
         let mut seen = String::new();
-        for _ in 0..200 {
+        // Hang guard only: a loaded machine can starve the task for a long while.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             seen = runner
                 .last_prompt
                 .lock()
@@ -3390,7 +3403,9 @@ mod tests {
         let moving = tokio::spawn(async move {
             crate::assistant::chat_move::begin(&st, &c, When::AfterTurn, "t-1").await
         });
-        for _ in 0..100 {
+        // Hang guard only: a loaded machine can starve the task for a long while.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             if transfer::gate(&state.pool, &chat).await == Gate::Frozen {
                 break;
             }
@@ -3407,7 +3422,7 @@ mod tests {
         assert!(!moving.is_finished(), "the move must wait for the turn");
         assert!(is_busy(&chat));
 
-        let begun = tokio::time::timeout(Duration::from_secs(10), moving)
+        let begun = tokio::time::timeout(Duration::from_secs(60), moving)
             .await
             .expect("the move should end with the turn")
             .unwrap()
