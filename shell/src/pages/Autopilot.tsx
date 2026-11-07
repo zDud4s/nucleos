@@ -864,7 +864,10 @@ function ProjectCarousel({
           </p>
         </Teach>
       )}
-      {!answered && <Skeleton label="Reading the roster" lines={3} />}
+      {/* The fan stage's own height (card + its room), so the cards drop in without a jump. */}
+      {!answered && (
+        <Skeleton label="Reading the roster" variant="block" height="calc(316px + 4rem)" />
+      )}
       {focused !== undefined && (
         <>
           {/* The setting leads, in the document and on the screen: project, mode, switch. The fan
@@ -1422,7 +1425,13 @@ function ShadowReviewPanel({
       {projectId !== null &&
         !decisions.isError &&
         decisions.data === undefined && (
-          <Skeleton label="Reading the shadow decisions" lines={3} />
+          <Skeleton
+            label="Reading the shadow decisions"
+            variant="cards"
+            count={2}
+            gridClassName="ap-list"
+            height="13rem"
+          />
         )}
       {rows.length > 0 && (
         <ul className="ap-list" aria-label="Shadow decisions">
@@ -1580,7 +1589,7 @@ function ScoreboardPanel({
       {projectId !== null &&
         !scoreboard.isError &&
         scoreboard.data === undefined && (
-          <Skeleton label="Reading the scoreboard" lines={3} />
+          <Skeleton label="Reading the scoreboard" variant="table" count={4} columns={8} />
         )}
       {evidence.length > 0 && (
         <TallyTable label="Shadow evidence" rows={evidence} projectMode={project?.mode} />
@@ -1810,9 +1819,8 @@ function TriggerKills() {
       {kills.isError && kills.data === undefined && (
         <ListError error={kills.error} what="the trigger brakes" />
       )}
-      {!kills.isError && kills.data === undefined && (
-        <Skeleton label="Reading the trigger brakes" lines={2} />
-      )}
+      {/* No skeleton: the rows below are fixed (the scopes are a constant) and already hold their
+          place, with the buttons disabled until the read lands. A bar above them only shifted them. */}
       <Rows label="Trigger brakes">
         {TRIGGER_SCOPES.map((scope) => {
           const engaged = scopeEngaged(kills.data, "trigger", scope.id);

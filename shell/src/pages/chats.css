@@ -1645,6 +1645,17 @@
  * are here" and one meaning "it is there". Not a state tone either — one meaning per tone, and
  * "this is the one you asked for" says where the reader is, not what state the turn is in.
  */
+/* The transcript's loading skeleton: the same column, gap and bottom anchoring as `.chats-turns`. */
+.chats-scroll > .ui-skeleton {
+  margin: auto 0 var(--space-6);
+}
+.ui-skeleton-grid.chats-turns {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-7);
+  margin: 0;
+}
+
 .chats-turn-lit {
   border-radius: var(--radius-md);
   outline: 2px solid var(--border-strong);

@@ -78,7 +78,19 @@ export function TeamRunDetail() {
         {run.isError ? (
           <DetailError error={run.error} onRetry={() => void run.refetch()} />
         ) : (
-          <Skeleton label="Loading the run" variant="cards" count={2} />
+          // The strip's own frame and tracks, then the panel under it: the run lands in place.
+          <>
+            <div className="teams-strip-frame">
+              <Skeleton
+                label="Loading the run"
+                variant="cards"
+                count={4}
+                gridClassName="teams-strip"
+                height="var(--teams-skeleton-stat, 7rem)"
+              />
+            </div>
+            <Skeleton label="Loading the rounds" variant="block" height="12rem" />
+          </>
         )}
       </>
     );

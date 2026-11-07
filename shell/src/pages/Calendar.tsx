@@ -437,7 +437,18 @@ export function Calendar() {
         {/* Last good data stays up when a refetch fails, but now says how old it is. */}
         {events.isError && rows.length > 0 && <StaleNote dataUpdatedAt={events.dataUpdatedAt} />}
         {events.data === undefined && !events.isError && (
-          <Skeleton label={view === "week" ? "Loading the week…" : "Loading the month…"} lines={8} />
+          // The grid's own geometry: the week's heads plus its 48rem body, or the month's
+          // weekday strip over six rows of 7 day cells at the cell height.
+          view === "week" ? (
+            <Skeleton label="Loading the week…" variant="block" height="calc(48rem + 1.75rem)" />
+          ) : (
+            <Skeleton
+              label="Loading the month…"
+              variant="cards"
+              count={42}
+              gridClassName="calendar-skeleton-month"
+            />
+          )
         )}
         {events.data !== undefined &&
           (view === "week" ? (

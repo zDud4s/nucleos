@@ -420,7 +420,8 @@ export function SessionColumn({
       )}
 
       <div className="chats-rail-scroll">
-        {!answered && <Skeleton label="Reading your conversations…" lines={3} />}
+        {/* The list's own row height (a 2-line-height row plus its padding), flat like the rows. */}
+        {!answered && <Skeleton label="Reading your conversations…" variant="row" count={8} height="2.25rem" />}
         {answered && rows.length === 0 && editors.length === 0 && groups.length === 0 && (
           <Teach title="No conversations yet">
             <p>Say something to start one: press New conversation above and write in the box.</p>

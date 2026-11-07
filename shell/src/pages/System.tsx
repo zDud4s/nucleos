@@ -304,7 +304,9 @@ function SpendSummary() {
       {budget.isError && budget.data === undefined && (
         <SystemListError error={budget.error} what="the budget" />
       )}
-      {!budget.isError && budget.data === undefined && <Skeleton label="Reading the budget" lines={2} />}
+      {!budget.isError && budget.data === undefined && (
+        <Skeleton label="Reading the budget" variant="cards" count={2} gridClassName="sy-spend-skeleton" height="1.75rem" />
+      )}
       {budget.data !== undefined && budget.data.paused && (
         <Notice tone="paused" role="status">
           Autonomous work is currently held: {budget.data.reason}
@@ -381,7 +383,11 @@ function HealthReadoutPanel({
   return (
     <Panel title="Subsystems" aside={aside}>
       {health.data === undefined && !health.isError && (
-        <Skeleton label="Reading the subsystems" variant="row" count={3} />
+        <>
+          {/* The stat strip's five tracks, then the three fixed attention rows (2.5rem each). */}
+          <Skeleton label="Reading the subsystems" variant="cards" count={5} gridClassName="sy-stats-skeleton" height="2.75rem" />
+          <Skeleton label="Reading the subsystems" variant="row" count={3} height="2.5rem" />
+        </>
       )}
       {health.isError && health.data === undefined && (
         <HealthError error={health.error} />
@@ -952,7 +958,7 @@ function BudgetPanel() {
         <SystemListError error={budget.error} what="the budget" />
       )}
       {!budget.isError && budget.data === undefined && (
-        <Skeleton label="Reading the budget" lines={2} />
+        <Skeleton label="Reading the budget" variant="row" count={9} height="2.75rem" />
       )}
       {budget.data !== undefined && budget.data.paused && (
         <Notice tone="paused" role="status">
@@ -1234,7 +1240,9 @@ function SpacePanel() {
       {storage.isError && space === undefined && (
         <SystemListError error={storage.error} what="the space readout" />
       )}
-      {!storage.isError && space === undefined && <Skeleton label="Reading the space used" lines={2} />}
+      {!storage.isError && space === undefined && (
+        <Skeleton label="Reading the space used" variant="cards" count={4} gridClassName="sy-space-cards" height="4.5rem" />
+      )}
       {space !== undefined && (
         <>
           <div className="sy-space-cards">
@@ -1401,7 +1409,7 @@ function BackupsPanel() {
         <SystemListError error={backups.error} what="the backups" />
       )}
       {!backups.isError && backups.data === undefined && (
-        <Skeleton label="Reading the backups" variant="row" count={3} />
+        <Skeleton label="Reading the backups" variant="row" count={3} height="3.25rem" />
       )}
       {backups.data !== undefined && backups.data.length > 0 && (
         <Rows label="Backups">
@@ -1663,7 +1671,7 @@ function TokensPanel() {
         <SystemListError error={tokens.error} what="the API tokens" />
       )}
       {!tokens.isError && tokens.data === undefined && (
-        <Skeleton label="Reading the tokens" variant="row" count={3} />
+        <Skeleton label="Reading the tokens" variant="row" count={3} height="3.25rem" />
       )}
       {tokens.data !== undefined && tokens.data.length === 0 && (
         <Quiet says="no token has been minted." />

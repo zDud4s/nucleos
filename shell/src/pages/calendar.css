@@ -244,6 +244,18 @@
    fires: a flex item's default minimum is its content, so the truncation is
    only reachable once every ancestor has agreed to be narrower than what is
    inside it. */
+/* The month's loading skeleton: the grid's seven tracks and the day cell's height, under
+   room for the weekday strip. */
+.ui-skeleton-grid.calendar-skeleton-month {
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 1px;
+  margin-top: 1.5rem;
+}
+.ui-skeleton-grid.calendar-skeleton-month > .ui-skeleton-card {
+  min-height: clamp(4.25rem, calc((100dvh - 19rem) / 6), 6.5rem);
+  border-radius: 0;
+}
+
 .calendar-cell {
   display: flex;
   min-width: 0;

@@ -692,7 +692,13 @@ function EditorDetail({
       <section className="chats-detail-inner">
         <div className="chats-scroll">
           {sessions.data === undefined && !sessions.isError ? (
-            <Skeleton label="Reading your editor sessions" variant="row" count={4} />
+            <Skeleton
+              label="Reading your editor sessions"
+              variant="cards"
+              count={3}
+              gridClassName="chats-turns"
+              height="5rem"
+            />
           ) : (
             <ErrorNote>
               that conversation is not on this machine any more
@@ -1141,7 +1147,13 @@ function ChatDetail({
           <TranscriptError error={transcript.error} />
         )}
         {!transcript.isError && transcript.data === undefined && (
-          <Skeleton label="Reading the conversation" variant="row" count={4} />
+          <Skeleton
+            label="Reading the conversation"
+            variant="cards"
+            count={3}
+            gridClassName="chats-turns"
+            height="5rem"
+          />
         )}
         {transcript.data !== undefined &&
           !(unrooted && transcript.data.turns.length === 0 && transcript.data.notices.length === 0) && (

@@ -29,7 +29,7 @@ export interface SkeletonProps {
   columns?: number;
   /** CSS width of a `line` / `block`. */
   width?: string;
-  /** CSS height of a `block`. */
+  /** CSS height of a `block`; for `row`, each row's height, drawn flush and ruled like a form's rows. */
   height?: string;
   /** Diameter in px of an `avatar`. Defaults to 32. */
   size?: number;
@@ -121,9 +121,12 @@ export function Skeleton({
       break;
     case "row":
       shape = (
-        <div className="ui-skeleton-rows" aria-hidden="true">
+        <div
+          className={height ? "ui-skeleton-rows ui-skeleton-rows-ruled" : "ui-skeleton-rows"}
+          aria-hidden="true"
+        >
           {Array.from({ length: n(count, 3) }, (_, i) => (
-            <span key={i} className="ui-skeleton-row">
+            <span key={i} className="ui-skeleton-row" style={height ? { minHeight: height } : undefined}>
               <span className="ui-skeleton-avatar" style={{ width: "1.25rem", height: "1.25rem" }} />
               <span className="ui-skeleton-bar" style={{ flex: 1 }} />
               <span className="ui-skeleton-bar" style={{ width: "4rem" }} />

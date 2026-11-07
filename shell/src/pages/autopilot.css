@@ -153,6 +153,12 @@
   list-style: none;
 }
 
+/* The loading skeleton of a list: the same single column as the cards it stands in for. */
+.ui-skeleton-grid.ap-list {
+  display: flex;
+  flex-direction: column;
+}
+
 /* ------------------------------------------------------ the project's name -- */
 
 /* The project a panel is about, beside the panel's title (the shadow review, the scoreboard). */

@@ -4316,6 +4316,18 @@ span.ui-skeleton-avatar {
   flex-direction: column;
   gap: var(--space-3);
 }
+/* Rows of a given height: no gap, a hairline under each, as the rows of a form or a list have. */
+.ui-skeleton-rows.ui-skeleton-rows-ruled {
+  gap: 0;
+}
+.ui-skeleton-rows-ruled .ui-skeleton-row {
+  box-sizing: border-box;
+  padding: var(--space-1) 0;
+}
+/* Inside a panel the rows are ruled (forms, token and backup lists); in a sidebar they are flat. */
+.ui-panel .ui-skeleton-rows-ruled .ui-skeleton-row {
+  border-bottom: 1px solid var(--border);
+}
 .ui-skeleton-row {
   display: flex;
   width: 100%;

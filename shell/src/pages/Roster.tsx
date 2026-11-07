@@ -137,7 +137,14 @@ export function Roster() {
         projects.isError ? (
           <RosterError error={projects.error} onRetry={() => void projects.refetch()} />
         ) : (
-          <Skeleton label="Loading the projects" variant="row" count={4} />
+          // The filter strip (30rem max, as `Filtered` draws it), then the group's rows at their
+          // `py-3` two-line height inside the same rounded surface.
+          <div className="flex flex-col gap-4">
+            <Skeleton label="Loading the projects" variant="block" width="min(30rem, 100%)" height="2.25rem" />
+            <div className="rounded-lg bg-surface">
+              <Skeleton label="Loading the project rows" variant="row" count={5} height="4.25rem" />
+            </div>
+          </div>
         )
       ) : rows.length === 0 ? (
         <Teach
