@@ -1,3 +1,4 @@
+mod background;
 mod cli;
 mod http;
 // `route_index` moved up from `nucleos-core` on 2026-11-02: only `http` reads it.
@@ -41,16 +42,42 @@ const OPENROUTER_KEY: &str = "openrouter-api-key";
 /// the engine row's gate reads the same credential from the library crate.
 const GEMINI_KEY: &str = nucleos_core::engines::GEMINI_KEY;
 
+/// The configured role controls shared-machine work, independently of development-instance mode.
+fn starts_channel_sidecar(is_primary_instance: bool, machine: &config::MachineConfig) -> bool {
+    is_primary_instance && machine.role == config::MachineRole::Primary
+}
+
+/// Scheduled routine loops belong to the configured primary machine, not the development instance.
+fn runs_scheduled_routine(machine: &config::MachineConfig) -> bool {
+    machine.role == config::MachineRole::Primary
+}
+
 /// A machine-scoped document from the settings snapshot, or its default when none is stored.
 fn machine_doc<T: settings::Document + Default>() -> T {
     (*settings::get::<T>(&settings::Scope::Machine)).clone()
 }
 
-#[tokio::main]
-async fn main() {
+fn main() -> std::process::ExitCode {
+    // Before anything spawns: reads the supervised marker and keeps it out of every child's
+    // environment (`relaunch::take_supervised_marker`). This must happen before Tokio creates
+    // worker threads because environment mutation is process-global.
+    relaunch::take_supervised_marker();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build the Tokio runtime")
+        .block_on(daemon_main())
+}
+
+async fn daemon_main() -> std::process::ExitCode {
     http::remember_home();
+    // The relauncher a restarted daemon spawns (`relaunch.rs`): first, because it must start
+    // nothing but the daemon it relaunches.
+    if let Some(code) = relaunch::dispatch(&std::env::args_os().collect::<Vec<_>>()) {
+        std::process::exit(code);
+    }
     if cli::run_subcommand().await {
-        return;
+        return std::process::ExitCode::SUCCESS;
     }
 
     // The offline recovery commands (`--settings-reset`, `--settings-rollback`) are answered here and exit: they
@@ -93,6 +120,13 @@ async fn main() {
 
     let log_dir = data_dir.join("logs");
     let _log_guard = logging::init(&log_dir);
+    // The executable a swap replaced waits here to be deleted; a supervisor still running from it
+    // keeps it locked, and then it goes at a later start.
+    if let Ok(exe) = std::env::current_exe()
+        && let Err(error) = relaunch::clean_old(&exe)
+    {
+        tracing::info!(%error, "could not remove the replaced executable yet");
+    }
 
     // Something that answers on a taken port must make this process leave before it touches
     // anything: the startup below marks the live runs of whoever owns the port as `interrupted`,
@@ -202,6 +236,11 @@ async fn main() {
             None
         }
     };
+    // Projects wired by an older daemon keep its hook script and its timeout until rewritten.
+    match governance::autopilot::rewire_wired_projects(&pool).await {
+        Ok(count) => tracing::info!("rewired the classifier hook in {count} project(s)"),
+        Err(error) => tracing::warn!("could not rewire the wired projects: {error}"),
+    }
     startup::install_agents(&pool, is_primary).await;
     startup::refresh_wired_hooks(&pool, is_primary).await;
 
@@ -271,6 +310,7 @@ async fn main() {
     // Still a file: the remote pairing is not a settings document.
     let machine_file = |file: &str| machine_config_root.as_ref().map(|root| root.join(file));
 
+    let machine_config: config::MachineConfig = machine_doc();
     let models_config: config::ModelsConfig = machine_doc();
     // The owner's saved choice (Settings) wins over the file, which is the default of an untouched
     // install; `embed::install` is called again by the settings door when the choice changes.
@@ -388,6 +428,10 @@ async fn main() {
     // Startup copy: ingestion keeps it for the run; the findings routes read the snapshot per request.
     let devtime_config: config::DevtimeConfig = machine_doc();
     let verify_config: config::VerifyConfig = machine_doc();
+    let keep_awake_config: config::KeepAwakeConfig = machine_doc();
+    let background_config: config::BackgroundConfig = machine_doc();
+    // Read once for the run, like the rest: the reaper consults it for every kept process.
+    assistant::set_background_silence(background_config.background_silence_hours);
     let web_config: config::WebConfig = machine_doc();
     let remote_config = machine_file(remote::REMOTE_FILE)
         .as_deref()
@@ -901,13 +945,18 @@ async fn main() {
         "nucleos-core listening on {}",
         listener.local_addr().unwrap()
     );
-    // Every sidecar below is gated on this, and the reason is not tidiness. Secrets live in
+    // The development-instance switch gates this process's sidecars and remains separate from the
+    // configured machine role. Secrets live in
     // Windows Credential Manager, which is NOT under the data directory — so a secondary instance
     // with its own empty database still loads the real Telegram bot token and the real mail
     // password. Two supervised telegram sidecars poll one account and answer every message twice;
     // two browser or web sidecars fight over the same fixed ports. A second daemon is for
     // exercising this process's own HTTP and MCP surface, and it does that without any of them.
     let sidecars_wanted = is_primary;
+    // Only channel adapters consume shared inboxes. Other sidecars keep their established startup
+    // behaviour on a secondary machine role.
+    let channel_sidecars_wanted = starts_channel_sidecar(sidecars_wanted, &machine_config);
+    let scheduled_routines_wanted = runs_scheduled_routine(&machine_config);
     let sidecar_path = sidecar::binary(sidecar::ECHO);
     if sidecars_wanted {
         tokio::spawn(sidecar::supervise(
@@ -968,6 +1017,9 @@ async fn main() {
     // The remote gateway. Armed <=> `remote.yaml` enables it AND validates; every other outcome
     // deletes the gateway's key, so a half-configured or switched-off install authenticates nothing.
     // Only the key minted for `Service::Remote` reaches the child — never the control token.
+    if sidecars_wanted {
+        remote::setup::allow_gateway();
+    }
     let remote_valid = match remote_config.validate() {
         Ok(()) => true,
         Err(error) => {
@@ -978,27 +1030,21 @@ async fn main() {
     if remote_config.enabled && remote_valid {
         match auth::mint_service_token(&state.pool, auth::Service::Remote).await {
             Ok(remote_key) => {
-                let dist_dir = match &remote_config.dist_dir {
-                    Some(dir) => dir.clone(),
-                    None => std::env::current_exe()
-                        .ok()
-                        .and_then(|exe| exe.parent().map(|dir| dir.join("dist-remote")))
-                        .map(|dir| dir.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "dist-remote".to_string()),
-                };
+                let dist_dir = std::env::current_exe()
+                    .ok()
+                    .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+                    .map(|dir| remote::setup::resolve_dist_dir(&remote_config, &dir))
+                    .unwrap_or_else(|| "dist-remote".into())
+                    .to_string_lossy()
+                    .into_owned();
                 let env = sidecar::remote_env(
                     &daemon_client::daemon_url(),
                     &remote_key,
                     &remote_config,
                     &dist_dir,
                 );
-                if sidecars_wanted {
-                    tokio::spawn(sidecar::supervise(
-                        sidecar::REMOTE.to_string(),
-                        sidecar::binary(sidecar::REMOTE),
-                        env,
-                    ));
-                }
+                // Tracked, so the setup wizard can replace or stop it later.
+                remote::setup::launch_gateway(env);
                 tracing::info!(origin = %remote_config.public_origin, "remote gateway supervised");
             }
             Err(error) => {
@@ -1039,26 +1085,7 @@ async fn main() {
 
         // Retention. Hourly rather than on a timer tied to reads: a cache that is never read again
         // must still empty, or "30 days" means "30 days after the last time anyone looked".
-        let retention_state = state.clone();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3600));
-            loop {
-                ticker.tick().await;
-                match integrations::web::prune(
-                    &retention_state.pool,
-                    retention_state.web.retain_pages_days,
-                    chrono::Utc::now(),
-                )
-                .await
-                {
-                    Ok(0) => {}
-                    Ok(pruned) => tracing::info!(pruned, "web: pages past the retention window"),
-                    // Best-effort, like the activity feed: a failed sweep is a full disk later, not
-                    // a reason to take the daemon down now.
-                    Err(error) => tracing::warn!(%error, "web: retention sweep failed"),
-                }
-            }
-        });
+        background::spawn_web_retention_loop(state.clone());
     }
     // The v1 Telegram supervisor is gone on purpose: the channel registry launches the v2 adapter
     // (`channels::registry::launch_all`, below). Two supervisors on one bot would both long-poll
@@ -1085,37 +1112,21 @@ async fn main() {
     });
     // Retries the finish intents a pass left (disk short) or a busy claim skipped.
     tokio::spawn(spec_backlog::finish::run_sweep_loop(state.clone()));
-    tokio::spawn(execution::scheduler::run_scheduler(state.clone()));
-    tokio::spawn({
-        let state = state.clone();
-        async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
-            loop {
-                ticker.tick().await;
-                match conductor::sweep::daemon_observations(&state).await {
-                    Ok(observed) => {
-                        if let Err(error) = conductor::sweep::tick(
-                            &state,
-                            &observed,
-                            &conductor::liveness::Limits::default(),
-                            chrono::Utc::now(),
-                        )
-                        .await
-                        {
-                            tracing::warn!(%error, "conductor liveness sweep failed");
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "could not collect conductor observations")
-                    }
-                }
-            }
-        }
-    });
-    // Its own loop, not a step inside the scheduler's: a job pass can sit inside `run_gate` for the
-    // whole gate timeout, and sharing a loop would stall every scheduled rule in the daemon behind
-    // one project's test suite.
-    tokio::spawn(execution::job::run_job_loop(state.clone()));
+    if scheduled_routines_wanted {
+        tokio::spawn(execution::scheduler::run_scheduler(state.clone()));
+    }
+    background::spawn_conductor_liveness_loop(state.clone());
+    if scheduled_routines_wanted {
+        // Its own loop, not a step inside the scheduler's: a job pass can sit inside `run_gate` for the
+        // whole gate timeout, and sharing a loop would stall every scheduled rule in the daemon behind
+        // one project's test suite.
+        tokio::spawn(execution::job::run_job_loop(state.clone()));
+    }
+    // Holds the machine awake while a run is live (setting `keep_awake_while_working`, on by default).
+    tokio::spawn(shutdown::run_keep_awake_loop(
+        state.pool.clone(),
+        keep_awake_config.keep_awake_while_working,
+    ));
     // AFTER `execution::runs::reconcile_orphaned_runs`, which ran near the top of this function and is what
     // marks the abandoned subprocesses `interrupted` — the ordering this depends on, and the same
     // one `execution::job::reconcile_orphaned_jobs` respects. Awaited rather than spawned, so the loop below
@@ -1129,12 +1140,14 @@ async fn main() {
     // its own.
     tokio::spawn(team::run_team_loop(state.clone()));
     tokio::spawn(team::run_workspace_gc_loop(state.clone()));
-    // A third loop and not a branch in either of the two above. What DECIDES that a department
-    // starts is a different question from how it runs — the same separation `scheduler.rs` has from
-    // `job.rs` — and it could not have gone in `scheduler_tick` at all: that loop is per project,
-    // and a department has no project, no root and no HEAD.
-    tokio::spawn(team::trigger::run_team_trigger_loop(state.clone()));
-    tokio::spawn(repo_trigger::run_repo_poller(state.clone()));
+    if scheduled_routines_wanted {
+        // A third loop and not a branch in either of the two above. What DECIDES that a department
+        // starts is a different question from how it runs — the same separation `scheduler.rs` has from
+        // `job.rs` — and it could not have gone in `scheduler_tick` at all: that loop is per project,
+        // and a department has no project, no root and no HEAD.
+        tokio::spawn(team::trigger::run_team_trigger_loop(state.clone()));
+        tokio::spawn(repo_trigger::run_repo_poller(state.clone()));
+    }
     tokio::spawn(execution::worktree::run_gc(state.pool.clone()));
     // Plan 2026-10-17 F1: every session in a rostered project gets the `verify` box, the main
     // checkout's and a worktree added by hand included, unless the owner switched it off.
@@ -1227,7 +1240,9 @@ async fn main() {
     ));
     // Opens the correction run of a `fix/` branch the gate worker prepared; with `revert_on_red` off
     // for every project there is never one, and a pass reads an empty query.
-    tokio::spawn(verify::postgate_worker::run_correction_loop(state.clone()));
+    if scheduled_routines_wanted {
+        tokio::spawn(verify::postgate_worker::run_correction_loop(state.clone()));
+    }
     tokio::spawn(verify::exec::run_executor(verify_executor));
     startup::rearm_verify_wakes(&state).await;
     tokio::spawn(execution::vcs::run_queue_worker(
@@ -1242,7 +1257,9 @@ async fn main() {
     // with: the worker holds a pool and a repository lock, and starting an agent needs an
     // `AppState` and the time an agent takes. The queue escalates and lets go; this picks the
     // conflict up afterwards.
-    tokio::spawn(resolver::run_resolution_loop(state.clone()));
+    if scheduled_routines_wanted {
+        tokio::spawn(resolver::run_resolution_loop(state.clone()));
+    }
     // Only when a local model is already configured, and reusing the triage one rather than adding
     // a key: this reads mail-derived text, which is the text that model was chosen for, and
     // `web.rs` sets the precedent of one local model pinned in one place serving more than one
@@ -1282,14 +1299,16 @@ async fn main() {
     // then launch the adapters: that fills the secrets cache `channel_instances_exist` reads.
     // A secondary daemon (a test run) must not import, and above all must not retire, the
     // machine's v1 files.
-    if sidecars_wanted {
+    if channel_sidecars_wanted {
         channels::telegram_switch::run_or_warn(&state).await;
     }
-    channels::registry::launch_all(&state, sidecars_wanted).await;
+    channels::registry::launch_all(&state, channel_sidecars_wanted).await;
     // Channel loops start only when a channel instance exists (a channel with its secrets present).
     // Seeding runs first so the turn watermark and the routing cursors exist before the first
     // discover/route_once.
-    if !channels::registry::all().is_empty() && channels::registry::channel_instances_exist(&state)
+    if channel_sidecars_wanted
+        && !channels::registry::all().is_empty()
+        && channels::registry::channel_instances_exist(&state)
     {
         let cadence = channels::bus::Cadence::default();
         channels::routing::seed_all(&state).await;
@@ -1359,7 +1378,7 @@ async fn main() {
                                 &email_config,
                                 &password,
                             );
-                            if sidecars_wanted {
+                            if channel_sidecars_wanted {
                                 tokio::spawn(sidecar::supervise(
                                     sidecar::EMAIL.to_string(),
                                     path,
@@ -1393,16 +1412,55 @@ async fn main() {
     // A held long-poll (`/hooks/ask-wait`) would keep graceful shutdown waiting forever, and the
     // old binary alive under the installer; after the deadline the process just leaves. The
     // watchdog runs on its own OS thread, so it outlives the runtime.
-    http::spawn_exit_watchdog(std::time::Duration::from_secs(10), || std::process::exit(0));
+    // A restart leaves with the exit the supervisor relaunches on (`relaunch::exit_code_for_stop`);
+    // any other stop is a plain 0. The relauncher, when there is one, was spawned before the stop.
+    http::spawn_exit_watchdog(std::time::Duration::from_secs(10), || {
+        std::process::exit(relaunch::exit_code_for_stop())
+    });
     axum::serve(listener, app)
         .with_graceful_shutdown(http::shutdown_requested())
         .await
         .unwrap();
+    // Returned, not `exit`ed, so a restart (21) unwinds like a plain stop (0): locals drop, the
+    // runtime drops and its `kill_on_drop` sidecars are killed, the log guard flushes.
+    std::process::ExitCode::from(u8::try_from(relaunch::exit_code_for_stop()).unwrap_or(1))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_secondary_daemon_starts_no_channel_sidecar() {
+        let machine = config::MachineConfig {
+            name: None,
+            role: config::MachineRole::Secondary,
+        };
+
+        assert!(!starts_channel_sidecar(true, &machine));
+    }
+
+    #[test]
+    fn a_secondary_daemon_runs_no_scheduled_routine() {
+        let machine = config::MachineConfig {
+            name: None,
+            role: config::MachineRole::Secondary,
+        };
+
+        assert!(!runs_scheduled_routine(&machine));
+    }
+
+    #[test]
+    fn a_primary_role_on_a_secondary_instance_starts_no_channel_sidecar_but_runs_scheduled_routines()
+     {
+        let machine = config::MachineConfig {
+            name: None,
+            role: config::MachineRole::Primary,
+        };
+
+        assert!(!starts_channel_sidecar(false, &machine));
+        assert!(runs_scheduled_routine(&machine));
+    }
 
     /// Uma equipa que nunca correu nao se desenha como uma tabela vazia.
     ///

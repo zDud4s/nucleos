@@ -10,7 +10,10 @@ import {
 } from "../data/context-refs";
 import { isApiRefusal } from "../data/client";
 import { DAEMON_NAME } from "../copy";
-import type { DroppedFile } from "../data/files";
+import { browserDropsApply, type DroppedFile } from "../data/files";
+
+const BROWSER_DROP_SENTENCE =
+  "A browser cannot tell the main machine where a dropped file lives, so it cannot become a context file. Type its path on the main machine in the field below.";
 import {
   Button,
   ConfirmButton,
@@ -58,6 +61,7 @@ export function ContextRefs({ ownerKind, ownerId }: ContextRefsProps) {
   const add = useAddContextRef(ownerKind, ownerId);
   const [path, setPath] = useState("");
   const [note, setNote] = useState("");
+  const [dropNote, setDropNote] = useState("");
 
   // The drop listener is registered once; it reaches the mutation through a ref.
   const addRef = useRef(add.mutate);
@@ -124,12 +128,26 @@ export function ContextRefs({ ownerKind, ownerId }: ContextRefsProps) {
   }
 
   return (
-    <section className="context-refs" aria-label="Context">
+    <section
+      className="context-refs"
+      aria-label="Context"
+      onDragOver={(event) => {
+        if (browserDropsApply()) event.preventDefault();
+      }}
+      onDrop={(event) => {
+        if (!browserDropsApply()) return;
+        // Only the page's own drop: a context ref is a path on the host, and a browser hands over
+        // a file's bytes and name, never where it lives. Say so rather than add nothing silently.
+        event.preventDefault();
+        setDropNote(BROWSER_DROP_SENTENCE);
+      }}
+    >
       <h3>Context</h3>
       <p className="context-lede">
-        Files and folders this {ownerKind}&rsquo;s runs may read. Type an absolute path, or drop a
-        file or folder on the window.
+        Files and folders this {ownerKind}&rsquo;s runs may read. Type an absolute path
+        {browserDropsApply() ? " on the main machine." : ", or drop a file or folder on the window."}
       </p>
+      {dropNote !== "" && <ErrorNote>{dropNote}</ErrorNote>}
       {body}
       <form className="context-add" onSubmit={submit}>
         <Field label="Path">

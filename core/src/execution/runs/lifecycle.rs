@@ -414,7 +414,15 @@ pub async fn cancel_run(State(state): State<AppState>, Path(id): Path<i64>) -> S
 }
 
 /// A run recovered from orphaned state: (id, project_id, chat_id, mode)
-pub(super) type ReconcileRow = (i64, Option<String>, Option<String>, Option<String>);
+pub(super) type ReconcileRow = (
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    i64,
+);
 
 /// Marks every run still `"running"` as `"interrupted"` — called once at startup to recover from a
 /// daemon crash that left in-flight runs' rows stuck (spec §3.2). Returns how many rows it changed.
@@ -422,12 +430,12 @@ pub async fn reconcile_orphaned_runs(pool: &sqlx::SqlitePool) -> Result<u64, sql
     let now = chrono::Utc::now().to_rfc3339();
     let reconciled: Vec<ReconcileRow> = sqlx::query_as(
         "UPDATE runs SET status = 'interrupted', completed_at = ? WHERE status = 'running'
-         RETURNING id, project_id, chat_id, mode",
+         RETURNING id, project_id, chat_id, mode, origin, from_relay_id, read_untrusted",
     )
     .bind(&now)
     .fetch_all(pool)
     .await?;
-    for (id, project_id, chat_id, mode) in &reconciled {
+    for (id, project_id, chat_id, mode, origin, from_relay_id, read_untrusted) in &reconciled {
         let _ = crate::feed::append(
             pool,
             project_id.as_deref(),
@@ -437,23 +445,42 @@ pub async fn reconcile_orphaned_runs(pool: &sqlx::SqlitePool) -> Result<u64, sql
             Some(&crate::feed::run_subject(pool, *id).await),
         )
         .await;
-        // A chat turn the restart cut says so in its conversation. A failed post never fails the
-        // reconcile: the run is already `interrupted` and the notice is only a courtesy.
-        if let (Some(chat_id), Some("assistant")) = (chat_id.as_deref(), mode.as_deref())
-            && let Err(error) = crate::chats::notices::post_system(
+        // A chat turn the restart cut says so in its conversation, and below the resume limit is
+        // queued to continue (drained at start-up, after this runs). A failed post never fails
+        // the reconcile: the run is already `interrupted` and the notice is only a courtesy.
+        if let (Some(chat_id), Some("assistant")) = (chat_id.as_deref(), mode.as_deref()) {
+            let body = match crate::chats::auto_resume::resume_or_notice(
+                pool,
+                chat_id,
+                crate::chats::auto_resume::CutTurn {
+                    origin: origin.as_deref(),
+                    from_relay_id: *from_relay_id,
+                    read_untrusted: *read_untrusted != 0,
+                },
+            )
+            .await
+            {
+                Ok(body) => body,
+                Err(error) => {
+                    tracing::warn!(run_id = *id, %error, "could not queue the resume of an interrupted turn");
+                    crate::chats::notices::RESTART_NOTICE
+                }
+            };
+            if let Err(error) = crate::chats::notices::post_system(
                 pool,
                 chat_id,
                 crate::chats::notices::KIND_RESTART,
                 *id,
-                crate::chats::notices::RESTART_NOTICE,
+                body,
             )
             .await
-        {
-            tracing::warn!(
-                run_id = *id,
-                %error,
-                "could not tell a conversation its turn was cut by the restart"
-            );
+            {
+                tracing::warn!(
+                    run_id = *id,
+                    %error,
+                    "could not tell a conversation its turn was cut by the restart"
+                );
+            }
         }
     }
     Ok(reconciled.len() as u64)

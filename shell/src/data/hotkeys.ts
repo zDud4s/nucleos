@@ -19,6 +19,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useQuery } from "@tanstack/react-query";
 
+import { pageChord } from "../lib/dictationTarget";
+import { isRemote } from "../remote/host";
 import { useVoiceConfig } from "./voice";
 
 export interface HotkeyRegistration {
@@ -31,6 +33,16 @@ export interface HotkeyRegistration {
 }
 
 async function register(dictation: string, memo: string, conversation: string, capture: string): Promise<HotkeyRegistration> {
+  // A browser tab cannot register OS-wide chords: say so with the same "unavailable" sentence the
+  // Voice page already shows, instead of attempting a host call that can only fail. The chords named
+  // are the ones the page really answers (see `pageChord`).
+  if (isRemote()) {
+    return {
+      unavailable: `In the browser the shortcuts only work while this page is open and focused: dictation ${pageChord(dictation)}, memo ${pageChord(memo)}.`,
+      conflicts: null,
+      failed: false,
+    };
+  }
   // Asked FIRST, and in the same call, because on Wayland the answer is a sentence and the
   // registration must not happen. Sequenced here, "there is a sentence" and "nothing was registered"
   // are the same decision rather than two that could disagree.

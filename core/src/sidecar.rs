@@ -165,6 +165,15 @@ pub fn liveness_of(name: &str) -> Option<Liveness> {
     Some(SIDECARS.lock().ok()?.get(name)?.liveness())
 }
 
+/// Drops `name` from the registry, for a sidecar its owner stopped on purpose. An aborted supervisor
+/// never writes `down` itself, so without this the row would read `running` for a process that is
+/// gone. `None` from [`liveness_of`] is the honest reading: nobody supervises it now.
+pub fn forget(name: &str) {
+    if let Ok(mut sidecars) = SIDECARS.lock() {
+        sidecars.remove(name);
+    }
+}
+
 fn record(name: &str, update: impl FnOnce(&mut SidecarState)) {
     let mut sidecars = SIDECARS.lock().unwrap();
     let entry = sidecars
@@ -1327,5 +1336,17 @@ mod tests {
             .expect("the sidecar outlived its lifeline")
             .expect("wait");
         assert!(status.success(), "{status}");
+    }
+
+    #[test]
+    fn a_forgotten_sidecar_has_no_row() {
+        let name = "forget-test-sidecar";
+        record(name, |entry| entry.state = RUNNING);
+        assert_eq!(liveness_of(name), Some(Liveness::Running));
+        forget(name);
+        assert_eq!(liveness_of(name), None);
+        assert!(states().iter().all(|row| row.name != name));
+        // Forgetting what is not there is fine.
+        forget(name);
     }
 }
