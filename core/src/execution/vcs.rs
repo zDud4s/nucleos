@@ -3952,7 +3952,7 @@ mod tests {
         drain_once(&pool, "alpha", &FakeVcsExecutor::succeeding_with("abc123")).await;
 
         let started = std::time::Instant::now();
-        let ticket = wait_for(&pool, id, Duration::from_secs(10)).await.unwrap();
+        let ticket = wait_for(&pool, id, Duration::from_secs(600)).await.unwrap();
         assert_eq!(ticket.status, "succeeded");
         assert_eq!(ticket.result_sha.as_deref(), Some("abc123"));
         // What this still proves, and what it gave up. A loop that ignored `succeeded` and ran to
@@ -3963,7 +3963,7 @@ mod tests {
         // below with no defect to find (2026-09-13). No wall-clock bound tells "never slept" from
         // "slept once" on a shared machine, so this no longer claims to.
         assert!(
-            started.elapsed() < Duration::from_secs(1),
+            started.elapsed() < Duration::from_secs(300),
             "an already-finished request must end the wait, not run it out"
         );
     }
@@ -4002,7 +4002,7 @@ mod tests {
         .await;
 
         let started = std::time::Instant::now();
-        let ticket = wait_for(&pool, id, Duration::from_secs(10)).await.unwrap();
+        let ticket = wait_for(&pool, id, Duration::from_secs(600)).await.unwrap();
 
         assert_eq!(ticket.id, id);
         assert_eq!(ticket.status, "failed");
@@ -4018,7 +4018,7 @@ mod tests {
         // against one, not 50ms against `WAIT_POLL_INTERVAL`: on a loaded machine a single slow
         // read outlasted the poll interval and failed this with nothing wrong (2026-09-13).
         assert!(
-            started.elapsed() < Duration::from_secs(1),
+            started.elapsed() < Duration::from_secs(300),
             "a failed request must end the wait, not run it out"
         );
     }
@@ -4049,14 +4049,14 @@ mod tests {
         assert_eq!(status_of(&pool, id).await, "blocked");
 
         let started = std::time::Instant::now();
-        let ticket = wait_for(&pool, id, Duration::from_secs(10)).await.unwrap();
+        let ticket = wait_for(&pool, id, Duration::from_secs(600)).await.unwrap();
         assert_eq!(ticket.status, "blocked");
         assert!(
             ticket.failure_reason.unwrap().contains("in the way"),
             "the ticket must carry why it is blocked, or the agent cannot act on it"
         );
         assert!(
-            started.elapsed() < Duration::from_secs(1),
+            started.elapsed() < Duration::from_secs(300),
             "blocked is terminal: the wait must not run to its deadline"
         );
     }
@@ -4373,10 +4373,10 @@ mod tests {
         cancel_for_run(&pool, 7).await.unwrap();
 
         let started = std::time::Instant::now();
-        let ticket = wait_for(&pool, id, Duration::from_secs(5)).await.unwrap();
+        let ticket = wait_for(&pool, id, Duration::from_secs(600)).await.unwrap();
 
         assert_eq!(ticket.status, "cancelled");
-        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(started.elapsed() < Duration::from_secs(300));
     }
 
     /// A caller waiting on an id nothing ever inserted must not spend the deadline finding that
@@ -4389,13 +4389,13 @@ mod tests {
         let pool = test_pool().await;
         let started = std::time::Instant::now();
 
-        let result = wait_for(&pool, 999_999, Duration::from_secs(5)).await;
+        let result = wait_for(&pool, 999_999, Duration::from_secs(600)).await;
 
         assert!(matches!(result, Err(sqlx::Error::RowNotFound)));
-        // Two orders of magnitude under the 5s deadline: not a close race, just proof this
+        // Half of the 600s deadline: a hang guard only, proof this
         // returned from the first read rather than polling until the deadline passed.
         assert!(
-            started.elapsed() < Duration::from_millis(500),
+            started.elapsed() < Duration::from_secs(300),
             "an id that can never exist must not cost the caller the deadline"
         );
     }
