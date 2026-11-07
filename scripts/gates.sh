@@ -40,6 +40,32 @@ summary_bytes=800
 captures="$(mktemp -d 2>/dev/null)" || captures=""
 trap 'rm -rf "$captures"' EXIT
 
+# Persist a step's whole capture, because the kept tail (and the daemon's 4096 bytes) cannot hold a
+# failing test's panic text. Keeps the newest 40 logs; every failure here is swallowed, so a full
+# disk or an odd filesystem can never turn a green step red or change an exit code.
+save_log() {
+  # save_log <label> <capture> <status>
+  local label="$1" capture="$2" status="$3" home logs name path
+  [ "$capture" = /dev/null ] && return 0
+  if [ -n "${NUCLEOS_DEV_HOME:-}" ]; then
+    home="$NUCLEOS_DEV_HOME"
+  elif [ -d /c/nucleos-dev ]; then
+    home=/c/nucleos-dev
+  else
+    home="${TMPDIR:-/tmp}"
+  fi
+  logs="$home/scratch/gate-logs"
+  name="$(printf '%s' "$label" | tr -c 'A-Za-z0-9._-' '_')"
+  path="$logs/$(date -u +%Y%m%dT%H%M%SZ)-$$-$name.log"
+  {
+    mkdir -p "$logs" && cp "$capture" "$path"
+  } 2>/dev/null || return 0
+  # Newest first by name (the UTC stamp leads), so everything past the 40th goes.
+  ( ls -1 "$logs"/*.log 2>/dev/null | sort -r | tail -n +41 | while IFS= read -r old; do rm -f "$old"; done ) 2>/dev/null || true
+  [ "$status" -ne 0 ] && printf 'full log: %s\n' "$path"
+  return 0
+}
+
 run() {
   # run <label> <dir> <command...>
   local label="$1" dir="$2" capture=/dev/null status started
@@ -72,6 +98,7 @@ run() {
   started="$SECONDS"
   ( cd "$dir" && "$@" ) 2>&1 | tee "$capture"
   status="${PIPESTATUS[0]}"
+  save_log "$label" "$capture" "$status"
   if [ "$status" -eq 0 ]; then
     printf 'ok   %s\n' "$label"
   else
