@@ -57,7 +57,7 @@ jobs:
         os: ${{ fromJSON(needs.plan.outputs.os) }}
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Linux system libraries
         if: runner.os == 'Linux'
@@ -72,7 +72,7 @@ jobs:
           toolchain="$(sed -n 's/^channel *= *"\(.*\)"[[:space:]]*$/\1/p' rust-toolchain.toml)"
           rustup toolchain install "$toolchain" --component clippy --component rustfmt
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - run: bash scripts/gates.sh core
 
@@ -88,14 +88,14 @@ jobs:
         os: ${{ fromJSON(needs.plan.outputs.os) }}
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # Pinned and installed rather than trusting the image's own Python. windows-latest also ships
       # an App Execution Alias named `python3` that is not an interpreter — it prints "Python was
       # not found", points at the Microsoft Store, and exits 49 — and `gates.sh` probes past it by
       # running the candidate rather than locating it. setup-python puts a real one first either
       # way, so the two guards are independent.
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: '3.11'
 
@@ -111,8 +111,8 @@ jobs:
   broker:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: '3.11'
       - run: bash scripts/gates.sh broker
@@ -123,7 +123,7 @@ jobs:
     steps:
       # A depth-1 checkout only sees the tip; a secret committed then removed is exactly what this
       # job must find, so it needs the full history.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
 
@@ -134,13 +134,19 @@ jobs:
         run: |
           if [ "$RUNNER_OS" = Windows ]; then rustup set default-host x86_64-pc-windows-gnu; fi
           toolchain="$(sed -n 's/^channel *= *"\(.*\)"[[:space:]]*$/\1/p' rust-toolchain.toml)"
-          rustup toolchain install "$toolchain" --component clippy --component rustfmt
+          rustup toolchain install "$toolchain" --profile minimal
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: '1.26.x'
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Install security tools
         run: |
-          cargo install cargo-audit --locked
+          cargo install cargo-audit --locked --version 0.22.2
+          go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
           gitleaks_version=8.30.0
           curl --fail --location --silent --show-error \
             "https://github.com/gitleaks/gitleaks/releases/download/v${gitleaks_version}/gitleaks_${gitleaks_version}_linux_x64.tar.gz" \
@@ -158,9 +164,9 @@ jobs:
         os: ${{ fromJSON(needs.plan.outputs.os) }}
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           # The highest any sidecar's go.mod asks for. `gates.sh` discovers the modules rather than
           # listing them, so a new sidecar needs nothing here unless it needs a newer Go.
@@ -179,12 +185,12 @@ jobs:
         os: ${{ fromJSON(needs.plan.outputs.os) }}
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # Node 24, the major the shell is developed on. `npm ci` needs a lockfile written by a
       # current npm: older npm 11 releases (11.6) drop the nested @emnapi entries of
       # @tailwindcss/oxide-wasm32-wasi, and every newer npm then reads the lock as out of sync.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24
           cache: npm

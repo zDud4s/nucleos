@@ -22,7 +22,36 @@ permissions:
   contents: write
 
 jobs:
+  # A pushed tag must not publish a build nobody tested: wait for the `gates` workflow (ci.yml) to
+  # finish green for the exact tagged commit, and refuse otherwise. Every build job needs this one.
+  ci-green:
+    runs-on: ubuntu-22.04
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Require a successful CI run for the tagged commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for attempt in $(seq 1 60); do
+            runs="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$GITHUB_SHA&per_page=100" --jq '.workflow_runs')"
+            if [ "$(echo "$runs" | jq '[.[] | select(.conclusion == "success")] | length')" -gt 0 ]; then
+              echo "CI succeeded for $GITHUB_SHA"
+              exit 0
+            fi
+            if [ "$(echo "$runs" | jq '[.[] | select(.status != "completed")] | length')" -eq 0 ]; then
+              echo "::error::no successful CI run (workflow gates) for $GITHUB_SHA; push the tag only after CI is green"
+              exit 1
+            fi
+            echo "CI still running for $GITHUB_SHA (attempt $attempt/60)"
+            sleep 60
+          done
+          echo "::error::timed out waiting for CI on $GITHUB_SHA"
+          exit 1
+
   build:
+    needs: ci-green
     strategy:
       fail-fast: false
       matrix:
@@ -35,23 +64,23 @@ jobs:
             bundles: --bundles appimage,deb,rpm
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # `python3` is not trusted on the Windows runner (see ci.yml), so pin one and call `python`.
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.11"
 
       # Node 24, the major the shell is developed on. `npm ci` needs a lockfile written by a
       # current npm: older npm 11 releases (11.6) drop the nested @emnapi entries of
       # @tailwindcss/oxide-wasm32-wasi, and every newer npm then reads the lock as out of sync.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24
           cache: npm
           cache-dependency-path: shell/package-lock.json
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: 1.26.x
 
@@ -68,7 +97,7 @@ jobs:
           toolchain="$(sed -n 's/^channel *= *"\(.*\)"[[:space:]]*$/\1/p' rust-toolchain.toml)"
           rustup toolchain install "$toolchain" --component clippy --component rustfmt
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Install shell dependencies
         working-directory: shell
@@ -97,7 +126,7 @@ jobs:
         shell: bash
         run: bash scripts/stage-bundle-bins.sh
 
-      - uses: tauri-apps/tauri-action@v0
+      - uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -153,7 +182,7 @@ jobs:
             dnf install -y curl git gh
           fi
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Download the draft's Linux packages
         env:
@@ -172,7 +201,7 @@ jobs:
     needs: [build, smoke-linux]
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Prove the draft is complete and publish it
         env:
