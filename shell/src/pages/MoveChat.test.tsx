@@ -241,6 +241,26 @@ describe("moving a chat", () => {
     expect(await screen.findByText(/now runs on Tower;.*both copies are live/i)).toBeTruthy();
   });
 
+  it.each([
+    ["sends the destination's stable machine id", { name: "Tower", machine_id: "m-uuid-1" }, { to: "tower", to_machine_id: "m-uuid-1" }],
+    ["sends only the alias for a peer that reports no id", { name: "Tower" }, { to: "tower" }],
+  ])("close-out %s", async (_label, machine, expected) => {
+    prepareMove();
+    vi.mocked(apiFetch).mockResolvedValue(machine as never);
+    vi.mocked(importChatTransfer).mockResolvedValue({} as never);
+    vi.mocked(finishChatTransfer).mockResolvedValue(undefined);
+    renderMoveDialog();
+
+    await waitFor(() => expect((screen.getByLabelText("Move chat to") as HTMLSelectElement).value).toBe("tower"));
+    fireEvent.click(screen.getByRole("button", { name: "Review move" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Move chat" }));
+
+    await waitFor(() => expect(finishChatTransfer).toHaveBeenCalledOnce());
+    const body = vi.mocked(finishChatTransfer).mock.calls[0][1];
+    expect(body).toMatchObject(expected);
+    if (!("to_machine_id" in expected)) expect(body).not.toHaveProperty("to_machine_id");
+  });
+
   it("a remote machine asks for step-up and this device does not", async () => {
     localStorage.setItem("nucleos-machines", JSON.stringify([{ id: "tower", origin: "https://tower.example", name: "Tower" }]));
     vi.mocked(requestNativeStepUp).mockResolvedValue({ kind: "verified" });

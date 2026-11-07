@@ -718,10 +718,10 @@
   flex-direction: column;
   gap: var(--space-2);
   padding: var(--space-3);
-  border: 1px solid var(--tone-pending-border);
-  /* The hairline alone was about 1.5:1; the leading edge carries the pending
-     foreground so the question has a marker besides its position. */
-  border-left: 3px solid var(--tone-pending-fg);
+  /* The pending foreground on all four sides: the darker border keeps the
+     contrast the tone's hairline lacked (about 1.5:1). No left stripe, since
+     DESIGN.md reserves that for the refusal note. */
+  border: 1px solid var(--tone-pending-fg);
   border-radius: var(--radius-sm);
   background: var(--surface-sunken);
 }

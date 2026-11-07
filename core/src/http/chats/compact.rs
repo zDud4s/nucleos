@@ -162,7 +162,9 @@ mod tests {
     /// The compaction row's status once it left `pending` and the turn's slot is free.
     async fn settled(state: &AppState, chat: &str, run_id: i64) -> String {
         let mut status = String::new();
-        for _ in 0..500 {
+        // Hang guard only: a loaded machine can starve the task for a long while.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             status = sqlx::query_scalar("SELECT status FROM chat_compactions WHERE run_id = ?")
                 .bind(run_id)
                 .fetch_optional(&state.pool)
@@ -234,7 +236,9 @@ mod tests {
             .await
             .unwrap();
         let mut next = String::new();
-        for _ in 0..500 {
+        // Hang guard only: a loaded machine can starve the task for a long while.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             next = fake.last_prompt.lock().unwrap().clone().unwrap_or_default();
             if next.contains("what now?") {
                 break;

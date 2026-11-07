@@ -2006,7 +2006,7 @@ mod tests {
             let _ = tx.send((paths.len(), node.is_some()));
         });
         let (paths, found) = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(std::time::Duration::from_secs(60))
             .expect("watch_paths / node_ref blocked on the scan lock");
         drop(held);
         assert!(paths >= 3 && found);

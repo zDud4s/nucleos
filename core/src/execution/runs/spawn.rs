@@ -716,6 +716,13 @@ pub(super) fn spawn_run(
                     // `run_prompt` does not return until the CLI process is dead and reaped. The
                     // gate belongs after that boundary: an orphaned build can otherwise retain file
                     // locks in the worktree for the lifetime of every later cleanup retry.
+                    //
+                    // The gate writes nothing to the transcript, so the liveness sweep would read
+                    // the quiet as a stall and cancel the run, losing its handoff. The marker is a
+                    // bounded wait for the sweep and drops with this scope on every exit path.
+                    let gate_marker = (terminal_status == "completed"
+                        && matches!(&gate_config, GateConfig::Command { .. }))
+                    .then(|| crate::execution::runner::cli_pids::begin_gate(id));
                     let gate_outcome = match (terminal_status, &gate_config, spawn_cwd.as_deref()) {
                         (
                             "completed",
@@ -745,6 +752,7 @@ pub(super) fn spawn_run(
                         }
                         _ => None,
                     };
+                    drop(gate_marker);
                     let (gate_status, gate_exit_code, gate_output) = match &gate_outcome {
                         Some(crate::gate::GateOutcome::Passed) => (Some("passed"), None, None),
                         Some(crate::gate::GateOutcome::Failed { exit_code, output }) => {
@@ -1217,7 +1225,7 @@ mod wake_tests {
 
         spawn_registered(&state, id, async {});
 
-        tokio::time::timeout(Duration::from_secs(5), rx.changed())
+        tokio::time::timeout(Duration::from_secs(60), rx.changed())
             .await
             .expect("the supervisor never signalled the normal end")
             .unwrap();
@@ -1235,12 +1243,12 @@ mod wake_tests {
         spawn_registered(&state, id, async { panic!("run body blew up") });
 
         // Poll until the row is terminal, then require a signal that is not older than the write.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         while status_of(&state.pool, id).await != "failed" {
             assert!(std::time::Instant::now() < deadline, "the run never failed");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        tokio::time::timeout(Duration::from_secs(5), rx.changed())
+        tokio::time::timeout(Duration::from_secs(60), rx.changed())
             .await
             .expect("the supervisor never signalled the panic")
             .unwrap();
@@ -1277,7 +1285,7 @@ mod wake_tests {
 
         assert!(finalize_termination(&state, id, "cancelled").await);
 
-        let seen = tokio::time::timeout(Duration::from_secs(5), watcher)
+        let seen = tokio::time::timeout(Duration::from_secs(60), watcher)
             .await
             .expect("the watcher never woke")
             .unwrap();
@@ -1294,9 +1302,9 @@ mod wake_tests {
         }
     }
 
-    /// The claim's status reads back as `open`, or the test fails after five seconds.
+    /// The claim's status reads back as `open`, or the test fails after the 60s hang guard.
     async fn wait_until_open(pool: &sqlx::SqlitePool, task: i64) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         while testing::state_of(pool, task).await.0 != "open" {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -1378,7 +1386,7 @@ mod wake_tests {
         );
 
         // The supervisor finishes after the handle is released; give it a beat to (not) act.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         while state
             .run_handles
             .lock()

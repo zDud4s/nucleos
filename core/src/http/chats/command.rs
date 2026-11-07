@@ -690,7 +690,9 @@ mod tests {
     }
 
     async fn first_user_input(seen: &Arc<std::sync::Mutex<Vec<Vec<Value>>>>) -> String {
-        for _ in 0..200 {
+        // Hang guard only: a loaded machine can starve the task for a long while.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             if let Some(first) = seen.lock().unwrap().first() {
                 return first
                     .iter()
@@ -740,7 +742,9 @@ mod tests {
         let (status, body) = command(&state, "claude", ECHO_LINE).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let mut claude = String::new();
-        for _ in 0..200 {
+        // Hang guard only: a loaded machine can starve the task for a long while.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             claude = fake.last_prompt.lock().unwrap().clone().unwrap_or_default();
             if !claude.is_empty() {
                 break;

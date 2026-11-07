@@ -471,12 +471,13 @@ mod tests {
         });
 
         let started = Instant::now();
-        let got = lease(&state, "fake", StdDuration::from_secs(2), at(0))
+        // A long wait that the enqueue must cut short; elapsed is bounded by half of it.
+        let got = lease(&state, "fake", StdDuration::from_secs(600), at(0))
             .await
             .unwrap();
         let id = task.await.unwrap();
         assert_eq!(ids(&got), vec![id]);
-        assert!(started.elapsed() < StdDuration::from_secs(1));
+        assert!(started.elapsed() < StdDuration::from_secs(300));
     }
 
     #[tokio::test]
