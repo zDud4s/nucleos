@@ -63,7 +63,7 @@ pub async fn tick(
         // One failing subject (a locked database, say) must not leave the rest of the tick undone:
         // the stalled runs after it still need cancelling.
         if let Err(error) = sweep_one(state, observed, limits, now, &mut report).await {
-            tracing::warn!(%error, "liveness sweep could not handle one subject");
+            tracing::warn!(%error, "liveness sweep could not handle one observed run or session");
         }
     }
     // Before `terminal_feed`, so a node reaped here has its failure announced in this same tick.
