@@ -151,6 +151,7 @@ class FingerprintTests(unittest.TestCase):
                 env.pop(k)
         env.update(
             NUCLEOS_HEAVY_DIR=str(self.state),
+            NUCLEOS_HEAVY_CACHE="0",  # the result cache would skip a repeated run
             NUCLEOS_HEAVY_CAPACITY=str(capacity),
             NUCLEOS_HEAVY_POLL_S="0.1",
             CARGO_HOME=str(self.cargo_home),

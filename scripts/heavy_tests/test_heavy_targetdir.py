@@ -175,6 +175,7 @@ class TargetDirTests(unittest.TestCase):
                 env.pop(k)
         env.update(
             NUCLEOS_HEAVY_DIR=str(self.state),
+            NUCLEOS_HEAVY_CACHE="0",  # the result cache would skip a repeated run
             NUCLEOS_HEAVY_CAPACITY="4",
             NUCLEOS_HEAVY_POLL_S="0.1",
             NUCLEOS_HEAVY_TD_ROOT=str(self.td_root),

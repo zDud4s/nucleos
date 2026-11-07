@@ -2629,6 +2629,8 @@ def _cost_mod():
 def append_log(row: dict, directory: Path) -> None:
     """Append one row in ONE write that lands whole: with several brokers finishing at once,
     buffered text-mode writes (split at the buffer size) interleaved their rows."""
+    if _SRC_STATE is not None:
+        row.setdefault("src_state", _SRC_STATE)
     try:
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / "log.jsonl"
@@ -2777,6 +2779,9 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
             return _spawn_failed(argv, exc)
         return code
 
+    cplan = _cache_plan(argv, held)
+    if cplan.hit is not None:
+        return _cache_hit(cplan, argv, opts)
     row: dict = {}
     job = None
     holding = False
@@ -3095,6 +3100,7 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
                     stripped[k] = env.pop(k)
         ff = _failfirst_plan(argv, run_argv, directory)
         run_argv = ff.run_argv
+        row_tap = _join_taps(ff.tap, cplan.tap)
         eff_td = None
         if kind in ("cargo", "auto") and _is_cargo(argv):
             eff_td = (inject or os.environ.get("CARGO_TARGET_DIR")
@@ -3176,7 +3182,7 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
         code, stats = run_child(run_argv, env, job, low=warm,
                                 progress=directory / "progress" / str(os.getpid()),
                                 yield_check=yield_check, on_test_phase=on_test_phase,
-                                tap=ff.tap)
+                                tap=row_tap)
     except OSError as exc:
         code, stats = _spawn_failed(argv, exc), _new_stats()
         row["broker_error"] = f"spawn: {exc}"
@@ -3196,6 +3202,8 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
     })
     ff.finish(code, bool(stats.get("compile_error")),
               stalled or preempted or code == EXIT_SPAWN_FAILED)
+    cplan.finish(code, narrowed=bool(getattr(ff, "narrowed", False)),
+                 interrupted=stalled or preempted or code == EXIT_SPAWN_FAILED)
     if drop_at:
         row["weight_drop_s"] = round(drop_at[0], 3)
     if preempted:
@@ -3232,6 +3240,61 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
     except Exception:
         pass
     return _PREEMPTED if preempted else code
+
+
+_SRC_STATE: str | None = None  # source-state id of this run (heavy_cache); stamped on its log rows
+
+
+def _cache_plan(argv: list[str], held: bool):
+    """Result cache (scripts/heavy_cache.py): looks the command up by source state BEFORE the
+    queue, the token and the worktree lock. Fail-open: an inert plan on any problem."""
+    global _SRC_STATE
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import heavy_cache  # type: ignore
+
+        if held or os.environ.get("NUCLEOS_HEAVY") == "0":
+            return heavy_cache.Plan(None, os.getcwd(), argv, sys.stderr, sys.stdout)
+        plan = heavy_cache.prepare(argv, state_dir(), os.getcwd())
+        _SRC_STATE = plan.state
+        return plan
+    except Exception:
+        return _InertCache()
+
+
+class _InertCache:
+    hit = None
+    tap = None
+    state = None
+
+    def finish(self, *_a, **_k) -> None:
+        pass
+
+
+def _join_taps(*taps):
+    taps = [t for t in taps if t is not None]
+    if len(taps) < 2:
+        return taps[0] if taps else None
+
+    def both(seg: bytes) -> None:
+        for t in taps:
+            t(seg)
+    return both
+
+
+def _cache_hit(plan, argv: list[str], opts: dict) -> int:
+    plan.replay()
+    now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    append_log({
+        "v": LOG_VERSION, "ts": now, "end": now, "worktree": os.getcwd(),
+        "agent": opts["agent"] or os.environ.get("NUCLEOS_HEAVY_AGENT"), "prio": None,
+        "eff_prio": None, "kind": opts["kind"], "weight": 0, "wait_lock_s": 0.0,
+        "wait_token_s": 0.0, "token": False, "nested": False, "in_held": False,
+        "run_s": 0.0, "compiled": False, "fp_hit": False, "fp_miss": False, "exit": 0,
+        "argv0": argv[0], "argv": _log_argv(argv), "cache_hit": True,
+        "cache_ts": plan.hit.get("ts"), "src_state": plan.state,
+    }, plan.directory)
+    return 0
 
 
 class _NoFailFirst:
