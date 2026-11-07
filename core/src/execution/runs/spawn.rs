@@ -716,6 +716,13 @@ pub(super) fn spawn_run(
                     // `run_prompt` does not return until the CLI process is dead and reaped. The
                     // gate belongs after that boundary: an orphaned build can otherwise retain file
                     // locks in the worktree for the lifetime of every later cleanup retry.
+                    //
+                    // The gate writes nothing to the transcript, so the liveness sweep would read
+                    // the quiet as a stall and cancel the run, losing its handoff. The marker is a
+                    // bounded wait for the sweep and drops with this scope on every exit path.
+                    let gate_marker = (terminal_status == "completed"
+                        && matches!(&gate_config, GateConfig::Command { .. }))
+                    .then(|| crate::execution::runner::cli_pids::begin_gate(id));
                     let gate_outcome = match (terminal_status, &gate_config, spawn_cwd.as_deref()) {
                         (
                             "completed",
@@ -745,6 +752,7 @@ pub(super) fn spawn_run(
                         }
                         _ => None,
                     };
+                    drop(gate_marker);
                     let (gate_status, gate_exit_code, gate_output) = match &gate_outcome {
                         Some(crate::gate::GateOutcome::Passed) => (Some("passed"), None, None),
                         Some(crate::gate::GateOutcome::Failed { exit_code, output }) => {
