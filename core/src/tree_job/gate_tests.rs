@@ -316,6 +316,35 @@ async fn a_ticket_seen_ending_without_measuring_is_forgotten() {
 }
 
 #[tokio::test]
+async fn a_regate_of_the_same_red_head_measures_again() {
+    // After a decision answer or a rescue the head is unchanged: the red already delivered must
+    // not be read back from its old ticket.
+    let fake = Fake::default();
+    assert!(gate_at_head(&fake, "h1", WAIT).await.is_err());
+    fake.set(ticket(100, true, Some("failed")));
+    assert!(matches!(
+        gate_at_head(&fake, "h1", WAIT).await,
+        Ok(GateVerdict::Red { .. })
+    ));
+    let again = gate_at_head(&fake, "h1", WAIT).await;
+    assert!(
+        matches!(again, Err(NotMeasured::Running(_))),
+        "a fresh unit is only waited on: {again:?}"
+    );
+    assert_eq!(fake.submits(), 2, "a fresh ticket was requested");
+}
+
+#[tokio::test]
+async fn a_regate_of_a_green_head_still_reads_its_ticket() {
+    let fake = Fake::default();
+    assert!(gate_at_head(&fake, "h1", WAIT).await.is_err());
+    fake.set(ticket(100, true, Some("passed")));
+    assert_eq!(gate_at_head(&fake, "h1", WAIT).await, Ok(GateVerdict::Green));
+    assert_eq!(gate_at_head(&fake, "h1", WAIT).await, Ok(GateVerdict::Green));
+    assert_eq!(fake.submits(), 1);
+}
+
+#[tokio::test]
 async fn a_new_head_gets_its_own_unit() {
     let fake = Fake::default();
     assert!(gate_at_head(&fake, "h1", WAIT).await.is_err());

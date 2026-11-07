@@ -162,7 +162,10 @@ pub(super) fn verdict_of(verdict: ScopeVerdict) -> Result<GateVerdict, NotMeasur
     match verdict {
         ScopeVerdict::Measured(GateOutcome::Passed) => Ok(GateVerdict::Green),
         ScopeVerdict::Measured(GateOutcome::Failed { output, .. }) => {
-            Ok(GateVerdict::Red { summary: output })
+            match super::retry::infrastructure_failure(&output) {
+                Some(reason) => Err(NotMeasured::Failed(reason)),
+                None => Ok(GateVerdict::Red { summary: output }),
+            }
         }
         ScopeVerdict::Measured(GateOutcome::Errored { reason }) => Err(NotMeasured::Failed(reason)),
         ScopeVerdict::NothingRan => Ok(GateVerdict::NothingRan),
@@ -1983,6 +1986,42 @@ mod tests {
             "the scope gate could not be submitted: queue-down"
         ));
         assert!(!is_load_reason("scope verification ticket 7 vanished"));
+    }
+
+    const SCCACHE_CRASH: &str = "== core (scope)\n   Compiling stacker v0.1.15\nerror: could not compile `stacker` (lib)\n\nCaused by:\n  process didn't exit successfully: `sccache rustc --crate-name stacker` (exit status: 2)\n";
+
+    #[test]
+    fn a_compiler_dying_without_a_diagnostic_is_unmeasured_load_not_a_red() {
+        use super::super::retry::is_load_reason;
+        let verdict = verdict_of(ScopeVerdict::Measured(GateOutcome::Failed {
+            exit_code: 101,
+            output: SCCACHE_CRASH.to_owned(),
+        }));
+        match verdict {
+            Err(NotMeasured::Failed(reason)) => {
+                assert!(is_load_reason(&reason), "{reason}");
+            }
+            other => panic!("expected an unmeasured gate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_compile_error_with_a_diagnostic_stays_a_red() {
+        let real = "== core (scope)\nerror[E0425]: cannot find value `x` in this scope\n --> src/a.rs:3:5\nerror: could not compile `core` (lib) due to 1 previous error\n\nCaused by:\n  process didn't exit successfully: `rustc` (exit status: 1)\n";
+        let plain = "== core (scope)\nerror: expected one of `;`, found `}`\nerror: could not compile `core` (lib)\n  process didn't exit successfully: `rustc` (exit status: 1)\n";
+        for output in [real, plain] {
+            let verdict = verdict_of(ScopeVerdict::Measured(GateOutcome::Failed {
+                exit_code: 101,
+                output: output.to_owned(),
+            }));
+            assert!(matches!(verdict, Ok(GateVerdict::Red { .. })), "{verdict:?}");
+        }
+    }
+
+    #[test]
+    fn sccache_errors_are_load_reasons() {
+        use super::super::retry::is_load_reason;
+        assert!(is_load_reason("sccache: error: Failed to send data to server"));
     }
 
     #[tokio::test]

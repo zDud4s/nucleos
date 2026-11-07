@@ -50,9 +50,39 @@ pub(super) fn is_load_reason(reason: &str) -> bool {
         "disk-pressure",
         "failed to spawn",
         "spawn failure",
+        "sccache",
+        "infrastructure failure",
     ]
     .iter()
     .any(|marker| reason.contains(marker))
+}
+
+/// Whether a failed unit's output is infrastructure, not the branch's: cargo says it could not
+/// compile and that a process did not exit successfully, but neither rustc nor a test runner said
+/// anything about the code (no `error[..]` or other `error:` line, no failed or panicked test).
+/// Answers the reason to give the gate, which `is_load_reason` reads as load.
+pub(super) fn infrastructure_failure(output: &str) -> Option<String> {
+    if !output.contains("could not compile") || !output.contains("process didn't exit successfully")
+    {
+        return None;
+    }
+    let diagnosed = output.lines().any(|line| {
+        let line = line.trim_start();
+        line.starts_with("error[")
+            || line.contains("panicked at")
+            || line.contains("FAILED")
+            || (line.starts_with("error:")
+                && !line.contains("could not compile")
+                && !line.contains("process didn't exit successfully"))
+    });
+    if diagnosed {
+        return None;
+    }
+    Some(
+        "infrastructure failure: a compiler process exited non-zero without any diagnostic \
+         (cargo could not compile, no rustc error), so nothing was measured"
+            .to_owned(),
+    )
 }
 
 /// How long a gate starved by load waits after `waits` earlier waits: 30 s doubling, capped at 10 min.

@@ -83,7 +83,12 @@ pub(super) async fn gate_at_head(
         match io.read(stored.ticket).await? {
             Some(ticket) if !ticket.done => id = Some(stored.ticket),
             Some(ticket) => match verdict_from(io, &ticket).await {
-                Ok(verdict) => return Ok(verdict),
+                Ok(verdict) => {
+                    if matches!(verdict, GateVerdict::Red { .. }) {
+                        io.remember(None).await?;
+                    }
+                    return Ok(verdict);
+                }
                 // It ended without measuring: only now is a fresh unit allowed.
                 Err(NotMeasured::Failed(reason) | NotMeasured::Running(reason)) => {
                     ended = Some(reason);
@@ -128,8 +133,10 @@ pub(super) async fn gate_at_head(
         )));
     }
     let verdict = verdict_from(io, &ticket).await;
-    if verdict.is_err() {
-        // Answered as `Failed` now, so a later call must not find it and report it again.
+    if matches!(verdict, Err(_) | Ok(GateVerdict::Red { .. })) {
+        // Answered now, so a later call must not find it and report it again. A red is forgotten
+        // too: a re-gate of the same HEAD (after a decision answer, a rescue or a load backoff)
+        // measures afresh instead of re-reading a verdict that may have been the machine's.
         io.remember(None).await?;
     }
     verdict
