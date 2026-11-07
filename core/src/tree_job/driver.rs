@@ -2014,14 +2014,19 @@ mod tests {
                 exit_code: 101,
                 output: output.to_owned(),
             }));
-            assert!(matches!(verdict, Ok(GateVerdict::Red { .. })), "{verdict:?}");
+            assert!(
+                matches!(verdict, Ok(GateVerdict::Red { .. })),
+                "{verdict:?}"
+            );
         }
     }
 
     #[test]
     fn sccache_errors_are_load_reasons() {
         use super::super::retry::is_load_reason;
-        assert!(is_load_reason("sccache: error: Failed to send data to server"));
+        assert!(is_load_reason(
+            "sccache: error: Failed to send data to server"
+        ));
     }
 
     #[tokio::test]

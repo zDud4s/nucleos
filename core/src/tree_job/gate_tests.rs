@@ -339,8 +339,14 @@ async fn a_regate_of_a_green_head_still_reads_its_ticket() {
     let fake = Fake::default();
     assert!(gate_at_head(&fake, "h1", WAIT).await.is_err());
     fake.set(ticket(100, true, Some("passed")));
-    assert_eq!(gate_at_head(&fake, "h1", WAIT).await, Ok(GateVerdict::Green));
-    assert_eq!(gate_at_head(&fake, "h1", WAIT).await, Ok(GateVerdict::Green));
+    assert_eq!(
+        gate_at_head(&fake, "h1", WAIT).await,
+        Ok(GateVerdict::Green)
+    );
+    assert_eq!(
+        gate_at_head(&fake, "h1", WAIT).await,
+        Ok(GateVerdict::Green)
+    );
     assert_eq!(fake.submits(), 1);
 }
 
