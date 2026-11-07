@@ -24,6 +24,7 @@ const CONNECTION_TEXT: Record<ConnectionState, string> = {
 
 /** Project filter, Active only, Follow, Fit, the house's slots, and whether the stream is up. */
 export function TopBar({ project, onProject, onlyActive, onOnlyActive, follow, onFollow, onFit }: TopBarProps) {
+  "use no memo"; // same reason as `FleetScreen`: `version` is only a dependency of the roots memo
   const store = useFleetStore();
   const version = useLayoutVersion();
   const connection = useConnection();

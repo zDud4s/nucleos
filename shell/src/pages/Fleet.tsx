@@ -33,6 +33,7 @@ export function Fleet() {
 }
 
 function FleetScreen() {
+  "use no memo"; // the compiler drops `version`, which only appears in dependency arrays, and caches the mutable store reads
   const store = useFleetStore();
   const version = useLayoutVersion();
   const received = useSyncExternalStore(store.subscribeLayout, store.hasSnapshot);
