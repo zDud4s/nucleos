@@ -64,7 +64,9 @@ if os.name == "nt":
     k = ctypes.windll.kernel32
     k.GetCurrentProcess.restype = ctypes.c_void_p
     k.GetPriorityClass.argtypes = [ctypes.c_void_p]
-    (d / f"{tag}.pclass").write_text(str(k.GetPriorityClass(k.GetCurrentProcess())))
+    # Write under a temp name and rename, so the file never appears empty to a reader.
+    (d / f"{tag}.pclass.tmp").write_text(str(k.GetPriorityClass(k.GetCurrentProcess())))
+    os.replace(d / f"{tag}.pclass.tmp", d / f"{tag}.pclass")
 if not os.environ.get("FAKE_FAST"):
     while not ((d / f"{tag}.stop").exists() or (d / "all.stop").exists()):
         time.sleep(0.05)
@@ -387,7 +389,7 @@ class WarmTests(unittest.TestCase):
         rc, out, _ = self.warm(self.repo_a)
         self.assertEqual(rc, 0, out)
         self.assert_started("no-run")
-        self.assertTrue(wait_for(lambda: (self.d / "no-run.pclass").exists()))
+        self.assertTrue(wait_for(lambda: (p := self.d / "no-run.pclass").exists() and p.read_text().strip() != ""))
         pclass = int((self.d / "no-run.pclass").read_text())
         self.assertIn(pclass, (BELOW_NORMAL, IDLE), f"priority class {pclass:#x}")
         # A normal request is NOT lowered: it runs at whatever class this test runs at. Compared
@@ -395,7 +397,7 @@ class WarmTests(unittest.TestCase):
         # whole job below normal already, and every child of it inherits that.
         real = self.broker("real", self.repo_b, prio=1)
         self.assert_started("real")
-        self.assertTrue(wait_for(lambda: (self.d / "real.pclass").exists()))
+        self.assertTrue(wait_for(lambda: (p := self.d / "real.pclass").exists() and p.read_text().strip() != ""))
         self.assertEqual(int((self.d / "real.pclass").read_text()), own_priority_class())
         self.stop("real")
         self.assertEqual(real.wait(timeout=20), 0)
