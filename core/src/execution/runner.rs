@@ -15,6 +15,7 @@ mod agy;
 mod auth_watch;
 mod claude;
 mod claude_args;
+pub mod cli_pids;
 mod codex;
 mod command;
 #[cfg(any(test, feature = "testkit"))]
