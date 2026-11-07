@@ -1076,6 +1076,7 @@ pub async fn run_ingest_loop(pool: SqlitePool, cfg: DevtimeConfig, projects_dir:
         };
         let stats = ingest_cycle(&pool, &live, &projects_dir).await;
         accumulate(&mut totals, &stats);
+        prune_old_sessions(&pool, live.retention_days).await;
         if live.rules.enabled && live.actions.enabled {
             let now_ms = chrono::Utc::now().timestamp_millis();
             if let Err(error) = close_due_outcomes(&pool, now_ms).await {
@@ -1086,6 +1087,22 @@ pub async fn run_ingest_loop(pool: SqlitePool, cfg: DevtimeConfig, projects_dir:
         if let Err(error) = devtime_store::write_ingest_status(&pool, &row).await {
             tracing::warn!(%error, "devtime: could not write the ingest status");
         }
+    }
+}
+
+/// Deletes the sessions idle for more than `retention_days` (0 keeps everything). Runs after the
+/// cycle's ingestion, in the same task, so it never races a reprocess.
+async fn prune_old_sessions(pool: &SqlitePool, retention_days: u32) {
+    if retention_days == 0 {
+        return;
+    }
+    let cutoff = (chrono::Utc::now() - chrono::Duration::days(i64::from(retention_days)))
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string();
+    match devtime_store::prune_sessions_before(pool, &cutoff).await {
+        Ok(0) => {}
+        Ok(pruned) => tracing::info!(pruned, %cutoff, "devtime: pruned sessions past retention"),
+        Err(error) => tracing::warn!(%error, "devtime: pruning old sessions failed"),
     }
 }
 
@@ -1140,6 +1157,23 @@ mod tests {
     use crate::devtime::store as devtime_store;
     use sha2::{Digest, Sha256};
     use sqlx::SqlitePool;
+
+    #[tokio::test]
+    async fn retention_zero_prunes_nothing_and_a_set_value_prunes_old_sessions() {
+        let pool = crate::testdb::fresh_pool().await;
+        sqlx::query(
+            "INSERT INTO devtime_sessions (session_id, project_id, parser_version, updated_at, ended_at)
+             VALUES ('old', 'p', 1, '2020-01-01T00:00:00.000Z', '2020-01-01T00:00:00.000Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let sessions = || sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM devtime_sessions");
+        prune_old_sessions(&pool, 0).await;
+        assert_eq!(sessions().fetch_one(&pool).await.unwrap(), 1);
+        prune_old_sessions(&pool, 180).await;
+        assert_eq!(sessions().fetch_one(&pool).await.unwrap(), 0);
+    }
 
     use std::collections::BTreeMap;
     use std::io::Write;

@@ -19,6 +19,10 @@ pub struct DevtimeConfig {
     pub parse_failure_amber_rate: f64,
     /// Fewer lines than this and the rate above is not judged.
     pub parse_failure_min_lines: u64,
+    /// Sessions whose last activity is older than this many days are deleted, with their turns,
+    /// messages, attempts, spans, markers and session-scoped findings. 0 keeps everything. File
+    /// offsets, the shadow history and cross-session findings are never pruned.
+    pub retention_days: u32,
     /// The rule engine's vocabularies and thresholds (sub-project 2).
     pub rules: DevtimeRulesConfig,
     /// The automatic actions' thresholds (phase 2, shadow mode first).
@@ -34,6 +38,7 @@ impl Default for DevtimeConfig {
             projects_dir: String::new(),
             parse_failure_amber_rate: 0.02,
             parse_failure_min_lines: 200,
+            retention_days: 180,
             rules: DevtimeRulesConfig::default(),
             actions: DevtimeActionsConfig::default(),
         }
@@ -737,6 +742,17 @@ mod actions_tests {
         assert_eq!(a.reentry_days, 14);
         assert_eq!(a.pairs["inject"], vec!["D3", "D6"]);
         assert_eq!(a.pairs["propose"], vec!["F1", "F2"]);
+    }
+
+    #[test]
+    fn retention_days_defaults_to_180_and_accepts_zero() {
+        assert_eq!(DevtimeConfig::default().retention_days, 180);
+        let config = parse_devtime_config(
+            "retention_days: 0
+",
+        )
+        .expect("parses");
+        assert_eq!(config.retention_days, 0);
     }
 
     #[test]
