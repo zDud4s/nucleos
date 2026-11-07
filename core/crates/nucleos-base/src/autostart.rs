@@ -1028,7 +1028,10 @@ mod tests {
             let start = xml.find(open).unwrap();
             &xml[start..start + xml[start..].find(close).unwrap()]
         };
-        assert!(between("<LogonTrigger>", "</LogonTrigger>").contains(id), "{xml}");
+        assert!(
+            between("<LogonTrigger>", "</LogonTrigger>").contains(id),
+            "{xml}"
+        );
         assert!(between("<Principal ", "</Principal>").contains(id), "{xml}");
     }
 
