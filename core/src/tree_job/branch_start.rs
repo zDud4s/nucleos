@@ -226,7 +226,13 @@ async fn find_or_open_node(
     }
     check_tree_budget(state, root_id).await?;
     let limits = NodeLimits::load(Some(FsPath::new(project_root)));
-    let opened = work_nodes::open(
+    // The tree's own root closes as `done` when its dispatch report arrives, while a start it made
+    // may still wait for its base: the driver's replay (and the owner's start) must still reach it.
+    let links = work_nodes::OpenLinks {
+        parent_may_be_done: caller == root_id,
+        ..work_nodes::OpenLinks::default()
+    };
+    let opened = work_nodes::open_linked(
         &state.pool,
         None,
         &limits,
@@ -238,6 +244,7 @@ async fn find_or_open_node(
             owned_paths: paths.to_vec(),
             ..OpenArgs::default()
         },
+        links,
     )
     .await
     .map_err(node_refusal)?;
@@ -979,6 +986,58 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(job.manifest.branches["later"].node_id.is_some());
+    }
+
+    /// The root closes as `done` once its dispatch report arrives, before the base merges. The replay
+    /// (and a fresh owner start) must still open the child under it; a branch left half-started by an
+    /// earlier failed replay (no node) is finished, not refused.
+    #[tokio::test]
+    async fn a_remembered_start_runs_under_a_root_that_is_already_done() {
+        let (state, app, caller, _repo) = tree().await;
+        post(&app, &uri(), body(&caller)).await;
+        post(&app, &uri(), dependent_body(&caller)).await;
+        let mut job = crate::tree_job::store::load(&state.pool, TREE)
+            .await
+            .unwrap()
+            .unwrap();
+        job.manifest.branches.get_mut("notes").unwrap().state = "merged".to_owned();
+        crate::tree_job::store::update(&state.pool, &job)
+            .await
+            .unwrap();
+        let record = job.manifest.extra["pending_starts"]["later"].clone();
+        sqlx::query("UPDATE work_nodes SET status = 'done' WHERE id = ?")
+            .bind(&caller)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let runs = count(&state, "runs").await;
+
+        start_pending(&state, TREE, "later", &record).await.unwrap();
+        // A second replay is idempotent.
+        start_pending(&state, TREE, "later", &record).await.unwrap();
+
+        assert_eq!(count(&state, "runs").await, runs + 1);
+        let job = crate::tree_job::store::load(&state.pool, TREE)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(job.manifest.branches["later"].node_id.is_some());
+        assert_eq!(job.manifest.branches["later"].state, "building");
+    }
+
+    /// Only `done` is waived: a root that failed still takes no child.
+    #[tokio::test]
+    async fn a_failed_root_still_takes_no_new_branch() {
+        let (state, app, caller, _repo) = tree().await;
+        sqlx::query("UPDATE work_nodes SET status = 'failed' WHERE id = ?")
+            .bind(&caller)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let (status, response) = post(&app, &uri(), body(&caller)).await;
+
+        assert_eq!(status, StatusCode::CONFLICT, "{response:?}");
     }
 
     #[tokio::test]
