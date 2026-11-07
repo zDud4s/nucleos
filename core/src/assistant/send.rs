@@ -2441,7 +2441,12 @@ mod tests {
             .await
             .unwrap();
         for _ in 0..300 {
-            if state.run_handles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(&turn) {
+            if state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&turn)
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2508,7 +2513,12 @@ mod tests {
             .await
             .unwrap();
         for _ in 0..300 {
-            if state.run_handles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(&turn) {
+            if state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&turn)
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2766,7 +2776,11 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!task.is_finished(), "the task of an ended turn was aborted");
         assert!(
-            state.run_handles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(&id),
+            state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&id),
             "the handle of an ended turn was taken"
         );
         task.abort();

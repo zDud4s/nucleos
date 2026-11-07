@@ -273,7 +273,10 @@ mod tests {
     /// An NTFS alternate data stream names the same file as its plain name.
     #[test]
     fn a_stream_suffix_names_the_file_it_hangs_on() {
-        assert_eq!(normalise("docs/a.txt:stream").as_deref(), Some("docs/a.txt"));
+        assert_eq!(
+            normalise("docs/a.txt:stream").as_deref(),
+            Some("docs/a.txt")
+        );
         assert_eq!(normalise("a.txt::$DATA").as_deref(), Some("a.txt"));
         assert_eq!(normalise("docs/:stream"), None);
     }

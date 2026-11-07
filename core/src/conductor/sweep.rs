@@ -358,7 +358,11 @@ pub async fn daemon_observations(state: &AppState) -> sqlx::Result<Vec<Observed>
             (Some(created), Some(attempt)) => Some(created.max(attempt)),
             (created, attempt) => created.or(attempt),
         };
-        let alive = state.run_handles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(&id);
+        let alive = state
+            .run_handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&id);
         // The task handle is the daemon's bookkeeping; the CLI is a child process that can outlive
         // it. Only a process the OS no longer has is proof of death.
         let cli_running = crate::execution::runner::cli_pids::pid_of(id)
@@ -690,7 +694,11 @@ mod tests {
     }
 
     fn has_handle(state: &AppState, id: i64) -> bool {
-        state.run_handles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(&id)
+        state
+            .run_handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&id)
     }
 
     fn publish_tail(state: &AppState, id: i64, text: &str) -> Arc<Mutex<String>> {

@@ -6001,7 +6001,11 @@ mod tests {
         );
 
         // And once the task is gone, the same row is the ending it says it is.
-        state.run_handles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&run_id);
+        state
+            .run_handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&run_id);
         task.abort();
         reconcile_nodes(&state, &job).await.unwrap();
         assert_eq!(item_statuses(&pool, job_id).await, vec!["implemented"]);
@@ -7926,7 +7930,11 @@ mod tests {
             "the node outlived the job the ceiling retired"
         );
         assert!(
-            !state.run_handles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(&run_id),
+            !state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&run_id),
             "the node's task was never stopped"
         );
         assert_eq!(item_statuses(&pool, job_id).await, vec![STATUS_CANCELLED]);

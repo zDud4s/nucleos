@@ -290,7 +290,11 @@ async fn write_terminal_status(
 /// meaning "this call terminated the task" — not "the run ended up in `status`". A caller that needs
 /// the latter reads the row back; today none does.
 pub async fn finalize_termination(state: &AppState, id: i64, status: &str) -> bool {
-    let handle = state.run_handles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&id);
+    let handle = state
+        .run_handles
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&id);
     match handle {
         Some(h) => {
             // Taken BEFORE the abort. The task's `Registration` removes this entry when it drops, and

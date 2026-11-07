@@ -328,7 +328,10 @@ impl Judge for ScriptedJudge {
 
     async fn ask(&self, state: &str, questions: &[Question]) -> Result<Answers, JudgeError> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let now = self.in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let now = self
+            .in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
         let _in_flight = InFlight(&self.in_flight);
         self.max_in_flight
             .fetch_max(now, std::sync::atomic::Ordering::SeqCst);

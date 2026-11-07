@@ -9018,13 +9018,22 @@ tests:
         spawn_registered(&state, id, async { panic!("run body blew up") });
 
         for _ in 0..100 {
-            if !state.run_handles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(&id) {
+            if !state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&id)
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(
-            !state.run_handles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(&id),
+            !state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&id),
             "a dead run must not stay registered as in-flight"
         );
     }
@@ -9396,13 +9405,22 @@ tests:
         // The handle is released by the guard the task captured, so an empty map is proof the body
         // reached the end — its terminal write included — rather than proof that time passed.
         for _ in 0..500 {
-            if !state.run_handles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(&id) {
+            if !state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&id)
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(
-            !state.run_handles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(&id),
+            !state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&id),
             "the run body never finished"
         );
 
@@ -9460,13 +9478,22 @@ tests:
 
         // Wait for the body to wake up, lose the CAS race, and finish.
         for _ in 0..500 {
-            if !state.run_handles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(&id) {
+            if !state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&id)
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(
-            !state.run_handles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(&id),
+            !state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&id),
             "the run body never finished"
         );
 

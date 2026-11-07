@@ -125,7 +125,12 @@ pub(super) async fn post_admit(
         crate::auth::Scope::Run(id) => id,
         _ => body.run_id,
     };
-    if !state.run_handles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(&run_id) {
+    if !state
+        .run_handles
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains_key(&run_id)
+    {
         return Json(AdmitAnswer::none());
     }
     let Some(book) = crate::execution::admission::installed() else {
