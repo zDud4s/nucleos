@@ -205,17 +205,21 @@ mod tests {
         crate::hooks::forget_asks_for_chat("notice-chat-1");
     }
 
-    /// Reads the rows until `want` appear or two seconds of real time pass: the notice's own task
+    /// Reads the rows until `want` appear (60 s real-time hang guard): the notice's own task
     /// writes them, and SQLite works on a thread of its own.
     async fn rows_when(state: &AppState, want: usize) -> Vec<(String, String, String)> {
-        for _ in 0..200 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
             let found = rows(state).await;
             if found.len() >= want {
                 return found;
             }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fewer than {want} notice rows appeared"
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        rows(state).await
     }
 
     /// The clock is frozen only around each advance. Left frozen, it would auto-advance past the

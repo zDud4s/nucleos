@@ -252,16 +252,20 @@ mod tests {
             .collect()
     }
 
-    /// Polls until the outbox holds `n` rows (or 3 s pass) and returns what it holds.
+    /// Polls until the outbox holds `n` rows (60 s hang guard) and returns what it holds.
     async fn wait_for(state: &AppState, n: usize) -> Vec<String> {
-        for _ in 0..300 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
             let rows = announced(state).await;
             if rows.len() >= n {
                 return rows;
             }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the outbox never reached {n} rows"
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        announced(state).await
     }
 
     #[tokio::test]

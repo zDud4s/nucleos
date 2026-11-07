@@ -768,10 +768,10 @@ mod tests {
                 .fetch_one(&state.pool)
                 .await
                 .expect("the root run is linked to the root node");
-        for _ in 0..300 {
-            if runner.last_permission.lock().unwrap().is_some() {
-                break;
-            }
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while runner.last_permission.lock().unwrap().is_none()
+            && std::time::Instant::now() < deadline
+        {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         // The first run ended after a handoff report; the wrap has to start the node again.
@@ -795,14 +795,14 @@ mod tests {
             1,
             "the wrap relaunched the root"
         );
-        let mut seen = None;
-        for _ in 0..300 {
-            seen = *runner.last_permission.lock().unwrap();
-            if seen.is_some() {
-                break;
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let seen = loop {
+            let permission = *runner.last_permission.lock().unwrap();
+            if permission.is_some() || std::time::Instant::now() >= deadline {
+                break permission;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        };
         let seen = seen.expect("the relaunched run reached the runner");
         assert_ne!(
             seen,

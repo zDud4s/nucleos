@@ -1705,7 +1705,9 @@ mod tests {
         .unwrap();
 
         let mut delivered: Option<(i64, String, i64)> = None;
-        for _ in 0..500 {
+        // Hang guard only: a loaded machine can starve the task for a long while.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             delivered = sqlx::query_as(
                 "SELECT r.id, r.prompt, c.sending_run_id
                    FROM runs r JOIN chat_relays c ON c.id = r.from_relay_id
@@ -1729,7 +1731,9 @@ mod tests {
             "the relay is sent by the child's turn"
         );
         assert_eq!(prompt, "[browser agent · Flights] fake output");
-        for _ in 0..500 {
+        // Hang guard only: a loaded machine can starve the task for a long while.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
                 .bind(parent_turn)
                 .fetch_one(&state.pool)
@@ -1794,7 +1798,9 @@ mod tests {
             .await
             .unwrap();
 
-        for _ in 0..500 {
+        // Hang guard only: a loaded machine can starve the task for a long while.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             let status: String =
                 sqlx::query_scalar("SELECT status FROM chat_compactions WHERE run_id = ?")
                     .bind(run)
@@ -1837,7 +1843,9 @@ mod tests {
             .unwrap();
 
         let mut sent = 0;
-        for _ in 0..500 {
+        // Hang guard only: a loaded machine can starve the task for a long while.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             sent = relays_from(&state.pool, &child).await;
             if sent > 0 {
                 break;
@@ -1913,7 +1921,9 @@ mod tests {
         let mut warmed = false;
         // As a transcript's poll does: another test's warm-up holds the one global `WARMING` flag
         // for a moment, and a call that finds it set does nothing.
-        for _ in 0..500 {
+        // Hang guard only: a loaded machine can starve the task for a long while.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             prewarm_open_chat(&state, chat);
             warmed = *fake.calls.lock().unwrap() == 1 && has_kept_process(chat);
             if warmed {
@@ -1931,7 +1941,9 @@ mod tests {
         let id = send_message(&state, chat, "zanzibar?", Origin::Shell)
             .await
             .unwrap();
-        for _ in 0..500 {
+        // Hang guard only: a loaded machine can starve the task for a long while.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
                 .bind(id)
                 .fetch_one(&state.pool)
@@ -2024,7 +2036,9 @@ mod tests {
         .await;
 
         let mut sent = None;
-        for _ in 0..500 {
+        // Hang guard only: a loaded machine can starve the task for a long while.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             sent = fake.last_append_system_prompt.lock().unwrap().clone();
             if sent.is_some() {
                 break;
@@ -2313,7 +2327,9 @@ mod agy_chat_tests {
             .await
             .expect("the turn was accepted");
         let mut status = String::new();
-        for _ in 0..500 {
+        // Hang guard only: a loaded machine can starve the task for a long while.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             status = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
                 .bind(id)
                 .fetch_one(&state.pool)

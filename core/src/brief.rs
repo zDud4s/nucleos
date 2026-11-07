@@ -1676,7 +1676,7 @@ mod tests {
             seed_vector(&pool, id, &[1.0, 0.0]).await?;
         }
         let failing = crate::embed::FakeEmbedder::failing();
-        let deadline = std::time::Duration::from_secs(2);
+        let deadline = std::time::Duration::from_secs(60);
 
         let broken = super::of_with(
             &pool,

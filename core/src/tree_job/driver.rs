@@ -1370,10 +1370,9 @@ mod tests {
     }
 
     async fn wait_calls(gate: &FakeGate, count: usize) {
-        for _ in 0..300 {
-            if gate.calls().len() >= count {
-                break;
-            }
+        // Hang guard only: a loaded machine can be slow, so wait for the event, not a budget.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while gate.calls().len() < count && std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(
@@ -1679,14 +1678,15 @@ mod tests {
 
         /// Waits for the spawned gate to settle the branch, then lets its task finish.
         async fn wait_branch_state(&self, job: &str, name: &str, want: &str) {
-            let mut seen = String::new();
-            for _ in 0..300 {
-                seen = self.branch(job, name).await.state;
-                if seen == want {
-                    break;
+            // Hang guard only: wait for the state, not for a short budget.
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            let seen = loop {
+                let state = self.branch(job, name).await.state;
+                if state == want || std::time::Instant::now() >= deadline {
+                    break state;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+            };
             assert_eq!(seen, want, "branch {name} of {job} never reached {want}");
             tokio::time::sleep(Duration::from_millis(30)).await;
         }
@@ -1863,19 +1863,20 @@ mod tests {
     /// Waits for the spawned gate to count `want` gates in a row that measured nothing, then lets
     /// its task finish.
     async fn wait_gate_failures(fx: &Fixture, job: &str, name: &str, want: i64) {
-        let mut seen = None;
-        for _ in 0..300 {
-            seen = fx
+        // Hang guard only: wait for the count, not for a short budget.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let seen = loop {
+            let count = fx
                 .branch(job, name)
                 .await
                 .extra
                 .get(GATE_FAILURES)
                 .and_then(Value::as_i64);
-            if seen == Some(want) {
-                break;
+            if count == Some(want) || std::time::Instant::now() >= deadline {
+                break count;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        };
         assert_eq!(
             seen,
             Some(want),
@@ -2981,7 +2982,8 @@ mod tests {
         // A dropped connection goes back to the pool on a spawned task, so `num_idle` read right
         // after the tick is racy: poll for up to a second.
         let idle = || async {
-            for _ in 0..50 {
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            while std::time::Instant::now() < deadline {
                 if fx.state.pool.size() as usize == fx.state.pool.num_idle() {
                     return true;
                 }

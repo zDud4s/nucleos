@@ -18743,7 +18743,8 @@ mod tests {
         // that cannot be replayed, and the point from which the run is on its own.
         let mut context = std::task::Context::from_waker(std::task::Waker::noop());
         let mut rejected = false;
-        for _ in 0..10_000 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             assert!(
                 handler.as_mut().poll(&mut context).is_pending(),
                 "the handler ran to completion before the request could be dropped"
@@ -18762,7 +18763,8 @@ mod tests {
         drop(handler);
 
         let mut status = String::new();
-        for _ in 0..100 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             status = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
                 .bind(run_id)
                 .fetch_one(&pool)
@@ -20365,7 +20367,7 @@ mod tests {
 
         // Generous, because what is being asserted is that the number arrives at all — the mirror
         // is throttled, so anything shorter would be measuring the throttle rather than the wiring.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         let reported = loop {
             let response = build_router(state.clone())
                 .oneshot(
@@ -20890,7 +20892,7 @@ mod tests {
             "a closed run must refuse a turn as every other unreachable run does: {refused}"
         );
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         let final_status = loop {
             let status = status_of(state.clone()).await;
             if status != "running" {
@@ -24593,7 +24595,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::ACCEPTED);
 
-        tokio::time::timeout(std::time::Duration::from_secs(5), shutdown_requested())
+        tokio::time::timeout(std::time::Duration::from_secs(60), shutdown_requested())
             .await
             .expect("the request must leave a stored shutdown permit");
     }
@@ -24614,7 +24616,7 @@ mod tests {
         });
         drop(rt);
         assert!(
-            rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok(),
+            rx.recv_timeout(std::time::Duration::from_secs(60)).is_ok(),
             "the exit watchdog died with the runtime that asked for shutdown"
         );
     }

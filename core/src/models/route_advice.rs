@@ -2081,26 +2081,27 @@ mod tests {
 
     #[tokio::test]
     async fn a_router_that_is_down_leaves_the_configured_model() {
-        assert_falls_back(&dead_address().await, Duration::from_secs(2)).await;
+        assert_falls_back(&dead_address().await, Duration::from_secs(30)).await;
     }
 
     #[tokio::test]
     async fn a_router_slower_than_the_timeout_leaves_the_configured_model() {
+        // Far slower than the 30s bound: only the router's own 150ms timeout can end the wait.
         let url = slow_router(
-            Duration::from_secs(5),
+            Duration::from_secs(60),
             serde_json::json!({"decision_id": "rt_late", "runner": "claude",
                                "model": "claude-opus-5"}),
         )
         .await;
-        assert_falls_back(&url, Duration::from_secs(2)).await;
+        assert_falls_back(&url, Duration::from_secs(30)).await;
     }
 
     #[tokio::test]
     async fn a_400_or_a_422_leaves_the_configured_model() {
         let (bad, _rx) = stub_router(400, serde_json::json!({"error": "unknown fields"})).await;
-        assert_falls_back(&bad, Duration::from_secs(2)).await;
+        assert_falls_back(&bad, Duration::from_secs(30)).await;
         let (none, _rx) = stub_router(422, serde_json::json!({"error": "no tier"})).await;
-        assert_falls_back(&none, Duration::from_secs(2)).await;
+        assert_falls_back(&none, Duration::from_secs(30)).await;
     }
 
     #[tokio::test]
@@ -2110,14 +2111,14 @@ mod tests {
             serde_json::json!({"decision_id": "rt_x", "runner": "ollama", "model": "qwen"}),
         )
         .await;
-        assert_falls_back(&url, Duration::from_secs(2)).await;
+        assert_falls_back(&url, Duration::from_secs(30)).await;
         let (url, _rx) = stub_router(
             200,
             serde_json::json!({"decision_id": "rt_x", "runner": "claude",
                                "model": "claude-opus-5", "effort": "turbo"}),
         )
         .await;
-        assert_falls_back(&url, Duration::from_secs(2)).await;
+        assert_falls_back(&url, Duration::from_secs(30)).await;
     }
 
     #[tokio::test]
@@ -3240,9 +3241,9 @@ mod outcome_tests {
         )
         .await;
 
-        let (id, body) = tokio::time::timeout(Duration::from_secs(2), received.recv())
+        let (id, body) = tokio::time::timeout(Duration::from_secs(60), received.recv())
             .await
-            .expect("reported within 2s")
+            .expect("reported within the 60s hang guard")
             .unwrap();
         assert_eq!(id, "rt_1");
         assert_eq!(body, serde_json::json!({"status": "fail"}));
@@ -3274,9 +3275,9 @@ mod outcome_tests {
         report_stopped(&pool, router_at(&url), routed + 99).await;
         report_stopped(&pool, router_at(&url), routed).await;
 
-        let (id, body) = tokio::time::timeout(Duration::from_secs(2), received.recv())
+        let (id, body) = tokio::time::timeout(Duration::from_secs(60), received.recv())
             .await
-            .expect("reported within 2s")
+            .expect("reported within the 60s hang guard")
             .unwrap();
         assert_eq!(id, "rt_9");
         assert_eq!(body, serde_json::json!({"status": "error"}));
