@@ -18,6 +18,9 @@ use std::sync::{LazyLock, Mutex};
 struct Entry {
     attempt_started: DateTime<Utc>,
     pid: Option<u32>,
+    /// When the post-run gate began, while it runs. The CLI is dead by then and the transcript tail
+    /// is silent, so this is the only sign of life the run gives.
+    gate_started: Option<DateTime<Utc>>,
 }
 
 static ATTEMPTS: LazyLock<Mutex<HashMap<i64, Entry>>> =
@@ -35,6 +38,7 @@ pub fn begin_attempt(run_id: i64) {
         Entry {
             attempt_started: Utc::now(),
             pid: None,
+            gate_started: None,
         },
     );
 }
@@ -52,6 +56,57 @@ pub fn attempt_started(run_id: i64) -> Option<DateTime<Utc>> {
 /// The pid of `run_id`'s CLI, while it is running.
 pub fn pid_of(run_id: i64) -> Option<u32> {
     attempts().get(&run_id).and_then(|entry| entry.pid)
+}
+
+/// Slack past `DEFAULT_GATE_TIMEOUT` before a gate marker stops protecting its run: the gate may
+/// queue on heavy admission and its final write comes after the command returns.
+pub const GATE_MARGIN: chrono::Duration = chrono::Duration::minutes(5);
+
+/// The latest moment a gate that began at `started` can still be legitimately running.
+fn gate_deadline(started: DateTime<Utc>) -> DateTime<Utc> {
+    started
+        + chrono::Duration::from_std(crate::state::DEFAULT_GATE_TIMEOUT).unwrap_or_default()
+        + GATE_MARGIN
+}
+
+/// Until when `run_id`'s post-run gate is a legitimate reason for a quiet transcript, if one is in
+/// flight. Bounded: a marker that outlives the gate's own timeout stops protecting the run.
+pub fn gate_in_flight_until(run_id: i64) -> Option<DateTime<Utc>> {
+    attempts()
+        .get(&run_id)
+        .and_then(|entry| entry.gate_started)
+        .map(gate_deadline)
+}
+
+/// Marks the post-run gate of `run_id` as running, until the guard drops (on every exit path,
+/// including the task being aborted).
+pub fn begin_gate(run_id: i64) -> GateInFlight {
+    set_gate_started(run_id, Utc::now())
+}
+
+fn set_gate_started(run_id: i64, at: DateTime<Utc>) -> GateInFlight {
+    if let Some(entry) = attempts().get_mut(&run_id) {
+        entry.gate_started = Some(at);
+    }
+    GateInFlight { run_id }
+}
+
+/// Test seam: a gate that began at `at`.
+#[cfg(test)]
+pub fn begin_gate_at(run_id: i64, at: DateTime<Utc>) -> GateInFlight {
+    set_gate_started(run_id, at)
+}
+
+pub struct GateInFlight {
+    run_id: i64,
+}
+
+impl Drop for GateInFlight {
+    fn drop(&mut self) {
+        if let Some(entry) = attempts().get_mut(&self.run_id) {
+            entry.gate_started = None;
+        }
+    }
 }
 
 /// Clears the pid when the CLI's attempt ends, and only if it is still this one's.
@@ -105,6 +160,18 @@ mod tests {
         assert!(attempt_started(9100001).is_some());
         forget(9100001);
         assert!(attempt_started(9100001).is_none());
+    }
+
+    #[test]
+    fn a_gate_marker_lasts_as_long_as_its_guard_and_is_bounded() {
+        begin_attempt(9100004);
+        assert_eq!(gate_in_flight_until(9100004), None);
+        let guard = begin_gate(9100004);
+        let until = gate_in_flight_until(9100004).expect("marker set");
+        assert!(until > Utc::now() + chrono::Duration::minutes(45));
+        drop(guard);
+        assert_eq!(gate_in_flight_until(9100004), None);
+        forget(9100004);
     }
 
     #[test]

@@ -225,10 +225,14 @@ class PhaseDrop(Base):
         self.assertEqual(len(rows), 2, rows)
         # The second one waited for the first one's drop (>= ~2 s of its 3 s compile phase);
         # the first was admitted at once.
-        waited = [r for r in rows if r["wait_token_s"] > 0.5]
-        self.assertEqual(len(waited), 1, rows)
+        # Identify the rows by the drop, not by a wait clock: under load the first one's own
+        # admission can also take > 0.5 s.
         dropped = [r for r in rows if "weight_drop_s" in r]
         self.assertEqual(len(dropped), 1, rows)
+        later = [r for r in rows if "weight_drop_s" not in r]
+        self.assertEqual(len(later), 1, rows)
+        self.assertGreater(later[0]["wait_token_s"], 1.0, rows)
+        self.assertGreater(later[0]["wait_token_s"], dropped[0]["wait_token_s"], rows)
 
 
 if __name__ == "__main__":

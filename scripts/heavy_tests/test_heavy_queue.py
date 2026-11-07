@@ -31,6 +31,10 @@ import os, pathlib, subprocess, sys, time
 
 d = pathlib.Path(os.environ["SLEEPER_DIR"])
 tag = sys.argv[-1]
+# heavy.py itself calls `cargo metadata` / `cargo clean` through this launcher when a target
+# slot changes owner; those are not the command under test and must return at once.
+if "metadata" in sys.argv[1:] or "clean" in sys.argv[1:]:
+    sys.exit(0)
 # order.txt first, the .start marker last: tests treat the marker as "started" and then read
 # order.txt, so the marker must not be visible before the line it vouches for.
 with open(d / "order.txt", "a") as f:
@@ -342,8 +346,16 @@ class QueueTests(unittest.TestCase):
         # takes no second token (it would deadlock waiting on its own parent).
         outer = self.broker("outer", "test", capacity=2, SLEEPER_NESTED="1")
         self.assert_started("outer")
+        # The wait is a backstop, not an expectation: the sleeper bounds the nested call itself
+        # (subprocess timeout=60), so a real hang kills the outer and ends the wait at once. A
+        # fixed 40 s clock only measured machine load (the full suite runs ~1650 s under a busy
+        # broker, where interpreter start-up alone can eat it).
         self.assertTrue(
-            wait_for(lambda: (self.d / "outer.nested").exists(), 40), "the nested call hung"
+            wait_for(
+                lambda: (self.d / "outer.nested").exists() or outer.poll() is not None, 300
+            )
+            and (self.d / "outer.nested").exists(),
+            "the nested call hung",
         )
         self.assertEqual((self.d / "outer.nested").read_text(), "0")
         self.assertTrue(self.started("inner"))

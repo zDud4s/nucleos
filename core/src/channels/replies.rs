@@ -834,19 +834,23 @@ mod tests {
         (tx, bus)
     }
 
-    /// Polls until the outbox holds `n` rows (or 3 s pass) and returns what it holds.
+    /// Polls until the outbox holds `n` rows (60 s hang guard) and returns what it holds.
     async fn wait_outbox(
         pool: &SqlitePool,
         n: usize,
     ) -> Vec<(String, String, Option<String>, String)> {
-        for _ in 0..300 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
             let rows = outbox_rows(pool).await;
             if rows.len() >= n {
                 return rows;
             }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the outbox never reached {n} rows"
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        outbox_rows(pool).await
     }
 
     #[tokio::test]

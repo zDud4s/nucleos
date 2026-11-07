@@ -1128,7 +1128,9 @@ mod tests {
     async fn seen_launch(
         runner: &crate::execution::runner::FakeCommandRunner,
     ) -> (Option<std::path::PathBuf>, Option<i64>, Option<Vec<String>>) {
-        for _ in 0..200 {
+        // Hang guard only: wait for the launch, not for a short budget.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             if let Some(seen) = runner.last_job_mcp.lock().unwrap().clone() {
                 return seen;
             }

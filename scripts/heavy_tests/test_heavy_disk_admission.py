@@ -34,6 +34,9 @@ import os, pathlib, sys, time
 
 d = pathlib.Path(os.environ["SLEEPER_DIR"])
 tag = sys.argv[-1]
+# heavy.py's own `cargo metadata` / `cargo clean` (slot handoff) must return at once.
+if "metadata" in sys.argv[1:] or "clean" in sys.argv[1:]:
+    sys.exit(0)
 (d / f"{tag}.start").write_text(str(os.getpid()))
 while not ((d / f"{tag}.stop").exists() or (d / "all.stop").exists()):
     time.sleep(0.05)

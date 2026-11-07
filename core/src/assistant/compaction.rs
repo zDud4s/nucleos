@@ -907,7 +907,9 @@ mod tests {
 
         // The compaction turn was told the compaction prompt; runs.prompt keeps what was typed.
         let mut status = String::new();
-        for _ in 0..500 {
+        // Hang guard only: a loaded machine can starve the task for a long while.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             status = compaction_status(&state.pool, id).await;
             if status != "pending" && !super::super::is_busy(&c) {
                 break;
@@ -936,7 +938,9 @@ mod tests {
             .await
             .unwrap();
         let mut handed = String::new();
-        for _ in 0..500 {
+        // Hang guard only: a loaded machine can starve the task for a long while.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             handed = fake.last_prompt.lock().unwrap().clone().unwrap_or_default();
             if handed.contains("what now?") {
                 break;
@@ -1357,7 +1361,9 @@ mod tests {
 
         start_as(&state, &c, "/compact", None, auto).await.unwrap();
 
-        for _ in 0..500 {
+        // Hang guard only: a loaded machine can starve the task for a long while.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             if fake.last_tool_policy.lock().unwrap().is_some() && !super::super::is_busy(&c) {
                 break;
             }

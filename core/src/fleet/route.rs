@@ -195,7 +195,8 @@ mod tests {
         assert!(f.hub.is_running());
 
         drop(response); // the client went away
-        for _ in 0..50 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             f.hub.emit_heartbeat();
             if !f.hub.is_running() {
                 break;
@@ -271,7 +272,7 @@ mod tests {
         drop(reader);
 
         f.hub.emit_heartbeat();
-        tokio::time::timeout(std::time::Duration::from_secs(1), pumping)
+        tokio::time::timeout(std::time::Duration::from_secs(60), pumping)
             .await
             .expect("the pump noticed")
             .unwrap();
