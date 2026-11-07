@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "`~/.nucleos/background.yaml`: how long a chat's background task may say nothing before its\nprocess stops being kept alive for it.",
+  "properties": {
+    "background_silence_hours": {
+      "default": 24,
+      "description": "Hours of silence, 24 by default. Counted from the task's last report, never from a client's\npoll, so work left running overnight is not cut off because nobody was connected.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "title": "BackgroundConfig",
+  "type": "object"
+}

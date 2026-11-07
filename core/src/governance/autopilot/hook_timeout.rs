@@ -16,17 +16,32 @@ pub(super) fn raise_short_timeouts(list: &mut [Value]) {
             continue;
         };
         for inner in inner_hooks {
-            let ours = inner
-                .get("command")
-                .and_then(Value::as_str)
-                .is_some_and(|command| command.contains(HOOK_SCRIPT));
-            let short = inner
-                .get("timeout")
-                .and_then(Value::as_u64)
-                .is_none_or(|seconds| seconds < HOOK_TIMEOUT_SECONDS);
-            if ours && short {
+            if is_ours_and_short(inner) {
                 inner["timeout"] = serde_json::json!(HOOK_TIMEOUT_SECONDS);
             }
         }
     }
+}
+
+/// Whether any tool event in these settings still carries a timeout from before the current one.
+pub(super) fn a_timeout_is_short(settings: &Value) -> bool {
+    ["PreToolUse", "PostToolUse", "PostToolUseFailure"]
+        .iter()
+        .filter_map(|event| settings.get("hooks")?.get(event)?.as_array())
+        .flatten()
+        .filter_map(|entry| entry.get("hooks").and_then(Value::as_array))
+        .flatten()
+        .any(is_ours_and_short)
+}
+
+fn is_ours_and_short(inner: &Value) -> bool {
+    let ours = inner
+        .get("command")
+        .and_then(Value::as_str)
+        .is_some_and(|command| command.contains(HOOK_SCRIPT));
+    let short = inner
+        .get("timeout")
+        .and_then(Value::as_u64)
+        .is_none_or(|seconds| seconds < HOOK_TIMEOUT_SECONDS);
+    ours && short
 }

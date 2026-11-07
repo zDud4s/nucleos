@@ -14,7 +14,7 @@ import {
   type TreeNode,
   type Worktree,
 } from "../data/project-code";
-import { openInVscode, vscodeUrl } from "../lib/vscode";
+import { editorRemoteNote, openInVscode, vscodeUrl } from "../lib/vscode";
 import { UI_LOCALE } from "../lib/locale";
 import { isApiRefusal } from "../data/client";
 import {
@@ -390,6 +390,8 @@ function useEditorDoor(): EditorDoor {
 }
 
 function DoorFailed() {
+  const remote = editorRemoteNote();
+  if (remote !== null) return <ErrorNote>{remote}</ErrorNote>;
   return (
     <ErrorNote>
       VS Code gave no reply. Is it installed, and does it open <code>vscode://</code> links on this

@@ -1,4 +1,5 @@
 import { DAEMON_URL, TokenReadError, getTransport } from "./transport";
+import { transportFor, type MachineId } from "./machineStore";
 
 /**
  * The núcleo, on loopback (defined with the desktop transport). The desktop
@@ -178,10 +179,10 @@ async function refusalFrom(res: Response): Promise<ApiRefusal> {
  * second 401, or a transport that answers "fail" (the remote session is gone),
  * is a real refusal.
  */
-async function request(path: string, init: RequestInit | undefined): Promise<Response> {
-  const transport = getTransport();
+async function request(path: string, init: RequestInit | undefined, machine: MachineId = "here"): Promise<Response> {
+  const transport = machine === "here" ? getTransport() : transportFor(machine);
   try {
-    return await requestOnce(transport, path, init);
+    return await withStepUp(transport, path, init);
   } catch (error) {
     if (!(error instanceof ApiRefusal) || error.status !== 401) throw error;
     const decision = await transport.onUnauthorized();
@@ -190,6 +191,34 @@ async function request(path: string, init: RequestInit | undefined): Promise<Res
       throw new ApiRefusal(401, transport.unauthorizedCode, error.detail, error.body);
     }
     throw error;
+  }
+}
+
+/**
+ * A grave action refused with `step_up_required` under a transport that can ask for a passkey: ask,
+ * and send the request exactly once more if the passkey verified. The second answer, whatever it is,
+ * is final, so a gateway that keeps refusing never becomes a loop. A request is only ever repeated
+ * after a verification, so a mutation is not sent twice without the person having confirmed it.
+ */
+async function withStepUp(
+  transport: ReturnType<typeof getTransport>,
+  path: string,
+  init: RequestInit | undefined,
+): Promise<Response> {
+  try {
+    return await requestOnce(transport, path, init);
+  } catch (error) {
+    if (
+      !(error instanceof ApiRefusal) ||
+      error.status !== 403 ||
+      error.code !== "step_up_required" ||
+      transport.onStepUp === undefined
+    ) {
+      throw error;
+    }
+    const outcome = await transport.onStepUp(path);
+    if (outcome.kind === "failed") throw new ApiRefusal(403, outcome.code, outcome.detail, error.body);
+    return await requestOnce(transport, path, init);
   }
 }
 
@@ -218,7 +247,7 @@ async function requestOnce(
 
   let res: Response;
   try {
-    res = await fetch(`${transport.baseUrl}${path}`, { credentials: transport.credentials, ...init, headers });
+    res = await (transport.fetch ?? fetch)(`${transport.baseUrl}${path}`, { credentials: transport.credentials, ...init, headers });
   } catch (cause) {
     throw new ApiUnavailable("transport", "the daemon did not answer", cause);
   }
@@ -231,8 +260,8 @@ async function requestOnce(
  * An authenticated streaming GET: the body, unread. Refusals arrive as
  * {@link ApiRefusal} through `request`, exactly as for a JSON call.
  */
-export async function openStream(path: string, signal: AbortSignal): Promise<ReadableStream<Uint8Array>> {
-  const res = await request(path, { signal });
+export async function openStream(path: string, signal: AbortSignal, machine: MachineId = "here"): Promise<ReadableStream<Uint8Array>> {
+  const res = await request(path, { signal }, machine);
   if (res.body === null) throw new Error(`the daemon answered ${path} with no body`);
   return res.body;
 }
@@ -249,8 +278,8 @@ export async function openStream(path: string, signal: AbortSignal): Promise<Rea
  * nothing (`POST /autopilot/kill`, `POST /autopilot/attention`) would throw a
  * parse error out of a success. Callers of those type `T` as `void`.
  */
-export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await request(path, init);
+export async function apiFetch<T>(path: string, init?: RequestInit, machine: MachineId = "here"): Promise<T> {
+  const res = await request(path, init, machine);
   if (res.status === 204 || res.status === 205) return undefined as T;
   try {
     return (await res.json()) as T;
@@ -269,8 +298,8 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
  * one endpoint shaped differently cannot tempt a caller into `res.json()` on
  * prose.
  */
-export async function apiText(path: string, init?: RequestInit): Promise<string> {
-  const res = await request(path, init);
+export async function apiText(path: string, init?: RequestInit, machine: MachineId = "here"): Promise<string> {
+  const res = await request(path, init, machine);
   return await res.text();
 }
 
@@ -286,8 +315,8 @@ export async function apiText(path: string, init?: RequestInit): Promise<string>
  * A `Blob` is the one shape a caller can hand to `URL.createObjectURL` or write
  * to disk without either failure mode.
  */
-export async function apiBlob(path: string, init?: RequestInit): Promise<Blob> {
-  const res = await request(path, init);
+export async function apiBlob(path: string, init?: RequestInit, machine: MachineId = "here"): Promise<Blob> {
+  const res = await request(path, init, machine);
   return await res.blob();
 }
 
@@ -297,8 +326,8 @@ export async function apiBlob(path: string, init?: RequestInit): Promise<Blob> {
  * The caller reads `res.body` itself. A 204 is returned, not thrown: it is how
  * the daemon says "nothing to stream", and the caller decides what that means.
  */
-export async function apiStream(path: string, init?: RequestInit): Promise<Response> {
-  return await request(path, init);
+export async function apiStream(path: string, init?: RequestInit, machine: MachineId = "here"): Promise<Response> {
+  return await request(path, init, machine);
 }
 
 /**
@@ -329,15 +358,32 @@ export async function probeHealth(): Promise<boolean> {
   }
 }
 
+/** A live run a restart or an update is waiting on (`core/src/shutdown.rs`, `BlockingRun`). */
+export interface BlockingRun {
+  run_id: number;
+  chat_id: string | null;
+}
+
 /**
- * What `GET /system/update-readiness` answers: the daemon's version, how many
- * runs are live (`running` or `awaiting_approval`), and whether it is already
- * draining for an update. The updater waits for `live_runs` to reach zero.
+ * What `GET /system/update-readiness` answers, and what `POST /system/restart` and
+ * `POST /system/shutdown` answer with 202: the daemon's version, how many runs are live
+ * (`running` or `awaiting_approval`), whether it is already draining, what a restart would
+ * wait on right now, and the process id (so a new daemon can be told from the one asked).
  */
 export interface UpdateReadiness {
   version: string;
   live_runs: number;
   draining: boolean;
+  waiting_on: BlockingRun[];
+  pid: number;
+}
+
+/** How the shell names what a restart or an update is waiting on, in one sentence fragment. */
+export function describeBlocking(waitingOn: BlockingRun[]): string {
+  if (waitingOn.length === 0) return "nothing: it is about to stop";
+  return waitingOn
+    .map((run) => (run.chat_id === null ? `run ${run.run_id}` : `run ${run.run_id} in chat ${run.chat_id}`))
+    .join(", ");
 }
 
 /**

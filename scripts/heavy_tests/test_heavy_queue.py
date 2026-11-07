@@ -114,9 +114,10 @@ class QueueTests(unittest.TestCase):
     # ---- helpers -------------------------------------------------------------------
     def env(self, capacity: int = 4, **extra: str) -> dict:
         env = dict(os.environ)
-        for k in ("NUCLEOS_HEAVY", "NUCLEOS_HEAVY_TOKEN", "NUCLEOS_HEAVY_HELD",
-                  "NUCLEOS_HEAVY_PRIO", "NUCLEOS_HEAVY_WAIT_MAX", "NUCLEOS_HEAVY_MAIN"):
-            env.pop(k, None)
+        # Strip every inherited NUCLEOS_HEAVY* variable (the shell may export any of them).
+        for k in list(env):
+            if k.startswith("NUCLEOS_HEAVY"):
+                env.pop(k)
         env.update(
             NUCLEOS_HEAVY_DIR=str(self.state),
             NUCLEOS_HEAVY_CAPACITY=str(capacity),

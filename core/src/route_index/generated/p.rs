@@ -252,7 +252,7 @@ pub(super) const ROUTES: &[RouteEntry] = &[
         method: "POST",
         path: "/projects/{id}/judge",
         purpose: "Two doors and not one PUT with a nullable field, because the three states are not a value and its absence: naming nobody is a decision, and taking the row away is withdrawing one.",
-        body: Body::Shapeless("JudgeRequest"),
+        body: Body::None,
         handler: "post_project_judge",
     },
     RouteEntry {
@@ -406,7 +406,7 @@ pub(super) const ROUTES: &[RouteEntry] = &[
         method: "POST",
         path: "/projects/{id}/onboard",
         purpose: "Bringing a project under NucleOS: the GET is what a person reads before confirming (what is in the folder, the proposed gate), the POST is the confirmation.",
-        body: Body::Shapeless("OnboardRequest"),
+        body: Body::None,
         handler: "post_project_onboard",
     },
     RouteEntry {

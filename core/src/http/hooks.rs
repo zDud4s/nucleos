@@ -71,7 +71,7 @@ pub(super) async fn post_ask_wait(
         }),
         None => Json(crate::hooks::Decision {
             decision: "deny".to_owned(),
-            reason: "nobody answered for this in time".to_owned(),
+            reason: "nobody answered for this while the session lived".to_owned(),
         }),
     }
 }

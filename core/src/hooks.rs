@@ -2597,25 +2597,90 @@ mod tests {
         assert!(asks_for(&chat_id).is_empty());
     }
 
-    /// A question older than any hook call could still be waiting on is about nothing: the CLI cut
-    /// both of the hook's calls off long ago. It leaves the window by itself.
+    /// A question a hook waits on stands as long as that hook's connection does, however long: the
+    /// CLI holds the call, and a person may answer hours later from another machine. Nothing ages
+    /// it out, not even a long time past the grace a question nobody waits on gets.
     #[tokio::test]
-    async fn a_question_older_than_any_live_hook_expires() {
+    async fn a_question_a_hook_waits_on_stands_past_the_grace() {
         let state = test_state().await;
         let root = tempfile::TempDir::new().unwrap();
         let (chat_id, run_id) = rooted_conversation(&state, &root).await;
 
         let id = ask_about(&chat_id, run_id, "Bash", Some("npm publish".to_owned()));
-        {
-            let mut asks = super::asks::ASKS.lock().unwrap();
-            let pending = asks.get_mut(&id).unwrap();
-            pending.asked_at = std::time::Instant::now()
-                .checked_sub(ASK_LIFETIME + Duration::from_secs(1))
-                .expect("the clock has run long enough to age a question");
+        let waiting =
+            tokio::spawn(async move { wait_for_run(run_id, Duration::from_secs(30)).await });
+        // The hook has started waiting once the receiver has been taken out of the table.
+        for _ in 0..200 {
+            let taken = super::asks::ASKS
+                .lock()
+                .unwrap()
+                .get(&id)
+                .is_some_and(|pending| pending.heard.is_none());
+            if taken {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
+        // Another run asking, which is what used to sweep the old ones out.
+        let _other = ask_about(&chat_id, run_id + 1, "Bash", None);
+        super::asks::backdate_ask(&id, ASK_WAIT_GRACE * 1000);
+
+        assert!(asks_for(&chat_id).iter().any(|ask| ask.id == id));
+        assert!(ask_is_open(&id));
+        assert!(run_is_parked(run_id));
+        assert!(chat_has_open_ask(&chat_id));
+        assert!(answer_ask(&id, true));
+        assert_eq!(waiting.await.unwrap(), Some(true));
+        forget_asks_for_chat(&chat_id);
+        assert!(!chat_has_open_ask(&chat_id));
+        assert!(!run_is_parked(run_id));
+    }
+
+    /// A question whose hook never came to wait is a ghost once the grace has passed: its CLI may
+    /// live on, so neither the hook's connection nor the process ending would ever clear it, and it
+    /// would pin the process and sit in the window for good.
+    #[tokio::test]
+    async fn a_question_no_hook_waits_on_goes_after_the_grace() {
+        let state = test_state().await;
+        let root = tempfile::TempDir::new().unwrap();
+        let (chat_id, run_id) = rooted_conversation(&state, &root).await;
+
+        let id = ask_about(&chat_id, run_id, "Bash", Some("npm publish".to_owned()));
+        assert!(ask_is_open(&id), "a fresh question stands within the grace");
+        super::asks::backdate_ask(&id, ASK_WAIT_GRACE + Duration::from_secs(1));
 
         assert!(asks_for(&chat_id).is_empty());
+        assert!(!chat_has_open_ask(&chat_id));
+        assert!(!ask_is_open(&id));
+        assert!(!run_is_parked(run_id));
         assert!(!answer_ask(&id, true), "an expired question took an answer");
+    }
+
+    /// The hook outwaits the daemon, so the daemon gives the answer, and the CLI's timeout outwaits
+    /// the hook, because a hook the CLI cuts does not block the tool.
+    #[test]
+    fn the_shipped_hook_waits_longer_than_the_daemon() {
+        let source = include_str!("../hooks/ask_daemon.py");
+        let wait = source
+            .lines()
+            .find_map(|line| line.strip_prefix("ASK_WAIT_TIMEOUT_SECONDS = "))
+            .expect("the hook names its ask wait")
+            .trim()
+            .replace('_', "")
+            .parse::<u64>()
+            .expect("the ask wait is a plain number of seconds");
+        assert!(
+            source.contains("urlopen(request, timeout=ASK_WAIT_TIMEOUT_SECONDS)"),
+            "the ask wait is not what `wait_for_answer` opens the connection with"
+        );
+        assert!(
+            wait > ASK_WINDOW.as_secs(),
+            "the hook gives up before the daemon"
+        );
+        assert!(
+            wait < crate::governance::autopilot::HOOK_TIMEOUT_SECONDS,
+            "the CLI would cut the hook before it gives its answer"
+        );
     }
 
     /// A conversation with a directory and a running turn, which is what `rooted_decision` needs.
@@ -5794,7 +5859,7 @@ mod tests {
 
     /// The cost claim, which is the reason the rung exists at all.
     ///
-    /// A registered `Ask` is what waits out `ASK_WINDOW` — 45 seconds per unrecognised action, for
+    /// A registered `Ask` is what waits out `ASK_WINDOW` — up to a month per unrecognised action, for
     /// an answer nobody is there to give. Asserting the verdict cannot see that: a `deny` returned
     /// AFTER `ask_about` would read identically here and still have minted the question and
     /// summoned the judge. The empty register and the judge counter are what pin the return ABOVE

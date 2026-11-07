@@ -87,8 +87,13 @@ pub async fn tick(
         {
             let run_id = run_id.expect("daemon runs have ids");
             if matches!(verdict, Veredicto::Dead) {
-                sqlx::query("UPDATE runs SET status = 'cancelled', completed_at = ? WHERE id = ? AND status = 'running'")
-                    .bind(now.to_rfc3339()).bind(run_id).execute(&state.pool).await?;
+                // Through the terminator first: it aborts the task (and with it the CLI tree) if a
+                // handle turned up since the observation. Dead is only declared with no live pid,
+                // so the bare write below is for the handle-less row the terminator cannot reach.
+                if !finalize_termination(state, run_id, "cancelled").await {
+                    sqlx::query("UPDATE runs SET status = 'cancelled', completed_at = ? WHERE id = ? AND status = 'running'")
+                        .bind(now.to_rfc3339()).bind(run_id).execute(&state.pool).await?;
+                }
             } else {
                 finalize_termination(state, run_id, "cancelled").await;
             }
@@ -288,10 +293,24 @@ pub async fn daemon_observations(state: &AppState) -> sqlx::Result<Vec<Observed>
                 .await?,
                 None => 0,
             };
+        // Silence is measured from the CURRENT attempt: a retry is a fresh CLI with an empty
+        // transcript and must not inherit the age of the run.
+        let created_at = started_at;
+        let started_at = match (
+            created_at,
+            crate::execution::runner::cli_pids::attempt_started(id),
+        ) {
+            (Some(created), Some(attempt)) => Some(created.max(attempt)),
+            (created, attempt) => created.or(attempt),
+        };
         let alive = state.run_handles.lock().unwrap().contains_key(&id);
-        let process_alive = if alive {
+        // The task handle is the daemon's bookkeeping; the CLI is a child process that can outlive
+        // it. Only a process the OS no longer has is proof of death.
+        let cli_running = crate::execution::runner::cli_pids::pid_of(id)
+            .is_some_and(crate::process_tree::pid_alive);
+        let process_alive = if alive || cli_running {
             Some(true)
-        } else if started_at.is_some_and(|start| now - start <= Duration::seconds(SPAWN_GRACE_SECS))
+        } else if created_at.is_some_and(|start| now - start <= Duration::seconds(SPAWN_GRACE_SECS))
         {
             None
         } else {
@@ -383,6 +402,8 @@ fn open_tool_deadline(
             }
         }
     }
+    // Bounded by the run's own timeout from the START OF THE CURRENT ATTEMPT (the caller passes
+    // that), so a retry's tool call is not judged against the run's creation time.
     (!open.is_empty()).then(|| {
         started_at.unwrap_or_else(Utc::now)
             + Duration::from_std(run_timeout_for_mode(state.run_timeout, mode)).unwrap_or_default()
@@ -1694,6 +1715,102 @@ mod tests {
             classify(observation, &limits(), moment),
             Veredicto::Waiting(Motivo::ToolInFlight)
         );
+    }
+
+    /// 2026-11-06: runs 365, 387, 419 and 457 lost their `run_handles` entry while their CLI kept
+    /// working, and the sweep cancelled them on the strength of the missing handle alone.
+    #[tokio::test]
+    async fn daemon_observations_does_not_call_a_run_dead_while_its_cli_process_lives() {
+        let state = state().await;
+        let now = Utc::now();
+        let id = seed_run(&state, "running", now - minutes(60)).await;
+        crate::execution::runner::cli_pids::begin_attempt(id);
+        // This test process stands in for the CLI: it is certainly alive.
+        let env = vec![("NUCLEOS_RUN_ID".to_string(), id.to_string())];
+        let _pid = crate::execution::runner::cli_pids::register(&env, Some(std::process::id()))
+            .expect("the attempt was announced");
+
+        let observed = daemon_observations(&state).await.unwrap();
+
+        let observation = &observation_of(&observed, id).observation;
+        assert!(!has_handle(&state, id), "no handle: the case under test");
+        assert_eq!(observation.process_alive, Some(true));
+        assert_ne!(classify(observation, &limits(), now), Veredicto::Dead);
+        crate::execution::runner::cli_pids::forget(id);
+    }
+
+    /// A retry is a fresh CLI with an empty transcript: its silence runs from its own start, not
+    /// from the run's creation an hour ago.
+    #[tokio::test]
+    async fn daemon_observations_measures_silence_from_the_current_attempt() {
+        let state = state().await;
+        let now = Utc::now();
+        let id = 880_011;
+        seed_live_run_with_id(&state, id, now - minutes(60)).await;
+        crate::execution::runner::cli_pids::begin_attempt(id);
+
+        let observed = daemon_observations(&state).await.unwrap();
+
+        let observation = &observation_of(&observed, id).observation;
+        assert_eq!(
+            classify(observation, &limits(), Utc::now()),
+            Veredicto::Healthy
+        );
+        crate::execution::runner::cli_pids::forget(id);
+    }
+
+    /// The open-call deadline is anchored at the attempt's start. Anchored at `created_at` (an hour
+    /// ago here) it had already run out, and the quiet call read as `Stalled`.
+    #[tokio::test]
+    async fn daemon_observations_anchors_an_open_tool_deadline_at_the_attempt_start() {
+        let state = state().await;
+        let now = Utc::now();
+        let id = 880_012;
+        seed_live_run_with_id(&state, id, now - minutes(60)).await;
+        sqlx::query("UPDATE runs SET mode = 'worktree' WHERE id = ?")
+            .bind(id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        crate::execution::runner::cli_pids::begin_attempt(id);
+        publish_tail(
+            &state,
+            id,
+            concat!(
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"building","name":"Bash","input":{}}]}}"#,
+                "\n",
+            ),
+        );
+
+        let observed = daemon_observations(&state).await.unwrap();
+
+        let observation = &observation_of(&observed, id).observation;
+        let written = observation
+            .last_transcript_write
+            .expect("a tail with lines has a write");
+        let moment = written + limits().stalled_after + Duration::seconds(1);
+        assert_eq!(
+            classify(observation, &limits(), moment),
+            Veredicto::Waiting(Motivo::ToolInFlight)
+        );
+        crate::execution::runner::cli_pids::forget(id);
+    }
+
+    /// Dead goes through the terminator, which aborts a task that is still registered, so a run
+    /// wrongly read as dead has its CLI tree taken down rather than left running with a
+    /// `cancelled` row (every hook of it then answers 401).
+    #[tokio::test]
+    async fn daemon_run_declared_dead_is_ended_through_the_terminator() {
+        let state = state().await;
+        let now = Utc::now();
+        let id = seed_live_run(&state).await;
+        assert!(has_handle(&state, id));
+        let observed = [daemon(id, None, dead_obs(now))];
+
+        tick(&state, &observed, &limits(), now).await.unwrap();
+
+        assert!(!has_handle(&state, id), "the terminator released the task");
+        assert_eq!(run_status(&state, id).await, "cancelled");
     }
 
     /// A run parked on an approval has no process to hold a handle and may wait for hours. Old on

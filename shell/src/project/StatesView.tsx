@@ -2,7 +2,7 @@ import { DAEMON_NAME } from "../copy";
 import { useId, useState } from "react";
 import { useProjectStates, type StateMachine } from "../data/project-states";
 import { absolutePath } from "../data/project-code";
-import { openInVscode } from "../lib/vscode";
+import { editorRemoteNote, openInVscode } from "../lib/vscode";
 import { layoutMachine, type MachineLayout } from "./states-model";
 import { Button, ErrorNote } from "../ui";
 
@@ -52,8 +52,12 @@ export function StatesView({ projectId }: { projectId: string }) {
     <div className="flex flex-col gap-6">
       {failed ? (
         <ErrorNote>
-          VS Code gave no reply. Is it installed, and does it open <code>vscode://</code> links on
-          this machine?
+          {editorRemoteNote() ?? (
+            <>
+              VS Code gave no reply. Is it installed, and does it open <code>vscode://</code> links on
+              this machine?
+            </>
+          )}
         </ErrorNote>
       ) : null}
       {machines.map((machine) => (
