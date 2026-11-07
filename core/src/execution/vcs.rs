@@ -4438,12 +4438,13 @@ mod tests {
         // The deadline is orders of magnitude past how long the operation actually takes: what
         // this proves is that `wait_for` returns once the row finishes, not that it merely survives
         // to a deadline that happens to still be far away.
-        let (ticket, drained) = tokio::join!(wait_for(&pool, id, Duration::from_secs(600)), async {
-            // A head start so `wait_for`'s first read sees "queued", not "running" — the loop, not
-            // a lucky initial read, is what has to notice the finish.
-            tokio::time::sleep(Duration::from_millis(5)).await;
-            drain_once(&pool, "alpha", &executor).await
-        });
+        let (ticket, drained) =
+            tokio::join!(wait_for(&pool, id, Duration::from_secs(600)), async {
+                // A head start so `wait_for`'s first read sees "queued", not "running" — the loop, not
+                // a lucky initial read, is what has to notice the finish.
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                drain_once(&pool, "alpha", &executor).await
+            });
 
         assert!(drained, "the operation ran");
         let ticket = ticket.unwrap();
