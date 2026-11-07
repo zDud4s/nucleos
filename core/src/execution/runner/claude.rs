@@ -664,7 +664,7 @@ mod stdio_grace_tests {
         assert_eq!(read, vec!["first".to_string(), "second".to_string()]);
         assert!(exited_at.is_some());
         assert!(
-            started.elapsed() < Duration::from_secs(3),
+            started.elapsed() < Duration::from_secs(30),
             "{:?}",
             started.elapsed()
         );

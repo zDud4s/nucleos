@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use super::driver::{GateVerdict, NotMeasured};
-use super::gate::{GateIo, Stored, gate_at_head};
+use super::gate::{GateIo, Stored, gate_at_head, gate_compiled_then_tested};
 use crate::verify::plan::{Progress, Ticket};
 
 const WAIT: Duration = Duration::from_millis(1);
@@ -74,6 +74,70 @@ impl GateIo for Fake {
         self.set(ticket(id, false, None));
         Ok(id)
     }
+}
+
+#[tokio::test]
+async fn a_head_that_does_not_compile_is_red_before_any_test_is_submitted() {
+    let check = Fake::default();
+    let test = Fake::default();
+    assert!(
+        gate_compiled_then_tested(&check, &test, "h1", WAIT)
+            .await
+            .is_err()
+    );
+    check.set(ticket(100, true, Some("failed")));
+    let verdict = gate_compiled_then_tested(&check, &test, "h1", WAIT).await;
+    assert!(
+        matches!(verdict, Ok(GateVerdict::Red { .. })),
+        "{verdict:?}"
+    );
+    assert_eq!(
+        test.submits(),
+        0,
+        "no test is spent on a head that does not build"
+    );
+}
+
+#[tokio::test]
+async fn a_head_that_compiles_goes_on_to_its_tests() {
+    let check = Fake::default();
+    let test = Fake::default();
+    assert!(
+        gate_compiled_then_tested(&check, &test, "h1", WAIT)
+            .await
+            .is_err()
+    );
+    check.set(ticket(100, true, Some("passed")));
+    assert!(
+        gate_compiled_then_tested(&check, &test, "h1", WAIT)
+            .await
+            .is_err()
+    );
+    assert_eq!(test.submits(), 1);
+    test.set(ticket(100, true, Some("failed")));
+    let verdict = gate_compiled_then_tested(&check, &test, "h1", WAIT).await;
+    assert!(
+        matches!(verdict, Ok(GateVerdict::Red { .. })),
+        "{verdict:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_diff_no_check_selects_still_reaches_its_tests() {
+    let check = Fake::default();
+    let test = Fake::default();
+    assert!(
+        gate_compiled_then_tested(&check, &test, "h1", WAIT)
+            .await
+            .is_err()
+    );
+    check.set(ticket(100, true, Some("nothing_ran")));
+    assert!(
+        gate_compiled_then_tested(&check, &test, "h1", WAIT)
+            .await
+            .is_err()
+    );
+    assert_eq!(test.submits(), 1);
 }
 
 #[tokio::test]
@@ -249,6 +313,41 @@ async fn a_ticket_seen_ending_without_measuring_is_forgotten() {
         None,
         "a failure already reported is not reported again by the next call"
     );
+}
+
+#[tokio::test]
+async fn a_regate_of_the_same_red_head_measures_again() {
+    // After a decision answer or a rescue the head is unchanged: the red already delivered must
+    // not be read back from its old ticket.
+    let fake = Fake::default();
+    assert!(gate_at_head(&fake, "h1", WAIT).await.is_err());
+    fake.set(ticket(100, true, Some("failed")));
+    assert!(matches!(
+        gate_at_head(&fake, "h1", WAIT).await,
+        Ok(GateVerdict::Red { .. })
+    ));
+    let again = gate_at_head(&fake, "h1", WAIT).await;
+    assert!(
+        matches!(again, Err(NotMeasured::Running(_))),
+        "a fresh unit is only waited on: {again:?}"
+    );
+    assert_eq!(fake.submits(), 2, "a fresh ticket was requested");
+}
+
+#[tokio::test]
+async fn a_regate_of_a_green_head_still_reads_its_ticket() {
+    let fake = Fake::default();
+    assert!(gate_at_head(&fake, "h1", WAIT).await.is_err());
+    fake.set(ticket(100, true, Some("passed")));
+    assert_eq!(
+        gate_at_head(&fake, "h1", WAIT).await,
+        Ok(GateVerdict::Green)
+    );
+    assert_eq!(
+        gate_at_head(&fake, "h1", WAIT).await,
+        Ok(GateVerdict::Green)
+    );
+    assert_eq!(fake.submits(), 1);
 }
 
 #[tokio::test]

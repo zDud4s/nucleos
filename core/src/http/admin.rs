@@ -705,14 +705,26 @@ fn require_control(scope: &crate::auth::Scope) -> Result<(), StatusCode> {
 struct MachineView {
     name: String,
     role: crate::config::MachineRole,
+    /// This install's stable id (a UUID kept in the db); peers record it at pairing time.
+    machine_id: String,
 }
 
-impl From<crate::config::MachineConfig> for MachineView {
-    fn from(machine: crate::config::MachineConfig) -> Self {
-        Self {
+impl MachineView {
+    async fn read(
+        pool: &sqlx::SqlitePool,
+        machine: crate::config::MachineConfig,
+    ) -> Result<Self, StatusCode> {
+        let machine_id = crate::machine_id::get_or_create(pool)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "could not read the machine id");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        Ok(Self {
             name: machine.name(),
             role: machine.role,
-        }
+            machine_id,
+        })
     }
 }
 
@@ -729,16 +741,16 @@ struct PutMachineView {
     restart_required: bool,
 }
 
-/// `GET /machine`: the local machine's display name and role.
+/// `GET /machine`: the local machine's display name, role and stable machine id.
 async fn get_machine(
+    State(state): State<AppState>,
     axum::Extension(scope): axum::Extension<crate::auth::Scope>,
 ) -> Result<Json<MachineView>, StatusCode> {
     require_control(&scope)?;
-    Ok(Json(
+    let machine =
         (*crate::settings::get::<crate::config::MachineConfig>(&crate::settings::Scope::Machine))
-            .clone()
-            .into(),
-    ))
+            .clone();
+    Ok(Json(MachineView::read(&state.pool, machine).await?))
 }
 
 /// `PUT /machine { name?, role? }`: update the local identity or role.
@@ -777,10 +789,9 @@ async fn put_machine(
 
     let machine =
         (*crate::settings::get::<crate::config::MachineConfig>(&crate::settings::Scope::Machine))
-            .clone()
-            .into();
+            .clone();
     Ok(Json(PutMachineView {
-        machine,
+        machine: MachineView::read(&state.pool, machine).await?,
         restart_required: role_changed.load(std::sync::atomic::Ordering::Relaxed),
     }))
 }

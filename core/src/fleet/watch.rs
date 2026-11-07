@@ -75,7 +75,7 @@ mod tests {
         let file = dir.path().join("session.jsonl");
         std::fs::write(&file, b"{}\n").unwrap();
 
-        let reported = tokio::time::timeout(Duration::from_secs(5), async {
+        let reported = tokio::time::timeout(Duration::from_secs(60), async {
             while let Some(path) = rx.recv().await {
                 if path.file_name() == file.file_name() {
                     return Some(path);
@@ -84,7 +84,7 @@ mod tests {
             None
         })
         .await
-        .expect("the watcher reported nothing in 5 s");
+        .expect("the watcher reported nothing in 60 s");
         assert!(reported.is_some());
     }
 

@@ -1256,7 +1256,9 @@ mod tests {
     async fn seen_launch(
         runner: &crate::execution::runner::FakeCommandRunner,
     ) -> Option<(crate::execution::runner::Permission, std::path::PathBuf)> {
-        for _ in 0..300 {
+        // Hang guard only: wait for the launch, not for a short budget.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             let permission = *runner.last_permission.lock().unwrap();
             let cwd = runner.last_cwd.lock().unwrap().clone();
             if let (Some(permission), Some(cwd)) = (permission, cwd) {

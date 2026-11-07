@@ -622,7 +622,8 @@ mod tests {
     }
 
     async fn wait_for_resume(runner: &crate::execution::runner::FakeCommandRunner) -> String {
-        for _ in 0..300 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             if let Some(session) = runner.last_resume.lock().unwrap().clone() {
                 return session;
             }

@@ -1158,7 +1158,8 @@ mod tests {
         // The supervisor records a row as soon as it first tries to spawn (running, or down when
         // the binary is not built).
         let mut seen = false;
-        for _ in 0..40 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             if crate::sidecar::liveness_of(crate::sidecar::REMOTE).is_some() {
                 seen = true;
                 break;

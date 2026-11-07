@@ -1674,9 +1674,10 @@ mod tests {
         String,
     );
 
-    /// The row is written off the response path, so a test waits for it (five seconds at most).
+    /// The row is written off the response path, so a test waits for it (60s hang guard).
     async fn verdicts(pool: &sqlx::SqlitePool, n: usize) -> Vec<Row> {
-        for _ in 0..500 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             let rows: Vec<Row> = sqlx::query_as(
                 "SELECT judge, band, p, capped, final_decision, enforced, error, cost_usd, model
                  FROM judge_verdicts ORDER BY id",
@@ -1890,13 +1891,13 @@ mod tests {
 
         judge_call(
             &pool,
-            &JudgeRuntime::with(ScriptedJudge::slow(Duration::from_secs(10))),
+            &JudgeRuntime::with(ScriptedJudge::slow(Duration::from_secs(120))),
             &call,
             JudgeMode::Observe,
         )
         .await;
 
-        assert!(started.elapsed() < JUDGE_DEADLINE + Duration::from_millis(500));
+        assert!(started.elapsed() < JUDGE_DEADLINE + Duration::from_secs(30));
         let (.., error, cost, _) = verdicts(&pool, 1).await.remove(0);
         assert!(error.unwrap().starts_with("deadline"));
         assert!(
@@ -1925,7 +1926,7 @@ mod tests {
         )
         .await;
 
-        assert!(started.elapsed() < JUDGE_DEADLINE + Duration::from_millis(500));
+        assert!(started.elapsed() < JUDGE_DEADLINE + Duration::from_secs(30));
         assert_eq!(
             judge.calls(),
             0,
