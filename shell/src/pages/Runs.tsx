@@ -23,6 +23,7 @@ import {
   type RunFilters,
   type RunSearchResult,
 } from "../data/runs";
+import { useAccounts } from "../data/accounts";
 import {
   useCreatePreset,
   useDeletePreset,
@@ -1074,6 +1075,8 @@ interface RunDraft {
   mode: AskableMode;
   steerable: boolean;
   name: string;
+  /** `auto` | `provider:<p>` | `account:<id>`. */
+  account: string;
 }
 
 /**
@@ -1095,6 +1098,7 @@ const EMPTY_DRAFT: RunDraft = {
   mode: "shadow",
   steerable: false,
   name: "",
+  account: "auto",
 };
 
 /**
@@ -1173,6 +1177,7 @@ function NewRunForm({
   onStarted: (id: number) => void;
 }) {
   const create = useCreateRun();
+  const accounts = useAccounts();
   const save = useCreatePreset();
   const kill = useKillSwitch();
   const hintId = useId();
@@ -1222,7 +1227,11 @@ function NewRunForm({
   function start() {
     if (blank || create.isPending) return;
     create.mutate(
-      { ...body, steerable: draft.steerable },
+      {
+        ...body,
+        steerable: draft.steerable,
+        ...(draft.account === "auto" ? {} : { account_choice: draft.account }),
+      },
       {
         onSuccess: (answer) => {
           setDraft(EMPTY_DRAFT);
@@ -1288,6 +1297,24 @@ function NewRunForm({
             />
           </Field>
         </div>
+
+        {(accounts.data ?? []).length > 0 && (
+          <Field label="Account">
+            <Select value={draft.account} onChange={(event) => patch({ account: event.target.value })}>
+              <option value="auto">Auto</option>
+              {[...new Set((accounts.data ?? []).map((a) => a.provider))].map((provider) => (
+                <option key={`p-${provider}`} value={`provider:${provider}`}>
+                  Any {provider} account
+                </option>
+              ))}
+              {(accounts.data ?? []).map((a) => (
+                <option key={a.id} value={`account:${a.id}`}>
+                  {a.label} ({a.provider})
+                </option>
+              ))}
+            </Select>
+          </Field>
+        )}
 
         <ModePicker
           name={modeName}
