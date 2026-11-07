@@ -955,7 +955,7 @@ function CaptureRow({ row, onDelete, deleting }: { row: Capture; onDelete?: () =
       <div className="voice-row-head">
         <StateBadge domain="voice_cleanup" state={row.cleanup_state} />
         <RelativeTime at={row.created_at} />
-        <span className="voice-row-duration">{(row.duration_ms / 1000).toFixed(1)}s</span>
+        <span className="voice-row-duration tabular">{(row.duration_ms / 1000).toFixed(1)}s</span>
         {row.model !== null && <span className="voice-row-model">{row.model}</span>}
       </div>
       {/* `clean_text` is non-null only when `cleanup_state === "cleaned"` — the
