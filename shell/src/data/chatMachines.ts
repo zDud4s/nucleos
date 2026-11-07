@@ -119,8 +119,20 @@ export interface MergedGroup {
   key: string;
   /** The name as the first machine to list it spells it. */
   name: string;
-  /** This group's id on each machine that has one. */
-  ids: Partial<Record<MachineId, number>>;
+  /**
+   * This group's ids on each machine that has one. A list, because a machine may hold two groups
+   * whose names differ only by case or spacing; both fold into this group and neither is dropped,
+   * so no chat of that machine is shown ungrouped.
+   */
+  ids: GroupIds;
+}
+
+/** A merged group's ids, by the machine that issued them. */
+export type GroupIds = Partial<Record<MachineId, number[]>>;
+
+/** The id this machine gave a merged group (its first, if it holds several), or `undefined`. */
+export function groupIdOn(group: MergedGroup, machine: MachineId): number | undefined {
+  return group.ids[machine]?.[0];
 }
 
 /**
@@ -134,8 +146,8 @@ export function mergeGroups(byMachine: MachineGroups[]): MergedGroup[] {
     for (const group of ordered) {
       const key = group.name.trim().toLowerCase();
       const known = merged.get(key);
-      if (known === undefined) merged.set(key, { key, name: group.name, ids: { [machine]: group.id } });
-      else if (known.ids[machine] === undefined) known.ids[machine] = group.id;
+      if (known === undefined) merged.set(key, { key, name: group.name, ids: { [machine]: [group.id] } });
+      else (known.ids[machine] ??= []).push(group.id);
     }
   }
   return [...merged.values()];
@@ -148,9 +160,10 @@ function rowMachine(row: ChatSummary): MachineId {
 
 /** The merged group a row is in, matched on its own machine's id; `undefined` when ungrouped or unknown. */
 export function groupOfRow(row: ChatSummary, groups: MergedGroup[]): MergedGroup | undefined {
-  if (row.group_id == null) return undefined;
+  const groupId = row.group_id;
+  if (groupId == null) return undefined;
   const machine = rowMachine(row);
-  return groups.find((group) => group.ids[machine] === row.group_id);
+  return groups.find((group) => group.ids[machine]?.includes(groupId) === true);
 }
 
 /**

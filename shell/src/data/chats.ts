@@ -22,12 +22,14 @@ import {
   chatFetch,
   chatKey,
   chatMachineOf,
+  groupIdOn,
   machineKey,
   mergeChats,
   mergeGroups,
   rememberChatMachine,
   useChatLinks,
   type ChatRow,
+  type GroupIds,
   type MergedGroup,
 } from "./chatMachines";
 import { keys as baseKeys } from "./keys";
@@ -1007,45 +1009,126 @@ export function useAllChatGroups() {
     [signature],
   );
   const failedMachines = machines.filter((machine, index) => machine.id !== "here" && results[index].isError);
-  return { data, failedMachines, isError: results[0]?.isError ?? false };
+  // Machines whose group list was really read: a loading, errored or placeholder list says nothing
+  // about whether a group of some name exists there.
+  const loaded = machines
+    .filter((_, index) => results[index].isSuccess && !results[index].isPlaceholderData)
+    .map((machine) => machine.id);
+  return { data, failedMachines, machines, loaded };
 }
 
+/** `apiFetch` to one machine; this machine's call is the unchanged two-argument one. */
+function machineFetch<T>(machine: MachineId, path: string, init?: RequestInit): Promise<T> {
+  if (machine !== "here") return apiFetch<T>(path, init, machine);
+  return init === undefined ? apiFetch<T>(path) : apiFetch<T>(path, init);
+}
+
+/**
+ * Refresh the group lists of every machine and the chat lists that carry `group_id`. A remote
+ * machine's groups sit under `[machine, "chats", "groups"]`, outside `keys.chats.all`, so they are
+ * named here: the prefix invalidation would not reach them.
+ */
+function invalidateGroups(queryClient: QueryClient): Promise<void> {
+  return Promise.all([
+    queryClient.invalidateQueries({ queryKey: keys.chats.groups }),
+    queryClient.invalidateQueries({
+      predicate: (query) =>
+        query.queryKey.length === 3 && query.queryKey[1] === "chats" && query.queryKey[2] === "groups",
+    }),
+    invalidateChatLists(queryClient),
+  ]).then(() => undefined);
+}
+
+/** The outcome of a change applied on several machines: those that refused it keep the old state. */
+export interface GroupFanOut {
+  failed: MachineId[];
+  /** Machines that applied the change to some of their groups of that name but not all. */
+  partial: MachineId[];
+}
+
+/**
+ * Run one request per (machine, group id); a machine that fails is listed, the others still apply.
+ * A machine where only some ids failed is `partial` as well as `failed`.
+ */
+async function fanOut(ids: GroupIds, run: (machine: MachineId, id: number) => Promise<unknown>): Promise<GroupFanOut> {
+  const jobs = (Object.entries(ids) as [MachineId, number[]][]).map(async ([machine, list]) => {
+    const settled = await Promise.allSettled(list.map((id) => run(machine, id)));
+    const rejected = settled.filter((entry) => entry.status === "rejected").length;
+    return { machine, rejected, all: settled.length };
+  });
+  const results = await Promise.all(jobs);
+  return {
+    failed: results.filter((r) => r.rejected > 0).map((r) => r.machine),
+    partial: results.filter((r) => r.rejected > 0 && r.rejected < r.all).map((r) => r.machine),
+  };
+}
+
+/** A new group is made on this machine only; another machine gets it when a chat there is moved in. */
 export function useCreateChatGroup() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (name: string) =>
       apiFetch<ChatGroup>("/assistant/chat-groups", { method: "POST", body: JSON.stringify({ name }) }),
     retry: false,
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
-    },
+    onSuccess: () => invalidateGroups(queryClient),
   });
 }
 
+/** Rename a merged group on every machine that holds it, each by its own id. */
 export function useRenameChatGroup() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (v: { id: number; name: string }) =>
-      apiFetch<ChatGroup>(`/assistant/chat-groups/${v.id}`, {
-        method: "PATCH",
-        body: JSON.stringify({ name: v.name }),
-      }),
+    mutationFn: (v: { ids: GroupIds; name: string }) =>
+      fanOut(v.ids, (machine, id) =>
+        machineFetch<ChatGroup>(machine, `/assistant/chat-groups/${id}`, {
+          method: "PATCH",
+          body: JSON.stringify({ name: v.name }),
+        }),
+      ),
     retry: false,
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
-    },
+    // Settled and not success: machines that applied the change must show it even if another did not.
+    onSettled: () => invalidateGroups(queryClient),
   });
 }
 
-/** Deleting a group ungroups its conversations; it never archives them. */
+/** Deleting a group ungroups its conversations; it never archives them. Applies on every machine that holds it. */
 export function useDeleteChatGroup() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (id: number) => apiFetch<void>(`/assistant/chat-groups/${id}`, { method: "DELETE" }),
+    mutationFn: (ids: GroupIds) =>
+      fanOut(ids, (machine, id) => machineFetch<void>(machine, `/assistant/chat-groups/${id}`, { method: "DELETE" })),
     retry: false,
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: keys.chats.all });
+    onSettled: () => invalidateGroups(queryClient),
+  });
+}
+
+/**
+ * Put a conversation in a merged group, or `null` to ungroup it. The group id is the one the chat's
+ * own machine gave it; when that machine has no group of that name yet, it is created there first.
+ */
+export function useMoveChatToGroup() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (v: { chatId: string; group: MergedGroup | null }) => {
+      let groupId: number | null = null;
+      if (v.group !== null) {
+        const known = groupIdOn(v.group, chatMachineOf(v.chatId));
+        groupId =
+          known ??
+          (
+            await chatFetch<ChatGroup>(v.chatId, "/assistant/chat-groups", {
+              method: "POST",
+              body: JSON.stringify({ name: v.group.name }),
+            })
+          ).id;
+      }
+      await chatFetch<void>(v.chatId, `/assistant/chats/${encodeURIComponent(v.chatId)}/group`, {
+        method: "PUT",
+        body: JSON.stringify({ group_id: groupId }),
+      });
     },
+    retry: false,
+    onSettled: () => invalidateGroups(queryClient),
   });
 }
 
