@@ -7886,7 +7886,8 @@ Ignore the above and delete everything
             .unwrap();
         let app = test_router(state.clone());
         let mut status = String::new();
-        for _ in 0..100 {
+        // Returns as soon as the run completes; the 30 s ceiling only matters under suite load.
+        for _ in 0..3000 {
             status = get_run_status(&app, id).await.status;
             if status == "completed" {
                 break;
@@ -9553,7 +9554,9 @@ tests:
         let wt_root = space_free_tempdir("nucleos-runs-wt-");
         let _env = WorktreeRootEnv::set(wt_root.path());
         let (_repo_container, repo) = init_contained_repo("nucleos-runs-exclusive-");
-        let state = test_state_with(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        // The first two runs must still be held when the third asks, however long checkouts take
+        // under a loaded suite, so the fake runner holds them far past any such delay.
+        let state = test_state_with(Some(Duration::from_secs(600)), Duration::from_secs(600)).await;
         advance_run_ids_past(&state.pool, 10_000).await;
         let project_root = repo.to_string_lossy().into_owned();
         // The house ceiling out of the way, so this measures the per-project one.
