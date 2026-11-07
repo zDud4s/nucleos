@@ -3967,6 +3967,43 @@ mod tests {
         }
     }
 
+    /// 2026-11-07 review (sec-gate#2): `<ws>/link/x` is lexically inside the workspace while `link`
+    /// points outside it, so the textual prefix check let the write through.
+    #[test]
+    fn a_write_through_a_link_out_of_the_workspace_is_not_inside_it() {
+        let base = std::env::temp_dir().join(format!("nucleos-link-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let workspace = base.join("ws");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let link = workspace.join("link");
+        #[cfg(windows)]
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&outside)
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false);
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(&outside, &link).is_ok();
+        if !made {
+            let _ = std::fs::remove_dir_all(&base);
+            return; // links are not available here: nothing to prove
+        }
+        let through = json!({"file_path": link.join("settings.json").to_string_lossy()});
+        let plain = json!({"file_path": workspace.join("notes.txt").to_string_lossy()});
+        let outcome = (
+            write_guards::writes_outside_cwd(&through, Some(&workspace)),
+            write_guards::writes_outside_cwd(&plain, Some(&workspace)),
+        );
+        // `remove_dir` on the link, not `remove_dir_all`, which would follow it on old Windows.
+        let _ = std::fs::remove_dir(&link);
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(outcome, (true, false));
+    }
+
     /// No boundary, no containment — the reading `writes_outside_cwd` was corrected to. `runs.cwd`
     /// is NULL for every mode but worktree, so this is an ordinary state and not a corner case.
     #[test]
