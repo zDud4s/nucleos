@@ -262,11 +262,11 @@ function Canvas({
       </p>
 
       <div className="ws-canvas-tools" role="group" aria-label="Zoom">
-        <button type="button" aria-label="Zoom out" onClick={() => zoomCentre(1 / 1.25)}>
+        <button type="button" className="hit-area" aria-label="Zoom out" onClick={() => zoomCentre(1 / 1.25)}>
           −
         </button>
         <span className="ws-canvas-zoom">{Math.round(view.k * 100)}%</span>
-        <button type="button" aria-label="Zoom in" onClick={() => zoomCentre(1.25)}>
+        <button type="button" className="hit-area" aria-label="Zoom in" onClick={() => zoomCentre(1.25)}>
           +
         </button>
         <button type="button" onClick={fit}>

@@ -140,4 +140,42 @@ describe("the resolver's readiness, queue and enforce", () => {
       }),
     );
   });
+
+  const queuedBlock = {
+    id: 7, run_id: 3, lineage_root_id: 3, event: "gate_failed", tool_name: null, tool_input: null,
+    gate_output: "FAILED core::x", p_off_task: null, p_needed: null, p_avoidable: null, p_fixable: 0.93,
+    default_outcome: "owner", judge_outcome: "correction", final_outcome: "owner", enforced: false,
+    created_at: "2026-09-27T10:00:00Z",
+  };
+
+  it("takes a reviewed block out of the queue at once, before the núcleo answers", async () => {
+    daemon.apiFetch.mockImplementation((path: string, init?: RequestInit) => {
+      if (init?.method === "POST") return new Promise(() => {}); // never settles
+      if (path.startsWith("/judge-resolutions/unreviewed")) return Promise.resolve([queuedBlock]);
+      return Promise.resolve(observing({ reviewed: 0, agree: 0, less_cautious: 0, ready: false }));
+    });
+    await renderWithRouter(panel("active"), { initialPath: "/autopilot" });
+
+    await screen.findByText("FAILED core::x");
+    fireEvent.click(screen.getByRole("button", { name: "hand it to me" }));
+    await waitPastTheDwell();
+    fireEvent.click(screen.getByRole("button", { name: "Yes, hand it to me" }));
+    await waitFor(() => expect(screen.queryByText("FAILED core::x")).toBeNull());
+  });
+
+  it("puts the block back and says so when the review is refused", async () => {
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (init?.method === "POST") throw new ApiRefusal(500, "boom", "boom");
+      if (path.startsWith("/judge-resolutions/unreviewed")) return [queuedBlock];
+      return observing({ reviewed: 0, agree: 0, less_cautious: 0, ready: false });
+    });
+    await renderWithRouter(panel("active"), { initialPath: "/autopilot" });
+
+    await screen.findByText("FAILED core::x");
+    fireEvent.click(screen.getByRole("button", { name: "hand it to me" }));
+    await waitPastTheDwell();
+    fireEvent.click(screen.getByRole("button", { name: "Yes, hand it to me" }));
+    expect(await screen.findByText("the review was not recorded")).toBeTruthy();
+    expect(await screen.findByText("FAILED core::x")).toBeTruthy();
+  });
 });

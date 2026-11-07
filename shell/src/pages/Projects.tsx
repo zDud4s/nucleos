@@ -38,6 +38,7 @@ import {
   Panel,
   Quiet,
   RefusalNote,
+  Skeleton,
   StaleNote,
 } from "../ui";
 import "./projects.css";
@@ -556,9 +557,7 @@ function BrowsePanel({ projectId, projectRoot }: { projectId: string; projectRoo
           <InspectAbsence error={listing.error} projectRoot={projectRoot} what="that folder" />
         )}
         {!listing.isError && listing.data === undefined && (
-          <p className="pj-loading" role="status">
-            Reading the folder…
-          </p>
+          <Skeleton label="Reading the folder" variant="row" count={6} />
         )}
         {listing.data !== undefined && entries.length > 0 && (
           <ListFilter
@@ -778,7 +777,7 @@ function FileView({
       {file.isError && file.data === undefined && (
         <InspectAbsence error={file.error} projectRoot={projectRoot} what="that file" />
       )}
-      {!file.isError && file.data === undefined && <p className="pj-loading" role="status">Reading the file…</p>}
+      {!file.isError && file.data === undefined && <Skeleton label="Reading the file" variant="block" height="12rem" />}
       {file.data !== undefined && file.data === "" && (
         <Quiet says="that file is empty: a real answer, not a failed read." />
       )}
@@ -933,7 +932,7 @@ function GrepPanel({ projectId, projectRoot }: { projectId: string; projectRoot:
         <InspectAbsence error={matches.error} projectRoot={projectRoot} what="that search" />
       )}
       {asked !== null && !matches.isError && matches.data === undefined && (
-        <p className="pj-loading" role="status">Searching…</p>
+        <Skeleton label="Searching" variant="row" count={3} />
       )}
       {matches.data !== undefined && groups.length === 0 && (
         <Quiet says="nothing in that folder contains it." />
@@ -1016,7 +1015,7 @@ function DiffPanel({ projectId, projectRoot }: { projectId: string; projectRoot:
       {diff.isError && diff.data === undefined && (
         <InspectAbsence error={diff.error} projectRoot={projectRoot} what="the diff" />
       )}
-      {!diff.isError && diff.data === undefined && <p className="pj-loading" role="status">Reading the tree…</p>}
+      {!diff.isError && diff.data === undefined && <Skeleton label="Reading the tree" variant="block" height="10rem" />}
       {diff.data !== undefined && diff.data.trim() === "" && (
         <Quiet says="nothing is uncommitted: the tree is clean." />
       )}

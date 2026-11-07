@@ -17,7 +17,7 @@ import {
   type ToolCall,
   type Turn,
 } from "../lib/turns";
-import { apiFetch, apiText } from "./client";
+import { apiFetch, apiText, withIdempotencyKey, type IdempotentCall } from "./client";
 import {
   chatFetch,
   chatKey,
@@ -1856,15 +1856,22 @@ export function useChatDiff(chatId: string, enabled: boolean) {
 export function useSendMessage(chatId: string) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: ({ text, images }: { text: string; images: Attachment[] }) =>
+    mutationFn: ({ text, images, idempotencyKey }: { text: string; images: Attachment[] } & IdempotentCall) =>
       // `wait_if_busy` is what turns the old 409 into a place in the queue. A person looking at the
       // window would rather their words were kept than be told no and handed back an empty box —
       // a channel sidecar, which gives up on a turn after a timeout, would rather be refused,
       // and so it does not ask.
-      chatFetch<{ turn_id?: number; queued?: boolean }>(chatId, "/assistant/message", {
-        method: "POST",
-        body: JSON.stringify({ chat_id: chatId, text, images, wait_if_busy: true }),
-      }),
+      chatFetch<{ turn_id?: number; queued?: boolean }>(
+        chatId,
+        "/assistant/message",
+        withIdempotencyKey(
+          {
+            method: "POST",
+            body: JSON.stringify({ chat_id: chatId, text, images, wait_if_busy: true }),
+          },
+          idempotencyKey,
+        ),
+      ),
     retry: false,
     // Drawn before the daemon answers: a person who pressed Send is looking at the box, and a
     // bubble that waits for the POST reads as the shell not having heard. The id is far above any

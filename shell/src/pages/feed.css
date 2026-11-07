@@ -55,6 +55,17 @@
  * matters and the part that does something, and neither of those is a hue. 24px tall at least,
  * so the target is not the height of the glyphs.
  */
+/* Counts, day heads and line times hold one width as they change (#16). */
+.feed-verdict-count,
+.feed-trace-meta,
+.feed-trace-clock,
+.feed-detail-time,
+.feed-day-date,
+.feed-line-time,
+.feed-line-meta {
+  font-variant-numeric: tabular-nums;
+}
+
 .feed-verdict-count {
   display: inline-flex;
   align-items: baseline;

@@ -2,7 +2,7 @@
 import { useEffect, useId, useState } from "react";
 import { Link, useNavigate, useParams } from "@tanstack/react-router";
 import { Search } from "lucide-react";
-import { isApiRefusal, type ApiRefusal } from "../data/client";
+import { apiFetch, isApiRefusal, type ApiRefusal } from "../data/client";
 import {
   useWebPage,
   useWebPages,
@@ -24,11 +24,22 @@ import {
   Row,
   Rows,
   Section,
+  Skeleton,
   StateBadge,
   Teach,
 } from "../ui";
 import "./web.css";
+import { keys } from "../data/keys";
+import { registerPrefetcher } from "../lib/prefetch";
 import { DAEMON_NAME } from "../copy";
+
+// Warm the archive list and the open sessions on hover of the sidebar link (#7).
+registerPrefetcher("/web", (qc) =>
+  Promise.all([
+    qc.prefetchQuery({ queryKey: keys.web.pages(undefined), queryFn: () => apiFetch<Hit[]>("/web/pages") }),
+    qc.prefetchQuery({ queryKey: keys.browser.sessions, queryFn: () => apiFetch("/browser/sessions") }),
+  ]),
+);
 import { plural } from "../lib/plural";
 
 /**
@@ -343,7 +354,7 @@ function ArchiveList({
 }) {
   return (
     <Panel title="Archive">
-      {loading && <p className="web-loading">reading the archive…</p>}
+      {loading && <Skeleton label="Reading the archive…" variant="row" count={4} />}
       {!loading && rows !== undefined && rows.length === 0 && (
         <Teach title={q === undefined ? "Nothing has been read yet" : "Nothing here matches"}>
           <p>
@@ -407,7 +418,7 @@ function ReaderView({ id }: { id: number }) {
   const detail = page.data;
 
   if (detail === undefined) {
-    return page.isError ? <ReaderError error={page.error} /> : <p className="web-loading">reading page {id}…</p>;
+    return page.isError ? <ReaderError error={page.error} /> : <Skeleton label={`Reading page ${String(id)}…`} lines={6} />;
   }
 
   return <ReaderPanel page={detail} />;

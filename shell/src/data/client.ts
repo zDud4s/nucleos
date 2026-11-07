@@ -267,6 +267,29 @@ export async function openStream(path: string, signal: AbortSignal, machine: Mac
 }
 
 /**
+ * The mutating calls that START something (`POST /runs`, `POST /jobs`,
+ * `POST /assistant/message`) accept an optional `idempotencyKey`, sent as the
+ * `Idempotency-Key` header. The daemon remembers the first successful answer
+ * under that key for a few minutes and replays it for the same key and body
+ * instead of starting a second run, job or turn.
+ *
+ * The key belongs to the *intent*, not to the attempt: the caller makes one
+ * when the person asks and passes the same one on every retry of that ask.
+ * This layer never retries by itself (see {@link apiFetch}), so it never
+ * invents a key either. Without a key the init is returned unchanged.
+ */
+export interface IdempotentCall {
+  idempotencyKey?: string;
+}
+
+export function withIdempotencyKey(init: RequestInit, idempotencyKey: string | undefined): RequestInit {
+  if (idempotencyKey === undefined || idempotencyKey === "") return init;
+  const headers = new Headers(init.headers);
+  headers.set("Idempotency-Key", idempotencyKey);
+  return { ...init, headers };
+}
+
+/**
  * One authenticated JSON call.
  *
  * There are no automatic retries anywhere below this line, on reads or on

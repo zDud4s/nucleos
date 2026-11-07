@@ -5,7 +5,7 @@ import {
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
-import { apiFetch, apiText } from "./client";
+import { apiFetch, apiText, withIdempotencyKey, type IdempotentCall } from "./client";
 import type { RunSearchResult } from "./fleet";
 import { keys } from "./keys";
 import type { MachineId } from "./machineStore";
@@ -520,8 +520,8 @@ export function useCreateRun() {
   return useMutation({
     // `machine` names where the run executes; it is never part of the body. Only creation is
     // machine-aware: a run created elsewhere is listed and opened by the machine that runs it.
-    mutationFn: ({ machine, ...run }: NewRun & { machine?: MachineId }) => {
-      const init = { method: "POST", body: JSON.stringify(run) };
+    mutationFn: ({ machine, idempotencyKey, ...run }: NewRun & IdempotentCall & { machine?: MachineId }) => {
+      const init = withIdempotencyKey({ method: "POST", body: JSON.stringify(run) }, idempotencyKey);
       return machine === undefined || machine === "here"
         ? apiFetch<{ id: number }>("/runs", init)
         : apiFetch<{ id: number }>("/runs", init, machine);

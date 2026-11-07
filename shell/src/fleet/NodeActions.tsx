@@ -20,7 +20,7 @@ export function NodeActions({ node }: { node: WireNode }) {
       {caps.full_transcript && (
         <button
           type="button"
-          className="fleet-act"
+          className="fleet-act hit-area"
           aria-label="Open the full transcript"
           title="Full transcript"
           onClick={() => ui.openPanel(node.id)}
@@ -30,7 +30,7 @@ export function NodeActions({ node }: { node: WireNode }) {
       )}
       {caps.open_run && node.run_id !== null && (
         <Link
-          className="fleet-act"
+          className="fleet-act hit-area"
           to="/runs/$runId"
           params={{ runId: String(node.run_id) }}
           aria-label="Open the run"
@@ -51,7 +51,7 @@ function PinButton({ node }: { node: WireNode }) {
     <>
       <button
         type="button"
-        className="fleet-act"
+        className="fleet-act hit-area"
         aria-label="Pin this tree"
         aria-pressed={node.pinned}
         title={node.pinned ? "Unpin this tree" : "Pin this tree"}
@@ -92,7 +92,7 @@ function StopControl({ runId, label }: { runId: number; label: string }) {
         <button
           ref={stopButton}
           type="button"
-          className="fleet-act fleet-act-stop"
+          className="fleet-act fleet-act-stop hit-area"
           aria-label={`Stop ${label}`}
           title="Stop"
           disabled={cancel.isPending}

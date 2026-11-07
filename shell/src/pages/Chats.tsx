@@ -51,7 +51,12 @@ import {
   SquarePen,
   X,
 } from "lucide-react";
-import { isApiRefusal } from "../data/client";
+import { apiFetch, isApiRefusal } from "../data/client";
+import { registerPrefetcher } from "../lib/prefetch";
+import { useOptimisticMutation } from "../lib/optimistic";
+import { usePageKeys } from "../project/pageKeys";
+import { newIdempotencyKey } from "../lib/idempotency";
+import { useGuardedAction } from "../lib/useGuardedAction";
 import { SlashCard, sourceLabel } from "../chats/SlashCard";
 import { McpMenuItems } from "../chats/McpPanel";
 import {
@@ -119,7 +124,7 @@ import { chatKey, chatMachineOf, rememberChatMachine, useChatMachine } from "../
 import { useMachines } from "../data/machines";
 import { MachinePicker, useNewWorkMachine } from "../chats/MachinePicker";
 import { type ChatNotice } from "../data/chats";
-import { usePaletteGroup, usePaletteQuery } from "../ui";
+import { Image, Skeleton, useUndoable, usePaletteGroup, usePaletteQuery } from "../ui";
 import {
   anyTurnLive,
   marksBetween,
@@ -185,6 +190,15 @@ import { MoveChatDialog } from "./MoveChat";
 const SPEAKER_LABEL = "service";
 
 import "./chats.css";
+
+/** Hovering "Chats" in the sidebar warms the conversation list under the key `useChats` reads. */
+registerPrefetcher("/chats", (qc) =>
+  qc.prefetchQuery({
+    queryKey: keys.chats.all,
+    queryFn: () => apiFetch<ChatSummary[]>("/assistant/chats"),
+    staleTime: 5_000,
+  }),
+);
 
 /**
  * Chats — one master-detail page serving `/chats` and `/chats/$chatId`.
@@ -334,6 +348,20 @@ export function Chats() {
       };
     }),
   });
+  // #3/#4: "New chat" in the palette, and the key it prints bound on the page.
+  const newChat = () => {
+    setPickingUp(null);
+    void navigate({ to: "/chats" });
+  };
+  usePaletteGroup({
+    id: "chats-actions",
+    heading: "Quick actions",
+    items: [
+      { id: "chats-new", label: "New chat", match: "new chat conversation", shortcut: "N", run: newChat },
+      { id: "chats-fleet", label: "Open fleet", match: "open fleet", shortcut: "F", run: () => void navigate({ to: "/fleet" }) },
+    ],
+  });
+  usePageKeys({ n: newChat, f: () => void navigate({ to: "/fleet" }) });
   usePaletteGroup(
     hits.length === 0 && silent.length === 0
       ? null
@@ -664,7 +692,7 @@ function EditorDetail({
       <section className="chats-detail-inner">
         <div className="chats-scroll">
           {sessions.data === undefined && !sessions.isError ? (
-            <p className="chats-loading">reading your editor sessions…</p>
+            <Skeleton label="Reading your editor sessions" variant="row" count={4} />
           ) : (
             <ErrorNote>
               that conversation is not on this machine any more
@@ -1113,7 +1141,7 @@ function ChatDetail({
           <TranscriptError error={transcript.error} />
         )}
         {!transcript.isError && transcript.data === undefined && (
-          <p className="chats-loading">reading the conversation…</p>
+          <Skeleton label="Reading the conversation" variant="row" count={4} />
         )}
         {transcript.data !== undefined &&
           !(unrooted && transcript.data.turns.length === 0 && transcript.data.notices.length === 0) && (
@@ -1212,6 +1240,18 @@ function NothingOpen() {
   const navigate = useNavigate();
   const start = useStartConversation();
   const [machine, setMachine] = useNewWorkMachine();
+  // #19: opening a conversation bills a turn, so a second press while the first POST is in flight
+  // joins it instead of opening a twin. `start` takes no idempotency key, hence the guard alone.
+  const opening = useGuardedAction((_intent, vars: Parameters<typeof start.mutateAsync>[0]) =>
+    start.mutateAsync(vars).then(
+      (opened) => {
+        holdMessage(opened.chat_id, { text: vars.text, images: vars.images }, MAX_PICTURES);
+        void navigate({ to: `/chats/${opened.chat_id}` });
+      },
+      // The refusal is drawn from `start.error` below.
+      () => undefined,
+    ),
+  );
 
   return (
     <div className="chats-front">
@@ -1221,27 +1261,19 @@ function NothingOpen() {
         </h2>
         <MachinePicker value={machine} onChange={setMachine} />
         <StartBox
-          pending={start.isPending}
+          pending={start.isPending || opening.pending}
           onSay={(model, effort, mode, text, images) =>
-            start.mutate(
-              {
-                machine,
-                model: model ?? undefined,
-                effort: effort ?? undefined,
-                permissionMode: mode,
-                text,
-                images,
-                // A conversation opened here has no project, and does not start until it has one:
-                // the words wait in the new conversation, which opens its project picker.
-                holdFirstMessage: true,
-              },
-              {
-                onSuccess: (opened) => {
-                  holdMessage(opened.chat_id, { text, images }, MAX_PICTURES);
-                  void navigate({ to: `/chats/${opened.chat_id}` });
-                },
-              },
-            )
+            void opening.run({
+              machine,
+              model: model ?? undefined,
+              effort: effort ?? undefined,
+              permissionMode: mode,
+              text,
+              images,
+              // A conversation opened here has no project, and does not start until it has one:
+              // the words wait in the new conversation, which opens its project picker.
+              holdFirstMessage: true,
+            })
           }
         />
         {start.isError && <CreateRefusal error={start.error} />}
@@ -1423,14 +1455,16 @@ function StartBox({
                 key={`start-attached-${index}`}
                 className="chats-attached-item"
               >
-                <img
+                <Image
                   className="chats-attached-thumb"
                   alt={`attached picture ${index + 1}`}
                   src={`data:${picture.media_type};base64,${picture.data}`}
+                  width={64}
+                  height={64}
                 />
                 <button
                   type="button"
-                  className="chats-attached-drop"
+                  className="chats-attached-drop hit-area"
                   aria-label={`Remove attached picture ${index + 1}`}
                   onClick={() =>
                     setAttached((was) => was.filter((_, at) => at !== index))
@@ -1695,12 +1729,10 @@ function DictateToggle({ dictation }: { dictation: DictationView }) {
  * says nothing; a line that always reads "plan only: no" is a line nobody reads by the
  * second day.
  *
- * **Archive is inside the menu but is not a menu item, and that is not an oversight.**
- * `ArchiveControl` is a `ConfirmButton`, which is this app's one interlock: two clicks
- * with a dwell between them. A `DropdownMenuItem` closes the menu the moment it is
- * chosen, so the first click would dismiss the control before the second could confirm —
- * turning a deliberate two-step into a one-click irreversible action. Rendered as plain
- * content, the menu stays open and both clicks land.
+ * **Archive is inside the menu but is not a menu item, and that is not an oversight.** It used to be a
+ * hold-to-confirm `ConfirmButton`; archiving is reversible, so it is now a delayed commit with an
+ * Undo window (`useUndoable`), and the toast is held by `ChatMenu` because the menu content unmounts
+ * when it closes.
  */
 function ChatMenu({ chatId }: { chatId: string }) {
   const project = useChatProject(chatId);
@@ -1715,6 +1747,24 @@ function ChatMenu({ chatId }: { chatId: string }) {
   const row = useChatRow(chatId);
   const helperCount = row?.agents.length ?? 0;
   const instructed = (row?.system_prompt ?? "") !== "";
+  // #5: archiving is reversible (every turn stays readable, `useRestoreChat` brings it back), so the
+  // hold-to-confirm is gone: the press opens an Undo window and the DELETE goes out when it closes.
+  // The toast lives here, outside the menu, because the menu content unmounts when it closes.
+  const [menuOpen, setMenuOpen] = useState(false);
+  const archive = useArchiveChat();
+  const navigate = useNavigate();
+  const undoable = useUndoable();
+  const archiveNow = () => {
+    setMenuOpen(false);
+    undoable.run({
+      message: "Archived this conversation",
+      commit: () =>
+        archive.mutateAsync(chatId).then(
+          () => void navigate({ to: "/chats" }),
+          () => undefined,
+        ),
+    });
+  };
 
   return (
     /* No line of its own any more. What this component used to carry beside the `⋯` — the
@@ -1722,7 +1772,7 @@ function ChatMenu({ chatId }: { chatId: string }) {
        derived sentence about the subject" belongs on every other page in the app. What is
        left here is the menu and the two dialogs it opens. */
     <>
-      <DropdownMenu>
+      <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
         <DropdownMenuTrigger
           className="chats-meta-more"
           aria-label="Conversation settings"
@@ -1786,7 +1836,7 @@ function ChatMenu({ chatId }: { chatId: string }) {
           <DropdownMenuSeparator />
           {/* The one thing that must not be a menu ITEM: see `ArchiveControl`, whose two-click
               interlock a menu item would collapse. */}
-          <ArchiveControl chatId={chatId} />
+          <ArchiveControl onArchive={archiveNow} />
         </DropdownMenuContent>
       </DropdownMenu>
 
@@ -1803,6 +1853,8 @@ function ChatMenu({ chatId }: { chatId: string }) {
         onOpenChange={setInstructions}
       />
       <MoveChatDialog chatId={chatId} open={moving} onOpenChange={setMoving} />
+      {archive.isError && <ArchiveRefusal error={archive.error} />}
+      {undoable.toast}
     </>
   );
 }
@@ -2358,7 +2410,20 @@ function ChatRename({
   onOpenChange: (open: boolean) => void;
 }) {
   const [draft, setDraft] = useState("");
-  const patch = usePatchChat();
+  // #2: the new name is written into the cached list at once and the dialog closes on the press;
+  // a refusal puts the old name back and says so beside the control (this app has no toast system).
+  const [failed, setFailed] = useState<unknown>(null);
+  const patch = useOptimisticMutation<ChatSummary[], { chatId: string; title: string }>({
+    queryKey: keys.chats.all,
+    mutationFn: ({ chatId: id, title: next }) =>
+      apiFetch<void>(`/assistant/chats/${encodeURIComponent(id)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ title: next }),
+      }),
+    apply: (prev, v) =>
+      prev?.map((row) => (row.chat_id === v.chatId ? { ...row, title: v.title } : row)) as ChatSummary[],
+    onError: (error) => setFailed(error),
+  });
   const auto = usePostChatTitle();
 
   const seeded = useRef(false);
@@ -2370,16 +2435,20 @@ function ChatRename({
     if (seeded.current) return;
     seeded.current = true;
     setDraft(title ?? "");
+    setFailed(null);
   }, [open, title]);
 
   const close = () => onOpenChange(false);
   const rename = () => {
     // Not while the first one is in flight: a second Enter is a person unsure the first took.
     if (draft.trim() === "" || patch.isPending) return;
-    patch.mutate({ chatId, title: draft.trim() }, { onSuccess: close });
+    patch.mutate({ chatId, title: draft.trim() });
+    close();
   };
 
   return (
+    <>
+    {failed !== null && <TitleRefusal error={failed} />}
     <Modal
       open={open}
       onOpenChange={onOpenChange}
@@ -2418,10 +2487,10 @@ function ChatRename({
             }
           }}
         />
-        {patch.isError && <TitleRefusal error={patch.error} />}
         {auto.isError && <AutoTitleRefusal error={auto.error} />}
       </div>
     </Modal>
+    </>
   );
 }
 
@@ -3934,24 +4003,13 @@ function HelperRefusal({ error }: { error: unknown }) {
 
 /* --------------------------------------------------------------- archive -- */
 
-function ArchiveControl({ chatId }: { chatId: string }) {
-  const archive = useArchiveChat();
-  const navigate = useNavigate();
-
+function ArchiveControl({ onArchive }: { onArchive: () => void }) {
   return (
     <div className="chats-archive chats-context-row">
-      <ConfirmButton
-        label="Archive"
-        confirmLabel="Keep holding to archive"
-        variant="quiet"
-        onConfirm={() =>
-          archive.mutate(chatId, {
-            onSuccess: () => void navigate({ to: "/chats" }),
-          })
-        }
-      />
-      <p className="chats-context-why">hold: off the list; every turn stays readable</p>
-      {archive.isError && <ArchiveRefusal error={archive.error} />}
+      <Button variant="quiet" onClick={onArchive}>
+        Archive
+      </Button>
+      <p className="chats-context-why">off the list, with a few seconds to undo; every turn stays readable</p>
     </div>
   );
 }
@@ -3996,7 +4054,7 @@ function PickedUp({
 }) {
   if (view.data === undefined && !view.isError) {
     return (
-      <p className="chats-loading">reading what was said in the editor…</p>
+      <Skeleton label="Reading what was said in the editor" variant="row" count={2} />
     );
   }
   if (view.data === undefined) {
@@ -4464,7 +4522,7 @@ function Waiting({ queued, chatId }: { queued: Waiting[]; chatId: string }) {
           <p className="chats-waiting-text">{message.text}</p>
           <button
             type="button"
-            className="chats-waiting-drop"
+            className="chats-waiting-drop hit-area"
             aria-label={`Do not send: ${message.text}`}
             disabled={drop.isPending}
             onClick={() => drop.mutate(message.id)}
@@ -4766,7 +4824,7 @@ function RestartNotice({
           <Button
             variant="ghost"
             disabled={send.isPending}
-            onClick={() => send.mutate({ text: CONTINUE_MESSAGE, images: [] })}
+            onClick={() => send.mutate({ text: CONTINUE_MESSAGE, images: [], idempotencyKey: newIdempotencyKey() })}
           >
             Continue
           </Button>
@@ -6223,7 +6281,7 @@ function Composer({
     setAttached([]);
     clearDraft(chatId);
     send.mutate(
-      { text: outgoing, images: snapshot.images },
+      { text: outgoing, images: snapshot.images, idempotencyKey: newIdempotencyKey() },
       {
         onError: () => {
           setText((was) => (was === "" ? snapshot.text : `${snapshot.text}\n\n${was}`));
@@ -6265,7 +6323,7 @@ function Composer({
       runCommand(message.text, false);
       return;
     }
-    send.mutate(message, {
+    send.mutate({ ...message, idempotencyKey: newIdempotencyKey() }, {
       onError: () => {
         setText((was) => (was === "" ? message.text : `${message.text}
 
@@ -6361,14 +6419,16 @@ ${was}`));
         <ul className="chats-attached" aria-label="Attached pictures">
           {attached.map((picture, index) => (
             <li key={`attached-${index}`} className="chats-attached-item">
-              <img
+              <Image
                 className="chats-attached-thumb"
                 alt={`attached picture ${index + 1}`}
                 src={`data:${picture.media_type};base64,${picture.data}`}
+                width={64}
+                height={64}
               />
               <button
                 type="button"
-                className="chats-attached-drop"
+                className="chats-attached-drop hit-area"
                 aria-label={`Remove attached picture ${index + 1}`}
                 onClick={() =>
                   setAttached((was) => was.filter((_, at) => at !== index))

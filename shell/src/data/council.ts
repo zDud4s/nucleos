@@ -1,5 +1,5 @@
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { apiFetch } from "./client";
+import { apiFetch, withIdempotencyKey, type IdempotentCall } from "./client";
 import { keys } from "./keys";
 import { POLL, pollWhile } from "./poll";
 
@@ -546,12 +546,19 @@ function createBody(request: CreateCouncilRequest): Record<string, unknown> {
 export function useCreateCouncil() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (request: CreateCouncilRequest) =>
-      apiFetch<{ id: string }>("/council", {
-        method: "POST",
-        // Built key by key rather than stringified whole — see `createBody`.
-        body: JSON.stringify(createBody(request)),
-      }),
+    // `idempotencyKey` rides as the `Idempotency-Key` header so a replayed Convene joins the first (#19).
+    mutationFn: ({ idempotencyKey, ...request }: CreateCouncilRequest & IdempotentCall) =>
+      apiFetch<{ id: string }>(
+        "/council",
+        withIdempotencyKey(
+          {
+            method: "POST",
+            // Built key by key rather than stringified whole — see `createBody`.
+            body: JSON.stringify(createBody(request)),
+          },
+          idempotencyKey,
+        ),
+      ),
     retry: false,
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: COUNCIL_KEYS.list });

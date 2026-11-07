@@ -5,7 +5,8 @@ import { useQueryClient } from "@tanstack/react-query";
 import { isApiRefusal } from "../data/client";
 import { keys } from "../data/keys";
 import { MAX_UPLOAD_BYTES, browserDropFiles, browserDropsApply, diskPath, downloadFile, dropTargetFolder, fileName, formatBytes, joinPath, openFile, parentPath, readFolder, runsOnOpen, sortEntries, useCreateFolder, useDelete, useFileSearch, useFolder, useMove, useRestore, useTrash, useUpload, type DeleteRequest, type Dropped, type Entry, type Hit, type SortColumn, type SortDirection, type Trashed } from "../data/files";
-import { Button, ErrorNote, Field, PageHeader } from "../ui";
+import { Button, ErrorNote, Field, PageHeader, usePaletteGroup } from "../ui";
+import { registerPrefetcher } from "../lib/prefetch";
 import { type ClashChoice, DELETE_SENTENCES, DOWNLOAD_SENTENCES, MOVE_SENTENCES, type MoveDone, type PathFailure, type PendingBatch, RESTORE_SENTENCES, RefusalOrError, UPLOAD_SENTENCES, type Undo, type UploadItem, type UploadProgress, type UploadRefusal, type UploadReport, type UploadSaved, describeUploadFailure, readHintRetired, storeHintRetired, useNarrow } from "./files/shared";
 import { DRAG_THRESHOLD_PX, Dismissable, FailureNotes, FilesUnavailableTeach, type FocusAfter, ghostTransform, moveRefusal, pageHeadline, swallowClick } from "./files/pageParts";
 import { FolderTree } from "./files/FolderTree";
@@ -18,6 +19,11 @@ import { MoveForm } from "./files/MoveForm";
 import { NotEmptyNote, RecentlyDeleted, UndoKeys, UndoNote, undoSummary, undoVerb } from "./files/Undo";
 import { ContextMenu } from "./files/ContextMenu";
 import "./files.css";
+
+// Warm the root listing when the sidebar link is hovered (#7).
+registerPrefetcher("/files", (qc) =>
+  qc.prefetchQuery({ queryKey: keys.files.list(""), queryFn: () => readFolder("") }),
+);
 
 /**
  * Files — the one managed root, browsed, searched, made, filled, moved and
@@ -633,6 +639,43 @@ export function Files() {
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
   }, []);
+
+  // The page's verbs in the palette (#3/#4). The shortcut is only a chip: the
+  // keys themselves are bound in the effects around this one, and ignore fields.
+  usePaletteGroup({
+    id: "files",
+    heading: "Files",
+    items: [
+      {
+        id: "files-search",
+        label: "Search files",
+        match: "search find files",
+        shortcut: "/",
+        run: () => {
+          searchRef.current?.focus();
+          searchRef.current?.select();
+        },
+      },
+      {
+        id: "files-undo",
+        label: "Undo last file action",
+        match: "undo last file action restore",
+        shortcut: "Ctrl+Z",
+        disabled: undo === null || undoBusy,
+        run: () => {
+          if (undo !== null && !undoBusy) takeBack(undo);
+        },
+      },
+      {
+        id: "files-paste",
+        label: "Paste cut items here",
+        match: "paste move cut items here",
+        shortcut: "Ctrl+V",
+        disabled: cut === null,
+        run: pasteHere,
+      },
+    ],
+  });
 
   // Ctrl+X and Ctrl+V from anywhere but a field, where they are the field's.
   // The cut takes the selection, else the row the keyboard is on; the paste
