@@ -1979,7 +1979,9 @@ mod tests {
         assert!(is_load_reason("the heavy broker is full"));
         assert!(is_load_reason("held: disk pressure"));
         assert!(is_load_reason("failed to spawn cargo"));
-        assert!(!is_load_reason("the scope gate could not be submitted: queue-down"));
+        assert!(!is_load_reason(
+            "the scope gate could not be submitted: queue-down"
+        ));
         assert!(!is_load_reason("scope verification ticket 7 vanished"));
     }
 
