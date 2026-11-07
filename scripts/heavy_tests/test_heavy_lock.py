@@ -216,7 +216,9 @@ class LockTests(unittest.TestCase):
         return sorted(h.iterdir()) if h.exists() else []
 
     def assert_started(self, tag: str) -> None:
-        self.assertTrue(wait_for(lambda: self.started(tag)), f"{tag} never started")
+        # Backstop, not an expectation: success returns at once. A fixed 30 s clock only measured
+        # machine load (the full suite runs ~1200-1650 s under a busy broker).
+        self.assertTrue(wait_for(lambda: self.started(tag), 300), f"{tag} never started")
 
     def assert_stays_waiting(self, tag: str, secs: float = 1.2) -> None:
         time.sleep(secs)
