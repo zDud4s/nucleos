@@ -157,7 +157,21 @@ export function Home() {
         project page.
       */}
       {firstRead ? (
-        <Skeleton label="Loading your readings" variant="cards" count={4} />
+        // The same two tiers as the real grid (lead pair, quiet pair, spend row), so nothing moves.
+        <div className="app-home-stats" role="status" aria-busy="true">
+          <span className="sr-only">Loading your readings</span>
+          <div className="app-home-lead" aria-hidden="true">
+            <Cell stale={false} pending loading="Loading waiting on you">{null}</Cell>
+            <Cell stale={false} pending loading="Loading subsystem health">{null}</Cell>
+          </div>
+          <div className="app-home-quiet" aria-hidden="true">
+            <Cell stale={false} pending loading="Loading projects">{null}</Cell>
+            <Cell stale={false} pending loading="Loading shadow decisions">{null}</Cell>
+          </div>
+          <div className="app-home-cell app-home-spend" aria-hidden="true">
+            <Skeleton label="Loading spend" />
+          </div>
+        </div>
       ) : (
       <div className="app-home-stats">
         <div className="app-home-lead">

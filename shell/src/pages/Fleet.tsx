@@ -95,20 +95,24 @@ function FleetScreen() {
 
   return (
     <FleetUiContext.Provider value={ui}>
-      <PageHeader title="Fleet" />
-      <TopBar
-        project={project}
-        onProject={setProject}
-        onlyActive={onlyActive}
-        onOnlyActive={setOnlyActive}
-        follow={follow}
-        onFollow={setFollow}
-        onFit={() => setFitSignal((n) => n + 1)}
+      <PageHeader
+        title="Fleet"
+        actions={
+          <TopBar
+            project={project}
+            onProject={setProject}
+            onlyActive={onlyActive}
+            onOnlyActive={setOnlyActive}
+            follow={follow}
+            onFollow={setFollow}
+            onFit={() => setFitSignal((n) => n + 1)}
+          />
+        }
       />
       <div className="fleet-stage">
         {!received ? (
           <>
-            <Skeleton label="Loading the fleet" variant="cards" count={3} />
+            <Skeleton label="Loading the fleet" variant="card" />
             {failedReconnects >= UNREACHABLE_AFTER && (
               <p className="fleet-note">Can't reach the fleet stream, retrying</p>
             )}

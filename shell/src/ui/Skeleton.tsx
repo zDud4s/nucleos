@@ -33,6 +33,8 @@ export interface SkeletonProps {
   height?: string;
   /** Diameter in px of an `avatar`. Defaults to 32. */
   size?: number;
+  /** Extra class on the `cards` grid, so it reuses the real grid's tracks (`height` is the card's min-height). */
+  gridClassName?: string;
 }
 
 const n = (value: number | undefined, fallback: number) => Math.max(1, Math.floor(value ?? fallback));
@@ -56,16 +58,25 @@ export function Skeleton({
   width,
   height,
   size = 32,
+  gridClassName,
 }: SkeletonProps) {
   if (variant === "lines") {
     return (
       <div
-        className="ui-skeleton"
+        className="ui-skeleton ui-skeleton-textlines"
         role="status"
         aria-busy="true"
         style={{ ["--skeleton-lines" as string]: String(lines) }}
       >
-        <span className="ui-skeleton-label">{label}</span>
+        <span className="ui-skeleton-label sr-only">{label}</span>
+        {Array.from({ length: n(lines, 1) }, (_, i) => (
+          <span
+            key={i}
+            className="ui-skeleton-bar ui-skeleton-textline"
+            aria-hidden="true"
+            style={{ width: n(lines, 1) > 1 && i === n(lines, 1) - 1 ? "60%" : "100%" }}
+          />
+        ))}
       </div>
     );
   }
@@ -74,9 +85,12 @@ export function Skeleton({
   switch (variant) {
     case "cards":
       shape = (
-        <div className="ui-skeleton-grid" aria-hidden="true">
+        <div
+          className={gridClassName ? `ui-skeleton-grid ${gridClassName}` : "ui-skeleton-grid"}
+          aria-hidden="true"
+        >
           {Array.from({ length: n(count, 3) }, (_, i) => (
-            <span key={i} className="ui-skeleton-card" />
+            <span key={i} className="ui-skeleton-card" style={height ? { minHeight: height } : undefined} />
           ))}
         </div>
       );

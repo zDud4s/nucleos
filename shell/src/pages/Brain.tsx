@@ -339,7 +339,12 @@ export function BrainGraphView({
 
   if (graph.isError)
     return <ErrorNote onRetry={() => void graph.refetch()}>the {DAEMON_NAME} is not responding: the graph is not known</ErrorNote>;
-  if (graph.data === undefined || model === null) return <Skeleton label="Loading the graph" variant="cards" count={4} />;
+  if (graph.data === undefined || model === null)
+    return (
+      <div className="brain-stage brain-stage-loading">
+        <Skeleton label="Loading the graph" variant="block" height="100%" />
+      </div>
+    );
   const missing = missingSentence(knowledge, projects);
   const drawerOpen = selected !== null || ref !== null;
   const close = () => {

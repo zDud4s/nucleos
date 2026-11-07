@@ -4254,11 +4254,28 @@ ol.ui-well {
   max-width: var(--measure-prose);
 }
 
+/* Text lines: one bar per line at the line's own height, no inset, so the bars start on the
+   same left edge as the text they stand in for. The label is sr-only. */
+.ui-skeleton-textlines {
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: flex-start;
+  gap: calc(1lh - 0.75rem);
+  padding: 0;
+  background: none;
+  min-height: calc(var(--skeleton-lines, 1) * 1lh);
+}
+.ui-skeleton-textlines > .ui-skeleton-textline {
+  flex: none;
+}
+
 /* Shaped variants: bars and blocks that hold the geometry of what is coming. */
 .ui-skeleton-shaped {
   flex-direction: column;
   align-items: stretch;
   gap: var(--space-3);
+  /* Full width: a page that centres or shrink-wraps its children must not shrink the placeholder. */
+  width: 100%;
   max-width: none;
   background: none;
   padding: 0;
@@ -4275,7 +4292,7 @@ span.ui-skeleton-card {
       transparent 100%
     )
     0 0 / 200% 100% no-repeat,
-    var(--surface-sunken);
+    color-mix(in oklab, var(--text) 8%, var(--surface));
   animation: ui-skeleton-shimmer 1.4s linear infinite;
 }
 .ui-skeleton-bar {
@@ -4295,11 +4312,13 @@ span.ui-skeleton-avatar {
 .ui-skeleton-rows,
 .ui-skeleton-table {
   display: flex;
+  width: 100%;
   flex-direction: column;
   gap: var(--space-3);
 }
 .ui-skeleton-row {
   display: flex;
+  width: 100%;
   align-items: center;
   gap: var(--space-3);
   min-height: 2rem;
@@ -4348,8 +4367,9 @@ span.ui-skeleton-avatar {
 span.ui-skeleton-card {
   display: block;
   min-height: 6rem;
-  border-radius: var(--radius-md);
-  background: var(--surface-sunken);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: color-mix(in oklab, var(--text) 6%, var(--surface));
 }
 
 /* A value that is not known is not zero: a dash in the faint tone. */

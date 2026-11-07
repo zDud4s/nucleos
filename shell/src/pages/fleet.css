@@ -78,12 +78,45 @@
 /* The canvas needs a box of known height: xyflow measures its container. */
 .fleet-stage {
   position: relative;
-  height: calc(100vh - 14rem);
-  min-height: 30rem;
+  flex: 1 1 auto;
+  min-height: 0;
   overflow: hidden;
   background: var(--surface-sunken);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
+}
+
+/* Full-bleed like the Brain's Graph view: the stage takes everything under the header, edge to
+   edge, and the page does not scroll. The toolbar sits in the header's actions, on one line. */
+.app-main:has(> .app-page > .fleet-stage) {
+  overflow: hidden;
+}
+
+.app-page:has(> .fleet-stage) {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  max-width: none;
+  padding-inline: 0;
+  padding-bottom: 0;
+}
+
+.app-page:has(> .fleet-stage) > .ui-page-header {
+  padding-inline: var(--space-6);
+  margin-bottom: 0;
+}
+
+.app-page:has(> .fleet-stage) > .ui-page-header .fleet-bar {
+  flex-wrap: nowrap;
+  margin-bottom: 0;
+}
+
+.fleet-stage > .ui-skeleton {
+  position: absolute;
+  inset: 0;
+}
+
+.fleet-stage > .ui-skeleton .ui-skeleton-card {
+  height: 100%;
 }
 
 .fleet-canvas {
