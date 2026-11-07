@@ -387,10 +387,18 @@ if [ "${BASH_SOURCE[0]}" != "$0" ]; then
   return 0
 fi
 
-# A gate is the full suite by definition (the pre-land gate above all): tell the broker not to
-# narrow any test command it runs to the previously failed tests (scripts/heavy_failfirst.py).
-# Failures are still recorded, so a plain re-run of the same command outside a gate benefits.
-export NUCLEOS_HEAVY_FULL=1
+# Only the daemon's final safety-net trees run the full suite unconditionally: the post-merge gate
+# tree (.nucleos/worktrees/postgate-<project>) and the merge queue's (.nucleos/worktrees/integration-*).
+# There, tell the broker not to narrow a test command to the previously failed tests
+# (scripts/heavy_failfirst.py). In an agent's own worktree a re-run after a failure should run only
+# the failed tests: that is the waste failed-first exists to cut. A caller-set NUCLEOS_HEAVY_FULL
+# wins either way. Failures are still recorded in every tree.
+if [ -z "${NUCLEOS_HEAVY_FULL+x}" ]; then
+  gate_top="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+  case "$gate_top" in
+    */.nucleos/worktrees/postgate-*|*/.nucleos/worktrees/integration-*) export NUCLEOS_HEAVY_FULL=1 ;;
+  esac
+fi
 
 target="${1:-all}"
 case "$target" in

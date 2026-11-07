@@ -2,7 +2,7 @@
 """Failed-first re-runs (`scripts/heavy_failfirst.py` and its hook in the broker).
 
 A brokered test command that fails records the failing test ids, keyed by (worktree, command);
-the next identical run narrows to them, a pass clears the record, and a gate (NUCLEOS_HEAVY_FULL=1,
+the next identical run narrows to them, a pass clears the record, and the daemon's postgate/integration gate trees (NUCLEOS_HEAVY_FULL=1,
 exported by scripts/gates.sh) always runs in full.
 
 Hermetic: temp NUCLEOS_HEAVY_DIR, a throwaway git repo, and fake `cargo`/`go`/`npm`/`npx`
@@ -279,6 +279,45 @@ class BrokerTests(unittest.TestCase):
         i = text.index("export NUCLEOS_HEAVY_FULL=1")
         self.assertGreater(i, text.index('if [ "${BASH_SOURCE[0]}" != "$0" ]'))
         self.assertLess(i, text.index('target="${1:-all}"'))
+
+    def gates_full(self, parts: tuple[str, ...], caller: str | None = None) -> str:
+        """What gates.sh's FULL block leaves NUCLEOS_HEAVY_FULL as, run in a git tree at `parts`."""
+        text = (HEAVY.parent / "gates.sh").read_text(encoding="utf-8")
+        a = text.index('if [ -z "${NUCLEOS_HEAVY_FULL+x}" ]')
+        block = text[a:text.index("\nfi\n", a) + 4]
+        bash = None
+        for cand in ("C:/Program Files/Git/bin/bash.exe", "/bin/bash"):
+            if os.path.exists(cand):
+                bash = cand
+                break
+        bash = bash or shutil.which("bash")
+        if not bash:
+            self.skipTest("no bash")
+        with tempfile.TemporaryDirectory() as d:
+            tree = Path(d).joinpath(*parts)
+            tree.mkdir(parents=True)
+            subprocess.run(["git", "init", "-q", str(tree)], check=True)
+            env = {k: v for k, v in os.environ.items() if k != "NUCLEOS_HEAVY_FULL"}
+            if caller is not None:
+                env["NUCLEOS_HEAVY_FULL"] = caller
+            out = subprocess.run(
+                [bash, "-c", block + '\nprintf "%s" "${NUCLEOS_HEAVY_FULL-unset}"'],
+                cwd=tree, env=env, capture_output=True, text=True, check=True,
+            )
+            return out.stdout
+
+    def test_gates_forces_full_in_postgate_and_integration_trees(self) -> None:
+        self.assertEqual(self.gates_full((".nucleos", "worktrees", "postgate-demo")), "1")
+        self.assertEqual(self.gates_full((".nucleos", "worktrees", "integration-7")), "1")
+
+    def test_gates_leaves_an_agent_worktree_narrowable(self) -> None:
+        self.assertEqual(self.gates_full((".claude", "worktrees", "feature")), "unset")
+        self.assertEqual(self.gates_full(("postgate-demo",)), "unset")
+
+    def test_gates_respects_a_caller_set_full(self) -> None:
+        self.assertEqual(self.gates_full((".claude", "worktrees", "feature"), caller="1"), "1")
+        self.assertEqual(
+            self.gates_full((".nucleos", "worktrees", "postgate-demo"), caller="0"), "0")
 
     def test_unparseable_output_runs_full(self) -> None:
         argv = ["cargo", "test"]
