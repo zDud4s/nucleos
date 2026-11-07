@@ -140,7 +140,17 @@ func TestPanelBindingFromAnotherContextIsDropped(t *testing.T) {
 			mu.Unlock()
 		})
 	}()
-	time.Sleep(100 * time.Millisecond)
+	// Registered, not guessed at: a binding call that lands before the subscriber is listed is
+	// delivered to nobody. The deadline is only a hang guard.
+	panel, err := driver.panelOf(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "the subscriber being registered", time.Minute, func() bool {
+		panel.mu.Lock()
+		defer panel.mu.Unlock()
+		return len(panel.subs) == 1
+	})
 
 	heardNow := func() []string {
 		mu.Lock()
@@ -149,22 +159,24 @@ func TestPanelBindingFromAnotherContextIsDropped(t *testing.T) {
 	}
 
 	binding(fake, cdpOf(driver, id), 70, `{"v":1,"kind":"say","text":"from the panel"}`)
-	eventually(t, "the panel's own message reaching its subscriber", 3*time.Second, func() bool {
+	eventually(t, "the panel's own message reaching its subscriber", time.Minute, func() bool {
 		return len(heardNow()) == 1
 	})
 
 	binding(fake, cdpOf(driver, id), 7, `{"v":1,"kind":"say","text":"from the page"}`)
 	binding(fake, cdpOf(driver, id), 99, `{"v":1,"kind":"say","text":"from a world nobody told the driver about"}`)
-	time.Sleep(200 * time.Millisecond)
-	if got := heardNow(); len(got) != 1 {
+
+	// Still alive afterwards: the drop did not take the channel down with it. Binding calls are judged
+	// inline and in order on one dispatch loop, so once this one is heard the two before it have been
+	// judged too, and nothing of theirs can still be on its way.
+	binding(fake, cdpOf(driver, id), 70, `{"v":1,"kind":"say","text":"again"}`)
+	eventually(t, "the panel's second message reaching its subscriber", time.Minute, func() bool {
+		return len(heardNow()) >= 2
+	})
+	got := heardNow()
+	if len(got) != 2 || !strings.Contains(got[1], "again") {
 		t.Errorf("a binding call from outside the panel world was delivered: %v", got)
 	}
-
-	// Still alive afterwards: the drop did not take the channel down with it.
-	binding(fake, cdpOf(driver, id), 70, `{"v":1,"kind":"say","text":"again"}`)
-	eventually(t, "the panel's second message reaching its subscriber", 3*time.Second, func() bool {
-		return len(heardNow()) == 2
-	})
 }
 
 // TestANewPanelWorldIsReplayedTheHistory. A navigation destroys the panel's world and makes another;
