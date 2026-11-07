@@ -31,6 +31,10 @@ import os, pathlib, subprocess, sys, time
 
 d = pathlib.Path(os.environ["SLEEPER_DIR"])
 tag = sys.argv[-1]
+# heavy.py itself calls `cargo metadata` / `cargo clean` through this launcher when a target
+# slot changes owner; those are not the command under test and must return at once.
+if "metadata" in sys.argv[1:] or "clean" in sys.argv[1:]:
+    sys.exit(0)
 # order.txt first, the .start marker last: tests treat the marker as "started" and then read
 # order.txt, so the marker must not be visible before the line it vouches for.
 with open(d / "order.txt", "a") as f:
