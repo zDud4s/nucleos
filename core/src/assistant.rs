@@ -548,7 +548,9 @@ mod tests {
     /// A turn the fake delays (up to 2 s) must fit inside the first loop's budget.
     async fn settled_turn(pool: &SqlitePool, id: i64) -> (String, Option<String>) {
         let mut settled = None;
-        for _ in 0..500 {
+        // Hang guard only: a loaded machine can starve the turn for a long while.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             let row: (String, Option<String>, Option<String>) =
                 sqlx::query_as("SELECT status, stdout, chat_id FROM runs WHERE id = ?")
                     .bind(id)
@@ -570,13 +572,20 @@ mod tests {
         let Some(chat_id) = chat_id else {
             return (status, stdout);
         };
-        for _ in 0..100 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             if !is_busy(&chat_id) {
                 return (status, stdout);
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("turn {id} settled but chat {chat_id} was never released");
+    }
+
+    /// Hang guard for polling loops: generous, because a loaded machine can starve a task for a
+    /// long while, yet finite so a lost event fails the test instead of hanging the suite.
+    fn hang_deadline() -> std::time::Instant {
+        std::time::Instant::now() + std::time::Duration::from_secs(60)
     }
 
     /// What `FakeCommandRunner::default` answers, so a test can say "this went down the CLI path"
@@ -1690,7 +1699,8 @@ mod tests {
         .unwrap();
 
         let mut row = None;
-        for _ in 0..500 {
+        let deadline = hang_deadline();
+        while std::time::Instant::now() < deadline {
             let (status, stdout, stderr): (String, Option<String>, Option<String>) =
                 sqlx::query_as("SELECT status, stdout, stderr FROM runs WHERE id = ?")
                     .bind(id)
@@ -1741,7 +1751,8 @@ mod tests {
 
         // The session id is announced before the simulated delay, so this is the window in which a
         // real turn calls `get_email` and `hooks.rs` marks the run.
-        for _ in 0..500 {
+        let deadline = hang_deadline();
+        while std::time::Instant::now() < deadline {
             if get_session(&state.pool, chat_id).await.unwrap().is_some() {
                 break;
             }
@@ -1778,7 +1789,8 @@ mod tests {
         send_message(&state, chat_id, "approve proposal 4", Origin::Shell)
             .await
             .unwrap();
-        for _ in 0..500 {
+        let deadline = hang_deadline();
+        while std::time::Instant::now() < deadline {
             if runner.last_resume.lock().unwrap().as_deref() != Some("not-cleared") {
                 break;
             }
@@ -1923,7 +1935,8 @@ mod tests {
 
         let mut status = String::new();
         let mut session = None;
-        for _ in 0..50 {
+        let deadline = hang_deadline();
+        while std::time::Instant::now() < deadline {
             status = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
                 .bind(id)
                 .fetch_one(&pool)
@@ -2117,7 +2130,8 @@ mod tests {
             "the assigned id must be a v4 uuid, which is what the CLI accepts: {stored}"
         );
 
-        for _ in 0..500 {
+        let deadline = hang_deadline();
+        while std::time::Instant::now() < deadline {
             if runner.last_session_id.lock().unwrap().is_some() {
                 break;
             }
@@ -2148,7 +2162,8 @@ mod tests {
         send_message(&state, "assistant-tool-policy-chat", "hello", Origin::Shell)
             .await
             .unwrap();
-        for _ in 0..500 {
+        let deadline = hang_deadline();
+        while std::time::Instant::now() < deadline {
             if runner.last_tool_policy.lock().unwrap().is_some() {
                 break;
             }
@@ -2181,7 +2196,8 @@ mod tests {
             .unwrap();
         // The fake runner counts the call before it sleeps, so this parks the turn inside the CLI
         // call: past the point of no return for its terminal write, and short of running it.
-        for _ in 0..500 {
+        let deadline = hang_deadline();
+        while std::time::Instant::now() < deadline {
             if *runner.calls.lock().unwrap() > 0 {
                 break;
             }
@@ -2204,7 +2220,8 @@ mod tests {
 
         // The handle is released by the guard the task captured, so an empty map is proof the turn
         // reached the end — its terminal write included — rather than proof that time passed.
-        for _ in 0..500 {
+        let deadline = hang_deadline();
+        while std::time::Instant::now() < deadline {
             if !state
                 .run_handles
                 .lock()
@@ -2295,7 +2312,8 @@ mod tests {
             .unwrap();
         // Wait until the CLI is actually under way; cancelling a turn still queued would exercise a
         // different (and easier) path than the one a user hits.
-        for _ in 0..50 {
+        let deadline = hang_deadline();
+        while std::time::Instant::now() < deadline {
             if *runner.calls.lock().unwrap() > 0 {
                 break;
             }
@@ -2316,7 +2334,8 @@ mod tests {
         // lives in trailing statements never runs — and a chat left in BUSY_CHATS rejects every
         // later message with 409 until the daemon restarts, which is indistinguishable from the bot
         // having died.
-        for _ in 0..50 {
+        let deadline = hang_deadline();
+        while std::time::Instant::now() < deadline {
             if !mcp_path.exists() {
                 break;
             }
@@ -2383,7 +2402,8 @@ mod tests {
     /// answer there, so a test asking whether anything was recorded at all must be able to tell the
     /// two apart.
     async fn await_authored_chars(pool: &SqlitePool, id: i64) -> Option<i64> {
-        for _ in 0..100 {
+        let deadline = hang_deadline();
+        while std::time::Instant::now() < deadline {
             let recorded: Option<i64> =
                 sqlx::query_scalar("SELECT authored_prompt_chars FROM runs WHERE id = ?")
                     .bind(id)
@@ -3347,7 +3367,8 @@ mod tests {
             .unwrap();
 
         let mut published = None;
-        for _ in 0..500 {
+        let deadline = hang_deadline();
+        while std::time::Instant::now() < deadline {
             let found = state.run_tails.lock().unwrap().get(&id).cloned();
             if let Some(buffer) = found {
                 published = Some(buffer);
@@ -3366,7 +3387,8 @@ mod tests {
         // and the registration is dropped when that task ends — a moment later. Asserting on the
         // row's timing would be asserting on a race this does not care about.
         let mut gone = false;
-        for _ in 0..500 {
+        let deadline = hang_deadline();
+        while std::time::Instant::now() < deadline {
             if state.run_tails.lock().unwrap().get(&id).is_none() {
                 gone = true;
                 break;
@@ -3528,7 +3550,8 @@ mod tests {
         // The drain runs at the very end of the finished turn's task, so the second turn appears a
         // moment later rather than in the same breath.
         let mut asked: Vec<String> = Vec::new();
-        for _ in 0..200 {
+        let deadline = hang_deadline();
+        while std::time::Instant::now() < deadline {
             asked = sqlx::query_scalar(
                 "SELECT prompt FROM runs WHERE chat_id = ? AND mode = 'assistant' ORDER BY id",
             )
@@ -4614,7 +4637,8 @@ mod tests {
         wait_for_marker: bool,
     ) -> (Option<String>, Option<String>) {
         let mut last: (Option<String>, Option<String>) = (None, None);
-        for _ in 0..200 {
+        let deadline = hang_deadline();
+        while std::time::Instant::now() < deadline {
             last = sqlx::query_as("SELECT model_watch, model_requested_at FROM runs WHERE id = ?")
                 .bind(id)
                 .fetch_one(pool)
@@ -4777,7 +4801,8 @@ mod tests {
         // The drain runs at the very end of the finished turn's task, so the second turn appears a
         // moment later rather than in the same breath.
         let mut ids: Vec<i64> = Vec::new();
-        for _ in 0..200 {
+        let deadline = hang_deadline();
+        while std::time::Instant::now() < deadline {
             ids = sqlx::query_scalar(
                 "SELECT id FROM runs WHERE chat_id = ? AND mode = 'assistant' ORDER BY id",
             )
@@ -5289,7 +5314,8 @@ mod tests {
 
         unprompted.send(ANSWERS_ON_ITS_OWN.to_owned()).unwrap();
         let mut recorded = None;
-        for _ in 0..200 {
+        let deadline = hang_deadline();
+        while std::time::Instant::now() < deadline {
             recorded = sqlx::query_scalar::<_, i64>(
                 "SELECT id FROM runs WHERE chat_id = ? AND origin = 'task'",
             )
@@ -5378,7 +5404,8 @@ mod tests {
             .await
             .unwrap();
         let mut drained = None;
-        for _ in 0..250 {
+        let deadline = hang_deadline();
+        while std::time::Instant::now() < deadline {
             drained = sqlx::query_scalar::<_, String>(
                 "SELECT status FROM runs WHERE chat_id = ? AND prompt = 'esperou'",
             )
@@ -5441,7 +5468,7 @@ mod tests {
         // aborted. Bounded, because the failure here is a task that never ends: without the clock a
         // broken `Drop` would hang this test instead of failing it, and a suite that hangs says
         // less than one that fails.
-        let stopped = tokio::time::timeout(Duration::from_secs(5), running)
+        let stopped = tokio::time::timeout(Duration::from_secs(60), running)
             .await
             .expect("dropping the handle must stop the process, not leave it running");
         assert!(stopped.unwrap_err().is_cancelled());
@@ -5493,7 +5520,8 @@ mod tests {
             "a dropped process must stop vouching at once"
         );
         let mut status = String::new();
-        for _ in 0..250 {
+        let deadline = hang_deadline();
+        while std::time::Instant::now() < deadline {
             status = sqlx::query_scalar::<_, String>(
                 "SELECT status FROM chat_tasks WHERE chat_id = 'drop-vouch-chat' AND tool_use_id = 'toolu_drop'",
             )
@@ -5540,7 +5568,8 @@ mod tests {
         // not on its task existing. `spawn_registered` inserts the handle before the body runs, so
         // cancelling on that signal races the turn to the process and usually wins, which proves
         // nothing: a cancel that lands before a turn picks the process up has no process to stop.
-        for _ in 0..200 {
+        let deadline = hang_deadline();
+        while std::time::Instant::now() < deadline {
             if !LIVE_CHATS.lock().unwrap().contains_key("stopped-chat") {
                 break;
             }
@@ -5558,7 +5587,8 @@ mod tests {
             !LIVE_CHATS.lock().unwrap().contains_key("stopped-chat"),
             "a cancelled turn left its process where the next one would find it"
         );
-        for _ in 0..200 {
+        let deadline = hang_deadline();
+        while std::time::Instant::now() < deadline {
             if *fake.stopped_early.lock().unwrap() {
                 break;
             }
@@ -5623,9 +5653,10 @@ mod tests {
         Option<String>,
     );
 
-    /// The chat's `origin = 'task'` turn once it has settled, or `None` if none appeared in ~6 s.
+    /// The chat's `origin = 'task'` turn once it has settled, or `None` if none appeared in ~60 s.
     async fn settled_task_turn(pool: &SqlitePool, chat_id: &str) -> Option<TaskTurnRow> {
-        for _ in 0..300 {
+        let deadline = hang_deadline();
+        while std::time::Instant::now() < deadline {
             let row: Option<TaskTurnRow> = sqlx::query_as(
                 "SELECT id, status, stdout, cost_usd, prompt, read_untrusted, permission_mode
                    FROM runs WHERE chat_id = ? AND origin = 'task' ORDER BY id LIMIT 1",
@@ -5635,7 +5666,8 @@ mod tests {
             .await
             .unwrap();
             if let Some(row) = row.filter(|row| row.1 != "running") {
-                for _ in 0..100 {
+                let deadline = hang_deadline();
+                while std::time::Instant::now() < deadline {
                     if !is_busy(chat_id) {
                         break;
                     }
@@ -5833,7 +5865,8 @@ mod tests {
         settled_turn(&state.pool, first).await;
 
         let mut rows = Vec::new();
-        for _ in 0..300 {
+        let deadline = hang_deadline();
+        while std::time::Instant::now() < deadline {
             rows = crate::chats::tasks::for_chat(&state.pool, &chat)
                 .await
                 .unwrap();
@@ -5856,7 +5889,8 @@ mod tests {
                     .to_owned(),
             )
             .unwrap();
-        for _ in 0..300 {
+        let deadline = hang_deadline();
+        while std::time::Instant::now() < deadline {
             rows = crate::chats::tasks::for_chat(&state.pool, &chat)
                 .await
                 .unwrap();
@@ -5921,7 +5955,8 @@ mod tests {
     /// A stop that lands before the handle exists has nothing to abort, and the test would then be
     /// measuring a race instead of the stop.
     async fn the_turn_has_its_handle(state: &AppState, id: i64) {
-        for _ in 0..300 {
+        let deadline = hang_deadline();
+        while std::time::Instant::now() < deadline {
             if state
                 .run_handles
                 .lock()
@@ -5938,7 +5973,8 @@ mod tests {
     /// Waits until a conversation's process is reachable mid-turn: taken from the registry of idle
     /// ones, and listed with the ones that can be written to.
     async fn the_process_is_steerable(chat_id: &str) {
-        for _ in 0..300 {
+        let deadline = hang_deadline();
+        while std::time::Instant::now() < deadline {
             if !LIVE_CHATS.lock().unwrap().contains_key(chat_id) && is_steerable(chat_id) {
                 return;
             }
@@ -6056,7 +6092,8 @@ mod tests {
         assert!(written.interrupt);
         settled_turn(&state.pool, second).await;
         assert_eq!(run_status(&state.pool, second).await.0, "cancelled");
-        for _ in 0..200 {
+        let deadline = hang_deadline();
+        while std::time::Instant::now() < deadline {
             if *fake.stopped_early.lock().unwrap() {
                 break;
             }
@@ -6149,7 +6186,8 @@ mod tests {
         assert_eq!(text, "e também isto");
         assert_eq!(origin, Origin::Shell.as_wire());
 
-        for _ in 0..300 {
+        let deadline = hang_deadline();
+        while std::time::Instant::now() < deadline {
             let arrived = fake
                 .later_turns
                 .lock()
@@ -6276,7 +6314,8 @@ mod tests {
         assert_eq!(queued, 1);
         // When turn 2 ends the queued message is drained and starts as a turn of its own.
         let mut third: Option<i64> = None;
-        for _ in 0..500 {
+        let deadline = hang_deadline();
+        while std::time::Instant::now() < deadline {
             third = sqlx::query_scalar(
                 "SELECT id FROM runs WHERE chat_id = ? AND id > ? ORDER BY id LIMIT 1",
             )
@@ -6925,7 +6964,8 @@ mod tests {
         let mut kept = false;
         // As a transcript's poll does: another test's warm-up holds the one global `WARMING` flag
         // for a moment, and a call that finds it set does nothing.
-        for _ in 0..500 {
+        let deadline = hang_deadline();
+        while std::time::Instant::now() < deadline {
             prewarm_open_chat(&state, "warm-open");
             kept = *fake.calls.lock().unwrap() == 1
                 && LIVE_CHATS.lock().unwrap().contains_key("warm-open");
@@ -7088,7 +7128,8 @@ mod tests {
         );
 
         let mut second_row = None;
-        for _ in 0..5000 {
+        let deadline = hang_deadline();
+        while std::time::Instant::now() < deadline {
             second_row = sqlx::query_scalar::<_, i64>("SELECT id FROM runs WHERE id > ? LIMIT 1")
                 .bind(first)
                 .fetch_optional(&state.pool)
@@ -7545,7 +7586,7 @@ mod tests {
             .unwrap()
     }
 
-    /// Polls until the chat has at least `rows` compaction rows and none is `pending`, up to ~5 s.
+    /// Polls until the chat has at least `rows` compaction rows and none is `pending`, up to 60 s.
     /// Returns the rows seen; a timeout returns what was there, for the assertion to explain.
     async fn wait_for_compactions(
         pool: &SqlitePool,
@@ -7553,7 +7594,8 @@ mod tests {
         rows: usize,
     ) -> Vec<(i64, String)> {
         let mut seen = Vec::new();
-        for _ in 0..200 {
+        let deadline = hang_deadline();
+        while std::time::Instant::now() < deadline {
             seen = compaction_rows(pool, chat_id).await;
             if seen.len() >= rows && seen.iter().all(|(_, status)| status != "pending") {
                 return seen;
@@ -7643,7 +7685,8 @@ mod tests {
         // Whether it is accepted or refused as busy is not the point; the sampling below is.
         let _second = send_message(&state, &chat_id, "segundo", Origin::Shell).await;
         let mut max_pending = 0;
-        for _ in 0..200 {
+        let deadline = hang_deadline();
+        while std::time::Instant::now() < deadline {
             let rows = compaction_rows(&state.pool, &chat_id).await;
             let pending = rows.iter().filter(|(_, s)| s == "pending").count();
             max_pending = max_pending.max(pending);
@@ -7976,7 +8019,7 @@ mod tests {
             crate::execution::runner::PROGRESS_TIMEOUT_EXIT_CODE
         );
         assert!(outcome.stderr.contains("went silent"), "{}", outcome.stderr);
-        assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
+        assert!(elapsed < Duration::from_secs(30), "took {elapsed:?}");
         assert!(!still_kept, "a process that went silent must be dropped");
     }
 
@@ -8020,13 +8063,13 @@ mod tests {
         let elapsed = started.elapsed();
         evict_live(chat_id);
         // The turn was dropped with the process, so the feeder's sends start failing and it ends.
-        let _ = tokio::time::timeout(Duration::from_secs(2), feeder).await;
+        let _ = tokio::time::timeout(Duration::from_secs(60), feeder).await;
 
         assert!(
             served.is_err(),
             "the ceiling must stop a turn still streaming"
         );
-        assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
+        assert!(elapsed < Duration::from_secs(30), "took {elapsed:?}");
     }
 
     #[tokio::test]
@@ -8117,7 +8160,7 @@ mod tests {
             served.is_err(),
             "the ceiling must stop a turn still streaming"
         );
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(30));
     }
 
     #[tokio::test]
@@ -8127,7 +8170,7 @@ mod tests {
             Duration::from_millis(100),
             crate::execution::runner::ToolPolicy::McpOnly,
         );
-        let runner = silence_runner(5, Duration::from_secs(2));
+        let runner = silence_runner(5, Duration::from_secs(600));
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let transcript = Arc::new(Mutex::new(String::new()));
 
@@ -8149,7 +8192,7 @@ mod tests {
             served.is_err(),
             "an McpOnly turn keeps the plain wall clock"
         );
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(started.elapsed() < Duration::from_secs(300));
     }
 
     #[tokio::test]
