@@ -1,0 +1,264 @@
+#!/usr/bin/env python3
+"""Lock-free waiting in the heavy broker (scripts/heavy_wait.py and its use in heavy.py):
+waiters read queue and holder state without the Mutex, take it only to write, and the Mutex
+holder runs boosted and reports per-step timings in its slow trace row."""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[2]
+SCRIPTS = ROOT / "scripts"
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+spec = importlib.util.spec_from_file_location("heavy", SCRIPTS / "heavy.py")
+heavy = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(heavy)
+import heavy_wait  # noqa: E402
+
+CHILD_PRELUDE = f"""
+import importlib.util, json, os, sys, time
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("heavy", {str(SCRIPTS / "heavy.py")!r})
+heavy = importlib.util.module_from_spec(spec); spec.loader.exec_module(heavy)
+state = Path(os.environ["NUCLEOS_HEAVY_DIR"])
+me = os.getpid()
+ctime = heavy.proc_identity(me)[1]
+"""
+
+TOKEN_WAITER = CHILD_PRELUDE + """
+cap = float(sys.argv[1])
+rec = {"pid": me, "ctime": ctime, "weight": 1, "prio": 1, "argv": ["x"]}
+t0 = time.time()
+ok, _ = heavy.acquire_token(state, rec, cap)
+print(json.dumps({"ok": ok, "acq": heavy.MUTEX_ACQUIRES, "dt": time.time() - t0}))
+"""
+
+TOKEN_USER = CHILD_PRELUDE + """
+rec = {"pid": me, "ctime": ctime, "weight": 1, "prio": 1, "argv": ["x"]}
+ok, _ = heavy.acquire_token(state, rec, 60.0)
+n = len(list((state / "held").iterdir()))
+time.sleep(0.25)
+heavy.release_token(state)
+print(json.dumps({"ok": ok, "held_seen": n}))
+"""
+
+LOCK_WAITER = CHILD_PRELUDE + """
+cap = float(sys.argv[1])
+rec = {"pid": me, "ctime": ctime, "argv": ["x"], "worktree": "w", "prio": 1}
+t0 = time.time()
+ok, _, _ = heavy.acquire_lock(state, "abc", rec, cap)
+print(json.dumps({"ok": ok, "acq": heavy.MUTEX_ACQUIRES, "dt": time.time() - t0}))
+"""
+
+LOCK_USER = CHILD_PRELUDE + """
+rec = {"pid": me, "ctime": ctime, "argv": ["x"], "worktree": "w", "prio": 1}
+ok, _, _ = heavy.acquire_lock(state, "abc", rec, 60.0)
+inside = state / "inside"
+clash = False
+try:
+    inside.mkdir()
+except OSError:
+    clash = True
+time.sleep(0.15)
+if not clash:
+    inside.rmdir()
+heavy.release_lock(state, "abc")
+print(json.dumps({"ok": ok, "clash": clash}))
+"""
+
+
+def spawn(script: str, state: Path, *args, poll="0.5") -> subprocess.Popen:
+    env = dict(os.environ, NUCLEOS_HEAVY_DIR=str(state), NUCLEOS_HEAVY_POLL_S=poll,
+               NUCLEOS_HEAVY_CAPACITY="2", NUCLEOS_HEAVY_LOCAL="1", NUCLEOS_HEAVY_BOOST="0")
+    return subprocess.Popen([sys.executable, "-c", script, *map(str, args)], env=env,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+
+def results(procs) -> list[dict]:
+    out = []
+    for p in procs:
+        so, se = p.communicate(timeout=120)
+        assert p.returncode == 0, se
+        out.append(json.loads(so.strip().splitlines()[-1]))
+    return out
+
+
+class _State(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+
+    def plant_holder(self, weight=2):
+        (self.state / "held").mkdir(parents=True, exist_ok=True)
+        rec = {"pid": os.getpid(), "ctime": heavy.proc_identity(os.getpid())[1],
+               "weight": weight, "prio": 1}
+        (self.state / "held" / str(os.getpid())).write_text(json.dumps(rec))
+
+
+class Contention(_State):
+    def test_waiters_barely_touch_the_mutex(self):
+        self.plant_holder(weight=2)  # capacity 2: everyone waits behind it
+        res = results([spawn(TOKEN_WAITER, self.state, 5.0) for _ in range(8)])
+        per_s = sum(r["acq"] for r in res) / sum(r["dt"] for r in res)
+        print(f"\nmutex acquisitions per waiter-second: {per_s:.3f} (was ~2.0)")
+        self.assertTrue(all(not r["ok"] for r in res))
+        self.assertLess(per_s, 0.6)
+
+    def test_lock_waiters_barely_touch_the_mutex(self):
+        (self.state / "wt").mkdir()
+        (self.state / "wt" / "abc.lock").write_text(json.dumps(
+            {"pid": os.getpid(), "ctime": heavy.proc_identity(os.getpid())[1],
+             "argv": ["x"], "acquired": time.time()}))
+        res = results([spawn(LOCK_WAITER, self.state, 5.0) for _ in range(8)])
+        per_s = sum(r["acq"] for r in res) / sum(r["dt"] for r in res)
+        print(f"\nlock mutex acquisitions per waiter-second: {per_s:.3f} (was ~2.0)")
+        self.assertLess(per_s, 0.6)
+
+
+class NoDoubleGrant(_State):
+    def test_held_weight_never_exceeds_capacity(self):
+        res = results([spawn(TOKEN_USER, self.state, poll="0.1") for _ in range(8)])
+        self.assertTrue(all(r["ok"] for r in res))
+        self.assertLessEqual(max(r["held_seen"] for r in res), 2)
+
+    def test_two_lock_holders_never_coexist(self):
+        res = results([spawn(LOCK_USER, self.state, poll="0.1") for _ in range(6)])
+        self.assertTrue(all(r["ok"] for r in res))
+        self.assertFalse(any(r["clash"] for r in res))
+
+
+class Torn(_State):
+    def test_torn_lock_is_not_granted_on_a_lock_free_poll(self):
+        holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        self.addCleanup(holder.kill)
+        lock = self.state / "wt" / "abc.lock"
+        lock.parent.mkdir()
+        lock.write_text(json.dumps({"pid": holder.pid,
+                                    "ctime": heavy.proc_identity(holder.pid)[1],
+                                    "argv": ["x"], "acquired": time.time()}))
+        rec = {"pid": os.getpid(), "ctime": heavy.proc_identity(os.getpid())[1],
+               "argv": ["x"], "worktree": "w", "prio": 1}
+
+        class Stop(Exception):
+            pass
+
+        sleeps = []
+
+        def fake_sleep(_s):
+            sleeps.append(1)
+            if len(sleeps) == 1:
+                lock.write_text("{")  # a writer caught mid-write
+            else:
+                raise Stop
+
+        with mock.patch.object(heavy.time, "sleep", fake_sleep), \
+                mock.patch.dict(os.environ, {"NUCLEOS_HEAVY_POLL_S": "0.1"}):
+            with self.assertRaises(Stop):
+                heavy.acquire_lock(self.state, "abc", rec, 30.0)
+        self.assertEqual(lock.read_text(), "{", "a torn lock must not be taken over")
+
+    def test_torn_queue_record_does_not_grant_or_crash(self):
+        self.plant_holder(weight=2)
+        (self.state / "queue").mkdir()
+        (self.state / "queue" / "1-1-99999999").write_text("{")
+        rec = {"pid": os.getpid(), "ctime": heavy.proc_identity(os.getpid())[1],
+               "weight": 1, "prio": 1, "argv": ["x"]}
+        with mock.patch.dict(os.environ, {"NUCLEOS_HEAVY_CAPACITY": "2",
+                                          "NUCLEOS_HEAVY_POLL_S": "0.05"}):
+            ok, _ = heavy.acquire_token(self.state, rec, 0.4)
+        self.assertFalse(ok)
+
+
+class AliveCacheTest(unittest.TestCase):
+    def test_answers_expire(self):
+        now = [0.0]
+        calls = []
+        cache = heavy_wait.AliveCache(lambda p, c: calls.append(p) or True, ttl=1.5,
+                                      clock=lambda: now[0])
+        self.assertTrue(cache.check(7, 1))
+        now[0] = 1.0
+        cache.check(7, 1)
+        self.assertEqual(len(calls), 1, "within the TTL the probe must not run again")
+        now[0] = 1.6
+        cache.check(7, 1)
+        self.assertEqual(len(calls), 2, "past the TTL the probe must run again")
+        cache.check(7, 2)  # another creation time is another process
+        self.assertEqual(len(calls), 3)
+
+
+class BackoffTest(unittest.TestCase):
+    def test_grows_jittered_and_resets(self):
+        b = heavy_wait.Backoff(0.2, 1.0, rng=lambda: 0.5)  # jitter factor 1.0
+        seq = [b.next() for _ in range(6)]
+        self.assertAlmostEqual(seq[0], 0.2)
+        self.assertAlmostEqual(seq[-1], 1.0)
+        self.assertAlmostEqual(b.next(head=True), 0.2)
+        b.reset()
+        self.assertAlmostEqual(b.next(), 0.2)
+        lo = heavy_wait.Backoff(1.0, 1.0, rng=lambda: 0.0).next()
+        hi = heavy_wait.Backoff(1.0, 1.0, rng=lambda: 1.0).next()
+        self.assertAlmostEqual(lo, 0.8)
+        self.assertAlmostEqual(hi, 1.2)
+
+
+class Boost(_State):
+    def test_boost_is_applied_and_restored(self):
+        calls = []
+        with mock.patch.object(heavy_wait, "_IS_WIN", True), \
+                mock.patch.object(heavy_wait, "_get_priority", lambda: heavy_wait.NORMAL), \
+                mock.patch.object(heavy_wait, "_set_priority",
+                                  lambda c: calls.append(c) or True), \
+                mock.patch.dict(os.environ, {"NUCLEOS_HEAVY_BOOST": "1"}), \
+                mock.patch.object(heavy, "MUTEX_TRACE_S", 0.0):
+            with heavy.Mutex(self.state) as mx:
+                self.assertEqual(calls, [heavy_wait.ABOVE_NORMAL])
+                self.assertTrue(mx.boosted)
+        self.assertEqual(calls, [heavy_wait.ABOVE_NORMAL, heavy_wait.NORMAL])
+        row = json.loads((self.state / "mutex.jsonl").read_text().splitlines()[-1])
+        self.assertTrue(row["boosted"])
+
+    def test_failure_never_raises_and_non_windows_is_a_no_op(self):
+        def boom(*_):
+            raise OSError("no")
+
+        with mock.patch.object(heavy_wait, "_IS_WIN", True), \
+                mock.patch.object(heavy_wait, "_get_priority", boom), \
+                mock.patch.dict(os.environ, {"NUCLEOS_HEAVY_BOOST": "1"}):
+            self.assertIsNone(heavy_wait.boost())
+        with mock.patch.object(heavy_wait, "_IS_WIN", False):
+            self.assertIsNone(heavy_wait.boost())
+        heavy_wait.restore(None)
+
+
+class SlowRowSteps(_State):
+    def test_slow_row_carries_steps(self):
+        rec = {"pid": os.getpid(), "ctime": heavy.proc_identity(os.getpid())[1],
+               "weight": 1, "prio": 1, "argv": ["x"]}
+        with mock.patch.object(heavy, "MUTEX_TRACE_S", 0.0), \
+                mock.patch.dict(os.environ, {"NUCLEOS_HEAVY_CAPACITY": "2",
+                                             "NUCLEOS_HEAVY_POLL_S": "0.05"}):
+            ok, _ = heavy.acquire_token(self.state, rec, 5.0)
+            heavy.release_token(self.state)
+        self.assertTrue(ok)
+        rows = [json.loads(ln)
+                for ln in (self.state / "mutex.jsonl").read_text().splitlines()]
+        steps = [r["steps"] for r in rows if r.get("event") == "slow" and "steps" in r]
+        self.assertTrue(steps)
+        self.assertTrue(any({"entries", "order", "decision", "write"} <= set(s)
+                            for s in steps), steps)
+        self.assertTrue(all("boosted" in r for r in rows if r.get("event") == "slow"))
+
+
+if __name__ == "__main__":
+    unittest.main()

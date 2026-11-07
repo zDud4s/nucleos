@@ -178,9 +178,56 @@ def is_alive(pid, ctime=None) -> bool:
 # ----------------------------------------------------------------------------- mutex
 
 
+def _wait_mod():
+    """Lock-free waiting helpers (scripts/heavy_wait.py), or None: they must never stop a run."""
+    global _HW
+    if _HW is False:
+        try:
+            here = str(Path(__file__).resolve().parent)
+            if here not in sys.path:
+                sys.path.insert(0, here)
+            import heavy_wait  # type: ignore
+
+            _HW = heavy_wait
+        except Exception:
+            _HW = None
+    return _HW
+
+
+_HW = False
+_ALIVE = None
+MUTEX_ACQUIRES = 0  # Mutex acquisitions made by this process (the contention test reads it)
+
+
+def _alive_c(pid, ctime=None) -> bool:
+    """is_alive through a ~1.5 s per-process cache (NUCLEOS_HEAVY_ALIVE_TTL_S): one poll of
+    the queue and held records used to cost an OpenProcess + GetProcessTimes per record."""
+    global _ALIVE
+    hw = _wait_mod()
+    if hw is None:
+        return is_alive(pid, ctime)
+    if _ALIVE is None:
+        _ALIVE = hw.AliveCache(lambda p, c: is_alive(p, c),
+                               _env_float("NUCLEOS_HEAVY_ALIVE_TTL_S", 1.5))
+    return _ALIVE.check(pid, ctime)
+
+
 # The mutex dirs this process holds right now; an owner record naming this process for a dir
 # not in here is a leftover of its own (see Mutex._stale).
 _MUTEX_HELD: set[str] = set()
+
+
+class _NoMutex:
+    """Stand-in for a Mutex that a lock-free poll did not need; `mark` is a no-op."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def mark(self, name: str) -> None:
+        pass
 
 
 class MutexBusy(TimeoutError):
@@ -203,6 +250,14 @@ class Mutex:
         self.waited = 0.0
         self.t_held = 0.0
         self.n_exists = self.n_perm = 0
+        self.steps = None
+        self._boost = None
+        self.boosted = False
+
+    def mark(self, name: str) -> None:
+        """Time since the previous mark (or the acquisition) inside the hold, for the slow row."""
+        if self.steps is not None:
+            self.steps.mark(name)
 
     def _trace(self, row: dict) -> None:
         try:
@@ -307,7 +362,18 @@ class Mutex:
                     raise MutexBusy("broker mutex busy")
                 time.sleep(MUTEX_POLL_S)
         self.held = True
+        global MUTEX_ACQUIRES
+        MUTEX_ACQUIRES += 1
         _MUTEX_HELD.add(str(self.path))
+        hw = _wait_mod()
+        if hw is not None:
+            try:
+                # A holder starved by 4-5 heavy jobs stalled 1-40 s in a sub-millisecond hold.
+                self._boost = hw.boost()
+                self.boosted = self._boost is not None
+                self.steps = hw.Steps()
+            except Exception:
+                self._boost = None
         self.t_held = time.time()
         self.waited = self.t_held - t0
         _, ctime = proc_identity(os.getpid())
@@ -321,10 +387,19 @@ class Mutex:
         if self.held:
             self.held = False
             held = time.time() - self.t_held
+            self.mark("release")
             self._remove()
             _MUTEX_HELD.discard(str(self.path))
+            if self._boost is not None:
+                hw = _wait_mod()
+                if hw is not None:
+                    hw.restore(self._boost)
+                self._boost = None
             if held >= MUTEX_TRACE_S or self.waited >= MUTEX_TRACE_S:
-                self._trace({"event": "slow", "held_s": round(held, 3)})
+                row = {"event": "slow", "held_s": round(held, 3), "boosted": self.boosted}
+                if self.steps is not None:
+                    row["steps"] = dict(self.steps.data)
+                self._trace(row)
 
     def _remove(self) -> None:
         # Windows refuses to delete `owner` while a waiter's _stale() has it open, and a dir
@@ -637,9 +712,24 @@ def wait_max_s(opt, agent) -> float:
     return AGENT_WAIT_MAX_S if agent else CALLER_WAIT_MAX_S
 
 
-def _entries(directory: Path, reap: bool = True) -> list[tuple[Path, dict]]:
+def _unlink(path: Path) -> None:
+    """Unlink, retrying briefly on Windows' sharing violation: waiters now read queue, held and
+    lock records without the Mutex, so a delete can meet an open reader. Raises like unlink
+    once the retries are spent (callers keep their own `except OSError`)."""
+    for _ in range(25):
+        try:
+            path.unlink()
+            return
+        except PermissionError:
+            time.sleep(0.02)
+    path.unlink()
+
+
+def _entries(directory: Path, reap: bool = True, alive=None) -> list[tuple[Path, dict]]:
     """Records in a state subdirectory. A dead owner (pid gone, or reused: other creation
-    time) is removed when `reap`, and never returned."""
+    time) is removed when `reap`, and never returned. `alive` replaces is_alive (the waiters
+    pass the cached one)."""
+    alive = alive or is_alive
     out = []
     try:
         files = list(directory.iterdir())
@@ -653,10 +743,10 @@ def _entries(directory: Path, reap: bool = True) -> list[tuple[Path, dict]]:
             pid = rec["pid"]
         except (OSError, ValueError, KeyError, TypeError):
             continue
-        if not is_alive(pid, rec.get("ctime")):
+        if not alive(pid, rec.get("ctime")):
             if reap:
                 try:
-                    f.unlink()
+                    _unlink(f)
                 except OSError:
                     pass
             continue
@@ -680,7 +770,8 @@ def _wkey(path: Path) -> tuple[int, int]:
     return prio, _epoch_ns(path)
 
 
-def _effective_prios(state: Path, items: list[tuple[Path, dict]]) -> dict[str, int]:
+def _effective_prios(state: Path, items: list[tuple[Path, dict]], alive=None
+                     ) -> dict[str, int]:
     """Queue-file name -> effective priority: the entry's own, lifted to the best priority
     of every waiter of any worktree lock its pid holds (priority inheritance)."""
     own = {f.name: _int_prio(r.get("prio")) for f, r in items}
@@ -694,7 +785,7 @@ def _effective_prios(state: Path, items: list[tuple[Path, dict]]) -> dict[str, i
         except (OSError, ValueError, KeyError, TypeError):
             continue
         wdir = wt / (lock.name[: -len(".lock")] + ".waiters")
-        for f, _ in _entries(wdir, reap=False):
+        for f, _ in _entries(wdir, reap=False, alive=alive):
             best[pid] = min(best.get(pid, 9), _wkey(f)[0])
     for f, r in items:
         try:
@@ -706,9 +797,9 @@ def _effective_prios(state: Path, items: list[tuple[Path, dict]]) -> dict[str, i
     return own
 
 
-def _queue_order(items: list[tuple[Path, dict]], state: Path | None = None
+def _queue_order(items: list[tuple[Path, dict]], state: Path | None = None, alive=None
                  ) -> list[tuple[Path, dict]]:
-    eff = _effective_prios(state, items) if state is not None else {}
+    eff = _effective_prios(state, items, alive) if state is not None else {}
     return sorted(items, key=lambda it: (
         eff.get(it[0].name, _int_prio(it[1].get("prio"))), _epoch_ns(it[0])))
 
@@ -779,6 +870,8 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
     light_retry = _env_float("NUCLEOS_HEAVY_LIGHT_RETRY_S", 2.0)
     last_light = None
     hold = None  # disk busy % while the head is held by the disk rule, else None
+    hw = _wait_mod()
+    bo = hw.Backoff(poll * 0.4, poll * 2.0) if hw is not None else None
     try:
         with Mutex(directory):
             queue_dir.mkdir(parents=True, exist_ok=True)
@@ -797,9 +890,38 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
             probed = dyn and last_pos <= 1
             pr = hc.dynamic_probe() if probed else None
             dk = _disk_sample(hc, directory) if probed else None
-            with Mutex(directory):
-                order = _queue_order(_entries(queue_dir), directory)
-                held_ents = _entries(held_dir)
+            # Lock-free look first: a waiter that is not the head, or a head that does not
+            # fit, has nothing to write, so it must not take the Mutex (8+ waiters polling
+            # through it convoyed). A torn or missing record only makes this look wrong; the
+            # Mutex block below re-reads everything before any write.
+            need = True
+            if bo is not None:
+                try:
+                    lorder = _queue_order(_entries(queue_dir, reap=False, alive=_alive_c),
+                                          directory, _alive_c)
+                    lnames = [f.name for f, _ in lorder]
+                    lpos = lnames.index(qfile.name) + 1 if qfile.name in lnames else 0
+                    if lpos == 0:
+                        need = not qfile.exists()  # present but unreadable: retry next poll
+                    elif lpos > 1:
+                        need = False
+                    elif shadow is None and not dyn:
+                        lheld = sum(int(r.get("weight") or 1) for _, r in
+                                    _entries(held_dir, reap=False, alive=_alive_c))
+                        need = lheld + rec["weight"] <= capacity()
+                    if not need:
+                        position = lpos
+                        if position != 1:
+                            hold = None
+                except Exception:
+                    need = True
+            with (Mutex(directory) if need else _NoMutex()) as mx:
+              if need:
+                q_ents = _entries(queue_dir, alive=_alive_c)
+                held_ents = _entries(held_dir, alive=_alive_c)
+                mx.mark("entries")
+                order = _queue_order(q_ents, directory, _alive_c)
+                mx.mark("order")
                 held_recs = [r for _, r in held_ents]
                 held = sum(int(r.get("weight") or 1) for r in held_recs)
                 names = [f.name for f, _ in order]
@@ -838,12 +960,16 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
                                 if (not fit and adm and adm.get("rule") == "disk") else None)
                         if fit and adm:
                             rec["adm"] = adm
+                    mx.mark("decision")
                     if fit:
                         (held_dir / str(me)).write_text(json.dumps(rec), encoding="utf-8")
-                        qfile.unlink()
+                        _unlink(qfile)
+                        mx.mark("write")
                         queued = False
                         admitted = True
                         return True, time.time() - t0
+            if bo is not None and 0 < position < last_pos:
+                bo.reset()  # moved up the queue: look again soon
             last_pos = position
             if light is not None and (last_light is None
                                       or time.monotonic() - last_light >= light_retry):
@@ -854,7 +980,7 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
                     got_light = False
                 if got_light:
                     try:
-                        qfile.unlink()
+                        _unlink(qfile)
                     except OSError:
                         pass
                     queued = False
@@ -869,11 +995,11 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
             if now - last_report >= 30:
                 last_report = now
                 sys.stderr.write(_wait_line(now - t0, position, hold))
-            time.sleep(poll)
+            time.sleep(bo.next(head=position <= 1) if bo is not None else poll)
     finally:
         if queued:
             try:
-                qfile.unlink()
+                _unlink(qfile)
             except OSError:
                 pass
         if shadow is not None:
@@ -882,7 +1008,7 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
 
 def release_token(directory: Path) -> None:
     try:
-        (directory / "held" / str(os.getpid())).unlink()
+        _unlink((directory / "held" / str(os.getpid())))
     except OSError:
         pass
 
@@ -940,8 +1066,15 @@ def drop_token_weight(directory: Path, me_ctime) -> bool:
             except OSError:
                 # Windows: a reader (status/heavy_watch) holding the file open refuses the
                 # replace. The callback fires once, so retry once before giving up.
-                time.sleep(0.2)
-                os.replace(tmp, path)
+                for _ in range(10):
+                    time.sleep(0.2)
+                    try:
+                        os.replace(tmp, path)
+                        break
+                    except OSError:
+                        continue
+                else:
+                    os.replace(tmp, path)
             return True
     except BaseException as exc:
         try:
@@ -1045,7 +1178,7 @@ def _leave_waiters(wfile: Path, wdir: Path) -> None:
     """Drop our waiter file and the waiters dir if now empty. Call under the Mutex: a
     peer's mkdir+write happens under it too."""
     try:
-        wfile.unlink()
+        _unlink(wfile)
     except OSError:
         pass
     try:
@@ -1054,16 +1187,16 @@ def _leave_waiters(wfile: Path, wdir: Path) -> None:
         pass
 
 
-def _read_lock(lock: Path) -> dict | None:
+def _read_lock(lock: Path, alive=None) -> dict | None:
     """The live holder's record, or None (a dead holder's file is removed)."""
     try:
         rec = json.loads(lock.read_text(encoding="utf-8"))
         pid = rec["pid"]
     except (OSError, ValueError, KeyError, TypeError):
         return None
-    if not is_alive(pid, rec.get("ctime")):
+    if not (alive or is_alive)(pid, rec.get("ctime")):
         try:
-            lock.unlink()
+            _unlink(lock)
         except OSError:
             pass
         return None
@@ -1120,6 +1253,9 @@ def acquire_lock(directory: Path, h: str, rec: dict, wait_cap: float,
     last_holder = None
     est = None
     est_key = None
+    hw = _wait_mod()
+    bo = hw.Backoff(poll * 0.4, poll * 2.0) if hw is not None else None
+    torn = 0  # consecutive polls on which the lock file existed but did not parse
 
     def est_for(h):
         # The estimate is only valid for the holder it was computed for.
@@ -1139,59 +1275,84 @@ def acquire_lock(directory: Path, h: str, rec: dict, wait_cap: float,
                 if pkey != est_key:
                     est_key = pkey
                     est = _holder_estimate(directory, peek)
-            with Mutex(directory):
-                wdir.mkdir(parents=True, exist_ok=True)
-                if not queued_reaped:
-                    _reap_dead_locks_held(directory)
-                    queued_reaped = True
-                holder = _read_lock(lock)
-                if holder is not None and holder.get("pid") == me:
-                    # Handed over by the previous holder on its release.
-                    lock.write_text(json.dumps(dict(rec, acquired=time.time())),
-                                    encoding="utf-8")
-                    _leave_waiters(wfile, wdir)
-                    queued = False
-                    return True, time.time() - t0, arrival
-                if holder is not None:
-                    last_holder = holder
-                if holder is not None and holder.get("hold") and fail_on_hold:
-                    sys.stderr.write(
-                        f"heavy: this worktree is held by a gate run "
-                        f"({_holder_line(holder, est_for(holder))}); nothing was compiled. A gate keeps its "
-                        "worktree until it ends - wait for it to finish rather than retrying, "
-                        "and run nothing heavy here meanwhile.\n")
-                    _leave_waiters(wfile, wdir)
-                    queued = False
-                    if why is not None:
-                        why["waited_on"] = "gate"
-                    return False, time.time() - t0, arrival
-                remaining = wait_cap - (time.time() - t0)
-                if (fail_on_hold and holder is not None
-                        and not (holder.get("warm") or holder.get("agent") == "warm")
-                        and est_for(holder) is not None and est_for(holder) > remaining):
-                    # The log says the holder outlasts this call's whole wait: waiting only
-                    # ends in the same exit 75, minutes later.
-                    sys.stderr.write(
-                        f"heavy: this worktree is held by {_holder_line(holder, est_for(holder))}; it will "
-                        f"not be free within this call's {int(remaining)}s wait - nothing was "
-                        "compiled. Wait for it to finish rather than retrying.\n")
-                    _leave_waiters(wfile, wdir)
-                    queued = False
-                    if why is not None:
-                        why["waited_on"] = "estimate"
-                    return False, time.time() - t0, arrival
-                if holder is None:
-                    ahead = [f for f, _ in _entries(wdir)
-                             if f.name != wfile.name and _wkey(f) < mine]
-                    if not ahead:
+            # Lock-free look first: behind a live holder that is not us, a queued waiter has
+            # nothing to write. Everything that mutates (grant, enqueue, reap, a refusal that
+            # leaves the queue) re-reads the holder and the waiters under the Mutex.
+            need = True
+            if bo is not None and queued:
+                try:
+                    if isinstance(peek, dict):
+                        torn = 0
+                        if _alive_c(peek.get("pid"), peek.get("ctime")) and peek.get("pid") != me:
+                            need = not wfile.exists()
+                            if fail_on_hold and not need:
+                                rem = wait_cap - (time.time() - t0)
+                                e = est_for(peek)
+                                need = bool(peek.get("hold")) or bool(
+                                    not (peek.get("warm") or peek.get("agent") == "warm")
+                                    and e is not None and e > rem)
+                            if not need:
+                                last_holder = peek
+                    elif lock.exists() and torn < 3:
+                        torn += 1  # probably mid-write: look again next poll, grant nothing
+                        need = False
+                except Exception:
+                    need = True
+            with (Mutex(directory) if need else _NoMutex()) as mx:
+                if need:
+                    wdir.mkdir(parents=True, exist_ok=True)
+                    if not queued_reaped:
+                        _reap_dead_locks_held(directory)
+                        queued_reaped = True
+                    holder = _read_lock(lock, _alive_c)
+                    mx.mark("holder")
+                    if holder is not None and holder.get("pid") == me:
+                        # Handed over by the previous holder on its release.
                         lock.write_text(json.dumps(dict(rec, acquired=time.time())),
                                         encoding="utf-8")
                         _leave_waiters(wfile, wdir)
                         queued = False
                         return True, time.time() - t0, arrival
-                if not queued or not wfile.exists():
-                    wfile.write_text(json.dumps(rec), encoding="utf-8")
-                    queued = True
+                    if holder is not None:
+                        last_holder = holder
+                    if holder is not None and holder.get("hold") and fail_on_hold:
+                        sys.stderr.write(
+                            f"heavy: this worktree is held by a gate run "
+                            f"({_holder_line(holder, est_for(holder))}); nothing was compiled. A gate keeps its "
+                            "worktree until it ends - wait for it to finish rather than retrying, "
+                            "and run nothing heavy here meanwhile.\n")
+                        _leave_waiters(wfile, wdir)
+                        queued = False
+                        if why is not None:
+                            why["waited_on"] = "gate"
+                        return False, time.time() - t0, arrival
+                    remaining = wait_cap - (time.time() - t0)
+                    if (fail_on_hold and holder is not None
+                            and not (holder.get("warm") or holder.get("agent") == "warm")
+                            and est_for(holder) is not None and est_for(holder) > remaining):
+                        # The log says the holder outlasts this call's whole wait: waiting only
+                        # ends in the same exit 75, minutes later.
+                        sys.stderr.write(
+                            f"heavy: this worktree is held by {_holder_line(holder, est_for(holder))}; it will "
+                            f"not be free within this call's {int(remaining)}s wait - nothing was "
+                            "compiled. Wait for it to finish rather than retrying.\n")
+                        _leave_waiters(wfile, wdir)
+                        queued = False
+                        if why is not None:
+                            why["waited_on"] = "estimate"
+                        return False, time.time() - t0, arrival
+                    if holder is None:
+                        ahead = [f for f, _ in _entries(wdir, alive=_alive_c)
+                                 if f.name != wfile.name and _wkey(f) < mine]
+                        if not ahead:
+                            lock.write_text(json.dumps(dict(rec, acquired=time.time())),
+                                            encoding="utf-8")
+                            _leave_waiters(wfile, wdir)
+                            queued = False
+                            return True, time.time() - t0, arrival
+                    if not queued or not wfile.exists():
+                        wfile.write_text(json.dumps(rec), encoding="utf-8")
+                        queued = True
             now = time.time()
             if now - t0 >= wait_cap:
                 sys.stderr.write(
@@ -1212,7 +1373,7 @@ def acquire_lock(directory: Path, h: str, rec: dict, wait_cap: float,
             if now - last_report >= 30:
                 last_report = now
                 sys.stderr.write(f"heavy: waiting {int(now - t0)}s for the worktree lock\n")
-            time.sleep(poll)
+            time.sleep(bo.next() if bo is not None else poll)
     finally:
         if queued:
             try:
@@ -1220,7 +1381,7 @@ def acquire_lock(directory: Path, h: str, rec: dict, wait_cap: float,
                     _leave_waiters(wfile, wdir)
             except Exception:
                 try:
-                    wfile.unlink()
+                    _unlink(wfile)
                 except OSError:
                     pass
 
@@ -1237,7 +1398,7 @@ def release_lock(directory: Path, h: str):
         if cur.get("pid") != os.getpid():
             return None
         try:
-            lock.unlink()
+            _unlink(lock)
         except OSError:
             pass
         waiting = sorted(_entries(wdir), key=lambda it: _wkey(it[0]))
@@ -1248,7 +1409,7 @@ def release_lock(directory: Path, h: str):
                     acquired=time.time())
         lock.write_text(json.dumps(wrec), encoding="utf-8")
         try:
-            f.unlink()
+            _unlink(f)
         except OSError:
             pass
         return wrec["pid"], wrec.get("ctime"), not wrec.get("hold")
