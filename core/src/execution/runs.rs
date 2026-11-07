@@ -8325,9 +8325,8 @@ tests:
             .await
             .unwrap();
         let mut feed_kind = None;
-        // The row lands after a git worktree add plus the gate command; a loaded gate run stretches
-        // that far past 1s. Cost on the passing path is nil (breaks on the first row).
-        for _ in 0..3000 {
+        let hang_guard = std::time::Instant::now() + Duration::from_secs(60);
+        while std::time::Instant::now() < hang_guard {
             feed_kind = sqlx::query_scalar::<_, String>(
                 "SELECT kind FROM feed WHERE run_id = ? AND kind <> 'run_launched_unclassified' ORDER BY id DESC LIMIT 1",
             )

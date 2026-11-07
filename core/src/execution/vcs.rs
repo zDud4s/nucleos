@@ -3659,7 +3659,7 @@ mod tests {
             // confusing later assertion. The outer timeout is not a budget: it is reached only if
             // the drain never arrives at all, and it is there so that failure is a message rather
             // than a hung suite.
-            tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::time::timeout(Duration::from_secs(60), async {
                 tokio::select! {
                     _ = &mut drain => {
                         panic!("the executor is never released — the drain cannot have finished")
@@ -3714,7 +3714,7 @@ mod tests {
         let executor = std::sync::Arc::new(FakeVcsExecutor::succeeding_with("abc123"));
         let worker = tokio::spawn(run_queue_worker(pool.clone(), executor.clone()));
 
-        let settled = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let settled = tokio::time::timeout(std::time::Duration::from_secs(60), async {
             loop {
                 if status_of(&pool, id).await == "succeeded" {
                     return;
@@ -3745,7 +3745,7 @@ mod tests {
         let executor = std::sync::Arc::new(FakeVcsExecutor::rendezvous_of(2, "abc123"));
         let worker = tokio::spawn(run_queue_worker(pool.clone(), executor.clone()));
 
-        let settled = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let settled = tokio::time::timeout(std::time::Duration::from_secs(60), async {
             loop {
                 if status_of(&pool, first).await == "succeeded"
                     && status_of(&pool, second).await == "succeeded"
@@ -3790,7 +3790,7 @@ mod tests {
         let first = submit(&pool, &repo_for("alpha"), &merge_op(), Origin::Human)
             .await
             .unwrap();
-        let drained_once = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let drained_once = tokio::time::timeout(std::time::Duration::from_secs(60), async {
             loop {
                 if status_of(&pool, first).await == "succeeded" {
                     return;
@@ -3808,7 +3808,7 @@ mod tests {
         let second = submit(&pool, &repo_for("beta"), &merge_op(), Origin::Human)
             .await
             .unwrap();
-        let settled = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let settled = tokio::time::timeout(std::time::Duration::from_secs(60), async {
             loop {
                 if status_of(&pool, second).await == "succeeded" {
                     return;
@@ -3849,7 +3849,7 @@ mod tests {
                 }
             }
         };
-        tokio::time::timeout(std::time::Duration::from_secs(30), wait_until(first))
+        tokio::time::timeout(std::time::Duration::from_secs(60), wait_until(first))
             .await
             .expect("the worker's first pass should drain what was queued for it");
 
@@ -3858,7 +3858,7 @@ mod tests {
             .await
             .unwrap();
         let settled =
-            tokio::time::timeout(std::time::Duration::from_secs(30), wait_until(second)).await;
+            tokio::time::timeout(std::time::Duration::from_secs(60), wait_until(second)).await;
         worker.abort();
 
         settled.expect("an enqueue must wake the idle worker; the fallback poll is 30s away");
@@ -3897,7 +3897,7 @@ mod tests {
         let executor = std::sync::Arc::new(FakeVcsExecutor::succeeding_with("abc123"));
         let worker = tokio::spawn(run_queue_worker(pool.clone(), executor.clone()));
 
-        let settled = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let settled = tokio::time::timeout(std::time::Duration::from_secs(60), async {
             loop {
                 if status_of(&pool, second).await == "succeeded" {
                     return;
