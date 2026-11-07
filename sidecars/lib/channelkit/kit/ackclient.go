@@ -49,7 +49,7 @@ func (c *Client) Ack(ctx context.Context, id uint64, ack contract.Ack) (AckResul
 		return AckResult{}, fmt.Errorf("%w: encode ack: %w", ErrFatal, err)
 	}
 	path := c.channelPath("/outbox/" + strconv.FormatUint(id, 10) + "/ack")
-	body, status, err := c.do(ctx, http.MethodPost, path, bytes.NewReader(payload), "application/json")
+	body, status, err := c.doBounded(ctx, http.MethodPost, path, bytes.NewReader(payload), "application/json")
 	if err != nil {
 		if ctx.Err() != nil {
 			return AckResult{}, fmt.Errorf("ack %d: %w", id, ctx.Err())

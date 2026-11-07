@@ -35,7 +35,7 @@ func (c *Client) Hello(ctx context.Context, hello contract.Hello) (contract.Hell
 	if err != nil {
 		return zero, fmt.Errorf("encode hello: %w", err)
 	}
-	body, status, err := c.do(ctx, http.MethodPut, c.channelPath("/hello"), bytes.NewReader(payload), "application/json")
+	body, status, err := c.doBounded(ctx, http.MethodPut, c.channelPath("/hello"), bytes.NewReader(payload), "application/json")
 	if err != nil {
 		return zero, fmt.Errorf("%w: hello: %w", ErrTransient, err)
 	}

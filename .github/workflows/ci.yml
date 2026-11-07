@@ -13,6 +13,7 @@ name: gates
 
 on:
   push:
+    branches: [master]
   pull_request:
 
 # A second push supersedes the first: the older run is answering a question nobody is asking now.
