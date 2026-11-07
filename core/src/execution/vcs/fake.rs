@@ -7,6 +7,8 @@ use super::*;
 #[cfg(any(test, feature = "testkit"))]
 pub(super) struct FakeVcsExecutor {
     pub(super) outcome: Outcome,
+    /// What `landed_sha` answers: the sha the target is at once the work has already landed.
+    pub(super) landed: Option<String>,
     /// How long to take before answering. A real merge takes seconds, and a test about what happens
     /// WHILE one runs — a drain abandoned mid-operation — needs a window to abandon it in. The same
     /// reason `FakeTranscriber` carries one.
@@ -55,6 +57,12 @@ impl FakeVcsExecutor {
             sha: Some(sha.into()),
             output_tail: format!("git printed this while succeeding at {sha}"),
         })
+    }
+
+    /// Reports the work as already landed at `sha`, as `GitExecutor::landed_sha` would.
+    pub(super) fn already_landed_at(mut self, sha: &str) -> Self {
+        self.landed = Some(sha.into());
+        self
     }
 
     /// Answers, but not immediately.
@@ -114,6 +122,7 @@ impl FakeVcsExecutor {
     pub(super) fn reporting(outcome: Outcome) -> Self {
         Self {
             outcome,
+            landed: None,
             delay: std::time::Duration::ZERO,
             barrier: None,
             seen: std::sync::Mutex::new(Vec::new()),
@@ -166,6 +175,10 @@ impl FakeVcsExecutor {
 #[cfg(any(test, feature = "testkit"))]
 #[async_trait::async_trait]
 impl VcsExecutor for FakeVcsExecutor {
+    async fn landed_sha(&self, _request: &ClaimedRequest) -> Option<String> {
+        self.landed.clone()
+    }
+
     async fn execute(&self, request: &ClaimedRequest) -> Outcome {
         // Recorded before the delay, not after: a drain abandoned mid-operation never reaches the
         // line after the await, and a test of that case still needs to see the executor was entered.

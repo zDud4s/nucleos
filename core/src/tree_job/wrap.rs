@@ -80,6 +80,7 @@ type NodeRow = (String, String, Option<String>, Option<String>);
 /// to call again at any time: every relaunch is keyed by the run it follows.
 pub async fn tick(state: &AppState) {
     wrap_running_nodes(state).await;
+    super::watchdog::sweep(state).await;
     super::root::retry_failed_starts(state).await;
 }
 
@@ -105,12 +106,24 @@ async fn wrap_running_nodes(state: &AppState) {
         if handled >= MAX_NODES_PER_TICK {
             break;
         }
+        // A relaunch that failed waits out its backoff (see `watchdog`).
+        if super::watchdog::backing_off(&state.pool, &node_id).await {
+            continue;
+        }
         match wrap_node(state, &node_id, &job_id, run_id, handoff).await {
             Ok(false) => {}
-            Ok(true) => handled += 1,
+            Ok(true) => {
+                handled += 1;
+                super::watchdog::record_success(&state.pool, &node_id).await;
+            }
             Err(error) => {
                 handled += 1;
                 tracing::warn!(node = %node_id, %error, "tree wrap-up failed for the node");
+                if let Err(error) =
+                    super::watchdog::record_failure(&state.pool, &job_id, &node_id, &error).await
+                {
+                    tracing::warn!(node = %node_id, %error, "watchdog could not record the failure");
+                }
             }
         }
     }

@@ -27,4 +27,5 @@ pub mod root;
 mod root_disk;
 pub mod root_pending;
 pub mod store;
+pub mod watchdog;
 pub mod wrap;
