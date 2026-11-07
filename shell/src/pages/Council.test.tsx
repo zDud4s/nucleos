@@ -611,6 +611,32 @@ describe("Council - refusals convening meets", () => {
     ).toBeDefined();
   });
 
+  it("sends one Idempotency-Key per Convene and reuses it on a retry after a refusal (#19)", async () => {
+    daemon.apiFetch.mockImplementation(
+      councilFetch([], {}, {
+        onCreate: () => {
+          throw new ApiRefusal(503, "unavailable", "no council is configured");
+        },
+      }),
+    );
+
+    await renderCouncil("/council");
+    fireEvent.change(await screen.findByLabelText("Question"), { target: { value: "well?" } });
+    await conveneWhenReady();
+    await screen.findByText(/no council is configured/);
+    await conveneWhenReady();
+
+    await waitFor(() => {
+      const posts = daemon.apiFetch.mock.calls.filter(
+        ([path, init]) => path === "/council" && (init as RequestInit | undefined)?.method === "POST",
+      );
+      expect(posts).toHaveLength(2);
+      const keys = posts.map(([, init]) => new Headers((init as RequestInit).headers).get("Idempotency-Key"));
+      expect(keys[0]).toBeTruthy();
+      expect(keys[1]).toBe(keys[0]);
+    });
+  });
+
   it("tells the reader where the roster lives, and it is not inside the repository", async () => {
     daemon.apiFetch.mockImplementation(councilFetch([], {}));
 
