@@ -164,14 +164,14 @@ mod tests {
 
     #[test]
     fn a_gate_marker_lasts_as_long_as_its_guard_and_is_bounded() {
-        begin_attempt(9100003);
-        assert_eq!(gate_in_flight_until(9100003), None);
-        let guard = begin_gate(9100003);
-        let until = gate_in_flight_until(9100003).expect("marker set");
+        begin_attempt(9100004);
+        assert_eq!(gate_in_flight_until(9100004), None);
+        let guard = begin_gate(9100004);
+        let until = gate_in_flight_until(9100004).expect("marker set");
         assert!(until > Utc::now() + chrono::Duration::minutes(45));
         drop(guard);
-        assert_eq!(gate_in_flight_until(9100003), None);
-        forget(9100003);
+        assert_eq!(gate_in_flight_until(9100004), None);
+        forget(9100004);
     }
 
     #[test]
