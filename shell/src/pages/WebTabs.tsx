@@ -3,7 +3,6 @@ import { useEffect, useRef, useState } from "react";
 import { useBrowserHealth, useBrowserSessions } from "../data/browser";
 import { useFocusNonce } from "../data/browser-store";
 import { isRemote } from "../remote/host";
-import { UnavailableRemotely } from "../remote/UnavailableRemotely";
 import { Count, StateBadge } from "../ui";
 import { AgentPanel } from "./AgentPanel";
 import { Browser } from "./Browser";
@@ -96,8 +95,24 @@ export function WebTabs() {
     </div>
   );
 
-  // The embedded browser is a native webview on the host: nothing to mount beside a browser tab.
-  if (isRemote()) return <UnavailableRemotely feature="The browser" />;
+  // The embedded browser's owner tabs are native webviews, but agent sessions and the archive are
+  // ordinary API surfaces. On a laptop the two panels take over the page instead of sitting beside
+  // a native view; `/web` keeps the live-session panel and archive routes keep their deep links.
+  if (isRemote()) {
+    return (
+      <div className="web-remote">
+        <div className="web-panel-toggles" role="toolbar" aria-label="Web panels">
+          <button type="button" className="web-panel-toggle" aria-pressed={!archiveOpen} onClick={() => void navigate({ to: "/web" })}>
+            Sessions
+          </button>
+          <button type="button" className="web-panel-toggle" aria-pressed={archiveOpen} onClick={() => void navigate({ to: "/web/archive" })}>
+            Archive
+          </button>
+        </div>
+        {archiveOpen ? <Web /> : <Browser />}
+      </div>
+    );
+  }
 
   return (
     <div className="web-split">

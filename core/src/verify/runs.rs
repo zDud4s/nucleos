@@ -455,22 +455,41 @@ pub async fn cancel_queued(
 /// path that delivers its verdict to the run. Tickets of other callers (owner, job, merge,
 /// post-merge gate) are never touched. Returns `(unit id, ticket id)` of each unit ended, so the
 /// caller can log it: nothing here ends silently.
+///
+/// An idle sweep takes no write lock: it first reads, with the same `WHERE` as the `UPDATE`, and
+/// writes only if something matches. The executor calls this on every pass (every 500 ms and
+/// after every submit), and even an `UPDATE` that changes nothing takes SQLite's single write
+/// lock, so it would wait behind any long writer and fail with "database is locked".
 pub async fn cancel_orphaned_queued(pool: &SqlitePool) -> sqlx::Result<Vec<(i64, i64)>> {
     let ended = crate::execution::runs::ENDED_RUN_STATUSES;
     let placeholders = vec!["?"; ended.len()].join(", ");
-    let sql = format!(
-        "UPDATE verify_runs SET status = 'errored', finished_at = ?, \
-         output_tail = 'orphaned: the run that asked for this verification (run ' || \
-         CAST(substr((SELECT caller FROM verify_requests WHERE id = verify_runs.origin_id), 5) \
-         AS INTEGER) || ') has ended or no longer exists, so nobody can read the result' \
-         WHERE status = 'queued' AND origin = ? AND origin_id IN ( \
+    // Shared by the read and the write so they cannot drift. Binds, in order: origin, then each
+    // ended status.
+    let filter = format!(
+        "WHERE status = 'queued' AND origin = ? AND origin_id IN ( \
            SELECT q.id FROM verify_requests q WHERE q.caller LIKE 'run:%' \
            AND NOT EXISTS (SELECT 1 FROM verify_wakes w WHERE w.ticket_id = q.id \
                            AND w.state = 'pending') \
            AND NOT EXISTS (SELECT 1 FROM runs r \
                            WHERE r.id = CAST(substr(q.caller, 5) AS INTEGER) \
-                           AND r.status NOT IN ({placeholders}))) \
-         RETURNING id, origin_id"
+                           AND r.status NOT IN ({placeholders})))"
+    );
+    let probe = format!("SELECT EXISTS (SELECT 1 FROM verify_runs {filter})");
+    // Audited: `probe` only interpolates a run of `?` placeholders; every value is bound.
+    let mut query = sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(probe)).bind(ORIGIN_VERIFY);
+    for status in ended {
+        query = query.bind(*status);
+    }
+    if !query.fetch_one(pool).await? {
+        return Ok(Vec::new());
+    }
+
+    let sql = format!(
+        "UPDATE verify_runs SET status = 'errored', finished_at = ?, \
+         output_tail = 'orphaned: the run that asked for this verification (run ' || \
+         CAST(substr((SELECT caller FROM verify_requests WHERE id = verify_runs.origin_id), 5) \
+         AS INTEGER) || ') has ended or no longer exists, so nobody can read the result' \
+         {filter} RETURNING id, origin_id"
     );
     // Audited: `sql` only interpolates a run of `?` placeholders; every value is bound.
     let mut query = sqlx::query_as::<_, (i64, i64)>(sqlx::AssertSqlSafe(sql))
@@ -1079,6 +1098,35 @@ mod tests {
         for id in [u_live, u_owner, u_woken] {
             assert_eq!(get(&pool, id).await.unwrap().unwrap().status, STATUS_QUEUED);
         }
+    }
+
+    /// The executor sweeps every 500 ms and after every submit; with nothing to end it must stay
+    /// a read, or each pass queues for the single write lock behind any long writer.
+    #[tokio::test]
+    async fn an_idle_orphan_sweep_takes_no_write_lock() {
+        use sqlx::Executor;
+        let pool = crate::testdb::fresh_shared_pool().await;
+        let mut holder = pool.acquire().await.unwrap();
+        holder.execute("BEGIN IMMEDIATE").await.unwrap();
+        holder
+            .execute(
+                "INSERT INTO runs (project_id, cwd, prompt, status, mode, created_at) \
+                 VALUES ('proj', '/wt', 'p', 'running', 'worktree', '2026-11-03T00:00:00Z')",
+            )
+            .await
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let swept = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            cancel_orphaned_queued(&pool),
+        )
+        .await
+        .expect("the idle sweep waited for the write lock");
+
+        assert!(swept.unwrap().is_empty());
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        holder.execute("ROLLBACK").await.unwrap();
     }
 
     #[test]

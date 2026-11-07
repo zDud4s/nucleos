@@ -352,6 +352,19 @@ export function fetchFileBlob(path: string): Promise<Blob> {
 }
 
 export async function downloadFile(path: string): Promise<void> {
+  if (isRemote()) {
+    // A native download: the browser streams the response to disk, so a multi-GB file never sits in
+    // the tab's memory. The gateway admits this one same-origin GET without the CSRF header an anchor
+    // cannot send (`sidecars/remote/serve/security.go`); the daemon answers it as an attachment.
+    // A failure shows in the browser's own downloads list, not here.
+    const link = document.createElement("a");
+    link.href = `/api/files/download?path=${encodeURIComponent(path)}`;
+    link.download = fileName(path);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    return;
+  }
   const blob = await apiBlob(`/files/download?path=${encodeURIComponent(path)}`);
   const url = URL.createObjectURL(blob);
   try {
@@ -418,6 +431,12 @@ const RUNS_ON_OPEN = new Set([
   "appx", "appxbundle", "msix", "msixbundle", "application", "gadget", "inf", "ins", "isp", "jnlp",
   "msu", "mst", "scf", "sct", "ws", "wsc", "chm", "ps1xml", "ps2", "psc1", "psc2", "psd1", "pyw",
   "settingcontent-ms", "library-ms", "search-ms",
+  // Office types that run code or fetch it (macro-enabled files, add-ins, query files).
+  "xll", "wll", "diagcab", "xbap", "iqy", "slk", "vsto", "docm", "xlsm", "pptm", "dotm", "xltm",
+  "potm", "ppam", "xlam",
+  // macOS and Linux launchers.
+  "command", "terminal", "app", "desktop", "sh", "pkg", "dmg", "workflow", "action", "run", "bash",
+  "zsh", "appimage", "deb", "rpm",
 ]);
 
 /** Whether opening this name would run it rather than show it. */
@@ -437,9 +456,77 @@ export function runsOnOpen(name: string): boolean {
 export async function openFile(relative: string): Promise<void> {
   // The page asks `runsOnOpen` first and says why; this is the floor under it.
   if (runsOnOpen(relative)) throw new Error("a program is never run from the files folder");
-  // The files live on the host's disk; the caller prints this after "Could not open it".
-  if (isRemote()) throw new Error("opening a file on disk is only available on the host machine");
+  // The disk is the host's, so from a browser "open" is the nearest honest thing: the file arrives
+  // as a native download (an anchor the gateway admits for this one route).
+  if (isRemote()) return downloadFile(relative);
   await openPath(await diskPath(relative));
+}
+
+/** Whether OS drops reach the page as DOM events (a browser) rather than as the host's events. */
+export function browserDropsApply(): boolean {
+  return isRemote();
+}
+
+/** The slice of a drop's `DataTransfer` that is read, so a test can hand over a plain object. */
+export interface DropTransfer {
+  files?: ArrayLike<File> | null;
+  items?: ArrayLike<{
+    kind: string;
+    getAsFile(): File | null;
+    webkitGetAsEntry?: () => { isDirectory: boolean; name: string } | null;
+  }> | null;
+}
+
+/** One dropped thing as the upload loop wants it: bytes read late, a refusal read the same way. */
+export interface BrowserDropFile {
+  name: string;
+  size: number;
+  read: () => Promise<ArrayBuffer>;
+}
+
+/**
+ * What a drop on the page holds, read with the browser's File API.
+ *
+ * A folder cannot be read as a file; it comes back as an item whose `read` rejects with a sentence,
+ * so it lands in the upload report beside the files that did go, named. A file the browser then
+ * fails to read (moved, locked, permission) is reported the same way instead of with a raw
+ * DOMException message.
+ */
+export function browserDropFiles(transfer: DropTransfer): BrowserDropFile[] {
+  const out: BrowserDropFile[] = [];
+  const entries = Array.from(transfer.items ?? []).filter((item) => item.kind === "file");
+  if (entries.length > 0) {
+    for (const item of entries) {
+      const entry = item.webkitGetAsEntry?.() ?? null;
+      if (entry?.isDirectory === true) {
+        out.push({
+          name: entry.name,
+          size: 0,
+          read: () => Promise.reject(new Error("a folder cannot be sent from a browser: drop the files inside it")),
+        });
+        continue;
+      }
+      const file = item.getAsFile();
+      if (file !== null) out.push(readableFile(file));
+    }
+    return out;
+  }
+  for (const file of Array.from(transfer.files ?? [])) out.push(readableFile(file));
+  return out;
+}
+
+function readableFile(file: File): BrowserDropFile {
+  return {
+    name: file.name,
+    size: file.size,
+    read: async () => {
+      try {
+        return await file.arrayBuffer();
+      } catch {
+        throw new Error("the browser could not read this file (it may have moved or be in use)");
+      }
+    },
+  };
 }
 
 /* ---------------------------------------------------------------- helpers -- */

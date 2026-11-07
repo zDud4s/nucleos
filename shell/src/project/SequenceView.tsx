@@ -3,7 +3,7 @@ import { DAEMON_NAME } from "../copy";
 import { useId } from "react";
 import { layoutSequence, useMapFlows, type FlowCheck } from "../data/map-flows";
 import { absolutePath } from "../data/project-code";
-import { openInVscode, vscodeUrl } from "../lib/vscode";
+import { editorAvailable, openInVscode, vscodeUrl } from "../lib/vscode";
 import { ErrorNote } from "../ui";
 
 const DANGER = "var(--tone-danger-fg)";
@@ -162,7 +162,10 @@ function FlowSection({ flow, root }: { flow: FlowCheck; root: string }) {
           return (
             <li key={i}>
               <span>{`${step.participant} · ${step.fn} `}</span>
-              {target === null ? null : (
+              {target === null ? null : !editorAvailable() ? (
+                // The editor opens on the main machine only, so here it is a location, not a link.
+                <span>{step.line === null ? step.path : `${step.path}:${step.line}`}</span>
+              ) : (
                 <a
                   href={vscodeUrl(target, step.line)}
                   onClick={(event) => {

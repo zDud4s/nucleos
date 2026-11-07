@@ -213,7 +213,12 @@ pub fn normalise(rel: &str) -> Option<String> {
         match part {
             "" | "." => continue,
             ".." => return None,
-            other => parts.push(other),
+            // `a.txt:stream` is another name for `a.txt` on NTFS, so it is read as the file
+            // itself: left whole it would match no claim and fall through to the repository.
+            other => match other.split(':').next() {
+                Some("") | None => return None,
+                Some(file) => parts.push(file),
+            },
         }
     }
     if parts.is_empty() {
@@ -263,6 +268,17 @@ mod tests {
         crate::config::parse_schedule_rules(contents)
             .map(|_| ())
             .map_err(|error| error.to_string())
+    }
+
+    /// An NTFS alternate data stream names the same file as its plain name.
+    #[test]
+    fn a_stream_suffix_names_the_file_it_hangs_on() {
+        assert_eq!(
+            normalise("docs/a.txt:stream").as_deref(),
+            Some("docs/a.txt")
+        );
+        assert_eq!(normalise("a.txt::$DATA").as_deref(), Some("a.txt"));
+        assert_eq!(normalise("docs/:stream"), None);
     }
 
     /// The project's two state documents live in the settings store now, so the static table claims

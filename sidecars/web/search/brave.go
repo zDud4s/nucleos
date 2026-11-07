@@ -50,7 +50,16 @@ func (b *Brave) Search(ctx context.Context, query string, limit int) ([]Result, 
 	request.Header.Set("Accept", "application/json")
 	request.Header.Set("X-Subscription-Token", b.key)
 
-	response, err := b.client.Do(request)
+	// Go strips only Authorization and Cookie on a redirect; X-Subscription-Token would follow the
+	// query to whatever host answered with a Location, so a redirect off the API host is refused.
+	client := *b.client
+	client.CheckRedirect = func(next *http.Request, _ []*http.Request) error {
+		if next.URL.Host != request.URL.Host {
+			return fmt.Errorf("refusing a redirect to another host")
+		}
+		return nil
+	}
+	response, err := client.Do(request)
 	if err != nil {
 		return nil, fmt.Errorf("brave: %w", err)
 	}

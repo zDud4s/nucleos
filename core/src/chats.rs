@@ -1,3 +1,4 @@
+pub mod auto_resume;
 pub mod compactions;
 pub mod groups;
 pub mod links;
@@ -6,6 +7,10 @@ pub mod mcp_servers;
 pub mod notices;
 pub mod seed;
 pub mod tasks;
+pub mod transfer;
+pub mod transfer_code;
+pub mod transfer_history;
+pub mod transfer_package;
 
 use sqlx::SqlitePool;
 
@@ -70,7 +75,7 @@ impl Brain {
 /// `dont_ask` is the sixth and it is ours, not the CLI's. It allows precisely what `auto` allows
 /// — the same classifier, the same rules, the same project policy — and REFUSES everything `auto`
 /// would have stopped to ask about, instead of asking. It is a conversation that asks nobody, for
-/// a turn nobody is watching: the question `auto` would have raised waits 45 seconds for an answer
+/// a turn nobody is watching: the question `auto` would have raised waits for an answer
 /// that is not coming, and this rung spends nothing on it. A refusal here costs one tool call and
 /// nothing else — the turn goes on.
 ///
@@ -195,6 +200,10 @@ pub struct ChatSummary {
     /// constant the client keeps its own copy of is a meter that is wrong for exactly the
     /// conversations most likely to be near their limit.
     pub context_window: Option<i64>,
+    /// The machine this chat was moved to, or `None` while this copy is live.
+    ///
+    /// The shell uses this to hide the old list row and make a directly opened origin read-only.
+    pub moved_to: Option<String>,
     pub created_at: String,
     /// Where this conversation's turns run, or `None` for the daemon's own directory.
     ///
@@ -1232,7 +1241,7 @@ macro_rules! list_select {
     () => {
         "SELECT c.chat_id, c.title, c.brain, c.model, c.effort, c.fallback_model,
                 c.extra_dirs, c.turn_budget_usd, c.agents, c.system_prompt, c.denied_tools,
-                c.cleared_after_run_id, c.context_window, c.created_at, c.cwd, c.ide_session_id,
+                c.cleared_after_run_id, c.context_window, c.moved_to, c.created_at, c.cwd, c.ide_session_id,
                 c.group_id, c.archived_at, c.auto_compact,
                 (SELECT substr(r.prompt, 1, 200) FROM runs r
                   WHERE r.chat_id = c.chat_id AND r.mode = 'assistant'

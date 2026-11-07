@@ -57,7 +57,7 @@ func (s *Sink) Post(ctx context.Context, ev contract.Event) (Outcome, error) {
 		if err := ctx.Err(); err != nil {
 			return Outcome{}, err
 		}
-		body, status, err := s.client.do(ctx, http.MethodPost, s.client.channelPath("/events"), bytes.NewReader(payload), "application/json")
+		body, status, err := s.client.doBounded(ctx, http.MethodPost, s.client.channelPath("/events"), bytes.NewReader(payload), "application/json")
 		if err != nil {
 			if ctx.Err() != nil {
 				return Outcome{}, ctx.Err()

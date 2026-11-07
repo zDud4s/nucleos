@@ -36,6 +36,7 @@ impl Drop for Registration {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&self.id);
+        crate::execution::runner::cli_pids::forget(self.id);
     }
 }
 
@@ -99,7 +100,10 @@ where
         tails: state.run_tails.clone(),
         id,
     };
-    let mut handles = state.run_handles.lock().unwrap();
+    let mut handles = state
+        .run_handles
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let join = tokio::spawn(async move {
         let _registration = registration;
         body.await;
@@ -522,12 +526,15 @@ pub(super) fn spawn_run(
             {
                 let pool = pool.clone();
                 tokio::spawn(async move {
-                    if let Some(session_id) = session_rx.recv().await {
-                        let _ = sqlx::query("UPDATE runs SET session_id = ? WHERE id = ?")
-                            .bind(&session_id)
-                            .bind(id)
-                            .execute(&pool)
-                            .await;
+                    if let Some(session_id) = session_rx.recv().await
+                        && let Err(error) =
+                            sqlx::query("UPDATE runs SET session_id = ? WHERE id = ?")
+                                .bind(&session_id)
+                                .bind(id)
+                                .execute(&pool)
+                                .await
+                    {
+                        tracing::warn!(run_id = id, %error, "could not persist the run's session id");
                     }
                 });
             }
@@ -545,6 +552,9 @@ pub(super) fn spawn_run(
             if let Ok(mut map) = run_tails.lock() {
                 map.insert(id, std::sync::Arc::clone(&transcript));
             }
+            // The liveness sweep measures silence from here, not from the run's `created_at`: a
+            // retry is a fresh CLI with an empty transcript and must not inherit the earlier age.
+            crate::execution::runner::cli_pids::begin_attempt(id);
             let context_fill = std::sync::Arc::new(std::sync::Mutex::new(None));
             // Held for this attempt only: a retry starts a fresh CLI on a fresh context, so the
             // previous attempt's mirror has nothing left to say. Dropping the guard at the end of
@@ -1369,7 +1379,12 @@ mod wake_tests {
 
         // The supervisor finishes after the handle is released; give it a beat to (not) act.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while state.run_handles.lock().unwrap().contains_key(&id) {
+        while state
+            .run_handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&id)
+        {
             assert!(std::time::Instant::now() < deadline, "the run never ended");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

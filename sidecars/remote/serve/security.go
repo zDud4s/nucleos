@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
+	"path"
 	"strings"
 )
 
@@ -103,10 +104,27 @@ func checkRequest(r *http.Request, p Policy, strict bool) *refusal {
 	} else if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		return &refusal{http.StatusForbidden, "bad_origin"}
 	}
-	if r.Header.Get(CSRFHeader) != csrfValue {
+	if r.Header.Get(CSRFHeader) != csrfValue && !isDownloadNavigation(r) {
 		return &refusal{http.StatusForbidden, "csrf"}
 	}
 	return nil
+}
+
+// downloadPath is the one route a browser may fetch without the CSRF header.
+const downloadPath = "/api/files/download"
+
+// isDownloadNavigation reports whether r is a native browser download: a GET of exactly
+// /api/files/download whose browser says it is same-origin. An anchor cannot add the CSRF header, and
+// a multi-GB file must stream to disk rather than through a Blob in memory. The exemption is only
+// the header: Host, the session cookie (SameSite=Strict), and any Origin present are still checked.
+// Safe because the request changes no state and the daemon answers it as an attachment, which the
+// browser saves and never renders in the app's origin. A missing Sec-Fetch-Site does not qualify.
+func isDownloadNavigation(r *http.Request) bool {
+	if r.Method != http.MethodGet || r.Header.Get("Sec-Fetch-Site") != "same-origin" {
+		return false
+	}
+	// The cleaned path must equal the raw one, so `/api/files/download/../x` and `//` forms never match.
+	return path.Clean(r.URL.Path) == downloadPath && r.URL.Path == downloadPath
 }
 
 // writeJSONError answers {"error": code} with the given status.

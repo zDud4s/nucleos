@@ -73,3 +73,20 @@ func TestWithoutLocalAppDataTheOffsetLivesInTheUserConfigDir(t *testing.T) {
 		t.Errorf("OffsetPath() = %q, want an absolute path", got)
 	}
 }
+
+func TestSaveOffsetLeavesNoTempFileAndOverwrites(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "telegram-offset")
+	for _, v := range []int64{7, 9001} {
+		if err := SaveOffset(path, v); err != nil {
+			t.Fatal(err)
+		}
+		if got := LoadOffset(path); got != v {
+			t.Fatalf("LoadOffset = %d, want %d", got, v)
+		}
+	}
+	entries, _ := os.ReadDir(dir)
+	if len(entries) != 1 {
+		t.Fatalf("expected only the offset file, got %v", entries)
+	}
+}
