@@ -56,6 +56,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/trees", post(post_tree))
         .route("/trees/{id}", get(get_tree))
+        .route("/trees/{id}/abandon", post(post_abandon))
         .route("/trees/{id}/branches", post(post_branch))
         .route("/trees/{id}/nodes/{node}/transition", post(post_transition))
         .merge(super::branch_start::routes())
@@ -475,6 +476,100 @@ async fn get_tree(
     })))
 }
 
+// ----- POST /trees/{id}/abandon -----
+
+#[derive(Debug, Deserialize)]
+struct AbandonBody {
+    reason: Option<String>,
+    force: Option<bool>,
+}
+
+/// Ends a stuck job: the job becomes `finished` with `finish.status = "abandoned"` (no new column,
+/// the terminal state is the existing one), queued branches and pending starts are dropped with
+/// the reason. Merged branches stay merged, no worktree or git branch is touched, and a branch at
+/// work refuses the call with 409 unless `force` is true (it is then left as it is).
+async fn post_abandon(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    body: Result<Json<AbandonBody>, JsonRejection>,
+) -> Result<Json<Value>, Refusal> {
+    let Json(body) = body.map_err(bad_body)?;
+    let reason = required("reason", body.reason)?;
+    let force = body.force.unwrap_or(false);
+
+    let lock = job_lock(&id);
+    let _guard = lock.lock().await;
+    let mut job = load_job(&state, &id).await?;
+
+    if job.state == JOB_TERMINAL_STATE {
+        let finish = job.manifest.extra.get("finish");
+        if finish.is_some_and(|finish| finish["status"] == json!("abandoned")) {
+            return Ok(Json(json!({
+                "id": id, "state": job.state, "finish": finish, "replayed": true,
+            })));
+        }
+        return Err(refuse(
+            StatusCode::CONFLICT,
+            format!("tree job {id} is already finished"),
+        ));
+    }
+    let live: Vec<String> = job
+        .manifest
+        .branches
+        .values()
+        .filter(|branch| LIVE_STATES.contains(&branch.state.as_str()))
+        .map(|branch| branch.name.clone())
+        .collect();
+    if !live.is_empty() && !force {
+        return Err(refuse(
+            StatusCode::CONFLICT,
+            format!(
+                "tree job {id} has live branches ({}); pass force to abandon anyway",
+                live.join(", ")
+            ),
+        ));
+    }
+
+    let at = now();
+    let mut dropped = Vec::new();
+    for branch in job.manifest.branches.values_mut() {
+        if branch.state == "queued" {
+            branch.state = "dropped".to_owned();
+            branch.extra.insert("drop_reason".to_owned(), json!(reason));
+            branch.extra.insert("dropped_at".to_owned(), json!(at));
+            dropped.push(branch.name.clone());
+        }
+    }
+    let pending: Vec<String> = job
+        .manifest
+        .extra
+        .remove("pending_starts")
+        .and_then(|value| value.as_object().map(|map| map.keys().cloned().collect()))
+        .unwrap_or_default();
+    if !pending.is_empty() {
+        // The records are consumed: a later refusal is a new question.
+        let next = super::branch_start::current_generation(&job.manifest.extra) + 1;
+        job.manifest
+            .extra
+            .insert(super::branch_start::GENERATION_KEY.to_owned(), json!(next));
+    }
+    let finish = json!({ "status": "abandoned", "reason": reason, "at": at, "forced": force });
+    job.manifest
+        .extra
+        .insert("finish".to_owned(), finish.clone());
+    job.manifest.state = JOB_TERMINAL_STATE.to_owned();
+    job.state = JOB_TERMINAL_STATE.to_owned();
+    job.updated_at = at;
+    store::update(&state.pool, &job)
+        .await
+        .map_err(store_refusal)?;
+    Ok(Json(json!({
+        "id": id, "state": job.state, "finish": finish,
+        "dropped_branches": dropped, "dropped_pending_starts": pending,
+        "live_branches_left": live,
+    })))
+}
+
 // ----- POST /trees/{id}/branches -----
 
 #[derive(Debug, Deserialize)]
@@ -676,6 +771,9 @@ async fn post_transition(
     if transition == "launch" {
         return launch(&state, &id, &node, &key, body).await;
     }
+    if transition == "relaunch" {
+        return relaunch(&state, &id, &node, &key, body.prompt.as_deref()).await;
+    }
     if !BRANCH_STATES.contains(&transition.as_str()) && transition != "done" {
         return Err(refuse(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -735,6 +833,32 @@ async fn post_transition(
         .map_err(run_refusal)?;
     Ok(Json(
         json!({ "result": applied.result, "replayed": applied.replayed }),
+    ))
+}
+
+/// The `relaunch` transition: starts again the agent of a fixing or building branch whose node has
+/// no live run, from the node's stored launch (worktree cwd, mode, project), plus the optional
+/// prompt of the owner. Any other branch state is a 409 and starts nothing.
+async fn relaunch(
+    state: &AppState,
+    id: &str,
+    node: &str,
+    key: &str,
+    prompt: Option<&str>,
+) -> Result<Json<Value>, Refusal> {
+    use crate::tree_job::relaunch::{ReviveError, revive_orphan};
+
+    let replayed = stored_result(state, node, "launch", key).await?.is_some();
+    let run_id =
+        revive_orphan(state, id, node, key, prompt)
+            .await
+            .map_err(|error| match error {
+                ReviveError::NotFound(text) => refuse(StatusCode::NOT_FOUND, text),
+                ReviveError::Refused(text) => refuse(StatusCode::CONFLICT, text),
+                ReviveError::Failed(text) => refuse(StatusCode::INTERNAL_SERVER_ERROR, text),
+            })?;
+    Ok(Json(
+        json!({ "result": run_id.to_string(), "replayed": replayed }),
     ))
 }
 
@@ -910,7 +1034,7 @@ mod tests {
             let _ = sender.send(work());
         });
         receiver
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(Duration::from_secs(60))
             .expect("the walk did not terminate")
     }
 
@@ -2413,6 +2537,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn abandon_finishes_the_job_drops_queued_branches_and_pending_starts() {
+        let state = test_state().await;
+        let app = app(&state);
+        let branches = vec![
+            branch("waiting", "queued", CORE, &[CODE_PATH], None),
+            branch("landed", "merged", CORE, &[OTHER_CODE_PATH], None),
+        ];
+        seed_job(&state.pool, JOB, "open", branches, &[]).await;
+        let mut job = loaded(&state.pool, JOB).await;
+        job.manifest.extra.insert(
+            "pending_starts".to_owned(),
+            json!({ "later": { "caller": "n", "layer": "code" } }),
+        );
+        store::update(&state.pool, &job).await.unwrap();
+
+        let (status, body) = post(
+            &app,
+            &format!("/trees/{JOB}/abandon"),
+            json!({ "reason": "stuck" }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert_eq!(body["dropped_branches"], json!(["waiting"]));
+        assert_eq!(body["dropped_pending_starts"], json!(["later"]));
+        let job = loaded(&state.pool, JOB).await;
+        assert_eq!(job.state, "finished");
+        assert_eq!(job.manifest.state, "finished");
+        assert_eq!(job.manifest.extra["finish"]["status"], json!("abandoned"));
+        assert_eq!(job.manifest.extra["finish"]["reason"], json!("stuck"));
+        assert!(!job.manifest.extra.contains_key("pending_starts"));
+        assert_eq!(job.manifest.branches["waiting"].state, "dropped");
+        assert_eq!(
+            job.manifest.branches["waiting"].extra["drop_reason"],
+            json!("stuck")
+        );
+        assert_eq!(job.manifest.branches["landed"].state, "merged");
+
+        let (again, replay) = post(
+            &app,
+            &format!("/trees/{JOB}/abandon"),
+            json!({ "reason": "stuck" }),
+        )
+        .await;
+        assert_eq!(again, StatusCode::OK);
+        assert_eq!(replay["replayed"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn abandon_with_live_branches_is_409_unless_forced() {
+        let state = test_state().await;
+        let app = app(&state);
+        let branches = vec![
+            branch("busy", "building", CORE, &[CODE_PATH], None),
+            branch("fixer", "fixing", CORE, &[OTHER_CODE_PATH], None),
+        ];
+        seed_job(&state.pool, JOB, "open", branches, &[]).await;
+        let uri = format!("/trees/{JOB}/abandon");
+
+        let (status, body) = post(&app, &uri, json!({ "reason": "stuck" })).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body:?}");
+        assert!(body["error"].as_str().unwrap().contains("busy"));
+        assert_eq!(loaded(&state.pool, JOB).await.state, "open");
+
+        let (status, body) = post(&app, &uri, json!({ "reason": "stuck", "force": true })).await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        let job = loaded(&state.pool, JOB).await;
+        assert_eq!(job.state, "finished");
+        assert_eq!(job.manifest.extra["finish"]["forced"], json!(true));
+        assert_eq!(job.manifest.branches["busy"].state, "building");
+    }
+
+    #[tokio::test]
+    async fn abandon_needs_a_reason_and_a_known_job() {
+        let state = test_state().await;
+        let app = app(&state);
+        seed_job(&state.pool, JOB, "open", Vec::new(), &[]).await;
+
+        let (status, _) = post(&app, &format!("/trees/{JOB}/abandon"), json!({})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = post(&app, "/trees/nope/abandon", json!({ "reason": "x" })).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn post_branch_on_a_finished_job_is_409_and_adds_nothing() {
         let state = test_state().await;
         seed_job(&state.pool, JOB, "finished", Vec::new(), &[]).await;
@@ -3052,6 +3261,139 @@ mod tests {
 
         assert_eq!(direct.unwrap(), routed);
         assert_eq!(run_rows(&state.pool).await, 1);
+    }
+
+    // ----- relaunch -----
+
+    fn relaunch_body(key: &str, prompt: Option<&str>) -> Value {
+        json!({ "transition": "relaunch", "key": key, "prompt": prompt })
+    }
+
+    /// The launch the branch was first started with, as `branch_start` stores it.
+    async fn store_base_launch(pool: &SqlitePool) {
+        crate::tree_job::open::save_launch(
+            pool,
+            &crate::tree_job::open::StoredLaunch {
+                node_id: NODE.to_owned(),
+                key: "branch-api".to_owned(),
+                prompt: "the node packet".to_owned(),
+                project_id: None,
+                cwd: None,
+                mode: "shadow".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn stored_prompt(pool: &SqlitePool, key: &str) -> String {
+        sqlx::query_scalar("SELECT prompt FROM tree_launches WHERE node_id = ? AND key = ?")
+            .bind(NODE)
+            .bind(key)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn relaunch_restarts_a_working_branch_from_its_stored_launch() {
+        for working in ["fixing", "building"] {
+            let state = test_state().await;
+            seed_one_branch(&state.pool, working).await;
+            store_base_launch(&state.pool).await;
+
+            let response = post(
+                &app(&state),
+                &transition_uri(JOB, NODE),
+                relaunch_body("revive-1", Some("carry on with the tests")),
+            )
+            .await;
+
+            let run_id = launched_run(&response);
+            assert_eq!(run_rows(&state.pool).await, 1, "{working}");
+            assert_eq!(
+                node_run_id(&state.pool, NODE).await,
+                Some(run_id.to_string())
+            );
+            let prompt = stored_prompt(&state.pool, "revive-1").await;
+            assert!(prompt.starts_with("the node packet"), "{prompt}");
+            assert!(prompt.contains("carry on with the tests"), "{prompt}");
+            assert_eq!(branch_state(&state.pool, JOB, BRANCH).await, working);
+        }
+    }
+
+    #[tokio::test]
+    async fn relaunch_is_idempotent_per_key() {
+        let state = test_state().await;
+        seed_one_branch(&state.pool, "fixing").await;
+        store_base_launch(&state.pool).await;
+        let app = app(&state);
+
+        let first = launched_run(
+            &post(
+                &app,
+                &transition_uri(JOB, NODE),
+                relaunch_body("revive-1", None),
+            )
+            .await,
+        );
+        let replay = post(
+            &app,
+            &transition_uri(JOB, NODE),
+            relaunch_body("revive-1", None),
+        )
+        .await;
+
+        assert_eq!(launched_run(&replay), first);
+        assert_eq!(replay.1["replayed"], json!(true));
+        assert_eq!(run_rows(&state.pool).await, 1);
+    }
+
+    #[tokio::test]
+    async fn relaunch_refuses_every_other_branch_state_and_creates_no_run() {
+        for refused in [
+            "dropped",
+            "parked",
+            "merged",
+            "queued",
+            "open",
+            "gating",
+            "green",
+            "red",
+            "reviewing",
+        ] {
+            let state = test_state().await;
+            seed_one_branch(&state.pool, refused).await;
+            store_base_launch(&state.pool).await;
+
+            let response = post(
+                &app(&state),
+                &transition_uri(JOB, NODE),
+                relaunch_body("revive-1", None),
+            )
+            .await;
+
+            assert_error(&response, StatusCode::CONFLICT);
+            assert_eq!(run_rows(&state.pool).await, 0, "{refused}");
+            assert_eq!(node_run_id(&state.pool, NODE).await, None, "{refused}");
+            assert_eq!(transition_rows(&state.pool).await, 0, "{refused}");
+        }
+    }
+
+    #[tokio::test]
+    async fn relaunch_without_a_stored_launch_fails_and_creates_no_run() {
+        let state = test_state().await;
+        seed_one_branch(&state.pool, "fixing").await;
+
+        let response = post(
+            &app(&state),
+            &transition_uri(JOB, NODE),
+            relaunch_body("revive-1", None),
+        )
+        .await;
+
+        assert!(response.0.is_server_error(), "{response:?}");
+        assert_eq!(run_rows(&state.pool).await, 0);
     }
 
     // ----- concurrency -----

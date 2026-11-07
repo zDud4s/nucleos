@@ -115,6 +115,7 @@ const LANE_OF: Record<string, FeedLane> = {
   vcs_request_finished: "git",
   vcs_request_cancelled: "git",
   vcs_request_interrupted: "git",
+  vcs_request_reconciled: "git",
   vcs_request_settled: "git",
   vcs_resolution_started: "git",
   vcs_resolution_cancelled: "git",

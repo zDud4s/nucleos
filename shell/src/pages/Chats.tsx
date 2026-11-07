@@ -1213,7 +1213,11 @@ function MovedChat({ chatId, destination }: { chatId: string; destination: strin
   } catch {
     // Older origins stored the display value directly.
   }
-  const target = machines.find((machine) => machine.id === stored.id || machine.name === stored.name);
+  // The stored id is the destination's stable machine id; the alias and name matches cover
+  // pointers written before that id existed.
+  const target =
+    machines.find((machine) => machine.machine_id !== undefined && machine.machine_id === stored.id) ??
+    machines.find((machine) => machine.id === stored.id || machine.name === stored.name);
   return (
     <section className="chats-detail-inner">
       <ErrorNote>

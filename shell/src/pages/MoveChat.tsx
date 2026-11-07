@@ -265,10 +265,18 @@ export function MoveChatDialog({
       setProgress("Waiting for passkey confirmation…");
       await stepUpForMove(source);
       await stepUpForMove(destination);
-      const namedDestination = (await apiFetch<{ name: string }>("/machine", undefined, destination)).name;
+      const destinationMachine = await apiFetch<{ name: string; machine_id?: string }>("/machine", undefined, destination);
+      const namedDestination = destinationMachine.name;
       destinationName = namedDestination;
       const destinationId = destination === "here" ? `name:${namedDestination}` : destination;
-      const closeOut = async () => await finishChatTransfer(chatId, { transfer_id: transferId, to: destinationId, to_name: namedDestination }, source);
+      // The destination's own stable id is what the move history records; the alias in `to` is
+      // only the fallback for a machine that predates the id.
+      const closeOut = async () =>
+        await finishChatTransfer(
+          chatId,
+          { transfer_id: transferId, to: destinationId, to_name: namedDestination, ...(destinationMachine.machine_id ? { to_machine_id: destinationMachine.machine_id } : {}) },
+          source,
+        );
       pendingFinish.current = closeOut;
       await finalizeChatMove({
         begin: async () => {

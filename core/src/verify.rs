@@ -351,12 +351,12 @@ pub async fn submit_narrowed(
     args: &VerifyArgs,
 ) -> Result<i64, VerifyError> {
     if !matches!(caller, Caller::Job(_))
-        || args.kind != Kind::Test
+        || !matches!(args.kind, Kind::Test | Kind::Check)
         || args.scope != ScopeArg::Scope
         || args.cover
     {
         return Err(VerifyError::BadRequest(
-            "only a tree branch's test/scope gate may be narrowed".into(),
+            "only a tree branch's test or check scope gate may be narrowed".into(),
         ));
     }
     let (id, _) = submit_with(executor, caller, args, true).await?;
@@ -1258,6 +1258,8 @@ mod tests {
     /// Long enough for a `git --version` unit, or a master proof (a fresh probe worktree plus its
     /// units), on a loaded machine; short enough to bound a test. Only a failing test waits it out.
     const WAIT: Duration = Duration::from_secs(60);
+    /// The most a proof that keeps moving is waited for.
+    const WAIT_CAP: Duration = Duration::from_secs(300);
 
     async fn test_pool() -> SqlitePool {
         let pool = SqlitePoolOptions::new()
@@ -3227,15 +3229,61 @@ tests:
 
     /// `finished`, but through `wait_ticket_with`: `installed()` is a global `OnceLock` the tests do not fill.
     async fn finished_with(f: &Fixture, id: i64) -> (Ticket, String) {
-        let (ticket, caller) = wait_ticket_with(&f.pool, Some(&f.ex), id, WAIT, true)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            ticket.done,
-            "ticket {id} did not finish in time: {ticket:?}"
-        );
-        (ticket, caller)
+        // A loaded machine slows the proof down but does not stop it, so the wait follows the
+        // proof: it gives up after `WAIT` without a run changing status, or `WAIT_CAP` in all.
+        let mut patience = crate::testdb::Patience::new(WAIT, WAIT_CAP);
+        loop {
+            let (ticket, caller) =
+                wait_ticket_with(&f.pool, Some(&f.ex), id, Duration::from_secs(5), true)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            if ticket.done {
+                return (ticket, caller);
+            }
+            let runs: Vec<(i64, String)> =
+                sqlx::query_as("SELECT id, status FROM verify_runs ORDER BY id")
+                    .fetch_all(&f.pool)
+                    .await
+                    .unwrap_or_default();
+            let marker = format!("{runs:?}");
+            assert!(
+                !patience.expired(&marker),
+                "ticket {id} did not finish: no progress for {WAIT:?}, or over {WAIT_CAP:?} in \
+                 all; last runs seen: {}; ticket: {ticket:?}",
+                patience.last()
+            );
+        }
+    }
+
+    /// `refresh_master_red` until the re-proof settles. Each look joins the proof already in
+    /// flight, so looping starts nothing new; the wait follows the proof (a run changing status)
+    /// and gives up after `WAIT` of silence or `WAIT_CAP` in all, not at a fixed deadline that a
+    /// loaded machine can overrun with nothing wrong.
+    async fn refreshed(f: &Fixture) -> crate::verify::inherit::Refresh {
+        let mut patience = crate::testdb::Patience::new(WAIT, WAIT_CAP);
+        loop {
+            let refresh = crate::verify::inherit::refresh_master_red(
+                &f.pool,
+                &f.ex,
+                "alpha",
+                Duration::from_secs(5),
+                chrono::Utc::now(),
+            )
+            .await;
+            if refresh != crate::verify::inherit::Refresh::InFlight {
+                return refresh;
+            }
+            let runs: Vec<(i64, String)> =
+                sqlx::query_as("SELECT id, status FROM verify_runs ORDER BY id")
+                    .fetch_all(&f.pool)
+                    .await
+                    .unwrap_or_default();
+            assert!(
+                !patience.expired(&format!("{runs:?}")),
+                "the re-proof did not settle: no progress for {WAIT:?}, or over {WAIT_CAP:?} in all"
+            );
+        }
     }
 
     /// A live `master-red`, written straight into the table the way the postgate leaves it.
@@ -3642,13 +3690,6 @@ tests:
         );
         let refused = [
             (Caller::Owner, scope.clone()),
-            (
-                Caller::Job(1),
-                VerifyArgs {
-                    kind: Kind::Check,
-                    ..scope.clone()
-                },
-            ),
             (
                 Caller::Job(1),
                 VerifyArgs {
@@ -4276,10 +4317,13 @@ tests:
             .unwrap();
 
         // The re-proof is launched, cannot create its tree, and records nothing: the lease stays.
-        let (waiting, _) = wait_ticket_with(&f.pool, Some(&f.ex), id, Duration::from_secs(3), true)
-            .await
-            .unwrap()
-            .unwrap();
+        // Long enough for a loaded machine to launch the re-proof; it never finishes, so the wait
+        // always runs to its end.
+        let (waiting, _) =
+            wait_ticket_with(&f.pool, Some(&f.ex), id, Duration::from_secs(15), true)
+                .await
+                .unwrap()
+                .unwrap();
         assert!(!waiting.done, "{waiting:?}");
         assert!(waiting.units.iter().any(|u| {
             u.pending
@@ -4416,14 +4460,7 @@ tests:
         )
         .await;
 
-        let refresh = crate::verify::inherit::refresh_master_red(
-            &f.pool,
-            &f.ex,
-            "alpha",
-            WAIT,
-            chrono::Utc::now(),
-        )
-        .await;
+        let refresh = refreshed(&f).await;
 
         assert_eq!(
             refresh,
@@ -4462,14 +4499,7 @@ tests:
         assert_eq!(in_flight, crate::verify::inherit::Refresh::InFlight);
 
         // A second look while the first proof still runs joins its flight instead of starting another.
-        let still_red = crate::verify::inherit::refresh_master_red(
-            &f.pool,
-            &f.ex,
-            "alpha",
-            WAIT,
-            chrono::Utc::now(),
-        )
-        .await;
+        let still_red = refreshed(&f).await;
         assert_eq!(still_red, crate::verify::inherit::Refresh::StillRed);
         assert_eq!(
             claim_row(&f.pool, incident).await.1.as_deref(),

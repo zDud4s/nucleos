@@ -542,7 +542,7 @@ mod tests {
             now: "2026-08-16T10:00:00Z",
         };
         let shell = async {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
             loop {
                 let (status, listed) =
                     call(&state, "GET", "/browser/embedded/requests", None).await;

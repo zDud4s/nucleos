@@ -440,7 +440,7 @@ mod tests {
             },
         ))
         .await;
-        let judge = JevJudge::for_tests(&url, Some("k-test"), Duration::from_secs(2));
+        let judge = JevJudge::for_tests(&url, Some("k-test"), Duration::from_secs(60));
 
         let answer = judge
             .ask("TASK:\nx\n", crate::judge::JUDGE_QUESTIONS)
@@ -489,7 +489,7 @@ mod tests {
             axum::Json(answers(json!(0.9), json!(0.9)))
         }))
         .await;
-        // Two seconds for every server that answers at once (a short client timeout on a busy
+        // A 60s guard for every server that answers at once (a short client timeout on a busy
         // test machine fails a test for the wrong reason); 300 ms only for the slow one.
         let ask = |url: String, timeout: Duration| async move {
             JevJudge::for_tests(&url, Some("k"), timeout)
@@ -497,7 +497,7 @@ mod tests {
                 .await
                 .unwrap_err()
         };
-        let quick = Duration::from_secs(2);
+        let quick = Duration::from_secs(60);
         assert_eq!(ask(refused, quick).await, JudgeError::Http(422));
         assert_eq!(ask(garbled, quick).await, JudgeError::InvalidJson);
         assert_eq!(ask(half, quick).await, JudgeError::Missing("safe"));
@@ -518,7 +518,7 @@ mod tests {
             async { axum::Json(answers(json!(0.9), json!(0.9))) }
         }))
         .await;
-        let error = JevJudge::for_tests(&url, None, Duration::from_secs(2))
+        let error = JevJudge::for_tests(&url, None, Duration::from_secs(60))
             .ask("s", crate::judge::JUDGE_QUESTIONS)
             .await
             .unwrap_err();

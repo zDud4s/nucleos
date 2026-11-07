@@ -8637,7 +8637,8 @@ mod tests {
         // The launch: the runner is handed the same set the row froze, and ana's folder as a
         // directory to add. The launch happens on a task, so wait for it as `runs.rs` does.
         let mut launch = None;
-        for _ in 0..200 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             if let Some(seen) = runner.last_job_mcp.lock().unwrap().clone() {
                 launch = Some(seen);
                 break;

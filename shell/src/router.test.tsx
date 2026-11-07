@@ -17,11 +17,13 @@ vi.mock("./data/client", async (original) => ({
   ...daemon,
 }));
 
-// Warm the lazy Brain chunk (it pulls in d3-force) before any test runs, so the
-// redirect test below does not pay the cold import inside its own timeout.
+// The lazy pages in `router.tsx` pull their whole module graph through vite's
+// transform on first import. Under full-suite load that cold import, not the
+// render, is what outran `findByRole`'s timeout. Import them once, here, with a
+// budget of their own: `lazy()` then resolves from the module cache.
 beforeAll(async () => {
-  await import("./pages/Brain");
-}, 60_000);
+  await Promise.all([import("./pages/Brain"), import("./pages/Fleet")]);
+}, 120_000);
 
 beforeEach(() => {
   daemon.apiFetch.mockReset();
@@ -54,9 +56,8 @@ describe("the app router", () => {
     const { router } = await renderApp({ initialPath: "/learned" });
 
     await waitFor(() => expect(router.state.location.pathname).toBe("/brain"));
-    // Wait for the lazy Brain chunk too, so its heavy import drains here rather
-    // than running on into the next test. A cold lazy page import can exceed the
-    // 3 s default under full-suite load.
+    // Wait for the lazy Brain chunk too, so it settles here rather than running
+    // on into the next test. Its module is preloaded in `beforeAll`.
     expect(await screen.findByRole("heading", { level: 1, name: "Brain" }, { timeout: 10_000 })).toBeDefined();
   });
 

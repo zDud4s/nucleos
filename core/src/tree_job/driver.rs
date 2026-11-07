@@ -162,7 +162,10 @@ pub(super) fn verdict_of(verdict: ScopeVerdict) -> Result<GateVerdict, NotMeasur
     match verdict {
         ScopeVerdict::Measured(GateOutcome::Passed) => Ok(GateVerdict::Green),
         ScopeVerdict::Measured(GateOutcome::Failed { output, .. }) => {
-            Ok(GateVerdict::Red { summary: output })
+            match super::retry::infrastructure_failure(&output) {
+                Some(reason) => Err(NotMeasured::Failed(reason)),
+                None => Ok(GateVerdict::Red { summary: output }),
+            }
         }
         ScopeVerdict::Measured(GateOutcome::Errored { reason }) => Err(NotMeasured::Failed(reason)),
         ScopeVerdict::NothingRan => Ok(GateVerdict::NothingRan),
@@ -242,6 +245,13 @@ async fn retry_pending_start(
     }
     // A start waiting for its base replays only once that base has merged.
     let waits_for_base = record["waits_for_base"].as_str();
+    if let Some(base) = waits_for_base
+        && base_is_gone(&job.manifest, base)
+    {
+        // The base was dropped (or left the tree): it will never merge, so the waiting branch is
+        // dropped with the base named, instead of staying queued behind a start nobody retries.
+        return drop_waiting_branch(pool, &job.id, name, base).await;
+    }
     if let Some(base) = waits_for_base
         && base_still_unmerged(&job.manifest, base)
     {
@@ -332,6 +342,53 @@ fn base_still_unmerged(manifest: &Manifest, base: &str) -> bool {
         .is_some_and(|branch| branch.state != "merged")
 }
 
+/// The base a pending start waits for was dropped, or is no longer in the tree.
+fn base_is_gone(manifest: &Manifest, base: &str) -> bool {
+    manifest
+        .branches
+        .get(base)
+        .is_none_or(|branch| branch.state == "dropped")
+}
+
+/// Drops the branch `name` that waits for the dropped base `base`, and its pending record, in one
+/// write under the job's lock. A branch that was never added only loses its record.
+async fn drop_waiting_branch(
+    pool: &SqlitePool,
+    job_id: &str,
+    name: &str,
+    base: &str,
+) -> Result<(), String> {
+    let lock = job_lock(job_id);
+    let _guard = lock.lock().await;
+    let Some(mut job) = store::load(pool, job_id).await.map_err(|e| e.to_string())? else {
+        return Ok(());
+    };
+    let reason = format!("base branch {base} was dropped");
+    if let Some(branch) = job.manifest.branches.get_mut(name)
+        && branch.state == "queued"
+    {
+        branch.state = "dropped".to_owned();
+        branch.extra.insert("drop_reason".to_owned(), json!(reason));
+        branch.extra.insert("dropped_at".to_owned(), json!(now()));
+    }
+    if let Some(pending) = job
+        .manifest
+        .extra
+        .get_mut("pending_starts")
+        .and_then(Value::as_object_mut)
+    {
+        pending.remove(name);
+        if pending.is_empty() {
+            job.manifest.extra.remove("pending_starts");
+        }
+    }
+    let next = super::branch_start::current_generation(&job.manifest.extra) + 1;
+    job.manifest
+        .extra
+        .insert(super::branch_start::GENERATION_KEY.to_owned(), json!(next));
+    persist(pool, &mut job).await
+}
+
 /// Removes the pending record of `name` under the job's lock, from a fresh read of the manifest.
 async fn drop_pending_start(pool: &SqlitePool, job_id: &str, name: &str) -> Result<(), String> {
     let lock = job_lock(job_id);
@@ -415,7 +472,9 @@ async fn root_step(pool: &SqlitePool, job: &TreeJob, parks: &mut Vec<Park>) -> R
     let report = node_report(pool, root).await?;
     if let (false, Some(outcome @ ("blocked" | "failed"))) = (report.live, report.result.as_deref())
     {
-        parks.push((root.clone(), stopped_question(root, None, outcome)));
+        let question = stopped_question(root, None, outcome)
+            + &super::gate_summary::reason_suffix(pool, root).await;
+        parks.push((root.clone(), question));
     }
     Ok(())
 }
@@ -522,7 +581,9 @@ async fn at_work(
                     return Ok(());
                 }
             }
-            parks.push((node.clone(), stopped_question(&node, Some(name), outcome)));
+            let question = stopped_question(&node, Some(name), outcome)
+                + &super::gate_summary::reason_suffix(pool, &node).await;
+            parks.push((node.clone(), question));
             return Ok(());
         }
         _ => return Ok(()),
@@ -562,7 +623,14 @@ async fn at_work(
             }
         }
     }
-    if let Some(gate) = gate {
+    let backing_off = job
+        .manifest
+        .branches
+        .get(name)
+        .is_some_and(|held| super::retry::gate_backing_off(&held.extra));
+    if let Some(gate) = gate
+        && !backing_off
+    {
         spawn_gate(state, gate, &job.id, name);
     }
     Ok(())
@@ -694,21 +762,18 @@ async fn record_verdict(
 
 /// The findings of the last red gate of the branch.
 fn last_findings(branch: &super::model::Branch) -> String {
-    let text = branch
+    let entry = branch
         .gates
         .iter()
         .rev()
-        .find(|entry| entry.get("verdict").and_then(Value::as_str) == Some("red"))
+        .find(|entry| entry.get("verdict").and_then(Value::as_str) == Some("red"));
+    let text = entry
         .and_then(|entry| entry.get("log_tail").and_then(Value::as_str))
         .unwrap_or("the gate failed without output");
-    if text.len() <= FINDINGS_MAX {
-        return text.to_owned();
-    }
-    let mut start = text.len() - FINDINGS_MAX;
-    while !text.is_char_boundary(start) {
-        start += 1;
-    }
-    text[start..].to_owned()
+    let failures = entry
+        .and_then(|entry| entry.get("failures").and_then(Value::as_str))
+        .unwrap_or("");
+    super::gate_summary::findings(failures, text, FINDINGS_MAX)
 }
 
 /// True when the gate findings name a failed formatter step (`FAIL core: fmt`, `  core: fmt`).
@@ -1360,10 +1425,9 @@ mod tests {
     }
 
     async fn wait_calls(gate: &FakeGate, count: usize) {
-        for _ in 0..300 {
-            if gate.calls().len() >= count {
-                break;
-            }
+        // Hang guard only: a loaded machine can be slow, so wait for the event, not a budget.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while gate.calls().len() < count && std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(
@@ -1669,14 +1733,15 @@ mod tests {
 
         /// Waits for the spawned gate to settle the branch, then lets its task finish.
         async fn wait_branch_state(&self, job: &str, name: &str, want: &str) {
-            let mut seen = String::new();
-            for _ in 0..300 {
-                seen = self.branch(job, name).await.state;
-                if seen == want {
-                    break;
+            // Hang guard only: wait for the state, not for a short budget.
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            let seen = loop {
+                let state = self.branch(job, name).await.state;
+                if state == want || std::time::Instant::now() >= deadline {
+                    break state;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+            };
             assert_eq!(seen, want, "branch {name} of {job} never reached {want}");
             tokio::time::sleep(Duration::from_millis(30)).await;
         }
@@ -1853,19 +1918,20 @@ mod tests {
     /// Waits for the spawned gate to count `want` gates in a row that measured nothing, then lets
     /// its task finish.
     async fn wait_gate_failures(fx: &Fixture, job: &str, name: &str, want: i64) {
-        let mut seen = None;
-        for _ in 0..300 {
-            seen = fx
+        // Hang guard only: wait for the count, not for a short budget.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let seen = loop {
+            let count = fx
                 .branch(job, name)
                 .await
                 .extra
                 .get(GATE_FAILURES)
                 .and_then(Value::as_i64);
-            if seen == Some(want) {
-                break;
+            if count == Some(want) || std::time::Instant::now() >= deadline {
+                break count;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        };
         assert_eq!(
             seen,
             Some(want),
@@ -1922,6 +1988,107 @@ mod tests {
             "a parked branch is not gated again"
         );
         assert_eq!(fx.open_questions(JOB, NODE).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_gate_starved_by_load_backs_off_without_spending_attempts_or_asking() {
+        const JOB: &str = "drv-load-backoff";
+        const NODE: &str = "api-node";
+        let fx = Fixture::new().await;
+        gated_job(&fx, JOB, NODE).await;
+        let starved = || {
+            Err(NotMeasured::Failed(
+                "pool timed out while waiting for an open connection".to_owned(),
+            ))
+        };
+        let gate = FakeGate::scripted((0..GATE_ATTEMPTS + 2).map(|_| starved()).collect());
+
+        fx.tick(JOB, &gate).await;
+        wait_calls(&gate, 1).await;
+        let mut until = None;
+        for _ in 0..300 {
+            until = fx
+                .branch(JOB, "api")
+                .await
+                .extra
+                .get("gate_backoff_until")
+                .cloned();
+            if until.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(until.is_some(), "a backoff is scheduled");
+        // Further ticks inside the backoff do not gate again.
+        for _ in 0..3 {
+            fx.tick(JOB, &gate).await;
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        assert_eq!(gate.calls().len(), 1, "the gate waits out its backoff");
+        let api = fx.branch(JOB, "api").await;
+        assert_eq!(api.state, "building");
+        assert!(
+            !api.extra.contains_key(GATE_FAILURES),
+            "load does not spend the attempts"
+        );
+        assert!(fx.open_questions(JOB, NODE).await.is_empty());
+        assert_eq!(count_of(&fx, "decisions").await, 0, "nobody was asked");
+    }
+
+    #[test]
+    fn load_reasons_are_told_from_genuine_failures() {
+        use super::super::retry::is_load_reason;
+        assert!(is_load_reason(
+            "pool timed out while waiting for an open connection"
+        ));
+        assert!(is_load_reason("the heavy broker is full"));
+        assert!(is_load_reason("held: disk pressure"));
+        assert!(is_load_reason("failed to spawn cargo"));
+        assert!(!is_load_reason(
+            "the scope gate could not be submitted: queue-down"
+        ));
+        assert!(!is_load_reason("scope verification ticket 7 vanished"));
+    }
+
+    const SCCACHE_CRASH: &str = "== core (scope)\n   Compiling stacker v0.1.15\nerror: could not compile `stacker` (lib)\n\nCaused by:\n  process didn't exit successfully: `sccache rustc --crate-name stacker` (exit status: 2)\n";
+
+    #[test]
+    fn a_compiler_dying_without_a_diagnostic_is_unmeasured_load_not_a_red() {
+        use super::super::retry::is_load_reason;
+        let verdict = verdict_of(ScopeVerdict::Measured(GateOutcome::Failed {
+            exit_code: 101,
+            output: SCCACHE_CRASH.to_owned(),
+        }));
+        match verdict {
+            Err(NotMeasured::Failed(reason)) => {
+                assert!(is_load_reason(&reason), "{reason}");
+            }
+            other => panic!("expected an unmeasured gate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_compile_error_with_a_diagnostic_stays_a_red() {
+        let real = "== core (scope)\nerror[E0425]: cannot find value `x` in this scope\n --> src/a.rs:3:5\nerror: could not compile `core` (lib) due to 1 previous error\n\nCaused by:\n  process didn't exit successfully: `rustc` (exit status: 1)\n";
+        let plain = "== core (scope)\nerror: expected one of `;`, found `}`\nerror: could not compile `core` (lib)\n  process didn't exit successfully: `rustc` (exit status: 1)\n";
+        for output in [real, plain] {
+            let verdict = verdict_of(ScopeVerdict::Measured(GateOutcome::Failed {
+                exit_code: 101,
+                output: output.to_owned(),
+            }));
+            assert!(
+                matches!(verdict, Ok(GateVerdict::Red { .. })),
+                "{verdict:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sccache_errors_are_load_reasons() {
+        use super::super::retry::is_load_reason;
+        assert!(is_load_reason(
+            "sccache: error: Failed to send data to server"
+        ));
     }
 
     #[tokio::test]
@@ -2870,7 +3037,8 @@ mod tests {
         // A dropped connection goes back to the pool on a spawned task, so `num_idle` read right
         // after the tick is racy: poll for up to a second.
         let idle = || async {
-            for _ in 0..50 {
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            while std::time::Instant::now() < deadline {
                 if fx.state.pool.size() as usize == fx.state.pool.num_idle() {
                     return true;
                 }
@@ -3460,6 +3628,41 @@ mod tests {
         );
         assert!(fx.open_questions(JOB, &root_node_of(JOB)).await.is_empty());
         assert_ne!(fx.branch(JOB, "late").await.state, "parked");
+    }
+
+    #[tokio::test]
+    async fn a_pending_start_whose_base_was_dropped_drops_the_waiting_branch_naming_the_base() {
+        const JOB: &str = "drv-pending-dropped-base";
+        let fx = Fixture::new().await;
+        fx.seed_job(JOB, Vec::new(), None).await;
+        let mut stored = fx.job(JOB).await;
+        let mut base = crate::tree_job::model::Branch::new("base", &[], "code", None);
+        base.state = "dropped".to_owned();
+        let late = crate::tree_job::model::Branch::new(PENDING_NAME, &[], "code", Some("base"));
+        stored.manifest.branches.insert("base".to_owned(), base);
+        stored
+            .manifest
+            .branches
+            .insert(PENDING_NAME.to_owned(), late);
+        stored.manifest.extra.insert(
+            "pending_starts".to_owned(),
+            json!({ PENDING_NAME: {
+                "caller": root_node_of(JOB),
+                "layer": "code",
+                "base": "base",
+                "waits_for_base": "base",
+            }}),
+        );
+        store::update(&fx.state.pool, &stored).await.unwrap();
+
+        fx.tick(JOB, &FakeGate::answering(vec![])).await;
+
+        let stored = fx.job(JOB).await;
+        let waiting = &stored.manifest.branches[PENDING_NAME];
+        assert_eq!(waiting.state, "dropped");
+        let reason = waiting.extra["drop_reason"].as_str().unwrap();
+        assert!(reason.contains("base"), "{reason}");
+        assert!(pending_starts(&stored).get(PENDING_NAME).is_none());
     }
 
     #[tokio::test]

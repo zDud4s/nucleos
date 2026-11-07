@@ -1096,6 +1096,7 @@ mod tests {
                 "task_done",
                 "task_list",
                 "task_release",
+                "tree_abandon",
                 "tree_branch_start",
                 "tree_launch",
                 "tree_status",
@@ -2795,6 +2796,7 @@ mod tests {
                 "task_done",
                 "task_list",
                 "task_release",
+                "tree_abandon",
                 "tree_branch_start",
                 "tree_launch",
                 "tree_status",
@@ -3022,6 +3024,7 @@ mod tests {
                 "create_job",
                 "create_run",
                 "spec_finish",
+                "tree_abandon",
                 "tree_branch_start",
                 "tree_launch",
             ]
@@ -3055,6 +3058,7 @@ mod tests {
                 "task_done",
                 "task_list",
                 "task_release",
+                "tree_abandon",
                 "tree_branch_start",
                 "tree_launch",
                 "tree_status",
@@ -3163,6 +3167,31 @@ mod tests {
             assert!(body[field].is_string(), "{field} missing from {body}");
         }
         assert!(body["project_id"].is_null(), "{body}");
+    }
+
+    #[test]
+    fn tree_abandon_is_acts_and_served_in_the_worktree_box() {
+        assert_eq!(tool_effect("tree_abandon"), ToolEffect::Acts);
+        assert!(WORKTREE_BOX_TOOLS.contains(&"tree_abandon"));
+        assert!(served_in_box(
+            &McpBox::Worktree("/work/a".to_owned()),
+            "tree_abandon"
+        ));
+    }
+
+    #[test]
+    fn tree_abandon_takes_a_reason_and_an_optional_force() {
+        let schema = rmcp::schemars::schema_for!(TreeAbandonParams);
+        let schema = serde_json::to_value(schema).unwrap();
+        let properties = schema["properties"].as_object().expect("properties");
+        for field in ["id", "reason", "force"] {
+            assert!(properties.contains_key(field), "missing {field}: {schema}");
+        }
+        assert_eq!(schema["required"], serde_json::json!(["id", "reason"]));
+        let args: TreeAbandonParams =
+            serde_json::from_value(serde_json::json!({ "id": "t", "reason": "stuck" }))
+                .expect("force is optional");
+        assert_eq!(args.force, None);
     }
 
     #[test]

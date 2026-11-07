@@ -237,6 +237,7 @@ pub const WORKTREE_BOX_TOOLS: &[&str] = &[
     "task_done",
     "task_list",
     "task_release",
+    "tree_abandon",
     "tree_branch_start",
     "tree_launch",
     "tree_status",

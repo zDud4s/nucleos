@@ -41,6 +41,17 @@ describe("machines", () => {
     expect(result.current).toEqual([{ id: "here", name: "This machine", reachable: true, needsPairing: false }]);
   });
 
+  it("the_pairing_record_keeps_the_peers_machine_id_when_it_reports_one", async () => {
+    const { machines } = await fresh();
+    invoke.mockResolvedValue({ id: "machine-aa", origin: "https://tower.example", name: "Tower", machine_id: "m-uuid-1" });
+
+    await machines.addMachine("https://tower.example", "ABCDE-FGHJK");
+
+    expect(JSON.parse(localStorage.getItem("nucleos-machines") ?? "[]")).toEqual([
+      { id: "machine-aa", origin: "https://tower.example", name: "Tower", machine_id: "m-uuid-1" },
+    ]);
+  });
+
   it("adding_a_machine_asks_before_making_this_one_secondary", async () => {
     const { machines } = await fresh();
     invoke.mockResolvedValue({ id: "machine-68747470733a2f2f746f7765722e6578616d706c65", origin: "https://tower.example", name: "Tower" });
