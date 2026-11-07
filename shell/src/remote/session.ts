@@ -9,6 +9,8 @@ export interface RemoteSession {
   name: string;
   accessLevel: string;
   expiresAt: string;
+  /** An owner device: the only kind that may register a passkey. */
+  owner: boolean;
 }
 
 export type SessionResult = { kind: "ok"; session: RemoteSession } | { kind: "none" } | { kind: "network" };
@@ -26,6 +28,7 @@ interface SessionWire {
   name?: string;
   access_level?: string;
   expires_at?: string;
+  owner?: boolean;
 }
 
 function toSession(wire: SessionWire): RemoteSession {
@@ -34,6 +37,7 @@ function toSession(wire: SessionWire): RemoteSession {
     name: wire.name ?? "",
     accessLevel: wire.access_level ?? "",
     expiresAt: wire.expires_at ?? "",
+    owner: wire.owner === true,
   };
 }
 

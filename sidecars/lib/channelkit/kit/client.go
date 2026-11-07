@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"nucleoschannelkit/clock"
 )
@@ -74,6 +75,21 @@ func (c *Client) do(ctx context.Context, method, path string, body io.Reader, co
 		return nil, resp.StatusCode, c.redact(fmt.Errorf("read response: %w", err))
 	}
 	return data, resp.StatusCode, nil
+}
+
+// requestTimeout bounds the short control calls (hello, events, ack, renew).
+// A core that accepts the connection and never answers would otherwise hang
+// them until the sidecar is stopped. Media and the outbox long-poll size their
+// own deadlines and do not use it.
+const requestTimeout = 30 * time.Second
+
+// doBounded is do with requestTimeout applied. The timeout surfaces as a
+// transport error (status 0) while the caller's own ctx stays unexpired, so
+// callers treat it like any other transient failure and retry.
+func (c *Client) doBounded(ctx context.Context, method, path string, body io.Reader, contentType string) ([]byte, int, error) {
+	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
+	defer cancel()
+	return c.do(ctx, method, path, body, contentType)
 }
 
 // redactedError hides the token in the message while keeping the cause chain.

@@ -479,6 +479,10 @@ pub async fn open(
 pub struct OpenLinks<'a> {
     pub tree_job_id: Option<&'a str>,
     pub continues_node_id: Option<&'a str>,
+    /// The tree driver's replay of a stored branch start: the parent (the tree's root) may already be
+    /// `done`, because the root closes when its dispatch report arrives while the start still waits.
+    /// Only `done` is waived; a failed, blocked or handed-off parent still refuses.
+    pub parent_may_be_done: bool,
 }
 
 /// [`open`], with its limits and guards, for a node that also carries `links`. A second continuation
@@ -525,7 +529,8 @@ pub async fn open_linked(
                     ));
                 }
                 let parent = get(pool, parent_id).await?;
-                if CLOSED_STATUSES.contains(&parent.status.as_str()) {
+                let waived = links.parent_may_be_done && parent.status == "done";
+                if !waived && CLOSED_STATUSES.contains(&parent.status.as_str()) {
                     return Err(NodeError::Conflict(format!(
                         "parent node is already {}; it cannot take new children",
                         parent.status

@@ -664,6 +664,31 @@
   color: var(--text-faint);
 }
 
+.chats-row-machine {
+  flex: none;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
+.chats-row-machine-down {
+  font-style: italic;
+}
+
+.chats-machine {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 8px;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.chats-machine-note {
+  margin: 0;
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}
+
 .chats-row-unread {
   display: inline-flex;
   align-items: center;
@@ -935,8 +960,8 @@
 }
 
 /* A tool call this conversation is being held on. Drawn where the next thing would have
-   appeared, and not tucked away: a turn is stopped while this stands, and the daemon refuses on its
-   own in about forty-five seconds. */
+   appeared, and not tucked away: a turn is stopped while this stands, and the question stands for as
+   long as the CLI lives. */
 .chats-asking {
   display: flex;
   flex-direction: column;

@@ -1,5 +1,6 @@
 import { policyAllows, readFeedKind, type FeedEntry, type NotifyPolicy } from "./feed";
-import type { ChatSummary } from "./chats";
+import type { ChatRow } from "./chatMachines";
+import type { MachineId } from "./machines";
 import type { Proposal } from "./system";
 
 /**
@@ -28,11 +29,13 @@ export interface NotifySeen {
   proposals: Set<number> | null;
   /** The newest feed line accounted for. */
   feedAfter: number | null;
-  /** Each conversation's unread count at the last reading. */
+  /** Each conversation's unread count at the last reading, keyed by machine and chat id. */
   chats: Map<string, number> | null;
+  /** Machines whose first successful chat-list read has been accounted for. */
+  chatMachines: Set<MachineId> | null;
 }
 
-export const EMPTY_SEEN: NotifySeen = { proposals: null, feedAfter: null, chats: null };
+export const EMPTY_SEEN: NotifySeen = { proposals: null, feedAfter: null, chats: null, chatMachines: null };
 
 export interface NotifyInputs {
   /** The window is in front of the owner. */
@@ -43,7 +46,9 @@ export interface NotifyInputs {
   /** `undefined` while a list has not answered yet. */
   proposals: Proposal[] | undefined;
   feed: FeedEntry[] | undefined;
-  chats: ChatSummary[] | undefined;
+  chats: ChatRow[] | undefined;
+  /** Machines whose current chat-list query succeeded, including machines with no chats. */
+  chatMachines?: readonly MachineId[];
   seen: NotifySeen;
 }
 
@@ -60,6 +65,10 @@ export interface Toast {
 function brief(text: string): string {
   const flat = text.replace(/\s+/g, " ").trim();
   return flat.length > BODY_LIMIT ? `${flat.slice(0, BODY_LIMIT - 1)}…` : flat;
+}
+
+function chatSeenKey(chat: ChatRow): string {
+  return `${chat.machine}:${chat.chat_id}`;
 }
 
 /**
@@ -96,22 +105,42 @@ export function toastsFor(inputs: NotifyInputs): { toasts: Toast[]; seen: Notify
   }
 
   let chats = seen.chats;
+  let chatMachines = seen.chatMachines;
   if (inputs.chats !== undefined) {
     const known = seen.chats;
-    chats = new Map(inputs.chats.map((c) => [c.chat_id, c.waiting]));
-    if (known !== null && speak) {
-      for (const c of inputs.chats) {
-        if (c.archived_at) continue;
+    const knownMachines = seen.chatMachines ?? new Set<MachineId>();
+    const answeredMachines = new Set(
+      inputs.chatMachines ?? inputs.chats.filter((chat) => !chat.unreachable).map((chat) => chat.machine),
+    );
+    const firstRead = new Set([...answeredMachines].filter((machine) => !knownMachines.has(machine)));
+    const next = new Map(known ?? []);
+
+    // A successful empty response is still a read: clear stale rows for that machine now, while
+    // failed machines keep their last count for the next successful poll to compare against.
+    for (const machine of answeredMachines) {
+      for (const key of next.keys()) {
+        if (key.startsWith(`${machine}:`)) next.delete(key);
+      }
+    }
+
+    for (const c of inputs.chats) {
+      if (c.unreachable || !answeredMachines.has(c.machine)) continue;
+      const key = chatSeenKey(c);
+      const previous = known?.get(key) ?? 0;
+      if (known !== null && !firstRead.has(c.machine) && speak && !c.archived_at && c.waiting > previous) {
         // An answer is news when the unread count rose; opening the chat lowers it and says nothing.
-        if (c.waiting <= (known.get(c.chat_id) ?? 0)) continue;
         found.push({
-          key: `chat:${c.chat_id}:${c.waiting}`,
+          // The toast key carries the count so two answers in one chat are two toasts; the seen key stays machine:chat_id.
+          key: `${key}:${c.waiting}`,
           title: `${c.title?.trim() || "Conversation"}: answered`,
-          body: "A new answer is waiting.",
+          body: `A new answer is waiting${c.machineName === undefined ? "" : ` on ${c.machineName}`}.`,
           to: `/chats/${c.chat_id}`,
         });
       }
+      next.set(key, c.waiting);
     }
+    chats = next;
+    chatMachines = new Set([...knownMachines, ...answeredMachines]);
   }
 
   let feedAfter = seen.feedAfter;
@@ -132,7 +161,7 @@ export function toastsFor(inputs: NotifyInputs): { toasts: Toast[]; seen: Notify
     }
   }
 
-  const next: NotifySeen = { proposals, feedAfter, chats };
+  const next: NotifySeen = { proposals, feedAfter, chats, chatMachines };
   if (found.length <= MAX_TOASTS) return { toasts: found, seen: next };
 
   const shown = found.slice(0, MAX_TOASTS);

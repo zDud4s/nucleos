@@ -72,6 +72,27 @@ describe("AppShell - the chord", () => {
   });
 });
 
+describe("AppShell - chat badge", () => {
+  it("counts unread chats from every paired machine", async () => {
+    localStorage.setItem(
+      "nucleos-machines",
+      JSON.stringify([{ id: "tower", name: "Tower", origin: "https://tower.example" }]),
+    );
+    const rest = daemonFetch(daemonState());
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit, machine?: string) => {
+      if (path === "/assistant/chats") {
+        return machine === "tower"
+          ? [{ chat_id: "tower-chat", title: "Tower", waiting: 2, archived_at: null }]
+          : [{ chat_id: "local-chat", title: "Local", waiting: 1, archived_at: null }];
+      }
+      return rest(path, init);
+    });
+
+    await renderApp({ initialPath: "/" });
+    await screen.findByRole("link", { name: "Chats, 3 unread" });
+  });
+});
+
 /* ------------------------------------------------------- A3, A4: the destinations -- */
 
 describe("AppShell - every destination", () => {

@@ -361,4 +361,20 @@ mod tests {
             relative,
         ));
     }
+
+    /// The hook looks a node up by run id on every tool call; that lookup must be an index search.
+    #[tokio::test]
+    async fn node_lookup_by_run_id_uses_an_index() {
+        let pool = crate::testdb::fresh_pool().await;
+        let plan: Vec<(i64, i64, i64, String)> =
+            sqlx::query_as("EXPLAIN QUERY PLAN SELECT id FROM work_nodes WHERE run_id = ?")
+                .bind("1")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(
+            plan.iter().any(|row| row.3.contains("USING INDEX")),
+            "no index on work_nodes.run_id: {plan:?}"
+        );
+    }
 }

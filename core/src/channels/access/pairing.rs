@@ -264,6 +264,16 @@ pub async fn pair(
     sender: &Sender,
     now: DateTime<Utc>,
 ) -> sqlx::Result<PairOutcome> {
+    // A sender that already guessed wrong too often is refused before the code is even looked at,
+    // so a stranger cannot burn the owner's attempts (the code's own counter stays untouched).
+    if state
+        .channels
+        .presence
+        .sender_pair_locked(channel, &sender.reference, now)
+    {
+        state.channels.presence.drop_pairing_failure(channel);
+        return Ok(PairOutcome::Refused);
+    }
     let mut tx = state.pool.begin().await?;
     let live: Option<(i64, String, String, i64)> = sqlx::query_as(
         "SELECT id, code_hash, expires_at, attempts FROM channel_pairing_codes \
@@ -287,6 +297,10 @@ pub async fn pair(
             .await?;
         tx.commit().await?;
         state.channels.presence.drop_pairing_failure(channel);
+        state
+            .channels
+            .presence
+            .note_sender_pair_failure(channel, &sender.reference, now);
         return Ok(PairOutcome::Refused);
     }
 
@@ -688,7 +702,9 @@ mod tests {
             .unwrap();
         let bad = wrong(&minted.code);
         for tried in 1..=MAX_PAIR_ATTEMPTS {
-            let outcome = pair(&st, "telegram", &bad, &private("c1"), &who("u1"), now())
+            // One sender per guess: the per-sender lockout is tested on its own below.
+            let guesser = format!("u{tried}");
+            let outcome = pair(&st, "telegram", &bad, &private("c1"), &who(&guesser), now())
                 .await
                 .unwrap();
             assert_eq!(outcome, PairOutcome::Refused);
@@ -724,6 +740,59 @@ mod tests {
             .unwrap();
         assert_eq!(attempts, i64::from(MAX_PAIR_ATTEMPTS));
         assert!(rows(&st.pool).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn one_sender_cannot_exhaust_the_code_for_the_owner() {
+        let st = state().await;
+        let minted = mint_pairing_code(&st.pool, "telegram", now())
+            .await
+            .unwrap();
+        let bad = wrong(&minted.code);
+        for _ in 0..10 {
+            let outcome = pair(
+                &st,
+                "telegram",
+                &bad,
+                &private("x"),
+                &who("stranger"),
+                now(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(outcome, PairOutcome::Refused);
+        }
+        let attempts: i64 = sqlx::query_scalar("SELECT attempts FROM channel_pairing_codes")
+            .fetch_one(&st.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            attempts, 3,
+            "only the first three guesses of one sender count"
+        );
+        // The stranger is locked out even with the right code; the owner still pairs.
+        let outcome = pair(
+            &st,
+            "telegram",
+            &minted.code,
+            &private("x"),
+            &who("stranger"),
+            now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, PairOutcome::Refused);
+        let outcome = pair(
+            &st,
+            "telegram",
+            &minted.code,
+            &private("c9"),
+            &who("owner"),
+            now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, PairOutcome::Paired { home: true });
     }
 
     #[tokio::test]

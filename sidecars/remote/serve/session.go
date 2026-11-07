@@ -5,11 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/go-webauthn/webauthn/webauthn"
 
 	"nucleosremote/config"
 )
@@ -93,8 +95,7 @@ func refusalOf(body []byte) string {
 	return v.Refusal
 }
 
-// limiter allows at most `limit` events per sliding `window`, in memory. Every browser reaches
-// the gateway from the same loopback peer, so the limit is global by design.
+// limiter allows at most limit events per sliding window, in memory. Pairing uses one global limiter; passkeys use scoped limiter sets.
 type limiter struct {
 	mu     sync.Mutex
 	limit  int
@@ -180,7 +181,9 @@ type deviceInfo struct {
 	DeviceID    json.RawMessage `json:"device_id"`
 	Name        json.RawMessage `json:"name"`
 	AccessLevel json.RawMessage `json:"access_level"`
-	ExpiresAt   json.RawMessage `json:"expires_at"`
+	// Owner is present only when the daemon sent it, so the shell knows whether to offer a passkey.
+	Owner     json.RawMessage `json:"owner,omitempty"`
+	ExpiresAt json.RawMessage `json:"expires_at"`
 }
 
 // authHandler serves /auth/*.
@@ -189,11 +192,28 @@ type authHandler struct {
 	d           *daemonClient
 	lim         *limiter
 	bodyTimeout time.Duration
+	// The passkey ceremonies (passkey.go). wa is nil when the public origin cannot be a relying
+	// party; the passkey routes then answer 503.
+	wa      *webauthn.WebAuthn
+	cer     *ceremonyStore
+	pglobal *limiterSet
+	pdev    *limiterSet
+	pfail   *limiterSet
 }
 
 // NewAuth builds the /auth/* handler.
 func NewAuth(cfg config.Config) http.Handler {
-	return &authHandler{cfg: cfg, d: newDaemonClient(cfg), lim: newLimiter(pairLimit, pairWindow), bodyTimeout: BodyReadTimeout}
+	wa, err := newRelyingParty(cfg)
+	if err != nil {
+		log.Printf("serve: passkeys disabled: %v", err)
+	}
+	return &authHandler{
+		cfg: cfg, d: newDaemonClient(cfg), lim: newLimiter(pairLimit, pairWindow), bodyTimeout: BodyReadTimeout,
+		wa: wa, cer: newCeremonyStore(),
+		pglobal: newLimiterSet(passkeyGlobalLimit, pairWindow),
+		pdev:    newLimiterSet(passkeyDeviceLimit, pairWindow),
+		pfail:   newLimiterSet(passkeyFailLimit, 10*time.Minute),
+	}
 }
 
 func (a *authHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -206,7 +226,9 @@ func (a *authHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "/auth/logout":
 		a.logout(w, r)
 	default:
-		writeJSONError(w, http.StatusNotFound, "not_found")
+		if !a.passkeyRoute(w, r) {
+			writeJSONError(w, http.StatusNotFound, "not_found")
+		}
 	}
 }
 
@@ -221,12 +243,7 @@ func (a *authHandler) pair(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if ok, wait := a.lim.allow(); !ok {
-		secs := int((wait + time.Second - 1) / time.Second)
-		if secs < 1 {
-			secs = 1
-		}
-		w.Header().Set("Retry-After", strconv.Itoa(secs))
-		writeJSONError(w, http.StatusTooManyRequests, "slow_down")
+		tooManyRequests(w, wait, "")
 		return
 	}
 	var in struct {
