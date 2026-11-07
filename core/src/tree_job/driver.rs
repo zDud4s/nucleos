@@ -1668,16 +1668,15 @@ mod tests {
 
         /// Waits for the spawned gate to settle the branch, then lets its task finish.
         async fn wait_branch_state(&self, job: &str, name: &str, want: &str) {
-            let mut seen = String::new();
             // Hang guard only: wait for the state, not for a short budget.
             let deadline = std::time::Instant::now() + Duration::from_secs(60);
-            loop {
-                seen = self.branch(job, name).await.state;
-                if seen == want || std::time::Instant::now() >= deadline {
-                    break;
+            let seen = loop {
+                let state = self.branch(job, name).await.state;
+                if state == want || std::time::Instant::now() >= deadline {
+                    break state;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+            };
             assert_eq!(seen, want, "branch {name} of {job} never reached {want}");
             tokio::time::sleep(Duration::from_millis(30)).await;
         }
@@ -1854,21 +1853,20 @@ mod tests {
     /// Waits for the spawned gate to count `want` gates in a row that measured nothing, then lets
     /// its task finish.
     async fn wait_gate_failures(fx: &Fixture, job: &str, name: &str, want: i64) {
-        let mut seen = None;
         // Hang guard only: wait for the count, not for a short budget.
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        loop {
-            seen = fx
+        let seen = loop {
+            let count = fx
                 .branch(job, name)
                 .await
                 .extra
                 .get(GATE_FAILURES)
                 .and_then(Value::as_i64);
-            if seen == Some(want) || std::time::Instant::now() >= deadline {
-                break;
+            if count == Some(want) || std::time::Instant::now() >= deadline {
+                break count;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        };
         assert_eq!(
             seen,
             Some(want),

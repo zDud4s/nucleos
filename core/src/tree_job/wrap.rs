@@ -795,15 +795,14 @@ mod tests {
             1,
             "the wrap relaunched the root"
         );
-        let mut seen = None;
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        loop {
-            seen = *runner.last_permission.lock().unwrap();
-            if seen.is_some() || std::time::Instant::now() >= deadline {
-                break;
+        let seen = loop {
+            let permission = *runner.last_permission.lock().unwrap();
+            if permission.is_some() || std::time::Instant::now() >= deadline {
+                break permission;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        };
         let seen = seen.expect("the relaunched run reached the runner");
         assert_ne!(
             seen,
