@@ -1117,10 +1117,12 @@ mod tests {
             .unwrap();
 
         let started = std::time::Instant::now();
-        let swept =
-            tokio::time::timeout(std::time::Duration::from_secs(1), cancel_orphaned_queued(&pool))
-                .await
-                .expect("the idle sweep waited for the write lock");
+        let swept = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            cancel_orphaned_queued(&pool),
+        )
+        .await
+        .expect("the idle sweep waited for the write lock");
 
         assert!(swept.unwrap().is_empty());
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
