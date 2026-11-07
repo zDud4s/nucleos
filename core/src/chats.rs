@@ -9,6 +9,7 @@ pub mod seed;
 pub mod tasks;
 pub mod transfer;
 pub mod transfer_code;
+pub mod transfer_history;
 pub mod transfer_package;
 
 use sqlx::SqlitePool;
