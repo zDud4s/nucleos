@@ -14,7 +14,7 @@
 
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// One limit period of one provider, exactly as the sidecar reports it.
 #[derive(Debug, Clone, Deserialize)]
@@ -34,6 +34,9 @@ pub struct WindowReading {
 /// Everything the sidecar knows about one provider's quota right now.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProviderReading {
+    /// Set on the per-account readings of `QuotaReport::accounts`; absent on the provider-wide ones.
+    #[serde(default)]
+    pub account_id: Option<String>,
     pub provider: String,
     /// `official`, `derived` or `unmeasured`. Parsed into [`crate::quota::Fidelity`] by the domain;
     /// kept as text here so a value this build does not know is a reading to describe rather than a
@@ -64,9 +67,21 @@ where
     Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
+/// One account the sidecar should read: its pool id, its engine and its credential directory
+/// (absolute).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AccountDir {
+    pub id: String,
+    pub engine: String,
+    pub dir: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct QuotaReport {
     pub providers: Vec<ProviderReading>,
+    /// One reading per account pushed with [`QuotaClient::put_accounts`]; empty before any push.
+    #[serde(default, deserialize_with = "null_as_empty")]
+    pub accounts: Vec<ProviderReading>,
     /// The answer came from the sidecar's TTL window rather than from a fresh call to the vendor.
     /// Surfaced because `read_at` alone cannot distinguish "measured a second ago" from "measured a
     /// minute ago and held", and the notch shows the age of a figure.
@@ -129,6 +144,25 @@ impl QuotaClient {
             base: format!("http://{addr}"),
             token,
         }
+    }
+
+    /// Replace the sidecar's account list. The list is complete: accounts left out are dropped.
+    pub async fn put_accounts(&self, accounts: &[AccountDir]) -> Result<(), QuotaError> {
+        let response = self
+            .http
+            .put(format!("{}/accounts", self.base))
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({ "accounts": accounts }))
+            .send()
+            .await
+            .map_err(|error| QuotaError(with_causes(&error)))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(QuotaError(format!("{}: {}", status.as_u16(), body.trim())));
+        }
+        Ok(())
     }
 
     /// Ask the sidecar for every provider's current quota.
@@ -265,6 +299,33 @@ mod tests {
 
         assert!(said.starts_with("error decoding response body: "), "{said}");
         assert!(said.contains("invalid type: null"), "{said}");
+    }
+
+    #[test]
+    fn per_account_readings_parse_and_are_optional() {
+        let report: QuotaReport = serde_json::from_str(
+            r#"{"providers":[],"accounts":[{"account_id":"claude:a","provider":"claude",
+                 "fidelity":"official","read_at":"2026-09-19T05:00:00Z",
+                 "windows":[{"window":"5h","used_fraction":0.5,"resets_at":null}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(report.accounts[0].account_id.as_deref(), Some("claude:a"));
+        let bare: QuotaReport = serde_json::from_str(r#"{"providers":[]}"#).unwrap();
+        assert!(bare.accounts.is_empty());
+    }
+
+    #[test]
+    fn the_account_list_serialises_as_the_sidecar_expects() {
+        let accounts = [AccountDir {
+            id: "claude:a".into(),
+            engine: "claude".into(),
+            dir: "/d".into(),
+        }];
+        let body = serde_json::json!({ "accounts": accounts });
+        assert_eq!(
+            body["accounts"][0],
+            serde_json::json!({"id": "claude:a", "engine": "claude", "dir": "/d"})
+        );
     }
 
     /// A window with no reset is a real answer (the 2026-09-19 capture had one), and `severity` is

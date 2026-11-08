@@ -1519,6 +1519,7 @@ mod tests {
     #[test]
     fn a_live_window_past_its_reset_is_stale_however_the_sidecar_flagged_it() {
         let reading = crate::quota::client::ProviderReading {
+            account_id: None,
             provider: "claude".into(),
             fidelity: "official".into(),
             read_at: at(BEFORE_RESET),
