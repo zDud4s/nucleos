@@ -68,8 +68,24 @@ def forced(environ=None) -> bool:
     return (environ if environ is not None else os.environ).get("NUCLEOS_HEAVY_FORCE") == "1"
 
 
-def full_forced(environ=None) -> bool:
-    return (environ if environ is not None else os.environ).get("NUCLEOS_HEAVY_FULL") == "1"
+_FINAL_GATE_TREE = re.compile(r"/\.nucleos/worktrees/(?:postgate|integration)-[^/]+(?:/|$)")
+
+
+def final_gate_tree(cwd) -> bool:
+    """A cwd inside the daemon's post-gate or integration tree: the final gate. It must really
+    run, whoever calls it (scripts/gates.sh exports NUCLEOS_HEAVY_FULL=1 there too, but the outer
+    broker looks the command up before gates.sh runs)."""
+    try:
+        return _FINAL_GATE_TREE.search(os.path.realpath(cwd).replace("\\", "/") + "/") is not None
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def full_forced(environ=None, cwd=None) -> bool:
+    env = environ if environ is not None else os.environ
+    if "NUCLEOS_HEAVY_FULL" in env:
+        return env.get("NUCLEOS_HEAVY_FULL") == "1"
+    return cwd is not None and final_gate_tree(cwd)
 
 
 # ------------------------------------------------------------------ argv
@@ -128,7 +144,9 @@ def cacheable(argv: list[str]) -> bool:
             return "run" in words[1:] or "--run" in rest
         return words[:1] in (["tsc"], ["eslint"], ["jest"], ["prettier"]) and (
             words[0] != "prettier" or "--check" in rest)
-    return True  # bash scripts/gates.sh
+    # bash scripts/gates.sh is not cached: it picks its targets from a merge-base diff, and the
+    # outer lookup runs before it exports NUCLEOS_HEAVY_FULL. Its inner commands cache.
+    return False
 
 
 # ------------------------------------------------------------------ source state
@@ -339,7 +357,7 @@ def prepare(argv: list[str], directory: Path, cwd: str, environ=None, err=None, 
             return plan
         plan.key = _key(cwd, argv, plan.state, environ)
         plan.tap = plan._feed
-        if full_forced(environ):
+        if full_forced(environ, cwd):
             return plan  # the daemon's final gate: really run, and store nothing
         plan.store = True
         if forced(environ):

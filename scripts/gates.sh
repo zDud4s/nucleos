@@ -101,6 +101,11 @@ run() {
   save_log "$label" "$capture" "$status"
   if [ "$status" -eq 0 ]; then
     printf 'ok   %s\n' "$label"
+    # heavy.py re-ran only the tests that failed last time (its stderr line is in the output
+    # above); say so here too, so a narrowed pass is never read as a green suite.
+    if grep -q 'heavy: PARTIAL pass' "$capture" 2>/dev/null; then
+      printf 'note %s: PARTIAL pass, only the previously failing tests re-ran (NUCLEOS_HEAVY_FULL=1 forces a full run)\n' "$label"
+    fi
   else
     printf 'FAIL %s\n' "$label"
     failures="$failures  $label"$'\n'"$(kept_lines "$capture")"$'\n'

@@ -178,6 +178,7 @@ class TargetDirTests(unittest.TestCase):
             NUCLEOS_HEAVY_CACHE="0",  # the result cache would skip a repeated run
             NUCLEOS_HEAVY_CAPACITY="4",
             NUCLEOS_HEAVY_POLL_S="0.1",
+            NUCLEOS_HEAVY_FAILFIRST="0",  # these fakes read argv; failfirst appends a flag
             NUCLEOS_HEAVY_TD_ROOT=str(self.td_root),
             CARGO_HOME=str(self.cargo_home),
             FAKE_OUT=str(self.out),

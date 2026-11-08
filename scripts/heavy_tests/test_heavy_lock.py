@@ -151,6 +151,7 @@ class LockTests(unittest.TestCase):
             NUCLEOS_HEAVY_DIR=str(self.state),
             NUCLEOS_HEAVY_CAPACITY=str(capacity),
             NUCLEOS_HEAVY_POLL_S="0.1",
+            NUCLEOS_HEAVY_FAILFIRST="0",  # these fakes read argv; failfirst appends a flag
             SLEEPER_DIR=str(self.d),
             SLEEPER_HEAVY=str(HEAVY),
             SLEEPER_CARGO=str(self.cargo),

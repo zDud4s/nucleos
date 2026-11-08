@@ -114,6 +114,7 @@ class Broker(unittest.TestCase):
         env.update(
             NUCLEOS_HEAVY_DIR=str(self.state),
             NUCLEOS_HEAVY_POLL_S="0.1",
+            NUCLEOS_HEAVY_FAILFIRST="0",  # these fakes read argv; failfirst appends a flag
             # No pooled target dirs: their 3 slots per worktree would cap these tests at 3
             # jobs before the admission rule under test does.
             NUCLEOS_HEAVY_TARGET="0",

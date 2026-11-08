@@ -288,6 +288,27 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(hv._poll_probe(HC, self.state, False), ({"avail_mb": 1.0}, True))
         self.assertEqual(calls, [1])
 
+    def test_batch_writes_the_charged_probe_back_with_its_timestamp(self) -> None:
+        os.environ["NUCLEOS_HEAVY_CAPACITY"] = "8"
+        hc = self.hv._cost_mod()
+        self.held.mkdir(parents=True, exist_ok=True)
+        probe = {"logical": 12, "total_mb": 64000, "avail_mb": 60000, "busy_cores": 1}
+        ts = time.time() - 0.5
+        (self.state / "probe.json").write_text(json.dumps({"ts": ts, "probe": probe}),
+                                               encoding="utf-8")
+        fs = [self.sleeper() for _ in range(2)]
+        order = [(Path("0-1-head"), self.head())]
+        for i, p in enumerate(fs):
+            f = self.plant(p, 1, 10 + i)
+            order.append((f, json.loads(f.read_text(encoding="utf-8"))))
+        os.environ["NUCLEOS_HEAVY_SETTLE_S"] = "0"
+        n = self.hv._grant_followers(hc, self.state, order, 1, 1, True, dict(probe), None)
+        self.assertEqual(n, 2)
+        c = json.loads((self.state / "probe.json").read_text(encoding="utf-8"))
+        self.assertEqual(c["ts"], ts, "the sample keeps its age: charging is not re-sampling")
+        self.assertEqual(c["probe"]["avail_mb"], 60000 - 2 * hc.JOB_BUDGET_MB)
+        self.assertEqual(c["probe"]["busy_cores"], 3)
+
 
 if __name__ == "__main__":
     unittest.main()

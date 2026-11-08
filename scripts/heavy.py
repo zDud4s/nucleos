@@ -859,10 +859,11 @@ def _read_shared_probe(directory: Path, now: float | None = None) -> dict | None
     return None
 
 
-def _write_shared_probe(directory: Path, p: dict) -> None:
+def _write_shared_probe(directory: Path, p: dict, ts: float | None = None) -> None:
     tmp = directory / f"probe.json.{os.getpid()}.tmp"
     try:
-        tmp.write_text(json.dumps({"ts": time.time(), "probe": p}), encoding="utf-8")
+        tmp.write_text(json.dumps({"ts": time.time() if ts is None else ts, "probe": p}),
+                       encoding="utf-8")
         hw = _wait_mod()
         if hw is not None:
             hw.retry_io(lambda: os.replace(tmp, directory / "probe.json"))
@@ -928,6 +929,13 @@ def _grant_followers(hc, directory: Path, order: list, held_n: int, held_w: int,
     p = dict(pr) if isinstance(pr, dict) else pr
     n, w, granted = held_n, held_w, 0
     me = os.getpid()
+    sample_ts = None
+    if isinstance(p, dict) and not os.environ.get("NUCLEOS_HEAVY_FAKE_PROBE"):
+        try:  # the age of the sample the charged probe is written back under
+            sample_ts = float(json.loads(
+                (directory / "probe.json").read_text(encoding="utf-8"))["ts"])
+        except (OSError, ValueError, KeyError, TypeError):
+            sample_ts = None
     for f, r in order[1:]:
         if granted >= limit:
             break
@@ -988,6 +996,10 @@ def _grant_followers(hc, directory: Path, order: list, held_n: int, held_w: int,
                 p["avail_mb"] = p["avail_mb"] - hc.JOB_BUDGET_MB
             if isinstance(p.get("busy_cores"), (int, float)):
                 p["busy_cores"] = p["busy_cores"] + 1
+    if granted and sample_ts is not None and isinstance(p, dict):
+        # The next head reads probe.json: hand it the charged figures, not the stale sample,
+        # under the original timestamp so the sample still expires on schedule.
+        _write_shared_probe(directory, p, sample_ts)
     return granted
 
 
@@ -1028,6 +1040,7 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
     hw = _wait_mod()
     bo = hw.Backoff(poll * 0.4, poll * 2.0) if hw is not None else None
     g = None
+    own_torn = 0  # consecutive lock-free polls on which my own queue file did not parse
     try:
         with Mutex(directory):
             queue_dir.mkdir(parents=True, exist_ok=True)
@@ -1053,6 +1066,8 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
                     lnames = [f.name for f, _ in lorder]
                     lqueued = len(lnames)
                     lpos = lnames.index(qfile.name) + 1 if qfile.name in lnames else 0
+                    if lpos:
+                        own_torn = 0
                     if lpos == 0:
                         if not qfile.exists():
                             # Gone from the queue: admitted on my behalf by the Mutex holder
@@ -1066,7 +1081,11 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
                                 return True, time.time() - t0
                             need = True
                         else:
-                            need = False  # present but unreadable: retry next poll
+                            # Present but unreadable: probably mid-write, so look again next
+                            # poll; a few polls in a row mean it is corrupt, and the Mutex path
+                            # below rewrites it.
+                            own_torn += 1
+                            need = own_torn > 3
                     elif lpos > 1:
                         need = False
                     elif shadow is None and not dyn:
@@ -1203,7 +1222,18 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
                 except FileNotFoundError:
                     queued = False
                 except Exception:
+                    # The Mutex could not be taken. A grant may still have landed just now:
+                    # removing my queue entry is the atomic test (a granter that finds it gone
+                    # takes its held record back, one that already removed it left the record).
                     g = None
+                    try:
+                        _unlink(qfile)
+                        queued = False
+                    except FileNotFoundError:
+                        queued = False
+                        g = _granted(held_dir, me, rec, qfile.name)
+                    except OSError:
+                        g = _granted(held_dir, me, rec, qfile.name)
                 if g is not None:
                     if g.get("adm"):
                         rec["adm"] = g["adm"]

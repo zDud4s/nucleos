@@ -19,6 +19,7 @@ Nothing here raises into the broker: every failure degrades to the old behaviour
 
 from __future__ import annotations
 
+import errno
 import os
 import random
 import time
@@ -31,7 +32,12 @@ NORMAL = 0x00000020
 def _sharing_violation(exc: BaseException) -> bool:
     """A Windows sharing/access violation (WinError 32 or 5), which a lock-free reader that
     still has the file open causes and which clears in milliseconds."""
-    return isinstance(exc, PermissionError) or getattr(exc, "winerror", None) in (32, 5)
+    if getattr(exc, "winerror", None) in (32, 5):
+        return True
+    # A bare EACCES without a winerror is a sharing violation only on Windows; elsewhere it is a
+    # real permission problem that waiting never fixes.
+    return (_IS_WIN and isinstance(exc, PermissionError)
+            and getattr(exc, "winerror", None) is None and exc.errno == errno.EACCES)
 
 
 def retry_io(fn, attempts: int = 25, delay: float = 0.02, sleep=time.sleep):

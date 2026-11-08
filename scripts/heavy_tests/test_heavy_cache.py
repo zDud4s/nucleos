@@ -129,11 +129,27 @@ class CacheTests(unittest.TestCase):
 
     def test_each_runner_hits(self) -> None:
         for argv in (["go", "vet", "./..."], ["go", "test", "-race", "./..."], ["npm", "test"],
-                     ["npx", "vitest", "run"], ["cargo", "clippy", "-p", "x"],
-                     ["bash", "scripts/gates.sh", "rust"]):
+                     ["npx", "vitest", "run"], ["cargo", "clippy", "-p", "x"]):
             with self.subTest(argv=argv):
                 self.assertEqual(self.run_cmd(argv)[3], 1)
                 self.assertEqual(self.run_cmd(argv)[3], 0)
+
+    def test_gates_script_is_never_cached(self) -> None:
+        # gates.sh picks its targets from a merge-base diff and exports NUCLEOS_HEAVY_FULL only
+        # after the outer lookup: the same tree can need different gates. Its inner commands cache.
+        argv = ["bash", "scripts/gates.sh", "rust"]
+        self.assertFalse(hc.cacheable(argv))
+        self.assertEqual(self.run_cmd(argv)[3], 1)
+        self.assertEqual(self.run_cmd(argv)[3], 1)
+        self.assertEqual(self.entries(), [])
+
+    def test_final_gate_trees_never_use_the_cache(self) -> None:
+        for name in ("postgate-demo", "integration-7"):
+            with self.subTest(tree=name):
+                tree = _fp.make_repo(self.tmp / "gt" / ".nucleos" / "worktrees" / name)
+                self.assertEqual(self.run_cmd(self.ARGV, cwd=tree)[3], 1)
+                self.assertEqual(self.run_cmd(self.ARGV, cwd=tree)[3], 1)
+                self.assertEqual(self.entries(), [], "and nothing is stored")
 
     def test_non_verification_commands_are_not_cached(self) -> None:
         for argv in (["cargo", "build"], ["npm", "install"], ["go", "build", "./..."]):

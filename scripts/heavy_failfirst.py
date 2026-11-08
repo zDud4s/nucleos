@@ -68,8 +68,20 @@ def disabled(environ=None) -> bool:
     return (environ if environ is not None else os.environ).get("NUCLEOS_HEAVY_FAILFIRST") == "0"
 
 
-def full_forced(environ=None) -> bool:
-    return (environ if environ is not None else os.environ).get("NUCLEOS_HEAVY_FULL") == "1"
+def full_forced(environ=None, cwd=None) -> bool:
+    """NUCLEOS_HEAVY_FULL=1, or unset inside a final-gate tree (.nucleos/worktrees/postgate-* or
+    integration-*): the final gate always runs in full, whoever calls it."""
+    env = environ if environ is not None else os.environ
+    if "NUCLEOS_HEAVY_FULL" in env:
+        return env.get("NUCLEOS_HEAVY_FULL") == "1"
+    if cwd is None:
+        return False
+    try:
+        import heavy_cache  # type: ignore
+
+        return heavy_cache.final_gate_tree(cwd)
+    except ImportError:
+        return False
 
 
 # ------------------------------------------------------------------ argv
@@ -175,6 +187,23 @@ def parse_failures(runner: str, lines) -> list[str] | None:
 
 
 # ------------------------------------------------------------------ narrowing
+
+
+def with_no_fail_fast(runner: str, argv: list[str]) -> tuple[list[str], bool]:
+    """(argv, complete) for a FULL run. The cargo runner and nextest stop at the first failing
+    binary by default, so the failures they print are only that binary's: --no-fail-fast (before
+    any `--`) makes the record complete. `complete` is False when the command itself asks to stop
+    early (--fail-fast, --max-fail, go -failfast, vitest --bail)."""
+    head, _tail = _split_dd(list(argv[1:]))
+    if runner in ("cargo-test", "nextest"):
+        if "--no-fail-fast" in head:
+            return list(argv), True
+        if any(a == "--fail-fast" or a.startswith(("--fail-fast=", "--max-fail")) for a in head):
+            return list(argv), False
+        return _insert_before_dd(argv, ["--no-fail-fast"]), True
+    if runner == "go":
+        return list(argv), not any(a in ("-failfast", "-failfast=true") for a in head)
+    return list(argv), not any(a == "--bail" or a.startswith("--bail=") for a in argv[1:])
 
 
 def _insert_before_dd(argv: list[str], extra: list[str]) -> list[str]:
@@ -308,12 +337,14 @@ def clear(directory: Path, cwd: str, argv: list[str]) -> None:
         pass
 
 
-def save(directory: Path, cwd: str, argv: list[str], runner: str, ids: list[str]) -> None:
+def save(directory: Path, cwd: str, argv: list[str], runner: str, ids: list[str],
+         complete: bool = False) -> None:
     head, dirty = _snapshot(cwd)
     p = _path(directory, _key(cwd, argv))
     p.parent.mkdir(parents=True, exist_ok=True)
     rec = {"worktree": os.path.realpath(cwd), "argv": normalize(argv), "runner": runner,
-           "ids": ids, "head": head, "dirty": dirty, "ts": time.time()}
+           "ids": ids, "complete": bool(complete), "head": head, "dirty": dirty,
+           "ts": time.time()}
     tmp = p.with_name(p.name + f".{os.getpid()}.tmp")
     tmp.write_text(json.dumps(rec), encoding="utf-8")
     os.replace(tmp, p)
@@ -343,6 +374,7 @@ class Plan:
         self.directory, self.cwd, self.argv = directory, cwd, argv
         self.runner, self.active, self.narrowed, self.ids = runner, active, narrowed, ids
         self.err = err
+        self.complete = False  # the run's failures are all of them (no fail-fast stop)
         self.collector = Collector() if active else None
         self.run_argv = argv
 
@@ -364,12 +396,18 @@ class Plan:
             if code == 0:
                 clear(self.directory, self.cwd, self.argv)
                 if self.narrowed:
-                    self.say("the narrowed run PASSED, but only the previously failed tests ran, "
-                             "not the whole suite; the record is cleared, the next run is full")
+                    try:
+                        self.err.write(
+                            f"heavy: PARTIAL pass - only {len(self.ids)} previously failing "
+                            "tests re-ran, not the whole suite; the record is cleared and the "
+                            "next run is full (NUCLEOS_HEAVY_FULL=1 forces a full run now)\n")
+                        self.err.flush()
+                    except Exception:
+                        pass
                 return
             ids = parse_failures(self.runner, self.collector.lines)
             if ids:
-                save(self.directory, self.cwd, self.argv, self.runner, ids)
+                save(self.directory, self.cwd, self.argv, self.runner, ids, self.complete)
                 if not self.narrowed:
                     self.say(f"recorded {len(ids)} failing test(s); the next identical run in "
                              "this worktree will run only those")
@@ -393,14 +431,19 @@ def prepare(argv: list[str], run_argv: list[str], directory: Path, cwd: str,
         if runner is None:
             return inert
         plan = Plan(directory, cwd, argv, runner, True, False, [], err)
+        run_argv, plan.complete = with_no_fail_fast(runner, run_argv)
         plan.run_argv = run_argv
         rec = load(directory, cwd, argv)
         if rec is None or rec.get("runner") != runner:
             return plan
         ids = [str(i) for i in rec["ids"]]
-        if full_forced(environ):
+        if full_forced(environ, cwd):
             plan.say(f"a full run was requested (NUCLEOS_HEAVY_FULL=1); the {len(ids)} recorded "
                      "failure(s) are not run first")
+            return plan
+        if rec.get("complete") is not True:
+            plan.say("not narrowed (the recorded failures may be incomplete: that run stopped "
+                     "at its first failing binary); running in full")
             return plan
         changed = changed_tests_since(cwd, rec) if runner == "js" else []
         narrowed, why = narrow(runner, run_argv, ids, changed)
@@ -408,6 +451,7 @@ def prepare(argv: list[str], run_argv: list[str], directory: Path, cwd: str,
             plan.say(f"not narrowed ({why}); running in full")
             return plan
         plan.narrowed, plan.ids, plan.run_argv = True, ids, narrowed
+        plan.complete = True  # a subset of a complete record, run without fail-fast
         shown = ", ".join(ids[:5]) + (f" and {len(ids) - 5} more" if len(ids) > 5 else "")
         extra = f" (+ changed test files: {', '.join(changed)})" if changed else ""
         plan.say(f"re-running ONLY the {len(ids)} test(s) that failed last time: {shown}{extra}. "

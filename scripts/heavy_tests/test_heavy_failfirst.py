@@ -210,9 +210,11 @@ class BrokerTests(unittest.TestCase):
     def test_failure_is_recorded(self) -> None:
         rc, err, args = self.run_cmd(["cargo", "test", "-p", "x"], CARGO_OUT, 101)
         self.assertEqual(rc, 101)
-        self.assertEqual(args, ["test", "-p", "x"])  # the first run is always full
+        # the first run is always full, and complete: --no-fail-fast reaches cargo
+        self.assertEqual(args, ["test", "-p", "x", "--no-fail-fast"])
         recs = self.records()
         self.assertEqual(len(recs), 1)
+        self.assertIs(recs[0]["complete"], True)
         self.assertEqual(recs[0]["ids"], ["a::bad_one", "b::bad_two"])
         self.assertEqual(recs[0]["runner"], "cargo-test")
         self.assertNotIn("ONLY", err)
@@ -220,9 +222,10 @@ class BrokerTests(unittest.TestCase):
     def test_next_run_is_narrowed_for_each_runner(self) -> None:
         cases = [
             (["cargo", "nextest", "run", "-p", "x"], NEXTEST_OUT,
-             ["nextest", "run", "-p", "x", "-E", "test(=tests::bad_one) | test(=tests::bad_two)"]),
+             ["nextest", "run", "-p", "x", "--no-fail-fast", "-E",
+              "test(=tests::bad_one) | test(=tests::bad_two)"]),
             (["cargo", "test", "-p", "x"], CARGO_OUT,
-             ["test", "-p", "x", "--", "a::bad_one", "b::bad_two", "--exact"]),
+             ["test", "-p", "x", "--no-fail-fast", "--", "a::bad_one", "b::bad_two", "--exact"]),
             # one name, and no `^` on Windows: cmd.exe eats `|` and `^` in the fake's .cmd shim
             # (the real go.exe is no shim); the multi-name pattern is in test_narrow_go_and_js
             (["go", "test", "./..."], "--- FAIL: TestBad (0.00s)\nFAIL\n",
@@ -245,10 +248,11 @@ class BrokerTests(unittest.TestCase):
         rc, err, args = self.run_cmd(argv, "test result: ok\n", 0)
         self.assertEqual(rc, 0)
         self.assertIn("ONLY", err)
-        self.assertIn("not the whole suite", err)  # a narrowed pass is never reported as green
+        self.assertIn("PARTIAL pass", err)  # a narrowed pass is never reported as green
+        self.assertIn("only 2 previously failing tests re-ran", err)
         self.assertEqual(self.records(), [])
         rc, err, args = self.run_cmd(argv, "test result: ok\n", 0)
-        self.assertEqual(args, ["test", "-p", "x"])
+        self.assertEqual(args, ["test", "-p", "x", "--no-fail-fast"])
         self.assertNotIn("ONLY", err)
 
     def test_still_failing_narrowed_run_replaces_the_record(self) -> None:
@@ -270,7 +274,7 @@ class BrokerTests(unittest.TestCase):
         argv = ["cargo", "test"]
         self.run_cmd(argv, CARGO_OUT, 101)
         rc, err, args = self.run_cmd(argv, CARGO_OUT, 101, NUCLEOS_HEAVY_FULL="1")
-        self.assertEqual(args, ["test"])
+        self.assertEqual(args, ["test", "--no-fail-fast"])
         self.assertNotIn("re-running ONLY", err)
         self.assertIn("full run was requested", err)
 
@@ -325,7 +329,7 @@ class BrokerTests(unittest.TestCase):
         self.run_cmd(argv, "Segmentation fault\n", 139)  # narrowed run died without ids
         self.assertEqual(self.records(), [])
         rc, err, args = self.run_cmd(argv, "", 0)
-        self.assertEqual(args, ["test"])
+        self.assertEqual(args, ["test", "--no-fail-fast"])
 
     def test_unparseable_first_failure_records_nothing_and_says_so(self) -> None:
         rc, err, args = self.run_cmd(["go", "test", "./..."], "panic: boom\n", 2)
@@ -343,8 +347,47 @@ class BrokerTests(unittest.TestCase):
         argv = ["cargo", "test"]
         self.run_cmd(argv, CARGO_OUT, 101)
         rc, err, args = self.run_cmd(argv, "", 0, cwd=self.repo2)
-        self.assertEqual(args, ["test"])
+        self.assertEqual(args, ["test", "--no-fail-fast"])
         self.assertNotIn("ONLY", err)
+
+    def test_final_gate_trees_run_full_whoever_calls(self) -> None:
+        for name in ("postgate-demo", "integration-7"):
+            with self.subTest(tree=name):
+                tree = _fp.make_repo(self.tmp / "gt" / ".nucleos" / "worktrees" / name)
+                argv = ["cargo", "test"]
+                self.run_cmd(argv, CARGO_OUT, 101, cwd=tree)
+                rc, err, args = self.run_cmd(argv, CARGO_OUT, 101, cwd=tree)
+                self.assertEqual(args, ["test", "--no-fail-fast"])
+                self.assertNotIn("re-running ONLY", err)
+
+    def test_no_fail_fast_goes_before_the_double_dash(self) -> None:
+        _, _, args = self.run_cmd(["cargo", "test", "--", "--nocapture"], "", 0)
+        self.assertEqual(args, ["test", "--no-fail-fast", "--", "--nocapture"])
+        _, _, args = self.run_cmd(["cargo", "nextest", "run"], "", 0)
+        self.assertEqual(args, ["nextest", "run", "--no-fail-fast"])
+        _, _, args = self.run_cmd(["cargo", "test", "--no-fail-fast"], "", 0)
+        self.assertEqual(args, ["test", "--no-fail-fast"], "never added twice")
+
+    def test_fail_fast_run_is_incomplete_and_never_narrows(self) -> None:
+        argv = ["cargo", "test", "--fail-fast"]
+        self.run_cmd(argv, CARGO_OUT, 101)
+        self.assertIs(self.records()[0]["complete"], False)
+        rc, err, args = self.run_cmd(argv, "", 0)
+        self.assertEqual(args, ["test", "--fail-fast"])
+        self.assertIn("not narrowed", err)
+        self.assertIn("incomplete", err)
+        self.assertNotIn("PARTIAL", err)
+
+    def test_record_without_complete_flag_is_not_narrowed(self) -> None:
+        argv = ["cargo", "test"]
+        self.run_cmd(argv, CARGO_OUT, 101)
+        p = next((self.state / "failfirst").glob("*.json"))
+        rec = json.loads(p.read_text(encoding="utf-8"))
+        del rec["complete"]
+        p.write_text(json.dumps(rec), encoding="utf-8")
+        rc, err, args = self.run_cmd(argv, "", 0)
+        self.assertEqual(args, ["test", "--no-fail-fast"])
+        self.assertIn("incomplete", err)
 
     def test_compile_error_keeps_the_record(self) -> None:
         argv = ["cargo", "test"]

@@ -186,16 +186,59 @@ class OpenReaderBlocksUnlink(_State):
         def flaky():
             calls.append(1)
             if len(calls) < 3:
-                raise PermissionError(13, "in use")
+                e = PermissionError(13, "in use")
+                e.winerror = 32
+                raise e
             return "done"
 
         self.assertEqual(heavy_wait.retry_io(flaky, sleep=lambda _s: None), "done")
+        def stuck():
+            e = PermissionError(13, "x")
+            e.winerror = 32
+            raise e
+
         with self.assertRaises(PermissionError):
-            heavy_wait.retry_io(lambda: (_ for _ in ()).throw(PermissionError(13, "x")),
-                                attempts=3, sleep=lambda _s: None)
+            heavy_wait.retry_io(stuck, attempts=3, sleep=lambda _s: None)
         with self.assertRaises(FileNotFoundError):
             heavy_wait.retry_io(lambda: (_ for _ in ()).throw(FileNotFoundError()),
                                 sleep=lambda _s: None)
+
+    def test_retry_io_retries_only_windows_sharing_violations(self):
+        # A plain permission error (a read-only file, a foreign owner) never clears by waiting.
+        for exc in (PermissionError(13, "denied"), PermissionError(1, "not permitted")):
+            calls = []
+
+            def denied(exc=exc, calls=calls):
+                calls.append(1)
+                raise exc
+
+            with self.assertRaises(PermissionError):
+                heavy_wait.retry_io(denied, sleep=lambda _s: None)
+            if os.name != "nt":
+                self.assertEqual(len(calls), 1, "no retry without a winerror off Windows")
+        for winerror in (32, 5):
+            calls = []
+
+            def shared(winerror=winerror, calls=calls):
+                calls.append(1)
+                e = PermissionError(13, "in use")
+                e.winerror = winerror
+                if len(calls) < 3:
+                    raise e
+                return "ok"
+
+            self.assertEqual(heavy_wait.retry_io(shared, sleep=lambda _s: None), "ok")
+        calls = []
+
+        def other_winerror():
+            calls.append(1)
+            e = PermissionError(13, "x")
+            e.winerror = 1314
+            raise e
+
+        with self.assertRaises(PermissionError):
+            heavy_wait.retry_io(other_winerror, sleep=lambda _s: None)
+        self.assertEqual(len(calls), 1)
 
 
 class Torn(_State):
@@ -318,6 +361,94 @@ class SlowRowSteps(_State):
         self.assertTrue(any({"entries", "order", "decision", "write"} <= set(s)
                             for s in steps), steps)
         self.assertTrue(all("boosted" in r for r in rows if r.get("event") == "slow"))
+
+
+class WaiterEdges(_State):
+    def _rec(self):
+        return {"pid": os.getpid(), "ctime": heavy.proc_identity(os.getpid())[1],
+                "weight": 1, "prio": 1, "argv": ["x"]}
+
+    def plant_other_holder(self, weight=2):
+        p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        self.addCleanup(p.kill)
+        (self.state / "held").mkdir(parents=True, exist_ok=True)
+        (self.state / "held" / str(p.pid)).write_text(json.dumps(
+            {"pid": p.pid, "ctime": heavy.proc_identity(p.pid)[1], "weight": weight, "prio": 1}))
+
+    def test_corrupt_own_queue_file_is_rewritten_after_three_polls(self):
+        self.plant_other_holder(weight=2)  # capacity 2: the waiter stays queued
+        qfile = self.state / "queue" / f"1-5-{os.getpid()}"
+        import threading
+
+        def corrupt():
+            end = time.time() + 5
+            while time.time() < end and not qfile.exists():
+                time.sleep(0.01)
+            qfile.write_text("{not json", encoding="utf-8")
+
+        def valid():
+            try:
+                return json.loads(qfile.read_text(encoding="utf-8")).get("pid") == os.getpid()
+            except (OSError, ValueError):
+                return False
+
+        seen = []
+
+        def watch():
+            end = time.time() + 7
+            while time.time() < end:
+                if valid() and seen:
+                    seen.append("rewritten")
+                    return
+                if not valid() and qfile.exists() and not seen:
+                    seen.append("corrupt")
+                time.sleep(0.02)
+
+        for fn in (corrupt, watch):
+            threading.Thread(target=fn, daemon=True).start()
+        with mock.patch.dict(os.environ, {"NUCLEOS_HEAVY_CAPACITY": "2",
+                                          "NUCLEOS_HEAVY_POLL_S": "0.05"}):
+            ok, _ = heavy.acquire_token(self.state, self._rec(), 6.0, 5)
+        self.assertFalse(ok)
+        self.assertIn("rewritten", seen, "the corrupt queue file was never put back")
+
+    def test_grant_landing_as_the_waiter_leaves_is_not_lost(self):
+        self.plant_other_holder(weight=2)
+        qname = f"1-5-{os.getpid()}"
+        real = heavy.Mutex
+        t_start = time.time()
+        rec = self._rec()
+
+        class Late:
+            """After the cap, the leave block finds the Mutex busy, and the holder's batch
+            grant has just landed: my held record exists, my queue entry is gone."""
+
+            def __init__(self, d):
+                self.real, self.d = real(d), d
+
+            def __enter__(self):
+                if time.time() - t_start >= 0.5:
+                    q = self.d / "queue" / qname
+                    (self.d / "held" / str(os.getpid())).write_text(
+                        json.dumps({**rec, "grant": qname}), encoding="utf-8")
+                    q.unlink()
+                    raise heavy.MutexBusy("busy")
+                return self.real.__enter__()
+
+            def __exit__(self, *a):
+                return self.real.__exit__(*a)
+
+            def __getattr__(self, n):
+                return getattr(self.real, n)
+
+        with mock.patch.object(heavy, "Mutex", Late), mock.patch.dict(
+                os.environ, {"NUCLEOS_HEAVY_CAPACITY": "2", "NUCLEOS_HEAVY_POLL_S": "0.05"}):
+            ok, _ = heavy.acquire_token(self.state, rec, 0.5, 5)
+        self.assertTrue(ok, "a grant that landed as the waiter left makes it admitted")
+        self.assertEqual(list((self.state / "queue").iterdir()), [])
+        self.assertTrue((self.state / "held" / str(os.getpid())).exists())
+        heavy.release_token(self.state)  # the caller's normal release frees that record
+        self.assertFalse((self.state / "held" / str(os.getpid())).exists())
 
 
 if __name__ == "__main__":
