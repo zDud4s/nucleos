@@ -52,7 +52,27 @@ var ErrInheritedInstance = errors.New("launch: chromium did not start a new inst
 var errNoPipeReply = errors.New("launch: the browser never answered on the DevTools pipe")
 
 // probeRequest is the first message sent: it proves the pipe is live and the browser is ours.
-const probeRequest = `{"id":1,"method":"Browser.getVersion"}`
+const probeRequest = `{"id":` + probeIDText + `,"method":"Browser.getVersion"}`
+
+// probeID is far above anything cdp.Conn will count to (it numbers from 1), so the probe's reply
+// can never be mistaken for the answer to a real call. probeIDText is the same number as source text.
+const (
+	probeID     = 1 << 40
+	probeIDText = "1099511627776"
+)
+
+// ExitedError means the launched process ended with an error before it answered on the pipe: a crash,
+// a refused flag, a missing library. It is not ErrInheritedInstance, which is a clean hand-off.
+type ExitedError struct {
+	// Code is the exit status, or -1 when the process died by a signal.
+	Code int
+	// State is the platform's description of the exit ("exit status 3", "signal: killed").
+	State string
+}
+
+func (e *ExitedError) Error() string {
+	return fmt.Sprintf("launch: chromium exited before answering on the DevTools pipe (%s, code %d)", e.State, e.Code)
+}
 
 // Start launches Chromium and waits for it to answer on the DevTools pipe.
 func Start(ctx context.Context, opts Options, wait time.Duration) (*Process, error) {
@@ -141,8 +161,7 @@ func (p *Process) probe(ctx context.Context, wait time.Duration) error {
 	select {
 	case err := <-result:
 		if err != nil {
-			// The pipe broke before any reply: the process we started is gone.
-			return ErrInheritedInstance
+			return p.explainBrokenPipe(err)
 		}
 		return nil
 	case <-timer.C:
@@ -152,11 +171,51 @@ func (p *Process) probe(ctx context.Context, wait time.Duration) error {
 	}
 }
 
+// exitGrace is how long a broken pipe is given to show the process has ended before it is judged alive.
+const exitGrace = 5 * time.Second
+
+// explainBrokenPipe turns a pipe error before the first reply into the right answer by looking at how
+// the child ended: success means Chromium handed off to a surviving instance, an error exit is a
+// failed launch, and a child still running is a pipe that broke on its own.
+func (p *Process) explainBrokenPipe(pipeErr error) error {
+	done := make(chan error, 1)
+	go func() { done <- p.cmd.Wait() }()
+	select {
+	case <-done:
+	case <-time.After(exitGrace):
+		killGroupFn(p.cmd.Process.Pid)
+		_ = p.cmd.Process.Kill()
+		<-done
+		return fmt.Errorf("%w: %v", errNoPipeReply, pipeErr)
+	}
+	state := p.cmd.ProcessState
+	if state != nil && state.Success() {
+		return ErrInheritedInstance
+	}
+	exited := &ExitedError{Code: -1}
+	if state != nil {
+		exited.Code = state.ExitCode()
+		exited.State = state.String()
+	}
+	return exited
+}
+
 // Pipe returns the parent's ends of the DevTools pipe: the browser's output (buffered, already past the
 // probe reply) and the writer for commands. Hand them to cdp.NewPipe.
+//
+// The reader is also a Closer: closing it (cdp.Conn.Close does) releases a goroutine blocked on it.
 func (p *Process) Pipe() (io.Reader, io.WriteCloser) {
-	return p.reader, p.pipes.parentWrite
+	return pipeReader{Reader: p.reader, closer: p.pipes.parentRead.Close}, p.pipes.parentWrite
 }
+
+// pipeReader is the buffered read end plus the close that unblocks it. It is deliberately not a
+// *bufio.Reader, so cdp.NewPipe wraps it (reading through the buffer, losing nothing) and keeps the Closer.
+type pipeReader struct {
+	io.Reader
+	closer func() error
+}
+
+func (r pipeReader) Close() error { return r.closer() }
 
 // Stop reaps the whole process tree.
 //

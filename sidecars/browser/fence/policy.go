@@ -280,7 +280,8 @@ func Decide(policy Policy, request Request) Verdict {
 	// the reason spec §5.5's "sub-resources are unrestricted" cannot be read literally. Agent mode is
 	// launched with --proxy-bypass-list=<-loopback> precisely so the fence sees loopback traffic; the
 	// consequence is that a page CAN address this machine's own services — the núcleo's API, the
-	// other sidecars, and the browser's own debugging port, all of which answer on 127.0.0.1. An
+	// other sidecars, all of which answer on 127.0.0.1 (the browser itself does not: it has no
+	// debugging port, only a pipe). An
 	// allowlist entry is the only way in, so a profile that has business with a local service says so
 	// in configuration rather than by a page guessing a port.
 	if isLoopbackURL(request.URL) {

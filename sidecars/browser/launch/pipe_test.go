@@ -10,8 +10,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
+
+	"nucleosbrowser/cdp"
 )
 
 // TestMain turns this test binary into a fake browser when GO_FAKE_CHROME is set. It runs before any
@@ -28,10 +32,15 @@ func TestMain(m *testing.M) {
 //
 //	reply:  answers every message with a result carrying the same id, until the pipe closes
 //	exit:   exits at once without answering (Chrome handing off to a surviving instance)
+//	hold:   answers like reply, but stays up with its end of the pipe open after the pipe closes
+//	fail:   exits with status 3 without answering (a browser that crashed or refused to start)
 //	silent: reads everything and never answers
 func fakeBrowser(mode string) {
-	if mode == "exit" {
+	switch mode {
+	case "exit":
 		return
+	case "fail":
+		os.Exit(3)
 	}
 	in, out := fakePipeEnds()
 	if in == nil || out == nil {
@@ -41,9 +50,12 @@ func fakeBrowser(mode string) {
 	for {
 		raw, err := reader.ReadBytes(0)
 		if err != nil {
+			if mode == "hold" {
+				time.Sleep(time.Minute)
+			}
 			return
 		}
-		if mode != "reply" {
+		if mode != "reply" && mode != "hold" {
 			continue
 		}
 		var msg struct {
@@ -136,5 +148,78 @@ func TestStartOpensNoDevToolsActivePortFile(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(profile, "DevToolsActivePort")); !os.IsNotExist(err) {
 		t.Fatalf("DevToolsActivePort exists or stat failed unexpectedly: %v", err)
+	}
+}
+
+func TestStartReportsTheExitStatusWhenTheLaunchedProcessFails(t *testing.T) {
+	_, _, err := startFake(t, "fail", 10*time.Second)
+	if err == nil {
+		t.Fatal("start succeeded against a browser that exited with an error")
+	}
+	if errors.Is(err, ErrInheritedInstance) {
+		t.Fatalf("a failed exit was reported as an inherited instance: %v", err)
+	}
+	var exited *ExitedError
+	if !errors.As(err, &exited) {
+		t.Fatalf("got %T %v, want *ExitedError", err, err)
+	}
+	if exited.Code != 3 {
+		t.Fatalf("exit code = %d, want 3", exited.Code)
+	}
+	if !strings.Contains(err.Error(), "3") {
+		t.Fatalf("the message must carry the status: %q", err)
+	}
+}
+
+func TestStartKeepsTheTimeoutErrorForASilentLiveBrowser(t *testing.T) {
+	_, _, err := startFake(t, "silent", 500*time.Millisecond)
+	if !errors.Is(err, errNoPipeReply) {
+		t.Fatalf("got %v, want errNoPipeReply", err)
+	}
+	if errors.Is(err, ErrInheritedInstance) {
+		t.Fatalf("a live browser must not read as an inherited instance: %v", err)
+	}
+}
+
+func TestProbeIdCannotCollideWithConnIds(t *testing.T) {
+	// cdp.Conn numbers its commands 1, 2, 3...; the probe runs before a Conn exists but its reply id
+	// must stay out of that range so a late duplicate could never be matched to a real call.
+	if probeID < 1<<32 {
+		t.Fatalf("probeID = %d, too close to the Conn's own counter", probeID)
+	}
+	if !strings.Contains(probeRequest, fmt.Sprintf(`"id":%d,`, probeID)) {
+		t.Fatalf("probeRequest %q does not use probeID %d", probeRequest, probeID)
+	}
+}
+
+func readLoops() int {
+	buf := make([]byte, 1<<20)
+	n := runtime.Stack(buf, true)
+	return strings.Count(string(buf[:n]), "cdp.(*Conn).readLoop")
+}
+
+func TestClosingTheConnReleasesTheReaderWhilePeerIsOpen(t *testing.T) {
+	before := readLoops()
+	process, _, err := startFake(t, "hold", 10*time.Second)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	r, w := process.Pipe()
+	conn := cdp.NewPipe(r, w)
+	// The browser is alive and holds its end open: only Close can end the reader.
+	started := time.Now().Add(2 * time.Second)
+	for readLoops() != before+1 {
+		if time.Now().After(started) {
+			t.Fatalf("readLoop goroutines = %d, want %d while the conn is open", readLoops(), before+1)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	_ = conn.Close()
+	deadline := time.Now().Add(3 * time.Second)
+	for readLoops() > before {
+		if time.Now().After(deadline) {
+			t.Fatalf("the reader goroutine is still blocked 3s after Close (%d, baseline %d)", readLoops(), before)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }

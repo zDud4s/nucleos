@@ -173,6 +173,10 @@ func (c *Conn) readLoop() {
 			c.shutdown(err)
 			return
 		}
+		if len(raw) == 0 {
+			// A bare NUL (or an empty WebSocket frame) carries no message; it is not a protocol breach.
+			continue
+		}
 		var msg message
 		if err := json.Unmarshal(raw, &msg); err != nil {
 			// A browser that sends something unparseable is a browser we can no longer reason
