@@ -26,6 +26,7 @@ use chrono::{SecondsFormat, Utc};
 use serde_json::Value;
 use sqlx::SqlitePool;
 
+use super::autofmt;
 use super::decisions;
 use super::engine::{apply_transition, branch_node_may_close};
 use super::http::job_lock;
