@@ -74,15 +74,18 @@ const STATE_TONE = { active: "active", paused: "pending", needs_login: "danger" 
 const STATE_TEXT = { active: "Active", paused: "Paused", needs_login: "Needs login" } as const;
 
 function AccountCard({ account, onLogin }: { account: PoolAccount; onLogin: (view: LoginView) => void }) {
-  const { rename, pause, resume, remove, logout } = useAccountActions();
+  const { rename, pause, resume, remove, logout, setToken } = useAccountActions();
   const relogin = useReloginAccount();
   const [confirmLogout, setConfirmLogout] = useState(false);
   const [renaming, setRenaming] = useState<string | null>(null);
   const [confirm, setConfirm] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [replacing, setReplacing] = useState<string | null>(null);
+  const isToken = account.kind === "token";
 
   const fail = (e: unknown) => setError(isApiRefusal(e) ? e.code : "the daemon did not answer");
-  const signIn = () => relogin.mutate(account.id, { onSuccess: onLogin, onError: fail });
+  const signIn = () =>
+    isToken ? setReplacing("") : relogin.mutate(account.id, { onSuccess: onLogin, onError: fail });
 
   const tryRemove = (force: boolean) => {
     remove.mutate(
@@ -121,7 +124,7 @@ function AccountCard({ account, onLogin }: { account: PoolAccount; onLogin: (vie
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end" className="ac-menu">
             <DropdownMenuItem onSelect={() => setRenaming(account.label)}>Rename</DropdownMenuItem>
-            <DropdownMenuItem onSelect={signIn}>Redo login</DropdownMenuItem>
+            <DropdownMenuItem onSelect={signIn}>{isToken ? "Replace token" : "Redo login"}</DropdownMenuItem>
             {account.state === "needs_login" ? null : (
               <DropdownMenuItem onSelect={() => setConfirmLogout(true)}>Log out</DropdownMenuItem>
             )}
@@ -151,6 +154,30 @@ function AccountCard({ account, onLogin }: { account: PoolAccount; onLogin: (vie
           <input aria-label="New label" value={renaming} onChange={(e) => setRenaming(e.target.value)} />
           <Button type="submit" variant="primary" disabled={renaming.trim() === ""}>Save</Button>
           <Button onClick={() => setRenaming(null)}>Cancel</Button>
+        </form>
+      ) : null}
+
+      {replacing !== null ? (
+        <form
+          className="ac-token"
+          onSubmit={(event) => {
+            event.preventDefault();
+            const token = replacing.trim();
+            if (token === "") return;
+            // The token leaves state as soon as it is sent, whatever the answer.
+            setReplacing(null);
+            setToken.mutate({ id: account.id, token }, { onError: fail });
+          }}
+        >
+          <input
+            type="password"
+            aria-label="New token"
+            autoComplete="off"
+            value={replacing}
+            onChange={(e) => setReplacing(e.target.value)}
+          />
+          <Button type="submit" variant="primary" disabled={replacing.trim() === "" || setToken.isPending}>Save</Button>
+          <Button onClick={() => setReplacing(null)}>Cancel</Button>
         </form>
       ) : null}
 
@@ -192,7 +219,9 @@ function AccountCard({ account, onLogin }: { account: PoolAccount; onLogin: (vie
 
       {account.state === "needs_login" ? (
         <div className="ac-card-primary">
-          <Button variant="primary" onClick={signIn} disabled={relogin.isPending}>Sign in</Button>
+          <Button variant="primary" onClick={signIn} disabled={relogin.isPending}>
+            {isToken ? "Replace token" : "Sign in"}
+          </Button>
         </div>
       ) : account.state === "paused" ? (
         <div className="ac-card-primary">

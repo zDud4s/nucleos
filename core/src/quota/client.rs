@@ -68,12 +68,26 @@ where
 }
 
 /// One account the sidecar should read: its pool id, its engine and its credential directory
-/// (absolute).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// (absolute). A token account also carries its `token`, which the sidecar uses instead of the
+/// directory's credentials file; it is sent only when there is one, and never printed by `Debug`.
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct AccountDir {
     pub id: String,
     pub engine: String,
     pub dir: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+}
+
+impl std::fmt::Debug for AccountDir {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccountDir")
+            .field("id", &self.id)
+            .field("engine", &self.engine)
+            .field("dir", &self.dir)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -320,12 +334,34 @@ mod tests {
             id: "claude:a".into(),
             engine: "claude".into(),
             dir: "/d".into(),
+            token: None,
         }];
         let body = serde_json::json!({ "accounts": accounts });
         assert_eq!(
             body["accounts"][0],
             serde_json::json!({"id": "claude:a", "engine": "claude", "dir": "/d"})
         );
+    }
+
+    #[test]
+    fn a_token_is_serialised_only_when_there_is_one_and_never_debug_printed() {
+        let with = AccountDir {
+            id: "claude:t".into(),
+            engine: "claude".into(),
+            dir: "/d".into(),
+            token: Some("sk-ant-oat01-fake".into()),
+        };
+        let body = serde_json::to_value(&with).unwrap();
+        assert_eq!(body["token"], "sk-ant-oat01-fake");
+        let printed = format!("{with:?}");
+        assert!(!printed.contains("sk-ant-oat01-fake"), "{printed}");
+        assert!(printed.contains("redacted"), "{printed}");
+        let without = serde_json::to_value(AccountDir {
+            token: None,
+            ..with
+        })
+        .unwrap();
+        assert!(without.get("token").is_none());
     }
 
     /// A window with no reset is a real answer (the 2026-09-19 capture had one), and `severity` is

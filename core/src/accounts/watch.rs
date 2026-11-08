@@ -1,7 +1,9 @@
 //! The auth watch per account (spec sections 6 and 11): a subscription account whose credential
 //! file went missing is flagged `needs_login`, leaves the pool, and the owner is told through the
 //! feed. Existence only: core never reads a credential. An account on the CLI's own directory
-//! (no `credential_locator`) is not watched here; the run-time auth watch covers it.
+//! (no `credential_locator`) is not watched here; the run-time auth watch covers it. A token
+//! account has no credential file at all (its token is in the credential store), so the sweep
+//! skips it; a rejection reported by a run (`report_rejected`) still flags it.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -80,6 +82,20 @@ pub async fn report_rejected(db: &SqlitePool, id: &AccountId) {
     match store::get(db, id).await {
         Ok(Some(account)) if account.state == AccountState::Active => {
             if flag(db, &account, "the provider rejected its credentials").await {
+                startup::accounts_changed(db).await;
+            }
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "account auth watch could not read an account"),
+    }
+}
+
+/// A token account was about to launch and its token is gone from the credential store: same
+/// outcome as a rejected credential, so the owner pastes a new one.
+pub async fn report_token_missing(db: &SqlitePool, id: &AccountId) {
+    match store::get(db, id).await {
+        Ok(Some(account)) if account.state == AccountState::Active => {
+            if flag(db, &account, "its token is no longer stored").await {
                 startup::accounts_changed(db).await;
             }
         }
@@ -192,6 +208,35 @@ mod tests {
             .unwrap();
         assert_eq!(rows, 1);
         assert_eq!(sweep(&db, lookup).await, 0, "already flagged: said once");
+    }
+
+    #[tokio::test]
+    async fn the_sweep_skips_token_accounts_but_a_rejection_still_flags_them() {
+        let db = pool().await;
+        // A token account's directory is empty by design: no credential file is no reason to flag.
+        let empty = tempfile::tempdir().unwrap();
+        store::insert(
+            &db,
+            &Account {
+                id: AccountId("fake:0000000t".into()),
+                engine: "fake".into(),
+                provider: "fakeco".into(),
+                label: "tok".into(),
+                kind: AccountKind::Token,
+                credential_locator: Some(empty.path().to_string_lossy().into_owned()),
+                state: AccountState::Active,
+                created_at: "t".into(),
+                updated_at: "t".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(sweep(&db, lookup).await, 0);
+        assert_eq!(state_of(&db, "0000000t").await, AccountState::Active);
+
+        report_rejected(&db, &AccountId("fake:0000000t".into())).await;
+        assert_eq!(state_of(&db, "0000000t").await, AccountState::NeedsLogin);
     }
 
     #[tokio::test]

@@ -18,7 +18,7 @@ export const accountKeys = {
 };
 
 export type AccountState = "active" | "paused" | "needs_login";
-export type AccountKind = "subscription" | "api_key";
+export type AccountKind = "subscription" | "api_key" | "token";
 
 /** One usage window of an account (`5h`, `7d`, ...). */
 export interface UsageWindow {
@@ -139,6 +139,17 @@ export function useStartAccount() {
   });
 }
 
+/** Adds a Claude account from a pasted subscription token (`claude setup-token`); answers 201. */
+export function useAddTokenAccount() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { engine: string; label: string; token: string }) =>
+      apiFetch<PoolAccount>("/accounts/token", { method: "POST", body: JSON.stringify(body) }),
+    retry: false,
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: accountKeys.all }),
+  });
+}
+
 /** Starts the login of an existing account again. */
 export function useReloginAccount() {
   return useMutation({
@@ -221,5 +232,11 @@ export function useAccountActions() {
     retry: false,
     onSuccess: refresh,
   });
-  return { rename, pause, resume, remove, logout };
+  const setToken = useMutation({
+    mutationFn: ({ id, token }: { id: string; token: string }) =>
+      apiFetch<PoolAccount>(accountPath(id, "/token"), { method: "POST", body: JSON.stringify({ token }) }),
+    retry: false,
+    onSuccess: refresh,
+  });
+  return { rename, pause, resume, remove, logout, setToken };
 }

@@ -3,14 +3,18 @@ package serve
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"nucleosquota/claude"
 	"nucleosquota/config"
 	"nucleosquota/reading"
 )
@@ -185,6 +189,71 @@ func Test_the_response_never_carries_the_directory(t *testing.T) {
 
 	if strings.Contains(rec.Body.String(), "secret-dir-name") {
 		t.Errorf("response leaks the account dir: %s", rec.Body.String())
+	}
+}
+
+const fakeToken = "sk-ant-oat01-fake"
+
+// A claude account with a token is read by the token reader; without one, by the dir reader.
+func Test_a_token_selects_the_token_reader_and_no_token_the_dir_reader(t *testing.T) {
+	oldDir, oldTok := newDirReader, newTokenReader
+	defer func() { newDirReader, newTokenReader = oldDir, oldTok }()
+	var used []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		used = append(used, r.Header.Get("Authorization"))
+		_, _ = w.Write([]byte(`{"five_hour":{"utilization":10.0}}`))
+	}))
+	defer srv.Close()
+	var dirCalls int
+	newDirReader = func(d time.Duration, dir string) *claude.Reader {
+		dirCalls++
+		return oldDir(d, dir)
+	}
+	newTokenReader = func(d time.Duration, tok string) *claude.Reader {
+		return oldTok(d, tok).WithEndpoint(srv.URL)
+	}
+	read := liveAccount(accTestCfg)
+
+	p := read(context.Background(), Account{ID: "t", Engine: "claude", Dir: absDir(t, "t"), Token: fakeToken}, time.Now())
+	if len(p.Windows) != 1 || len(used) != 1 || used[0] != "Bearer "+fakeToken || dirCalls != 0 {
+		t.Errorf("token path: windows=%d used=%v dirCalls=%d", len(p.Windows), used, dirCalls)
+	}
+	read(context.Background(), Account{ID: "d", Engine: "claude", Dir: absDir(t, "d")}, time.Now())
+	if dirCalls != 1 {
+		t.Errorf("dirCalls = %d, want 1", dirCalls)
+	}
+}
+
+// The token is never in GET /quota output, in a 400 body, or in any fmt/log rendering of an Account.
+func Test_the_token_never_appears_in_output_or_logs(t *testing.T) {
+	var logs strings.Builder
+	log.SetOutput(&logs)
+	defer log.SetOutput(os.Stderr)
+
+	var seen []Account
+	c := &cache{}
+	quota := quotaHandler(accTestCfg, accountReaders(&seen), c, time.Now)
+	raw, _ := json.Marshal(AccountsRequest{Accounts: []Account{{ID: "a", Engine: "claude", Dir: absDir(t, "a"), Token: fakeToken}}})
+	rec := put(t, accountsHandler(c), http.MethodPut, string(raw))
+	if strings.Contains(rec.Body.String(), fakeToken) {
+		t.Errorf("PUT response leaks the token: %s", rec.Body.String())
+	}
+	rec, _ = doGet(t, quota, "")
+	if strings.Contains(rec.Body.String(), fakeToken) {
+		t.Errorf("GET /quota leaks the token: %s", rec.Body.String())
+	}
+
+	a := Account{ID: "a", Engine: "claude", Dir: "/x", Token: fakeToken}
+	log.Printf("%v %+v %#v %s", a, a, a, a)
+	log.Print(a)
+	err := fmt.Errorf("bad: %v", []Account{a})
+	if strings.Contains(logs.String(), fakeToken) || strings.Contains(err.Error(), fakeToken) {
+		t.Errorf("token leaked via fmt: %q / %q", logs.String(), err.Error())
+	}
+
+	bad := `{"accounts":[{"id":"a","engine":"claude","dir":"rel","token":"` + fakeToken + `"}]}`
+	if rec := put(t, accountsHandler(&cache{}), http.MethodPut, bad); strings.Contains(rec.Body.String(), fakeToken) {
+		t.Errorf("400 body leaks the token: %s", rec.Body.String())
 	}
 }
 

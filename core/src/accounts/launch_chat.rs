@@ -14,7 +14,9 @@ use super::pool::{Holder, PickRequest, PoolState};
 use super::provider::{LimitHit, ProviderAdapter};
 use super::settings::AccountPoolDoc;
 use super::store::{self, ChatAccountRow};
-use super::{ACCOUNT_ENV_MARKER, Account, AccountChoice, AccountId, AccountPick};
+use super::{
+    ACCOUNT_ENV_MARKER, Account, AccountChoice, AccountId, AccountKind, AccountPick, token, watch,
+};
 
 fn parse_time(text: Option<&str>) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(text?)
@@ -39,6 +41,70 @@ fn env_for(adapter: &dyn ProviderAdapter, account: &Account) -> Vec<(String, Str
         account.id.as_str().to_owned(),
     ));
     env
+}
+
+/// Adds a token account's token to a launch env (replacing any earlier entry of the same name).
+fn add_token(env: &mut Vec<(String, String)>, secret: &str) {
+    env.retain(|(key, _)| key != token::ENV_VAR);
+    env.push(token::env_pair(secret));
+}
+
+/// How many times a pick is redone after a token account turned out to have no token. Each redo
+/// follows the account being flagged `needs_login`, so it cannot be chosen again; the bound only
+/// guards a flag that did not stick.
+const TOKEN_REPICKS: usize = 4;
+
+/// `pick_with`, then the credential a token account needs: its token is read from the credential
+/// store (on a blocking thread) and added to the env. A token account whose token is gone is
+/// flagged `needs_login` and the pick is redone without it; one whose store cannot be read is not
+/// flagged (the failure may be passing) and yields no pick at all. A launch never starts on a token
+/// account without its token.
+async fn pick_with_credentials(
+    db: &SqlitePool,
+    pool: &Arc<PoolState>,
+    adapter: &dyn ProviderAdapter,
+    doc: &AccountPoolDoc,
+    holder: Holder,
+    session: SessionView,
+    now: DateTime<Utc>,
+) -> AccountPick {
+    for _ in 0..TOKEN_REPICKS {
+        let pick = pick_with(pool, adapter, doc, holder.clone(), session.clone(), now);
+        let Some(id) = pick.account_id.clone() else {
+            return pick;
+        };
+        let is_token = pool
+            .view()
+            .candidates
+            .iter()
+            .any(|c| c.account.id == id && c.account.kind == AccountKind::Token);
+        if !is_token {
+            return pick;
+        }
+        match token::load(&id).await {
+            Ok(Some(secret)) => {
+                let mut pick = pick;
+                add_token(&mut pick.env, &secret);
+                return pick;
+            }
+            Ok(None) => {
+                // Dropping the pick releases its reservation.
+                drop(pick);
+                watch::report_token_missing(db, &id).await;
+            }
+            Err(error) => {
+                drop(pick);
+                tracing::warn!(%error, account = %id.as_str(), "could not read an account token");
+                return AccountPick {
+                    blocked: Some(Decision::NoCandidate {
+                        why: "the token of the account could not be read".to_owned(),
+                    }),
+                    ..AccountPick::default_launch()
+                };
+            }
+        }
+    }
+    AccountPick::default_launch()
 }
 
 /// Decides and reserves under the pool's one lock, then turns the decision into a launch.
@@ -138,7 +204,8 @@ pub async fn pick_for_chat_turn(
             .ok()
             .flatten();
     }
-    pick_with(
+    pick_with_credentials(
+        db,
         pool,
         adapter,
         &doc,
@@ -146,6 +213,7 @@ pub async fn pick_for_chat_turn(
         session,
         now,
     )
+    .await
 }
 
 /// Picks the account for one run launch on `engine`: the run's own `account_choice`, else the
@@ -178,7 +246,7 @@ pub async fn pick_for_run_launch(
         choice: effective_choice(own, &doc.default_choice),
         ..SessionView::default()
     };
-    pick_with(pool, adapter, &doc, Holder::Run(run_id), session, now)
+    pick_with_credentials(db, pool, adapter, &doc, Holder::Run(run_id), session, now).await
 }
 
 /// Reads a launch's output for a limit error and marks the window exhausted when there is one,
@@ -373,6 +441,106 @@ mod tests {
             choice,
             ..SessionView::default()
         }
+    }
+
+    async fn db() -> SqlitePool {
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(":memory:")
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        crate::storage::MIGRATOR.run(&db).await.unwrap();
+        db
+    }
+
+    fn token_account(id: &str) -> Account {
+        let mut built = account(id);
+        built.kind = AccountKind::Token;
+        built.credential_locator = Some("/d".into());
+        built
+    }
+
+    #[test]
+    fn the_token_joins_the_env_of_the_launch_once() {
+        let account = token_account("fake:t");
+        let mut env = env_for(&adapter(), &account);
+        add_token(&mut env, "sk-ant-oat01-fake");
+        add_token(&mut env, "sk-ant-oat01-fake-2");
+        let named = |name: &str| -> Vec<&str> {
+            env.iter()
+                .filter(|(key, _)| key == name)
+                .map(|(_, value)| value.as_str())
+                .collect()
+        };
+        assert_eq!(named(token::ENV_VAR), vec!["sk-ant-oat01-fake-2"]);
+        assert_eq!(named("FAKE_HOME"), vec!["/d"]);
+        assert_eq!(crate::accounts::account_of(&env), Some("fake:t"));
+    }
+
+    #[tokio::test]
+    async fn a_token_account_launches_with_its_token() {
+        let db = db().await;
+        let now = Utc::now();
+        let account = token_account("fake:token-launch");
+        token::store(&account.id, "sk-ant-oat01-fake")
+            .await
+            .unwrap();
+        let pool = PoolState::new();
+        pool.set_accounts(vec![account.clone()]);
+        pool.set_usage(vec![usage("fake:token-launch", &[("1h", 0.1, 600)], now)]);
+
+        let pick = pick_with_credentials(
+            &db,
+            &pool,
+            &adapter(),
+            &AccountPoolDoc::default(),
+            Holder::Run(11),
+            SessionView::default(),
+            now,
+        )
+        .await;
+
+        assert_eq!(pick.account_id.as_ref(), Some(&account.id));
+        assert!(
+            pick.env
+                .contains(&(token::ENV_VAR.to_owned(), "sk-ant-oat01-fake".to_owned()))
+        );
+        token::delete(&account.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_token_account_without_its_token_is_flagged_and_never_launched() {
+        let db = db().await;
+        let now = Utc::now();
+        let account = token_account("fake:token-gone");
+        store::insert(&db, &account).await.unwrap();
+        let pool = PoolState::new();
+        pool.set_accounts(vec![account.clone()]);
+        pool.set_usage(vec![usage("fake:token-gone", &[("1h", 0.1, 600)], now)]);
+
+        let pick = pick_with_credentials(
+            &db,
+            &pool,
+            &adapter(),
+            &AccountPoolDoc::default(),
+            Holder::Run(12),
+            SessionView::default(),
+            now,
+        )
+        .await;
+
+        assert!(pick.account_id.is_none() && pick.env.is_empty());
+        assert_eq!(
+            pool.live_sessions(&account.id),
+            0,
+            "the reservation is released"
+        );
+        let stored = store::get(&db, &account.id).await.unwrap().unwrap();
+        assert_eq!(stored.state, crate::accounts::AccountState::NeedsLogin);
     }
 
     #[test]

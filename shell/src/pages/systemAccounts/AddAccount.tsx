@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   isLoginFinished,
+  useAddTokenAccount,
   useCancelLogin,
   useLogin,
   useStartAccount,
@@ -83,6 +84,14 @@ function AddAccountStep({
   const label = typed ?? suggestLabel(engine, taken);
   const trimmed = label.trim();
   const start = useStartAccount();
+  const addToken = useAddTokenAccount();
+  const [wanted, setMethod] = useState<"signin" | "token">("signin");
+  // Only Claude takes a token; another engine falls back to the sign-in flow.
+  const tokenOk = engine === "claude";
+  const method = tokenOk ? wanted : "signin";
+  const [token, setToken] = useState("");
+  const pasting = method === "token";
+  const failed = pasting ? addToken : start;
 
   const hint =
     trimmed === ""
@@ -97,6 +106,14 @@ function AddAccountStep({
       onSubmit={(event) => {
         event.preventDefault();
         if (hint !== null) return;
+        if (pasting) {
+          const pasted = token.trim();
+          if (pasted === "") return;
+          // The token leaves state as soon as it is sent, whatever the answer.
+          setToken("");
+          addToken.mutate({ engine, label: trimmed, token: pasted }, { onSuccess: onClose });
+          return;
+        }
         start.mutate({ engine, label: trimmed }, { onSuccess: onStarted });
       }}
     >
@@ -118,21 +135,46 @@ function AddAccountStep({
       <Field label="Account name" helper="Shown on the account's card and in the chat account chip.">
         <input value={label} onChange={(e) => setTyped(e.target.value)} autoComplete="off" />
       </Field>
+      <div className="ac-methods" role="group" aria-label="Method">
+        <button
+          type="button"
+          aria-pressed={!pasting}
+          className={`ac-engine${!pasting ? " ac-engine-on" : ""}`}
+          onClick={() => setMethod("signin")}
+        >
+          <strong>Sign in</strong>
+        </button>
+        <button
+          type="button"
+          aria-pressed={pasting}
+          disabled={!tokenOk}
+          className={`ac-engine${pasting ? " ac-engine-on" : ""}`}
+          onClick={() => setMethod("token")}
+        >
+          <strong>Paste token</strong>
+        </button>
+      </div>
+      {!tokenOk ? <p className="ac-hint">Only Claude accounts can use a token.</p> : null}
+      {pasting ? (
+        <Field label="Token" helper="Run `claude setup-token` in a terminal and paste the token it prints.">
+          <input type="password" value={token} onChange={(e) => setToken(e.target.value)} autoComplete="off" />
+        </Field>
+      ) : null}
       <div className="ac-add-actions">
         <Button onClick={onClose}>Cancel</Button>
         <Button
           type="submit"
           variant="primary"
-          disabled={hint !== null || start.isPending}
+          disabled={hint !== null || start.isPending || addToken.isPending || (pasting && token.trim() === "")}
           aria-describedby={hint === null ? undefined : "ac-add-hint"}
         >
-          Start login
+          {pasting ? "Add account" : "Start login"}
         </Button>
       </div>
       {hint !== null ? <p id="ac-add-hint" className="ac-hint">{hint}</p> : null}
-      {start.isError ? (
+      {failed.isError ? (
         <div role="alert" className="ac-error">
-          {isApiRefusal(start.error) ? (start.error.detail || start.error.code) : "the daemon did not answer"}
+          {isApiRefusal(failed.error) ? (failed.error.detail || failed.error.code) : "the daemon did not answer"}
         </div>
       ) : null}
     </form>
