@@ -957,7 +957,7 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
             &control_token,
         )
         .await;
-        env.extend(pick.env.drain(..));
+        env.append(&mut pick.env);
 
         // A turn with no `resume` is a conversation that was deliberately let go of — it read
         // third-party text, or somebody asked for a fresh context — so a process still holding the
