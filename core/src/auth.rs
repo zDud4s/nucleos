@@ -1348,13 +1348,23 @@ pub async fn mint_chat_token(
     Ok(format!("chat:{chat_id}.{secret}"))
 }
 
-/// Resolves a presented bearer to a scope, or `None` if it authenticates nothing.
+/// [`try_resolve`] with a database failure folded into "authenticates nothing" — the shape every
+/// test of the credential families asserts against.
+#[cfg(test)]
 async fn resolve(state: &AppState, presented: &str) -> Option<Scope> {
+    try_resolve(state, presented).await.ok().flatten()
+}
+
+/// Resolves a presented bearer to a scope: `Ok(None)` if it authenticates nothing, `Err` if the
+/// database could not be asked. The two are kept apart because they mean opposite things to the
+/// caller: a mismatch is a refusal, while a locked or exhausted pool says nothing about the key,
+/// and answering it with 401 would make a run's hook treat a valid key as revoked.
+async fn try_resolve(state: &AppState, presented: &str) -> Result<Option<Scope>, sqlx::Error> {
     // Constant-time compare: `==` on the token short-circuits at the first differing byte, timing
     // which leaks the secret's content one byte at a time. `ct_eq` only short-circuits on a length
     // mismatch, and the length is not the secret.
     if bool::from(presented.as_bytes().ct_eq(state.token.0.as_bytes())) {
-        return Some(Scope::Control);
+        return Ok(Some(Scope::Control));
     }
 
     // Read whole, before the split every other family shares, and split from the RIGHT. The
@@ -1365,18 +1375,23 @@ async fn resolve(state: &AppState, presented: &str) -> Option<Scope> {
     // prefix, the alphanumerics alone) and can never hold a dot, so the last one is
     // always the separator.
     if let Some(rest) = presented.strip_prefix("chat:") {
-        let (chat_id, secret) = rest.rsplit_once('.')?;
-        let stored: String = sqlx::query_scalar("SELECT token FROM chat_tokens WHERE chat_id = ?")
-            .bind(chat_id)
-            .fetch_optional(&state.pool)
-            .await
-            .ok()??;
+        let Some((chat_id, secret)) = rest.rsplit_once('.') else {
+            return Ok(None);
+        };
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT token FROM chat_tokens WHERE chat_id = ?")
+                .bind(chat_id)
+                .fetch_optional(&state.pool)
+                .await?;
+        let Some(stored) = stored else {
+            return Ok(None);
+        };
         // The secret first, and the conversation's state only after it matches. Resolving the run
         // first would answer a caller holding no secret at all — whether this conversation is
         // busy — by how long the refusal took. The task lookup below is chat state too, so it also
         // comes after the secret.
         if !bool::from(secret.as_bytes().ct_eq(stored.as_bytes())) {
-            return None;
+            return Ok(None);
         }
         // Resolved when presented rather than when minted, which is the whole reason this family
         // exists. A CLI kept alive across turns is handed its environment once, at spawn, so a key
@@ -1386,16 +1401,16 @@ async fn resolve(state: &AppState, presented: &str) -> Option<Scope> {
         // A running turn first. Otherwise the newest live task's launcher, and only while a live
         // process of THIS chat served it: a `running` row alone is never enough, because the row can
         // outlive the process that held the task. Between turns with no live task, nothing — that is
-        // the rule `runs.token` already follows, kept rather than weakened. Every failure is `None`.
+        // the rule `runs.token` already follows, kept rather than weakened. Every refusal is
+        // `Ok(None)`; only a failed query is an `Err`.
         let running = sqlx::query_scalar::<_, i64>(
             "SELECT id FROM runs WHERE chat_id = ? AND status = 'running' ORDER BY id DESC LIMIT 1",
         )
         .bind(chat_id)
         .fetch_optional(&state.pool)
-        .await
-        .ok()?;
+        .await?;
         if let Some(turn) = running {
-            return Some(Scope::Run(turn));
+            return Ok(Some(Scope::Run(turn)));
         }
         let launchers = sqlx::query_scalar::<_, i64>(
             "SELECT DISTINCT t.launched_by_run_id FROM chat_tasks t
@@ -1405,83 +1420,100 @@ async fn resolve(state: &AppState, presented: &str) -> Option<Scope> {
         )
         .bind(chat_id)
         .fetch_all(&state.pool)
-        .await
-        .ok()?;
-        return launchers
+        .await?;
+        return Ok(launchers
             .into_iter()
             .find(|&launcher| crate::assistant_types::live_process_served(chat_id, launcher))
-            .map(Scope::Run);
+            .map(Scope::Run));
     }
 
-    let (prefix, secret) = presented.split_once('.')?;
+    let Some((prefix, secret)) = presented.split_once('.') else {
+        return Ok(None);
+    };
 
     // `api:<name>` contains a colon: it is neither the integer prefix of a run nor any service
     // name (service names are fixed enum values), so the three credential families cannot collide.
     if let Some(name) = prefix.strip_prefix("api:") {
-        let (stored, level) = sqlx::query_as::<_, (String, String)>(
+        let row = sqlx::query_as::<_, (String, String)>(
             "SELECT token, access_level FROM api_tokens WHERE name = ?",
         )
         .bind(name)
         .fetch_optional(&state.pool)
-        .await
-        .ok()??;
-        let level = ApiTokenLevel::from_str(&level)?;
-        return bool::from(secret.as_bytes().ct_eq(stored.as_bytes()))
-            .then_some(Scope::ApiToken(level));
+        .await?;
+        let Some((stored, level)) = row else {
+            return Ok(None);
+        };
+        let Some(level) = ApiTokenLevel::from_str(&level) else {
+            return Ok(None);
+        };
+        return Ok(bool::from(secret.as_bytes().ct_eq(stored.as_bytes()))
+            .then_some(Scope::ApiToken(level)));
     }
 
     // `team:<id>` contains a colon for the same reason `api:<name>` does, and the id is TEXT, so
     // without the prefix it would either be read as a service name or fail the integer parse below.
     if let Some(team_run_id) = prefix.strip_prefix("team:") {
-        let (stored, run_state) = sqlx::query_as::<_, (String, String)>(
+        let row = sqlx::query_as::<_, (String, String)>(
             "SELECT token, state FROM team_runs WHERE id = ?",
         )
         .bind(team_run_id)
         .fetch_optional(&state.pool)
-        .await
-        .ok()??;
+        .await?;
+        let Some((stored, run_state)) = row else {
+            return Ok(None);
+        };
 
         // A team token dies with its run, for the reason the run branch below gives and more so: it
         // lives for hours and crosses dozens of subprocesses, which makes it the longest-lived key
         // in the house and the one that most needs the rule. `team::is_live` rather than a fourth
         // copy of the state list.
         if !crate::team::is_live(&run_state) {
-            return None;
+            return Ok(None);
         }
-        return bool::from(secret.as_bytes().ct_eq(stored.as_bytes()))
-            .then_some(Scope::TeamRun(team_run_id.to_owned()));
+        return Ok(bool::from(secret.as_bytes().ct_eq(stored.as_bytes()))
+            .then_some(Scope::TeamRun(team_run_id.to_owned())));
     }
 
     // A service name never parses as an integer and a run id always does, so the remaining prefix
     // picks the table without a second marker to keep in sync.
     if let Some(service) = Service::from_name(prefix) {
-        let stored: String = sqlx::query_scalar("SELECT token FROM service_tokens WHERE name = ?")
-            .bind(prefix)
-            .fetch_optional(&state.pool)
-            .await
-            .ok()??;
-        return bool::from(secret.as_bytes().ct_eq(stored.as_bytes()))
-            .then_some(Scope::Service(service));
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT token FROM service_tokens WHERE name = ?")
+                .bind(prefix)
+                .fetch_optional(&state.pool)
+                .await?;
+        let Some(stored) = stored else {
+            return Ok(None);
+        };
+        return Ok(bool::from(secret.as_bytes().ct_eq(stored.as_bytes()))
+            .then_some(Scope::Service(service)));
     }
 
-    let id: i64 = prefix.parse().ok()?;
-    let (stored, status) = sqlx::query_as::<_, (Option<String>, String)>(
+    let Ok(id) = prefix.parse::<i64>() else {
+        return Ok(None);
+    };
+    let row = sqlx::query_as::<_, (Option<String>, String)>(
         "SELECT token, status FROM runs WHERE id = ?",
     )
     .bind(id)
     .fetch_optional(&state.pool)
-    .await
-    .ok()??;
+    .await?;
+    let Some((stored, status)) = row else {
+        return Ok(None);
+    };
 
     // A run token dies with its run. Otherwise a finished run's environment — still sitting in a
     // log, a crash dump, or a child process that outlived the CLI — would stay a working key long
     // after the run it belonged to stopped being governed by anything.
     if status != "running" {
-        return None;
+        return Ok(None);
     }
     // `None` is every row written before migration 0022 and every orchestrator turn: no stored
     // secret, so nothing to match, so the token authenticates nothing.
-    bool::from(secret.as_bytes().ct_eq(stored?.as_bytes())).then_some(Scope::Run(id))
+    let Some(stored) = stored else {
+        return Ok(None);
+    };
+    Ok(bool::from(secret.as_bytes().ct_eq(stored.as_bytes())).then_some(Scope::Run(id)))
 }
 
 pub async fn require_token(
@@ -1497,9 +1529,17 @@ pub async fn require_token(
         .ok_or(StatusCode::UNAUTHORIZED)?
         .to_owned();
 
-    let mut scope = resolve(&state, &presented)
-        .await
-        .ok_or(StatusCode::UNAUTHORIZED)?;
+    // A failed lookup is 503, not 401: the key may be perfectly valid, and a run's hook reads 401
+    // as "this key is refused" and blocks the tool call. 503 tells it to try again. The error is
+    // logged; the presented key never is.
+    let mut scope = match try_resolve(&state, &presented).await {
+        Ok(Some(scope)) => scope,
+        Ok(None) => return Err(StatusCode::UNAUTHORIZED),
+        Err(error) => {
+            tracing::warn!(%error, "could not resolve a bearer token: the database failed");
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
+    };
 
     // The remote gateway's device-session branch. The header is read ONLY for the gateway's own
     // key: for every other credential it is ignored, so it can neither downgrade the control token
@@ -3908,6 +3948,54 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A database that cannot be asked says nothing about the key, so it must not answer as if the
+    /// key were wrong: 401 makes a run's hook treat a valid key as refused and block the call. A
+    /// closed pool stands in for a locked or exhausted one; an unknown key stays a plain 401, and a
+    /// bearer that needs no lookup at all is unaffected by the outage.
+    #[tokio::test]
+    async fn a_database_failure_answers_503_and_an_unknown_token_still_401() {
+        async fn status_of(app: &Router, bearer: &str) -> StatusCode {
+            app.clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .uri("/secret")
+                        .header("Authorization", format!("Bearer {bearer}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+        }
+
+        let state = test_state("expected-token").await;
+        let (_, run_key) = running_run_with_token(&state).await;
+        let app = protected_router(state.clone());
+
+        assert_eq!(
+            status_of(&app, "999999.nos_run_unknown").await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_ne!(status_of(&app, &run_key).await, StatusCode::UNAUTHORIZED);
+
+        state.pool.close().await;
+        assert!(try_resolve(&state, &run_key).await.is_err());
+        assert_eq!(
+            status_of(&app, &run_key).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            status_of(&app, "999999.nos_run_unknown").await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "with no database, an unknown key cannot be told from a known one"
+        );
+        assert_eq!(
+            status_of(&app, "wrong-token").await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(status_of(&app, "expected-token").await, StatusCode::OK);
     }
 
     #[tokio::test]

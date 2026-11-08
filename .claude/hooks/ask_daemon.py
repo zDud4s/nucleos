@@ -117,6 +117,10 @@ ADMIT_HOOK_BUDGET_SECONDS = 3300
 # plus half an hour, so the daemon decides a question nobody answered. Under the settings entry's
 # timeout (`autopilot::HOOK_TIMEOUT_SECONDS`, thirty days). A literal, so a test can read it.
 ASK_WAIT_TIMEOUT_SECONDS = 2_590_200
+# The pauses before each retry of a gate call the daemon answered 503: it could not look the key
+# up (a locked or exhausted database), which says nothing about the key. Three tries in all, about
+# 1.5 s of waiting, and the last 503 still fails closed like any other error.
+GATE_UNAVAILABLE_RETRY_DELAYS_SECONDS = (0.5, 1.0)
 
 
 def governed_git_verb(command: str) -> str:
@@ -2126,8 +2130,7 @@ def main() -> None:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=5) as response:
-            decision = json.loads(response.read())
+        decision = open_json_retrying_unavailable(request, timeout=5)
     except Exception as exc:
         deny(f"daemon unreachable or errored ({exc}) - failing closed")
 
@@ -2147,6 +2150,24 @@ def main() -> None:
         deny(f"daemon returned an unrecognized decision {verdict!r} - failing closed")
     admit_heavy(daemon_url, token, run_id, payload)
     approve(decision.get("reason", "autopilot: allowed"), rewrite, context)
+
+
+def open_json_retrying_unavailable(request, timeout):
+    """Sends `request` and returns its decoded JSON body, retrying only a 503.
+
+    A 503 from the daemon's auth layer means it could not ask its database about the key, not that
+    the key is wrong: refusing the tool call on the first one would turn a moment of database load
+    into a blocked read. Every other error, and a 503 that outlasts the retries, is raised for the
+    caller to fail closed on exactly as before.
+    """
+    for delay in GATE_UNAVAILABLE_RETRY_DELAYS_SECONDS + (None,):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            if exc.code != 503 or delay is None:
+                raise
+        time.sleep(delay)
 
 
 def wait_for_answer(daemon_url, token, run_id):

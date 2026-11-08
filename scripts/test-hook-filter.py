@@ -922,7 +922,10 @@ def _run_main_gate(replies):
     queue = list(replies)
 
     def urlopen(_request, timeout=None):
-        return _Reply(queue.pop(0))
+        reply = queue.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        return _Reply(reply)
 
     env = {
         "NUCLEOS_RUN_ID": "7",
@@ -969,6 +972,48 @@ def run_ask_wait_cases():
         "the wait on a question outlasts the daemon's window and stays under the hook timeout",
         _verdict(bool(good), f"timeout {seen!r}"),
     )]
+
+
+def _http_status(code):
+    return urllib.error.HTTPError("http://x", code, "status", None, None)
+
+
+def run_unavailable_cases():
+    """A 503 (the daemon could not look the key up) is retried a bounded number of times; a 401 is not."""
+    cases = []
+    allow = {"decision": "allow", "reason": "ok"}
+
+    def gate(replies):
+        queue = list(replies)
+        with mock.patch.object(hook.time, "sleep") as slept:
+            code, printed = _run_main_gate(queue)
+        return code, printed, slept.call_count
+
+    code, printed, slept = gate([_http_status(503), allow])
+    special = _special_of(printed)
+    cases.append((
+        "one 503 on the gate is retried and the allow that follows is honoured",
+        _verdict(
+            special is not None and special.get("permissionDecision") == "allow" and slept == 1,
+            f"{code!r} {printed!r} slept {slept}",
+        ),
+    ))
+
+    replies = [_http_status(503)] * 3 + [allow]
+    code, printed, slept = gate(replies)
+    blocked = printed and json.loads(printed).get("decision") == "block"
+    cases.append((
+        "a 503 that outlasts three tries still fails closed",
+        _verdict(bool(blocked) and slept == 2, f"{code!r} {printed!r} slept {slept}"),
+    ))
+
+    code, printed, slept = gate([_http_status(401), allow])
+    blocked = printed and json.loads(printed).get("decision") == "block"
+    cases.append((
+        "a 401 on the gate is refused at once, with no retry",
+        _verdict(bool(blocked) and slept == 0, f"{code!r} {printed!r} slept {slept}"),
+    ))
+    return cases
 
 
 def run_rewrite_cases():
@@ -1732,6 +1777,7 @@ def main() -> int:
         + interactive_follow_up_cases()
         + verify_hint_cases()
         + run_rewrite_cases()
+        + run_unavailable_cases()
         + run_ask_wait_cases()
         + admit_cases()
         + one_source_cases()

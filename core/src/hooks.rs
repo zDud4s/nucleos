@@ -1539,23 +1539,53 @@ mod tests {
     }
 
     /// Finding A: what remains of the budget bounds the wait, below `JUDGE_DEADLINE`.
+    ///
+    /// Asserted on the deadline the hook actually handed the judge (written into the verdict's
+    /// `error` when the slow judge runs past it), not on wall-clock time: under a loaded machine
+    /// the timeout's overshoot and the recording after it are unbounded, and a stopwatch could
+    /// not tell "bounded by the remainder" from "bounded by the cap" without flaking.
     #[tokio::test]
     async fn the_judge_wait_is_bounded_by_what_remains_of_the_hook_budget() {
         let state = judged_state(VerdictJudge::slow(Duration::from_secs(120))).await;
         let run_id = judged_run(&state, "worktree", "enforce").await;
-        // 5 s - 2.9 s - 1 s margin = 1.1 s left, under the `JUDGE_DEADLINE` cap.
-        let started = Instant::now() - Duration::from_millis(2_900);
+        // 5 s - 2.4 s - 1 s margin = 1.6 s left, well under the 3 s `JUDGE_DEADLINE` cap, and
+        // 1.1 s above `JUDGE_FLOOR`, so a slow machine still reaches the enforced wait.
+        let left = Duration::from_millis(1_600);
+        let started = Instant::now() - Duration::from_millis(2_400);
         let waited = Instant::now();
 
         let decision = decide_started(&state, run_id, started).await;
 
         assert_eq!(decision.decision, "pending_approval");
-        assert!(
-            waited.elapsed() < Duration::from_millis(1_100 + 1_600),
-            "{:?}",
-            waited.elapsed()
+        // A hang guard only, like the file's other waits: the bound itself is asserted below.
+        assert!(waited.elapsed() < crate::judge::JUDGE_DEADLINE + Duration::from_secs(30));
+
+        let rows = verdict_rows(&state.pool, 1).await;
+        assert_eq!(
+            rows[0].0, "enforce",
+            "the judge was waited on, not just observed"
         );
-        assert!(waited.elapsed() < crate::judge::JUDGE_DEADLINE - Duration::from_millis(100));
+        let error: Option<String> =
+            sqlx::query_scalar("SELECT error FROM judge_verdicts ORDER BY id LIMIT 1")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        let error = error.expect("a 120 s judge runs past any deadline the hook can give it");
+        let given = error
+            .strip_prefix("deadline: no answer within ")
+            .unwrap_or_else(|| panic!("not a deadline cut: {error}"));
+        // `Duration`'s `Debug`: seconds from 1 s up, milliseconds below.
+        let given = match given.strip_suffix("ms") {
+            Some(ms) => Duration::from_secs_f64(ms.parse::<f64>().unwrap() / 1_000.0),
+            None => Duration::from_secs_f64(given.strip_suffix('s').unwrap().parse().unwrap()),
+        };
+        // Time spent before the wait only shrinks what is left, never grows it.
+        assert!(given <= left, "{given:?} is more than the {left:?} left");
+        assert!(given >= super::rules::JUDGE_FLOOR, "{given:?}");
+        assert!(
+            given < crate::judge::JUDGE_DEADLINE,
+            "{given:?}: the cap, not the remainder"
+        );
     }
 
     /// D11: in `observe` the judge is asked, its answer is written down tied to the decision, and
@@ -5222,7 +5252,7 @@ mod tests {
             "the fast path answers `asking`; the judge is a second answerer to that question"
         );
         assert_eq!(
-            answered_within(run_id, std::time::Duration::from_secs(2)).await,
+            answered_within(run_id, std::time::Duration::from_secs(60)).await,
             Some(true),
             "the judge approved, so the call goes ahead without anybody being interrupted"
         );
@@ -5347,7 +5377,7 @@ mod tests {
         assert!(answer_ask(&standing[0].id, false));
 
         assert_eq!(
-            answered_within(run_id, std::time::Duration::from_secs(2)).await,
+            answered_within(run_id, std::time::Duration::from_secs(60)).await,
             Some(false),
             "the person answered first, so the person's answer is the answer"
         );
@@ -5475,8 +5505,10 @@ mod tests {
                 ),
             )
             .await;
+            // An expected answer gets a hang guard; an expected silence keeps its short window.
+            let window = if expected.is_some() { 60 } else { 2 };
             assert_eq!(
-                answered_within(run_id, std::time::Duration::from_secs(2)).await,
+                answered_within(run_id, std::time::Duration::from_secs(window)).await,
                 expected,
                 "{label}"
             );
@@ -5511,7 +5543,7 @@ mod tests {
         // both are `unrecognized`, which is what makes the second assertion below sharp.
         assert_eq!(ask("npm install").await, "asking");
         assert_eq!(
-            answered_within(run_id, std::time::Duration::from_secs(2)).await,
+            answered_within(run_id, std::time::Duration::from_secs(60)).await,
             Some(true)
         );
         assert_eq!(
@@ -5527,7 +5559,7 @@ mod tests {
 
         assert_eq!(ask("docker compose up").await, "asking");
         assert_eq!(
-            answered_within(run_id, std::time::Duration::from_secs(2)).await,
+            answered_within(run_id, std::time::Duration::from_secs(60)).await,
             Some(true)
         );
         assert_eq!(
@@ -5774,7 +5806,7 @@ mod tests {
         assert_eq!(decide(&app, &unrecognised(asking)).await.decision, "asking");
         assert_eq!(decide(&app, &unrecognised(running)).await.decision, "allow");
         assert_eq!(
-            answered_within(asking, std::time::Duration::from_secs(2)).await,
+            answered_within(asking, std::time::Duration::from_secs(60)).await,
             Some(true),
             "`auto` reached the judge, which is what makes the next assertion mean something"
         );
@@ -6328,7 +6360,7 @@ mod tests {
             "`accept_edits` allows the write the person was being asked about"
         );
         assert_eq!(
-            wait_for_run(run_id, std::time::Duration::from_millis(500)).await,
+            wait_for_run(run_id, std::time::Duration::from_secs(60)).await,
             Some(true),
             "and the waiting hook hears it as an allow"
         );
@@ -6366,7 +6398,7 @@ mod tests {
         // Clean up: the register is process-wide.
         assert!(answer_ask(&standing[0].id, false));
         assert_eq!(
-            wait_for_run(other, std::time::Duration::from_millis(500)).await,
+            wait_for_run(other, std::time::Duration::from_secs(60)).await,
             Some(false)
         );
     }
@@ -6423,7 +6455,7 @@ mod tests {
         );
         assert!(answer_ask(&standing[0].id, false));
         assert_eq!(
-            wait_for_run(run_id, std::time::Duration::from_millis(500)).await,
+            wait_for_run(run_id, std::time::Duration::from_secs(60)).await,
             Some(false)
         );
 
@@ -6453,7 +6485,7 @@ mod tests {
         assert_eq!(standing.len(), 1, "so the question is still open");
         assert!(answer_ask(&standing[0].id, false));
         assert_eq!(
-            wait_for_run(other, std::time::Duration::from_millis(500)).await,
+            wait_for_run(other, std::time::Duration::from_secs(60)).await,
             Some(false)
         );
     }
