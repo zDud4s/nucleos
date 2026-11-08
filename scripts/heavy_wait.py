@@ -28,6 +28,24 @@ ABOVE_NORMAL = 0x00008000
 NORMAL = 0x00000020
 
 
+def _sharing_violation(exc: BaseException) -> bool:
+    """A Windows sharing/access violation (WinError 32 or 5), which a lock-free reader that
+    still has the file open causes and which clears in milliseconds."""
+    return isinstance(exc, PermissionError) or getattr(exc, "winerror", None) in (32, 5)
+
+
+def retry_io(fn, attempts: int = 25, delay: float = 0.02, sleep=time.sleep):
+    """Run `fn()`, retrying a sharing violation up to `attempts` times (about 0.5 s with the
+    defaults, a small backoff growing to 4x `delay`). Re-raises the last error."""
+    for i in range(attempts):
+        try:
+            return fn()
+        except OSError as exc:
+            if not _sharing_violation(exc) or i == attempts - 1:
+                raise
+            sleep(min(delay * 4, delay * (1 + i / 4)))
+
+
 class AliveCache:
     """`check(pid, ctime)` -> alive, remembering each answer for `ttl` seconds. A stale
     "alive" only ever makes a waiter more conservative for at most `ttl`; the grant itself is

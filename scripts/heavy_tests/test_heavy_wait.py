@@ -138,6 +138,66 @@ class NoDoubleGrant(_State):
         self.assertFalse(any(r["clash"] for r in res))
 
 
+class OpenReaderBlocksUnlink(_State):
+    """Windows refuses to unlink a file another handle holds open; lock-free readers can hold
+    the queue record open exactly when the granter removes it."""
+
+    def _rec(self):
+        return {"pid": os.getpid(), "ctime": heavy.proc_identity(os.getpid())[1],
+                "weight": 1, "prio": 1, "argv": ["x"]}
+
+    def _grant_with_reader(self, hold_s, cap=2.0):
+        import threading
+        handles = []
+        real = heavy._queue_order
+
+        def spy(*a, **k):
+            if not handles:  # first Mutex-held look: the queue record exists, open it
+                f = open(next((self.state / "queue").iterdir()), "rb")
+                handles.append(f)
+                threading.Timer(hold_s, f.close).start()
+            return real(*a, **k)
+
+        with mock.patch.object(heavy, "_queue_order", spy),                 mock.patch.dict(os.environ, {"NUCLEOS_HEAVY_CAPACITY": "2",
+                                             "NUCLEOS_HEAVY_POLL_S": "0.05"}):
+            ok, _ = heavy.acquire_token(self.state, self._rec(), cap)
+        for f in handles:
+            f.close()
+        return ok, handles
+
+    @unittest.skipUnless(os.name == "nt", "sharing violations are Windows-only")
+    def test_a_briefly_open_queue_record_still_grants_once(self):
+        ok, handles = self._grant_with_reader(0.05)
+        self.assertTrue(ok)
+        self.assertEqual(len(list((self.state / "held").iterdir())), 1)
+        self.assertEqual(list((self.state / "queue").iterdir()), [])
+
+    @unittest.skipUnless(os.name == "nt", "sharing violations are Windows-only")
+    def test_a_stuck_reader_never_leaves_held_and_queue_both(self):
+        ok, _ = self._grant_with_reader(30.0, cap=1.5)
+        # The grant is refused while the reader stays open; a held record next to a live
+        # queue entry would be the double claim.
+        self.assertFalse(ok)
+        self.assertEqual(list((self.state / "held").iterdir()), [])
+
+    def test_retry_io_retries_sharing_violations_then_gives_up(self):
+        calls = []
+
+        def flaky():
+            calls.append(1)
+            if len(calls) < 3:
+                raise PermissionError(13, "in use")
+            return "done"
+
+        self.assertEqual(heavy_wait.retry_io(flaky, sleep=lambda _s: None), "done")
+        with self.assertRaises(PermissionError):
+            heavy_wait.retry_io(lambda: (_ for _ in ()).throw(PermissionError(13, "x")),
+                                attempts=3, sleep=lambda _s: None)
+        with self.assertRaises(FileNotFoundError):
+            heavy_wait.retry_io(lambda: (_ for _ in ()).throw(FileNotFoundError()),
+                                sleep=lambda _s: None)
+
+
 class Torn(_State):
     def test_torn_lock_is_not_granted_on_a_lock_free_poll(self):
         holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])

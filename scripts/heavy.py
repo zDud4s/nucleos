@@ -716,6 +716,10 @@ def _unlink(path: Path) -> None:
     """Unlink, retrying briefly on Windows' sharing violation: waiters now read queue, held and
     lock records without the Mutex, so a delete can meet an open reader. Raises like unlink
     once the retries are spent (callers keep their own `except OSError`)."""
+    hw = _wait_mod()
+    if hw is not None:
+        hw.retry_io(path.unlink)
+        return
     for _ in range(25):
         try:
             path.unlink()
@@ -963,11 +967,24 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
                     mx.mark("decision")
                     if fit:
                         (held_dir / str(me)).write_text(json.dumps(rec), encoding="utf-8")
-                        _unlink(qfile)
-                        mx.mark("write")
-                        queued = False
-                        admitted = True
-                        return True, time.time() - t0
+                        try:
+                            _unlink(qfile)
+                        except FileNotFoundError:
+                            pass
+                        except OSError:
+                            # The queue record is still open in a lock-free reader. Granting
+                            # now would leave a held record AND a queue entry (a double
+                            # claim), so take the held record back and try on the next poll.
+                            try:
+                                _unlink(held_dir / str(me))
+                            except OSError:
+                                pass
+                            fit = False
+                        if fit:
+                            mx.mark("write")
+                            queued = False
+                            admitted = True
+                            return True, time.time() - t0
             if bo is not None and 0 < position < last_pos:
                 bo.reset()  # moved up the queue: look again soon
             last_pos = position
