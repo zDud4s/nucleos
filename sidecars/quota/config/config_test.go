@@ -6,40 +6,9 @@ import (
 )
 
 // This sidecar answers with the owner's usage figures and reaches the vendor with the owner's
-// token in hand (see the package comment on requireLoopback), so an address that is not this
-// machine's own loopback must never be accepted, whatever else is valid about it.
-func an_address_off_loopback_is_refused(t *testing.T) {
-	cases := []struct {
-		name    string
-		addr    string
-		wantErr bool
-	}{
-		{"IPv4 loopback", "127.0.0.1:8796", false},
-		{"IPv4 loopback, another port", "127.0.0.2:8796", false},
-		{"the hostname localhost", "localhost:8796", false},
-		{"IPv6 loopback", "[::1]:8796", false},
-		{"all interfaces", "0.0.0.0:8796", true},
-		{"a LAN address", "192.168.1.5:8796", true},
-		{"a public address", "1.2.3.4:8796", true},
-		{"no port at all", "127.0.0.1", true},
-		{"not an address", "not-an-addr", true},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			err := requireLoopback(tc.addr)
-			if tc.wantErr && err == nil {
-				t.Errorf("requireLoopback(%q) = nil, want an error", tc.addr)
-			}
-			if !tc.wantErr && err != nil {
-				t.Errorf("requireLoopback(%q) = %v, want nil", tc.addr, err)
-			}
-		})
-	}
-}
-
-// Load is the one place QUOTA_ADDR reaches requireLoopback from the environment the núcleo sets;
-// this covers that wiring rather than the check itself.
+// token in hand, so a QUOTA_ADDR off this machine's loopback must never be accepted. Load is the
+// one place QUOTA_ADDR reaches the check (netguard.RequireLoopbackAddr, tested there); this covers
+// that wiring rather than the check itself.
 func load_refuses_a_quota_addr_off_loopback(t *testing.T) {
 	t.Setenv("NUCLEOS_DAEMON_TOKEN", "tok")
 	t.Setenv("QUOTA_ADDR", "0.0.0.0:8796")
@@ -114,7 +83,6 @@ func load_passes_in_range_values_through_as_seconds(t *testing.T) {
 }
 
 func TestConfig(t *testing.T) {
-	t.Run("an address off loopback is refused", an_address_off_loopback_is_refused)
 	t.Run("Load refuses a QUOTA_ADDR off loopback", load_refuses_a_quota_addr_off_loopback)
 	t.Run("Load requires a daemon token", load_requires_a_daemon_token)
 	t.Run("Load rejects a malformed TTL rather than clamping it", load_rejects_a_malformed_ttl_rather_than_clamping_it)

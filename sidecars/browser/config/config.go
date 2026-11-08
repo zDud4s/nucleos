@@ -11,11 +11,12 @@ package config
 import (
 	"errors"
 	"fmt"
-	"net"
 	"os"
 	"path/filepath"
 	"strconv"
 	"time"
+
+	"nucleoschannelkit/netguard"
 )
 
 type Config struct {
@@ -77,8 +78,13 @@ func Load() (Config, error) {
 	if addr == "" {
 		addr = DefaultAddr
 	}
-	if err := requireLoopback(addr); err != nil {
-		return Config{}, err
+	// Refuse to open this sidecar's listener to anything but this machine.
+	//
+	// The web sidecar has the same check for the same reason, and here the stake is higher: this
+	// process drives browsers that hold the owner's logged-in sessions. A listener on the network would
+	// hand those to whoever asked.
+	if err := netguard.RequireLoopbackAddr("BROWSER_ADDR", addr); err != nil {
+		return Config{}, fmt.Errorf("%w — this sidecar drives logged-in profiles and is never served off this machine", err)
 	}
 
 	driver := os.Getenv("BROWSER_DRIVER")
@@ -179,24 +185,4 @@ func positive(name string, fallback int) (int, error) {
 		return 0, fmt.Errorf("%s is %d, which is not a ceiling", name, parsed)
 	}
 	return parsed, nil
-}
-
-// requireLoopback refuses to open this sidecar's listener to anything but this machine.
-//
-// The web sidecar has the same check for the same reason, and here the stake is higher: this
-// process drives browsers that hold the owner's logged-in sessions. A listener on the network would
-// hand those to whoever asked.
-func requireLoopback(addr string) error {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		return fmt.Errorf("BROWSER_ADDR is not host:port: %w", err)
-	}
-	ip := net.ParseIP(host)
-	if host == "localhost" || (ip != nil && ip.IsLoopback()) {
-		return nil
-	}
-	return fmt.Errorf(
-		"BROWSER_ADDR must be a loopback address, got %q — this sidecar drives logged-in profiles and is never served off this machine",
-		addr,
-	)
 }

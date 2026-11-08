@@ -10,6 +10,7 @@ toolchain go1.26.6
 require (
 	github.com/fxamacker/cbor/v2 v2.9.4
 	github.com/go-webauthn/webauthn v0.18.2
+	nucleoschannelkit v0.0.0
 )
 
 require (
@@ -24,3 +25,5 @@ require (
 	golang.org/x/crypto v0.57.0 // indirect
 	golang.org/x/sys v0.48.0 // indirect
 )
+
+replace nucleoschannelkit => ../lib/channelkit

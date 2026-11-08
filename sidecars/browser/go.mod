@@ -16,3 +16,7 @@ toolchain go1.26.6
 // request is same-site (SameSite cookies). A site is a registrable domain, and that cannot be
 // computed without the public suffix list.
 require golang.org/x/net v0.57.0
+
+require nucleoschannelkit v0.0.0
+
+replace nucleoschannelkit => ../lib/channelkit
