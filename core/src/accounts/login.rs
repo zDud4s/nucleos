@@ -238,6 +238,14 @@ impl Logins {
         self.begin(db, adapter, account, Mode::Relogin).await
     }
 
+    /// Whether a login for this account is still running.
+    pub fn is_logging_in(&self, id: &AccountId) -> bool {
+        self.shared
+            .lock()
+            .values()
+            .any(|e| e.view.account_id == id.as_str() && !e.view.phase.is_terminal())
+    }
+
     async fn begin(
         &self,
         db: &SqlitePool,

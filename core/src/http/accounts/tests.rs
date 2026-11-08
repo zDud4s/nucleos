@@ -5,7 +5,7 @@ use axum::http::StatusCode;
 use serde_json::{Value, json};
 
 use super::super::tests::{test_state, workflow_call};
-use super::manage::remove_owned_dir;
+use super::manage::{logout_in, remove_owned_dir};
 use crate::accounts::pool::{Holder, PoolState};
 use crate::accounts::{
     Account, AccountId, AccountKind, AccountState, UNPINNED_KIND, account_dir, store,
@@ -365,4 +365,91 @@ async fn only_the_directory_nucleos_made_is_deleted_with_the_account() {
     remove_owned_dir(data.path(), &account).await;
     assert!(!ours.exists());
     assert!(theirs.path().exists());
+}
+
+#[tokio::test]
+async fn logout_deletes_the_credential_file_and_marks_the_account_needs_login() {
+    let (_home, state) = fixture().await;
+    let data = tempfile::tempdir().unwrap();
+    let mut account = extra("0000000a", "work", AccountState::Active);
+    let ours = account_dir(data.path(), &account.id);
+    std::fs::create_dir_all(&ours).unwrap();
+    let credentials = ours.join(".credentials.json");
+    std::fs::write(&credentials, "{}").unwrap();
+    std::fs::write(ours.join("history.txt"), "kept").unwrap();
+    account.credential_locator = Some(ours.to_string_lossy().into_owned());
+    store::insert(&state.pool, &account).await.unwrap();
+
+    let answer = logout_in(&state, account.id.as_str(), data.path())
+        .await
+        .unwrap();
+    assert_eq!(answer.0["state"], "needs_login");
+    assert!(!credentials.exists());
+    assert!(ours.join("history.txt").exists(), "only credentials go");
+    let stored = store::get(&state.pool, &account.id).await.unwrap().unwrap();
+    assert_eq!(stored.state, AccountState::NeedsLogin);
+
+    // A second logout finds nothing to delete and still succeeds.
+    let again = logout_in(&state, account.id.as_str(), data.path()).await;
+    assert!(again.is_ok());
+}
+
+#[tokio::test]
+async fn logout_of_an_account_without_its_own_credentials_is_refused_and_deletes_nothing() {
+    let (_home, state) = fixture().await;
+    let data = tempfile::tempdir().unwrap();
+    let theirs = tempfile::tempdir().unwrap();
+    let foreign = theirs.path().join(".credentials.json");
+    std::fs::write(&foreign, "{}").unwrap();
+
+    // A locator outside the account's own directory, and no locator at all.
+    let mut outside = extra("0000000b", "outside", AccountState::Active);
+    outside.credential_locator = Some(theirs.path().to_string_lossy().into_owned());
+    let mut bare = extra("0000000c", "bare", AccountState::Active);
+    bare.credential_locator = None;
+    for account in [&outside, &bare] {
+        store::insert(&state.pool, account).await.unwrap();
+        let (status, answer) = logout_in(&state, account.id.as_str(), data.path())
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+        assert_eq!(answer["refusal"], "logout_not_owned");
+        let stored = store::get(&state.pool, &account.id).await.unwrap().unwrap();
+        assert_eq!(stored.state, AccountState::Active);
+    }
+    assert!(foreign.exists());
+
+    // The same refusal through the route, whichever data directory the daemon resolves.
+    let (status, answer) = call(&state, "POST", "/accounts/claude:0000000c/logout", None).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+    assert_eq!(answer["refusal"], "logout_not_owned");
+}
+
+#[tokio::test]
+async fn logout_of_an_unknown_account_is_not_found() {
+    let (_home, state) = fixture().await;
+    let (status, answer) = call(&state, "POST", "/accounts/claude:ffffffff/logout", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{answer}");
+}
+
+#[tokio::test]
+async fn logout_is_refused_while_the_account_has_live_sessions() {
+    let (_home, state) = fixture().await;
+    let data = tempfile::tempdir().unwrap();
+    let mut account = extra("0000000d", "busy", AccountState::Active);
+    let ours = account_dir(data.path(), &account.id);
+    std::fs::create_dir_all(&ours).unwrap();
+    let credentials = ours.join(".credentials.json");
+    std::fs::write(&credentials, "{}").unwrap();
+    account.credential_locator = Some(ours.to_string_lossy().into_owned());
+    store::insert(&state.pool, &account).await.unwrap();
+    let reservation = PoolState::global().reserve(&account.id, Holder::Chat("live-chat".into()));
+
+    let (status, answer) = logout_in(&state, account.id.as_str(), data.path())
+        .await
+        .unwrap_err();
+    assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+    assert_eq!(answer["refusal"], "live_sessions");
+    assert!(credentials.exists());
+    drop(reservation);
 }
