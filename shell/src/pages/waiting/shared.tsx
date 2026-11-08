@@ -1,5 +1,6 @@
 import { useId, useLayoutEffect, useRef, useState, type FocusEvent, type ReactNode } from "react";
-import { isApiRefusal, type ApiRefusal } from "../../data/client";
+import { isApiRefusal } from "../../data/client";
+import { daemonProse } from "../../team/prose";
 import type { ApprovalOutcome } from "../../data/waiting";
 import { pluralWord } from "../../lib/plural";
 import { Count, ErrorNote, Panel, Quiet, Skeleton, RefusalNote, Section, StaleNote } from "../../ui";
@@ -425,22 +426,6 @@ const DECISION_SENTENCES: Record<string, string> = {
   internal:
     "the daemon failed while carrying the decision out, so nothing was changed",
 };
-
-/**
- * The daemon's own sentence, when it really sent one.
- *
- * `client.ts` falls back to `statusText` for a refusal with an empty body, so a
- * bare 409 arrives carrying the word "Conflict" — which is the code spelled with
- * a capital letter and explains nothing. Four words is the line between a status
- * word ("Unprocessable Entity") and a sentence the daemon wrote on purpose
- * ("these two people carry standing decisions that disagree — …").
- */
-function daemonProse(refusal: ApiRefusal): Record<string, string> {
-  const detail = refusal.detail.trim();
-  if (detail === "" || detail === refusal.code) return {};
-  if (detail.split(/\s+/).length < 4) return {};
-  return { [refusal.code]: detail };
-}
 
 export function DecisionRefusal({
   error,

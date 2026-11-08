@@ -1,7 +1,8 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { Globe } from "lucide-react";
 import { Link, useNavigate } from "@tanstack/react-router";
-import { isApiRefusal, type ApiRefusal } from "../data/client";
+import { isApiRefusal } from "../data/client";
+import { daemonProse } from "../team/prose";
 import {
   useBrowserHealth,
   useBrowserSessions,
@@ -146,14 +147,6 @@ function headline(rows: BrowserSession[] | undefined, subsystem: SubsystemReadou
   const asking = rows.filter((row) => row.mode === "wheel-requested").length;
   const open = plural(rows.length, "session");
   return asking === 0 ? `${open} open` : `${open} open, ${asking} asking for the wheel`;
-}
-
-/** The daemon's own sentence, when it really sent one — `RunDetail.tsx`'s pattern. */
-function daemonProse(refusal: ApiRefusal): Record<string, string> {
-  const detail = refusal.detail.trim();
-  if (detail === "" || detail === refusal.code) return {};
-  if (detail.split(/\s+/).length < 4) return {};
-  return { [refusal.code]: detail };
 }
 
 function MutationNote({ error, what }: { error: unknown; what: string }) {
