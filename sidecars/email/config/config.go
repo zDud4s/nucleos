@@ -10,10 +10,11 @@ package config
 import (
 	"errors"
 	"fmt"
-	"net"
 	"os"
 	"strconv"
 	"time"
+
+	"nucleoschannelkit/netguard"
 )
 
 type Config struct {
@@ -109,8 +110,13 @@ func Load() (Config, error) {
 	if fetchAddr == "" {
 		fetchAddr = DefaultFetchAddr
 	}
-	if err := requireLoopback(fetchAddr); err != nil {
-		return Config{}, err
+	// Refuse to open the attachment listener to anything but this machine.
+	//
+	// The núcleo sets this variable, so a bad value is a wiring mistake rather than an attack — but the
+	// mistake would put a service that reads a person's mailbox on the network, which is worth one
+	// check rather than one day of trust.
+	if err := netguard.RequireLoopbackAddr("EMAIL_FETCH_ADDR", fetchAddr); err != nil {
+		return Config{}, fmt.Errorf("%w — attachments are never served off this machine", err)
 	}
 
 	return Config{
@@ -136,26 +142,6 @@ const DefaultFetchAddr = "127.0.0.1:8793"
 // DefaultSMTPPort is submission over implicit TLS. Not 587: that one starts in plaintext and asks
 // for TLS afterwards, and the credential this process holds is the person's own mail password.
 const DefaultSMTPPort = 465
-
-// requireLoopback refuses to open the attachment listener to anything but this machine.
-//
-// The núcleo sets this variable, so a bad value is a wiring mistake rather than an attack — but the
-// mistake would put a service that reads a person's mailbox on the network, which is worth one
-// check rather than one day of trust.
-func requireLoopback(addr string) error {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		return fmt.Errorf("EMAIL_FETCH_ADDR is not host:port: %w", err)
-	}
-	ip := net.ParseIP(host)
-	if host == "localhost" || (ip != nil && ip.IsLoopback()) {
-		return nil
-	}
-	return fmt.Errorf(
-		"EMAIL_FETCH_ADDR must be a loopback address, got %q — attachments are never served off this machine",
-		addr,
-	)
-}
 
 // Addr is the dial target for the IMAP connection.
 func (c Config) Addr() string {

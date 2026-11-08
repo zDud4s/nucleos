@@ -11,10 +11,11 @@ package config
 import (
 	"errors"
 	"fmt"
-	"net"
 	"os"
 	"strconv"
 	"time"
+
+	"nucleoschannelkit/netguard"
 )
 
 type Config struct {
@@ -57,8 +58,13 @@ func Load() (Config, error) {
 	if addr == "" {
 		addr = DefaultAddr
 	}
-	if err := requireLoopback(addr); err != nil {
-		return Config{}, err
+	// Refuse to open this sidecar's listener to anything but this machine.
+	//
+	// The núcleo sets the variable, so a bad value is a wiring mistake rather than an attack — but the
+	// mistake would put a service that fetches arbitrary URLs on the network, which turns a personal
+	// assistant into an open proxy. One check is cheaper than that day.
+	if err := netguard.RequireLoopbackAddr("WEB_ADDR", addr); err != nil {
+		return Config{}, fmt.Errorf("%w — this sidecar is never served off this machine", err)
 	}
 
 	provider := os.Getenv("WEB_SEARCH_PROVIDER")
@@ -105,24 +111,4 @@ func Load() (Config, error) {
 		FetchTimeout: timeout,
 		MaxPageBytes: maxBytes,
 	}, nil
-}
-
-// requireLoopback refuses to open this sidecar's listener to anything but this machine.
-//
-// The núcleo sets the variable, so a bad value is a wiring mistake rather than an attack — but the
-// mistake would put a service that fetches arbitrary URLs on the network, which turns a personal
-// assistant into an open proxy. One check is cheaper than that day.
-func requireLoopback(addr string) error {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		return fmt.Errorf("WEB_ADDR is not host:port: %w", err)
-	}
-	ip := net.ParseIP(host)
-	if host == "localhost" || (ip != nil && ip.IsLoopback()) {
-		return nil
-	}
-	return fmt.Errorf(
-		"WEB_ADDR must be a loopback address, got %q — this sidecar is never served off this machine",
-		addr,
-	)
 }

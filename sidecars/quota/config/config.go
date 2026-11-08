@@ -9,10 +9,11 @@ package config
 import (
 	"errors"
 	"fmt"
-	"net"
 	"os"
 	"strconv"
 	"time"
+
+	"nucleoschannelkit/netguard"
 )
 
 type Config struct {
@@ -59,8 +60,13 @@ func Load() (Config, error) {
 	if addr == "" {
 		addr = DefaultAddr
 	}
-	if err := requireLoopback(addr); err != nil {
-		return Config{}, err
+	// Refuse to open this sidecar's listener to anything but this machine.
+	//
+	// The núcleo sets the variable, so a bad value is a wiring mistake rather than an attack — but this
+	// process answers with the owner's usage figures and reaches the vendor with the owner's token in
+	// hand. A listener off this machine would publish the first and invite abuse of the second.
+	if err := netguard.RequireLoopbackAddr("QUOTA_ADDR", addr); err != nil {
+		return Config{}, fmt.Errorf("%w — this sidecar is never served off this machine", err)
 	}
 
 	// The bounds below are seconds, and must be scaled by time.Second before being passed in: min
@@ -109,24 +115,4 @@ func seconds(name string, fallback, min, max time.Duration) (time.Duration, erro
 		d = max
 	}
 	return d, nil
-}
-
-// requireLoopback refuses to open this sidecar's listener to anything but this machine.
-//
-// The núcleo sets the variable, so a bad value is a wiring mistake rather than an attack — but this
-// process answers with the owner's usage figures and reaches the vendor with the owner's token in
-// hand. A listener off this machine would publish the first and invite abuse of the second.
-func requireLoopback(addr string) error {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		return fmt.Errorf("QUOTA_ADDR is not host:port: %w", err)
-	}
-	ip := net.ParseIP(host)
-	if host == "localhost" || (ip != nil && ip.IsLoopback()) {
-		return nil
-	}
-	return fmt.Errorf(
-		"QUOTA_ADDR must be a loopback address, got %q — this sidecar is never served off this machine",
-		addr,
-	)
 }

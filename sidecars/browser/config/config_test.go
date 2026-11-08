@@ -9,32 +9,6 @@ import (
 	"testing"
 )
 
-func TestRequireLoopback(t *testing.T) {
-	cases := []struct {
-		addr string
-		ok   bool
-	}{
-		{"127.0.0.1:8795", true},
-		{"localhost:8795", true},
-		{"[::1]:8795", true},
-		{"0.0.0.0:8795", false},
-		{"192.168.1.135:8795", false},
-		{"example.com:8795", false},
-		{"127.0.0.1", false}, // no port
-	}
-	for _, tc := range cases {
-		t.Run(tc.addr, func(t *testing.T) {
-			err := requireLoopback(tc.addr)
-			if tc.ok && err != nil {
-				t.Fatalf("expected %q to be allowed, got %v", tc.addr, err)
-			}
-			if !tc.ok && err == nil {
-				t.Fatalf("expected %q to be refused", tc.addr)
-			}
-		})
-	}
-}
-
 // TestLoadRequiresAToken. This sidecar drives logged-in profiles; starting it with no token would
 // leave those reachable by any local process that guessed the port.
 func TestLoadRequiresAToken(t *testing.T) {

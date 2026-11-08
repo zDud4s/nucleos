@@ -3,9 +3,9 @@ package kit
 import (
 	"errors"
 	"fmt"
-	"net"
 	"net/url"
-	"strings"
+
+	"nucleoschannelkit/netguard"
 )
 
 // Environment variables the daemon sets on a channel adapter (spec 5.4, env_for).
@@ -47,17 +47,9 @@ func validateLoopbackURL(raw string) error {
 	if host == "" {
 		return fmt.Errorf("%s %q has no host", envDaemonURL, raw)
 	}
-	if !isLoopbackHost(host) {
+	if !netguard.IsLoopbackHost(host) {
 		return errors.New(envDaemonURL + " " + fmt.Sprintf("%q", raw) +
 			" is not loopback: the channel token must not leave this machine")
 	}
 	return nil
-}
-
-func isLoopbackHost(host string) bool {
-	if strings.EqualFold(host, "localhost") {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
 }

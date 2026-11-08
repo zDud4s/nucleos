@@ -7,7 +7,11 @@ go 1.26
 // parses what comes back, so crypto/tls and encoding/json are its exposure.
 toolchain go1.26.6
 
-// No `require` block, and that is worth stating rather than leaving as an absence: this sidecar has
-// no third-party dependency at all. It reads two local files and calls one well-known endpoint, all
-// of which the standard library does. The web sidecar needs a readability parser; this one would
-// gain nothing but supply chain.
+// No third-party dependency, and that is worth stating rather than leaving as an absence. It reads
+// two local files and calls one well-known endpoint, all of which the standard library does. The
+// web sidecar needs a readability parser; this one would gain nothing but supply chain. The one
+// require below is the in-repo channel kit (its netguard loopback check), not a third party.
+
+require nucleoschannelkit v0.0.0
+
+replace nucleoschannelkit => ../lib/channelkit

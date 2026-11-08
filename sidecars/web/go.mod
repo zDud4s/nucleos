@@ -17,3 +17,7 @@ require github.com/mackee/go-readability v0.3.1
 // this sidecar's whole job is running that parser over HTML a stranger wrote, so a parser DoS is
 // the one class of bug it is guaranteed to be handed.
 require golang.org/x/net v0.55.0 // indirect
+
+require nucleoschannelkit v0.0.0
+
+replace nucleoschannelkit => ../lib/channelkit

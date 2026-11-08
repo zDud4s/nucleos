@@ -8,12 +8,13 @@ package config
 import (
 	"errors"
 	"fmt"
-	"net"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	"nucleoschannelkit/netguard"
 )
 
 // Environment variable names, fixed by the contract.
@@ -70,15 +71,15 @@ func LoadFrom(getenv func(string) string) (Config, error) {
 	if cfg.Addr == "" {
 		cfg.Addr = DefaultAddr
 	}
-	if err := requireLoopbackAddr(cfg.Addr); err != nil {
-		return Config{}, fmt.Errorf("%s: %w", EnvAddr, err)
+	if err := netguard.RequireLoopbackAddr(EnvAddr, cfg.Addr); err != nil {
+		return Config{}, err
 	}
 
 	daemon := strings.TrimRight(strings.TrimSpace(getenv(EnvDaemonURL)), "/")
 	if daemon == "" {
 		return Config{}, fmt.Errorf("%s is required", EnvDaemonURL)
 	}
-	if err := requireLoopbackURL(daemon); err != nil {
+	if err := netguard.RequireLoopbackURL(daemon); err != nil {
 		return Config{}, fmt.Errorf("%s: %w", EnvDaemonURL, err)
 	}
 	cfg.DaemonURL = daemon
@@ -137,40 +138,6 @@ func intVar(getenv func(string) string, name string, def int) (int, error) {
 		return 0, fmt.Errorf("%s: not a whole number: %q", name, raw)
 	}
 	return n, nil
-}
-
-// isLoopbackHost accepts "localhost" and loopback IP literals, nothing resolved through DNS.
-func isLoopbackHost(host string) bool {
-	if strings.EqualFold(host, "localhost") {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
-}
-
-func requireLoopbackAddr(addr string) error {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		return fmt.Errorf("not a host:port address: %q", addr)
-	}
-	if !isLoopbackHost(host) {
-		return fmt.Errorf("must bind loopback only, got %q", addr)
-	}
-	return nil
-}
-
-func requireLoopbackURL(raw string) error {
-	u, err := url.Parse(raw)
-	if err != nil || u.Host == "" {
-		return errors.New("not a valid URL")
-	}
-	if u.Scheme != "http" && u.Scheme != "https" {
-		return fmt.Errorf("unsupported scheme %q", u.Scheme)
-	}
-	if !isLoopbackHost(u.Hostname()) {
-		return fmt.Errorf("must be a loopback address, got host %q", u.Hostname())
-	}
-	return nil
 }
 
 // parsePublicOrigin accepts only `https://host[:port]`: no path, query, fragment or userinfo.

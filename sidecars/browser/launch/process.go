@@ -70,8 +70,17 @@ func Start(ctx context.Context, opts Options, wait time.Duration) (*Process, err
 	cmd := exec.CommandContext(ctx, opts.ExecutablePath, args...)
 	// Its own process group on Unix, so Stop can take every helper it spawns at once.
 	ownProcessGroup(cmd)
+	// Suspended on Windows, so joinJob can put it in this sidecar's kill-on-close job before it has
+	// spawned a single helper: see job_windows.go. A no-op elsewhere.
+	startSuspended(cmd)
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("starting chromium: %w", err)
+	}
+	if err := joinJob(cmd); err != nil {
+		// Never resumed, so it has spawned nothing: the pid is the whole tree.
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+		return nil, err
 	}
 
 	process := &Process{cmd: cmd, ProfileDir: opts.ProfileDir}
