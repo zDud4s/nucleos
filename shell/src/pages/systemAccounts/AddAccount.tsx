@@ -5,6 +5,7 @@ import {
   useCancelLogin,
   useLogin,
   useStartAccount,
+  usePooledEngines,
   useSubmitLoginCode,
   type LoginPhase,
   type LoginView,
@@ -12,7 +13,8 @@ import {
 import { isApiRefusal } from "../../data/client";
 import { Button } from "../../ui";
 
-const ENGINES = ["claude", "codex"] as const;
+/** Used only when the daemon does not name its engines (an older daemon, or not loaded yet). */
+const FALLBACK_ENGINES: readonly string[] = ["claude", "codex"];
 
 const PHASE_TEXT: Record<LoginPhase, string> = {
   starting: "Starting the login...",
@@ -27,7 +29,11 @@ const PHASE_TEXT: Record<LoginPhase, string> = {
 /** The `+ Add account` form: an engine and a label; starting it hands the login view up. */
 export function AddAccount({ onStarted }: { onStarted: (view: LoginView) => void }) {
   const [open, setOpen] = useState(false);
-  const [engine, setEngine] = useState<string>(ENGINES[0]);
+  const pooled = usePooledEngines().data;
+  const engines = pooled && pooled.length > 0 ? pooled : FALLBACK_ENGINES;
+  const [picked, setEngine] = useState<string>(engines[0]);
+  // The list can change under the form (it loads after the first render); keep a valid choice.
+  const engine = engines.includes(picked) ? picked : engines[0];
   const [label, setLabel] = useState("");
   const start = useStartAccount();
 
@@ -44,7 +50,7 @@ export function AddAccount({ onStarted }: { onStarted: (view: LoginView) => void
       <label>
         Engine
         <select value={engine} onChange={(e) => setEngine(e.target.value)}>
-          {ENGINES.map((e) => (
+          {engines.map((e) => (
             <option key={e} value={e}>{e}</option>
           ))}
         </select>

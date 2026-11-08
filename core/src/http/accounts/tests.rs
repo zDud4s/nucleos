@@ -60,6 +60,18 @@ async fn the_list_carries_the_migrated_defaults_without_the_credential_locator()
 }
 
 #[tokio::test]
+async fn the_list_names_the_engines_the_pool_can_add() {
+    let (_home, state) = fixture().await;
+    let (status, answer) = call(&state, "GET", "/accounts", None).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(
+        answer["engines"],
+        serde_json::json!(crate::accounts::adapters::pooled_engines())
+    );
+    assert_eq!(answer["engines"], serde_json::json!(["claude", "codex"]));
+}
+
+#[tokio::test]
 async fn starting_a_login_for_an_engine_outside_the_pool_is_refused() {
     let (_home, state) = fixture().await;
     let body = json!({ "engine": "local", "label": "x" });

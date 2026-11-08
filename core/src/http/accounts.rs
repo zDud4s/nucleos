@@ -1,6 +1,7 @@
 //! The account pool's routes. Owner-only by omission from every scoped route table in `auth.rs`.
 //!
-//! - `GET /accounts`: every account with its usage windows and live sessions.
+//! - `GET /accounts`: every account with its usage windows and live sessions, plus `engines`,
+//!   the engines a new account can be added for.
 //! - `POST /accounts {engine, label}`: starts a guided login (202 + the login view). The account
 //!   row exists only once the login succeeds.
 //! - `GET|DELETE /account-logins/{login_id}`, `POST /account-logins/{login_id}/code {code}`.
@@ -98,6 +99,7 @@ async fn list_accounts(State(state): State<AppState>) -> Result<Json<Value>, Ref
     let view = crate::accounts::pool::PoolState::global().view();
     Ok(Json(json!({
         "accounts": accounts.iter().map(|a| account_json(a, &view)).collect::<Vec<_>>(),
+        "engines": crate::accounts::adapters::pooled_engines(),
     })))
 }
 
