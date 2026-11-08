@@ -12,9 +12,12 @@
 //! person's own Claude Code session) is the main caller here too, alongside the MCP daemon client
 //! of such a session. The one exception is an autonomous tree run: `auth::tree_run_admits` lets a
 //! `Scope::Run` key use `PATCH /nodes/{id}` and `POST /nodes/{id}/close` for the node its run is
-//! bound to (`work_nodes.run_id`) and no other. `POST /nodes`, `GET /nodes/active` and the tree
-//! read stay out of a run key's reach, so a tree run cannot open or list nodes itself. So does
-//! `POST /nodes/scope`, the edit fence of an interactive session: a run is fenced daemon-side.
+//! bound to (`work_nodes.run_id`) and no other. It also admits `POST /nodes` for a run bound to an
+//! orchestrator node, and `post_node` then accepts only that node as `parent_id`: an orchestrator
+//! opens its own children, never a sibling's or an ancestor's, and a leaf run opens nothing.
+//! `GET /nodes/active` and the tree read stay out of a run key's reach, so a tree run cannot list
+//! nodes itself. So does `POST /nodes/scope`, the edit fence of an interactive session: a run is
+//! fenced daemon-side.
 
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::routing::patch;
@@ -136,11 +139,34 @@ async fn ancestor_chain(
 ///
 /// The project is best effort: a root opened by the owner has none (the body names no worktree),
 /// and a child inherits its parent's, which is also where its limits are read from.
+///
+/// A `Scope::Run` caller (an orchestrator run, admitted by `auth::tree_run_admits`) may only open
+/// children of the node its own run is bound to: any other `parent_id`, or none, is a 403.
 async fn post_node(
     State(state): State<AppState>,
+    Extension(scope): Extension<crate::auth::Scope>,
     body: Result<Json<OpenBody>, JsonRejection>,
 ) -> Result<Json<work_nodes::Opened>, Refusal> {
     let Json(body) = body.map_err(bad_body)?;
+    if let crate::auth::Scope::Run(run_id) = &scope {
+        let own: Option<i64> = match body.parent_id.as_deref().filter(|id| !id.trim().is_empty()) {
+            Some(parent_id) => sqlx::query_scalar(
+                "SELECT 1 FROM work_nodes WHERE id = ? AND run_id = ?",
+            )
+            .bind(parent_id)
+            .bind(run_id.to_string())
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|error| refused(NodeError::Db(error)))?,
+            None => None,
+        };
+        if own.is_none() {
+            return Err(refuse(
+                StatusCode::FORBIDDEN,
+                "a node opens only its own children",
+            ));
+        }
+    }
     let args = OpenArgs {
         parent_id: present(body.parent_id),
         kind: required("kind", body.kind)?,
@@ -535,10 +561,46 @@ mod tests {
         uri: &str,
         body: Option<Value>,
     ) -> (StatusCode, Value) {
+        call_bearer(app, "test-token", method, uri, body).await
+    }
+
+    /// A run bound to `node` (made an orchestrator), and its run key.
+    async fn orchestrator_run_key(pool: &sqlx::SqlitePool, node: &str) -> String {
+        let run_id = sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, created_at)
+             VALUES ('x', 'running', 'worktree', '2026-01-01T00:00:00Z')",
+        )
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let (bearer, secret) = crate::auth::mint_run_token(run_id);
+        sqlx::query("UPDATE runs SET token = ? WHERE id = ?")
+            .bind(&secret)
+            .bind(run_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE work_nodes SET run_id = ?, kind = 'orchestrator' WHERE id = ?")
+            .bind(run_id.to_string())
+            .bind(node)
+            .execute(pool)
+            .await
+            .unwrap();
+        bearer
+    }
+
+    async fn call_bearer(
+        app: &Router,
+        bearer: &str,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
         let mut request = Request::builder()
             .method(method)
             .uri(uri)
-            .header("Authorization", "Bearer test-token");
+            .header("Authorization", format!("Bearer {bearer}"));
         let body = match body {
             Some(value) => {
                 request = request.header("Content-Type", "application/json");
@@ -611,6 +673,73 @@ mod tests {
         ));
         std::fs::write(&path, "# handoff\n").unwrap();
         path.to_string_lossy().into_owned()
+    }
+
+    fn child_body(parent: Option<&str>, title: &str, owned: &[&str]) -> Value {
+        json!({
+            "parent_id": parent, "kind": "leaf", "title": title, "goal": format!("Goal of {title}"),
+            "owned_paths": owned, "budget_tokens": null,
+        })
+    }
+
+    #[tokio::test]
+    async fn an_orchestrator_run_cannot_open_a_child_of_another_node() {
+        let (app, pool) = app_and_pool().await;
+        let root = open_root(&app, "s-fence").await;
+        let (_, mine) = open_leaf(&app, &root, "Mine", &["core/src/a/**"]).await;
+        let (_, sibling) = open_leaf(&app, &root, "Sibling", &["core/src/b/**"]).await;
+        let mine = mine["id"].as_str().unwrap().to_owned();
+        let sibling = sibling["id"].as_str().unwrap().to_owned();
+        let key = orchestrator_run_key(&pool, &mine).await;
+
+        for (label, parent) in [
+            ("a sibling", Some(sibling.as_str())),
+            ("the root, an ancestor", Some(root.as_str())),
+            ("no parent at all", None),
+        ] {
+            let (status, body) = call_bearer(
+                &app,
+                &key,
+                "POST",
+                "/nodes",
+                Some(child_body(parent, "Intruder", &["core/src/a/x/**"])),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{label}: {body}");
+            assert_eq!(body["error"], "a node opens only its own children");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_orchestrator_run_opens_a_child_under_its_own_node() {
+        let (app, pool) = app_and_pool().await;
+        let root = open_root(&app, "s-own").await;
+        let (_, mine) = open_leaf(&app, &root, "Mine", &["core/src/a/**"]).await;
+        let mine = mine["id"].as_str().unwrap().to_owned();
+        let key = orchestrator_run_key(&pool, &mine).await;
+
+        let (status, child) = call_bearer(
+            &app,
+            &key,
+            "POST",
+            "/nodes",
+            Some(child_body(Some(&mine), "Part", &["core/src/a/x/**"])),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{child}");
+        assert_eq!(child["depth"], 2);
+        assert_eq!(child["root_id"], root.as_str());
+
+        let (status, body) = call_bearer(
+            &app,
+            &key,
+            "POST",
+            "/nodes",
+            Some(child_body(Some(&mine), "Escape", &["core/src/b/**"])),
+        )
+        .await;
+        assert_ne!(status, StatusCode::OK, "containment still applies: {body}");
+        assert_ne!(status, StatusCode::FORBIDDEN, "{body}");
     }
 
     #[tokio::test]
