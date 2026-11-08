@@ -117,6 +117,16 @@ impl Shared {
             .is_none_or(|entry| entry.view.phase.is_terminal())
     }
 
+    /// The directory `end` would hand back for a login still running, without ending it.
+    fn pending_dir(&self, login_id: &str) -> Option<PathBuf> {
+        let entries = self.lock();
+        let entry = entries.get(login_id)?;
+        if entry.view.phase.is_terminal() {
+            return None;
+        }
+        entry.new_dir.clone()
+    }
+
     /// Ends the login in `phase` and stops its process. Returns the directory to delete.
     fn end(&self, login_id: &str, phase: LoginPhase, message: Option<String>) -> Option<PathBuf> {
         let mut entries = self.lock();
@@ -353,10 +363,10 @@ impl Logins {
     }
 
     pub async fn cancel(&self, login_id: &str) -> Option<LoginView> {
-        let dir = self
-            .shared
+        // Pollers must not see Cancelled before the directory is gone.
+        remove_dir(self.shared.pending_dir(login_id).as_deref()).await;
+        self.shared
             .end(login_id, LoginPhase::Cancelled, Some("cancelled".into()));
-        remove_dir(dir.as_deref()).await;
         self.view(login_id)
     }
 }
@@ -409,8 +419,9 @@ async fn drive(
         }
         Err(why) => {
             let why: String = why.chars().take(300).collect();
-            let dir = shared.end(&login_id, LoginPhase::Failed, Some(why));
-            remove_dir(dir.as_deref()).await;
+            // Pollers must not see Failed before the directory is gone.
+            remove_dir(shared.pending_dir(&login_id).as_deref()).await;
+            shared.end(&login_id, LoginPhase::Failed, Some(why));
         }
     }
 }
