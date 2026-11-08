@@ -614,7 +614,7 @@ async fn check_own_node(
     let bound = nesting::run_bound_nodes(&state.pool, *run_id)
         .await
         .map_err(db_refusal)?;
-    if !bound.iter().any(|node| *node == caller.id) {
+    if !bound.contains(&caller.id) {
         return Err(refuse(
             StatusCode::FORBIDDEN,
             format!(
