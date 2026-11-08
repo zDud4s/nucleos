@@ -601,11 +601,12 @@ async fn post_branch_start(
 
 /// 403 when the request carries a run key bound to nodes that do not include `caller`: a node opens
 /// only its own children. No key (the control token, an Admin key, the driver's replay) opens any
-/// node of the tree.
+/// node of the tree. A run bound to a leaf is refused too (owner decision 2026-11-08): a leaf that
+/// outgrows its budget finishes the best leaf it can and says so, it does not open branches.
 async fn check_own_node(
     state: &AppState,
     scope: Option<&Scope>,
-    caller: &str,
+    caller: &work_nodes::Node,
 ) -> Result<(), Refusal> {
     let Some(Scope::Run(run_id)) = scope else {
         return Ok(());
@@ -613,15 +614,22 @@ async fn check_own_node(
     let bound = nesting::run_bound_nodes(&state.pool, *run_id)
         .await
         .map_err(db_refusal)?;
-    if bound.iter().any(|node| node == caller) {
-        return Ok(());
+    if !bound.contains(&caller.id) {
+        return Err(refuse(
+            StatusCode::FORBIDDEN,
+            format!(
+                "a node opens only its own children: node_id {} is not the node this run is bound to",
+                caller.id
+            ),
+        ));
     }
-    Err(refuse(
-        StatusCode::FORBIDDEN,
-        format!(
-            "a node opens only its own children: node_id {caller} is not the node this run is bound to"
-        ),
-    ))
+    if caller.kind == work_nodes::KIND_LEAF {
+        return Err(refuse(
+            StatusCode::FORBIDDEN,
+            "a leaf does not open branches; report that the work exceeds the leaf budget",
+        ));
+    }
+    Ok(())
 }
 
 /// The steps of `post_branch_start`, apart from recording its refusals.
@@ -684,7 +692,7 @@ async fn start_branch(
     if caller_node.root_id != job.root_node_id {
         return Err(not_in_tree());
     }
-    check_own_node(&state, scope.as_ref(), &caller).await?;
+    check_own_node(&state, scope.as_ref(), &caller_node).await?;
     if job.state == JOB_TERMINAL_STATE {
         return Err(refuse(
             StatusCode::CONFLICT,
@@ -1985,6 +1993,56 @@ mod tests {
             Scope::Control,
         )
         .await;
+        assert_eq!(status, StatusCode::OK, "{ok:?}");
+    }
+
+    #[tokio::test]
+    async fn a_leaf_run_cannot_start_branches_and_the_refusal_is_recorded() {
+        let (state, app, caller, _repo) = tree().await;
+        let (status, web) = post(
+            &app,
+            &uri(),
+            code_body(&caller, "web", "Build the web", &["web/**"]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{web:?}");
+        let leaf = web["node_id"].as_str().unwrap().to_owned();
+        assert_eq!(kind_of(&state, &leaf).await, work_nodes::KIND_LEAF);
+        sqlx::query("UPDATE work_nodes SET run_id = '4343' WHERE id = ?")
+            .bind(&leaf)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let nodes = count(&state, "work_nodes").await;
+
+        let body = code_body(&leaf, "web-child", "Too big for a leaf", &["web/c/**"]);
+        let (status, refused) = post_as(&app, body, Scope::Run(4343)).await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN, "{refused:?}");
+        assert!(
+            refused
+                .to_string()
+                .contains("a leaf does not open branches"),
+            "{refused:?}"
+        );
+        assert_eq!(count(&state, "work_nodes").await, nodes);
+        let job = job_of(&state).await;
+        let last = job.manifest.extra[start_log::REFUSALS_KEY]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        assert_eq!(last["branch"], "web-child");
+        assert_eq!(last["status"], 403);
+        assert!(
+            last["reason"].as_str().unwrap().contains("leaf budget"),
+            "{last:?}"
+        );
+
+        // The control token still opens under any node of the tree, a leaf included.
+        let body = code_body(&leaf, "web-ok", "Opened by the owner", &["web/o/**"]);
+        let (status, ok) = post_as(&app, body, Scope::Control).await;
         assert_eq!(status, StatusCode::OK, "{ok:?}");
     }
 

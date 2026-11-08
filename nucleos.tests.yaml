@@ -73,6 +73,7 @@ tests:
         - scripts/heavy_cost.py
         - scripts/heavy_wait.py
         - scripts/heavy_cache.py
+        - scripts/heavy_cache_report.py
         - scripts/heavy_failfirst.py
         # Its test, heavy_tests/test_heavy_watch.py, is picked up by the same unittest discovery.
         - scripts/heavy_watch.py
