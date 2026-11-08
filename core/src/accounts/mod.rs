@@ -14,6 +14,7 @@ pub mod settings;
 pub mod startup;
 pub mod store;
 pub mod switch;
+pub mod token;
 pub mod usage;
 pub mod watch;
 
@@ -44,6 +45,9 @@ impl AccountId {
 pub enum AccountKind {
     Subscription,
     ApiKey,
+    /// A pasted subscription token (`claude setup-token`). The token lives in the OS credential
+    /// store (see `token`), never in the row; the locator is the account's empty config dir.
+    Token,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

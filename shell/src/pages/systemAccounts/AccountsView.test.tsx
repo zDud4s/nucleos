@@ -229,6 +229,64 @@ describe("the accounts view", () => {
   });
 });
 
+describe("token accounts", () => {
+  it("adds a Claude account from a pasted token and closes the dialog", async () => {
+    serve([account()]);
+    renderWithQuery(<AccountsView />);
+    await screen.findByText("Work");
+    fireEvent.click(screen.getByRole("button", { name: "+ Add account" }));
+    fireEvent.click(screen.getByRole("button", { name: "Paste token" }));
+    const field = screen.getByLabelText("Token") as HTMLInputElement;
+    expect(field.type).toBe("password");
+    const add = screen.getByRole("button", { name: "Add account" }) as HTMLButtonElement;
+    expect(add.disabled).toBe(true);
+    fireEvent.change(screen.getByLabelText("Account name"), { target: { value: "Tok" } });
+    fireEvent.change(field, { target: { value: "fake-token-value" } });
+    fireEvent.click(add);
+    await waitFor(() =>
+      expect(
+        calls.some(
+          (c) =>
+            c.path === "/accounts/token" &&
+            c.method === "POST" &&
+            c.body === JSON.stringify({ engine: "claude", label: "Tok", token: "fake-token-value" }),
+        ),
+      ).toBe(true),
+    );
+    await waitFor(() => expect(screen.queryByLabelText("Token")).toBeNull());
+  });
+
+  it("disables the token method for a non-Claude engine", async () => {
+    serve([account()]);
+    renderWithQuery(<AccountsView />);
+    await screen.findByText("Work");
+    fireEvent.click(screen.getByRole("button", { name: "+ Add account" }));
+    fireEvent.click(screen.getByRole("radio", { name: /Codex/ }));
+    expect((screen.getByRole("button", { name: "Paste token" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText("Only Claude accounts can use a token.")).toBeTruthy();
+  });
+
+  it("replaces the token of a token account through the card", async () => {
+    serve([account({ kind: "token", state: "needs_login" })]);
+    renderWithQuery(<AccountsView />);
+    await screen.findByText("Work");
+    expect(screen.queryByRole("button", { name: "Sign in" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Replace token" }));
+    const field = screen.getByLabelText("New token") as HTMLInputElement;
+    expect(field.type).toBe("password");
+    fireEvent.change(field, { target: { value: "fake-new-token" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(
+        calls.some(
+          (c) => c.path === "/accounts/claude%3Awork/token" && c.method === "POST" && c.body === JSON.stringify({ token: "fake-new-token" }),
+        ),
+      ).toBe(true),
+    );
+    expect(calls.some((c) => c.path.endsWith("/login"))).toBe(false);
+  });
+});
+
 describe("helpers", () => {
   it("builds the default options: Auto, providers, accounts", () => {
     expect(defaultOptions([account()]).map((o) => o.value)).toEqual(["auto", "provider:anthropic", "account:claude:work"]);

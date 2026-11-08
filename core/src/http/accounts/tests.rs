@@ -453,3 +453,172 @@ async fn logout_is_refused_while_the_account_has_live_sessions() {
     assert!(credentials.exists());
     drop(reservation);
 }
+
+// ---- token accounts ----
+
+use super::token::AddToken;
+use crate::accounts::token as secrets;
+
+const FAKE_TOKEN: &str = "sk-ant-oat01-fake";
+
+fn token_account(hex: &str, label: &str, state: AccountState) -> Account {
+    Account {
+        kind: AccountKind::Token,
+        ..extra(hex, label, state)
+    }
+}
+
+fn add_body(engine: &str, label: &str, token: &str) -> AddToken {
+    AddToken {
+        engine: engine.into(),
+        label: label.into(),
+        token: token.into(),
+    }
+}
+
+#[tokio::test]
+async fn a_token_account_is_created_with_its_token_in_the_secret_store_only() {
+    let (_home, state) = fixture().await;
+    let data = tempfile::tempdir().unwrap();
+
+    let (status, answer) = super::token::add_in(
+        &state,
+        data.path(),
+        add_body("claude", " token one ", &format!("  {FAKE_TOKEN}\n")),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::CREATED);
+    let answer = answer.0;
+    assert_eq!(answer["kind"], "token");
+    assert_eq!(answer["state"], "active");
+    assert_eq!(answer["label"], "token one");
+    assert_eq!(answer["provider"], "anthropic");
+    assert!(answer.get("credential_locator").is_none());
+    assert!(!answer.to_string().contains(FAKE_TOKEN));
+
+    let id = AccountId(answer["id"].as_str().unwrap().to_owned());
+    assert!(id.as_str().starts_with("claude:"));
+    assert_eq!(secrets::peek(&id).as_deref(), Some(FAKE_TOKEN));
+    let stored = store::get(&state.pool, &id).await.unwrap().unwrap();
+    assert_eq!(stored.kind, AccountKind::Token);
+    let ours = account_dir(data.path(), &id);
+    assert!(ours.is_dir(), "the empty config dir is made");
+    assert_eq!(
+        stored.credential_locator,
+        Some(ours.to_string_lossy().into_owned())
+    );
+
+    // The same label for the same engine is the login path's refusal.
+    let (status, answer) = super::token::add_in(
+        &state,
+        data.path(),
+        add_body("claude", "token one", FAKE_TOKEN),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer:?}");
+    assert_eq!(answer["refusal"], "login_refused");
+}
+
+#[tokio::test]
+async fn an_empty_token_and_a_non_claude_engine_are_refused_and_create_nothing() {
+    let (_home, state) = fixture().await;
+    let before = store::list(&state.pool).await.unwrap().len();
+
+    for token in ["", "   \n"] {
+        let body = json!({ "engine": "claude", "label": "t", "token": token });
+        let (status, answer) = call(&state, "POST", "/accounts/token", Some(body)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+        assert_eq!(answer["refusal"], "empty_token");
+    }
+    for engine in ["codex", "local"] {
+        let body = json!({ "engine": engine, "label": "t", "token": FAKE_TOKEN });
+        let (status, answer) = call(&state, "POST", "/accounts/token", Some(body)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+        assert_eq!(answer["refusal"], "token_engine_unsupported");
+    }
+    assert_eq!(store::list(&state.pool).await.unwrap().len(), before);
+}
+
+#[tokio::test]
+async fn replacing_a_token_stores_it_and_brings_the_account_back_to_active() {
+    let (_home, state) = fixture().await;
+    let account = token_account("0000000e", "tok", AccountState::NeedsLogin);
+    store::insert(&state.pool, &account).await.unwrap();
+    secrets::store(&account.id, "sk-ant-oat01-fake-old")
+        .await
+        .unwrap();
+
+    let uri = "/accounts/claude:0000000e/token";
+    let (status, answer) = call(&state, "POST", uri, Some(json!({ "token": FAKE_TOKEN }))).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["state"], "active");
+    assert_eq!(answer["kind"], "token");
+    assert_eq!(secrets::peek(&account.id).as_deref(), Some(FAKE_TOKEN));
+
+    let (status, answer) = call(&state, "POST", uri, Some(json!({ "token": " " }))).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+    assert_eq!(answer["refusal"], "empty_token");
+    assert_eq!(secrets::peek(&account.id).as_deref(), Some(FAKE_TOKEN));
+
+    let ordinary = extra("0000000f", "plain", AccountState::Active);
+    store::insert(&state.pool, &ordinary).await.unwrap();
+    let (status, answer) = call(
+        &state,
+        "POST",
+        "/accounts/claude:0000000f/token",
+        Some(json!({ "token": FAKE_TOKEN })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+    assert_eq!(answer["refusal"], "not_token_account");
+    let (status, _) = call(
+        &state,
+        "POST",
+        "/accounts/claude:ffffffff/token",
+        Some(json!({ "token": FAKE_TOKEN })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    secrets::delete(&account.id).await.unwrap();
+}
+
+#[tokio::test]
+async fn logging_a_token_account_out_deletes_its_token_and_a_redo_login_is_refused() {
+    let (_home, state) = fixture().await;
+    let data = tempfile::tempdir().unwrap();
+    let account = token_account("00000010", "tok", AccountState::Active);
+    store::insert(&state.pool, &account).await.unwrap();
+    secrets::store(&account.id, FAKE_TOKEN).await.unwrap();
+
+    let answer = logout_in(&state, account.id.as_str(), data.path())
+        .await
+        .unwrap();
+    assert_eq!(answer.0["state"], "needs_login");
+    assert_eq!(secrets::peek(&account.id), None);
+    let stored = store::get(&state.pool, &account.id).await.unwrap().unwrap();
+    assert_eq!(stored.state, AccountState::NeedsLogin);
+
+    let (status, answer) = call(&state, "POST", "/accounts/claude:00000010/login", None).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+    assert_eq!(answer["refusal"], "not_login_account");
+}
+
+#[tokio::test]
+async fn removing_a_token_account_deletes_its_token() {
+    let (_home, state) = fixture().await;
+    let account = token_account("00000011", "tok", AccountState::Active);
+    store::insert(&state.pool, &account).await.unwrap();
+    secrets::store(&account.id, FAKE_TOKEN).await.unwrap();
+
+    let (status, answer) = call(&state, "DELETE", "/accounts/claude:00000011", None).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(secrets::peek(&account.id), None);
+    assert!(
+        store::get(&state.pool, &account.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}

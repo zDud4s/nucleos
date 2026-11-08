@@ -83,6 +83,9 @@ type Reader struct {
 	// `.credentials.json`. Never assumed to be ~/.claude: one Reader exists per account. A field so
 	// the tests can point it somewhere with a fixture in it.
 	dir string
+	// token, when set, is a subscription token (from `claude setup-token`) used as-is: the
+	// credentials file is not read and there is no expiry to check. Never logged or returned.
+	token string
 	// endpoint is Endpoint in every build. A field only so the tests can aim this at an httptest
 	// server: the alternative is a suite that either reaches the real vendor or never exercises the
 	// parser at all, and the parser is where the interesting mistakes live.
@@ -98,6 +101,19 @@ func New(timeout time.Duration, home string) *Reader {
 // NewForDir builds a Reader bounded by timeout over one account's config directory.
 func NewForDir(timeout time.Duration, configDir string) *Reader {
 	return &Reader{client: &http.Client{Timeout: timeout}, dir: configDir, endpoint: Endpoint}
+}
+
+// NewForToken builds a Reader that authenticates with a subscription token handed in by the núcleo
+// instead of reading a credentials file. The token lives only in this Reader.
+func NewForToken(timeout time.Duration, token string) *Reader {
+	return &Reader{client: &http.Client{Timeout: timeout}, token: token, endpoint: Endpoint}
+}
+
+// WithEndpoint points the Reader at another usage endpoint and returns it. For tests only: it lets a
+// caller outside this package aim the reader at an httptest server.
+func (r *Reader) WithEndpoint(url string) *Reader {
+	r.endpoint = url
+	return r
 }
 
 // Read returns this provider's current quota, or an Unmeasured reading explaining why not.
@@ -184,6 +200,9 @@ func severity(body *usageResponse) string {
 // indistinguishable at the call site from the vendor revoking access. Checking the clock first
 // turns a confusing error into "log in again".
 func (r *Reader) credential(now time.Time) (token, tier string, err error) {
+	if r.token != "" {
+		return r.token, "", nil
+	}
 	path := filepath.Join(r.dir, ".credentials.json")
 	raw, err := os.ReadFile(path)
 	if err != nil {

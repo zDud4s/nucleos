@@ -14,6 +14,7 @@ fn kind_text(kind: AccountKind) -> &'static str {
     match kind {
         AccountKind::Subscription => "subscription",
         AccountKind::ApiKey => "api_key",
+        AccountKind::Token => "token",
     }
 }
 
@@ -33,10 +34,10 @@ fn account_of_row(row: &SqliteRow) -> sqlx::Result<Account> {
         engine: row.try_get("engine")?,
         provider: row.try_get("provider")?,
         label: row.try_get("label")?,
-        kind: if kind == "api_key" {
-            AccountKind::ApiKey
-        } else {
-            AccountKind::Subscription
+        kind: match kind.as_str() {
+            "api_key" => AccountKind::ApiKey,
+            "token" => AccountKind::Token,
+            _ => AccountKind::Subscription,
         },
         credential_locator: row.try_get("credential_locator")?,
         state: match state.as_str() {

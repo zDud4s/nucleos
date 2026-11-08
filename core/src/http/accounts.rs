@@ -4,6 +4,8 @@
 //!   the engines a new account can be added for.
 //! - `POST /accounts {engine, label}`: starts a guided login (202 + the login view). The account
 //!   row exists only once the login succeeds.
+//! - `POST /accounts/token {engine, label, token}`: adds a token account (201 + the account);
+//!   `POST /accounts/{id}/token {token}` replaces its token. See `token.rs`.
 //! - `GET|DELETE /account-logins/{login_id}`, `POST /account-logins/{login_id}/code {code}`.
 //! - `POST /accounts/{id}/rename {label}`, `/pause`, `/resume`, `/login` (redo login),
 //!   `/logout`, `DELETE /accounts/{id}[?force=true]`.
@@ -26,13 +28,16 @@ mod choice;
 mod manage;
 #[cfg(test)]
 mod tests;
+mod token;
 
 type Refused = (StatusCode, Json<Value>);
 
 pub(super) fn routes() -> Router<AppState> {
     Router::new()
         .route("/accounts", get(list_accounts).post(start_account))
+        .route("/accounts/token", post(token::add_token_account))
         .route("/accounts/{id}", delete(manage::remove_account))
+        .route("/accounts/{id}/token", post(token::replace_token))
         .route("/accounts/{id}/rename", post(manage::rename_account))
         .route("/accounts/{id}/pause", post(manage::pause_account))
         .route("/accounts/{id}/resume", post(manage::resume_account))

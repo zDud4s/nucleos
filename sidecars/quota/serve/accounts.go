@@ -22,6 +22,20 @@ type Account struct {
 	ID     string `json:"id"`
 	Engine string `json:"engine"`
 	Dir    string `json:"dir"`
+	// Token is an optional Claude subscription token (from `claude setup-token`). When set for a
+	// claude account it is used instead of the credentials file in Dir. It is a secret: it is never
+	// echoed, and Format below keeps it out of any fmt rendering of the struct.
+	Token string `json:"token,omitempty"`
+}
+
+// Format renders an Account without its token under every fmt verb (%v, %+v, %#v, %s), so a stray
+// log line or error cannot leak it. The directory stays, as before.
+func (a Account) Format(f fmt.State, _ rune) {
+	redacted := ""
+	if a.Token != "" {
+		redacted = "[redacted]"
+	}
+	fmt.Fprintf(f, "Account{ID:%q Engine:%q Dir:%q Token:%q}", a.ID, a.Engine, a.Dir, redacted)
 }
 
 // AccountsRequest is the body of PUT /accounts: the complete list of active accounts. Each call
@@ -114,12 +128,21 @@ func readAccounts(ctx context.Context, readers Readers, accounts []Account, now 
 	return out
 }
 
+// Reader constructors, variables only so tests can aim them at an httptest server.
+var (
+	newDirReader   = claude.NewForDir
+	newTokenReader = claude.NewForToken
+)
+
 // liveAccount builds the reader for one account from its engine and directory.
 func liveAccount(cfg config.Config) func(context.Context, Account, time.Time) reading.Provider {
 	return func(ctx context.Context, a Account, now time.Time) reading.Provider {
 		switch a.Engine {
 		case claude.Name:
-			return claude.NewForDir(cfg.FetchTimeout, a.Dir).Read(ctx, now)
+			if a.Token != "" {
+				return newTokenReader(cfg.FetchTimeout, a.Token).Read(ctx, now)
+			}
+			return newDirReader(cfg.FetchTimeout, a.Dir).Read(ctx, now)
 		case codex.Name:
 			return codex.NewForDir(a.Dir).Read(now)
 		default:

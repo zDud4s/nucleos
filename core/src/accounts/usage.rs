@@ -12,7 +12,7 @@ use sqlx::SqlitePool;
 use tokio::sync::Notify;
 
 use super::pool::{AccountUsage, PoolState, WindowUse, window_length};
-use super::{Account, AccountId, AccountState};
+use super::{Account, AccountId, AccountKind, AccountState, token};
 use crate::quota::Fidelity;
 use crate::quota::client::{AccountDir, ProviderReading, QuotaClient};
 
@@ -71,7 +71,8 @@ async fn round(
         .into_iter()
         .map(|c| c.account)
         .collect();
-    let wanted = accounts_to_push(&accounts);
+    let wanted = with_tokens(accounts_to_push(&accounts), &accounts).await;
+    // `AccountDir` compares its token too, so a replaced token is a changed set and is pushed.
     if pushed.as_ref() != Some(&wanted) {
         client.put_accounts(&wanted).await?;
         *pushed = Some(wanted.clone());
@@ -85,7 +86,34 @@ async fn round(
     Ok(())
 }
 
+/// Fills the `token` of every pushed token account from the credential store. A token account
+/// whose token cannot be read is left out: the sidecar would look for a credentials file that
+/// never exists and report an error for it every round.
+async fn with_tokens(wanted: Vec<AccountDir>, accounts: &[Account]) -> Vec<AccountDir> {
+    let is_token = |dir: &AccountDir| {
+        accounts
+            .iter()
+            .any(|a| a.id.as_str() == dir.id && a.kind == AccountKind::Token)
+    };
+    let mut kept = Vec::with_capacity(wanted.len());
+    for mut dir in wanted {
+        if is_token(&dir) {
+            match token::load(&AccountId(dir.id.clone())).await {
+                Ok(Some(secret)) => dir.token = Some(secret),
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::warn!(%error, account = %dir.id, "could not read an account token for the usage feed");
+                    continue;
+                }
+            }
+        }
+        kept.push(dir);
+    }
+    kept
+}
+
 /// PURE: the accounts the sidecar can read — Active, not a default, with a credential directory.
+/// A token account's `token` is filled in by the push loop, not here.
 pub fn accounts_to_push(accounts: &[Account]) -> Vec<AccountDir> {
     accounts
         .iter()
@@ -96,6 +124,7 @@ pub fn accounts_to_push(accounts: &[Account]) -> Vec<AccountDir> {
                 id: a.id.as_str().to_owned(),
                 engine: a.engine.clone(),
                 dir: dir.to_owned(),
+                token: None,
             })
         })
         .collect()
@@ -161,8 +190,35 @@ mod tests {
                 id: "claude:ok".into(),
                 engine: "claude".into(),
                 dir: "/d/ok".into(),
+                token: None,
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn a_token_account_is_pushed_with_its_token_and_a_replaced_token_changes_the_set() {
+        let mut have = with("claude:tok-push", AccountState::Active, Some("/d/t"));
+        have.kind = AccountKind::Token;
+        let mut gone = with("claude:tok-gone", AccountState::Active, Some("/d/g"));
+        gone.kind = AccountKind::Token;
+        let plain = with("claude:plain", AccountState::Active, Some("/d/p"));
+        let accounts = vec![have.clone(), gone, plain];
+        token::store(&have.id, "sk-ant-oat01-fake").await.unwrap();
+
+        let first = with_tokens(accounts_to_push(&accounts), &accounts).await;
+        assert_eq!(
+            first.len(),
+            2,
+            "the token account without a token is left out"
+        );
+        assert_eq!(first[0].id, "claude:tok-push");
+        assert_eq!(first[0].token.as_deref(), Some("sk-ant-oat01-fake"));
+        assert_eq!(first[1].token, None);
+
+        token::store(&have.id, "sk-ant-oat01-fake-2").await.unwrap();
+        let second = with_tokens(accounts_to_push(&accounts), &accounts).await;
+        assert_ne!(first, second);
+        token::delete(&have.id).await.unwrap();
     }
 
     #[test]

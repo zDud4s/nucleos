@@ -7,17 +7,17 @@ use super::*;
 use crate::accounts::login::clean_label;
 use crate::accounts::pool::PoolState;
 use crate::accounts::{
-    AccountChoice, AccountId, AccountState, UNPINNED_KIND, account_dir, startup,
+    AccountChoice, AccountId, AccountKind, AccountState, UNPINNED_KIND, account_dir, startup,
 };
 
-async fn account_or_404(state: &AppState, id: &str) -> Result<Account, Refused> {
+pub(super) async fn account_or_404(state: &AppState, id: &str) -> Result<Account, Refused> {
     store::get(&state.pool, &AccountId(id.to_owned()))
         .await
         .map_err(internal)?
         .ok_or_else(|| refusal(StatusCode::NOT_FOUND, "no_such_account"))
 }
 
-async fn answer(state: &AppState, id: &str) -> Result<Json<Value>, Refused> {
+pub(super) async fn answer(state: &AppState, id: &str) -> Result<Json<Value>, Refused> {
     let account = account_or_404(state, id).await?;
     let view = PoolState::global().view();
     Ok(Json(account_json(&account, &view)))
@@ -89,6 +89,13 @@ pub(super) async fn relogin_account(
     Path(id): Path<String>,
 ) -> Result<(StatusCode, Json<LoginView>), Refused> {
     let account = account_or_404(&state, &id).await?;
+    if account.kind == AccountKind::Token {
+        // A token account has no login to redo: the owner pastes a new token instead.
+        return Err(refusal(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "not_login_account",
+        ));
+    }
     let view = Logins::global()
         .start_relogin(&state.pool, &account.id)
         .await
@@ -98,8 +105,9 @@ pub(super) async fn relogin_account(
     Ok((StatusCode::ACCEPTED, Json(view)))
 }
 
-/// Signs an account out: deletes its credential files and marks it `needs_login`; its row, history
-/// and directory stay, and a redo login brings it back. Refused while runs use the account or a
+/// Signs an account out: deletes its credential files (a token account: its stored token) and
+/// marks it `needs_login`; its row, history and directory stay, and a redo login (a token account:
+/// `POST /accounts/{id}/token`) brings it back. Refused while runs use the account or a
 /// login for it is in progress (no force), and for an account whose credentials are not NucleOS's
 /// own: that one shares the CLI's directory, and logging it out would sign the owner out of their
 /// normal CLI.
@@ -118,8 +126,13 @@ pub(super) async fn logout_in(
     data_dir: &FsPath,
 ) -> Result<Json<Value>, Refused> {
     let account = account_or_404(state, id).await?;
-    let files = owned_credential_files(data_dir, &account)
-        .ok_or_else(|| refusal(StatusCode::UNPROCESSABLE_ENTITY, "logout_not_owned"))?;
+    // A token account has no credential file: its token is in the credential store.
+    let files = if account.kind == AccountKind::Token {
+        Vec::new()
+    } else {
+        owned_credential_files(data_dir, &account)
+            .ok_or_else(|| refusal(StatusCode::UNPROCESSABLE_ENTITY, "logout_not_owned"))?
+    };
     let live = PoolState::global().live_sessions(&account.id);
     if live > 0 {
         return Err((
@@ -137,6 +150,12 @@ pub(super) async fn logout_in(
             tracing::warn!(%error, "could not delete a credential file on logout");
             return Err(refusal(StatusCode::INTERNAL_SERVER_ERROR, "logout_failed"));
         }
+    }
+    if account.kind == AccountKind::Token
+        && let Err(error) = crate::accounts::token::delete(&account.id).await
+    {
+        tracing::warn!(%error, "could not delete an account token on logout");
+        return Err(refusal(StatusCode::INTERNAL_SERVER_ERROR, "logout_failed"));
     }
     store::set_state(&state.pool, &account.id, AccountState::NeedsLogin)
         .await
@@ -200,6 +219,11 @@ pub(super) async fn remove_account(
     let default_reset = crate::accounts::settings::current().default_choice == pinned_default;
     if default_reset {
         choice::set_default(&state, AccountChoice::Auto).await?;
+    }
+    if account.kind == AccountKind::Token
+        && let Err(error) = crate::accounts::token::delete(&account.id).await
+    {
+        tracing::warn!(%error, "could not delete the token of a removed account");
     }
     if let Ok(data_dir) = data_dir() {
         remove_owned_dir(&data_dir, &account).await;
