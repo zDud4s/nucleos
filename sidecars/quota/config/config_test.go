@@ -10,7 +10,7 @@ import (
 // token in hand, so a QUOTA_ADDR off this machine's loopback must never be accepted. Load is the
 // one place QUOTA_ADDR reaches the check (netguard.RequireLoopbackAddr, tested there); this covers
 // that wiring rather than the check itself.
-func load_refuses_a_quota_addr_off_loopback(t *testing.T) {
+func TestLoadRefusesAQuotaAddrOffLoopback(t *testing.T) {
 	t.Setenv("NUCLEOS_DAEMON_TOKEN", "tok")
 	t.Setenv("QUOTA_ADDR", "0.0.0.0:8796")
 
@@ -21,7 +21,7 @@ func load_refuses_a_quota_addr_off_loopback(t *testing.T) {
 
 // The núcleo always sets this, so its absence is a wiring bug — reported clearly rather than
 // leaving the sidecar to fail confusingly at its first outbound call.
-func load_requires_a_daemon_token(t *testing.T) {
+func TestLoadRequiresADaemonToken(t *testing.T) {
 	t.Setenv("QUOTA_ADDR", DefaultAddr)
 
 	if _, err := Load(); err == nil {
@@ -31,7 +31,7 @@ func load_requires_a_daemon_token(t *testing.T) {
 
 // A malformed TTL is a wiring bug too — the núcleo writes these — and must fail rather than be
 // silently clamped like a merely-unreasonable one.
-func load_rejects_a_malformed_ttl_rather_than_clamping_it(t *testing.T) {
+func TestLoadRejectsAMalformedTTLRatherThanClampingIt(t *testing.T) {
 	t.Setenv("NUCLEOS_DAEMON_TOKEN", "tok")
 	t.Setenv("QUOTA_SUCCESS_TTL_SECS", "not-a-number")
 
@@ -42,7 +42,7 @@ func load_rejects_a_malformed_ttl_rather_than_clamping_it(t *testing.T) {
 
 // An out-of-range but well-formed TTL is a different case: clamped to the nearest bound rather
 // than refused, because the value itself is not evidence of a wiring mistake.
-func load_clamps_an_out_of_range_ttl_rather_than_rejecting_it(t *testing.T) {
+func TestLoadClampsAnOutOfRangeTTLRatherThanRejectingIt(t *testing.T) {
 	t.Setenv("NUCLEOS_DAEMON_TOKEN", "tok")
 	t.Setenv("QUOTA_ERROR_TTL_SECS", "999999")
 
@@ -62,7 +62,7 @@ func load_clamps_an_out_of_range_ttl_rather_than_rejecting_it(t *testing.T) {
 // silently — except that 60 nanoseconds is what QUOTA_FETCH_TIMEOUT_SECS=15 became historically, and
 // nothing here checks the actual unit of what comes back. Comparing against a real seconds value,
 // for FetchTimeout and both TTLs, is the only thing that would have caught it.
-func load_passes_in_range_values_through_as_seconds(t *testing.T) {
+func TestLoadPassesInRangeValuesThroughAsSeconds(t *testing.T) {
 	t.Setenv("NUCLEOS_DAEMON_TOKEN", "tok")
 	t.Setenv("QUOTA_FETCH_TIMEOUT_SECS", "15")
 	t.Setenv("QUOTA_SUCCESS_TTL_SECS", "90")
@@ -81,14 +81,6 @@ func load_passes_in_range_values_through_as_seconds(t *testing.T) {
 	if cfg.ErrorTTL != 20*time.Second {
 		t.Errorf("ErrorTTL = %v, want 20s", cfg.ErrorTTL)
 	}
-}
-
-func TestConfig(t *testing.T) {
-	t.Run("Load refuses a QUOTA_ADDR off loopback", load_refuses_a_quota_addr_off_loopback)
-	t.Run("Load requires a daemon token", load_requires_a_daemon_token)
-	t.Run("Load rejects a malformed TTL rather than clamping it", load_rejects_a_malformed_ttl_rather_than_clamping_it)
-	t.Run("Load clamps an out-of-range TTL rather than rejecting it", load_clamps_an_out_of_range_ttl_rather_than_rejecting_it)
-	t.Run("Load passes in-range values through as seconds", load_passes_in_range_values_through_as_seconds)
 }
 
 // The daemon URL is where the sidecar sends its token, so it must stay on this machine.
