@@ -193,7 +193,9 @@ pub fn validate(decls: &[ParamDecl]) -> Result<(), String> {
             }
             ParamType::Bool | ParamType::Enum => {
                 if decl.min.is_some() || decl.max.is_some() {
-                    return Err(format!("param `{name}`: min/max are for int and float only"));
+                    return Err(format!(
+                        "param `{name}`: min/max are for int and float only"
+                    ));
                 }
                 if decl.ty == ParamType::Bool && !decl.values.is_empty() {
                     return Err(format!("param `{name}`: values is for enum only"));
@@ -308,7 +310,8 @@ mod tests {
     }
 
     #[test]
-    fn validate_refuses_duplicate_names_unknown_tier_min_above_max_and_a_default_that_fails_check() {
+    fn validate_refuses_duplicate_names_unknown_tier_min_above_max_and_a_default_that_fails_check()
+    {
         assert!(validate(&[int_decl()]).is_ok());
         assert!(validate(&[int_decl(), int_decl()]).is_err());
         let mut d = int_decl();
@@ -382,7 +385,8 @@ mod tests {
     fn an_unknown_field_in_a_param_is_refused() {
         let text = "- name: a\n  tyep: int\n  tier: 1\n  file: p.yaml\n  key: a\n";
         assert!(parse_yaml(text).is_err());
-        let ok = "- name: a\n  type: int\n  min: 1\n  max: 2\n  tier: 1\n  file: p.yaml\n  key: a\n";
+        let ok =
+            "- name: a\n  type: int\n  min: 1\n  max: 2\n  tier: 1\n  file: p.yaml\n  key: a\n";
         assert_eq!(parse_yaml(ok).unwrap().len(), 1);
     }
 
@@ -433,13 +437,17 @@ mod tests {
         assert!(by("parallel_execute.max_workers").check(&json!(2)).is_ok());
         assert!(by("parallel_execute.max_units").check(&json!(4)).is_ok());
         assert!(by("parallel_execute.max_units").check(&json!(5)).is_ok());
-        assert!(by("parallel_execute.max_wave_seconds")
-            .check(&json!(2400))
-            .is_ok());
+        assert!(
+            by("parallel_execute.max_wave_seconds")
+                .check(&json!(2400))
+                .is_ok()
+        );
         assert!(by("tree.floor_gb").check(&json!(5)).is_ok());
         assert!(by("tree.floor_gb").check(&json!(4)).is_err());
-        assert!(by("parallel_execute.max_wave_seconds")
-            .check(&json!(5))
-            .is_err());
+        assert!(
+            by("parallel_execute.max_wave_seconds")
+                .check(&json!(5))
+                .is_err()
+        );
     }
 }

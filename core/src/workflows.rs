@@ -66,9 +66,9 @@ pub mod effective;
 pub mod facts;
 pub mod graph;
 pub mod hooks;
-pub mod param_manifest;
 pub mod materialize;
 pub mod package;
+pub mod param_manifest;
 pub mod timeout;
 pub mod walk;
 
