@@ -35,7 +35,7 @@ use crate::speed::Speed;
 mod engines;
 mod item_context;
 pub use engines::{Engines, RoutedRunner, allowed_models, front, front_with, installed_engines};
-use engines::{codex_runner, resolve_pin};
+use engines::{codex_runner, engines_without_headroom_now, resolve_pin};
 pub use item_context::{ItemContext, ItemRef, failed_label, item_context};
 
 /// Where the router listens unless `router.yaml` says otherwise.
@@ -797,6 +797,23 @@ pub async fn braked_runners(pool: &SqlitePool) -> Vec<RunnerKind> {
         .collect()
 }
 
+/// `runners` minus the engines whose provider pool has no account out of risk right now (design
+/// §8), in `runners`' order. The per-launch filter `resolve` applies, for the launchers that build
+/// their own runner list outside it (`seat_advice`). Empty means "do not route": a caller never asks
+/// the router with it, since an empty list is "any runner" there.
+pub(crate) fn without_headroom(runners: &[RunnerKind]) -> Vec<RunnerKind> {
+    drop_engines(runners, &engines_without_headroom_now())
+}
+
+/// `runners` minus every kind whose `as_str()` is in `blocked`, in `runners`' order.
+pub(crate) fn drop_engines(runners: &[RunnerKind], blocked: &[String]) -> Vec<RunnerKind> {
+    runners
+        .iter()
+        .copied()
+        .filter(|kind| !blocked.iter().any(|name| name == kind.as_str()))
+        .collect()
+}
+
 /// What `spawn_run` launches, and what it keeps for reporting the outcome.
 pub struct Resolved {
     pub runner: Arc<dyn CommandRunner>,
@@ -825,6 +842,34 @@ pub async fn resolve(
     route: Option<RouteQuery>,
     shape: RunShape,
     speed: Speed,
+) -> Resolved {
+    resolve_with(
+        pool,
+        run_id,
+        runner,
+        model,
+        effort,
+        route,
+        shape,
+        speed,
+        &engines_without_headroom_now,
+    )
+    .await
+}
+
+/// `resolve` with the inter-provider filter's source given, so a test does not depend on the
+/// daemon's global account pool. `without_headroom` is read once per routed launch.
+#[allow(clippy::too_many_arguments)]
+async fn resolve_with(
+    pool: &SqlitePool,
+    run_id: i64,
+    runner: Arc<dyn CommandRunner>,
+    model: Option<String>,
+    effort: Option<String>,
+    route: Option<RouteQuery>,
+    shape: RunShape,
+    speed: Speed,
+    without_headroom: &(dyn Fn() -> Vec<String> + Sync),
 ) -> Resolved {
     let pin = route.as_ref().and_then(|query| query.pin.clone());
     // A node's own effort (no pin) beats the configured one on every path that does not route.
@@ -880,13 +925,22 @@ pub async fn resolve(
     } else {
         mode
     };
-    let braked = braked_runners(pool).await;
+    let eligible = router.eligible(shape);
+    // Design §8: an engine whose provider pool has no account out of risk is held like a braked
+    // one, the primary included. Judged now, on every launch, not when the front was built.
+    let blocked = without_headroom();
+    let braked: Vec<RunnerKind> = braked_runners(pool)
+        .await
+        .into_iter()
+        .chain(
+            eligible
+                .iter()
+                .copied()
+                .filter(|kind| blocked.iter().any(|name| name == kind.as_str())),
+        )
+        .collect();
     // The restriction is applied to the eligible set BEFORE the quota brake is subtracted.
-    let runners = narrowed_runners(
-        router.eligible(shape),
-        query.restrict_runners.as_deref(),
-        &braked,
-    );
+    let runners = narrowed_runners(eligible, query.restrict_runners.as_deref(), &braked);
     if query
         .restrict_runners
         .as_ref()
@@ -904,7 +958,7 @@ pub async fn resolve(
     let advice = if runners.is_empty() {
         tracing::info!(
             run_id,
-            "every eligible runner is held by the quota brake; not routing"
+            "every eligible runner is held by the quota brake or has no account headroom; not routing"
         );
         None
     } else {
@@ -2158,6 +2212,92 @@ mod tests {
         let sent = received.recv().await.unwrap();
         assert_eq!(sent["runners"], serde_json::json!(["claude"]));
         assert_eq!(sent["models"], serde_json::json!(["claude-*"]));
+    }
+
+    #[tokio::test]
+    async fn a_primary_without_headroom_is_not_offered_at_resolve() {
+        let pool = pool().await;
+        let run_id = seed_run(&pool).await;
+        let (url, mut received) = stub_router(
+            200,
+            serde_json::json!({"decision_id": "rt_h", "runner": "codex",
+                               "model": "gpt-5.6-terra", "effort": "low"}),
+        )
+        .await;
+        let (runner, codex) = routed(config(Mode::Apply, &url), Arc::new(Probe));
+
+        let resolved = resolve_with(
+            &pool,
+            run_id,
+            Arc::clone(&runner),
+            None,
+            None,
+            Some(query()),
+            shape(),
+            Speed::Normal,
+            &|| vec!["claude".to_owned()],
+        )
+        .await;
+
+        let sent = received.recv().await.unwrap();
+        assert_eq!(sent["runners"], serde_json::json!(["codex"]));
+        assert_eq!(sent["models"], serde_json::json!(["gpt-*"]));
+        assert!(Arc::ptr_eq(&resolved.runner, &codex));
+        assert!(resolved.refused.is_none());
+    }
+
+    #[tokio::test]
+    async fn headroom_is_judged_on_every_launch_not_when_the_front_was_built() {
+        let pool = pool().await;
+        let (url, mut received) = stub_router(
+            200,
+            serde_json::json!({"decision_id": "rt_l", "runner": "claude", "model": "claude-opus-5"}),
+        )
+        .await;
+        // One router for the three launches: only the headroom read changes between them.
+        let (runner, _) = routed(config(Mode::Shadow, &url), Arc::new(Probe));
+        let launch = |blocked: Vec<String>| {
+            let pool = pool.clone();
+            let runner = Arc::clone(&runner);
+            async move {
+                let run_id = seed_run(&pool).await;
+                let without_headroom = move || blocked.clone();
+                resolve_with(
+                    &pool,
+                    run_id,
+                    runner,
+                    Some("claude-sonnet-5".into()),
+                    Some("low".into()),
+                    Some(query()),
+                    shape(),
+                    Speed::Normal,
+                    &without_headroom,
+                )
+                .await
+            }
+        };
+
+        launch(Vec::new()).await;
+        let sent = received.recv().await.unwrap();
+        assert_eq!(sent["runners"], serde_json::json!(["claude", "codex"]));
+
+        launch(vec!["codex".to_owned()]).await;
+        let sent = received.recv().await.unwrap();
+        assert_eq!(
+            sent["runners"],
+            serde_json::json!(["claude"]),
+            "codex ran out after the front was built"
+        );
+
+        // Every eligible engine without headroom: not routing, the configured launch.
+        let resolved = launch(vec!["claude".to_owned(), "codex".to_owned()]).await;
+        assert!(
+            received.try_recv().is_err(),
+            "the router is never asked with no runner"
+        );
+        assert!(Arc::ptr_eq(&resolved.runner, &runner));
+        assert_eq!(resolved.model.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(resolved.decision_id, None);
     }
 
     #[test]
