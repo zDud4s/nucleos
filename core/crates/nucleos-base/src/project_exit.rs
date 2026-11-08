@@ -112,6 +112,10 @@ const PROJECT_SCOPED: &[&str] = &[
     "run_presets",
     "runs",
     "scheduler_state",
+    // The daily rollup of a project's shadow decisions and the actions its owner already reviewed
+    // (migration 0291): the project's history once the raw rows are pruned, so it goes with it.
+    "shadow_decision_days",
+    "shadow_reviewed_actions",
     // Slot occupancy over time (migrations 0205, 0206): the project's rows are its history. The
     // house's rows (`project_id` NULL raw, '' daily) never match a project id, so they stay.
     "slot_samples",
