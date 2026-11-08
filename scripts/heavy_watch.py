@@ -239,6 +239,9 @@ def queue_reason(pos: int, rec: dict, used: int, cap: int, dyn: dict | None = No
     head = f"token (free {free}/{cap}, needs {need}"
     if dyn is not None:
         if pos > 1:
+            if not dyn["short"] and used + need <= cap:
+                # It fits: the head's admission grants it in the same pass (batch grant).
+                return f"its turn ({pos - 1} ahead); room is free, granted with the head"
             return f"its turn ({pos - 1} ahead)"
         if dyn["short"]:
             reason = "room: " + ", ".join(dyn["short"])

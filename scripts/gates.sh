@@ -101,6 +101,11 @@ run() {
   save_log "$label" "$capture" "$status"
   if [ "$status" -eq 0 ]; then
     printf 'ok   %s\n' "$label"
+    # heavy.py re-ran only the tests that failed last time (its stderr line is in the output
+    # above); say so here too, so a narrowed pass is never read as a green suite.
+    if grep -q 'heavy: PARTIAL pass' "$capture" 2>/dev/null; then
+      printf 'note %s: PARTIAL pass, only the previously failing tests re-ran (NUCLEOS_HEAVY_FULL=1 forces a full run)\n' "$label"
+    fi
   else
     printf 'FAIL %s\n' "$label"
     failures="$failures  $label"$'\n'"$(kept_lines "$capture")"$'\n'
@@ -385,6 +390,19 @@ gate_holds_worktree() {
 # could rewrite unseen, and it would be the part that decides between `ok` and `FAIL`.
 if [ "${BASH_SOURCE[0]}" != "$0" ]; then
   return 0
+fi
+
+# Only the daemon's final safety-net trees run the full suite unconditionally: the post-merge gate
+# tree (.nucleos/worktrees/postgate-<project>) and the merge queue's (.nucleos/worktrees/integration-*).
+# There, tell the broker not to narrow a test command to the previously failed tests
+# (scripts/heavy_failfirst.py). In an agent's own worktree a re-run after a failure should run only
+# the failed tests: that is the waste failed-first exists to cut. A caller-set NUCLEOS_HEAVY_FULL
+# wins either way. Failures are still recorded in every tree.
+if [ -z "${NUCLEOS_HEAVY_FULL+x}" ]; then
+  gate_top="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+  case "$gate_top" in
+    */.nucleos/worktrees/postgate-*|*/.nucleos/worktrees/integration-*) export NUCLEOS_HEAVY_FULL=1 ;;
+  esac
 fi
 
 target="${1:-all}"

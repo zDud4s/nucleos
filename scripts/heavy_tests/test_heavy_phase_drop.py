@@ -62,6 +62,7 @@ def clean_env(state_dir: str, **extra: str) -> dict:
         if k.startswith("NUCLEOS_HEAVY") or k.startswith("FAKECARGO"):
             env.pop(k)
     env["NUCLEOS_HEAVY_DIR"] = state_dir
+    env["NUCLEOS_HEAVY_CACHE"] = "0"  # the result cache would skip a repeated run
     env.update(extra)
     return env
 
