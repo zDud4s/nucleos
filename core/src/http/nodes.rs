@@ -13,7 +13,8 @@
 //! of such a session. The one exception is an autonomous tree run: `auth::tree_run_admits` lets a
 //! `Scope::Run` key use `PATCH /nodes/{id}` and `POST /nodes/{id}/close` for the node its run is
 //! bound to (`work_nodes.run_id`) and no other. `POST /nodes`, `GET /nodes/active` and the tree
-//! read stay out of a run key's reach, so a tree run cannot open or list nodes itself.
+//! read stay out of a run key's reach, so a tree run cannot open or list nodes itself. So does
+//! `POST /nodes/scope`, the edit fence of an interactive session: a run is fenced daemon-side.
 
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::routing::patch;
@@ -32,6 +33,7 @@ pub(super) fn routes() -> Router<AppState> {
         // so neither is ever read as a node id.
         .route("/nodes/active", get(get_active))
         .route("/nodes/tree/{root_id}", get(get_tree))
+        .route("/nodes/scope", post(post_scope))
         .route("/nodes/{id}", patch(patch_node))
         .route("/nodes/{id}/close", post(post_close))
 }
@@ -204,14 +206,17 @@ async fn post_node(
     Ok(Json(opened))
 }
 
-/// `PATCH /nodes/{id}`: `{status?, decision?, context_peak?}`; only what is sent changes.
+/// `PATCH /nodes/{id}`: `{status?, decision?, context_peak?, widen_paths?}`; only what is sent
+/// changes. A widen refused for a running sibling's path is a 409 naming that sibling.
 async fn patch_node(
     State(state): State<AppState>,
     Path(id): Path<String>,
     body: Result<Json<UpdateArgs>, JsonRejection>,
 ) -> Result<Json<work_nodes::Node>, Refusal> {
     let Json(args) = body.map_err(bad_body)?;
-    work_nodes::update(&state.pool, &id, &args)
+    let node = work_nodes::get(&state.pool, &id).await.map_err(refused)?;
+    let limits = limits_for(&state, node.project_id.as_deref()).await;
+    work_nodes::update(&state.pool, &id, &limits, &args)
         .await
         .map(Json)
         .map_err(refused)
@@ -415,6 +420,63 @@ async fn get_active(
             "no running work tree is bound to that session or chat",
         )),
         Err(error) => Err(refused(error)),
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ScopeBody {
+    session_id: Option<String>,
+    cwd: Option<String>,
+    tool_name: Option<String>,
+    #[serde(default)]
+    tool_input: Value,
+}
+
+/// `POST /nodes/scope {session_id, cwd, tool_name, tool_input}`: whether the interactive session
+/// may make this edit, `{allowed: true}` or `{allowed: false, reason}`. The hook of a person's own
+/// Claude Code session asks it before a file-writing tool; the fence of an autonomous run is
+/// `node_scope::for_run` instead. Fail-open: a non-edit tool, a session bound to no running node,
+/// an unreadable `owned_paths` and any storage error all answer allowed.
+async fn post_scope(
+    State(state): State<AppState>,
+    body: Result<Json<ScopeBody>, JsonRejection>,
+) -> Result<Json<Value>, Refusal> {
+    let Json(body) = body.map_err(bad_body)?;
+    let reason = scope_refusal(&state, body).await;
+    Ok(Json(match reason {
+        Some(reason) => json!({ "allowed": false, "reason": reason }),
+        None => json!({ "allowed": true }),
+    }))
+}
+
+/// The refusal for one interactive edit, or `None` to let it through.
+async fn scope_refusal(state: &AppState, body: ScopeBody) -> Option<String> {
+    let session_id = present(body.session_id)?;
+    let root = present(body.cwd)?;
+    let tool_name = body.tool_name?;
+    let file = crate::node_scope::edited_path(&tool_name, &body.tool_input)?;
+    let found: Option<(String, Option<String>)> = match sqlx::query_as(
+        "SELECT owned_paths, project_id FROM work_nodes \
+         WHERE session_id = ? AND status = 'running' ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .bind(&session_id)
+    .fetch_optional(&state.pool)
+    .await
+    {
+        Ok(found) => found,
+        Err(error) => {
+            tracing::warn!(%error, "node scope: could not read the session's node, not fencing");
+            return None;
+        }
+    };
+    let (owned_json, project_id) = found?;
+    let owned: Vec<String> = serde_json::from_str(&owned_json).ok()?;
+    let limits = crate::node_scope::project_limits(&state.pool, project_id.as_deref()).await;
+    match crate::node_scope::check(&owned, &limits.shared_files, &root, file) {
+        crate::node_scope::ScopeVerdict::Allowed => None,
+        crate::node_scope::ScopeVerdict::Outside { path } => {
+            Some(crate::node_scope::refusal(&owned, &path))
+        }
     }
 }
 
@@ -823,5 +885,135 @@ mod tests {
         let (status, _) = close_node(&app, &root, "done", &"x".repeat(1501)).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert!(tree_lines(&pool).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn patch_with_widen_paths_answers_409_with_the_sibling_in_the_body() {
+        let app = app().await;
+        let root = open_root(&app, "s-widen").await;
+        let (status, a) = open_leaf(&app, &root, "Sibling A", &["core/src/a/**"]).await;
+        assert_eq!(status, StatusCode::OK, "{a}");
+        let a_id = a["id"].as_str().unwrap().to_owned();
+        let (status, b) = open_leaf(&app, &root, "Leaf B", &["core/src/b/**"]).await;
+        assert_eq!(status, StatusCode::OK, "{b}");
+        let b_id = b["id"].as_str().unwrap().to_owned();
+
+        let (status, body) = call(
+            &app,
+            "PATCH",
+            &format!("/nodes/{b_id}"),
+            Some(json!({ "status": "blocked", "widen_paths": ["core/src/a/x.rs"] })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        let error = body["error"].as_str().unwrap();
+        assert!(error.contains("Sibling A"), "{error}");
+        assert!(error.contains(&a_id), "{error}");
+        assert!(error.contains("mcp__nucleos__task_report"), "{error}");
+
+        let (status, tree) =
+            call(&app, "GET", &format!("/nodes/tree/{root}?view=full"), None).await;
+        assert_eq!(status, StatusCode::OK, "{tree}");
+        let stored = tree["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["id"] == b_id.as_str())
+            .unwrap();
+        assert_eq!(stored["status"], "running");
+        assert_eq!(stored["owned_paths"], json!(["core/src/b/**"]));
+
+        let (status, node) = call(
+            &app,
+            "PATCH",
+            &format!("/nodes/{b_id}"),
+            Some(json!({ "widen_paths": ["core/src/c/y.rs"] })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{node}");
+        assert_eq!(
+            node["owned_paths"],
+            json!(["core/src/b/**", "core/src/c/y.rs"])
+        );
+        assert_eq!(
+            node["decisions"],
+            json!(["widened owned_paths: +core/src/c/y.rs"])
+        );
+    }
+
+    /// Opens a root and one leaf owning `core/src/a/**`, and binds the leaf, running, to `session`.
+    async fn session_bound_leaf(session: &str) -> (Router, sqlx::SqlitePool) {
+        let (app, pool) = app_and_pool().await;
+        let root = open_root(&app, &format!("{session}-root")).await;
+        let (status, leaf) = open_leaf(&app, &root, "Leaf", &["core/src/a/**"]).await;
+        assert_eq!(status, StatusCode::OK, "{leaf}");
+        sqlx::query("UPDATE work_nodes SET session_id = ?, status = 'running' WHERE id = ?")
+            .bind(session)
+            .bind(leaf["id"].as_str().unwrap())
+            .execute(&pool)
+            .await
+            .unwrap();
+        (app, pool)
+    }
+
+    async fn scope(app: &Router, session: &str, tool: &str, file: &str) -> Value {
+        let (status, body) = call(
+            app,
+            "POST",
+            "/nodes/scope",
+            Some(json!({
+                "session_id": session,
+                "cwd": "/work/repo",
+                "tool_name": tool,
+                "tool_input": { "file_path": file },
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body
+    }
+
+    #[tokio::test]
+    async fn a_session_bound_to_a_running_node_is_fenced_and_one_without_a_node_is_allowed() {
+        let (app, _pool) = session_bound_leaf("s-fenced").await;
+
+        let outside = scope(&app, "s-fenced", "Edit", "/work/repo/shell/x.ts").await;
+        assert_eq!(outside["allowed"], false, "{outside}");
+        let reason = outside["reason"].as_str().unwrap();
+        assert!(reason.contains("shell/x.ts"), "{reason}");
+        assert!(reason.contains("core/src/a/**"), "{reason}");
+
+        for tool in ["Write", "MultiEdit"] {
+            let body = scope(&app, "s-fenced", tool, "shell/x.ts").await;
+            assert_eq!(body["allowed"], false, "{tool}: {body}");
+        }
+
+        let inside = scope(&app, "s-fenced", "Edit", "/work/repo/core/src/a/b.rs").await;
+        assert_eq!(inside, json!({ "allowed": true }));
+
+        // A tool that writes no file is never fenced.
+        let read = scope(&app, "s-fenced", "Read", "/work/repo/shell/x.ts").await;
+        assert_eq!(read, json!({ "allowed": true }));
+
+        // A session no running node is bound to, and one with no id at all, are left alone.
+        let nobody = scope(&app, "s-nobody", "Edit", "/work/repo/shell/x.ts").await;
+        assert_eq!(nobody, json!({ "allowed": true }));
+        let blank = scope(&app, "", "Edit", "/work/repo/shell/x.ts").await;
+        assert_eq!(blank, json!({ "allowed": true }));
+    }
+
+    #[tokio::test]
+    async fn the_scope_route_allows_shared_files() {
+        let (app, _pool) = session_bound_leaf("s-shared").await;
+        for file in [
+            "/work/repo/core/AGENTS.md",
+            "/work/repo/core/hooks/ask_daemon.py",
+            "/work/repo/core/migrations/0300_new.sql",
+        ] {
+            let body = scope(&app, "s-shared", "Edit", file).await;
+            assert_eq!(body, json!({ "allowed": true }), "{file}");
+        }
+        let outside = scope(&app, "s-shared", "Edit", "/work/repo/core/src/b/c.rs").await;
+        assert_eq!(outside["allowed"], false, "{outside}");
     }
 }

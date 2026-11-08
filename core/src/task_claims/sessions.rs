@@ -3,10 +3,12 @@
 //! The hooks send `(session_id, cwd)` on every PreToolUse and PostToolUse. `touch_session` registers it
 //! and renews the lease of every claim the session still holds; `take_notices` answers "what happened
 //! to my claims since I last asked" from the event log, advancing a per-session cursor so each fact is
-//! delivered once.
+//! delivered once. A run has no hook of its own session id: `register_pseudo` gives it a cursor row
+//! (`run-<id>`) when a ticket is offered to it, and `take_notices` is asked with that cursor and the
+//! run's holder.
 
 use super::store::{green_sha, row_by_id};
-use super::{HolderKind, Notice, SESSION_LEASE_SECONDS, Status};
+use super::{Holder, HolderKind, Notice, SESSION_LEASE_SECONDS, Status, TaskRow, competence};
 use crate::execution::wave::stamp;
 use chrono::{DateTime, Duration, Utc};
 use sqlx::{SqliteConnection, SqlitePool};
@@ -52,6 +54,34 @@ pub async fn touch_session(
     Ok(())
 }
 
+/// Registers a cursor row for a holder that is not an interactive session (a run offered a ticket is
+/// `run-<id>`), so `take_notices` can deliver to it. The cursor starts at `cursor_before_event` -- the
+/// caller passes the id of the event it just wrote minus one -- and NOT at the end of the log as
+/// `touch_session` does, which would skip that very event. A row that already exists keeps its own,
+/// older cursor and everything else (`ON CONFLICT DO NOTHING`).
+pub async fn register_pseudo(
+    pool: &SqlitePool,
+    session_id: &str,
+    project_id: &str,
+    worktree: &str,
+    cursor_before_event: i64,
+    now: DateTime<Utc>,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO task_sessions (session_id, project_id, worktree, last_seen, notice_cursor)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(session_id) DO NOTHING",
+    )
+    .bind(session_id)
+    .bind(project_id)
+    .bind(worktree)
+    .bind(stamp(now))
+    .bind(cursor_before_event.max(0))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Was `session_id` registered from this worktree? Plan B validates a session id passed by an agent
 /// against this: the id must have been seen coming from the very worktree the MCP box serves.
 pub async fn session_seen_in(
@@ -69,7 +99,10 @@ pub async fn session_seen_in(
     Ok(found != 0)
 }
 
-/// What happened to the session's claims since its cursor, and the cursor moves past it.
+/// What happened to a holder's claims since its cursor, and the cursor moves past it. The cursor is the
+/// `task_sessions` row `cursor_session_id`; the events are read for the holder `(holder_kind,
+/// holder_id)`. An interactive session is its own cursor: `(id, HolderKind::Session, id)`; a run is
+/// `("run-<id>", HolderKind::Run, "<id>")` (see `register_pseudo`).
 ///
 /// - `ClaimLost`: an `expired_reclaimed` / `taken_over` event names this session as the PREVIOUS owner,
 ///   and the task is claimed now by somebody else.
@@ -78,11 +111,17 @@ pub async fn session_seen_in(
 ///
 /// - `InheritedClosed`: a `done` event for an incident that this session's worktree inherited in a
 ///   verify ticket (`verify_requests.inherited_task_ids`); see `inherited_notices`.
+/// - `Offered`: an `offered` event names this holder as the offeree, and the ticket is still `open`
+///   and still offered to it (a claim by anyone, or a re-route, drops the notice). It carries
+///   `competence::context` as of `now`.
 pub async fn take_notices(
     pool: &SqlitePool,
-    session_id: &str,
-    _now: DateTime<Utc>,
+    cursor_session_id: &str,
+    holder_kind: HolderKind,
+    holder_id: &str,
+    now: DateTime<Utc>,
 ) -> sqlx::Result<Vec<Notice>> {
+    let session_id = cursor_session_id;
     // This runs on every tool call of every session, almost always with nothing new to say: look first
     // with plain reads and only take the write lock (`BEGIN IMMEDIATE`) when there is something to
     // deliver. The unlocked look is only a filter; the real read of the cursor happens again inside.
@@ -119,13 +158,14 @@ pub async fn take_notices(
     }
     let events: Vec<(i64, String, String)> = sqlx::query_as(
         "SELECT task_id, event, note FROM task_claim_events
-         WHERE id > ? AND id <= ? AND holder_kind = 'session' AND holder_id = ?
-           AND event IN ('taken_over', 'expired_reclaimed', 'done')
+         WHERE id > ? AND id <= ? AND holder_kind = ? AND holder_id = ?
+           AND event IN ('taken_over', 'expired_reclaimed', 'done', 'offered')
          ORDER BY id",
     )
     .bind(cursor)
     .bind(newest)
-    .bind(session_id)
+    .bind(holder_kind.as_str())
+    .bind(holder_id)
     .fetch_all(&mut *tx)
     .await?;
     sqlx::query("UPDATE task_sessions SET notice_cursor = ? WHERE session_id = ?")
@@ -135,20 +175,37 @@ pub async fn take_notices(
         .await?;
 
     let mut notices = Vec::new();
+    let mut offered: Vec<(TaskRow, String)> = Vec::new();
     for (task_id, event, note) in events {
         let Some(task) = row_by_id(&mut tx, task_id).await? else {
             continue;
         };
-        if event == "done" {
+        if event == "offered" {
+            let still_mine = task.status == Status::Open
+                && task
+                    .offered_to
+                    .as_ref()
+                    .is_some_and(|to| to.kind == holder_kind && to.id == holder_id);
+            if still_mine {
+                // A later offer of the same ticket supersedes the earlier one.
+                offered.retain(|(seen, _)| seen.id != task.id);
+                offered.push((task, note));
+            }
+        } else if event == "done" {
             if let Some(sha) = green_sha(&note) {
                 notices.push(Notice::IncidentClosed {
                     task,
                     sha: Some(sha),
                 });
+            } else if let Some(resolved) = super::resolved_note(&note) {
+                notices.push(Notice::TicketClosed {
+                    task,
+                    note: resolved.to_owned(),
+                });
             }
         } else if task.status == Status::Claimed
             && let Some(new_holder) = task.holder()
-            && !(new_holder.kind == HolderKind::Session && new_holder.id == session_id)
+            && !(new_holder.kind == holder_kind && new_holder.id == holder_id)
         {
             // One notice per task per call: a later event for the same task supersedes the earlier one.
             notices.retain(
@@ -159,9 +216,86 @@ pub async fn take_notices(
     }
     // Inside the same transaction: the cursor has advanced, so an error here rolls the advance back and
     // the notice is not lost.
-    inherited_notices(&mut tx, session_id, cursor, newest, &mut notices).await?;
+    inherited_notices(
+        &mut tx,
+        session_id,
+        holder_kind,
+        holder_id,
+        cursor,
+        newest,
+        &mut notices,
+    )
+    .await?;
+    reporter_notices(
+        &mut tx,
+        holder_kind,
+        holder_id,
+        cursor,
+        newest,
+        &mut notices,
+    )
+    .await?;
     tx.commit().await?;
+    // The context reads through the pool (git included, bounded), so it is built after the commit:
+    // the cursor has moved, and an offer is delivered once. A failed context read must not swallow the
+    // other notices, so the offer then goes out with a null context.
+    for (task, note) in offered {
+        let context = competence::context(pool, &task, now)
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, task = task.id, "task claims: offer delivered without its context");
+                serde_json::Value::Null
+            });
+        notices.push(Notice::Offered {
+            task,
+            note,
+            context,
+        });
+    }
     Ok(notices)
+}
+
+/// A session that reported a ticket as blocking hears when it closes, whoever closed it. A ticket this
+/// call already notified about (the old owner's `IncidentClosed` / `TicketClosed`) is not repeated.
+async fn reporter_notices(
+    conn: &mut SqliteConnection,
+    holder_kind: HolderKind,
+    holder_id: &str,
+    cursor: i64,
+    newest: i64,
+    notices: &mut Vec<Notice>,
+) -> sqlx::Result<()> {
+    let closed: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT e.task_id, e.note FROM task_claim_events e
+         WHERE e.id > ? AND e.id <= ? AND e.event = 'done'
+           AND EXISTS (SELECT 1 FROM task_claim_reports r
+                       WHERE r.task_id = e.task_id AND r.reporter_kind = ?
+                         AND r.reporter_id = ? AND r.blocking = 1)
+         ORDER BY e.id",
+    )
+    .bind(cursor)
+    .bind(newest)
+    .bind(holder_kind.as_str())
+    .bind(holder_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    for (task_id, note) in closed {
+        let already = notices.iter().any(|notice| match notice {
+            Notice::IncidentClosed { task, .. }
+            | Notice::InheritedClosed { task, .. }
+            | Notice::TicketClosed { task, .. } => task.id == task_id,
+            Notice::ClaimLost { .. } | Notice::Offered { .. } => false,
+        });
+        if already {
+            continue;
+        }
+        let Some(task) = row_by_id(conn, task_id).await? else {
+            continue;
+        };
+        let note = super::resolved_note(&note).unwrap_or(&note).to_owned();
+        notices.push(Notice::TicketClosed { task, note });
+    }
+    Ok(())
 }
 
 /// The comparison key of a worktree path. `canonicalize` adds the `\\?\` verbatim prefix on Windows,
@@ -203,6 +337,8 @@ async fn worktree_key_of(path: &str) -> Option<String> {
 async fn inherited_notices(
     conn: &mut SqliteConnection,
     session_id: &str,
+    holder_kind: HolderKind,
+    holder_id: &str,
     cursor: i64,
     newest: i64,
     notices: &mut Vec<Notice>,
@@ -229,9 +365,9 @@ async fn inherited_notices(
     let Some(mine) = worktree_key_of(&worktree).await else {
         return Ok(());
     };
-    for (task_id, holder_kind, holder_id) in closed {
-        let held_it =
-            holder_kind.as_deref() == Some("session") && holder_id.as_deref() == Some(session_id);
+    for (task_id, event_kind, event_id) in closed {
+        let held_it = event_kind.as_deref() == Some(holder_kind.as_str())
+            && event_id.as_deref() == Some(holder_id);
         if held_it {
             continue;
         }
@@ -268,9 +404,123 @@ async fn inherited_notices(
     Ok(())
 }
 
+/// What a run is owed, worded for its next allowed PreToolUse: `take_notices` on the run's
+/// pseudo-session `run-<id>` (registered by `offers` when a ticket is offered to it), each notice
+/// rendered by [`render_notice`]. Empty for a run nothing was ever offered to: it has no cursor row.
+pub async fn take_run_notices(
+    pool: &SqlitePool,
+    run_id: i64,
+    now: DateTime<Utc>,
+) -> sqlx::Result<Vec<String>> {
+    let id = run_id.to_string();
+    let notices = take_notices(pool, &format!("run-{id}"), HolderKind::Run, &id, now).await?;
+    Ok(notices.iter().map(render_notice).collect())
+}
+
+/// A notice as the agent reads it: what happened and what to do about it. The one renderer:
+/// `http::tasks` re-exports it and the PreToolUse hook reaches it through [`take_run_notices`].
+pub fn render_notice(notice: &Notice) -> String {
+    match notice {
+        Notice::ClaimLost { task, new_holder } => format!(
+            "Your claim on #{} `{}` is gone: it is now held by {}. Stop working on it; take another task or ask.",
+            task.id,
+            task.key,
+            holder_label(new_holder),
+        ),
+        Notice::IncidentClosed { task, sha } => format!(
+            "Incident #{} `{}` was closed{}: master is green again. If you were fixing it, stop; \
+             if your verify inherited it, rebase on master and verify again.",
+            task.id,
+            task.key,
+            at_sha(sha.as_deref()),
+        ),
+        Notice::InheritedClosed { task, sha } => format!(
+            "Incident #{} `{}` was closed{}: master is green again. Your verify inherited it: \
+             rebase on master and verify again.",
+            task.id,
+            task.key,
+            at_sha(sha.as_deref()),
+        ),
+        Notice::TicketClosed { task, note } => format!(
+            "Ticket #{} `{}` was closed: {note}. If you were fixing it, stop. If you were waiting for it, \
+             rebase on the target and continue.",
+            task.id, task.key,
+        ),
+        Notice::Offered {
+            task,
+            note,
+            context,
+        } => format!(
+            "Ticket #{} `{}` is yours: {}. {note}. Competent: {}. Claim it with task_claim, or \
+             decline with task_decline (message, optional suggest_session_id). Independent of your \
+             own work? Launch a leaf for it and carry on.",
+            task.id,
+            task.key,
+            task.title,
+            render_competent(context),
+        ),
+    }
+}
+
+/// How an agent can name a holder when it reads who has a task.
+fn holder_label(holder: &Holder) -> String {
+    match holder.kind {
+        HolderKind::Run => format!("run #{}", holder.id),
+        HolderKind::Job => format!("job #{}", holder.id),
+        HolderKind::Postgate => "the daemon (post-merge gate)".to_owned(),
+        HolderKind::Verify => "the daemon (verify)".to_owned(),
+        HolderKind::Session => format!("another session in {}", holder.worktree),
+    }
+}
+
+/// ` at <first seven characters of the sha>`, cut on a character boundary, or nothing.
+fn at_sha(sha: Option<&str>) -> String {
+    sha.map(|sha| {
+        let short = sha
+            .char_indices()
+            .nth(7)
+            .map_or(sha, |(end, _)| &sha[..end]);
+        format!(" at {short}")
+    })
+    .unwrap_or_default()
+}
+
+/// The `competent` list of a `competence::context` as one line: `session:abc (owned: doing), ...`,
+/// or `none` when the context is null, unreadable or lists nobody.
+fn render_competent(context: &serde_json::Value) -> String {
+    use serde_json::Value;
+    let listed: Vec<String> = context
+        .get("competent")
+        .and_then(Value::as_array)
+        .map(|competent| {
+            competent
+                .iter()
+                .filter_map(|entry| {
+                    let holder = entry.get("holder")?;
+                    let kind = holder.get("kind").and_then(Value::as_str)?;
+                    let id = holder.get("id").and_then(Value::as_str)?;
+                    let source = entry.get("source").and_then(Value::as_str).unwrap_or("?");
+                    let doing = entry.get("doing").and_then(Value::as_str).unwrap_or("");
+                    Some(if doing.is_empty() {
+                        format!("{kind}:{id} ({source})")
+                    } else {
+                        format!("{kind}:{id} ({source}: {doing})")
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if listed.is_empty() {
+        "none".to_owned()
+    } else {
+        listed.join(", ")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::task_claims::offers;
     use crate::task_claims::store::{self, claim, done};
     use crate::task_claims::{ClaimOutcome, Closer, Holder, NewTask, TaskKey, TaskKind};
     use chrono::TimeZone;
@@ -381,14 +631,19 @@ mod tests {
         let late = t0() + secs(SESSION_LEASE_SECONDS + 1);
         claimed(&pool, "file:core/a.rs", &holder("s2"), late).await;
 
-        let notices = take_notices(&pool, "s1", late).await.unwrap();
+        let notices = take_notices(&pool, "s1", HolderKind::Session, "s1", late)
+            .await
+            .unwrap();
         let [Notice::ClaimLost { task, new_holder }] = notices.as_slice() else {
             panic!("expected one ClaimLost, got {notices:?}")
         };
         assert_eq!(task.key.as_str(), "file:core/a.rs");
         assert_eq!(new_holder.id, "s2");
         assert!(
-            take_notices(&pool, "s1", late).await.unwrap().is_empty(),
+            take_notices(&pool, "s1", HolderKind::Session, "s1", late)
+                .await
+                .unwrap()
+                .is_empty(),
             "the cursor advanced"
         );
     }
@@ -419,7 +674,9 @@ mod tests {
         let t3 = t2 + secs(10);
         claimed(&pool, "file:core/a.rs", &holder("s3"), t3).await;
 
-        let notices = take_notices(&pool, "s1", t3).await.unwrap();
+        let notices = take_notices(&pool, "s1", HolderKind::Session, "s1", t3)
+            .await
+            .unwrap();
         let [Notice::ClaimLost { new_holder, .. }] = notices.as_slice() else {
             panic!("expected one ClaimLost, got {notices:?}")
         };
@@ -443,7 +700,10 @@ mod tests {
             .unwrap();
         claimed(&pool, "file:core/a.rs", &me, late + secs(1)).await;
         assert!(
-            take_notices(&pool, "s1", late).await.unwrap().is_empty(),
+            take_notices(&pool, "s1", HolderKind::Session, "s1", late)
+                .await
+                .unwrap()
+                .is_empty(),
             "it holds the task again"
         );
     }
@@ -472,13 +732,131 @@ mod tests {
             .await
             .unwrap();
 
-        let notices = take_notices(&pool, "s1", t0() + secs(7)).await.unwrap();
+        let notices = take_notices(&pool, "s1", HolderKind::Session, "s1", t0() + secs(7))
+            .await
+            .unwrap();
         let [Notice::IncidentClosed { task, sha }] = notices.as_slice() else {
             panic!("expected one IncidentClosed, got {notices:?}")
         };
         assert_eq!(
             (task.id, task.status, sha.as_deref()),
             (red, Status::Done, Some("abc123"))
+        );
+    }
+
+    async fn reported_by(pool: &SqlitePool, key: &str, who: &Holder, blocking: bool) -> i64 {
+        let outcome = store::report(
+            pool,
+            "p",
+            task(key),
+            &crate::task_claims::Reporter::Holder(who),
+            "it blocks me",
+            &[],
+            blocking,
+            None,
+            t0(),
+        )
+        .await
+        .unwrap();
+        outcome.task.id
+    }
+
+    #[tokio::test]
+    async fn a_blocking_reporter_hears_when_the_ticket_closes_whoever_closed_it() {
+        let pool = pool().await;
+        let (reporter, fixer) = (holder("s1"), holder("s2"));
+        touch_session(&pool, "s1", "/wt/s1", "p", t0())
+            .await
+            .unwrap();
+        let id = claimed(&pool, "file:core/a.rs", &fixer, t0()).await;
+        reported_by(&pool, "file:core/a.rs", &reporter, true).await;
+        done(&pool, id, Closer::Holder(&fixer), "fixed", t0() + secs(5))
+            .await
+            .unwrap();
+
+        let notices = take_notices(&pool, "s1", HolderKind::Session, "s1", t0() + secs(6))
+            .await
+            .unwrap();
+        let [Notice::TicketClosed { task, note }] = notices.as_slice() else {
+            panic!("expected one TicketClosed, got {notices:?}")
+        };
+        assert_eq!((task.id, note.as_str()), (id, "fixed"));
+    }
+
+    #[tokio::test]
+    async fn a_non_blocking_reporter_hears_nothing() {
+        let pool = pool().await;
+        let (reporter, fixer) = (holder("s1"), holder("s2"));
+        touch_session(&pool, "s1", "/wt/s1", "p", t0())
+            .await
+            .unwrap();
+        let id = claimed(&pool, "file:core/a.rs", &fixer, t0()).await;
+        reported_by(&pool, "file:core/a.rs", &reporter, false).await;
+        done(&pool, id, Closer::Holder(&fixer), "fixed", t0() + secs(5))
+            .await
+            .unwrap();
+        assert!(
+            take_notices(&pool, "s1", HolderKind::Session, "s1", t0() + secs(6))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resolved_closure_tells_the_old_owner() {
+        let pool = pool().await;
+        let me = holder("s1");
+        touch_session(&pool, "s1", "/wt/s1", "p", t0())
+            .await
+            .unwrap();
+        let id = claimed(&pool, "file:core/a.rs", &me, t0()).await;
+        done(
+            &pool,
+            id,
+            Closer::Resolved,
+            "branch no longer collides",
+            t0() + secs(5),
+        )
+        .await
+        .unwrap();
+
+        let notices = take_notices(&pool, "s1", HolderKind::Session, "s1", t0() + secs(6))
+            .await
+            .unwrap();
+        let [Notice::TicketClosed { task, note }] = notices.as_slice() else {
+            panic!("expected one TicketClosed, got {notices:?}")
+        };
+        assert_eq!((task.id, note.as_str()), (id, "branch no longer collides"));
+    }
+
+    #[tokio::test]
+    async fn master_red_green_closure_still_gives_incident_closed() {
+        let pool = pool().await;
+        let me = holder("s1");
+        touch_session(&pool, "s1", "/wt/s1", "p", t0())
+            .await
+            .unwrap();
+        let red = claimed(&pool, "master-red", &me, t0()).await;
+        // The owner also reported it as blocking: the green closure must still be one notice.
+        reported_by(&pool, "master-red", &me, true).await;
+        done(
+            &pool,
+            red,
+            Closer::Green {
+                sha: "abc123".into(),
+            },
+            "revert",
+            t0() + secs(5),
+        )
+        .await
+        .unwrap();
+        let notices = take_notices(&pool, "s1", HolderKind::Session, "s1", t0() + secs(6))
+            .await
+            .unwrap();
+        assert!(
+            matches!(notices.as_slice(), [Notice::IncidentClosed { .. }]),
+            "{notices:?}"
         );
     }
 
@@ -503,9 +881,14 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(take_notices(&pool, "s1", t0()).await.unwrap().is_empty());
         assert!(
-            take_notices(&pool, "never-seen", t0())
+            take_notices(&pool, "s1", HolderKind::Session, "s1", t0())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            take_notices(&pool, "never-seen", HolderKind::Session, "never-seen", t0())
                 .await
                 .unwrap()
                 .is_empty()
@@ -578,25 +961,29 @@ mod tests {
         .await
         .unwrap();
 
-        let s1 = take_notices(&pool, "s1", t0() + secs(6)).await.unwrap();
+        let s1 = take_notices(&pool, "s1", HolderKind::Session, "s1", t0() + secs(6))
+            .await
+            .unwrap();
         let [Notice::InheritedClosed { task, sha }] = s1.as_slice() else {
             panic!("expected one InheritedClosed, got {s1:?}")
         };
         assert_eq!((task.id, sha.as_deref()), (red, Some("abc123")));
         assert!(
-            take_notices(&pool, "s1", t0() + secs(7))
+            take_notices(&pool, "s1", HolderKind::Session, "s1", t0() + secs(7))
                 .await
                 .unwrap()
                 .is_empty(),
             "the cursor advanced"
         );
-        let s2 = take_notices(&pool, "s2", t0() + secs(6)).await.unwrap();
+        let s2 = take_notices(&pool, "s2", HolderKind::Session, "s2", t0() + secs(6))
+            .await
+            .unwrap();
         assert!(
             matches!(s2.as_slice(), [Notice::InheritedClosed { .. }]),
             "{s2:?}"
         );
         assert!(
-            take_notices(&pool, "s3", t0() + secs(6))
+            take_notices(&pool, "s3", HolderKind::Session, "s3", t0() + secs(6))
                 .await
                 .unwrap()
                 .is_empty()
@@ -625,7 +1012,9 @@ mod tests {
         .await
         .unwrap();
 
-        let notices = take_notices(&pool, "s1", t0() + secs(6)).await.unwrap();
+        let notices = take_notices(&pool, "s1", HolderKind::Session, "s1", t0() + secs(6))
+            .await
+            .unwrap();
         assert!(
             matches!(notices.as_slice(), [Notice::IncidentClosed { .. }]),
             "{notices:?}"
@@ -666,16 +1055,30 @@ mod tests {
         .await
         .unwrap();
 
-        let live_notices = take_notices(&pool, "s-live", t0() + secs(6)).await.unwrap();
+        let live_notices = take_notices(
+            &pool,
+            "s-live",
+            HolderKind::Session,
+            "s-live",
+            t0() + secs(6),
+        )
+        .await
+        .unwrap();
         assert!(
             matches!(live_notices.as_slice(), [Notice::InheritedClosed { .. }]),
             "{live_notices:?}"
         );
         assert!(
-            take_notices(&pool, "s-gone", t0() + secs(6))
-                .await
-                .unwrap()
-                .is_empty(),
+            take_notices(
+                &pool,
+                "s-gone",
+                HolderKind::Session,
+                "s-gone",
+                t0() + secs(6)
+            )
+            .await
+            .unwrap()
+            .is_empty(),
             "a session whose own worktree is gone hears nothing, and nothing panics"
         );
     }
@@ -700,5 +1103,118 @@ mod tests {
     #[cfg(not(windows))]
     fn elsewhere_worktree_keys_keep_case() {
         assert_ne!(worktree_key("/r/WT"), worktree_key("/r/wt"));
+    }
+
+    /// An `open` ticket of project `p` guarding `core/a.rs`, and the session `owner` registered and
+    /// owning that path through a running work node (so `offers::route` offers it to `owner`).
+    async fn offerable_ticket(pool: &SqlitePool, owner: &str) -> i64 {
+        touch_session(pool, owner, &format!("/wt/{owner}"), "p", t0())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO work_nodes (id, project_id, root_id, depth, kind, title, goal, status,
+                                     owned_paths, session_id, created_at, updated_at)
+             VALUES ('n1', 'p', 'n1', 0, 'leaf', 'edit a', 'goal', 'running', '[\"core/a.rs\"]', ?, 't', 't')",
+        )
+        .bind(owner)
+        .execute(pool)
+        .await
+        .unwrap();
+        let mut new = task("file:core/a.rs");
+        new.guard_paths = vec!["core/a.rs".to_owned()];
+        store::create_or_adopt_open(pool, "p", new, t0())
+            .await
+            .unwrap()
+            .id
+    }
+
+    #[tokio::test]
+    async fn the_offered_session_is_told_once_with_the_context() {
+        let pool = pool().await;
+        let id = offerable_ticket(&pool, "s1").await;
+        let routed = offers::route(&pool, id, t0()).await.unwrap();
+        assert_eq!(routed, offers::Routed::Offered(holder("s1")));
+
+        let notices = take_notices(&pool, "s1", HolderKind::Session, "s1", t0() + secs(1))
+            .await
+            .unwrap();
+        let [
+            Notice::Offered {
+                task,
+                note,
+                context,
+            },
+        ] = notices.as_slice()
+        else {
+            panic!("expected one Offered, got {notices:?}")
+        };
+        assert_eq!(task.id, id);
+        assert!(note.starts_with("routed: owned"), "{note}");
+        assert_eq!(context["competent"][0]["holder"]["id"], "s1", "{context}");
+        assert!(
+            take_notices(&pool, "s1", HolderKind::Session, "s1", t0() + secs(2))
+                .await
+                .unwrap()
+                .is_empty(),
+            "delivered once"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_offer_already_claimed_by_someone_else_is_not_delivered() {
+        let pool = pool().await;
+        let id = offerable_ticket(&pool, "s1").await;
+        offers::route(&pool, id, t0()).await.unwrap();
+        store::claim_by_id(&pool, id, &holder("s2"), t0() + secs(1))
+            .await
+            .unwrap();
+
+        let notices = take_notices(&pool, "s1", HolderKind::Session, "s1", t0() + secs(2))
+            .await
+            .unwrap();
+        assert!(
+            !notices.iter().any(|n| matches!(n, Notice::Offered { .. })),
+            "{notices:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_decline_notifies_the_suggested_session_with_the_message() {
+        let pool = pool().await;
+        let id = offerable_ticket(&pool, "s1").await;
+        touch_session(&pool, "s2", "/wt/s2", "p", t0())
+            .await
+            .unwrap();
+        offers::route(&pool, id, t0()).await.unwrap();
+
+        let routed = offers::decline(
+            &pool,
+            id,
+            &holder("s1"),
+            "you wrote this module",
+            Some(holder("s2")),
+            t0() + secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(routed, offers::Routed::Offered(holder("s2")));
+
+        let notices = take_notices(&pool, "s2", HolderKind::Session, "s2", t0() + secs(2))
+            .await
+            .unwrap();
+        let [Notice::Offered { task, note, .. }] = notices.as_slice() else {
+            panic!("expected one Offered, got {notices:?}")
+        };
+        assert_eq!(task.id, id);
+        assert!(note.contains("session:s1"), "{note}");
+        assert!(note.contains("you wrote this module"), "{note}");
+        assert!(
+            !take_notices(&pool, "s1", HolderKind::Session, "s1", t0() + secs(2))
+                .await
+                .unwrap()
+                .iter()
+                .any(|n| matches!(n, Notice::Offered { .. })),
+            "the offer moved off s1"
+        );
     }
 }

@@ -34,6 +34,7 @@ use serde::Serialize;
 use crate::execution::vcs::{Branch, Op, Origin, ResolvedRepo};
 
 pub mod claim_gate;
+pub mod migration_gate;
 
 /// Decision #7's feed kind: a conflict resolution the agent could not produce, or that admission
 /// otherwise refused. Named so it reads as this module's own line among `vcs_request_finished` and
@@ -519,6 +520,11 @@ pub async fn submit_with(
     };
     if let claim_gate::Verdict::Refused(message) =
         claim_gate::check(pool, &landing, owner_override, deadline, chrono::Utc::now()).await
+    {
+        return Err(LandRefusal::Claimed(message));
+    }
+    if let claim_gate::Verdict::Refused(message) =
+        migration_gate::check(pool, &landing, deadline, chrono::Utc::now()).await
     {
         return Err(LandRefusal::Claimed(message));
     }

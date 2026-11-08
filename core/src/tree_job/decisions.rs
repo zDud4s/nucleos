@@ -281,6 +281,55 @@ pub(super) async fn ask_pending_with_id(
     Ok(decision)
 }
 
+/// Opens a decision that belongs to no tree job (`tree_id` and `node_id` NULL), e.g. a ticket the
+/// launch cap parked: the open row and one `work_tree_parked` feed line land together. The caller
+/// picks `id`, insert-or-ignore: asked again under the same id, nothing is written, no feed line is
+/// added, and the stored decision is returned as it is (open or already answered).
+pub async fn ask_ownerless(
+    pool: &SqlitePool,
+    id: &str,
+    question: &str,
+) -> Result<Decision, DecisionError> {
+    let decision = Decision {
+        id: id.to_owned(),
+        tree_id: None,
+        node_id: None,
+        question: question.to_owned(),
+        answer: None,
+        origin: Some(ORIGIN_AGENT.to_owned()),
+        at: now(),
+        status: STATUS_OPEN.to_owned(),
+    };
+    let line = format!("decision {} — {question}", decision.id);
+
+    // Nothing below may ask the pool for a connection while `tx` holds one.
+    let mut tx = pool.begin().await?;
+    let inserted = sqlx::query(
+        "INSERT OR IGNORE INTO decisions (id, tree_id, node_id, question, answer, origin, at, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&decision.id)
+    .bind(&decision.tree_id)
+    .bind(&decision.node_id)
+    .bind(&decision.question)
+    .bind(&decision.answer)
+    .bind(&decision.origin)
+    .bind(&decision.at)
+    .bind(&decision.status)
+    .execute(&mut *tx)
+    .await?;
+    if inserted.rows_affected() == 0 {
+        let existing: Option<Decision> = sqlx::query_as(select_decisions!("WHERE id = ?"))
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        return existing.ok_or_else(|| DecisionError::NotFound(id.to_owned()));
+    }
+    crate::feed::append_on(&mut tx, None, FEED_KIND, &line, None, None).await?;
+    tx.commit().await?;
+    Ok(decision)
+}
+
 /// `manifest.extra` key naming the decision a root without a branch waits on: `{ "decision_id" }`.
 /// `relaunch::node_waiting_on` reads it, so only this decision's answer restarts the root.
 pub(super) const ROOT_PARK_KEY: &str = "root_park";
@@ -1089,5 +1138,33 @@ mod tests {
 
         assert_eq!(ids(&undecided), ["d-open", "c-open"]);
         assert_eq!(undecided, [rows[2].clone(), rows[0].clone()]);
+    }
+
+    #[tokio::test]
+    async fn an_ownerless_decision_is_listed_among_the_open_ones_and_asked_twice_writes_once() {
+        let pool = crate::testdb::fresh_pool().await;
+
+        let first = ask_ownerless(&pool, "d-ticket-7", QUESTION).await.unwrap();
+        let second = ask_ownerless(&pool, "d-ticket-7", "a different wording")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            (first.tree_id.as_deref(), first.node_id.as_deref()),
+            (None, None)
+        );
+        assert_eq!(first.status, STATUS_OPEN);
+        assert_eq!(second, first, "the second ask returns the stored decision");
+        assert_eq!(decision_rows(&pool).await, 1);
+        assert_eq!(
+            feed_rows(&pool).await,
+            1,
+            "the second ask adds no feed line"
+        );
+        let lines = tree_lines(&pool).await;
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].0, FEED_KIND);
+        assert!(lines[0].1.contains("d-ticket-7") && lines[0].1.contains(QUESTION));
+        assert_eq!(open(&pool).await.unwrap(), [first]);
     }
 }

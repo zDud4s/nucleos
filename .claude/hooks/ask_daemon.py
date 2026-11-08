@@ -733,7 +733,7 @@ def claims_exchange(payload, want_incidents=False, force=False, now=None):
 
 
 # Equals mcp_tools::TASK_TOOL_NAMES behind the server prefix; a test compares the two.
-TASK_TOOLS = tuple(f"mcp__nucleos__task_{name}" for name in ("list", "claim", "release", "done"))
+TASK_TOOLS = tuple(f"mcp__nucleos__task_{name}" for name in ("list", "claim", "release", "done", "report", "decline"))
 INCIDENTS_HEADER = (
     "Live incidents in this project. Before fixing anything outside your own task, claim it with "
     "mcp__nucleos__task_claim, and if you do not win, leave it:\n"
@@ -1839,6 +1839,95 @@ def conductor_gate(payload):
         _conductor_report(payload, verdict.get("reason"))
 
 
+SCOPE_FENCED_TOOLS = ("Write", "Edit", "MultiEdit", "NotebookEdit")
+SCOPE_PATH_KEYS = ("file_path", "notebook_path")
+
+
+def _scope_repo_root(cwd):
+    """The repository `cwd` sits in: the first folder at or above it holding a `.git` (a folder in a
+    main checkout, a file in a worktree), or `cwd` itself, unchanged, when there is none.
+
+    The daemon computes owned-path globs relative to the root it is sent, so a session started in a
+    subdirectory must send the repository root, not its own cwd.
+    """
+    for folder in _ancestors(cwd):
+        if os.path.exists(os.path.join(folder, ".git")):
+            return folder
+    return cwd
+
+
+def _scope_tool_input(tool_input, cwd, root):
+    """`tool_input` with a relative edited path made absolute against `cwd`, the folder the tool
+    resolves it from, so the daemon does not resolve it against `root` instead."""
+    if root == cwd:
+        return tool_input
+    fixed = dict(tool_input)
+    for key in SCOPE_PATH_KEYS:
+        path = fixed.get(key)
+        # The daemon's own test of absolute: `/x`, `\x` or a drive letter (`node_scope::is_absolute`).
+        absolute = isinstance(path, str) and (path[:1] in ("/", "\\") or path[1:2] == ":")
+        if isinstance(path, str) and path.strip() and not absolute:
+            fixed[key] = os.path.join(os.path.abspath(cwd), path)
+    return fixed
+
+
+def scope_refusal(payload):
+    """The daemon's refusal of an edit outside the paths of this session's work node, or None.
+
+    Fail-open on everything: claims switched off, a governed run (the daemon fences those itself),
+    a non-edit tool, an unusable session id or cwd, no token, a daemon that is down or slow, a
+    non-200 answer, a session bound to no running node, or anything unexpected. One total budget
+    of CLAIMS_TIMEOUT_SECONDS covers token discovery (at most 1 s of it) and the HTTP call.
+    """
+    try:
+        if claims_off() or os.environ.get("NUCLEOS_RUN_ID") is not None:
+            return None
+        if not isinstance(payload, dict) or payload.get("tool_name") not in SCOPE_FENCED_TOOLS:
+            return None
+        session_id = payload.get("session_id")
+        cwd = payload.get("cwd")
+        tool_input = payload.get("tool_input")
+        if not isinstance(session_id, str) or not SESSION_ID_SHAPE.fullmatch(session_id):
+            return None
+        if not isinstance(cwd, str) or not cwd.strip() or not isinstance(tool_input, dict):
+            return None
+        started = time.monotonic()
+        token, _why = read_control_token(cwd, 1, 1, total_timeout=1)
+        if not token:
+            return None
+        # The owned globs are relative to the repository root, which a session started in a
+        # subdirectory does not have as its cwd.
+        root = _scope_repo_root(cwd)
+        daemon_url = os.environ.get("NUCLEOS_DAEMON_URL") or DEFAULT_DAEMON_URL
+        request = urllib.request.Request(
+            f"{daemon_url}/nodes/scope",
+            data=json.dumps(
+                {
+                    "session_id": session_id,
+                    "cwd": root,
+                    "tool_name": payload.get("tool_name"),
+                    "tool_input": _scope_tool_input(tool_input, cwd, root),
+                }
+            ).encode(),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        remaining = max(0.2, CLAIMS_TIMEOUT_SECONDS - (time.monotonic() - started))
+        with urllib.request.urlopen(request, timeout=remaining) as response:
+            if getattr(response, "status", 200) != 200:
+                return None
+            answer = json.loads(response.read())
+        if not isinstance(answer, dict) or answer.get("allowed") is not False:
+            return None
+        reason = answer.get("reason")
+        return reason if isinstance(reason, str) and reason.strip() else None
+    except Exception:
+        return None
+
+
 def interactive_session(payload: dict) -> None:
     """A session a person opened. Answers to the conductor policy first (`conductor_gate`), then
     refuses queue operations; may add context. The one thing it ever approves is a call to one of the
@@ -1850,6 +1939,12 @@ def interactive_session(payload: dict) -> None:
     tool = payload.get("tool_name")
     session_id = payload.get("session_id")
     tool_input = payload.get("tool_input")
+    # The node fence: an edit outside the paths of the work node this session drives is refused
+    # with the daemon's sentence. Only the file-writing tools ask, and every failure lets it through.
+    if tool in SCOPE_FENCED_TOOLS:
+        reason = scope_refusal(payload)
+        if reason:
+            deny(reason)
     stamping = (
         tool in TASK_TOOLS
         and isinstance(session_id, str)

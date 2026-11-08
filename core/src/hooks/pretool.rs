@@ -2,8 +2,11 @@
 
 use super::*;
 
+mod job_tools;
 mod node_context;
 mod web_builtin;
+
+use job_tools::{job_id_of, job_node_web_builtin};
 
 pub async fn pretooluse_decision(
     State(state): State<AppState>,
@@ -23,9 +26,19 @@ pub async fn pretooluse_decision(
     } else {
         None
     };
-    // A node run in its warn band is told to split, on an allow only: a refusal already says why.
+    // On an allow only (a refusal already says why): a run offered a ticket is told it is its own,
+    // and a node run in its warn band is told to split. Both reach it, neither replaces the other.
+    // Fail open: a notice that cannot be read now stays unread, and the next call asks again.
     let additional_context = if decision.decision == "allow" {
-        node_context::warn_hint(&state, run_id).await
+        let now = chrono::Utc::now();
+        let mut parts = crate::task_claims::sessions::take_run_notices(&state.pool, run_id, now)
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(run_id, %error, "pretooluse-decision: could not read the run's ticket notices");
+                Vec::new()
+            });
+        parts.extend(node_context::warn_hint(&state, run_id).await);
+        (!parts.is_empty()).then(|| parts.join("\n\n"))
     } else {
         None
     };
@@ -80,49 +93,6 @@ pub(super) async fn filter_rewrite(
         tool_input,
         &exe,
         &crate::execution::output_filter::run_log_dir(&data, run_id),
-    )
-}
-
-/// Whether `tool_name` is one of the job-node tools: `mcp__nucleos__<name>` for a `<name>` in
-/// `mcp_tools::JOB_NODE_BASE`, matched as a WHOLE name and never by prefix or wildcard.
-///
-/// This is the base list an unattended run may call, and it is a branch in
-/// `pretooluse_decision` and not a classifier class: the classifier is pure and per-tool, and a
-/// class would also have to be kept away from the judge and the scoreboard. A widening of
-/// `JOB_NODE_BASE` widens this by construction, so that list is the thing review must watch. The
-/// extras (`JOB_NODE_EXTRAS`) are admitted only from the run's loadout, see `job_node_extra`.
-pub(super) fn is_job_node_tool(tool_name: &str) -> bool {
-    tool_name
-        .strip_prefix("mcp__nucleos__")
-        .is_some_and(|name| crate::mcp_tools::JOB_NODE_BASE.contains(&name))
-}
-
-/// The `<n>` of a whole-segment `mcp__nucleos__<n>` that names a job-node extra, else `None`.
-pub(super) fn job_node_extra(tool_name: &str) -> Option<&str> {
-    tool_name
-        .strip_prefix("mcp__nucleos__")
-        .filter(|name| !name.contains("__"))
-        .filter(|name| crate::mcp_tools::JOB_NODE_EXTRAS.contains(name))
-}
-
-/// Whether `tool_name` is a Claude built-in web tool an agent's `web` capability can grant: a WHOLE
-/// name match on `WebFetch` or `WebSearch`. Unlike `job_node_extra` these are the engine's own
-/// tools, not `mcp__nucleos__` ones, so the grant lives in the run's loadout under the bare name.
-pub(super) fn job_node_web_builtin(tool_name: &str) -> bool {
-    crate::loadout::is_engine_builtin(tool_name)
-}
-
-/// The job a run belongs to, `None` for a run that is not a job's node (or whose row is gone).
-pub(super) async fn job_id_of(
-    pool: &sqlx::SqlitePool,
-    run_id: i64,
-) -> Result<Option<i64>, sqlx::Error> {
-    Ok(
-        sqlx::query_scalar::<_, Option<i64>>("SELECT job_id FROM runs WHERE id = ?")
-            .bind(run_id)
-            .fetch_optional(pool)
-            .await?
-            .flatten(),
     )
 }
 
@@ -373,144 +343,44 @@ pub(super) async fn pretooluse_decision_from(
         return decision;
     }
 
-    // A job's node may call its box's base tools (a finding, verification, `request_tool`,
-    // `read_context`): the `mcp__` tools an unattended run is allowed without a loadout row. Before
-    // the classifier, like the branches above, so it never reaches the judge, never parks and writes
-    // no scoreboard row (the scoreboard measures the classifier, and this is not its decision).
-    // Anything short of ALL the conditions falls through and is refused as an unrecognised tool.
-    if is_job_node_tool(&payload.tool_name)
-        && is_in_flight
-        && crate::execution::runs::runs_unattended(&mode)
+    // The node scope fence: a run behind a `running` node writes only what its node owns, plus the
+    // shared files. Before the classifier, so a refusal is immediate and parks nothing; counted
+    // like the other hard refusals. Fail-open: a run not in flight (no cwd), a run with no node,
+    // or any read error falls through to the rules below.
+    if let Some(root) = cwd.as_deref()
+        && crate::node_scope::edited_path(&payload.tool_name, &payload.tool_input).is_some()
     {
-        match job_id_of(&state.pool, run_id).await {
-            Ok(Some(job_id)) => {
-                // A base tool that carries a third party's words (`read_context`) taints the run
-                // exactly as an extra does: the mark is what the later steps are judged against.
-                let bare = payload
-                    .tool_name
-                    .strip_prefix("mcp__nucleos__")
-                    .unwrap_or_default();
-                if crate::mcp_tools::effect_of_call(&state.pool, bare, &payload.tool_input).await
-                    == crate::mcp_tools::ToolEffect::ReadsUntrusted
-                    && let Err(error) =
-                        crate::execution::runs::mark_untrusted_context(&state.pool, run_id).await
-                {
-                    tracing::warn!(
-                        run_id = run_id,
-                        tool = bare,
-                        %error,
-                        "pretooluse-decision: could not record that a job node read third-party content - refusing the read"
-                    );
-                    return Json(Decision {
-                        decision: "deny".to_owned(),
-                        reason: "could not record that this run read third-party content"
-                            .to_owned(),
-                    });
-                }
-                tracing::info!(
-                    run_id = run_id,
-                    job_id = job_id,
-                    tool = %payload.tool_name,
-                    "pretooluse-decision: allowed a job-node tool"
-                );
-                return Json(Decision {
-                    decision: "allow".to_owned(),
-                    reason: "a job's run may use its box's base tools".to_owned(),
-                });
-            }
-            Ok(None) => {}
-            Err(error) => {
-                tracing::warn!(
-                    run_id = run_id,
-                    %error,
-                    "pretooluse-decision: failed to resolve the run's job — failing closed"
-                );
-                return Json(Decision {
-                    decision: "deny".to_owned(),
-                    reason: "could not resolve the run's job — failing closed".to_owned(),
-                });
-            }
+        let shared = crate::node_scope::project_limits(&state.pool, project_id.as_deref())
+            .await
+            .shared_files;
+        if let Some(reason) = crate::node_scope::for_run(
+            &state.pool,
+            run_id,
+            root,
+            &shared,
+            &payload.tool_name,
+            &payload.tool_input,
+        )
+        .await
+        {
+            let _ = count_denial_and_stop_a_prober(&state, run_id, &payload.tool_name).await;
+            return Json(Decision {
+                decision: "deny".to_owned(),
+                reason,
+            });
         }
     }
 
-    // A job's node may also call an EXTRA tool its run's loadout lists. Same preconditions as the
-    // base branch; a tool that is not listed is refused with the way to ask for it.
-    if let Some(extra) = job_node_extra(&payload.tool_name)
-        && is_in_flight
-        && crate::execution::runs::runs_unattended(&mode)
+    // A job's node may call its box's base tools, or an extra its loadout lists; see `job_tools`.
+    if let Some(decision) =
+        job_tools::base_tool_decision(&state, &payload, run_id, is_in_flight, &mode).await
     {
-        match job_id_of(&state.pool, run_id).await {
-            Ok(Some(job_id)) => {
-                match crate::tool_loadout::run_lists_tool(&state.pool, run_id, extra).await {
-                    Ok(true) => {
-                        let effect = crate::mcp_tools::effect_of_call(
-                            &state.pool,
-                            extra,
-                            &payload.tool_input,
-                        )
-                        .await;
-                        if effect == crate::mcp_tools::ToolEffect::ReadsUntrusted
-                            && let Err(error) =
-                                crate::execution::runs::mark_untrusted_context(&state.pool, run_id)
-                                    .await
-                        {
-                            tracing::warn!(
-                                run_id = run_id,
-                                tool = extra,
-                                %error,
-                                "pretooluse-decision: could not record that a job node read third-party content - refusing the read"
-                            );
-                            return Json(Decision {
-                                decision: "deny".to_owned(),
-                                reason: "could not record that this run read third-party content"
-                                    .to_owned(),
-                            });
-                        }
-                        tracing::info!(
-                            run_id = run_id,
-                            job_id = job_id,
-                            tool = extra,
-                            "pretooluse-decision: allowed a job-node extra tool its loadout lists"
-                        );
-                        return Json(Decision {
-                            decision: "allow".to_owned(),
-                            reason: "this run's loadout lists it".to_owned(),
-                        });
-                    }
-                    Ok(false) => {
-                        return Json(Decision {
-                            decision: "deny".to_owned(),
-                            reason: format!(
-                                "{extra} is not available to an autonomous run: it is not in this run's loadout; ask the owner for it with request_tool"
-                            ),
-                        });
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            run_id = run_id,
-                            %error,
-                            "pretooluse-decision: failed to read the run's loadout — failing closed"
-                        );
-                        return Json(Decision {
-                            decision: "deny".to_owned(),
-                            reason: "could not read the run's loadout — failing closed".to_owned(),
-                        });
-                    }
-                }
-            }
-            Ok(None) => {}
-            Err(error) => {
-                tracing::warn!(
-                    run_id = run_id,
-                    %error,
-                    "pretooluse-decision: failed to resolve the run's job — failing closed"
-                );
-                return Json(Decision {
-                    decision: "deny".to_owned(),
-                    reason: "could not resolve the run's job — failing closed".to_owned(),
-                });
-            }
-        }
+        return decision;
+    }
+    if let Some(decision) =
+        job_tools::extra_tool_decision(&state, &payload, run_id, is_in_flight, &mode).await
+    {
+        return decision;
     }
 
     // A job node granted `web` may use Claude's `WebFetch`/`WebSearch`; see `web_builtin`.
@@ -1649,6 +1519,75 @@ mod tests {
             .additional_context
             .expect("a warn must reach the agent");
         assert!(context.contains("handoff"), "got {context:?}");
+    }
+
+    /// An `open` ticket of the test project guarding `core/a.rs`, routed to the run whose node owns
+    /// that path. Returns the ticket id.
+    async fn offer_a_ticket_to(state: &AppState, run_id: i64, node_id: &str) -> i64 {
+        use crate::task_claims::{HolderKind, TaskKind, offers, store, testing};
+        sqlx::query("UPDATE work_nodes SET owned_paths = '[\"core/a.rs\"]' WHERE id = ?")
+            .bind(node_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let mut new = testing::new_task("file:core/a.rs", TaskKind::Declared);
+        new.guard_paths = vec!["core/a.rs".to_owned()];
+        let now = chrono::Utc::now();
+        let id = store::create_or_adopt_open(&state.pool, PROJECT, new, now)
+            .await
+            .unwrap()
+            .id;
+        let routed = offers::route(&state.pool, id, now).await.unwrap();
+        assert!(
+            matches!(&routed, offers::Routed::Offered(to)
+                if to.kind == HolderKind::Run && to.id == run_id.to_string()),
+            "the ticket must be offered to run {run_id}: {routed:?}"
+        );
+        id
+    }
+
+    #[tokio::test]
+    async fn a_run_offered_a_ticket_is_told() {
+        let state = test_state().await;
+        let (run_id, node_id, _) = seed_node_run(&state, "shadow", "leaf", Some(1_000)).await;
+        let ticket = offer_a_ticket_to(&state, run_id, &node_id).await;
+
+        let first = answer(&state, run_id, "Read", read_input()).await;
+
+        assert_allowed(&first.decision, "a read of an offered run");
+        let context = first
+            .additional_context
+            .expect("the offer must reach the run");
+        assert!(context.contains("is yours"), "got {context:?}");
+        assert!(context.contains(&format!("#{ticket}")), "got {context:?}");
+
+        let second = answer(&state, run_id, "Read", read_input()).await;
+        assert!(
+            second.additional_context.is_none(),
+            "an offer is told once: {:?}",
+            second.additional_context
+        );
+    }
+
+    #[tokio::test]
+    async fn the_offered_notice_and_the_warn_hint_are_both_delivered() {
+        let state = test_state().await;
+        let (run_id, node_id, _) =
+            seed_node_run(&state, "shadow", "leaf", Some(LEAF_IN_WARN)).await;
+        offer_a_ticket_to(&state, run_id, &node_id).await;
+
+        let answer = answer(&state, run_id, "Read", read_input()).await;
+
+        assert_allowed(&answer.decision, "a read in warn of an offered run");
+        let context = answer
+            .additional_context
+            .expect("both must reach the agent");
+        let (notice, hint) = context
+            .split_once("\n\n")
+            .unwrap_or_else(|| panic!("two parts joined by a blank line, got {context:?}"));
+        assert!(notice.contains("is yours"), "got {context:?}");
+        assert!(hint.contains("handoff"), "got {context:?}");
+        assert!(!hint.contains("is yours"), "got {context:?}");
     }
 
     #[tokio::test]

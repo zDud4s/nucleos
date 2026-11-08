@@ -257,21 +257,35 @@ pub async fn drain_once(
             .ok()
             .flatten()
             .is_some_and(|origin| origin == Origin::Daemon.as_str());
-    let held = crate::execution::land::claim_gate::refusal_for_op(
+    let queue_origin = if from_daemon {
+        Origin::Daemon
+    } else {
+        Origin::Shell
+    };
+    let mut held = crate::execution::land::claim_gate::refusal_for_op(
         pool,
         &claimed.project_id,
         std::path::Path::new(&claimed.project_root),
         &claimed.op,
         claimed.from_resolution,
-        if from_daemon {
-            Origin::Daemon
-        } else {
-            Origin::Shell
-        },
+        queue_origin,
         claimed.run_id,
         claimed.integration_branch.as_ref(),
     )
     .await;
+    if held.is_none() {
+        held = crate::execution::land::migration_gate::refusal_for_op(
+            pool,
+            &claimed.project_id,
+            std::path::Path::new(&claimed.project_root),
+            &claimed.op,
+            claimed.from_resolution,
+            queue_origin,
+            claimed.run_id,
+            claimed.integration_branch.as_ref(),
+        )
+        .await;
+    }
     let outcome = if let Some(reason) = held {
         Outcome::Failed {
             reason,
@@ -415,6 +429,27 @@ pub async fn drain_once(
             // `drain_once`). Only a landing that really succeeded leaves a target dir to drop.
             if matches!(outcome, Outcome::Succeeded { .. }) {
                 crate::execution::land::clean_after_landing(pool, &claimed);
+            }
+            // A merge that went through is the close condition of its `conflict:` ticket. Best
+            // effort, like the feed row: the write above already stands.
+            if matches!(outcome, Outcome::Succeeded { .. })
+                && let Op::Merge { source, target } = &claimed.op
+            {
+                let closed = crate::task_claims::machine::close_conflict(
+                    pool,
+                    &claimed.project_id,
+                    source.as_str(),
+                    target.as_str(),
+                    chrono::Utc::now(),
+                )
+                .await;
+                if let Err(error) = closed {
+                    tracing::warn!(
+                        request_id = id,
+                        %error,
+                        "tasks: could not close the conflict ticket of a merge"
+                    );
+                }
             }
             // The push decided "not green" while its row was `running`, and a green written since
             // found nothing to release. Looking again AFTER the park is persisted closes that

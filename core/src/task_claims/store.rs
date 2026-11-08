@@ -9,13 +9,18 @@
 //! expired claim counts as free everywhere.
 
 use super::{
-    ClaimOutcome, Closer, FailedProbe, Holder, HolderKind, NewTask, PROBE_LEASE_SECONDS,
-    ProbeStart, SESSION_LEASE_SECONDS, Status, TaskKey, TaskKind, TaskRow,
+    ClaimOutcome, Closer, Holder, HolderKind, NewTask, SESSION_LEASE_SECONDS, Status, TaskKey,
+    TaskKind, TaskRow,
 };
 use crate::execution::wave::stamp;
 use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
 use sqlx::{SqliteConnection, SqlitePool};
+
+/// The master-red probes live in their own file; callers keep reaching them as `store::begin_probe` etc.
+pub use super::probes::{begin_probe, begin_reprobe, finish_probe, finish_reprobe};
+/// Reporting lives in its own file; callers keep reaching it as `store::report`.
+pub use super::reports::report;
 
 #[derive(sqlx::FromRow)]
 struct RawRow {
@@ -38,6 +43,13 @@ struct RawRow {
     claimed_at: Option<String>,
     closed_at: Option<String>,
     close_note: Option<String>,
+    linked_to: Option<i64>,
+    report_count: i64,
+    offered_to: Option<String>,
+    offered_at: Option<String>,
+    launch_attempts: i64,
+    last_launch_at: Option<String>,
+    parked_at: Option<String>,
 }
 
 fn corrupt(column: &str, detail: impl std::fmt::Display) -> sqlx::Error {
@@ -48,11 +60,37 @@ fn json_list(column: &str, text: &str) -> sqlx::Result<Vec<String>> {
     serde_json::from_str(text).map_err(|error| corrupt(column, error))
 }
 
+/// `offered_to` is the JSON of a [`Holder`]: `{"kind","id","worktree"}`, `kind` as stored text.
+fn decode_holder(text: &str) -> sqlx::Result<Holder> {
+    let value: Value = serde_json::from_str(text).map_err(|error| corrupt("offered_to", error))?;
+    let field = |name: &str| value.get(name).and_then(Value::as_str);
+    let kind = field("kind")
+        .and_then(HolderKind::parse)
+        .ok_or_else(|| corrupt("offered_to", text))?;
+    let id = field("id").ok_or_else(|| corrupt("offered_to", text))?;
+    Ok(Holder {
+        kind,
+        id: id.to_owned(),
+        worktree: field("worktree").unwrap_or_default().to_owned(),
+    })
+}
+
+/// The stored text of `offered_to` (see [`decode_holder`]).
+pub(super) fn encode_holder(holder: &Holder) -> String {
+    serde_json::json!({
+        "kind": holder.kind.as_str(),
+        "id": holder.id,
+        "worktree": holder.worktree,
+    })
+    .to_string()
+}
+
 fn decode(raw: RawRow) -> sqlx::Result<TaskRow> {
     let holder_kind = match raw.holder_kind.as_deref() {
         None => None,
         Some(text) => Some(HolderKind::parse(text).ok_or_else(|| corrupt("holder_kind", text))?),
     };
+    let offered_to = raw.offered_to.as_deref().map(decode_holder).transpose()?;
     Ok(TaskRow {
         id: raw.id,
         project_id: raw.project_id,
@@ -73,6 +111,13 @@ fn decode(raw: RawRow) -> sqlx::Result<TaskRow> {
         claimed_at: raw.claimed_at,
         closed_at: raw.closed_at,
         close_note: raw.close_note,
+        linked_to: raw.linked_to,
+        report_count: raw.report_count,
+        offered_to,
+        offered_at: raw.offered_at,
+        launch_attempts: raw.launch_attempts,
+        last_launch_at: raw.last_launch_at,
+        parked_at: raw.parked_at,
     })
 }
 
@@ -89,7 +134,7 @@ pub(super) async fn row_by_id(
 }
 
 /// The row holding the unique-index slot for `(project, key)`: `probing`, `open` or `claimed`.
-async fn unresolved_by_key(
+pub(super) async fn unresolved_by_key(
     conn: &mut SqliteConnection,
     project_id: &str,
     key: &TaskKey,
@@ -128,7 +173,7 @@ pub async fn is_live(pool: &SqlitePool, row: &TaskRow, now: DateTime<Utc>) -> sq
     is_live_on(&mut conn, row, now).await
 }
 
-async fn is_live_on(
+pub(super) async fn is_live_on(
     conn: &mut SqliteConnection,
     row: &TaskRow,
     now: DateTime<Utc>,
@@ -156,7 +201,7 @@ async fn is_live_on(
 
 /// Spelled out, not assembled from `concurrency::LIVE_RUN_STATUSES`: sqlx refuses SQL built at run
 /// time. `a_run_claim_is_live_only_while_its_run_is_active` walks the constant, so the two cannot drift.
-async fn run_is_live(conn: &mut SqliteConnection, id: &str) -> sqlx::Result<bool> {
+pub(crate) async fn run_is_live(conn: &mut SqliteConnection, id: &str) -> sqlx::Result<bool> {
     let Ok(id) = id.parse::<i64>() else {
         return Ok(false);
     };
@@ -170,7 +215,7 @@ async fn run_is_live(conn: &mut SqliteConnection, id: &str) -> sqlx::Result<bool
 }
 
 /// The statuses of `execution::job::store::LIVE_STATUSES`, spelled out for the same reason.
-async fn job_is_live(conn: &mut SqliteConnection, id: &str) -> sqlx::Result<bool> {
+pub(crate) async fn job_is_live(conn: &mut SqliteConnection, id: &str) -> sqlx::Result<bool> {
     let Ok(id) = id.parse::<i64>() else {
         return Ok(false);
     };
@@ -184,7 +229,10 @@ async fn job_is_live(conn: &mut SqliteConnection, id: &str) -> sqlx::Result<bool
 }
 
 /// Red as the postgate itself reads it (`postgate::read_before`): a non-empty `red_groups` list.
-async fn project_is_red(conn: &mut SqliteConnection, project_id: &str) -> sqlx::Result<bool> {
+pub(super) async fn project_is_red(
+    conn: &mut SqliteConnection,
+    project_id: &str,
+) -> sqlx::Result<bool> {
     let found: i64 = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM postgate_state WHERE project_id = ? AND red_groups NOT IN ('', '[]'))",
     )
@@ -271,7 +319,7 @@ pub async fn guarding(
 
 // ---- writes: claim --------------------------------------------------------------------------------
 
-async fn begin(pool: &SqlitePool) -> sqlx::Result<sqlx::Transaction<'_, sqlx::Sqlite>> {
+pub(super) async fn begin(pool: &SqlitePool) -> sqlx::Result<sqlx::Transaction<'_, sqlx::Sqlite>> {
     pool.begin_with("BEGIN IMMEDIATE").await
 }
 
@@ -282,7 +330,7 @@ fn lease_for(holder: &Holder, now: DateTime<Utc>) -> Option<String> {
 
 /// Appends one event inside a transaction the caller already holds. `who` is the holder the event is
 /// ABOUT (for a takeover, the previous owner).
-async fn record_event_on(
+pub(super) async fn record_event_on(
     conn: &mut SqliteConnection,
     task_id: i64,
     event: &str,
@@ -290,7 +338,21 @@ async fn record_event_on(
     note: &str,
     now: DateTime<Utc>,
 ) -> sqlx::Result<()> {
-    sqlx::query(
+    insert_event_on(conn, task_id, event, who, note, now).await?;
+    Ok(())
+}
+
+/// [`record_event_on`] that returns the id of the event row (an offer starts its offeree's cursor
+/// just before it).
+pub(super) async fn insert_event_on(
+    conn: &mut SqliteConnection,
+    task_id: i64,
+    event: &str,
+    who: Option<&Holder>,
+    note: &str,
+    now: DateTime<Utc>,
+) -> sqlx::Result<i64> {
+    let id = sqlx::query(
         "INSERT INTO task_claim_events (task_id, event, holder_kind, holder_id, holder_worktree, at, note)
          VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
@@ -302,8 +364,9 @@ async fn record_event_on(
     .bind(stamp(now))
     .bind(note)
     .execute(conn)
-    .await?;
-    Ok(())
+    .await?
+    .last_insert_rowid();
+    Ok(id)
 }
 
 /// Public, pool-level twin of `record_event_on`: opens its own `BEGIN IMMEDIATE` transaction. Chunk 3
@@ -343,7 +406,7 @@ pub async fn override_recorded(pool: &SqlitePool, task_id: i64, note: &str) -> s
     Ok(found != 0)
 }
 
-async fn insert_open(
+pub(super) async fn insert_open(
     conn: &mut SqliteConnection,
     project_id: &str,
     new: &NewTask,
@@ -369,7 +432,7 @@ async fn insert_open(
 }
 
 /// Deletes a task nobody saw resolve (a discarded probe) together with its events.
-async fn delete_task(conn: &mut SqliteConnection, id: i64) -> sqlx::Result<()> {
+pub(super) async fn delete_task(conn: &mut SqliteConnection, id: i64) -> sqlx::Result<()> {
     sqlx::query("DELETE FROM task_claim_events WHERE task_id = ?")
         .bind(id)
         .execute(&mut *conn)
@@ -383,7 +446,7 @@ async fn delete_task(conn: &mut SqliteConnection, id: i64) -> sqlx::Result<()> {
 
 /// Live unresolved tasks of the project that look like this one: the same file under the same key kind
 /// (`test:core/a.rs::x` vs `test:core/a.rs::y`), or whose guard/hint paths overlap.
-async fn similar_to(
+pub(super) async fn similar_to(
     conn: &mut SqliteConnection,
     project_id: &str,
     key: &TaskKey,
@@ -423,16 +486,16 @@ pub async fn claim(
     now: DateTime<Utc>,
 ) -> sqlx::Result<ClaimOutcome> {
     let mut tx = begin(pool).await?;
-    if is_declared_master_red(new.kind, &new.key) {
-        // A session may not CREATE `master-red`, but it may claim the incident the daemon
+    if is_declared_machine(new.kind, &new.key) {
+        // A session may not CREATE a machine ticket, but it may claim the one the daemon
         // already opened ("claim it with task_claim"): first claim wins, through the same CAS.
-        // The incident's detail and paths are the daemon's, so nothing of `new` is merged.
+        // The ticket's detail and paths are the daemon's, so nothing of `new` is merged.
         let incident = unresolved_by_key(&mut tx, project_id, &new.key)
             .await?
             .filter(|row| matches!(row.status, Status::Open | Status::Claimed));
         let Some(incident) = incident else {
-            // No incident (or only a proof in flight): the refusal; the dropped `tx` rolls back.
-            return Err(master_red_refusal());
+            // No ticket (or only a proof in flight): the refusal; the dropped `tx` rolls back.
+            return Err(machine_refusal());
         };
         let outcome = cas(&mut tx, incident.id, holder, now).await?;
         tx.commit().await?;
@@ -489,29 +552,30 @@ pub async fn claim_by_id(
     let row = row_by_id(&mut tx, task_id)
         .await?
         .ok_or(sqlx::Error::RowNotFound)?;
-    refuse_declared_master_red(row.kind, &row.key)?;
+    refuse_declared_machine(row.kind, &row.key)?;
     let outcome = cas(&mut tx, task_id, holder, now).await?;
     tx.commit().await?;
     Ok(outcome)
 }
 
-fn is_declared_master_red(kind: TaskKind, key: &TaskKey) -> bool {
-    kind == TaskKind::Declared && key.as_str() == super::MASTER_RED_KEY
+pub(super) fn is_declared_machine(kind: TaskKind, key: &TaskKey) -> bool {
+    kind == TaskKind::Declared && key.is_machine()
 }
 
-/// Only the daemon creates `master-red` (through `create_or_adopt_open` / `begin_probe`); an agent's
-/// `declared` claim that would create one is refused (`claim` lets it take an existing incident).
-/// The store has no refusal shape, so this is a `Protocol` error.
-fn refuse_declared_master_red(kind: TaskKind, key: &TaskKey) -> sqlx::Result<()> {
-    if is_declared_master_red(kind, key) {
-        return Err(master_red_refusal());
+/// Only the daemon creates machine tickets (`master-red`, `migration:`, `fmt:`, `conflict:`), through
+/// `create_or_adopt_open` / `begin_probe`; an agent's `declared` claim or report that would create one
+/// is refused (`claim` and `report` let it take or join an existing one). The store has no refusal
+/// shape, so this is a `Protocol` error.
+fn refuse_declared_machine(kind: TaskKind, key: &TaskKey) -> sqlx::Result<()> {
+    if is_declared_machine(kind, key) {
+        return Err(machine_refusal());
     }
     Ok(())
 }
 
-fn master_red_refusal() -> sqlx::Error {
+pub(super) fn machine_refusal() -> sqlx::Error {
     sqlx::Error::Protocol(
-        "the master-red task is created by the daemon only; it cannot be declared".to_owned(),
+        "this ticket is opened by the daemon only; it cannot be declared".to_owned(),
     )
 }
 
@@ -556,7 +620,9 @@ async fn cas(
     }
 }
 
-/// `UPDATE ... WHERE <what was read>`: one row changed means this caller won.
+/// `UPDATE ... WHERE <what was read>`: one row changed means this caller won. An offer is advisory:
+/// whoever wins the claim clears it, offeree or not. A parked ticket stays claimable; claiming clears
+/// `parked_at`.
 async fn take(
     conn: &mut SqliteConnection,
     row: TaskRow,
@@ -567,7 +633,8 @@ async fn take(
 ) -> sqlx::Result<ClaimOutcome> {
     let moved = sqlx::query(
         "UPDATE task_claims
-         SET status = 'claimed', holder_kind = ?, holder_id = ?, holder_worktree = ?, lease_until = ?, claimed_at = ?
+         SET status = 'claimed', holder_kind = ?, holder_id = ?, holder_worktree = ?, lease_until = ?, claimed_at = ?,
+             offered_to = NULL, offered_at = NULL, parked_at = NULL
          WHERE id = ? AND status = ? AND holder_kind IS ? AND holder_id IS ?",
     )
     .bind(holder.kind.as_str())
@@ -635,7 +702,7 @@ async fn renew(
 
 /// Shallow object merge: keys of `new` win, a `null` never erases what is there ("add what you know
 /// on top of the live incident"). Anything that is not an object replaces, unless it is `null`.
-fn merge_detail(old: &Value, new: &Value) -> Value {
+pub(super) fn merge_detail(old: &Value, new: &Value) -> Value {
     match (old, new) {
         (Value::Object(old), Value::Object(new)) => {
             let mut merged = old.clone();
@@ -651,7 +718,7 @@ fn merge_detail(old: &Value, new: &Value) -> Value {
     }
 }
 
-fn union(old: &[String], new: &[String]) -> Vec<String> {
+pub(super) fn union(old: &[String], new: &[String]) -> Vec<String> {
     let mut merged = old.to_vec();
     for path in new {
         if !merged.contains(path) {
@@ -661,7 +728,7 @@ fn union(old: &[String], new: &[String]) -> Vec<String> {
     merged
 }
 
-fn encode_list(list: &[String]) -> String {
+pub(super) fn encode_list(list: &[String]) -> String {
     serde_json::to_string(list).unwrap_or_else(|_| "[]".to_owned())
 }
 
@@ -831,7 +898,7 @@ pub async fn done(
     Ok(closed)
 }
 
-async fn close_in_tx(
+pub(super) async fn close_in_tx(
     conn: &mut SqliteConnection,
     task_id: i64,
     closer: &Closer<'_>,
@@ -858,6 +925,7 @@ async fn close_in_tx(
         }
         Closer::Green { sha } => green_note(sha, note),
         Closer::Reconcile => format!("reconciled: {note}"),
+        Closer::Resolved => format!("resolved: {note}"),
     };
     // A closure by green records the sha it was proved on: `finish_reprobe(false)` closes through here,
     // and the row must say which master sha showed the failure gone. Other closers keep `checked_sha`.
@@ -913,204 +981,30 @@ pub async fn release_for_owner(
     Ok(released)
 }
 
-// ---- writes: master-red probes ----------------------------------------------------------------------
-
-/// A verify found a suspect group and asks to prove it on the master's HEAD. At most one `probing`
-/// row per project (the unique index); a lapsed one is taken over and the proof repeats.
-///
-/// The row is born `probing`, held by the verify ticket on a 10-minute lease, and records no event: it
-/// is not a task until the proof fails on master (`finish_probe`).
-pub async fn begin_probe(
-    pool: &SqlitePool,
-    project_id: &str,
-    ticket_id: &str,
-    worktree: &str,
-    now: DateTime<Utc>,
-) -> sqlx::Result<ProbeStart> {
+/// The sweep before a launch: every `claimed` row whose holder is dead by [`is_live`] goes back to
+/// `open` (event `expired_reclaimed`, note `lease_lapsed`), so the launcher sees it as free. The event
+/// keeps the previous holder, so `take_notices` still tells the old owner once somebody claims it.
+/// Postgate claims are left out: `postgate_worker::incident::takeover_step` owns them. Returns how
+/// many rows were reopened.
+pub async fn reopen_lapsed(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<u64> {
     let mut tx = begin(pool).await?;
-    let lease = stamp(now + Duration::seconds(PROBE_LEASE_SECONDS));
-    let key = TaskKey::master_red();
-    let result = match unresolved_by_key(&mut tx, project_id, &key).await? {
-        None => {
-            let id = sqlx::query(
-                "INSERT INTO task_claims (project_id, task_key, kind, title, status, holder_kind, holder_id,
-                                          holder_worktree, lease_until, created_at)
-                 VALUES (?, ?, 'incident', 'master red (probing)', 'probing', 'verify', ?, ?, ?, ?)",
-            )
-            .bind(project_id)
-            .bind(key.as_str())
-            .bind(ticket_id)
-            .bind(worktree)
-            .bind(&lease)
-            .bind(stamp(now))
-            .execute(&mut *tx)
-            .await?
-            .last_insert_rowid();
-            let row = row_by_id(&mut tx, id)
-                .await?
-                .ok_or(sqlx::Error::RowNotFound)?;
-            ProbeStart::Started(row)
-        }
-        Some(row) if row.status == Status::Probing => {
-            // Only a LAPSED probe is retaken, whoever held it (the same ticket included). A live one is
-            // in flight even for its own ticket: a retry must not start a second proof beside the first.
-            if !is_live_on(&mut tx, &row, now).await? {
-                sqlx::query(
-                    "UPDATE task_claims SET holder_id = ?, holder_worktree = ?, lease_until = ? WHERE id = ?",
-                )
-                .bind(ticket_id)
-                .bind(worktree)
-                .bind(&lease)
-                .bind(row.id)
-                .execute(&mut *tx)
-                .await?;
-                let row = row_by_id(&mut tx, row.id)
-                    .await?
-                    .ok_or(sqlx::Error::RowNotFound)?;
-                ProbeStart::Started(row)
-            } else {
-                ProbeStart::InFlight(row)
-            }
-        }
-        Some(row) => ProbeStart::Exists(row),
-    };
-    tx.commit().await?;
-    Ok(result)
-}
-
-/// The proof ended. `Some(failed)`: the groups fail on master too, so the row becomes an `open`
-/// incident (`red_groups`, `red_tests`, `red_sha` and `red_since_sha` merged into the detail, the last
-/// two both the master sha the proof ran on, i.e. the postgate's own keys; `checked_sha` set, the guard
-/// paths added). `None`: they pass there, so the row is deleted and the failure is the task's.
-///
-/// `ticket_id` is the ticket that holds the probe. Returns the row after the call:
-/// - `Some(open | claimed)`: an incident (made now, or adopted by the postgate meanwhile, in which case
-///   it is left alone -- a "passes on master" must not delete the postgate's incident).
-/// - `None`: the probe row is gone (deleted by this call, or already gone before it).
-/// - `Some(probing)`: the row is another ticket's proof (this ticket's lease lapsed and the proof was
-///   retaken). It is returned untouched and nothing is written; the caller must conclude NOTHING from
-///   its own result (neither "the failure is the task's" nor "master is red").
-pub async fn finish_probe(
-    pool: &SqlitePool,
-    task_id: i64,
-    ticket_id: &str,
-    failed_on_master: Option<FailedProbe>,
-    now: DateTime<Utc>,
-) -> sqlx::Result<Option<TaskRow>> {
-    let mut tx = begin(pool).await?;
-    let Some(row) = row_by_id(&mut tx, task_id).await? else {
-        return Ok(None);
-    };
-    if row.status == Status::Probing && row.holder_id.as_deref() != Some(ticket_id) {
-        tx.commit().await?;
-        return Ok(Some(row));
-    }
-    if row.status == Status::Probing {
-        match failed_on_master {
-            Some(failed) => {
-                let proved = serde_json::json!({
-                    "red_groups": failed.red_groups,
-                    "red_tests": failed.red_tests,
-                    "red_sha": failed.master_sha,
-                    "red_since_sha": failed.master_sha,
-                });
-                sqlx::query(
-                    "UPDATE task_claims
-                     SET status = 'open', holder_kind = NULL, holder_id = NULL, holder_worktree = NULL,
-                         lease_until = NULL, title = 'master red', detail = ?, guard_paths = ?, checked_sha = ?
-                     WHERE id = ? AND status = 'probing'",
-                )
-                .bind(merge_detail(&row.detail, &proved).to_string())
-                .bind(encode_list(&union(&row.guard_paths, &failed.guard_paths)))
-                .bind(&failed.master_sha)
-                .bind(task_id)
-                .execute(&mut *tx)
-                .await?;
-                record_event_on(
-                    &mut tx,
-                    task_id,
-                    "created",
-                    None,
-                    "proved failing on master",
-                    now,
-                )
-                .await?;
-            }
-            None => delete_task(&mut tx, task_id).await?,
-        }
-    }
-    let after = row_by_id(&mut tx, task_id)
-        .await?
-        .filter(|row| matches!(row.status, Status::Open | Status::Claimed));
-    tx.commit().await?;
-    Ok(after)
-}
-
-/// Takes the single flight of the master-red re-proof: `true` when the caller may run it. The flight
-/// lapses after `PROBE_LEASE_SECONDS`, so a crashed re-proof does not wedge the incident.
-pub async fn begin_reprobe(
-    pool: &SqlitePool,
-    task_id: i64,
-    now: DateTime<Utc>,
-) -> sqlx::Result<bool> {
-    let taken = sqlx::query(
-        "UPDATE task_claims SET probe_lease_until = ?
-         WHERE id = ? AND status IN ('open', 'claimed')
-           AND (probe_lease_until IS NULL OR probe_lease_until < ?)",
+    let raws = sqlx::query_as::<_, RawRow>(
+        "SELECT * FROM task_claims
+         WHERE status = 'claimed' AND holder_kind IN ('session', 'verify', 'run', 'job') ORDER BY id",
     )
-    .bind(stamp(now + Duration::seconds(PROBE_LEASE_SECONDS)))
-    .bind(task_id)
-    .bind(stamp(now))
-    .execute(pool)
+    .fetch_all(&mut *tx)
     .await?;
-    Ok(taken.rows_affected() == 1)
-}
-
-/// The re-proof ran the `red_tests` on `master_sha`. Still failing: `checked_sha` moves to it and the
-/// flight is released. Passing: the incident closes by green at that sha (previous owner kept in the
-/// event, exactly as the postgate's green does) -- unless the project's `postgate_state` is still
-/// red: the postgate is still on this red (bisecting, reverting), and closing under it would make
-/// its next `ensure_incident` open a second `master-red`. Then only the flight is released, and the
-/// incident waits for the postgate's own green close (`incident::close_if_green`).
-pub async fn finish_reprobe(
-    pool: &SqlitePool,
-    task_id: i64,
-    master_sha: &str,
-    still_red: bool,
-    now: DateTime<Utc>,
-) -> sqlx::Result<()> {
-    let mut tx = begin(pool).await?;
-    let postgate_red = match row_by_id(&mut tx, task_id).await? {
-        Some(row) => project_is_red(&mut tx, &row.project_id).await?,
-        None => false,
-    };
-    if !still_red && postgate_red {
-        // `checked_sha` stays: the red tests were NOT proved failing at `master_sha`.
-        sqlx::query("UPDATE task_claims SET probe_lease_until = NULL WHERE id = ?")
-            .bind(task_id)
-            .execute(&mut *tx)
-            .await?;
-    } else if still_red {
-        sqlx::query(
-            "UPDATE task_claims SET checked_sha = ?, probe_lease_until = NULL WHERE id = ?",
-        )
-        .bind(master_sha)
-        .bind(task_id)
-        .execute(&mut *tx)
-        .await?;
-    } else {
-        let sha = master_sha.to_owned();
-        close_in_tx(
-            &mut tx,
-            task_id,
-            &Closer::Green { sha },
-            "re-proof passed",
-            now,
-        )
-        .await?;
+    let mut reopened = 0;
+    for raw in raws {
+        let row = decode(raw)?;
+        if is_live_on(&mut tx, &row, now).await? {
+            continue;
+        }
+        reopen(&mut tx, &row, "expired_reclaimed", "lease_lapsed", now).await?;
+        reopened += 1;
     }
     tx.commit().await?;
-    Ok(())
+    Ok(reopened)
 }
 
 // ---- startup ----------------------------------------------------------------------------------------
@@ -1168,6 +1062,9 @@ pub async fn reconcile_at_startup(pool: &SqlitePool, now: DateTime<Utc>) -> sqlx
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::task_claims::{
+        FailedProbe, PROBE_LEASE_SECONDS, ProbeStart, ReportOutcome, Reporter,
+    };
     use chrono::TimeZone;
 
     pub(super) fn t0() -> DateTime<Utc> {
@@ -1862,6 +1759,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_agent_cannot_create_a_machine_ticket_by_claim_or_report() {
+        let pool = test_pool().await;
+        let key = "migration:master:0276";
+        let claimed = claim(&pool, "p", task(key), &session("s1"), t0()).await;
+        assert!(matches!(claimed, Err(sqlx::Error::Protocol(_))));
+        let reported = report(
+            &pool,
+            "p",
+            task(key),
+            &Reporter::Holder(&session("s1")),
+            "seen",
+            &[],
+            false,
+            None,
+            t0(),
+        )
+        .await;
+        assert!(matches!(reported, Err(sqlx::Error::Protocol(_))));
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_claims")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "neither attempt left a row");
+
+        // Once the daemon opened it, both work.
+        seed(
+            &pool,
+            Seed {
+                key,
+                status: "open",
+                ..Seed::default()
+            },
+        )
+        .await;
+        let reported = report(
+            &pool,
+            "p",
+            task(key),
+            &Reporter::Holder(&session("s2")),
+            "also hit",
+            &[],
+            false,
+            None,
+            t0() + secs(1),
+        )
+        .await
+        .unwrap();
+        assert!(!reported.created);
+        let won = claim(&pool, "p", task(key), &session("s1"), t0() + secs(2))
+            .await
+            .unwrap();
+        assert!(matches!(won, ClaimOutcome::Won { .. }));
+    }
+
+    #[tokio::test]
+    async fn done_by_resolved_closes_without_an_owner_and_keeps_the_note() {
+        let pool = test_pool().await;
+        let id = seed(
+            &pool,
+            Seed {
+                key: "migration:master:0276",
+                status: "open",
+                ..Seed::default()
+            },
+        )
+        .await;
+        let closed = done(
+            &pool,
+            id,
+            Closer::Resolved,
+            "branch no longer collides",
+            t0(),
+        )
+        .await
+        .unwrap();
+        assert!(closed);
+        assert_eq!(row(&pool, id).await.status, Status::Done);
+        let last = events(&pool, id).await.pop().unwrap();
+        assert_eq!(last.0, "done");
+        assert_eq!(last.1, None, "no holder on the event");
+        assert_eq!(last.2, "resolved: branch no longer collides");
+    }
+
+    #[tokio::test]
     async fn a_second_holder_loses_and_is_told_who_has_it() {
         let pool = test_pool().await;
         claim(&pool, "p", task("file:core/a.rs"), &session("s1"), t0())
@@ -2000,6 +1981,153 @@ mod tests {
             log.last().unwrap().1.as_deref(),
             Some(run_id.to_string().as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn a_session_claim_past_its_lease_is_reopened_by_the_sweep_with_expired_reclaimed() {
+        let pool = test_pool().await;
+        let id = seed(
+            &pool,
+            Seed {
+                key: "file:a.rs",
+                status: "claimed",
+                holder: Some(("session", "s1")),
+                lease: Some(t0() - secs(1)),
+                ..Seed::default()
+            },
+        )
+        .await;
+        assert_eq!(reopen_lapsed(&pool, t0()).await.unwrap(), 1);
+        let task = row(&pool, id).await;
+        assert_eq!(task.status, Status::Open);
+        assert_eq!(task.holder(), None);
+        let log = events(&pool, id).await;
+        let last = log.last().unwrap();
+        assert_eq!(
+            (last.0.as_str(), last.1.as_deref(), last.2.as_str()),
+            ("expired_reclaimed", Some("s1"), "lease_lapsed"),
+            "the event keeps the previous holder"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_claim_whose_run_ended_gets_reopened_by_the_sweep() {
+        let pool = test_pool().await;
+        let run_id = sqlx::query(
+            "INSERT INTO runs (prompt, status, created_at) VALUES ('x', 'completed', 't')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let id = seed(
+            &pool,
+            Seed {
+                key: "file:a.rs",
+                status: "claimed",
+                holder: Some(("run", &run_id.to_string())),
+                ..Seed::default()
+            },
+        )
+        .await;
+        assert_eq!(reopen_lapsed(&pool, t0()).await.unwrap(), 1);
+        assert_eq!(row(&pool, id).await.status, Status::Open);
+        let log = events(&pool, id).await;
+        assert_eq!(log.last().unwrap().0, "expired_reclaimed");
+        assert_eq!(
+            log.last().unwrap().1.as_deref(),
+            Some(run_id.to_string().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_claim_is_left_alone_by_the_sweep() {
+        let pool = test_pool().await;
+        let run_id = sqlx::query(
+            "INSERT INTO runs (prompt, status, created_at) VALUES ('x', 'running', 't')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        let leased = seed(
+            &pool,
+            Seed {
+                key: "file:a.rs",
+                status: "claimed",
+                holder: Some(("session", "s1")),
+                lease: Some(t0() + secs(60)),
+                ..Seed::default()
+            },
+        )
+        .await;
+        let running = seed(
+            &pool,
+            Seed {
+                key: "file:b.rs",
+                status: "claimed",
+                holder: Some(("run", &run_id.to_string())),
+                ..Seed::default()
+            },
+        )
+        .await;
+        assert_eq!(reopen_lapsed(&pool, t0()).await.unwrap(), 0);
+        for id in [leased, running] {
+            assert_eq!(row(&pool, id).await.status, Status::Claimed);
+            assert!(
+                events(&pool, id).await.is_empty(),
+                "the sweep wrote nothing"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_postgate_claim_is_never_reopened_by_the_sweep() {
+        let pool = test_pool().await;
+        // No `postgate_state` row: the project is not red, so `is_live` calls the claim dead.
+        let id = seed(
+            &pool,
+            Seed {
+                key: "file:pg.rs",
+                status: "claimed",
+                holder: Some(("postgate", "p")),
+                ..Seed::default()
+            },
+        )
+        .await;
+        assert!(!is_live(&pool, &row(&pool, id).await, t0()).await.unwrap());
+        assert_eq!(reopen_lapsed(&pool, t0()).await.unwrap(), 0);
+        assert_eq!(row(&pool, id).await.status, Status::Claimed);
+        assert!(events(&pool, id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn claiming_a_parked_ticket_clears_parked_at() {
+        let pool = test_pool().await;
+        let id = seed(
+            &pool,
+            Seed {
+                key: "file:a.rs",
+                status: "open",
+                ..Seed::default()
+            },
+        )
+        .await;
+        sqlx::query("UPDATE task_claims SET parked_at = ? WHERE id = ?")
+            .bind(stamp(t0()))
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row(&pool, id).await.parked_at, Some(stamp(t0())));
+        let outcome = claim_by_id(&pool, id, &session("s1"), t0() + secs(1))
+            .await
+            .unwrap();
+        let ClaimOutcome::Won { task, .. } = outcome else {
+            panic!("a parked ticket stays claimable")
+        };
+        assert_eq!(task.parked_at, None);
+        assert_eq!(task.status, Status::Claimed);
     }
 
     #[tokio::test]
@@ -3041,5 +3169,291 @@ mod tests {
             again.id, id,
             "the postgate's next report adopts the same incident"
         );
+    }
+
+    // ---- reports -----------------------------------------------------------------------------------
+
+    async fn report_one(
+        pool: &SqlitePool,
+        new: NewTask,
+        who: &Holder,
+        detail: &str,
+        at: DateTime<Utc>,
+    ) -> ReportOutcome {
+        report(
+            pool,
+            "p",
+            new,
+            &Reporter::Holder(who),
+            detail,
+            &[],
+            false,
+            None,
+            at,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_report_on_a_new_key_creates_an_open_declared_ticket_with_one_report() {
+        let pool = test_pool().await;
+        let out = report_one(
+            &pool,
+            task("file:core/a.rs"),
+            &session("s1"),
+            "it breaks",
+            t0(),
+        )
+        .await;
+        assert!(out.created);
+        assert_eq!(out.task.status, Status::Open);
+        assert!(out.task.holder().is_none());
+        assert_eq!(out.reports, 1);
+        let names: Vec<String> = events(&pool, out.task.id)
+            .await
+            .into_iter()
+            .map(|e| e.0)
+            .collect();
+        assert_eq!(names, vec!["created", "reported"]);
+    }
+
+    #[tokio::test]
+    async fn a_second_report_on_the_same_key_adds_a_report_and_creates_nothing() {
+        let pool = test_pool().await;
+        let mut first = task("file:core/a.rs");
+        first.hint_paths = vec!["core/a.rs".into()];
+        let mut second = task("file:core/a.rs");
+        second.hint_paths = vec!["core/b.rs".into()];
+        let one = report_one(&pool, first, &session("s1"), "one", t0()).await;
+        let two = report_one(&pool, second, &session("s2"), "two", t0() + secs(1)).await;
+        assert!(!two.created);
+        assert_eq!(two.task.id, one.task.id);
+        assert_eq!(two.reports, 2);
+        assert_eq!(two.task.hint_paths, vec!["core/a.rs", "core/b.rs"]);
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_claims")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    #[tokio::test]
+    async fn a_report_on_a_claimed_ticket_does_not_touch_the_owner() {
+        let pool = test_pool().await;
+        let ClaimOutcome::Won { task: won, .. } =
+            claim(&pool, "p", task("file:core/a.rs"), &session("s1"), t0())
+                .await
+                .unwrap()
+        else {
+            panic!()
+        };
+        let out = report_one(
+            &pool,
+            task("file:core/a.rs"),
+            &session("s2"),
+            "me too",
+            t0() + secs(1),
+        )
+        .await;
+        assert!(!out.created);
+        assert_eq!(out.reports, 1);
+        assert_eq!(out.task.id, won.id);
+        assert_eq!(out.task.holder().map(|h| h.id), Some("s1".to_owned()));
+        assert_eq!(out.task.status, Status::Claimed);
+    }
+
+    #[tokio::test]
+    async fn a_report_on_a_closed_key_opens_a_new_ticket() {
+        let pool = test_pool().await;
+        let first = report_one(&pool, task("file:core/a.rs"), &session("s1"), "x", t0()).await;
+        sqlx::query("UPDATE task_claims SET status = 'done' WHERE id = ?")
+            .bind(first.task.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let again = report_one(
+            &pool,
+            task("file:core/a.rs"),
+            &session("s1"),
+            "x",
+            t0() + secs(5),
+        )
+        .await;
+        assert!(again.created);
+        assert_ne!(again.task.id, first.task.id);
+        assert_eq!(again.reports, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_connections_reporting_one_key_yield_one_ticket_and_two_reports() {
+        let pool = crate::testdb::fresh_shared_pool().await;
+        let mut handles = Vec::new();
+        for who in ["s1", "s2"] {
+            let pool = pool.clone();
+            handles.push(tokio::spawn(async move {
+                report_one(&pool, task("file:core/a.rs"), &session(who), "x", t0()).await
+            }));
+        }
+        let mut created = 0;
+        for handle in handles {
+            if handle.await.unwrap().created {
+                created += 1;
+            }
+        }
+        assert_eq!(created, 1);
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_claims")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let reports: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_claim_reports")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!((rows, reports), (1, 2));
+    }
+
+    #[tokio::test]
+    async fn the_answer_lists_similar_tickets_and_linked_to_is_stored_without_inheriting_guard_paths()
+     {
+        let pool = test_pool().await;
+        let mut other = task("file:core/a.rs");
+        other.hint_paths = vec!["core/a.rs".into()];
+        let other = report_one(&pool, other, &session("s1"), "a", t0())
+            .await
+            .task;
+        let mut mine = task("topic:flaky");
+        mine.hint_paths = vec!["core/a.rs".into()];
+        mine.guard_paths = vec!["core/a.rs".into()];
+        let s2 = session("s2");
+        let out = report(
+            &pool,
+            "p",
+            mine,
+            &Reporter::Holder(&s2),
+            "b",
+            &[],
+            false,
+            Some(other.id),
+            t0() + secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.task.linked_to, Some(other.id));
+        assert!(out.task.guard_paths.is_empty(), "a report never guards");
+        assert_eq!(
+            out.similar.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![other.id]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_linked_to_pointing_at_another_project_or_a_missing_ticket_is_refused() {
+        let pool = test_pool().await;
+        // `seed` writes project `p`; the report below is for `other-project`.
+        let foreign = seed(
+            &pool,
+            Seed {
+                key: "topic:x",
+                status: "open",
+                ..Seed::default()
+            },
+        )
+        .await;
+        let s1 = session("s1");
+        for target in [foreign, 9999] {
+            let err = report(
+                &pool,
+                "other-project",
+                task("file:core/a.rs"),
+                &Reporter::Holder(&s1),
+                "x",
+                &[],
+                false,
+                Some(target),
+                t0(),
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(err, sqlx::Error::Protocol(_)), "{err:?}");
+        }
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM task_claims WHERE project_id = 'other-project'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    #[tokio::test]
+    async fn the_fifty_first_report_summarises_the_oldest() {
+        let pool = test_pool().await;
+        let mut id = 0;
+        for n in 0..51 {
+            let out = report_one(
+                &pool,
+                task("file:core/a.rs"),
+                &session("s1"),
+                &format!("report {n}"),
+                t0() + secs(n),
+            )
+            .await;
+            id = out.task.id;
+        }
+        let stored: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM task_claim_reports WHERE task_id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let task = row(&pool, id).await;
+        assert_eq!(stored, 50);
+        assert_eq!(task.report_count, 51);
+        assert_eq!(task.detail["reports_dropped"], 1);
+        let oldest: String = sqlx::query_scalar(
+            "SELECT detail FROM task_claim_reports WHERE task_id = ? ORDER BY id LIMIT 1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(oldest, "report 1");
+    }
+
+    #[tokio::test]
+    async fn a_report_of_master_red_without_an_incident_is_refused_and_with_one_is_recorded() {
+        let pool = test_pool().await;
+        let mut declared = task("master-red");
+        declared.kind = TaskKind::Declared;
+        let s1 = session("s1");
+        let err = report(
+            &pool,
+            "p",
+            declared.clone(),
+            &Reporter::Holder(&s1),
+            "red",
+            &[],
+            false,
+            None,
+            t0(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, sqlx::Error::Protocol(_)), "{err:?}");
+        // `seed` writes project `p`, the project of the report.
+        let incident = seed(
+            &pool,
+            Seed {
+                key: "master-red",
+                status: "open",
+                ..Seed::default()
+            },
+        )
+        .await;
+        let out = report_one(&pool, declared, &s1, "still red", t0() + secs(1)).await;
+        assert!(!out.created);
+        assert_eq!(out.task.id, incident);
+        assert_eq!(out.reports, 1);
     }
 }

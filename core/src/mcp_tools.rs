@@ -1093,9 +1093,11 @@ mod tests {
                 "spec_finish",
                 "suggest_model",
                 "task_claim",
+                "task_decline",
                 "task_done",
                 "task_list",
                 "task_release",
+                "task_report",
                 "tree_abandon",
                 "tree_branch_start",
                 "tree_launch",
@@ -2793,9 +2795,11 @@ mod tests {
                 "spec_backlog",
                 "spec_finish",
                 "task_claim",
+                "task_decline",
                 "task_done",
                 "task_list",
                 "task_release",
+                "task_report",
                 "tree_abandon",
                 "tree_branch_start",
                 "tree_launch",
@@ -3055,9 +3059,11 @@ mod tests {
                 "spec_backlog",
                 "spec_finish",
                 "task_claim",
+                "task_decline",
                 "task_done",
                 "task_list",
                 "task_release",
+                "task_report",
                 "tree_abandon",
                 "tree_branch_start",
                 "tree_launch",
@@ -3307,7 +3313,9 @@ mod tests {
                 "task_list",
                 "task_claim",
                 "task_release",
-                "task_done"
+                "task_done",
+                "task_report",
+                "task_decline"
             ]
         );
         for name in EVERY_BOX_TOOLS {
@@ -3367,9 +3375,41 @@ mod tests {
     #[test]
     fn listing_is_a_read_and_the_rest_write_only_the_daemons_own_rows() {
         assert_eq!(tool_effect("task_list"), ToolEffect::ReadsOwn);
-        for name in ["task_claim", "task_release", "task_done"] {
+        for name in [
+            "task_claim",
+            "task_release",
+            "task_done",
+            "task_report",
+            "task_decline",
+        ] {
             assert_eq!(tool_effect(name), ToolEffect::WritesOwn, "{name}");
         }
+    }
+
+    /// Declining an offer names the ticket and says why; a better-fitting session is only a hint.
+    #[test]
+    fn task_decline_takes_the_ticket_id_a_message_and_an_optional_suggestion() {
+        let tool = NucleosTools::tool_router()
+            .list_all()
+            .into_iter()
+            .find(|t| t.name == "task_decline")
+            .expect("task_decline is registered");
+        let props = tool
+            .input_schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("properties");
+        for field in ["id", "message", "suggest_session_id", "session_id"] {
+            assert!(props.contains_key(field), "{field}");
+        }
+        let mut required: Vec<&str> = tool
+            .input_schema
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .map(|list| list.iter().filter_map(serde_json::Value::as_str).collect())
+            .unwrap_or_default();
+        required.sort_unstable();
+        assert_eq!(required, ["id", "message"]);
     }
 
     /// No `worktree` and no `project_id`: the holder's worktree comes from the box, so a model

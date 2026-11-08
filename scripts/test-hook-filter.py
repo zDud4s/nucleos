@@ -1578,7 +1578,7 @@ def claims_tool_call_cases():
     rust = os.path.join(ROOT, "core", "src", "mcp_tools", "boxes.rs")
     try:
         with open(rust, encoding="utf-8") as handle:
-            listed = re.search(r"TASK_TOOL_NAMES: \[&str; 4\] = \[([^\]]*)\]", handle.read())
+            listed = re.search(r"TASK_TOOL_NAMES: \[&str; \d+\] = \[([^\]]*)\]", handle.read())
     except OSError:
         listed = None
     want = sorted(f"mcp__nucleos__{n}" for n in re.findall(r'"(task_[a-z]+)"', listed.group(1))) if listed else []
@@ -1741,6 +1741,186 @@ def stop_timer_cases():
             for label, got, want in cases]
 
 
+def _run_scope(tmp, payload, scope_reply, token="tok", claims_off=False):
+    """`interactive_session` with claims on and a fake daemon; returns `(code, printed, scope_calls)`.
+
+    `scope_calls` are the `(body, timeout)` of every `/nodes/scope` request. `scope_reply` is the
+    body that route answers, an exception it raises, or a function from the request body to the
+    answer. `/tasks/session` answers "not registered".
+    """
+    scope_calls, captured, code = [], io.StringIO(), "no exit"
+
+    def urlopen(request, timeout=None):
+        if request.full_url.endswith("/nodes/scope"):
+            body = json.loads(request.data)
+            scope_calls.append((body, timeout))
+            if isinstance(scope_reply, Exception):
+                raise scope_reply
+            return _Reply(scope_reply(body) if callable(scope_reply) else scope_reply)
+        return _Reply({"registered": False})
+
+    env = _claims_env(tmp, NUCLEOS_CLAIMS_OFF="1" if claims_off else "")
+    env[hook.PENDING_DIR_ENV] = tmp
+    with mock.patch.dict(os.environ, env):
+        os.environ.pop("NUCLEOS_RUN_ID", None)
+        with mock.patch.object(hook, "read_control_token", return_value=(token, None)):
+            with mock.patch.object(hook, "control_token", return_value=token):
+                with mock.patch.object(hook.urllib.request, "urlopen", side_effect=urlopen):
+                    with mock.patch("sys.stdout", captured):
+                        try:
+                            hook.interactive_session(payload)
+                        except SystemExit as exit_:
+                            code = exit_.code
+    return code, captured.getvalue(), scope_calls
+
+
+def _blocked(printed):
+    try:
+        return json.loads(printed).get("decision") == "block"
+    except Exception:  # noqa: BLE001 - anything that is not a block object is not a block
+        return False
+
+
+def scope_fence_cases():
+    """The interactive-session fence: an edit outside the session's node paths is denied with the
+    daemon's sentence; every failure and every non-edit tool leaves the call alone."""
+    cases = []
+    edit = {
+        "hook_event_name": "PreToolUse",
+        "session_id": "scope1",
+        "cwd": "/work/repo",
+        "tool_name": "Edit",
+        "tool_input": {"file_path": "/work/repo/shell/x.ts", "old_string": "a", "new_string": "b"},
+    }
+    reason = "`shell/x.ts` is outside the paths this node owns (core/**). Do not edit it."
+
+    with tempfile.TemporaryDirectory() as tmp:
+        code, printed, calls = _run_scope(tmp, edit, {"allowed": False, "reason": reason})
+        good = (
+            code == 0
+            and _blocked(printed)
+            and json.loads(printed).get("reason") == reason
+            and len(calls) == 1
+            and calls[0][0] == {
+                "session_id": "scope1",
+                "cwd": "/work/repo",
+                "tool_name": "Edit",
+                "tool_input": edit["tool_input"],
+            }
+            and calls[0][1] is not None
+            and calls[0][1] <= 2
+        )
+        cases.append((
+            "scope, an_edit_outside_the_nodes_paths_is_denied_with_the_daemons_reason",
+            "" if good else f"{code!r} {printed!r} {calls!r}",
+        ))
+
+    failures = []
+    for tool in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, printed, calls = _run_scope(tmp, dict(edit, tool_name=tool), {"allowed": True})
+            if code not in (0, None) or _blocked(printed) or len(calls) != 1:
+                failures.append(f"{tool}: {code!r} {printed!r} {calls!r}")
+    cases.append(("scope, an_edit_the_daemon_allows_gets_no_opinion", "; ".join(failures)))
+
+    failures = []
+    for label, reply, token in (
+        ("refused connection", urllib.error.URLError("refused"), "tok"),
+        ("timeout", TimeoutError("timed out"), "tok"),
+        ("http 500", urllib.error.HTTPError("http://x", 500, "boom", None, None), "tok"),
+        ("not json", ValueError("bad body"), "tok"),
+        ("allowed false without a reason", {"allowed": False}, "tok"),
+        ("an answer that is not an object", ["no"], "tok"),
+        ("no token", {"allowed": False, "reason": reason}, None),
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, printed, calls = _run_scope(tmp, edit, reply, token=token)
+            if code not in (0, None) or _blocked(printed):
+                failures.append(f"{label}: {code!r} {printed!r}")
+            if token is None and calls:
+                failures.append(f"{label}: asked without a token {calls!r}")
+    cases.append(("scope, a_daemon_error_or_timeout_never_denies_an_edit", "; ".join(failures)))
+
+    failures = []
+    for tool, tool_input in (
+        ("Read", {"file_path": "/work/repo/shell/x.ts"}),
+        ("Bash", {"command": "ls"}),
+        ("Grep", {"pattern": "x"}),
+        ("mcp__nucleos__task_list", {}),
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = dict(edit, tool_name=tool, tool_input=tool_input)
+            code, printed, calls = _run_scope(tmp, payload, {"allowed": False, "reason": reason})
+            if calls or _blocked(printed):
+                failures.append(f"{tool}: {printed!r} {calls!r}")
+    # An edit without a usable session id has no node to ask about.
+    for session in (None, "", "../evil", 7):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, printed, calls = _run_scope(
+                tmp, dict(edit, session_id=session), {"allowed": False, "reason": reason}
+            )
+            if calls or _blocked(printed):
+                failures.append(f"session {session!r}: {printed!r} {calls!r}")
+    cases.append(("scope, a_non_edit_tool_never_asks_the_daemon", "; ".join(failures)))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        code, printed, calls = _run_scope(
+            tmp, edit, {"allowed": False, "reason": reason}, claims_off=True
+        )
+        good = not calls and not _blocked(printed)
+        cases.append((
+            "scope, claims_off_skips_the_scope_check",
+            "" if good else f"{code!r} {printed!r} {calls!r}",
+        ))
+
+    def owns_core(body):
+        # The daemon's side, reduced: globs are relative to the root it is sent, a relative path is
+        # resolved against that root, and a path outside the root is let through.
+        root, path = body["cwd"], body["tool_input"]["file_path"]
+        if not (path[:1] in ("/", "\\") or path[1:2] == ":"):
+            path = os.path.join(root, path)
+        rel = os.path.relpath(path, root).replace("\\", "/")
+        if rel.startswith("../") or rel.startswith("core/"):
+            return {"allowed": True}
+        return {"allowed": False, "reason": reason}
+
+    failures = {False: [], True: []}
+    for layout in ("checkout", "worktree"):
+        for label, target, want_blocked in (
+            ("inside an owned glob", ("core", "src", "a.rs"), False),
+            ("a relative path inside an owned glob", None, False),
+            ("elsewhere in the repo", ("shell", "x.ts"), True),
+        ):
+            with tempfile.TemporaryDirectory() as tmp:
+                repo = os.path.join(tmp, "repo")
+                sub = os.path.join(repo, "core")
+                os.makedirs(os.path.join(sub, "src"))
+                if layout == "checkout":
+                    os.makedirs(os.path.join(repo, ".git"))
+                else:
+                    with open(os.path.join(repo, ".git"), "w", encoding="utf-8") as f:
+                        f.write("gitdir: /elsewhere/.git/worktrees/repo\n")
+                file_path = os.path.join("src", "a.rs") if target is None else os.path.join(repo, *target)
+                payload = dict(edit, cwd=sub, tool_input=dict(edit["tool_input"], file_path=file_path))
+                code, printed, calls = _run_scope(tmp, payload, owns_core)
+                sent_root = calls[0][0]["cwd"] if calls else None
+                if (
+                    _blocked(printed) != want_blocked
+                    or len(calls) != 1
+                    or sent_root != os.path.abspath(repo)
+                ):
+                    failures[want_blocked].append(f"{layout}, {label}: {code!r} {printed!r} {calls!r}")
+    cases.append((
+        "scope, an_edit_from_a_subdirectory_inside_an_owned_glob_is_allowed",
+        "; ".join(failures[False]),
+    ))
+    cases.append((
+        "scope, an_edit_from_a_subdirectory_elsewhere_in_the_repository_is_refused",
+        "; ".join(failures[True]),
+    ))
+    return cases
+
+
 def main() -> int:
     failures = 0
     for command, want in CASES:
@@ -1787,6 +1967,7 @@ def main() -> int:
         + claims_prompt_cases()
         + claimed_land_override_cases()
         + stop_timer_cases()
+        + scope_fence_cases()
     ):
         total += 1
         if failure:

@@ -730,6 +730,8 @@ async fn handle_red(
             {
                 tracing::warn!(project = project_id, %reason, "postgate: cannot open the incident");
             }
+            // A failed format step also opens its `fmt:` ticket, at the same confirmed red.
+            incident::open_fmt_tickets(pool, project_id, state, &ticket).await;
         }
         return settle(pool, project_id, phase, sha, status).await;
     }
@@ -2601,10 +2603,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status, "done");
-        let notices =
-            crate::task_claims::sessions::take_notices(&f.pool, "sess-1", chrono::Utc::now())
-                .await
-                .unwrap();
+        let notices = crate::task_claims::sessions::take_notices(
+            &f.pool,
+            "sess-1",
+            crate::task_claims::HolderKind::Session,
+            "sess-1",
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
         assert!(
             matches!(notices.as_slice(), [crate::task_claims::Notice::IncidentClosed { sha, .. }] if sha.as_deref() == Some(c5.as_str())),
             "the owning session hears it: {notices:?}"

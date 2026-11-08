@@ -3447,7 +3447,8 @@ mod tests {
             allowed,
             "mcp__nucleos__note_finding,mcp__nucleos__record,mcp__nucleos__verify,\
              mcp__nucleos__verify_status,mcp__nucleos__task_list,mcp__nucleos__task_claim,\
-             mcp__nucleos__task_release,mcp__nucleos__task_done"
+             mcp__nucleos__task_release,mcp__nucleos__task_done,mcp__nucleos__task_report,\
+             mcp__nucleos__task_decline"
         );
         assert_ne!(allowed, "mcp__nucleos__*");
         assert!(args.iter().any(|arg| arg == "--strict-mcp-config"));

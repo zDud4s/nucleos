@@ -19,8 +19,8 @@ use serde_json::{Value, json};
 use crate::auth::{ApiTokenLevel, Scope};
 use crate::state::AppState;
 use crate::task_claims::{
-    ClaimOutcome, Closer, Holder, HolderKind, NewTask, Notice, Status, TaskKind, TaskRow, keys,
-    sessions, store,
+    ClaimOutcome, Closer, Holder, HolderKind, NewTask, Reporter, Status, TaskKind, TaskRow,
+    competence, keys, offers, sessions, store,
 };
 
 /// The result of resolving one `cwd`: `(project_id, canonical worktree root)`, or `None` when no
@@ -83,40 +83,9 @@ fn short(sha: &str) -> &str {
         .map_or(sha, |(end, _)| &sha[..end])
 }
 
-/// A notice as the agent reads it: what happened and what to do about it.
-pub(super) fn render_notice(notice: &Notice) -> String {
-    match notice {
-        Notice::ClaimLost { task, new_holder } => format!(
-            "Your claim on #{} `{}` is gone: it is now held by {}. Stop working on it; take another task or ask.",
-            task.id,
-            task.key,
-            holder_label(new_holder),
-        ),
-        Notice::IncidentClosed { task, sha } => {
-            let at = sha
-                .as_deref()
-                .map(|sha| format!(" at {}", short(sha)))
-                .unwrap_or_default();
-            format!(
-                "Incident #{} `{}` was closed{at}: master is green again. If you were fixing it, stop; \
-                 if your verify inherited it, rebase on master and verify again.",
-                task.id, task.key,
-            )
-        }
-        // Delivered by chunk 4; the same call to action as `IncidentClosed`, for the verify side.
-        Notice::InheritedClosed { task, sha } => {
-            let at = sha
-                .as_deref()
-                .map(|sha| format!(" at {}", short(sha)))
-                .unwrap_or_default();
-            format!(
-                "Incident #{} `{}` was closed{at}: master is green again. Your verify inherited it: \
-                 rebase on master and verify again.",
-                task.id, task.key,
-            )
-        }
-    }
-}
+/// A notice as the agent reads it. One renderer, shared with the PreToolUse hook
+/// (`sessions::take_run_notices`), so the HTTP and hook wordings cannot drift.
+pub(super) use crate::task_claims::sessions::render_notice;
 
 /// One line of the "live incidents" list.
 pub(super) fn render_incident(task: &TaskRow) -> String {
@@ -296,6 +265,28 @@ pub(super) struct ClaimBody {
 }
 
 #[derive(Debug, Default, Deserialize)]
+pub(super) struct ReportBody {
+    worktree: Option<String>,
+    session_id: Option<String>,
+    key: Option<String>,
+    title: Option<String>,
+    paths: Option<Vec<String>>,
+    tests: Option<Vec<String>>,
+    detail: Option<String>,
+    blocking: Option<bool>,
+    linked_to: Option<i64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct DeclineBody {
+    worktree: Option<String>,
+    session_id: Option<String>,
+    id: Option<i64>,
+    message: Option<String>,
+    suggest_session_id: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 pub(super) struct CloseBody {
     worktree: Option<String>,
     session_id: Option<String>,
@@ -319,7 +310,30 @@ fn age_seconds(created_at: &str, now: Now) -> i64 {
         .unwrap_or(0)
 }
 
-/// The live tasks of one project, each with its age.
+/// How many tickets of a listing carry a `context`: the newest `open`/`claimed` ones. Building one
+/// can ask git about live sessions, so the list stays cheap however many tickets are live.
+const LISTED_CONTEXTS: usize = 20;
+
+/// A ticket's `competence::context`, or `null` when it cannot be read: the answer it rides on (a
+/// claim already committed, a listing) stands either way. `diffs` is the request's git cache: one
+/// listing shares one, so its git work is bounded once for all its tickets.
+async fn context_of(
+    pool: &sqlx::SqlitePool,
+    task: &TaskRow,
+    now: Now,
+    diffs: &mut competence::SessionDiffs,
+) -> Value {
+    match competence::context_with(pool, task, now, diffs).await {
+        Ok(context) => context,
+        Err(error) => {
+            tracing::warn!(%error, task = task.id, "could not build the ticket's context");
+            Value::Null
+        }
+    }
+}
+
+/// The live tasks of one project, each with its age; the newest [`LISTED_CONTEXTS`] `open`/`claimed`
+/// ones also carry their `context`.
 pub(super) async fn list_tasks(
     pool: &sqlx::SqlitePool,
     project_id: &str,
@@ -328,19 +342,33 @@ pub(super) async fn list_tasks(
     let rows = store::list_live(pool, project_id, now)
         .await
         .map_err(internal)?;
-    let tasks: Vec<Value> = rows
+    let mut with_context: Vec<i64> = rows
         .iter()
-        .map(|row| {
-            let mut task = serde_json::to_value(row).unwrap_or(Value::Null);
-            if let Some(fields) = task.as_object_mut() {
-                fields.insert(
-                    "age_seconds".to_owned(),
-                    json!(age_seconds(&row.created_at, now)),
-                );
-            }
-            task
-        })
+        .filter(|row| matches!(row.status, Status::Open | Status::Claimed))
+        .map(|row| row.id)
         .collect();
+    with_context.sort_unstable_by(|a, b| b.cmp(a));
+    with_context.truncate(LISTED_CONTEXTS);
+    let mut tasks: Vec<Value> = Vec::with_capacity(rows.len());
+    let mut diffs = competence::SessionDiffs::default();
+    for row in &rows {
+        let mut task = serde_json::to_value(row).unwrap_or(Value::Null);
+        let context = if with_context.contains(&row.id) {
+            Some(context_of(pool, row, now, &mut diffs).await)
+        } else {
+            None
+        };
+        if let Some(fields) = task.as_object_mut() {
+            fields.insert(
+                "age_seconds".to_owned(),
+                json!(age_seconds(&row.created_at, now)),
+            );
+            if let Some(context) = context {
+                fields.insert("context".to_owned(), context);
+            }
+        }
+        tasks.push(task);
+    }
     Ok(json!({ "project_id": project_id, "tasks": tasks }))
 }
 
@@ -405,14 +433,186 @@ pub(super) async fn claim_task(
         .map_err(claim_error)?
     {
         ClaimOutcome::Won { task, similar } => {
-            Ok(json!({ "won": true, "task": task, "holder": null, "similar": similar }))
+            let context =
+                context_of(pool, &task, now, &mut competence::SessionDiffs::default()).await;
+            Ok(json!({
+                "won": true,
+                "task": task,
+                "holder": null,
+                "similar": similar,
+                "context": context,
+            }))
         }
         ClaimOutcome::Lost {
             task,
             holder,
             similar,
-        } => Ok(json!({ "won": false, "task": task, "holder": holder, "similar": similar })),
+        } => {
+            let context =
+                context_of(pool, &task, now, &mut competence::SessionDiffs::default()).await;
+            Ok(json!({
+                "won": false,
+                "task": task,
+                "holder": holder,
+                "similar": similar,
+                "context": context,
+            }))
+        }
     }
+}
+
+/// `task_report`: reports a problem WITHOUT claiming it. The same key adds one more report to the
+/// live ticket; a report never guards, so its paths are hints only.
+pub(super) async fn report_task(
+    pool: &sqlx::SqlitePool,
+    at: &Located,
+    holder: &Holder,
+    body: &ReportBody,
+    now: Now,
+) -> Result<Value, Fail> {
+    let raw = body
+        .key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .ok_or_else(|| bad_request("key is required"))?;
+    let key = under_either_root(at, |root| keys::normalize(raw, root))?;
+    let title = body
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map_or_else(|| key.to_string(), str::to_owned);
+    let new = NewTask {
+        key,
+        kind: TaskKind::Declared,
+        title,
+        detail: json!({}),
+        guard_paths: Vec::new(),
+        hint_paths: normalize_paths(body.paths.as_deref(), at)?,
+    };
+    let detail = body.detail.as_deref().map(str::trim).unwrap_or_default();
+    let outcome = store::report(
+        pool,
+        &at.project_id,
+        new,
+        &Reporter::Holder(holder),
+        detail,
+        body.tests.as_deref().unwrap_or_default(),
+        body.blocking.unwrap_or(false),
+        body.linked_to,
+        now,
+    )
+    .await
+    .map_err(claim_error)?;
+    // Only a new ticket is routed ("this ticket is yours"); one more report leaves the offer as it is.
+    // The answer's `task` is the row as reported, from before the offer.
+    if outcome.created {
+        offers::route_or_warn(pool, outcome.task.id, now).await;
+    }
+    Ok(json!({
+        "created": outcome.created,
+        "task": outcome.task,
+        "reports": outcome.reports,
+        "similar": outcome.similar,
+    }))
+}
+
+/// What routing did, as the agent reads it.
+fn routed_json(routed: &offers::Routed) -> Value {
+    match routed {
+        offers::Routed::Offered(to) => json!({ "routed": "offered", "to": to }),
+        offers::Routed::NoCandidates => json!({ "routed": "no_candidates" }),
+        offers::Routed::AllDeclined => json!({ "routed": "all_declined" }),
+    }
+}
+
+fn no_such_ticket(id: i64) -> Fail {
+    (
+        StatusCode::NOT_FOUND,
+        format!("there is no ticket #{id} in this project"),
+    )
+}
+
+/// The holder a decline suggests: a session, believed only if it has been seen in this project, and
+/// placed in the worktree it was last seen in (`task_sessions` keeps one row per session). An unknown
+/// session is a 400, as an unseen session is refused for a claim: the suggestion must name somebody
+/// the offer can reach. A run's pseudo-session (`run-<id>`) is not a session.
+async fn suggested_holder(
+    pool: &sqlx::SqlitePool,
+    at: &Located,
+    session: &str,
+) -> Result<Holder, Fail> {
+    if !valid_session_id(session) || session.starts_with("run-") {
+        return Err(bad_request("suggest_session_id has an unexpected shape"));
+    }
+    let worktree: Option<String> = sqlx::query_scalar(
+        "SELECT worktree FROM task_sessions WHERE session_id = ? AND project_id = ?",
+    )
+    .bind(session)
+    .bind(&at.project_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(internal)?;
+    let worktree = worktree.ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "session {session} has not been seen in project {}; suggest a session that works on it",
+                at.project_id
+            ),
+        )
+    })?;
+    Ok(Holder {
+        kind: HolderKind::Session,
+        id: session.to_owned(),
+        worktree,
+    })
+}
+
+/// `task_decline`: turns down a ticket ("not mine"), optionally handing it to another session. The
+/// message is required: it is the history people read. The answer says where the ticket went.
+pub(super) async fn decline_task(
+    pool: &sqlx::SqlitePool,
+    at: &Located,
+    holder: &Holder,
+    body: &DeclineBody,
+    now: Now,
+) -> Result<Value, Fail> {
+    let message = body
+        .message
+        .as_deref()
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .ok_or_else(|| bad_request("message is required"))?;
+    let id = body.id.ok_or_else(|| bad_request("id is required"))?;
+    let suggest = match body
+        .suggest_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|session| !session.is_empty())
+    {
+        Some(session) => Some(suggested_holder(pool, at, session).await?),
+        None => None,
+    };
+    let project: Option<String> =
+        sqlx::query_scalar("SELECT project_id FROM task_claims WHERE id = ?")
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .map_err(internal)?;
+    if project.as_deref() != Some(at.project_id.as_str()) {
+        return Err(no_such_ticket(id));
+    }
+    let routed = offers::decline(pool, id, holder, message, suggest, now)
+        .await
+        .map_err(|error| match error {
+            sqlx::Error::RowNotFound => no_such_ticket(id),
+            other => internal(other),
+        })?;
+    let mut answer = routed_json(&routed);
+    answer["id"] = json!(id);
+    Ok(answer)
 }
 
 /// A note is required: the history in `task_claim_events` is read by people.
@@ -534,11 +734,12 @@ pub(super) async fn session_step(
     } else {
         Vec::new()
     };
-    let notices: Vec<String> = sessions::take_notices(pool, session_id, now)
-        .await?
-        .iter()
-        .map(render_notice)
-        .collect();
+    let notices: Vec<String> =
+        sessions::take_notices(pool, session_id, HolderKind::Session, session_id, now)
+            .await?
+            .iter()
+            .map(render_notice)
+            .collect();
     Ok(
         json!({ "registered": true, "project_id": project_id, "notices": notices, "incidents": incidents }),
     )
@@ -637,6 +838,8 @@ pub(super) fn routes() -> Router<AppState> {
     Router::new()
         .route("/tasks/list", post(post_list))
         .route("/tasks/claim", post(post_claim))
+        .route("/tasks/decline", post(post_decline))
+        .route("/tasks/report", post(post_report))
         .route("/tasks/release", post(post_release))
         .route("/tasks/done", post(post_done))
         .route("/tasks/session", post(post_session))
@@ -694,6 +897,40 @@ async fn post_claim(
     )
     .await?;
     claim_task(&state.pool, &at, &holder, &body, chrono::Utc::now())
+        .await
+        .map(Json)
+}
+
+async fn post_report(
+    State(state): State<AppState>,
+    Extension(scope): Extension<Scope>,
+    Json(body): Json<ReportBody>,
+) -> Reply {
+    let (at, holder) = acting(
+        &state,
+        &scope,
+        body.worktree.as_deref(),
+        body.session_id.as_deref(),
+    )
+    .await?;
+    report_task(&state.pool, &at, &holder, &body, chrono::Utc::now())
+        .await
+        .map(Json)
+}
+
+async fn post_decline(
+    State(state): State<AppState>,
+    Extension(scope): Extension<Scope>,
+    Json(body): Json<DeclineBody>,
+) -> Reply {
+    let (at, holder) = acting(
+        &state,
+        &scope,
+        body.worktree.as_deref(),
+        body.session_id.as_deref(),
+    )
+    .await?;
+    decline_task(&state.pool, &at, &holder, &body, chrono::Utc::now())
         .await
         .map(Json)
 }
@@ -942,6 +1179,38 @@ mod tests {
     }
 
     #[test]
+    fn a_ticket_closed_notice_names_the_ticket_and_the_note() {
+        let task = crate::task_claims::testing::row("migration:master:0276", 9);
+        let text = render_notice(&Notice::TicketClosed {
+            task,
+            note: "branch no longer collides".into(),
+        });
+        assert!(
+            text.contains("#9") && text.contains("migration:master:0276"),
+            "{text}"
+        );
+        assert!(text.contains("branch no longer collides"), "{text}");
+        assert!(text.contains("stop") && text.contains("rebase"), "{text}");
+    }
+
+    #[test]
+    fn the_offered_notice_text_tells_how_to_claim_or_decline() {
+        let task = crate::task_claims::testing::row("file:core/a.rs", 5);
+        let text = render_notice(&Notice::Offered {
+            task,
+            note: "routed: owned (node n1)".into(),
+            context: Value::Null,
+        });
+        assert!(
+            text.contains("#5") && text.contains("file:core/a.rs"),
+            "{text}"
+        );
+        assert!(text.contains("is yours"), "{text}");
+        assert!(text.contains("task_claim"), "{text}");
+        assert!(text.contains("task_decline"), "{text}");
+    }
+
+    #[test]
     fn an_incident_line_names_the_red_sha_and_the_owner() {
         let mut task = crate::task_claims::testing::row("master-red", 4);
         task.detail = serde_json::json!({ "red_since_sha": "1234567890abcdef" });
@@ -1151,6 +1420,258 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_claim_answer_carries_the_context() {
+        let pool = crate::testdb::fresh_pool().await;
+        let run: i64 = sqlx::query(
+            "INSERT INTO runs (prompt, status, created_at) VALUES ('x', 'running', 't')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        sqlx::query(
+            "INSERT INTO work_nodes (id, project_id, root_id, depth, kind, title, goal, status,
+                                     owned_paths, run_id, created_at, updated_at)
+             VALUES ('n1', 'alpha', 'n1', 0, 'leaf', 'edit a', 'goal', 'running', '[\"core/**\"]', ?, 't', 't')",
+        )
+        .bind(run.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let at = located("alpha", "/w");
+        let body = ClaimBody {
+            key: Some("file:core/a.rs".into()),
+            guard_paths: Some(vec!["core/a.rs".into()]),
+            ..Default::default()
+        };
+
+        let won = claim_task(
+            &pool,
+            &at,
+            &holder(HolderKind::Session, "s7", "/w"),
+            &body,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(won["won"], true);
+        let lost = claim_task(
+            &pool,
+            &at,
+            &holder(HolderKind::Session, "s8", "/w2"),
+            &body,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(lost["won"], false);
+        for answer in [&won, &lost] {
+            let context = &answer["context"];
+            assert!(context["reports"].is_array(), "{answer}");
+            assert_eq!(
+                context["competent"][0]["holder"]["id"],
+                run.to_string(),
+                "{answer}"
+            );
+            assert_eq!(context["competent"][0]["source"], "owned");
+            assert_eq!(context["introduced_by"], Value::Null);
+        }
+
+        let listed = list_tasks(&pool, "alpha", chrono::Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            listed["tasks"][0]["context"]["competent"][0]["holder"]["id"],
+            run.to_string(),
+            "a listed claimed ticket carries its context too: {listed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_report_over_http_is_idempotent_and_returns_similar() {
+        let pool = crate::testdb::fresh_pool().await;
+        let at = located("alpha", "/w");
+        let first = holder(HolderKind::Session, "s7", "/w");
+        let second = holder(HolderKind::Session, "s8", "/w2");
+        let body = ReportBody {
+            key: Some("test:core/a.rs::b".into()),
+            title: Some("b fails".into()),
+            detail: Some("seen twice".into()),
+            paths: Some(vec!["core/a.rs".into()]),
+            ..Default::default()
+        };
+        let one = report_task(&pool, &at, &first, &body, chrono::Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(one["created"], true);
+        assert_eq!(one["reports"], 1);
+        let two = report_task(&pool, &at, &second, &body, chrono::Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(two["created"], false);
+        assert_eq!(two["reports"], 2);
+        assert_eq!(two["task"]["id"], one["task"]["id"]);
+        assert_eq!(two["task"]["status"], "open");
+
+        let sibling = ReportBody {
+            key: Some("test:core/a.rs::c".into()),
+            ..Default::default()
+        };
+        let third = report_task(&pool, &at, &second, &sibling, chrono::Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(third["created"], true);
+        assert_eq!(third["similar"][0]["id"], one["task"]["id"]);
+    }
+
+    /// A live session `id` of project `alpha`, seen in `/wt/<id>` a minute before `now`, owning
+    /// `core/a.rs` through a running work node.
+    async fn competent_session(pool: &sqlx::SqlitePool, id: &str, now: Now) {
+        sqlx::query(
+            "INSERT INTO task_sessions (session_id, project_id, worktree, last_seen)
+             VALUES (?, 'alpha', ?, ?)",
+        )
+        .bind(id)
+        .bind(format!("/wt/{id}"))
+        .bind(crate::execution::wave::stamp(
+            now - chrono::Duration::seconds(60),
+        ))
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO work_nodes (id, project_id, root_id, depth, kind, title, goal, status,
+                                     owned_paths, session_id, created_at, updated_at)
+             VALUES (?, 'alpha', ?, 0, 'leaf', 'edit a', 'goal', 'running', '[\"core/a.rs\"]', ?, 't', ?)",
+        )
+        .bind(format!("n-{id}"))
+        .bind(format!("n-{id}"))
+        .bind(id)
+        .bind(crate::execution::wave::stamp(now - chrono::Duration::seconds(120)))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    fn offered_to(tasks: &[TaskRow], id: i64) -> Option<(HolderKind, String)> {
+        tasks
+            .iter()
+            .find(|task| task.id == id)
+            .expect("the ticket is live")
+            .offered_to
+            .as_ref()
+            .map(|to| (to.kind, to.id.clone()))
+    }
+
+    #[tokio::test]
+    async fn a_report_that_creates_a_ticket_routes_it() {
+        let pool = crate::testdb::fresh_pool().await;
+        let now = chrono::Utc::now();
+        competent_session(&pool, "s1", now).await;
+        let at = located("alpha", "/w");
+        let body = ReportBody {
+            key: Some("test:core/a.rs::b".into()),
+            detail: Some("b fails".into()),
+            paths: Some(vec!["core/a.rs".into()]),
+            ..Default::default()
+        };
+
+        let answer = report_task(
+            &pool,
+            &at,
+            &holder(HolderKind::Session, "s7", "/w"),
+            &body,
+            now,
+        )
+        .await
+        .unwrap();
+        assert_eq!(answer["created"], true);
+        let id = answer["task"]["id"].as_i64().expect("a ticket id");
+
+        let live = store::list_live(&pool, "alpha", now).await.unwrap();
+        assert_eq!(
+            offered_to(&live, id),
+            Some((HolderKind::Session, "s1".to_owned())),
+            "the new ticket is offered to the session that owns its path"
+        );
+    }
+
+    #[tokio::test]
+    async fn decline_over_http_needs_a_message() {
+        let pool = crate::testdb::fresh_pool().await;
+        let at = located("alpha", "/w");
+        let me = holder(HolderKind::Session, "s7", "/w");
+        for message in [None, Some(""), Some("   ")] {
+            let body = DeclineBody {
+                id: Some(1),
+                message: message.map(str::to_owned),
+                ..Default::default()
+            };
+            let (status, text) = decline_task(&pool, &at, &me, &body, chrono::Utc::now())
+                .await
+                .expect_err("a decline without a message is refused");
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{message:?}");
+            assert!(text.contains("message"), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn decline_over_http_hands_the_ticket_to_a_suggested_session_it_knows() {
+        let pool = crate::testdb::fresh_pool().await;
+        let now = chrono::Utc::now();
+        competent_session(&pool, "s1", now).await;
+        competent_session(&pool, "s2", now).await;
+        let at = located("alpha", "/wt/s1");
+        let report = ReportBody {
+            key: Some("test:core/a.rs::b".into()),
+            paths: Some(vec!["core/a.rs".into()]),
+            ..Default::default()
+        };
+        let reported = report_task(
+            &pool,
+            &at,
+            &holder(HolderKind::Session, "s7", "/w"),
+            &report,
+            now,
+        )
+        .await
+        .unwrap();
+        let id = reported["task"]["id"].as_i64().unwrap();
+        let offeree = offered_to(&store::list_live(&pool, "alpha", now).await.unwrap(), id)
+            .expect("the report routed the ticket");
+        let other = if offeree.1 == "s1" { "s2" } else { "s1" };
+        let at = located("alpha", &format!("/wt/{}", offeree.1));
+        let me = holder(HolderKind::Session, &offeree.1, &at.root);
+
+        let unknown = DeclineBody {
+            id: Some(id),
+            message: Some("not mine".into()),
+            suggest_session_id: Some("nobody".into()),
+            ..Default::default()
+        };
+        let (status, _) = decline_task(&pool, &at, &me, &unknown, now)
+            .await
+            .expect_err("an unseen suggested session is refused");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let body = DeclineBody {
+            id: Some(id),
+            message: Some("they wrote it".into()),
+            suggest_session_id: Some(other.into()),
+            ..Default::default()
+        };
+        let answer = decline_task(&pool, &at, &me, &body, now).await.unwrap();
+        assert_eq!(answer["routed"], "offered", "{answer}");
+        assert_eq!(answer["to"]["id"], other, "{answer}");
+        assert_eq!(answer["to"]["worktree"], format!("/wt/{other}"), "{answer}");
+        assert_eq!(answer["id"], id);
+        assert_eq!(
+            offered_to(&store::list_live(&pool, "alpha", now).await.unwrap(), id),
+            Some((HolderKind::Session, other.to_owned()))
+        );
+    }
+
+    #[tokio::test]
     async fn a_declared_claim_on_master_red_is_a_409_not_a_500() {
         let pool = crate::testdb::fresh_pool().await;
         let body = ClaimBody {
@@ -1168,7 +1689,7 @@ mod tests {
         .expect_err("the store refuses a declared master-red");
         assert_eq!(refused.0, StatusCode::CONFLICT);
         assert!(
-            refused.1.contains("created by the daemon only"),
+            refused.1.contains("opened by the daemon only"),
             "{}",
             refused.1
         );

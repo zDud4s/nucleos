@@ -347,9 +347,11 @@ pub(super) const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     // `WritesOwn`: a row in this machine's own claim table, keyed to the caller; nothing leaves the
     // machine and nothing is acted on. A claim is advisory until the land gate reads it.
     ("task_claim", ToolEffect::WritesOwn),
+    ("task_decline", ToolEffect::WritesOwn),
     ("task_done", ToolEffect::WritesOwn),
     ("task_list", ToolEffect::ReadsOwn),
     ("task_release", ToolEffect::WritesOwn),
+    ("task_report", ToolEffect::WritesOwn),
     // `Acts`: it ends a tree job and drops its queued branches; nothing already merged is touched.
     ("tree_abandon", ToolEffect::Acts),
     // `Acts`: it adds a branch, makes its worktree and starts a paid run in it.

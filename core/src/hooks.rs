@@ -9592,4 +9592,115 @@ mod tests {
 
         assert_eq!(answer.reason, VERIFY_GUARD_REFUSAL);
     }
+
+    // -- The node scope fence ----------------------------------------------------------------
+
+    const FENCE_ROOT: &str = r"C:\work\repo";
+    const FENCE_TEXT: &str = "is outside the paths this node owns";
+
+    /// An in-flight worktree run behind a `running` leaf that owns `owned`.
+    async fn fenced_node_run(state: &AppState, owned: &[&str]) -> i64 {
+        let run_id = in_flight_run(state, "worktree", None, Some(FENCE_ROOT), None).await;
+        sqlx::query(
+            "INSERT INTO work_nodes
+               (id, root_id, depth, kind, title, goal, status, owned_paths, run_id, created_at,
+                updated_at)
+             VALUES (?, ?, 1, 'leaf', 't', 'g', 'running', ?, ?, '2026-11-07T00:00:00Z',
+                '2026-11-07T00:00:00Z')",
+        )
+        .bind(format!("node-{run_id}"))
+        .bind(format!("root-{run_id}"))
+        .bind(serde_json::to_string(owned).unwrap())
+        .bind(run_id.to_string())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        run_id
+    }
+
+    async fn write_to(app: &Router, run_id: i64, file: &str) -> Decision {
+        decide(
+            app,
+            &serde_json::json!({"run_id": run_id, "tool_name": "Write",
+                "tool_input": {"file_path": file, "content": "x"}})
+            .to_string(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_node_run_editing_outside_its_owned_paths_is_denied_with_the_report_hint() {
+        let state = test_state().await;
+        let run_id = fenced_node_run(&state, &["core/src/hooks/**"]).await;
+        let app = test_router(state.clone());
+
+        let answer = write_to(&app, run_id, r"C:\work\repo\shell\src\App.tsx").await;
+
+        assert_eq!(answer.decision, "deny");
+        assert!(answer.reason.contains(FENCE_TEXT), "{}", answer.reason);
+        assert!(
+            answer.reason.starts_with("`shell/src/App.tsx`"),
+            "{}",
+            answer.reason
+        );
+        assert!(
+            answer.reason.contains("mcp__nucleos__task_report"),
+            "{}",
+            answer.reason
+        );
+        assert_eq!(
+            denials(&state, run_id).await,
+            1,
+            "counted like any hard refusal"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_node_run_editing_a_shared_file_is_allowed() {
+        let state = test_state().await;
+        let run_id = fenced_node_run(&state, &["core/src/hooks/**"]).await;
+        let app = test_router(state.clone());
+
+        let shared = write_to(&app, run_id, r"C:\work\repo\core\AGENTS.md").await;
+        let owned = write_to(&app, run_id, r"C:\work\repo\core\src\hooks\pretool.rs").await;
+
+        for answer in [shared, owned] {
+            assert!(!answer.reason.contains(FENCE_TEXT), "{}", answer.reason);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_run_without_a_node_is_untouched() {
+        let state = test_state().await;
+        let plain = in_flight_run(&state, "worktree", None, Some(FENCE_ROOT), None).await;
+        let unowned = fenced_node_run(&state, &[]).await;
+        let app = test_router(state.clone());
+
+        let without = write_to(&app, plain, r"C:\work\repo\shell\src\App.tsx").await;
+        let empty = write_to(&app, unowned, r"C:\work\repo\shell\src\App.tsx").await;
+
+        assert!(!without.reason.contains(FENCE_TEXT), "{}", without.reason);
+        assert_eq!(
+            (without.decision.as_str(), without.reason.as_str()),
+            (empty.decision.as_str(), empty.reason.as_str()),
+            "a node with no globs is judged as a run without a node"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_node_lookup_failure_does_not_deny() {
+        let state = test_state().await;
+        let run_id = fenced_node_run(&state, &["core/src/hooks/**"]).await;
+        // Only the fence reads this column on the hook's path, so renaming it makes exactly its
+        // lookup fail.
+        sqlx::query("ALTER TABLE work_nodes RENAME COLUMN owned_paths TO owned_paths_gone")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let app = test_router(state.clone());
+
+        let answer = write_to(&app, run_id, r"C:\work\repo\shell\src\App.tsx").await;
+
+        assert!(!answer.reason.contains(FENCE_TEXT), "{}", answer.reason);
+    }
 }

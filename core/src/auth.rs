@@ -198,15 +198,18 @@ const VERIFY_STATUS_ROUTE: &str = "/verify/status";
 /// fences exactly as it does for verification — this table only lets the request in.
 const WORKFLOW_RECORD_ROUTE: &str = "/workflow/records";
 
-/// The task-claim routes (`task_list`, `task_claim`, `task_release`, `task_done`). A run reaches
-/// them for the reason it reaches `/verify`: the holder is the run itself, taken from this key's
+/// The task-claim routes (`task_list`, `task_claim`, `task_release`, `task_done`, `task_report`,
+/// `task_decline`). A run reaches them for the reason it reaches `/verify`: the holder is the run
+/// itself, taken from this key's
 /// scope by the handler, never from the body; this table only lets the request in. All POST, so
 /// the literal-path rule of `Scope::Run` covers them.
-const TASK_ROUTES: [&str; 4] = [
+const TASK_ROUTES: [&str; 6] = [
     "/tasks/list",
     "/tasks/claim",
     "/tasks/release",
     "/tasks/done",
+    "/tasks/report",
+    "/tasks/decline",
 ];
 
 /// The email sidecar's whole daemon surface: report what it fetched, and ask where it got to.

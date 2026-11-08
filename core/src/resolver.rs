@@ -49,6 +49,7 @@ pub async fn run_resolution_loop(state: AppState) {
         // half-landed request. They keep their own inner deadlines.
         cancel_settled(&state).await;
         step_with_timeout("release_unfinished", release_unfinished(&state.pool)).await;
+        step_with_timeout("open_conflict_tickets", open_conflict_tickets(&state.pool)).await;
         launch_once(&state).await;
         land_finished(&state.pool, &mut refused).await;
         step_with_timeout("record_discards", record_discards(&state.pool)).await;
@@ -94,7 +95,7 @@ fn read_switch(read: sqlx::Result<bool>) -> SwitchReading {
 /// Total resolution runs one conflict may be given, the first included. An attempt that ended
 /// without a verdict is retried until this many have been spent; after that the row stays
 /// escalated for a person, as it always did.
-const MAX_RESOLUTION_ATTEMPTS: i64 = 3;
+pub(crate) const MAX_RESOLUTION_ATTEMPTS: i64 = 3;
 
 /// Frees escalated conflicts whose resolution run ended without a verdict, so `next_conflict`
 /// mints a fresh attempt.
@@ -148,6 +149,22 @@ async fn release_unfinished(pool: &sqlx::SqlitePool) -> u64 {
             tracing::warn!(%error, "resolver: could not release unfinished resolutions");
             0
         }
+    }
+}
+
+/// Opens a `conflict:<source>-><target>` ticket for every conflict the loop has given up on: its
+/// `MAX_RESOLUTION_ATTEMPTS` are spent and no resolution of it is live, or the same merge was
+/// escalated more than once. Fail-open: a ticket that could not be written is only logged, since
+/// the gate owns the red and the escalated row is still there for a person.
+async fn open_conflict_tickets(pool: &sqlx::SqlitePool) {
+    if let Err(error) = crate::task_claims::machine::open_conflict_tickets(
+        pool,
+        MAX_RESOLUTION_ATTEMPTS,
+        chrono::Utc::now(),
+    )
+    .await
+    {
+        tracing::warn!(%error, "resolver: could not open the tickets of spent conflicts");
     }
 }
 
@@ -1375,6 +1392,33 @@ mod tests {
         .await
         .expect("publish it");
         id
+    }
+
+    /// Once the cap is spent and the last resolution ended, nothing will retry the conflict, so the
+    /// loop leaves a `conflict:` ticket for whoever picks the work up.
+    #[tokio::test]
+    async fn the_loop_opens_a_conflict_ticket_once_the_attempts_are_spent() {
+        let pool = test_pool().await;
+        let request = escalated_merge(&pool, false).await;
+        insert_run(&pool, 1, "cancelled").await;
+        resolving(&pool, request, 1).await;
+        sqlx::query("UPDATE vcs_requests SET resolution_attempts = ? WHERE id = ?")
+            .bind(MAX_RESOLUTION_ATTEMPTS)
+            .bind(request)
+            .execute(&pool)
+            .await
+            .expect("spend the attempts");
+        open_conflict_tickets(&pool).await;
+        let key = crate::task_claims::keys::normalize(
+            "conflict:feat/x->master",
+            std::path::Path::new(""),
+        )
+        .expect("a conflict key");
+        let ticket =
+            crate::task_claims::store::live_by_key(&pool, "proj", &key, chrono::Utc::now())
+                .await
+                .expect("read the ticket");
+        assert!(ticket.is_some(), "the spent conflict has a live ticket");
     }
 
     /// A resolution run that was cancelled or interrupted gets a fresh attempt, up to the cap; one
