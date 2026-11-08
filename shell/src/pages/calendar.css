@@ -256,6 +256,32 @@
   border-radius: 0;
 }
 
+/* The week's loading skeleton wears the loaded grid's classes; only the scroll window is still. */
+.calendar-week-skeleton .calendar-week-scroll {
+  overflow: hidden;
+  mask-image: none;
+  -webkit-mask-image: none;
+}
+.calendar-week-skeleton .calendar-week-head {
+  cursor: default;
+}
+.calendar-week-skeleton .calendar-week-head > .ui-skeleton-bar {
+  height: 1lh;
+}
+span.calendar-skeleton-tick {
+  position: absolute;
+  right: var(--space-1);
+  width: 1.25rem;
+  height: 0.5rem;
+}
+span.calendar-skeleton-event {
+  position: absolute;
+  left: var(--space-1);
+  right: var(--space-1);
+  min-height: 0;
+  border-radius: var(--radius-sm);
+}
+
 .calendar-cell {
   display: flex;
   min-width: 0;

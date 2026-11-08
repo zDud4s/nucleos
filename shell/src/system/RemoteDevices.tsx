@@ -13,6 +13,7 @@ import {
   type RemoteSetup,
 } from "../data/remote";
 import { QrCode } from "./QrCode";
+import { TokenRowsSkeleton } from "./SkeletonLists";
 import type { ApiTokenLevel } from "../data/system";
 import { DAEMON_NAME } from "../copy";
 import {
@@ -29,7 +30,6 @@ import {
   Row,
   Rows,
   Select,
-  Skeleton,
 } from "../ui";
 
 /**
@@ -86,6 +86,12 @@ export function RemoteDevices() {
         Pair a browser on another device. Create a code here, then enter it on that device.
       </p>
       {setup.data !== undefined && <SetupWizard setup={setup.data} />}
+      {setup.data === undefined && !setup.isError && (<div className="sy-note" aria-hidden="true">
+          <p style={{ display: "flex", alignItems: "center", minHeight: "1lh" }}>
+            <span className="ui-skeleton-bar" style={{ width: "60%", height: "1em" }} />
+          </p>
+          <span className="ui-skeleton-bar" style={{ display: "block", width: "10rem", height: "2rem" }} />
+        </div>)}
 
       {created !== null && (
         <>
@@ -151,7 +157,7 @@ export function RemoteDevices() {
       {devices.isError && devices.data === undefined && (
         <ErrorNote>the paired devices could not be read: the {DAEMON_NAME} is not responding</ErrorNote>
       )}
-      {!devices.isError && devices.data === undefined && <Skeleton label="Reading the devices" />}
+      {!devices.isError && devices.data === undefined && <TokenRowsSkeleton label="Reading the devices" count={2} />}
       {devices.data !== undefined && devices.data.length === 0 && (
         <Quiet says="no device has been paired." />
       )}

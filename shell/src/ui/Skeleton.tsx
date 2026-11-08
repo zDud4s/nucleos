@@ -35,6 +35,8 @@ export interface SkeletonProps {
   size?: number;
   /** Extra class on the `cards` grid, so it reuses the real grid's tracks (`height` is the card's min-height). */
   gridClassName?: string;
+  /** Per-card min-heights of a `cards` grid (one card each, overriding `count` and `height`), for cards of unequal height. */
+  heights?: string[];
 }
 
 const n = (value: number | undefined, fallback: number) => Math.max(1, Math.floor(value ?? fallback));
@@ -59,6 +61,7 @@ export function Skeleton({
   height,
   size = 32,
   gridClassName,
+  heights,
 }: SkeletonProps) {
   if (variant === "lines") {
     return (
@@ -89,9 +92,10 @@ export function Skeleton({
           className={gridClassName ? `ui-skeleton-grid ${gridClassName}` : "ui-skeleton-grid"}
           aria-hidden="true"
         >
-          {Array.from({ length: n(count, 3) }, (_, i) => (
-            <span key={i} className="ui-skeleton-card" style={height ? { minHeight: height } : undefined} />
-          ))}
+          {Array.from({ length: heights ? heights.length : n(count, 3) }, (_, i) => {
+            const h = heights ? heights[i] : height;
+            return <span key={i} className="ui-skeleton-card" style={h ? { minHeight: h } : undefined} />;
+          })}
         </div>
       );
       break;

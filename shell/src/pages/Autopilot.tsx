@@ -851,9 +851,7 @@ function ProjectCarousel({
         </Teach>
       )}
       {/* The fan stage's own height (card + its room), so the cards drop in without a jump. */}
-      {!answered && (
-        <Skeleton label="Reading the roster" variant="block" height="calc(316px + 4rem)" />
-      )}
+      {!answered && <RosterSkeleton />}
       {focused !== undefined && (
         <>
           {/* The setting leads, in the document and on the screen: project, mode, switch. The fan
@@ -1858,6 +1856,32 @@ function TriggerKills() {
 
 /* ---------------------------------------------------------------- the work -- */
 
+/**
+ * The roster section while it is read, in the loaded layout's own grid: the setting on the left
+ * (title, gate sentence, mode switch, the note, the spend bar), the fan's stage beside it, the
+ * roster list under both. Same classes as the real thing, so nothing moves when the data lands.
+ */
+function RosterSkeleton() {
+  return (
+    <>
+      <div className="ap-fan-control">
+        <Skeleton label="Reading the roster" variant="line" width="45%" />
+        <Skeleton label="Reading the gate" lines={2} />
+        <Skeleton label="Reading the mode" variant="block" height="2.75rem" />
+        <Skeleton label="Reading the note" lines={4} />
+      </div>
+      <div className="ap-fan-view">
+        <div className="ap-fan-pane">
+          <Skeleton label="Reading the fan" variant="block" height="calc(316px + 4rem)" />
+          <Skeleton label="Reading the fan hint" variant="line" width="60%" />
+        </div>
+      </div>
+      <Skeleton label="Reading the roster list" variant="row" count={4} height="1.9rem" />
+      <Skeleton label="Reading the spend" variant="block" height="2.5rem" />
+    </>
+  );
+}
+
 function JobsPanel({
   rows,
   selected,
@@ -1882,6 +1906,10 @@ function JobsPanel({
   return (
     <Panel title="Jobs in flight" aside={<Count n={jobs.data?.length} />}>
       {jobs.isError && jobs.data === undefined && <ListError error={jobs.error} what="the jobs" />}
+      {!jobs.isError && jobs.data === undefined && (
+        // The shape of a job row: id and state on one line, the round under it, the actions last.
+        <Skeleton label="Reading the jobs" variant="cards" count={1} gridClassName="ap-list" height="5.75rem" />
+      )}
       {jobs.data !== undefined && live.length === 0 && <Quiet says="Nothing is running. Start one below." />}
       {live.length > 0 && (
         <ul className="ap-list" aria-label="Jobs in flight">
