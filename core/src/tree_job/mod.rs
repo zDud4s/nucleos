@@ -21,6 +21,7 @@ pub mod nesting;
 pub mod node_run;
 pub mod open;
 pub mod partition;
+mod pending_start;
 mod relaunch;
 pub mod report;
 mod rescue;
