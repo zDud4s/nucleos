@@ -547,6 +547,22 @@ pub async fn open_branch(
             .map_err(OpenError::Git)?;
         Some(feature.as_str())
     };
+    // A child starts from its parent's tip, not from the feature branch.
+    let start = match super::nesting::start_ref(&job.manifest, &branch, &feature) {
+        Ok(start) => start,
+        Err(reason) => {
+            roll_back(
+                &root_text,
+                &worktree,
+                &[],
+                &git_branch,
+                false,
+                created_feature,
+            )
+            .await;
+            return Err(OpenError::Git(reason));
+        }
+    };
     let added = git(
         &root_text,
         &[
@@ -555,7 +571,7 @@ pub async fn open_branch(
             "-b",
             &git_branch,
             &path_text(&worktree),
-            &feature,
+            &start,
         ],
     )
     .await;
@@ -1551,6 +1567,49 @@ mod tests {
             "tree/job-1/api"
         );
         assert_eq!(opened.git_branch.as_deref(), Some("tree/job-1/api"));
+    }
+
+    #[tokio::test]
+    async fn a_child_worktree_starts_from_the_parents_tip() {
+        let pool = crate::testdb::fresh_pool().await;
+        let checkout = Checkout::new();
+        checkout.feature_past_master();
+        let mut child = code("kid", "queued");
+        child.parent = Some(BRANCH.to_owned());
+        seed_on(&pool, &checkout, vec![code(BRANCH, "queued"), child]).await;
+        let parent = open_branch(&pool, TREE, BRANCH, &checkout.config())
+            .await
+            .unwrap();
+        let parent_tree = PathBuf::from(parent.worktree.as_deref().unwrap());
+        commit_file(&parent_tree, "from-parent.txt", "parent work
+");
+        let parent_tip = git(&parent_tree, &["rev-parse", "HEAD"]);
+
+        let opened = open_branch(&pool, TREE, "kid", &checkout.config())
+            .await
+            .unwrap();
+
+        let worktree = PathBuf::from(opened.worktree.as_deref().unwrap());
+        assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), parent_tip);
+        assert!(worktree.join("from-parent.txt").exists());
+        assert_eq!(branch_of(&pool, "kid").await.base, None);
+    }
+
+    #[tokio::test]
+    async fn a_child_of_a_parent_not_opened_yet_stays_queued() {
+        let pool = crate::testdb::fresh_pool().await;
+        let checkout = Checkout::new();
+        checkout.feature_past_master();
+        let mut child = code("kid", "queued");
+        child.parent = Some(BRANCH.to_owned());
+        seed_on(&pool, &checkout, vec![code(BRANCH, "queued"), child]).await;
+
+        let error = open_branch(&pool, TREE, "kid", &checkout.config())
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("parent branch"), "{error}");
+        assert_still_queued(&pool, "kid").await;
     }
 
     #[tokio::test]

@@ -601,6 +601,23 @@ async fn at_work(
         }
         return Ok(());
     }
+    // An orchestrator branch waits for its children: its gate runs after they merged into it.
+    if !super::nesting::children_settled(&job.manifest, name) {
+        return Ok(());
+    }
+    if super::nesting::all_children_dropped(&job.manifest, name) {
+        let held = job
+            .manifest
+            .branches
+            .get_mut(name)
+            .ok_or("branch vanished")?;
+        apply_transition(held, "dropped").map_err(|e| e.to_string())?;
+        held.extra.insert(
+            "drop_reason".to_owned(),
+            Value::String("every child was dropped, so it changed nothing".to_owned()),
+        );
+        return persist(pool, job).await;
+    }
     if name == "root" {
         let changed = has_diff(job, branch).await;
         match changed {
@@ -3102,6 +3119,83 @@ mod tests {
         fx.wait_branch_state(JOB, "api", "green").await;
         assert_eq!(gate.calls().len(), 1);
         assert_eq!(fx.branch(JOB, "api").await.gates.len(), 1);
+    }
+
+    /// `api` (parent, its run done) with the given children as `(name, state)`.
+    async fn parent_with_children(fx: &Fixture, job: &str, kids: &[(&str, &str)]) {
+        let mut branches = vec![code_branch("api", "building", Some("api-node"))];
+        for (name, state) in kids {
+            let mut kid = code_branch(name, state, Some(&format!("{name}-node")));
+            kid.parent = Some("api".to_owned());
+            branches.push(kid);
+        }
+        fx.seed_job(job, branches, None).await;
+        fx.add_node(job, "api-node", "orchestrator").await;
+        fx.run_ended("api-node", Some("done")).await;
+        for (name, _) in kids {
+            let node = format!("{name}-node");
+            fx.add_node(job, &node, "leaf").await;
+            fx.run_live(&node).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_parent_is_not_gated_while_a_child_is_building() {
+        const JOB: &str = "drv-parent-waits";
+        let fx = Fixture::new().await;
+        parent_with_children(&fx, JOB, &[("api-x", "building")]).await;
+        let gate = FakeGate::answering(vec![GateVerdict::Green]);
+
+        fx.tick(JOB, &gate).await;
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(gate.calls().iter().all(|(_, branch)| branch != "api"));
+        assert_eq!(fx.branch(JOB, "api").await.state, "building");
+    }
+
+    #[tokio::test]
+    async fn a_parent_is_gated_once_its_children_merged() {
+        const JOB: &str = "drv-parent-gated";
+        let fx = Fixture::new().await;
+        parent_with_children(&fx, JOB, &[("api-x", "merged")]).await;
+        let gate = FakeGate::answering(vec![GateVerdict::Green]);
+
+        fx.tick(JOB, &gate).await;
+
+        wait_calls(&gate, 1).await;
+        assert_eq!(gate.calls(), vec![(JOB.to_owned(), "api".to_owned())]);
+    }
+
+    #[tokio::test]
+    async fn a_parent_whose_children_were_all_dropped_is_dropped_as_changed_nothing() {
+        const JOB: &str = "drv-parent-all-dropped";
+        let fx = Fixture::new().await;
+        parent_with_children(&fx, JOB, &[("api-x", "dropped"), ("api-y", "dropped")]).await;
+        let gate = FakeGate::answering(vec![GateVerdict::Green]);
+
+        fx.tick(JOB, &gate).await;
+
+        let parent = fx.branch(JOB, "api").await;
+        assert_eq!(parent.state, "dropped");
+        assert!(parent.extra["drop_reason"].as_str().unwrap().contains("changed nothing"));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(gate.calls().is_empty(), "an empty parent is not gated");
+        assert_eq!(fx.requests().await, 0, "an empty parent is not merged");
+    }
+
+    #[tokio::test]
+    async fn a_parked_child_keeps_the_parent_waiting_and_the_job_unlanded() {
+        const JOB: &str = "drv-parent-parked-child";
+        let fx = Fixture::new().await;
+        parent_with_children(&fx, JOB, &[("api-x", "parked"), ("api-y", "merged")]).await;
+        let gate = FakeGate::answering(vec![GateVerdict::Green]);
+
+        fx.tick(JOB, &gate).await;
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(gate.calls().iter().all(|(_, branch)| branch != "api"));
+        assert_eq!(fx.branch(JOB, "api").await.state, "building");
+        fx.assert_not_landing(JOB).await;
     }
 
     #[tokio::test]
