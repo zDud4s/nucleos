@@ -198,10 +198,183 @@ def env_part(environ=None) -> dict:
     return out
 
 
-def _key(cwd: str, argv: list[str], tree: str, environ=None) -> str:
+def _key(cwd: str, argv: list[str], tree: str, environ=None, toolchain=None) -> str:
     wt = os.path.normcase(os.path.realpath(cwd))
-    blob = json.dumps([wt, normalize(argv), tree, env_part(environ)], sort_keys=True)
+    blob = json.dumps([wt, normalize(argv), tree, env_part(environ), toolchain or {}],
+                      sort_keys=True)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:32]
+
+
+# ------------------------------------------------------------------ toolchain fingerprint
+
+UNKNOWN = "unknown"
+_TC_MEMO: dict = {}  # per process: one command per broker process, so this is one entry
+
+
+def _stat_id(path, notes: list[str]) -> str:
+    """`size:mtime_ns` of a file, or the stable UNKNOWN marker (noted, never raised)."""
+    try:
+        st = os.stat(path)
+        return f"{st.st_size}:{st.st_mtime_ns}"
+    except (OSError, TypeError, ValueError) as exc:
+        notes.append(f"cannot stat {path}: {type(exc).__name__}")
+        return UNKNOWN
+
+
+def _which(name: str, environ) -> str | None:
+    try:
+        return shutil.which(name, path=environ.get("PATH"))
+    except Exception:
+        return None
+
+
+def _walk_up(cwd: str, names: tuple[str, ...]) -> str | None:
+    d = os.path.realpath(cwd)
+    while True:
+        for n in names:
+            p = os.path.join(d, n)
+            if os.path.isfile(p):
+                return p
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
+def _read(path: str, notes: list[str]) -> str | None:
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read(65536)
+    except OSError as exc:
+        notes.append(f"cannot read {path}: {type(exc).__name__}")
+        return None
+
+
+def _rustup_toolchain_name(env_name, tc_text, settings_text) -> str | None:
+    if env_name:
+        return env_name
+    if tc_text:
+        m = re.search(r'^\s*channel\s*=\s*"([^"]+)"', tc_text, re.M)
+        if m:
+            return m.group(1)
+        first = tc_text.strip().splitlines()[0].strip() if tc_text.strip() else ""
+        if first and "=" not in first and not first.startswith("["):
+            return first
+    if settings_text:
+        m = re.search(r'^\s*default_toolchain\s*=\s*"([^"]+)"', settings_text, re.M)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _active_rustc(home: str, name: str) -> str | None:
+    tcs = os.path.join(home, "toolchains")
+    exe = "rustc.exe" if os.name == "nt" else "rustc"
+    cands = [os.path.join(tcs, name, "bin", exe)]
+    try:
+        for d in sorted(os.listdir(tcs)):
+            if d.startswith(name + "-"):
+                cands.append(os.path.join(tcs, d, "bin", exe))
+    except OSError:
+        pass
+    return next((c for c in cands if os.path.isfile(c)), None)
+
+
+def toolchain_parts(argv: list[str], cwd: str, environ=None) -> tuple[dict, list[str]]:
+    """Cheap fingerprint of the toolchain the command will use, from stat() and small file reads
+    only (never `rustc -V`). Returns (parts, notes); a part that cannot be read is UNKNOWN."""
+    environ = environ if environ is not None else os.environ
+    notes: list[str] = []
+    prog = _prog(argv)
+    parts: dict = {}
+    exe = _which(argv[0], environ) if argv else None
+    parts["exe"] = _stat_id(exe, notes) if exe else UNKNOWN
+    if not exe:
+        notes.append(f"cannot resolve {argv[0] if argv else '?'}")
+    if prog == "cargo":
+        rustc = environ.get("RUSTC") or _which("rustc", environ)
+        parts["rustc"] = _stat_id(rustc, notes) if rustc else UNKNOWN
+        tcfile = _walk_up(cwd, ("rust-toolchain.toml", "rust-toolchain"))
+        tc_text = _read(tcfile, notes) if tcfile else None
+        if tc_text is not None:
+            parts["toolchain_file"] = hashlib.sha256(tc_text.encode("utf-8")).hexdigest()[:16]
+        env_name = environ.get("RUSTUP_TOOLCHAIN")
+        parts["rustup_toolchain"] = env_name or ""
+        home = environ.get("RUSTUP_HOME") or os.path.join(os.path.expanduser("~"), ".rustup")
+        settings = os.path.join(home, "settings.toml")
+        settings_text = None
+        if os.path.isfile(settings):
+            parts["rustup_settings"] = _stat_id(settings, notes)
+            settings_text = _read(settings, notes)
+        name = _rustup_toolchain_name(env_name, tc_text, settings_text)
+        if name:
+            real = _active_rustc(home, name)
+            if real:
+                parts["active_rustc"] = _stat_id(real, notes)
+    elif prog == "go":
+        parts["gotoolchain"] = environ.get("GOTOOLCHAIN", "")
+        gomod = _walk_up(cwd, ("go.mod",))
+        text = _read(gomod, notes) if gomod else None
+        m = re.search(r"^\s*toolchain\s+(\S+)", text or "", re.M)
+        parts["gomod_toolchain"] = m.group(1) if m else ""
+    elif prog in ("npm", "npx", "pnpm", "yarn", "node"):
+        node = _which("node", environ)
+        parts["node"] = _stat_id(node, notes) if node else UNKNOWN
+    return parts, notes
+
+
+def toolchain_fp(argv: list[str], cwd: str, environ=None) -> tuple[dict, list[str], float]:
+    """(parts, notes, ms), memoized per process; ms is the cost of the real computation."""
+    k = (tuple(argv[:1]), os.path.realpath(cwd))
+    if environ is None and k in _TC_MEMO:
+        parts, notes, _ = _TC_MEMO[k]
+        return parts, notes, 0.0
+    t = time.perf_counter()
+    try:
+        parts, notes = toolchain_parts(argv, cwd, environ)
+    except Exception as exc:  # fail-open: a stable marker, never a crash
+        parts, notes = {"all": UNKNOWN}, [f"toolchain fingerprint failed: {type(exc).__name__}"]
+    ms = (time.perf_counter() - t) * 1000.0
+    if environ is None:
+        _TC_MEMO[k] = (parts, notes, ms)
+    return parts, notes, ms
+
+
+def _digest(obj) -> str:
+    return hashlib.sha256(json.dumps(obj, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+
+
+def _index_path(directory: Path, cwd: str, argv: list[str]) -> Path:
+    wt = os.path.normcase(os.path.realpath(cwd))
+    h = hashlib.sha256(json.dumps([wt, normalize(argv)]).encode("utf-8")).hexdigest()[:32]
+    return _dir(directory) / "index" / f"{h}.json"
+
+
+def _classify_miss(directory: Path, cwd: str, argv: list[str], comps: dict) -> str:
+    """Which key component changed since the last lookup of this path+argv."""
+    try:
+        old = json.loads(_index_path(directory, cwd, argv).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "miss_none"
+    if not isinstance(old, dict):
+        return "miss_none"
+    for name, out in (("src", "miss_src"), ("toolchain", "miss_toolchain"), ("env", "miss_env")):
+        if old.get(name) != comps.get(name):
+            return out
+    return "miss_none"
+
+
+def _write_index(directory: Path, cwd: str, argv: list[str], comps: dict) -> None:
+    p = _index_path(directory, cwd, argv)
+    try:
+        if json.loads(p.read_text(encoding="utf-8")) == comps:
+            return
+    except (OSError, ValueError):
+        pass
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(p.name + f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(comps), encoding="utf-8")
+    os.replace(tmp, p)
 
 
 # ------------------------------------------------------------------ store
@@ -284,6 +457,10 @@ class Plan:
         self.head: str = ""
         self.key: str | None = None
         self.store = False  # a full success of this run may be remembered
+        self.outcome: str | None = None  # lookup outcome, logged as `cache`
+        self.store_outcome: str | None = None  # `store` / `store_skip_fail`, logged as `cache_store`
+        self.key_ms: float | None = None
+        self.fp_ms: float | None = None
         self._segs: collections.deque = collections.deque(maxlen=_KEEP_SEGMENTS)
         self.tap = None
 
@@ -316,16 +493,31 @@ class Plan:
         except Exception:
             pass
 
-    def finish(self, code: int, *, narrowed: bool = False, interrupted: bool = False) -> None:
+    def log_fields(self) -> dict:
+        """Fields for this command's log.jsonl row (empty outside the cache family)."""
+        if self.outcome is None:
+            return {}
+        out = {"cache": self.outcome}
+        if self.key_ms is not None:
+            out["cache_key_ms"] = round(self.key_ms, 2)
+        if self.fp_ms is not None:
+            out["toolchain_fp_ms"] = round(self.fp_ms, 2)
+        if self.store_outcome:
+            out["cache_store"] = self.store_outcome
+        if self.hit is not None and self.hit.get("run_s") is not None:
+            out["cache_saved_s"] = round(float(self.hit["run_s"]), 3)
+        return out
+
+    def finish(self, code: int, *, narrowed: bool = False, interrupted: bool = False,
+               run_s: float | None = None) -> None:
         """Remember a full success; forget the key on a failure. Never raises."""
         if self.key is None or interrupted or self.hit is not None:
             return
         try:
-            if code != 0:
+            if code != 0 or narrowed:
                 _drop(self.directory, self.key)
-                return
-            if narrowed:
-                _drop(self.directory, self.key)
+                if self.store:
+                    self.store_outcome = "store_skip_fail"
                 return
             if not self.store:
                 return
@@ -336,7 +528,8 @@ class Plan:
             _store(self.directory, self.key, {
                 "worktree": os.path.realpath(self.cwd), "argv": normalize(self.argv),
                 "tree": self.state, "head": self.head, "exit": 0, "ts": time.time(),
-                "tail": _tail(self._segs)})
+                "tail": _tail(self._segs), "run_s": run_s})
+            self.store_outcome = "store"
         except Exception as exc:
             self.say(f"bookkeeping failed ({type(exc).__name__}: {exc})")
 
@@ -349,22 +542,41 @@ def prepare(argv: list[str], directory: Path, cwd: str, environ=None, err=None, 
     try:
         if disabled(environ) or not in_family(argv):
             return plan
+        t0 = time.perf_counter()
         st = source_state(cwd)
         if st is None:
             return plan
         plan.state, plan.head = st
         if not cacheable(argv):
+            plan.outcome = "uncacheable"
             return plan
-        plan.key = _key(cwd, argv, plan.state, environ)
+        parts, notes, plan.fp_ms = toolchain_fp(argv, cwd, environ)
+        for n in notes:
+            plan.say(f"toolchain fingerprint: {n} (marker {UNKNOWN})")
+        plan.key = _key(cwd, argv, plan.state, environ, parts)
+        plan.key_ms = (time.perf_counter() - t0) * 1000.0 - plan.fp_ms
         plan.tap = plan._feed
-        if full_forced(environ, cwd):
-            return plan  # the daemon's final gate: really run, and store nothing
-        plan.store = True
-        if forced(environ):
-            return plan
-        if _failfirst_pending(directory, cwd, argv):
-            return plan
-        plan.hit = _load(directory, plan.key)
+        comps = {"src": plan.state, "toolchain": _digest(parts),
+                 "env": _digest(env_part(environ))}
+        try:
+            if full_forced(environ, cwd):
+                plan.outcome = "skip_full"
+                return plan  # the daemon's final gate: really run, and store nothing
+            plan.store = True
+            if forced(environ):
+                plan.outcome = "skip_forced"
+                return plan
+            if _failfirst_pending(directory, cwd, argv):
+                plan.outcome = "skip_failfirst"
+                return plan
+            plan.hit = _load(directory, plan.key)
+            plan.outcome = "hit" if plan.hit is not None else _classify_miss(
+                directory, cwd, argv, comps)
+        finally:
+            try:
+                _write_index(directory, cwd, argv, comps)
+            except OSError:
+                pass
     except Exception:
         plan.hit = None
     return plan
