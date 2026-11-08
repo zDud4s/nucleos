@@ -3,6 +3,9 @@
 //! `attempts` counts deliveries: it rises once per lease and nowhere else (Q6). The tenth delivery
 //! without an `ok` is the last, the next poll fails the row with `attempts_exhausted`. A row with a
 //! live lease is never handed out again (Q12), so a poll never raises `attempts` by itself.
+//!
+//! Each lease also raises `lease_generation` and hands it out with the action (contract 1.1), so the
+//! ack of a lease that expired and was handed out again can be told from the current one.
 
 use std::time::{Duration as StdDuration, Instant};
 
@@ -10,7 +13,9 @@ use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
 
 use super::{FailReason, degrade, parse_time, stamp};
-use crate::channels::contract::{self, Button, Ephemeral, OutAction, OutPart, OutboxPoll};
+use crate::channels::contract::{
+    self, Button, Ephemeral, LeasedAction, OutAction, OutPart, OutboxPoll,
+};
 use crate::channels::registry;
 use crate::state::AppState;
 
@@ -187,7 +192,7 @@ async fn lease_once(
     .fetch_all(&mut *tx)
     .await?;
 
-    let mut actions: Vec<OutAction> = Vec::with_capacity(due.len());
+    let mut actions: Vec<LeasedAction> = Vec::with_capacity(due.len());
     for (id, conversation, action, payload) in due {
         let Some(built) = build(id, conversation, &action, &payload) else {
             sqlx::query(
@@ -200,17 +205,18 @@ async fn lease_once(
             .await?;
             continue;
         };
-        sqlx::query(
+        let generation: i64 = sqlx::query_scalar(
             "UPDATE channel_outbox SET state = 'leased', lease_until = ?, \
-             attempts = attempts + 1 WHERE id = ?",
+             attempts = attempts + 1, lease_generation = lease_generation + 1 \
+             WHERE id = ? RETURNING lease_generation",
         )
         .bind(&lease_until)
         .bind(id)
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await?;
         // The stored row stays as enqueued; only the delivered copy is degraded.
         match degrade::degrade(&mut tx, channel, &caps, built).await? {
-            Some(action) => actions.push(action),
+            Some(action) => actions.push(LeasedAction { action, generation }),
             None => {
                 // A best-effort progress edit that cannot be applied in place: settled without a
                 // delivery, so it neither retries nor holds back the conversation.
@@ -316,7 +322,7 @@ mod tests {
     }
 
     fn ids(poll: &OutboxPoll) -> Vec<i64> {
-        poll.actions.iter().map(action_id).collect()
+        poll.actions.iter().map(|a| action_id(&a.action)).collect()
     }
 
     async fn poll(state: &AppState, now: DateTime<Utc>) -> OutboxPoll {
@@ -390,7 +396,10 @@ mod tests {
 
         let got = poll(&state, at(1)).await;
         assert_eq!(ids(&got), vec![answer]);
-        assert!(matches!(got.actions[0], OutAction::AnswerAction { .. }));
+        assert!(matches!(
+            got.actions[0].action,
+            OutAction::AnswerAction { .. }
+        ));
     }
 
     #[tokio::test]
@@ -426,6 +435,17 @@ mod tests {
         let (st, attempts, _, lease_until, _) = row(&state.pool, id).await;
         assert_eq!((st.as_str(), attempts), ("leased", 2));
         assert_eq!(lease_until, Some(stamp(at(121))));
+    }
+
+    #[tokio::test]
+    async fn every_lease_hands_out_a_new_generation() {
+        let state = crate::channels::testkit::state().await;
+        let id = push(&state, "c1").await;
+        for (n, secs) in [0, 61, 122].into_iter().enumerate() {
+            let got = poll(&state, at(secs)).await;
+            assert_eq!(ids(&got), vec![id]);
+            assert_eq!(got.actions[0].generation, n as i64 + 1);
+        }
     }
 
     #[tokio::test]

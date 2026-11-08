@@ -72,6 +72,9 @@ pub struct OutActionWire {
     pub action_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// The lease generation of this delivery (contract 1.1), at least 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -170,6 +173,11 @@ fn validate_buttons(rows: &[Vec<ButtonWire>], base: &str) -> Result<(), Contract
 fn validate_out_action(action: &OutActionWire, base: &str) -> Result<(), ContractError> {
     let at = |field: &str| format!("{base}/{field}");
     check(action.id >= 1, ErrorCode::Range, &at("id"))?;
+    check(
+        action.generation.is_none_or(|g| g >= 1),
+        ErrorCode::Range,
+        &at("generation"),
+    )?;
     check_ref(&action.conversation, &at("conversation"))?;
     let present = [
         ("reply_to", action.reply_to.is_some()),
@@ -290,7 +298,9 @@ impl Shape for OutboxResponseShape {
 mod tests {
     use super::*;
     use crate::channels::contract::decode::tests::{assert_fails, round_trips};
-    use crate::channels::contract::{Button, Ephemeral, OutAction, OutPart, OutboxPoll};
+    use crate::channels::contract::{
+        Button, Ephemeral, LeasedAction, OutAction, OutPart, OutboxPoll,
+    };
     use serde_json::Value;
 
     const SEND_FULL: &str = r#"{ "id": 57, "type": "send", "conversation": "-100123:5",
@@ -467,6 +477,28 @@ mod tests {
     }
 
     #[test]
+    fn generation_zero() {
+        action_fails(
+            r#"{"id":41,"type":"send","conversation":"4242","parts":[{"type":"text","text":"Done."}],"generation":0}"#,
+            ErrorCode::Range,
+            Some("/generation"),
+        );
+    }
+
+    #[test]
+    fn a_generation_round_trips() {
+        let json = r#"{"id":41,"type":"send","conversation":"4242","parts":[{"type":"text","text":"Done."}],"generation":2}"#;
+        let original: Value = serde_json::from_str(json).unwrap();
+        round_trips::<OutActionShape>(json, original);
+        assert_eq!(
+            decode::<OutActionShape>(json.as_bytes())
+                .unwrap()
+                .generation,
+            Some(2)
+        );
+    }
+
+    #[test]
     fn edit_without_target_refs() {
         action_fails(
             r#"{"id":58,"type":"edit","conversation":"4242","target":57,"parts":[{"type":"text","text":"x"}]}"#,
@@ -546,7 +578,7 @@ mod tests {
     #[test]
     fn a_generated_poll_validates() {
         let poll = OutboxPoll {
-            actions: vec![
+            actions: [
                 OutAction::Send {
                     id: 57,
                     conversation: "-100123:5".to_string(),
@@ -590,7 +622,13 @@ mod tests {
                     action_ref: "551".to_string(),
                     text: "Already handled.".to_string(),
                 },
-            ],
+            ]
+            .into_iter()
+            .map(|action| LeasedAction {
+                action,
+                generation: 3,
+            })
+            .collect(),
             ephemeral: vec![Ephemeral::Typing {
                 conversation: "4242".to_string(),
             }],
@@ -599,6 +637,7 @@ mod tests {
         let valid = decode::<OutboxResponseShape>(&bytes)
             .expect("what the núcleo emits must pass its own validation");
         assert_eq!(valid.actions.len(), 3);
+        assert!(valid.actions.iter().all(|a| a.generation == Some(3)));
         assert_eq!(valid.ephemeral.len(), 1);
     }
 }

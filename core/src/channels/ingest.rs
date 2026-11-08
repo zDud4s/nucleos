@@ -1442,7 +1442,7 @@ mod tests {
         let key = fake_key(&st).await;
         let (status, body) = call(&st, &key, "PUT", "/channels/fake/hello", HELLO).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body, serde_json::json!({"contract_version": "1.0.0"}));
+        assert_eq!(body, serde_json::json!({"contract_version": "1.1.0"}));
     }
 
     #[tokio::test]
@@ -1456,7 +1456,7 @@ mod tests {
             body,
             serde_json::json!({
                 "error": "contract_version",
-                "contract_version": "1.0.0",
+                "contract_version": "1.1.0",
                 "detail": "adapter speaks 2.0.0"
             })
         );

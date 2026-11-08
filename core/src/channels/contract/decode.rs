@@ -411,6 +411,10 @@ pub struct AckBody {
     pub platform_refs: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed: Option<AckFailure>,
+    /// The lease generation of the delivery this ack settles (contract 1.1). Absent = an adapter of
+    /// contract 1.0, whose ack is applied without the check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -432,6 +436,11 @@ impl Shape for AckShape {
         if ack.ok.is_some() == ack.failed.is_some() {
             return Err(ContractError::new(ErrorCode::OneOf, ""));
         }
+        check(
+            ack.generation.is_none_or(|g| g >= 1),
+            ErrorCode::Range,
+            "/generation",
+        )?;
         if let Some(ok) = ack.ok {
             check(ok, ErrorCode::Value, "/ok")?;
             for (i, reference) in ack.platform_refs.iter().enumerate() {
@@ -933,7 +942,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             serde_json::to_value(ErrorResponse::contract_version(&hello)).unwrap(),
-            json!({"error": "contract_version", "contract_version": "1.0.0",
+            json!({"error": "contract_version", "contract_version": "1.1.0",
                 "detail": "adapter speaks 2.0.0"})
         );
     }

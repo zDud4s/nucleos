@@ -34,11 +34,18 @@ func (r *Runner) shutdownGrace() time.Duration {
 // Execute sends no ack at all: the lease expires and the core redelivers (D-B6).
 // The caller releases the Inflight entry when runAction returns, i.e. after the
 // ack settled, whatever the outcome (panic included).
+//
+// Every ack echoes the lease generation of the delivery it settles (contract 1.1):
+// the action's own, or a newer one recorded by a redelivery skipped meanwhile.
 func (r *Runner) runAction(ctx, hard context.Context, client *Client, caps contract.Capabilities, a contract.Action) {
 	id := a.ActionID()
+	gen := a.LeaseGeneration()
+	r.noteGeneration(id, gen)
 	if r.Guard != nil {
 		if ack := r.Guard(caps, a); ack != nil {
-			r.ackLogged(hard, client, id, *ack)
+			veto := *ack
+			veto.Generation = r.generationOf(id, gen)
+			r.ackLogged(hard, client, id, veto)
 			return
 		}
 	}
@@ -53,6 +60,7 @@ func (r *Runner) runAction(ctx, hard context.Context, client *Client, caps contr
 	if !send {
 		return
 	}
+	ack.Generation = r.generationOf(id, gen)
 	r.ackLogged(hard, client, id, ack)
 }
 

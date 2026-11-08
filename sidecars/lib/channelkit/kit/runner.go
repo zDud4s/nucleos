@@ -36,6 +36,45 @@ type Runner struct {
 	fatal   fatalState
 	leaseMu sync.Mutex
 	leases  map[uint64]*Lease // renewal of every in-flight action, by action id
+	// generations is the newest lease generation seen for every in-flight action,
+	// by action id: a redelivery skipped while the first execution runs leases the
+	// row afresh, and the ack of that execution must echo the new generation or
+	// the core ignores it (contract 1.1).
+	generations map[uint64]uint64
+}
+
+// noteGeneration records gen as a lease generation of the in-flight action id,
+// keeping the newest (generations only grow). Zero (a 1.0 core) is not recorded.
+func (r *Runner) noteGeneration(id, gen uint64) {
+	if gen == 0 {
+		return
+	}
+	r.leaseMu.Lock()
+	defer r.leaseMu.Unlock()
+	if r.generations == nil {
+		r.generations = make(map[uint64]uint64)
+	}
+	if gen > r.generations[id] {
+		r.generations[id] = gen
+	}
+}
+
+// generationOf returns the newest lease generation recorded for id, or gen when
+// none newer is.
+func (r *Runner) generationOf(id, gen uint64) uint64 {
+	r.leaseMu.Lock()
+	defer r.leaseMu.Unlock()
+	if g := r.generations[id]; g > gen {
+		return g
+	}
+	return gen
+}
+
+// forgetGeneration drops the generation of an action that finished.
+func (r *Runner) forgetGeneration(id uint64) {
+	r.leaseMu.Lock()
+	defer r.leaseMu.Unlock()
+	delete(r.generations, id)
 }
 
 // trackLease records the lease of an in-flight action.
@@ -175,8 +214,10 @@ func (r *Runner) dispatch(ctx, hard context.Context, wg *sync.WaitGroup, client 
 	if !r.Inflight.TryAdd(key) {
 		// Redelivered while still running: the execution in flight settles it. The
 		// core leased it afresh, though, and nobody renews that new lease unless the
-		// old renewal had already given up, so restart it.
+		// old renewal had already given up, so restart it. The new lease has a new
+		// generation, which the ack of the execution in flight must carry.
 		r.Stats.RedeliveredSkipped.Add(1)
+		r.noteGeneration(it.ID, it.Action.LeaseGeneration())
 		if l := r.leaseOf(it.ID); l != nil {
 			l.Resume()
 		}
@@ -186,6 +227,7 @@ func (r *Runner) dispatch(ctx, hard context.Context, wg *sync.WaitGroup, client 
 	go func() {
 		defer wg.Done()
 		defer r.Inflight.Done(key)
+		defer r.forgetGeneration(it.ID)
 		r.runAction(ctx, hard, client, caps, it.Action)
 	}()
 }
