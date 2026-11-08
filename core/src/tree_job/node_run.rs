@@ -22,7 +22,7 @@ const CLAIM_TICKET: &str = "When a ticket is offered to you and it is independen
 const CLAIM_TICKET_LEAF: &str = "When a ticket is offered to you and it is independent of your work, leave it: a leaf opens no branches, and the daemon launches a new tree for a ticket nobody claims.";
 
 /// What a leaf is told when its work is too large: it opens no branch.
-const LEAF_TOO_LARGE: &str = "You are a leaf and a leaf does not open branches: tree_branch_start is refused for you. If the work is too large for this node, make the best leaf you can and say in your report summary that the work exceeded the leaf budget.";
+const LEAF_TOO_LARGE: &str = "You are a leaf and a leaf does not open branches. If the work is too large for this node, make the best leaf you can and say in your report summary that the work exceeded the leaf budget.";
 
 const NODE_PROMPT_HEADER: &str = "You are the agent for NucleOS tree node ";
 
