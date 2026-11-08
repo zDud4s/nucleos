@@ -1,6 +1,6 @@
 import { DAEMON_NAME } from "../copy";
 import { useEffect, useId, useRef, useState, type ReactNode } from "react";
-import { Link } from "@tanstack/react-router";
+import { Link, useNavigate } from "@tanstack/react-router";
 import { isApiRefusal } from "../data/client";
 import {
   autonomyOf,
@@ -506,6 +506,7 @@ function GatePanel({
 }) {
   const configured = command !== null && command.trim() !== "";
   const contradiction = beforePublish && !configured;
+  const navigate = useNavigate();
 
   return (
     <Panel title="Gate">
@@ -529,14 +530,8 @@ function GatePanel({
           reason is a key in an unreviewed file — so this is where it stops being
           invisible. */}
       {contradiction ? (
-        <ErrorNote>
-          <span>
-            <code className="pj-verbatim">gate_before_publish</code> is on and no gate command is
-            set, so the queue refuses every merge.{" "}
-            <Link className="pj-fix-link" to={rulesEditorPath(projectId)}>
-              Set a gate command
-            </Link>
-          </span>
+        <ErrorNote onRetry={() => void navigate({ to: rulesEditorPath(projectId) })} retryLabel="Set a gate command">
+          gate_before_publish is on and no gate command is set, so the queue refuses every merge.
         </ErrorNote>
       ) : (
         <p className="pj-note">

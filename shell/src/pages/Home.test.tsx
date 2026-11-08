@@ -345,7 +345,7 @@ describe("Home", () => {
     expect(
       screen
         .queryAllByRole("button")
-        .filter((b) => b.getAttribute("aria-describedby") === null && b.textContent !== "Retry"),
+        .filter((b) => b.getAttribute("aria-describedby") === null && b.textContent !== "Retry" && b.getAttribute("aria-label") !== "Dismiss notification"),
     ).toHaveLength(0);
     // Each reading is a link to its page (no more "Where to look next").
     expect(screen.getByRole("link", { name: /^Shadow decisions pending/ }).getAttribute("href")).toBe("/autopilot");

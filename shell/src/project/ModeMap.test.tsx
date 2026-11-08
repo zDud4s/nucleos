@@ -311,7 +311,7 @@ describe("a map that could not be read", () => {
     expect(await screen.findByText(/could not read this project/)).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: /^Specs/ }));
-    expect(screen.queryByText(/could not read this project/)).toBeNull();
+    // (The failure was a toast; it stays until it times out, wherever the person goes next.)
     expect(await screen.findByRole("region", { name: "Read a spec" })).toBeTruthy();
   });
 });

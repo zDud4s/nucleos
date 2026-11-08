@@ -4,7 +4,11 @@ use super::*;
 
 pub(super) fn routes() -> Router<AppState> {
     Router::new()
-        .route("/assistant/message", post(post_assistant_message))
+        .route(
+            "/assistant/message",
+            post(post_assistant_message)
+                .layer(axum::middleware::from_fn(super::idempotency::guard)),
+        )
         // Answering a question a turn is being held on. Under `assistant` and not under `hooks`
         // because this is the person speaking, not the CLI: the hook's own half carries a run's key
         // and lives beside the gate.

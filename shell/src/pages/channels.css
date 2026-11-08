@@ -1,7 +1,8 @@
 /* Channels page: the card grid. No colour of its own beyond the shared tokens. */
 .ch-page { display: flex; flex-direction: column; gap: var(--space-4); }
 /* `auto-fit` so two channels share the row instead of leaving a blank third of it. */
-.ch-grid {
+.ch-grid,
+.ui-skeleton-grid.ch-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(min(22rem, 100%), 1fr));
   align-items: start;

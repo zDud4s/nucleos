@@ -1081,3 +1081,10 @@
   font-size: var(--text-sm);
   color: var(--text);
 }
+
+/* #16: counters, durations, costs and figures stand in columns. */
+.pj-file-nums,
+.pj-figure,
+.pj-match-line {
+  font-variant-numeric: tabular-nums;
+}

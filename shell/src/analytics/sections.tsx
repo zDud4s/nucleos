@@ -440,7 +440,7 @@ export function TopRunsSection({ report }: SectionProps) {
                     >
                       <rect className="an-top-bar-fill" width={share} height={4} />
                     </svg>
-                    <span className="an-top-cost">{usd(run.cost_usd)}</span>
+                    <span className="an-top-cost tabular">{usd(run.cost_usd)}</span>
                     {/* A track of its own, so the amount never moves: the tag is short to see, the words are whole to hear. */}
                     {run.cost_is_estimated ? (
                       <span className="an-top-est" title="Estimated from run time">

@@ -21,9 +21,10 @@ describe("ConflictNote", () => {
       </>,
     );
 
-    const [conflict, error] = Array.from(container.querySelectorAll("p"));
-    expect(conflict?.className).toContain("ui-note-conflict");
-    expect(error?.className).toContain("ui-note-error");
-    expect(screen.getByRole("alert").textContent).toBe("this failed");
+    // The conflict stays inline; the failure is a toast, so it leaves no paragraph behind.
+    const paragraphs = Array.from(container.querySelectorAll("p"));
+    expect(paragraphs).toHaveLength(1);
+    expect(paragraphs[0]?.className).toContain("ui-note-conflict");
+    expect(screen.getByRole("alert").textContent).toContain("this failed");
   });
 });

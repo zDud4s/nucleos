@@ -372,7 +372,7 @@ describe("the Agent panel", () => {
     act(() => setActiveTab({ scope: "p1", tab: agentTab("7") }));
     await renderPanel();
 
-    expect(await screen.findByText("Not delivered to the conversation: owner_away")).toBeDefined();
+    expect(await screen.findByText("owner_away")).toBeDefined();
   });
 
   it("the composer sends through the shown conversation", async () => {

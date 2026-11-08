@@ -258,7 +258,7 @@ describe("adding a project", () => {
   it("says which of the three reasons a folder could not be read", async () => {
     await openWizard({ detected: null });
     await look("C:/nowhere");
-    const note = (await screen.findByText(/nothing at that path/)).closest("p");
+    const note = (await screen.findByText(/nothing at that path/)).closest(".ui-toast");
     expect(note?.getAttribute("role")).toBe("status");
     expect(within(note as HTMLElement).getByText("no_such_folder")).toBeTruthy();
   });

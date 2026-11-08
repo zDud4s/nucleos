@@ -837,7 +837,7 @@ describe("Waiting - batch action approvals", () => {
     const failedRow = screen.getByText("approval #1").closest("li");
     expect(failedRow).not.toBeNull();
     expect(
-      await within(failedRow as HTMLElement).findByText(
+      await screen.findByText(
         "this one was already answered. The list clears it on the next read, and nothing further is needed",
       ),
     ).toBeDefined();

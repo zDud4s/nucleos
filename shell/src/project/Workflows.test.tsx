@@ -495,7 +495,7 @@ describe("the install step lists what will run", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "use here" }));
     const panel = within(await screen.findByRole("group", { name: "Commands in harness 1.0" }));
-    expect(await panel.findByText("invalid_graph")).toBeTruthy();
+    expect(await screen.findByText("invalid_graph")).toBeTruthy();
     expect(
       (panel.getByRole("button", { name: "agree and use here" }) as HTMLButtonElement).disabled,
     ).toBe(true);

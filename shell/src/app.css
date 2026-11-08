@@ -2448,6 +2448,13 @@
   border-radius: var(--radius-lg);
 }
 
+/* A card-shaped skeleton keeps its own inset and ground; the bars sit inside it like the stat's text. */
+.app-home-cell .ui-skeleton-textlines {
+  padding: var(--space-4) var(--space-5);
+  background: var(--surface-sunken);
+  justify-content: center;
+}
+
 .app-home-lead .ui-skeleton {
   min-height: 9rem;
 }

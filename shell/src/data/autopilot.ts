@@ -1,4 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useOptimisticMutation } from "../lib/optimistic";
 import { apiFetch } from "./client";
 import { keys } from "./keys";
 import { POLL } from "./poll";
@@ -528,19 +529,24 @@ export function useJudgeResolutions(projectId: string | null) {
   });
 }
 
-/** 204, once. Moves the readiness, so the status is invalidated beside the queue. */
-export function useSetResolutionOutcome() {
+/**
+ * 204, once. Moves the readiness, so the status is invalidated beside the queue.
+ *
+ * Optimistic (#2): marking a review only files a note — it releases nothing and starts nothing — so the
+ * row leaves the queue at once and comes back, with the caller's error note, if the daemon refuses.
+ */
+export function useSetResolutionOutcome(projectId: string | null) {
   const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: ({ id, outcome }: { id: number; outcome: ResolveOutcome }) =>
+  return useOptimisticMutation<Resolution[], { id: number; outcome: ResolveOutcome }>({
+    queryKey: keys.autopilot.judgeResolutions(projectId ?? ""),
+    mutationFn: ({ id, outcome }) =>
       apiFetch<void>(`/judge-resolutions/${id}/outcome`, {
         method: "POST",
         body: JSON.stringify({ outcome }),
+      }).finally(() => {
+        void queryClient.invalidateQueries({ queryKey: keys.autopilot.all });
       }),
-    retry: false,
-    onSettled: () => {
-      void queryClient.invalidateQueries({ queryKey: keys.autopilot.all });
-    },
+    apply: (prev, { id }) => (prev ?? []).filter((r) => r.id !== id),
   });
 }
 

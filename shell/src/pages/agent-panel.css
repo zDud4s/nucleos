@@ -35,12 +35,6 @@
   gap: var(--space-2);
 }
 
-.agent-panel-refused {
-  margin: 0;
-  font-size: var(--text-sm);
-  color: var(--text);
-}
-
 .agent-panel-empty {
   display: flex;
   flex-direction: column;

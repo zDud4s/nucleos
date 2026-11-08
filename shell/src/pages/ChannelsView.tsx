@@ -25,7 +25,11 @@ export function ChannelsView() {
     );
   }
   if (!channels.data) {
-    return <Skeleton label="Reading the channels" variant="cards" count={3} />;
+    return (
+      <div className="ch-page">
+        <Skeleton label="Reading the channels" variant="cards" count={3} gridClassName="ch-grid" height="9rem" />
+      </div>
+    );
   }
 
   const { routing, primary, channels: list } = channels.data;

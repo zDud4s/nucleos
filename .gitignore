@@ -159,3 +159,10 @@ __pycache__/
 # The owner's ablation harness for the AI workflow (it scores agent layers against historical fixes).
 # It measures the development workflow, not the product, and its results live in the local .ai/eval/.
 /scripts/eval/
+
+# Test litter: `space_free_tempdir` helpers create git repos with tempdir_in(current_dir()), which
+# is core/ under cargo test. A killed test leaves the directory behind, and `git add -A` then fails
+# with "adding embedded git repository" or commits it as a gitlink. Prefixes seen: nucleos-wt-test-,
+# nucleos-wfroster-, nucleos-wfseed-, tree-root-*, tree-post-, tree-wrap-plan-.
+/core/nucleos-*-??????/
+/core/tree-*/

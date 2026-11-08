@@ -612,7 +612,7 @@ describe("Projects - what starts work without you", () => {
     expect(within(table).getByText("never fires")).toBeDefined();
     // The daemon logs this at debug 2,880 times a day and the rule silently does
     // nothing; the page is where that stops being invisible.
-    expect(within(table).getByText("unknown timezone: Europe/Lisboa")).toBeDefined();
+    expect(screen.getByText("unknown timezone: Europe/Lisboa")).toBeDefined();
     expect(within(table).getByText("UTC")).toBeDefined();
 
     // Both rules are in the one table, and the trigger's state is its own word

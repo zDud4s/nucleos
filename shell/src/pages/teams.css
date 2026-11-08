@@ -1618,7 +1618,8 @@
   container: teams-strip / inline-size;
 }
 
-.teams-strip {
+.teams-strip,
+.ui-skeleton-grid.teams-strip {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: var(--space-3);
@@ -1980,4 +1981,12 @@
   margin: 0 0 var(--space-4);
   color: var(--text-muted);
   overflow-wrap: anywhere;
+}
+
+/* #16: counters, durations, costs and figures stand in columns. */
+.teams-task-when,
+.teams-matrix-count,
+.teams-count,
+.teams-figure {
+  font-variant-numeric: tabular-nums;
 }

@@ -1628,6 +1628,17 @@
  * are here" and one meaning "it is there". Not a state tone either — one meaning per tone, and
  * "this is the one you asked for" says where the reader is, not what state the turn is in.
  */
+/* The transcript's loading skeleton: the same column, gap and bottom anchoring as `.chats-turns`. */
+.chats-scroll > .ui-skeleton {
+  margin: auto 0 var(--space-6);
+}
+.ui-skeleton-grid.chats-turns {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-7);
+  margin: 0;
+}
+
 .chats-turn-lit {
   border-radius: var(--radius-md);
   outline: 2px solid var(--border-strong);
@@ -2718,16 +2729,6 @@
 .chats-helper-tools-trigger:focus-visible {
   border-color: var(--border-strong);
   outline: none;
-}
-
-/* Why the daemon would refuse this one, said in place rather than as a single
-   "no" about the whole set — which is all a bare 400 could tell anybody. The
-   pending tone on purpose: it is the one that asks a person for something, and
-   this asks rather than reports a fault. */
-.chats-helper-why {
-  margin: 0;
-  color: var(--tone-pending-fg);
-  font-size: var(--text-xs);
 }
 
 /**
@@ -3868,16 +3869,6 @@
   cursor: default;
 }
 
-.chats-forward-refused {
-  margin: 0;
-  font-size: var(--text-xs);
-  color: var(--text-faint);
-}
-
-.chats-forward-refused {
-  color: var(--tone-danger-fg);
-}
-
 /* -------------------------------------------------- what a department said -- */
 
 /* A message, not a turn. No avatar column, no cost, no status chip: a notice has
@@ -4751,14 +4742,6 @@ button.agent-card:hover {
   overflow-wrap: anywhere;
 }
 
-.agent-stop-error {
-  flex-basis: 100%;
-  margin: 0;
-  color: var(--tone-danger-fg);
-  font-size: var(--text-xs);
-  text-align: right;
-}
-
 .agent-io-failed {
   color: var(--tone-danger-fg);
 }
@@ -4817,4 +4800,31 @@ button.agent-card:hover {
 /* The live-region wrapper around the transcript list adds no box of its own. */
 .chats-log {
   display: contents;
+}
+
+/* #16: counters, durations, costs and figures stand in columns. */
+.chats-turn-elapsed,
+.chats-changes-counts,
+.chats-row-when,
+.chats-turn-foot,
+.agent-card-meta,
+.agent-detail-facts {
+  font-variant-numeric: tabular-nums;
+}
+
+/* #13: `.hit-area` sets `position: relative`; this one is pinned to its picture. */
+.chats-attached-drop.hit-area {
+  position: absolute;
+}
+
+.chats-rail-actions > .chats-rail-tip {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.chats-rail-tip > .chats-rail-new {
+  width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  padding-inline: var(--space-2);
 }

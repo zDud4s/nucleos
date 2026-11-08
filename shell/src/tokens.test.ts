@@ -156,6 +156,7 @@ const BASE_ONLY: readonly string[] = [
   "--z-cover",
   "--z-overlay",
   "--z-top",
+  "--z-toast",
 
   "--opacity-disabled",
   "--opacity-quiet",

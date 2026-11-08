@@ -117,13 +117,6 @@
   align-items: baseline;
 }
 
-/* What the last decision did — a receipt, not a state of the machine. */
-.browser-outcome {
-  margin: var(--space-2) 0 0;
-  font-size: var(--text-sm);
-  color: var(--tone-active-fg);
-}
-
 /* =================================================================== list == */
 
 /* -------------------------------------------------------------- sessions == */

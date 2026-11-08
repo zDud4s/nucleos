@@ -1,11 +1,14 @@
 // §spec correspondent-contacts
 import { useId, useState, type ReactNode } from "react";
-import { isApiRefusal, type ApiRefusal } from "../data/client";
+import { useQueryClient } from "@tanstack/react-query";
+import { apiFetch, isApiRefusal, type ApiRefusal } from "../data/client";
+import { keys } from "../data/keys";
+import { useOptimisticMutation } from "../lib/optimistic";
+import { registerPrefetcher } from "../lib/prefetch";
 import {
   mergeVerdictsConflict,
   useContactMerges,
   useContacts,
-  useSenderVerdict,
   useUnmerge,
   type Correspondent,
   type MergeSide,
@@ -579,12 +582,19 @@ function SenderVerdictToggles({
   onProblem: ReportProblem;
   onVerdictSet: (options: UndoToastOptions) => void;
 }) {
-  const mutate = useSenderVerdict();
+  const queryClient = useQueryClient();
+  // Optimistic: the row's badge flips at once and rolls back if the daemon refuses.
+  const mutate = useOptimisticMutation<Correspondent[], { address: string; verdict: "pin" | "mute" | null }>({
+    queryKey: keys.contacts.all,
+    mutationFn: (input) => apiFetch<void>("/contacts/verdict", { method: "POST", body: JSON.stringify(input) }),
+    apply: (prev, input) => (prev ?? []).map((r) => (r.address === input.address ? { ...r, verdict: input.verdict } : r)),
+  });
   const send = (next: "pin" | "mute" | null, isUndo = false) =>
     mutate.mutate(
       { address, verdict: next },
       {
         onSuccess: () => {
+          void queryClient.invalidateQueries({ queryKey: keys.mail.all });
           onProblem(null);
           if (isUndo) return;
           // Undo restores what was there before this press, through the same door.
@@ -668,3 +678,8 @@ function UnmergeError({ error }: { error: unknown }) {
   }
   return <ErrorNote>The {DAEMON_NAME} is not responding: that address was not pulled apart</ErrorNote>;
 }
+
+// Warm the roster when the sidebar link is hovered (#7).
+registerPrefetcher("/contacts", (qc) =>
+  qc.prefetchQuery({ queryKey: keys.contacts.all, queryFn: () => apiFetch<Correspondent[]>("/contacts"), staleTime: 5_000 }),
+);

@@ -20,7 +20,7 @@ export function GroupNode({ data }: NodeProps<FlowGroup>) {
       <span>✓ {group.count} finished</span>
       <button
         type="button"
-        className="fleet-group-toggle nodrag nopan"
+        className="fleet-group-toggle hit-area nodrag nopan"
         aria-expanded={group.open}
         aria-label={`${group.open ? "Collapse" : "Expand"} the finished nodes under ${parentLabel}`}
         onClick={(event) => {

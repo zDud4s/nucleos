@@ -1,4 +1,6 @@
 // §spec novo-frontend
+import { registerRouteLoader } from "./lib/prefetch";
+import { canViewTransition } from "./lib/viewTransition";
 import { Suspense, lazy, type ComponentType, type ReactNode } from "react";
 import {
   Outlet,
@@ -42,7 +44,9 @@ import { validateSystemSearch } from "./pages/systemSearch";
  * boundary lives here, around the page, so the shell (rail, kill switch) stays on screen while a
  * chunk loads. Chunks are local, so the fallback is empty rather than a spinner that would flash.
  */
-function lazyPage(load: () => Promise<{ default: ComponentType }>): () => ReactNode {
+function lazyPage(path: string, load: () => Promise<{ default: ComponentType }>): () => ReactNode {
+  // Hover/focus on the rail link warms this chunk (lib/prefetch); the import promise is shared.
+  registerRouteLoader(path, load);
   const Page = lazy(load);
   return function LazyPage() {
     return (
@@ -53,14 +57,14 @@ function lazyPage(load: () => Promise<{ default: ComponentType }>): () => ReactN
   };
 }
 
-const Autopilot = lazyPage(() => import("./pages/Autopilot").then((m) => ({ default: m.Autopilot })));
-const Brain = lazyPage(() => import("./pages/Brain").then((m) => ({ default: m.Brain })));
-const Chats = lazyPage(() => import("./pages/Chats").then((m) => ({ default: m.Chats })));
-const Council = lazyPage(() => import("./pages/Council").then((m) => ({ default: m.Council })));
-const Files = lazyPage(() => import("./pages/Files").then((m) => ({ default: m.Files })));
-const Fleet = lazyPage(() => import("./pages/Fleet").then((m) => ({ default: m.Fleet })));
-const System = lazyPage(() => import("./pages/System").then((m) => ({ default: m.System })));
-const Teams = lazyPage(() => import("./pages/Teams").then((m) => ({ default: m.Teams })));
+const Autopilot = lazyPage("/autopilot", () => import("./pages/Autopilot").then((m) => ({ default: m.Autopilot })));
+const Brain = lazyPage("/brain", () => import("./pages/Brain").then((m) => ({ default: m.Brain })));
+const Chats = lazyPage("/chats", () => import("./pages/Chats").then((m) => ({ default: m.Chats })));
+const Council = lazyPage("/council", () => import("./pages/Council").then((m) => ({ default: m.Council })));
+const Files = lazyPage("/files", () => import("./pages/Files").then((m) => ({ default: m.Files })));
+const Fleet = lazyPage("/fleet", () => import("./pages/Fleet").then((m) => ({ default: m.Fleet })));
+const System = lazyPage("/system", () => import("./pages/System").then((m) => ({ default: m.System })));
+const Teams = lazyPage("/teams", () => import("./pages/Teams").then((m) => ({ default: m.Teams })));
 
 /**
  * Memory history, in the real app as well as in the tests.
@@ -409,6 +413,8 @@ export function createAppRouter(initialPath = "/") {
      * firing twenty route loads on a machine that is already polling.
      */
     defaultPreload: false,
+    /** Cross-fade routes where supported and motion is allowed (lib/viewTransition). */
+    defaultViewTransition: canViewTransition(),
     /**
      * The belt under the braces. Every child route above names `RouteError`
      * explicitly; this catches the one somebody adds without it, which is the

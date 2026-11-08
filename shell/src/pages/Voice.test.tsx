@@ -276,6 +276,29 @@ describe("Voice — capture outcomes", () => {
 
     expect(await screen.findByText("call the plumber")).toBeDefined();
   });
+
+  it("deleting a memo hides it behind an undo window and only commits when the window closes", async () => {
+    daemon.apiFetch.mockImplementation(async (path: string) => {
+      if (path === "/voice/config") return voiceConfig();
+      if (path === "/voice/memos") return [capture({ id: 7, raw_text: "call the plumber" })];
+      if (path === "/voice/dictations") return [];
+      return undefined;
+    });
+    const deletes = () =>
+      daemon.apiFetch.mock.calls.filter(([path, init]) => path === "/voice/memos/7" && init?.method === "DELETE");
+
+    await renderVoice();
+    fireEvent.click(await screen.findByRole("button", { name: /^Archive/ }));
+    await screen.findByText("call the plumber");
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    expect(screen.queryByText("call the plumber")).toBeNull();
+    expect(deletes()).toHaveLength(0);
+
+    fireEvent.click(screen.getByRole("button", { name: "Undo" }));
+    expect(await screen.findByText("call the plumber")).toBeDefined();
+    expect(deletes()).toHaveLength(0);
+  });
 });
 
 /* --------------------------------------------------- the spoken conversation -- */

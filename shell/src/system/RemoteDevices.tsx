@@ -156,11 +156,13 @@ export function RemoteDevices() {
         <Quiet says="no device has been paired." />
       )}
       {devices.data !== undefined && devices.data.length > 0 && (
-        <Rows label="Remote devices">
-          {devices.data.map((device) => (
-            <DeviceRow key={device.id} device={device} />
-          ))}
-        </Rows>
+        <div className="sy-list-scroll" tabIndex={0}>
+          <Rows label="Remote devices">
+            {devices.data.map((device) => (
+              <DeviceRow key={device.id} device={device} />
+            ))}
+          </Rows>
+        </div>
       )}
     </Panel>
   );

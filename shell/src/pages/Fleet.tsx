@@ -8,7 +8,8 @@ import { FleetCanvas } from "../fleet/Surface";
 import { TopBar } from "../fleet/TopBar";
 import { TranscriptPanel } from "../fleet/TranscriptPanel";
 import { FleetUiContext, type FleetUi } from "../fleet/ui-context";
-import { PageHeader, Quiet, Skeleton } from "../ui";
+import { PageHeader, Quiet, Skeleton, usePaletteGroup } from "../ui";
+import { usePageKeys } from "../project/pageKeys";
 import "./fleet.css";
 
 const NONE: ReadonlySet<string> = new Set();
@@ -32,6 +33,7 @@ export function Fleet() {
 }
 
 function FleetScreen() {
+  "use no memo"; // the compiler drops `version`, which only appears in dependency arrays, and caches the mutable store reads
   const store = useFleetStore();
   const version = useLayoutVersion();
   const received = useSyncExternalStore(store.subscribeLayout, store.hasSnapshot);
@@ -68,6 +70,21 @@ function FleetScreen() {
     if (panel !== null && store.getEntry(panel) === undefined) setPanel(null);
   }, [store, received, version, selected, panel]);
 
+  // #3/#4: the TopBar's three verbs in the palette, with the keys they print.
+  const fit = () => setFitSignal((n) => n + 1);
+  const toggleFollow = () => setFollow((v) => !v);
+  const toggleActive = () => setOnlyActive((v) => !v);
+  usePaletteGroup({
+    id: "fleet-actions",
+    heading: "Quick actions",
+    items: [
+      { id: "fleet-fit", label: "Fit the view", match: "fit view zoom", shortcut: "F", run: fit },
+      { id: "fleet-follow", label: "Follow the activity", match: "follow activity", shortcut: "L", run: toggleFollow },
+      { id: "fleet-active", label: "Only what is running", match: "only active running", shortcut: "A", run: toggleActive },
+    ],
+  });
+  usePageKeys({ f: fit, l: toggleFollow, a: toggleActive });
+
   // Empty means "the canvas would draw nothing", by the same filters the layout applies.
   const { nothing, filtered } = useMemo(() => {
     const nodes = store.nodes();
@@ -79,20 +96,24 @@ function FleetScreen() {
 
   return (
     <FleetUiContext.Provider value={ui}>
-      <PageHeader title="Fleet" />
-      <TopBar
-        project={project}
-        onProject={setProject}
-        onlyActive={onlyActive}
-        onOnlyActive={setOnlyActive}
-        follow={follow}
-        onFollow={setFollow}
-        onFit={() => setFitSignal((n) => n + 1)}
+      <PageHeader
+        title="Fleet"
+        actions={
+          <TopBar
+            project={project}
+            onProject={setProject}
+            onlyActive={onlyActive}
+            onOnlyActive={setOnlyActive}
+            follow={follow}
+            onFollow={setFollow}
+            onFit={() => setFitSignal((n) => n + 1)}
+          />
+        }
       />
       <div className="fleet-stage">
         {!received ? (
           <>
-            <Skeleton label="Loading the fleet" variant="cards" count={3} />
+            <Skeleton label="Loading the fleet" variant="card" />
             {failedReconnects >= UNREACHABLE_AFTER && (
               <p className="fleet-note">Can't reach the fleet stream, retrying</p>
             )}
