@@ -438,6 +438,7 @@ def _token_found_at(wanted, env=None):
     captured = io.StringIO()
     with mock.patch.dict(os.environ, env or {}, clear=False):
         os.environ.pop("NUCLEOS_DAEMON_TOKEN", None)
+        os.environ.pop("NUCLEOS_DAEMON_TOKEN_FILE", None)
         with mock.patch.object(hook, "cargo_target_dirs", lambda _root: target):
             with mock.patch.object(hook.os.path, "exists", lambda path: path == wanted):
                 with mock.patch.object(hook.subprocess, "run", side_effect=run):
@@ -478,6 +479,105 @@ def control_token_cases():
         )
         for name in ("nucleos-core", "nucleos-core.exe")
     ]
+
+
+def token_file_cases():
+    """A Claude run's key arrives as a FILE, named by `NUCLEOS_DAEMON_TOKEN_FILE`, not as a value.
+
+    The runner strips `NUCLEOS_DAEMON_TOKEN` from the CLI's environment so the agent's shell
+    commands do not inherit it (`core/src/execution/runner/claude.rs`). The hook must still
+    authenticate: the gate and the outcome report send the file's key, and the token discovery the
+    bundle scripts share (`read_control_token`) answers with it rather than falling through to
+    `--print-token`, which would hand a run the daemon's control token instead of its own.
+    """
+    cases = []
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "run-token")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("7.file-secret")
+        base = {
+            "NUCLEOS_RUN_ID": "7",
+            "NUCLEOS_DAEMON_URL": "http://127.0.0.1:1",
+            "NUCLEOS_DAEMON_TOKEN_FILE": path,
+        }
+
+        with mock.patch.dict(os.environ, base, clear=True):
+            got = hook.run_token()
+        cases.append((
+            "run_token reads the key from NUCLEOS_DAEMON_TOKEN_FILE",
+            "" if got == "7.file-secret" else f"got {got!r}",
+        ))
+
+        with mock.patch.dict(os.environ, {**base, "NUCLEOS_DAEMON_TOKEN": "7.env"}, clear=True):
+            got = hook.run_token()
+        cases.append((
+            "run_token prefers NUCLEOS_DAEMON_TOKEN when both are set",
+            "" if got == "7.env" else f"got {got!r}",
+        ))
+
+        missing = {**base, "NUCLEOS_DAEMON_TOKEN_FILE": os.path.join(tmp, "absent")}
+        with mock.patch.dict(os.environ, missing, clear=True):
+            got = hook.run_token()
+        cases.append((
+            "run_token answers None for a file that is not there",
+            "" if got is None else f"got {got!r}",
+        ))
+
+        # The gate: no token in the environment at all, only the file.
+        payload = {
+            "hook_event_name": "PreToolUse",
+            "session_id": "token-file",
+            "tool_name": "Read",
+            "tool_input": {"file_path": "/work/repo/a.txt"},
+            "cwd": "/work/repo",
+        }
+        sent = []
+
+        def urlopen(request, timeout=None):
+            sent.append(request.get_header("Authorization"))
+            return _Reply({"decision": "allow", "reason": "ok"})
+
+        captured = io.StringIO()
+        with mock.patch.dict(os.environ, base, clear=True):
+            with mock.patch("sys.stdin", io.StringIO(json.dumps(payload))):
+                with mock.patch.object(hook.urllib.request, "urlopen", side_effect=urlopen):
+                    with mock.patch("sys.stdout", captured):
+                        try:
+                            hook.main()
+                        except SystemExit:
+                            pass
+        special = _special_of(captured.getvalue())
+        allowed = special is not None and special.get("permissionDecision") == "allow"
+        cases.append((
+            "the gate authenticates with the key from the file and honours the allow",
+            _verdict(
+                allowed and bool(sent) and all(h == "Bearer 7.file-secret" for h in sent),
+                f"{captured.getvalue()!r} sent {sent!r}",
+            ),
+        ))
+
+        # The outcome report, same environment.
+        sent.clear()
+        with mock.patch.dict(os.environ, base, clear=True):
+            with mock.patch.object(hook.urllib.request, "urlopen", side_effect=urlopen):
+                failure = _silent_and_did_not_raise(lambda: hook.report_outcome(_OUTCOME_PAYLOAD))
+        cases.append((
+            "report_outcome authenticates with the key from the file",
+            failure or _verdict(sent == ["Bearer 7.file-secret"], f"sent {sent!r}"),
+        ))
+
+        # Token discovery: the file wins, and no git or `--print-token` is run at all.
+        with mock.patch.dict(os.environ, base, clear=True):
+            with mock.patch.object(hook.subprocess, "run", side_effect=AssertionError("ran")):
+                try:
+                    got = hook.read_control_token("/work/repo")
+                except AssertionError:
+                    got = "ran a subprocess"
+        cases.append((
+            "read_control_token answers with the run's file key, not the control token",
+            "" if got == ("7.file-secret", None) else f"got {got!r}",
+        ))
+    return cases
 
 
 def one_source_cases():
@@ -1953,6 +2053,7 @@ def main() -> int:
     for label, failure in (
         binary_candidate_cases()
         + control_token_cases()
+        + token_file_cases()
         + pending_follow_up_cases()
         + interactive_follow_up_cases()
         + verify_hint_cases()

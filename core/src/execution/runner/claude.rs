@@ -96,6 +96,69 @@ where
     }
 }
 
+/// The variable a run's daemon key arrives in on `RunRequest::env` (`runs::run_env`).
+const DAEMON_TOKEN_VAR: &str = "NUCLEOS_DAEMON_TOKEN";
+
+/// The request's environment without the daemon key, and the key. Case-insensitive like agy's
+/// filter, because Windows reads environment names that way. An empty key is no key.
+fn split_daemon_token(env: &[(String, String)]) -> (Vec<&(String, String)>, Option<&str>) {
+    let mut token = None;
+    let mut rest = Vec::with_capacity(env.len());
+    for entry in env {
+        if entry.0.eq_ignore_ascii_case(DAEMON_TOKEN_VAR) {
+            if !entry.1.is_empty() {
+                token = Some(entry.1.as_str());
+            }
+        } else if entry
+            .0
+            .eq_ignore_ascii_case(crate::daemon_client::TOKEN_FILE_VAR)
+        {
+            // Only the path this runner writes may name a key file.
+        } else {
+            rest.push(entry);
+        }
+    }
+    (rest, token)
+}
+
+/// One run's daemon key, on disk for as long as the run's CLI lives; removed on drop.
+///
+/// In the per-user temp directory (on Windows its ACL admits only the user, SYSTEM and
+/// Administrators), under a name with a fresh UUID so no other run can guess it, created with
+/// `create_new` so a file planted at that name is refused rather than reused, and `0600` off
+/// Windows. Outside every worktree, so it can never be committed.
+struct RunTokenFile {
+    path: PathBuf,
+}
+
+impl RunTokenFile {
+    fn write(token: &str) -> std::io::Result<Self> {
+        let path = std::env::temp_dir().join(format!(
+            "nucleos-run-token-{}-{}",
+            std::process::id(),
+            crate::auth::generate_uuid_v4()
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path)?;
+        // Owned from here on, so a failed write still removes what it created.
+        let staged = Self { path };
+        std::io::Write::write_all(&mut file, token.as_bytes())?;
+        Ok(staged)
+    }
+}
+
+impl Drop for RunTokenFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 #[async_trait]
 impl CommandRunner for ClaudeCliRunner {
     /// Only `plan` and `review` are routable: both are read-mostly turns with short output.
@@ -200,8 +263,25 @@ impl CommandRunner for ClaudeCliRunner {
         ) {
             cmd.env_remove("ANTHROPIC_API_KEY");
         }
-        for (k, v) in &request.env {
+        // The run's daemon key never enters the CLI's environment, from the request or inherited:
+        // every shell command the agent runs inherits that environment, and `echo $VAR` is a
+        // `read-local` action. The key goes to a per-run file instead, and the CLI gets only its
+        // path, which the hook and the MCP server read (`ask_daemon.py`'s `run_token`,
+        // `DaemonClient::from_env`). Written before the spawn, so a failure to write is the `Err`
+        // that means the CLI never ran. Lives until this function returns, which is after the CLI
+        // has been reaped.
+        let (child_env, daemon_token) = split_daemon_token(&request.env);
+        let token_file = match daemon_token {
+            Some(token) => Some(RunTokenFile::write(token)?),
+            None => None,
+        };
+        cmd.env_remove(DAEMON_TOKEN_VAR);
+        cmd.env_remove(crate::daemon_client::TOKEN_FILE_VAR);
+        for (k, v) in child_env {
             cmd.env(k, v);
+        }
+        if let Some(file) = &token_file {
+            cmd.env(crate::daemon_client::TOKEN_FILE_VAR, &file.path);
         }
         if let Some(dir) = &request.cwd {
             cmd.current_dir(dir);

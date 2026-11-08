@@ -508,9 +508,9 @@ the contract, not a snapshot.
 | `channels/contract/decode/event.rs` | The `event` and `event_response` shapes (D2) and the valid event -> `InboundEvent` conversion. |
 | `channels/contract/decode/outbox.rs` | The `outbox_response` and `action` shapes (D3): the wire types and validation of what the núcleo sends an adapter. |
 | `channels/fake.rs` | Test-only: a fake adapter used by the contract scenarios. |
-| `channels/ingest.rs` | Adapter ingest: `hello` and `events`. |
 | `channels/inbound_limit.rs` | Rate limit of unknown senders (per sender and per channel, fixed one-hour windows, bounded memory), asked by ingest before a `channel_events` row is written; excess is counted and dropped. |
 | `channels/media.rs` | Media bytes, transcription and turn input. |
+| `channels/ingest.rs` | Adapter ingest: `hello` and `events`. |
 | `channels/outbox.rs` | The outbound queue with leases; the adapter-facing routes. |
 | `channels/outbox/ack.rs` | Outbox acknowledgement handling. |
 | `channels/outbox/degrade.rs` | Outbox degradation of unsupported content. |
@@ -579,7 +579,7 @@ the contract, not a snapshot.
 | `mcp_tools/boxes.rs` | Which tools each box serves, the admission rule, and the worktree, ticket and client a box's calls are held to. |
 | `mcp_tools/effects.rs` | What each tool does to the world: `ToolEffect`, the effects table and the effect of one call. |
 | `mcp_tools/local_box.rs` | `LocalToolBox`, the in-process tool box, and its bounded reads of project files. |
-| `daemon_client.rs` | Parent of `daemon_client/`. Typed HTTP client for the local daemon API (bearer auth via `NUCLEOS_DAEMON_URL`/`NUCLEOS_DAEMON_TOKEN`), used by `mcp_tools.rs`'s stdio process — a separate process from the daemon itself, so it cannot just call `AppState` in-process. Also the one place that answers **where this daemon is**: `port_from`, `url_for` and `is_primary` are pure, `port()`/`daemon_url()` read `NUCLEOS_PORT`, and everything that hands an address to something it launches derives it from here. A second instance (`NUCLEOS_PORT` + `NUCLEOS_DATA_DIR`) binds its own port, keeps its own database, and registers no autostart and no sidecars — see `is_primary`. |
+| `daemon_client.rs` | Parent of `daemon_client/`. Typed HTTP client for the local daemon API (bearer auth via `NUCLEOS_DAEMON_URL`/`NUCLEOS_DAEMON_TOKEN`, or the key file `NUCLEOS_DAEMON_TOKEN_FILE` names — the Claude runner passes only that path, never the key), used by `mcp_tools.rs`'s stdio process — a separate process from the daemon itself, so it cannot just call `AppState` in-process. Also the one place that answers **where this daemon is**: `port_from`, `url_for` and `is_primary` are pure, `port()`/`daemon_url()` read `NUCLEOS_PORT`, and everything that hands an address to something it launches derives it from here. A second instance (`NUCLEOS_PORT` + `NUCLEOS_DATA_DIR`) binds its own port, keeps its own database, and registers no autostart and no sidecars — see `is_primary`. |
 | `data_dir.rs` | Where THIS process's database lives. `DB_FILE` (`nucleos.db`), `default_data_dir()` (the `ProjectDirs::from("dev", "nucleos", "NucleOS")` local data dir), `data_dir_from(override, default)` (PURE; an empty `NUCLEOS_DATA_DIR` is not an override), `data_dir()` (reads the variable `daemon_client::DATA_DIR_VAR` names) and `db_path(dir)`. Shared by startup (`main.rs`), the settings recovery CLI (`settings_cli.rs`) and the classifier's database-path rule, so that all of them look at the same file. A module of its own only because `daemon_client.rs`, which owns the port and the variable, is at its file-size ceiling. |
 | `daemon_client/browser.rs` | The browser agent verbs (`browser_open`, snapshot, act, look, handoff, close). |
 | `daemon_client/delivery.rs` | The code-delivery verbs: the git queue (`vcs_request`, `vcs_ticket`), GitHub, and verify. |
