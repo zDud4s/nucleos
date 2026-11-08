@@ -3,8 +3,7 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import { keepFocus, useDictation, type CaptureOutcome, type Delivery } from "../app/Dictation";
-import { isApiRefusal } from "../data/client";
-import { daemonProse } from "../team/prose";
+import { isApiRefusal, type ApiRefusal } from "../data/client";
 import { useVoiceConversation, type ConversationView } from "../data/conversation";
 import { useHotkeyRegistration } from "../data/hotkeys";
 import { useVoiceChat } from "../data/voice-chat";
@@ -93,6 +92,14 @@ function headline(
   }
   if (memos === undefined || dictations === undefined) return "armed";
   return `armed: ${plural(memos.length, "memo")}, ${plural(dictations.length, "dictation")}`;
+}
+
+/** The daemon's own sentence, when it really sent one — the pattern `Web.tsx` and `Contacts.tsx` share. */
+function daemonProse(refusal: ApiRefusal): Record<string, string> {
+  const detail = refusal.detail.trim();
+  if (detail === "" || detail === refusal.code) return {};
+  if (detail.split(/\s+/).length < 4) return {};
+  return { [refusal.code]: detail };
 }
 
 export function Voice() {

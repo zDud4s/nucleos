@@ -1,7 +1,6 @@
 import { Link, useNavigate, useParams } from "@tanstack/react-router";
 import { DAEMON_NAME } from "../copy";
-import { isApiRefusal } from "../data/client";
-import { daemonProse } from "../team/prose";
+import { isApiRefusal, type ApiRefusal } from "../data/client";
 import {
   parseActionPayload,
   teamActionState,
@@ -288,6 +287,13 @@ function CancelNote({ error }: { error: unknown }) {
 function DeleteNote({ error }: { error: unknown }) {
   if (isApiRefusal(error)) return <RefusalNote refusal={error} sentences={daemonProse(error)} />;
   return <ErrorNote>The {DAEMON_NAME} is not responding, so this run was not deleted.</ErrorNote>;
+}
+
+function daemonProse(refusal: ApiRefusal): Record<string, string> {
+  const detail = refusal.detail.trim();
+  if (detail === "" || detail === refusal.code) return {};
+  if (detail.split(/\s+/).length < 4) return {};
+  return { [refusal.code]: detail };
 }
 
 /* ------------------------------------------------------------------ origin -- */

@@ -2,8 +2,7 @@
 import { useEffect, useId, useState } from "react";
 import { Link, useNavigate, useParams } from "@tanstack/react-router";
 import { Search } from "lucide-react";
-import { isApiRefusal } from "../data/client";
-import { daemonProse } from "../team/prose";
+import { isApiRefusal, type ApiRefusal } from "../data/client";
 import {
   useWebPage,
   useWebPages,
@@ -118,6 +117,14 @@ function headline(rows: Hit[] | undefined): string | undefined {
   if (rows === undefined) return undefined;
   if (rows.length === 0) return "nothing has been read yet";
   return `${plural(rows.length, "page")} in the archive`;
+}
+
+/** The daemon's own sentence, when it really sent one — `RunDetail.tsx`'s pattern. */
+function daemonProse(refusal: ApiRefusal): Record<string, string> {
+  const detail = refusal.detail.trim();
+  if (detail === "" || detail === refusal.code) return {};
+  if (detail.split(/\s+/).length < 4) return {};
+  return { [refusal.code]: detail };
 }
 
 /* ---------------------------------------------------------------- the bar -- */
