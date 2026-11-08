@@ -26,12 +26,13 @@ use crate::execution::git_exec::GitExecutor;
 use crate::execution::git_exec::tests::sha_of;
 use crate::execution::vcs::drain_once;
 
-/// `speed.yaml` of the test repository: room for many live branches, no disk floor, and the depth
-/// limit under test.
+/// `speed.yaml` of the test repository: `master` as the integration branch (the main checkout
+/// stands on the feature branch, which is what an unset base would resolve to), room for many live
+/// branches, no disk floor, and the depth limit under test.
 fn speed(max_depth: i64) -> String {
     format!(
-        "tree:\n  floor_gb: 0\n  max_live_branches: 12\nnodes:\n  max_depth: {max_depth}\n  \
-         leaf_budget: 120000\n"
+        "tree:\n  base_branch: master\n  floor_gb: 0\n  max_live_branches: 12\nnodes:\n  \
+         max_depth: {max_depth}\n  leaf_budget: 120000\n"
     )
 }
 
