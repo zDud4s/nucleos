@@ -30,6 +30,18 @@
 #   script: path relative to this version directory
 #   args: argv after the script
 #   timeout_secs: 1..50
+#
+# `params:` declares the tunable parameters the daemon may version and (tier 1) let the tuner
+# change, inside bounds, by editing ONE scalar of a YAML file under the project's state directory.
+# The daemon reads it from the library copy only and never knows what a key means.
+#   name: unique in the bundle; [A-Za-z0-9_.-]+, at most 64
+#   type: int | float | bool | enum
+#   min / max: int and float only, max >= min
+#   values: enum only, non-empty and unique
+#   default: optional; used when the key is absent in the file; must pass the type check
+#   tier: 1 = the tuner may write it; 2 or 3 = owner only
+#   file: relative to the state directory, forward slashes, .yaml or .yml
+#   key: dotted path inside the file, one or two segments
 
 description: >-
   The nucleos-dev workflow: triage, plan, execute, review and maintain phases, their packet
@@ -42,6 +54,48 @@ origin: nucleos
 # markers) is this file verbatim, markers included, and only that region is written. It must
 # carry both markers.
 agents_block: agents-block.md
+
+# Tunable parameters. The bounds are the guard rails the tuner lives inside. `parallel_execute.*`
+# has no default on purpose: the wave engine fails closed without it, so an absent key stays absent
+# until the owner sets it.
+params:
+  - name: tree.max_live_branches
+    type: int
+    min: 1
+    max: 12
+    default: 4
+    tier: 1
+    file: project.yaml
+    key: tree.max_live_branches
+  - name: tree.floor_gb
+    type: int
+    min: 5
+    max: 100
+    default: 15
+    tier: 1
+    file: project.yaml
+    key: tree.floor_gb
+  - name: parallel_execute.max_workers
+    type: int
+    min: 1
+    max: 4
+    tier: 1
+    file: models.yaml
+    key: parallel_execute.max_workers
+  - name: parallel_execute.max_units
+    type: int
+    min: 2
+    max: 8
+    tier: 1
+    file: models.yaml
+    key: parallel_execute.max_units
+  - name: parallel_execute.max_wave_seconds
+    type: int
+    min: 300
+    max: 7200
+    tier: 1
+    file: models.yaml
+    key: parallel_execute.max_wave_seconds
 
 owns:
   # ---- pipeline instructions, speed table, prompt contract, packet schemas ---------------------
