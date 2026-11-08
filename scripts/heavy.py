@@ -3613,7 +3613,9 @@ def _broker_attempt(args: list[str], held: bool = False, deadline: float | None 
     ff.finish(code, bool(stats.get("compile_error")),
               stalled or preempted or code == EXIT_SPAWN_FAILED)
     cplan.finish(code, narrowed=bool(getattr(ff, "narrowed", False)),
-                 interrupted=stalled or preempted or code == EXIT_SPAWN_FAILED)
+                 interrupted=stalled or preempted or code == EXIT_SPAWN_FAILED,
+                 run_s=row["run_s"])
+    row.update(cplan.log_fields())
     if drop_at:
         row["weight_drop_s"] = round(drop_at[0], 3)
     if preempted:
@@ -3680,6 +3682,9 @@ class _InertCache:
     def finish(self, *_a, **_k) -> None:
         pass
 
+    def log_fields(self) -> dict:
+        return {}
+
 
 def _join_taps(*taps):
     taps = [t for t in taps if t is not None]
@@ -3702,7 +3707,7 @@ def _cache_hit(plan, argv: list[str], opts: dict) -> int:
         "wait_token_s": 0.0, "token": False, "nested": False, "in_held": False,
         "run_s": 0.0, "compiled": False, "fp_hit": False, "fp_miss": False, "exit": 0,
         "argv0": argv[0], "argv": _log_argv(argv), "cache_hit": True,
-        "cache_ts": plan.hit.get("ts"), "src_state": plan.state,
+        "cache_ts": plan.hit.get("ts"), "src_state": plan.state, **plan.log_fields(),
     }, plan.directory)
     return 0
 
