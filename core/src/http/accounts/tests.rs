@@ -412,7 +412,7 @@ async fn logout_of_an_account_without_its_own_credentials_is_refused_and_deletes
         let (status, answer) = logout_in(&state, account.id.as_str(), data.path())
             .await
             .unwrap_err();
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer}");
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{answer:?}");
         assert_eq!(answer["refusal"], "logout_not_owned");
         let stored = store::get(&state.pool, &account.id).await.unwrap().unwrap();
         assert_eq!(stored.state, AccountState::Active);
@@ -448,7 +448,7 @@ async fn logout_is_refused_while_the_account_has_live_sessions() {
     let (status, answer) = logout_in(&state, account.id.as_str(), data.path())
         .await
         .unwrap_err();
-    assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+    assert_eq!(status, StatusCode::CONFLICT, "{answer:?}");
     assert_eq!(answer["refusal"], "live_sessions");
     assert!(credentials.exists());
     drop(reservation);
