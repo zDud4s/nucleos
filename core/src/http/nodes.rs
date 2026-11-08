@@ -150,14 +150,14 @@ async fn post_node(
     let Json(body) = body.map_err(bad_body)?;
     if let crate::auth::Scope::Run(run_id) = &scope {
         let own: Option<i64> = match body.parent_id.as_deref().filter(|id| !id.trim().is_empty()) {
-            Some(parent_id) => sqlx::query_scalar(
-                "SELECT 1 FROM work_nodes WHERE id = ? AND run_id = ?",
-            )
-            .bind(parent_id)
-            .bind(run_id.to_string())
-            .fetch_optional(&state.pool)
-            .await
-            .map_err(|error| refused(NodeError::Db(error)))?,
+            Some(parent_id) => {
+                sqlx::query_scalar("SELECT 1 FROM work_nodes WHERE id = ? AND run_id = ?")
+                    .bind(parent_id)
+                    .bind(run_id.to_string())
+                    .fetch_optional(&state.pool)
+                    .await
+                    .map_err(|error| refused(NodeError::Db(error)))?
+            }
             None => None,
         };
         if own.is_none() {

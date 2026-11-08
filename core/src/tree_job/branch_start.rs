@@ -618,7 +618,9 @@ async fn check_own_node(
     }
     Err(refuse(
         StatusCode::FORBIDDEN,
-        format!("a node opens only its own children: node_id {caller} is not the node this run is bound to"),
+        format!(
+            "a node opens only its own children: node_id {caller} is not the node this run is bound to"
+        ),
     ))
 }
 
@@ -643,7 +645,10 @@ async fn start_branch(
         .filter(|layer| !layer.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_LAYER.to_owned());
     let base = body.base.filter(|base| !base.trim().is_empty());
-    let kind_omitted = body.kind.as_deref().is_none_or(|kind| kind.trim().is_empty());
+    let kind_omitted = body
+        .kind
+        .as_deref()
+        .is_none_or(|kind| kind.trim().is_empty());
     let requested = requested_kind(body.kind.as_deref())?;
     let estimate = body.estimate_tokens;
     if estimate.is_some_and(|estimate| estimate <= 0) {
@@ -764,7 +769,9 @@ async fn start_branch(
             if docs && requested == Kind::Orchestrator {
                 nesting::Decision {
                     kind: Kind::Leaf,
-                    degraded: Some("a docs branch is never an orchestrator: opened as a leaf".to_owned()),
+                    degraded: Some(
+                        "a docs branch is never an orchestrator: opened as a leaf".to_owned(),
+                    ),
                 }
             } else {
                 nesting::decide_kind(
@@ -1622,7 +1629,10 @@ mod tests {
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
     }
 
     async fn job_of(state: &AppState) -> crate::tree_job::store::TreeJob {
@@ -1654,7 +1664,8 @@ mod tests {
             "kind",
             json!("orchestrator"),
         );
-        let (status, response) = post(app, &uri(), with(body, "estimate_tokens", json!(400_000))).await;
+        let (status, response) =
+            post(app, &uri(), with(body, "estimate_tokens", json!(400_000))).await;
         assert_eq!(status, StatusCode::OK, "{response:?}");
         response["node_id"].as_str().unwrap().to_owned()
     }
@@ -1683,18 +1694,25 @@ mod tests {
         assert_eq!(response["parent"], Value::Null);
         assert_eq!(response["degraded"], Value::Null);
         assert_eq!(response["depth"], 1);
-        assert_eq!(kind_of(&state, response["node_id"].as_str().unwrap()).await, "leaf");
+        assert_eq!(
+            kind_of(&state, response["node_id"].as_str().unwrap()).await,
+            "leaf"
+        );
         let job = job_of(&state).await;
         let branch = &job.manifest.branches["api"];
         assert_eq!(branch.parent, None);
         assert!(!branch.extra.contains_key("descent"));
         assert!(!branch.extra.contains_key("degraded"));
-        assert_eq!(branch.extra["kind_reason"], "kind omitted: opened as a leaf");
+        assert_eq!(
+            branch.extra["kind_reason"],
+            "kind omitted: opened as a leaf"
+        );
         assert_eq!(descents(&state).await, 0);
     }
 
     #[tokio::test]
-    async fn an_orchestrator_start_opens_an_orchestrator_node_with_a_parentless_branch_at_the_stem() {
+    async fn an_orchestrator_start_opens_an_orchestrator_node_with_a_parentless_branch_at_the_stem()
+    {
         let (state, app, caller, _repo) = tree().await;
 
         let api_node = stem_orchestrator(&app, &caller).await;
@@ -1727,7 +1745,10 @@ mod tests {
             "piece api-x estimated 180000 tokens > leaf_budget 120000"
         );
         assert_eq!(child.extra["descent"]["depth"], 2);
-        assert_eq!(kind_of(&state, response["node_id"].as_str().unwrap()).await, "orchestrator");
+        assert_eq!(
+            kind_of(&state, response["node_id"].as_str().unwrap()).await,
+            "orchestrator"
+        );
     }
 
     #[tokio::test]
@@ -1750,11 +1771,15 @@ mod tests {
         assert_eq!(count(&state, "runs").await, runs);
         assert_eq!(descents(&state).await, lines, "no second descent line");
         let job = job_of(&state).await;
-        assert_eq!(crate::tree_job::nesting::children(&job.manifest, "api").len(), 1);
+        assert_eq!(
+            crate::tree_job::nesting::children(&job.manifest, "api").len(),
+            1
+        );
     }
 
     #[tokio::test]
-    async fn a_disk_queued_nested_start_keeps_kind_estimate_and_parent_when_the_driver_retries_it() {
+    async fn a_disk_queued_nested_start_keeps_kind_estimate_and_parent_when_the_driver_retries_it()
+    {
         let (state, app, caller, _repo) = tree().await;
         let api_node = stem_orchestrator(&app, &caller).await;
         let pending = PendingStart {
@@ -1783,11 +1808,15 @@ mod tests {
         let child = &job.manifest.branches["api-x"];
         assert_eq!(child.parent.as_deref(), Some("api"));
         assert_eq!(child.extra["estimate_tokens"], 180_000);
-        assert_eq!(kind_of(&state, started["node_id"].as_str().unwrap()).await, "orchestrator");
+        assert_eq!(
+            kind_of(&state, started["node_id"].as_str().unwrap()).await,
+            "orchestrator"
+        );
     }
 
     #[tokio::test]
-    async fn a_nested_leaf_with_a_repeated_ancestor_goal_is_409_but_an_orchestrator_degrades_to_a_leaf() {
+    async fn a_nested_leaf_with_a_repeated_ancestor_goal_is_409_but_an_orchestrator_degrades_to_a_leaf()
+     {
         let (state, app, caller, _repo) = tree().await;
         let api_node = stem_orchestrator(&app, &caller).await;
         let repeated = |name: &str, kind: &str| {
@@ -1809,11 +1838,24 @@ mod tests {
         let (status, degraded) = post(&app, &uri(), repeated("api-orch", "orchestrator")).await;
         assert_eq!(status, StatusCode::OK, "{degraded:?}");
         assert_eq!(degraded["kind"], "leaf");
-        assert!(degraded["degraded"].as_str().unwrap().contains("repeated goal"));
-        assert_eq!(kind_of(&state, degraded["node_id"].as_str().unwrap()).await, "leaf");
+        assert!(
+            degraded["degraded"]
+                .as_str()
+                .unwrap()
+                .contains("repeated goal")
+        );
+        assert_eq!(
+            kind_of(&state, degraded["node_id"].as_str().unwrap()).await,
+            "leaf"
+        );
         let job = job_of(&state).await;
         let branch = &job.manifest.branches["api-orch"];
-        assert!(branch.extra["degraded"].as_str().unwrap().contains("repeated goal"));
+        assert!(
+            branch.extra["degraded"]
+                .as_str()
+                .unwrap()
+                .contains("repeated goal")
+        );
         assert_eq!(branch.extra["descent"]["kind"], "leaf");
     }
 
@@ -1886,7 +1928,11 @@ mod tests {
             ("kind", json!("branch")),
         ] {
             let (status, refused) = post(&app, &uri(), with(base.clone(), key, value)).await;
-            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{key}: {refused:?}");
+            assert_eq!(
+                status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{key}: {refused:?}"
+            );
         }
         assert_eq!(count(&state, "work_nodes").await, nodes);
     }
@@ -1902,7 +1948,12 @@ mod tests {
         )
         .unwrap();
         let api_node = stem_orchestrator(&app, &caller).await;
-        let (status, web) = post(&app, &uri(), code_body(&caller, "web", "Build the web", &["web/**"])).await;
+        let (status, web) = post(
+            &app,
+            &uri(),
+            code_body(&caller, "web", "Build the web", &["web/**"]),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "{web:?}");
         let web_node = web["node_id"].as_str().unwrap().to_owned();
         sqlx::query("UPDATE work_nodes SET run_id = '4242' WHERE id = ?")
@@ -1940,19 +1991,34 @@ mod tests {
     #[tokio::test]
     async fn a_refused_start_leaves_a_recorded_refusal_naming_the_reason() {
         let (state, app, caller, _repo) = tree().await;
-        let (status, _) = post(&app, &uri(), code_body(&caller, "a", "Build a", &["core/**"])).await;
+        let (status, _) = post(
+            &app,
+            &uri(),
+            code_body(&caller, "a", "Build a", &["core/**"]),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
 
-        let (status, refused) = post(&app, &uri(), code_body(&caller, "b", "Build b", &["core/**"])).await;
+        let (status, refused) = post(
+            &app,
+            &uri(),
+            code_body(&caller, "b", "Build b", &["core/**"]),
+        )
+        .await;
         assert_eq!(status, StatusCode::CONFLICT, "{refused:?}");
 
         let job = job_of(&state).await;
-        let list = job.manifest.extra[start_log::REFUSALS_KEY].as_array().unwrap();
+        let list = job.manifest.extra[start_log::REFUSALS_KEY]
+            .as_array()
+            .unwrap();
         let last = list.last().unwrap();
         assert_eq!(last["job"], TREE);
         assert_eq!(last["branch"], "b");
         assert_eq!(last["status"], 409);
-        assert!(last["reason"].as_str().unwrap().contains("overlap"), "{last:?}");
+        assert!(
+            last["reason"].as_str().unwrap().contains("overlap"),
+            "{last:?}"
+        );
     }
 
     #[tokio::test]
@@ -1971,6 +2037,9 @@ mod tests {
         let reloaded: crate::tree_job::model::Manifest = serde_json::from_str(&text).unwrap();
 
         assert_eq!(reloaded.branches["api"].extra["estimate_tokens"], 50_000);
-        assert_eq!(job.manifest.branches["api"].extra["estimate_tokens"], 50_000);
+        assert_eq!(
+            job.manifest.branches["api"].extra["estimate_tokens"],
+            50_000
+        );
     }
 }

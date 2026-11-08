@@ -310,7 +310,8 @@ mod tests {
         seed_node(&pool, "n-b", "orchestrator", 2).await;
         seed_node(&pool, "n-c", "leaf", 3).await;
         let b = m.branches.get_mut("b").unwrap();
-        b.extra.insert("descent".to_owned(), json!({ "reason": "too big" }));
+        b.extra
+            .insert("descent".to_owned(), json!({ "reason": "too big" }));
         b.extra.insert("estimate_tokens".to_owned(), json!(180_000));
         let c = m.branches.get_mut("c").unwrap();
         c.extra.insert("degraded".to_owned(), json!("fits"));
@@ -319,7 +320,10 @@ mod tests {
         let nodes = describe_nodes(&pool, &m).await.unwrap();
 
         let nodes = nodes.as_array().unwrap();
-        let names: Vec<_> = nodes.iter().map(|n| n["branch"].as_str().unwrap()).collect();
+        let names: Vec<_> = nodes
+            .iter()
+            .map(|n| n["branch"].as_str().unwrap())
+            .collect();
         assert_eq!(names, ["a", "b", "c"]);
         assert_eq!(nodes[0]["depth"], 1);
         assert_eq!(nodes[0]["parent"], Value::Null);
@@ -347,7 +351,13 @@ mod tests {
         let nodes = nodes.as_array().unwrap();
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0]["depth"], 1);
-        for key in ["descent", "degraded", "estimate_tokens", "kind_reason", "parent"] {
+        for key in [
+            "descent",
+            "degraded",
+            "estimate_tokens",
+            "kind_reason",
+            "parent",
+        ] {
             assert_eq!(nodes[0][key], Value::Null, "{key}");
         }
     }
@@ -355,7 +365,14 @@ mod tests {
     const BUDGET: i64 = 120_000;
 
     fn decide(estimate: Option<i64>, depth: i64, refusal: Option<DepthRefusal>) -> Decision {
-        decide_kind(Kind::Orchestrator, estimate, BUDGET, depth, Some(6), refusal)
+        decide_kind(
+            Kind::Orchestrator,
+            estimate,
+            BUDGET,
+            depth,
+            Some(6),
+            refusal,
+        )
     }
 
     #[test]

@@ -70,12 +70,7 @@ impl Tree {
         fx.seed_job(job, vec![], None).await;
         let app = http::routes().with_state(fx.state.clone());
         let root = super::driver::tests::root_node_of(job);
-        Tree {
-            fx,
-            job,
-            app,
-            root,
-        }
+        Tree { fx, job, app, root }
     }
 
     async fn send(&self, request: Request<Body>) -> (StatusCode, Value) {
@@ -86,7 +81,10 @@ impl Tree {
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
     }
 
     /// `tree_branch_start` as `caller`, a leaf-or-orchestrator `kind` and an estimate.
@@ -228,7 +226,10 @@ impl Tree {
     async fn merge_sha(&self, name: &str) -> String {
         let branch = self.fx.branch(self.job, name).await;
         assert_eq!(branch.state, "merged", "branch {name}");
-        branch.extra["merge_sha"].as_str().expect("a merge sha").to_owned()
+        branch.extra["merge_sha"]
+            .as_str()
+            .expect("a merge sha")
+            .to_owned()
     }
 
     async fn descents(&self) -> i64 {
@@ -262,7 +263,10 @@ async fn a_small_task_is_a_two_level_tree_identical_to_today() {
     // The prompt of a stem-level leaf is the task, with no orchestrator text in front of it.
     let prompt = tree.fx.prompt_of(a["run_id"].as_i64().unwrap()).await;
     assert!(prompt.contains("Build a."), "{prompt:?}");
-    assert!(!prompt.contains("You are an orchestrator at depth"), "{prompt:?}");
+    assert!(
+        !prompt.contains("You are an orchestrator at depth"),
+        "{prompt:?}"
+    );
     tree.leaf_works(&a, "a/one.txt").await;
     tree.leaf_works(&b, "b/one.txt").await;
     let (tip_a, tip_b) = (tree.tip("a"), tree.tip("b"));
@@ -293,7 +297,11 @@ async fn a_small_task_is_a_two_level_tree_identical_to_today() {
     let status = tree.status().await;
     let nodes = status["nodes"].as_array().unwrap();
     assert_eq!(nodes.len(), 2);
-    assert!(nodes.iter().all(|node| node["depth"] == 1 && node["kind"] == "leaf"));
+    assert!(
+        nodes
+            .iter()
+            .all(|node| node["depth"] == 1 && node["kind"] == "leaf")
+    );
     assert_eq!(status["start_refusals"], json!([]));
     assert_eq!(status["state"], JOB_TERMINAL_STATE);
 }
@@ -305,7 +313,13 @@ async fn one_oversized_piece_becomes_an_orchestrator_whose_leaves_merge_into_it(
         .started(&tree.root, "a", &["a/**"], Some("leaf"), Some(40_000))
         .await;
     let b = tree
-        .started(&tree.root, "b", &["b/**"], Some("orchestrator"), Some(180_000))
+        .started(
+            &tree.root,
+            "b",
+            &["b/**"],
+            Some("orchestrator"),
+            Some(180_000),
+        )
         .await;
     assert_eq!(b["kind"], "orchestrator");
     assert_eq!(b["parent"], Value::Null, "the stem is not nested");
@@ -337,7 +351,10 @@ async fn one_oversized_piece_becomes_an_orchestrator_whose_leaves_merge_into_it(
         "a never descends"
     );
     assert!(!job.manifest.branches["a"].extra.contains_key("descent"));
-    assert_eq!(job.manifest.branches["b"].extra["descent"]["kind"], "orchestrator");
+    assert_eq!(
+        job.manifest.branches["b"].extra["descent"]["kind"],
+        "orchestrator"
+    );
     assert_eq!(nesting::children(&job.manifest, "b").len(), 2);
     // The leaves merged into b's git branch, and b merged into the feature branch.
     let b_ref = tree.git_branch("b");
@@ -350,41 +367,81 @@ async fn one_oversized_piece_becomes_an_orchestrator_whose_leaves_merge_into_it(
     assert_eq!(sha_of(&tree.fx.repo, &format!("{b_sha}^2")), tree.tip("b"));
     assert!(tree.reachable(&b_sha, "feat/tree"));
     let a_sha = tree.merge_sha("a").await;
-    assert!(!tree.reachable(&a_sha, &b_ref), "a merged into the feature, not into b");
+    assert!(
+        !tree.reachable(&a_sha, &b_ref),
+        "a merged into the feature, not into b"
+    );
     for file in ["a/one.txt", "b/one/x.txt", "b/two/x.txt"] {
         assert!(tree.feature_has(file), "{file}");
     }
     // b is gated only after both leaves merged into it.
     let gated = Tree::gated(&gate);
     let position = |name: &str| gated.iter().position(|gated| gated == name).unwrap();
-    assert!(position("b-1") < position("b") && position("b-2") < position("b"), "{gated:?}");
+    assert!(
+        position("b-1") < position("b") && position("b-2") < position("b"),
+        "{gated:?}"
+    );
     assert_eq!(gated.len(), 4, "{gated:?}");
-    assert_eq!(tree.descents().await, 1, "only the orchestrator records a descent");
+    assert_eq!(
+        tree.descents().await,
+        1,
+        "only the orchestrator records a descent"
+    );
 }
 
 #[tokio::test]
 async fn a_three_level_descent_closes_end_to_end_without_basenotmerged_or_deadlock() {
     let tree = Tree::new("e2e-deep", 6).await;
     let b = tree
-        .started(&tree.root, "b", &["b/**"], Some("orchestrator"), Some(900_000))
+        .started(
+            &tree.root,
+            "b",
+            &["b/**"],
+            Some("orchestrator"),
+            Some(900_000),
+        )
         .await;
     let b_node = b["node_id"].as_str().unwrap().to_owned();
     let c = tree
-        .started(&b_node, "b-c", &["b/c/**"], Some("orchestrator"), Some(400_000))
+        .started(
+            &b_node,
+            "b-c",
+            &["b/c/**"],
+            Some("orchestrator"),
+            Some(400_000),
+        )
         .await;
     let d = tree
         .started(&b_node, "b-d", &["b/d/**"], Some("leaf"), Some(60_000))
         .await;
     let c_node = c["node_id"].as_str().unwrap().to_owned();
-    assert_eq!((c["depth"].as_i64(), c["parent"].as_str()), (Some(2), Some("b")));
+    assert_eq!(
+        (c["depth"].as_i64(), c["parent"].as_str()),
+        (Some(2), Some("b"))
+    );
     let c1 = tree
-        .started(&c_node, "b-c-1", &["b/c/one/**"], Some("leaf"), Some(60_000))
+        .started(
+            &c_node,
+            "b-c-1",
+            &["b/c/one/**"],
+            Some("leaf"),
+            Some(60_000),
+        )
         .await;
     let c2 = tree
-        .started(&c_node, "b-c-2", &["b/c/two/**"], Some("leaf"), Some(60_000))
+        .started(
+            &c_node,
+            "b-c-2",
+            &["b/c/two/**"],
+            Some("leaf"),
+            Some(60_000),
+        )
         .await;
     for leaf in [&c1, &c2] {
-        assert_eq!((leaf["depth"].as_i64(), leaf["parent"].as_str()), (Some(3), Some("b-c")));
+        assert_eq!(
+            (leaf["depth"].as_i64(), leaf["parent"].as_str()),
+            (Some(3), Some("b-c"))
+        );
     }
     tree.leaf_works(&c1, "b/c/one/x.txt").await;
     tree.leaf_works(&c2, "b/c/two/x.txt").await;
@@ -397,10 +454,18 @@ async fn a_three_level_descent_closes_end_to_end_without_basenotmerged_or_deadlo
     tree.drive(&gate).await;
 
     let job = tree.fx.job(tree.job).await;
-    for (name, parent) in [("b-c", "b"), ("b-d", "b"), ("b-c-1", "b-c"), ("b-c-2", "b-c")] {
+    for (name, parent) in [
+        ("b-c", "b"),
+        ("b-d", "b"),
+        ("b-c-1", "b-c"),
+        ("b-c-2", "b-c"),
+    ] {
         assert_eq!(job.manifest.branches[name].parent.as_deref(), Some(parent));
         let sha = tree.merge_sha(name).await;
-        assert!(tree.reachable(&sha, &tree.git_branch(parent)), "{name} into {parent}");
+        assert!(
+            tree.reachable(&sha, &tree.git_branch(parent)),
+            "{name} into {parent}"
+        );
     }
     assert_eq!(job.manifest.branches["b"].parent, None);
     let b_sha = tree.merge_sha("b").await;
@@ -414,14 +479,22 @@ async fn a_three_level_descent_closes_end_to_end_without_basenotmerged_or_deadlo
         .await
         .unwrap();
     assert_eq!(questions, 0);
-    assert!(job.manifest.extra.get("pending_starts").is_none_or(|p| p == &json!({})));
+    assert!(
+        job.manifest
+            .extra
+            .get("pending_starts")
+            .is_none_or(|p| p == &json!({}))
+    );
     assert_eq!(tree.status().await["start_refusals"], json!([]));
     // Each parent was gated after every one of its children had merged.
     let gated = Tree::gated(&gate);
     let position = |name: &str| gated.iter().position(|gated| gated == name).unwrap();
     for (parent, children) in [("b-c", &["b-c-1", "b-c-2"][..]), ("b", &["b-c", "b-d"][..])] {
         for child in children {
-            assert!(position(child) < position(parent), "{child} before {parent}: {gated:?}");
+            assert!(
+                position(child) < position(parent),
+                "{child} before {parent}: {gated:?}"
+            );
         }
     }
     assert_eq!(gated.len(), 5, "{gated:?}");
@@ -431,7 +504,13 @@ async fn a_three_level_descent_closes_end_to_end_without_basenotmerged_or_deadlo
 async fn a_failed_child_runs_the_existing_rescue_and_does_not_leave_the_parent_stuck() {
     let tree = Tree::new("e2e-rescue", 6).await;
     let b = tree
-        .started(&tree.root, "b", &["b/**"], Some("orchestrator"), Some(300_000))
+        .started(
+            &tree.root,
+            "b",
+            &["b/**"],
+            Some("orchestrator"),
+            Some(300_000),
+        )
         .await;
     let b_node = b["node_id"].as_str().unwrap().to_owned();
     let b1 = tree
@@ -461,7 +540,11 @@ async fn a_failed_child_runs_the_existing_rescue_and_does_not_leave_the_parent_s
     assert_eq!(tree.fx.open_questions(tree.job, &b2_node).await.len(), 1);
     assert_eq!(tree.fx.branch(tree.job, "b-1").await.state, "merged");
     assert_eq!(tree.fx.branch(tree.job, "b").await.state, "building");
-    assert!(!Tree::gated(&gate).contains(&"b".to_owned()), "{:?}", Tree::gated(&gate));
+    assert!(
+        !Tree::gated(&gate).contains(&"b".to_owned()),
+        "{:?}",
+        Tree::gated(&gate)
+    );
     assert_eq!(tree.fx.job(tree.job).await.state, "open");
 
     // The owner answers: the child's new run finishes and the parent follows it to the feature.
@@ -478,7 +561,11 @@ async fn a_failed_child_runs_the_existing_rescue_and_does_not_leave_the_parent_s
     tree.drive(&gate).await;
 
     for name in ["b-1", "b-2", "b"] {
-        assert_eq!(tree.fx.branch(tree.job, name).await.state, "merged", "{name}");
+        assert_eq!(
+            tree.fx.branch(tree.job, name).await.state,
+            "merged",
+            "{name}"
+        );
     }
     assert!(tree.feature_has("b/one/x.txt") && tree.feature_has("b/two/x.txt"));
     let gated = Tree::gated(&gate);
@@ -489,7 +576,13 @@ async fn a_failed_child_runs_the_existing_rescue_and_does_not_leave_the_parent_s
 async fn reaching_max_depth_degrades_to_a_leaf_instead_of_failing_the_tree() {
     let tree = Tree::new("e2e-limit", 3).await;
     let b = tree
-        .started(&tree.root, "b", &["b/**"], Some("orchestrator"), Some(900_000))
+        .started(
+            &tree.root,
+            "b",
+            &["b/**"],
+            Some("orchestrator"),
+            Some(900_000),
+        )
         .await;
     let c = tree
         .started(
@@ -500,18 +593,35 @@ async fn reaching_max_depth_degrades_to_a_leaf_instead_of_failing_the_tree() {
             Some(900_000),
         )
         .await;
-    assert_eq!((c["kind"].as_str(), c["depth"].as_i64()), (Some("orchestrator"), Some(2)));
+    assert_eq!(
+        (c["kind"].as_str(), c["depth"].as_i64()),
+        (Some("orchestrator"), Some(2))
+    );
     let c_node = c["node_id"].as_str().unwrap().to_owned();
 
     // Depth 3 is the last level: an orchestrator is asked for and a leaf is opened.
     let d = tree
-        .started(&c_node, "b-c-d", &["b/c/d/**"], Some("orchestrator"), Some(900_000))
+        .started(
+            &c_node,
+            "b-c-d",
+            &["b/c/d/**"],
+            Some("orchestrator"),
+            Some(900_000),
+        )
         .await;
-    assert_eq!((d["kind"].as_str(), d["depth"].as_i64()), (Some("leaf"), Some(3)));
+    assert_eq!(
+        (d["kind"].as_str(), d["depth"].as_i64()),
+        (Some("leaf"), Some(3))
+    );
     assert!(d["degraded"].as_str().unwrap().contains("depth 3"), "{d:?}");
     let job = tree.fx.job(tree.job).await;
     let recorded = &job.manifest.branches["b-c-d"];
-    assert!(recorded.extra["degraded"].as_str().unwrap().contains("depth 3"));
+    assert!(
+        recorded.extra["degraded"]
+            .as_str()
+            .unwrap()
+            .contains("depth 3")
+    );
     assert_eq!(recorded.extra["descent"]["kind"], "leaf");
     assert_eq!(job.state, "open", "the tree is not failed");
 
@@ -538,7 +648,10 @@ async fn reaching_max_depth_degrades_to_a_leaf_instead_of_failing_the_tree() {
         .iter()
         .find(|node| node["branch"] == "b-c-d")
         .expect("the leaf is in the status");
-    assert_eq!((entry["kind"].as_str(), entry["depth"].as_i64()), (Some("leaf"), Some(3)));
+    assert_eq!(
+        (entry["kind"].as_str(), entry["depth"].as_i64()),
+        (Some("leaf"), Some(3))
+    );
     assert!(entry["degraded"].as_str().unwrap().contains("depth 3"));
     let refusals = status["start_refusals"].as_array().unwrap();
     assert_eq!(refusals.last().unwrap()["branch"], "too-deep");
@@ -555,7 +668,13 @@ async fn reaching_max_depth_degrades_to_a_leaf_instead_of_failing_the_tree() {
 async fn sibling_leaves_under_one_parent_cannot_share_files() {
     let tree = Tree::new("e2e-overlap", 6).await;
     let b = tree
-        .started(&tree.root, "b", &["b/**"], Some("orchestrator"), Some(300_000))
+        .started(
+            &tree.root,
+            "b",
+            &["b/**"],
+            Some("orchestrator"),
+            Some(300_000),
+        )
         .await;
     let b_node = b["node_id"].as_str().unwrap().to_owned();
     tree.started(&b_node, "b-1", &["b/x/**"], Some("leaf"), Some(50_000))
@@ -568,11 +687,18 @@ async fn sibling_leaves_under_one_parent_cannot_share_files() {
 
     assert_eq!(status, StatusCode::CONFLICT, "{refused:?}");
     assert!(refused.to_string().contains("overlap"), "{refused:?}");
-    assert_eq!(tree.node_count().await, nodes, "a refused sibling opens no node");
+    assert_eq!(
+        tree.node_count().await,
+        nodes,
+        "a refused sibling opens no node"
+    );
     let job = tree.fx.job(tree.job).await;
     assert!(!job.manifest.branches.contains_key("b-2"));
     let status = tree.status().await;
-    assert_eq!(status["start_refusals"].as_array().unwrap().last().unwrap()["status"], 409);
+    assert_eq!(
+        status["start_refusals"].as_array().unwrap().last().unwrap()["status"],
+        409
+    );
     // A sibling of its own files is fine, and so is the parent's scope being wider than theirs.
     tree.started(&b_node, "b-3", &["b/z/**"], Some("leaf"), Some(50_000))
         .await;

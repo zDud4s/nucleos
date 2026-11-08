@@ -85,9 +85,10 @@ pub fn stamp(extra: &mut BTreeMap<String, Value>, shape: &StartShape<'_>) -> boo
         changed = true;
     }
     if (shape.kind_omitted || shape.degraded.is_some()) && !extra.contains_key("kind_reason") {
-        let reason = shape
-            .degraded
-            .map_or_else(|| "kind omitted: opened as a leaf".to_owned(), str::to_owned);
+        let reason = shape.degraded.map_or_else(
+            || "kind omitted: opened as a leaf".to_owned(),
+            str::to_owned,
+        );
         extra.insert("kind_reason".to_owned(), json!(reason));
         changed = true;
     }
