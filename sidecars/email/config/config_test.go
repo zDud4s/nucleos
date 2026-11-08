@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestSentMailboxIsOptional(t *testing.T) {
 	t.Setenv("NUCLEOS_DAEMON_TOKEN", "token")
@@ -57,6 +60,29 @@ func TestFetchAddrMustBeLoopback(t *testing.T) {
 		t.Setenv("EMAIL_FETCH_ADDR", addr)
 		if _, err := Load(); err != nil {
 			t.Errorf("rejected %q: %v", addr, err)
+		}
+	}
+}
+
+// The daemon URL is where the sidecar sends its token, so it must stay on this machine.
+func TestDaemonURLMustBeLoopback(t *testing.T) {
+	t.Setenv("NUCLEOS_DAEMON_TOKEN", "token")
+	t.Setenv("EMAIL_IMAP_HOST", "imap.example.com")
+	t.Setenv("EMAIL_IMAP_USERNAME", "me@example.com")
+	t.Setenv("EMAIL_IMAP_PASSWORD", "password")
+	t.Setenv("EMAIL_IMAP_PORT", "")
+	t.Setenv("EMAIL_POLL_INTERVAL_SECS", "")
+	t.Setenv("EMAIL_FETCH_ADDR", "")
+	for _, raw := range []string{"http://example.com:8791", "http://10.0.0.2:8791", "ftp://127.0.0.1:8791"} {
+		t.Setenv("NUCLEOS_DAEMON_URL", raw)
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "NUCLEOS_DAEMON_URL") {
+			t.Errorf("accepted %q (err = %v)", raw, err)
+		}
+	}
+	for _, raw := range []string{"http://127.0.0.1:8791", "http://[::1]:8791", "http://localhost:8791"} {
+		t.Setenv("NUCLEOS_DAEMON_URL", raw)
+		if _, err := Load(); err != nil {
+			t.Errorf("rejected %q: %v", raw, err)
 		}
 	}
 }
