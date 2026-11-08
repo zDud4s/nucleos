@@ -89,10 +89,11 @@ pub async fn latest(
     bundle: &str,
     param: &str,
 ) -> sqlx::Result<Option<Row>> {
-    let raw: Option<RawRow> = sqlx::query_as(&format!(
+    // Only the `COLUMNS` const is interpolated; every value is bound.
+    let raw: Option<RawRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {COLUMNS} FROM workflow_param_history
          WHERE project_id = ? AND bundle = ? AND param = ? ORDER BY version DESC LIMIT 1"
-    ))
+    )))
     .bind(project_id)
     .bind(bundle)
     .bind(param)
@@ -108,10 +109,11 @@ pub async fn history(
     bundle: &str,
     param: &str,
 ) -> sqlx::Result<Vec<Row>> {
-    let raws: Vec<RawRow> = sqlx::query_as(&format!(
+    // Only the `COLUMNS` const is interpolated; every value is bound.
+    let raws: Vec<RawRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {COLUMNS} FROM workflow_param_history
          WHERE project_id = ? AND bundle = ? AND param = ? ORDER BY version DESC"
-    ))
+    )))
     .bind(project_id)
     .bind(bundle)
     .bind(param)
