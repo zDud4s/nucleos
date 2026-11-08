@@ -992,6 +992,24 @@ pub(super) fn spawn_run(
                         ))
                         .await;
                     }
+                    // A refused hop (`handoff::refuse_handoff`) turned this row from `completed`
+                    // into `failed` after the terminal write, so what follows reads the row, not
+                    // the status this arm wrote: a run whose task did not finish gets no verify
+                    // wake and no E4 correction.
+                    let terminal_status = if terminal_status == "completed" && terminal_write_won {
+                        match sqlx::query_scalar::<_, String>(
+                            "SELECT status FROM runs WHERE id = ?",
+                        )
+                        .bind(id)
+                        .fetch_one(&pool)
+                        .await
+                        {
+                            Ok(status) if status == "failed" => "failed",
+                            _ => terminal_status,
+                        }
+                    } else {
+                        terminal_status
+                    };
 
                     // A handed-off run starts a chain that is still live, so sweep only after the
                     // handoff has had the chance to link its successor. The verdict reader leaves

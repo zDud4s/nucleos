@@ -136,9 +136,68 @@ GATE_OUTPUT>>>
 /// Bounded rather than trusting the links: `successor_run_id` is an ordinary column and a cycle in
 /// it would hang a run's completion path, which is not a place to discover one.
 pub(super) async fn original_task(pool: &sqlx::SqlitePool, run_id: i64) -> sqlx::Result<String> {
-    const MAX_HOPS: usize = 32;
+    let (id, _) = chain_origin(pool, run_id).await?;
+    let prompt: String = sqlx::query_scalar("SELECT prompt FROM runs WHERE id = ?")
+        .bind(id)
+        .fetch_one(pool)
+        .await?;
+    Ok(task_to_carry(&prompt).to_owned())
+}
+
+/// How many context handoffs one chain may take (owner's decision, 2026-11-08). A run whose chain
+/// already handed off this many times gets no successor and ends `failed` with the reason.
+///
+/// Without it a task that keeps filling its window handed itself on forever, every hop a fresh
+/// agent spending money nobody was watching.
+pub const MAX_HANDOFF_HOPS: usize = 5;
+
+/// The first run of the chain `run_id` belongs to, and how many handoffs lie between it and
+/// `run_id` (0 for a run nothing handed off to).
+///
+/// Walked back through `successor_run_id`, bounded rather than trusting the links: the column is an
+/// ordinary one and a cycle in it would hang a run's completion path. A walk that hits the bound
+/// reports the bound, which is past `MAX_HANDOFF_HOPS` and therefore refuses another hop.
+pub(super) async fn chain_origin(
+    pool: &sqlx::SqlitePool,
+    run_id: i64,
+) -> sqlx::Result<(i64, usize)> {
     let mut id = run_id;
-    for _ in 0..MAX_HOPS {
+    let mut hops = 0;
+    for _ in 0..WALK_BOUND {
+        let predecessor: Option<i64> =
+            sqlx::query_scalar("SELECT id FROM runs WHERE successor_run_id = ?")
+                .bind(id)
+                .fetch_optional(pool)
+                .await?;
+        match predecessor {
+            Some(earlier) if earlier != id => {
+                id = earlier;
+                hops += 1;
+            }
+            _ => break,
+        }
+    }
+    Ok((id, hops))
+}
+
+/// How far back a chain walk goes before it stops trusting `successor_run_id` (see `chain_origin`).
+const WALK_BOUND: usize = 32;
+
+/// The turns the chain `run_id` belongs to has already spent: `runs.num_turns` summed from the
+/// chain's first run through `run_id`, walked back the same bounded way as `chain_origin`. A run
+/// whose CLI reported no count (NULL) adds nothing.
+async fn chain_turns(pool: &sqlx::SqlitePool, run_id: i64) -> sqlx::Result<i64> {
+    let mut id = run_id;
+    let mut turns = 0i64;
+    for step in 0..=WALK_BOUND {
+        let own: Option<i64> = sqlx::query_scalar("SELECT num_turns FROM runs WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await?;
+        turns = turns.saturating_add(own.unwrap_or(0).max(0));
+        if step == WALK_BOUND {
+            break;
+        }
         let predecessor: Option<i64> =
             sqlx::query_scalar("SELECT id FROM runs WHERE successor_run_id = ?")
                 .bind(id)
@@ -149,11 +208,101 @@ pub(super) async fn original_task(pool: &sqlx::SqlitePool, run_id: i64) -> sqlx:
             _ => break,
         }
     }
-    let prompt: String = sqlx::query_scalar("SELECT prompt FROM runs WHERE id = ?")
-        .bind(id)
-        .fetch_one(pool)
-        .await?;
-    Ok(task_to_carry(&prompt).to_owned())
+    Ok(turns)
+}
+
+/// PURE: the turn ceiling a successor launches with, given the chain's `max_turns` and the turns
+/// its runs have `used` so far. The ceiling counts across the whole chain, like the wall clock in
+/// `next_hop`: a successor that got `max_turns` afresh would let a task outspend its ceiling by
+/// handing itself on. `Ok(None)` means no ceiling was set; `Err` is the sentence the refused run is
+/// failed with.
+pub(super) fn remaining_turns(used: i64, max_turns: Option<i64>) -> Result<Option<i64>, String> {
+    let Some(limit) = max_turns else {
+        return Ok(None);
+    };
+    match limit.saturating_sub(used) {
+        remaining if remaining > 0 => Ok(Some(remaining)),
+        _ => Err(format!(
+            "context handoff refused: turn budget of the handoff chain exhausted: used {used} of \
+             {limit}"
+        )),
+    }
+}
+
+/// PURE: whether a chain that has taken `hops` handoffs and run for `elapsed` since its first run
+/// was created may take one more, and with what wall clock.
+///
+/// `Ok(Some(remaining))` is the successor's deadline: `run_timeout` counts from the FIRST run of
+/// the chain, so a successor gets only what is left of it, never the whole span again. `Ok(None)`
+/// means no deadline was asked about. `Err` is the sentence the refused run is failed with.
+pub(super) fn next_hop(
+    hops: usize,
+    elapsed: chrono::Duration,
+    run_timeout: Option<std::time::Duration>,
+) -> Result<Option<std::time::Duration>, String> {
+    if hops >= MAX_HANDOFF_HOPS {
+        return Err(format!(
+            "context handoff refused: this chain already handed off {hops} times and the cap is \
+             {MAX_HANDOFF_HOPS}; the task did not finish within that many fresh windows"
+        ));
+    }
+    let Some(limit) = run_timeout else {
+        return Ok(None);
+    };
+    // A first run stamped in the future (a clock step) has used nothing, not a negative amount.
+    let elapsed = elapsed.to_std().unwrap_or(std::time::Duration::ZERO);
+    match limit.checked_sub(elapsed) {
+        Some(remaining) if !remaining.is_zero() => Ok(Some(remaining)),
+        _ => Err(format!(
+            "context handoff refused: this chain has used its whole run timeout of {}s since its \
+             first run started",
+            limit.as_secs()
+        )),
+    }
+}
+
+/// Ends a run whose handoff was refused: a `context_handoff_refused` event with the reason, and a
+/// `completed` row turned `failed` with the reason appended to `stderr`.
+///
+/// `failed` because the task did not finish: the run only "completed" its turn, and a job item
+/// that read it as done would gate or move past work that stopped halfway. The job's own pass
+/// waits for this task's registration to drop before it reads the status (`ingest.rs`), so it sees
+/// `failed`, not the `completed` this replaces. One transaction, so the event and the status
+/// cannot disagree; a run that is no longer `completed` keeps its status and still gets the event.
+async fn refuse_handoff(
+    pool: &sqlx::SqlitePool,
+    run_id: i64,
+    hops: usize,
+    reason: &str,
+) -> sqlx::Result<()> {
+    let mut transaction = pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO run_events (run_id, seq, kind, payload, created_at)
+         SELECT ?, COALESCE(MAX(seq), -1) + 1, 'context_handoff_refused', ?, ?
+         FROM run_events
+         WHERE run_id = ?",
+    )
+    .bind(run_id)
+    .bind(serde_json::json!({ "reason": reason, "hops": hops }).to_string())
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(run_id)
+    .execute(&mut *transaction)
+    .await?;
+    let failed = sqlx::query(
+        "UPDATE runs SET status = 'failed',
+                stderr = COALESCE(NULLIF(stderr, '') || char(10), '') || ?
+         WHERE id = ? AND status = 'completed'",
+    )
+    .bind(reason)
+    .bind(run_id)
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    // After the commit, and only if the status actually moved.
+    if failed.rows_affected() == 1 {
+        nucleos_base::wake::bump(nucleos_base::wake::Topic::Runs);
+    }
+    Ok(())
 }
 
 pub(super) struct HandoffSuccessor {
@@ -169,6 +318,12 @@ pub(super) struct HandoffSuccessor {
     /// Read back from the row that was just written rather than passed alongside it, so the flag
     /// the launch uses and the flag `post_run_message` reads are the same fact and not two.
     pub(super) steerable: bool,
+    /// What is left of the chain's run timeout, measured from its first run (`next_hop`). `None`
+    /// only when the caller asked about no deadline.
+    pub(super) run_timeout: Option<std::time::Duration>,
+    /// What is left of the chain's turn ceiling (`remaining_turns`). `None` when the chain has no
+    /// ceiling, which is what the successor then launches with.
+    pub(super) max_turns: Option<i64>,
 }
 
 /// Applies the durable handoff policy to a prepared successor.
@@ -420,9 +575,36 @@ pub(super) fn ends_in_a_handoff(status: &str) -> bool {
     status == "completed" || !TERMINAL_RUN_STATUSES.contains(&status)
 }
 
+/// `prepare_handoff_successor_within` with no deadline to honour: the hop cap still applies.
+#[cfg(test)]
 pub(super) async fn prepare_handoff_successor(
     pool: &sqlx::SqlitePool,
     run_id: i64,
+) -> sqlx::Result<Option<HandoffSuccessor>> {
+    prepare_handoff_successor_within(pool, run_id, None).await
+}
+
+/// `prepare_handoff_successor_bounded` with no turn ceiling: the hop cap and the clock still apply.
+#[cfg(test)]
+pub(super) async fn prepare_handoff_successor_within(
+    pool: &sqlx::SqlitePool,
+    run_id: i64,
+    run_timeout: Option<std::time::Duration>,
+) -> sqlx::Result<Option<HandoffSuccessor>> {
+    prepare_handoff_successor_bounded(pool, run_id, run_timeout, None).await
+}
+
+/// Inserts and links the successor of `run_id` when its context is near the limit.
+///
+/// `run_timeout` is the chain's wall clock: it counts from the chain's first run, and `max_turns`
+/// is the chain's turn ceiling, counted over every run of it. A chain with none of either left — or
+/// one already `MAX_HANDOFF_HOPS` long — gets no successor, and `run_id` is failed with the reason
+/// (`refuse_handoff`).
+pub(super) async fn prepare_handoff_successor_bounded(
+    pool: &sqlx::SqlitePool,
+    run_id: i64,
+    run_timeout: Option<std::time::Duration>,
+    max_turns: Option<i64>,
 ) -> sqlx::Result<Option<HandoffSuccessor>> {
     let (status, context_fill, existing_successor, job_id, transcript, steerable): (
         String,
@@ -451,6 +633,35 @@ pub(super) async fn prepare_handoff_successor(
     ) {
         return Ok(None);
     }
+
+    // The chain's brakes, checked before anything is inserted: a refused hop leaves no successor
+    // row behind, not even a failed one.
+    let (origin, hops) = chain_origin(pool, run_id).await?;
+    let elapsed = if run_timeout.is_some() {
+        let started: String = sqlx::query_scalar("SELECT created_at FROM runs WHERE id = ?")
+            .bind(origin)
+            .fetch_one(pool)
+            .await?;
+        chrono::Utc::now() - crate::governance::budget::parse_run_timestamp(&started)?
+    } else {
+        chrono::Duration::zero()
+    };
+    let used_turns = if max_turns.is_some() {
+        chain_turns(pool, run_id).await?
+    } else {
+        0
+    };
+    let brakes = next_hop(hops, elapsed, run_timeout).and_then(|remaining| {
+        remaining_turns(used_turns, max_turns).map(|turns| (remaining, turns))
+    });
+    let (successor_timeout, successor_turns) = match brakes {
+        Ok(remaining) => remaining,
+        Err(reason) => {
+            tracing::warn!(run_id, hops, %reason, "context handoff refused");
+            refuse_handoff(pool, run_id, hops, &reason).await?;
+            return Ok(None);
+        }
+    };
 
     let session_id = crate::auth::generate_uuid_v4();
     // Read from the row rather than from memory: both callers reach here AFTER the terminal write,
@@ -616,6 +827,8 @@ pub(super) async fn prepare_handoff_successor(
         prompt,
         job_id,
         steerable: steerable != 0,
+        run_timeout: successor_timeout,
+        max_turns: successor_turns,
     }))
 }
 
@@ -748,17 +961,21 @@ pub(super) async fn spawn_handoff_if_needed(
     effort: Option<String>,
     // Inherited, for the reason the fields above it are: a successor is the same node continuing
     // the same task, and re-resolving the ceiling here would let a handoff quietly run under a
-    // different one than the work it continues.
+    // different one than the work it continues. It is the CHAIN's ceiling: the successor launches
+    // with what the chain has left of it (`remaining_turns`).
     max_turns: Option<i64>,
 ) {
-    let successor = match prepare_handoff_successor(&state.pool, run_id).await {
-        Ok(Some(successor)) => successor,
-        Ok(None) => return,
-        Err(error) => {
-            tracing::warn!(run_id, %error, "could not prepare context handoff");
-            return;
-        }
-    };
+    let successor =
+        match prepare_handoff_successor_bounded(&state.pool, run_id, Some(run_timeout), max_turns)
+            .await
+        {
+            Ok(Some(successor)) => successor,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(run_id, %error, "could not prepare context handoff");
+                return;
+            }
+        };
     let daemon_token = mint_run_token(&state.pool, successor.id).await;
     // A successor of a job node keeps the handoff directory: same node, same tree, same item.
     // `spawn_cwd` is the job's worktree, which is where `prepare_artifacts` put it.
@@ -809,9 +1026,10 @@ pub(super) async fn spawn_handoff_if_needed(
         // copies the column, so the row and this launch agree — which is what the old comment
         // required before the flag could be carried at all.
         successor.steerable,
-        // Inherited, not re-derived: a successor continues one task, and a handoff that reset the
-        // clock would let a run outlive its deadline by handing itself on.
-        run_timeout,
+        // What is LEFT of the chain's clock, not the whole span again: a successor continues one
+        // task, and a handoff that reset the clock would let a run outlive its deadline by handing
+        // itself on. It used to pass `run_timeout` itself, which did exactly that on every hop.
+        successor.run_timeout.unwrap_or(run_timeout),
         // Inherited for the same reason. The silence deadline is per-mode, the successor's mode is
         // its predecessor's, and re-deriving it here would need a `mode` this function does not
         // have — the same reason `spawn_run` is handed it rather than reading `state`.
@@ -828,7 +1046,9 @@ pub(super) async fn spawn_handoff_if_needed(
         // choice, and a second opinion halfway through one task would be a different run.
         None,
         JobNodeMcp::for_run(successor.id, successor.job_id),
-        max_turns,
+        // What is LEFT of the chain's turn ceiling, for the reason the clock above is: a fresh
+        // ceiling per hop let a chain spend `max_turns` again on every handoff.
+        successor.max_turns,
     );
 }
 
@@ -873,5 +1093,305 @@ mod wake_tests {
                 .await
                 .unwrap();
         assert_eq!(failed, 1, "the signal follows the failed write");
+    }
+}
+
+#[cfg(test)]
+mod chain_tests {
+    use super::*;
+
+    /// Inserts a chain of `length` runs, `first..first + length`, each the successor of the one
+    /// before, all `completed`; the last is over the handoff threshold and has no successor. The
+    /// first was created `started_ago` before now. Inserted last-first, because `successor_run_id`
+    /// references `runs(id)`.
+    async fn chain(
+        pool: &sqlx::SqlitePool,
+        first: i64,
+        length: i64,
+        started_ago: chrono::Duration,
+    ) -> i64 {
+        let last = first + length - 1;
+        for id in (first..=last).rev() {
+            let successor = (id < last).then_some(id + 1);
+            let fill = (id == last).then_some(HANDOFF_CONTEXT_LIMIT_FLOOR * 4 / 5);
+            let created = if id == first {
+                chrono::Utc::now() - started_ago
+            } else {
+                chrono::Utc::now()
+            };
+            sqlx::query(
+                "INSERT INTO runs (id, project_id, prompt, status, mode, context_fill,
+                                   successor_run_id, created_at)
+                 VALUES (?, 'project-c', 'the task', 'completed', 'worktree', ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(fill)
+            .bind(successor)
+            .bind(created.to_rfc3339())
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        last
+    }
+
+    async fn runs_count(pool: &sqlx::SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[test]
+    fn the_hop_cap_refuses_the_hop_past_it_and_allows_the_last_one_under_it() {
+        let none = chrono::Duration::zero();
+        assert_eq!(next_hop(MAX_HANDOFF_HOPS - 1, none, None), Ok(None));
+        let refused = next_hop(MAX_HANDOFF_HOPS, none, None).unwrap_err();
+        assert!(refused.contains("cap"), "{refused}");
+    }
+
+    #[test]
+    fn a_successor_gets_only_what_is_left_of_the_chains_clock() {
+        let limit = std::time::Duration::from_secs(1800);
+        assert_eq!(
+            next_hop(1, chrono::Duration::seconds(600), Some(limit)),
+            Ok(Some(std::time::Duration::from_secs(1200)))
+        );
+        let spent = next_hop(1, chrono::Duration::seconds(1800), Some(limit)).unwrap_err();
+        assert!(spent.contains("run timeout"), "{spent}");
+        assert!(next_hop(1, chrono::Duration::seconds(4000), Some(limit)).is_err());
+        // A first run stamped in the future has used nothing.
+        assert_eq!(
+            next_hop(0, chrono::Duration::seconds(-60), Some(limit)),
+            Ok(Some(limit))
+        );
+    }
+
+    #[tokio::test]
+    async fn chain_origin_counts_the_hops_back_to_the_first_run() {
+        let pool = crate::testdb::fresh_pool().await;
+        let last = chain(&pool, 44101, 3, chrono::Duration::zero()).await;
+        assert_eq!(chain_origin(&pool, last).await.unwrap(), (44101, 2));
+        assert_eq!(chain_origin(&pool, 44101).await.unwrap(), (44101, 0));
+    }
+
+    /// A chain that already handed off `MAX_HANDOFF_HOPS` times gets no successor, and the run that
+    /// asked for one ends `failed` with the reason in `stderr` and a `context_handoff_refused`
+    /// event — so a job item reading it fails instead of reading a finished node.
+    #[tokio::test]
+    async fn the_hop_cap_leaves_no_successor_and_fails_the_run_with_the_reason() {
+        let pool = crate::testdb::fresh_pool().await;
+        let length = MAX_HANDOFF_HOPS as i64 + 1;
+        let last = chain(&pool, 44201, length, chrono::Duration::zero()).await;
+        let before = runs_count(&pool).await;
+
+        let outcome = prepare_handoff_successor_within(
+            &pool,
+            last,
+            Some(std::time::Duration::from_secs(3600)),
+        )
+        .await
+        .unwrap();
+
+        assert!(outcome.is_none(), "the cap was reached");
+        assert_eq!(
+            runs_count(&pool).await,
+            before,
+            "no successor row, not even a failed one"
+        );
+        let (status, stderr, successor): (String, Option<String>, Option<i64>) =
+            sqlx::query_as("SELECT status, stderr, successor_run_id FROM runs WHERE id = ?")
+                .bind(last)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "failed");
+        assert!(
+            stderr.unwrap_or_default().contains("cap"),
+            "the reason is recorded"
+        );
+        assert_eq!(successor, None);
+        let events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM run_events WHERE run_id = ? AND kind = 'context_handoff_refused'",
+        )
+        .bind(last)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(events, 1);
+
+        // A second look (a retry after a restart) neither hands off nor writes a second event.
+        assert!(
+            prepare_handoff_successor_within(&pool, last, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let events_after: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM run_events WHERE run_id = ? AND kind = 'context_handoff_refused'",
+        )
+        .bind(last)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(events_after, 1);
+    }
+
+    /// One hop under the cap still hands off.
+    #[tokio::test]
+    async fn a_chain_under_the_cap_still_hands_off() {
+        let pool = crate::testdb::fresh_pool().await;
+        let last = chain(
+            &pool,
+            44301,
+            MAX_HANDOFF_HOPS as i64,
+            chrono::Duration::zero(),
+        )
+        .await;
+        let successor = prepare_handoff_successor_within(&pool, last, None)
+            .await
+            .unwrap()
+            .expect("the chain has one hop left");
+        assert_eq!(successor.run_timeout, None);
+    }
+
+    /// The successor's wall clock is what is left of the chain's, counted from its FIRST run.
+    #[tokio::test]
+    async fn the_successor_is_given_the_remaining_timeout() {
+        let pool = crate::testdb::fresh_pool().await;
+        let last = chain(&pool, 44401, 2, chrono::Duration::minutes(10)).await;
+        let limit = std::time::Duration::from_secs(30 * 60);
+
+        let successor = prepare_handoff_successor_within(&pool, last, Some(limit))
+            .await
+            .unwrap()
+            .expect("twenty minutes remain");
+
+        let remaining = successor.run_timeout.expect("a deadline was asked about");
+        assert!(
+            remaining <= std::time::Duration::from_secs(20 * 60),
+            "{remaining:?} is more than what was left"
+        );
+        assert!(
+            remaining > std::time::Duration::from_secs(19 * 60),
+            "{remaining:?} is far less than what was left"
+        );
+    }
+
+    /// A chain whose clock has run out gets no successor and fails with the reason.
+    #[tokio::test]
+    async fn a_chain_out_of_time_gets_no_successor() {
+        let pool = crate::testdb::fresh_pool().await;
+        let last = chain(&pool, 44501, 2, chrono::Duration::minutes(31)).await;
+        let before = runs_count(&pool).await;
+
+        let outcome = prepare_handoff_successor_within(
+            &pool,
+            last,
+            Some(std::time::Duration::from_secs(30 * 60)),
+        )
+        .await
+        .unwrap();
+
+        assert!(outcome.is_none());
+        assert_eq!(runs_count(&pool).await, before);
+        let (status, stderr): (String, Option<String>) =
+            sqlx::query_as("SELECT status, stderr FROM runs WHERE id = ?")
+                .bind(last)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "failed");
+        assert!(stderr.unwrap_or_default().contains("run timeout"));
+    }
+
+    async fn set_turns(pool: &sqlx::SqlitePool, run_id: i64, turns: Option<i64>) {
+        sqlx::query("UPDATE runs SET num_turns = ? WHERE id = ?")
+            .bind(turns)
+            .bind(run_id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn the_turn_ceiling_counts_across_the_chain() {
+        assert_eq!(remaining_turns(25, None), Ok(None));
+        assert_eq!(remaining_turns(25, Some(40)), Ok(Some(15)));
+        let spent = remaining_turns(40, Some(40)).unwrap_err();
+        assert!(
+            spent.contains("turn budget of the handoff chain exhausted: used 40 of 40"),
+            "{spent}"
+        );
+        assert!(remaining_turns(55, Some(40)).is_err());
+    }
+
+    /// The successor gets the chain's ceiling minus every turn its runs spent, origin included; a
+    /// run whose count is NULL spent none.
+    #[tokio::test]
+    async fn the_successor_is_given_the_remaining_turns() {
+        let pool = crate::testdb::fresh_pool().await;
+        let last = chain(&pool, 44601, 3, chrono::Duration::zero()).await;
+        set_turns(&pool, 44601, Some(10)).await;
+        set_turns(&pool, 44602, None).await;
+        set_turns(&pool, 44603, Some(15)).await;
+
+        let successor = prepare_handoff_successor_bounded(&pool, last, None, Some(40))
+            .await
+            .unwrap()
+            .expect("fifteen turns remain");
+
+        assert_eq!(successor.max_turns, Some(15));
+    }
+
+    /// A chain that spent its whole turn ceiling gets no successor row, and the run that asked for
+    /// one ends `failed` with the reason.
+    #[tokio::test]
+    async fn a_chain_out_of_turns_gets_no_successor() {
+        let pool = crate::testdb::fresh_pool().await;
+        let last = chain(&pool, 44701, 2, chrono::Duration::zero()).await;
+        set_turns(&pool, 44701, Some(20)).await;
+        set_turns(&pool, 44702, Some(20)).await;
+        let before = runs_count(&pool).await;
+
+        let outcome = prepare_handoff_successor_bounded(&pool, last, None, Some(40))
+            .await
+            .unwrap();
+
+        assert!(outcome.is_none(), "the turn budget is spent");
+        assert_eq!(
+            runs_count(&pool).await,
+            before,
+            "no successor row, not even a failed one"
+        );
+        let (status, stderr, successor): (String, Option<String>, Option<i64>) =
+            sqlx::query_as("SELECT status, stderr, successor_run_id FROM runs WHERE id = ?")
+                .bind(last)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "failed");
+        assert!(
+            stderr
+                .unwrap_or_default()
+                .contains("turn budget of the handoff chain exhausted: used 40 of 40"),
+            "the reason is recorded"
+        );
+        assert_eq!(successor, None);
+    }
+
+    /// No ceiling: the successor launches with none, whatever the chain spent.
+    #[tokio::test]
+    async fn no_turn_ceiling_leaves_the_successor_without_one() {
+        let pool = crate::testdb::fresh_pool().await;
+        let last = chain(&pool, 44801, 2, chrono::Duration::zero()).await;
+        set_turns(&pool, 44801, Some(500)).await;
+
+        let successor = prepare_handoff_successor_bounded(&pool, last, None, None)
+            .await
+            .unwrap()
+            .expect("nothing brakes this hop");
+
+        assert_eq!(successor.max_turns, None);
     }
 }
