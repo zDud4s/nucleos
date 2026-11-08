@@ -17,7 +17,20 @@ pub(super) enum Reconciled {
     JobRetired,
 }
 
+/// [`reconcile_nodes_at`] on the wall clock, for the tests that do not care what time it is. The
+/// daemon's pass hands its own `now` in.
+#[cfg(test)]
 pub(super) async fn reconcile_nodes(state: &AppState, job: &JobRow) -> sqlx::Result<Reconciled> {
+    reconcile_nodes_at(state, job, Utc::now()).await
+}
+
+/// Folds finished nodes back into the job on the clock the caller hands in, which is what the backoff of a transient
+/// API error is measured against: the pass's own `now`, and a test's fixed instant.
+pub(super) async fn reconcile_nodes_at(
+    state: &AppState,
+    job: &JobRow,
+    now: DateTime<Utc>,
+) -> sqlx::Result<Reconciled> {
     let pool = &state.pool;
 
     // An item claimed `running` whose run was never linked (the daemon died between the claim and
@@ -98,6 +111,99 @@ pub(super) async fn reconcile_nodes(state: &AppState, job: &JobRow) -> sqlx::Res
                 continue;
             }
             interruptions += 1;
+        }
+
+        // **A node that failed on a transient API error says nothing about the item either**: no
+        // answer at all, 408, 429 or any 5xx (529 "overloaded" among them), read off the run's last
+        // `result` event exactly as the review's retry reads it. The item is run again, at most
+        // `MAX_ITEM_RETRIES_AFTER_TRANSIENT_ERROR` times, after the backoff for that retry. While the
+        // backoff runs the item stays `running` on its failed run — which every reader already takes
+        // as "a node is busy with this item", so nothing else is started on its tree — and this
+        // pass leaves it be until the time recorded on the row is reached. Then it goes back to
+        // `pending`, as an interruption does: the same item, a fresh attempt, the tree as it stands.
+        // Any other failure, and one past the cap, falls through to the arms below unchanged.
+        let mut transient_retries = 0i64;
+        if run_status == "failed" {
+            let stdout: Option<String> =
+                sqlx::query_scalar::<_, Option<String>>("SELECT stdout FROM runs WHERE id = ?")
+                    .bind(run_id)
+                    .fetch_optional(pool)
+                    .await?
+                    .flatten();
+            if stdout
+                .as_deref()
+                .is_some_and(crate::execution::runner::failed_on_a_transient_api_error)
+            {
+                let (retries, retry_at): (i64, Option<String>) = sqlx::query_as(
+                    "SELECT transient_retries, transient_retry_at FROM job_nodes
+                     WHERE job_id = ? AND ordinal = ?",
+                )
+                .bind(job.id)
+                .bind(ordinal)
+                .fetch_one(pool)
+                .await?;
+                transient_retries = retries;
+                if retries < MAX_ITEM_RETRIES_AFTER_TRANSIENT_ERROR {
+                    let due = retry_at
+                        .as_deref()
+                        .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+                        .map(|at| at.with_timezone(&Utc));
+                    match due {
+                        // First seen: the wait starts now, and is said once, here.
+                        None => {
+                            let wait = transient_retry_backoff(retries);
+                            // `AND status = 'running'` for the reason the write below gives.
+                            let scheduled = sqlx::query(
+                                "UPDATE job_nodes SET transient_retry_at = ?
+                                 WHERE job_id = ? AND ordinal = ? AND status = 'running'",
+                            )
+                            .bind((now + wait).to_rfc3339())
+                            .bind(job.id)
+                            .bind(ordinal)
+                            .execute(pool)
+                            .await?;
+                            if scheduled.rows_affected() == 1 {
+                                say(
+                                    pool,
+                                    job,
+                                    "job_item_retry",
+                                    &format!(
+                                        "job {} item {}: its node failed on a transient API error, \
+                                         so the item runs again: retry {} of {} in {}",
+                                        job.id,
+                                        ordinal + 1,
+                                        retries + 1,
+                                        MAX_ITEM_RETRIES_AFTER_TRANSIENT_ERROR,
+                                        spoken_wait(wait)
+                                    ),
+                                )
+                                .await;
+                            }
+                            continue;
+                        }
+                        Some(due) if now < due => continue,
+                        Some(_) => {
+                            sqlx::query(
+                                "UPDATE job_nodes
+                                 SET status = 'pending', transient_retries = transient_retries + 1,
+                                     transient_retry_at = NULL
+                                 WHERE job_id = ? AND ordinal = ? AND status = 'running'",
+                            )
+                            .bind(job.id)
+                            .bind(ordinal)
+                            .execute(pool)
+                            .await?;
+                            tracing::info!(
+                                job_id = job.id,
+                                ordinal,
+                                transient_retries = retries + 1,
+                                "an item whose node failed on a transient API error is run again"
+                            );
+                            continue;
+                        }
+                    }
+                }
+            }
         }
 
         // Only `completed` is done. `timed_out`, `cancelled` and `interrupted` all leave a tree
@@ -202,6 +308,11 @@ pub(super) async fn reconcile_nodes(state: &AppState, job: &JobRow) -> sqlx::Res
                             format!(
                                 "its node was interrupted {interruptions} times, running it again gave up"
                             )
+                        } else if transient_retries > 0 {
+                            format!(
+                                "its node failed on a transient API error again after \
+                                 {transient_retries} retries, running it again gave up"
+                            )
                         } else {
                             format!("its node ended `{run_status}`")
                         }
@@ -255,6 +366,31 @@ const MAX_PLAN_REPLANS_AFTER_INTERRUPTION: i64 = 2;
 
 /// How many times an item whose node ended `interrupted` is run again before the item fails.
 pub(super) const MAX_ITEM_RERUNS_AFTER_INTERRUPTION: i64 = 2;
+
+/// The wait before each retry of an item whose node failed on a transient API error, in seconds:
+/// 30s, then 2m, then 8m. A service that is still down after the third is not coming back within
+/// the night's patience, and the item fails as it always did.
+const TRANSIENT_RETRY_BACKOFF_SECS: [i64; 3] = [30, 120, 480];
+
+/// How many times an item whose node failed on a transient API error is run again before it fails.
+pub(super) const MAX_ITEM_RETRIES_AFTER_TRANSIENT_ERROR: i64 =
+    TRANSIENT_RETRY_BACKOFF_SECS.len() as i64;
+
+/// PURE: the wait before retry `retries + 1`, i.e. after `retries` retries already made.
+fn transient_retry_backoff(retries: i64) -> chrono::Duration {
+    let index = (retries.max(0) as usize).min(TRANSIENT_RETRY_BACKOFF_SECS.len() - 1);
+    chrono::Duration::seconds(TRANSIENT_RETRY_BACKOFF_SECS[index])
+}
+
+/// A wait as the feed says it: whole minutes as `2m`, anything else in seconds.
+fn spoken_wait(wait: chrono::Duration) -> String {
+    let seconds = wait.num_seconds();
+    if seconds >= 60 && seconds % 60 == 0 {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{seconds}s")
+    }
+}
 
 /// Turns a finished plan node into the job's queue.
 pub(super) async fn ingest_plan(state: &AppState, job: &JobRow) -> sqlx::Result<()> {
