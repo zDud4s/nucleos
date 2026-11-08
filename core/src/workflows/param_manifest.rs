@@ -185,10 +185,10 @@ pub fn validate(decls: &[ParamDecl]) -> Result<(), String> {
                         return Err(format!("param `{name}`: bounds must be finite"));
                     }
                 }
-                if let (Some(min), Some(max)) = (decl.min, decl.max) {
-                    if min > max {
-                        return Err(format!("param `{name}`: min is above max"));
-                    }
+                if let (Some(min), Some(max)) = (decl.min, decl.max)
+                    && min > max
+                {
+                    return Err(format!("param `{name}`: min is above max"));
                 }
             }
             ParamType::Bool | ParamType::Enum => {
