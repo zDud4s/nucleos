@@ -171,7 +171,9 @@ struct Found {
 enum Lookup {
     Found(Found),
     /// The key is absent; `parent` is the line of an existing first segment (2-segment keys).
-    Absent { parent: Option<usize> },
+    Absent {
+        parent: Option<usize>,
+    },
 }
 
 /// Whether the line after `idx` continues a multi-line scalar (more indented text).
@@ -196,20 +198,17 @@ fn locate(lines: &[Line<'_>], segs: &[&str]) -> Result<Lookup, FileError> {
         return Ok(Lookup::Absent { parent: None });
     };
     let top_rest = key_rest(lines[top].body, segs[0], 0).unwrap_or("");
-    let found = |idx: usize,
-                 key_indent: usize,
-                 rest: &str,
-                 offset: usize|
-     -> Result<Lookup, FileError> {
-        let (s, e) = scalar_span(rest)?;
-        if continues_scalar(lines, idx, key_indent) {
-            return Err(FileError::NotAScalar("multi-line scalar".into()));
-        }
-        Ok(Lookup::Found(Found {
-            line: idx,
-            span: (offset + s, offset + e),
-        }))
-    };
+    let found =
+        |idx: usize, key_indent: usize, rest: &str, offset: usize| -> Result<Lookup, FileError> {
+            let (s, e) = scalar_span(rest)?;
+            if continues_scalar(lines, idx, key_indent) {
+                return Err(FileError::NotAScalar("multi-line scalar".into()));
+            }
+            Ok(Lookup::Found(Found {
+                line: idx,
+                span: (offset + s, offset + e),
+            }))
+        };
     if segs.len() == 1 {
         let offset = lines[top].body.len() - top_rest.len();
         return found(top, 0, top_rest, offset);
@@ -549,7 +548,10 @@ max_parallel: 9
             let out = write("k: x\n", "k", &json!(s)).unwrap();
             assert_eq!(out, format!("k: {quoted}\n"));
         }
-        assert_eq!(write("k: x\n", "k", &json!("fast-1")).unwrap(), "k: fast-1\n");
+        assert_eq!(
+            write("k: x\n", "k", &json!("fast-1")).unwrap(),
+            "k: fast-1\n"
+        );
     }
 
     #[test]

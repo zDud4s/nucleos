@@ -292,7 +292,12 @@ pub async fn set_mode(
     tx.commit().await
 }
 
-async fn mode_row(pool: &SqlitePool, scope: &Scope, bundle: &str, param: &str) -> sqlx::Result<Option<Mode>> {
+async fn mode_row(
+    pool: &SqlitePool,
+    scope: &Scope,
+    bundle: &str,
+    param: &str,
+) -> sqlx::Result<Option<Mode>> {
     let text: Option<String> = sqlx::query_scalar(
         "SELECT mode FROM workflow_param_modes WHERE scope = ? AND bundle = ? AND param = ?",
     )
@@ -329,17 +334,21 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    async fn add(
-        pool: &SqlitePool,
-        project: &str,
-        bundle: &str,
-        param: &str,
-        value: Value,
-    ) -> i64 {
+    async fn add(pool: &SqlitePool, project: &str, bundle: &str, param: &str, value: Value) -> i64 {
         let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
-        let v = append(&mut tx, project, bundle, param, &value, Kind::Set, "owner:x", "", None)
-            .await
-            .unwrap();
+        let v = append(
+            &mut tx,
+            project,
+            bundle,
+            param,
+            &value,
+            Kind::Set,
+            "owner:x",
+            "",
+            None,
+        )
+        .await
+        .unwrap();
         tx.commit().await.unwrap();
         v
     }
@@ -425,13 +434,27 @@ mod tests {
         let pool = crate::testdb::fresh_pool().await;
         let get = || effective_mode(&pool, "p", "b", "x");
         assert_eq!(get().await.unwrap(), (Mode::Auto, ModeSource::Default));
-        set_mode(&pool, &Scope::Machine, "b", "x", Some(Mode::Fixed), "owner:x")
-            .await
-            .unwrap();
+        set_mode(
+            &pool,
+            &Scope::Machine,
+            "b",
+            "x",
+            Some(Mode::Fixed),
+            "owner:x",
+        )
+        .await
+        .unwrap();
         assert_eq!(get().await.unwrap(), (Mode::Fixed, ModeSource::Machine));
-        set_mode(&pool, &Scope::project("p"), "b", "x", Some(Mode::Auto), "owner:x")
-            .await
-            .unwrap();
+        set_mode(
+            &pool,
+            &Scope::project("p"),
+            "b",
+            "x",
+            Some(Mode::Auto),
+            "owner:x",
+        )
+        .await
+        .unwrap();
         assert_eq!(get().await.unwrap(), (Mode::Auto, ModeSource::Project));
         set_mode(&pool, &Scope::project("p"), "b", "x", None, "owner:x")
             .await
@@ -451,6 +474,9 @@ mod tests {
         add(&pool, "p", "b", "x", json!(2)).await;
         add(&pool, "p", "b", "y", json!(1)).await;
         add(&pool, "p", "other", "z", json!(1)).await;
-        assert_eq!(params_with_history(&pool, "p", "b").await.unwrap(), ["x", "y"]);
+        assert_eq!(
+            params_with_history(&pool, "p", "b").await.unwrap(),
+            ["x", "y"]
+        );
     }
 }
