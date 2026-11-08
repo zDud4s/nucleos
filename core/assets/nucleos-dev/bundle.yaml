@@ -54,6 +54,7 @@ owns:
   - .claude/skills/conduct/
   - .claude/skills/executor/
   - .claude/skills/maintenance/
+  - .claude/skills/model-requests/
   - .claude/skills/orchestrate/
   - .claude/skills/orchestrate-agents/
   - .claude/skills/orchestrate-node/
@@ -85,6 +86,7 @@ owns:
   - .agents/skills/conduct/
   - .agents/skills/executor/
   - .agents/skills/maintenance/
+  - .agents/skills/model-requests/
   - .agents/skills/orchestrate/
   - .agents/skills/orchestrate-agents/
   - .agents/skills/orchestrate-node/
