@@ -451,6 +451,20 @@ pub(super) type ReconcileRow = (
 /// Marks every run still `"running"` as `"interrupted"` — called once at startup to recover from a
 /// daemon crash that left in-flight runs' rows stuck (spec §3.2). Returns how many rows it changed.
 pub async fn reconcile_orphaned_runs(pool: &sqlx::SqlitePool) -> Result<u64, sqlx::Error> {
+    // First, so the UPDATE below never sees them: a resume that was approved and never launched
+    // goes back to awaiting approval rather than to `interrupted` (review auto-agents-r2#6).
+    // Best effort: failing here leaves those rows to the interrupt below, which is what happened
+    // before this pass existed, and must not stop the daemon from starting.
+    match super::resume::return_unspawned_resumes(pool).await {
+        Ok(0) => {}
+        Ok(returned) => tracing::warn!(
+            returned,
+            "handed back approval(s) whose resume never launched before the restart"
+        ),
+        Err(error) => {
+            tracing::warn!(%error, "could not hand back approvals whose resume never launched")
+        }
+    }
     let now = chrono::Utc::now().to_rfc3339();
     let reconciled: Vec<ReconcileRow> = sqlx::query_as(
         "UPDATE runs SET status = 'interrupted', completed_at = ? WHERE status = 'running'

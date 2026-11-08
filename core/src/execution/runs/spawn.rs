@@ -532,6 +532,21 @@ pub(super) fn spawn_run(
             Ok(launch) => launch,
             Err(()) => return,
         };
+        // The last await before the CLI starts: from here on a resume is an ordinary run that a
+        // restart interrupts, not an approval that never got delivered (migration 0292). Only a
+        // resume can carry the mark, so nothing else pays for the write. A failed write leaves the
+        // mark set, and the worst that does is ask the owner again after a crash.
+        if resume_session_id.is_some()
+            && let Err(error) = sqlx::query(
+                "UPDATE runs SET pending_resume_proposal_id = NULL
+                 WHERE id = ? AND pending_resume_proposal_id IS NOT NULL",
+            )
+            .bind(id)
+            .execute(&pool)
+            .await
+        {
+            tracing::warn!(run_id = id, %error, "could not record that a resume has launched");
+        }
         let mut attempt: u32 = 1;
         loop {
             // A fresh session channel per attempt: persist session_id the instant the runner parses it
