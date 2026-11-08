@@ -208,11 +208,12 @@ pub fn overlap_outside_base_chain(
     parent: Option<&str>,
 ) -> Option<String> {
     let mut chain = BTreeSet::new();
+    let mut exempt = BTreeSet::new();
     if let Some(parent) = parent {
-        chain.insert(parent);
+        exempt.insert(parent);
         for name in super::nesting::ancestors(manifest, parent) {
             if let Some((key, _)) = manifest.branches.get_key_value(&name) {
-                chain.insert(key.as_str());
+                exempt.insert(key.as_str());
             }
         }
     }
@@ -228,7 +229,9 @@ pub fn overlap_outside_base_chain(
     }
     let mut rest = manifest.clone();
     rest.branches
-        .retain(|name, _| !chain.contains(name.as_str()));
+        .retain(|name, _| {
+            !chain.contains(name.as_str()) && !exempt.contains(name.as_str())
+        });
     overlapping_branch(&rest, paths)
 }
 
