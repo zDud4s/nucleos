@@ -2,7 +2,20 @@ import { useState } from "react";
 import { isApiRefusal } from "../data/client";
 import { useAutostart, useSetAutostart, type AutostartMode } from "../data/system";
 import { DAEMON_NAME } from "../copy";
-import { Badge, Button, ErrorNote, Field, Panel, RefusalNote, Skeleton } from "../ui";
+import { Badge, Button, ErrorNote, Field, Panel, RefusalNote } from "../ui";
+
+/** The loaded note's shape: a state badge, then one sentence, on the note's own class and margins. */
+function AutostartSkeleton() {
+  return (
+    <div role="status" aria-busy="true">
+      <span className="sr-only">Reading the start-up setting</span>
+      <p className="sy-note" aria-hidden="true" style={{ display: "flex", alignItems: "center", gap: "var(--space-2)" }}>
+        <span className="ui-skeleton-bar" style={{ width: "2.25rem", height: "1.25rem", flex: "none" }} />
+        <span className="ui-skeleton-bar" style={{ width: "55%" }} />
+      </p>
+    </div>
+  );
+}
 
 /**
  * Keep the daemon running without anyone logged in.
@@ -37,7 +50,7 @@ export function Autostart() {
       {autostart.isError && view === undefined && (
         <ErrorNote>the start-up setting could not be read: the {DAEMON_NAME} is not responding</ErrorNote>
       )}
-      {!autostart.isError && view === undefined && <Skeleton label="Reading the start-up setting" />}
+      {!autostart.isError && view === undefined && <AutostartSkeleton />}
       {view !== undefined && (
         <>
           <p className="sy-note">
