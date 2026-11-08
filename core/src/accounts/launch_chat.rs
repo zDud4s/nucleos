@@ -201,11 +201,36 @@ static ANNOUNCED: std::sync::Mutex<Vec<(String, String, DateTime<Utc>)>> =
 /// How long a notice with no known reset time holds off a repeat.
 const NOTICE_FALLBACK: chrono::Duration = chrono::Duration::hours(5);
 
+/// When a hit's mark and notice stop holding: the provider's reset, else the fallback.
+fn notice_until(hit: &LimitHit, now: DateTime<Utc>) -> DateTime<Utc> {
+    hit.resets_at.unwrap_or(now + NOTICE_FALLBACK)
+}
+
+/// Seeds the dedup set from the marks stored before a restart, so their notices are not repeated.
+pub(super) fn seed_announced(marks: &[store::Exhaustion], now: DateTime<Utc>) {
+    let Ok(mut seen) = ANNOUNCED.lock() else {
+        return;
+    };
+    seen.retain(|(_, _, until)| *until > now);
+    for mark in marks.iter().filter(|m| m.until > now) {
+        if !seen
+            .iter()
+            .any(|(id, w, _)| id == mark.account_id.as_str() && *w == mark.window)
+        {
+            seen.push((
+                mark.account_id.as_str().to_owned(),
+                mark.window.clone(),
+                mark.until,
+            ));
+        }
+    }
+}
+
 /// True once per account per window: the first hit of a window says so, the rest stay quiet
 /// until the window resets.
-fn limit_notice_due(account: &AccountId, hit: &LimitHit, now: DateTime<Utc>) -> bool {
+pub(super) fn limit_notice_due(account: &AccountId, hit: &LimitHit, now: DateTime<Utc>) -> bool {
     let window = hit.window.clone().unwrap_or_default();
-    let until = hit.resets_at.unwrap_or(now + NOTICE_FALLBACK);
+    let until = notice_until(hit, now);
     let Ok(mut seen) = ANNOUNCED.lock() else {
         return false;
     };
@@ -221,7 +246,8 @@ fn limit_notice_due(account: &AccountId, hit: &LimitHit, now: DateTime<Utc>) -> 
 }
 
 /// `note_limit`, plus one feed row (`LIMIT_HIT_KIND`) the first time an account's window is
-/// found exhausted. Returns the hit like `note_limit`.
+/// found exhausted. The mark is stored too (`account_exhaustions`), so a restart restores it and
+/// does not repeat the notice. Returns the hit like `note_limit`.
 pub async fn note_limit_and_announce(
     db: &SqlitePool,
     project_id: Option<&str>,
@@ -243,6 +269,17 @@ pub async fn note_limit_and_announce(
         {
             tracing::warn!(%error, "could not write the account limit notice");
         }
+    }
+    // Every hit refreshes the stored mark; the first `announced_at` is kept by the upsert.
+    let mark = store::Exhaustion {
+        account_id: account.clone(),
+        window: hit.window.clone().unwrap_or_default(),
+        resets_at: hit.resets_at,
+        until: notice_until(&hit, now),
+        announced_at: now,
+    };
+    if let Err(error) = store::upsert_exhaustion(db, &mark).await {
+        tracing::warn!(%error, "could not store the account exhaustion mark");
     }
     Some(hit)
 }

@@ -1,6 +1,7 @@
 //! SQL of the account pool: the `accounts` and `chat_accounts` tables and the account columns of
 //! `runs`. Free async fns over the pool, like `runs.rs`: this module owns its SQL.
 
+use chrono::{DateTime, SecondsFormat, Utc};
 use sqlx::{Row, SqlitePool, sqlite::SqliteRow};
 
 use super::{Account, AccountChoice, AccountId, AccountKind, AccountState};
@@ -311,6 +312,92 @@ pub async fn recent_run_usage(
     Ok((row.try_get("mean")?, row.try_get("n")?))
 }
 
+/// One stored exhaustion mark (`account_exhaustions`): an account's window found at its limit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Exhaustion {
+    pub account_id: AccountId,
+    /// The window name; '' when the provider named none.
+    pub window: String,
+    pub resets_at: Option<DateTime<Utc>>,
+    /// When the mark and its notice stop holding.
+    pub until: DateTime<Utc>,
+    pub announced_at: DateTime<Utc>,
+}
+
+/// Whole-second RFC 3339 UTC text, so stored times compare as text.
+fn stamp(at: DateTime<Utc>) -> String {
+    at.to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+fn parse_stamp(text: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(text)
+        .ok()
+        .map(|at| at.with_timezone(&Utc))
+}
+
+/// Inserts or refreshes the mark of an account's window. A refresh keeps the first
+/// `announced_at`: the notice was written then.
+pub async fn upsert_exhaustion(db: &SqlitePool, mark: &Exhaustion) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO account_exhaustions (account_id, window_name, resets_at, until, announced_at) \
+         VALUES (?, ?, ?, ?, ?) \
+         ON CONFLICT(account_id, window_name) DO UPDATE SET \
+           resets_at = excluded.resets_at, until = excluded.until",
+    )
+    .bind(mark.account_id.as_str())
+    .bind(&mark.window)
+    .bind(mark.resets_at.map(stamp))
+    .bind(stamp(mark.until))
+    .bind(stamp(mark.announced_at))
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// The marks still holding at `now`. A row whose times this build cannot read is skipped.
+pub async fn live_exhaustions(
+    db: &SqlitePool,
+    now: DateTime<Utc>,
+) -> sqlx::Result<Vec<Exhaustion>> {
+    let rows = sqlx::query(
+        "SELECT account_id, window_name, resets_at, until, announced_at \
+         FROM account_exhaustions WHERE until > ? ORDER BY account_id, window_name",
+    )
+    .bind(stamp(now))
+    .fetch_all(db)
+    .await?;
+    let mut marks = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let until: String = row.try_get("until")?;
+        let announced_at: String = row.try_get("announced_at")?;
+        let resets_at: Option<String> = row.try_get("resets_at")?;
+        let (Some(until), Some(announced_at)) = (parse_stamp(&until), parse_stamp(&announced_at))
+        else {
+            continue;
+        };
+        if until <= now {
+            continue;
+        }
+        marks.push(Exhaustion {
+            account_id: AccountId(row.try_get("account_id")?),
+            window: row.try_get("window_name")?,
+            resets_at: resets_at.as_deref().and_then(parse_stamp),
+            until,
+            announced_at,
+        });
+    }
+    Ok(marks)
+}
+
+/// Deletes the marks that no longer hold at `now`; returns how many went.
+pub async fn prune_exhaustions(db: &SqlitePool, now: DateTime<Utc>) -> sqlx::Result<u64> {
+    let done = sqlx::query("DELETE FROM account_exhaustions WHERE until <= ?")
+        .bind(stamp(now))
+        .execute(db)
+        .await?;
+    Ok(done.rows_affected())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,5 +567,53 @@ mod tests {
         );
         assert_eq!(account_of_session(&db, "s2").await.unwrap(), None);
         assert_eq!(recent_run_usage(&db, &acc, 5).await.unwrap(), (100.0, 1));
+    }
+
+    #[tokio::test]
+    async fn exhaustions_upsert_load_the_live_ones_and_prune_the_rest() {
+        let db = pool().await;
+        let now = parse_stamp("2026-11-08T10:00:00Z").unwrap();
+        let hour = chrono::Duration::hours(1);
+        let live = Exhaustion {
+            account_id: AccountId("claude:aaaaaaaa".into()),
+            window: "5h".into(),
+            resets_at: Some(now + hour),
+            until: now + hour,
+            announced_at: now,
+        };
+        let expired = Exhaustion {
+            account_id: AccountId("claude:bbbbbbbb".into()),
+            window: String::new(),
+            resets_at: None,
+            until: now - hour,
+            announced_at: now - hour * 6,
+        };
+        upsert_exhaustion(&db, &live).await.unwrap();
+        upsert_exhaustion(&db, &expired).await.unwrap();
+        assert_eq!(
+            live_exhaustions(&db, now).await.unwrap(),
+            vec![live.clone()]
+        );
+        // A refresh moves the reset but keeps when the notice was written.
+        let refreshed = Exhaustion {
+            resets_at: Some(now + hour * 2),
+            until: now + hour * 2,
+            announced_at: now + hour,
+            ..live.clone()
+        };
+        upsert_exhaustion(&db, &refreshed).await.unwrap();
+        assert_eq!(
+            live_exhaustions(&db, now).await.unwrap(),
+            vec![Exhaustion {
+                announced_at: now,
+                ..refreshed
+            }]
+        );
+        assert_eq!(prune_exhaustions(&db, now).await.unwrap(), 1);
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM account_exhaustions")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(left, 1);
     }
 }
