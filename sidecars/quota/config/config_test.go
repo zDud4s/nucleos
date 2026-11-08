@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -88,4 +89,22 @@ func TestConfig(t *testing.T) {
 	t.Run("Load rejects a malformed TTL rather than clamping it", load_rejects_a_malformed_ttl_rather_than_clamping_it)
 	t.Run("Load clamps an out-of-range TTL rather than rejecting it", load_clamps_an_out_of_range_ttl_rather_than_rejecting_it)
 	t.Run("Load passes in-range values through as seconds", load_passes_in_range_values_through_as_seconds)
+}
+
+// The daemon URL is where the sidecar sends its token, so it must stay on this machine.
+func TestDaemonURLMustBeLoopback(t *testing.T) {
+	t.Setenv("NUCLEOS_DAEMON_TOKEN", "tok")
+	t.Setenv("QUOTA_ADDR", DefaultAddr)
+	for _, raw := range []string{"http://example.com:8791", "http://10.0.0.2:8791", "ftp://127.0.0.1:8791"} {
+		t.Setenv("NUCLEOS_DAEMON_URL", raw)
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "NUCLEOS_DAEMON_URL") {
+			t.Errorf("accepted %q (err = %v)", raw, err)
+		}
+	}
+	for _, raw := range []string{"http://127.0.0.1:8791", "http://[::1]:8791", "http://localhost:8791"} {
+		t.Setenv("NUCLEOS_DAEMON_URL", raw)
+		if _, err := Load(); err != nil {
+			t.Errorf("rejected %q: %v", raw, err)
+		}
+	}
 }

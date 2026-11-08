@@ -50,6 +50,9 @@ func Load() (Config, error) {
 	if daemonURL == "" {
 		daemonURL = "http://127.0.0.1:8791"
 	}
+	if err := netguard.RequireLoopbackURL(daemonURL); err != nil {
+		return Config{}, fmt.Errorf("NUCLEOS_DAEMON_URL: %w", err)
+	}
 
 	token := os.Getenv("NUCLEOS_DAEMON_TOKEN")
 	if token == "" {
