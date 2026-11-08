@@ -562,9 +562,7 @@ pub async fn shadow_readiness(
     // One row per (project, action class): project_id, action_class, then the four counters in the
     // order the SELECT lists them. The distinct reviewed actions are counted below, in Rust.
     type ReadinessRow = (String, String, i64, i64, i64, i64);
-    let rows: Vec<ReadinessRow> = sqlx::query_as(SQL)
-        .fetch_all(pool)
-        .await?;
+    let rows: Vec<ReadinessRow> = sqlx::query_as(SQL).fetch_all(pool).await?;
 
     // Live reviewed rows, grouped in SQL by the raw action and hashed here, beside the hashes
     // `rollup::prune` kept. (project, class) -> action hash -> a person ever disagreed.
