@@ -70,6 +70,7 @@ pub mod materialize;
 pub mod package;
 pub mod param_file;
 pub mod param_manifest;
+pub mod param_service;
 pub mod param_store;
 pub mod timeout;
 pub mod walk;
