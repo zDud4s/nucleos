@@ -1893,7 +1893,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_run_bound_caller_cannot_start_branches_for_another_node() {
-        let (state, app, caller, _repo) = tree().await;
+        let (state, app, caller, repo) = tree().await;
+        // The two successful starts at the end would be the fifth live branch under the default
+        // limit of four; this test is about who may start, not about that limit.
+        std::fs::write(
+            repo.path.join(".nucleos/workflow/speed.yaml"),
+            "tree:\n  floor_gb: 0\n  max_live_branches: 12\n",
+        )
+        .unwrap();
         let api_node = stem_orchestrator(&app, &caller).await;
         let (status, web) = post(&app, &uri(), code_body(&caller, "web", "Build the web", &["web/**"])).await;
         assert_eq!(status, StatusCode::OK, "{web:?}");
