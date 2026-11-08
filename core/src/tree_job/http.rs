@@ -2356,7 +2356,7 @@ mod tests {
             crate::tree_job::start_log::REFUSALS_KEY.to_owned(),
             json!([refusal]),
         );
-        store::save(&state.pool, &job).await.unwrap();
+        store::update(&state.pool, &job).await.unwrap();
 
         let (status, body) = get(&app(&state), &format!("/trees/{JOB}")).await;
 
