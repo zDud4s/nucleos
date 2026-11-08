@@ -307,7 +307,7 @@ pub async fn compute_merge(
         // by hand — the very thing `verify_resolution` says a resolver arrives already holding.
         //
         // What it says instead is what actually happens, because a resolution IS started for them:
-        // `resolver.rs` picks this row up within a minute and hands the conflict to an agent in a
+        // `resolver.rs` picks this row up on its next tick (once the project has a free slot) and hands the conflict to an agent in a
         // worktree of its own, staged, with MERGE_HEAD set. Nothing here is the asker's to do.
         return Err(Outcome::Escalated {
             reason: format!(
@@ -315,9 +315,10 @@ pub async fn compute_merge(
                  was left conflicted. This is the queue's to carry and not yours to fix from \
                  here — the merge ran in an integration worktree you do not have, and there is no \
                  conflicted state in your copy to resolve. What happens next is not yours to start \
-                 either: a resolution is minted for this row within a minute, in a worktree of its \
-                 own with the conflict already staged, and if one cannot be started then this row \
-                 is what asks a person to look. Do not re-run the merge, and do not merge the \
+                 either: a resolution starts as soon as the project has a free slot, in a \
+                 worktree of its own with the conflict already staged, and if one cannot be started \
+                 then this row is what asks a person to look. Do not re-run the merge, and do not \
+                 merge the \
                  other direction to get at the conflict — it is the same conflict, and it is \
                  computed here too."
             ),
