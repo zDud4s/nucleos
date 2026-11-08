@@ -163,6 +163,8 @@ export interface NewRun {
    * side too: a run listens only because somebody asked for one that would.
    */
   steerable: boolean;
+  /** `auto` | `provider:<p>` | `account:<id>`; left out, the settings default applies. */
+  account_choice?: string;
 }
 
 /**

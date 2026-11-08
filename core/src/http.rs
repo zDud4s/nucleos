@@ -20751,6 +20751,7 @@ mod tests {
                 mode: "real".to_owned(),
                 steerable: false,
                 permission_mode: None,
+                account_choice: None,
             },
         )
         .await

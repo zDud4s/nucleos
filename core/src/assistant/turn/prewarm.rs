@@ -197,7 +197,11 @@ async fn warm_chat(state: &crate::state::AppState, chat_id: &str) {
     let busy = is_busy(chat_id);
     let warming = WARMING.load(std::sync::atomic::Ordering::SeqCst);
     if !should_prewarm(
-        true,
+        // A warmed process keeps the credentials it started with, so a pooled chat is not warmed.
+        crate::accounts::pool::PoolState::global()
+            .view()
+            .candidates
+            .is_empty(),
         cli,
         tool_policy,
         resume.is_some(),

@@ -902,9 +902,60 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
         // a different and much worse proposition. So only rooted Claude conversations keep a
         // process, and the barrier that makes it safe is the same one that earned it the tools. A
         // Codex turn has no stdin a later turn can arrive on.
-        let may_live = may_keep_process(tool_policy, cli);
+        // The account this turn runs under. With no accounts (or an engine outside the pool) this
+        // is today's turn: no env, no reservation, nothing written.
+        let mut pick = crate::accounts::launch_chat::pick_for_chat_turn(
+            &pool,
+            &crate::accounts::pool::PoolState::global(),
+            &turn.slot.chat_id,
+            cli,
+            resume.as_deref(),
+            chrono::Utc::now(),
+        )
+        .await;
+        if let Some(decision) = pick.blocked.take() {
+            use crate::accounts::choose::Decision;
+            // A pinned account that cannot run, or a session stuck on an exhausted one, fails the
+            // turn with the reason. No candidate at all falls back to today's turn.
+            let reason = match decision {
+                Decision::PinnedBlocked { pinned, why, .. } => Some(format!(
+                    "the pinned account {} cannot take this turn ({why:?})",
+                    pinned.as_str()
+                )),
+                Decision::SessionStuck { current, .. } => Some(format!(
+                    "the account {} holding this session is at its limit",
+                    current.as_str()
+                )),
+                _ => None,
+            };
+            if let Some(reason) = reason {
+                tracing::warn!(run_id = id, chat_id = %turn.slot.chat_id, %reason, "refusing the turn");
+                let failed = sqlx::query(
+                    "UPDATE runs SET status = 'failed', stderr = ?, completed_at = ? WHERE id = ? AND status = 'running'",
+                )
+                .bind(&reason)
+                .bind(chrono::Utc::now().to_rfc3339())
+                .bind(id)
+                .execute(&pool)
+                .await;
+                crate::execution::runs::warn_on_terminal_write_err(&failed, id, "failed");
+                drop(turn);
+                drain_queued(&after, &drained_chat).await;
+                return;
+            }
+        }
+        // Held to the end of the turn: dropping it releases the account's slot.
+        let pooled = pick.account_id.take();
+        let reservation = pick.reservation.take();
+        // A kept or warmed process was spawned under one account's credentials and cannot change
+        // them, so a turn on a pooled account always runs one-shot, and a stale kept process of
+        // this chat goes rather than answers.
+        let may_live = may_keep_process(tool_policy, cli) && pooled.is_none();
+        if pooled.is_some() {
+            evict_live(&turn.slot.chat_id);
+        }
 
-        let env = chat_key::turn_env(
+        let mut env = chat_key::turn_env(
             tool_policy,
             may_live,
             &pool,
@@ -913,6 +964,7 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
             &control_token,
         )
         .await;
+        env.append(&mut pick.env);
 
         // A turn with no `resume` is a conversation that was deliberately let go of — it read
         // third-party text, or somebody asked for a fresh context — so a process still holding the
@@ -1047,6 +1099,23 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
             late_briefing,
         )
         .await;
+        // Records the cache usage on the account and reads the output for a limit error. A turn
+        // that never produced an outcome records nothing.
+        if let (Some(account), Ok(Ok(o))) = (pooled.as_ref(), &result) {
+            crate::accounts::launch_chat::after_chat_turn(
+                &pool,
+                &turn.slot.chat_id,
+                account,
+                cli,
+                o.cache_creation_tokens.unwrap_or_default(),
+                o.cache_read_tokens.unwrap_or_default(),
+                &o.stdout,
+                &o.stderr,
+                chrono::Utc::now(),
+            )
+            .await;
+        }
+        drop(reservation);
         // The process this turn kept (if any) learns what it has now served, before anything can
         // read it between turns.
         // Only a turn that could have run in the kept process: a one-shot turn never touched it, and

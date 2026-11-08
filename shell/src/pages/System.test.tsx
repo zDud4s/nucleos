@@ -1820,6 +1820,7 @@ describe("System - the channels tab", () => {
       "Tokens",
       "Channels",
       "Notifications",
+      "Accounts",
       "Machine",
     ]);
   });

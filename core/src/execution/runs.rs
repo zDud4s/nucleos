@@ -4356,6 +4356,76 @@ pub mod tests {
     /// The pair to the test above, and it is the half that keeps the change from being a
     /// default: an assertion on `dont_ask` alone would pass just as well against a route that
     /// stamped every run with a rung.
+    fn choice_request(choice: Option<&str>) -> Json<CreateRunRequest> {
+        Json(CreateRunRequest {
+            prompt: "pooled".to_owned(),
+            project_id: None,
+            cwd: None,
+            mode: "real".to_owned(),
+            steerable: false,
+            permission_mode: None,
+            account_choice: choice.map(str::to_owned),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_misspelt_account_choice_fails_the_request_and_writes_no_row() {
+        let state = test_state().await;
+        let result = create_run(State(state.clone()), choice_request(Some("sideways"))).await;
+        assert!(matches!(result, Err((StatusCode::UNPROCESSABLE_ENTITY, _))));
+        let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(runs, 0);
+    }
+
+    #[tokio::test]
+    async fn an_account_choice_is_stored_on_the_run_and_absent_means_null() {
+        let state = test_state().await;
+        let pinned = create_run(
+            State(state.clone()),
+            choice_request(Some("provider:anthropic")),
+        )
+        .await
+        .unwrap();
+        let plain = create_run(State(state.clone()), choice_request(None))
+            .await
+            .unwrap();
+        let stored = |id: i64| {
+            let pool = state.pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT account_choice FROM runs WHERE id = ?",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(
+            stored(pinned.0.id).await.as_deref(),
+            Some("provider:anthropic")
+        );
+        assert_eq!(stored(plain.0.id).await, None);
+    }
+
+    #[tokio::test]
+    async fn the_run_status_json_carries_the_account_id_nullable() {
+        let state = test_state().await;
+        let app = test_router(state.clone());
+        let created = create_run_via_http(&app, "which account").await;
+        assert_eq!(get_run_status(&app, created.id).await.account_id, None);
+        sqlx::query("UPDATE runs SET account_id = 'claude:1a2b3c4d' WHERE id = ?")
+            .bind(created.id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let status = get_run_status(&app, created.id).await;
+        assert_eq!(status.account_id.as_deref(), Some("claude:1a2b3c4d"));
+    }
+
     #[tokio::test]
     async fn a_run_that_names_no_rung_is_stored_without_one() {
         let state = test_state().await;
@@ -8782,6 +8852,7 @@ tests:
                 mode: "real".to_owned(),
                 steerable: false,
                 permission_mode: None,
+                account_choice: None,
             }),
         )
         .await;
@@ -8810,6 +8881,7 @@ tests:
                 mode: "real".to_owned(),
                 steerable: false,
                 permission_mode: None,
+                account_choice: None,
             }),
         )
         .await;
@@ -8840,6 +8912,7 @@ tests:
                 mode: "worktree".to_owned(),
                 steerable: false,
                 permission_mode: None,
+                account_choice: None,
             }),
         )
         .await;
@@ -8886,6 +8959,7 @@ tests:
                 mode: "worktree".to_owned(),
                 steerable: false,
                 permission_mode: None,
+                account_choice: None,
             }),
         )
         .await;
@@ -8929,6 +9003,7 @@ tests:
                 mode: "real".to_owned(),
                 steerable: false,
                 permission_mode: None,
+                account_choice: None,
             }),
         )
         .await;
@@ -8992,6 +9067,7 @@ tests:
                 mode: "worktree".to_owned(),
                 steerable: false,
                 permission_mode: None,
+                account_choice: None,
             }),
         ));
 
@@ -12039,6 +12115,7 @@ tests:
             advised_model: None,
             advised_effort: None,
             route_failed: None,
+            account_id: None,
         }
         .with_prompt_budget();
 

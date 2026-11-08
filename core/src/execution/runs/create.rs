@@ -97,6 +97,7 @@ async fn create_run_inner_with_mcp_box(
             steerable,
             provisioning: None,
             permission_mode: None,
+            account_choice: None,
         },
         None,
         worktree_mcp_box,
@@ -396,6 +397,8 @@ pub(super) struct NewRun<'a> {
     pub(super) steerable: bool,
     pub(super) provisioning: Option<Provisioning>,
     pub(super) permission_mode: Option<crate::chats::PermissionMode>,
+    /// What the caller asked for in the account pool; NULL = the settings default.
+    pub(super) account_choice: Option<crate::accounts::AccountChoice>,
 }
 
 impl NewRun<'static> {
@@ -429,6 +432,7 @@ impl NewRun<'static> {
             steerable: false,
             provisioning: Some(provisioning),
             permission_mode: None,
+            account_choice: None,
         }
     }
 }
@@ -463,6 +467,7 @@ pub async fn create_no_tools_run(
             steerable: false,
             provisioning: None,
             permission_mode: None,
+            account_choice: None,
         },
         Some(crate::execution::runner::ToolPolicy::None),
         false,
@@ -486,6 +491,7 @@ async fn create_run_with_policy(
         steerable,
         provisioning,
         permission_mode,
+        account_choice,
     } = run;
     let node = provisioning.as_ref().and_then(Provisioning::node);
     let resolution = provisioning.as_ref().and_then(Provisioning::resolution);
@@ -557,8 +563,8 @@ async fn create_run_with_policy(
     // be a value that looks like a setting and means nothing.
     let inserted = sqlx::query(
         "INSERT INTO runs (project_id, cwd, prompt, status, mode, session_id, steerable,
-                           permission_mode, judge, judge_resolve, created_at)
-         VALUES (?, ?, ?, 'running', ?, ?, ?, ?,
+                           permission_mode, account_choice, judge, judge_resolve, created_at)
+         VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?,
                  CASE WHEN ? IN ('shadow', 'worktree')
                       THEN COALESCE((SELECT judge FROM autopilot_state WHERE project_id = ?), 'off')
                       ELSE 'off' END,
@@ -574,6 +580,7 @@ async fn create_run_with_policy(
     .bind(&session_id)
     .bind(i64::from(steerable))
     .bind(permission_mode.map(crate::chats::PermissionMode::as_str))
+    .bind(account_choice.map(|choice| choice.to_string()))
     .bind(mode)
     .bind(&project_id)
     .bind(mode)
@@ -1039,7 +1046,12 @@ async fn create_run_with_policy(
                 .map(str::to_owned),
             item: item_context,
             resume: false,
-            restrict_runners: node.and_then(|node| node.launch.restrict_runners.clone()),
+            restrict_runners: restrict_by_account(
+                &state.pool,
+                id,
+                node.and_then(|node| node.launch.restrict_runners.clone()),
+            )
+            .await,
             pin: node.and_then(|node| node.launch.pin.clone()),
             judged_later: node.is_some_and(|node| node.launch.judged_later),
             effort: node.and_then(|node| node.launch.effort.clone()),
@@ -1140,6 +1152,46 @@ async fn create_run_with_policy(
     );
 
     Ok(id)
+}
+
+/// The node's engine restriction, narrowed by the run's account choice (a pinned account, or
+/// `provider:<p>`, can only run on that provider's engines). With no accounts, or `auto`, it is
+/// `existing` untouched.
+async fn restrict_by_account(
+    pool: &sqlx::SqlitePool,
+    run_id: i64,
+    existing: Option<Vec<crate::models::route_advice::RunnerKind>>,
+) -> Option<Vec<crate::models::route_advice::RunnerKind>> {
+    use crate::models::route_advice::RunnerKind;
+    let accounts: Vec<crate::accounts::Account> = crate::accounts::pool::PoolState::global()
+        .view()
+        .candidates
+        .into_iter()
+        .map(|candidate| candidate.account)
+        .collect();
+    if accounts.is_empty() {
+        return existing;
+    }
+    let own = crate::accounts::store::run_choice(pool, run_id)
+        .await
+        .ok()
+        .flatten();
+    let choice = crate::accounts::launch_chat::effective_choice(
+        own,
+        &crate::accounts::settings::current().default_choice,
+    );
+    let names = existing.map(|kinds| {
+        kinds
+            .into_iter()
+            .map(|kind| kind.as_str().to_owned())
+            .collect::<Vec<_>>()
+    });
+    crate::accounts::launch_chat::narrow_by_choice(names, &choice, &accounts).map(|names| {
+        names
+            .iter()
+            .filter_map(|name| RunnerKind::parse(name))
+            .collect()
+    })
 }
 
 #[cfg(test)]

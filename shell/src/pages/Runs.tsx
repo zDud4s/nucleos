@@ -27,6 +27,7 @@ import {
 } from "../data/runs";
 import { MachinePicker, useNewWorkMachine } from "../chats/MachinePicker";
 import { useMachines } from "../data/machines";
+import { useAccounts } from "../data/accounts";
 import {
   useCreatePreset,
   useDeletePreset,
@@ -1116,6 +1117,8 @@ interface RunDraft {
   mode: AskableMode;
   steerable: boolean;
   name: string;
+  /** `auto` | `provider:<p>` | `account:<id>`. */
+  account: string;
 }
 
 /**
@@ -1137,6 +1140,7 @@ const EMPTY_DRAFT: RunDraft = {
   mode: "shadow",
   steerable: false,
   name: "",
+  account: "auto",
 };
 
 /**
@@ -1219,6 +1223,7 @@ function NewRunForm({
   const machines = useMachines();
   // Where the last run went when it was not this machine: the run list stays local for now.
   const [startedOn, setStartedOn] = useState<string | null>(null);
+  const accounts = useAccounts();
   const save = useCreatePreset();
   const kill = useKillSwitch();
   const hintId = useId();
@@ -1270,7 +1275,13 @@ function NewRunForm({
   // retried request cannot create a twin either.
   const guard = useGuardedAction((intent) =>
     create
-      .mutateAsync({ ...body, steerable: draft.steerable, machine, idempotencyKey: intent.key })
+      .mutateAsync({
+        ...body,
+        steerable: draft.steerable,
+        machine,
+        ...(draft.account === "auto" ? {} : { account_choice: draft.account }),
+        idempotencyKey: intent.key,
+      })
       .then((answer) => {
         setDraft(EMPTY_DRAFT);
         // The run's page reads this machine; a run created elsewhere is not on it.
@@ -1349,6 +1360,24 @@ function NewRunForm({
             />
           </Field>
         </div>
+
+        {(accounts.data ?? []).length > 0 && (
+          <Field label="Account">
+            <Select value={draft.account} onChange={(event) => patch({ account: event.target.value })}>
+              <option value="auto">Auto</option>
+              {[...new Set((accounts.data ?? []).map((a) => a.provider))].map((provider) => (
+                <option key={`p-${provider}`} value={`provider:${provider}`}>
+                  Any {provider} account
+                </option>
+              ))}
+              {(accounts.data ?? []).map((a) => (
+                <option key={a.id} value={`account:${a.id}`}>
+                  {a.label} ({a.provider})
+                </option>
+              ))}
+            </Select>
+          </Field>
+        )}
 
         <ModePicker
           name={modeName}

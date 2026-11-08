@@ -1,6 +1,7 @@
 //! Daemon start and the fan-out after any account change.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use sqlx::SqlitePool;
 
@@ -12,6 +13,7 @@ use crate::quota::client::QuotaClient;
 /// With no account rows the pool stays empty and every launch is today's.
 pub fn start(db: SqlitePool, quota: Option<QuotaClient>, _data_dir: PathBuf) {
     let pool = PoolState::global();
+    DAEMON_STARTED.store(true, Ordering::SeqCst);
     tokio::spawn(async move {
         reload(&db, &pool).await;
         usage::start(db.clone(), quota, pool.clone());
@@ -19,8 +21,17 @@ pub fn start(db: SqlitePool, quota: Option<QuotaClient>, _data_dir: PathBuf) {
     });
 }
 
+/// Set once by `start`, which only the daemon's `main` calls. The global pool is the daemon's
+/// own: a test database must never load its accounts into it, or runs and chat turns of
+/// unrelated tests would pick them.
+static DAEMON_STARTED: AtomicBool = AtomicBool::new(false);
+
 /// After any insert, rename, state change or removal: reload the pool and tell the feeds.
+/// Outside a started daemon (tests) the global pool is left alone.
 pub async fn accounts_changed(db: &SqlitePool) {
+    if !DAEMON_STARTED.load(Ordering::SeqCst) {
+        return;
+    }
     let pool = PoolState::global();
     reload(db, &pool).await;
     usage::on_accounts_changed(db, &pool).await;
