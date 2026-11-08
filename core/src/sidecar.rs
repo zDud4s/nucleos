@@ -432,6 +432,10 @@ pub async fn supervise(name: String, binary_path: PathBuf, env: Vec<(String, Str
         cmd.stderr(std::process::Stdio::piped());
         // The lifeline (spec D3); see `arm_lifeline`.
         arm_lifeline(&mut cmd);
+        // Defence in depth: never let a console-subsystem sidecar open its own visible window, even
+        // if the daemon itself has no console.
+        #[cfg(windows)]
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         match cmd.spawn() {
             Ok(mut child) => {
                 // Adopted before anything else is done with it, and while the `Child` is still held

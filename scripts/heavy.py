@@ -188,8 +188,8 @@ class MutexBusy(TimeoutError):
 
 
 class Mutex:
-    """`mkdir $DIR/.mutex` plus an `owner` file. Stale when older than 60 s, when the owner
-    is dead, or when the owner is this very process and it does not hold it; a stale one is
+    """`mkdir $DIR/.mutex` plus an `owner` file. Stale when the owner is dead (or unreadable
+    for over 5 s; age alone never condemns a live owner), or when the owner is this very process and it does not hold it; a stale one is
     removed and the acquisition retried."""
 
     def __init__(self, state_dir: Path, timeout: float = MUTEX_WAIT_S):
@@ -238,8 +238,7 @@ class Mutex:
 
     def _stale(self) -> bool:
         try:
-            if time.time() - self.path.stat().st_mtime > MUTEX_STALE_S:
-                return True
+            age = time.time() - self.path.stat().st_mtime
         except OSError:
             return False  # vanished meanwhile: the retry will take it
         try:
@@ -252,10 +251,8 @@ class Mutex:
             return not is_alive(owner.get("pid"), owner.get("ctime"))
         except (OSError, ValueError):
             # No readable owner yet: its creator may be between mkdir and the write.
-            try:
-                return time.time() - self.path.stat().st_mtime > 5.0
-            except OSError:
-                return False
+            # Age decides only here, where there is no live owner to protect.
+            return age > 5.0
 
     def _break_stale(self) -> bool:
         """Remove a stale mutex under a breaker lock. Two waiters that both judged it stale

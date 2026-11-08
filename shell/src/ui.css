@@ -13,24 +13,6 @@
  * surfaces as something looking wrong on screen.
  */
 
-/* ------------------------------------------------------------------ boot -- */
-
-/**
- * The stub the app renders before the shell exists. It is here rather than in a
- * feature sheet because it must survive until the AppShell replaces it, and a
- * blank dark rectangle is indistinguishable from a webview that failed to load.
- */
-.ui-boot {
-  display: grid;
-  place-items: center;
-  min-height: 100vh;
-  font-family: var(--font-display);
-  font-size: var(--text-2xl);
-  font-weight: var(--weight-semibold);
-  letter-spacing: var(--tracking-wide);
-  color: var(--text-faint);
-}
-
 /* ----------------------------------------------------------------- panel -- */
 
 .ui-panel {

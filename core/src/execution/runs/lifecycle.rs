@@ -580,6 +580,9 @@ pub(super) fn transcript_retention_days() -> i64 {
         .unwrap_or(DEFAULT_TRANSCRIPT_RETENTION_DAYS)
 }
 
+/// How many `run_events` rows one DELETE of the transcript prune removes.
+const PRUNE_BATCH: u64 = 500;
+
 /// What one retention pass removed.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct PrunedTranscripts {
@@ -621,8 +624,16 @@ pub async fn prune_transcripts(
     // `COALESCE(completed_at, created_at)` because a terminal row with no completion stamp is a row
     // some older path left half-written; ageing it from when it was created is what keeps it from
     // being immortal.
-    let past_the_window =
-        format!("status IN ({placeholders}) AND COALESCE(completed_at, created_at) < ?");
+    //
+    // Written as `completed_at < ? OR (completed_at IS NULL AND created_at < ?)` rather than the
+    // COALESCE it equals: a function over the column cannot use `runs_by_completed` /
+    // `runs_by_created`, this form can. It binds the cutoff twice.
+    let past_the_window = |alias: &str| {
+        format!(
+            "{alias}status IN ({placeholders}) AND ({alias}completed_at < ? \
+             OR ({alias}completed_at IS NULL AND {alias}created_at < ?))"
+        )
+    };
 
     // `AssertSqlSafe` because sqlx otherwise takes only `&'static str`. The sole interpolated thing
     // is a row of `?` generated from a constant's length — every status and the cutoff are bound —
@@ -631,14 +642,34 @@ pub async fn prune_transcripts(
     //
     // Events first. Between the two statements the row still says it holds a transcript, so a crash
     // in the gap leaves work to redo rather than a run that claims to have events it no longer has.
-    let mut delete = sqlx::query(sqlx::AssertSqlSafe(format!(
+    //
+    // In batches: one DELETE over a backlog holds the write lock for the whole of it, and each
+    // deleted row also fires the FTS delete trigger. A short statement per batch lets other writers
+    // in between.
+    let batch_sql = format!(
         "DELETE FROM run_events
-          WHERE run_id IN (SELECT id FROM runs WHERE {past_the_window})"
-    )));
-    for status in TERMINAL_RUN_STATUSES {
-        delete = delete.bind(status);
+          WHERE id IN (SELECT e.id FROM run_events e JOIN runs r ON r.id = e.run_id
+                        WHERE {} LIMIT {PRUNE_BATCH})",
+        past_the_window("r.")
+    );
+    let mut events = 0;
+    loop {
+        let mut delete = sqlx::query(sqlx::AssertSqlSafe(batch_sql.clone()));
+        for status in TERMINAL_RUN_STATUSES {
+            delete = delete.bind(status);
+        }
+        let removed = delete
+            .bind(&cutoff)
+            .bind(&cutoff)
+            .execute(pool)
+            .await?
+            .rows_affected();
+        events += removed;
+        if removed < PRUNE_BATCH {
+            break;
+        }
     }
-    let events = delete.bind(&cutoff).execute(pool).await?.rows_affected();
+    let past_the_window = past_the_window("");
 
     // The `IS NOT NULL` guard is what makes the count mean something: without it every sweep
     // rewrites every old row for ever and reports them all as freshly pruned.
@@ -656,7 +687,12 @@ pub async fn prune_transcripts(
     for status in TERMINAL_RUN_STATUSES {
         update = update.bind(status);
     }
-    let runs = update.bind(&cutoff).execute(pool).await?.rows_affected();
+    let runs = update
+        .bind(&cutoff)
+        .bind(&cutoff)
+        .execute(pool)
+        .await?
+        .rows_affected();
 
     Ok(PrunedTranscripts { runs, events })
 }

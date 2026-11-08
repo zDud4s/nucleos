@@ -107,6 +107,53 @@ pub fn stop_draining() {
     }
 }
 
+// Job passes in flight. Process-wide in a real build; per thread under `cfg(test)` for the same
+// reason as the draining flag.
+#[cfg(not(test))]
+static JOB_PASSES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static JOB_PASSES_IN_THIS_TEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Held for the length of one job pass; the graceful drain does not conclude while any is alive.
+/// Released on drop, so an early return or a panic cannot leak a count.
+#[derive(Debug)]
+pub struct JobPassGuard(());
+
+impl JobPassGuard {
+    /// Registers a job pass as in flight.
+    pub fn enter() -> Self {
+        #[cfg(not(test))]
+        JOB_PASSES.fetch_add(1, Ordering::SeqCst);
+        #[cfg(test)]
+        JOB_PASSES_IN_THIS_TEST.with(|n| n.set(n.get() + 1));
+        JobPassGuard(())
+    }
+}
+
+impl Drop for JobPassGuard {
+    fn drop(&mut self) {
+        #[cfg(not(test))]
+        JOB_PASSES.fetch_sub(1, Ordering::SeqCst);
+        #[cfg(test)]
+        JOB_PASSES_IN_THIS_TEST.with(|n| n.set(n.get().saturating_sub(1)));
+    }
+}
+
+/// How many job passes are running right now.
+#[cfg(not(test))]
+pub fn job_passes_in_flight() -> usize {
+    JOB_PASSES.load(Ordering::SeqCst)
+}
+
+/// How many job passes are running right now.
+#[cfg(test)]
+pub fn job_passes_in_flight() -> usize {
+    JOB_PASSES_IN_THIS_TEST.with(|n| n.get())
+}
+
 /// How many runs are live: the same two statuses a slot is held for (`LIVE_RUN_STATUSES`).
 pub async fn live_runs(pool: &SqlitePool) -> sqlx::Result<i64> {
     sqlx::query_scalar("SELECT COUNT(*) FROM runs WHERE status IN (?, ?)")
@@ -219,6 +266,8 @@ pub struct Readiness {
     pub version: &'static str,
     pub live_runs: i64,
     pub draining: bool,
+    /// Job passes (scheduler `job_tick`) in flight; the drain waits for them like for a live run.
+    pub job_passes: usize,
     /// What a restart would wait on right now. Additive: `live_runs` keeps its meaning.
     pub waiting_on: Vec<BlockingRun>,
     /// This daemon's process id, so `--restart` can tell a new daemon from the one it asked.
@@ -240,6 +289,7 @@ pub async fn readiness_for(
         version: env!("CARGO_PKG_VERSION"),
         live_runs: live_runs(pool).await?,
         draining: is_draining(),
+        job_passes: job_passes_in_flight(),
         waiting_on: blocking_runs(pool, requester_run, parked).await?,
         pid: std::process::id(),
     })
@@ -282,7 +332,8 @@ pub async fn drain_until_idle(
                 return Err(error);
             }
         };
-        if waiting_on.is_empty() {
+        // A job pass in `run_gate` is work with no run row to count, so it blocks like a live run.
+        if waiting_on.is_empty() && job_passes_in_flight() == 0 {
             quiet_reads += 1;
             if quiet_reads >= 2 {
                 stop();
@@ -408,6 +459,18 @@ mod tests {
     use axum::routing::post;
     use std::sync::Arc;
     use tower::ServiceExt;
+
+    #[test]
+    fn job_pass_guard_counts_until_dropped() {
+        assert_eq!(job_passes_in_flight(), 0);
+        let first = JobPassGuard::enter();
+        let second = JobPassGuard::enter();
+        assert_eq!(job_passes_in_flight(), 2);
+        drop(first);
+        assert_eq!(job_passes_in_flight(), 1);
+        drop(second);
+        assert_eq!(job_passes_in_flight(), 0);
+    }
 
     #[test]
     fn a_stuck_database_lets_the_hold_go() {

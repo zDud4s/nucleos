@@ -3,7 +3,8 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import { keepFocus, useDictation, type CaptureOutcome, type Delivery } from "../app/Dictation";
-import { apiFetch, isApiRefusal, type ApiRefusal } from "../data/client";
+import { apiFetch, isApiRefusal } from "../data/client";
+import { daemonProse } from "../team/prose";
 import { keys } from "../data/keys";
 import { registerPrefetcher } from "../lib/prefetch";
 import { useVoiceConversation, type ConversationView } from "../data/conversation";
@@ -94,14 +95,6 @@ function headline(
   }
   if (memos === undefined || dictations === undefined) return "armed";
   return `armed: ${plural(memos.length, "memo")}, ${plural(dictations.length, "dictation")}`;
-}
-
-/** The daemon's own sentence, when it really sent one — the pattern `Web.tsx` and `Contacts.tsx` share. */
-function daemonProse(refusal: ApiRefusal): Record<string, string> {
-  const detail = refusal.detail.trim();
-  if (detail === "" || detail === refusal.code) return {};
-  if (detail.split(/\s+/).length < 4) return {};
-  return { [refusal.code]: detail };
 }
 
 // Hovering the rail link warms the configuration the page opens with (#7).

@@ -139,18 +139,24 @@ class RuntimeTests(unittest.TestCase):
         dead.wait()
         state = Path(self.state)
 
-        def plant(owner_pid: int, age_s: float) -> None:
+        def plant(owner_pid: int, ctime, age_s: float) -> None:
             mutex = state / ".mutex"
             if mutex.exists():
                 shutil.rmtree(mutex)
             mutex.mkdir(parents=True)
-            (mutex / "owner").write_text(json.dumps({"pid": owner_pid, "ctime": None}))
+            (mutex / "owner").write_text(json.dumps({"pid": owner_pid, "ctime": ctime}))
             old = time.time() - age_s
             os.utime(mutex, (old, old))
 
-        # (a) fresh mutex whose owner is dead; (b) live owner but older than 60 s.
-        for owner, age in ((dead.pid, 1), (os.getpid(), 120)):
-            plant(owner, age)
+        # (a) fresh mutex whose owner is dead; (b) live pid but a recorded creation time that
+        # does not match it, i.e. a reused pid. A live owner is never broken by age alone
+        # (see test_heavy_races), so identity is what makes (b) reclaimable.
+        _, real_ctime = heavy.proc_identity(os.getpid())
+        cases = [(dead.pid, None, 1)]
+        if real_ctime is not None:
+            cases.append((os.getpid(), real_ctime + 1, 120))
+        for owner, ctime, age in cases:
+            plant(owner, ctime, age)
             t0 = time.time()
             cp = run_broker(
                 ["--", sys.executable, "-c", "print('after-stale')"], clean_env(self.state), 30
