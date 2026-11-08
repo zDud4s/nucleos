@@ -784,15 +784,7 @@ pub mod tests {
     }
 
     pub fn space_free_tempdir(prefix: &str) -> tempfile::TempDir {
-        let base = std::env::current_dir().expect("resolve current directory");
-        assert!(
-            !base.to_string_lossy().contains(' '),
-            "test checkout must have a space-free path"
-        );
-        tempfile::Builder::new()
-            .prefix(prefix)
-            .tempdir_in(base)
-            .expect("create space-free tempdir")
+        crate::execution::git_exec::testkit::space_free_tempdir(prefix)
     }
 
     /// Points worktree provisioning at a root of the test's own, and switches the disk floor off.
@@ -11040,8 +11032,9 @@ tests:
         // Eight run fields and the nine route fields: what launched and what the router advised
         // are model names and ids, never transcript text. Four conversation fields join them: the
         // chat's id and title and two counts (turns, running_turns), never transcript text. Two more
-        // name the conversation that launched the run (0195), an id and a title.
-        assert_eq!(object.len(), 23);
+        // name the conversation that launched the run (0195), an id and a title. One more names
+        // the pool account the run launched on (0274), or null.
+        assert_eq!(object.len(), 24);
         for field in [
             "id",
             "project_id",
@@ -11066,6 +11059,7 @@ tests:
             "running_turns",
             "launched_by_chat_id",
             "launched_by_chat_title",
+            "account_id",
         ] {
             assert!(object.contains_key(field), "missing metadata field {field}");
         }

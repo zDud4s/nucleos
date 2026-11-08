@@ -869,6 +869,9 @@ function RunRow({ row, kind }: { row: RunSearchResult; kind: RowKind }) {
             </Link>
             <p className="runs-row-sub">
               <span className="runs-row-id" title="Run">run {row.id}</span>
+              {row.account_id != null && (
+                <span className="runs-row-account" title="Account">{row.account_id}</span>
+              )}
               {row.launched_by_chat_id != null && (
                 <Link to={`/chats/${row.launched_by_chat_id}`} className="runs-row-origin">
                   from chat {row.launched_by_chat_title ?? row.launched_by_chat_id}

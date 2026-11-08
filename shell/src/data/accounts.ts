@@ -86,12 +86,28 @@ export function windowOf(account: PoolAccount, name: string): UsageWindow | unde
   return account.usage?.windows.find((w) => w.name === name);
 }
 
-export function useAccounts() {
-  return useQuery({
+/** `GET /accounts`. `engines` is absent from a daemon older than the field. */
+export interface AccountsResponse {
+  accounts: PoolAccount[];
+  engines?: string[];
+}
+
+/** The list query, shared by {@link useAccounts} and {@link usePooledEngines}: one fetch, one cache entry. */
+function accountsQuery() {
+  return {
     queryKey: accountKeys.list,
-    queryFn: async () => (await apiFetch<{ accounts: PoolAccount[] }>("/accounts")).accounts,
+    queryFn: () => apiFetch<AccountsResponse>("/accounts"),
     refetchInterval: POLL.queue,
-  });
+  };
+}
+
+export function useAccounts() {
+  return useQuery({ ...accountsQuery(), select: (answer: AccountsResponse) => answer.accounts });
+}
+
+/** The engines a new account can be added for; undefined until loaded or from an older daemon. */
+export function usePooledEngines() {
+  return useQuery({ ...accountsQuery(), select: (answer: AccountsResponse) => answer.engines });
 }
 
 export function useAccountDefault() {

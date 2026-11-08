@@ -41,12 +41,12 @@ function account(over: Partial<PoolAccount> = {}): PoolAccount {
 
 const calls: { path: string; method: string; body?: string }[] = [];
 
-function serve(accounts: PoolAccount[]) {
+function serve(accounts: PoolAccount[], engines?: string[]) {
   calls.length = 0;
   daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
     const method = init?.method ?? "GET";
     calls.push({ path, method, body: init?.body as string | undefined });
-    if (path === "/accounts" && method === "GET") return { accounts };
+    if (path === "/accounts" && method === "GET") return engines ? { accounts, engines } : { accounts };
     if (path === "/account-pool/default") return { choice: "auto" };
     if (path === "/accounts" && method === "POST") {
       return { login_id: "l1", account_id: "claude:new", engine: "claude", label: "New", phase: "awaiting_browser", auth_url: "https://auth.example/x", message: null };
@@ -129,6 +129,32 @@ describe("the accounts view", () => {
     await waitFor(() =>
       expect(calls.some((c) => c.path === "/account-logins/l1/code" && c.body === JSON.stringify({ code: "abc123" }))).toBe(true),
     );
+  });
+
+  it("offers the engines the daemon names", async () => {
+    serve([account()], ["codex", "gemini"]);
+    renderWithQuery(<AccountsView />);
+    await screen.findByText("Work");
+    fireEvent.click(screen.getByRole("button", { name: "+ Add account" }));
+    const select = screen.getByLabelText("Engine") as HTMLSelectElement;
+    await waitFor(() => expect(Array.from(select.options).map((o) => o.value)).toEqual(["codex", "gemini"]));
+    expect(select.value).toBe("codex");
+    fireEvent.change(screen.getByLabelText("Label"), { target: { value: "New" } });
+    fireEvent.click(screen.getByRole("button", { name: "Start login" }));
+    await waitFor(() =>
+      expect(
+        calls.some((c) => c.path === "/accounts" && c.method === "POST" && c.body === JSON.stringify({ engine: "codex", label: "New" })),
+      ).toBe(true),
+    );
+  });
+
+  it("falls back to claude and codex when an older daemon names no engines", async () => {
+    serve([account()]);
+    renderWithQuery(<AccountsView />);
+    await screen.findByText("Work");
+    fireEvent.click(screen.getByRole("button", { name: "+ Add account" }));
+    const select = screen.getByLabelText("Engine") as HTMLSelectElement;
+    expect(Array.from(select.options).map((o) => o.value)).toEqual(["claude", "codex"]);
   });
 });
 

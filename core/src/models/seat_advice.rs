@@ -26,7 +26,7 @@ use sqlx::SqlitePool;
 use crate::execution::runner::RunRequest;
 use crate::models::route_advice::{
     Mode, Outcome, RouteQuery, Router, RunnerKind, Surface, clamp_effort, effort_ceiling,
-    glob_match, outcome_of_run_end, report_detached, speed_of,
+    glob_match, outcome_of_run_end, report_detached, speed_of, without_headroom,
 };
 use crate::router_client::{RouteAdvice, RouteRequest};
 
@@ -215,11 +215,24 @@ pub async fn route_agent_seat(
     if mode == Mode::Off {
         return Ok((router.primary.kind, None));
     }
-    let sent = router.build_request(&seat_query(&request.prompt), runners);
-    let advice = ask(router, &sent, Some(run_id), |advice| {
-        router.check_answer(advice, &sent).map(|_| ())
-    })
-    .await;
+    // Design §8, judged on every seat as `resolve` judges every run: an engine whose provider pool
+    // has no account out of risk is not offered to the router. With none left nothing is asked, and
+    // the fallback below holds the default engine against the agent's own `runners`, as `resolve`
+    // launches the configured runner when it does not route.
+    let routable = without_headroom(runners);
+    let sent = router.build_request(&seat_query(&request.prompt), &routable);
+    let advice = if routable.is_empty() {
+        tracing::info!(
+            run_id,
+            "every runner this seat may use has no account headroom; not routing"
+        );
+        None
+    } else {
+        ask(router, &sent, Some(run_id), |advice| {
+            router.check_answer(advice, &sent).map(|_| ())
+        })
+        .await
+    };
     let advised = advice.and_then(|advice| {
         let kind = router.check_answer(&advice, &sent).ok()?;
         Some((advice, kind))
@@ -337,6 +350,11 @@ pub async fn suggest(
     // A request with no globs is "any model" to the router, so nothing is asked.
     if runners.is_empty() {
         return Err("the model adviser has no engine that can take a recruit here".to_owned());
+    }
+    // Design §8, judged now: an engine with no account out of risk is not suggested.
+    let runners = without_headroom(&runners);
+    if runners.is_empty() {
+        return Err("no engine the model adviser knows has account headroom now".to_owned());
     }
     let sent = router.build_request(&seat_query(task), &runners);
     ask(&router, &sent, None, |advice| {
@@ -1022,6 +1040,18 @@ mod tests {
         assert_eq!(team_item_outcome("cancelled", ""), None);
         assert_eq!(team_item_outcome("interrupted", ""), None);
         assert_eq!(team_item_outcome("running", ""), None);
+    }
+
+    #[test]
+    fn engines_without_headroom_are_dropped_in_order() {
+        use crate::models::route_advice::drop_engines;
+        let both = [RunnerKind::Claude, RunnerKind::Codex];
+        assert_eq!(drop_engines(&both, &[]), both.to_vec());
+        assert_eq!(
+            drop_engines(&both, &["claude".to_owned()]),
+            vec![RunnerKind::Codex]
+        );
+        assert!(drop_engines(&both, &["codex".to_owned(), "claude".to_owned()]).is_empty());
     }
 
     #[test]

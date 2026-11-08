@@ -268,6 +268,8 @@ export interface RunSearchResult {
   advised_model?: string | null;
   advised_effort?: string | null;
   route_failed?: string | null;
+  /** The account the run actually ran under; null when none was recorded. */
+  account_id?: string | null;
   chat_id?: string | null;
   /** Only on a row `GET /runs?group=chat` folded: the conversation's title. */
   chat_title?: string | null;
