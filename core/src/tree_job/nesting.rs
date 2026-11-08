@@ -175,7 +175,10 @@ mod tests {
         ]);
         assert!(!all_children_dropped(&m, "p"));
         assert!(!all_children_dropped(&m, "a"));
-        let all = manifest(&[("p", "building", None, None), ("a", "dropped", Some("p"), None)]);
+        let all = manifest(&[
+            ("p", "building", None, None),
+            ("a", "dropped", Some("p"), None),
+        ]);
         assert!(all_children_dropped(&all, "p"));
     }
 

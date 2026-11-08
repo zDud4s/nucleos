@@ -2959,7 +2959,12 @@ mod tests {
 
         let parent = fx.branch(JOB, "api").await;
         assert_eq!(parent.state, "dropped");
-        assert!(parent.extra["drop_reason"].as_str().unwrap().contains("changed nothing"));
+        assert!(
+            parent.extra["drop_reason"]
+                .as_str()
+                .unwrap()
+                .contains("changed nothing")
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(gate.calls().is_empty(), "an empty parent is not gated");
         assert_eq!(fx.requests().await, 0, "an empty parent is not merged");
@@ -2991,14 +2996,26 @@ mod tests {
         let parent_tree = holder.path().join("api");
         assert!(git_in(
             &fx.repo,
-            &["worktree", "add", "-q", &parent_tree.to_string_lossy(), "tree/api"]
+            &[
+                "worktree",
+                "add",
+                "-q",
+                &parent_tree.to_string_lossy(),
+                "tree/api"
+            ]
         ));
         // The child branch stands one commit above the parent's tip, in a file of its own.
         assert!(git_in(&fx.repo, &["branch", "tree/api-x", "tree/api"]));
         let child_tree = holder.path().join("api-x");
         assert!(git_in(
             &fx.repo,
-            &["worktree", "add", "-q", &child_tree.to_string_lossy(), "tree/api-x"]
+            &[
+                "worktree",
+                "add",
+                "-q",
+                &child_tree.to_string_lossy(),
+                "tree/api-x"
+            ]
         ));
         commit_file(&child_tree, "api-x.txt", "from the child\n", "child");
         let child_tip = sha_of(&fx.repo, "tree/api-x");
@@ -3024,14 +3041,22 @@ mod tests {
         let merged = fx.branch(JOB, "api-x").await;
         assert_eq!(merged.state, "merged");
         let sha = merged.extra["merge_sha"].as_str().expect("the merge sha");
-        assert_eq!(sha, sha_of(&fx.repo, "tree/api"), "the parent's branch moved");
+        assert_eq!(
+            sha,
+            sha_of(&fx.repo, "tree/api"),
+            "the parent's branch moved"
+        );
         assert_eq!(sha_of(&fx.repo, &format!("{sha}^2")), child_tip);
         assert_eq!(
             sha_of(&fx.repo, "feat/tree"),
             feature_before,
             "a child does not merge into the feature branch"
         );
-        assert_eq!(sha_of(&parent_tree, "HEAD"), sha, "the worktree's HEAD followed the ref");
+        assert_eq!(
+            sha_of(&parent_tree, "HEAD"),
+            sha,
+            "the worktree's HEAD followed the ref"
+        );
         assert_eq!(
             std::fs::read_to_string(parent_tree.join("api-x.txt")).unwrap(),
             "from the child\n"

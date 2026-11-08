@@ -229,9 +229,7 @@ pub fn overlap_outside_base_chain(
     }
     let mut rest = manifest.clone();
     rest.branches
-        .retain(|name, _| {
-            !chain.contains(name.as_str()) && !exempt.contains(name.as_str())
-        });
+        .retain(|name, _| !chain.contains(name.as_str()) && !exempt.contains(name.as_str()));
     overlapping_branch(&rest, paths)
 }
 
@@ -650,7 +648,10 @@ async fn post_branch(
             Some(found) => {
                 return Err(refuse(
                     StatusCode::UNPROCESSABLE_ENTITY,
-                    format!("parent branch {parent} is {} and takes no child", found.state),
+                    format!(
+                        "parent branch {parent} is {} and takes no child",
+                        found.state
+                    ),
                 ));
             }
             None => {
@@ -669,7 +670,9 @@ async fn post_branch(
             format!("{path} is not a path a docs branch may write"),
         ));
     }
-    if let Some(other) = overlap_outside_base_chain(&job.manifest, &paths, base.as_deref(), parent.as_deref()) {
+    if let Some(other) =
+        overlap_outside_base_chain(&job.manifest, &paths, base.as_deref(), parent.as_deref())
+    {
         return Err(refuse(
             StatusCode::CONFLICT,
             format!("paths overlap branch {other}"),
@@ -2558,7 +2561,10 @@ mod tests {
 
         assert_first_call(&response);
         let job = loaded(&state.pool, JOB).await;
-        assert_eq!(job.manifest.branches["notes"].parent.as_deref(), Some("api"));
+        assert_eq!(
+            job.manifest.branches["notes"].parent.as_deref(),
+            Some("api")
+        );
     }
 
     #[tokio::test]

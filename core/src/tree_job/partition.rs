@@ -121,7 +121,10 @@ mod tests {
     #[test]
     fn fold_small_merges_pieces_under_the_floor_into_a_neighbour() {
         // 10k + 20k are under 30k: they fold together (30k, no longer under the floor); 90k stays.
-        let out = fold_small(pieces(&[("a", 10_000), ("b", 20_000), ("c", 90_000)]), 120_000);
+        let out = fold_small(
+            pieces(&[("a", 10_000), ("b", 20_000), ("c", 90_000)]),
+            120_000,
+        );
         assert_eq!(names(&out), ["a+b", "c"]);
         assert_eq!(out[0].estimate, 30_000);
     }

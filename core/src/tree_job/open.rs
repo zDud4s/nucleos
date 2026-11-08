@@ -1581,8 +1581,12 @@ mod tests {
             .await
             .unwrap();
         let parent_tree = PathBuf::from(parent.worktree.as_deref().unwrap());
-        commit_file(&parent_tree, "from-parent.txt", "parent work
-");
+        commit_file(
+            &parent_tree,
+            "from-parent.txt",
+            "parent work
+",
+        );
         let parent_tip = git(&parent_tree, &["rev-parse", "HEAD"]);
 
         let opened = open_branch(&pool, TREE, "kid", &checkout.config())
