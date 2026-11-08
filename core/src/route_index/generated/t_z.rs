@@ -278,6 +278,13 @@ pub(super) const ROUTES: &[RouteEntry] = &[
     },
     RouteEntry {
         method: "POST",
+        path: "/trees/{id}/abandon",
+        purpose: "Post abandon.",
+        body: Body::Shapeless("AbandonBody"),
+        handler: "post_abandon",
+    },
+    RouteEntry {
+        method: "POST",
         path: "/trees/{id}/branch_start",
         purpose: "Post branch start.",
         body: Body::Shapeless("StartBody"),

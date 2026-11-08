@@ -1,6 +1,6 @@
-import { useState } from "react";
 import { DAEMON_NAME } from "../copy";
 import { Button } from "./Button";
+import { toastManager } from "./toast";
 
 export interface CopyOnceProps {
   /** The secret. Held in the caller's state; this component never fetches it. */
@@ -29,7 +29,6 @@ export interface CopyOnceProps {
  * with a sentence saying to select and copy it by hand.
  */
 export function CopyOnce({ value, label, onDismiss }: CopyOnceProps) {
-  const [copied, setCopied] = useState(false);
   const canCopy =
     typeof navigator !== "undefined" &&
     navigator.clipboard !== undefined &&
@@ -38,11 +37,10 @@ export function CopyOnce({ value, label, onDismiss }: CopyOnceProps) {
   async function handleCopy() {
     try {
       await navigator.clipboard.writeText(value);
-      setCopied(true);
+      toastManager.add({ type: "success", title: "Copied", description: `${label} is on the clipboard.` });
     } catch {
       // A refused clipboard write is not a defect in this component — the
       // field stays selectable either way, which is the whole fallback.
-      setCopied(false);
     }
   }
 
@@ -73,11 +71,6 @@ export function CopyOnce({ value, label, onDismiss }: CopyOnceProps) {
           Dismiss
         </Button>
       </div>
-      {copied && (
-        <p className="ui-copy-once-copied" role="status">
-          Copied.
-        </p>
-      )}
     </div>
   );
 }

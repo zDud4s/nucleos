@@ -121,7 +121,7 @@ describe("ActionsShadowPanel", () => {
     await mount({ verdict: () => Promise.reject(new ApiRefusal(404, "unknown_shadow", "")) });
     const row = (await screen.findByText("tpl_reread")).closest("li") as HTMLElement;
     fireEvent.click(within(row).getByRole("button", { name: "useful" }));
-    expect(await within(row).findByText("The mark was not saved.")).toBeTruthy();
+    expect(await screen.findByText("The mark was not saved.")).toBeTruthy();
     expect(within(row).getByRole("button", { name: "useful" }).getAttribute("aria-pressed")).toBe("false");
   });
 

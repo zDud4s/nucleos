@@ -193,10 +193,10 @@ export function LivePrompt({ prompt, onAnswer, pending = false }: LivePromptProp
     body = (
       <>
         <Field label="Username">
-          <input type="text" value={username} onChange={(e) => setUsername(e.target.value)} disabled={pending} />
+          <input type="text" autoComplete="off" value={username} onChange={(e) => setUsername(e.target.value)} disabled={pending} />
         </Field>
         <Field label="Password">
-          <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} disabled={pending} />
+          <input type="password" autoComplete="off" value={password} onChange={(e) => setPassword(e.target.value)} disabled={pending} />
         </Field>
       </>
     );

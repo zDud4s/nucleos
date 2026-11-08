@@ -601,7 +601,18 @@ impl CommandRunner for ClaudeCliRunner {
             // The CLI's zero is a claim about the turn, and says nothing about the work it left
             // running when the turn ended.
             (None, None, None, None) if !orphaned.is_empty() => -1,
-            (None, None, None, None) => status.and_then(|status| status.code()).unwrap_or(-1),
+            (None, None, None, None) => {
+                let code = status.and_then(|status| status.code());
+                if exits_zero_without_a_result(code, turn_ended, request.steerable) {
+                    stderr_str.push_str(
+                        "\nnucleos: the CLI exited 0 without a `result` event; the turn never \
+                         reported an end, so the run is not recorded as completed\n",
+                    );
+                    -1
+                } else {
+                    code.unwrap_or(-1)
+                }
+            }
         };
 
         // Only when no turn ended: a `result` is the CLI's own account and is never second-guessed,
@@ -624,6 +635,32 @@ impl CommandRunner for ClaudeCliRunner {
             compacted,
             model_requested: init_seen,
         })
+    }
+}
+
+/// Whether a clean exit is not to be believed: the CLI said 0 but never emitted the `result` event
+/// that closes a turn, so the stream was cut short (a crash after flush, a killed pipe). A steerable
+/// run is exempt because its process may legitimately be closed between turns; a cancelled run never
+/// gets here, its future is dropped.
+fn exits_zero_without_a_result(code: Option<i32>, turn_ended: bool, steerable: bool) -> bool {
+    code == Some(0) && !turn_ended && !steerable
+}
+
+#[cfg(test)]
+mod exit_without_result_tests {
+    use super::exits_zero_without_a_result;
+
+    #[test]
+    fn a_zero_exit_with_no_result_is_not_a_success() {
+        assert!(exits_zero_without_a_result(Some(0), false, false));
+    }
+
+    #[test]
+    fn a_result_a_steerable_run_or_a_real_failure_keeps_its_own_code() {
+        assert!(!exits_zero_without_a_result(Some(0), true, false));
+        assert!(!exits_zero_without_a_result(Some(0), false, true));
+        assert!(!exits_zero_without_a_result(Some(1), false, false));
+        assert!(!exits_zero_without_a_result(None, false, false));
     }
 }
 

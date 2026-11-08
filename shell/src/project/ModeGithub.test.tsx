@@ -16,6 +16,11 @@ import { ApiRefusal } from "../data/client";
 import type { DeclarableGitOp } from "../data/project-policy";
 import { ModeGithub } from "./ModeGithub";
 
+/** Text of everything on the toast stack: refusals are toasts, not notes in the page. */
+function toastText(): string {
+  return document.querySelector(".ui-toaster")?.textContent ?? "";
+}
+
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const daemon = vi.hoisted(() => ({ apiFetch: vi.fn(), apiText: vi.fn(), probeHealth: vi.fn() }));
 vi.mock("../data/client", async (original) => ({
@@ -336,14 +341,8 @@ describe("what runs on its own", () => {
     const row = await screen.findByRole("listitem", { name: "operation pr_list" });
     await pressTwice(row, "grant", "grant without asking · pr_list");
 
-    await waitFor(() =>
-      expect(
-        screen.getByRole("listitem", { name: "operation pr_list" }).querySelector(".ui-note-refusal"),
-      ).not.toBeNull(),
-    );
-    expect(screen.getByRole("listitem", { name: "operation pr_list" }).textContent).toContain(
-      "kill_switch",
-    );
+    // The refusal is a toast now, so the row keeps its footprint.
+    await waitFor(() => expect(toastText()).toContain("kill_switch"));
     expect(
       screen.getByRole("listitem", { name: "operation run_list" }).querySelector(".ui-note-refusal"),
     ).toBeNull();
@@ -660,7 +659,7 @@ describe("what the worktrees may run", () => {
     fireEvent.change(box, { target: { value: "bash scripts/gates.sh" } });
     await pressTwice(document.body, "allow it here", "allow without asking · bash scripts/gates.sh");
 
-    const note = (await screen.findByText(/is not blocked/i)).closest(".ui-note-refusal") as HTMLElement;
+    const note = (await screen.findByText(/is not blocked/i)).closest(".ui-toast") as HTMLElement;
     expect(note.textContent).toContain("kill_switch");
     expect(note.textContent).toMatch(/is not blocked/i);
     expect(note.textContent).toContain("narrowing");
@@ -1166,11 +1165,12 @@ describe("the remote", () => {
     });
 
     const section = await remote();
-    expect(section.textContent).toContain("no github token is stored");
-    expect(section.textContent).toMatch(/Credential Manager/i);
+    expect(toastText()).toContain("no github token is stored");
+    expect(toastText()).toMatch(/Credential Manager/i);
     // Both panels say it. One that stayed blank while the other explained would be the empty panel
     // this rule forbids, in half the section.
-    expect(section.querySelectorAll(".ui-note-refusal")).toHaveLength(2);
+    // Both panels' refusals are the same, so they are one toast, not two.
+    expect(document.querySelectorAll(".ui-toast")).toHaveLength(1);
     expect(section.querySelectorAll("pre")).toHaveLength(0);
   });
 
@@ -1191,9 +1191,9 @@ describe("the remote", () => {
       },
     });
 
-    const section = await remote();
-    expect(section.textContent).toContain("gh is not on this machine's PATH");
-    expect(section.textContent).toMatch(/~\/\.nucleos\/github\.yaml/);
+    await remote();
+    expect(toastText()).toContain("gh is not on this machine's PATH");
+    expect(toastText()).toMatch(/~\/\.nucleos\/github\.yaml/);
   });
 
   /**
@@ -1216,9 +1216,9 @@ describe("the remote", () => {
       },
     });
 
-    const section = await remote();
-    expect(section.textContent).toContain("the github task did not finish");
-    expect(section.textContent).not.toContain("error of its own handling this");
+    await remote();
+    expect(toastText()).toContain("the github task did not finish");
+    expect(toastText()).not.toContain("error of its own handling this");
   });
 
   /**
@@ -1271,8 +1271,8 @@ describe("the remote", () => {
   it("explains a project the núcleo does not have", async () => {
     open({ githubRepo: null });
 
-    const section = await remote();
-    expect(section.textContent).toMatch(/no project by this name/i);
+    await remote();
+    expect(toastText()).toMatch(/no project by this name/i);
   });
 
   /**
@@ -1319,8 +1319,8 @@ describe("the page as a whole", () => {
     ]) {
       const section = await screen.findByRole("region", { name: label });
       await waitFor(() => expect(section.textContent ?? "").not.toMatch(/Reading/i));
-      expect(section.querySelector(".ui-note-refusal")).not.toBeNull();
     }
+    expect(toastText()).toMatch(/internal/);
   });
 
   /**

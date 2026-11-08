@@ -122,16 +122,10 @@ async fn sweep_one(
         )
     {
         let run_id = run_id.expect("daemon runs have ids");
-        if matches!(verdict, Veredicto::Dead) {
-            // Through the terminator first: it aborts the task (and with it the CLI tree) if a
-            // handle turned up since the observation. Dead is only declared with no live pid,
-            // so the bare write below is for the handle-less row the terminator cannot reach.
-            if !finalize_termination(state, run_id, "cancelled").await {
-                sqlx::query("UPDATE runs SET status = 'cancelled', completed_at = ? WHERE id = ? AND status = 'running'")
-                    .bind(now.to_rfc3339()).bind(run_id).execute(&state.pool).await?;
-            }
-        } else {
-            finalize_termination(state, run_id, "cancelled").await;
+        // Through the terminator first: it aborts the task (and with it the CLI tree) if the run
+        // still has a handle. Without one it does nothing, and the row is ended here instead.
+        if !finalize_termination(state, run_id, "cancelled").await {
+            cancel_handleless_run(state, run_id, now).await?;
         }
         report.cancelled.push(run_id);
         if let Some(node_id) = node_id {
@@ -149,6 +143,38 @@ async fn sweep_one(
             }
         }
     }
+    Ok(())
+}
+
+/// Ends a run the terminator could not reach because it has no `run_handles` entry. A `Stalled` or
+/// `SilentSinceStart` run can still have a live CLI (it is what kept it from reading as `Dead`), and
+/// a `cancelled` row under a working CLI is incoherent: every hook it calls then answers 401. So the
+/// registered CLI is taken down first, then the row is written. `Dead` is only declared with no live
+/// pid, so for it the kill finds nothing and only the write happens.
+async fn cancel_handleless_run(
+    state: &AppState,
+    run_id: i64,
+    now: DateTime<Utc>,
+) -> sqlx::Result<()> {
+    // `pid_of` is cleared when the CLI's `Child` is reaped, so a pid it still returns has not been
+    // reissued to some other process.
+    if let Some(pid) = crate::execution::runner::cli_pids::pid_of(run_id)
+        .filter(|pid| crate::process_tree::pid_alive(*pid))
+    {
+        tracing::warn!(
+            run_id,
+            pid,
+            "liveness sweep is killing the CLI of a run with no handle"
+        );
+        crate::process_tree::TreeKiller::new(pid).kill_now();
+    }
+    sqlx::query(
+        "UPDATE runs SET status = 'cancelled', completed_at = ? WHERE id = ? AND status = 'running'",
+    )
+    .bind(now.to_rfc3339())
+    .bind(run_id)
+    .execute(&state.pool)
+    .await?;
     Ok(())
 }
 
@@ -1091,6 +1117,51 @@ mod tests {
         assert_eq!(report.marked_nodes, ["n1"]);
         assert_failed_naming(&state, "n1", "dead").await;
         assert_eq!(rows(&state, "session_dead", &run_key(id)).await, 1);
+    }
+
+    /// A stalled run whose handle is gone (its CLI may still be registered) used to be reported
+    /// as cancelled while its row stayed `running`.
+    #[tokio::test]
+    async fn daemon_run_stalled_without_a_handle_ends_cancelled() {
+        let state = state().await;
+        let now = Utc::now();
+        let id = seed_run(&state, "running", now - minutes(60)).await;
+        seed_node(&state, "n1", "leaf", "running", Some(id)).await;
+        assert!(!has_handle(&state, id), "no handle: the case under test");
+
+        let report = tick(
+            &state,
+            &[daemon(id, Some("n1"), stalled_obs(now))],
+            &limits(),
+            now,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.cancelled, [id]);
+        assert_eq!(run_status(&state, id).await, "cancelled");
+        assert_failed_naming(&state, "n1", "stalled").await;
+    }
+
+    #[tokio::test]
+    async fn daemon_run_silent_without_a_handle_ends_cancelled() {
+        let state = state().await;
+        let now = Utc::now();
+        let id = seed_run(&state, "running", now - minutes(60)).await;
+        seed_node(&state, "n1", "leaf", "running", Some(id)).await;
+
+        let report = tick(
+            &state,
+            &[daemon(id, Some("n1"), silent_obs(now))],
+            &limits(),
+            now,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.cancelled, [id]);
+        assert_eq!(run_status(&state, id).await, "cancelled");
+        assert_failed_naming(&state, "n1", "silent").await;
     }
 
     /// A dialog can still be answered, so this one is a warning and not a kill.

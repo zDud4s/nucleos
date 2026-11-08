@@ -57,6 +57,29 @@ class StaleMutexBreakTest(unittest.TestCase):
         self.assertTrue((self.dir / ".mutex").exists(), "a live mutex was deleted")
         first.release()
 
+    def test_an_old_mutex_with_a_live_owner_is_not_stale(self):
+        # A slow but live owner must keep the mutex however old the dir is.
+        import os
+        mutex_dir = self.dir / ".mutex"
+        mutex_dir.mkdir()
+        _, ctime = heavy.proc_identity(os.getpid())
+        (mutex_dir / "owner").write_text(json.dumps({"pid": os.getpid(), "ctime": ctime}))
+        old = time.time() - 10 * heavy.MUTEX_STALE_S
+        os.utime(mutex_dir, (old, old))
+        waiter = heavy.Mutex(self.dir, timeout=5)
+        heavy._MUTEX_HELD.add(str(mutex_dir))
+        try:
+            self.assertFalse(waiter._stale())
+        finally:
+            heavy._MUTEX_HELD.discard(str(mutex_dir))
+
+    def test_an_old_mutex_with_a_dead_owner_is_stale(self):
+        import os
+        self.leave_dead()
+        old = time.time() - 10 * heavy.MUTEX_STALE_S
+        os.utime(self.dir / ".mutex", (old, old))
+        self.assertTrue(heavy.Mutex(self.dir, timeout=5)._stale())
+
     def test_concurrent_waiters_never_both_hold(self):
         self.leave_dead()
         lock = threading.Lock()

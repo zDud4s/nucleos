@@ -560,7 +560,7 @@ describe("Agents - a delete answering 409", () => {
     fireEvent.click(within(editor).getByRole("button", { name: /Delete director/ }));
 
     expect(
-      await within(editor).findByText(
+      await screen.findByText(
         "this agent directs or belongs to a team, or is holding an item of a team run or of a job",
       ),
     ).toBeDefined();
@@ -651,7 +651,7 @@ describe("Agents - the route", () => {
     expect(within(editor).getAllByRole("button", { name: "Close" }).length).toBeGreaterThan(0);
   });
 
-  it("says why Save is off, and says Saved once the daemon answered", async () => {
+  it("says why Save is off, and toasts Agent saved once the daemon answered", async () => {
     daemon.apiFetch.mockImplementation(agentsFetch([agent()]));
     renderWithQuery(<Agents />);
 
@@ -662,7 +662,8 @@ describe("Agents - the route", () => {
 
     fireEvent.change(within(editor).getByLabelText("Name"), { target: { value: "copywriter two" } });
     fireEvent.click(within(editor).getByRole("button", { name: "Save changes" }));
-    expect(await within(editor).findByText("Saved")).toBeDefined();
+    expect(await screen.findByText("Agent saved")).toBeDefined();
+    expect(within(editor).queryByText("Saved")).toBeNull();
   });
 
   it("keeps the Model hint attached to the field instead of replacing its name", async () => {

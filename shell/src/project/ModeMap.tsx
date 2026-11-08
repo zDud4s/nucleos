@@ -161,11 +161,8 @@ export function ModeMap({ projectId }: ModeMapProps) {
       ) : view === "states" ? (
         <StatesView projectId={projectId} />
       ) : map.isError && map.data === undefined ? (
-        <ErrorNote>
-          The {DAEMON_NAME} could not read this project&rsquo;s map: its folder may have moved.{" "}
-          <Button variant="quiet" onClick={readAgain} disabled={map.isFetching}>
-            {map.isFetching ? "reading…" : "read it again"}
-          </Button>
+        <ErrorNote onRetry={readAgain} retryLabel="read it again">
+          The {DAEMON_NAME} could not read this project&rsquo;s map: its folder may have moved.
         </ErrorNote>
       ) : map.data === undefined || atlas === undefined ? (
         <p className="text-sm text-text-faint">Reading the project&rsquo;s tree…</p>

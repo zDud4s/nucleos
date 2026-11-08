@@ -418,3 +418,10 @@
   font-size: var(--text-sm);
   color: var(--text-muted);
 }
+
+/* #16: counters, durations, costs and figures stand in columns. */
+.agents-figure,
+.agents-standing,
+.agents-changed {
+  font-variant-numeric: tabular-nums;
+}

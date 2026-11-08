@@ -87,8 +87,7 @@ describe("AgentControlBar", () => {
     mocks.embeddedOwner.mockRejectedValue(new ApiRefusal(409, "pillar_off", ""));
     render(bar());
     fireEvent.click(screen.getByRole("button", { name: "Take control" }));
-    const note = await screen.findByRole("status");
-    expect(note.textContent).toBe("Could not take control (pillar is off)");
+    expect(await screen.findByText("Could not take control (pillar is off)")).toBeTruthy();
     expect(screen.getByText("Agent is driving")).toBeTruthy();
   });
 
@@ -96,7 +95,7 @@ describe("AgentControlBar", () => {
     mocks.embeddedOwner.mockRejectedValue(new ApiRefusal(404, "not_found", ""));
     render(bar());
     fireEvent.click(screen.getByRole("button", { name: "Take control" }));
-    expect((await screen.findByRole("status")).textContent).toBe("Session is gone");
+    expect(await screen.findByText("Session is gone")).toBeTruthy();
   });
 
   it("calls back to open the tab in my tabs", async () => {

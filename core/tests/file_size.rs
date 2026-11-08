@@ -28,13 +28,24 @@ fn code_lines(source: &str) -> usize {
     let lines: Vec<&str> = source.lines().collect();
     let mut count = 0;
     let mut in_block = false;
+    // While inside an inline test module: the closing line is the first `}` at the module's own
+    // indentation (rustfmt's layout), so code after a mid-file test module is still counted.
+    let mut in_tests: Option<usize> = None;
     for (at, line) in lines.iter().enumerate() {
         let line = line.trim_end_matches('\r');
+        if let Some(indent) = in_tests {
+            let closes = line.trim() == "}" && line.len() - line.trim_start().len() == indent;
+            if closes {
+                in_tests = None;
+            }
+            continue;
+        }
         let opens_tests = lines
             .get(at + 1)
             .is_some_and(|next| opens_module(next) && !declares_module(next.trim()));
-        if line == "#[cfg(test)]" && opens_tests {
-            break;
+        if line.trim() == "#[cfg(test)]" && opens_tests {
+            in_tests = Some(line.len() - line.trim_start().len());
+            continue;
         }
         let text = line.trim();
         if in_block {
@@ -208,6 +219,23 @@ pub(crate) mod tests {
     // `use`, `fn a() {`, `*value = 1;`, `}`, `#[cfg(test)]`, `fn helper() {}`. The two module
     // declarations, and the attribute over one of them, are not code.
     assert_eq!(code_lines(source), 6);
+}
+
+#[test]
+fn code_after_a_mid_file_test_module_is_counted() {
+    let source = "\
+fn a() {}
+
+#[cfg(test)]
+mod tests {
+    fn not_counted() {
+        let x = 1;
+    }
+}
+
+fn b() {}
+";
+    assert_eq!(code_lines(source), 2);
 }
 
 #[test]

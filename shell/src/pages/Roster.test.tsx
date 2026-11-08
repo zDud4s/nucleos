@@ -348,7 +348,7 @@ describe("the roster", () => {
     expect(screen.queryByRole("status", { name: /Loading the projects/ })).toBeNull();
     answering = true;
     await act(async () => {
-      within(alert.closest("p") as HTMLElement).getByRole("button", { name: "Retry" }).click();
+      within(alert.closest(".ui-toast") as HTMLElement).getByRole("button", { name: "Retry" }).click();
     });
     expect(await screen.findByRole("heading", { name: /no project has been registered/i })).toBeTruthy();
   });

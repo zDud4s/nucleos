@@ -669,8 +669,9 @@ describe("Browser - opening a window yourself", () => {
       url: "https://jira.example.com",
       agent: true,
     });
-    const link = screen.getByRole("link", { name: "open its conversation" }) as HTMLAnchorElement;
-    expect(link.getAttribute("href")).toBe("/chats/c-web");
+    // A toast action and not an inline link: the result must not shift the page.
+    expect(screen.queryByRole("link", { name: /open its conversation/i })).toBeNull();
+    expect(screen.getByRole("button", { name: "Open conversation" })).toBeTruthy();
   });
 
   it("says when the agent's window opened in a throwaway, and how to bring the project's login into it", async () => {
@@ -692,7 +693,8 @@ describe("Browser - opening a window yourself", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "Open with agent" }));
 
-    expect(await screen.findByText(/opened session #13 with the agent in a throwaway profile/i)).toBeTruthy();
+    expect(await screen.findByText(/opened session #13 with the agent/i)).toBeTruthy();
+    expect(screen.getByText(/in a throwaway profile/i)).toBeTruthy();
     expect(screen.getByText(/log in with Open a window and keep the site first/i)).toBeTruthy();
   });
 

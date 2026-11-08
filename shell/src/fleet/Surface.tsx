@@ -77,6 +77,7 @@ export function FleetCanvas(props: FleetCanvasProps) {
  * frames what is alive once, and Follow (off by default) centers the node that spoke last.
  */
 function Surface({ project, onlyActive, expanded, follow, fitSignal }: FleetCanvasProps) {
+  "use no memo"; // same reason as `FleetScreen`: `version` is only a dependency of the layout memo
   const store = useFleetStore();
   const ui = useFleetUi();
   const version = useLayoutVersion();

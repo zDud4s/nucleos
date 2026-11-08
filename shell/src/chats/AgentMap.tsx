@@ -8,6 +8,7 @@ import { Modal } from "../ui/Modal";
 import { Button } from "../ui/Button";
 import { Quiet } from "../ui/Quiet";
 import { tokenCount } from "../ui/readings";
+import { toastManager } from "../ui/toast";
 import { cacheState, leftText } from "./cache";
 import { AccountChip } from "./AccountChip";
 
@@ -327,16 +328,20 @@ function StopAgent({ chatId, card }: { chatId: string; card: AgentCard }) {
             : "stop this agent; the turn and the other agents go on"
         }
         onClick={() => {
-          if (taskId !== undefined) stop.mutate(taskId);
+          if (taskId !== undefined)
+            stop.mutate(taskId, {
+              onError: () =>
+                toastManager.add({
+                  type: "error",
+                  title: "Could not stop the agent",
+                  description: "The turn is no longer running, so nothing was there to stop it.",
+                  dedupeKey: `agent-stop:${taskId}`,
+                }),
+            });
         }}
       >
         {stop.isSuccess ? "Stopping…" : "Stop agent"}
       </Button>
-      {stop.isError && (
-        <p className="agent-stop-error" role="status">
-          the turn is no longer running, so nothing was there to stop it
-        </p>
-      )}
     </>
   );
 }

@@ -74,3 +74,20 @@ withObserver.ResizeObserver ??= NoLayoutResizeObserver as unknown as typeof Resi
 if (typeof Element !== "undefined") {
   delete (Element.prototype as { animate?: unknown }).animate;
 }
+
+// Errors and refusals are toasts now. A Toaster is mounted for every test so assertions on their
+// text still find it; the store is emptied between tests so a toast cannot leak or dedupe across.
+if (typeof document !== "undefined") {
+  const { act, createElement } = await import("react");
+  const { createRoot } = await import("react-dom/client");
+  const { Toaster, toastManager } = await import("./ui/toast");
+  const host = document.createElement("div");
+  host.setAttribute("data-test-toaster", "");
+  document.body.appendChild(host);
+  (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+  act(() => createRoot(host).render(createElement(Toaster)));
+  afterEach(() => {
+    act(() => toastManager.clear());
+    if (!host.isConnected) document.body.appendChild(host);
+  });
+}

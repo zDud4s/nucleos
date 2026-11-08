@@ -15,6 +15,7 @@ import { FeedEmbed } from "../app/FeedEmbed";
 import { DAEMON_NAME } from "../copy";
 import { plural } from "../lib/plural";
 import { isApiRefusal, type ApiRefusal } from "../data/client";
+import { daemonProse } from "../team/prose";
 import {
   READINESS_MIN_AGREE_PERCENT,
   READINESS_MIN_REVIEWED,
@@ -69,7 +70,12 @@ import {
   Th,
   readState,
   usd,
+  usePaletteGroup,
 } from "../ui";
+import { apiFetch } from "../data/client";
+import { keys } from "../data/keys";
+import { newIdempotencyKey } from "../lib/idempotency";
+import { registerPrefetcher } from "../lib/prefetch";
 import { whereWaiting } from "../data/roster";
 import {
   EASE,
@@ -116,6 +122,11 @@ const SECTIONS = [
   { id: "ap-records", label: "Records and feed" },
 ];
 const SECTION_IDS = SECTIONS.map((section) => section.id);
+
+// Hovering the rail link warms the roster the whole page is built from (#7).
+registerPrefetcher("/autopilot", (qc) =>
+  qc.prefetchQuery({ queryKey: keys.projects.all, queryFn: () => apiFetch<ProjectSummary[]>("/projects"), staleTime: 5_000 }),
+);
 
 /**
  * The section the reader is in: the first group, in page order, whose box crosses the top 40% of
@@ -217,6 +228,30 @@ export function Autopilot() {
 
   const stale = projects.isError && projects.data !== undefined;
 
+  // Palette actions (#3/#4): jump to a section, or put a project in focus.
+  const paletteGroup = useMemo(
+    () => ({
+      id: "autopilot",
+      heading: "Autopilot",
+      items: [
+        ...SECTIONS.map((section) => ({
+          id: `autopilot.section.${section.id}`,
+          label: `Go to ${section.label}`,
+          match: `autopilot go to ${section.label}`,
+          run: () => document.getElementById(section.id)?.scrollIntoView({ block: "start" }),
+        })),
+        ...order.map((id) => ({
+          id: `autopilot.project.${id}`,
+          label: `Focus project ${id}`,
+          match: `autopilot focus project ${id}`,
+          run: () => setChosen(id),
+        })),
+      ],
+    }),
+    [order],
+  );
+  usePaletteGroup(paletteGroup);
+
   return (
     <>
       {/* Always the span, even before the roster answers: the box is two lines tall from the
@@ -304,21 +339,6 @@ function RosterError({ error }: { error: unknown }) {
       Could not reach the {DAEMON_NAME}: nothing is known about the roster.
     </ErrorNote>
   );
-}
-
-/**
- * The daemon's own sentence, when it really sent one.
- *
- * `client.ts` falls back to `statusText` for a refusal with an empty body, so a
- * bare 422 arrives carrying the words "Unprocessable Entity" — the code spelled
- * with capital letters, explaining nothing. Four words is the line between a
- * status word and a sentence somebody wrote on purpose.
- */
-function daemonProse(refusal: ApiRefusal): Record<string, string> {
-  const detail = refusal.detail.trim();
-  if (detail === "" || detail === refusal.code) return {};
-  if (detail.split(/\s+/).length < 4) return {};
-  return { [refusal.code]: detail };
 }
 
 /* ---------------------------------------------------------------- banners -- */
@@ -830,7 +850,8 @@ function ProjectCarousel({
           </p>
         </Teach>
       )}
-      {!answered && <Skeleton label="Reading the roster" lines={3} />}
+      {/* The fan stage's own height (card + its room), so the cards drop in without a jump. */}
+      {!answered && <RosterSkeleton />}
       {focused !== undefined && (
         <>
           {/* The setting leads, in the document and on the screen: project, mode, switch. The fan
@@ -1388,7 +1409,13 @@ function ShadowReviewPanel({
       {projectId !== null &&
         !decisions.isError &&
         decisions.data === undefined && (
-          <Skeleton label="Reading the shadow decisions" lines={3} />
+          <Skeleton
+            label="Reading the shadow decisions"
+            variant="cards"
+            count={2}
+            gridClassName="ap-list"
+            height="13rem"
+          />
         )}
       {rows.length > 0 && (
         <ul className="ap-list" aria-label="Shadow decisions">
@@ -1546,7 +1573,7 @@ function ScoreboardPanel({
       {projectId !== null &&
         !scoreboard.isError &&
         scoreboard.data === undefined && (
-          <Skeleton label="Reading the scoreboard" lines={3} />
+          <Skeleton label="Reading the scoreboard" variant="table" count={4} columns={8} />
         )}
       {evidence.length > 0 && (
         <TallyTable label="Shadow evidence" rows={evidence} projectMode={project?.mode} />
@@ -1776,9 +1803,8 @@ function TriggerKills() {
       {kills.isError && kills.data === undefined && (
         <ListError error={kills.error} what="the trigger brakes" />
       )}
-      {!kills.isError && kills.data === undefined && (
-        <Skeleton label="Reading the trigger brakes" lines={2} />
-      )}
+      {/* No skeleton: the rows below are fixed (the scopes are a constant) and already hold their
+          place, with the buttons disabled until the read lands. A bar above them only shifted them. */}
       <Rows label="Trigger brakes">
         {TRIGGER_SCOPES.map((scope) => {
           const engaged = scopeEngaged(kills.data, "trigger", scope.id);
@@ -1830,6 +1856,32 @@ function TriggerKills() {
 
 /* ---------------------------------------------------------------- the work -- */
 
+/**
+ * The roster section while it is read, in the loaded layout's own grid: the setting on the left
+ * (title, gate sentence, mode switch, the note, the spend bar), the fan's stage beside it, the
+ * roster list under both. Same classes as the real thing, so nothing moves when the data lands.
+ */
+function RosterSkeleton() {
+  return (
+    <>
+      <div className="ap-fan-control">
+        <Skeleton label="Reading the roster" variant="line" width="45%" />
+        <Skeleton label="Reading the gate" lines={2} />
+        <Skeleton label="Reading the mode" variant="block" height="2.75rem" />
+        <Skeleton label="Reading the note" lines={4} />
+      </div>
+      <div className="ap-fan-view">
+        <div className="ap-fan-pane">
+          <Skeleton label="Reading the fan" variant="block" height="calc(316px + 4rem)" />
+          <Skeleton label="Reading the fan hint" variant="line" width="60%" />
+        </div>
+      </div>
+      <Skeleton label="Reading the roster list" variant="row" count={4} height="1.9rem" />
+      <Skeleton label="Reading the spend" variant="block" height="2.5rem" />
+    </>
+  );
+}
+
 function JobsPanel({
   rows,
   selected,
@@ -1840,6 +1892,9 @@ function JobsPanel({
   const jobs = useLiveJobs();
   const create = useCreateJob();
   const [prompt, setPrompt] = useState("");
+  // One key per intent (#19): minted on the first click, reused by a retry after a failure, so a
+  // request that did land but whose answer was lost cannot start the job twice. Cleared on success.
+  const intentKey = useRef<string | null>(null);
   const live = jobs.data ?? [];
 
   const target = rows.find((row) => row.project_id === selected);
@@ -1851,6 +1906,10 @@ function JobsPanel({
   return (
     <Panel title="Jobs in flight" aside={<Count n={jobs.data?.length} />}>
       {jobs.isError && jobs.data === undefined && <ListError error={jobs.error} what="the jobs" />}
+      {!jobs.isError && jobs.data === undefined && (
+        // The shape of a job row: id and state on one line, the round under it, the actions last.
+        <Skeleton label="Reading the jobs" variant="cards" count={1} gridClassName="ap-list" height="5.75rem" />
+      )}
       {jobs.data !== undefined && live.length === 0 && <Quiet says="Nothing is running. Start one below." />}
       {live.length > 0 && (
         <ul className="ap-list" aria-label="Jobs in flight">
@@ -1869,7 +1928,11 @@ function JobsPanel({
           className="ap-field-input"
           rows={2}
           value={prompt}
-          onChange={(event) => setPrompt(event.target.value)}
+          onChange={(event) => {
+            // Editing the prompt is a new intent, so it gets a new key.
+            intentKey.current = null;
+            setPrompt(event.target.value);
+          }}
         />
         {/* Said before the click rather than after the 409, and right above the control it
             explains. A project that is off starts nothing, and one whose queue is full defers
@@ -1895,9 +1958,11 @@ function JobsPanel({
           intent="go"
           disabled={blocked || prompt.trim() === "" || create.isPending}
           onClick={() => {
-            if (selected === null) return;
+            if (selected === null || create.isPending) return;
+            intentKey.current ??= newIdempotencyKey();
             create.mutate(
               {
+                idempotencyKey: intentKey.current,
                 project_id: selected,
                 prompt: prompt.trim(),
                 budget_usd: null,
@@ -1908,7 +1973,12 @@ function JobsPanel({
                 // always started.
                 team_id: null,
               },
-              { onSuccess: () => setPrompt("") },
+              {
+                onSuccess: () => {
+                  intentKey.current = null;
+                  setPrompt("");
+                },
+              },
             );
           }}
         >

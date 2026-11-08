@@ -41,12 +41,53 @@ pub async fn run_resolution_loop(state: AppState) {
     let mut refused = std::collections::HashSet::new();
     loop {
         interval.tick().await;
+        // Steps that only read and then write one self-contained row are bounded, so a wedged one
+        // costs its own tick and not the loop. `cancel_settled` (aborts a run, then writes the
+        // feed), `launch_once` (mints a run row and spawns an agent) and `land_finished` (enqueues
+        // a vcs request across several statements) are NOT wrapped: dropping their future at an
+        // await point could leave a half-cancelled run, a run row without its agent, or a
+        // half-landed request. They keep their own inner deadlines.
         cancel_settled(&state).await;
-        release_unfinished(&state.pool).await;
+        step_with_timeout("release_unfinished", release_unfinished(&state.pool)).await;
         launch_once(&state).await;
         land_finished(&state.pool, &mut refused).await;
-        record_discards(&state.pool).await;
-        settle_moot(&state.pool).await;
+        step_with_timeout("record_discards", record_discards(&state.pool)).await;
+        step_with_timeout("settle_moot", settle_moot(&state.pool)).await;
+    }
+}
+
+/// Longest one bounded step of a tick may run before it is abandoned until the next tick.
+const STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// Runs one step under `STEP_TIMEOUT`, saying which step wedged if it does.
+async fn step_with_timeout<T>(name: &str, step: impl std::future::Future<Output = T>) -> Option<T> {
+    match tokio::time::timeout(STEP_TIMEOUT, step).await {
+        Ok(out) => Some(out),
+        Err(_) => {
+            tracing::warn!(
+                step = name,
+                "resolver: step timed out and was abandoned until the next tick"
+            );
+            None
+        }
+    }
+}
+
+/// What the kill-switch read allows the launcher to do.
+#[derive(Debug, PartialEq, Eq)]
+enum SwitchReading {
+    Clear,
+    Engaged,
+    Unreadable(String),
+}
+
+/// Keeps "engaged" and "could not be read" apart: both stop the launch (fail closed), but only
+/// the first is a statement about the switch.
+fn read_switch(read: sqlx::Result<bool>) -> SwitchReading {
+    match read {
+        Ok(false) => SwitchReading::Clear,
+        Ok(true) => SwitchReading::Engaged,
+        Err(error) => SwitchReading::Unreadable(error.to_string()),
     }
 }
 
@@ -351,16 +392,18 @@ async fn cancel_settled(state: &AppState) {
 async fn launch_once(state: &AppState) -> Option<i64> {
     // The emergency stop, and it has no exemptions — `runs::create_run` makes the same argument at
     // its own door. Fails closed: a switch that cannot be read stops runs rather than starting them.
-    if crate::governance::autopilot::kill_switch_engaged(&state.pool)
-        .await
-        .unwrap_or(true)
-    {
-        // Said once per tick at info: a silent skip looked like the resolver being broken when
-        // conflicts sat unattempted behind an engaged switch.
-        tracing::info!(
-            "resolver: kill switch engaged (or unreadable); no conflict resolution started"
-        );
-        return None;
+    match read_switch(crate::governance::autopilot::kill_switch_engaged(&state.pool).await) {
+        SwitchReading::Clear => {}
+        SwitchReading::Engaged => {
+            // Said once per tick at info: a silent skip looked like the resolver being broken when
+            // conflicts sat unattempted behind an engaged switch.
+            tracing::info!("resolver: kill switch engaged; no conflict resolution started");
+            return None;
+        }
+        SwitchReading::Unreadable(error) => {
+            tracing::warn!(%error, "resolver: could not read the kill switch; skipping this tick");
+            return None;
+        }
     }
     // A resolution costs an agent, so it is spend, and spend is what the budget governs.
     //
@@ -1219,6 +1262,24 @@ mod tests {
 
     async fn test_pool() -> sqlx::SqlitePool {
         crate::testdb::fresh_pool().await
+    }
+
+    #[test]
+    fn kill_switch_read_error_is_not_reported_as_engaged() {
+        assert_eq!(read_switch(Ok(false)), SwitchReading::Clear);
+        assert_eq!(read_switch(Ok(true)), SwitchReading::Engaged);
+        let unreadable = read_switch(Err(sqlx::Error::PoolTimedOut));
+        assert!(
+            matches!(unreadable, SwitchReading::Unreadable(_)),
+            "a read error must fail closed without claiming the switch is engaged: {unreadable:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wedged_step_is_abandoned_after_the_step_timeout() {
+        let out = step_with_timeout("wedged", std::future::pending::<()>()).await;
+        assert!(out.is_none());
+        assert_eq!(step_with_timeout("fine", async { 7 }).await, Some(7));
     }
 
     async fn escalated_merge(pool: &sqlx::SqlitePool, from_resolution: bool) -> i64 {

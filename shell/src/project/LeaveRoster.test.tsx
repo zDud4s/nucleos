@@ -173,7 +173,7 @@ describe("leaving the roster, from inside the project", () => {
 
     const panel = await openRemove("busy");
     fireEvent.click(panel.getByRole("button", { name: "remove" }));
-    expect(await panel.findByText(/work is still in flight here/)).toBeTruthy();
+    expect(await screen.findByText(/work is still in flight here/)).toBeTruthy();
     expect(rendered.router.state.location.pathname).toBe("/projects/busy/state");
   });
 

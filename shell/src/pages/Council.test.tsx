@@ -611,6 +611,32 @@ describe("Council - refusals convening meets", () => {
     ).toBeDefined();
   });
 
+  it("sends one Idempotency-Key per Convene and reuses it on a retry after a refusal (#19)", async () => {
+    daemon.apiFetch.mockImplementation(
+      councilFetch([], {}, {
+        onCreate: () => {
+          throw new ApiRefusal(503, "unavailable", "no council is configured");
+        },
+      }),
+    );
+
+    await renderCouncil("/council");
+    fireEvent.change(await screen.findByLabelText("Question"), { target: { value: "well?" } });
+    await conveneWhenReady();
+    await screen.findByText(/no council is configured/);
+    await conveneWhenReady();
+
+    await waitFor(() => {
+      const posts = daemon.apiFetch.mock.calls.filter(
+        ([path, init]) => path === "/council" && (init as RequestInit | undefined)?.method === "POST",
+      );
+      expect(posts).toHaveLength(2);
+      const keys = posts.map(([, init]) => new Headers((init as RequestInit).headers).get("Idempotency-Key"));
+      expect(keys[0]).toBeTruthy();
+      expect(keys[1]).toBe(keys[0]);
+    });
+  });
+
   it("tells the reader where the roster lives, and it is not inside the repository", async () => {
     daemon.apiFetch.mockImplementation(councilFetch([], {}));
 
@@ -730,7 +756,7 @@ describe("Council - a chairman that failed", () => {
     // The picture is aria-hidden, so the judge's state is read off the drawing itself.
     expect(screen.getByRole("button", { name: /^Chairman,/ })).toBeDefined();
     expect(document.querySelector(".council-court-judge")?.getAttribute("data-state")).toBe("failed");
-    expect(await within(dossier()).findByText(/ended in timeout/)).toBeDefined();
+    expect(await screen.findByText(/ended in timeout/)).toBeDefined();
     // The seats' own answers are still on the record.
     await openTheRecord();
     expect(await screen.findByRole("list", { name: "Seats" })).toBeDefined();

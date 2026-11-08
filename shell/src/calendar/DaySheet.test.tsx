@@ -308,15 +308,15 @@ describe("the draft form", () => {
     expect((seen["POST /calendar/events"] as Record<string, unknown>).starts_at_local).toBe("2026-08-20T09:05:00");
   });
 
-  it("confirms by title and time, never by id, and clears the line when the title is edited", async () => {
+  it("confirms by title and time, never by id, in a toast and not inline", async () => {
     renderWithQuery(<DraftEventForm slot={{ day: new Date(2026, 7, 20), hour: null }} config={CONFIG} />);
 
     fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Coffee" } });
     fireEvent.click(screen.getByRole("button", { name: "Add to calendar" }));
 
-    expect(await screen.findByText("Added: Coffee at 09:00")).toBeDefined();
-    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "T" } });
-    expect(screen.queryByText(/^Added:/)).toBeNull();
+    const toast = await screen.findByText("Coffee at 09:00");
+    expect(toast.closest(".ui-toast")).not.toBeNull();
+    expect(screen.getByRole("status").textContent).toContain("Event added");
   });
 
   it("says why the button is grey when the duration is empty", () => {

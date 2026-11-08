@@ -2,7 +2,7 @@ import { Link } from "@tanstack/react-router";
 import { DAEMON_NAME } from "../copy";
 import { isApiRefusal } from "../data/client";
 import { useRecentFeed, type FeedEntry } from "../data/feed";
-import { ErrorNote, Panel, Quiet, RefusalNote, RelativeTime } from "../ui";
+import { ErrorNote, Panel, Quiet, RefusalNote, RelativeTime, Skeleton } from "../ui";
 import { KindBadge } from "../pages/Feed";
 /*
   The rules this block is drawn with are `ap-` and live in `pages/autopilot.css`, where
@@ -50,6 +50,10 @@ export function FeedEmbed({ lines = EMBED_LINES }: FeedEmbedProps) {
       }
     >
       {feed.isError && feed.data === undefined && <FeedError error={feed.error} />}
+      {/* One row per line the block will show, at a feed line's pitch (~2.3rem), so the card keeps its height. */}
+      {feed.data === undefined && !feed.isError && (
+        <Skeleton label="Reading the feed" variant="row" count={lines} height="2.3rem" />
+      )}
       {feed.data !== undefined && rows.length === 0 && (
         <Quiet compact says={`the ${DAEMON_NAME} has not written a line yet.`} />
       )}

@@ -362,6 +362,14 @@
 }
 
 /* Sender and time under the heading: facts, not a panel. */
+/* Counters, times and sizes hold one width as they change (#16). */
+.mail-row-meta,
+.mail-detail-meta,
+.mail-detail-attachment-meta,
+.mail-triage-status {
+  font-variant-numeric: tabular-nums;
+}
+
 .mail-detail-meta {
   margin-bottom: var(--space-4);
 }

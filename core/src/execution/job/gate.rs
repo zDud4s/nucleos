@@ -868,27 +868,19 @@ pub(super) async fn record_gate(
     // job's branch is reset to the merge base and the retry brings the branch back into the item's
     // tree, which keeps its work (spec 2026-08-19 section 3.2, decision #9). Without that reset the
     // rejected merge would stay on the job branch while other items merge on top of it.
+    //
+    // Counted on BOTH paths, whether or not the count buys anything. The count is written in the
+    // SAME statement as the status (as an absolute value, read before and bumped here), never as a
+    // separate `+ 1` ahead of it: a status write that fails and is retried then lands on the same
+    // number instead of counting the one red gate twice.
+    let mut red_count: Option<i64> = None;
+    let mut red_output: Option<String> = None;
     if let crate::gate::GateOutcome::Failed { exit_code, output } = &outcome {
-        // Counted on BOTH paths, whether or not the count buys anything. A counter that only
-        // incremented where a retry was spent would disagree with itself about what happened to the
-        // item — and the budget it is read against is a number that can differ between two jobs
-        // gating the same repository on the same night.
-        if let Err(error) = sqlx::query(
-            "UPDATE job_nodes SET gate_attempts = gate_attempts + 1, gate_output = ?
-             WHERE job_id = ? AND ordinal = ?",
-        )
-        .bind(gate_output_tail(output))
-        .bind(job.id)
-        .bind(ordinal as i64)
-        .execute(pool)
-        .await
-        {
-            tracing::warn!(job_id = job.id, ordinal, %error, "could not count a red gate against its item");
-        }
+        red_output = Some(gate_output_tail(output).to_owned());
 
-        // Read back rather than reasoned about, and read as a pair: the count and the budget are the
-        // only two numbers that can tell a first red gate from a last one. Fails CLOSED — a budget
-        // that cannot be read spends nothing, which is exactly today's behaviour.
+        // Read as a pair: the count and the budget are the only two numbers that can tell a first
+        // red gate from a last one. Fails CLOSED — a budget that cannot be read spends nothing,
+        // which is exactly today's behaviour. The count read is the one BEFORE this red gate.
         let spendable: Option<(i64, i64)> = sqlx::query_as(
             "SELECT i.gate_attempts, j.gate_retries
              FROM job_nodes i JOIN jobs j ON j.id = i.job_id
@@ -918,15 +910,20 @@ pub(super) async fn record_gate(
         // failure this module has already had three times, each under a comment asserting they
         // agreed. `item_state_from` owns the comparison; this passes it the status it is about to
         // write and believes the answer.
+        let spendable = spendable.map(|(before, retries)| (before + 1, retries));
+        red_count = spendable.map(|(attempts, _)| attempts);
         if let Some((attempts, retries)) = spendable
             && !merged
             && item_state_from(item_status, attempts, retries) == ItemState::GateRetriable
         {
             let written = sqlx::query(
-                "UPDATE job_nodes SET status = ?, gate_status = ? WHERE job_id = ? AND ordinal = ?",
+                "UPDATE job_nodes SET status = ?, gate_status = ?, gate_attempts = ?, gate_output = ?
+                 WHERE job_id = ? AND ordinal = ?",
             )
             .bind(item_status)
             .bind(gate_status)
+            .bind(attempts)
+            .bind(red_output.as_deref())
             .bind(job.id)
             .bind(ordinal as i64)
             .execute(pool)
@@ -966,9 +963,14 @@ pub(super) async fn record_gate(
     // said no.
     if matches!(outcome, crate::gate::GateOutcome::Failed { .. }) {
         let marked = sqlx::query(
-            "UPDATE job_nodes SET status = 'reverted', gate_status = ? WHERE job_id = ? AND ordinal = ?",
+            "UPDATE job_nodes SET status = 'reverted', gate_status = ?,
+                 gate_attempts = COALESCE(?, gate_attempts + 1),
+                 gate_output = COALESCE(?, gate_output)
+             WHERE job_id = ? AND ordinal = ?",
         )
         .bind(gate_status)
+        .bind(red_count)
+        .bind(red_output.as_deref())
         .bind(job.id)
         .bind(ordinal as i64)
         .execute(pool)

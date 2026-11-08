@@ -142,7 +142,7 @@ export function RestartDaemon({
         Restarting waits for running work to finish, so no turn is cut. New work is refused while it
         waits.
       </p>
-      <div>
+      <div className="sy-actions">
         <Button
           variant="ghost"
           disabled={asking || waiting || stage.kind === "restarting"}

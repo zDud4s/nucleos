@@ -298,6 +298,18 @@
   border-radius: 0;
 }
 
+/* While the graph loads, one block fills the stage exactly as the canvas will. */
+.brain-stage-loading > .ui-skeleton {
+  position: absolute;
+  inset: 0;
+  gap: 0;
+}
+.brain-stage-loading .ui-skeleton-blockbox {
+  flex: 1 1 auto;
+  height: auto;
+  border-radius: 0;
+}
+
 /* The zoom buttons step aside for the drawer instead of hiding under it. */
 .brain-stage.has-drawer .brain-force-controls {
   right: calc(min(23rem, 100%) + var(--space-3));

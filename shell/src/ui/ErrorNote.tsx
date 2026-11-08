@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { Button } from "./Button";
+import { textOf, useToastOnce } from "./toast";
 
 export interface ErrorNoteProps {
   children: ReactNode;
@@ -10,29 +10,19 @@ export interface ErrorNoteProps {
 }
 
 /**
- * Something went wrong, said next to the control that caused it.
+ * Something went wrong. Said as a toast, not as a box in the page.
  *
- * `role="alert"` — assertive, because this is the case where the app tried and
- * could not, and the person is waiting on an answer that is not coming.
- * {@link RefusalNote} is the deliberate contrast: a refusal is the daemon
- * answering, and answering is not failing.
- *
- * `onRetry` is optional and additive: a failed read can be tried again, a
- * failed one-off action usually should not offer to repeat itself.
- *
- * There are no toasts in this app. A message that appears in a corner, away
- * from the button that produced it, is a message about nothing in particular
- * — and it leaves before the person who was reading something else looks up.
+ * An inline banner pushed the page around when it appeared; this component keeps its old
+ * call sites and API but renders nothing, and raises an error toast (role="alert") when it
+ * mounts or its message changes. The same message is not toasted twice in a row, so a poll
+ * that keeps failing speaks once. `onRetry` becomes the toast's action button.
+ * {@link RefusalNote} is the deliberate contrast: a refusal is the daemon answering.
  */
 export function ErrorNote({ children, onRetry, retryLabel = "Retry" }: ErrorNoteProps) {
-  return (
-    <p className="ui-note ui-note-error" role="alert">
-      <span>{children}</span>
-      {onRetry ? (
-        <Button type="button" onClick={onRetry}>
-          {retryLabel}
-        </Button>
-      ) : null}
-    </p>
-  );
+  useToastOnce({
+    type: "error",
+    title: textOf(children),
+    action: onRetry ? { label: retryLabel, onClick: onRetry } : undefined,
+  });
+  return null;
 }

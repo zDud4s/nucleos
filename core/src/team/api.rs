@@ -522,3 +522,91 @@ pub async fn post_read_file(
         content,
     }))
 }
+
+// ---------------------------------------------------------------------------------------------
+// Handlers — all Control, and none of them a department's
+// ---------------------------------------------------------------------------------------------
+
+fn refuse_trigger(error: trigger::TriggerError) -> (StatusCode, String) {
+    let status = match &error {
+        trigger::TriggerError::NotFound => StatusCode::NOT_FOUND,
+        trigger::TriggerError::Invalid(_) => StatusCode::BAD_REQUEST,
+        // 409 and not 400: the rule is well-formed and the graph is what refuses it.
+        trigger::TriggerError::Cycle(_) | trigger::TriggerError::Duplicate => StatusCode::CONFLICT,
+        trigger::TriggerError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, error.to_string())
+}
+
+pub async fn list_triggers(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<trigger::TeamTrigger>>, (StatusCode, String)> {
+    trigger::list(&state.pool)
+        .await
+        .map(Json)
+        .map_err(refuse_trigger)
+}
+
+pub async fn create_trigger(
+    State(state): State<AppState>,
+    Json(request): Json<trigger::TriggerRequest>,
+) -> Result<(StatusCode, Json<trigger::TeamTrigger>), (StatusCode, String)> {
+    trigger::create(&state.pool, request)
+        .await
+        .map(|trigger| (StatusCode::CREATED, Json(trigger)))
+        .map_err(refuse_trigger)
+}
+
+pub async fn delete_trigger(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    trigger::delete(&state.pool, id)
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(refuse_trigger)
+}
+
+#[derive(serde::Deserialize)]
+pub struct EnableRequest {
+    pub enabled: bool,
+}
+
+pub async fn post_trigger_enable(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<EnableRequest>,
+) -> Result<Json<trigger::TeamTrigger>, (StatusCode, String)> {
+    trigger::set_enabled(&state.pool, id, body.enabled)
+        .await
+        .map(Json)
+        .map_err(refuse_trigger)
+}
+
+#[derive(serde::Serialize)]
+pub struct NextView {
+    pub next: Option<String>,
+    /// Why there is no next one. The whole reason this route exists: an invalid cron otherwise
+    /// makes a rule that never runs and says nothing anywhere.
+    pub error: Option<String>,
+}
+
+pub async fn get_trigger_next(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<NextView>, (StatusCode, String)> {
+    let trigger = trigger::get(&state.pool, id)
+        .await
+        .map_err(refuse_trigger)?
+        .ok_or_else(|| refuse_trigger(trigger::TriggerError::NotFound))?;
+    Ok(Json(match trigger::next_at(&trigger, chrono::Utc::now()) {
+        Ok(next) => NextView {
+            next: Some(next.to_rfc3339()),
+            error: None,
+        },
+        Err(error) => NextView {
+            next: None,
+            error: Some(error),
+        },
+    }))
+}

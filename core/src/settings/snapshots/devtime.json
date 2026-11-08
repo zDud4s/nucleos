@@ -1035,6 +1035,13 @@
       "description": "Where the transcripts live. Empty means `<home>/.claude/projects`.",
       "type": "string"
     },
+    "retention_days": {
+      "default": 180,
+      "description": "Sessions whose last activity is older than this many days are deleted, with their turns,\nmessages, attempts, spans, markers and session-scoped findings. 0 keeps everything. File\noffsets, the shadow history and cross-session findings are never pruned.",
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
     "rules": {
       "$ref": "#/$defs/DevtimeRulesConfig",
       "default": {

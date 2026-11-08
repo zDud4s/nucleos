@@ -3,7 +3,7 @@ import { useState, useSyncExternalStore } from "react";
 import { isApiRefusal } from "../data/client";
 import { embeddedKeep, embeddedOwner } from "../data/browser-embedded";
 import type { Tab } from "../data/browser-tabs";
-import { Button } from "../ui";
+import { Button, toastManager } from "../ui";
 
 type Mode =
   | { kind: "agent" }
@@ -83,7 +83,6 @@ export function AgentControlBar({ tab, highlight, onOpenInMyTabs }: Props) {
     () => (sessionId === undefined ? undefined : modes.get(sessionId)) ?? { kind: "agent" },
   );
   const [busy, setBusy] = useState(false);
-  const [notice, setNotice] = useState<string | null>(null);
 
   function setMode(next: Mode) {
     if (sessionId !== undefined) storeMode(sessionId, next);
@@ -92,11 +91,10 @@ export function AgentControlBar({ tab, highlight, onOpenInMyTabs }: Props) {
 
   async function run(work: () => Promise<void>, action: string) {
     setBusy(true);
-    setNotice(null);
     try {
       await work();
     } catch (e: unknown) {
-      setNotice(refusal(action, e));
+      toastManager.add({ type: "error", title: refusal(action, e) });
     } finally {
       setBusy(false);
     }
@@ -170,11 +168,6 @@ export function AgentControlBar({ tab, highlight, onOpenInMyTabs }: Props) {
             No
           </Button>
         </>
-      ) : null}
-      {notice !== null ? (
-        <span className="browser-agent-notice" role="status">
-          {notice}
-        </span>
       ) : null}
     </div>
   );

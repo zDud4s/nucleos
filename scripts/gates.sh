@@ -594,7 +594,38 @@ if [ "$target" = security ]; then
     echo "cargo-audit missing — run cargo install cargo-audit --locked first" >&2
     failures="$failures  security: cargo-audit not installed"$'\n'
   else
-    run "security: deps" . cargo audit
+    # Advisories the project has consciously accepted, one `--ignore <ID>` per entry. Empty on
+    # purpose: a silent ignore hides a real finding, so every ID added here needs a reason beside it.
+    # TODO(controller): after a real `cargo audit` run, list the RUSTSEC ids of the unmaintained
+    # gtk3-family crates (pulled in by tauri/wry on Linux) here, each with a one-line reason and a
+    # revisit date. Do not guess ids.
+    audit_ignore=()
+    audit_args=()
+    for id in ${audit_ignore[@]+"${audit_ignore[@]}"}; do audit_args+=(--ignore "$id"); done
+    run "security: deps" . cargo audit ${audit_args[@]+"${audit_args[@]}"}
+    # shell/src-tauri is outside the workspace (see Cargo.toml `exclude`) and has its own
+    # Cargo.lock, which the workspace audit above never reads.
+    run "security: deps (shell/src-tauri)" . cargo audit --file shell/src-tauri/Cargo.lock ${audit_args[@]+"${audit_args[@]}"}
+  fi
+
+  # Known-vulnerable Go dependencies, per module (sidecars/* and sidecars/lib/*), reachability-aware.
+  if ! command -v govulncheck >/dev/null 2>&1; then
+    echo "govulncheck missing — run go install golang.org/x/vuln/cmd/govulncheck@v1.9.0 first" >&2
+    failures="$failures  security: govulncheck not installed"$'\n'
+  else
+    for gomod in "$repo_root"/sidecars/*/go.mod "$repo_root"/sidecars/lib/*/go.mod; do
+      [ -e "$gomod" ] || continue
+      dir="$(dirname "$gomod")"
+      run "security: govulncheck ${dir#"$repo_root"/}" "$dir" govulncheck ./...
+    done
+  fi
+
+  # Production dependencies of the shell only: dev tooling does not ship.
+  if ! command -v npm >/dev/null 2>&1; then
+    echo "npm missing — install Node to audit the shell's JavaScript dependencies" >&2
+    failures="$failures  security: npm not installed"$'\n'
+  else
+    run "security: npm audit (shell)" shell npm audit --audit-level=high --omit=dev
   fi
 
   if ! command -v gitleaks >/dev/null 2>&1; then

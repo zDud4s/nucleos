@@ -654,6 +654,7 @@ const SHOTS_TO_TAKE = [
   ["95-system-health", { path: "/system/health" }],
   ["95a-system-health-light", { path: "/system/health", theme: "light" }],
   ["96-system-limits", { path: "/system/limits" }],
+  ["96a-system-limits-light", { path: "/system/limits", theme: "light" }],
   ["97-system-backups", { path: "/system/backups" }],
   ["98-system-tokens", { path: "/system/tokens" }],
   // The browser is the page: no native webview here, so the placeholder shows the area it gets.

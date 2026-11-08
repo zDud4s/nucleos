@@ -989,7 +989,8 @@ describe("Files — reachable without a mouse", () => {
     expect(await screen.findByText(/that move did not go through/)).toBeDefined();
 
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
-    await waitFor(() => expect(screen.queryByText(/did not go through/)).toBeNull());
+    // The failure was a toast, so it is not tied to the form; Cancel closes the form.
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Move" })).toBeNull());
   });
 
   it("gives the listing one Tab stop, not two per row", async () => {
@@ -1055,7 +1056,7 @@ describe("Files — reachable without a mouse", () => {
     fireEvent.change(field, { target: { value: "final.docx" } });
     fireEvent.click(within(row).getByRole("button", { name: "Rename" }));
 
-    expect(await within(row).findByText(/that rename did not go through/)).toBeDefined();
+    expect(await screen.findByText(/that rename did not go through/)).toBeDefined();
     expect(field.getAttribute("aria-invalid")).toBe("true");
   });
 

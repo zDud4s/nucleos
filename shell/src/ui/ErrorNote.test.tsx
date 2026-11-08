@@ -3,10 +3,11 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { ErrorNote } from "./ErrorNote";
 
 describe("ErrorNote", () => {
-  it("stays an assertive alert without a retry", () => {
-    render(<ErrorNote>boom</ErrorNote>);
-    expect(screen.getByRole("alert").textContent).toBe("boom");
-    expect(screen.queryByRole("button")).toBeNull();
+  it("renders no inline banner, and toasts an assertive alert without a retry", () => {
+    const { container } = render(<ErrorNote>boom</ErrorNote>);
+    expect(container.innerHTML).toBe("");
+    expect(screen.getByRole("alert").textContent).toContain("boom");
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
   });
 
   it("offers Retry when given an action, and calls it", () => {

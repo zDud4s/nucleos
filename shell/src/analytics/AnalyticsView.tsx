@@ -159,7 +159,20 @@ function Readout({ data, failed, missing, updatedAt, global, quota, quotaFailed,
     if (missing && !global) return <Absent label="Analytics" why="No project by that name." />;
     if (failed || missing) return <ErrorNote onRetry={onRetry}>{unreachable("analytics")}</ErrorNote>;
     // Height reserved for the cards and the panel, so the page does not jump when they land.
-    return <Skeleton label="Loading analytics" lines={14} />;
+    // Mirrors the loaded page: four KPI cards, the full-width chart panel, then the lower row.
+    return (
+      <>
+        <Skeleton label="Loading analytics" variant="cards" count={4} gridClassName="an-metrics" height="11.125rem" />
+        <Skeleton label="Loading the chart" variant="cards" count={1} gridClassName="an-detail-skeleton" height="21.875rem" />
+        <Skeleton
+          label="Loading the lower section"
+          variant="cards"
+          count={global ? 2 : 1}
+          gridClassName={global ? "an-lower an-lower-split" : "an-lower"}
+          height="18.75rem"
+        />
+      </>
+    );
   }
   return (
     <>

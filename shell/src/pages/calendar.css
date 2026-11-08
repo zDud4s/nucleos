@@ -47,12 +47,6 @@
   gap: var(--space-4);
 }
 
-.calendar-outcome {
-  margin: var(--space-3) 0 0;
-  font-size: var(--text-sm);
-  color: var(--tone-active-fg);
-}
-
 /* The tone that marks a proposal or a moved occurrence is colour, and colour
    is not a label — so both grids say the word to a screen reader and to nobody
    else. That is `.sr-only` from `base.css`, which is this recipe exactly and is
@@ -196,6 +190,18 @@
   with meetings in it bulged, pushing Saturday off the right-hand edge of the
   panel. Nothing in jsdom can see that, because jsdom computes no layout at all.
 */
+/* Day numbers, gutter hours and event clocks hold one width (#16). */
+.calendar-day-number,
+.calendar-week-head-number,
+.calendar-chip-clock,
+.calendar-gutter-hour,
+.calendar-block-clock,
+.calendar-occurrence-clock,
+.calendar-draft-when,
+.calendar-day-more {
+  font-variant-numeric: tabular-nums;
+}
+
 .calendar-weekdays {
   display: grid;
   grid-template-columns: repeat(7, minmax(0, 1fr));
@@ -238,6 +244,44 @@
    fires: a flex item's default minimum is its content, so the truncation is
    only reachable once every ancestor has agreed to be narrower than what is
    inside it. */
+/* The month's loading skeleton: the grid's seven tracks and the day cell's height, under
+   room for the weekday strip. */
+.ui-skeleton-grid.calendar-skeleton-month {
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 1px;
+  margin-top: 1.5rem;
+}
+.ui-skeleton-grid.calendar-skeleton-month > .ui-skeleton-card {
+  min-height: clamp(4.25rem, calc((100dvh - 19rem) / 6), 6.5rem);
+  border-radius: 0;
+}
+
+/* The week's loading skeleton wears the loaded grid's classes; only the scroll window is still. */
+.calendar-week-skeleton .calendar-week-scroll {
+  overflow: hidden;
+  mask-image: none;
+  -webkit-mask-image: none;
+}
+.calendar-week-skeleton .calendar-week-head {
+  cursor: default;
+}
+.calendar-week-skeleton .calendar-week-head > .ui-skeleton-bar {
+  height: 1lh;
+}
+span.calendar-skeleton-tick {
+  position: absolute;
+  right: var(--space-1);
+  width: 1.25rem;
+  height: 0.5rem;
+}
+span.calendar-skeleton-event {
+  position: absolute;
+  left: var(--space-1);
+  right: var(--space-1);
+  min-height: 0;
+  border-radius: var(--radius-sm);
+}
+
 .calendar-cell {
   display: flex;
   min-width: 0;
@@ -920,11 +964,6 @@
 .calendar-move input:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 1px;
-}
-
-/* The outcome and any refusal span the footer under both lines. */
-.calendar-draft > .calendar-outcome {
-  margin: 0;
 }
 
 @media (prefers-reduced-motion: reduce) {

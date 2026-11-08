@@ -59,6 +59,7 @@
 .council-seat-idx,
 .council-seat-ref {
   font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
   font-size: var(--text-xs);
   color: var(--text-faint);
 }

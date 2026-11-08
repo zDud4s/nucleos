@@ -1411,23 +1411,6 @@
   margin: var(--space-2) calc(var(--space-2) * -1);
 }
 
-/* A heading INSIDE the model menu, one level under its own "Which model answers"
-   title — four of them, one per route. Quieter and smaller than that title on
-   purpose: the menu has one subject and these are its divisions, so headings
-   drawn with the same weight would read as four menus stacked. The space goes on
-   the heading's top rather than on the group, so the first section sits tight
-   under the title and only the ones after it are pushed apart. */
-.chats-meta-menu-section {
-  margin-top: var(--space-2);
-  color: var(--text-muted);
-  font-size: var(--text-xs);
-  letter-spacing: 0.02em;
-}
-
-.chats-meta-menu-section:first-of-type {
-  margin-top: 0;
-}
-
 /* Archiving, which is menu CONTENT and never a menu item — a `DropdownMenuItem`
    closes on the first select and would collapse the two-click interlock into
    one irreversible press. It shared a rule with the brain picker until that
@@ -1645,6 +1628,17 @@
  * are here" and one meaning "it is there". Not a state tone either — one meaning per tone, and
  * "this is the one you asked for" says where the reader is, not what state the turn is in.
  */
+/* The transcript's loading skeleton: the same column, gap and bottom anchoring as `.chats-turns`. */
+.chats-scroll > .ui-skeleton {
+  margin: auto 0 var(--space-6);
+}
+.ui-skeleton-grid.chats-turns {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-7);
+  margin: 0;
+}
+
 .chats-turn-lit {
   border-radius: var(--radius-md);
   outline: 2px solid var(--border-strong);
@@ -2737,16 +2731,6 @@
   outline: none;
 }
 
-/* Why the daemon would refuse this one, said in place rather than as a single
-   "no" about the whole set — which is all a bare 400 could tell anybody. The
-   pending tone on purpose: it is the one that asks a person for something, and
-   this asks rather than reports a fault. */
-.chats-helper-why {
-  margin: 0;
-  color: var(--tone-pending-fg);
-  font-size: var(--text-xs);
-}
-
 /**
  * Send, as the arrow it has been in every chat box for a decade.
  *
@@ -3390,18 +3374,13 @@
 }
 
 .chats-mentions-cut {
-  margin: 0 0 var(--space-2);
+  margin: 0;
   padding: var(--space-1) var(--space-2);
   border-radius: var(--radius-sm);
-  background: var(--surface-sunken);
+  background: none;
   color: var(--text-faint);
   font-size: var(--text-xs);
   text-align: center;
-}
-
-.chats-mentions-cut {
-  margin: 0;
-  background: none;
 }
 
 /* Where a command came from: a tag, not part of the sentence, so a muted pill set apart from the
@@ -3888,16 +3867,6 @@
 .chats-forward-target:disabled {
   opacity: var(--opacity-disabled);
   cursor: default;
-}
-
-.chats-forward-refused {
-  margin: 0;
-  font-size: var(--text-xs);
-  color: var(--text-faint);
-}
-
-.chats-forward-refused {
-  color: var(--tone-danger-fg);
 }
 
 /* -------------------------------------------------- what a department said -- */
@@ -4773,14 +4742,6 @@ button.agent-card:hover {
   overflow-wrap: anywhere;
 }
 
-.agent-stop-error {
-  flex-basis: 100%;
-  margin: 0;
-  color: var(--tone-danger-fg);
-  font-size: var(--text-xs);
-  text-align: right;
-}
-
 .agent-io-failed {
   color: var(--tone-danger-fg);
 }
@@ -4839,4 +4800,31 @@ button.agent-card:hover {
 /* The live-region wrapper around the transcript list adds no box of its own. */
 .chats-log {
   display: contents;
+}
+
+/* #16: counters, durations, costs and figures stand in columns. */
+.chats-turn-elapsed,
+.chats-changes-counts,
+.chats-row-when,
+.chats-turn-foot,
+.agent-card-meta,
+.agent-detail-facts {
+  font-variant-numeric: tabular-nums;
+}
+
+/* #13: `.hit-area` sets `position: relative`; this one is pinned to its picture. */
+.chats-attached-drop.hit-area {
+  position: absolute;
+}
+
+.chats-rail-actions > .chats-rail-tip {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.chats-rail-tip > .chats-rail-new {
+  width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  padding-inline: var(--space-2);
 }

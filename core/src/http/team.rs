@@ -60,19 +60,19 @@ pub(super) fn routes() -> Router<AppState> {
         // the graph the cycle check walks.
         .route(
             "/team-triggers",
-            get(crate::team::trigger::list_triggers).post(crate::team::trigger::create_trigger),
+            get(crate::team::list_triggers).post(crate::team::create_trigger),
         )
         .route(
             "/team-triggers/{id}",
-            axum::routing::delete(crate::team::trigger::delete_trigger),
+            axum::routing::delete(crate::team::delete_trigger),
         )
         .route(
             "/team-triggers/{id}/enable",
-            post(crate::team::trigger::post_trigger_enable),
+            post(crate::team::post_trigger_enable),
         )
         .route(
             "/team-triggers/{id}/next",
-            get(crate::team::trigger::get_trigger_next),
+            get(crate::team::get_trigger_next),
         )
         // The council. In no scope table in `auth.rs`, which leaves it to Admin and the control
         // token — the fail-closed default that module documents, and the right one for a route

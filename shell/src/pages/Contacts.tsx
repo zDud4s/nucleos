@@ -1,11 +1,15 @@
 // §spec correspondent-contacts
 import { useId, useState, type ReactNode } from "react";
-import { isApiRefusal, type ApiRefusal } from "../data/client";
+import { useQueryClient } from "@tanstack/react-query";
+import { apiFetch, isApiRefusal } from "../data/client";
+import { daemonProse } from "../team/prose";
+import { keys } from "../data/keys";
+import { useOptimisticMutation } from "../lib/optimistic";
+import { registerPrefetcher } from "../lib/prefetch";
 import {
   mergeVerdictsConflict,
   useContactMerges,
   useContacts,
-  useSenderVerdict,
   useUnmerge,
   type Correspondent,
   type MergeSide,
@@ -307,7 +311,7 @@ function MergeSideView({ side, role }: { side: MergeSide; role: string }) {
  *
  * The 409 is the one worth writing for: `reject_merge` and `approve_merge`
  * both guard on the pair's own standing decisions disagreeing, and the
- * daemon's own sentence names which two — see `daemonProse` below, which is
+ * daemon's own sentence names which two — see `daemonProse` (imported from `team/prose`), which is
  * what lets that exact wording through instead of this generic fallback.
  */
 const IDENTITY_SENTENCES: Record<string, string> = {
@@ -316,19 +320,6 @@ const IDENTITY_SENTENCES: Record<string, string> = {
   unprocessable: `the ${DAEMON_NAME} found nothing usable in this suggestion to act on`,
   internal: `the ${DAEMON_NAME} failed while recording the decision: nothing changed`,
 };
-
-/**
- * The daemon's own sentence, when it really sent one — `RunDetail.tsx`'s
- * pattern: a refusal under four words is a status word repeated, not prose
- * written on purpose, so only a longer one is trusted over this page's own
- * copy.
- */
-function daemonProse(refusal: ApiRefusal): Record<string, string> {
-  const detail = refusal.detail.trim();
-  if (detail === "" || detail === refusal.code) return {};
-  if (detail.split(/\s+/).length < 4) return {};
-  return { [refusal.code]: detail };
-}
 
 function DecisionNotes({
   outcome,
@@ -579,12 +570,19 @@ function SenderVerdictToggles({
   onProblem: ReportProblem;
   onVerdictSet: (options: UndoToastOptions) => void;
 }) {
-  const mutate = useSenderVerdict();
+  const queryClient = useQueryClient();
+  // Optimistic: the row's badge flips at once and rolls back if the daemon refuses.
+  const mutate = useOptimisticMutation<Correspondent[], { address: string; verdict: "pin" | "mute" | null }>({
+    queryKey: keys.contacts.all,
+    mutationFn: (input) => apiFetch<void>("/contacts/verdict", { method: "POST", body: JSON.stringify(input) }),
+    apply: (prev, input) => (prev ?? []).map((r) => (r.address === input.address ? { ...r, verdict: input.verdict } : r)),
+  });
   const send = (next: "pin" | "mute" | null, isUndo = false) =>
     mutate.mutate(
       { address, verdict: next },
       {
         onSuccess: () => {
+          void queryClient.invalidateQueries({ queryKey: keys.mail.all });
           onProblem(null);
           if (isUndo) return;
           // Undo restores what was there before this press, through the same door.
@@ -668,3 +666,8 @@ function UnmergeError({ error }: { error: unknown }) {
   }
   return <ErrorNote>The {DAEMON_NAME} is not responding: that address was not pulled apart</ErrorNote>;
 }
+
+// Warm the roster when the sidebar link is hovered (#7).
+registerPrefetcher("/contacts", (qc) =>
+  qc.prefetchQuery({ queryKey: keys.contacts.all, queryFn: () => apiFetch<Correspondent[]>("/contacts"), staleTime: 5_000 }),
+);

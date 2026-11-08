@@ -1,5 +1,5 @@
 // §spec calendario-local
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import { ChevronLeft, ChevronRight } from "lucide-react";
 import { DaySheet } from "../calendar/DaySheet";
@@ -35,6 +35,8 @@ import {
   Section,
   Skeleton,
   StaleNote,
+  usePaletteGroup,
+  type PaletteGroup,
 } from "../ui";
 import "./calendar.css";
 
@@ -317,6 +319,54 @@ export function Calendar() {
     );
   }
 
+  // Palette actions (#3/#4). The group is built once; the closures it calls are read off a ref
+  // refreshed each render, so it never re-registers. The key chips are only hints: the listener
+  // below binds them and ignores typing in fields and chorded keys.
+  const actions = useRef({
+    prev: () => step(-1),
+    next: () => step(1),
+    today: () => goTo(view === "week" ? new Date() : startOfMonth(new Date())),
+    month: () => switchTo("month"),
+    week: () => switchTo("week"),
+  });
+  actions.current = {
+    prev: () => step(-1),
+    next: () => step(1),
+    today: () => goTo(view === "week" ? new Date() : startOfMonth(new Date())),
+    month: () => switchTo("month"),
+    week: () => switchTo("week"),
+  };
+  const paletteGroup = useMemo<PaletteGroup>(
+    () => ({
+      id: "calendar",
+      heading: "Calendar",
+      items: [
+        { id: "calendar-today", label: "Go to today", match: "calendar today go to", shortcut: "T", run: () => actions.current.today() },
+        { id: "calendar-prev", label: "Previous period", match: "calendar previous back period", shortcut: "[", run: () => actions.current.prev() },
+        { id: "calendar-next", label: "Next period", match: "calendar next forward period", shortcut: "]", run: () => actions.current.next() },
+        { id: "calendar-month", label: "Month view", match: "calendar month view", shortcut: "M", run: () => actions.current.month() },
+        { id: "calendar-week", label: "Week view", match: "calendar week view", shortcut: "W", run: () => actions.current.week() },
+      ],
+    }),
+    [],
+  );
+  usePaletteGroup(paletteGroup);
+  useEffect(() => {
+    function onKey(event: KeyboardEvent) {
+      if (event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey) return;
+      const target = event.target as HTMLElement | null;
+      if (target !== null && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName))) return;
+      const a = actions.current;
+      if (event.key === "t") a.today();
+      else if (event.key === "[") a.prev();
+      else if (event.key === "]") a.next();
+      else if (event.key === "m") a.month();
+      else if (event.key === "w") a.week();
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
   const label =
     view === "week"
       ? weekLabel(weekOf(anchor))
@@ -337,6 +387,7 @@ export function Calendar() {
         */
         title={label}
         headline={headline(rows, anchor, view, config.data)}
+        reserveHeadline={config.data === undefined && !config.isError}
         actions={
           <div className="calendar-nav">
             <BusyIndicator busy={busy.data?.busy} />
@@ -387,7 +438,18 @@ export function Calendar() {
         {/* Last good data stays up when a refetch fails, but now says how old it is. */}
         {events.isError && rows.length > 0 && <StaleNote dataUpdatedAt={events.dataUpdatedAt} />}
         {events.data === undefined && !events.isError && (
-          <Skeleton label={view === "week" ? "Loading the week…" : "Loading the month…"} lines={8} />
+          // The grid's own geometry: the week's heads plus its 48rem body, or the month's
+          // weekday strip over six rows of 7 day cells at the cell height.
+          view === "week" ? (
+            <WeekSkeleton />
+          ) : (
+            <Skeleton
+              label="Loading the month…"
+              variant="cards"
+              count={42}
+              gridClassName="calendar-skeleton-month"
+            />
+          )
         )}
         {events.data !== undefined &&
           (view === "week" ? (
@@ -427,6 +489,44 @@ export function Calendar() {
 
       <HeldNotifications />
     </>
+  );
+}
+
+/**
+ * The week's loading state, drawn with the loaded grid's own classes: the gutter plus seven
+ * day heads, then the same scroll window over a 48rem body (gutter hour ticks, seven columns),
+ * so the panel is the same height when the events land.
+ */
+function WeekSkeleton() {
+  return (
+    <div className="calendar-week-view calendar-week-skeleton" role="status" aria-busy="true">
+      <span className="sr-only">Loading the week…</span>
+      <div className="calendar-week-heads" aria-hidden="true">
+        <span className="calendar-gutter-head" />
+        {Array.from({ length: 7 }, (_, i) => (
+          <span key={i} className="calendar-week-head">
+            <span className="ui-skeleton-bar" />
+          </span>
+        ))}
+      </div>
+      <div className="calendar-week-scroll">
+        <div className="calendar-week-body" aria-hidden="true">
+          <div className="calendar-gutter">
+            {Array.from({ length: 6 }, (_, i) => (
+              <span key={i} className="calendar-skeleton-tick ui-skeleton-bar" style={{ top: `${(i + 1) * 12.5 - 1}%` }} />
+            ))}
+          </div>
+          {Array.from({ length: 7 }, (_, i) => (
+            <span key={i} className="calendar-column">
+              <span
+                className="calendar-skeleton-event ui-skeleton-card"
+                style={{ top: `${20 + ((i * 17) % 40)}%`, height: `${6 + ((i * 5) % 9)}%` }}
+              />
+            </span>
+          ))}
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -511,6 +611,7 @@ export function HeldNotifications() {
       </p>
       {pending.isError && rows.length === 0 && <NotificationsError error={pending.error} />}
       {pending.data !== undefined && rows.length === 0 && <Quiet says="nothing has been held." />}
+      {pending.data === undefined && !pending.isError && <NotificationsSkeleton />}
       {/*
         `level={3}`, because the `Panel` above already titles this region with
         an `h2`. A section heading announced as a sibling of the panel that
@@ -537,6 +638,44 @@ export function HeldNotifications() {
         )}
       </div>
     </Panel>
+  );
+}
+
+/**
+ * The held notifications while they are read: the two groups' own headings and rows (two held,
+ * one let through), each row's kind, summary and time as bars, so the panel keeps its height.
+ */
+function NotificationsSkeleton() {
+  const line = { display: "flex", alignItems: "center", minHeight: "1lh" } as const;
+  const rows = (n: number) => (
+    <Rows label="Reading the held notifications" className="calendar-notifications">
+      {Array.from({ length: n }, (_, i) => (
+        <Row key={i} className="calendar-notification">
+          <span className="calendar-notification-kind" style={line}>
+            <span className="ui-skeleton-bar" style={{ width: "6rem" }} />
+          </span>
+          <p className="calendar-notification-summary" style={line}>
+            <span className="ui-skeleton-bar" style={{ width: "55%" }} />
+          </p>
+          <span style={line}>
+            <span className="ui-skeleton-bar" style={{ width: "3.5rem" }} />
+          </span>
+        </Row>
+      ))}
+    </Rows>
+  );
+  return (
+    <div role="status" aria-busy="true">
+      <span className="sr-only">Reading the held notifications</span>
+      <div className="calendar-sections" aria-hidden="true">
+        <Section label="held right now" level={3}>
+          {rows(2)}
+        </Section>
+        <Section label="held, then let through" level={3}>
+          {rows(1)}
+        </Section>
+      </div>
+    </div>
   );
 }
 

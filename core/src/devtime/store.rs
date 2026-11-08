@@ -926,6 +926,62 @@ pub async fn replace_spans(
     tx.commit().await
 }
 
+/// Deletes whole sessions whose last activity (the later of `ended_at` and `updated_at`) is before
+/// `cutoff`, with their per-session rows: turns, messages, attempts, spans, markers, session-scoped
+/// findings, attempt marks and turn stats. One transaction per session. Returns the sessions pruned.
+///
+/// Kept on purpose: `devtime_files` (its offsets keep a transcript from being re-ingested), the
+/// shadow and action-state tables (the promotion report's history), the owner's feedback, and
+/// cross-session findings (`scope = 'cross'`).
+///
+/// `cutoff` is RFC 3339 with the same shape [`now`] writes, so the text comparison is chronological.
+pub async fn prune_sessions_before(pool: &SqlitePool, cutoff: &str) -> sqlx::Result<u64> {
+    const PER_SESSION: [&str; 7] = [
+        "DELETE FROM devtime_turns WHERE session_id = ?",
+        "DELETE FROM devtime_messages WHERE session_id = ?",
+        "DELETE FROM devtime_attempts WHERE session_id = ?",
+        "DELETE FROM devtime_spans WHERE session_id = ?",
+        "DELETE FROM devtime_markers WHERE session_id = ?",
+        "DELETE FROM devtime_attempt_marks WHERE session_id = ?",
+        "DELETE FROM devtime_turn_stats WHERE session_id = ?",
+    ];
+    let old: Vec<String> = sqlx::query_scalar(
+        "SELECT session_id FROM devtime_sessions
+         WHERE MAX(COALESCE(ended_at, ''), updated_at) < ?",
+    )
+    .bind(cutoff)
+    .fetch_all(pool)
+    .await?;
+    let mut pruned = 0;
+    for session_id in &old {
+        let mut tx = pool.begin().await?;
+        for sql in PER_SESSION {
+            sqlx::query(sql).bind(session_id).execute(&mut *tx).await?;
+        }
+        sqlx::query("DELETE FROM devtime_findings WHERE session_id = ? AND scope = 'session'")
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await?;
+        // Re-checked in the transaction: a chunk that landed since the read keeps the session.
+        let gone = sqlx::query(
+            "DELETE FROM devtime_sessions
+             WHERE session_id = ? AND MAX(COALESCE(ended_at, ''), updated_at) < ?",
+        )
+        .bind(session_id)
+        .bind(cutoff)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if gone == 0 {
+            tx.rollback().await?;
+            continue;
+        }
+        tx.commit().await?;
+        pruned += 1;
+    }
+    Ok(pruned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1498,6 +1554,145 @@ mod tests {
 
     async fn count(pool: &SqlitePool, sql: &'static str) -> i64 {
         sqlx::query_scalar(sql).fetch_one(pool).await.unwrap()
+    }
+
+    const OLD: &str = "2025-01-01T00:00:00.000Z";
+    const CUTOFF: &str = "2026-01-01T00:00:00.000Z";
+
+    /// Session `s1` is old and fully populated; `s2` is recent. Also seeds the rows prune must keep.
+    async fn seed_prune(pool: &SqlitePool) {
+        add_session(pool, "s1", "p1", 0).await;
+        add_session(pool, "s2", "p1", 0).await;
+        add_attempt(pool, "s1", "a1", "main", T0).await;
+        add_attempt(pool, "s2", "a2", "main", T0).await;
+        let mut tx = begin_chunk(pool).await.unwrap();
+        upsert_message(&mut tx, &message("m1", T0, T0, 1, 0))
+            .await
+            .unwrap();
+        insert_marker(&mut tx, &marker("bg_notification", "r1", T0))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        replace_spans(pool, "s1", &[span("s1", T0, T0)])
+            .await
+            .unwrap();
+        replace_spans(pool, "s2", &[span("s2", T0, T0)])
+            .await
+            .unwrap();
+        rule_session(
+            pool,
+            "s1",
+            vec![finding("f1", "D3", "s1", "session", "exact")],
+        )
+        .await;
+        replace_cross_findings(
+            pool,
+            "p1",
+            &["F1"],
+            &[finding("fx", "F1", "s1", "cross", "exact")],
+        )
+        .await
+        .unwrap();
+        for sql in [
+            "INSERT INTO devtime_turns (session_id, seq, started_at, ended_at, interrupted,
+                opens_with_correction, parser_version) VALUES ('s1', 1, 'a', 'b', 0, 0, 1)",
+            "INSERT INTO devtime_attempt_marks (attempt_id, session_id, verified, rules_version)
+                VALUES ('a1', 's1', 'unknown', 'fp')",
+            "INSERT INTO devtime_turn_stats (session_id, turn_seq, project_id, turn_class,
+                started_at, calls, active_ms, explained_ms, rules_version)
+                VALUES ('s1', 1, 'p1', 'c0', 'a', 1, 1, 1, 'fp')",
+            "INSERT INTO devtime_files (path, session_id, offset, size, parser_version, updated_at)
+                VALUES ('/x', 's1', 10, 10, 1, 'a')",
+            "INSERT INTO devtime_action_state (action, rule_id, mode, since, changed_by)
+                VALUES ('inject', 'D3', 'shadow', 'a', 'owner')",
+            "INSERT INTO devtime_shadow (action, rule_id, project_id, session_id, subject_key, mode,
+                decision, template_id, rule_version, action_version, thresholds_hash, rules_version,
+                decided_at, window_end_at)
+                VALUES ('inject', 'D3', 'p1', 's1', 'k', 'shadow', 'fire', 't', 1, 1, 'h', 'fp',
+                'a', 'b')",
+        ] {
+            sqlx::query(sql).execute(pool).await.unwrap();
+        }
+        sqlx::query(
+            "UPDATE devtime_sessions SET ended_at = ?, updated_at = ? WHERE session_id = 's1'",
+        )
+        .bind(OLD)
+        .bind(OLD)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn prune_counts(pool: &SqlitePool, session: &str) -> Vec<i64> {
+        let mut out = Vec::new();
+        for table in [
+            "devtime_sessions",
+            "devtime_turns",
+            "devtime_messages",
+            "devtime_attempts",
+            "devtime_spans",
+            "devtime_markers",
+            "devtime_attempt_marks",
+            "devtime_turn_stats",
+        ] {
+            let sql =
+                sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table} WHERE session_id = ?"));
+            out.push(
+                sqlx::query_scalar(sql)
+                    .bind(session)
+                    .fetch_one(pool)
+                    .await
+                    .unwrap(),
+            );
+        }
+        out.push(
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM devtime_findings WHERE session_id = ? AND scope = 'session'",
+            )
+            .bind(session)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        );
+        out
+    }
+
+    #[tokio::test]
+    async fn prune_removes_an_old_session_whole_and_keeps_the_history() {
+        let pool = test_pool().await;
+        seed_prune(&pool).await;
+        assert!(prune_counts(&pool, "s1").await.iter().all(|n| *n > 0));
+        assert_eq!(prune_sessions_before(&pool, CUTOFF).await.unwrap(), 1);
+        assert!(prune_counts(&pool, "s1").await.iter().all(|n| *n == 0));
+        // The recent session keeps its rows.
+        let recent = prune_counts(&pool, "s2").await;
+        assert_eq!(recent[0], 1);
+        assert_eq!(recent[3], 1);
+        assert_eq!(recent[4], 1);
+        // Files, shadow, action state and cross findings survive.
+        for sql in [
+            "SELECT COUNT(*) FROM devtime_files",
+            "SELECT COUNT(*) FROM devtime_shadow",
+            "SELECT COUNT(*) FROM devtime_action_state",
+            "SELECT COUNT(*) FROM devtime_findings WHERE scope = 'cross'",
+        ] {
+            assert_eq!(count(&pool, sql).await, 1, "{sql}");
+        }
+        // A second run has nothing left to do.
+        assert_eq!(prune_sessions_before(&pool, CUTOFF).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn prune_keeps_a_session_whose_updated_at_is_recent() {
+        let pool = test_pool().await;
+        seed_prune(&pool).await;
+        sqlx::query("UPDATE devtime_sessions SET updated_at = ? WHERE session_id = 's1'")
+            .bind("2026-06-01T00:00:00.000Z")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(prune_sessions_before(&pool, CUTOFF).await.unwrap(), 0);
+        assert_eq!(prune_counts(&pool, "s1").await[0], 1);
     }
 
     #[tokio::test]

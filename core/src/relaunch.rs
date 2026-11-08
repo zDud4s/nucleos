@@ -355,6 +355,18 @@ fn spawn_relauncher() -> std::io::Result<()> {
     spawn_detached(&program, &command_args)
 }
 
+/// Not `DETACHED_PROCESS` (0x8): that leaves the daemon console-less, so every console-subsystem
+/// child it spawns (sidecars, git, pwsh) allocates its own visible console window. A hidden console
+/// (`CREATE_NO_WINDOW`) is inherited by children, so none of them shows a window.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+#[cfg(windows)]
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+#[cfg(windows)]
+const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+#[cfg(windows)]
+const WINDOWS_DETACH_FLAGS: u32 = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP;
+
 /// Starts `exe` outside this process's session and job, with no console and no inherited stdio, so
 /// it outlives its parent.
 pub fn spawn_detached(exe: &Path, args: &[OsString]) -> std::io::Result<()> {
@@ -381,17 +393,12 @@ pub fn spawn_detached(exe: &Path, args: &[OsString]) -> std::io::Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
         // Breakaway is refused when the job does not allow it; then the plain detach has to do.
-        command.creation_flags(
-            DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB,
-        );
+        command.creation_flags(WINDOWS_DETACH_FLAGS | CREATE_BREAKAWAY_FROM_JOB);
         if command.spawn().is_ok() {
             return Ok(());
         }
-        command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        command.creation_flags(WINDOWS_DETACH_FLAGS);
     }
     command.spawn().map(|_| ())
 }
@@ -439,6 +446,15 @@ mod tests {
 
     fn os(words: &[&str]) -> Vec<OsString> {
         words.iter().map(OsString::from).collect()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_detach_hides_the_console_instead_of_dropping_it() {
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        assert_ne!(WINDOWS_DETACH_FLAGS & CREATE_NO_WINDOW, 0);
+        assert_eq!(WINDOWS_DETACH_FLAGS & DETACHED_PROCESS, 0);
+        assert_ne!(WINDOWS_DETACH_FLAGS & CREATE_NEW_PROCESS_GROUP, 0);
     }
 
     #[test]

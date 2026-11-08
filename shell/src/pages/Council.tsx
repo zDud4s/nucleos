@@ -1,8 +1,10 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { newIdempotencyKey } from "../lib/idempotency";
 import { Link, useNavigate, useParams } from "@tanstack/react-router";
 import { canTakeASeat, useAgents } from "../data/agents";
 import { useAssistantModels } from "../data/chats";
-import { isApiRefusal, type ApiRefusal } from "../data/client";
+import { apiFetch, isApiRefusal } from "../data/client";
+import { daemonProse } from "../team/prose";
 import {
   useCancelCouncil,
   useCouncil,
@@ -17,7 +19,9 @@ import {
   type CouncilView,
 } from "../data/council";
 import { DAEMON_NAME } from "../copy";
+import { keys } from "../data/keys";
 import { plural } from "../lib/plural";
+import { registerPrefetcher } from "../lib/prefetch";
 import { CouncilDeliberation } from "./CouncilRounds";
 import { clearDraft, draftFrom, offerDraft, peekDraft } from "./council-draft";
 import { Courtroom, type CourtSelection } from "./council/Courtroom";
@@ -46,11 +50,18 @@ import {
   RelativeTime,
   Row,
   Rows,
+  Skeleton,
   StaleNote,
   StateBadge,
   Teach,
+  usePaletteGroup,
 } from "../ui";
 import "./council.css";
+
+// Hovering the rail link warms the list, so the page paints from the cache on arrival (#7).
+registerPrefetcher("/council", (qc) =>
+  qc.prefetchQuery({ queryKey: [...keys.council.all, "list"], queryFn: () => apiFetch<CouncilSummary[]>("/council"), staleTime: 10_000 }),
+);
 
 /**
  * Council — one component serving `/council` and `/council/$councilId`. The
@@ -76,6 +87,31 @@ export function Council() {
   const councils = useCouncils();
   const rows = councils.data ?? [];
   const stale = councils.isError && councils.data !== undefined;
+  const navigate = useNavigate();
+
+  // Palette actions (#3/#4): start a new council, and jump to one that is still deliberating.
+  const paletteGroup = useMemo(
+    () => ({ id: "council", heading: "Council", items: [
+      {
+        id: "council.new",
+        label: "New council",
+        match: "new council convene ask question",
+        run: (): void => { void navigate({ to: "/council" }); },
+      },
+      ...(councils.data ?? [])
+        .filter((row) => councilIsAlive(row.status))
+        .slice(0, 5)
+        .map((row) => ({
+          id: `council.open.${row.id}`,
+          label: `Open: ${row.question.slice(0, 60)}`,
+          match: `open deliberating ${row.question}`,
+          hint: "deliberating",
+          run: (): void => { void navigate({ to: `/council/${row.id}` }); },
+        })),
+    ] }),
+    [councils.data, navigate],
+  );
+  usePaletteGroup(paletteGroup);
 
   return (
     <>
@@ -131,21 +167,6 @@ function ListError({ error, onRetry }: { error: unknown; onRetry: () => void }) 
   return (
     <ErrorNote onRetry={onRetry}>Could not reach the {DAEMON_NAME}: nothing is known about the councils</ErrorNote>
   );
-}
-
-/**
- * The daemon's own sentence, when it really sent one.
- *
- * `client.ts` falls back to `statusText` for a refusal with an empty body, so a
- * bare status arrives carrying only the status word — four words is the floor
- * between that and a sentence the daemon wrote on purpose, such as the budget
- * refusal naming the limit and the spend.
- */
-function daemonProse(refusal: ApiRefusal): Record<string, string> {
-  const detail = refusal.detail.trim();
-  if (detail === "" || detail === refusal.code) return {};
-  if (detail.split(/\s+/).length < 4) return {};
-  return { [refusal.code]: detail };
 }
 
 /* ------------------------------------------------------------- convene -- */
@@ -211,10 +232,15 @@ function CourtSetup() {
 
   // The button and ctrl+enter share this path, so the keyboard can never send
   // what the disabled button would have refused.
+  // One key per Convene intent: a retry after a failure reuses it so the daemon can join the first
+  // attempt instead of opening a twin; success mints a fresh one next time (#19).
+  const intentKey = useRef<string | null>(null);
   const submit = () => {
     if (disabled) return;
-    create.mutate(requestFrom(question, draft, pickedRounds, config), {
+    intentKey.current ??= newIdempotencyKey();
+    create.mutate({ ...requestFrom(question, draft, pickedRounds, config), idempotencyKey: intentKey.current }, {
       onSuccess: (result) => {
+        intentKey.current = null;
         setQuestion("");
         rememberChairs(result.id, draft);
         void navigate({ to: `/council/${result.id}` });
@@ -306,7 +332,7 @@ function CouncilList({ rows, answered }: { rows: CouncilSummary[]; answered: boo
           line is faint prose about to be replaced by the list; `Quiet` is the
           answer that there is no list, which is the panel's content and is set
           at the rung content is set at. */}
-      {!answered && <p className="council-loading" role="status">reading the councils…</p>}
+      {!answered && <Skeleton label="Reading the councils" variant="row" count={3} />}
       {rows.length > 0 && (
         <Rows label="Councils">
           {/* Deliberating councils lead (stable sort keeps the daemon's order within each group). */}
@@ -373,7 +399,7 @@ function CouncilDetail({ id }: { id: string }) {
         {council.isError ? (
           <DetailError error={council.error} />
         ) : (
-          <p className="council-loading" role="status">reading the council…</p>
+          <Skeleton label="Reading the council" lines={6} />
         )}
       </Panel>
     );
