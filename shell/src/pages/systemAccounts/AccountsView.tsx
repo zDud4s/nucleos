@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { MoreHorizontal } from "lucide-react";
 import {
   useAccountActions,
   useAccountDefault,
@@ -10,28 +11,41 @@ import {
   type PoolAccount,
 } from "../../data/accounts";
 import { isApiRefusal } from "../../data/client";
+import { resetsIn } from "../../chats/AccountChip";
 import { percentText } from "../../lib/format";
-import { Badge, Button, ErrorNote, Quiet, RefusalNote, Skeleton } from "../../ui";
-import { AddAccount, LoginPanel } from "./AddAccount";
+import { Badge, Button, ErrorNote, Field, Quiet, RefusalNote, Select, Skeleton } from "../../ui";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "../../ui/vendor/dropdown-menu";
+import { AddAccountDialog } from "./AddAccount";
+import { engineName } from "./engines";
 import "./accounts.css";
 
-/** The default selector's options: Auto, then each provider, then each concrete account. */
+/** The default selector's options: Auto, then each engine, then each concrete account. */
 export function defaultOptions(accounts: PoolAccount[]): { value: string; label: string }[] {
   const providers = [...new Set(accounts.map((a) => a.provider))];
   return [
     { value: "auto", label: "Auto" },
-    ...providers.map((p) => ({ value: `provider:${p}`, label: `Any ${p} account` })),
-    ...accounts.map((a) => ({ value: `account:${a.id}`, label: `${a.label} (${a.provider})` })),
+    ...providers.map((p) => ({ value: `provider:${p}`, label: `Any ${engineName(p)} account` })),
+    ...accounts.map((a) => ({ value: `account:${a.id}`, label: `${a.label} (${engineName(a.engine)})` })),
   ];
 }
 
-/** "42%" or an em dash for a window the account has no reading for. */
-function BarCell({ account, name }: { account: PoolAccount; name: string }) {
+/** One usage window as a meter: its name, the percent, and when it resets if the provider said. */
+function Meter({ account, name }: { account: PoolAccount; name: string }) {
   const window = windowOf(account, name);
   const fraction = window?.used_fraction ?? null;
-  const text = percentText(fraction);
+  const reset = resetsIn(window?.resets_at);
   return (
-    <div className="ac-bar" title={window?.resets_at ? `Resets ${window.resets_at}` : undefined}>
+    <div className="ac-meter" title={window?.resets_at ? `Resets ${window.resets_at}` : undefined}>
+      <div className="ac-meter-head">
+        <span className="ac-meter-name">{name}</span>
+        <span>{percentText(fraction)}</span>
+      </div>
       <div
         className={`ac-bar-track${window?.stale ? " ac-stale" : ""}`}
         role="progressbar"
@@ -42,7 +56,7 @@ function BarCell({ account, name }: { account: PoolAccount; name: string }) {
       >
         <div className="ac-bar-fill" style={{ width: `${Math.min(100, Math.round((fraction ?? 0) * 100))}%` }} />
       </div>
-      <span>{text}</span>
+      {reset !== null ? <span className="ac-meter-reset">resets in {reset}</span> : null}
     </div>
   );
 }
@@ -57,18 +71,18 @@ export function readingText(account: PoolAccount, now: number = Date.now()): str
 }
 
 const STATE_TONE = { active: "active", paused: "pending", needs_login: "danger" } as const;
+const STATE_TEXT = { active: "Active", paused: "Paused", needs_login: "Needs login" } as const;
 
-function AccountRow({ account, onLogin }: { account: PoolAccount; onLogin: (view: LoginView) => void }) {
+function AccountCard({ account, onLogin }: { account: PoolAccount; onLogin: (view: LoginView) => void }) {
   const { rename, pause, resume, remove, logout } = useAccountActions();
   const relogin = useReloginAccount();
-  const [open, setOpen] = useState(false);
   const [confirmLogout, setConfirmLogout] = useState(false);
   const [renaming, setRenaming] = useState<string | null>(null);
   const [confirm, setConfirm] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const fail = (e: unknown) => setError(isApiRefusal(e) ? e.code : "the daemon did not answer");
-  const close = () => setOpen(false);
+  const signIn = () => relogin.mutate(account.id, { onSuccess: onLogin, onError: fail });
 
   const tryRemove = (force: boolean) => {
     remove.mutate(
@@ -85,95 +99,117 @@ function AccountRow({ account, onLogin }: { account: PoolAccount; onLogin: (view
     );
   };
 
+  const five = windowOf(account, "5h")?.used_fraction ?? null;
+  const seven = windowOf(account, "7d")?.used_fraction ?? null;
+  const measured = five !== null || seven !== null;
+
   return (
-    <tr>
-      <td>
-        {renaming !== null ? (
-          <form
-            onSubmit={(event) => {
-              event.preventDefault();
-              rename.mutate(
-                { id: account.id, label: renaming },
-                { onSuccess: () => setRenaming(null), onError: fail },
-              );
-            }}
+    <article className="ac-card" aria-label={`${account.label} account`}>
+      <header className="ac-card-head">
+        <div className="ac-card-title">
+          <span className="ac-engine-tag">{engineName(account.engine)}</span>
+          {renaming === null ? <strong className="ac-card-label">{account.label}</strong> : null}
+        </div>
+        <Badge tone={STATE_TONE[account.state]}>{STATE_TEXT[account.state]}</Badge>
+        <DropdownMenu>
+          <DropdownMenuTrigger
+            className="ui-icon-button"
+            aria-label={`Actions for ${account.label}`}
+            title={`Actions for ${account.label}`}
           >
-            <input aria-label="New label" value={renaming} onChange={(e) => setRenaming(e.target.value)} />
-            <Button type="submit" variant="primary" disabled={renaming.trim() === ""}>Save</Button>
-            <Button onClick={() => setRenaming(null)}>Cancel</Button>
-          </form>
-        ) : (
-          <>
-            <strong>{account.label}</strong> <Badge tone={STATE_TONE[account.state]}>{account.state.replace("_", " ")}</Badge>
-          </>
-        )}
-        {error !== null ? <div role="alert" className="ac-error">{error}</div> : null}
-        {confirm !== null ? (
-          <div role="alert" className="ac-confirm">
-            {confirm} live session{confirm === 1 ? "" : "s"} use this account.{" "}
-            <Button intent="stop" onClick={() => tryRemove(true)}>Remove anyway</Button>
-            <Button onClick={() => setConfirm(null)}>Keep</Button>
-          </div>
-        ) : null}
-        {confirmLogout ? (
-          <div role="alert" className="ac-confirm">
-            Sign this account out? Its history stays; use Redo login to sign back in.{" "}
-            <Button
-              intent="stop"
-              onClick={() => logout.mutate(account.id, { onSuccess: () => setConfirmLogout(false), onError: (e) => { setConfirmLogout(false); fail(e); } })}
-            >
-              Log out
-            </Button>
-            <Button onClick={() => setConfirmLogout(false)}>Keep</Button>
-          </div>
-        ) : null}
-      </td>
-      <td>{account.provider}</td>
-      <td>{account.kind === "api_key" ? "API key" : "Subscription"}</td>
-      <td><BarCell account={account} name="5h" /></td>
-      <td><BarCell account={account} name="7d" /></td>
-      <td>{account.live_sessions}</td>
-      <td>{readingText(account)}</td>
-      <td className="ac-menu">
-        <Button aria-label={`Actions for ${account.label}`} aria-expanded={open} onClick={() => setOpen(!open)}>
-          ...
-        </Button>
-        {open ? (
-          <div role="menu" className="ac-menu-list">
-            <Button role="menuitem" onClick={() => { setRenaming(account.label); close(); }}>Rename</Button>
-            <Button
-              role="menuitem"
-              onClick={() => {
-                relogin.mutate(account.id, { onSuccess: onLogin, onError: fail });
-                close();
-              }}
-            >
-              Redo login
-            </Button>
+            <MoreHorizontal className="ui-icon-button-glyph" strokeWidth={1.5} aria-hidden="true" />
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="ac-menu">
+            <DropdownMenuItem onSelect={() => setRenaming(account.label)}>Rename</DropdownMenuItem>
+            <DropdownMenuItem onSelect={signIn}>Redo login</DropdownMenuItem>
             {account.state === "needs_login" ? null : (
-              <Button role="menuitem" onClick={() => { setConfirmLogout(true); close(); }}>Log out</Button>
+              <DropdownMenuItem onSelect={() => setConfirmLogout(true)}>Log out</DropdownMenuItem>
             )}
             {account.state === "paused" ? (
-              <Button role="menuitem" onClick={() => { resume.mutate(account.id, { onError: fail }); close(); }}>Resume</Button>
+              <DropdownMenuItem onSelect={() => resume.mutate(account.id, { onError: fail })}>Resume</DropdownMenuItem>
             ) : (
-              <Button role="menuitem" onClick={() => { pause.mutate(account.id, { onError: fail }); close(); }}>Pause</Button>
+              <DropdownMenuItem onSelect={() => pause.mutate(account.id, { onError: fail })}>Pause</DropdownMenuItem>
             )}
             {account.is_default ? null : (
-              <Button role="menuitem" intent="stop" onClick={() => { tryRemove(false); close(); }}>Remove</Button>
+              <>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem variant="destructive" onSelect={() => tryRemove(false)}>Remove</DropdownMenuItem>
+              </>
             )}
-          </div>
-        ) : null}
-      </td>
-    </tr>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </header>
+
+      {renaming !== null ? (
+        <form
+          className="ac-rename"
+          onSubmit={(event) => {
+            event.preventDefault();
+            rename.mutate({ id: account.id, label: renaming }, { onSuccess: () => setRenaming(null), onError: fail });
+          }}
+        >
+          <input aria-label="New label" value={renaming} onChange={(e) => setRenaming(e.target.value)} />
+          <Button type="submit" variant="primary" disabled={renaming.trim() === ""}>Save</Button>
+          <Button onClick={() => setRenaming(null)}>Cancel</Button>
+        </form>
+      ) : null}
+
+      {measured ? (
+        <div className="ac-meters">
+          <Meter account={account} name="5h" />
+          <Meter account={account} name="7d" />
+        </div>
+      ) : (
+        <p className="ac-muted">No usage reading yet</p>
+      )}
+
+      {account.live_sessions > 0 ? (
+        <p className="ac-muted">
+          {account.live_sessions} live session{account.live_sessions === 1 ? "" : "s"}
+        </p>
+      ) : null}
+
+      {error !== null ? <div role="alert" className="ac-error">{error}</div> : null}
+      {confirm !== null ? (
+        <div role="alert" className="ac-confirm">
+          {confirm} live session{confirm === 1 ? "" : "s"} use this account.{" "}
+          <Button intent="stop" onClick={() => tryRemove(true)}>Remove anyway</Button>
+          <Button onClick={() => setConfirm(null)}>Keep</Button>
+        </div>
+      ) : null}
+      {confirmLogout ? (
+        <div role="alert" className="ac-confirm">
+          Sign this account out? Its history stays; use Redo login to sign back in.{" "}
+          <Button
+            intent="stop"
+            onClick={() => logout.mutate(account.id, { onSuccess: () => setConfirmLogout(false), onError: (e) => { setConfirmLogout(false); fail(e); } })}
+          >
+            Log out
+          </Button>
+          <Button onClick={() => setConfirmLogout(false)}>Keep</Button>
+        </div>
+      ) : null}
+
+      {account.state === "needs_login" ? (
+        <div className="ac-card-primary">
+          <Button variant="primary" onClick={signIn} disabled={relogin.isPending}>Sign in</Button>
+        </div>
+      ) : account.state === "paused" ? (
+        <div className="ac-card-primary">
+          <Button variant="primary" onClick={() => resume.mutate(account.id, { onError: fail })}>Resume</Button>
+        </div>
+      ) : null}
+    </article>
   );
 }
 
-/** System > Accounts: the pool's default, its accounts, and the way to add one. */
+/** System > Accounts: the pool's default, its accounts as cards, and the way to add one. */
 export function AccountsView() {
   const accounts = useAccounts();
   const chosen = useAccountDefault();
   const setDefault = useSetAccountDefault();
   const [login, setLogin] = useState<LoginView | null>(null);
+  const [adding, setAdding] = useState(false);
 
   if (accounts.isError) {
     if (isApiRefusal(accounts.error)) return <RefusalNote refusal={accounts.error} />;
@@ -191,51 +227,41 @@ export function AccountsView() {
 
   return (
     <div className="ac-page">
-      <label className="ac-default">
-        Default account
-        <select
-          value={options.some((o) => o.value === current) ? current : "auto"}
-          onChange={(event) => setDefault.mutate(event.target.value)}
-        >
-          {options.map((o) => (
-            <option key={o.value} value={o.value}>{o.label}</option>
-          ))}
-        </select>
-      </label>
+      <div className="ac-toolbar">
+        <Field label="Default account" helper="Used when a chat's account chip is on Auto.">
+          <Select
+            value={options.some((o) => o.value === current) ? current : "auto"}
+            onChange={(event) => setDefault.mutate(event.target.value)}
+          >
+            {options.map((o) => (
+              <option key={o.value} value={o.value}>{o.label}</option>
+            ))}
+          </Select>
+        </Field>
+        <Button variant="primary" onClick={() => setAdding(true)}>+ Add account</Button>
+      </div>
       {setDefault.isError ? <div role="alert" className="ac-error">The default could not be saved.</div> : null}
 
       {list.length === 0 ? (
         <Quiet says="no accounts yet: add one to start the pool" />
       ) : (
-        <table className="ac-table">
-          <thead>
-            <tr>
-              <th>Account</th>
-              <th>Provider</th>
-              <th>Kind</th>
-              <th>5h</th>
-              <th>7d</th>
-              <th>Live sessions</th>
-              <th>Reading</th>
-              <th><span className="sr-only">Actions</span></th>
-            </tr>
-          </thead>
-          <tbody>
-            {list.map((account) => (
-              <AccountRow key={account.id} account={account} onLogin={setLogin} />
-            ))}
-            <tr className="ac-disabled">
-              <td>API key</td>
-              <td colSpan={6}>Not available yet</td>
-              <td>
-                <Button disabled>Add</Button>
-              </td>
-            </tr>
-          </tbody>
-        </table>
+        <div className="ac-grid">
+          {list.map((account) => (
+            <AccountCard key={account.id} account={account} onLogin={setLogin} />
+          ))}
+        </div>
       )}
 
-      {login !== null ? <LoginPanel initial={login} onClose={() => setLogin(null)} /> : <AddAccount onStarted={setLogin} />}
+      <AddAccountDialog
+        open={adding || login !== null}
+        login={login}
+        accounts={list}
+        onStarted={setLogin}
+        onClose={() => {
+          setAdding(false);
+          setLogin(null);
+        }}
+      />
     </div>
   );
 }

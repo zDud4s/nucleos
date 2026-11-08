@@ -67,14 +67,49 @@ beforeEach(() => {
 });
 
 describe("the accounts view", () => {
-  it("lists accounts with bars, sessions and reading, plus a disabled API key row", async () => {
+  it("shows a card per account with the engine name, meters and live sessions", async () => {
     serve([account()]);
     renderWithQuery(<AccountsView />);
     expect(await screen.findByText("Work")).toBeTruthy();
+    expect(screen.getByText("Claude")).toBeTruthy();
     expect(screen.getByText("42%")).toBeTruthy();
     expect(screen.getByText("10%")).toBeTruthy();
-    expect(screen.getByText("2")).toBeTruthy();
-    expect((screen.getByRole("button", { name: "Add" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText("2 live sessions")).toBeTruthy();
+    expect(screen.queryByText("No usage reading yet")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Add" })).toBeNull();
+  });
+
+  it("says there is no usage reading instead of drawing empty meters, and hides zero sessions", async () => {
+    serve([account({ usage: null, live_sessions: 0 })]);
+    renderWithQuery(<AccountsView />);
+    await screen.findByText("Work");
+    expect(screen.getByText("No usage reading yet")).toBeTruthy();
+    expect(screen.queryByRole("progressbar")).toBeNull();
+    expect(screen.queryByText(/live session/)).toBeNull();
+  });
+
+  it("offers a primary Sign in on a card that needs a login", async () => {
+    serve([account({ state: "needs_login" })]);
+    renderWithQuery(<AccountsView />);
+    await screen.findByText("Work");
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+    await waitFor(() => expect(calls.some((c) => c.path === "/accounts/claude%3Awork/login" && c.method === "POST")).toBe(true));
+  });
+
+  it("offers a primary Resume on a paused card and none on an active one", async () => {
+    serve([account({ state: "paused" })]);
+    renderWithQuery(<AccountsView />);
+    await screen.findByText("Work");
+    fireEvent.click(screen.getByRole("button", { name: "Resume" }));
+    await waitFor(() => expect(calls.some((c) => c.path === "/accounts/claude%3Awork/resume" && c.method === "POST")).toBe(true));
+  });
+
+  it("has no primary button on an active card", async () => {
+    serve([account()]);
+    renderWithQuery(<AccountsView />);
+    await screen.findByText("Work");
+    expect(screen.queryByRole("button", { name: "Sign in" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Resume" })).toBeNull();
   });
 
   it("saves the default choice", async () => {
@@ -91,8 +126,8 @@ describe("the accounts view", () => {
     serve([account()]);
     renderWithQuery(<AccountsView />);
     await screen.findByText("Work");
-    fireEvent.click(screen.getByRole("button", { name: "Actions for Work" }));
-    fireEvent.click(screen.getByRole("menuitem", { name: "Pause" }));
+    fireEvent.keyDown(screen.getByRole("button", { name: "Actions for Work" }), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Pause" }));
     await waitFor(() => expect(calls.some((c) => c.path === "/accounts/claude%3Awork/pause" && c.method === "POST")).toBe(true));
   });
 
@@ -100,8 +135,8 @@ describe("the accounts view", () => {
     serve([account()]);
     renderWithQuery(<AccountsView />);
     await screen.findByText("Work");
-    fireEvent.click(screen.getByRole("button", { name: "Actions for Work" }));
-    fireEvent.click(screen.getByRole("menuitem", { name: "Log out" }));
+    fireEvent.keyDown(screen.getByRole("button", { name: "Actions for Work" }), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Log out" }));
     expect(await screen.findByText(/Sign this account out\?/)).toBeTruthy();
     expect(calls.some((c) => c.path.endsWith("/logout"))).toBe(false);
     fireEvent.click(screen.getByRole("button", { name: "Log out" }));
@@ -112,8 +147,8 @@ describe("the accounts view", () => {
     serve([account({ state: "needs_login" })]);
     renderWithQuery(<AccountsView />);
     await screen.findByText("Work");
-    fireEvent.click(screen.getByRole("button", { name: "Actions for Work" }));
-    expect(screen.getByRole("menuitem", { name: "Redo login" })).toBeTruthy();
+    fireEvent.keyDown(screen.getByRole("button", { name: "Actions for Work" }), { key: "Enter" });
+    expect(await screen.findByRole("menuitem", { name: "Redo login" })).toBeTruthy();
     expect(screen.queryByRole("menuitem", { name: "Log out" })).toBeNull();
   });
 
@@ -129,8 +164,8 @@ describe("the accounts view", () => {
     });
     renderWithQuery(<AccountsView />);
     await screen.findByText("Work");
-    fireEvent.click(screen.getByRole("button", { name: "Actions for Work" }));
-    fireEvent.click(screen.getByRole("menuitem", { name: "Remove" }));
+    fireEvent.keyDown(screen.getByRole("button", { name: "Actions for Work" }), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Remove" }));
     fireEvent.click(await screen.findByRole("button", { name: "Remove anyway" }));
     await waitFor(() => expect(calls.some((c) => c.path === "/accounts/claude%3Awork?force=true")).toBe(true));
   });
@@ -140,7 +175,7 @@ describe("the accounts view", () => {
     renderWithQuery(<AccountsView />);
     await screen.findByText("Work");
     fireEvent.click(screen.getByRole("button", { name: "+ Add account" }));
-    fireEvent.change(screen.getByLabelText("Label"), { target: { value: "New" } });
+    fireEvent.change(screen.getByLabelText("Account name"), { target: { value: "New" } });
     fireEvent.click(screen.getByRole("button", { name: "Start login" }));
     expect(await screen.findByText("https://auth.example/x")).toBeTruthy();
     await waitFor(() => expect(opener.openUrl).toHaveBeenCalledWith("https://auth.example/x"));
@@ -152,15 +187,14 @@ describe("the accounts view", () => {
     );
   });
 
-  it("offers the engines the daemon names", async () => {
+  it("offers the engines the daemon names as cards", async () => {
     serve([account()], ["codex", "gemini"]);
     renderWithQuery(<AccountsView />);
     await screen.findByText("Work");
     fireEvent.click(screen.getByRole("button", { name: "+ Add account" }));
-    const select = screen.getByLabelText("Engine") as HTMLSelectElement;
-    await waitFor(() => expect(Array.from(select.options).map((o) => o.value)).toEqual(["codex", "gemini"]));
-    expect(select.value).toBe("codex");
-    fireEvent.change(screen.getByLabelText("Label"), { target: { value: "New" } });
+    await waitFor(() => expect(screen.getAllByRole("radio").map((r) => r.textContent)).toEqual(["Codexcodex", "Geminigemini"]));
+    expect(screen.getByRole("radio", { name: /Codex/ }).getAttribute("aria-checked")).toBe("true");
+    fireEvent.change(screen.getByLabelText("Account name"), { target: { value: "New" } });
     fireEvent.click(screen.getByRole("button", { name: "Start login" }));
     await waitFor(() =>
       expect(
@@ -174,14 +208,31 @@ describe("the accounts view", () => {
     renderWithQuery(<AccountsView />);
     await screen.findByText("Work");
     fireEvent.click(screen.getByRole("button", { name: "+ Add account" }));
-    const select = screen.getByLabelText("Engine") as HTMLSelectElement;
-    expect(Array.from(select.options).map((o) => o.value)).toEqual(["claude", "codex"]);
+    expect(screen.getAllByRole("radio").map((r) => r.textContent)).toEqual(["Claudeclaude", "Codexcodex"]);
+  });
+
+  it("prefills a free name and explains why Start login is disabled", async () => {
+    serve([account({ label: "claude" })]);
+    renderWithQuery(<AccountsView />);
+    await screen.findByText("claude");
+    fireEvent.click(screen.getByRole("button", { name: "+ Add account" }));
+    const name = screen.getByLabelText("Account name") as HTMLInputElement;
+    expect(name.value).toBe("claude-2");
+    const start = screen.getByRole("button", { name: "Start login" }) as HTMLButtonElement;
+    expect(start.disabled).toBe(false);
+    fireEvent.change(name, { target: { value: "" } });
+    expect(start.disabled).toBe(true);
+    expect(screen.getByText("Give the account a name to continue.")).toBeTruthy();
+    fireEvent.change(name, { target: { value: "claude" } });
+    expect(start.disabled).toBe(true);
+    expect(screen.getByText(/already exists/)).toBeTruthy();
   });
 });
 
 describe("helpers", () => {
   it("builds the default options: Auto, providers, accounts", () => {
     expect(defaultOptions([account()]).map((o) => o.value)).toEqual(["auto", "provider:anthropic", "account:claude:work"]);
+    expect(defaultOptions([account()]).map((o) => o.label)).toEqual(["Auto", "Any Claude account", "Work (Claude)"]);
   });
 
   it("reads the reading source and age, or says not measured", () => {
