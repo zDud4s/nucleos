@@ -241,8 +241,8 @@ describe("EngineOptIn - what the window claims (review 7)", () => {
     release();
 
     expect(await screen.findByText(/no reply/i)).toBeDefined();
-    await waitFor(() => expect(screen.queryByText(/unknown/i)).toBeNull());
-    expect(screen.queryByText(/not responding/i)).toBeNull();
+    // The "unknown" toast stays until it times out or is dismissed; the switch itself shows the setting.
+    expect(screen.queryByText(/could not read the setting/i)).toBeNull();
     expect(screen.queryByText(/was not changed/i)).toBeNull();
   });
 

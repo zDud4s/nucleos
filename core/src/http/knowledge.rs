@@ -4,7 +4,12 @@ use super::*;
 
 pub(super) fn routes() -> Router<AppState> {
     Router::new()
-        .route("/jobs", get(get_jobs).post(create_job))
+        .route(
+            "/jobs",
+            get(get_jobs)
+                .post(create_job)
+                .layer(axum::middleware::from_fn(super::idempotency::guard)),
+        )
         .route("/jobs/{id}", get(get_job))
         // Distinct from `/runs/{id}/cancel`, which stops one node. Both end the job — a stopped
         // node leaves the tree holding edits no gate measured — but only this one reaches a job

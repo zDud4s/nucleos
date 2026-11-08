@@ -18,7 +18,7 @@ import { DAEMON_NAME } from "../copy";
 import { inputFromStamp, occurrenceMinutes, stampFromInput } from "../lib/calendar-grid";
 import { UI_LOCALE } from "../lib/locale";
 import { formatSpan } from "../lib/when";
-import { Badge, Button, ConfirmButton, ErrorNote, Modal, Quiet, RefusalNote, Row, Rows, Select, TimeField } from "../ui";
+import { Badge, Button, ConfirmButton, ErrorNote, Modal, Quiet, RefusalNote, Row, Rows, Select, TimeField, toastManager } from "../ui";
 import { placementOf, slotStamp, type Slot } from "./slot";
 
 /**
@@ -172,9 +172,6 @@ export function DraftEventForm({
   // Not a whole positive number of minutes: the button would grey out with no reason given.
   const durationBad = !Number.isFinite(duration) || duration < 1;
   const durationHint = useId();
-  /* What was just added, by name and time. Cleared as soon as the title is edited, so the
-     line never outlives the moment it confirms. */
-  const [added, setAdded] = useState<string | null>(null);
   const canSubmit = title.trim() !== "" && stamp !== null && !durationBad && !create.isPending;
 
   function submit() {
@@ -190,7 +187,7 @@ export function DraftEventForm({
     create.mutate(input, {
       onSuccess: () => {
         setTitle("");
-        setAdded(summary);
+        toastManager.add({ type: "success", title: "Event added", description: summary });
       },
     });
   }
@@ -210,7 +207,6 @@ export function DraftEventForm({
           value={title}
           onChange={(event) => {
             setTitle(event.target.value);
-            setAdded(null);
           }}
           placeholder="Add an event to this day"
           aria-label="Title"
@@ -269,11 +265,6 @@ export function DraftEventForm({
       {durationBad && (
         <p id={durationHint} className="calendar-draft-hint">
           Duration must be at least 1 minute.
-        </p>
-      )}
-      {added !== null && !create.isError && (
-        <p className="calendar-outcome" role="status">
-          Added: {added}
         </p>
       )}
       {create.isError && <DraftError error={create.error} onRetry={submit} />}

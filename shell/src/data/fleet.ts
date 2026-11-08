@@ -1,5 +1,5 @@
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { apiFetch, apiText, isApiUnavailable } from "./client";
+import { apiFetch, apiText, isApiUnavailable, withIdempotencyKey, type IdempotentCall } from "./client";
 import { keys } from "./keys";
 import { POLL, pollWhile } from "./poll";
 import type { Proposal } from "./system";
@@ -451,8 +451,11 @@ export function useExclusionRequests() {
 export function useCreateJob() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (job: NewJob) =>
-      apiFetch<{ job_id: number }>("/jobs", { method: "POST", body: JSON.stringify(job) }),
+    mutationFn: ({ idempotencyKey, ...job }: NewJob & IdempotentCall) =>
+      apiFetch<{ job_id: number }>(
+        "/jobs",
+        withIdempotencyKey({ method: "POST", body: JSON.stringify(job) }, idempotencyKey),
+      ),
     retry: false,
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: keys.concurrency });

@@ -42,7 +42,11 @@ import {
   Td,
   Teach,
   Th,
+  Tip,
+  toastManager,
+  usePaletteGroup,
 } from "../ui";
+import { usePageKeys } from "../project/pageKeys";
 import { DAEMON_NAME } from "../copy";
 import { plural } from "../lib/plural";
 import "./agents.css";
@@ -138,15 +142,28 @@ export function Agents() {
       (!chipsOn.includes(NOBODY_USES) || (employmentKnown && unemployed(employmentOf(row.id, departments)))),
   );
 
+  // #3/#4: the palette's "New agent" and the key it prints.
+  const openCreate = () => setCreating(true);
+  usePaletteGroup({
+    id: "agents-actions",
+    heading: "Quick actions",
+    items: [{ id: "agents-new", label: "New agent", match: "new agent create", shortcut: "N", run: openCreate }],
+  });
+  usePageKeys({ n: openCreate }, !creating);
+
   return (
     <>
       <PageHeader
         title="Agents"
         headline={headlineFor(rows, departments, answered, employmentKnown)}
         actions={
-          <Button intent="go" onClick={() => setCreating(true)} aria-haspopup="dialog">
-            New agent
-          </Button>
+          <Tip tip="Add an agent to the catalogue" shortcut="N">
+            {({ tipId }) => (
+              <Button intent="go" onClick={() => setCreating(true)} aria-haspopup="dialog" aria-describedby={tipId}>
+                New agent
+              </Button>
+            )}
+          </Tip>
         }
       />
 
@@ -157,7 +174,7 @@ export function Agents() {
           nobody had read yet — the very thing the console rewrite undid. */}
       {creating && <NewAgentForm onDone={() => setCreating(false)} />}
 
-      {!answered && !agents.isError && <Skeleton label="Reading the catalogue…" lines={3} />}
+      {!answered && !agents.isError && <Skeleton label="Reading the catalogue" variant="row" count={4} />}
 
       {answered && rows.length === 0 && (
         <Teach title="No agent has been hired yet">
@@ -832,7 +849,6 @@ function AgentEditor({
 }) {
   const [draft, setDraft] = useState<AgentDraft>(() => draftFromAgent(agent));
   const [tab, setTab] = useState<EditorTab>("definition");
-  const [saved, setSaved] = useState(false);
   const update = useUpdateAgent();
   const del = useDeleteAgent();
   const valid = draftIsValid(draft);
@@ -840,7 +856,6 @@ function AgentEditor({
   const dirty = JSON.stringify(draft) !== JSON.stringify(draftFromAgent(agent));
 
   function patch(next: Partial<AgentDraft>) {
-    setSaved(false);
     setDraft((current) => ({ ...current, ...next }));
   }
 
@@ -858,13 +873,11 @@ function AgentEditor({
             <span className="agents-save-status" role="status">
               {update.isPending
                 ? "Saving…"
-                : saved
-                  ? "Saved"
-                  : !valid
-                    ? invalidReason(draft)
-                    : dirty
-                      ? "Unsaved changes"
-                      : ""}
+                : !valid
+                  ? invalidReason(draft)
+                  : dirty
+                    ? "Unsaved changes"
+                    : ""}
             </span>
             <Button variant="ghost" onClick={onClose}>
               Cancel
@@ -901,16 +914,15 @@ function AgentEditor({
                 {DAEMON_NAME} stored rather than what you typed — trimmed, and a blank model
                 turned back into the engine's default — and the row above changes
                 under you, which is the acknowledgement that a form closing itself
-                used to be standing in for. The footer says "Saved" as well, because
+                used to be standing in for. A "saved" toast says so as well, because
                 that row sits behind the overlay.
               */
-              setSaved(false);
               update.mutate(
                 { id: agent.id, request: requestFromDraft(draft) },
                 {
                   onSuccess: (savedAgent) => {
                     setDraft(draftFromAgent(savedAgent));
-                    setSaved(true);
+                    toastManager.add({ type: "success", title: "Agent saved", description: savedAgent.name });
                   },
                 },
               );

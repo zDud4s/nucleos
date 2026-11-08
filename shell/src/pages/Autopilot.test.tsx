@@ -1681,3 +1681,40 @@ describe("Autopilot - the page map and the advanced panels", () => {
     expect(brakes.closest("#ap-brakes")).not.toBeNull();
   });
 });
+
+describe("Autopilot - starting a job is one intent", () => {
+  it("retries a failed start under the same idempotency key, and mints a new one after a success", async () => {
+    const world = cockpitWorld({ projects: [project({ project_id: "alpha", mode: "active", project_root: "C:/repos/alpha" })] });
+    const base = cockpitFetch(world);
+    let attempts = 0;
+    const keys: string[] = [];
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === "/jobs" && init?.method === "POST") {
+        attempts += 1;
+        keys.push(new Headers(init.headers).get("Idempotency-Key") ?? "");
+        if (attempts === 1) throw new Error("connection lost");
+        return { job_id: attempts };
+      }
+      return base(path, init);
+    });
+
+    await renderCockpit();
+    const field = await screen.findByLabelText(/What should alpha do/);
+    fireEvent.change(field, { target: { value: "tidy the logs" } });
+    const start = screen.getByRole("button", { name: "Start a job" });
+
+    fireEvent.click(start);
+    await waitFor(() => expect(attempts).toBe(1));
+    await waitFor(() => expect((start as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(start);
+    await waitFor(() => expect(attempts).toBe(2));
+    expect(keys[0]).not.toBe("");
+    expect(keys[1]).toBe(keys[0]);
+
+    // The success cleared the prompt, so a new prompt is a new intent with a new key.
+    fireEvent.change(field, { target: { value: "tidy the logs again" } });
+    fireEvent.click(screen.getByRole("button", { name: "Start a job" }));
+    await waitFor(() => expect(attempts).toBe(3));
+    expect(keys[2]).not.toBe(keys[0]);
+  });
+});

@@ -155,8 +155,8 @@ describe("SessionColumn", () => {
     expect(onNew).toHaveBeenCalledTimes(1);
     // New group sits beside it, on the same row, and nowhere else.
     expect(screen.getAllByRole("button", { name: "New group" })).toHaveLength(1);
-    expect(screen.getByRole("button", { name: "New group" }).parentElement).toBe(
-      screen.getByRole("button", { name: "New conversation" }).parentElement,
+    expect(screen.getByRole("button", { name: "New group" }).closest(".chats-rail-actions")).toBe(
+      screen.getByRole("button", { name: "New conversation" }).closest(".chats-rail-actions"),
     );
 
     // The group holds its own row, the rest are ungrouped, and each heading carries a count.
@@ -501,7 +501,8 @@ describe("SessionColumn - groups across paired machines", () => {
     expect(await screen.findByText(/Tower did not apply the change to/)).toBeDefined();
     towerDown = false;
     await renameWork();
-    await waitFor(() => expect(screen.queryByText(/did not apply the change to/)).toBeNull());
+    // The earlier failure was a toast; it stays until dismissed or timed out, and the retry succeeds quietly.
+    await waitFor(() => expect(screen.getAllByText(/did not apply the change to/)).toHaveLength(1));
   });
 
   async function renameWork() {

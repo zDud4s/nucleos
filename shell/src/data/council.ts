@@ -1,5 +1,7 @@
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { apiFetch } from "./client";
+import { useRef } from "react";
+import { newIdempotencyKey } from "../lib/idempotency";
+import { apiFetch, withIdempotencyKey, type IdempotentCall } from "./client";
 import { keys } from "./keys";
 import { POLL, pollWhile } from "./poll";
 
@@ -344,7 +346,7 @@ export function seatName(seat: SeatView): string {
  * namespace (`keys.ts:431` records the reform) and is no longer an example of
  * anything.
  */
-const COUNCIL_KEYS = {
+export const COUNCIL_KEYS = {
   list: [...keys.council.all, "list"] as const,
   detail: (id: string) => [...keys.council.all, "detail", id] as const,
   config: [...keys.council.all, "config"] as const,
@@ -545,15 +547,27 @@ function createBody(request: CreateCouncilRequest): Record<string, unknown> {
  */
 export function useCreateCouncil() {
   const queryClient = useQueryClient();
+  // The intent: one `Idempotency-Key` per ask. It survives failed attempts with
+  // the same body (a retry or double click must not convene a second council)
+  // and is dropped on success or when the body changes (a new ask).
+  const intent = useRef<{ key: string; fingerprint: string } | null>(null);
   return useMutation({
-    mutationFn: (request: CreateCouncilRequest) =>
-      apiFetch<{ id: string }>("/council", {
-        method: "POST",
-        // Built key by key rather than stringified whole — see `createBody`.
-        body: JSON.stringify(createBody(request)),
-      }),
+    // `idempotencyKey` rides as the `Idempotency-Key` header so a replayed Convene joins the first (#19).
+    // A caller-supplied key wins; without one the hook keeps its own per-ask intent key.
+    mutationFn: ({ idempotencyKey, ...request }: CreateCouncilRequest & IdempotentCall) => {
+      // Built key by key rather than stringified whole — see `createBody`.
+      const body = JSON.stringify(createBody(request));
+      if (idempotencyKey !== undefined && idempotencyKey !== "") {
+        return apiFetch<{ id: string }>("/council", withIdempotencyKey({ method: "POST", body }, idempotencyKey));
+      }
+      if (intent.current === null || intent.current.fingerprint !== body) {
+        intent.current = { key: newIdempotencyKey(), fingerprint: body };
+      }
+      return apiFetch<{ id: string }>("/council", withIdempotencyKey({ method: "POST", body }, intent.current.key));
+    },
     retry: false,
     onSuccess: () => {
+      intent.current = null;
       void queryClient.invalidateQueries({ queryKey: COUNCIL_KEYS.list });
     },
   });

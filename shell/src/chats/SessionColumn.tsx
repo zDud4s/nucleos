@@ -44,6 +44,7 @@ import {
   RelativeTime,
   Skeleton,
   Teach,
+  Tip,
   relativeText,
   useUndoToast,
 } from "../ui";
@@ -298,10 +299,14 @@ export function SessionColumn({
       <div className="chats-rail-actions">
         {/* Opens an empty chat, and asks nothing: the model is a control in the box, answerable
             while you type the first sentence and changeable after it. */}
-        <button type="button" className="chats-rail-new" onClick={onNew}>
-          <Plus className="chats-rail-icon" aria-hidden="true" />
-          New conversation
-        </button>
+        <Tip tip="Start an empty conversation" shortcut="N" className="chats-rail-tip">
+          {({ tipId }) => (
+            <button type="button" className="chats-rail-new" aria-describedby={tipId} onClick={onNew}>
+              <Plus className="chats-rail-icon" aria-hidden="true" />
+              New conversation
+            </button>
+          )}
+        </Tip>
         <button
           type="button"
           className="chats-rail-new chats-rail-new-group"
@@ -415,7 +420,8 @@ export function SessionColumn({
       )}
 
       <div className="chats-rail-scroll">
-        {!answered && <Skeleton label="Reading your conversations…" lines={3} />}
+        {/* The list's own row height (a 2-line-height row plus its padding), flat like the rows. */}
+        {!answered && <Skeleton label="Reading your conversations…" variant="row" count={8} height="2.25rem" />}
         {answered && rows.length === 0 && editors.length === 0 && groups.length === 0 && (
           <Teach title="No conversations yet">
             <p>Say something to start one: press New conversation above and write in the box.</p>

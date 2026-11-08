@@ -1,5 +1,5 @@
 // §spec pilar-de-browser
-import { useCallback, useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type FormEvent, type KeyboardEvent, type MouseEvent, type ReactNode } from "react";
 import { ArrowLeft, ArrowRight, Bot, Lock, LockOpen, Plus, RotateCw, Square, X } from "lucide-react";
 import { useProjects } from "../data/system";
 import {
@@ -33,6 +33,7 @@ import { AgentControlBar, useHumanDriving } from "./AgentControlBar";
 import { Button, ErrorNote, IconButton, Select } from "../ui";
 import { useOverlayOpen } from "../ui/overlay";
 import { resolveOmnibox } from "./browser-omnibox";
+import { isEditableTarget } from "../lib/useHistoryNavigation";
 import "./browser-page.css";
 
 const NO_BOUNDS: Bounds = { x: 0, y: 0, width: 0, height: 0 };
@@ -219,8 +220,30 @@ export function BrowserPage({ actions }: { actions?: ReactNode } = {}) {
     guard(tabReload(id));
   }
 
+  // Back/forward inside the page: the mouse side buttons and Alt+Left/Right step this tab's own
+  // history and stop there, so the shell's route navigation (#12) never also fires.
+  const stepTab = (dir: "back" | "forward"): void => {
+    if (active === null || agentLocked) return;
+    if (dir === "back" && active.canGoBack) guard(tabBack(active.id));
+    if (dir === "forward" && active.canGoForward) guard(tabForward(active.id));
+  };
+  const onPointerNav = (e: MouseEvent<HTMLElement>) => {
+    if (e.button !== 3 && e.button !== 4) return;
+    e.preventDefault();
+    e.stopPropagation();
+    stepTab(e.button === 3 ? "back" : "forward");
+  };
+  const onKeyNav = (e: KeyboardEvent<HTMLElement>) => {
+    if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+    if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+    if (isEditableTarget(e.target)) return; // the address field keeps Alt+Arrow for its caret
+    e.preventDefault();
+    e.nativeEvent.stopPropagation();
+    stepTab(e.key === "ArrowLeft" ? "back" : "forward");
+  };
+
   return (
-    <section className="browser-page">
+    <section className="browser-page" onMouseUp={onPointerNav} onKeyDown={onKeyNav}>
       <header className="browser-bar">
         <div className="browser-tabs" role="tablist">
           {current.tabs.map((tab) => (

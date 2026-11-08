@@ -1140,3 +1140,12 @@
   font-size: var(--text-xs);
   color: var(--text-muted);
 }
+
+/* #16: counters, durations, costs and figures stand in columns. */
+.runs-row-cost,
+.runs-row-when,
+.runs-turns,
+.runs-older-count,
+.runs-event-meta {
+  font-variant-numeric: tabular-nums;
+}

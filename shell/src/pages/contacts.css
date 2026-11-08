@@ -39,6 +39,11 @@
 
 /* Body type, not mono: this line is counts and relative times, prose with numbers in
    it. Tabular figures keep the digits from jittering as the times tick over. */
+/* Message counts and last-seen times hold one width as they change (#16). */
+.contacts-meta {
+  font-variant-numeric: tabular-nums;
+}
+
 .contacts-meta {
   margin: 0;
   font-family: var(--font-body);

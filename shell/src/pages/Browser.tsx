@@ -1,6 +1,6 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { Globe } from "lucide-react";
-import { Link } from "@tanstack/react-router";
+import { Link, useNavigate } from "@tanstack/react-router";
 import { isApiRefusal, type ApiRefusal } from "../data/client";
 import {
   useBrowserHealth,
@@ -44,6 +44,7 @@ import {
   Select,
   Skeleton,
   StateBadge,
+  toastManager,
 } from "../ui";
 import { DAEMON_NAME } from "../copy";
 import { plural } from "../lib/plural";
@@ -492,6 +493,7 @@ function OpenBar({ health }: { health: ReturnType<typeof useBrowserHealth> }) {
   const [url, setUrl] = useState("");
   const open = useOpenWindow();
   const withAgent = useOpenWithAgent();
+  const navigate = useNavigate();
   const hintId = useId();
   const options = projects.data ?? [];
   const projectId = chosen ?? options[0]?.project_id;
@@ -518,7 +520,17 @@ function OpenBar({ health }: { health: ReturnType<typeof useBrowserHealth> }) {
         onSubmit={(event) => {
           event.preventDefault();
           if (projectId === undefined || !ready) return;
-          open.mutate({ projectId, url: url.trim() === "" ? BLANK_PAGE : url.trim() });
+          open.mutate(
+            { projectId, url: url.trim() === "" ? BLANK_PAGE : url.trim() },
+            {
+              onSuccess: (data) =>
+                toastManager.add({
+                  type: "success",
+                  title: `Opened session #${data.id}`,
+                  description: `On the ${data.profile_kind} profile ${data.profile_id}. Give it back below when you are done.`,
+                }),
+            },
+          );
         }}
       >
         {/* A visible label: the window opens on this project's profile, logins included, and the
@@ -558,7 +570,24 @@ function OpenBar({ health }: { health: ReturnType<typeof useBrowserHealth> }) {
           disabled={!readyWithAgent}
           onClick={() => {
             if (projectId === undefined || !readyWithAgent) return;
-            withAgent.mutate({ projectId, url: url.trim() });
+            withAgent.mutate(
+              { projectId, url: url.trim() },
+              {
+                onSuccess: (data) =>
+                  toastManager.add({
+                    type: "success",
+                    title: `Opened session #${data.session.id} with the agent`,
+                    description:
+                      data.session.profile_kind === "ephemeral"
+                        ? "In a throwaway profile, with none of the project's logins. To use your login here, log in with Open a window and keep the site first."
+                        : undefined,
+                    action: {
+                      label: "Open conversation",
+                      onClick: () => void navigate({ to: "/chats/$chatId", params: { chatId: data.chat_id } }),
+                    },
+                  }),
+              },
+            );
           }}
         >
           {withAgent.isPending ? "Opening…" : "Open with agent"}
@@ -574,22 +603,7 @@ function OpenBar({ health }: { health: ReturnType<typeof useBrowserHealth> }) {
       </p>
       {unavailable && <SidecarTrouble health={health} />}
 
-      {open.data !== undefined && (
-        <p className="browser-outcome" role="status">
-          opened session #{open.data.id} on the {open.data.profile_kind} profile {open.data.profile_id}.
-          Give it back below when you are done
-        </p>
-      )}
       {open.isError && <MutationNote error={open.error} what="the window could not be opened" />}
-      {withAgent.data !== undefined && (
-        <p className="browser-outcome" role="status">
-          opened session #{withAgent.data.session.id} with the agent
-          {withAgent.data.session.profile_kind === "ephemeral"
-            ? " in a throwaway profile, with none of the project's logins. To use your login here, log in with Open a window and keep the site first"
-            : ""}{" "}
-          (<Link to="/chats/$chatId" params={{ chatId: withAgent.data.chat_id }}>open its conversation</Link>)
-        </p>
-      )}
       {withAgent.isError && (
         <MutationNote error={withAgent.error} what="the window with the agent could not be opened" />
       )}
@@ -712,13 +726,17 @@ function SiteGrants() {
               confirmLabel={`Forget ${projectId}: every site, every login, every session`}
               variant="danger"
               disabled={forget.isPending}
-              onConfirm={() => forget.mutate(projectId)}
+              onConfirm={() =>
+                forget.mutate(projectId, {
+                  onSuccess: (data) =>
+                    toastManager.add({
+                      type: "success",
+                      title: "Profile forgotten",
+                      description: `Stopped ${plural(data.stopped, "running session")} and cleared every site.`,
+                    }),
+                })
+              }
             />
-            {forget.data !== undefined && (
-              <p className="browser-outcome" role="status">
-                stopped {plural(forget.data.stopped, "running session")} and cleared every site
-              </p>
-            )}
             {forget.isError && <MutationNote error={forget.error} what="the profile could not be forgotten" />}
           </div>
         </>

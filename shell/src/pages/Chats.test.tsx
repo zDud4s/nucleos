@@ -2462,10 +2462,8 @@ describe("Chats - the helpers a conversation may hand work to", () => {
 
     // Waits on the served list arriving — before that, every name would read as unknown, which
     // would flash a refusal a helper opened with valid tools does not deserve.
-    const alerts = await screen.findAllByRole("alert");
+    const alerts = await screen.findAllByText(/is not a tool the daemon can grant/i);
     expect(alerts).toHaveLength(2);
-    expect(alerts[0].textContent).toMatch(/is not a tool the daemon can grant/i);
-    expect(alerts[1].textContent).toMatch(/is not a tool the daemon can grant/i);
     const save = screen.getByRole("button", { name: /^save$/i }) as HTMLButtonElement;
     expect(save.disabled).toBe(true);
     expect(daemon.apiFetch).not.toHaveBeenCalledWith(
@@ -2486,8 +2484,7 @@ describe("Chats - the helpers a conversation may hand work to", () => {
 
     // The daemon answers a bad set with a bare 400 and no body. Without this, a dialog holding five
     // helpers would say "no" without saying which one or why.
-    expect(await screen.findByRole("alert")).toBeDefined();
-    expect(screen.getByText(/reads as a flag/i)).toBeDefined();
+    expect(await screen.findByText(/reads as a flag/i)).toBeDefined();
     const save = screen.getByRole("button", { name: /^save$/i }) as HTMLButtonElement;
     expect(save.disabled).toBe(true);
   });
@@ -2999,7 +2996,12 @@ describe("Chats - automatic compaction", () => {
 });
 
 describe("Chats - archiving a conversation", () => {
-  it("arms and then confirms in two separate waits, with copy that says the turns are kept", async () => {
+  const archived = () =>
+    daemon.apiFetch.mock.calls.filter(
+      (call) => String(call[0]) === "/assistant/chats/c-1" && call[1]?.method === "DELETE",
+    );
+
+  it("offers Undo at once and only writes when the window closes", async () => {
     const summary = chatSummary({ chat_id: "c-1" });
     daemon.apiFetch.mockImplementation(chatsFetch([summary], { "c-1": [] }));
 
@@ -3007,15 +3009,26 @@ describe("Chats - archiving a conversation", () => {
     await openConversationSettings();
     fireEvent.click(await screen.findByRole("button", { name: "Archive" }));
 
-    // First wait: the interlock has armed and swapped its own label.
-    const confirm = await screen.findByRole("button", { name: /^keep holding to archive$/i });
-    await afterDwell();
-    fireEvent.click(confirm);
+    expect(await screen.findByText("Archived this conversation")).toBeDefined();
+    expect(archived()).toHaveLength(0);
 
-    // Second wait: the write actually happened.
-    await waitFor(() => {
-      expect(daemon.apiFetch).toHaveBeenCalledWith("/assistant/chats/c-1", { method: "DELETE" });
-    });
+    // The window is real time: the write lands once it closes.
+    await waitFor(() => expect(archived()).toHaveLength(1), { timeout: 9000 });
+  }, 15000);
+
+  it("Undo inside the window sends no write at all", async () => {
+    const summary = chatSummary({ chat_id: "c-1" });
+    daemon.apiFetch.mockImplementation(chatsFetch([summary], { "c-1": [] }));
+
+    await renderChats("/chats/c-1");
+    await openConversationSettings();
+    fireEvent.click(await screen.findByRole("button", { name: "Archive" }));
+    await screen.findByText("Archived this conversation");
+    fireEvent.click(screen.getByRole("button", { name: /^undo$/i }));
+
+    await waitFor(() => expect(screen.queryByText("Archived this conversation")).toBeNull());
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(archived()).toHaveLength(0);
   });
 });
 
@@ -3825,7 +3838,7 @@ describe("Chats - giving a conversation a project", () => {
     fireEvent.click(await within(dialog).findByRole("radio", { name: /nucleos/i }));
     fireEvent.click(within(dialog).getByRole("button", { name: "Use this" }));
 
-    expect(await within(dialog).findByText(/does not exist on this machine/i)).toBeTruthy();
+    expect(await screen.findByText(/does not exist on this machine/i)).toBeTruthy();
   });
 });
 
@@ -7619,6 +7632,28 @@ describe("Chats - stopping and typing", () => {
     expect(callsTo("/assistant/chats/c-1", "PATCH")).toHaveLength(0);
   });
 
+  it("a refused rename puts the old title back and says why", async () => {
+    const base = chatsFetch([chatSummary({ chat_id: "c-1", title: "old name" })], { "c-1": [] });
+    daemon.apiFetch.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === "/assistant/chats/c-1" && init?.method === "PATCH") {
+        throw new ApiRefusal(404, "not_found", "gone");
+      }
+      return base(path, init);
+    });
+
+    await renderChats("/chats/c-1");
+    await openConversationSettings();
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Rename" }));
+    const dialog = await screen.findByRole("dialog", { name: "Rename conversation" });
+    const field = within(dialog).getByRole("textbox", { name: "Conversation title" });
+    fireEvent.change(field, { target: { value: "new name" } });
+    fireEvent.keyDown(field, { key: "Enter" });
+
+    expect(await screen.findByText(/nothing left to rename/)).toBeDefined();
+    await waitFor(() => expect(screen.queryByText("new name")).toBeNull());
+    expect(screen.getAllByText("old name").length).toBeGreaterThan(0);
+  });
+
   it("pressing Enter twice on a rename sends one rename", async () => {
     const base = chatsFetch([chatSummary({ chat_id: "c-1", title: "old name" })], { "c-1": [] });
     let release!: () => void;
@@ -7771,14 +7806,14 @@ describe("Chats - refusals and failures that used to say nothing", () => {
     await renderChats("/chats/c-1");
     await openConversationSettings();
     fireEvent.click(await screen.findByRole("button", { name: "Archive" }));
-    const confirm = await screen.findByRole("button", { name: /^keep holding to archive$/i });
-    await afterDwell();
-    fireEvent.click(confirm);
 
+    // The write waits out the Undo window, then the refusal is said.
     expect(
-      await screen.findByText(/a turn is still running here; stop it before archiving/),
+      await screen.findByText(/a turn is still running here; stop it before archiving/, undefined, {
+        timeout: 9000,
+      }),
     ).toBeDefined();
-  });
+  }, 15000);
 
   it("a picture that cannot be read is reported rather than thrown", async () => {
     class UnreadableReader {

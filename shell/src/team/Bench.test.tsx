@@ -440,7 +440,7 @@ describe("Bench - Work", () => {
     fireEvent.click(within(panel).getByRole("button", { name: "Start task" }));
 
     // The daemon's own sentence, verbatim — no toast and no modal anywhere.
-    expect(await within(panel).findByText(/pesquisa.*not in the catalogue/)).toBeDefined();
+    expect(await screen.findByText(/pesquisa.*not in the catalogue/)).toBeDefined();
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 });

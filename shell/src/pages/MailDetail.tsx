@@ -1,17 +1,18 @@
 import { useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { useParams } from "@tanstack/react-router";
 import { DAEMON_NAME } from "../copy";
-import { isApiRefusal, type ApiRefusal } from "../data/client";
+import { apiFetch, isApiRefusal, withIdempotencyKey, type ApiRefusal } from "../data/client";
+import { useGuardedAction } from "../lib/useGuardedAction";
 import {
   useDownloadAttachment,
   useEmail,
   useRequeue,
   useSaveAllAttachments,
   useSaveAttachment,
-  useSendReply,
   useSenderVerdict,
   type EmailAttachment,
   type EmailDetail,
+  type ReplyInput,
   type SavedAttachments,
   type SavedFile,
 } from "../data/mail";
@@ -490,7 +491,14 @@ function VerdictError({ error }: { error: unknown }) {
  * shell's own generic copy.
  */
 function ReplyForm({ to, subject }: { to: string; subject: string | null }) {
-  const send = useSendReply();
+  // One Idempotency-Key per Send intent; a double press while in flight rejoins the same call (#19).
+  const [outcome, setOutcome] = useState<{ ok: true } | { ok: false; error: unknown } | null>(null);
+  const send = useGuardedAction((intent, input: ReplyInput) =>
+    apiFetch<void>(
+      "/email/send",
+      withIdempotencyKey({ method: "POST", body: JSON.stringify(input) }, intent.key),
+    ),
+  );
   const [body, setBody] = useState("");
   const sendRef = useRef<HTMLSpanElement>(null);
   // The daemon may omit a field the type says is always present; absent is not null.
@@ -529,23 +537,27 @@ function ReplyForm({ to, subject }: { to: string; subject: string | null }) {
             sayAs={`Send this reply to ${to}`}
             variant="approve"
             intent="go"
-            disabled={body.trim() === "" || send.isPending}
-            onConfirm={() =>
-              send.mutate(
-                { to, subject: replySubject, body: body.trim() },
-                { onSuccess: () => setBody("") },
-              )
-            }
+            disabled={body.trim() === "" || send.pending}
+            onConfirm={() => {
+              setOutcome(null);
+              send.run({ to, subject: replySubject, body: body.trim() }).then(
+                () => {
+                  setBody("");
+                  setOutcome({ ok: true });
+                },
+                (error: unknown) => setOutcome({ ok: false, error }),
+              );
+            }}
           />
         </span>
         <p className="mail-note">If no sending account is set up, Send will say so. Ctrl+Enter arms Send.</p>
       </form>
-      {send.isSuccess && (
+      {outcome?.ok === true && (
         <p className="mail-outcome" role="status">
           Sent to {to}
         </p>
       )}
-      {send.isError && <SendError error={send.error} />}
+      {outcome?.ok === false && <SendError error={outcome.error} />}
     </Panel>
   );
 }

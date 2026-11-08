@@ -19,7 +19,8 @@ import { useProjects } from "../data/system";
 import { ComposerBox } from "../chats/ComposerBox";
 import { MessageList, type ListedMessage } from "../chats/MessageList";
 import type { Turn } from "../lib/turns";
-import { Button, ErrorNote, Select } from "../ui";
+import { newIdempotencyKey } from "../lib/idempotency";
+import { Button, ErrorNote, Select, Skeleton, toastManager } from "../ui";
 import "./agent-panel.css";
 
 const PLACEHOLDER = "Message the agent…";
@@ -118,6 +119,21 @@ export function AgentPanel() {
     viewRef.current = viewKey;
   }, [viewKey]);
 
+  // Said once, when the outcome turns to refused (or its reason changes), not on every render.
+  // Called before the early returns below so the hook order never changes.
+  const lastDelivery = linkState?.last_delivery ?? null;
+  const refusedReason =
+    lastDelivery?.outcome === "refused" ? (lastDelivery.reason ?? "unknown") : null;
+  useEffect(() => {
+    if (refusedReason === null) return;
+    toastManager.add({
+      type: "info",
+      title: "Not delivered to the conversation",
+      description: refusedReason,
+      dedupeKey: `agent-panel-refused:${chatId ?? ""}:${refusedReason}`,
+    });
+  }, [chatId, refusedReason]);
+
   const titleOf = (id: string): string | null =>
     chats?.find((chat) => chat.chat_id === id)?.title ?? null;
 
@@ -132,7 +148,7 @@ export function AgentPanel() {
   if (sessionPending) {
     return (
       <section className="agent-panel" aria-label="Agent">
-        <p className="agent-panel-note">Loading the conversation of this tab…</p>
+        <Skeleton label="Loading the conversation of this tab" variant="row" count={3} />
       </section>
     );
   }
@@ -202,7 +218,7 @@ export function AgentPanel() {
     }
     const view = viewKey;
     send.mutate(
-      { text: words, images: [] },
+      { text: words, images: [], idempotencyKey: newIdempotencyKey() },
       {
         // A refused send gives the words back rather than losing them.
         onError: (e: unknown) => {
@@ -217,7 +233,6 @@ export function AgentPanel() {
 
   const link = linkState?.link ?? null;
   const parentId = link !== null && link.unlinked_at === null ? link.parent_chat_id : null;
-  const delivery = linkState?.last_delivery ?? null;
   const title = chatId !== null ? (titleOf(chatId) ?? (last?.chat_id === chatId ? last.title : null)) : null;
 
   const unlink = () => {
@@ -282,11 +297,6 @@ export function AgentPanel() {
                   </option>
                 ))}
             </Select>
-          )}
-          {delivery?.outcome === "refused" && (
-            <p className="agent-panel-refused" role="status">
-              Not delivered to the conversation: {delivery.reason ?? "unknown"}
-            </p>
           )}
         </header>
       )}

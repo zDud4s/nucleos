@@ -4029,6 +4029,26 @@ export function answer(path: string, init?: RequestInit): unknown {
   }
   if (path === "/pii/observations") return PII;
   if (path === "/api-tokens" && init?.method === undefined) return API_TOKENS;
+  // The rest of the Tokens tab: without these the tab threw on a missing Tailscale state.
+  if (path === "/remote/setup" && init?.method === undefined) {
+    return {
+      enabled: true,
+      public_origin: "https://studio.tail1234.ts.net",
+      tailscale: { installed: true, signed_in: true, dns_name: "studio.tail1234.ts.net", https_ok: true },
+      serving: true,
+      funnel: false,
+      port_taken: false,
+    };
+  }
+  if (path === "/remote/devices" && init?.method === undefined) {
+    return [
+      { id: 1, name: "Paulo's phone", access_level: "run-creating", created_at: ago(12 * DAY), last_seen_at: ago(2 * HOUR), revoked_at: null, owner: false },
+      { id: 2, name: "Laptop (owner)", access_level: "admin", created_at: ago(30 * DAY), last_seen_at: ago(10 * 60_000), revoked_at: null, owner: true },
+    ];
+  }
+  if (path === "/system/autostart" && init?.method === undefined) {
+    return { mode: "at-login", at_boot: false, needs_password: true, why_not: null };
+  }
   if (path === "/config/machine" && init?.method === undefined) return MACHINE_CONFIG;
   if (path === "/config/distiller" && init?.method === undefined) return { model: "cloud" };
   if (path === "/engines/agy" && init?.method === undefined) {

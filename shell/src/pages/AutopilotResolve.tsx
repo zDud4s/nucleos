@@ -39,7 +39,7 @@ export function ResolvePanel({
   const status = useJudgeResolveStatus(projectId);
   const queue = useJudgeResolutions(projectId);
   const setMode = useSetProjectJudgeResolve();
-  const setOutcome = useSetResolutionOutcome();
+  const setOutcome = useSetResolutionOutcome(projectId);
   /** Whether the dialog for turning observing on is open: it sends data off this computer. */
   const [asking, setAsking] = useState(false);
   if (projectId === null) {

@@ -3,7 +3,9 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import { keepFocus, useDictation, type CaptureOutcome, type Delivery } from "../app/Dictation";
-import { isApiRefusal, type ApiRefusal } from "../data/client";
+import { apiFetch, isApiRefusal, type ApiRefusal } from "../data/client";
+import { keys } from "../data/keys";
+import { registerPrefetcher } from "../lib/prefetch";
 import { useVoiceConversation, type ConversationView } from "../data/conversation";
 import { useHotkeyRegistration } from "../data/hotkeys";
 import { useVoiceChat } from "../data/voice-chat";
@@ -21,7 +23,6 @@ import {
 } from "../data/voice";
 import {
   Button,
-  ConfirmButton,
   CopyButton,
   Count,
   Drawer,
@@ -42,6 +43,7 @@ import {
   TabsTrigger,
   Teach,
   Section,
+  useUndoable,
 } from "../ui";
 import { VoiceOrb } from "./VoiceOrb";
 import { ROOM_BOTTOM, VoiceRoom } from "./VoiceRoom";
@@ -101,6 +103,11 @@ function daemonProse(refusal: ApiRefusal): Record<string, string> {
   if (detail.split(/\s+/).length < 4) return {};
   return { [refusal.code]: detail };
 }
+
+// Hovering the rail link warms the configuration the page opens with (#7).
+registerPrefetcher("/voice", (qc) =>
+  qc.prefetchQuery({ queryKey: keys.voice.config, queryFn: () => apiFetch<VoiceConfigView>("/voice/config"), staleTime: 5_000 }),
+);
 
 export function Voice() {
   const config = useVoiceConfig();
@@ -857,8 +864,27 @@ function MemoList({
   memos: ReturnType<typeof useMemos>;
   deleteMemo: ReturnType<typeof useDeleteMemo>;
 }) {
-  const rows = memos.data;
+  // Deleting a memo hides it at once and commits after the undo window (#5), so a slip of the
+  // finger is undone with one press instead of being guarded by an "are you sure" step.
+  const [hidden, setHidden] = useState<ReadonlySet<number>>(() => new Set());
+  const undoable = useUndoable();
+  const rows = memos.data?.filter((row) => !hidden.has(row.id));
   const stale = memos.isError && rows !== undefined;
+  const unhide = (id: number) =>
+    setHidden((current) => {
+      const next = new Set(current);
+      next.delete(id);
+      return next;
+    });
+  const removeMemo = (id: number) => {
+    setHidden((current) => new Set(current).add(id));
+    undoable.run({
+      message: "Memo deleted",
+      onUndo: () => unhide(id),
+      // A refused delete brings the row back; the error note below says why.
+      commit: () => deleteMemo.mutate(id, { onError: () => unhide(id) }),
+    });
+  };
 
   return (
     <>
@@ -879,7 +905,7 @@ function MemoList({
             <CaptureRow
               key={row.id}
               row={row}
-              onDelete={() => deleteMemo.mutate(row.id)}
+              onDelete={() => removeMemo(row.id)}
               deleting={deleteMemo.isPending}
             />
           ))}
@@ -888,6 +914,7 @@ function MemoList({
       {deleteMemo.isError && <DeleteMemoError error={deleteMemo.error} />}
     </Panel>
       )}
+      {undoable.toast}
     </>
   );
 }
@@ -943,7 +970,7 @@ function CaptureRow({ row, onDelete, deleting }: { row: Capture; onDelete?: () =
       <div className="voice-row-head">
         <StateBadge domain="voice_cleanup" state={row.cleanup_state} />
         <RelativeTime at={row.created_at} />
-        <span className="voice-row-duration">{(row.duration_ms / 1000).toFixed(1)}s</span>
+        <span className="voice-row-duration tabular">{(row.duration_ms / 1000).toFixed(1)}s</span>
         {row.model !== null && <span className="voice-row-model">{row.model}</span>}
       </div>
       {/* `clean_text` is non-null only when `cleanup_state === "cleaned"` — the
@@ -957,13 +984,9 @@ function CaptureRow({ row, onDelete, deleting }: { row: Capture; onDelete?: () =
         <p className="voice-row-clean">{row.raw_text}</p>
       )}
       {onDelete !== undefined && (
-        <ConfirmButton
-          label="Delete"
-          confirmLabel="Delete this memo"
-          variant="danger"
-          disabled={deleting}
-          onConfirm={onDelete}
-        />
+        <Button variant="danger" disabled={deleting} onClick={onDelete}>
+          Delete
+        </Button>
       )}
     </Row>
   );
