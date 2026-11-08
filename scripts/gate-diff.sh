@@ -66,7 +66,7 @@ if mb="$(git merge-base HEAD "$base" 2>/dev/null)" && [ -n "$mb" ]; then
       scripts/csp-gate.mjs) add shell "$p" ;;
       .claude/hooks/*|scripts/test-*.py|scripts/refresh-models.py|scripts/run-daemon.ps1|VERSION|scripts/bump-version.py|scripts/release-manifest.py|scripts/install.ps1|scripts/install.sh)
         add hooks "$p" ;;
-      scripts/heavy.py|scripts/heavy_classify.py|scripts/heavy_guard.py|scripts/heavy_cost.py|scripts/heavy_watch.py|scripts/heavy_tests/*)
+      scripts/heavy.py|scripts/heavy_classify.py|scripts/heavy_guard.py|scripts/heavy_cost.py|scripts/heavy_watch.py|scripts/heavy_wait.py|scripts/heavy_cache.py|scripts/heavy_failfirst.py|scripts/heavy_tests/*)
         add broker "$p" ;;
     esac
   done <<< "$paths"

@@ -808,7 +808,7 @@ def _queue_order(items: list[tuple[Path, dict]], state: Path | None = None, aliv
         eff.get(it[0].name, _int_prio(it[1].get("prio"))), _epoch_ns(it[0])))
 
 
-def _disk_sample(hc, directory: Path) -> dict | None:
+def _disk_sample(hc, directory: Path, force: bool = False) -> dict | None:
     """The disk-pressure signal for dynamic admission (hc.disk_probe, cached in
     `directory/disk.json`), sampled for the drives of the target dir root and the cwd. None on
     any failure. Call it OUTSIDE the Mutex: a fresh sample blocks for its window.
@@ -821,10 +821,11 @@ def _disk_sample(hc, directory: Path) -> dict | None:
     held = directory / "held"
     try:
         with os.scandir(held) as it:
-            if next(it, None) is None:
+            if next(it, None) is None and not force:
                 return None
     except FileNotFoundError:
-        return None
+        if not force:
+            return None
     except OSError:
         pass
     try:
@@ -838,6 +839,156 @@ def _wait_line(waited_s: float, position: int, hold: float | None) -> str:
     held by the disk rule, else None."""
     why = f"; disk busy {hold:.0f}%" if hold is not None else ""
     return f"heavy: waiting {int(waited_s)}s, position {position} in the queue{why}\n"
+
+
+def _probe_ttl() -> float:
+    return _env_float("NUCLEOS_HEAVY_PROBE_TTL_S", 2.0)
+
+
+def _read_shared_probe(directory: Path, now: float | None = None) -> dict | None:
+    """The dynamic probe another waiter sampled recently (`probe.json`, {"ts", "probe"}), or None
+    when there is none, it is unreadable, or it is older than NUCLEOS_HEAVY_PROBE_TTL_S (2 s)."""
+    try:
+        c = json.loads((directory / "probe.json").read_text(encoding="utf-8"))
+        t = time.time() if now is None else now
+        p = c["probe"]
+        if isinstance(p, dict) and 0 <= t - float(c["ts"]) <= _probe_ttl():
+            return p
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return None
+
+
+def _write_shared_probe(directory: Path, p: dict) -> None:
+    tmp = directory / f"probe.json.{os.getpid()}.tmp"
+    try:
+        tmp.write_text(json.dumps({"ts": time.time(), "probe": p}), encoding="utf-8")
+        hw = _wait_mod()
+        if hw is not None:
+            hw.retry_io(lambda: os.replace(tmp, directory / "probe.json"))
+        else:
+            os.replace(tmp, directory / "probe.json")
+    except Exception:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def _poll_probe(hc, directory: Path, was_head: bool) -> tuple[dict | None, bool]:
+    """(probe, probed) for one dynamic poll. A fresh shared sample is reused by anyone, so a
+    waiter that has just become head decides at once; only a waiter that was the head on the
+    previous poll samples (blocking, OUTSIDE the Mutex) and publishes the result. With a fake
+    probe (tests) there is nothing to share: the sample is instant and never cached."""
+    if os.environ.get("NUCLEOS_HEAVY_FAKE_PROBE"):
+        return (hc.dynamic_probe(), True) if was_head else (None, False)
+    p = _read_shared_probe(directory)
+    if p is not None:
+        return p, True
+    if not was_head:
+        return None, False
+    p = hc.dynamic_probe()
+    if p is not None:
+        _write_shared_probe(directory, p)
+    return p, True
+
+
+def _granted(held_dir: Path, me: int, rec: dict, qname: str) -> dict | None:
+    """My held record when another process admitted me on my behalf: it names this very queue
+    entry (`grant`) and has my pid and creation time. None when absent, torn, or a record of
+    some other admission."""
+    try:
+        h = json.loads((held_dir / str(me)).read_text(encoding="utf-8"))
+        if (h.get("pid") == me and h.get("ctime") == rec.get("ctime")
+                and h.get("grant") == qname):
+            return h
+    except (OSError, ValueError, AttributeError):
+        pass
+    return None
+
+
+# Followers one Mutex pass may grant on top of the head. It equals the dynamic default ceiling
+# (DEFAULT_DYNAMIC_MAX_JOBS): admission never holds more than that many jobs anyway, so a larger
+# batch could not be used, and each grant is two small file operations that run under the Mutex.
+BATCH_MAX = 8
+
+
+def _grant_followers(hc, directory: Path, order: list, held_n: int, held_w: int, dyn: bool,
+                     pr: dict | None, dk: dict | None) -> int:
+    """Called by the Mutex holder right after it admitted the head: admit the entries behind it,
+    in queue order, for as long as they fit (static capacity, then dynamic_fit with the held
+    count and probe updated for each grant, which also applies the disk rule). The first that does
+    not fit stops the pass, so priority order is never skipped. The held record is written for
+    the waiter, with its own pid and creation time, BEFORE its queue entry is removed; if the
+    queue entry cannot be removed the held record is taken back, so the two never coexist. The
+    waiter sees both on its next lock-free poll. Returns how many were granted."""
+    hw = _wait_mod()
+    held_dir = directory / "held"
+    limit = int(_env_float("NUCLEOS_HEAVY_BATCH_MAX", float(BATCH_MAX)))
+    p = dict(pr) if isinstance(pr, dict) else pr
+    n, w, granted = held_n, held_w, 0
+    me = os.getpid()
+    for f, r in order[1:]:
+        if granted >= limit:
+            break
+        try:
+            wt = int(r.get("weight") or 1)
+            fpid = int(r["pid"])
+        except (TypeError, ValueError, KeyError):
+            break
+        hpath = held_dir / str(fpid)
+        if fpid == me or hpath.exists() or w + wt > capacity():
+            break
+        adm = None
+        if dyn:
+            try:
+                ok, adm = hc.dynamic_fit(n, p, 0.0, hc.dynamic_max_jobs(p), True, disk=dk)
+            except Exception:
+                break
+            if not ok:
+                break
+        frec = dict(r)
+        frec.pop("adm", None)
+        frec["grant"] = f.name  # the entry it replaces: the waiter recognises its own grant
+        if adm:
+            frec["adm"] = adm
+        try:
+            if hw is not None:
+                hw.retry_io(lambda: hpath.write_text(json.dumps(frec), encoding="utf-8"))
+            else:
+                hpath.write_text(json.dumps(frec), encoding="utf-8")
+        except OSError:
+            try:
+                hpath.unlink()
+            except OSError:
+                pass
+            break
+        try:
+            _unlink(f)
+        except FileNotFoundError:
+            # The waiter is gone (reaped, or it left): nobody will claim this record.
+            try:
+                _unlink(hpath)
+            except OSError:
+                pass
+            continue
+        except OSError:
+            try:
+                _unlink(hpath)
+            except OSError:
+                pass
+            break
+        granted += 1
+        n += 1
+        w += wt
+        if isinstance(p, dict):
+            # The probe predates this grant: charge one job budget so a batch cannot admit
+            # more than the machine had room for.
+            if isinstance(p.get("avail_mb"), (int, float)):
+                p["avail_mb"] = p["avail_mb"] - hc.JOB_BUDGET_MB
+            if isinstance(p.get("busy_cores"), (int, float)):
+                p["busy_cores"] = p["busy_cores"] + 1
+    return granted
 
 
 def acquire_token(directory: Path, rec: dict, wait_cap: float,
@@ -876,6 +1027,7 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
     hold = None  # disk busy % while the head is held by the disk rule, else None
     hw = _wait_mod()
     bo = hw.Backoff(poll * 0.4, poll * 2.0) if hw is not None else None
+    g = None
     try:
         with Mutex(directory):
             queue_dir.mkdir(parents=True, exist_ok=True)
@@ -888,25 +1040,33 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
             position = 0
             if shadow is not None:
                 shadow.tick()
-            # Dynamic admission reads the live machine state OUTSIDE the Mutex (the probe may
-            # sleep to prime its CPU sample), and only from a waiter that was at the head on the
-            # previous poll: the others cannot be admitted, so they would only add probe load.
-            probed = dyn and last_pos <= 1
-            pr = hc.dynamic_probe() if probed else None
-            dk = _disk_sample(hc, directory) if probed else None
             # Lock-free look first: a waiter that is not the head, or a head that does not
             # fit, has nothing to write, so it must not take the Mutex (8+ waiters polling
             # through it convoyed). A torn or missing record only makes this look wrong; the
             # Mutex block below re-reads everything before any write.
             need = True
+            lqueued = 0
             if bo is not None:
                 try:
                     lorder = _queue_order(_entries(queue_dir, reap=False, alive=_alive_c),
                                           directory, _alive_c)
                     lnames = [f.name for f, _ in lorder]
+                    lqueued = len(lnames)
                     lpos = lnames.index(qfile.name) + 1 if qfile.name in lnames else 0
                     if lpos == 0:
-                        need = not qfile.exists()  # present but unreadable: retry next poll
+                        if not qfile.exists():
+                            # Gone from the queue: admitted on my behalf by the Mutex holder
+                            # (its batch grant) when my held record exists, else wiped state.
+                            g = _granted(held_dir, me, rec, qfile.name)
+                            if g is not None:
+                                if g.get("adm"):
+                                    rec["adm"] = g["adm"]
+                                queued = False
+                                admitted = True
+                                return True, time.time() - t0
+                            need = True
+                        else:
+                            need = False  # present but unreadable: retry next poll
                     elif lpos > 1:
                         need = False
                     elif shadow is None and not dyn:
@@ -919,6 +1079,13 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
                             hold = None
                 except Exception:
                     need = True
+            # Dynamic admission reads the live machine state OUTSIDE the Mutex (the probe may
+            # sleep to prime its CPU sample). A fresh shared sample (probe.json) is reused by
+            # anyone, so a new head decides on this very poll; only a waiter that was the head
+            # on the previous poll takes a new one, and only when it may need it.
+            pr, probed = (_poll_probe(hc, directory, last_pos <= 1) if dyn and need
+                          else (None, False))
+            dk = (_disk_sample(hc, directory, force=lqueued > 1) if probed else None)
             with (Mutex(directory) if need else _NoMutex()) as mx:
               if need:
                 q_ents = _entries(queue_dir, alive=_alive_c)
@@ -934,6 +1101,14 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
                     # Only the head is held by the disk rule; a head that dropped off position 1
                     # must not keep showing the disk reason on the wait line.
                     hold = None
+                if position == 0 and (g := _granted(held_dir, me, rec, qfile.name)) is not None:
+                    # Admitted on my behalf (batch grant) and the lock-free look could not read
+                    # my held record: re-queueing would double the claim.
+                    if g.get("adm"):
+                        rec["adm"] = g["adm"]
+                    queued = False
+                    admitted = True
+                    return True, time.time() - t0
                 if position == 0:
                     # Our own entry vanished (state wiped): put it back and carry on.
                     qfile.parent.mkdir(parents=True, exist_ok=True)
@@ -984,6 +1159,13 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
                             mx.mark("write")
                             queued = False
                             admitted = True
+                            try:
+                                _grant_followers(
+                                    hc, directory, order, len(held_recs) + 1,
+                                    held + int(rec["weight"]), dyn and probed, pr, dk)
+                            except Exception:
+                                pass  # the head is admitted either way
+                            mx.mark("batch")
                             return True, time.time() - t0
             if bo is not None and 0 < position < last_pos:
                 bo.reset()  # moved up the queue: look again soon
@@ -1000,11 +1182,34 @@ def acquire_token(directory: Path, rec: dict, wait_cap: float,
                         _unlink(qfile)
                     except OSError:
                         pass
+                    if _granted(held_dir, me, rec, qfile.name) is not None:
+                        try:
+                            _unlink(held_dir / str(me))  # granted too, in the same instant
+                        except OSError:
+                            pass
                     queued = False
                     admitted = True
                     return True, time.time() - t0
             now = time.time()
             if now - t0 >= wait_cap:
+                # Leave under the Mutex: a holder's batch grant also runs under it, so either
+                # it already wrote my held record (I am admitted after all) or it never will.
+                try:
+                    with Mutex(directory):
+                        g = _granted(held_dir, me, rec, qfile.name)
+                        if g is None:
+                            _unlink(qfile)
+                            queued = False
+                except FileNotFoundError:
+                    queued = False
+                except Exception:
+                    g = None
+                if g is not None:
+                    if g.get("adm"):
+                        rec["adm"] = g["adm"]
+                    queued = False
+                    admitted = True
+                    return True, time.time() - t0
                 sys.stderr.write(
                     f"heavy: in queue for {int(now - t0)}s (position {position}); nothing was "
                     "compiled - try again, re-run with the Bash tool timeout set to 600000\n")
