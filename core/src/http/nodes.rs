@@ -743,6 +743,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_orchestrator_run_cannot_open_a_child_past_max_depth() {
+        let (app, pool) = app_and_pool().await;
+        let root = open_root(&app, "s-depth").await;
+        let (_, mine) = open_leaf(&app, &root, "Mine", &["core/src/a/**"]).await;
+        let mine = mine["id"].as_str().unwrap().to_owned();
+        // The limit is the project's: `speed.yaml` under the root the roster row points at.
+        let project = tempfile::tempdir().unwrap();
+        let workflow = project.path().join(".nucleos/workflow");
+        std::fs::create_dir_all(&workflow).unwrap();
+        std::fs::write(workflow.join("speed.yaml"), "nodes:\n  max_depth: 1\n").unwrap();
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) \
+             VALUES ('p-depth', 'active', ?)",
+        )
+        .bind(project.path().to_string_lossy().into_owned())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE work_nodes SET project_id = 'p-depth' WHERE id = ?")
+            .bind(&mine)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let key = orchestrator_run_key(&pool, &mine).await;
+        let nodes_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_nodes")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        // Mine is at depth 1, the limit: its child would be at depth 2.
+        let (status, body) = call_bearer(
+            &app,
+            &key,
+            "POST",
+            "/nodes",
+            Some(child_body(Some(&mine), "Part", &["core/src/a/x/**"])),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        let message = body["error"].as_str().unwrap_or_default();
+        assert!(message.contains("depth 2 exceeds the limit of 1"), "{body}");
+        let nodes_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_nodes")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(nodes_after, nodes_before, "a refused child opens no node");
+    }
+
+    #[tokio::test]
     async fn a_tree_opens_is_found_by_its_session_and_closes() {
         let app = app().await;
         let root = open_root(&app, "s-happy").await;

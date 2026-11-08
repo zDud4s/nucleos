@@ -1002,7 +1002,7 @@ pub(super) async fn finish_held(pool: &SqlitePool, job: &mut TreeJob) -> Result<
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     // The process-wide env guard is held across awaits on purpose, as in `landing::tests`.
     #![allow(clippy::await_holding_lock)]
 
@@ -1097,7 +1097,7 @@ mod tests {
 
     // ---- fixtures: git ---------------------------------------------------------------------------
 
-    fn git_in(dir: &Path, args: &[&str]) -> bool {
+    pub(crate) fn git_in(dir: &Path, args: &[&str]) -> bool {
         Command::new("git")
             .arg("-C")
             .arg(dir)
@@ -1107,7 +1107,7 @@ mod tests {
             .success()
     }
 
-    fn commit_file(repo: &Path, file: &str, text: &str, message: &str) {
+    pub(crate) fn commit_file(repo: &Path, file: &str, text: &str, message: &str) {
         std::fs::write(repo.join(file), text).expect("write");
         assert!(git_in(repo, &["add", "-A"]));
         assert!(git_in(repo, &["commit", "-q", "-m", message]));
@@ -1117,7 +1117,7 @@ mod tests {
     /// one commit ahead of `feat/tree` in a file of its own so every merge is clean; `tree/root-empty`
     /// equal to `feat/tree` and `tree/root-full` one commit ahead. The main checkout stands on
     /// `feat/tree`, the target of a branch merge.
-    fn tree_repo() -> (tempfile::TempDir, PathBuf) {
+    pub(crate) fn tree_repo() -> (tempfile::TempDir, PathBuf) {
         let container = space_free_tempdir("nucleos-driver-repo-");
         let repo = container.path().join("repo");
         initialize_repo(&repo);
@@ -1142,7 +1142,7 @@ mod tests {
 
     // ---- fixtures: branches ----------------------------------------------------------------------
 
-    fn code_branch(name: &str, state: &str, node: Option<&str>) -> Branch {
+    pub(crate) fn code_branch(name: &str, state: &str, node: Option<&str>) -> Branch {
         let mut branch = Branch::new(name, &[format!("{name}/**")], "backend", None);
         branch.state = state.to_owned();
         branch.git_branch = Some(format!("tree/{name}"));
@@ -1150,7 +1150,7 @@ mod tests {
         branch
     }
 
-    fn merged_branch(name: &str, node: Option<&str>) -> Branch {
+    pub(crate) fn merged_branch(name: &str, node: Option<&str>) -> Branch {
         let mut branch = code_branch(name, "merged", node);
         branch
             .extra
@@ -1158,11 +1158,11 @@ mod tests {
         branch
     }
 
-    fn root_node_of(job: &str) -> String {
+    pub(crate) fn root_node_of(job: &str) -> String {
         format!("root-{job}")
     }
 
-    fn red(summary: &str) -> GateVerdict {
+    pub(crate) fn red(summary: &str) -> GateVerdict {
         GateVerdict::Red {
             summary: summary.to_owned(),
         }
@@ -1173,20 +1173,20 @@ mod tests {
     /// A gate that records its calls and answers from a script. With `release` set, every call waits
     /// on it first, which is how a test keeps a gate in progress.
     #[derive(Clone)]
-    struct FakeGate {
+    pub(crate) struct FakeGate {
         calls: Arc<Mutex<Vec<(String, String)>>>,
         script: Arc<Mutex<VecDeque<Result<GateVerdict, NotMeasured>>>>,
         release: Option<Arc<Notify>>,
     }
 
     impl FakeGate {
-        fn answering(script: Vec<GateVerdict>) -> FakeGate {
+        pub(crate) fn answering(script: Vec<GateVerdict>) -> FakeGate {
             FakeGate::scripted(script.into_iter().map(Ok).collect())
         }
 
         /// A gate that also answers "nothing measured". Once the script runs out it answers that
         /// its ticket is still running, which the driver only waits on.
-        fn scripted(script: Vec<Result<GateVerdict, NotMeasured>>) -> FakeGate {
+        pub(crate) fn scripted(script: Vec<Result<GateVerdict, NotMeasured>>) -> FakeGate {
             FakeGate {
                 calls: Arc::default(),
                 script: Arc::new(Mutex::new(script.into())),
@@ -1194,18 +1194,18 @@ mod tests {
             }
         }
 
-        fn held(verdict: GateVerdict) -> (FakeGate, Arc<Notify>) {
+        pub(crate) fn held(verdict: GateVerdict) -> (FakeGate, Arc<Notify>) {
             let release = Arc::new(Notify::new());
             let mut gate = FakeGate::answering(vec![verdict]);
             gate.release = Some(release.clone());
             (gate, release)
         }
 
-        fn calls(&self) -> Vec<(String, String)> {
+        pub(crate) fn calls(&self) -> Vec<(String, String)> {
             self.calls.lock().unwrap().clone()
         }
 
-        fn gate(&self) -> GateFn {
+        pub(crate) fn gate(&self) -> GateFn {
             let fake = self.clone();
             Arc::new(move |job: String, branch: String| -> GateFuture {
                 let fake = fake.clone();
@@ -1223,7 +1223,7 @@ mod tests {
         }
     }
 
-    async fn wait_calls(gate: &FakeGate, count: usize) {
+    pub(crate) async fn wait_calls(gate: &FakeGate, count: usize) {
         // Hang guard only: a loaded machine can be slow, so wait for the event, not a budget.
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
         while gate.calls().len() < count && std::time::Instant::now() < deadline {
@@ -1240,11 +1240,11 @@ mod tests {
 
     /// A real git repository registered as project `alpha`, an app state over a one-connection pool
     /// and the worktree root the queue's integration worktrees go under.
-    struct Fixture {
-        state: AppState,
-        repo: PathBuf,
+    pub(crate) struct Fixture {
+        pub(crate) state: AppState,
+        pub(crate) repo: PathBuf,
         /// The queue's repository key: what `drain_once` claims by.
-        key: String,
+        pub(crate) key: String,
         /// Where the handoff files of the seeded reports live.
         files: tempfile::TempDir,
         next_run: Cell<i64>,
@@ -1256,7 +1256,7 @@ mod tests {
     }
 
     impl Fixture {
-        async fn new() -> Fixture {
+        pub(crate) async fn new() -> Fixture {
             let lock = test_env_lock();
             let (container, repo) = tree_repo();
             let roots = space_free_tempdir("nucleos-driver-wt-");
@@ -1292,13 +1292,18 @@ mod tests {
             }
         }
 
-        fn resolved(&self) -> ResolvedRepo {
+        pub(crate) fn resolved(&self) -> ResolvedRepo {
             ResolvedRepo::synthetic(PROJECT, &self.repo.to_string_lossy(), &self.key)
         }
 
         /// Saves the job with its root node (running, no run yet). `landing` is the manifest's
         /// landing mode; `None` leaves it absent.
-        async fn seed_job(&self, id: &str, branches: Vec<Branch>, landing: Option<&str>) {
+        pub(crate) async fn seed_job(
+            &self,
+            id: &str,
+            branches: Vec<Branch>,
+            landing: Option<&str>,
+        ) {
             let mut manifest = Manifest::new(
                 id,
                 "feat/tree",
@@ -1332,7 +1337,7 @@ mod tests {
             self.add_node(id, &root_node_of(id), "root").await;
         }
 
-        async fn add_node(&self, job: &str, id: &str, kind: &str) {
+        pub(crate) async fn add_node(&self, job: &str, id: &str, kind: &str) {
             sqlx::query(
                 "INSERT INTO work_nodes (id, root_id, depth, kind, title, goal, status, run_id, \
                                          tree_job_id, handoff_path, created_at, updated_at) \
@@ -1352,15 +1357,15 @@ mod tests {
 
         /// Gives the node a run that has ended, and with `report` the report row of that run and a
         /// handoff file, as `node_close` leaves them. Returns the run id.
-        async fn run_ended(&self, node: &str, report: Option<&str>) -> i64 {
+        pub(crate) async fn run_ended(&self, node: &str, report: Option<&str>) -> i64 {
             self.run_with(node, "interrupted", report).await
         }
 
-        async fn run_live(&self, node: &str) -> i64 {
+        pub(crate) async fn run_live(&self, node: &str) -> i64 {
             self.run_with(node, "running", None).await
         }
 
-        async fn run_with(&self, node: &str, status: &str, report: Option<&str>) -> i64 {
+        pub(crate) async fn run_with(&self, node: &str, status: &str, report: Option<&str>) -> i64 {
             let run = self.next_run.get() + 1;
             self.next_run.set(run);
             let pool = &self.state.pool;
@@ -1395,17 +1400,17 @@ mod tests {
             run
         }
 
-        async fn root_done(&self, job: &str) {
+        pub(crate) async fn root_done(&self, job: &str) {
             self.run_ended(&root_node_of(job), Some("done")).await;
         }
 
         /// The node's agent, started again by the driver, ends and reports `done`.
-        async fn relaunched_run_reports_done(&self, node: &str) {
+        pub(crate) async fn relaunched_run_reports_done(&self, node: &str) {
             self.relaunched_run_reports(node, "done").await;
         }
 
         /// The node's agent, started again by the driver, ends and reports `result`.
-        async fn relaunched_run_reports(&self, node: &str, result: &str) {
+        pub(crate) async fn relaunched_run_reports(&self, node: &str, result: &str) {
             let run = self.current_run(node).await;
             sqlx::query("UPDATE runs SET status = 'interrupted' WHERE id = ?")
                 .bind(run)
@@ -1417,7 +1422,7 @@ mod tests {
                 .unwrap();
         }
 
-        async fn current_run(&self, node: &str) -> i64 {
+        pub(crate) async fn current_run(&self, node: &str) -> i64 {
             sqlx::query_scalar("SELECT CAST(run_id AS INTEGER) FROM work_nodes WHERE id = ?")
                 .bind(node)
                 .fetch_one(&self.state.pool)
@@ -1425,7 +1430,7 @@ mod tests {
                 .unwrap()
         }
 
-        async fn prompt_of(&self, run: i64) -> String {
+        pub(crate) async fn prompt_of(&self, run: i64) -> String {
             sqlx::query_scalar("SELECT prompt FROM runs WHERE id = ?")
                 .bind(run)
                 .fetch_one(&self.state.pool)
@@ -1433,7 +1438,7 @@ mod tests {
                 .unwrap()
         }
 
-        async fn launches(&self, node: &str, prefix: &str) -> i64 {
+        pub(crate) async fn launches(&self, node: &str, prefix: &str) -> i64 {
             sqlx::query_scalar(
                 "SELECT COUNT(*) FROM tree_transitions \
                  WHERE node_id = ? AND transition = 'launch' AND key LIKE ?",
@@ -1445,11 +1450,11 @@ mod tests {
             .unwrap()
         }
 
-        async fn save_launch(&self, node: &str) {
+        pub(crate) async fn save_launch(&self, node: &str) {
             self.save_launch_keyed(node, "initial").await;
         }
 
-        async fn save_launch_keyed(&self, node: &str, key: &str) {
+        pub(crate) async fn save_launch_keyed(&self, node: &str, key: &str) {
             open::save_launch(
                 &self.state.pool,
                 &StoredLaunch {
@@ -1465,14 +1470,14 @@ mod tests {
             .unwrap();
         }
 
-        async fn job(&self, id: &str) -> TreeJob {
+        pub(crate) async fn job(&self, id: &str) -> TreeJob {
             store::load(&self.state.pool, id)
                 .await
                 .unwrap()
                 .expect("the job is stored")
         }
 
-        async fn branch(&self, job: &str, name: &str) -> Branch {
+        pub(crate) async fn branch(&self, job: &str, name: &str) -> Branch {
             self.job(job)
                 .await
                 .manifest
@@ -1482,7 +1487,7 @@ mod tests {
                 .expect("the branch is in the manifest")
         }
 
-        async fn set_branch_state(&self, job: &str, name: &str, state: &str) {
+        pub(crate) async fn set_branch_state(&self, job: &str, name: &str, state: &str) {
             let mut stored = self.job(job).await;
             stored
                 .manifest
@@ -1493,11 +1498,11 @@ mod tests {
             store::update(&self.state.pool, &stored).await.unwrap();
         }
 
-        async fn node(&self, id: &str) -> work_nodes::Node {
+        pub(crate) async fn node(&self, id: &str) -> work_nodes::Node {
             work_nodes::get(&self.state.pool, id).await.unwrap()
         }
 
-        async fn open_jobs(&self) -> Vec<String> {
+        pub(crate) async fn open_jobs(&self) -> Vec<String> {
             store::list_non_terminal(&self.state.pool)
                 .await
                 .unwrap()
@@ -1506,32 +1511,32 @@ mod tests {
                 .collect()
         }
 
-        async fn requests(&self) -> i64 {
+        pub(crate) async fn requests(&self) -> i64 {
             sqlx::query_scalar("SELECT COUNT(*) FROM vcs_requests")
                 .fetch_one(&self.state.pool)
                 .await
                 .unwrap()
         }
 
-        async fn drain(&self) {
+        pub(crate) async fn drain(&self) {
             assert!(
                 drain_once(&self.state.pool, &self.key, &GitExecutor::default()).await,
                 "the queue had a request to run"
             );
         }
 
-        async fn tick_within(&self, job: &str, gate: &FakeGate, limit: Duration) {
+        pub(crate) async fn tick_within(&self, job: &str, gate: &FakeGate, limit: Duration) {
             tokio::time::timeout(limit, advance_job_with_gate(&self.state, job, gate.gate()))
                 .await
                 .expect("the tick returned in time");
         }
 
-        async fn tick(&self, job: &str, gate: &FakeGate) {
+        pub(crate) async fn tick(&self, job: &str, gate: &FakeGate) {
             self.tick_within(job, gate, Duration::from_secs(30)).await;
         }
 
         /// Waits for the spawned gate to settle the branch, then lets its task finish.
-        async fn wait_branch_state(&self, job: &str, name: &str, want: &str) {
+        pub(crate) async fn wait_branch_state(&self, job: &str, name: &str, want: &str) {
             // Hang guard only: wait for the state, not for a short budget.
             let deadline = std::time::Instant::now() + Duration::from_secs(60);
             let seen = loop {
@@ -1546,7 +1551,7 @@ mod tests {
         }
 
         /// From now on every write to a watched table leaves a line in `write_log`.
-        async fn watch_writes(&self) {
+        pub(crate) async fn watch_writes(&self) {
             sqlx::query("CREATE TABLE write_log (what TEXT NOT NULL)")
                 .execute(&self.state.pool)
                 .await
@@ -1565,14 +1570,14 @@ mod tests {
             }
         }
 
-        async fn writes(&self) -> Vec<String> {
+        pub(crate) async fn writes(&self) -> Vec<String> {
             sqlx::query_scalar("SELECT what FROM write_log ORDER BY rowid")
                 .fetch_all(&self.state.pool)
                 .await
                 .unwrap()
         }
 
-        async fn assert_not_landing(&self, job: &str) {
+        pub(crate) async fn assert_not_landing(&self, job: &str) {
             let stored = self.job(job).await;
             assert!(
                 !stored.manifest.extra.contains_key("land_id"),
@@ -1583,7 +1588,7 @@ mod tests {
         }
 
         /// The questions of the open decisions the job asked about `node`.
-        async fn open_questions(&self, job: &str, node: &str) -> Vec<String> {
+        pub(crate) async fn open_questions(&self, job: &str, node: &str) -> Vec<String> {
             sqlx::query_scalar(
                 "SELECT question FROM decisions WHERE tree_id = ? AND node_id = ? AND status = ?",
             )
@@ -1597,7 +1602,7 @@ mod tests {
 
         /// Gives the job's tree a limit of `limit` dollars and charges `spent` dollars to the
         /// node's current run, so the tree's budget refuses its next node.
-        async fn exhaust_budget(&self, job: &str, node: &str, limit: f64, spent: f64) {
+        pub(crate) async fn exhaust_budget(&self, job: &str, node: &str, limit: f64, spent: f64) {
             sqlx::query(
                 "INSERT INTO tree_budgets (tree_id, limit_usd, soft_pct, created_at, updated_at) \
                  VALUES (?, ?, 80.0, ?, ?)",
