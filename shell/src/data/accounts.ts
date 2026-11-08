@@ -216,5 +216,10 @@ export function useAccountActions() {
     retry: false,
     onSuccess: refresh,
   });
-  return { rename, pause, resume, remove };
+  const logout = useMutation({
+    mutationFn: (id: string) => apiFetch<PoolAccount>(accountPath(id, "/logout"), { method: "POST" }),
+    retry: false,
+    onSuccess: refresh,
+  });
+  return { rename, pause, resume, remove, logout };
 }

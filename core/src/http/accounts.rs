@@ -6,7 +6,7 @@
 //!   row exists only once the login succeeds.
 //! - `GET|DELETE /account-logins/{login_id}`, `POST /account-logins/{login_id}/code {code}`.
 //! - `POST /accounts/{id}/rename {label}`, `/pause`, `/resume`, `/login` (redo login),
-//!   `DELETE /accounts/{id}[?force=true]`.
+//!   `/logout`, `DELETE /accounts/{id}[?force=true]`.
 //! - `GET|PUT /account-pool/default {choice}`: the default for new chats and runs.
 //! - `GET|PUT /assistant/chats/{chat_id}/account {choice}`.
 //!
@@ -37,6 +37,7 @@ pub(super) fn routes() -> Router<AppState> {
         .route("/accounts/{id}/pause", post(manage::pause_account))
         .route("/accounts/{id}/resume", post(manage::resume_account))
         .route("/accounts/{id}/login", post(manage::relogin_account))
+        .route("/accounts/{id}/logout", post(manage::logout_account))
         .route(
             "/account-logins/{login_id}",
             get(read_login).delete(cancel_login),

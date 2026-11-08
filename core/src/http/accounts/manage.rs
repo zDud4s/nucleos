@@ -98,6 +98,68 @@ pub(super) async fn relogin_account(
     Ok((StatusCode::ACCEPTED, Json(view)))
 }
 
+/// Signs an account out: deletes its credential files and marks it `needs_login`; its row, history
+/// and directory stay, and a redo login brings it back. Refused while runs use the account or a
+/// login for it is in progress (no force), and for an account whose credentials are not NucleOS's
+/// own: that one shares the CLI's directory, and logging it out would sign the owner out of their
+/// normal CLI.
+pub(super) async fn logout_account(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, Refused> {
+    let data_dir = data_dir()?;
+    logout_in(&state, &id, &data_dir).await
+}
+
+/// `logout_account` against an explicit data directory (the tests use a temp one).
+pub(super) async fn logout_in(
+    state: &AppState,
+    id: &str,
+    data_dir: &FsPath,
+) -> Result<Json<Value>, Refused> {
+    let account = account_or_404(state, id).await?;
+    let files = owned_credential_files(data_dir, &account)
+        .ok_or_else(|| refusal(StatusCode::UNPROCESSABLE_ENTITY, "logout_not_owned"))?;
+    let live = PoolState::global().live_sessions(&account.id);
+    if live > 0 {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({ "refusal": "live_sessions", "live_sessions": live })),
+        ));
+    }
+    if Logins::global().is_logging_in(&account.id) {
+        return Err(refusal(StatusCode::CONFLICT, "login_in_progress"));
+    }
+    for file in &files {
+        if let Err(error) = tokio::fs::remove_file(file).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(%error, "could not delete a credential file on logout");
+            return Err(refusal(StatusCode::INTERNAL_SERVER_ERROR, "logout_failed"));
+        }
+    }
+    store::set_state(&state.pool, &account.id, AccountState::NeedsLogin)
+        .await
+        .map_err(internal)?;
+    startup::accounts_changed(&state.pool).await;
+    answer(state, id).await
+}
+
+/// The credential files of an account that sit inside the directory NucleOS made for it. `None`
+/// when there are none, or when any path leaves that directory: nothing outside it is ever touched.
+fn owned_credential_files(data_dir: &FsPath, account: &Account) -> Option<Vec<std::path::PathBuf>> {
+    let adapter = crate::accounts::adapters::adapter_for(&account.engine)?;
+    let files = adapter.credential_paths(account);
+    let ours = account_dir(data_dir, &account.id);
+    let inside = |file: &std::path::PathBuf| {
+        file.starts_with(&ours)
+            && !file
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+    };
+    (!files.is_empty() && files.iter().all(inside)).then_some(files)
+}
+
 #[derive(Deserialize, Default)]
 pub(super) struct RemoveQuery {
     #[serde(default)]

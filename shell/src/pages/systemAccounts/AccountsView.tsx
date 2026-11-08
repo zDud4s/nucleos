@@ -59,9 +59,10 @@ export function readingText(account: PoolAccount, now: number = Date.now()): str
 const STATE_TONE = { active: "active", paused: "pending", needs_login: "danger" } as const;
 
 function AccountRow({ account, onLogin }: { account: PoolAccount; onLogin: (view: LoginView) => void }) {
-  const { rename, pause, resume, remove } = useAccountActions();
+  const { rename, pause, resume, remove, logout } = useAccountActions();
   const relogin = useReloginAccount();
   const [open, setOpen] = useState(false);
+  const [confirmLogout, setConfirmLogout] = useState(false);
   const [renaming, setRenaming] = useState<string | null>(null);
   const [confirm, setConfirm] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -114,6 +115,18 @@ function AccountRow({ account, onLogin }: { account: PoolAccount; onLogin: (view
             <Button onClick={() => setConfirm(null)}>Keep</Button>
           </div>
         ) : null}
+        {confirmLogout ? (
+          <div role="alert" className="ac-confirm">
+            Sign this account out? Its history stays; use Redo login to sign back in.{" "}
+            <Button
+              intent="stop"
+              onClick={() => logout.mutate(account.id, { onSuccess: () => setConfirmLogout(false), onError: (e) => { setConfirmLogout(false); fail(e); } })}
+            >
+              Log out
+            </Button>
+            <Button onClick={() => setConfirmLogout(false)}>Keep</Button>
+          </div>
+        ) : null}
       </td>
       <td>{account.provider}</td>
       <td>{account.kind === "api_key" ? "API key" : "Subscription"}</td>
@@ -137,6 +150,9 @@ function AccountRow({ account, onLogin }: { account: PoolAccount; onLogin: (view
             >
               Redo login
             </Button>
+            {account.state === "needs_login" ? null : (
+              <Button role="menuitem" onClick={() => { setConfirmLogout(true); close(); }}>Log out</Button>
+            )}
             {account.state === "paused" ? (
               <Button role="menuitem" onClick={() => { resume.mutate(account.id, { onError: fail }); close(); }}>Resume</Button>
             ) : (

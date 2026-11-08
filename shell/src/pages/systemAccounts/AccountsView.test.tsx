@@ -96,6 +96,27 @@ describe("the accounts view", () => {
     await waitFor(() => expect(calls.some((c) => c.path === "/accounts/claude%3Awork/pause" && c.method === "POST")).toBe(true));
   });
 
+  it("logs an account out through the menu, only after the confirmation", async () => {
+    serve([account()]);
+    renderWithQuery(<AccountsView />);
+    await screen.findByText("Work");
+    fireEvent.click(screen.getByRole("button", { name: "Actions for Work" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Log out" }));
+    expect(await screen.findByText(/Sign this account out\?/)).toBeTruthy();
+    expect(calls.some((c) => c.path.endsWith("/logout"))).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "Log out" }));
+    await waitFor(() => expect(calls.some((c) => c.path === "/accounts/claude%3Awork/logout" && c.method === "POST")).toBe(true));
+  });
+
+  it("does not offer Log out for an account that already needs a login", async () => {
+    serve([account({ state: "needs_login" })]);
+    renderWithQuery(<AccountsView />);
+    await screen.findByText("Work");
+    fireEvent.click(screen.getByRole("button", { name: "Actions for Work" }));
+    expect(screen.getByRole("menuitem", { name: "Redo login" })).toBeTruthy();
+    expect(screen.queryByRole("menuitem", { name: "Log out" })).toBeNull();
+  });
+
   it("asks before removing an account with live sessions, then forces", async () => {
     serve([account()]);
     const { ApiRefusal } = await import("../../data/client");
