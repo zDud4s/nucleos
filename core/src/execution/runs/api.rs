@@ -97,6 +97,9 @@ pub struct RunSearchResult {
     pub advised_effort: Option<String>,
     /// A JSON array of `model[@effort]`, as TEXT: handed over as the column holds it, not parsed.
     pub route_failed: Option<String>,
+    /// The account the run actually ran under, as `GET /runs/{id}` answers it; NULL when none was
+    /// recorded.
+    pub account_id: Option<String>,
     /// The conversation this run is a turn of; `None` for every non-chat run.
     pub chat_id: Option<String>,
     /// The conversation whose turn asked for this run through `POST /runs` (0195); `None` for a run
@@ -153,8 +156,8 @@ pub async fn list_awaiting_approval(pool: &sqlx::SqlitePool) -> sqlx::Result<Vec
 }
 
 /// The tail of the grouped shape: folds every chat turn of the filtered set into one row per
-/// conversation, and passes every other run through as it is. Both arms carry the same 23 columns.
-pub(super) const GROUPED_BY_CHAT: &str = "), g AS (SELECT chat_id AS g_chat_id, COUNT(*) AS g_turns,      SUM(status = 'running') AS g_running, SUM(cost_usd) AS g_cost, MAX(id) AS g_last      FROM f WHERE mode = 'assistant' AND chat_id IS NOT NULL GROUP BY chat_id)      SELECT * FROM (      SELECT f.*, NULL AS chat_title, NULL AS turns, NULL AS running_turns FROM f      WHERE NOT (f.mode = 'assistant' AND f.chat_id IS NOT NULL)      UNION ALL      SELECT f.id, f.project_id, f.status, f.mode, f.created_at, f.completed_at,      g.g_cost AS cost_usd, f.prompt_excerpt, f.model, f.effort, f.runner, f.route_mode,      f.route_decision_id, f.advised_runner, f.advised_model, f.advised_effort,      f.route_failed, f.chat_id, f.launched_by_chat_id, f.launched_by_chat_title,      (SELECT title FROM chats WHERE chats.chat_id = g.g_chat_id) AS chat_title,      g.g_turns AS turns, g.g_running AS running_turns      FROM g JOIN f ON f.id = g.g_last)";
+/// conversation, and passes every other run through as it is. Both arms carry the same 24 columns.
+pub(super) const GROUPED_BY_CHAT: &str = "), g AS (SELECT chat_id AS g_chat_id, COUNT(*) AS g_turns,      SUM(status = 'running') AS g_running, SUM(cost_usd) AS g_cost, MAX(id) AS g_last      FROM f WHERE mode = 'assistant' AND chat_id IS NOT NULL GROUP BY chat_id)      SELECT * FROM (      SELECT f.*, NULL AS chat_title, NULL AS turns, NULL AS running_turns FROM f      WHERE NOT (f.mode = 'assistant' AND f.chat_id IS NOT NULL)      UNION ALL      SELECT f.id, f.project_id, f.status, f.mode, f.created_at, f.completed_at,      g.g_cost AS cost_usd, f.prompt_excerpt, f.model, f.effort, f.runner, f.route_mode,      f.route_decision_id, f.advised_runner, f.advised_model, f.advised_effort,      f.route_failed, f.account_id, f.chat_id, f.launched_by_chat_id, f.launched_by_chat_title,      (SELECT title FROM chats WHERE chats.chat_id = g.g_chat_id) AS chat_title,      g.g_turns AS turns, g.g_running AS running_turns      FROM g JOIN f ON f.id = g.g_last)";
 
 /// Searches run metadata newest-first. The result is an index, so it never returns stdout or stderr.
 /// With `group_by_chat`, every chat turn folds into one row per conversation.
@@ -163,7 +166,7 @@ pub async fn search(
     filter: &SearchFilter,
 ) -> sqlx::Result<Vec<RunSearchResult>> {
     let columns = format!(
-        "id, project_id, status, mode, created_at, completed_at, cost_usd,          substr(prompt, 1, {PROMPT_EXCERPT_CHARS}) AS prompt_excerpt,          model, effort, runner, route_mode, route_decision_id,          advised_runner, advised_model, advised_effort, route_failed, chat_id,          launched_by_chat_id,          (SELECT title FROM chats WHERE chats.chat_id = runs.launched_by_chat_id)          AS launched_by_chat_title"
+        "id, project_id, status, mode, created_at, completed_at, cost_usd,          substr(prompt, 1, {PROMPT_EXCERPT_CHARS}) AS prompt_excerpt,          model, effort, runner, route_mode, route_decision_id,          advised_runner, advised_model, advised_effort, route_failed, account_id, chat_id,          launched_by_chat_id,          (SELECT title FROM chats WHERE chats.chat_id = runs.launched_by_chat_id)          AS launched_by_chat_title"
     );
     let mut query = if filter.group_by_chat {
         sqlx::QueryBuilder::<sqlx::Sqlite>::new(format!(
@@ -815,3 +818,81 @@ pub(crate) async fn tag_origin(pool: &sqlx::SqlitePool, id: i64, headers: &axum:
 
 #[cfg(test)]
 mod origin_tests;
+
+#[cfg(test)]
+mod account_search_tests {
+    use super::*;
+
+    fn filter(group_by_chat: bool) -> SearchFilter {
+        SearchFilter {
+            project_id: None,
+            status: None,
+            mode: None,
+            q: None,
+            since: None,
+            until: None,
+            limit: 50,
+            live: false,
+            chat_id: None,
+            group_by_chat,
+            hide_chat_turns: false,
+            before: None,
+        }
+    }
+
+    /// The run list answers `account_id` as `GET /runs/{id}` does, flat and grouped: the account a
+    /// run ran under, and an explicit `null` for a run without one. The folded chat row is the
+    /// positional UNION arm, so it is checked too.
+    #[tokio::test]
+    async fn the_run_list_carries_the_account_id_flat_and_grouped() {
+        let pool = crate::testdb::fresh_pool().await;
+        let insert = |prompt: &'static str, mode: &'static str, chat: Option<&'static str>| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO runs (prompt, status, mode, chat_id, created_at)
+                     VALUES (?, 'completed', ?, ?, '2026-11-01T00:00:00Z')",
+                )
+                .bind(prompt)
+                .bind(mode)
+                .bind(chat)
+                .execute(&pool)
+                .await
+                .unwrap()
+                .last_insert_rowid()
+            }
+        };
+        let with_account = insert("with account", "worktree", None).await;
+        let without_account = insert("without account", "worktree", None).await;
+        let turn = insert("chat turn", "assistant", Some("c-1")).await;
+        for id in [with_account, turn] {
+            sqlx::query("UPDATE runs SET account_id = 'claude:1a2b3c4d' WHERE id = ?")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        for grouped in [false, true] {
+            let rows = search(&pool, &filter(grouped)).await.unwrap();
+            let account = |id: i64| {
+                let row = rows.iter().find(|row| row.id == id).expect("listed");
+                serde_json::to_value(row).unwrap()["account_id"].clone()
+            };
+            assert_eq!(
+                account(with_account),
+                "claude:1a2b3c4d",
+                "grouped={grouped}"
+            );
+            assert_eq!(
+                account(without_account),
+                serde_json::Value::Null,
+                "grouped={grouped}"
+            );
+            assert_eq!(account(turn), "claude:1a2b3c4d", "grouped={grouped}");
+        }
+        let folded = search(&pool, &filter(true)).await.unwrap();
+        let folded_turn = folded.iter().find(|row| row.id == turn).expect("folded");
+        assert_eq!(folded_turn.turns, Some(1));
+    }
+}

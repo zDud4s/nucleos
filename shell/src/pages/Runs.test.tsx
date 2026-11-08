@@ -1214,6 +1214,34 @@ describe("Runs - presets", () => {
   });
 });
 
+/* ------------------------------------------------------------- account -- */
+
+describe("Runs - account", () => {
+  it("names the account a run ran under beside its id, and nothing for a run without one", async () => {
+    daemon.apiFetch.mockImplementation(
+      runsFetch(
+        world({
+          rows: [
+            row({ id: 7, account_id: "claude:1a2b3c4d" }),
+            row({ id: 8, account_id: null }),
+          ],
+        }),
+      ),
+    );
+
+    await renderRuns();
+
+    const items = await findRunRows();
+    expect(items.length).toBe(2);
+    const accountOf = (item: Element) =>
+      item.querySelector(".runs-row-sub .runs-row-account")?.textContent ?? null;
+    const byId = (id: number) =>
+      items.find((item) => item.querySelector(".runs-row-id")?.textContent === `run ${id}`) as Element;
+    expect(accountOf(byId(7))).toBe("claude:1a2b3c4d");
+    expect(accountOf(byId(8))).toBeNull();
+  });
+});
+
 /* ---------------------------------------------------------- chat turns -- */
 
 describe("Runs - chat turns", () => {
