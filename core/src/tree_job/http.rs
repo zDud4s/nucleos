@@ -198,14 +198,24 @@ pub fn branch_admission(
 
 /// The first branch, by name, outside the new branch's base chain that still holds paths
 /// overlapping `paths`. The chain is the base, its base, and so on, and is cut where a name repeats
-/// or names no branch. It is filtered out before the search, since `overlapping_branch` answers
+/// or names no branch. The `parent` and its ancestors are exempt the same way: a child works inside
+/// its parent's paths. It is filtered out before the search, since `overlapping_branch` answers
 /// only the first overlap by name and that one may belong to the chain.
 pub fn overlap_outside_base_chain(
     manifest: &Manifest,
     paths: &[String],
     base: Option<&str>,
+    parent: Option<&str>,
 ) -> Option<String> {
     let mut chain = BTreeSet::new();
+    if let Some(parent) = parent {
+        chain.insert(parent);
+        for name in super::nesting::ancestors(manifest, parent) {
+            if let Some((key, _)) = manifest.branches.get_key_value(&name) {
+                chain.insert(key.as_str());
+            }
+        }
+    }
     let mut next = base;
     while let Some(name) = next {
         let Some(branch) = manifest.branches.get(name) else {
@@ -578,6 +588,7 @@ struct BranchBody {
     paths: Option<Vec<String>>,
     layer: Option<String>,
     base: Option<String>,
+    parent: Option<String>,
 }
 
 /// `POST /trees/{id}/branches`: adds a `queued` branch. Checked in this order: replay, finished
@@ -594,13 +605,18 @@ async fn post_branch(
         .ok_or_else(|| refuse(StatusCode::BAD_REQUEST, "paths is required"))?;
     let layer = required("layer", body.layer)?;
     let base = body.base.filter(|base| !base.trim().is_empty());
+    let parent = body.parent.filter(|parent| !parent.trim().is_empty());
 
     let lock = job_lock(&id);
     let _guard = lock.lock().await;
     let mut job = load_job(&state, &id).await?;
 
     if let Some(existing) = job.manifest.branches.get(&name) {
-        if existing.paths == paths && existing.layer == layer && existing.base == base {
+        if existing.paths == paths
+            && existing.layer == layer
+            && existing.base == base
+            && existing.parent == parent
+        {
             return Ok(Json(json!({
                 "name": name, "state": existing.state, "layer": layer, "base": base,
                 "replayed": true,
@@ -608,7 +624,7 @@ async fn post_branch(
         }
         return Err(refuse(
             StatusCode::CONFLICT,
-            format!("branch {name} already exists with other paths, layer or base"),
+            format!("branch {name} already exists with other paths, layer, base or parent"),
         ));
     }
     if job.state == JOB_TERMINAL_STATE {
@@ -625,6 +641,23 @@ async fn post_branch(
             format!("base branch {base} is not in this tree"),
         ));
     }
+    if let Some(parent) = parent.as_deref() {
+        match job.manifest.branches.get(parent) {
+            Some(found) if super::engine::may_attach_child(found) => {}
+            Some(found) => {
+                return Err(refuse(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("parent branch {parent} is {} and takes no child", found.state),
+                ));
+            }
+            None => {
+                return Err(refuse(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("parent branch {parent} is not in this tree"),
+                ));
+            }
+        }
+    }
     if layer == DOCS_LAYER
         && let Some(path) = paths.iter().find(|path| !is_allowed_docs_path(path))
     {
@@ -633,7 +666,7 @@ async fn post_branch(
             format!("{path} is not a path a docs branch may write"),
         ));
     }
-    if let Some(other) = overlap_outside_base_chain(&job.manifest, &paths, base.as_deref()) {
+    if let Some(other) = overlap_outside_base_chain(&job.manifest, &paths, base.as_deref(), parent.as_deref()) {
         return Err(refuse(
             StatusCode::CONFLICT,
             format!("paths overlap branch {other}"),
@@ -671,7 +704,8 @@ async fn post_branch(
         return Err((StatusCode::CONFLICT, Json(refusal)));
     }
 
-    let branch = Branch::new(&name, &paths, &layer, base.as_deref());
+    let mut branch = Branch::new(&name, &paths, &layer, base.as_deref());
+    branch.parent = parent.clone();
     let queued = branch.state.clone();
     job.manifest.branches.insert(name.clone(), branch);
     job.updated_at = now();
@@ -1549,7 +1583,7 @@ mod tests {
     }
 
     fn overlap(manifest: &Manifest, base: Option<&str>) -> Option<String> {
-        overlap_outside_base_chain(manifest, &strings(&[CODE_PATH]), base)
+        overlap_outside_base_chain(manifest, &strings(&[CODE_PATH]), base, None)
     }
 
     #[test]
@@ -2498,6 +2532,84 @@ mod tests {
         .await;
 
         assert_error_naming(&response, StatusCode::CONFLICT, "stranger-z");
+    }
+
+    #[tokio::test]
+    async fn post_branch_inside_its_parent_paths_is_200() {
+        let state = test_state().await;
+        seed_job(
+            &state.pool,
+            JOB,
+            "open",
+            vec![branch("api", "building", DOCS, &[SHARED], None)],
+            &[],
+        )
+        .await;
+
+        let response = post(
+            &app(&state),
+            &branches_uri(JOB),
+            json!({ "name": "notes", "paths": [SHARED], "layer": DOCS, "parent": "api" }),
+        )
+        .await;
+
+        assert_first_call(&response);
+        let job = loaded(&state.pool, JOB).await;
+        assert_eq!(job.manifest.branches["notes"].parent.as_deref(), Some("api"));
+    }
+
+    #[tokio::test]
+    async fn post_branch_overlapping_a_sibling_under_one_parent_is_409() {
+        let state = test_state().await;
+        let mut sibling = branch("sibling", "queued", DOCS, &[SHARED], None);
+        sibling.parent = Some("api".to_owned());
+        seed_job(
+            &state.pool,
+            JOB,
+            "open",
+            vec![branch("api", "building", DOCS, &[SHARED], None), sibling],
+            &[],
+        )
+        .await;
+
+        let response = post(
+            &app(&state),
+            &branches_uri(JOB),
+            json!({ "name": "notes", "paths": [SHARED], "layer": DOCS, "parent": "api" }),
+        )
+        .await;
+
+        assert_error_naming(&response, StatusCode::CONFLICT, "sibling");
+    }
+
+    #[tokio::test]
+    async fn post_branch_with_an_unknown_or_finished_parent_is_422() {
+        let state = test_state().await;
+        seed_job(
+            &state.pool,
+            JOB,
+            "open",
+            vec![branch("old", "merged", DOCS, &[SHARED], None)],
+            &[],
+        )
+        .await;
+
+        for parent in ["ghost", "old"] {
+            let response = post(
+                &app(&state),
+                &branches_uri(JOB),
+                json!({ "name": "notes", "paths": [SHARED], "layer": DOCS, "parent": parent }),
+            )
+            .await;
+            assert_error_naming(&response, StatusCode::UNPROCESSABLE_ENTITY, parent);
+        }
+        assert!(
+            !loaded(&state.pool, JOB)
+                .await
+                .manifest
+                .branches
+                .contains_key("notes")
+        );
     }
 
     #[tokio::test]

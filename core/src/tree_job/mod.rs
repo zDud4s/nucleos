@@ -17,6 +17,7 @@ mod gate_tests;
 pub mod http;
 pub mod landing;
 pub mod model;
+pub mod nesting;
 pub mod node_run;
 pub mod open;
 pub mod partition;
