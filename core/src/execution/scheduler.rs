@@ -1022,15 +1022,7 @@ mod tests {
     }
 
     fn space_free_tempdir(prefix: &str) -> tempfile::TempDir {
-        let base = std::env::current_dir().expect("resolve current directory");
-        assert!(
-            !base.to_string_lossy().contains(' '),
-            "test checkout must have a space-free path"
-        );
-        tempfile::Builder::new()
-            .prefix(prefix)
-            .tempdir_in(base)
-            .expect("create space-free tempdir")
+        crate::execution::git_exec::testkit::space_free_tempdir(prefix)
     }
 
     fn initialize_repo(repo: &FsPath) {

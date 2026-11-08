@@ -3899,15 +3899,7 @@ mod tests {
         prefix: &str,
         gate: &str,
     ) -> (tempfile::TempDir, std::path::PathBuf) {
-        let base = std::env::current_dir().expect("resolve current directory");
-        assert!(
-            !base.to_string_lossy().contains(' '),
-            "test checkout must have a space-free path"
-        );
-        let container = tempfile::Builder::new()
-            .prefix(prefix)
-            .tempdir_in(base)
-            .expect("create space-free tempdir");
+        let container = crate::execution::git_exec::testkit::space_free_tempdir(prefix);
         let repo = container.path().join("repo");
         std::fs::create_dir_all(&repo).expect("create repository directory");
         for args in [

@@ -62,8 +62,10 @@ pub mod testkit {
     /// Cargo cannot link under a path containing a space, and the daemon refuses such a worktree
     /// root for the same reason (`worktree.rs:107-111`) — so a tempdir under the checkout, not the
     /// system temp directory, which on Windows is routinely under `C:\Users\Some Name\`.
+    /// On Windows the base is `<dev home>\scratch\test-tmp` (so a leaked dir does not litter the
+    /// checkout), falling back to the current directory when that cannot be created.
     pub fn space_free_tempdir(prefix: &str) -> tempfile::TempDir {
-        let base = std::env::current_dir().expect("resolve current directory");
+        let base = space_free_tempdir_base();
         assert!(
             !base.to_string_lossy().contains(' '),
             "test checkout must have a space-free path"
@@ -72,6 +74,21 @@ pub mod testkit {
             .prefix(prefix)
             .tempdir_in(base)
             .expect("create space-free tempdir")
+    }
+
+    fn space_free_tempdir_base() -> PathBuf {
+        let current = || std::env::current_dir().expect("resolve current directory");
+        if !cfg!(windows) {
+            return current();
+        }
+        let scratch = crate::tree_job::open::dev_home()
+            .join("scratch")
+            .join("test-tmp");
+        if !scratch.to_string_lossy().contains(' ') && std::fs::create_dir_all(&scratch).is_ok() {
+            scratch
+        } else {
+            current()
+        }
     }
 
     /// `pub` for `runs.rs`, which needs a real repository to test the approval path against —
