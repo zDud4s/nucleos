@@ -101,6 +101,7 @@ registerPrefetcher("/system", (qc) =>
 import { DAEMON_NAME } from "../copy";
 import { percentText } from "../lib/format";
 import { plural } from "../lib/plural";
+import { BackupRowsSkeleton, ConfigFactsSkeleton, PiiTableSkeleton, TokenRowsSkeleton } from "../system/SkeletonLists";
 
 /**
  * System — the machine's own state, not a project's.
@@ -169,7 +170,7 @@ export function System() {
 
   return (
     <>
-      <PageHeader title="System" headline={headlineNodeFor(health.data)} />
+      <PageHeader title="System" headline={headlineNodeFor(health.data)} reserveHeadline />
       <ViewTabs view={view} />
       <div className="sy-sections">
         {view === "health" && (
@@ -1240,7 +1241,28 @@ function SpacePanel() {
         <SystemListError error={storage.error} what="the space readout" />
       )}
       {!storage.isError && space === undefined && (
-        <Skeleton label="Reading the space used" variant="cards" count={4} gridClassName="sy-space-cards" height="4.5rem" />
+        <>
+          <Skeleton label="Reading the space used" variant="cards" count={4} gridClassName="sy-space-cards" height="4.75rem" />
+          {/* The reclaimable bar, the notes line and the compact button: what sits under the figures. */}
+          <div aria-hidden="true">
+            <div className="sy-space-meter">
+              <span className="ui-skeleton-bar" style={{ height: "1.7rem" }} />
+            </div>
+            <p className="sy-space-notes" style={{ display: "flex", alignItems: "center", minHeight: "1lh" }}>
+              <span className="ui-skeleton-bar" style={{ width: "50%" }} />
+            </p>
+            <div className="sy-space-compact">
+              <span className="ui-skeleton-bar" style={{ width: "10rem", height: "2rem", borderRadius: "var(--radius-md)" }} />
+              <span className="sy-space-notes" style={{ display: "block", flex: "1 1 16rem" }}>
+                {[100, 100, 60].map((w, i) => (
+                  <span key={i} style={{ display: "flex", alignItems: "center", minHeight: "1lh" }}>
+                    <span className="ui-skeleton-bar" style={{ width: `${w}%` }} />
+                  </span>
+                ))}
+              </span>
+            </div>
+          </div>
+        </>
       )}
       {space !== undefined && (
         <>
@@ -1384,6 +1406,11 @@ function BackupsPanel() {
         </Button>
       }
     >
+      {!backups.isError && backups.data === undefined && (
+        <p className="sy-backups-summary" aria-hidden="true" style={{ display: "flex", alignItems: "center", minHeight: "1lh" }}>
+          <span className="ui-skeleton-bar" style={{ width: "14rem" }} />
+        </p>
+      )}
       {backups.data !== undefined && backups.data.length > 0 && (
         <p className="sy-backups-summary">
           {plural(backups.data.length, "snapshot")} ·{" "}
@@ -1408,7 +1435,7 @@ function BackupsPanel() {
         <SystemListError error={backups.error} what="the backups" />
       )}
       {!backups.isError && backups.data === undefined && (
-        <Skeleton label="Reading the backups" variant="row" count={3} height="3.25rem" />
+        <BackupRowsSkeleton label="Reading the backups" />
       )}
       {backups.data !== undefined && backups.data.length > 0 && (
         <Rows label="Backups">
@@ -1499,7 +1526,7 @@ function PiiObservations() {
   return (
     <Panel title="PII observations">
       {pii.isError && pii.data === undefined && <SystemListError error={pii.error} what="the PII tally" />}
-      {!pii.isError && pii.data === undefined && <Skeleton label="Reading the PII tally" lines={2} />}
+      {!pii.isError && pii.data === undefined && <PiiTableSkeleton label="Reading the PII tally" />}
       {pii.data !== undefined && pii.data.length === 0 && <Quiet says="nothing recorded." />}
       {pii.data !== undefined && pii.data.length > 0 && (
         <Table label="PII observations">
@@ -1670,7 +1697,7 @@ function TokensPanel() {
         <SystemListError error={tokens.error} what="the API tokens" />
       )}
       {!tokens.isError && tokens.data === undefined && (
-        <Skeleton label="Reading the tokens" variant="row" count={3} height="3.25rem" />
+        <TokenRowsSkeleton label="Reading the tokens" count={4} />
       )}
       {tokens.data !== undefined && tokens.data.length === 0 && (
         <Quiet says="no token has been minted." />
@@ -1803,7 +1830,7 @@ function EmailConfigPanel() {
         <SystemListError error={email.error} what="the e-mail configuration" />
       )}
       {!email.isError && email.data === undefined && (
-        <Skeleton label="Reading the e-mail configuration" lines={2} />
+        <ConfigFactsSkeleton label="Reading the e-mail configuration" flags={2} facts={8} note />
       )}
       {email.data !== undefined && <EmailConfigFacts config={email.data} />}
     </Panel>
@@ -1867,7 +1894,7 @@ function VoiceConfigPanel() {
         <SystemListError error={voice.error} what="the voice configuration" />
       )}
       {!voice.isError && voice.data === undefined && (
-        <Skeleton label="Reading the voice configuration" lines={2} />
+        <ConfigFactsSkeleton label="Reading the voice configuration" flags={1} facts={7} />
       )}
       {voice.data !== undefined && <VoiceConfigFacts config={voice.data} />}
     </Panel>
@@ -1916,7 +1943,7 @@ function CalendarConfigPanel() {
         />
       )}
       {!calendar.isError && calendar.data === undefined && (
-        <Skeleton label="Reading the calendar configuration" lines={2} />
+        <ConfigFactsSkeleton label="Reading the calendar configuration" facts={3} />
       )}
       {calendar.data !== undefined && (
         <CalendarConfigFacts config={calendar.data} />

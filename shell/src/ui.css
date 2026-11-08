@@ -1621,6 +1621,11 @@ ol.ui-well {
   font-size: var(--text-base);
 }
 
+/* An empty headline slot that holds its line while the page reads its data. */
+.ui-page-headline-reserved {
+  min-height: 1lh;
+}
+
 .ui-page-actions {
   display: flex;
   flex: 0 0 auto;
@@ -4274,7 +4279,7 @@ span.ui-skeleton-card {
       transparent 100%
     )
     0 0 / 200% 100% no-repeat,
-    color-mix(in oklab, var(--text) 8%, var(--surface));
+    var(--skeleton-fill, color-mix(in oklab, var(--text) 8%, var(--surface)));
   animation: ui-skeleton-shimmer 1.4s linear infinite;
 }
 .ui-skeleton-bar {
@@ -4363,7 +4368,7 @@ span.ui-skeleton-card {
   min-height: 6rem;
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
-  background: color-mix(in oklab, var(--text) 6%, var(--surface));
+  background: var(--skeleton-card-fill, color-mix(in oklab, var(--text) 6%, var(--surface)));
 }
 
 /* A value that is not known is not zero: a dash in the faint tone. */

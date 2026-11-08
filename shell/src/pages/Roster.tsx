@@ -17,7 +17,6 @@ import { PageHeader } from "../ui/PageHeader";
 import { Quiet } from "../ui/Quiet";
 import { RefusalNote } from "../ui/RefusalNote";
 import { SectionTitle } from "../ui/SectionTitle";
-import { Skeleton } from "../ui/Skeleton";
 import { Tip, usePaletteGroup } from "../ui";
 import { usePageKeys } from "../project/pageKeys";
 import { StaleNote } from "../ui/StaleNote";
@@ -99,6 +98,7 @@ export function Roster() {
     <>
       <PageHeader
         title="Projects"
+        reserveHeadline
         headline={
           projects.data === undefined
             ? undefined
@@ -137,14 +137,7 @@ export function Roster() {
         projects.isError ? (
           <RosterError error={projects.error} onRetry={() => void projects.refetch()} />
         ) : (
-          // The filter strip (30rem max, as `Filtered` draws it), then the group's rows at their
-          // `py-3` two-line height inside the same rounded surface.
-          <div className="flex flex-col gap-4">
-            <Skeleton label="Loading the projects" variant="block" width="min(30rem, 100%)" height="2.25rem" />
-            <div className="rounded-lg bg-surface">
-              <Skeleton label="Loading the project rows" variant="row" count={5} height="4.25rem" />
-            </div>
-          </div>
+          <RosterSkeleton />
         )
       ) : rows.length === 0 ? (
         <Teach
@@ -388,6 +381,86 @@ function Groups({ rows, stale }: { rows: ProjectSummary[]; stale: boolean }) {
             ))}
           </Group>
         ))}
+    </div>
+  );
+}
+
+/**
+ * The roster while it is being read: the filter strip (search box and its "N results" slot) and two
+ * groups drawn on the loaded rows' own grid, insets and tiers — a titled card of rows, then a bare
+ * list — with a bar at every column edge. The bars take the height of the text they stand in for,
+ * so the page keeps its height when the rows land.
+ */
+function RosterSkeleton() {
+  const bar = (width: string, height = "0.75rem") => (
+    <span className="ui-skeleton-bar" style={{ width, height }} />
+  );
+  const cell = (width: string, extra = "") => (
+    <span className={`flex min-h-[1lh] items-center text-sm ${extra}`}>{bar(width)}</span>
+  );
+  const row = (key: number, tier: Tier) => (
+    <li
+      key={key}
+      className={
+        tier === "quiet"
+          ? "border-t border-border"
+          : "border-t border-border first:rounded-t-lg first:border-t-0 last:rounded-b-lg"
+      }
+    >
+      <div className={`grid items-center gap-x-3 gap-y-1 px-3 py-3 ${NARROW_COLUMNS} ${WIDE_COLUMNS}`}>
+        <span className="col-start-2 row-start-1 flex items-center gap-2 @min-[52rem]:col-auto @min-[52rem]:row-auto">
+          <span className="ui-skeleton-avatar" style={{ width: "0.5rem", height: "0.5rem" }} />
+          {bar("3rem")}
+        </span>
+        <span className="col-start-1 row-start-1 min-w-0 @min-[52rem]:col-auto @min-[52rem]:row-auto">
+          <span className="flex min-h-[1lh] items-center font-display text-md leading-snug">{bar("45%", "1rem")}</span>
+          <span className="flex min-h-[1lh] items-center text-xs">{bar("70%", "0.625rem")}</span>
+        </span>
+        <span className="hidden @min-[52rem]:contents">
+          {cell("3.5rem")}
+          {cell("3rem")}
+          {cell("4.5rem")}
+          {cell("6rem")}
+        </span>
+        <span className="col-start-3 row-start-1 flex items-center justify-end text-sm @min-[52rem]:col-auto @min-[52rem]:row-auto">
+          {bar("2.5rem")}
+        </span>
+      </div>
+    </li>
+  );
+  const group = (label: string, count: number, tier: Tier, labelled: boolean) => (
+    <section aria-hidden="true" className="flex flex-col gap-2">
+      <div className={`grid items-center gap-x-3 px-3 ${WIDE_COLUMNS}`}>
+        <div className="flex min-h-[1lh] items-center text-xs @min-[52rem]:col-span-2">{bar("7rem", "0.875rem")}</div>
+        {labelled &&
+          COLUMN_HEADS.map((head) => (
+            <span key={head} className="hidden @min-[52rem]:flex">
+              {bar("3.5rem", "0.5rem")}
+            </span>
+          ))}
+      </div>
+      <ul className={`m-0 list-none p-0 ${tier === "quiet" ? "" : "rounded-lg bg-surface"}`}>
+        {Array.from({ length: count }, (_, i) => row(i, tier))}
+      </ul>
+      <span className="sr-only">{label}</span>
+    </section>
+  );
+  return (
+    <div role="status" aria-busy="true">
+      <span className="sr-only">Loading the projects</span>
+      <div className="mt-1 mb-6 max-w-[30rem]" aria-hidden="true">
+        <div className="ui-filter-bar">
+          <span
+            className="ui-skeleton-bar"
+            style={{ flex: "1 1 14rem", minWidth: "10rem", height: "1.75rem", borderRadius: "var(--radius-md)" }}
+          />
+          <span className="font-mono text-xs">{bar("4.5rem")}</span>
+        </div>
+      </div>
+      <div className="@container flex flex-col gap-8">
+        {group("Needs you", 2, "needs", true)}
+        {group("Quiet", 2, "quiet", false)}
+      </div>
     </div>
   );
 }

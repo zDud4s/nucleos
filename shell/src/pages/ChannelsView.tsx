@@ -27,7 +27,8 @@ export function ChannelsView() {
   if (!channels.data) {
     return (
       <div className="ch-page">
-        <Skeleton label="Reading the channels" variant="cards" count={3} gridClassName="ch-grid" height="9rem" />
+        {/* The daemon ships two adapters (Telegram, Discord): two cards of their loaded heights. */}
+        <Skeleton label="Reading the channels" variant="cards" gridClassName="ch-grid" heights={["35.25rem", "30.25rem"]} />
       </div>
     );
   }

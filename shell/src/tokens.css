@@ -295,6 +295,11 @@
     --surface: #ffffff;
     --surface-raised: #ffffff;
     --surface-sunken: #eceef3;
+    /* Skeleton bars are an alpha wash of the text colour, so they read on the page, on a white
+       card and on a sunken card alike (~1.6:1, ~1.5:1, ~1.4:1); a fill mixed into one surface
+       was 1.2:1 on white and nearly invisible on sunken. */
+    --skeleton-fill: color-mix(in oklab, var(--text) 16%, transparent);
+    --skeleton-card-fill: color-mix(in oklab, var(--text) 9%, transparent);
 
     --border: #dcdfe6;
     --border-strong: #b4bbc7;

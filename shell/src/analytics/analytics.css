@@ -111,6 +111,11 @@
   }
 }
 
+/* The chart panel's skeleton: one full-width card, like the real panel. */
+.ui-skeleton-grid.an-detail-skeleton {
+  grid-template-columns: minmax(0, 1fr);
+}
+
 .an-metric {
   position: relative;
   display: flex;

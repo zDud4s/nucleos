@@ -17,6 +17,11 @@ export interface PageHeaderProps {
    * tab strip right below the header carries the rule, and two lines would read as a double rule.
    */
   ruled?: boolean;
+  /**
+   * The page will have a headline once it has read its data: keep the line's height while
+   * `headline` is absent, so the header does not grow when the sentence arrives.
+   */
+  reserveHeadline?: boolean;
 }
 
 /**
@@ -28,12 +33,16 @@ export interface PageHeaderProps {
  * sentence goes. Keeping the slot in the shared header is what stops it from
  * being omitted on the pages nobody rewrote.
  */
-export function PageHeader({ title, headline, actions, ruled = true }: PageHeaderProps) {
+export function PageHeader({ title, headline, actions, ruled = true, reserveHeadline = false }: PageHeaderProps) {
   return (
     <header className={ruled ? "ui-page-header" : "ui-page-header ui-page-header-unruled"}>
       <div className="ui-page-header-text">
         <h1 className="ui-page-title">{title}</h1>
-        {headline === undefined ? null : <p className="ui-page-headline">{headline}</p>}
+        {headline !== undefined ? (
+          <p className="ui-page-headline">{headline}</p>
+        ) : reserveHeadline ? (
+          <p className="ui-page-headline ui-page-headline-reserved" aria-hidden="true" />
+        ) : null}
       </div>
       {actions === undefined ? null : <div className="ui-page-actions">{actions}</div>}
     </header>
