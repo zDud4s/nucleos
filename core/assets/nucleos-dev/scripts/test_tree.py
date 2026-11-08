@@ -333,6 +333,57 @@ class Prompt(CliCase):
         self.assertIn("return the report as your final message", review)
         self.assertNotIn("Write it to", review)
 
+    def test_prompt_depth_comes_from_the_parent(self):
+        nodes = self.root / "nodes.json"
+        nodes.write_text(json.dumps({"nodes": [
+            {"id": "root-1", "parent_id": None, "kind": "root"},
+            {"id": "n-1", "parent_id": "root-1"}, {"id": "n-2", "parent_id": "n-1"}]}), encoding="utf-8")
+        text = self.prompt("n-7", "leaf", "--parent", "n-2", "--nodes", str(nodes))["prompt"]
+        self.assertIn("Current depth: 3", text)
+        # no parent: the root's child, depth 1
+        self.assertIn("Current depth: 1", self.prompt("n-8")["prompt"])
+
+    def test_prompt_explicit_depth_still_wins(self):
+        text = self.prompt("n-7", "leaf", "--parent", "n-2", "--depth", "5")["prompt"]
+        self.assertIn("Current depth: 5", text)
+
+    def write_pieces(self, pieces):
+        path = self.root / "pieces.json"
+        path.write_text(json.dumps(pieces), encoding="utf-8")
+        return str(path)
+
+    def test_partition_folds_pieces_under_the_floor(self):
+        path = self.write_pieces([{"name": "a", "estimate": 10000, "paths": ["x/a"]},
+                                  {"name": "b", "estimate": 20000, "paths": ["x/b"]},
+                                  {"name": "c", "estimate": 90000, "paths": ["x/c"]}])
+        out = self.ok("partition", "--pieces", path)
+        self.assertEqual([(p["name"], p["estimate"], p["kind"]) for p in out["pieces"]],
+                         [("a+b", 30000, "leaf"), ("c", 90000, "leaf")])
+
+    def test_partition_marks_a_piece_over_the_budget_as_orchestrator(self):
+        out = self.ok("partition", "--pieces", self.write_pieces(
+            [{"name": "big", "estimate": 180000}, {"name": "fit", "estimate": 120000}]))
+        self.assertEqual([p["kind"] for p in out["pieces"]], ["orchestrator", "leaf"])
+
+    def test_partition_never_builds_a_piece_over_the_budget(self):
+        out = self.ok("partition", "--pieces", self.write_pieces(
+            [{"name": "a", "estimate": 20000}, {"name": "b", "estimate": 110000}]))
+        self.assertEqual([p["name"] for p in out["pieces"]], ["a", "b"])
+
+    def test_partition_refuses_a_non_positive_estimate(self):
+        for bad in (0, -5):
+            self.assertIn("estimate", self.refused("partition", "--pieces",
+                                                   self.write_pieces([{"name": "a", "estimate": bad}])))
+
+    def test_orchestrate_node_skill_no_longer_says_merge_or_sequence(self):
+        skills = WORKFLOW.parents[1] / ".claude" / "skills"
+        text = (skills / "orchestrate-node" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertNotIn("merge parts or sequence them", text)
+        self.assertIn("wf-leaf", text)
+        self.assertIn("25%", text)
+        dispatch = (WORKFLOW / "dispatch.md").read_text(encoding="utf-8")
+        self.assertIn("wf-leaf", dispatch)
+
     def test_refusals(self):
         base = ["prompt", "n-9", "--goal", "g"]
         self.assertIn("no branch", self.refused(*base, "--branch", "zzz", "--kind", "leaf", "--paths", "core/src/a.rs"))

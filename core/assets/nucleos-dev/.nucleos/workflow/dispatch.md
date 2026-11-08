@@ -99,7 +99,7 @@ Leaf phases (`plan`, `execute`, `review`, `rescue`, `bootstrap`, `maintenance`; 
 - invoke the `claude` or `codex` bridge skills, or shell out to `claude -p` / `codex exec` for a "second opinion";
 - read `.nucleos/workflow/dispatch.md`, the `orchestrate*` skills, or another phase's skill and act on them.
 
-A sub-orchestrator runs in the `wf-orchestrator` cockpit (skill `orchestrate-node`) and may dispatch only `wf-orchestrator`, `wf-planner`, `wf-executor` and `wf-reviewer`. Its phase name for model routing is `orchestrate_node`.
+A sub-orchestrator runs in the `wf-orchestrator` cockpit (skill `orchestrate-node`) and may dispatch only `wf-orchestrator`, `wf-planner`, `wf-leaf`, `wf-executor` and `wf-reviewer`. Its phase name for model routing is `orchestrate_node`.
 
 In a tree driven by `tree.py` there are two more cockpits. The top-of-branch orchestrator runs in `wf-tree-orchestrator` (same walls as `wf-orchestrator`; its node is not closed by itself, it stays `running` until the branch merges), routing phase `tree_orchestrate`. A leaf `execute` runs in `wf-leaf` (routing phase `tree_leaf`): it is the one leaf cockpit with `node_update` and `node_close`, usable on **its own node only**. Reviewers get no `node_close`; they return their report as text and the controller stores it.
 

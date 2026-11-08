@@ -6,6 +6,7 @@
     tree.py branch bind <name> --node-id ID      (record the branch node after node_open)
     tree.py branch drop <name> --reason R
     tree.py prompt <node_id> --branch B --kind leaf|orchestrator|review --goal G ...
+    tree.py partition --pieces FILE                  (fold small pieces, mark leaf or orchestrator)
     tree.py status [--nodes FILE]
     tree.py review|merge|park|finish ...             (the 4c verbs, below)
     tree.py budget|open|close|gate|record ...        (tree_resources.py, tree_record.py)
@@ -298,7 +299,9 @@ def configure_prompt(p) -> None:
     p.add_argument("--sections", nargs="*", default=[], help="contract ids to read, e.g. A3 E2")
     p.add_argument("--title", default=None)
     p.add_argument("--parent", default=None, help="parent node id (default: the root)")
-    p.add_argument("--depth", type=int, default=1)
+    p.add_argument("--depth", type=int, default=None,
+                   help="override; default: the parent node's depth + 1 (from --nodes), else 1")
+    p.add_argument("--nodes", default=None, help="a node_tree output as JSON: gives the parent's depth")
     p.add_argument("--task-id", default="none")
 
 
@@ -403,6 +406,37 @@ def contained(path: str, owned: list[str]) -> bool:
     return False
 
 
+def node_depth(nodes: list[dict], node_id: str, root_id: str) -> int | None:
+    """The depth of `node_id` (the root is 0): its own `depth` field if the node_tree output has
+    one, else the length of its parent chain. None when the node is not in the list."""
+    by_id = {n["id"]: n for n in nodes}
+    if node_id == root_id:
+        return 0
+    depth, seen, current = 0, set(), node_id
+    while current != root_id:
+        node = by_id.get(current)
+        if node is None or current in seen:
+            return None
+        if isinstance(node.get("depth"), int):
+            return node["depth"] + depth
+        seen.add(current)
+        current, depth = node.get("parent_id"), depth + 1
+        if current is None:
+            return None
+    return depth
+
+
+def prompt_depth(args, tree_id: str) -> int:
+    """`--depth` if given, else the parent's depth + 1 (parent default: the root, depth 0)."""
+    if args.depth is not None:
+        return args.depth
+    parent = args.parent or tree_id
+    if parent == tree_id:
+        return 1
+    found = node_depth(load_nodes_file(args.nodes), parent, tree_id) if args.nodes else None
+    return 1 if found is None else found + 1
+
+
 def posix(path) -> str:
     return str(path).replace("\\", "/")
 
@@ -434,7 +468,7 @@ def run_prompt(args) -> dict:
         "Kind": "orchestrator" if kind == "orchestrator" else "leaf",
         "Title": args.title or goal[:60], "Owned paths": ", ".join(paths) or "none (read-only)",
         "Budget tokens": limits["orchestrator_budget" if kind == "orchestrator" else "leaf_budget"],
-        "Current depth": args.depth, "Max depth": limits["max_depth"], "Max width": limits["max_width"],
+        "Current depth": prompt_depth(args, tree_id), "Max depth": limits["max_depth"], "Max width": limits["max_width"],
         "Leaf budget": limits["leaf_budget"], "Orchestrator budget": limits["orchestrator_budget"],
         "Ceiling": limits["ceiling"], "Subtree verify": str(bool(limits["subtree_verify"])).lower()}
     pre, sections = split_sections(_COMMENT.sub("", fill_fields(template, values)))
@@ -462,6 +496,32 @@ def run_prompt(args) -> dict:
     target.write_text(text, encoding="utf-8")
     return {"verb": "prompt", "tree_id": tree_id, "node_id": node_id, "branch": args.branch, "kind": kind,
             "prompt_file": str(target), "handoff_file": handoff, "prompt": text}
+
+
+# --- partition --------------------------------------------------------------------------------
+
+def configure_partition(p) -> None:
+    p.add_argument("--pieces", required=True,
+                   help='a JSON file: a list of {"name", "estimate", "paths"} (estimate in tokens)')
+
+
+def run_partition(args) -> dict:
+    """Fold the small pieces and say which of the rest is a leaf and which must be split again."""
+    try:
+        data = json.loads(Path(args.pieces).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise TreeError(f"--pieces {args.pieces}: {error}") from error
+    if not isinstance(data, list) or not all(isinstance(p, dict) and p.get("name") for p in data):
+        raise TreeError("--pieces must hold a list of objects that have a name")
+    for piece in data:
+        estimate = piece.get("estimate")
+        if isinstance(estimate, bool) or not isinstance(estimate, int) or estimate <= 0:
+            raise TreeError(f"piece {piece['name']!r}: estimate must be a positive integer, got {estimate!r}")
+    budget = ts.load_nodes_limits()["leaf_budget"]
+    folded = ts.fold_small(data, budget)
+    return {"verb": "partition", "leaf_budget": budget,
+            "pieces": [{"name": p["name"], "estimate": p["estimate"],
+                        "kind": "leaf" if p["estimate"] <= budget else "orchestrator"} for p in folded]}
 
 
 # --- status -----------------------------------------------------------------------------------
@@ -871,6 +931,7 @@ def core_verbs() -> Verbs:
     verbs["init"] = (configure_init, run_init)
     verbs["branch"] = (configure_branch, run_branch)
     verbs["prompt"] = (configure_prompt, run_prompt)
+    verbs["partition"] = (configure_partition, run_partition)
     verbs["status"] = (configure_status, run_status)
     verbs["review"] = (configure_review, run_review)
     verbs["merge"] = (configure_merge, run_merge)

@@ -115,6 +115,41 @@ def load_nodes_limits(root: Path | None = None) -> dict:
     return {**NODES_DEFAULTS, **{k: v for k, v in block.items() if k in NODES_DEFAULTS}}
 
 
+FLOOR_PERCENT = 25  # a piece under this share of leaf_budget is folded into a neighbour
+
+
+def fold_small(pieces: list[dict], leaf_budget: int) -> list[dict]:
+    """Fold pieces under 25% of `leaf_budget` into a neighbour, greedy left to right (the rule of
+    core/src/tree_job/partition.rs `fold_small`). A small piece merges with the next one if the sum
+    stays within `leaf_budget`, else with the previous one under the same condition, else it stays
+    alone. A merged piece is checked again, so a run of tiny pieces collapses until it reaches the
+    floor or the budget. Never builds a piece above the budget. Pieces are `{"name", "estimate"}`
+    dicts; `paths` lists are concatenated."""
+    floor = leaf_budget * FLOOR_PERCENT // 100
+
+    def merged(left: dict, right: dict) -> dict:
+        out = {**left, "name": f"{left['name']}+{right['name']}",
+               "estimate": left["estimate"] + right["estimate"]}
+        if "paths" in left or "paths" in right:
+            out["paths"] = [*left.get("paths", []), *right.get("paths", [])]
+        return out
+
+    out: list[dict] = []
+    rest = list(pieces)
+    i = 0
+    while i < len(rest):
+        cur = rest[i]
+        i += 1
+        while cur["estimate"] < floor and i < len(rest) and cur["estimate"] + rest[i]["estimate"] <= leaf_budget:
+            cur = merged(cur, rest[i])
+            i += 1
+        if cur["estimate"] < floor and out and out[-1]["estimate"] + cur["estimate"] <= leaf_budget:
+            out[-1] = merged(out[-1], cur)
+            continue
+        out.append(cur)
+    return out
+
+
 def dev_home() -> Path:
     """Where this machine's dev-only NucleOS state lives. Copy of heavy.py `_dev_home`
     (scripts/heavy.py): NUCLEOS_DEV_HOME, else `<system drive>/nucleos-dev` on Windows, else
