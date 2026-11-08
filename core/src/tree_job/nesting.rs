@@ -125,6 +125,49 @@ pub async fn ancestor_chain(
     Ok(chain)
 }
 
+/// One entry per branch that has a work node: `{branch, node_id, kind, depth, parent, descent,
+/// degraded, estimate_tokens, kind_reason}`, shallowest first. `kind` and `depth` come from the
+/// node row; the rest from the branch (null when absent). A branch whose node row is gone is left
+/// out, so the answer never blocks on a stale manifest.
+pub async fn describe_nodes(
+    pool: &sqlx::SqlitePool,
+    manifest: &Manifest,
+) -> Result<serde_json::Value, sqlx::Error> {
+    let mut entries: Vec<(i64, serde_json::Value)> = Vec::new();
+    for branch in manifest.branches.values() {
+        let Some(node_id) = branch.node_id.as_deref() else {
+            continue;
+        };
+        let row: Option<(String, i64)> =
+            sqlx::query_as("SELECT kind, depth FROM work_nodes WHERE id = ?")
+                .bind(node_id)
+                .fetch_optional(pool)
+                .await?;
+        let Some((kind, depth)) = row else {
+            continue;
+        };
+        let extra = |key: &str| branch.extra.get(key).cloned().unwrap_or_default();
+        entries.push((
+            depth,
+            serde_json::json!({
+                "branch": branch.name,
+                "node_id": node_id,
+                "kind": kind,
+                "depth": depth,
+                "parent": branch.parent,
+                "descent": extra("descent"),
+                "degraded": extra("degraded"),
+                "estimate_tokens": extra("estimate_tokens"),
+                "kind_reason": extra("kind_reason"),
+            }),
+        ));
+    }
+    entries.sort_by_key(|(depth, _)| *depth);
+    Ok(serde_json::Value::Array(
+        entries.into_iter().map(|(_, entry)| entry).collect(),
+    ))
+}
+
 /// The branch bound to `caller_node`, or `None` when that is the stem branch (`root`) or no branch
 /// is bound, so a stem-level start stays unparented.
 pub fn parent_branch_of(manifest: &Manifest, caller_node: &str) -> Option<String> {
@@ -222,6 +265,8 @@ fn live_parent_ref(manifest: &Manifest, parent: &str) -> Result<String, String> 
 
 #[cfg(test)]
 mod tests {
+    use serde_json::{Value, json};
+
     use super::*;
 
     fn manifest(branches: &[(&str, &str, Option<&str>, Option<&str>)]) -> Manifest {
@@ -234,6 +279,77 @@ mod tests {
             manifest.branches.insert((*name).to_owned(), branch);
         }
         manifest
+    }
+
+    async fn seed_node(pool: &sqlx::SqlitePool, id: &str, kind: &str, depth: i64) {
+        sqlx::query(
+            "INSERT INTO work_nodes (id, root_id, depth, kind, title, goal, status, \
+             created_at, updated_at) \
+             VALUES (?, 'n-root', ?, ?, 't', 'g', 'running', '2026-11-08T00:00:00Z', \
+             '2026-11-08T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(depth)
+        .bind(kind)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn describe_nodes_gives_each_branch_its_depth_parent_and_descent() {
+        let pool = crate::testdb::fresh_pool().await;
+        let mut m = manifest(&[
+            ("a", "building", None, Some("n-a")),
+            ("b", "building", Some("a"), Some("n-b")),
+            ("c", "building", Some("b"), Some("n-c")),
+            ("ghost", "building", None, Some("n-gone")),
+            ("bare", "building", None, None),
+        ]);
+        seed_node(&pool, "n-a", "orchestrator", 1).await;
+        seed_node(&pool, "n-b", "orchestrator", 2).await;
+        seed_node(&pool, "n-c", "leaf", 3).await;
+        let b = m.branches.get_mut("b").unwrap();
+        b.extra.insert("descent".to_owned(), json!({ "reason": "too big" }));
+        b.extra.insert("estimate_tokens".to_owned(), json!(180_000));
+        let c = m.branches.get_mut("c").unwrap();
+        c.extra.insert("degraded".to_owned(), json!("fits"));
+        c.extra.insert("kind_reason".to_owned(), json!("fits"));
+
+        let nodes = describe_nodes(&pool, &m).await.unwrap();
+
+        let nodes = nodes.as_array().unwrap();
+        let names: Vec<_> = nodes.iter().map(|n| n["branch"].as_str().unwrap()).collect();
+        assert_eq!(names, ["a", "b", "c"]);
+        assert_eq!(nodes[0]["depth"], 1);
+        assert_eq!(nodes[0]["parent"], Value::Null);
+        assert_eq!(nodes[0]["descent"], Value::Null);
+        assert_eq!(nodes[1]["depth"], 2);
+        assert_eq!(nodes[1]["parent"], "a");
+        assert_eq!(nodes[1]["kind"], "orchestrator");
+        assert_eq!(nodes[1]["descent"]["reason"], "too big");
+        assert_eq!(nodes[1]["estimate_tokens"], 180_000);
+        assert_eq!(nodes[2]["depth"], 3);
+        assert_eq!(nodes[2]["kind"], "leaf");
+        assert_eq!(nodes[2]["degraded"], "fits");
+        assert_eq!(nodes[2]["kind_reason"], "fits");
+        assert_eq!(nodes[2]["estimate_tokens"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn a_two_level_tree_reports_depth_one_and_no_descent() {
+        let pool = crate::testdb::fresh_pool().await;
+        let m = manifest(&[("api", "building", None, Some("n-api"))]);
+        seed_node(&pool, "n-api", "leaf", 1).await;
+
+        let nodes = describe_nodes(&pool, &m).await.unwrap();
+
+        let nodes = nodes.as_array().unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0]["depth"], 1);
+        for key in ["descent", "degraded", "estimate_tokens", "kind_reason", "parent"] {
+            assert_eq!(nodes[0][key], Value::Null, "{key}");
+        }
     }
 
     const BUDGET: i64 = 120_000;

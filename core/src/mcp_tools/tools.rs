@@ -794,7 +794,10 @@ impl NucleosTools {
 
     #[tool(
         description = "Read one tree job by the id it was launched with: its state, root node \
-                       and progress."
+                       and progress. `nodes[]` lists each branch's node with `nodes[].depth`, \
+                       its parent and `nodes[].descent.reason` (why it became an orchestrator, \
+                       or `degraded`/`kind_reason` when it opened as a leaf); `start_refusals` \
+                       lists the recent `tree_branch_start` calls that were refused and why."
     )]
     pub(super) async fn tree_status(
         &self,

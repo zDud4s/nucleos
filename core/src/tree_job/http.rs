@@ -472,6 +472,15 @@ async fn get_tree(
     let job = load_job(&state, &id).await?;
     let manifest = serde_json::to_value(&job.manifest)
         .map_err(|error| refuse(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let nodes = crate::tree_job::nesting::describe_nodes(&state.pool, &job.manifest)
+        .await
+        .map_err(|error| refuse(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let start_refusals = job
+        .manifest
+        .extra
+        .get(crate::tree_job::start_log::REFUSALS_KEY)
+        .cloned()
+        .unwrap_or_else(|| json!([]));
     Ok(Json(json!({
         "id": job.id,
         "root_node_id": job.root_node_id,
@@ -484,6 +493,8 @@ async fn get_tree(
         "created_at": job.created_at,
         "updated_at": job.updated_at,
         "manifest": manifest,
+        "nodes": nodes,
+        "start_refusals": start_refusals,
     })))
 }
 
@@ -2295,6 +2306,62 @@ mod tests {
         assert_eq!(body["goal"], json!("Ship it"));
         assert_eq!(body["manifest"]["tree_id"], json!(JOB));
         assert_eq!(body["manifest"]["branches"][BRANCH]["node_id"], json!(NODE));
+    }
+
+    #[tokio::test]
+    async fn get_tree_keeps_every_existing_key_and_adds_nodes() {
+        let state = test_state().await;
+        seed_one_branch(&state.pool, "queued").await;
+
+        let (status, body) = get(&app(&state), &format!("/trees/{JOB}")).await;
+
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        for key in [
+            "id",
+            "root_node_id",
+            "project_id",
+            "feature_branch",
+            "goal",
+            "state",
+            "root_start_failure",
+            "contract",
+            "created_at",
+            "updated_at",
+            "manifest",
+        ] {
+            assert!(body.get(key).is_some(), "missing {key}");
+        }
+        let nodes = body["nodes"].as_array().expect("nodes is an array");
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0]["branch"], json!(BRANCH));
+        assert_eq!(nodes[0]["node_id"], json!(NODE));
+        assert_eq!(nodes[0]["depth"], json!(0));
+        assert_eq!(nodes[0]["descent"], Value::Null);
+        assert_eq!(body["start_refusals"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn get_tree_exposes_recorded_start_refusals() {
+        let state = test_state().await;
+        seed_one_branch(&state.pool, "queued").await;
+        let mut job = loaded(&state.pool, JOB).await;
+        let refusal = json!({
+            "at": CREATED,
+            "job": JOB,
+            "branch": "deep",
+            "status": 409,
+            "reason": "depth 7 exceeds the limit of 6",
+        });
+        job.manifest.extra.insert(
+            crate::tree_job::start_log::REFUSALS_KEY.to_owned(),
+            json!([refusal]),
+        );
+        store::save(&state.pool, &job).await.unwrap();
+
+        let (status, body) = get(&app(&state), &format!("/trees/{JOB}")).await;
+
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert_eq!(body["start_refusals"], json!([refusal]));
     }
 
     #[tokio::test]
