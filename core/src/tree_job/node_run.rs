@@ -15,6 +15,15 @@ use crate::tree_job::store::{self, StoreError, TreeJob};
 /// The transition name `launch` records its key under.
 pub(super) const LAUNCH: &str = "launch";
 
+/// The sentence of `TICKET_RULES` that sends a node to `tree_branch_start`.
+const CLAIM_TICKET: &str = "When a ticket is offered to you and it is independent of your work, claim it and start a branch (a leaf) for it with tree_branch_start, then carry on. The daemon launches a new tree for a ticket nobody claims; it never starts a leaf for one you hold.";
+
+/// What a leaf is told instead: a leaf opens no branch, so a ticket it holds is worked in place.
+const CLAIM_TICKET_LEAF: &str = "When a ticket is offered to you and it is independent of your work, leave it: a leaf opens no branches, and the daemon launches a new tree for a ticket nobody claims.";
+
+/// What a leaf is told when its work is too large: it opens no branch.
+const LEAF_TOO_LARGE: &str = "You are a leaf and a leaf does not open branches: tree_branch_start is refused for you. If the work is too large for this node, make the best leaf you can and say in your report summary that the work exceeded the leaf budget.";
+
 const NODE_PROMPT_HEADER: &str = "You are the agent for NucleOS tree node ";
 
 /// What every node, root included, is told about problems outside its owned paths (spec
@@ -25,12 +34,19 @@ pub(super) const TICKET_RULES: &str = "Problems outside your owned paths are not
 ///
 /// A relaunch receives the already stored prompt, so the marker must make this a no-op after the
 /// first launch rather than accumulating a second copy of the instructions.
-pub(super) fn node_prompt(node_id: &str, root_id: &str, tree_job_id: &str, task: &str) -> String {
+pub(super) fn node_prompt(
+    node_id: &str,
+    root_id: &str,
+    tree_job_id: &str,
+    kind: &str,
+    task: &str,
+) -> String {
     if task.starts_with(NODE_PROMPT_HEADER) {
         return task.to_owned();
     }
     // A node outside any tree job has no id to name.
-    let job_line = if tree_job_id.is_empty() {
+    let leaf = kind == crate::work_nodes::KIND_LEAF;
+    let job_line = if tree_job_id.is_empty() || leaf {
         String::new()
     } else {
         format!(
@@ -38,8 +54,24 @@ pub(super) fn node_prompt(node_id: &str, root_id: &str, tree_job_id: &str, task:
         )
     };
     let report = report_format(node_id, root_id);
+    let size_rule = if leaf {
+        LEAF_TOO_LARGE.to_owned()
+    } else {
+        "If the work is too large for this node, split it with the tree_branch_start tool (a leaf run cannot open children with node_open; an orchestrator opens only its own).".to_owned()
+    };
+    let ticket_rules = if leaf {
+        TICKET_RULES.replace(CLAIM_TICKET, CLAIM_TICKET_LEAF)
+    } else {
+        TICKET_RULES.to_owned()
+    };
     format!(
-        "{NODE_PROMPT_HEADER}{node_id}.{job_line} If the work is too large for this node, split it with the tree_branch_start tool (a leaf run cannot open children with node_open; an orchestrator opens only its own). Finish by writing a handoff file and calling node_close. Write the handoff file as `.nucleos-report.md` in your worktree (your current directory; the daemon keeps it out of git, so do not commit it) and pass its absolute path as handoff_path.\n\n{report}\n\n{TICKET_RULES}\n\n{task}"
+        "{NODE_PROMPT_HEADER}{node_id}.{job_line} {size_rule} Finish by writing a handoff file and calling node_close. Write the handoff file as `.nucleos-report.md` in your worktree (your current directory; the daemon keeps it out of git, so do not commit it) and pass its absolute path as handoff_path.
+
+{report}
+
+{ticket_rules}
+
+{task}"
     )
 }
 
@@ -359,16 +391,17 @@ pub async fn launch(
     let prompt = match cwd.as_ref() {
         Some(_) => {
             // A missing row yields empty ids, as it did before the root id was read.
-            let (tree_job_id, root_id): (Option<String>, Option<String>) =
-                sqlx::query_as("SELECT tree_job_id, root_id FROM work_nodes WHERE id = ?")
+            let (tree_job_id, root_id, kind): (Option<String>, Option<String>, String) =
+                sqlx::query_as("SELECT tree_job_id, root_id, kind FROM work_nodes WHERE id = ?")
                     .bind(node_id)
                     .fetch_optional(pool)
                     .await?
-                    .unwrap_or((None, None));
+                    .unwrap_or((None, None, String::new()));
             node_prompt(
                 node_id,
                 root_id.as_deref().unwrap_or(""),
                 tree_job_id.as_deref().unwrap_or(""),
+                &kind,
                 &prompt,
             )
         }
@@ -1240,7 +1273,13 @@ mod tests {
 
     #[test]
     fn a_node_prompt_names_its_node_id_and_tells_it_to_close() {
-        let prompt = node_prompt("node-abc-123", "root-9", "job-1", "Implement the parser.");
+        let prompt = node_prompt(
+            "node-abc-123",
+            "root-9",
+            "job-1",
+            "orchestrator",
+            "Implement the parser.",
+        );
 
         assert!(prompt.contains("node-abc-123"), "{prompt}");
         assert!(prompt.contains("node_close"), "{prompt}");
@@ -1249,7 +1288,7 @@ mod tests {
     }
 
     /// `node_prompt` takes the tree job's id as its third argument,
-    /// `node_prompt(node_id, root_id, tree_job_id, task)`. The branch routes key on the job id,
+    /// `node_prompt(node_id, root_id, tree_job_id, kind, task)`. The branch routes key on the job id,
     /// not on the node uuid.
     #[test]
     fn a_node_prompt_names_its_tree_job_id() {
@@ -1257,6 +1296,7 @@ mod tests {
             "node-abc-123",
             "root-9",
             "proof-slugify-3",
+            "orchestrator",
             "Implement the parser.",
         );
 
@@ -1270,7 +1310,7 @@ mod tests {
     /// `Root ID: <root_id>`, so the node does not have to look it up in `node_tree`.
     #[test]
     fn a_node_prompt_names_its_root_id() {
-        let prompt = node_prompt("node-abc-123", "root-9", "job-1", "Task.");
+        let prompt = node_prompt("node-abc-123", "root-9", "job-1", "orchestrator", "Task.");
 
         assert!(prompt.contains("Root ID: root-9"), "{prompt}");
         assert!(!prompt.contains("node_tree shows"), "{prompt}");
@@ -1285,7 +1325,13 @@ mod tests {
     /// 67-70, 101-106, 130-134, 136-151, 161, 171-173); the prompt does not carry them yet.
     #[test]
     fn a_node_prompt_gives_the_report_format() {
-        let prompt = node_prompt("node-abc-123", "root-9", "job-1", "Implement the parser.");
+        let prompt = node_prompt(
+            "node-abc-123",
+            "root-9",
+            "job-1",
+            "orchestrator",
+            "Implement the parser.",
+        );
 
         assert!(prompt.contains("node-abc-123"), "{prompt}");
         assert!(prompt.contains("Node ID:"), "{prompt}");
@@ -1299,15 +1345,33 @@ mod tests {
 
     #[test]
     fn a_node_prompt_carries_the_ticket_rules_once() {
-        let first = node_prompt("node-abc-123", "root-9", "job-1", "Implement the parser.");
+        let first = node_prompt(
+            "node-abc-123",
+            "root-9",
+            "job-1",
+            "orchestrator",
+            "Implement the parser.",
+        );
         assert_eq!(first.matches(TICKET_RULES).count(), 1, "{first}");
         let report_at = first.find("## Summary").expect("report format");
         let rules_at = first.find(TICKET_RULES).expect("rules");
         let task_at = first.find("Implement the parser.").expect("task");
         assert!(report_at < rules_at && rules_at < task_at, "{first}");
-        let relaunch = node_prompt("node-abc-123", "root-9", "job-1", &first);
+        let relaunch = node_prompt("node-abc-123", "root-9", "job-1", "orchestrator", &first);
         assert_eq!(relaunch, first);
         assert_eq!(relaunch.matches(TICKET_RULES).count(), 1);
+    }
+
+    #[test]
+    fn a_leaf_prompt_does_not_name_tree_branch_start_and_mentions_the_budget() {
+        let prompt = node_prompt("node-abc-123", "root-9", "job-1", "leaf", "Implement it.");
+
+        assert!(!prompt.contains("tree_branch_start"), "{prompt}");
+        assert!(prompt.contains("exceeded the leaf budget"), "{prompt}");
+        assert!(prompt.contains("node_close"), "{prompt}");
+        assert!(prompt.contains("Implement it."), "{prompt}");
+        let relaunch = node_prompt("node-abc-123", "root-9", "job-1", "leaf", &prompt);
+        assert_eq!(relaunch, prompt);
     }
 
     #[test]
