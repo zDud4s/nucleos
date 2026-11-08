@@ -291,7 +291,14 @@ fn render(value: &Value) -> Result<String, FileError> {
             }
         }
         Value::String(s) => {
+            // The bundle's scripts read these files with PyYAML (YAML 1.1), where words
+            // serde_yaml (YAML 1.2) keeps as strings still parse as booleans or null.
+            let yaml11_word = matches!(
+                s.to_ascii_lowercase().as_str(),
+                "y" | "n" | "yes" | "no" | "on" | "off" | "true" | "false" | "null" | "~"
+            );
             let plain = !s.is_empty()
+                && !yaml11_word
                 && s.chars()
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '/' | '-'))
                 && matches!(
