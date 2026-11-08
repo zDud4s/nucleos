@@ -59,6 +59,9 @@ struct Owns {
     /// The bundle's hook declarations (`workflows::hooks`), raw until they are parsed below.
     #[serde(default)]
     hooks: serde_yaml::Value,
+    /// The bundle's tunable parameters (`workflows::param_manifest`), raw until parsed below.
+    #[serde(default)]
+    params: serde_yaml::Value,
 }
 
 /// Copy one file or directory tree, files only, skipping symlinks for the reason
@@ -111,9 +114,13 @@ pub async fn package(
         owns,
         agents_block,
         hooks,
+        params,
     } = serde_yaml::from_str::<Option<Owns>>(&text)
         .map_err(|error| format!("{}: {error}", manifest.display()))?
         .unwrap_or_default();
+    crate::workflows::param_manifest::parse(params)
+        .and_then(|params| crate::workflows::param_manifest::validate(&params))
+        .map_err(|error| format!("{}: {error}", manifest.display()))?;
     if owns.is_empty() {
         return Err(format!(
             "{} names no files under `owns:`, so there is nothing to package",
@@ -274,9 +281,13 @@ pub async fn package_source(
         owns,
         agents_block,
         hooks,
+        params,
     } = serde_yaml::from_str::<Option<Owns>>(&text)
         .map_err(|error| format!("{}: {error}", manifest.display()))?
         .unwrap_or_default();
+    crate::workflows::param_manifest::parse(params)
+        .and_then(|params| crate::workflows::param_manifest::validate(&params))
+        .map_err(|error| format!("{}: {error}", manifest.display()))?;
     if owns.is_empty() {
         return Err(format!(
             "{} names no files under `owns:`, so there is nothing to materialize",
@@ -756,6 +767,24 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.contains("MANAGED BLOCK"), "{error}");
+        assert!(!library.exists());
+    }
+
+    #[tokio::test]
+    async fn a_bundle_whose_params_escape_the_state_directory_does_not_package() {
+        let temp = project();
+        let library = temp.path().join("lib");
+        let root = temp.path().join("project");
+        let manifest = temp.path().join("params.yaml");
+        std::fs::write(
+            &manifest,
+            "owns:\n  - .ai/workflow/\nparams:\n  - name: a\n    type: int\n    tier: 1\n    file: ../x.yaml\n    key: a\n",
+        )
+        .unwrap();
+        let error = package(&library, "dev", "1.0.0", &root, &manifest)
+            .await
+            .unwrap_err();
+        assert!(error.contains("params.yaml"), "{error}");
         assert!(!library.exists());
     }
 

@@ -68,6 +68,7 @@ pub mod graph;
 pub mod hooks;
 pub mod materialize;
 pub mod package;
+pub mod param_manifest;
 pub mod timeout;
 pub mod walk;
 
@@ -259,6 +260,11 @@ struct ManifestFile {
     /// take the whole workflow with it. Parsed late, it costs only the hooks.
     #[serde(default)]
     hooks: serde_yaml::Value,
+    /// Tunable parameters this workflow declares: a list of [`param_manifest::ParamDecl`]. Raw
+    /// YAML here for the reason `hooks` is: a mistyped param must cost only the params, never the
+    /// bundle's `owns:` and `agents_block`. Parsed late by [`param_manifest`].
+    #[serde(default)]
+    params: serde_yaml::Value,
 }
 
 /// Whether `text` parses as a manifest, field types included.
