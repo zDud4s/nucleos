@@ -68,8 +68,10 @@ type Core struct {
 	media      map[string]storedMedia
 	mediaSeq   int
 	mediaLimit int64
-	outbox     *queue // guarded by mu; created by mountOutbox
-	polls      int    // outbox long-polls being served right now; guarded by mu
+	outbox     *queue            // guarded by mu; created by mountOutbox
+	polls      int               // outbox long-polls being served right now; guarded by mu
+	staleAcks  int               // acks refused because their lease generation was superseded
+	ackGens    map[uint64]uint64 // generation carried by the last accepted ack, by id
 	fallback   func(reason string, failed contract.Action)
 }
 

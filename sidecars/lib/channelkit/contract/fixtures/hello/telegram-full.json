@@ -1,4 +1,4 @@
-{ "kind": "telegram", "version": "1.0.0",
+{ "kind": "telegram", "version": "1.1.0",
   "capabilities": { "buttons": true, "edit": true, "typing": true, "threads": true,
                     "reply_to": true, "max_text": 4096,
                     "media_in":  ["audio", "image", "file"],

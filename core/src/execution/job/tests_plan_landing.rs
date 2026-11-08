@@ -281,3 +281,206 @@ async fn an_item_whose_node_failed_by_itself_is_not_run_again() {
 
     assert_eq!(item_row(&pool, job_id).await, ("failed".to_owned(), 0));
 }
+
+// ---- transient API errors: retried on a backoff, then failed ------------------------------------
+
+/// The last line of a run the API refused outright: a 400 is the request, and a second attempt
+/// would be refused the same way.
+const REFUSED_BY_THE_API: &str = r#"{"type":"result","subtype":"success","is_error":true,"terminal_reason":"api_error","api_error_status":400,"result":"API Error: 400 invalid request"}"#;
+
+/// A fixed instant, so the backoff is measured against the clock the test hands in, never a sleep.
+fn at_noon() -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339("2026-11-08T12:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc)
+}
+
+async fn set_stdout(pool: &sqlx::SqlitePool, run_id: i64, stdout: &str) {
+    sqlx::query("UPDATE runs SET stdout = ? WHERE id = ?")
+        .bind(stdout)
+        .bind(run_id)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// `(status, transient_retries, transient_retry_at)` of item 0.
+async fn retry_row(pool: &sqlx::SqlitePool, job_id: i64) -> (String, i64, Option<String>) {
+    sqlx::query_as(
+        "SELECT status, transient_retries, transient_retry_at FROM job_nodes
+         WHERE job_id = ? AND ordinal = 0",
+    )
+    .bind(job_id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn reconcile_at(state: &AppState, pool: &sqlx::SqlitePool, job_id: i64, now: DateTime<Utc>) {
+    let job = load_job(pool, job_id).await.unwrap();
+    reconcile_nodes_at(state, &job, now).await.unwrap();
+}
+
+/// The next pass claims the item and starts a node, which fails on the API again.
+async fn fail_again_on_the_api(pool: &sqlx::SqlitePool, job_id: i64) {
+    sqlx::query("UPDATE job_nodes SET status = 'running' WHERE job_id = ? AND ordinal = 0")
+        .bind(job_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    let run_id = point_item_at_new_node(pool, job_id, "failed").await;
+    set_stdout(
+        pool,
+        run_id,
+        crate::execution::runner::REVIEW_THAT_NEVER_REACHED_THE_API,
+    )
+    .await;
+}
+
+/// A node that never reached the API says nothing about the item: the item waits out 30s, then
+/// 2m, then 8m, each wait read off the clock the pass is handed, and goes back to `pending` for a
+/// fresh run of the SAME item — the count is on the item's row, no new item is queued.
+#[tokio::test]
+async fn an_item_that_failed_on_a_transient_api_error_is_retried_on_the_backoff_schedule() {
+    let pool = test_pool().await;
+    let state = test_state(pool.clone()).await;
+    let worktree = tempfile::tempdir().unwrap();
+    let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
+    seed_worktree(&pool, job_id, worktree.path()).await;
+    let run_id = seed_item_with_node(&pool, job_id, "failed").await;
+    set_stdout(
+        &pool,
+        run_id,
+        crate::execution::runner::REVIEW_THAT_NEVER_REACHED_THE_API,
+    )
+    .await;
+
+    let mut now = at_noon();
+    for (retry, wait_secs) in [(1i64, 30i64), (2, 120), (3, 480)] {
+        // The failure is seen: the item holds on its failed run until the backoff is out.
+        reconcile_at(&state, &pool, job_id, now).await;
+        let (status, retries, due) = retry_row(&pool, job_id).await;
+        assert_eq!((status.as_str(), retries), ("running", retry - 1));
+        let due = DateTime::parse_from_rfc3339(&due.expect("a retry time is recorded"))
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(due, now + chrono::Duration::seconds(wait_secs));
+
+        // One second short of it, still waiting.
+        reconcile_at(&state, &pool, job_id, due - chrono::Duration::seconds(1)).await;
+        assert_eq!(retry_row(&pool, job_id).await.0, "running");
+
+        // At it, the same item is put back for a fresh run, and the job carries on.
+        now = due;
+        reconcile_at(&state, &pool, job_id, now).await;
+        assert_eq!(
+            retry_row(&pool, job_id).await,
+            ("pending".to_owned(), retry, None)
+        );
+        assert_eq!(job_status(&pool, job_id).await, "running");
+
+        fail_again_on_the_api(&pool, job_id).await;
+        now += chrono::Duration::seconds(5);
+    }
+
+    let items: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_nodes WHERE job_id = ?")
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        items, 1,
+        "a retry is a new attempt of the item, never a new item"
+    );
+    let told: Vec<(String, String)> = sqlx::query_as("SELECT kind, summary FROM feed")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    for line in [
+        "retry 1 of 3 in 30s",
+        "retry 2 of 3 in 2m",
+        "retry 3 of 3 in 8m",
+    ] {
+        assert!(
+            told.iter()
+                .any(|(kind, summary)| kind == "job_item_retry" && summary.contains(line)),
+            "{line:?} in {told:?}"
+        );
+    }
+}
+
+/// Only a transient error is retried: an API that refused the request fails the item at once, as
+/// it always has.
+#[tokio::test]
+async fn an_item_that_failed_on_a_non_transient_api_error_is_not_retried() {
+    let pool = test_pool().await;
+    let state = test_state(pool.clone()).await;
+    let worktree = tempfile::tempdir().unwrap();
+    let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
+    seed_worktree(&pool, job_id, worktree.path()).await;
+    let run_id = seed_item_with_node(&pool, job_id, "failed").await;
+    set_stdout(&pool, run_id, REFUSED_BY_THE_API).await;
+
+    reconcile_at(&state, &pool, job_id, at_noon()).await;
+
+    assert_eq!(
+        retry_row(&pool, job_id).await,
+        ("failed".to_owned(), 0, None)
+    );
+    let kinds: Vec<String> = sqlx::query_scalar("SELECT kind FROM feed")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert!(
+        !kinds.iter().any(|kind| kind == "job_item_retry"),
+        "{kinds:?}"
+    );
+}
+
+/// Three retries and no more: a service that stays down fails the item the fourth time, and the
+/// reason names the retries.
+#[tokio::test]
+async fn an_item_that_fails_on_the_api_after_three_retries_fails() {
+    let pool = test_pool().await;
+    let state = test_state(pool.clone()).await;
+    let worktree = tempfile::tempdir().unwrap();
+    let job_id = seed_job(&pool, "project-a", "running").await.unwrap();
+    seed_worktree(&pool, job_id, worktree.path()).await;
+    let run_id = seed_item_with_node(&pool, job_id, "failed").await;
+    set_stdout(
+        &pool,
+        run_id,
+        crate::execution::runner::REVIEW_THAT_NEVER_REACHED_THE_API,
+    )
+    .await;
+
+    let mut now = at_noon();
+    for retry in 1..=3 {
+        reconcile_at(&state, &pool, job_id, now).await;
+        // Well past the longest backoff.
+        now += chrono::Duration::hours(1);
+        reconcile_at(&state, &pool, job_id, now).await;
+        assert_eq!(
+            retry_row(&pool, job_id).await,
+            ("pending".to_owned(), retry, None)
+        );
+        fail_again_on_the_api(&pool, job_id).await;
+    }
+
+    reconcile_at(&state, &pool, job_id, now).await;
+
+    assert_eq!(
+        retry_row(&pool, job_id).await,
+        ("failed".to_owned(), 3, None)
+    );
+    let told: Vec<(String, String)> = sqlx::query_as("SELECT kind, summary FROM feed")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert!(
+        told.iter().any(|(kind, line)| kind == "job_item_failed"
+            && line.contains("transient API error")
+            && line.contains("3 retries")),
+        "{told:?}"
+    );
+}

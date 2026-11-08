@@ -5,10 +5,11 @@ mod ack;
 mod degrade;
 mod lease;
 
-pub use ack::{AckOutcome, ActionState, RenewError, Renewed, ack, renew};
+pub use ack::{AckOutcome, Acked, ActionState, RenewError, Renewed, ack, renew};
 pub use lease::lease;
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
@@ -502,11 +503,18 @@ async fn post_ack(
         Ok(decoded) => decoded,
         Err(error) => return contract_error(error),
     };
+    let generation = decoded.generation;
     let Some(verdict) = ack_of(decoded) else {
         return contract_error(contract::ContractError::new(contract::ErrorCode::OneOf, ""));
     };
-    match ack(&state, channel, id, verdict, Utc::now()).await {
-        Ok(Some(outcome)) => Json(outcome).into_response(),
+    match ack(&state, channel, id, verdict, generation, Utc::now()).await {
+        Ok(Some(Acked::Settled(outcome))) => Json(outcome).into_response(),
+        // The kit already reads 409 `not_leased` on an ack as "this delivery was lost".
+        Ok(Some(Acked::Stale { .. })) => named_error(
+            StatusCode::CONFLICT,
+            "not_leased",
+            Some("the ack's lease generation was superseded by a newer lease"),
+        ),
         Ok(None) => not_found(),
         Err(error) => database_failure(&error, channel, "ack"),
     }
@@ -534,10 +542,12 @@ async fn post_renew(
     }
 }
 
-/// Per-channel long-poll wakers and the ephemeral set (`typing`, memory only).
+/// Per-channel long-poll wakers, the ephemeral set (`typing`, memory only) and the count of acks
+/// ignored for a superseded lease generation.
 pub struct Waiters {
     wakers: HashMap<&'static str, Arc<Notify>>,
     typing: Mutex<HashSet<(String, String)>>,
+    stale_acks: AtomicU64,
 }
 
 impl Default for Waiters {
@@ -548,6 +558,7 @@ impl Default for Waiters {
                 .map(|m| (m.id, Arc::new(Notify::new())))
                 .collect(),
             typing: Mutex::default(),
+            stale_acks: AtomicU64::new(0),
         }
     }
 }
@@ -564,6 +575,16 @@ impl Waiters {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert((channel.to_string(), conversation.to_string()));
+    }
+
+    fn note_stale_ack(&self) {
+        self.stale_acks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many acks were ignored because they echoed a lease generation the row no longer held
+    /// (since the daemon started).
+    pub fn stale_acks(&self) -> u64 {
+        self.stale_acks.load(Ordering::Relaxed)
     }
 
     /// Removes and returns the conversations the channel should show as typing.
@@ -1349,6 +1370,7 @@ mod tests {
         let (status, body) = call(st, key, "GET", "/channels/fake/outbox", "").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["actions"][0]["id"], id);
+        assert_eq!(body["actions"][0]["generation"], 1);
         id
     }
 
@@ -1494,6 +1516,36 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, serde_json::json!({"state": "pending"}));
+    }
+
+    #[tokio::test]
+    async fn route_an_ack_of_a_superseded_lease_generation_is_409_not_leased() {
+        let st = crate::channels::testkit::state().await;
+        let token = fake_key(&st).await;
+        let id = leased(&st, &token).await; // generation 1
+        let (status, body) = call(
+            &st,
+            &token,
+            "POST",
+            &format!("/channels/fake/outbox/{id}/ack"),
+            r#"{"failed":{"retryable":true,"reason":"network"},"generation":7}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "not_leased");
+        assert_eq!(state_of(&st.pool, id).await.0, "leased");
+        assert_eq!(st.channels.outbox.stale_acks(), 1);
+
+        let (status, body) = call(
+            &st,
+            &token,
+            "POST",
+            &format!("/channels/fake/outbox/{id}/ack"),
+            r#"{"ok":true,"generation":1}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!({"state": "done"}));
     }
 
     #[tokio::test]

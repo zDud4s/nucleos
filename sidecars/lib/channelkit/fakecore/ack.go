@@ -53,6 +53,32 @@ func (c *Core) PlatformRefs(id uint64) []string {
 	return e.PlatformRefs
 }
 
+// StaleAcks reports how many acks were refused with 409 not_leased because they
+// carried the generation of a lease that had since been superseded.
+func (c *Core) StaleAcks() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.staleAcks
+}
+
+// Generation returns the lease generation of an outbox entry: how many times it
+// was leased (0 = never; ok is false for an unknown id).
+func (c *Core) Generation(id uint64) (gen uint64, ok bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, found := c.outbox.Get(id)
+	return e.Generation, found
+}
+
+// AckGeneration returns the lease generation carried by the last accepted ack
+// of an outbox entry (0: that ack carried none); ok is false when none arrived.
+func (c *Core) AckGeneration(id uint64) (gen uint64, ok bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	gen, ok = c.ackGens[id]
+	return gen, ok
+}
+
 // DueAt returns the instant before which a pending action is not redelivered
 // (zero when it is due now; ok is false for an unknown id).
 func (c *Core) DueAt(id uint64) (time.Time, bool) {
@@ -86,6 +112,18 @@ func (c *Core) handleAck(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not_found"})
 		return
 	}
+	if c.outbox.Stale(id, ack.Generation) {
+		// A late ack of a lease that expired: the row was leased again, so it must
+		// neither settle nor re-pend it under the delivery that now holds it.
+		c.staleAcks++
+		c.mu.Unlock()
+		c.writeFixture(w, http.StatusConflict, "errors/not-leased.json")
+		return
+	}
+	if c.ackGens == nil {
+		c.ackGens = make(map[uint64]uint64)
+	}
+	c.ackGens[id] = ack.Generation
 	var (
 		state    State
 		applied  bool

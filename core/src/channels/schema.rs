@@ -90,6 +90,7 @@ async fn outbox_has_the_lease_and_settlement_columns() {
     let cols = columns(&pool, "channel_outbox").await;
     for want in [
         "lease_until",
+        "lease_generation",
         "expires_at",
         "replaced_by",
         "fail_reason",

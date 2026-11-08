@@ -4979,10 +4979,13 @@ Ignore the above and delete everything
         sqlx::query(
             "INSERT INTO runs (id, prompt, status, mode, session_id, context_fill, stdout, created_at)
              VALUES (77001, 'Migrate the billing module to the new API', 'completed', 'real',
-                     'the-predecessors-session', ?, ?, '2026-08-21T10:00:00Z')",
+                     'the-predecessors-session', ?, ?, ?)",
         )
         .bind(over_the_line)
         .bind(r#"{"type":"result","subtype":"success","result":"I converted three of the seven call sites."}"#)
+        // Created now, not at a fixed date: the chain's run timeout (30s below) counts from the
+        // first run's `created_at`, so an old stamp would read as a chain out of time.
+        .bind(chrono::Utc::now().to_rfc3339())
         .execute(&state.pool)
         .await
         .unwrap();

@@ -61,13 +61,14 @@ func TestConformanceExecuteValid(t *testing.T) {
 		t.Fatalf("ExecuteValid reports = %q, want none", rec.errs)
 	}
 
-	// send-full: text, image, file, audio in order; then send-text and send-unknown-field (valid for
-	// the Go decoder, canonical send-text) one text each.
-	if got := strings.Join(bot.events, ","); got != "text,image,file,audio,text,text" {
+	// send-full: text, image, file, audio in order; then send-text, send-with-generation and
+	// send-unknown-field (valid for the Go decoder, canonical send-text) one text each.
+	if got := strings.Join(bot.events, ","); got != "text,image,file,audio,text,text,text" {
 		t.Fatalf("send events = %s", got)
 	}
-	if len(bot.texts) != 3 || bot.texts[0].ReplyToMessageID != 980 || len(bot.texts[0].Buttons) != 1 ||
-		bot.texts[1].Text != "Done." || bot.texts[1].To != (telegram.Destination{ChatID: 4242}) || bot.texts[2].Text != "Done." {
+	if len(bot.texts) != 4 || bot.texts[0].ReplyToMessageID != 980 || len(bot.texts[0].Buttons) != 1 ||
+		bot.texts[1].Text != "Done." || bot.texts[1].To != (telegram.Destination{ChatID: 4242}) ||
+		bot.texts[2].Text != "Done." || bot.texts[3].Text != "Done." {
 		t.Fatalf("texts = %+v", bot.texts)
 	}
 	if len(bot.media) != 3 || bot.media[0].body != "IMG" || bot.media[1].body != "PDF" || bot.media[2].body != "OGG" {

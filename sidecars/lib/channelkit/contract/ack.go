@@ -23,12 +23,16 @@ type ackRaw struct {
 	OK           *bool      `json:"ok,omitempty"`
 	PlatformRefs *[]string  `json:"platform_refs,omitempty"`
 	Failed       *failedRaw `json:"failed,omitempty"`
+	Generation   *uint64    `json:"generation,omitempty"`
 }
 
 // Validate checks the ok/failed alternative, the refs and the failure rules.
 func (a *ackRaw) Validate() *Error {
 	if (a.OK == nil) == (a.Failed == nil) {
 		return errOneOf("")
+	}
+	if a.Generation != nil && *a.Generation == 0 {
+		return errRange("/generation")
 	}
 	if a.OK != nil {
 		if !*a.OK {
@@ -74,21 +78,29 @@ type Failed struct {
 
 // Ack is the adapter's answer to one outbox action: success (OK) or Failed.
 // Empty PlatformRefs are omitted when encoding (T6).
+//
+// Generation echoes the lease generation of the delivery being acknowledged
+// (contract 1.1). The core ignores an ack whose generation is no longer the
+// row's (the lease expired and the action was leased again) and answers 409
+// not_leased. Zero means absent: an ack of a 1.0 adapter, which the core
+// applies without the check.
 type Ack struct {
 	OK           bool
 	PlatformRefs []string
 	Failed       *Failed
+	Generation   uint64
 }
 
 type ackWire struct {
 	OK           *bool    `json:"ok,omitempty"`
 	PlatformRefs []string `json:"platform_refs,omitempty"`
 	Failed       *Failed  `json:"failed,omitempty"`
+	Generation   uint64   `json:"generation,omitempty"`
 }
 
 // MarshalJSON encodes the ack in its wire form.
 func (a Ack) MarshalJSON() ([]byte, error) {
-	w := ackWire{PlatformRefs: a.PlatformRefs, Failed: a.Failed}
+	w := ackWire{PlatformRefs: a.PlatformRefs, Failed: a.Failed, Generation: a.Generation}
 	if a.Failed == nil {
 		ok := true
 		w.OK = &ok
@@ -106,6 +118,9 @@ func DecodeAck(b []byte) (Ack, error) {
 		return Ack{}, err
 	}
 	var a Ack
+	if r.Generation != nil {
+		a.Generation = *r.Generation
+	}
 	if r.Failed != nil {
 		a.Failed = &Failed{Retryable: *r.Failed.Retryable, RetryAfterMS: r.Failed.RetryAfterMS, Reason: *r.Failed.Reason}
 		return a, nil

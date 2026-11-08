@@ -3,6 +3,10 @@
 //! `attempts` is not touched here: it was counted when the action was leased (Q6). A retryable
 //! failure puts the same row back to `pending` with a later `due_at`; the tenth delivery without an
 //! `ok` is permanent.
+//!
+//! Contract 1.1: an ack echoes the `lease_generation` of the delivery it settles. One that no longer
+//! matches an open row is the late ack of a lease that expired and was handed out again; it is
+//! ignored (409 `not_leased`), so it neither settles nor re-pends the row under the new lease.
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -29,6 +33,15 @@ pub struct AckOutcome {
     pub state: ActionState,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub ignored: bool,
+}
+
+/// What `ack` did with an acknowledgement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Acked {
+    /// Applied, or answered `ignored` on a row that was already settled.
+    Settled(AckOutcome),
+    /// The ack carried the generation of a lease the open row no longer holds: nothing changed.
+    Stale { generation: i64, current: i64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -91,43 +104,70 @@ fn decide(ack: contract::Ack, attempts: i64, now: DateTime<Utc>, best_effort: bo
 }
 
 /// Settles one acknowledgement. `None` = no such row on this channel (404). A late ack of a row
-/// that is already `done`/`failed` changes nothing and answers `ignored`. Wakes the channel at the
-/// end: the next action of the conversation may now be due.
+/// that is already `done`/`failed` changes nothing and answers `ignored`. `generation` is the lease
+/// generation the ack echoes (`None`: an adapter of contract 1.0, applied without the check); on an
+/// open row whose `lease_generation` differs it is `Stale`, logged, counted and changes nothing.
+/// Wakes the channel at the end: the next action of the conversation may now be due.
 pub async fn ack(
     state: &AppState,
     channel: &'static str,
     id: i64,
     ack: contract::Ack,
+    generation: Option<i64>,
     now: DateTime<Utc>,
-) -> sqlx::Result<Option<AckOutcome>> {
+) -> sqlx::Result<Option<Acked>> {
     let stamped = stamp(now);
     let mut tx = state.pool.begin().await?;
-    type OutboxRow = (String, i64, String, String, String, String, Option<String>);
+    type OutboxRow = (
+        String,
+        i64,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        i64,
+    );
     let row: Option<OutboxRow> = sqlx::query_as(
-        "SELECT state, attempts, conversation, action, payload, class, subject \
+        "SELECT state, attempts, conversation, action, payload, class, subject, lease_generation \
              FROM channel_outbox WHERE id = ? AND channel = ?",
     )
     .bind(id)
     .bind(channel)
     .fetch_optional(&mut *tx)
     .await?;
-    let Some((row_state, attempts, conversation, action, payload, class, subject)) = row else {
+    let Some((row_state, attempts, conversation, action, payload, class, subject, current)) = row
+    else {
         return Ok(None);
     };
     match row_state.as_str() {
         "leased" | "pending" => {}
         "done" => {
-            return Ok(Some(AckOutcome {
+            return Ok(Some(Acked::Settled(AckOutcome {
                 state: ActionState::Done,
                 ignored: true,
-            }));
+            })));
         }
         _ => {
-            return Ok(Some(AckOutcome {
+            return Ok(Some(Acked::Settled(AckOutcome {
                 state: ActionState::Failed,
                 ignored: true,
-            }));
+            })));
         }
+    }
+    if let Some(generation) = generation.filter(|g| *g != current) {
+        state.channels.outbox.note_stale_ack();
+        tracing::warn!(
+            channel,
+            id,
+            generation,
+            current,
+            "outbox ack ignored: its lease expired and the action was leased again"
+        );
+        return Ok(Some(Acked::Stale {
+            generation,
+            current,
+        }));
     }
 
     let outcome_state = match decide(ack, attempts, now, class == Class::Progress.as_str()) {
@@ -188,10 +228,10 @@ pub async fn ack(
     };
     tx.commit().await?;
     wake(state, channel);
-    Ok(Some(AckOutcome {
+    Ok(Some(Acked::Settled(AckOutcome {
         state: outcome_state,
         ignored: false,
-    }))
+    })))
 }
 
 /// A project thread that no longer exists: the same content goes to the home conversation, marked
@@ -399,7 +439,32 @@ mod tests {
         ack_body: contract::Ack,
         now: DateTime<Utc>,
     ) -> Option<AckOutcome> {
-        ack(state, "fake", id, ack_body, now).await.unwrap()
+        settle_as(state, id, ack_body, None, now).await
+    }
+
+    /// `settle` with the lease generation the ack echoes; panics on a `Stale` answer.
+    async fn settle_as(
+        state: &AppState,
+        id: i64,
+        ack_body: contract::Ack,
+        generation: Option<i64>,
+        now: DateTime<Utc>,
+    ) -> Option<AckOutcome> {
+        match ack(state, "fake", id, ack_body, generation, now)
+            .await
+            .unwrap()?
+        {
+            Acked::Settled(outcome) => Some(outcome),
+            stale @ Acked::Stale { .. } => panic!("ack of {id} was {stale:?}"),
+        }
+    }
+
+    async fn generation_of(pool: &SqlitePool, id: i64) -> i64 {
+        sqlx::query_scalar("SELECT lease_generation FROM channel_outbox WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
     }
 
     /// `(state, attempts, fail_reason, lease_until, settled_at, due_at)`.
@@ -628,7 +693,7 @@ mod tests {
         let ids: Vec<i64> = got
             .actions
             .iter()
-            .map(|a| match a {
+            .map(|a| match &a.action {
                 contract::OutAction::Send { id, .. }
                 | contract::OutAction::Edit { id, .. }
                 | contract::OutAction::AnswerAction { id, .. } => *id,
@@ -754,7 +819,9 @@ mod tests {
 
         // A row of another channel is not this channel's row either.
         let id = push(&state).await;
-        let other = ack(&state, "telegram", id, ok(&[]), at(0)).await.unwrap();
+        let other = ack(&state, "telegram", id, ok(&[]), None, at(0))
+            .await
+            .unwrap();
         assert_eq!(other, None);
         assert_eq!(row(&state.pool, id).await.0, "pending");
     }
@@ -776,6 +843,88 @@ mod tests {
         );
         assert_eq!(row(&state.pool, a).await.0, "done");
         assert_eq!(row(&state.pool, b).await.0, "done");
+    }
+
+    /// rel-channels#1: A's lease expires, B leases the row again, then A's late retryable failure
+    /// arrives. It carries A's generation, so it is ignored and the row stays leased by B.
+    #[tokio::test]
+    async fn a_late_ack_of_an_expired_lease_does_not_repend_the_released_row() {
+        let state = crate::channels::testkit::state().await;
+        let id = push(&state).await;
+        deliver(&state, at(0)).await; // A: generation 1, lease until 60
+        assert_eq!(generation_of(&state.pool, id).await, 1);
+        deliver(&state, at(61)).await; // expired; B: generation 2, lease until 121
+        assert_eq!(generation_of(&state.pool, id).await, 2);
+        let before = state.channels.outbox.stale_acks();
+
+        let late = ack(
+            &state,
+            "fake",
+            id,
+            failed(true, None, "network"),
+            Some(1),
+            at(62),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            late,
+            Some(Acked::Stale {
+                generation: 1,
+                current: 2
+            })
+        );
+        let (st, attempts, reason, lease_until, settled, _) = row(&state.pool, id).await;
+        assert_eq!((st.as_str(), attempts), ("leased", 2));
+        assert_eq!(lease_until, Some(stamp(at(121))));
+        assert_eq!((reason, settled), (None, None));
+        assert_eq!(state.channels.outbox.stale_acks(), before + 1);
+
+        // B's own ack still settles it.
+        assert_eq!(
+            settle_as(&state, id, ok(&["7"]), Some(2), at(63)).await,
+            outcome(ActionState::Done, false)
+        );
+        assert_eq!(row(&state.pool, id).await.0, "done");
+    }
+
+    #[tokio::test]
+    async fn an_ack_with_the_current_generation_or_none_is_applied() {
+        let state = crate::channels::testkit::state().await;
+        let current = push_to(&state, "c1").await;
+        let legacy = push_to(&state, "c2").await;
+        deliver(&state, at(0)).await;
+        deliver(&state, at(61)).await;
+
+        assert_eq!(
+            settle_as(
+                &state,
+                current,
+                failed(true, None, "network"),
+                Some(2),
+                at(62)
+            )
+            .await,
+            outcome(ActionState::Pending, false)
+        );
+        // Contract 1.0 adapters send no generation: their ack is applied as before.
+        assert_eq!(
+            settle(&state, legacy, ok(&["1"]), at(62)).await,
+            outcome(ActionState::Done, false)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_generation_on_a_settled_row_is_a_late_ack() {
+        let state = crate::channels::testkit::state().await;
+        let id = push(&state).await;
+        deliver(&state, at(0)).await;
+        settle_as(&state, id, ok(&["1"]), Some(1), at(1)).await;
+        assert_eq!(
+            settle_as(&state, id, failed(true, None, "network"), Some(9), at(2)).await,
+            outcome(ActionState::Done, true)
+        );
+        assert_eq!(state.channels.outbox.stale_acks(), 0);
     }
 
     #[tokio::test]

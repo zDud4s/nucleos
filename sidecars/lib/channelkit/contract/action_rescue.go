@@ -43,15 +43,17 @@ const (
 // id is usable (an integer >= 1), it also returns the rescue ack the kit must send
 // so the core does not retry forever: a permanent failure, "unsupported_action" for
 // an unknown type and "invalid_action" for anything else. Without a usable id there
-// is no ack (the kit logs and drops the action).
+// is no ack (the kit logs and drops the action). The rescue ack carries the
+// action's generation when it is an integer >= 1.
 func DecodeAction(raw []byte) (Action, *Ack, error) {
 	a, err := ParseAction(raw)
 	if err == nil {
 		return a, nil, nil
 	}
 	var head struct {
-		ID   json.RawMessage `json:"id"`
-		Type json.RawMessage `json:"type"`
+		ID         json.RawMessage `json:"id"`
+		Type       json.RawMessage `json:"type"`
+		Generation json.RawMessage `json:"generation"`
 	}
 	if json.Unmarshal(raw, &head) != nil {
 		return nil, nil, err
@@ -68,5 +70,11 @@ func DecodeAction(raw []byte) (Action, *Ack, error) {
 			reason = ReasonUnsupportedAction
 		}
 	}
-	return nil, &Ack{Failed: &Failed{Retryable: false, Reason: reason}}, err
+	rescue := &Ack{Failed: &Failed{Retryable: false, Reason: reason}}
+	// The rescue settles this delivery, so it echoes its lease generation when that
+	// one is readable; otherwise it goes without (the core then skips the check).
+	if g, gerr := strconv.ParseUint(string(bytes.TrimSpace(head.Generation)), 10, 64); gerr == nil && g > 0 {
+		rescue.Generation = g
+	}
+	return nil, rescue, err
 }

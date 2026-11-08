@@ -107,6 +107,30 @@ pub fn daemon_url() -> String {
     url_for(port())
 }
 
+/// The variable that names the file a Claude run's daemon key is in.
+///
+/// The Claude runner takes `NUCLEOS_DAEMON_TOKEN` out of the CLI's environment, so the shell
+/// commands an agent runs do not inherit the key, and hands over only this path
+/// (`execution::runner::claude`). The MCP server the CLI starts inherits the path and reads the key
+/// from it.
+pub const TOKEN_FILE_VAR: &str = "NUCLEOS_DAEMON_TOKEN_FILE";
+
+/// PURE but for the one file read: the key a launched process authenticates with.
+///
+/// The value in `NUCLEOS_DAEMON_TOKEN` wins when it is set and non-empty — every launcher but the
+/// Claude runner still passes it that way. Otherwise the trimmed contents of the file at
+/// [`TOKEN_FILE_VAR`]. `None` when neither yields a non-empty key, including a file that cannot be
+/// read: the caller's error is the same "not set" either way.
+pub fn token_from(value: Option<String>, file: Option<std::path::PathBuf>) -> Option<String> {
+    if let Some(value) = value.filter(|value| !value.is_empty()) {
+        return Some(value);
+    }
+    let file = file.filter(|path| !path.as_os_str().is_empty())?;
+    let text = std::fs::read_to_string(file).ok()?;
+    let token = text.trim();
+    (!token.is_empty()).then(|| token.to_owned())
+}
+
 #[derive(Clone)]
 pub struct DaemonClient {
     base_url: String,
@@ -153,11 +177,11 @@ impl DaemonClient {
         // environment does not reach. The fallback is derived rather than written out again, so a
         // secondary instance's tools reach the secondary rather than the machine's real daemon.
         let base_url = std::env::var("NUCLEOS_DAEMON_URL").unwrap_or_else(|_| daemon_url());
-        let token = std::env::var("NUCLEOS_DAEMON_TOKEN")
-            .map_err(|_| "NUCLEOS_DAEMON_TOKEN not set".to_owned())?;
-        if token.is_empty() {
-            return Err("NUCLEOS_DAEMON_TOKEN not set".into());
-        }
+        let token = token_from(
+            std::env::var("NUCLEOS_DAEMON_TOKEN").ok(),
+            std::env::var_os(TOKEN_FILE_VAR).map(std::path::PathBuf::from),
+        )
+        .ok_or_else(|| "NUCLEOS_DAEMON_TOKEN not set".to_owned())?;
 
         Ok(Self {
             // Absent for the runs that have no use for it, and unparseable is the same as absent:
@@ -1257,6 +1281,36 @@ mod instance_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Claude run's MCP server has no `NUCLEOS_DAEMON_TOKEN`, only the file the runner wrote; it
+    /// must still authenticate, and the value still wins wherever a launcher passes one.
+    #[test]
+    fn the_token_comes_from_the_value_or_else_from_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("run-token");
+        std::fs::write(&file, "7.file-secret\n").unwrap();
+
+        assert_eq!(
+            token_from(None, Some(file.clone())).as_deref(),
+            Some("7.file-secret")
+        );
+        assert_eq!(
+            token_from(Some("7.env".to_owned()), Some(file.clone())).as_deref(),
+            Some("7.env")
+        );
+        // An empty value is not a value: the file is read.
+        assert_eq!(
+            token_from(Some(String::new()), Some(file)).as_deref(),
+            Some("7.file-secret")
+        );
+
+        // Nothing usable anywhere is `None`, never an empty key.
+        assert_eq!(token_from(None, None), None);
+        assert_eq!(token_from(None, Some(dir.path().join("absent"))), None);
+        let blank = dir.path().join("blank");
+        std::fs::write(&blank, "  \n").unwrap();
+        assert_eq!(token_from(None, Some(blank)), None);
+    }
 
     /// A folder name reaches the daemon as a query value. Left raw, `&` would start a second
     /// parameter and `..` would arrive somewhere the path guard never inspects — which is how a

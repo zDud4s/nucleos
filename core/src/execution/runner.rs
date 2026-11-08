@@ -2839,6 +2839,102 @@ mod tests {
         );
     }
 
+    /// sec-exec-r2#2: the run's daemon key is not in the Claude CLI's environment — so no shell
+    /// command the agent runs inherits it — neither from the request nor from the daemon's own
+    /// environment. What the CLI gets instead is the path of a file holding the key, which the hook
+    /// and the MCP server read (`run_token`, `DaemonClient::from_env`), and the file is gone once
+    /// the run is.
+    #[tokio::test]
+    async fn the_claude_cli_gets_a_key_file_and_never_the_daemon_key_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().display().to_string().replace('\\', "/");
+        let script = format!(
+            "printf 'token=%s\\n' \"${{NUCLEOS_DAEMON_TOKEN-unset}}\" > \"{out}/seen.txt\"\n\
+             printf 'marker=%s\\n' \"${{NUCLEOS_TOKEN_TEST_MARKER-unset}}\" >> \"{out}/seen.txt\"\n\
+             printf '%s' \"${{NUCLEOS_DAEMON_TOKEN_FILE-unset}}\" > \"{out}/path.txt\"\n\
+             cat \"$NUCLEOS_DAEMON_TOKEN_FILE\" > \"{out}/key.txt\"\n"
+        ) + &printing(&[
+            r#"{"type":"system","subtype":"init","session_id":"fake","tools":[]}"#,
+            r#"{"type":"result","subtype":"success","result":"ok","session_id":"fake"}"#,
+        ]);
+        let mut request = fake_cli(dir.path(), &script);
+        request.env = vec![
+            (
+                "NUCLEOS_DAEMON_TOKEN".to_string(),
+                "7.request-secret".to_string(),
+            ),
+            ("NUCLEOS_TOKEN_TEST_MARKER".to_string(), "kept".to_string()),
+        ];
+        let _bin = FakeClaudeBin::set("sh");
+        // Also inherited from the daemon's own environment; `_bin` holds the env lock.
+        let before = std::env::var_os("NUCLEOS_DAEMON_TOKEN");
+        unsafe { std::env::set_var("NUCLEOS_DAEMON_TOKEN", "inherited-secret") };
+        let (session_tx, _session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        let outcome = claude_runner()
+            .run_prompt(request, session_tx, discard_transcript())
+            .await;
+        match before {
+            Some(value) => unsafe { std::env::set_var("NUCLEOS_DAEMON_TOKEN", value) },
+            None => unsafe { std::env::remove_var("NUCLEOS_DAEMON_TOKEN") },
+        }
+        let outcome = outcome.expect("the fake CLI spawns");
+        assert_eq!(outcome.exit_code, 0, "{}", outcome.stderr);
+
+        let seen = std::fs::read_to_string(dir.path().join("seen.txt")).unwrap();
+        assert!(
+            seen.contains("token=unset\n"),
+            "the CLI must not see the daemon key: {seen:?}"
+        );
+        assert!(
+            seen.contains("marker=kept\n"),
+            "other request entries still arrive: {seen:?}"
+        );
+        let path = std::fs::read_to_string(dir.path().join("path.txt")).unwrap();
+        assert_ne!(path, "unset", "the CLI must be told where the key is");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("key.txt")).unwrap(),
+            "7.request-secret",
+            "the file holds the request's key, not the inherited one"
+        );
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "the key file must not outlive the run: {path}"
+        );
+    }
+
+    /// No key in the request is no key file, and nothing inherited stands in for it.
+    #[tokio::test]
+    async fn a_run_with_no_daemon_key_gets_no_key_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().display().to_string().replace('\\', "/");
+        let script = format!(
+            "printf '%s|%s' \"${{NUCLEOS_DAEMON_TOKEN-unset}}\" \"${{NUCLEOS_DAEMON_TOKEN_FILE-unset}}\" > \"{out}/seen.txt\"\n"
+        ) + &printing(&[
+            r#"{"type":"system","subtype":"init","session_id":"fake","tools":[]}"#,
+            r#"{"type":"result","subtype":"success","result":"ok","session_id":"fake"}"#,
+        ]);
+        let request = fake_cli(dir.path(), &script);
+        let _bin = FakeClaudeBin::set("sh");
+        let before = std::env::var_os("NUCLEOS_DAEMON_TOKEN_FILE");
+        unsafe { std::env::set_var("NUCLEOS_DAEMON_TOKEN_FILE", "C:/inherited/key") };
+        let (session_tx, _session_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        let outcome = claude_runner()
+            .run_prompt(request, session_tx, discard_transcript())
+            .await;
+        match before {
+            Some(value) => unsafe { std::env::set_var("NUCLEOS_DAEMON_TOKEN_FILE", value) },
+            None => unsafe { std::env::remove_var("NUCLEOS_DAEMON_TOKEN_FILE") },
+        }
+        let outcome = outcome.expect("the fake CLI spawns");
+        assert_eq!(outcome.exit_code, 0, "{}", outcome.stderr);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("seen.txt")).unwrap(),
+            "unset|unset"
+        );
+    }
+
     /// Off by one is the entire bug class of a ceiling, so it is asserted on both sides of the edge.
     #[test]
     fn the_ceiling_trips_at_the_number_it_names_and_never_without_one() {

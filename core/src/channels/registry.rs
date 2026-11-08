@@ -189,6 +189,8 @@ pub struct Seen {
 pub struct Drops {
     pub unknown_sender: u64,
     pub pairing_failures: u64,
+    /// Unknown-sender events over `inbound_limit`'s limits: dropped before any row was written.
+    pub unknown_sender_limited: u64,
     pub counted_since: DateTime<Utc>,
 }
 
@@ -196,8 +198,10 @@ pub struct Drops {
 struct PresenceInner {
     seen: HashMap<&'static str, Seen>,
     launched: HashMap<&'static str, DateTime<Utc>>,
-    /// `(unknown_sender, pairing_failures)` per channel.
-    drops: HashMap<&'static str, (u64, u64)>,
+    /// `(unknown_sender, pairing_failures, unknown_sender_limited)` per channel.
+    drops: HashMap<&'static str, (u64, u64, u64)>,
+    /// Rate limit of unknown senders, asked before ingest writes a `channel_events` row.
+    inbound: super::inbound_limit::InboundLimit,
     /// Cache of the required secrets still missing, per channel (`set_secrets_present`).
     missing: HashMap<&'static str, Vec<&'static str>>,
     /// Wrong `/pair` guesses per `(channel, sender)` with the time of the first one in the window.
@@ -256,6 +260,22 @@ impl Presence {
         self.lock().drops.entry(channel).or_default().0 += 1;
     }
 
+    /// Whether one more event from this unknown sender may be recorded (`inbound_limit`). A
+    /// refusal bumps `Drops::unknown_sender_limited`; the caller drops the event unwritten.
+    pub fn allow_unknown_sender(
+        &self,
+        channel: &'static str,
+        sender: &str,
+        now: DateTime<Utc>,
+    ) -> bool {
+        let mut inner = self.lock();
+        if inner.inbound.allow(channel, sender, now) {
+            return true;
+        }
+        inner.drops.entry(channel).or_default().2 += 1;
+        false
+    }
+
     /// Whether this sender has used up its wrong guesses. A locked sender is refused without
     /// touching the code's own attempt counter, so a stranger cannot exhaust the owner's code.
     pub fn sender_pair_locked(
@@ -304,11 +324,12 @@ impl Presence {
     }
 
     pub fn drops(&self, channel: &str) -> Drops {
-        let (unknown_sender, pairing_failures) =
+        let (unknown_sender, pairing_failures, unknown_sender_limited) =
             self.lock().drops.get(channel).copied().unwrap_or_default();
         Drops {
             unknown_sender,
             pairing_failures,
+            unknown_sender_limited,
             counted_since: self.counted_since,
         }
     }
@@ -837,6 +858,10 @@ fn health_row(status: &ChannelStatus, binary: &str) -> crate::health::SubsystemR
                 "pairing_failures",
                 i64::try_from(status.drops.pairing_failures).unwrap_or(i64::MAX),
             ),
+            (
+                "unknown_sender_limited",
+                i64::try_from(status.drops.unknown_sender_limited).unwrap_or(i64::MAX),
+            ),
             ("outbox_failed", i64::from(status.outbox.failed)),
         ])),
     }
@@ -1216,6 +1241,20 @@ mod tests {
         let none = p.drops("other");
         assert_eq!((none.unknown_sender, none.pairing_failures), (0, 0));
         assert_eq!(none.counted_since, t.counted_since);
+    }
+
+    #[test]
+    fn a_limited_unknown_sender_is_counted_apart() {
+        let p = Presence::default();
+        let now = Utc::now();
+        for _ in 0..super::super::inbound_limit::PER_SENDER_LIMIT {
+            assert!(p.allow_unknown_sender("telegram", "stranger", now));
+        }
+        assert!(!p.allow_unknown_sender("telegram", "stranger", now));
+        assert!(!p.allow_unknown_sender("telegram", "stranger", now));
+        let t = p.drops("telegram");
+        assert_eq!((t.unknown_sender, t.unknown_sender_limited), (0, 2));
+        assert_eq!(p.drops("fake").unknown_sender_limited, 0);
     }
 
     #[tokio::test]

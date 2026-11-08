@@ -3,8 +3,8 @@ package contract
 import "testing"
 
 func TestVersionConstant(t *testing.T) {
-	if Version != "1.0.0" {
-		t.Fatalf("Version = %q, want 1.0.0", Version)
+	if Version != "1.1.0" {
+		t.Fatalf("Version = %q, want 1.1.0", Version)
 	}
 }
 
@@ -15,7 +15,8 @@ func TestCompatible(t *testing.T) {
 	}{
 		{"1.0.9", true},
 		{"1.0.0", true},
-		{"1.1.0", false},
+		{"1.1.0", true},
+		{"1.2.0", false},
 		{"2.0.0", false},
 		{"1.0", false},
 		{"v1", false},

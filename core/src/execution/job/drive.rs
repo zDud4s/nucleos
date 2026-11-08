@@ -1011,7 +1011,7 @@ pub(super) async fn drive(state: &AppState, job: JobRow, now: DateTime<Utc>) {
     let pool = &state.pool;
 
     // Bookkeeping about work that already happened, before any decision and before any brake.
-    match reconcile_nodes(state, &job).await {
+    match reconcile_nodes_at(state, &job, now).await {
         Ok(Reconciled::KeepGoing) => {
             // The bundle's own agent nodes land beside the autopilot's, on both roads: `drive` is
             // what `advance` runs under.

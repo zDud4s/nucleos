@@ -86,12 +86,16 @@ type actionRaw struct {
 	Parts              []outPartRaw  `json:"parts,omitempty"`
 	Buttons            [][]buttonRaw `json:"buttons,omitempty"`
 	Silent             bool          `json:"silent,omitempty"`
+	Generation         *uint64       `json:"generation,omitempty"`
 }
 
 // Validate checks the fields common to all actions, then the rules of the type.
 func (a *actionRaw) Validate() *Error {
 	if *a.ID == 0 {
 		return errRange("/id")
+	}
+	if a.Generation != nil && *a.Generation == 0 {
+		return errRange("/generation")
 	}
 	if err := checkRef(*a.Conversation, "/conversation"); err != nil {
 		return err
@@ -319,6 +323,10 @@ type Action interface {
 	Type() ActionType
 	// Lane is the delivery lane: answer_action is Immediate, the rest Ordered.
 	Lane() Lane
+	// LeaseGeneration is the generation of the lease this delivery was handed out
+	// under (contract 1.1); every ack of the action echoes it. Zero: the core sent
+	// none (a 1.0 core).
+	LeaseGeneration() uint64
 }
 
 // Send posts a new message to a conversation.
@@ -330,10 +338,14 @@ type Send struct {
 	Parts              []OutPart
 	Buttons            [][]Button
 	Silent             bool
+	Generation         uint64
 }
 
 // ActionID returns the outbox row id.
 func (s Send) ActionID() uint64 { return s.ID }
+
+// LeaseGeneration returns the lease generation of the delivery.
+func (s Send) LeaseGeneration() uint64 { return s.Generation }
 
 // Type returns ActionSend.
 func (Send) Type() ActionType { return ActionSend }
@@ -347,11 +359,12 @@ type sendWire struct {
 	Parts              []OutPart  `json:"parts"`
 	Buttons            [][]Button `json:"buttons,omitempty"`
 	Silent             bool       `json:"silent,omitempty"`
+	Generation         uint64     `json:"generation,omitempty"`
 }
 
 // MarshalJSON encodes the action in its wire form, omitting defaults (T6).
 func (s Send) MarshalJSON() ([]byte, error) {
-	return json.Marshal(sendWire{s.ID, ActionSend, s.Conversation, s.ReplyTo, s.ReplyToPlatformRef, s.Parts, s.Buttons, s.Silent})
+	return json.Marshal(sendWire{s.ID, ActionSend, s.Conversation, s.ReplyTo, s.ReplyToPlatformRef, s.Parts, s.Buttons, s.Silent, s.Generation})
 }
 
 func convertParts(raw []outPartRaw) []OutPart {
@@ -401,10 +414,14 @@ type Edit struct {
 	TargetPlatformRefs []string
 	Parts              []OutPart
 	Buttons            [][]Button
+	Generation         uint64
 }
 
 // ActionID returns the outbox row id.
 func (e Edit) ActionID() uint64 { return e.ID }
+
+// LeaseGeneration returns the lease generation of the delivery.
+func (e Edit) LeaseGeneration() uint64 { return e.Generation }
 
 // Type returns ActionEdit.
 func (Edit) Type() ActionType { return ActionEdit }
@@ -417,11 +434,12 @@ type editWire struct {
 	TargetPlatformRefs []string   `json:"target_platform_refs"`
 	Parts              []OutPart  `json:"parts"`
 	Buttons            [][]Button `json:"buttons,omitempty"`
+	Generation         uint64     `json:"generation,omitempty"`
 }
 
 // MarshalJSON encodes the action in its wire form, omitting defaults (T6).
 func (e Edit) MarshalJSON() ([]byte, error) {
-	return json.Marshal(editWire{e.ID, ActionEdit, e.Conversation, e.Target, e.TargetPlatformRefs, e.Parts, e.Buttons})
+	return json.Marshal(editWire{e.ID, ActionEdit, e.Conversation, e.Target, e.TargetPlatformRefs, e.Parts, e.Buttons, e.Generation})
 }
 
 // AnswerAction answers a button press (the action_ref of an action event).
@@ -430,10 +448,14 @@ type AnswerAction struct {
 	Conversation string
 	ActionRef    string
 	Text         string
+	Generation   uint64
 }
 
 // ActionID returns the outbox row id.
 func (a AnswerAction) ActionID() uint64 { return a.ID }
+
+// LeaseGeneration returns the lease generation of the delivery.
+func (a AnswerAction) LeaseGeneration() uint64 { return a.Generation }
 
 // Type returns ActionAnswerAction.
 func (AnswerAction) Type() ActionType { return ActionAnswerAction }
@@ -444,11 +466,12 @@ type answerWire struct {
 	Conversation string     `json:"conversation"`
 	ActionRef    string     `json:"action_ref"`
 	Text         string     `json:"text"`
+	Generation   uint64     `json:"generation,omitempty"`
 }
 
 // MarshalJSON encodes the action in its wire form.
 func (a AnswerAction) MarshalJSON() ([]byte, error) {
-	return json.Marshal(answerWire{a.ID, ActionAnswerAction, a.Conversation, a.ActionRef, a.Text})
+	return json.Marshal(answerWire{a.ID, ActionAnswerAction, a.Conversation, a.ActionRef, a.Text, a.Generation})
 }
 
 // ParseAction decodes one outbox action leniently (an output shape: unknown keys
@@ -459,6 +482,10 @@ func ParseAction(b []byte) (Action, error) {
 	if err != nil {
 		return nil, err
 	}
+	var generation uint64
+	if r.Generation != nil {
+		generation = *r.Generation
+	}
 	switch *r.Type {
 	case ActionEdit:
 		return Edit{
@@ -468,9 +495,10 @@ func ParseAction(b []byte) (Action, error) {
 			TargetPlatformRefs: r.TargetPlatformRefs,
 			Parts:              convertParts(r.Parts),
 			Buttons:            convertButtons(r.Buttons),
+			Generation:         generation,
 		}, nil
 	case ActionAnswerAction:
-		return AnswerAction{ID: *r.ID, Conversation: *r.Conversation, ActionRef: *r.ActionRef, Text: *r.Text}, nil
+		return AnswerAction{ID: *r.ID, Conversation: *r.Conversation, ActionRef: *r.ActionRef, Text: *r.Text, Generation: generation}, nil
 	}
 	s := Send{
 		ID:           *r.ID,
@@ -479,6 +507,7 @@ func ParseAction(b []byte) (Action, error) {
 		Parts:        convertParts(r.Parts),
 		Buttons:      convertButtons(r.Buttons),
 		Silent:       r.Silent,
+		Generation:   generation,
 	}
 	if r.ReplyToPlatformRef != nil {
 		s.ReplyToPlatformRef = *r.ReplyToPlatformRef

@@ -5,7 +5,7 @@ package contract
 import "strconv"
 
 // Version is the contract version this kit implements.
-const Version = "1.0.0"
+const Version = "1.1.0"
 
 // Compatible reports whether an adapter built against adapterVersion can talk
 // to a core implementing Version: same MAJOR, and the adapter's MINOR must not

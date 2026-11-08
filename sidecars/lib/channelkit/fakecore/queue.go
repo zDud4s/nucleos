@@ -49,6 +49,7 @@ type entry struct {
 	Lane         contract.Lane
 	State        State
 	Attempts     int
+	Generation   uint64 // lease generation: rises once per delivery, echoed by acks
 	PlatformRefs []string
 	LeaseUntil   time.Time
 	DueAt        time.Time // zero = due now
@@ -142,8 +143,19 @@ func (q *queue) Take(now time.Time) []entry {
 func (q *queue) deliver(e *entry, now time.Time) entry {
 	e.State = StateLeased
 	e.Attempts++
+	e.Generation++
+	e.Action = withGeneration(e.Action, e.Generation)
 	e.LeaseUntil = now.Add(LeaseTTL)
 	return snapshot(e)
+}
+
+// Stale reports whether an ack carrying gen belongs to an older lease of an
+// entry that is still open: the lease it was handed out under expired and the
+// entry was leased again (or released by a hello and leased again). Zero (an ack
+// of a 1.0 adapter) is never stale; a settled entry is answered as a late ack.
+func (q *queue) Stale(id, gen uint64) bool {
+	e := q.find(id)
+	return e != nil && gen != 0 && open(e) && gen != e.Generation
 }
 
 // Expire applies the passage of time: an immediate action older than ImmediateTTL
@@ -310,6 +322,21 @@ func conversationOf(a contract.Action) string {
 		return v.Conversation
 	}
 	return ""
+}
+
+func withGeneration(a contract.Action, gen uint64) contract.Action {
+	switch v := a.(type) {
+	case contract.Send:
+		v.Generation = gen
+		return v
+	case contract.Edit:
+		v.Generation = gen
+		return v
+	case contract.AnswerAction:
+		v.Generation = gen
+		return v
+	}
+	return a
 }
 
 func withID(a contract.Action, id uint64) contract.Action {

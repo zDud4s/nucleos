@@ -892,6 +892,17 @@ pub(super) async fn continue_paused_run(
         return Err(sqlx::Error::RowNotFound.into());
     }
     let resume_id = result.last_insert_rowid();
+    // An approval is only half-delivered until the launch below runs, and the launch is after the
+    // commit. The row says so until `spawn_run` clears it, so a daemon that dies in between leaves
+    // a mark `return_unspawned_resumes` can find at startup and hand the approval back to the owner
+    // (migration 0292). A decline is not marked: what it records is a refusal, not a grant to lose.
+    if how == Continuation::Approve {
+        sqlx::query("UPDATE runs SET pending_resume_proposal_id = ? WHERE id = ?")
+            .bind(proposal_id)
+            .bind(resume_id)
+            .execute(&mut *tx)
+            .await?;
+    }
     // The paused run names its continuation, so every reader that walks `successor_run_id` (the
     // lineage walk, the brief's chain end) follows an approval the same way it follows a handoff.
     sqlx::query("UPDATE runs SET successor_run_id = ? WHERE id = ?")
@@ -1171,6 +1182,418 @@ pub(super) async fn continue_paused_run(
     );
 
     Ok(resume_id)
+}
+
+/// Why a resume that never ran ended (its `stderr`), and the `failure_reason` of a git request its
+/// approval had queued, when the approval is handed back.
+const RESUME_NEVER_STARTED_REASON: &str =
+    "the daemon stopped before the approved run resumed; the approval is back with the owner";
+
+/// Startup: hands back every approval whose resume run was committed and never launched.
+///
+/// `continue_paused_run` commits the approval and only then starts the CLI. A daemon that died in
+/// between left the resume `running` with no process, the startup sweep made it `interrupted`, and
+/// the approval was gone: the paused run `superseded`, the proposal `approved`, and nothing left
+/// that anyone could press. The owner's decision (review auto-agents-r2#6): such a run goes back to
+/// awaiting approval and the owner approves again. It is never respawned on its own — an approval
+/// is a person's answer to a moment, and a restart is a new moment.
+///
+/// Runs before `reconcile_orphaned_runs` marks what is left `interrupted` (it calls this first).
+/// One row's failure does not stop the rest; that row is then interrupted like any other.
+pub(super) async fn return_unspawned_resumes(pool: &sqlx::SqlitePool) -> Result<u64, sqlx::Error> {
+    let stranded: Vec<(i64, i64, Option<String>)> = sqlx::query_as(
+        "SELECT id, pending_resume_proposal_id, project_id FROM runs
+         WHERE status = 'running' AND pending_resume_proposal_id IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut returned = 0;
+    for (resume_id, proposal_id, project_id) in stranded {
+        match return_unspawned_resume(pool, resume_id, proposal_id).await {
+            Ok(true) => {
+                returned += 1;
+                let _ = crate::feed::append(
+                    pool,
+                    project_id.as_deref(),
+                    "run_interrupted",
+                    &format!(
+                        "resume never started before the restart; approval #{proposal_id} is waiting for the owner again"
+                    ),
+                    Some(resume_id),
+                    Some(&crate::feed::run_subject(pool, resume_id).await),
+                )
+                .await;
+            }
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
+                run_id = resume_id,
+                proposal_id,
+                %error,
+                "could not hand an unlaunched resume's approval back; it is interrupted instead"
+            ),
+        }
+    }
+    if returned > 0 {
+        nucleos_base::wake::bump(nucleos_base::wake::Topic::Runs);
+        nucleos_base::wake::bump(nucleos_base::wake::Topic::Proposals);
+    }
+    Ok(returned)
+}
+
+/// One resume, one transaction: `continue_paused_run`'s hand-overs undone, so every reader finds
+/// the state the approval was given from. `Ok(false)` when the row is not what an unlaunched
+/// resume looks like, and then nothing is written.
+async fn return_unspawned_resume(
+    pool: &sqlx::SqlitePool,
+    resume_id: i64,
+    proposal_id: i64,
+) -> Result<bool, sqlx::Error> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut tx = pool.begin().await?;
+    // The paused run is the one the proposal names AND the one this resume continues; anything else
+    // is a row this pass does not understand, and is left to the ordinary interrupt.
+    let original: Option<i64> = sqlx::query_scalar(
+        "SELECT runs.id FROM proposals JOIN runs ON runs.id = proposals.run_id
+         WHERE proposals.id = ? AND proposals.kind = 'action-approval'
+           AND proposals.status = 'approved'
+           AND runs.status = 'superseded' AND runs.successor_run_id = ?",
+    )
+    .bind(proposal_id)
+    .bind(resume_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(original) = original else {
+        return Ok(false);
+    };
+    // An approval that queued the action handed it to git on the owner's authority. Still queued,
+    // it is withdrawn with the approval, or approving again would queue it twice. Already taken by
+    // the queue, the action has happened or is happening, and asking the owner again would be
+    // asking to do it a second time — so that resume is left to be interrupted.
+    let queued: Option<Option<i64>> = sqlx::query_scalar(
+        "SELECT queued_request_id FROM action_grants WHERE run_id = ? AND proposal_id = ?",
+    )
+    .bind(resume_id)
+    .bind(proposal_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(Some(request_id)) = queued {
+        let withdrawn = sqlx::query(
+            "UPDATE vcs_requests SET status = 'cancelled', finished_at = ?, failure_reason = ?
+             WHERE id = ? AND status = 'queued'",
+        )
+        .bind(&now)
+        .bind(RESUME_NEVER_STARTED_REASON)
+        .bind(request_id)
+        .execute(&mut *tx)
+        .await?;
+        if withdrawn.rows_affected() != 1 {
+            tracing::warn!(
+                run_id = resume_id,
+                request_id,
+                "an unlaunched resume's queued git request already left the queue; not asking again"
+            );
+            return Ok(false);
+        }
+    }
+    let ended = sqlx::query(
+        "UPDATE runs SET status = 'interrupted', completed_at = ?, stderr = ?,
+                pending_resume_proposal_id = NULL
+         WHERE id = ? AND status = 'running' AND pending_resume_proposal_id = ?",
+    )
+    .bind(&now)
+    .bind(RESUME_NEVER_STARTED_REASON)
+    .bind(resume_id)
+    .bind(proposal_id)
+    .execute(&mut *tx)
+    .await?;
+    if ended.rows_affected() != 1 {
+        return Ok(false);
+    }
+    // `completed_at` keeps the pause time, as the supersede kept it.
+    sqlx::query(
+        "UPDATE runs SET status = 'awaiting_approval', successor_run_id = NULL
+         WHERE id = ? AND status = 'superseded' AND successor_run_id = ?",
+    )
+    .bind(original)
+    .bind(resume_id)
+    .execute(&mut *tx)
+    .await?;
+    // The four hand-overs back, in `continue_paused_run`'s order and with its filters: the tree and
+    // the slot (a no-op for a job's), the job node, and a conflict resolution.
+    sqlx::query("UPDATE worktrees SET owner_id = ? WHERE owner_kind = 'run' AND owner_id = ?")
+        .bind(original)
+        .bind(resume_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE project_slots SET owner_id = ? WHERE owner_kind = 'run' AND owner_id = ?")
+        .bind(original)
+        .bind(resume_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE job_nodes SET run_id = ? WHERE run_id = ?")
+        .bind(original)
+        .bind(resume_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE vcs_requests SET resolution_run_id = ? WHERE resolution_run_id = ?")
+        .bind(original)
+        .bind(resume_id)
+        .execute(&mut *tx)
+        .await?;
+    // The grant belonged to a run that never ran and is now terminal, so it authorizes nothing; it
+    // stays as the record of what the first approval minted. Re-approving mints a fresh one.
+    let reopened = sqlx::query(
+        "UPDATE proposals SET status = 'pending', decided_at = NULL
+         WHERE id = ? AND status = 'approved'",
+    )
+    .bind(proposal_id)
+    .execute(&mut *tx)
+    .await?;
+    if reopened.rows_affected() != 1 {
+        return Ok(false);
+    }
+    sqlx::query(
+        "INSERT INTO proposal_events (proposal_id, from_status, to_status, note, at)
+         VALUES (?, 'approved', 'pending', ?, ?)",
+    )
+    .bind(proposal_id)
+    .bind(format!(
+        "resume run {resume_id} never started before the daemon stopped; approve again to continue"
+    ))
+    .bind(&now)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+#[cfg(test)]
+mod unspawned_resume_tests {
+    use std::time::Duration;
+
+    use crate::execution::runs::testkit::{seed_real_worktree_approval, test_state_with_runner};
+    use crate::state::AppState;
+
+    /// Approves, then kills the launch before it runs: a daemon that died after the commit and
+    /// before the CLI. `#[tokio::test]` is current-thread and `continue_paused_run` returns right
+    /// after `spawn_run` without awaiting, so the launch task has not been polled yet.
+    async fn approve_without_launching(state: &AppState, proposal_id: i64) -> i64 {
+        let resume_id =
+            super::continue_paused_run(state, proposal_id, super::Continuation::Approve)
+                .await
+                .unwrap();
+        let handle = state
+            .run_handles
+            .lock()
+            .unwrap()
+            .remove(&resume_id)
+            .expect("the resume's launch was registered");
+        handle.abort();
+        resume_id
+    }
+
+    async fn original_of(state: &AppState, proposal_id: i64) -> i64 {
+        sqlx::query_scalar("SELECT run_id FROM proposals WHERE id = ?")
+            .bind(proposal_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn status_of(state: &AppState, run_id: i64) -> String {
+        sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
+            .bind(run_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn proposal_status(state: &AppState, proposal_id: i64) -> String {
+        sqlx::query_scalar("SELECT status FROM proposals WHERE id = ?")
+            .bind(proposal_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    /// Review auto-agents-r2#6: an approval committed and never launched goes back to awaiting
+    /// approval at startup — the paused run, its proposal, its tree, its slot and its job node all
+    /// as they were before the approval — and the owner can approve it again.
+    #[tokio::test]
+    async fn a_resume_that_never_launched_goes_back_to_awaiting_approval() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (proposal_id, _branch, _container) =
+            seed_real_worktree_approval(&state, "cargo build").await;
+        let original = original_of(&state, proposal_id).await;
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO jobs (id, project_id, project_root, status, max_items, created_at)
+             VALUES (9601, 'proj', 'C:/somewhere', 'running', 5, ?)",
+        )
+        .bind(&now)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO job_nodes (job_id, node_id, ordinal, description, status, run_id)
+             VALUES (9601, 'implement', 0, 'an item', 'running', ?)",
+        )
+        .bind(original)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO project_slots (project_id, slot, owner_kind, owner_id, claimed_at)
+             VALUES ('proj', 0, 'run', ?, ?)",
+        )
+        .bind(original)
+        .bind(&now)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let resume_id = approve_without_launching(&state, proposal_id).await;
+        assert_eq!(status_of(&state, resume_id).await, "running");
+        assert_eq!(status_of(&state, original).await, "superseded");
+
+        crate::execution::runs::reconcile_orphaned_runs(&state.pool)
+            .await
+            .unwrap();
+
+        assert_eq!(status_of(&state, original).await, "awaiting_approval");
+        assert_eq!(status_of(&state, resume_id).await, "interrupted");
+        assert_eq!(proposal_status(&state, proposal_id).await, "pending");
+        let (successor, decided_at): (Option<i64>, Option<String>) = sqlx::query_as(
+            "SELECT runs.successor_run_id, proposals.decided_at
+             FROM runs JOIN proposals ON proposals.run_id = runs.id WHERE proposals.id = ?",
+        )
+        .bind(proposal_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!((successor, decided_at), (None, None));
+        let marker: Option<i64> =
+            sqlx::query_scalar("SELECT pending_resume_proposal_id FROM runs WHERE id = ?")
+                .bind(resume_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(marker, None);
+        let tree_owner: i64 =
+            sqlx::query_scalar("SELECT owner_id FROM worktrees WHERE owner_kind = 'run'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        let slot_owner: i64 =
+            sqlx::query_scalar("SELECT owner_id FROM project_slots WHERE project_id = 'proj'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        let (node_run, node_status): (i64, String) =
+            sqlx::query_as("SELECT run_id, status FROM job_nodes WHERE job_id = 9601")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            (tree_owner, slot_owner, node_run, node_status.as_str()),
+            (original, original, original, "running"),
+            "the tree, the slot and the job node follow the paused run back"
+        );
+
+        // The rest of the startup pass leaves a run with a pending proposal alone.
+        assert_eq!(
+            crate::execution::runs::reconcile_stranded_approvals(&state.pool)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            crate::proposals::expire_orphaned_approvals(&state.pool)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(status_of(&state, original).await, "awaiting_approval");
+
+        // And the owner can approve it again.
+        let again = super::continue_paused_run(&state, proposal_id, super::Continuation::Approve)
+            .await
+            .unwrap();
+        assert_ne!(again, resume_id);
+        assert_eq!(status_of(&state, original).await, "superseded");
+    }
+
+    /// A resume whose CLI did launch is an ordinary run: a restart interrupts it and the approval
+    /// it was given stays given.
+    #[tokio::test]
+    async fn a_resume_that_launched_is_interrupted_and_keeps_its_approval() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(30)), Duration::from_secs(600)).await;
+        let (proposal_id, _branch, _container) =
+            seed_real_worktree_approval(&state, "cargo build").await;
+        let original = original_of(&state, proposal_id).await;
+
+        let resume_id =
+            super::continue_paused_run(&state, proposal_id, super::Continuation::Approve)
+                .await
+                .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let marker: Option<i64> =
+                sqlx::query_scalar("SELECT pending_resume_proposal_id FROM runs WHERE id = ?")
+                    .bind(resume_id)
+                    .fetch_one(&state.pool)
+                    .await
+                    .unwrap();
+            if marker.is_none() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the launch never cleared the mark"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // The daemon dies mid-run: the task goes, the row stays `running`.
+        if let Some(handle) = state.run_handles.lock().unwrap().remove(&resume_id) {
+            handle.abort();
+        }
+        assert_eq!(status_of(&state, resume_id).await, "running");
+
+        crate::execution::runs::reconcile_orphaned_runs(&state.pool)
+            .await
+            .unwrap();
+
+        assert_eq!(status_of(&state, resume_id).await, "interrupted");
+        assert_eq!(status_of(&state, original).await, "superseded");
+        assert_eq!(proposal_status(&state, proposal_id).await, "approved");
+    }
+
+    /// A resume that already ended is untouched even while it still carries the mark (a launch the
+    /// router refused ends `failed` before the mark is cleared).
+    #[tokio::test]
+    async fn a_finished_resume_is_untouched() {
+        let (state, _runner) =
+            test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
+        let (proposal_id, _branch, _container) =
+            seed_real_worktree_approval(&state, "cargo build").await;
+        let original = original_of(&state, proposal_id).await;
+        let resume_id = approve_without_launching(&state, proposal_id).await;
+        sqlx::query("UPDATE runs SET status = 'failed' WHERE id = ?")
+            .bind(resume_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        crate::execution::runs::reconcile_orphaned_runs(&state.pool)
+            .await
+            .unwrap();
+
+        assert_eq!(status_of(&state, resume_id).await, "failed");
+        assert_eq!(status_of(&state, original).await, "superseded");
+        assert_eq!(proposal_status(&state, proposal_id).await, "approved");
+    }
 }
 
 #[cfg(test)]

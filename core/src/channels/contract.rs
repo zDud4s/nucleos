@@ -37,7 +37,8 @@ pub fn fixtures_dir() -> std::path::PathBuf {
     built_in.join(FIXTURES_REL)
 }
 
-pub const CONTRACT_VERSION: &str = "1.0.0";
+/// 1.1 adds the lease generation: on every delivered action and, echoed back, on every ack.
+pub const CONTRACT_VERSION: &str = "1.1.0";
 
 /// The largest `retry_after_ms` an adapter may report (24 h). Shared with the adapter kit.
 pub const MAX_RETRY_AFTER_MS: u64 = 86_400_000;
@@ -345,8 +346,18 @@ pub struct MediaCreated {
 
 #[derive(Debug, Default, Serialize)]
 pub struct OutboxPoll {
-    pub actions: Vec<OutAction>,
+    pub actions: Vec<LeasedAction>,
     pub ephemeral: Vec<Ephemeral>,
+}
+
+/// One delivered action with the generation of the lease it went out under (contract 1.1): the
+/// row's `lease_generation`, which rises on every lease. The adapter echoes it in the ack, so a late
+/// ack of a lease that expired and was handed out again is told apart from the current one.
+#[derive(Debug, Clone, Serialize)]
+pub struct LeasedAction {
+    #[serde(flatten)]
+    pub action: OutAction,
+    pub generation: i64,
 }
 
 /// `id` is the `channel_outbox.id`; `reply_to` / `target` are núcleo ids, with the platform refs
@@ -465,8 +476,9 @@ mod tests {
     fn compatible_follows_major_and_minor() {
         assert!(compatible("1.0.0"));
         assert!(compatible("1.0.9"));
+        assert!(compatible("1.1.0"));
         for bad in [
-            "1.1.0", "2.0.0", "0.9.0", "v1", "1.0", "1.0.0.0", "1.x.0", "", "1..0",
+            "1.2.0", "2.0.0", "0.9.0", "v1", "1.0", "1.0.0.0", "1.x.0", "", "1..0",
         ] {
             assert!(!compatible(bad), "{bad}");
         }

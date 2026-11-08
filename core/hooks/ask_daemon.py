@@ -401,6 +401,32 @@ def control_token(cwd: str) -> str:
     )
 
 
+TOKEN_FILE_VAR = "NUCLEOS_DAEMON_TOKEN_FILE"
+
+
+def run_token():
+    """The daemon key this process was launched with, or None. Raises nothing.
+
+    `NUCLEOS_DAEMON_TOKEN` when it is set -- every launcher but the Claude runner still passes it
+    that way, and a sidecar or a test may too. Otherwise the file `NUCLEOS_DAEMON_TOKEN_FILE`
+    names: the Claude runner (`core/src/execution/runner/claude.rs`) takes the run's key OUT of the
+    CLI's environment, so that the shell commands the agent runs do not inherit it, writes it to a
+    per-run file, and hands over only that file's path. The file is removed when the run ends.
+    """
+    from_env = os.environ.get("NUCLEOS_DAEMON_TOKEN")
+    if from_env:
+        return from_env
+    path = os.environ.get(TOKEN_FILE_VAR)
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            token = handle.read().strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    return token or None
+
+
 def read_control_token(cwd: str, git_timeout=10, print_timeout=20, total_timeout=None):
     """`(token, why)`: the token or None, and why none (`"repo"` or `"token"`).
 
@@ -409,9 +435,12 @@ def read_control_token(cwd: str, git_timeout=10, print_timeout=20, total_timeout
     `total_timeout`, when given, is one budget for git and every `--print-token` together; each
     call gets the smaller of its own timeout and what is left of it.
     """
-    from_env = os.environ.get("NUCLEOS_DAEMON_TOKEN")
-    if from_env:
-        return from_env, None
+    # A run's own key first, by either route: inside a run this must never fall through to
+    # `--print-token`, which answers with the daemon's CONTROL token -- a wider key than the run was
+    # given.
+    from_run = run_token()
+    if from_run:
+        return from_run, None
 
     deadline = None if total_timeout is None else time.monotonic() + total_timeout
 
@@ -822,7 +851,7 @@ def report_outcome(payload: dict) -> None:
     try:
         run_id = int(os.environ.get("NUCLEOS_RUN_ID", ""))
         daemon_url = os.environ.get("NUCLEOS_DAEMON_URL")
-        token = os.environ.get("NUCLEOS_DAEMON_TOKEN")
+        token = run_token()
         if not daemon_url or not token:
             return
 
@@ -2195,7 +2224,7 @@ def main() -> None:
         deny(parse_error)
 
     daemon_url = os.environ.get("NUCLEOS_DAEMON_URL")
-    token = os.environ.get("NUCLEOS_DAEMON_TOKEN")
+    token = run_token()
     if not daemon_url or not token:
         deny(
             "NUCLEOS_DAEMON_URL/NUCLEOS_DAEMON_TOKEN not set for autopilot run "
