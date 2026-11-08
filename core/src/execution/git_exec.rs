@@ -1553,7 +1553,7 @@ gate_command: git rev-parse --verify nao-existe
                     "the reason must say there is nothing to resolve: {reason}"
                 );
                 assert!(
-                    reason.contains("a resolution is minted"),
+                    reason.contains("a resolution starts as soon as the project has a free slot"),
                     "a refusal that does not say what happens next sends the asker looking: {reason}"
                 );
                 // The alternative this used to name was unactionable in BOTH directions — the
