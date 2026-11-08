@@ -31,6 +31,18 @@ pub(crate) fn classifier_sql() -> String {
     )
 }
 
+/// The same three counts for the days `shadow::rollup::prune` folded into `shadow_decision_days`
+/// (raw rows older than `RAW_RETENTION_DAYS`, so only a 90-day window reaches them). The window
+/// bounds are dates and the rollup's `day` is one, so a day is wholly in or out. A rolled-up row
+/// was deleted from `shadow_decisions` in the same transaction, so the two reads never count one
+/// decision twice and `read` adds them per class. `project_id` is '' for a decision whose run is
+/// gone, which the global figure keeps, as the LEFT JOIN above does.
+pub(crate) const CLASSIFIER_DAYS_SQL: &str =
+    "SELECT action_class, SUM(reviewed) AS n, SUM(agree) AS agreed, SUM(unreviewed) AS pending
+       FROM shadow_decision_days
+      WHERE day >= ?1 AND day < ?2 AND (?3 IS NULL OR project_id = ?3)
+      GROUP BY action_class ORDER BY action_class";
+
 pub(crate) const JUDGE_SQL: &str =
     "SELECT jv.latency_ms, jv.input_tokens, jv.cost_usd, jv.error IS NOT NULL AS errored,
         jv.enforced
@@ -149,6 +161,21 @@ pub(crate) async fn read(
             .bind(project)
             .fetch_all(pool)
             .await?;
+    let rolled_up: Vec<(String, i64, i64, i64)> = sqlx::query_as(CLASSIFIER_DAYS_SQL)
+        .bind(window.from_bound())
+        .bind(window.to_bound())
+        .bind(project)
+        .fetch_all(pool)
+        .await?;
+    // Per class, in the byte order both queries sort by: `BTreeMap<String, _>` and SQLite's
+    // default BINARY collation agree.
+    let mut by_class: BTreeMap<String, (i64, i64, i64)> = BTreeMap::new();
+    for (action_class, n, agreed, pending) in classes.into_iter().chain(rolled_up) {
+        let sums = by_class.entry(action_class).or_default();
+        sums.0 += n;
+        sums.1 += agreed;
+        sums.2 += pending;
+    }
     let judge: Vec<JudgeRow> = sqlx::query_as(JUDGE_SQL)
         .bind(window.from_bound())
         .bind(window.to_bound())
@@ -170,9 +197,9 @@ pub(crate) async fn read(
         .await?;
 
     Ok(Autopilot {
-        classifier: classes
+        classifier: by_class
             .into_iter()
-            .map(|(action_class, n, agreed, pending)| ClassAgreement {
+            .map(|(action_class, (n, agreed, pending))| ClassAgreement {
                 action_class,
                 n,
                 agree: stats::ratio(agreed, n),
@@ -312,6 +339,92 @@ mod tests {
         let (fs, net) = (&only_a[0], &only_a[1]);
         assert_eq!((fs.n, fs.pending, fs.agree), (1, 1, Some(1.0)));
         assert_eq!((net.n, net.agree), (1, Some(1.0)));
+    }
+
+    /// A 90-day window reaches past the 30 days `shadow_decisions` keeps raw: the classifier block
+    /// reads the folded days for that part, so its figures are the same before and after a sweep,
+    /// globally (a decision whose run is gone included) and per project.
+    #[tokio::test]
+    async fn classifier_agreement_is_the_same_before_and_after_the_rollup() {
+        let pool = crate::testdb::fresh_pool().await;
+        let a = run(&pool, "a").await;
+        let b = run(&pool, "b").await;
+        let gone_run = run(&pool, "gone").await;
+        let seed = [
+            (
+                a,
+                "fs.write",
+                "allow",
+                Some("approve"),
+                "2026-09-01T10:00:00Z",
+            ),
+            (
+                a,
+                "fs.write",
+                "deny",
+                Some("approve"),
+                "2026-09-02T10:00:00Z",
+            ),
+            (
+                b,
+                "fs.write",
+                "pending_approval",
+                Some("reject"),
+                "2026-09-01T11:00:00Z",
+            ),
+            // Unreviewed in a shadow run: the review queue, kept raw however old.
+            (a, "net", "deny", None, "2026-09-01T12:00:00Z"),
+            (b, "net", "allow", Some("reject"), "2026-11-01T10:00:00Z"),
+            (
+                gone_run,
+                "net",
+                "deny",
+                Some("reject"),
+                "2026-09-03T10:00:00Z",
+            ),
+            // Outside even the 90-day window, before and after.
+            (a, "net", "allow", Some("approve"), "2026-07-01T10:00:00Z"),
+        ];
+        for (run_id, class, decision, verdict, created) in seed {
+            sqlx::query(
+                "INSERT INTO shadow_decisions (run_id, tool_name, decision, action_class,
+                                               classifier_version, human_verdict, created_at)
+                 VALUES (?, 'Write', ?, ?, 1, ?, ?)",
+            )
+            .bind(run_id)
+            .bind(decision)
+            .bind(class)
+            .bind(verdict)
+            .bind(created)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query("DELETE FROM runs WHERE id = ?")
+            .bind(gone_run)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let at: chrono::DateTime<chrono::Utc> = "2026-11-08T12:00:00Z".parse().unwrap();
+        let window = Window::new(90, at).unwrap();
+        let figures = |project: Option<&'static str>| {
+            let pool = pool.clone();
+            async move { read(&pool, project, window).await.unwrap().classifier }
+        };
+        let (global, only_a) = (figures(None).await, figures(Some("a")).await);
+        assert_eq!(global.iter().map(|c| c.n).sum::<i64>(), 5, "{global:?}");
+
+        let pruned = crate::governance::shadow::rollup::prune(
+            &pool,
+            crate::governance::shadow::rollup::RAW_RETENTION_DAYS,
+            at,
+        )
+        .await
+        .unwrap();
+        assert_eq!(pruned.rows, 5, "{pruned:?}");
+
+        assert_eq!(figures(None).await, global);
+        assert_eq!(figures(Some("a")).await, only_a);
     }
 
     /// The judge over the window: latency percentiles, tokens, cost, error and enforced shares,

@@ -270,12 +270,13 @@ pub(crate) mod tests {
         let classifier = autopilot::classifier_sql();
         let judge_agreement = autopilot::judge_agreement_sql();
         // `(from, to, project)`: every read with a window.
-        let windowed: [(&str, &str); 11] = [
+        let windowed: [(&str, &str); 12] = [
             ("landing", landing::LANDING_ROWS_SQL),
             ("landing settled", landing::LANDING_SETTLED_SQL),
             ("gate", gate::GATE_ROWS_SQL),
             ("jobs", jobs::JOB_ROWS_SQL),
             ("classifier", &classifier),
+            ("classifier days", autopilot::CLASSIFIER_DAYS_SQL),
             ("judge", autopilot::JUDGE_SQL),
             ("judge agreement", &judge_agreement),
             ("refused", autopilot::REFUSED_SQL),

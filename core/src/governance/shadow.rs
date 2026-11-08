@@ -6,6 +6,8 @@ use sqlx::{FromRow, SqlitePool};
 
 use crate::governance::classifier::{self, Classification};
 
+pub mod rollup;
+
 #[derive(Debug, Clone, Serialize, FromRow)]
 pub struct ShadowDecision {
     pub id: i64,
@@ -260,7 +262,7 @@ pub async fn set_verdict(pool: &SqlitePool, id: i64, verdict: &str) -> sqlx::Res
 ///
 /// Used by `scoreboard`, which reports ACTIVITY: how many decisions were taken and how the human
 /// judged each one. `shadow_readiness` deliberately does not share it — the gate counts distinct
-/// ACTIONS (see `REVIEWED_DISTINCT`), because ten reviews of one command are ten data points about
+/// ACTIONS (see `action_hash`), because ten reviews of one command are ten data points about
 /// the same thing. Same rule for what counts as agreement, applied to different units, and the
 /// scoreboard's column headings are what tell the two apart on screen.
 ///
@@ -273,43 +275,49 @@ pub const AGREE_CASE: &str = "CASE
     ELSE 0
 END";
 
-/// Distinct reviewed ACTIONS, not reviewed rows.
+/// The key of one distinct ACTION, the unit readiness counts in: the hex SHA-256 of the tool name,
+/// the unit separator (`0x1f`) and the tool input.
 ///
 /// Ten reviews of the same `ls` are one piece of evidence about the classifier, not ten. Counting
 /// rows meant a single shadow run looping one harmless command, bulk-approved, cleared its class
 /// and unlocked active mode having proved nothing about anything risky. The tool name joins the
-/// key because a `Read` of a path and a `Bash` touching it are different actions, and `char(31)`
-/// is the unit separator, so the two fields cannot run together into a colliding string.
-const REVIEWED_DISTINCT: &str =
-    "COUNT(DISTINCT CASE WHEN shadow_decisions.human_verdict IS NOT NULL
-        THEN shadow_decisions.tool_name || char(31) || COALESCE(shadow_decisions.tool_input, '')
-    END)";
-
-/// Distinct actions the classifier got right: reviewed, minus every action a human EVER rejected.
+/// key because a `Read` of a path and a `Bash` touching it are different actions, and the
+/// separator keeps the two fields from running together into a colliding string.
 ///
-/// Subtracting disagreements rather than counting agreements, because the same action can be
-/// reviewed more than once. Counting agreements directly would let one approval cancel out a
-/// rejection of that very action, and an action anyone disagreed about is not evidence that the
-/// classifier handles it correctly.
-const AGREE_DISTINCT: &str = "COUNT(DISTINCT CASE WHEN shadow_decisions.human_verdict IS NOT NULL
-        THEN shadow_decisions.tool_name || char(31) || COALESCE(shadow_decisions.tool_input, '')
-    END)
-    - COUNT(DISTINCT CASE
-        WHEN shadow_decisions.human_verdict IS NOT NULL
-             AND NOT (
-                 (shadow_decisions.human_verdict = 'approve' AND shadow_decisions.decision = 'allow')
-                 OR (shadow_decisions.human_verdict = 'reject'
-                     AND shadow_decisions.decision IN ('deny', 'pending_approval'))
-             )
-        THEN shadow_decisions.tool_name || char(31) || COALESCE(shadow_decisions.tool_input, '')
-    END)";
+/// A hash and not the text: `rollup::prune` keeps this key in `shadow_reviewed_actions` forever,
+/// and the raw `tool_input` (commands, paths, file contents) must not outlive the retention
+/// window. SQLite has no SHA-256, so every reader hashes in Rust.
+pub(crate) fn action_hash(tool_name: &str, tool_input: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(tool_name.as_bytes());
+    hasher.update([0x1f]);
+    hasher.update(tool_input.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
 
-pub async fn scoreboard(pool: &SqlitePool, project_id: &str) -> sqlx::Result<Vec<ClassTally>> {
-    let sql = format!(
-        "SELECT
-             runs.mode AS mode,
-             shadow_decisions.action_class,
-             COUNT(*) AS total,
+/// One reviewed action as the SQL hands it over, before [`action_hash`]: project, action class,
+/// tool name, tool input, and whether a person disagreed about it (0 or 1).
+pub(crate) type ReviewedActionRow = (String, String, String, String, i64);
+
+/// The scoreboard's counters, in [`ClassTally`] order after `mode` and `action_class`. Named by
+/// [`tally_select`], and the column list `rollup::prune` inserts them into.
+pub(crate) const TALLY_NAMES: &str = "total, would_allow, would_pend, would_deny, reviewed, agree, \
+     disagree, stricter, looser, unreviewed, oldest_unreviewed_at, reviewed_allow, reviewed_pend, \
+     reviewed_deny";
+
+/// The scoreboard's counters over raw `shadow_decisions` rows, aliased as [`TALLY_NAMES`].
+///
+/// One list for `scoreboard`, which reads the rows still in the table, and for `rollup::prune`,
+/// which folds the rows it deletes into `shadow_decision_days`: a day folded and a day still raw
+/// are counted by the same rule, or the totals would change the moment a day aged out.
+pub(crate) fn tally_select() -> String {
+    format!(
+        "COUNT(*) AS total,
              SUM(CASE WHEN shadow_decisions.decision = 'allow' THEN 1 ELSE 0 END) AS would_allow,
              SUM(CASE WHEN shadow_decisions.decision = 'pending_approval' THEN 1 ELSE 0 END) AS would_pend,
              SUM(CASE WHEN shadow_decisions.decision = 'deny' THEN 1 ELSE 0 END) AS would_deny,
@@ -347,17 +355,56 @@ pub async fn scoreboard(pool: &SqlitePool, project_id: &str) -> sqlx::Result<Vec
                  WHEN shadow_decisions.human_verdict IS NOT NULL
                       AND shadow_decisions.decision = 'deny' THEN 1
                  ELSE 0
-             END) AS reviewed_deny
-         FROM shadow_decisions
-         JOIN runs ON runs.id = shadow_decisions.run_id
-         WHERE runs.project_id = ?
-         GROUP BY runs.mode, shadow_decisions.action_class
-         ORDER BY runs.mode, shadow_decisions.action_class"
+             END) AS reviewed_deny"
+    )
+}
+
+/// Per run mode and action class, the whole history of one project: the rows still in
+/// `shadow_decisions` plus the days `rollup::prune` folded into `shadow_decision_days`. The two
+/// never hold the same decision (a row is deleted in the transaction that folds it), so adding
+/// them is the total the table alone would have given had nothing been pruned.
+pub async fn scoreboard(pool: &SqlitePool, project_id: &str) -> sqlx::Result<Vec<ClassTally>> {
+    let tally = tally_select();
+    let sql = format!(
+        "SELECT mode, action_class,
+             SUM(total) AS total,
+             SUM(would_allow) AS would_allow,
+             SUM(would_pend) AS would_pend,
+             SUM(would_deny) AS would_deny,
+             SUM(reviewed) AS reviewed,
+             SUM(agree) AS agree,
+             SUM(disagree) AS disagree,
+             SUM(stricter) AS stricter,
+             SUM(looser) AS looser,
+             SUM(unreviewed) AS unreviewed,
+             MIN(oldest_unreviewed_at) AS oldest_unreviewed_at,
+             SUM(reviewed_allow) AS reviewed_allow,
+             SUM(reviewed_pend) AS reviewed_pend,
+             SUM(reviewed_deny) AS reviewed_deny
+         FROM (
+             SELECT runs.mode AS mode, shadow_decisions.action_class AS action_class, {tally}
+             FROM shadow_decisions
+             JOIN runs ON runs.id = shadow_decisions.run_id
+             WHERE runs.project_id = ?1
+             GROUP BY runs.mode, shadow_decisions.action_class
+             UNION ALL
+             SELECT mode, action_class,
+                    SUM(total), SUM(would_allow), SUM(would_pend), SUM(would_deny), SUM(reviewed),
+                    SUM(agree), SUM(disagree), SUM(stricter), SUM(looser), SUM(unreviewed),
+                    MIN(oldest_unreviewed_at), SUM(reviewed_allow), SUM(reviewed_pend),
+                    SUM(reviewed_deny)
+             FROM shadow_decision_days
+             WHERE project_id = ?1
+             GROUP BY mode, action_class
+         )
+         GROUP BY mode, action_class
+         ORDER BY mode, action_class"
     );
 
     // `AssertSqlSafe` because sqlx 0.9 only trusts `&'static str` by default. Safe here by
-    // construction: the only interpolated fragment is the private `AGREE_CASE` const, and the
-    // project id stays a bound parameter — no caller input reaches the SQL text.
+    // construction: the only interpolated fragment is `tally_select`, built from the private
+    // `AGREE_CASE` const, and the project id stays a bound parameter — no caller input reaches the
+    // SQL text.
     sqlx::query_as(sqlx::AssertSqlSafe(sql))
         .bind(project_id)
         .fetch_all(pool)
@@ -440,53 +487,123 @@ pub fn promotable(classes_ready: i64, classes_total: i64, withheld_classes_ready
 /// A class is ready only if it clears `class_ready` AND, when it has any `pending_approval`
 /// decision, at least one of those was reviewed. Otherwise its agreement is measured on the other
 /// decisions alone, which says nothing about whether the classifier was right to hold back.
+///
+/// The whole history, pruned or not: the rows still in `shadow_decisions` together with what
+/// `rollup::prune` kept of the ones it deleted — their counts in `shadow_decision_days` and their
+/// distinct reviewed actions (as hashes) in `shadow_reviewed_actions`. The distinct counts are taken over the
+/// UNION of the live keys and the kept ones, never added, so an action reviewed on both sides of
+/// the retention window is still one action. "Withheld" is "every decision was `pending_approval`
+/// or `deny`", i.e. the count of those equals the count of all, which adds across days where the
+/// `MIN` it replaces would not.
 pub async fn shadow_readiness(
     pool: &SqlitePool,
 ) -> sqlx::Result<std::collections::HashMap<String, (i64, i64, i64)>> {
-    let sql = format!(
-        "SELECT
-             runs.project_id AS project_id,
-             shadow_decisions.action_class AS action_class,
-             MIN(CASE
-                 WHEN shadow_decisions.decision IN ('pending_approval', 'deny') THEN 1
-                 ELSE 0
-             END) AS withheld,
-             {REVIEWED_DISTINCT} AS reviewed,
-             {AGREE_DISTINCT} AS agree,
-             COUNT(DISTINCT shadow_decisions.policy_digest) AS policies,
-             SUM(CASE WHEN shadow_decisions.decision = 'pending_approval' THEN 1 ELSE 0 END) AS would_pend,
-             SUM(CASE
-                 WHEN shadow_decisions.human_verdict IS NOT NULL
-                      AND shadow_decisions.decision = 'pending_approval' THEN 1
-                 ELSE 0
-             END) AS reviewed_pend
-         FROM shadow_decisions
-         JOIN runs ON runs.id = shadow_decisions.run_id
-         WHERE runs.mode = 'shadow'
-         GROUP BY runs.project_id, shadow_decisions.action_class"
-    );
+    const SQL: &str = "WITH counted AS (
+             SELECT runs.project_id AS project_id,
+                    shadow_decisions.action_class AS action_class,
+                    COUNT(*) AS total,
+                    SUM(CASE
+                        WHEN shadow_decisions.decision IN ('pending_approval', 'deny') THEN 1
+                        ELSE 0
+                    END) AS withheld_total,
+                    SUM(CASE WHEN shadow_decisions.decision = 'pending_approval' THEN 1 ELSE 0 END)
+                        AS would_pend,
+                    SUM(CASE
+                        WHEN shadow_decisions.human_verdict IS NOT NULL
+                             AND shadow_decisions.decision = 'pending_approval' THEN 1
+                        ELSE 0
+                    END) AS reviewed_pend
+             FROM shadow_decisions
+             JOIN runs ON runs.id = shadow_decisions.run_id
+             WHERE runs.mode = 'shadow'
+             GROUP BY runs.project_id, shadow_decisions.action_class
+             UNION ALL
+             SELECT project_id, action_class, SUM(total), SUM(would_pend + would_deny),
+                    SUM(would_pend), SUM(reviewed_pend)
+             FROM shadow_decision_days
+             WHERE mode = 'shadow'
+             GROUP BY project_id, action_class
+         ),
+         classes AS (
+             SELECT project_id, action_class, SUM(total) AS total,
+                    SUM(withheld_total) AS withheld_total, SUM(would_pend) AS would_pend,
+                    SUM(reviewed_pend) AS reviewed_pend
+             FROM counted
+             GROUP BY project_id, action_class
+         ),
+         digests AS (
+             SELECT runs.project_id AS project_id,
+                    shadow_decisions.action_class AS action_class,
+                    shadow_decisions.policy_digest AS policy_digest
+             FROM shadow_decisions
+             JOIN runs ON runs.id = shadow_decisions.run_id
+             WHERE runs.mode = 'shadow'
+             UNION ALL
+             SELECT project_id, action_class, NULLIF(policy_digest, '')
+             FROM shadow_decision_days
+             WHERE mode = 'shadow'
+         ),
+         policies AS (
+             SELECT project_id, action_class, COUNT(DISTINCT policy_digest) AS policies
+             FROM digests
+             GROUP BY project_id, action_class
+         )
+         SELECT classes.project_id,
+                classes.action_class,
+                CASE WHEN classes.withheld_total = classes.total THEN 1 ELSE 0 END AS withheld,
+                COALESCE(policies.policies, 0) AS policies,
+                classes.would_pend,
+                classes.reviewed_pend
+         FROM classes
+         LEFT JOIN policies
+                ON policies.project_id = classes.project_id
+               AND policies.action_class = classes.action_class";
 
-    // Same `AssertSqlSafe` reasoning as `scoreboard`: the only interpolation is `AGREE_CASE`.
-    // One row per (project, action class): project_id, action_class, then the six counters in the
-    // order the SELECT lists them.
-    type ReadinessRow = (String, String, i64, i64, i64, i64, i64, i64);
-    let rows: Vec<ReadinessRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+    // One row per (project, action class): project_id, action_class, then the four counters in the
+    // order the SELECT lists them. The distinct reviewed actions are counted below, in Rust.
+    type ReadinessRow = (String, String, i64, i64, i64, i64);
+    let rows: Vec<ReadinessRow> = sqlx::query_as(SQL)
         .fetch_all(pool)
         .await?;
 
+    // Live reviewed rows, grouped in SQL by the raw action and hashed here, beside the hashes
+    // `rollup::prune` kept. (project, class) -> action hash -> a person ever disagreed.
+    let live: Vec<ReviewedActionRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT runs.project_id, shadow_decisions.action_class, shadow_decisions.tool_name,
+                COALESCE(shadow_decisions.tool_input, ''),
+                MAX(CASE WHEN ({AGREE_CASE}) = 0 THEN 1 ELSE 0 END)
+         FROM shadow_decisions
+         JOIN runs ON runs.id = shadow_decisions.run_id
+         WHERE runs.mode = 'shadow' AND shadow_decisions.human_verdict IS NOT NULL
+         GROUP BY runs.project_id, shadow_decisions.action_class, shadow_decisions.tool_name,
+                  COALESCE(shadow_decisions.tool_input, '')"
+    )))
+    .fetch_all(pool)
+    .await?;
+    let kept: Vec<(String, String, String, i64)> = sqlx::query_as(
+        "SELECT project_id, action_class, action_hash, disagreed FROM shadow_reviewed_actions",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut actions: std::collections::HashMap<
+        (String, String),
+        std::collections::HashMap<String, bool>,
+    > = std::collections::HashMap::new();
+    let hashed = live
+        .into_iter()
+        .map(|(project, class, name, input, d)| (project, class, action_hash(&name, &input), d));
+    for (project, class, hash, disagreed) in hashed.chain(kept) {
+        let slot = actions
+            .entry((project, class))
+            .or_default()
+            .entry(hash)
+            .or_insert(false);
+        *slot |= disagreed != 0;
+    }
+
     let mut readiness: std::collections::HashMap<String, (i64, i64, i64)> =
         std::collections::HashMap::new();
-    for (
-        project_id,
-        action_class,
-        withheld,
-        reviewed,
-        agree,
-        policies,
-        would_pend,
-        reviewed_pend,
-    ) in rows
-    {
+    for (project_id, action_class, withheld, policies, would_pend, reviewed_pend) in rows {
         // A count and NOT a `GROUP BY`, and the tempting change is the wrong one. This function's
         // contract above is that each action class contributes exactly one row, "even when
         // historical classifier versions recorded different decisions for it" — grouping by digest
@@ -507,6 +624,16 @@ pub async fn shadow_readiness(
                 "shadow evidence for one action class spans more than one github policy"
             );
         }
+        // Distinct actions over the UNION of the live keys and the kept ones: an action reviewed
+        // on both sides of the retention window is one action, and one disagreement anywhere
+        // makes it a disagreement ("an action anyone disagreed about never counts as agreement").
+        let (reviewed, agree) = actions
+            .get(&(project_id.clone(), action_class.clone()))
+            .map_or((0, 0), |keys| {
+                let reviewed = keys.len() as i64;
+                let disagreed = keys.values().filter(|&&d| d).count() as i64;
+                (reviewed, reviewed - disagreed)
+            });
         let entry = readiness.entry(project_id).or_insert((0, 0, 0));
         entry.1 += 1;
         // Here and not inside `class_ready`, which the judge also reads and which knows nothing of

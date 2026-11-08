@@ -775,8 +775,8 @@ pub trait Consolidation: Send + Sync {
 }
 
 /// Retention for everything finished work leaves behind: a run's transcript and events, its
-/// entries in the activity feed, councils that are over, queued VCS output tails, and briefing
-/// traces. The filtered command-output logs of a run go with its transcript, on the same window. The sixth sweep consolidates durable gate and refused-action histories on its own
+/// entries in the activity feed, councils that are over, queued VCS output tails, briefing
+/// traces, and shadow decisions (folded into their daily rollup before they go). The filtered command-output logs of a run go with its transcript, on the same window. The sixth sweep consolidates durable gate and refused-action histories on its own
 /// six-hour interval.
 ///
 /// One loop rather than six, because they are the same sweep at different windows and splitting
@@ -866,6 +866,24 @@ pub async fn run_retention_loop(
                 )
             }
             Err(error) => tracing::warn!(%error, "knowledge: trace retention sweep failed"),
+        }
+        // Folds, then deletes: a shadow decision past the window leaves its counts in the daily
+        // rollup the scoreboard, readiness and analytics read, in the same transaction that
+        // removes it. Rows a person still has to answer are left alone (`shadow::rollup`).
+        match crate::governance::shadow::rollup::prune(
+            &state.pool,
+            crate::governance::shadow::rollup::RAW_RETENTION_DAYS,
+            now,
+        )
+        .await
+        {
+            Ok(pruned) if pruned.rows == 0 => {}
+            Ok(pruned) => tracing::info!(
+                days = pruned.days,
+                rows = pruned.rows,
+                "shadow: decisions past the retention window folded into the daily rollup"
+            ),
+            Err(error) => tracing::warn!(%error, "shadow: decision retention sweep failed"),
         }
         match crate::knowledge::close_orphaned_working(&state.pool).await {
             Ok(0) => {}
