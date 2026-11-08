@@ -4,6 +4,7 @@
 pub mod access;
 pub mod bus;
 pub mod contract;
+pub mod inbound_limit;
 pub mod outbox;
 pub mod registry;
 pub mod replies;

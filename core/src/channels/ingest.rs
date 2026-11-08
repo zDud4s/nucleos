@@ -171,6 +171,16 @@ async fn ingest_event_checked(
     event: InboundEvent,
     now: DateTime<Utc>,
 ) -> Result<IngestReply, StatusCode> {
+    // Step 0 (sec-inbound#1): an unknown sender over `inbound_limit` is dropped before `claim`,
+    // so a flood writes no row; it is only counted (`Drops::unknown_sender_limited`).
+    match within_inbound_limit(state, channel, &event, now).await {
+        Ok(true) => {}
+        Ok(false) => return Ok(IngestReply::Dropped),
+        Err(error) => {
+            tracing::warn!(%error, channel, "ingest could not check the sender");
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
+    }
     match claim(&state.pool, channel, &event.event_id, now).await {
         Ok(true) => {}
         Ok(false) => return Ok(IngestReply::Duplicate),
@@ -191,6 +201,24 @@ async fn ingest_event_checked(
         tracing::warn!(%error, channel, "ingest could not settle the event");
     }
     Ok(reply)
+}
+
+/// `true` when the event may be recorded: its sender is known (never limited), or it is unknown
+/// and still inside both the per-sender and the per-channel limit of `inbound_limit`.
+async fn within_inbound_limit(
+    state: &AppState,
+    channel: &'static str,
+    event: &InboundEvent,
+    now: DateTime<Utc>,
+) -> sqlx::Result<bool> {
+    let sender = &event.sender.reference;
+    if access::is_known_sender(&state.pool, channel, sender).await? {
+        return Ok(true);
+    }
+    Ok(state
+        .channels
+        .presence
+        .allow_unknown_sender(channel, sender, now))
 }
 
 /// Step 1, dedup: `true` when this call owns the event. A `processing` row older than
@@ -730,6 +758,151 @@ mod tests {
         assert_eq!(outcome_of(&st.pool, "ev-stranger").await, "dropped");
         assert_eq!(run_count(&st.pool, "telegram:drop-chat").await, 0);
         assert!(outbox_rows(&st.pool).await.is_empty());
+    }
+
+    // ---- the unknown-sender limit (sec-inbound#1) -------------------------------------------
+
+    use crate::channels::inbound_limit::{PER_CHANNEL_LIMIT, PER_SENDER_LIMIT, WINDOW};
+
+    async fn event_rows(pool: &SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM channel_events")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// `count` distinct events from `sender` at `at`, each answered `Dropped` (unknown sender).
+    async fn strangers_events(st: &AppState, sender: &str, count: u32, at: DateTime<Utc>) {
+        for n in 0..count {
+            let reply = ingest_event(
+                st,
+                "telegram",
+                text_event(&format!("ev-{sender}-{n}"), sender, "flood-chat", "hi"),
+                at,
+            )
+            .await;
+            assert_eq!(reply, IngestReply::Dropped);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unknown_sender_over_its_limit_is_dropped_unwritten_and_counted() {
+        let st = state().await;
+        strangers_events(&st, "stranger", PER_SENDER_LIMIT, now()).await;
+        let written = event_rows(&st.pool).await;
+        assert_eq!(written, i64::from(PER_SENDER_LIMIT));
+
+        let reply = ingest_event(
+            &st,
+            "telegram",
+            text_event("ev-over", "stranger", "flood-chat", "hi"),
+            now(),
+        )
+        .await;
+        assert_eq!(reply, IngestReply::Dropped);
+        assert_eq!(event_rows(&st.pool).await, written, "no row past the limit");
+        let drops = st.channels.presence.drops("telegram");
+        assert_eq!(drops.unknown_sender_limited, 1);
+        assert_eq!(drops.unknown_sender, u64::from(PER_SENDER_LIMIT));
+    }
+
+    #[tokio::test]
+    async fn the_channel_ceiling_caps_many_distinct_unknown_senders() {
+        let st = state().await;
+        // Fill the channel's allowance without the database, one sender per event.
+        for n in 0..PER_CHANNEL_LIMIT {
+            assert!(st.channels.presence.allow_unknown_sender(
+                "telegram",
+                &format!("bot-{n}"),
+                now()
+            ));
+        }
+        let reply = ingest_event(
+            &st,
+            "telegram",
+            text_event("ev-fresh", "fresh-stranger", "flood-chat", "hi"),
+            now(),
+        )
+        .await;
+        assert_eq!(reply, IngestReply::Dropped);
+        assert_eq!(event_rows(&st.pool).await, 0);
+        assert_eq!(
+            st.channels
+                .presence
+                .drops("telegram")
+                .unknown_sender_limited,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_known_sender_is_never_limited() {
+        let st = state().await;
+        owner(&st.pool, "u1", "owner-chat").await;
+        // A flood of strangers has used up the whole channel ceiling.
+        for n in 0..PER_CHANNEL_LIMIT {
+            st.channels
+                .presence
+                .allow_unknown_sender("telegram", &format!("bot-{n}"), now());
+        }
+        // Past both limits, with a slash command so no turn runner is needed.
+        let total = PER_SENDER_LIMIT + 2;
+        for n in 0..total {
+            let reply = ingest_event(
+                &st,
+                "telegram",
+                text_event(&format!("ev-owner-{n}"), "u1", "owner-chat", "/help"),
+                now(),
+            )
+            .await;
+            assert_eq!(reply, IngestReply::Accepted);
+        }
+        assert_eq!(event_rows(&st.pool).await, i64::from(total));
+        assert_eq!(
+            st.channels
+                .presence
+                .drops("telegram")
+                .unknown_sender_limited,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn the_window_rolling_over_admits_an_unknown_sender_again() {
+        let st = state().await;
+        strangers_events(&st, "stranger", PER_SENDER_LIMIT, now()).await;
+        let limited = ingest_event(
+            &st,
+            "telegram",
+            text_event("ev-limited", "stranger", "flood-chat", "hi"),
+            now(),
+        )
+        .await;
+        assert_eq!(limited, IngestReply::Dropped);
+        let before = event_rows(&st.pool).await;
+
+        let later = now() + WINDOW;
+        let reply = ingest_event(
+            &st,
+            "telegram",
+            text_event("ev-later", "stranger", "flood-chat", "hi"),
+            later,
+        )
+        .await;
+        assert_eq!(
+            reply,
+            IngestReply::Dropped,
+            "recorded, then dropped by admit"
+        );
+        assert_eq!(event_rows(&st.pool).await, before + 1);
+        assert_eq!(outcome_of(&st.pool, "ev-later").await, "dropped");
+        assert_eq!(
+            st.channels
+                .presence
+                .drops("telegram")
+                .unknown_sender_limited,
+            1
+        );
     }
 
     #[tokio::test]

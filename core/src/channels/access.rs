@@ -88,14 +88,7 @@ pub async fn admit(
     sender: &contract::Sender,
 ) -> sqlx::Result<Verdict> {
     let pool = &state.pool;
-    let owner: Option<i64> = sqlx::query_scalar(
-        "SELECT 1 FROM channel_identities WHERE channel = ? AND sender_ref = ? LIMIT 1",
-    )
-    .bind(channel)
-    .bind(&sender.reference)
-    .fetch_optional(pool)
-    .await?;
-    if owner.is_none() {
+    if !is_known_sender(pool, channel, &sender.reference).await? {
         state.channels.presence.drop_unknown_sender(channel);
         return Ok(Verdict::Drop(DropReason::UnknownSender));
     }
@@ -114,6 +107,23 @@ pub async fn admit(
         return Ok(Verdict::Admit);
     }
     Ok(Verdict::Drop(DropReason::ConversationNotAllowed))
+}
+
+/// Whether a row of `channel_identities` carries this sender: the owner check of `admit`, also
+/// asked by ingest before it records an event (an unknown sender goes through `inbound_limit`).
+pub async fn is_known_sender(
+    pool: &SqlitePool,
+    channel: &str,
+    sender_ref: &str,
+) -> sqlx::Result<bool> {
+    let owner: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM channel_identities WHERE channel = ? AND sender_ref = ? LIMIT 1",
+    )
+    .bind(channel)
+    .bind(sender_ref)
+    .fetch_optional(pool)
+    .await?;
+    Ok(owner.is_some())
 }
 
 async fn conversation_is_paired(

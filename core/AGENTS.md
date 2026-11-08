@@ -509,6 +509,7 @@ the contract, not a snapshot.
 | `channels/contract/decode/outbox.rs` | The `outbox_response` and `action` shapes (D3): the wire types and validation of what the núcleo sends an adapter. |
 | `channels/fake.rs` | Test-only: a fake adapter used by the contract scenarios. |
 | `channels/ingest.rs` | Adapter ingest: `hello` and `events`. |
+| `channels/inbound_limit.rs` | Rate limit of unknown senders (per sender and per channel, fixed one-hour windows, bounded memory), asked by ingest before a `channel_events` row is written; excess is counted and dropped. |
 | `channels/media.rs` | Media bytes, transcription and turn input. |
 | `channels/outbox.rs` | The outbound queue with leases; the adapter-facing routes. |
 | `channels/outbox/ack.rs` | Outbox acknowledgement handling. |
