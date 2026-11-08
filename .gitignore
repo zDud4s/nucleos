@@ -166,3 +166,6 @@ __pycache__/
 # nucleos-wfroster-, nucleos-wfseed-, tree-root-*, tree-post-, tree-wrap-plan-.
 /core/nucleos-*-??????/
 /core/tree-*/
+/core/crates/*/http-land-*/
+/core/crates/*/http-land-claims-*/
+/core/http-land-*/
