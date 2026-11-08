@@ -2020,7 +2020,9 @@ mod tests {
 
         assert_eq!(status, StatusCode::FORBIDDEN, "{refused:?}");
         assert!(
-            refused.to_string().contains("a leaf does not open branches"),
+            refused
+                .to_string()
+                .contains("a leaf does not open branches"),
             "{refused:?}"
         );
         assert_eq!(count(&state, "work_nodes").await, nodes);
