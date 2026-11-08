@@ -36,6 +36,7 @@ impl Drop for Registration {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&self.id);
+        crate::execution::runner::cli_pids::forget(self.id);
     }
 }
 
@@ -99,7 +100,10 @@ where
         tails: state.run_tails.clone(),
         id,
     };
-    let mut handles = state.run_handles.lock().unwrap();
+    let mut handles = state
+        .run_handles
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let join = tokio::spawn(async move {
         let _registration = registration;
         body.await;
@@ -536,12 +540,15 @@ pub(super) fn spawn_run(
             {
                 let pool = pool.clone();
                 tokio::spawn(async move {
-                    if let Some(session_id) = session_rx.recv().await {
-                        let _ = sqlx::query("UPDATE runs SET session_id = ? WHERE id = ?")
-                            .bind(&session_id)
-                            .bind(id)
-                            .execute(&pool)
-                            .await;
+                    if let Some(session_id) = session_rx.recv().await
+                        && let Err(error) =
+                            sqlx::query("UPDATE runs SET session_id = ? WHERE id = ?")
+                                .bind(&session_id)
+                                .bind(id)
+                                .execute(&pool)
+                                .await
+                    {
+                        tracing::warn!(run_id = id, %error, "could not persist the run's session id");
                     }
                 });
             }
@@ -559,6 +566,9 @@ pub(super) fn spawn_run(
             if let Ok(mut map) = run_tails.lock() {
                 map.insert(id, std::sync::Arc::clone(&transcript));
             }
+            // The liveness sweep measures silence from here, not from the run's `created_at`: a
+            // retry is a fresh CLI with an empty transcript and must not inherit the earlier age.
+            crate::execution::runner::cli_pids::begin_attempt(id);
             let context_fill = std::sync::Arc::new(std::sync::Mutex::new(None));
             // Held for this attempt only: a retry starts a fresh CLI on a fresh context, so the
             // previous attempt's mirror has nothing left to say. Dropping the guard at the end of
@@ -735,6 +745,13 @@ pub(super) fn spawn_run(
                     // `run_prompt` does not return until the CLI process is dead and reaped. The
                     // gate belongs after that boundary: an orphaned build can otherwise retain file
                     // locks in the worktree for the lifetime of every later cleanup retry.
+                    //
+                    // The gate writes nothing to the transcript, so the liveness sweep would read
+                    // the quiet as a stall and cancel the run, losing its handoff. The marker is a
+                    // bounded wait for the sweep and drops with this scope on every exit path.
+                    let gate_marker = (terminal_status == "completed"
+                        && matches!(&gate_config, GateConfig::Command { .. }))
+                    .then(|| crate::execution::runner::cli_pids::begin_gate(id));
                     let gate_outcome = match (terminal_status, &gate_config, spawn_cwd.as_deref()) {
                         (
                             "completed",
@@ -764,6 +781,7 @@ pub(super) fn spawn_run(
                         }
                         _ => None,
                     };
+                    drop(gate_marker);
                     let (gate_status, gate_exit_code, gate_output) = match &gate_outcome {
                         Some(crate::gate::GateOutcome::Passed) => (Some("passed"), None, None),
                         Some(crate::gate::GateOutcome::Failed { exit_code, output }) => {
@@ -1336,7 +1354,7 @@ mod wake_tests {
 
         spawn_registered(&state, id, async {});
 
-        tokio::time::timeout(Duration::from_secs(5), rx.changed())
+        tokio::time::timeout(Duration::from_secs(60), rx.changed())
             .await
             .expect("the supervisor never signalled the normal end")
             .unwrap();
@@ -1354,12 +1372,12 @@ mod wake_tests {
         spawn_registered(&state, id, async { panic!("run body blew up") });
 
         // Poll until the row is terminal, then require a signal that is not older than the write.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         while status_of(&state.pool, id).await != "failed" {
             assert!(std::time::Instant::now() < deadline, "the run never failed");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        tokio::time::timeout(Duration::from_secs(5), rx.changed())
+        tokio::time::timeout(Duration::from_secs(60), rx.changed())
             .await
             .expect("the supervisor never signalled the panic")
             .unwrap();
@@ -1396,7 +1414,7 @@ mod wake_tests {
 
         assert!(finalize_termination(&state, id, "cancelled").await);
 
-        let seen = tokio::time::timeout(Duration::from_secs(5), watcher)
+        let seen = tokio::time::timeout(Duration::from_secs(60), watcher)
             .await
             .expect("the watcher never woke")
             .unwrap();
@@ -1413,9 +1431,9 @@ mod wake_tests {
         }
     }
 
-    /// The claim's status reads back as `open`, or the test fails after five seconds.
+    /// The claim's status reads back as `open`, or the test fails after the 60s hang guard.
     async fn wait_until_open(pool: &sqlx::SqlitePool, task: i64) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         while testing::state_of(pool, task).await.0 != "open" {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -1497,8 +1515,13 @@ mod wake_tests {
         );
 
         // The supervisor finishes after the handle is released; give it a beat to (not) act.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while state.run_handles.lock().unwrap().contains_key(&id) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while state
+            .run_handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&id)
+        {
             assert!(std::time::Instant::now() < deadline, "the run never ended");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

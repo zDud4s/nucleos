@@ -30,7 +30,9 @@ prompt, layer?, base?, node_id}: `name` is a short branch name (letters, digits,
 lists the paths that part may write, `layer` and `base` are optional (`base` names a branch that \
 must merge first), and `node_id` is your own Node ID. Each call creates the branch, its worktree \
 and its agent, and starts it. Opening the same branch twice is safe. Each started part must pass \
-the gate on its own, so a part that needs another part's code must name that branch as `base`.
+the gate on its own, so a part that needs another part's code must name that branch as `base`. \
+Open every part now, later ones too: a part whose base has not merged answers `queued` with \
+`waiting_for`, and the daemon starts it by itself once the base merges. Leave no part for later.
 
 You cannot wait for your branches, and you never merge, land or push anything: the daemon gates \
 and merges each branch when its agent reports, then lands the job. When every part is opened, \
@@ -274,13 +276,9 @@ async fn retry_failed_start(state: &AppState, job: &TreeJob, record: &Value) -> 
         .await;
     } else {
         let attempts = record["attempts"].as_u64().unwrap_or(0);
-        if attempts >= ROOT_START_CAP {
-            let error = record["error"].as_str().unwrap_or("unknown");
-            let question = format!(
-                "The root of tree job {} did not start after {attempts} tries (last error: \
-                 {error}). Fix the cause and answer to try again, or say how the job should go on.",
-                job.id
-            );
+        let error = record["error"].as_str().unwrap_or("unknown");
+        if attempts >= super::root_disk::start_cap(error, ROOT_START_CAP) {
+            let question = super::root_disk::question(&job.id, attempts, error);
             let asked = decisions::park_or_ask(pool, &job.id, &job.root_node_id, &question)
                 .await
                 .map_err(|error| error.to_string())?;
@@ -298,6 +296,10 @@ async fn retry_failed_start(state: &AppState, job: &TreeJob, record: &Value) -> 
             }
             return Ok(());
         }
+    }
+    // A refused admission waits out a backoff before the next try (see `watchdog`).
+    if super::watchdog::root_start_waits(record) {
+        return Ok(());
     }
     start(state, job).await.map(|_| ())
 }
@@ -420,7 +422,9 @@ mod tests {
 
     /// The permission and the directory the runner was launched with, once there is a launch.
     async fn first_launch(runner: &FakeCommandRunner) -> Option<(Permission, PathBuf)> {
-        for _ in 0..300 {
+        // Hang guard only: wait for the launch, not for a short budget.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             let permission = *runner.last_permission.lock().unwrap();
             let cwd = runner.last_cwd.lock().unwrap().clone();
             if let (Some(permission), Some(cwd)) = (permission, cwd) {
@@ -720,6 +724,25 @@ mod tests {
     /// `POST /trees` answers 200 when the root cannot start (here: the project root is not there
     /// yet), and the job stays open. The 60-second sweep starts it once it can, instead of leaving an
     /// open job with no run that nothing ever moves again.
+    /// Moves a recorded root-start failure back in time, past any admission backoff, so the next
+    /// sweep may retry it at once.
+    async fn age_start_record(state: &AppState) {
+        super::edit_start_record(state, TREE, |extra| {
+            match extra
+                .get_mut(super::ROOT_START_KEY)
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                Some(record) => {
+                    let old = chrono::Utc::now() - chrono::Duration::hours(2);
+                    record.insert("at".to_owned(), json!(old.to_rfc3339()));
+                    true
+                }
+                None => false,
+            }
+        })
+        .await;
+    }
+
     #[tokio::test]
     async fn a_root_start_that_failed_is_retried_by_the_sweep() {
         let container = space_free_tempdir("tree-root-retry-");
@@ -729,6 +752,7 @@ mod tests {
         assert_eq!(run, None, "no repository yet: the start failed");
 
         tree_repo(&container);
+        age_start_record(&state).await;
         crate::tree_job::wrap::tick(&state).await;
 
         let (_, run) = root_run(&state).await;
@@ -744,6 +768,7 @@ mod tests {
         let (state, _runner) = start_tree(&missing, Some(Duration::from_secs(5))).await;
 
         for _ in 0..10 {
+            age_start_record(&state).await;
             crate::tree_job::wrap::tick(&state).await;
         }
 
@@ -762,6 +787,7 @@ mod tests {
         crate::tree_job::open::answer_and_relaunch(&state, &asked[0].0, "it is there now", "shell")
             .await
             .unwrap();
+        age_start_record(&state).await;
         crate::tree_job::wrap::tick(&state).await;
 
         let (_, run) = root_run(&state).await;

@@ -946,7 +946,8 @@ mod tests {
     /// only be observed through a channel the test holds, the test is not exercising the surface
     /// anybody actually reads.
     async fn settled(state: &crate::state::AppState, id: &str) -> CouncilRow {
-        for _ in 0..600 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             let row = get_council_row(&state.pool, id).await.unwrap().unwrap();
             if row.status != STATUS_RUNNING {
                 return row;
@@ -1035,13 +1036,20 @@ mod tests {
         let id = start(&state, "why?", None).await.unwrap();
         assert_eq!(settled(&state, &id).await.status, STATUS_DONE);
 
+        // Wait for the expected reports (hang guard), then a short silence for any extra one.
+        let routed = asked.load(Ordering::SeqCst);
         let mut reports = Vec::new();
+        while reports.len() < routed {
+            match tokio::time::timeout(std::time::Duration::from_secs(60), received.recv()).await {
+                Ok(Some(report)) => reports.push(report),
+                _ => break,
+            }
+        }
         while let Ok(Some(report)) =
-            tokio::time::timeout(std::time::Duration::from_millis(500), received.recv()).await
+            tokio::time::timeout(std::time::Duration::from_millis(300), received.recv()).await
         {
             reports.push(report);
         }
-        let routed = asked.load(Ordering::SeqCst);
         assert!(routed > 0, "no seat was routed");
         assert_eq!(
             reports.len(),
@@ -1312,13 +1320,27 @@ mod tests {
         assert!(config_path.exists(), "the seats were given an MCP config");
 
         // Wait for both seats to be in flight, so the cancel has something to terminate.
-        for _ in 0..300 {
-            if state.run_handles.lock().unwrap().len() == 2 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
+            if state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len()
+                == 2
+            {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        assert_eq!(state.run_handles.lock().unwrap().len(), 2);
+        assert_eq!(
+            state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            2
+        );
 
         assert!(cancel(&state, &id).await.unwrap());
         let row = settled(&state, &id).await;
@@ -1333,7 +1355,8 @@ mod tests {
                 .all(|prompt| !prompt.contains(prompts::CRITIQUE_MARKER))
         );
 
-        for _ in 0..300 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             if !config_path.exists() {
                 break;
             }
@@ -1353,7 +1376,13 @@ mod tests {
             statuses.iter().all(|status| status == "cancelled"),
             "{statuses:?}"
         );
-        assert!(state.run_handles.lock().unwrap().is_empty());
+        assert!(
+            state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+        );
     }
 
     /// Every prompt the council sent, in order.
@@ -1737,7 +1766,8 @@ mod tests {
 
         let id = start(&state, "why?", None).await.unwrap();
         // Wait for the first seat to land its answer while the second still hangs.
-        for _ in 0..300 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             let steps = steps_for(&state, &id).await;
             if step_at(&steps, 0, 0, store::PHASE_ANSWER).is_some_and(|step| step.status == SEAT_OK)
             {
@@ -3986,9 +4016,15 @@ mod tests {
         let id = start(&state, "why?", None).await.unwrap();
         // Both seats in flight, and each one's step written `pending` with its run beside it —
         // the run id on the step is what `cancel` terminates by.
-        for _ in 0..300 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             let steps = steps_for(&state, &id).await;
-            if state.run_handles.lock().unwrap().len() == 2
+            if state
+                .run_handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len()
+                == 2
                 && steps.len() == 2
                 && steps.iter().all(|step| step.run_id.is_some())
             {
@@ -4010,7 +4046,8 @@ mod tests {
 
         // Settled however the seats' own futures unwind: never `error`, never left `pending`.
         let mut steps = Vec::new();
-        for _ in 0..300 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             steps = steps_for(&state, &id).await;
             if steps.iter().all(|step| step.status == SEAT_CANCELLED) {
                 break;
@@ -4816,7 +4853,8 @@ mod tests {
             .await
             .unwrap();
         // Wait until all three revisions are in flight, each with its run on its step.
-        for _ in 0..300 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             let steps = steps_for(&state, &id).await;
             let revising: Vec<&store::StepRow> = steps
                 .iter()
@@ -4837,7 +4875,8 @@ mod tests {
         assert_eq!(row.status, STATUS_CANCELLED);
 
         let mut steps = Vec::new();
-        for _ in 0..300 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             steps = steps_for(&state, &id).await;
             if steps
                 .iter()
@@ -4950,13 +4989,20 @@ mod tests {
         assert_eq!(row.status, STATUS_DONE, "{:?}", row.error);
         assert_eq!(row.rounds_run, 2);
 
+        // Wait for the expected reports (hang guard), then a short silence for any extra one.
+        let routed = asked.load(Ordering::SeqCst);
         let mut reports = Vec::new();
+        while reports.len() < routed {
+            match tokio::time::timeout(std::time::Duration::from_secs(60), received.recv()).await {
+                Ok(Some(report)) => reports.push(report),
+                _ => break,
+            }
+        }
         while let Ok(Some(report)) =
-            tokio::time::timeout(std::time::Duration::from_millis(500), received.recv()).await
+            tokio::time::timeout(std::time::Duration::from_millis(300), received.recv()).await
         {
             reports.push(report);
         }
-        let routed = asked.load(Ordering::SeqCst);
         assert!(routed > 3, "only the answers were routed: {routed}");
         assert_eq!(
             reports.len(),

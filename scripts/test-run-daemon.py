@@ -66,6 +66,25 @@ def test_staging_copies_the_daemon_and_every_sidecar_and_touches_no_source():
         assert after == before, "the source directory changed"
 
 
+def test_stage_puts_the_build_beside_the_running_exe_and_replaces_nothing():
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        target = fake_target(base)
+        run_dir = base / "run"
+        missing = run("-TargetDir", str(target), "-RunDir", str(run_dir), "-NoBuild", "-Stage")
+        assert missing.returncode == 2, (missing.returncode, missing.stdout, missing.stderr)
+        run_dir.mkdir()
+        (run_dir / "nucleos-core.exe").write_bytes(b"running")
+        done = run("-TargetDir", str(target), "-RunDir", str(run_dir), "-NoBuild", "-Stage")
+        assert done.returncode == 0, (done.returncode, done.stdout, done.stderr)
+        assert (run_dir / "nucleos-core.exe").read_bytes() == b"running"
+        assert (run_dir / "nucleos-core.next.exe").read_bytes() == b"fake nucleos-core"
+        assert sorted(p.name for p in run_dir.iterdir()) == [
+            "nucleos-core.exe",
+            "nucleos-core.next.exe",
+        ]
+
+
 def test_a_run_dir_exe_in_use_is_refused_and_left_alone():
     with tempfile.TemporaryDirectory() as tmp:
         base = Path(tmp)
@@ -198,6 +217,7 @@ def test_a_busy_port_is_refused_before_staging():
 
 
 test_staging_copies_the_daemon_and_every_sidecar_and_touches_no_source()
+test_stage_puts_the_build_beside_the_running_exe_and_replaces_nothing()
 test_a_run_dir_exe_in_use_is_refused_and_left_alone()
 test_mcp_tool_servers_holding_the_copy_are_moved_aside_not_killed_or_refused()
 test_a_stale_moved_aside_image_is_swept_but_a_held_one_is_kept()

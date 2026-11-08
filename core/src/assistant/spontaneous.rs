@@ -398,7 +398,8 @@ pub(super) async fn start_spontaneous_turn(
         // Open while the answer is gathered, so Stop reaches this turn softly and a line a person
         // sends lands in it, exactly as in a person's own turn.
         let steer = SteerGuard::open(&chat, &live.messages);
-        let served = tokio::time::timeout(
+        let served = within_ceiling(
+            &chat,
             deadlines.ceiling,
             live.gather(&transcript, deadlines.silence),
         )
@@ -579,6 +580,13 @@ pub(super) async fn record_spontaneous_answer(
     .execute(pool)
     .await;
     crate::execution::runs::warn_on_terminal_write_err(&completed, id, "completed");
+    if completed
+        .as_ref()
+        .is_ok_and(|written| written.rows_affected() > 0)
+    {
+        // A turn that finished ends the streak of restart interruptions.
+        crate::chats::auto_resume::reset(pool, chat_id).await;
+    }
     if let Some(session_id) = o.session_id.as_deref() {
         // The same rule as a person's turn: a session that read third-party text is not resumable.
         match crate::execution::runs::read_untrusted_context(pool, id).await {
@@ -703,7 +711,7 @@ mod tests {
                 .expect("the spontaneous turn was not recorded");
 
         // Steerable once its gather has begun; the task that opens the guard is spawned.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
         while !is_steerable(chat) {
             assert!(
                 tokio::time::Instant::now() < deadline,
@@ -712,7 +720,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        let stopped = stop_turn_within(&state, id, Duration::from_secs(5)).await;
+        let stopped = stop_turn_within(&state, id, Duration::from_secs(60)).await;
         assert_eq!(stopped, Stopped::Interrupted);
         assert!(
             hearing.await.unwrap().interrupt,

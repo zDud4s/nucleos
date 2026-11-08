@@ -84,6 +84,7 @@ const LANE_OF: Record<string, FeedLane> = {
   work_tree_conflict: "jobs",
   work_tree_corrupt: "jobs",
   work_tree_root_start_failed: "jobs",
+  work_tree_root_started: "jobs",
   work_tree_relaunch_skipped: "jobs",
   spec_audit_unavailable: "machine",
 
@@ -114,6 +115,7 @@ const LANE_OF: Record<string, FeedLane> = {
   vcs_request_finished: "git",
   vcs_request_cancelled: "git",
   vcs_request_interrupted: "git",
+  vcs_request_reconciled: "git",
   vcs_request_settled: "git",
   vcs_resolution_started: "git",
   vcs_resolution_cancelled: "git",

@@ -1161,8 +1161,14 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    /// Long enough for a `git --version` unit on a loaded machine, short enough to bound a test.
+    /// How long a gate may show no progress before it is called hung. Each step is real work (git
+    /// subprocesses, worktrees, SQLite) and the module's ~40 tests run in parallel, so on a loaded
+    /// machine starvation stretches a step by several times; `tick_until` returns the moment the
+    /// step shows up.
     const WAIT: Duration = Duration::from_secs(30);
+    /// The most a gate that keeps moving is waited for. An upper bound on a hung test, not an
+    /// expectation.
+    const WAIT_CAP: Duration = Duration::from_secs(300);
 
     /// Runs git in `dir`, asserts it succeeded, and returns its trimmed stdout.
     fn git_in(dir: &Path, args: &[&str]) -> String {
@@ -1277,18 +1283,34 @@ mod tests {
             .map(|pass| pass.step)
     }
 
-    /// Ticks until `alpha`'s step satisfies `want`, and returns it. Panics after `WAIT`.
+    /// What the gate has done so far, as one string: it changes whenever a unit moves.
+    async fn progress_of(f: &Fixture) -> String {
+        let runs: Vec<(i64, String)> =
+            sqlx::query_as("SELECT id, status FROM verify_runs ORDER BY id")
+                .fetch_all(&f.pool)
+                .await
+                .unwrap_or_default();
+        format!("{runs:?}")
+    }
+
+    /// Ticks until `alpha`'s step satisfies `want`, and returns it. Panics when the gate has shown
+    /// no progress (a new step, a unit changing status) for `WAIT`, or after `WAIT_CAP` in all: a
+    /// loaded machine slows the gate down but does not stop it, so the wait follows the gate.
     async fn tick_until(f: &Fixture, want: impl Fn(&Step) -> bool) -> Step {
-        let started = Instant::now();
+        let mut patience = crate::testdb::Patience::new(WAIT, WAIT_CAP);
         loop {
-            if let Some(step) = step_of(f).await
+            let step = step_of(f).await;
+            let marker = format!("{step:?} {}", progress_of(f).await);
+            if let Some(step) = step
                 && want(&step)
             {
                 return step;
             }
             assert!(
-                started.elapsed() < WAIT,
-                "the gate did not reach the expected step in {WAIT:?}"
+                !patience.expired(&marker),
+                "the gate did not reach the expected step: no progress for {WAIT:?}, or over \
+                 {WAIT_CAP:?} in all; last seen: {}",
+                patience.last()
             );
             tokio::time::sleep(Duration::from_millis(200)).await;
         }

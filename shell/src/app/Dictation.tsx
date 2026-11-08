@@ -17,9 +17,11 @@ import {
 import {
   phaseAfter,
   postCapture,
+  useVoiceConfig,
   type CaptureResult,
   type VoicePhase,
 } from "../data/voice";
+import { chordMatches, focusedField, insertIntoField, pageChord } from "../lib/dictationTarget";
 
 /**
  * The dictation and memo capture, held by the shell rather than by the Voice page.
@@ -54,9 +56,13 @@ export type CaptureOutcome =
   | { kind: "silent" }
   | { kind: "done"; result: CaptureResult }
   | { kind: "refused"; error: unknown }
-  | { kind: "mic-error" };
+  | { kind: "mic-error"; reason?: "denied" | "unsupported" };
 
-export type Delivery = { pasted: boolean; held: string | null };
+/**
+ * `note` is the sentence for a delivery that did land, when "pasted into the window you dictated
+ * into" is not true (a browser tab types into its own field instead).
+ */
+export type Delivery = { pasted: boolean; held: string | null; note?: string };
 
 export interface Dictation {
   phase: VoicePhase;
@@ -68,6 +74,60 @@ export interface Dictation {
   /** The page's own buttons: the same toggle the chord is, for the window that has focus. */
   press: (memo: boolean) => Promise<void>;
   abandon: () => Promise<void>;
+}
+
+/**
+ * `onMouseDown` for a dictation button: in a browser tab the text goes to the field that had focus,
+ * so pressing the button must not take the focus away. The desktop pastes through the host and is
+ * left alone.
+ */
+export function keepFocus(event: { preventDefault: () => void }) {
+  if (isRemote()) event.preventDefault();
+}
+
+/**
+ * Why a browser could not open the microphone. `mediaDevices` is absent outside a secure context
+ * (plain HTTP), which is a different thing to fix from a permission the person refused.
+ */
+function micReason(error: unknown): "denied" | "unsupported" | undefined {
+  if (navigator.mediaDevices?.getUserMedia === undefined) return "unsupported";
+  const name = error instanceof Error ? error.name : "";
+  if (name === "NotAllowedError" || name === "SecurityError") return "denied";
+  return undefined;
+}
+
+/**
+ * The dictation and memo shortcuts, inside the page only. The global chords belong to the desktop
+ * host; a browser tab cannot register them, so while the tab is focused the same keys press the same
+ * toggles. Renders nothing, and does nothing on the desktop.
+ */
+export function PageDictationShortcuts() {
+  const config = useVoiceConfig();
+  const { press } = useDictation();
+  const pressRef = useRef(press);
+  pressRef.current = press;
+  const dictation = pageChord(config.data?.hotkey ?? "");
+  const memo = pageChord(config.data?.memo_hotkey ?? "");
+
+  useEffect(() => {
+    if (!isRemote()) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.repeat) return;
+      // Ctrl+Alt is how Windows types AltGr characters; that is typing, not a shortcut.
+      if (event.getModifierState?.("AltGraph")) return;
+      if (chordMatches(event, dictation)) {
+        event.preventDefault();
+        void pressRef.current(false);
+      } else if (chordMatches(event, memo)) {
+        event.preventDefault();
+        void pressRef.current(true);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [dictation, memo]);
+
+  return null;
 }
 
 const DictationContext = createContext<Dictation | null>(null);
@@ -93,9 +153,16 @@ export function DictationProvider({ children }: { children: ReactNode }) {
   const startingRef = useRef(false);
   /** A stop arrived while `startingRef` was set: honoured the moment the microphone is up. */
   const stopRequestedRef = useRef(false);
+  /** The text field focused when a browser recording started — where the text goes if it is still there. */
+  const targetRef = useRef<HTMLElement | null>(null);
+  /** The latest phase, for a press that arrives through a listener closed over an older render. */
+  const phaseRef = useRef<VoicePhase>("idle");
+  phaseRef.current = phase;
 
   /** The phase the host already holds, in case it is mid-capture from before this window loaded. */
   useEffect(() => {
+    // No host behind a browser tab to ask.
+    if (isRemote()) return;
     let cancelled = false;
     // Started from a resolved promise so that a host answering with anything but a promise is caught
     // below too: this runs on every page, and a throw here would take the whole window with it.
@@ -117,6 +184,7 @@ export function DictationProvider({ children }: { children: ReactNode }) {
    * failed capture leaves the host there and every hotkey answers "busy" until the app restarts.
    */
   async function abandonHost() {
+    if (isRemote()) return;
     try {
       await invoke("voice_abandon");
     } catch {
@@ -129,14 +197,17 @@ export function DictationProvider({ children }: { children: ReactNode }) {
     setDelivery(null);
     startingRef.current = true;
     stopRequestedRef.current = false;
+    // Read now, not when the text arrives: by then focus has moved (to the button, usually).
+    targetRef.current = isRemote() ? focusedField() : null;
     let started = false;
     try {
       captureRef.current = { ...(await startCapture()), kind };
       started = true;
       setActiveKind(kind);
       setPhase(phaseAfter({ type: "start", kind }));
-    } catch {
-      setOutcome({ kind: "mic-error" });
+    } catch (error) {
+      targetRef.current = null;
+      setOutcome({ kind: "mic-error", reason: isRemote() ? micReason(error) : undefined });
       setActiveKind(null);
       await abandonHost();
       setPhase(phaseAfter({ type: "abandon" }));
@@ -170,7 +241,8 @@ export function DictationProvider({ children }: { children: ReactNode }) {
       } else {
         setOutcome({ kind: "done", result });
         if (active.kind === "dictation") {
-          await deliverPaste(result.text);
+          if (isRemote()) await deliverInPage(result.text);
+          else await deliverPaste(result.text);
         }
       }
       setPhase(phaseAfter({ type: "capture-done" }));
@@ -179,7 +251,29 @@ export function DictationProvider({ children }: { children: ReactNode }) {
       await abandonHost();
       setPhase(phaseAfter({ type: "capture-error" }));
     } finally {
+      targetRef.current = null;
       setActiveKind(null);
+    }
+  }
+
+  /**
+   * A browser tab's delivery: into the field that had focus when the recording started if it is still
+   * on the page, otherwise onto the clipboard, and if even that is refused the text is shown rather
+   * than lost.
+   */
+  async function deliverInPage(text: string) {
+    const target = targetRef.current;
+    targetRef.current = null;
+    if (target !== null && insertIntoField(target, text)) {
+      setDelivery({ pasted: true, held: null, note: "typed into the field you were in" });
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+      setDelivery({ pasted: false, held: "copied to the clipboard: paste it where you need it" });
+    } catch {
+      // No clipboard (plain HTTP) or permission refused: the text must not be lost with the error.
+      setDelivery({ pasted: false, held: `could not copy it; the dictation was: ${text}` });
     }
   }
 
@@ -206,10 +300,13 @@ export function DictationProvider({ children }: { children: ReactNode }) {
       for (const track of active.stream.getTracks()) track.stop();
       await active.context.close();
     }
-    try {
-      await invoke("voice_abandon");
-    } catch {
-      // Best-effort — the host may already have nothing to abandon either.
+    targetRef.current = null;
+    if (!isRemote()) {
+      try {
+        await invoke("voice_abandon");
+      } catch {
+        // Best-effort — the host may already have nothing to abandon either.
+      }
     }
     setOutcome(null);
     setDelivery(null);
@@ -218,8 +315,14 @@ export function DictationProvider({ children }: { children: ReactNode }) {
   }
 
   async function press(memo: boolean) {
-    // No microphone chord or paste host behind a browser tab: the buttons are inert there.
-    if (pending || isRemote()) return;
+    if (isRemote()) {
+      // No host to ask: the page decides the toggle itself.
+      if (captureRef.current !== null) await endRecordingAndCapture();
+      else if (startingRef.current) stopRequestedRef.current = true;
+      else if (phaseRef.current === "idle") await beginRecording(memo ? "memo" : "dictation");
+      return;
+    }
+    if (pending) return;
     setPending(true);
     try {
       const result = await invoke<"recording" | "transcribing" | "busy">(
@@ -239,6 +342,18 @@ export function DictationProvider({ children }: { children: ReactNode }) {
       setPending(false);
     }
   }
+
+  /** A browser tab that goes away must not leave the microphone indicator on. */
+  useEffect(() => {
+    if (!isRemote()) return;
+    const onHide = () => {
+      const active = captureRef.current;
+      if (active === null) return;
+      for (const track of active.stream.getTracks()) track.stop();
+    };
+    window.addEventListener("pagehide", onHide);
+    return () => window.removeEventListener("pagehide", onHide);
+  }, []);
 
   /** The real chords — fired by the host whether or not this window is focused, on whatever page. */
   useEffect(() => {

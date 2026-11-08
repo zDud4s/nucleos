@@ -225,6 +225,8 @@ pub(super) async fn spawn_local_turn(
                         .is_ok_and(|written| written.rows_affected() > 0)
                     {
                         auto_fill = Some(fill);
+                        // A turn that finished ends the streak of restart interruptions.
+                        crate::chats::auto_resume::reset(&pool, &chat_id).await;
                     }
                     completed
                 }
@@ -693,6 +695,9 @@ pub(super) struct TurnLaunch {
     /// is read and the doctrine fills its `system_prompt` only when that is empty — a person's own
     /// instructions must never be replaced, only completed.
     pub(super) doctrine: Option<String>,
+    /// The turn came in through a channel, whose conversation already carries the reply; a long
+    /// turn then does not tell the owner a second time. Carried for the same reason as `doctrine`.
+    pub(super) from_channel: bool,
 }
 
 pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnLaunch) {
@@ -707,7 +712,9 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
         cwd,
         tool_policy,
         doctrine,
+        from_channel,
     } = launch;
+    let started = std::time::Instant::now();
     let pool = state.pool.clone();
     let daemon_runner = state.runner.clone();
     let utility_model = state.utility_model.clone();
@@ -1243,6 +1250,8 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
                             .is_ok_and(|written| written.rows_affected() > 0)
                     {
                         linked_reply = reply.clone();
+                        // A turn that finished ends the streak of restart interruptions.
+                        crate::chats::auto_resume::reset(&pool, &turn.slot.chat_id).await;
                     }
                     if let Some(session_id) = o.session_id.as_deref() {
                         // `get_session` would refuse to resume this session anyway, by looking at the
@@ -1364,6 +1373,14 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
         // cannot set another aside before this one is written.
         record_set_aside(&after, &drained_chat).await;
         drop(turn);
+        // The final state is written; a turn that ran long tells an owner who may have walked away.
+        crate::channels::owner_notice::long_turn_ended(
+            &after,
+            &drained_chat,
+            started.elapsed(),
+            from_channel,
+        )
+        .await;
         // Automatic compaction runs in a task of its own, for the reason given above: the
         // compaction turn must not start inside this one's registered task.
         // An unknown fill never fires, so a turn without one needs no task.
@@ -1757,7 +1774,9 @@ mod tests {
         .unwrap();
 
         let mut delivered: Option<(i64, String, i64)> = None;
-        for _ in 0..500 {
+        // Hang guard only: a loaded machine can starve the task for a long while.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             delivered = sqlx::query_as(
                 "SELECT r.id, r.prompt, c.sending_run_id
                    FROM runs r JOIN chat_relays c ON c.id = r.from_relay_id
@@ -1781,7 +1800,9 @@ mod tests {
             "the relay is sent by the child's turn"
         );
         assert_eq!(prompt, "[browser agent · Flights] fake output");
-        for _ in 0..500 {
+        // Hang guard only: a loaded machine can starve the task for a long while.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
                 .bind(parent_turn)
                 .fetch_one(&state.pool)
@@ -1846,7 +1867,9 @@ mod tests {
             .await
             .unwrap();
 
-        for _ in 0..500 {
+        // Hang guard only: a loaded machine can starve the task for a long while.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             let status: String =
                 sqlx::query_scalar("SELECT status FROM chat_compactions WHERE run_id = ?")
                     .bind(run)
@@ -1889,7 +1912,9 @@ mod tests {
             .unwrap();
 
         let mut sent = 0;
-        for _ in 0..500 {
+        // Hang guard only: a loaded machine can starve the task for a long while.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             sent = relays_from(&state.pool, &child).await;
             if sent > 0 {
                 break;
@@ -1965,7 +1990,9 @@ mod tests {
         let mut warmed = false;
         // As a transcript's poll does: another test's warm-up holds the one global `WARMING` flag
         // for a moment, and a call that finds it set does nothing.
-        for _ in 0..500 {
+        // Hang guard only: a loaded machine can starve the task for a long while.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             prewarm_open_chat(&state, chat);
             warmed = *fake.calls.lock().unwrap() == 1 && has_kept_process(chat);
             if warmed {
@@ -1983,7 +2010,9 @@ mod tests {
         let id = send_message(&state, chat, "zanzibar?", Origin::Shell)
             .await
             .unwrap();
-        for _ in 0..500 {
+        // Hang guard only: a loaded machine can starve the task for a long while.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
                 .bind(id)
                 .fetch_one(&state.pool)
@@ -2076,7 +2105,9 @@ mod tests {
         .await;
 
         let mut sent = None;
-        for _ in 0..500 {
+        // Hang guard only: a loaded machine can starve the task for a long while.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             sent = fake.last_append_system_prompt.lock().unwrap().clone();
             if sent.is_some() {
                 break;
@@ -2365,7 +2396,9 @@ mod agy_chat_tests {
             .await
             .expect("the turn was accepted");
         let mut status = String::new();
-        for _ in 0..500 {
+        // Hang guard only: a loaded machine can starve the task for a long while.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             status = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
                 .bind(id)
                 .fetch_one(&state.pool)

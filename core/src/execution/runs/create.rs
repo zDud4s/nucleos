@@ -861,7 +861,8 @@ async fn create_run_with_policy(
         // same two branches.
         if let Some(resolution) = resolution {
             match sqlx::query(
-                "UPDATE vcs_requests SET resolution_run_id = ?
+                "UPDATE vcs_requests SET resolution_run_id = ?,
+                        resolution_attempts = resolution_attempts + 1
                   WHERE id = ? AND resolution_run_id IS NULL
                     AND COALESCE(settled_reason, '') <> 'tree-merge'",
             )

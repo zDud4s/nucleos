@@ -110,11 +110,13 @@ async fn post_event(
         Err(error) => return contract_error(error),
     };
     let now = Utc::now();
-    match crate::door::uncancellable(async move { ingest_event(&state, channel, event, now).await })
-        .await
+    match crate::door::uncancellable(async move {
+        ingest_event_checked(&state, channel, event, now).await
+    })
+    .await
     {
-        Ok(reply) => reply.into_response(),
-        Err(status) => status.into_response(),
+        Ok(Ok(reply)) => reply.into_response(),
+        Ok(Err(status)) | Err(status) => status.into_response(),
     }
 }
 
@@ -147,21 +149,34 @@ enum Processed {
 /// the body (section 7.3). Runs inside `door::uncancellable`: the adapter dropping the connection
 /// must not leave a command half-done.
 ///
-/// A database failure cannot be told to the adapter (the reply has three shapes and none is an
+/// A database failure cannot be told to the adapter through `IngestReply` (three shapes, none an
 /// error): it is logged, the row stays `processing` so a redelivery after a minute runs again, and
-/// the reply is `Accepted`.
+/// the reply is `Accepted`. The HTTP route uses `ingest_event_checked` and answers 503 instead.
 pub async fn ingest_event(
     state: &AppState,
     channel: &'static str,
     event: InboundEvent,
     now: DateTime<Utc>,
 ) -> IngestReply {
+    ingest_event_checked(state, channel, event, now)
+        .await
+        .unwrap_or(IngestReply::Accepted)
+}
+
+/// `ingest_event`, but a database failure is an `Err(503)` instead of a fake `Accepted`, so the
+/// HTTP route can ask the adapter to redeliver rather than lose the message.
+async fn ingest_event_checked(
+    state: &AppState,
+    channel: &'static str,
+    event: InboundEvent,
+    now: DateTime<Utc>,
+) -> Result<IngestReply, StatusCode> {
     match claim(&state.pool, channel, &event.event_id, now).await {
         Ok(true) => {}
-        Ok(false) => return IngestReply::Duplicate,
+        Ok(false) => return Ok(IngestReply::Duplicate),
         Err(error) => {
             tracing::warn!(%error, channel, "ingest could not record the event");
-            return IngestReply::Accepted;
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
         }
     }
     let (reply, outcome) = match process(state, channel, &event, now).await {
@@ -169,13 +184,13 @@ pub async fn ingest_event(
         Ok(Processed::Dropped) => (IngestReply::Dropped, "dropped"),
         Err(error) => {
             tracing::warn!(%error, channel, "ingest failed; the event stays processing");
-            return IngestReply::Accepted;
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
         }
     };
     if let Err(error) = settle(&state.pool, channel, &event.event_id, outcome).await {
         tracing::warn!(%error, channel, "ingest could not settle the event");
     }
-    reply
+    Ok(reply)
 }
 
 /// Step 1, dedup: `true` when this call owns the event. A `processing` row older than
@@ -868,6 +883,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_database_failure_asks_the_adapter_to_redeliver() {
+        let st = state().await;
+        st.pool.close().await;
+        let result = ingest_event_checked(
+            &st,
+            "telegram",
+            text_event("ev-down", "u1", "down-chat", "hello"),
+            now(),
+        )
+        .await;
+        assert_eq!(result, Err(StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    #[tokio::test]
     async fn a_stale_button_token_answers_already_handled() {
         let st = state().await;
         owner(&st.pool, "u1", "button-chat").await;
@@ -1339,7 +1368,8 @@ mod tests {
         // One poll starts the handler, then the future (the "client") is dropped.
         let _ = tokio::time::timeout(std::time::Duration::ZERO, router.oneshot(request)).await;
         let mut outcome = String::new();
-        for _ in 0..200 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             outcome = sqlx::query_scalar("SELECT outcome FROM channel_events WHERE event_id = ?")
                 .bind("r-gone")
                 .fetch_optional(&st.pool)

@@ -20,8 +20,8 @@ use crate::config::VerifyConfig;
 use crate::execution::admission::{AdmissionBook, VerifyGrant};
 use crate::gate::{self, ArgvOutcome};
 use crate::tests_map::{self, MapState};
-use crate::verify::resolve;
 use crate::verify::runs::{self as verify_runs, Claimed, Request, State, Submitted};
+use crate::verify::{live, resolve};
 use crate::verify_sched::{self, Candidate};
 use crate::warm;
 
@@ -126,6 +126,8 @@ struct InFlight {
 pub struct Executor {
     pub pool: SqlitePool,
     pub config: VerifyConfig,
+    /// Capacity and unit timeout as the settings store has them now.
+    limits: live::Limits,
     pub machine_root: Option<PathBuf>,
     /// Where warm state lives (`warm::home`): the machine root unless the daemon moved it.
     warm_home: Option<PathBuf>,
@@ -182,22 +184,56 @@ impl Drop for Reservation {
 }
 
 impl Executor {
+    /// Keeps `config`'s capacity and timeout for good: no live source, so tests do not depend on
+    /// the global settings store.
     pub fn new(pool: SqlitePool, config: VerifyConfig, machine_root: Option<PathBuf>) -> Arc<Self> {
         let warm_home = machine_root.clone();
-        Self::with_warm_home(pool, config, machine_root, warm_home)
+        let source: live::Source = Arc::new(|| None);
+        Self::build(pool, config, machine_root, warm_home, source)
     }
 
     /// `new` with warm state kept under `warm_home` rather than the machine root; `main` passes
     /// `warm::home`, so `NUCLEOS_WARM_HOME` moves it. Tests keep `new`, whatever the env says.
+    /// Capacity and the unit timeout follow the settings store live.
     pub fn with_warm_home(
         pool: SqlitePool,
         config: VerifyConfig,
         machine_root: Option<PathBuf>,
         warm_home: Option<PathBuf>,
     ) -> Arc<Self> {
+        Self::build(
+            pool,
+            config,
+            machine_root,
+            warm_home,
+            live::settings_source(),
+        )
+    }
+
+    /// `new` with capacity and unit timeout read from `source` on every use.
+    #[cfg(test)]
+    pub(crate) fn with_limits_source(
+        pool: SqlitePool,
+        config: VerifyConfig,
+        machine_root: Option<PathBuf>,
+        source: live::Source,
+    ) -> Arc<Self> {
+        let warm_home = machine_root.clone();
+        Self::build(pool, config, machine_root, warm_home, source)
+    }
+
+    fn build(
+        pool: SqlitePool,
+        config: VerifyConfig,
+        machine_root: Option<PathBuf>,
+        warm_home: Option<PathBuf>,
+        source: live::Source,
+    ) -> Arc<Self> {
+        let limits = live::Limits::new(&config, source);
         Arc::new(Self {
             pool,
             config,
+            limits,
             machine_root,
             warm_home,
             wake: Arc::new(Notify::new()),
@@ -221,7 +257,7 @@ impl Executor {
     }
 
     fn capacity(&self) -> i64 {
-        i64::from(self.config.capacity).max(1)
+        self.limits.capacity()
     }
 
     /// The sweep's guard: grants `dir` for removal unless a unit holds it, and keeps units off it
@@ -248,7 +284,7 @@ impl Executor {
             weight_of(&request.argv, capacity)
         };
         if request.timeout_ms <= 0 {
-            request.timeout_ms = seconds_to_ms(self.config.unit_timeout_seconds);
+            request.timeout_ms = seconds_to_ms(self.limits.unit_timeout_seconds());
         }
         let submitted = verify_runs::enqueue(&self.pool, &request, now_ms()).await?;
         self.wake.notify_one();
@@ -470,7 +506,7 @@ async fn run_unit(executor: Arc<Executor>, claimed: Claimed, mut reservation: Re
     let timeout_ms = if claimed.timeout_ms > 0 {
         u64::try_from(claimed.timeout_ms).unwrap_or(u64::MAX)
     } else {
-        executor.config.unit_timeout_seconds.saturating_mul(1000)
+        executor.limits.unit_timeout_seconds().saturating_mul(1000)
     };
     let outcome = gate::run_argv(
         &argv,
@@ -701,7 +737,7 @@ mod tests {
     }
 
     async fn wait_terminal(executor: &Arc<Executor>, id: i64) -> State {
-        tokio::time::timeout(Duration::from_secs(20), async {
+        tokio::time::timeout(Duration::from_secs(60), async {
             loop {
                 let state = executor.get(id).await.unwrap().unwrap();
                 if state.status != verify_runs::STATUS_QUEUED
@@ -948,6 +984,172 @@ mod tests {
         assert_eq!(ex.lock().used, 2);
         ex.release_removal(&parked);
         wait_terminal(&ex, queued.id).await;
+    }
+
+    type Setting = Arc<Mutex<Option<VerifyConfig>>>;
+
+    fn settings(capacity: u32, unit_timeout_seconds: u64) -> VerifyConfig {
+        VerifyConfig {
+            capacity,
+            unit_timeout_seconds,
+            ..VerifyConfig::default()
+        }
+    }
+
+    /// An executor whose capacity and unit timeout follow `setting` live; `None` there means
+    /// "nothing new", so the initial config stays.
+    async fn live_executor(initial: VerifyConfig, root: &Path, setting: &Setting) -> Arc<Executor> {
+        let reader = Arc::clone(setting);
+        let source: crate::verify::live::Source = Arc::new(move || reader.lock().unwrap().clone());
+        Executor::with_limits_source(test_pool().await, initial, Some(root.to_path_buf()), source)
+    }
+
+    async fn status_of_unit(ex: &Arc<Executor>, id: i64) -> String {
+        ex.get(id).await.unwrap().unwrap().status
+    }
+
+    /// Waits until every reservation has been given back.
+    async fn wait_idle(ex: &Arc<Executor>) {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while ex.lock().used != 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the reservations were not released in time");
+    }
+
+    #[tokio::test]
+    async fn lowering_capacity_admits_nothing_new_and_kills_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let setting: Setting = Arc::new(Mutex::new(None));
+        let ex = live_executor(settings(3, 600), root.path(), &setting).await;
+        let parked = park(&ex, root.path(), wt.path());
+        let argv = ["git", "--version"];
+        let mut running = Vec::new();
+        for _ in 0..3 {
+            running.push(ex.submit(request(wt.path(), &argv, None, 1)).await.unwrap());
+        }
+        // Parked on the warm dir, so all three hold their weight and stay running.
+        assert_eq!(ex.start_ready().await, 3);
+        assert_eq!(ex.lock().used, 3);
+        let waiting = ex.submit(request(wt.path(), &argv, None, 1)).await.unwrap();
+
+        *setting.lock().unwrap() = Some(settings(1, 600));
+        assert_eq!(
+            ex.start_ready().await,
+            0,
+            "used 3 + 1 does not fit the new capacity of 1"
+        );
+        assert_eq!(ex.lock().used, 3, "the running units keep their weight");
+        for unit in &running {
+            assert_eq!(
+                status_of_unit(&ex, unit.id).await,
+                verify_runs::STATUS_RUNNING,
+                "a running unit is not touched by the lower capacity"
+            );
+        }
+        assert_eq!(
+            status_of_unit(&ex, waiting.id).await,
+            verify_runs::STATUS_QUEUED
+        );
+
+        ex.release_removal(&parked);
+        for unit in &running {
+            let done = wait_terminal(&ex, unit.id).await;
+            assert_eq!(done.status, verify_runs::STATUS_PASSED);
+        }
+        wait_idle(&ex).await;
+        assert_eq!(ex.start_ready().await, 1, "it fits once the units are done");
+        let done = wait_terminal(&ex, waiting.id).await;
+        assert_eq!(done.status, verify_runs::STATUS_PASSED);
+    }
+
+    #[tokio::test]
+    async fn raising_capacity_admits_the_queued_unit_on_the_next_pass() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let setting: Setting = Arc::new(Mutex::new(None));
+        let ex = live_executor(settings(1, 600), root.path(), &setting).await;
+        let parked = park(&ex, root.path(), wt.path());
+        let argv = ["git", "--version"];
+        let first = ex.submit(request(wt.path(), &argv, None, 1)).await.unwrap();
+        let second = ex.submit(request(wt.path(), &argv, None, 1)).await.unwrap();
+        assert_eq!(ex.start_ready().await, 1);
+        assert_eq!(
+            status_of_unit(&ex, second.id).await,
+            verify_runs::STATUS_QUEUED
+        );
+
+        *setting.lock().unwrap() = Some(settings(2, 600));
+        assert_eq!(ex.start_ready().await, 1, "the raised capacity has room");
+        assert_eq!(ex.lock().used, 2);
+        assert_eq!(
+            status_of_unit(&ex, second.id).await,
+            verify_runs::STATUS_RUNNING
+        );
+        ex.release_removal(&parked);
+        wait_terminal(&ex, first.id).await;
+        wait_terminal(&ex, second.id).await;
+    }
+
+    #[tokio::test]
+    async fn an_invalid_setting_keeps_the_last_good_capacity() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let setting: Setting = Arc::new(Mutex::new(None));
+        let ex = live_executor(settings(2, 600), root.path(), &setting).await;
+        let parked = park(&ex, root.path(), wt.path());
+        let argv = ["git", "--version"];
+        let first = ex.submit(request(wt.path(), &argv, None, 1)).await.unwrap();
+        assert_eq!(ex.start_ready().await, 1);
+
+        // Capacity 0 is rejected by `VerifyConfig::check`: the capacity of 2 stays.
+        *setting.lock().unwrap() = Some(settings(0, 600));
+        let second = ex.submit(request(wt.path(), &argv, None, 1)).await.unwrap();
+        assert_eq!(
+            ex.start_ready().await,
+            1,
+            "the old capacity of 2 still has room for a second unit"
+        );
+        assert_eq!(ex.lock().used, 2);
+        let third = ex.submit(request(wt.path(), &argv, None, 1)).await.unwrap();
+        assert_eq!(ex.start_ready().await, 0, "and not for a third");
+        assert_eq!(
+            status_of_unit(&ex, third.id).await,
+            verify_runs::STATUS_QUEUED
+        );
+        ex.release_removal(&parked);
+        wait_terminal(&ex, first.id).await;
+        wait_terminal(&ex, second.id).await;
+        wait_idle(&ex).await;
+        assert_eq!(ex.start_ready().await, 1);
+        wait_terminal(&ex, third.id).await;
+    }
+
+    async fn stored_timeout_ms(ex: &Arc<Executor>, id: i64) -> Option<i64> {
+        sqlx::query_scalar("SELECT timeout_ms FROM verify_runs WHERE id = ?")
+            .bind(id)
+            .fetch_one(&ex.pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_unit_submitted_after_the_timeout_changed_gets_the_new_one() {
+        let root = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let setting: Setting = Arc::new(Mutex::new(None));
+        let ex = live_executor(settings(4, 600), root.path(), &setting).await;
+        let argv = ["git", "--version"];
+        let before = ex.submit(request(wt.path(), &argv, None, 0)).await.unwrap();
+
+        *setting.lock().unwrap() = Some(settings(4, 30));
+        let after = ex.submit(request(wt.path(), &argv, None, 0)).await.unwrap();
+
+        assert_eq!(stored_timeout_ms(&ex, before.id).await, Some(600_000));
+        assert_eq!(stored_timeout_ms(&ex, after.id).await, Some(30_000));
     }
 
     #[tokio::test]

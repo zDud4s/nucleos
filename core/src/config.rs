@@ -4,12 +4,14 @@ use std::path::Path;
 
 mod council;
 mod devtime;
+mod machine;
 mod models;
 mod pillars;
 mod voice;
 
 pub use self::council::*;
 pub use self::devtime::*;
+pub use self::machine::*;
 pub use self::models::*;
 pub use self::pillars::*;
 #[cfg(test)]

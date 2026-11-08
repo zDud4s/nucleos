@@ -328,7 +328,9 @@ mod tests {
     }
 
     async fn settled(pool: &SqlitePool, id: i64) {
-        for _ in 0..500 {
+        // Hang guard only: a loaded machine can starve the task for a long while.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
                 .bind(id)
                 .fetch_one(pool)

@@ -290,7 +290,35 @@ pub async fn run_scheduler(state: AppState) {
     let mut interval = tokio::time::interval(TICK);
     loop {
         interval.tick().await;
-        scheduler_tick(&state, Utc::now()).await;
+        let tick_state = state.clone();
+        survive_tick_panic(async move { scheduler_tick(&tick_state, Utc::now()).await }).await;
+    }
+}
+
+/// Runs one tick on its own task so a panic inside it comes back as a logged value instead of
+/// ending the loop: the loop is spawned bare, and one panic would otherwise stop every scheduled
+/// firing until the daemon restarted (the job loop does the same, see `job::drive::survive_panic`).
+async fn survive_tick_panic<F>(tick: F) -> bool
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    match tokio::spawn(tick).await {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::error!(%error, "a scheduler tick panicked; the loop carries on");
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+mod survive_tick_panic_tests {
+    use super::survive_tick_panic;
+
+    #[tokio::test]
+    async fn a_panicking_scheduler_tick_is_reported_and_the_next_one_still_runs() {
+        assert!(!survive_tick_panic(async { panic!("tick blew up") }).await);
+        assert!(survive_tick_panic(async {}).await);
     }
 }
 
@@ -312,14 +340,17 @@ pub async fn scheduler_tick(state: &AppState, now: DateTime<Utc>) {
     match crate::quota::permits_new_run(state, now).await {
         crate::governance::budget::BudgetDecision::Pause { reason, source, .. } => {
             if source == crate::quota::PAUSE_SOURCE {
-                let _ = sqlx::query(
+                if let Err(error) = sqlx::query(
                     "UPDATE autopilot_global
                      SET quota_hold_started_at = ?, quota_hold_ended_at = NULL
                      WHERE quota_hold_started_at IS NULL OR quota_hold_ended_at IS NOT NULL",
                 )
                 .bind(now.to_rfc3339())
                 .execute(&state.pool)
-                .await;
+                .await
+                {
+                    tracing::warn!(%error, "could not record the start of the quota hold");
+                }
                 tracing::info!(reason = %reason, "quota exhausted; scheduler paused this tick");
             } else {
                 tracing::info!(reason = %reason, "budget exhausted; scheduler paused this tick");
@@ -327,13 +358,16 @@ pub async fn scheduler_tick(state: &AppState, now: DateTime<Utc>) {
             return;
         }
         crate::governance::budget::BudgetDecision::Allow => {
-            let _ = sqlx::query(
+            if let Err(error) = sqlx::query(
                 "UPDATE autopilot_global SET quota_hold_ended_at = ?
                  WHERE quota_hold_started_at IS NOT NULL AND quota_hold_ended_at IS NULL",
             )
             .bind(now.to_rfc3339())
             .execute(&state.pool)
-            .await;
+            .await
+            {
+                tracing::warn!(%error, "could not record the end of the quota hold");
+            }
         }
     }
 
@@ -1713,7 +1747,7 @@ mod tests {
     async fn wait_for_command_result(
         state: &AppState,
     ) -> (Option<String>, Option<i64>, Option<String>) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         loop {
             let row: (Option<String>, Option<i64>, Option<String>, Option<String>) =
                 sqlx::query_as(

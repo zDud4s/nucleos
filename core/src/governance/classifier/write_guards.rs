@@ -223,9 +223,46 @@ pub(super) fn writes_outside_cwd(tool_input: &Value, cwd: Option<&Path>) -> bool
         return false;
     };
 
-    let target = fold_for_containment(&normalize_path(file_path, Some(cwd)));
-    let cwd = fold_for_containment(&normalize_path(&cwd.to_string_lossy(), None));
-    !super::area::inside(&target, &cwd)
+    let normalized = normalize_path(file_path, Some(cwd));
+    let target = fold_for_containment(&normalized);
+    let lexical_cwd = fold_for_containment(&normalize_path(&cwd.to_string_lossy(), None));
+    if !super::area::inside(&target, &lexical_cwd) {
+        return true;
+    }
+    escapes_through_a_link(&normalized, &target, &lexical_cwd, cwd)
+}
+
+/// IO: whether a target that lies lexically in the workspace reaches outside it through a
+/// symlink or junction on the way. The lexical check cannot see `<ws>/link/x` where `link` points
+/// at `C:/Users/x/.claude`. Only a target under the workspace itself is judged (the area's other
+/// roots keep their lexical reading), and only when both the workspace and the deepest existing
+/// ancestor of the target resolve: a path that does not exist yet has nothing to follow.
+fn escapes_through_a_link(
+    normalized: &str,
+    folded_target: &str,
+    folded_cwd: &str,
+    cwd: &Path,
+) -> bool {
+    if folded_target != folded_cwd && !folded_target.starts_with(&format!("{folded_cwd}/")) {
+        return false;
+    }
+    let Ok(real_cwd) = std::fs::canonicalize(cwd) else {
+        return false;
+    };
+    let mut ancestor = Some(Path::new(normalized));
+    while let Some(candidate) = ancestor {
+        if let Ok(real) = std::fs::canonicalize(candidate) {
+            let plain = |path: &Path| {
+                let text = path.to_string_lossy();
+                let text = text.strip_prefix(r"\\?\").unwrap_or(&text);
+                fold_for_containment(&normalize_path(text, None))
+            };
+            let (real, real_cwd) = (plain(&real), plain(&real_cwd));
+            return real != real_cwd && !real.starts_with(&format!("{real_cwd}/"));
+        }
+        ancestor = candidate.parent();
+    }
+    false
 }
 
 /// PURE: splits the first whitespace-delimited token (quotes respected) off `raw`, returning the

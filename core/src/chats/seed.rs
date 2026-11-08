@@ -67,9 +67,11 @@ fn seed_with(
     copy: impl Fn(&Path, &Path) -> std::io::Result<()>,
 ) -> Result<Seeded, String> {
     let Some(main) = main_checkout_of(dir) else {
+        raise_wired_hook(dir);
         return Ok(Seeded::NotAWorktree);
     };
     if dir.join(".claude").exists() || dir.join(".agents").exists() {
+        raise_wired_hook(dir);
         return Ok(Seeded::AlreadyHasWorkflow);
     }
     let mut copied = Vec::new();
@@ -101,6 +103,25 @@ fn seed_with(
         crate::governance::autopilot::wire_classifier_hook(dir)?;
     }
     Ok(Seeded::Done { copied, hook })
+}
+
+/// Brings a hook this folder was wired with before the last upgrade up to the current one.
+///
+/// A folder the seed leaves alone is one that already has a workflow, and its hook entry may carry
+/// the old `timeout`: the CLI would then cut a question at the old limit while the daemon holds it
+/// open, and the tool would fall through to the ordinary permission flow. `rewire_wired_projects`
+/// only reaches autopilot projects, so a chat folder is mended here, before its CLI starts. Only a
+/// folder wired with an old timeout is touched, and a failure is logged, never raised: the turn goes
+/// on exactly as it would have.
+fn raise_wired_hook(dir: &Path) {
+    if !crate::governance::autopilot::classifier_hook_is_wired(dir)
+        || !crate::governance::autopilot::classifier_hook_timeout_is_short(dir)
+    {
+        return;
+    }
+    if let Err(error) = crate::governance::autopilot::wire_classifier_hook(dir) {
+        tracing::warn!(dir = %dir.display(), %error, "could not rewire the hook in the chat folder");
+    }
 }
 
 /// Copies a directory tree. Links are not followed: a junction inside the workflow folders would
@@ -215,6 +236,36 @@ mod tests {
         assert!(!crate::governance::autopilot::classifier_hook_is_wired(
             &tree
         ));
+    }
+
+    #[test]
+    fn a_chat_folder_wired_with_the_old_timeout_is_raised() {
+        let (_root, _main, tree) = checkout_and_worktree(true);
+        crate::governance::autopilot::wire_classifier_hook(&tree).unwrap();
+        let settings_path = tree.join(".claude/settings.json");
+        let mut settings: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        for event in ["PreToolUse", "PostToolUse", "PostToolUseFailure"] {
+            settings["hooks"][event][0]["hooks"][0]["timeout"] = serde_json::json!(3600);
+        }
+        std::fs::write(&settings_path, settings.to_string()).unwrap();
+        // A folder with a workflow of its own, but nothing wired: it must gain no settings.
+        let (_other_root, _other_main, unwired) = checkout_and_worktree(false);
+        std::fs::create_dir_all(unwired.join(".claude/skills/mine")).unwrap();
+
+        assert_eq!(seed_if_empty(&tree).unwrap(), Seeded::AlreadyHasWorkflow);
+        assert_eq!(seed_if_empty(&unwired).unwrap(), Seeded::AlreadyHasWorkflow);
+
+        let settings: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        for event in ["PreToolUse", "PostToolUse", "PostToolUseFailure"] {
+            assert_eq!(
+                settings["hooks"][event][0]["hooks"][0]["timeout"].as_u64(),
+                Some(crate::governance::autopilot::HOOK_TIMEOUT_SECONDS),
+                "{event}"
+            );
+        }
+        assert!(!unwired.join(".claude/settings.json").exists());
     }
 
     #[test]

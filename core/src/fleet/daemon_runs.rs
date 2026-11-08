@@ -41,7 +41,8 @@ struct RunRow {
 const DISCOVER_SQL: &str = "SELECT id, project_id, cwd, status, session_id, cost_usd, created_at,
         completed_at, mode, job_id, runner, model, context_fill, substr(prompt, 1, 2000) AS prompt_head
      FROM runs
-     WHERE status IN ('running', 'awaiting_approval') OR COALESCE(completed_at, created_at) >= ?
+     WHERE (status IN ('running', 'awaiting_approval') OR COALESCE(completed_at, created_at) >= ?)
+       AND imported_at IS NULL
      ORDER BY id DESC LIMIT 500";
 
 pub struct DaemonRuns {

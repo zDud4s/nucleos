@@ -62,7 +62,6 @@ import {
   useAssistantModels,
   useModelGroups,
   useChatTranscript,
-  useChats,
   useIdeConversation,
   useIdeSessions,
   useSetChatProject,
@@ -77,6 +76,7 @@ import {
   useChatFiles,
   useChatProject,
   useDropQueued,
+  useForwardAsMessage,
   useForwardTurn,
   useLiveTurn,
   useRelayChain,
@@ -89,6 +89,7 @@ import {
   usePostChatTitle,
   useSendMessage,
   useStartConversation,
+  useAllChats,
   useStopTurn,
   useSayNow,
   type Attachment,
@@ -100,9 +101,10 @@ import {
   useFreshContext,
   useSetChatAutoCompact,
   useOlderTurns,
-  useSaid,
+  linkSaidHit,
+  useSaidAll,
   useTurnTools,
-  type SaidHit,
+  type SaidHitFrom,
   type Command,
   type Exchange,
   type Ask,
@@ -113,6 +115,9 @@ import {
   type Turn,
 } from "../data/chats";
 import { type RelaySent } from "../lib/turns";
+import { chatKey, chatMachineOf, rememberChatMachine, useChatMachine } from "../data/chatMachines";
+import { useMachines } from "../data/machines";
+import { MachinePicker, useNewWorkMachine } from "../chats/MachinePicker";
 import { type ChatNotice } from "../data/chats";
 import { usePaletteGroup, usePaletteQuery } from "../ui";
 import {
@@ -174,6 +179,7 @@ import { holdMessage, takeHeld, useHeldMessage } from "../chats/held";
 import { clearDraft, readDraft, readScroll, saveDraft, saveScroll } from "../chats/drafts";
 import { useChatTabs } from "../chats/tabs";
 import { DAEMON_NAME } from "../copy";
+import { MoveChatDialog } from "./MoveChat";
 
 /** The short label over a turn of the background service. `DAEMON_NAME` is too long for a turn label. */
 const SPEAKER_LABEL = "service";
@@ -201,7 +207,7 @@ export function Chats() {
   const params = useParams({ strict: false }) as { chatId?: string };
   const chatId = params.chatId ?? null;
 
-  const chats = useChats();
+  const chats = useAllChats();
   const transcript = useChatTranscript(chatId);
 
   const rows = chats.data ?? [];
@@ -293,7 +299,7 @@ export function Chats() {
   };
   const unseen = rows.reduce((total, row) => total + row.waiting, 0);
   const query = usePaletteQuery();
-  const said = useSaid(query);
+  const said = useSaidAll(query);
   const needle = query.trim().toLowerCase();
 
   // Matched here rather than by cmdk, and `shouldFilter={false}` below is the other half of that.
@@ -306,6 +312,7 @@ export function Chats() {
     return `${name} ${row.cwd ?? ""}`.toLowerCase().includes(needle);
   });
   const hits = said.data ?? [];
+  const silent = said.failedMachines;
 
   usePaletteGroup({
     id: ["chats", "named"].join("-"),
@@ -328,22 +335,34 @@ export function Chats() {
     }),
   });
   usePaletteGroup(
-    hits.length === 0
+    hits.length === 0 && silent.length === 0
       ? null
       : {
           id: "chats-said",
           heading: "Said in a conversation",
           prematched: true,
-          items: hits.map((hit) => ({
-            id: `said-${hit.turn_id}`,
-            label: <SaidRow hit={hit} />,
-            match: hit.excerpt,
-            run: () => {
-              openingAChat();
-              void navigate({ to: `/chats/${hit.chat_id}` });
-              setFound({ chatId: hit.chat_id, turnId: hit.turn_id, at: Date.now() });
-            },
-          })),
+          items: [
+            ...hits.map((hit) => ({
+              id: `said-${hit.machine}-${hit.turn_id}`,
+              label: <SaidRow hit={hit} />,
+              match: hit.excerpt,
+              run: () => {
+                // Before navigating, so the turn jump and the transcript read reach the right machine.
+                linkSaidHit(hit);
+                openingAChat();
+                void navigate({ to: `/chats/${hit.chat_id}` });
+                setFound({ chatId: hit.chat_id, turnId: hit.turn_id, at: Date.now() });
+              },
+            })),
+            ...silent.map((machine) => ({
+              id: `said-silent-${machine.id}`,
+              label: <span className="chats-palette-said-text">{machine.name} is not reachable</span>,
+              match: `${machine.name} is not reachable`,
+              // Informational: listed, but not something to choose.
+              disabled: true,
+              run: () => {},
+            })),
+          ],
         },
   );
 
@@ -531,7 +550,7 @@ function ListError({ error }: { error: unknown }) {
 }
 
 /** One search hit: whose half it was, what it said, and which conversation it was said in. */
-function SaidRow({ hit }: { hit: SaidHit }) {
+function SaidRow({ hit }: { hit: SaidHitFrom }) {
   return (
     <span className="chats-palette-said">
       <span className="chats-palette-said-head">
@@ -978,6 +997,10 @@ function ChatDetail({
   find: { turnId: number; at: number } | null;
 }) {
   const seen = usePostChatSeen();
+  const localRow = useChatRow(chatId);
+  // The lists drop moved rows, so a chat with no live copy anywhere is found through the pointer map.
+  const pointer = useAllChats().moved.get(chatId);
+  const movedTo = summary?.moved_to ?? localRow?.moved_to ?? pointer ?? null;
   const pickedUp = useIdeConversation(summary?.ide_session_id ?? null);
   const markedSeen = useRef(false);
   const { box, follows, noteScroll, keepUp } = useFollowsItsEnd();
@@ -1046,6 +1069,8 @@ function ChatDetail({
   }, [keepUp, chatId, transcript.data, box, follows]);
 
   const stale = transcript.isError && transcript.data !== undefined;
+
+  if (movedTo !== null) return <MovedChat chatId={chatId} destination={movedTo} />;
 
   return (
     /* No frame and no title. The tab above already names the conversation — a panel captioned
@@ -1137,6 +1162,40 @@ function ChatDetail({
   );
 }
 
+function MovedChat({ chatId, destination }: { chatId: string; destination: string }) {
+  const navigate = useNavigate();
+  const machines = useMachines();
+  let stored = { id: destination, name: destination };
+  try {
+    const parsed = JSON.parse(destination) as { id?: unknown; name?: unknown };
+    const { id, name } = parsed;
+    if (typeof id === "string" && typeof name === "string") stored = { id, name };
+  } catch {
+    // Older origins stored the display value directly.
+  }
+  // The stored id is the destination's stable machine id; the alias and name matches cover
+  // pointers written before that id existed.
+  const target =
+    machines.find((machine) => machine.machine_id !== undefined && machine.machine_id === stored.id) ??
+    machines.find((machine) => machine.id === stored.id || machine.name === stored.name);
+  return (
+    <section className="chats-detail-inner">
+      <ErrorNote>
+        This chat was moved to {stored.name} and is read-only here.
+      </ErrorNote>
+      {target !== undefined && <Button
+        variant="approve"
+        onClick={() => {
+          rememberChatMachine([chatId], target.id);
+          void navigate({ to: `/chats/${chatId}` });
+        }}
+      >
+        Open on the destination
+      </Button>}
+    </section>
+  );
+}
+
 /** Morning, afternoon or evening, as a pure function so it can be asserted without a clock. */
 export function greetingFor(hour: number): string {
   if (hour < 5) return "Still up";
@@ -1156,6 +1215,7 @@ export function greetingFor(hour: number): string {
 function NothingOpen() {
   const navigate = useNavigate();
   const start = useStartConversation();
+  const [machine, setMachine] = useNewWorkMachine();
 
   return (
     <div className="chats-front">
@@ -1163,11 +1223,13 @@ function NothingOpen() {
         <h2 className="chats-front-greeting">
           {greetingFor(new Date().getHours())}
         </h2>
+        <MachinePicker value={machine} onChange={setMachine} />
         <StartBox
           pending={start.isPending}
           onSay={(model, effort, mode, text, images) =>
             start.mutate(
               {
+                machine,
                 model: model ?? undefined,
                 effort: effort ?? undefined,
                 permissionMode: mode,
@@ -1653,6 +1715,7 @@ function ChatMenu({ chatId }: { chatId: string }) {
   const [helpers, setHelpers] = useState(false);
   const [instructions, setInstructions] = useState(false);
   const [renaming, setRenaming] = useState(false);
+  const [moving, setMoving] = useState(false);
   const row = useChatRow(chatId);
   const helperCount = row?.agents.length ?? 0;
   const instructed = (row?.system_prompt ?? "") !== "";
@@ -1700,6 +1763,7 @@ function ChatMenu({ chatId }: { chatId: string }) {
               {helperCount === 0 ? "none" : `${helperCount}`}
             </span>
           </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => setMoving(true)}>Move chat</DropdownMenuItem>
           <DropdownMenuSeparator />
           {/* Folders and the web live here and nowhere else: the "+" menu only adds to a message. */}
           <DropdownMenuLabel>Limits and access</DropdownMenuLabel>
@@ -1742,6 +1806,7 @@ function ChatMenu({ chatId }: { chatId: string }) {
         open={instructions}
         onOpenChange={setInstructions}
       />
+      <MoveChatDialog chatId={chatId} open={moving} onOpenChange={setMoving} />
     </>
   );
 }
@@ -1796,7 +1861,10 @@ function Project({
  * The project picker over a conversation that already has a directory: opened by `/project`, and
  * closed once a project is chosen. `NoProject` owns the same dialog for the unrooted case.
  */
-function ChangeProject({
+const REMOTE_PROJECT_NOTE =
+  "This chat runs on another machine, so its project can only be changed there.";
+
+export function ChangeProject({
   chatId,
   picking,
   onPicking,
@@ -1806,6 +1874,18 @@ function ChangeProject({
   onPicking: (open: boolean) => void;
 }) {
   const point = useSetChatProject(chatId);
+  const remote = useChatMachine(chatId) !== "here";
+  // A folder path from this machine means nothing on another one, so the change is not offered.
+  if (remote) {
+    return picking ? (
+      <p className="chats-unrooted-why" role="status">
+        {REMOTE_PROJECT_NOTE}{" "}
+        <Button type="button" variant="ghost" onClick={() => onPicking(false)}>
+          Close
+        </Button>
+      </p>
+    ) : null;
+  }
   return (
     <ProjectPicker
       open={picking}
@@ -2075,14 +2155,23 @@ function NoProject({
 }) {
   const point = useSetChatProject(chatId);
   const held = useHeldMessage(chatId);
+  const remote = useChatMachine(chatId) !== "here";
 
   // Once per opening of the conversation: `ChatDetail` is keyed on the chat, so this mount IS the
   // opening. Not on every render, or "Not now" would be answered by the dialog coming straight back.
   useEffect(() => {
-    onPicking(true);
+    if (!remote) onPicking(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  if (remote) {
+    return (
+      <div className="chats-unrooted" role="status">
+        <FolderOpen className="chats-unrooted-icon" strokeWidth={1.5} aria-hidden="true" />
+        <p className="chats-unrooted-why">{REMOTE_PROJECT_NOTE}</p>
+      </div>
+    );
+  }
   return (
     <>
       {/* The whole of an empty window, centred: the one question this conversation is waiting on,
@@ -3044,7 +3133,7 @@ function ModelRefusal({ error }: { error: unknown }) {
 
 /** The conversation this control is about, or undefined while the list is still being read. */
 function useChatRow(chatId: string): ChatSummary | undefined {
-  const chats = useChats();
+  const chats = useAllChats();
   return (chats.data ?? []).find((row) => row.chat_id === chatId);
 }
 
@@ -4303,8 +4392,8 @@ function ChangedRefusal({ error }: { error: unknown }) {
  * There was nowhere else. It is their window and they are looking at it, and the honest reply to
  * somebody who is watching is a question.
  *
- * Urgent on purpose. A turn is held while this stands and the daemon refuses on its own after about
- * forty-five seconds, because the CLI will not hold a hook call longer than that — so this is drawn
+ * Urgent on purpose. A turn is held while this stands and the question stands as long as the CLI lives
+ * (it can be answered hours later from another device) — so this is drawn
  * where the next thing would have appeared rather than tucked away somewhere tidy.
  *
  * **On `auto` a question can now answer itself, and it is drawn anyway.** A local judge races the
@@ -4783,7 +4872,7 @@ const TurnBlock = memo(function TurnBlock({
       {live && <LiveAnswer turnId={turn.id} chatId={chatId} since={turn.createdAt} />}
       {!live && <Thought thought={turn.thought} tokens={turn.thoughtTokens} />}
       {!live && <Plan todos={planOf(turn.did)} />}
-      {!live && <WhatItDid did={turn.did} turnId={turn.id} settled />}
+      {!live && <WhatItDid did={turn.did} turnId={turn.id} chatId={chatId} settled />}
       {!live && turn.answer !== null && <AnswerBlock text={turn.answer} />}
       {!live && turn.answer === null && (
         <p className="chats-turn-answer chats-turn-answer-empty">
@@ -4972,7 +5061,7 @@ function LiveAnswer({
       {/* `settled={false}`: the answers are already on this stream — the live route reads it whole
           on every poll — and the database column they would be fetched from is not written until
           the turn ends. */}
-      <WhatItDid did={live.data?.did ?? []} turnId={turnId} settled={false} />
+      <WhatItDid did={live.data?.did ?? []} turnId={turnId} chatId={chatId} settled={false} />
       <p className="chats-turn-live">
         {/* Turning, because the three words below can stand unchanged for two minutes while a
             build runs and a page that never moves is a page that looks stopped. For anybody who
@@ -5268,15 +5357,18 @@ function Plan({ todos }: { todos: Todo[] }) {
 function WhatItDid({
   did,
   turnId,
+  chatId,
   settled,
 }: {
   did: ToolCall[];
   turnId: number;
+  /** The chat the turn belongs to: turn ids repeat across machines. */
+  chatId: string;
   /** Whether the turn has ended. A live turn's answers are not in the database yet. */
   settled: boolean;
 }) {
   const [open, setOpen] = useState<number | null>(null);
-  const tools = useTurnTools(turnId, settled && open !== null);
+  const tools = useTurnTools(turnId, settled && open !== null, chatId);
   // The fetched list when there is one, and what the transcript gave otherwise. Same calls in the
   // same order either way — the daemon reads both from one column.
   const calls = tools.data?.did ?? did;
@@ -5563,7 +5655,7 @@ function ForwardTurn({ chatId, turn }: { chatId: string; turn: Turn }) {
  * subscribed to only while a panel is open: every settled turn used to subscribe from the moment it
  * was drawn, hundreds of subscriptions on a long transcript, to fill a menu nobody had opened.
  */
-function ForwardPanel({
+export function ForwardPanel({
   chatId,
   turn,
   text,
@@ -5576,9 +5668,21 @@ function ForwardPanel({
   onText: (text: string) => void;
   onSent: () => void;
 }) {
-  const chats = useChats();
+  const chats = useAllChats();
   const forward = useForwardTurn();
-  const elsewhere = (chats.data ?? []).filter((row) => row.chat_id !== chatId);
+  // Forward needs the source turn in the target's own database, so only chats on the source's machine.
+  const sourceMachine = chatMachineOf(chatId);
+  const elsewhere = (chats.data ?? []).filter((row) => row.chat_id !== chatId && row.machine === sourceMachine);
+  // Chats on any other machine cannot be handed the turn (the daemons do not talk to each other), so
+  // they get its text as a plain message under a header saying where it came from. A machine that
+  // is not answering is left out: the message would not arrive and there is no queue to keep it in.
+  const asMessage = useForwardAsMessage();
+  const source = (chats.data ?? []).find((row) => row.chat_id === chatId);
+  // Title and machine name are untrusted text: collapse every whitespace run (newlines included) so
+  // they cannot fake extra header lines.
+  const oneLine = (value: string) => value.replace(/\s+/g, " ").trim();
+  const sourceLabel = `${oneLine(source?.title ?? source?.first_message ?? "a conversation")} on ${oneLine(source?.machineName ?? "This device")}`;
+  const otherMachines = (chats.data ?? []).filter((row) => row.machine !== sourceMachine && !row.unreachable);
 
   return (
     <>
@@ -5593,7 +5697,7 @@ function ForwardPanel({
             value={text}
             onChange={(event) => onText(event.target.value)}
           />
-          {elsewhere.length === 0 && (
+          {elsewhere.length === 0 && otherMachines.length === 0 && (
             <Quiet compact says="there is no other conversation to hand this to." />
           )}
           <ul className="chats-forward-targets" aria-label="Hand it to">
@@ -5615,6 +5719,40 @@ function ForwardPanel({
               </li>
             ))}
           </ul>
+          {otherMachines.length > 0 && (
+            <>
+              <p className="chats-forward-label">
+                On another machine. It is sent as a message, not handed over: the other side sees your
+                words under a note of where they came from.
+              </p>
+              <ul className="chats-forward-targets" aria-label="Send as a message to">
+                {otherMachines.map((row) => (
+                  <li key={row.chat_id}>
+                    <button
+                      type="button"
+                      className="chats-forward-target"
+                      disabled={asMessage.isPending || text.trim() === ""}
+                      onClick={() => {
+                        asMessage.mutate(
+                          { toChatId: row.chat_id, text: `Forwarded from ${sourceLabel}:\n\n${text}` },
+                          { onSuccess: onSent },
+                        );
+                      }}
+                    >
+                      {`${row.title ?? row.first_message ?? "New conversation"} on ${row.machineName ?? "This device"}`}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+              {asMessage.isError && (
+                <p className="chats-forward-refused" role="status">
+                  {isApiRefusal(asMessage.error)
+                    ? (MESSAGE_SENTENCES[asMessage.error.code] ?? asMessage.error.code)
+                    : "could not send the message"}
+                </p>
+              )}
+            </>
+          )}
           {/* The daemon's own word for why, not a sentence this side invented: `relay_cycle`,
               `relay_too_deep`, `owner_away`. A refusal shown as "something went wrong" is one
               nobody can act on, and each of these has a different answer. */}
@@ -6029,7 +6167,7 @@ function Composer({
           // hold lands: the hold re-renders this box at once, and the effect below would otherwise
           // send the line straight back out while the box still believed in a directory.
           flushSync(() => onRefusedRoot?.());
-          void queryClient.invalidateQueries({ queryKey: keys.chats.project(chatId) });
+          void queryClient.invalidateQueries({ queryKey: chatKey(keys.chats.project(chatId), chatId) });
           holdMessage(chatId, { text: line, images: [], command: true }, MAX_PICTURES);
           if (typed) {
             setText("");

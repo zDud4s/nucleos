@@ -29,6 +29,8 @@ import { ConsentListing } from "../project/WorkflowConsent";
 import { MODE_MEANING, MODE_REFUSAL_PROSE } from "../lib/mode";
 import { plural } from "../lib/plural";
 import { Roster } from "./Roster";
+import { isRemote } from "../remote/host";
+import { PathPicker } from "../remote/PathPicker";
 import "./new-project.css";
 import {
   Button,
@@ -96,14 +98,18 @@ export function NewProject() {
   const found = useDetect(looking);
 
   /*
-    The native folder picker. Always offered, so the control is where a person looks for it, but it
-    only answers inside the app: a browser (the preview) has no file dialog that hands back an
-    absolute path, so there the button says so instead. A folder chosen in the app is read at once,
-    as `?path=` is: the person already said which folder, and a click on "look" would be ceremony.
+    Browse stays where a person expects it. The desktop keeps its native folder picker; a remote
+    browser gets the tower's directory picker instead. A chosen folder is read at once, as
+    `?path=` is: the person already said which folder, and a click on "look" would be ceremony.
   */
   const [browseNote, setBrowseNote] = useState<string | null>(null);
+  const [pathPickerOpen, setPathPickerOpen] = useState(false);
   async function browse() {
     setBrowseNote(null);
+    if (isRemote()) {
+      setPathPickerOpen(true);
+      return;
+    }
     if (!isTauri()) {
       setBrowseNote("the folder picker only opens in the desktop app: here, type the path");
       return;
@@ -227,6 +233,18 @@ export function NewProject() {
           )}
         </div>
       </Modal>
+      {isRemote() ? (
+        <PathPicker
+          open={pathPickerOpen}
+          onOpenChange={setPathPickerOpen}
+          initialPath={typed.trim()}
+          onSelect={(path) => {
+            setPathPickerOpen(false);
+            setTyped(path);
+            setLooking(path);
+          }}
+        />
+      ) : null}
     </>
   );
 }

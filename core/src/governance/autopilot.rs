@@ -7,13 +7,14 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
 use crate::judge::JudgeMode;
-use crate::wip::{open_proposals_term, open_shadow_decisions_term};
 
 mod hook_timeout;
 mod refresh;
+mod roster;
 mod stop_timer;
 
-pub use refresh::refresh_wired_hooks;
+pub use refresh::{classifier_hook_timeout_is_short, refresh_wired_hooks, rewire_wired_projects};
+pub use roster::{ProjectSummary, project_roster};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -21,53 +22,6 @@ pub enum Mode {
     Off,
     Shadow,
     Active,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProjectSummary {
-    pub project_id: String,
-    pub mode: Mode,
-    pub project_root: Option<String>,
-    pub pending: i64,
-    /// Shadow-exit progress (§8.2): action classes clearing the bar, out of those exercised so far.
-    pub classes_ready: i64,
-    pub classes_total: i64,
-    /// How many of those ready classes are ones the classifier WITHHELD (`pending_approval`/`deny`).
-    /// Surfaced separately because it is the criterion a project can fail while looking finished:
-    /// every class ready out of every class exercised, and still nothing proving restraint.
-    pub withheld_classes_ready: i64,
-    /// Whether the shell should unlock the promote-to-active control. Computed here rather than in
-    /// the shell so the displayed gate and the enforced rule are the same arithmetic (`shadow.rs`).
-    pub promotable: bool,
-    /// WIP brake (§8.4): proposals waiting on the human, the effective ceiling (`None` = brake off),
-    /// and whether the project is currently deferring new work because of it. A project can be idle
-    /// purely because its queue is full, so the UI has to be able to say so.
-    pub open_review_items: i64,
-    /// The two queues `open_review_items` is the sum of, so a screen can say WHICH one is full.
-    ///
-    /// The total on its own is what produced the report this field exists to answer: the panel said
-    /// the queue was full, the proposals list was empty, and both were telling the truth about
-    /// different queues. Measured on `nucleos` 2026-09-08 -- 0 proposals, 13 shadow decisions --
-    /// which is exactly the shape that makes a correct total look like a broken one.
-    ///
-    /// Summed in Rust rather than in SQL so the parts and the whole cannot disagree: there is no
-    /// second expression here that could be changed without the first.
-    pub open_proposals: i64,
-    pub open_shadow_decisions: i64,
-    pub wip_limit: Option<i64>,
-    pub queue_full: bool,
-    /// The last thing this project's gate said, and when it said it.
-    ///
-    /// The LAST verdict and not a tally over a window, because the roster's question is *is this
-    /// one broken right now*. [`crate::project::readings`] already answers "how has it been going"
-    /// for the one project somebody opened, and a thirty-day count in a roster column would read
-    /// green for a project that broke this morning.
-    ///
-    /// `None` means this project has never produced one — no gate command, or no run that got far
-    /// enough to reach it. `0032_run_gate.sql` argues that case: it is not a pass and not a
-    /// failure, it is nobody having asked for a measurement.
-    pub last_gate: Option<String>,
-    pub last_gate_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -523,148 +477,17 @@ pub async fn autopilot_projects(pool: &SqlitePool) -> sqlx::Result<Vec<(String, 
         .collect()
 }
 
-/// One raw roster row: `(project_id, mode, project_root, pending, open_proposals,
-/// open_shadow_decisions, wip_override)`. Named because the tuple carries seven positional fields
-/// and is only readable at the destructure.
-type RosterRow = (String, String, Option<String>, i64, i64, i64, Option<i64>);
-
-/// The most recent gate verdict for every project, in one query.
-///
-/// One grouped read and not one per row, for the reason `shadow_readiness` is one: the shell polls
-/// the roster every three seconds, and a call per project turns a roster of twenty-five into
-/// twenty-five round trips on every tick.
-///
-/// **This leans on a documented SQLite behaviour and says so, because it is not standard SQL.** With
-/// a bare column beside `MAX(...)` in an aggregate query, SQLite takes that column from the row
-/// that supplied the maximum — so `gate_status` here is the status of the newest run, not an
-/// arbitrary one from the group. Every other engine is free to return any row, and this query would
-/// have to be rewritten as a window function the day this stops being SQLite.
-///
-/// Rows with no verdict are excluded rather than counted as anything: a run that never reached its
-/// gate says nothing about the code, and the last run that DID reach one is still the answer.
-async fn last_gate_verdicts(
-    pool: &SqlitePool,
-) -> sqlx::Result<std::collections::HashMap<String, (String, String)>> {
-    let rows: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT project_id, gate_status, MAX(completed_at)
-         FROM runs
-         WHERE project_id IS NOT NULL
-           AND gate_status IS NOT NULL
-           AND completed_at IS NOT NULL
-         GROUP BY project_id",
-    )
-    .fetch_all(pool)
-    .await?;
-
-    Ok(rows
-        .into_iter()
-        .map(|(project_id, status, at)| (project_id, (status, at)))
-        .collect())
-}
-
-pub async fn project_roster(pool: &SqlitePool) -> sqlx::Result<Vec<ProjectSummary>> {
-    // Every subquery below that also feeds the WIP brake is EXPANDED FROM `wip.rs`, not retyped.
-    // These were two hand-written copies of one piece of arithmetic, and they drifted twice --
-    // most recently into a roster that displayed 19 against a daemon that refused work at 13. The
-    // macro takes the only thing that differs (a bound `?1` there, a correlated `state.project_id`
-    // here) as an argument, so the filters cannot be changed in one place and not the other.
-    //
-    // Selected as two columns and added in Rust, rather than summed in SQL: the parts are what the
-    // shell needs to point at a screen, and deriving the total from them is one fewer expression
-    // that could go out of step with itself.
-    // The shadow-decisions term is computed ONCE per row, in a MATERIALIZED CTE, and `pending` /
-    // `open_shadow_decisions` are derived from that column. Written as a plain subquery SQLite
-    // flattens it and pastes the expression back into both places (measured with EXPLAIN QUERY
-    // PLAN: the term ran twice per row), and that term is the expensive one.
-    let projects: Vec<RosterRow> = sqlx::query_as(concat!(
-        "WITH s AS MATERIALIZED (
-            SELECT state.project_id AS project_id, state.mode AS mode,
-                   state.project_root AS project_root,
-                   ",
-        open_shadow_decisions_term!("state.project_id"),
-        " AS open_shadow_decisions,
-                   (SELECT COUNT(*)
-                    FROM runs
-                    WHERE runs.project_id = state.project_id
-                      AND runs.status = 'awaiting_approval') AS awaiting,
-                   ",
-        open_proposals_term!("state.project_id"),
-        " AS open_proposals,
-                   state.wip_limit AS wip_limit
-            FROM autopilot_state AS state)
-         SELECT project_id, mode, project_root,
-                open_shadow_decisions + awaiting AS pending,
-                open_proposals, open_shadow_decisions, wip_limit
-         FROM s
-         ORDER BY project_id"
-    ))
-    .fetch_all(pool)
-    .await?;
-
-    // One grouped query for every project's readiness, rather than a scoreboard call per row — the
-    // shell polls this endpoint every 3s. Same reason the WIP ceiling is resolved from one global
-    // read plus the per-row override already selected above.
-    let readiness = crate::governance::shadow::shadow_readiness(pool).await?;
-    let global_wip_limit = crate::wip::global_wip_limit(pool).await?;
-    let gates = last_gate_verdicts(pool).await?;
-
-    projects
-        .into_iter()
-        .map(
-            |(
-                project_id,
-                mode,
-                project_root,
-                pending,
-                open_proposals,
-                open_shadow_decisions,
-                wip_override,
-            )| {
-                let mode = Mode::from_db_str(&mode).ok_or_else(|| {
-                    sqlx::Error::Protocol(format!("invalid autopilot mode in database: {mode}"))
-                })?;
-                let (classes_ready, classes_total, withheld_classes_ready) =
-                    readiness.get(&project_id).copied().unwrap_or((0, 0, 0));
-                let wip_limit = wip_override.or(global_wip_limit);
-                let (last_gate, last_gate_at) = match gates.get(&project_id) {
-                    Some((status, at)) => (Some(status.clone()), Some(at.clone())),
-                    None => (None, None),
-                };
-                let open_review_items = open_proposals + open_shadow_decisions;
-                Ok(ProjectSummary {
-                    project_id,
-                    mode,
-                    project_root,
-                    pending,
-                    classes_ready,
-                    classes_total,
-                    withheld_classes_ready,
-                    promotable: crate::governance::shadow::promotable(
-                        classes_ready,
-                        classes_total,
-                        withheld_classes_ready,
-                    ),
-                    open_review_items,
-                    open_proposals,
-                    open_shadow_decisions,
-                    wip_limit,
-                    queue_full: crate::wip::queue_full(open_review_items, wip_limit),
-                    last_gate,
-                    last_gate_at,
-                })
-            },
-        )
-        .collect()
-}
-
 /// The hook script that makes a project's tool calls reach this daemon. Written with forward
 /// slashes because it is compared against a JSON command string, where that is the spelling.
 pub const HOOK_SCRIPT: &str = ".claude/hooks/ask_daemon.py";
 
-/// The timeout, in seconds, written onto the tool-event hook entries. A shell command can wait for
-/// admission inside the hook (`admit_heavy`), far longer than the CLI's default; the script's own
-/// budget (`ADMIT_HOOK_BUDGET_SECONDS`, 3300) stays below this.
-pub const HOOK_TIMEOUT_SECONDS: u64 = 3600;
+/// The timeout, in seconds, written onto the tool-event hook entries: thirty days. A shell command
+/// can wait for admission inside the hook (`admit_heavy`), far longer than the CLI's default, and a
+/// question put to a person (`wait_for_answer`) can stand for as long as the CLI lives. The script's
+/// own waits stay below this: the admission budget (`ADMIT_HOOK_BUDGET_SECONDS`, 3300) and the ask
+/// window plus half an hour. A hook the CLI cuts by timeout does not block the tool, so the hook
+/// must end first and give the answer itself.
+pub const HOOK_TIMEOUT_SECONDS: u64 = 2_592_000;
 
 /// This daemon's classifier hook, carried inside the binary so it can be installed anywhere.
 ///
@@ -1955,6 +1778,28 @@ pub mod tests {
         );
     }
 
+    /// A roster row with nothing happening: the baseline the roster tests override field by field.
+    fn idle_summary(project_id: &str, mode: Mode) -> ProjectSummary {
+        ProjectSummary {
+            project_id: project_id.to_owned(),
+            mode,
+            project_root: None,
+            pending: 0,
+            classes_ready: 0,
+            classes_total: 0,
+            withheld_classes_ready: 0,
+            promotable: false,
+            open_review_items: 0,
+            open_proposals: 0,
+            open_shadow_decisions: 0,
+            wip_limit: Some(3),
+            queue_full: false,
+            last_gate: None,
+            last_gate_at: None,
+            remote: None,
+        }
+    }
+
     async fn test_pool() -> SqlitePool {
         crate::testdb::fresh_pool().await
     }
@@ -2052,6 +1897,72 @@ pub mod tests {
 
         assert!(command.starts_with(expected_prefix), "{command}");
         assert!(command.ends_with(&format!("/{HOOK_SCRIPT}\"")), "{command}");
+    }
+
+    /// A project wired by an older daemon is brought up at boot: its entry is raised from the old
+    /// hour to the new timeout and its script is replaced. One that never had the hook gains none.
+    #[tokio::test]
+    async fn rewiring_at_boot_raises_an_old_project_and_its_script() {
+        let pool = test_pool().await;
+        let old = TempDir::new().unwrap();
+        let bare = TempDir::new().unwrap();
+        wire_classifier_hook(old.path()).unwrap();
+        let settings_path = old.path().join(".claude/settings.json");
+        let mut settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        for event in ["PreToolUse", "PostToolUse", "PostToolUseFailure"] {
+            settings["hooks"][event][0]["hooks"][0]["timeout"] = serde_json::json!(3600);
+        }
+        fs::write(&settings_path, settings.to_string()).unwrap();
+        let script = old.path().join(".claude/hooks/ask_daemon.py");
+        fs::write(&script, "# an older script").unwrap();
+        for (id, root) in [("old", old.path()), ("bare", bare.path())] {
+            sqlx::query(
+                "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES (?, 'active', ?)",
+            )
+            .bind(id)
+            .bind(root.to_str().unwrap())
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(rewire_wired_projects(&pool).await.unwrap(), 1);
+
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        for event in ["PreToolUse", "PostToolUse", "PostToolUseFailure"] {
+            assert_eq!(
+                settings["hooks"][event][0]["hooks"][0]["timeout"].as_u64(),
+                Some(HOOK_TIMEOUT_SECONDS),
+                "{event}"
+            );
+        }
+        assert_eq!(fs::read_to_string(&script).unwrap(), HOOK_SOURCE);
+        assert!(!bare.path().join(".claude").exists());
+    }
+
+    /// A later daemon's script still reaches a project whose timeout is current, and a project with
+    /// nothing behind is not written at all.
+    #[tokio::test]
+    async fn rewiring_at_boot_refreshes_a_stale_script_and_leaves_a_current_project_alone() {
+        let pool = test_pool().await;
+        let root = TempDir::new().unwrap();
+        wire_classifier_hook(root.path()).unwrap();
+        let script = root.path().join(".claude/hooks/ask_daemon.py");
+        fs::write(&script, "# an older script").unwrap();
+        sqlx::query(
+            "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('p', 'active', ?)",
+        )
+        .bind(root.path().to_str().unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(rewire_wired_projects(&pool).await.unwrap(), 1);
+        assert_eq!(fs::read_to_string(&script).unwrap(), HOOK_SOURCE);
+
+        assert_eq!(rewire_wired_projects(&pool).await.unwrap(), 0);
     }
 
     #[test]
@@ -2198,57 +2109,9 @@ pub mod tests {
         assert_eq!(
             project_roster(&pool).await.unwrap(),
             vec![
-                ProjectSummary {
-                    project_id: "project-active".to_owned(),
-                    mode: Mode::Active,
-                    project_root: None,
-                    pending: 0,
-                    classes_ready: 0,
-                    classes_total: 0,
-                    withheld_classes_ready: 0,
-                    promotable: false,
-                    open_review_items: 0,
-                    open_proposals: 0,
-                    open_shadow_decisions: 0,
-                    wip_limit: Some(3),
-                    queue_full: false,
-                    last_gate: None,
-                    last_gate_at: None,
-                },
-                ProjectSummary {
-                    project_id: "project-off".to_owned(),
-                    mode: Mode::Off,
-                    project_root: None,
-                    pending: 0,
-                    classes_ready: 0,
-                    classes_total: 0,
-                    withheld_classes_ready: 0,
-                    promotable: false,
-                    open_review_items: 0,
-                    open_proposals: 0,
-                    open_shadow_decisions: 0,
-                    wip_limit: Some(3),
-                    queue_full: false,
-                    last_gate: None,
-                    last_gate_at: None,
-                },
-                ProjectSummary {
-                    project_id: "project-shadow".to_owned(),
-                    mode: Mode::Shadow,
-                    project_root: None,
-                    pending: 0,
-                    classes_ready: 0,
-                    classes_total: 0,
-                    withheld_classes_ready: 0,
-                    promotable: false,
-                    open_review_items: 0,
-                    open_proposals: 0,
-                    open_shadow_decisions: 0,
-                    wip_limit: Some(3),
-                    queue_full: false,
-                    last_gate: None,
-                    last_gate_at: None,
-                },
+                idle_summary("project-active", Mode::Active),
+                idle_summary("project-off", Mode::Off),
+                idle_summary("project-shadow", Mode::Shadow),
             ]
         );
     }
@@ -2272,39 +2135,10 @@ pub mod tests {
         assert_eq!(
             project_roster(&pool).await.unwrap(),
             vec![
+                idle_summary("project-off", Mode::Off),
                 ProjectSummary {
-                    project_id: "project-off".to_owned(),
-                    mode: Mode::Off,
-                    project_root: None,
-                    pending: 0,
-                    classes_ready: 0,
-                    classes_total: 0,
-                    withheld_classes_ready: 0,
-                    promotable: false,
-                    open_review_items: 0,
-                    open_proposals: 0,
-                    open_shadow_decisions: 0,
-                    wip_limit: Some(3),
-                    queue_full: false,
-                    last_gate: None,
-                    last_gate_at: None,
-                },
-                ProjectSummary {
-                    project_id: "project-rooted".to_owned(),
-                    mode: Mode::Shadow,
                     project_root: Some("/some/root".to_owned()),
-                    pending: 0,
-                    classes_ready: 0,
-                    classes_total: 0,
-                    withheld_classes_ready: 0,
-                    promotable: false,
-                    open_review_items: 0,
-                    open_proposals: 0,
-                    open_shadow_decisions: 0,
-                    wip_limit: Some(3),
-                    queue_full: false,
-                    last_gate: None,
-                    last_gate_at: None,
+                    ..idle_summary("project-rooted", Mode::Shadow)
                 },
             ]
         );
@@ -2455,26 +2289,16 @@ pub mod tests {
         assert_eq!(
             project_roster(&pool).await.unwrap(),
             vec![ProjectSummary {
-                project_id: "project-pending".to_owned(),
-                mode: Mode::Active,
-                project_root: None,
                 pending: 3,
-                classes_ready: 0,
                 classes_total: 1,
-                withheld_classes_ready: 0,
-                promotable: false,
                 // The one unreviewed shadow decision seeded above. It counts here as well as in
                 // `pending`, because the WIP brake throttles on everything waiting for a human and
                 // a shadow run mints no proposal to stand for it. The overlap is deliberate:
                 // `pending` is what the person is shown, `open_review_items` is what the brake
                 // measures, and both have to see the same backlog.
                 open_review_items: 1,
-                open_proposals: 0,
                 open_shadow_decisions: 1,
-                wip_limit: Some(3),
-                queue_full: false,
-                last_gate: None,
-                last_gate_at: None,
+                ..idle_summary("project-pending", Mode::Active)
             }]
         );
     }
@@ -2491,23 +2315,7 @@ pub mod tests {
 
         assert_eq!(
             project_roster(&pool).await.unwrap(),
-            vec![ProjectSummary {
-                project_id: "project-idle".to_owned(),
-                mode: Mode::Off,
-                project_root: None,
-                pending: 0,
-                classes_ready: 0,
-                classes_total: 0,
-                withheld_classes_ready: 0,
-                promotable: false,
-                open_review_items: 0,
-                open_proposals: 0,
-                open_shadow_decisions: 0,
-                wip_limit: Some(3),
-                queue_full: false,
-                last_gate: None,
-                last_gate_at: None,
-            }]
+            vec![idle_summary("project-idle", Mode::Off)]
         );
     }
 

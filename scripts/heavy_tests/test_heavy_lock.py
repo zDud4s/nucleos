@@ -21,6 +21,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -31,6 +32,11 @@ import os, pathlib, sys, time
 
 d = pathlib.Path(os.environ["SLEEPER_DIR"])
 tag = sys.argv[-1]
+# heavy.py itself calls `cargo metadata` / `cargo clean` through this launcher when a target
+# slot changes owner; those are not the command under test and must return at once (else
+# `--format-version 1` became a "1" sleeper that blocked the slot handoff for minutes).
+if "metadata" in sys.argv[1:] or "clean" in sys.argv[1:]:
+    sys.exit(0)
 # order.txt and .token first, the .start marker last: tests treat the marker as "started" and
 # then read the other marks, so the marker must not be visible before what it vouches for.
 with open(d / "order.txt", "a") as f:
@@ -137,9 +143,10 @@ class LockTests(unittest.TestCase):
     # ---- helpers -------------------------------------------------------------------
     def env(self, capacity: int = 8, **extra: str) -> dict:
         env = dict(os.environ)
-        for k in ("NUCLEOS_HEAVY", "NUCLEOS_HEAVY_TOKEN", "NUCLEOS_HEAVY_HELD",
-                  "NUCLEOS_HEAVY_PRIO", "NUCLEOS_HEAVY_WAIT_MAX", "NUCLEOS_HEAVY_MAIN"):
-            env.pop(k, None)
+        # Strip every inherited NUCLEOS_HEAVY* variable (the shell may export any of them).
+        for k in list(env):
+            if k.startswith("NUCLEOS_HEAVY"):
+                env.pop(k)
         env.update(
             NUCLEOS_HEAVY_DIR=str(self.state),
             NUCLEOS_HEAVY_CAPACITY=str(capacity),
@@ -216,7 +223,9 @@ class LockTests(unittest.TestCase):
         return sorted(h.iterdir()) if h.exists() else []
 
     def assert_started(self, tag: str) -> None:
-        self.assertTrue(wait_for(lambda: self.started(tag)), f"{tag} never started")
+        # Backstop, not an expectation: success returns at once. A fixed 30 s clock only measured
+        # machine load (the full suite runs ~1200-1650 s under a busy broker).
+        self.assertTrue(wait_for(lambda: self.started(tag), 300), f"{tag} never started")
 
     def assert_stays_waiting(self, tag: str, secs: float = 1.2) -> None:
         time.sleep(secs)
@@ -294,6 +303,16 @@ class LockTests(unittest.TestCase):
             self.assertEqual(self.finish(p)[0], 0)
 
     # 31
+    def test_env_ignores_inherited_heavy_variables(self) -> None:
+        # A shell exporting NUCLEOS_HEAVY_* must not leak into the brokers under test.
+        leaked = {"NUCLEOS_HEAVY_TARGET_SLOTS": "2", "NUCLEOS_HEAVY_CAPACITY": "99",
+                  "NUCLEOS_HEAVY_ADMISSION": "dynamic"}
+        with mock.patch.dict(os.environ, leaked):
+            env = self.env(capacity=5)
+        self.assertNotIn("NUCLEOS_HEAVY_TARGET_SLOTS", env)
+        self.assertNotIn("NUCLEOS_HEAVY_ADMISSION", env)
+        self.assertEqual(env["NUCLEOS_HEAVY_CAPACITY"], "5")
+
     def test_priority_inheritance_lifts_holder(self) -> None:
         cap = 2
         # B (prio 1) spends the whole machine budget (cargo test = weight 2).

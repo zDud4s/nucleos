@@ -262,6 +262,21 @@ fn cut_chat_answer(seen: &str) -> Option<String> {
     (!text.trim().is_empty()).then_some(text)
 }
 
+/// The compare-and-set that ends a running row: it changes the row only while it is still `running`.
+async fn write_terminal_status(
+    pool: &sqlx::SqlitePool,
+    id: i64,
+    status: &str,
+    now: &str,
+) -> sqlx::Result<sqlx::sqlite::SqliteQueryResult> {
+    sqlx::query("UPDATE runs SET status = ?, completed_at = ? WHERE id = ? AND status = 'running'")
+        .bind(status)
+        .bind(now)
+        .bind(id)
+        .execute(pool)
+        .await
+}
+
 /// Terminates an in-flight run: aborts its task (which, via `kill_on_drop`, kills the CLI process)
 /// and records `status`. Removing the entry from the handle map is the atomic arbiter when several
 /// termination reasons race (user cancel, timeout, or Chunk 3's §8.4 approval-pause): whoever removes
@@ -275,7 +290,11 @@ fn cut_chat_answer(seen: &str) -> Option<String> {
 /// meaning "this call terminated the task" — not "the run ended up in `status`". A caller that needs
 /// the latter reads the row back; today none does.
 pub async fn finalize_termination(state: &AppState, id: i64, status: &str) -> bool {
-    let handle = state.run_handles.lock().unwrap().remove(&id);
+    let handle = state
+        .run_handles
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&id);
     match handle {
         Some(h) => {
             // Taken BEFORE the abort. The task's `Registration` removes this entry when it drops, and
@@ -290,14 +309,19 @@ pub async fn finalize_termination(state: &AppState, id: i64, status: &str) -> bo
             let now = chrono::Utc::now().to_rfc3339();
             // First writer wins: no rows means the run finalised itself while this call was on its
             // way, which is an outcome, not a failure — nothing to retry and nothing to report.
-            let result = sqlx::query(
-                "UPDATE runs SET status = ?, completed_at = ? WHERE id = ? AND status = 'running'",
-            )
-            .bind(status)
-            .bind(&now)
-            .bind(id)
-            .execute(&state.pool)
-            .await;
+            //
+            // An ERROR is not an outcome, though: the handle is already gone, so a second cancel
+            // answers 404 and nothing else would ever write the terminal status. The write is tried
+            // a few times, with a short wait, before it is given up on (the daemon's restart
+            // reconcile is then the only thing left to end the row).
+            let mut result = write_terminal_status(&state.pool, id, status, &now).await;
+            for wait_ms in [100u64, 400, 1600] {
+                if result.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+                result = write_terminal_status(&state.pool, id, status, &now).await;
+            }
             warn_on_terminal_write_err(&result, id, status);
             // Only for the terminator that won. No rows means the body finished on its own and wrote
             // its own stdout and usage, read off a real `result` — those are the ones to keep.
@@ -414,7 +438,15 @@ pub async fn cancel_run(State(state): State<AppState>, Path(id): Path<i64>) -> S
 }
 
 /// A run recovered from orphaned state: (id, project_id, chat_id, mode)
-pub(super) type ReconcileRow = (i64, Option<String>, Option<String>, Option<String>);
+pub(super) type ReconcileRow = (
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    i64,
+);
 
 /// Marks every run still `"running"` as `"interrupted"` — called once at startup to recover from a
 /// daemon crash that left in-flight runs' rows stuck (spec §3.2). Returns how many rows it changed.
@@ -422,12 +454,12 @@ pub async fn reconcile_orphaned_runs(pool: &sqlx::SqlitePool) -> Result<u64, sql
     let now = chrono::Utc::now().to_rfc3339();
     let reconciled: Vec<ReconcileRow> = sqlx::query_as(
         "UPDATE runs SET status = 'interrupted', completed_at = ? WHERE status = 'running'
-         RETURNING id, project_id, chat_id, mode",
+         RETURNING id, project_id, chat_id, mode, origin, from_relay_id, read_untrusted",
     )
     .bind(&now)
     .fetch_all(pool)
     .await?;
-    for (id, project_id, chat_id, mode) in &reconciled {
+    for (id, project_id, chat_id, mode, origin, from_relay_id, read_untrusted) in &reconciled {
         let _ = crate::feed::append(
             pool,
             project_id.as_deref(),
@@ -437,23 +469,42 @@ pub async fn reconcile_orphaned_runs(pool: &sqlx::SqlitePool) -> Result<u64, sql
             Some(&crate::feed::run_subject(pool, *id).await),
         )
         .await;
-        // A chat turn the restart cut says so in its conversation. A failed post never fails the
-        // reconcile: the run is already `interrupted` and the notice is only a courtesy.
-        if let (Some(chat_id), Some("assistant")) = (chat_id.as_deref(), mode.as_deref())
-            && let Err(error) = crate::chats::notices::post_system(
+        // A chat turn the restart cut says so in its conversation, and below the resume limit is
+        // queued to continue (drained at start-up, after this runs). A failed post never fails
+        // the reconcile: the run is already `interrupted` and the notice is only a courtesy.
+        if let (Some(chat_id), Some("assistant")) = (chat_id.as_deref(), mode.as_deref()) {
+            let body = match crate::chats::auto_resume::resume_or_notice(
+                pool,
+                chat_id,
+                crate::chats::auto_resume::CutTurn {
+                    origin: origin.as_deref(),
+                    from_relay_id: *from_relay_id,
+                    read_untrusted: *read_untrusted != 0,
+                },
+            )
+            .await
+            {
+                Ok(body) => body,
+                Err(error) => {
+                    tracing::warn!(run_id = *id, %error, "could not queue the resume of an interrupted turn");
+                    crate::chats::notices::RESTART_NOTICE
+                }
+            };
+            if let Err(error) = crate::chats::notices::post_system(
                 pool,
                 chat_id,
                 crate::chats::notices::KIND_RESTART,
                 *id,
-                crate::chats::notices::RESTART_NOTICE,
+                body,
             )
             .await
-        {
-            tracing::warn!(
-                run_id = *id,
-                %error,
-                "could not tell a conversation its turn was cut by the restart"
-            );
+            {
+                tracing::warn!(
+                    run_id = *id,
+                    %error,
+                    "could not tell a conversation its turn was cut by the restart"
+                );
+            }
         }
     }
     Ok(reconciled.len() as u64)

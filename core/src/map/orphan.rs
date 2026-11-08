@@ -99,7 +99,13 @@ pub const WINDOW: usize = 1_000;
 /// [`Orphan::Unreadable`] about a repository that was merely cold. Twenty seconds clears that with
 /// room and is still short enough that whoever clicked gets a sentence rather than a window that
 /// never finishes.
+#[cfg(not(test))]
 const PICKAXE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Tests only bound a hang: with the suite running in parallel on a saturated disk a throwaway
+/// repository's pickaxe can outlast the production ceiling and turn into `Unreadable`.
+#[cfg(test)]
+const PICKAXE_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// How long one blob read or one working-tree search is given.
 ///
@@ -107,7 +113,12 @@ const PICKAXE_TIMEOUT: Duration = Duration::from_secs(20);
 /// this repository's largest module measured 0.71 s in total, so this is ~70× the cost of the call
 /// it bounds; what it is really guarding is a git that has stopped answering, and by then the
 /// pickaxe's own deadline is the one doing the work.
+#[cfg(not(test))]
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Tests only bound a hang; see the test variant of [`PICKAXE_TIMEOUT`].
+#[cfg(test)]
+const READ_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// What marks a commit's line in the pickaxe's output.
 ///

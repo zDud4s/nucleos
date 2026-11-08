@@ -24,6 +24,14 @@ pub const EXIT_PORT_BUSY: i32 = 20;
 /// code only keeps it apart from the plain `1`, which means "somebody stopped it".
 pub const EXIT_CREDENTIAL_STORE: i32 = 78;
 
+/// The exit code of a daemon that was asked to restart (`POST /system/restart`) and has settled.
+/// The supervisor relaunches at once, after swapping in a staged executable, and the restart does
+/// not count against the failure budget. An older supervisor would read 21 as a failure and
+/// restart, but it sets no supervised marker, so its daemon takes the relauncher path and exits 0.
+/// In that narrow case (a supervisor that predates this and outlives an exe replacement) the job
+/// kills the relauncher and the daemon stays down until the next logon or a manual start.
+pub const EXIT_RESTART_REQUESTED: i32 = 21;
+
 /// `STATUS_CONTROL_C_EXIT` (0xC000013A) as the signed code `ExitStatus::code` reports.
 pub const EXIT_CONTROL_C: i32 = 0xC000_013A_u32 as i32;
 
@@ -36,6 +44,8 @@ pub enum ExitKind {
     Deliberate,
     /// Another daemon already owns the port.
     PortBusy,
+    /// The daemon left on purpose to be restarted (`EXIT_RESTART_REQUESTED`).
+    RestartRequested,
     /// Anything else, including a panic (101) and a process the OS ended without a code.
     Failure,
 }
@@ -98,13 +108,17 @@ pub fn classify_exit(code: Option<i32>) -> ExitKind {
         Some(0) => ExitKind::Clean,
         Some(1 | -1 | EXIT_CONTROL_C) => ExitKind::Deliberate,
         Some(EXIT_PORT_BUSY) => ExitKind::PortBusy,
+        Some(EXIT_RESTART_REQUESTED) => ExitKind::RestartRequested,
         _ => ExitKind::Failure,
     }
 }
 
 /// PURE: whether an exit with this code is worth a relaunch at all (before the budget is looked at).
 pub fn should_restart(code: Option<i32>) -> bool {
-    classify_exit(code) == ExitKind::Failure
+    matches!(
+        classify_exit(code),
+        ExitKind::Failure | ExitKind::RestartRequested
+    )
 }
 
 /// PURE: the pause before restart number `restarts_in_window` (0 is the first restart).
@@ -142,6 +156,12 @@ impl Tracker {
         match classify_exit(code) {
             ExitKind::Clean | ExitKind::Deliberate => return Decision::Stop(StopReason::Stopped),
             ExitKind::PortBusy => return Decision::Stop(StopReason::PortBusy),
+            // Asked for, so no pause and no budget spent; the history is left as it was.
+            ExitKind::RestartRequested => {
+                return Decision::Restart {
+                    after: Duration::ZERO,
+                };
+            }
             ExitKind::Failure => {}
         }
         if ended.saturating_sub(started) >= self.policy.healthy_after {
@@ -209,6 +229,35 @@ mod tests {
         assert!(!should_restart(Some(EXIT_PORT_BUSY)));
         // A panic must not look like a taken port.
         assert_ne!(EXIT_PORT_BUSY, 101);
+    }
+
+    #[test]
+    fn a_requested_restart_is_relaunched_at_once_and_spends_no_budget() {
+        assert_eq!(
+            classify_exit(Some(EXIT_RESTART_REQUESTED)),
+            ExitKind::RestartRequested
+        );
+        assert!(should_restart(Some(EXIT_RESTART_REQUESTED)));
+        assert_ne!(EXIT_RESTART_REQUESTED, EXIT_PORT_BUSY);
+        let policy = Policy {
+            max_restarts: 1,
+            ..Policy::default()
+        };
+        let mut tracker = Tracker::new(policy);
+        for n in 0..4 {
+            assert_eq!(
+                tracker.on_exit(Some(EXIT_RESTART_REQUESTED), secs(n), secs(n + 1)),
+                Decision::Restart {
+                    after: Duration::ZERO
+                }
+            );
+        }
+        assert_eq!(tracker.restarts_counted(), 0);
+        // The one failure the budget allows is still whole.
+        assert!(matches!(
+            tracker.on_exit(Some(101), secs(10), secs(11)),
+            Decision::Restart { .. }
+        ));
     }
 
     #[test]

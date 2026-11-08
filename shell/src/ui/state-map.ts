@@ -220,6 +220,7 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     work_tree_conflict: { tone: "paused", label: "node tree branch did not merge" },
     work_tree_corrupt: { tone: "danger", label: "node tree unreadable" },
     work_tree_root_start_failed: { tone: "danger", label: "node tree root did not start" },
+    work_tree_root_started: { tone: "info", label: "node tree root started" },
     work_tree_relaunch_skipped: { tone: "info", label: "node relaunch skipped" },
     // The audit before a spec's tree could not run (`spec_backlog/finish.rs`): the spec went on unaudited, said once.
     spec_audit_unavailable: { tone: "info", label: "spec audit unavailable" },
@@ -269,6 +270,8 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     vcs_request_finished: { tone: "info", label: "git request settled" },
     vcs_request_cancelled: { tone: "off", label: "git request cancelled" },
     vcs_request_interrupted: { tone: "paused", label: "git request interrupted" },
+    // A running request whose executor was gone, settled from git state at startup.
+    vcs_request_reconciled: { tone: "info", label: "git request reconciled" },
     // Settled: the request stopped wanting a person (merged by hand, superseded, dismissed, its
     // branch gone). Closes the request's sequence, so a resolution started before it stops reading
     // as still going.

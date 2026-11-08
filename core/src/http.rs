@@ -37,6 +37,7 @@ mod analytics;
 mod analytics_pipeline;
 mod brains;
 mod chat_edit;
+mod chat_transfer;
 mod chat_turns;
 mod chats;
 mod commands;
@@ -45,6 +46,7 @@ mod email;
 mod engines;
 mod files;
 mod fleet;
+mod fs;
 mod git_ops;
 mod hooks;
 mod judging;
@@ -58,8 +60,10 @@ mod proposals;
 mod relay;
 mod remote;
 mod repo;
+mod restart;
 mod run_queue;
 mod settings;
+mod stepup;
 mod tasks;
 mod team;
 mod themes;
@@ -130,12 +134,14 @@ pub fn build_router(state: AppState) -> Router {
         .merge(brains::routes())
         .merge(crate::channels::routes())
         .merge(chat_edit::routes())
+        .merge(chat_transfer::routes())
         .merge(chat_turns::routes())
         .merge(chats::routes())
         .merge(commands::routes())
         .merge(email::routes())
         .merge(files::routes())
         .merge(fleet::routes())
+        .merge(fs::routes())
         .merge(crate::fleet::route::routes())
         .merge(git_ops::routes())
         .merge(hooks::routes())
@@ -150,6 +156,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(proposals::routes())
         .merge(relay::routes())
         .merge(remote::routes())
+        .merge(stepup::routes())
         .merge(repo::routes())
         .merge(run_queue::routes())
         .merge(engines::routes())
@@ -8978,6 +8985,35 @@ mod tests {
         );
     }
 
+    /// No grave GET route serves a stored credential back, even after a step-up opened it: the
+    /// listing is presence only. Every parameterless GET in `GRAVE_ROUTES` that needs no disk is
+    /// read after a secret is stored, and the value is searched in each whole body.
+    #[tokio::test]
+    async fn no_route_returns_a_stored_secret() {
+        let state = test_state().await;
+        let (status, _) = workflow_call(
+            state.clone(),
+            "PUT",
+            "/config/secrets/github-token",
+            Some(serde_json::json!({ "value": "ghp_never_served_back" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        for (method, route) in crate::auth::GRAVE_ROUTES {
+            if *method != axum::http::Method::GET || route.contains('{') || *route == "/backups" {
+                continue;
+            }
+            let (_, body) = workflow_call(state.clone(), "GET", route, None).await;
+            assert!(
+                !body.to_string().contains("ghp_never_served_back"),
+                "GET {route} served a stored credential"
+            );
+        }
+        let (_, listing) = workflow_call(state, "GET", "/config/secrets", None).await;
+        assert!(!listing.to_string().contains("ghp_never_served_back"));
+    }
+
     /// The daemon's own token is not a credential this app may set.
     ///
     /// It is the app's key to the daemon: overwriting it through the API would lock out the caller
@@ -12647,6 +12683,19 @@ mod tests {
         json_body(response).await
     }
 
+    #[tokio::test]
+    async fn get_machine_reports_a_stable_machine_id_beside_name_and_role() {
+        let state = test_state().await;
+        let first = get_json(&state, "/machine").await;
+        let second = get_json(&state, "/machine").await;
+
+        let id = first["machine_id"].as_str().expect("a machine_id string");
+        assert_eq!(id.len(), 36, "{id}");
+        assert_eq!(first["machine_id"], second["machine_id"]);
+        assert!(first["name"].is_string());
+        assert!(first["role"].is_string());
+    }
+
     /// One settled assistant turn, with whatever it asked, answered and ran.
     async fn seed_turn(
         state: &AppState,
@@ -12704,11 +12753,11 @@ mod tests {
         get_json(&state, &format!("/assistant/chats/{b}")).await;
 
         assert!(
-            crate::assistant::chat_is_open(&a),
+            crate::assistant::was_marked_open(&a),
             "the header marks the chat open"
         );
         assert!(
-            !crate::assistant::chat_is_open(&b),
+            !crate::assistant::was_marked_open(&b),
             "a read without the header does not"
         );
     }
@@ -13239,7 +13288,7 @@ mod tests {
     ///
     /// The turn that asked is still running and its hook is blocked on the question, so a person who
     /// widens the rung to `accept_edits` has just said yes to a `Write` they are looking at. Without
-    /// the re-read the ask sits there until `ASK_WINDOW` runs out and refuses the call the person
+    /// the re-read the ask sits there until `ASK_WINDOW` runs out (or the CLI goes) and refuses the call the person
     /// had already permitted, which reads as the new rung not having taken.
     ///
     /// The call is parked under `manual`, where a `Write` asks, and the PATCH moves it to a rung that
@@ -18694,7 +18743,8 @@ mod tests {
         // that cannot be replayed, and the point from which the run is on its own.
         let mut context = std::task::Context::from_waker(std::task::Waker::noop());
         let mut rejected = false;
-        for _ in 0..10_000 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             assert!(
                 handler.as_mut().poll(&mut context).is_pending(),
                 "the handler ran to completion before the request could be dropped"
@@ -18713,7 +18763,8 @@ mod tests {
         drop(handler);
 
         let mut status = String::new();
-        for _ in 0..100 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             status = sqlx::query_scalar("SELECT status FROM runs WHERE id = ?")
                 .bind(run_id)
                 .fetch_one(&pool)
@@ -18963,6 +19014,135 @@ mod tests {
         assert_eq!(by_id("unset")["root_exists"], serde_json::Value::Null);
         // Flattened, not nested: the shell reads one object per project, as it always did.
         assert_eq!(by_id("rooted")["mode"], "shadow");
+    }
+
+    /// **The list carries each project's `origin`, so another machine can recognise the repository.**
+    ///
+    /// Without it the shell never knows two machines hold the same project and offers no other
+    /// machine for it. A folder with no remote, or no git at all, simply has no `remote` key.
+    #[tokio::test]
+    async fn the_project_list_carries_the_git_remote() {
+        let state = test_state().await;
+        let with_remote = tempfile::tempdir().unwrap();
+        let without_remote = tempfile::tempdir().unwrap();
+        let not_git = tempfile::tempdir().unwrap();
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .status()
+                .expect("git runs");
+            assert!(status.success(), "git {args:?}");
+        };
+        git(with_remote.path(), &["init", "-q"]);
+        git(
+            with_remote.path(),
+            &["remote", "add", "origin", "git@example.com:team/app.git"],
+        );
+        git(without_remote.path(), &["init", "-q"]);
+
+        for (id, dir) in [
+            ("remote", &with_remote),
+            ("local", &without_remote),
+            ("plain", &not_git),
+        ] {
+            sqlx::query(
+                "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES (?, 'shadow', ?)",
+            )
+            .bind(id)
+            .bind(dir.path().to_string_lossy().to_string())
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query("INSERT INTO autopilot_state (project_id, mode) VALUES ('unset', 'shadow')")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/projects")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        let by_id = |id: &str| {
+            rows.iter()
+                .find(|row| row["project_id"] == id)
+                .unwrap()
+                .clone()
+        };
+
+        assert_eq!(by_id("remote")["remote"], "git@example.com:team/app.git");
+        for id in ["local", "plain", "unset"] {
+            assert!(by_id(id).get("remote").is_none(), "{id}");
+        }
+    }
+
+    /// **The list never carries credentials a remote URL may hold.**
+    ///
+    /// `GET /projects` goes to every client, so `https://user:token@host/a/b` leaves it as
+    /// `https://host/a/b`; an scp-style `git@host:a/b` is untouched. (`/projects/detect` is not
+    /// covered: it returns the raw origin.)
+    #[tokio::test]
+    async fn the_project_list_strips_credentials_from_the_remote() {
+        let state = test_state().await;
+        let https = tempfile::tempdir().unwrap();
+        let scp = tempfile::tempdir().unwrap();
+        for (dir, url) in [
+            (&https, "https://user:s3cret@example.com/team/app.git"),
+            (&scp, "git@example.com:team/app.git"),
+        ] {
+            for args in [vec!["init", "-q"], vec!["remote", "add", "origin", url]] {
+                let status = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(dir.path())
+                    .args(&args)
+                    .status()
+                    .expect("git runs");
+                assert!(status.success(), "git {args:?}");
+            }
+        }
+        for (id, dir) in [("https", &https), ("scp", &scp)] {
+            sqlx::query(
+                "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES (?, 'shadow', ?)",
+            )
+            .bind(id)
+            .bind(dir.path().to_string_lossy().to_string())
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/projects")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        let remote_of =
+            |id: &str| rows.iter().find(|row| row["project_id"] == id).unwrap()["remote"].clone();
+        assert_eq!(remote_of("https"), "https://example.com/team/app.git");
+        assert_eq!(remote_of("scp"), "git@example.com:team/app.git");
+        assert!(!String::from_utf8_lossy(&body).contains("s3cret"));
     }
 
     /// **The way out, end to end, and the refusal names the shell switches on.**
@@ -20187,7 +20367,7 @@ mod tests {
 
         // Generous, because what is being asserted is that the number arrives at all — the mirror
         // is throttled, so anything shorter would be measuring the throttle rather than the wiring.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         let reported = loop {
             let response = build_router(state.clone())
                 .oneshot(
@@ -20397,7 +20577,7 @@ mod tests {
         state
             .run_handles
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(run_id, task.abort_handle());
 
         let (messages_tx, messages_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -20713,7 +20893,7 @@ mod tests {
             "a closed run must refuse a turn as every other unreachable run does: {refused}"
         );
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         let final_status = loop {
             let status = status_of(state.clone()).await;
             if status != "running" {
@@ -24336,6 +24516,7 @@ mod tests {
 
         for (method, path) in [
             ("POST", "/system/shutdown"),
+            ("POST", "/system/restart"),
             ("GET", "/system/update-readiness"),
         ] {
             let response = build_router(state.clone())
@@ -24394,6 +24575,9 @@ mod tests {
         assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(body["live_runs"], 1);
         assert_eq!(body["draining"], false);
+        assert_eq!(body["pid"], std::process::id());
+        assert_eq!(body["waiting_on"].as_array().map(Vec::len), Some(1));
+        assert!(body["waiting_on"][0]["run_id"].is_i64());
     }
 
     /// Only this test may await `shutdown_requested()`: the notifiers are process-wide.
@@ -24412,7 +24596,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::ACCEPTED);
 
-        tokio::time::timeout(std::time::Duration::from_secs(5), shutdown_requested())
+        tokio::time::timeout(std::time::Duration::from_secs(60), shutdown_requested())
             .await
             .expect("the request must leave a stored shutdown permit");
     }
@@ -24433,7 +24617,7 @@ mod tests {
         });
         drop(rt);
         assert!(
-            rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok(),
+            rx.recv_timeout(std::time::Duration::from_secs(60)).is_ok(),
             "the exit watchdog died with the runtime that asked for shutdown"
         );
     }

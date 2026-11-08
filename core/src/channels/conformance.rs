@@ -986,13 +986,25 @@ mod tests {
         // marks the run done, removes its tail and answers the turn by itself. Stop it and wait until
         // it is gone, then put the turn back as it was right after its ack: running, unanswered,
         // with the "working" send as the only outbox row.
-        if let Some(handle) = st.run_handles.lock().unwrap().get(&run_id) {
+        if let Some(handle) = st
+            .run_handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&run_id)
+        {
             handle.abort();
         }
-        for _ in 0..200 {
-            if !st.run_handles.lock().unwrap().contains_key(&run_id) {
-                break;
-            }
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while st
+            .run_handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&run_id)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the aborted turn's run handle was never removed"
+            );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         sqlx::query("UPDATE runs SET status = 'running', completed_at = NULL WHERE id = ?")

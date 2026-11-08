@@ -56,11 +56,13 @@ pub mod health;
 pub use nucleos_base::inspect;
 pub mod integrations;
 pub use nucleos_base::join;
+pub use nucleos_base::keep_awake;
 pub mod judge;
 pub mod knowledge;
 pub mod loadout;
 pub use nucleos_base::logging;
 pub mod machine_config;
+pub mod machine_id;
 // Only `map::intent` stays in the library (`distill` asks a model through it); the rest of `map`
 // compiles in `nucleos-app`, whose `map.rs` re-exports this one.
 pub mod map {
@@ -82,9 +84,11 @@ pub use nucleos_base::prompt_budget;
 pub mod proposals;
 pub mod quota;
 pub use nucleos_base::recurrence;
+pub mod relaunch;
 pub mod remote;
 pub mod repo_trigger;
 pub mod resolver;
+pub mod restart_cli;
 pub use nucleos_base::router_client;
 pub use nucleos_base::search;
 pub use nucleos_base::secrets;

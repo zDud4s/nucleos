@@ -152,7 +152,9 @@ def cores_p90(trace: list[tuple[float, float]], window_s: float = 2.0) -> float 
         return None
 
 
-def job_peak_mem_mb(job) -> float | None:
+def _job_ext_info(job):
+    """The job object's JOBOBJECT_EXTENDED_LIMIT_INFORMATION (IoInfo + peak memory), or None
+    when not on Windows, without a job, or when the query fails."""
     if os.name != "nt" or not job:
         return None
     try:
@@ -194,10 +196,32 @@ def job_peak_mem_mb(job) -> float | None:
         info = EXT()
         if not k32.QueryInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info), None):
             return None
+        return info
+    except Exception:
+        return None
+
+
+def job_peak_mem_mb(job) -> float | None:
+    info = _job_ext_info(job)
+    if info is None:
+        return None
+    try:
         peak = info.PeakJobMemoryUsed
         if not peak:
             return None
         return round(peak / 2**20, 1)
+    except Exception:
+        return None
+
+
+def job_write_mb(job) -> float | None:
+    """MB the job's processes wrote (IoInfo.WriteTransferCount), 0.0 for zero bytes; None when
+    unknown (not Windows, no job, query failed)."""
+    info = _job_ext_info(job)
+    if info is None:
+        return None
+    try:
+        return round(info.IoInfo.WriteTransferCount / 2**20, 1)
     except Exception:
         return None
 
@@ -212,9 +236,10 @@ def measure_fields(stats: dict, run_s: float, job) -> dict:
             "peak_mem_mb": job_peak_mem_mb(job),
             "cores_avg": avg,
             "cores_p90": cores_p90((stats or {}).get("cpu_trace") or []),
+            "write_mb": job_write_mb(job),
         }
     except Exception:
-        return {"peak_mem_mb": None, "cores_avg": None, "cores_p90": None}
+        return {"peak_mem_mb": None, "cores_avg": None, "cores_p90": None, "write_mb": None}
 
 
 # ----------------------------------------------------------------------------- cost model
@@ -477,6 +502,188 @@ def _env_pos(name: str, default: float) -> float:
         return default
 
 
+# ----------------------------------------------------------------------------- disk pressure
+
+
+def _win_disk_sample(paths, window_s: float) -> dict | None:
+    """One Windows PDH sample of the physical disks: `\\PhysicalDisk(*)\\% Idle Time` and
+    `\\PhysicalDisk(*)\\Avg. Disk Queue Length`, taken `window_s` seconds apart (a rate counter
+    needs two collections). The instances kept are those whose drive letter matches the drive of
+    any of `paths` (instance names look like `0 C:` or `1 D: E:`); when none match, every
+    instance but `_Total`. Returns {"busy_pct", "queue", "disks", "ts"} where busy_pct is the
+    highest `100 - idle` over the selected instances and queue the highest queue length (None if
+    that counter failed). None on any error or when no instance is found. Blocks for `window_s`."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+
+        class VALUE(ctypes.Structure):
+            # PDH_FMT_COUNTERVALUE with only the double member of the union; the 8-byte
+            # alignment padding after CStatus is what ctypes inserts for the c_double.
+            _fields_ = [("CStatus", ctypes.c_uint32), ("doubleValue", ctypes.c_double)]
+
+        class ITEM(ctypes.Structure):
+            _fields_ = [("szName", ctypes.c_wchar_p), ("FmtValue", VALUE)]
+
+        pdh = ctypes.WinDLL("pdh")
+        pdh.PdhOpenQueryW.argtypes = [ctypes.c_wchar_p, ctypes.c_size_t,
+                                      ctypes.POINTER(ctypes.c_void_p)]
+        pdh.PdhAddEnglishCounterW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_size_t,
+                                              ctypes.POINTER(ctypes.c_void_p)]
+        pdh.PdhCollectQueryData.argtypes = [ctypes.c_void_p]
+        pdh.PdhGetFormattedCounterArrayW.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32),
+            ctypes.POINTER(ctypes.c_uint32), ctypes.c_void_p]
+        pdh.PdhCloseQuery.argtypes = [ctypes.c_void_p]
+        for fn in (pdh.PdhOpenQueryW, pdh.PdhAddEnglishCounterW, pdh.PdhCollectQueryData,
+                   pdh.PdhGetFormattedCounterArrayW, pdh.PdhCloseQuery):
+            fn.restype = ctypes.c_uint32
+
+        pdh_fmt_double = 0x200
+        more_data = 0x800007D2
+
+        def read_array(hcounter) -> dict:
+            size = ctypes.c_uint32(0)
+            count = ctypes.c_uint32(0)
+            st = pdh.PdhGetFormattedCounterArrayW(
+                hcounter, pdh_fmt_double, ctypes.byref(size), ctypes.byref(count), None)
+            if (st & 0xFFFFFFFF) != more_data:
+                raise OSError(f"PdhGetFormattedCounterArrayW sizing: {st & 0xFFFFFFFF:#x}")
+            buf = ctypes.create_string_buffer(size.value)
+            st = pdh.PdhGetFormattedCounterArrayW(
+                hcounter, pdh_fmt_double, ctypes.byref(size), ctypes.byref(count), buf)
+            if (st & 0xFFFFFFFF) != 0:
+                raise OSError(f"PdhGetFormattedCounterArrayW: {st & 0xFFFFFFFF:#x}")
+            items = ctypes.cast(buf, ctypes.POINTER(ITEM))
+            out: dict = {}
+            for i in range(count.value):
+                it = items[i]
+                # 0 = valid data, 1 = new data; anything else carries no usable number.
+                if it.FmtValue.CStatus in (0, 1) and it.szName:
+                    out[it.szName] = it.FmtValue.doubleValue
+            return out
+
+        hquery = ctypes.c_void_p()
+        if pdh.PdhOpenQueryW(None, 0, ctypes.byref(hquery)) != 0:
+            return None
+        try:
+            h_idle = ctypes.c_void_p()
+            if pdh.PdhAddEnglishCounterW(
+                    hquery, r"\PhysicalDisk(*)\% Idle Time", 0, ctypes.byref(h_idle)) != 0:
+                return None
+            h_queue = ctypes.c_void_p()
+            if pdh.PdhAddEnglishCounterW(
+                    hquery, r"\PhysicalDisk(*)\Avg. Disk Queue Length", 0,
+                    ctypes.byref(h_queue)) != 0:
+                h_queue = None
+            pdh.PdhCollectQueryData(hquery)
+            time.sleep(window_s)
+            if pdh.PdhCollectQueryData(hquery) != 0:
+                return None
+            idle = read_array(h_idle)
+            try:
+                queue = read_array(h_queue) if h_queue is not None else {}
+            except Exception:
+                queue = {}
+        finally:
+            pdh.PdhCloseQuery(hquery)
+
+        drives = set()
+        for p in paths or []:
+            d = os.path.splitdrive(os.path.abspath(str(p)))[0].upper()
+            if d:
+                drives.add(d)
+        names = [n for n in idle if n.upper() != "_TOTAL"]
+        picked = [n for n in names if drives & set(n.upper().split())] or names
+        if not picked:
+            return None
+        busy = max(max(0.0, min(100.0, 100.0 - idle[n])) for n in picked)
+        qs = [queue[n] for n in picked if n in queue]
+        q = round(max(qs), 2) if qs else None
+        return {"busy_pct": round(busy, 1), "queue": q, "disks": picked, "ts": time.time()}
+    except Exception:
+        return None
+
+
+def disk_threshold() -> float:
+    """Busy percentage from which the disk counts as saturated: NUCLEOS_HEAVY_DISK_BUSY_PCT,
+    default 90. An explicit 0 switches the disk gate off (0.0); garbage or a negative value
+    takes the default. (Its own parse: `_env_pos` would turn 0 into the default.)"""
+    try:
+        v = float(os.environ.get("NUCLEOS_HEAVY_DISK_BUSY_PCT", ""))
+    except ValueError:
+        return 90.0
+    return v if v >= 0 else 90.0
+
+
+def disk_saturated(disk) -> float | None:
+    """The disk's busy percentage when `disk` (a disk_probe record) says it is saturated, else
+    None. Saturated means busy_pct >= disk_threshold() (NUCLEOS_HEAVY_DISK_BUSY_PCT, default 90,
+    0 = off) and, only when NUCLEOS_HEAVY_DISK_QUEUE is above 0 (default off), also queue >= that
+    value. A missing or non-numeric busy_pct (or queue, when the queue gate is on) is no signal
+    and never gates."""
+    try:
+        if not isinstance(disk, dict):
+            return None
+        thr = disk_threshold()
+        busy = disk.get("busy_pct")
+        if thr <= 0 or not _num(busy) or busy < thr:
+            return None
+        qthr = _env_pos("NUCLEOS_HEAVY_DISK_QUEUE", 0.0)
+        if qthr > 0:
+            q = disk.get("queue")
+            if not _num(q) or q < qthr:
+                return None
+        return busy
+    except Exception:
+        return None
+
+
+def disk_probe(cache_dir=None, paths=(), now=None) -> dict | None:
+    """The disk-pressure signal {"busy_pct", "queue", "disks", "ts"}, or None when there is none
+    (never raises). Order: (1) NUCLEOS_HEAVY_FAKE_DISK, a JSON test hook, is returned as is
+    (`ts` defaulted to now), uncached; (2) not Windows: None; (3) NUCLEOS_HEAVY_FAKE_PROBE set
+    without a fake disk: None -- a fake RAM probe means a hermetic machine view, so broker tests
+    are never gated by the real disk; (4) with `cache_dir`, a fresh `disk.json` there (age under
+    NUCLEOS_HEAVY_DISK_CACHE_S, default 3; relative to `now`, default time.time()) is reused so
+    concurrent waiters share one sample; (5) otherwise a PDH sample (_win_disk_sample, window
+    NUCLEOS_HEAVY_DISK_WINDOW_S, default 1.0, blocking: call it OUTSIDE the broker Mutex) that is
+    written to the cache atomically. `paths` pick which drives are sampled."""
+    try:
+        fake = os.environ.get("NUCLEOS_HEAVY_FAKE_DISK")
+        if fake:
+            d = json.loads(fake)
+            if isinstance(d, dict):
+                d.setdefault("ts", time.time())
+            return d
+        if os.name != "nt":
+            return None
+        if os.environ.get("NUCLEOS_HEAVY_FAKE_PROBE"):
+            return None
+        t = time.time() if now is None else now
+        cache = Path(cache_dir) / "disk.json" if cache_dir else None
+        if cache is not None:
+            try:
+                c = json.loads(cache.read_text(encoding="utf-8"))
+                ts = c.get("ts") if isinstance(c, dict) else None
+                if (_num(ts) and 0 <= t - ts < _env_pos("NUCLEOS_HEAVY_DISK_CACHE_S", 3.0)):
+                    return c
+            except Exception:
+                pass
+        s = _win_disk_sample(list(paths), _env_pos("NUCLEOS_HEAVY_DISK_WINDOW_S", 1.0))
+        if s is not None and cache is not None:
+            try:
+                tmp = cache.with_name(f"disk.json.{os.getpid()}.tmp")
+                tmp.write_text(json.dumps(s), encoding="utf-8")
+                os.replace(tmp, cache)
+            except Exception:
+                pass
+        return s
+    except Exception:
+        return None
+
+
 DEFAULT_DYNAMIC_MAX_JOBS = 8
 DEFAULT_MIN_AVAIL_MB = 10240.0
 # RAM budgeted per job when sizing the ceiling (cargo test peaks near 7 GB), and its floor.
@@ -644,11 +851,13 @@ def dynamic_probe() -> dict | None:
 
 
 def dynamic_fit(n_held: int, p: dict | None, since_admit_s: float, ceiling: int,
-                static_fit: bool) -> tuple[bool, dict]:
+                static_fit: bool, disk: dict | None = None) -> tuple[bool, dict]:
     """Dynamic admission decision for the head of the queue. Returns (ok, adm); `adm` is the
     record kept with the admission (it is meaningful on a denial too, the caller ignores it).
 
-    Nothing held: admitted ("alone"). Unreadable probe: the static weight-sum decision stands
+    Nothing held: admitted ("alone"). Otherwise, a saturated disk (`disk`, see disk_saturated)
+    holds the head with rule "disk" and an extra `disk_busy_pct` key in `adm`; this check comes
+    before the probe check, so a disk hold beats the static fallback. Unreadable probe: the static weight-sum decision stands
     ("static_fallback"). Otherwise the held COUNT must be under `ceiling` (the caller passes
     dynamic_max_jobs()) and the probe must show room: free RAM, idle cores (skipped when busy_cores is unknown) and, only when that room is
     close to the floors (or from SETTLE_ALWAYS_HELD held jobs on, whatever the room), a settle
@@ -677,6 +886,9 @@ def dynamic_fit(n_held: int, p: dict | None, since_admit_s: float, ceiling: int,
 
     if n_held <= 0:
         return True, adm("alone")
+    busy = disk_saturated(disk)
+    if busy is not None:
+        return False, {**adm("disk"), "disk_busy_pct": busy}
     if not usable:
         return bool(static_fit), adm("static_fallback")
     if n_held >= ceiling:

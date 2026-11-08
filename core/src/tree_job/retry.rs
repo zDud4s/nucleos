@@ -3,6 +3,7 @@
 //! not merge. Each of these used to repeat on every tick without end and without a word; here each
 //! has an allowance persisted in the manifest, and past it the owner is asked once.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use chrono::{SecondsFormat, Utc};
@@ -11,6 +12,7 @@ use sqlx::SqlitePool;
 
 use super::decisions::{ROOT_PARK_KEY, STATUS_OPEN};
 use super::driver::{GateVerdict, NotMeasured, Park, RESOLVER_GRACE};
+use super::final_verify::is_gate_red;
 use super::landing::{LandSettlement, apply_gate_verdict, claim_land};
 use super::store::{self, TreeJob};
 use crate::gate::GateOutcome;
@@ -29,6 +31,80 @@ pub(super) const LAND_ATTEMPTS_KEY: &str = "land_attempts";
 pub(super) const LAND_ESCALATED_SINCE: &str = "land_escalated_since";
 /// The key of `Branch.extra` naming the base's park decision a green dependent was announced for.
 pub(super) const BASE_WAIT_KEY: &str = "base_wait_noted";
+
+/// The key of `Branch.extra` counting gates in a row that ended unmeasured because of load.
+pub(super) const GATE_LOAD_WAITS: &str = "gate_load_waits";
+/// The key of `Branch.extra` stamping (RFC 3339) until when the branch's gate waits.
+pub(super) const GATE_BACKOFF_UNTIL: &str = "gate_backoff_until";
+/// The key of `Branch.extra` with the last load reason, for whoever reads the manifest.
+pub(super) const GATE_LOAD_REASON: &str = "gate_load_reason";
+
+/// Whether a reason for an unmeasured gate says the machine was too busy, not that the gate is broken.
+pub(super) fn is_load_reason(reason: &str) -> bool {
+    let reason = reason.to_ascii_lowercase();
+    [
+        "pool timed out",
+        "broker is full",
+        "broker full",
+        "disk pressure",
+        "disk-pressure",
+        "failed to spawn",
+        "spawn failure",
+        "sccache",
+        "infrastructure failure",
+    ]
+    .iter()
+    .any(|marker| reason.contains(marker))
+}
+
+/// Whether a failed unit's output is infrastructure, not the branch's: cargo says it could not
+/// compile and that a process did not exit successfully, but neither rustc nor a test runner said
+/// anything about the code (no `error[..]` or other `error:` line, no failed or panicked test).
+/// Answers the reason to give the gate, which `is_load_reason` reads as load.
+pub(super) fn infrastructure_failure(output: &str) -> Option<String> {
+    if !output.contains("could not compile") || !output.contains("process didn't exit successfully")
+    {
+        return None;
+    }
+    let diagnosed = output.lines().any(|line| {
+        let line = line.trim_start();
+        line.starts_with("error[")
+            || line.contains("panicked at")
+            || line.contains("FAILED")
+            || (line.starts_with("error:")
+                && !line.contains("could not compile")
+                && !line.contains("process didn't exit successfully"))
+    });
+    if diagnosed {
+        return None;
+    }
+    Some(
+        "infrastructure failure: a compiler process exited non-zero without any diagnostic \
+         (cargo could not compile, no rustc error), so nothing was measured"
+            .to_owned(),
+    )
+}
+
+/// How long a gate starved by load waits after `waits` earlier waits: 30 s doubling, capped at 10 min.
+pub(super) fn load_backoff(waits: i64) -> Duration {
+    let exp = u32::try_from(waits.clamp(0, 5)).unwrap_or(5);
+    Duration::from_secs((30u64 << exp).min(600))
+}
+
+fn clear_load_wait(extra: &mut BTreeMap<String, Value>) {
+    extra.remove(GATE_LOAD_WAITS);
+    extra.remove(GATE_BACKOFF_UNTIL);
+    extra.remove(GATE_LOAD_REASON);
+}
+
+/// Whether the branch's gate is still inside a load backoff.
+pub(super) fn gate_backing_off(extra: &BTreeMap<String, Value>) -> bool {
+    extra
+        .get(GATE_BACKOFF_UNTIL)
+        .and_then(Value::as_str)
+        .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+        .is_some_and(|until| until > Utc::now())
+}
 
 fn now() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Secs, false)
@@ -77,7 +153,28 @@ pub(super) async fn apply_gate_answer(
     }
     let mut park = None;
     match answer {
+        // The machine was too busy to measure: wait with backoff, spend nothing, ask nobody.
+        Err(NotMeasured::Failed(reason)) if is_load_reason(&reason) => {
+            let waits = held
+                .extra
+                .get(GATE_LOAD_WAITS)
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            let delay = load_backoff(waits);
+            let until = Utc::now()
+                + chrono::Duration::from_std(delay)
+                    .unwrap_or_else(|_| chrono::Duration::minutes(10));
+            held.extra
+                .insert(GATE_LOAD_WAITS.to_owned(), json!(waits + 1));
+            held.extra.insert(
+                GATE_BACKOFF_UNTIL.to_owned(),
+                json!(until.to_rfc3339_opts(SecondsFormat::Secs, false)),
+            );
+            held.extra
+                .insert(GATE_LOAD_REASON.to_owned(), json!(reason));
+        }
         Err(NotMeasured::Failed(reason)) => {
+            clear_load_wait(&mut held.extra);
             let count = held
                 .extra
                 .get(GATE_FAILURES)
@@ -100,6 +197,7 @@ pub(super) async fn apply_gate_answer(
             }
         }
         answer => {
+            clear_load_wait(&mut held.extra);
             held.extra.remove(GATE_FAILURES);
             apply_gate_verdict(held, &scope).map_err(|e| e.to_string())?;
             let entry = held.gates.last_mut().and_then(Value::as_object_mut);
@@ -135,6 +233,12 @@ fn land_record(job: &TreeJob) -> serde_json::Map<String, Value> {
 }
 
 fn land_question(count: i64, reason: &str) -> String {
+    if is_gate_red(reason) {
+        return format!(
+            "The final verify of the tree is red at the tip being landed, so nothing was published; {reason}
+Fix the integrated branch, then answer to let the landing try again."
+        );
+    }
     format!(
         "The landing of the tree did not go through after {count} attempt(s); last reason: {reason}. Answer to let it try again."
     )
@@ -148,11 +252,17 @@ pub(super) async fn count_land_attempt(
     reason: &str,
     parks: &mut Vec<Park>,
 ) -> Result<(), String> {
-    let count = land_record(job)
-        .get("count")
-        .and_then(Value::as_i64)
-        .unwrap_or(0)
-        + 1;
+    // A red final verify is about a tip that has not changed: trying again repeats it, so the
+    // allowance is spent at once and the owner is asked.
+    let count = if is_gate_red(reason) {
+        LAND_ATTEMPTS
+    } else {
+        land_record(job)
+            .get("count")
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+            + 1
+    };
     set_land_record(job, count, reason);
     persist(pool, job).await?;
     if count >= LAND_ATTEMPTS {

@@ -73,9 +73,13 @@ def drive(steps: str, workdir: Path, keep_going: bool = True) -> tuple[int, str]
         cwd=workdir,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        env=dict(os.environ, TMPDIR=scratch.as_posix(),
+        env=dict(os.environ, NUCLEOS_DEV_HOME=(workdir / "dev").as_posix(), TMPDIR=scratch.as_posix(),
                  NUCLEOS_GATE_KEEP_GOING="1" if keep_going else "0"),
-        timeout=120,
+        # Only a hung bash should hit this. Each drive forks bash, tee, tail and awk per step, and
+        # Git-for-Windows fork emulation under a loaded gate machine stretched 120s into a
+        # TimeoutExpired on steps that finish in a second when idle; there is no event to wait on
+        # for a subprocess, so the bound is wide rather than tight.
+        timeout=int(os.environ.get("GATES_SUMMARY_TIMEOUT", "600")),
     )
     left = list(scratch.iterdir())
     assert not left, f"captures left behind in TMPDIR: {left}"
@@ -194,6 +198,31 @@ def test_the_gate_stops_at_its_first_red_step() -> None:
     assert skipped == "  fake: quiet\n  fake: after\n", skipped
 
 
+def test_a_red_step_keeps_its_full_log() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        status, output = drive(STEPS, Path(tmp))
+        match = re.search(r"^full log: (.+)$", output, re.M)
+        assert match, output[-2000:]
+        assert output.count("full log: ") == 2, "one line per red step"
+        text = Path(match.group(1).strip()).read_text(encoding="utf-8")
+        assert "noisy line 1\n" in text and "noisy line 500\n" in text, text[:200]
+        assert "noisy's own verdict" in text
+        logs = list((Path(tmp) / "dev" / "scratch" / "gate-logs").glob("*.log"))
+        assert len(logs) == 3, logs
+
+
+def test_old_logs_are_pruned_to_forty() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        logs = Path(tmp) / "dev" / "scratch" / "gate-logs"
+        logs.mkdir(parents=True)
+        for i in range(60):
+            (logs / f"2000010100{i:04d}Z-1-old.log").write_text("x")
+        drive('run "fake: fine" . true', Path(tmp))
+        assert len(list(logs.glob("*.log"))) == 40
+
+
+test_a_red_step_keeps_its_full_log()
+test_old_logs_are_pruned_to_forty()
 test_a_red_steps_own_lines_follow_its_name()
 test_the_gate_stops_at_its_first_red_step()
 test_three_red_steps_fit_well_inside_the_daemons_tail()

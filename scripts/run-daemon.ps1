@@ -32,12 +32,23 @@
 # the new exe, and a later run sweeps the *.old-* files nothing holds any more. If a rename fails,
 # it falls back to the exit-3 refusal.
 #
+# -Stage: for a daemon that is already running. Builds, then copies the fresh nucleos-core.exe to
+# <RunDir>\nucleos-core.next.exe and stops; the running daemon, its sidecars and its remote shell
+# are left alone, and nothing refuses because they are held. The next restart that settles
+# (`nucleos-core --restart`, or the restart button) swaps that file in before it relaunches
+# (core/src/relaunch.rs). Only the daemon exe is staged: sidecars and dist-remote need a full run.
+#
 # Exit codes: 2 bad arguments, 3 the daemon is already running (or the port is taken),
 # 4 build output missing; a build failure exits with the build's own code; otherwise the
 # daemon's exit code (0 under -NoStart).
 #
+# Start: when the "NucleOS Daemon" scheduled task exists and runs the staged copy, the daemon is
+# started with Start-ScheduledTask (exit 0 right away; it is the task's child, not this session's).
+# Otherwise -- no task, the task names another exe, or -Foreground -- it runs in the foreground as
+# before. Exit 5: the task exists but could not be started.
+#
 # Usage: powershell -File scripts/run-daemon.ps1 [-RunDir D] [-TargetDir T] [-BuildProfile debug|release]
-#        [-Port N] [-NoBuild] [-NoStart] [daemon args...]
+#        [-Port N] [-NoBuild] [-NoStart] [-Stage] [-Foreground] [daemon args...]
 param(
     [string]$RunDir,
     [string]$TargetDir,
@@ -45,6 +56,8 @@ param(
     [int]$Port = 0,
     [switch]$NoBuild,
     [switch]$NoStart,
+    [switch]$Stage,
+    [switch]$Foreground,
     [Parameter(ValueFromRemainingArguments = $true)][string[]]$DaemonArgs
 )
 
@@ -75,6 +88,9 @@ if ([string]::IsNullOrEmpty($TargetDir)) {
         Push-Location $RepoRoot
         try {
             $TargetDir = (cargo metadata --format-version 1 --no-deps | ConvertFrom-Json).target_directory
+            if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrEmpty($TargetDir)) {
+                Fail 2 "could not resolve the cargo target dir (cargo metadata failed); pass -TargetDir or set CARGO_TARGET_DIR"
+            }
         }
         finally { Pop-Location }
     }
@@ -97,7 +113,7 @@ if ($Port -eq 0) {
 $held = @()
 $moveAside = @()   # held files that only --mcp-tools servers hold: renamed at stage time
 $toolPids = @()
-if (Test-Path -LiteralPath $RunDir) {
+if ((Test-Path -LiteralPath $RunDir) -and -not $Stage) {
     # Images moved aside by an earlier run: delete the ones nothing holds any more, quietly.
     foreach ($old in @(Get-ChildItem -LiteralPath $RunDir -File -Filter '*.exe.old-*' -ErrorAction SilentlyContinue)) {
         try { Remove-Item -LiteralPath $old.FullName -Force -ErrorAction Stop } catch { }
@@ -142,7 +158,7 @@ if ($held.Count -gt 0) {
     }
 }
 # --- 2e. is something already answering on the port? -----------------------------------------
-if (-not $NoStart) {
+if (-not $NoStart -and -not $Stage) {
     $answers = $false
     $client = New-Object Net.Sockets.TcpClient
     try {
@@ -187,6 +203,19 @@ if (-not $NoBuild) {
 $core = Join-Path $out 'nucleos-core.exe'
 if (-not (Test-Path -LiteralPath $core)) {
     Fail 4 "build output missing: $core (build first, or drop -NoBuild)"
+}
+if ($Stage) {
+    # Beside the running exe, under the name the relauncher looks for; the daemon stays up.
+    if (-not (Test-Path -LiteralPath $RunDir)) {
+        Fail 2 "-Stage needs the run dir of a running daemon, and $RunDir does not exist (run without -Stage first)"
+    }
+    # Copy to a temp name, then move onto the real one: a restart that swaps at that moment sees
+    # either no staged file or a whole one, never a half-copied exe.
+    $tmpNext = Join-Path $RunDir 'nucleos-core.next.exe.tmp'
+    Copy-Item -LiteralPath $core -Destination $tmpNext -Force
+    Move-Item -LiteralPath $tmpNext -Destination (Join-Path $RunDir 'nucleos-core.next.exe') -Force
+    Write-Output "staged nucleos-core.next.exe into $RunDir; the daemon swaps it in at its next restart"
+    exit 0
 }
 if ($moveAside.Count -gt 0) {
     $suffix = ".old-" + (Get-Date -Format 'yyyyMMdd-HHmmss') + "-$PID"
@@ -261,6 +290,51 @@ Write-Output "staged $count files into $RunDir"
 if ($NoStart) { exit 0 }
 
 # --- 5. start (foreground, like `cargo run`) ---------------------------------------------------
+
+# The daemon must not be a child of the agent session that ran this script: when that session
+# ends, a child daemon dies with it. The "NucleOS Daemon" logon task (conhost --headless
+# nucleos-core.exe --supervise) is the daemon's real parent, so when it exists and runs the staged
+# copy, start it through the task. The decision is a pure function, kept apart for testing.
+function Get-DaemonStartMode([bool]$TaskExists, [string]$TaskArguments, [string]$StagedExe, [bool]$Foreground) {
+    if ($Foreground) { return 'direct-forced' }
+    if (-not $TaskExists) { return 'direct-no-task' }
+    # The task runs whatever exe it names; starting it must start the copy staged above, not an
+    # older build elsewhere. A mismatch falls back to a direct start, and that daemon re-registers
+    # the task to its own path, so the next start goes through the task.
+    if ([string]::IsNullOrEmpty($TaskArguments) -or
+        $TaskArguments.IndexOf($StagedExe, [StringComparison]::OrdinalIgnoreCase) -lt 0) { return 'direct-task-elsewhere' }
+    return 'task'
+}
+
+$forceDirect = [bool]($Foreground -or @($DaemonArgs).Count -gt 0)   # the task cannot carry extra args
+$taskInfo = $null
+if (-not $forceDirect) {
+    try {
+        $taskInfo = Get-ScheduledTask -TaskName 'NucleOS Daemon' -ErrorAction Stop
+    }
+    catch { $taskInfo = $null }
+}
+$taskArgs = if ($taskInfo) { [string](@($taskInfo.Actions | ForEach-Object { $_.Arguments }) -join ' ') } else { '' }
+$mode = Get-DaemonStartMode ($null -ne $taskInfo) $taskArgs (Join-Path $RunDir 'nucleos-core.exe') $forceDirect
+if ($mode -eq 'task') {
+    try {
+        Start-ScheduledTask -TaskName 'NucleOS Daemon' -ErrorAction Stop
+    }
+    catch {
+        Fail 5 ("could not start the 'NucleOS Daemon' task: $($_.Exception.Message). " +
+            "Run it from Task Scheduler, or re-run with -Foreground to start the daemon directly.")
+    }
+    Write-Output "started the daemon through the 'NucleOS Daemon' scheduled task (not a child of this session)"
+    exit 0
+}
+if ($mode -eq 'direct-task-elsewhere') {
+    [Console]::Error.WriteLine("run-daemon: WARNING: the 'NucleOS Daemon' task does not run $RunDir\nucleos-core.exe; " +
+        "starting directly (the daemon will re-point the task at this copy)")
+}
+elseif ($mode -eq 'direct-no-task') {
+    [Console]::Error.WriteLine("run-daemon: no 'NucleOS Daemon' task registered; starting directly")
+}
+
 Remove-Item Env:NUCLEOS_SIDECAR_DIR -ErrorAction SilentlyContinue
 # Started from a Claude Code session, the daemon would inherit its id and hand it to every gate it
 # runs, and heavy.py would file the daemon's gates under that session.

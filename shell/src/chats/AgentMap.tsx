@@ -302,7 +302,7 @@ function AgentDetail({
           )}
         </div>
       </Modal>
-      {transcript && <AgentTranscript card={card} onClose={() => setTranscript(false)} />}
+      {transcript && <AgentTranscript card={card} chatId={chatId} onClose={() => setTranscript(false)} />}
     </>
   );
 }
@@ -346,8 +346,16 @@ function StopAgent({ chatId, card }: { chatId: string; card: AgentCard }) {
  * what went IN and what came OUT. The results are not on the transcript poll (see `ToolCall.result`),
  * so they are read here, once, from the turn's own tool record.
  */
-function AgentTranscript({ card, onClose }: { card: AgentCard; onClose: () => void }) {
-  const tools = useTurnTools(card.turnId ?? 0, card.turnId !== undefined);
+function AgentTranscript({
+  card,
+  chatId,
+  onClose,
+}: {
+  card: AgentCard;
+  chatId?: string;
+  onClose: () => void;
+}) {
+  const tools = useTurnTools(card.turnId ?? 0, card.turnId !== undefined, chatId);
   const full = new Map<string, ToolCall>();
   for (const c of tools.data?.did ?? []) if (c.id !== undefined) full.set(c.id, c);
   const steps = card.kind === "subagent" ? card.calls : [card.call];
@@ -513,7 +521,7 @@ export function ChatChips({
   // A live turn's newest calls reach the live poll before the transcript; merge them in so a
   // subagent shows up while it is working.
   // Read from the cache the page's own live poll fills; polling here too doubled the requests.
-  const liveSnapshot = useLiveTurnSnapshot(last?.id ?? 0);
+  const liveSnapshot = useLiveTurnSnapshot(last?.id ?? 0, chatId);
   const merged = useMemo(() => {
     if (turns === undefined) return undefined;
     const liveDid = live ? liveSnapshot?.did : undefined;

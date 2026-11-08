@@ -226,7 +226,13 @@ async fn find_or_open_node(
     }
     check_tree_budget(state, root_id).await?;
     let limits = NodeLimits::load(Some(FsPath::new(project_root)));
-    let opened = work_nodes::open(
+    // The tree's own root closes as `done` when its dispatch report arrives, while a start it made
+    // may still wait for its base: the driver's replay (and the owner's start) must still reach it.
+    let links = work_nodes::OpenLinks {
+        parent_may_be_done: caller == root_id,
+        ..work_nodes::OpenLinks::default()
+    };
+    let opened = work_nodes::open_linked(
         &state.pool,
         None,
         &limits,
@@ -238,6 +244,7 @@ async fn find_or_open_node(
             owned_paths: paths.to_vec(),
             ..OpenArgs::default()
         },
+        links,
     )
     .await
     .map_err(node_refusal)?;
@@ -267,6 +274,22 @@ struct PendingStart<'a> {
     paths: &'a [String],
     layer: &'a str,
     base: Option<&'a str>,
+    /// Set when the start waits for this base branch to merge rather than for the disk.
+    waits_for_base: Option<&'a str>,
+}
+
+/// The base a queued branch waits on: named, in the tree and not merged yet. The same test
+/// `open_branch` applies before it refuses with `BaseNotMerged`.
+fn unmerged_base<'m>(
+    manifest: &'m super::model::Manifest,
+    branch: &'m super::model::Branch,
+) -> Option<&'m str> {
+    let base = branch.base.as_deref()?;
+    manifest
+        .branches
+        .get(base)
+        .is_some_and(|base_branch| base_branch.state != "merged")
+        .then_some(base)
 }
 
 /// Stores a start the disk alone refused under `manifest.extra["pending_starts"][name]` and asks
@@ -310,6 +333,7 @@ async fn remember_pending_start(
         "paths": pending.paths,
         "layer": pending.layer,
         "base": pending.base,
+        "waits_for_base": pending.waits_for_base,
     });
     let slot = job
         .manifest
@@ -325,6 +349,10 @@ async fn remember_pending_start(
     job.updated_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
     if let Err(error) = store::update(&state.pool, &job).await {
         tracing::warn!(%error, job = job_id, branch = name, "could not record a pending start");
+        return;
+    }
+    // A start that waits for its base asks nobody: the driver replays it when the base merges.
+    if pending.waits_for_base.is_some() {
         return;
     }
     // Then the ask, then the id into the record. Both failures are healed by the next pass.
@@ -598,6 +626,7 @@ async fn post_branch_start(
                     paths: &paths,
                     layer: &layer,
                     base: base.as_deref(),
+                    waits_for_base: None,
                 };
                 remember_pending_start(&state, &id, &name, &pending).await;
             }
@@ -617,6 +646,29 @@ async fn post_branch_start(
         .get(&name)
         .cloned()
         .ok_or_else(|| refuse(StatusCode::NOT_FOUND, format!("branch {name} not found")))?;
+    // A base that has not merged keeps the branch from opening, and the root that asked cannot wait
+    // for it. The start is remembered whole and the driver replays it once the base merges; an
+    // error here would leave a queued branch nobody ever opens, blocking the landing for ever.
+    if branch.state == "queued"
+        && let Some(base) = unmerged_base(&job.manifest, &branch)
+    {
+        let pending = PendingStart {
+            caller: &caller,
+            goal: &goal,
+            prompt: &prompt,
+            paths: &paths,
+            layer: &layer,
+            base: Some(base),
+            waits_for_base: Some(base),
+        };
+        remember_pending_start(&state, &id, &name, &pending).await;
+        return Ok(Json(json!({
+            "branch": name,
+            "queued": true,
+            "waiting_for": base,
+            "replayed": false,
+        })));
+    }
     let worktree = if branch.state == "queued" {
         let opened = call(
             open::routes(),
@@ -866,6 +918,128 @@ mod tests {
         );
     }
 
+    fn dependent_body(caller: &str) -> Value {
+        json!({
+            "name": "later",
+            "goal": "Write the later notes",
+            "owned_paths": [".ai/plans/**"],
+            "prompt": "Write the later notes.",
+            "layer": "docs",
+            "base": "notes",
+            "node_id": caller,
+        })
+    }
+
+    /// A branch whose base has not merged cannot open yet, and the root that asked for it reports
+    /// and stops (it cannot wait). The start is remembered so that the driver replays it once the
+    /// base merges; without that the branch stays `queued` for ever and blocks the landing.
+    #[tokio::test]
+    async fn a_start_whose_base_is_not_merged_is_remembered_not_lost() {
+        let (state, app, caller, _repo) = tree().await;
+        let (status, first) = post(&app, &uri(), body(&caller)).await;
+        assert_eq!(status, StatusCode::OK, "{first:?}");
+        let nodes = count(&state, "work_nodes").await;
+        let runs = count(&state, "runs").await;
+
+        let (status, waiting) = post(&app, &uri(), dependent_body(&caller)).await;
+
+        assert_eq!(status, StatusCode::OK, "{waiting:?}");
+        assert_eq!(waiting["waiting_for"], "notes", "{waiting:?}");
+        assert_eq!(count(&state, "work_nodes").await, nodes, "no node yet");
+        assert_eq!(count(&state, "runs").await, runs, "no run yet");
+        let job = crate::tree_job::store::load(&state.pool, TREE)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.manifest.branches["later"].state, "queued");
+        let record = &job.manifest.extra["pending_starts"]["later"];
+        assert_eq!(record["waits_for_base"], "notes", "{record:?}");
+        assert_eq!(record["prompt"], "Write the later notes.");
+        assert!(
+            record["decision_id"].is_null(),
+            "no owner question: {record:?}"
+        );
+    }
+
+    /// The replay the driver makes once the base merged starts the branch from the stored record.
+    #[tokio::test]
+    async fn a_remembered_start_runs_once_its_base_has_merged() {
+        let (state, app, caller, _repo) = tree().await;
+        post(&app, &uri(), body(&caller)).await;
+        post(&app, &uri(), dependent_body(&caller)).await;
+        let mut job = crate::tree_job::store::load(&state.pool, TREE)
+            .await
+            .unwrap()
+            .unwrap();
+        job.manifest.branches.get_mut("notes").unwrap().state = "merged".to_owned();
+        crate::tree_job::store::update(&state.pool, &job)
+            .await
+            .unwrap();
+        let record = job.manifest.extra["pending_starts"]["later"].clone();
+        let runs = count(&state, "runs").await;
+
+        start_pending(&state, TREE, "later", &record).await.unwrap();
+
+        assert_eq!(count(&state, "runs").await, runs + 1);
+        let job = crate::tree_job::store::load(&state.pool, TREE)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(job.manifest.branches["later"].node_id.is_some());
+    }
+
+    /// The root closes as `done` once its dispatch report arrives, before the base merges. The replay
+    /// (and a fresh owner start) must still open the child under it; a branch left half-started by an
+    /// earlier failed replay (no node) is finished, not refused.
+    #[tokio::test]
+    async fn a_remembered_start_runs_under_a_root_that_is_already_done() {
+        let (state, app, caller, _repo) = tree().await;
+        post(&app, &uri(), body(&caller)).await;
+        post(&app, &uri(), dependent_body(&caller)).await;
+        let mut job = crate::tree_job::store::load(&state.pool, TREE)
+            .await
+            .unwrap()
+            .unwrap();
+        job.manifest.branches.get_mut("notes").unwrap().state = "merged".to_owned();
+        crate::tree_job::store::update(&state.pool, &job)
+            .await
+            .unwrap();
+        let record = job.manifest.extra["pending_starts"]["later"].clone();
+        sqlx::query("UPDATE work_nodes SET status = 'done' WHERE id = ?")
+            .bind(&caller)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let runs = count(&state, "runs").await;
+
+        start_pending(&state, TREE, "later", &record).await.unwrap();
+        // A second replay is idempotent.
+        start_pending(&state, TREE, "later", &record).await.unwrap();
+
+        assert_eq!(count(&state, "runs").await, runs + 1);
+        let job = crate::tree_job::store::load(&state.pool, TREE)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(job.manifest.branches["later"].node_id.is_some());
+        assert_eq!(job.manifest.branches["later"].state, "building");
+    }
+
+    /// Only `done` is waived: a root that failed still takes no child.
+    #[tokio::test]
+    async fn a_failed_root_still_takes_no_new_branch() {
+        let (state, app, caller, _repo) = tree().await;
+        sqlx::query("UPDATE work_nodes SET status = 'failed' WHERE id = ?")
+            .bind(&caller)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        let (status, response) = post(&app, &uri(), body(&caller)).await;
+
+        assert_eq!(status, StatusCode::CONFLICT, "{response:?}");
+    }
+
     #[tokio::test]
     async fn branch_start_called_twice_makes_one_branch_one_node_one_run() {
         let (state, app, caller, _repo) = tree().await;
@@ -1082,7 +1256,9 @@ mod tests {
     async fn seen_launch(
         runner: &crate::execution::runner::FakeCommandRunner,
     ) -> Option<(crate::execution::runner::Permission, std::path::PathBuf)> {
-        for _ in 0..300 {
+        // Hang guard only: wait for the launch, not for a short budget.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             let permission = *runner.last_permission.lock().unwrap();
             let cwd = runner.last_cwd.lock().unwrap().clone();
             if let (Some(permission), Some(cwd)) = (permission, cwd) {

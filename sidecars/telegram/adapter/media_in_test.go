@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"reflect"
 	"strings"
 	"testing"
@@ -461,4 +462,53 @@ func assertUnsupported(t *testing.T, ev contract.Event, label string) {
 		t.Fatalf("no unsupported part labelled %q in %+v", label, ev.Message.Parts)
 	}
 	assertDecodes(t, ev)
+}
+
+func TestFetchAndUploadFatalUploadDegradesToUnsupported(t *testing.T) {
+	msg := mediaMsg()
+	msg.Voice = &telegram.Voice{FileID: "v", Duration: 4, FileSize: 3}
+	ev := baseEvent(t, msg)
+	bot := &fakeBot{files: map[string][]byte{"v": []byte("ogg")}}
+	up := &fakeUploader{err: fmt.Errorf("%w: upload media: status 415", kit.ErrFatal)}
+	if err := AttachMedia(context.Background(), &ev, msg, bot, up); err != nil {
+		t.Fatalf("a permanently rejected upload must not block the cursor: %v", err)
+	}
+}
+
+func TestFetchAndUploadTransientUploadStillRetries(t *testing.T) {
+	msg := mediaMsg()
+	msg.Voice = &telegram.Voice{FileID: "v", Duration: 4, FileSize: 3}
+	ev := baseEvent(t, msg)
+	bot := &fakeBot{files: map[string][]byte{"v": []byte("ogg")}}
+	up := &fakeUploader{err: fmt.Errorf("%w: upload media: status 503", kit.ErrTransient)}
+	if err := AttachMedia(context.Background(), &ev, msg, bot, up); err == nil {
+		t.Fatal("a transient upload failure must still be returned")
+	}
+}
+
+func TestFetchAndUploadBotTransportFailureIsRetried(t *testing.T) {
+	transport := &url.Error{Op: "Get", URL: "https://api.telegram.org", Err: errors.New("connection reset")}
+	for name, bot := range map[string]*fakeBot{
+		"getFile":  {getErr: transport},
+		"download": {downloadErr: transport, files: map[string][]byte{}},
+		"5xx":      {getErr: &telegram.APIError{Method: "getFile", StatusCode: 502}},
+	} {
+		msg := mediaMsg()
+		msg.Voice = &telegram.Voice{FileID: "v", FileSize: 3}
+		ev := baseEvent(t, msg)
+		err := AttachMedia(context.Background(), &ev, msg, bot, &fakeUploader{})
+		if !errors.Is(err, kit.ErrTransient) {
+			t.Fatalf("%s: err = %v, want a transient error so the update is retried", name, err)
+		}
+	}
+}
+
+func TestFetchAndUploadBotDefinitiveRefusalDegrades(t *testing.T) {
+	msg := mediaMsg()
+	msg.Voice = &telegram.Voice{FileID: "v", FileSize: 3}
+	ev := baseEvent(t, msg)
+	bot := &fakeBot{getErr: &telegram.APIError{Method: "getFile", StatusCode: 400, Description: "file is too big"}}
+	if err := AttachMedia(context.Background(), &ev, msg, bot, &fakeUploader{}); err != nil {
+		t.Fatalf("a definitive 400 must degrade, got %v", err)
+	}
 }

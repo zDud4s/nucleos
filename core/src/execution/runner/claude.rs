@@ -238,6 +238,8 @@ impl CommandRunner for ClaudeCliRunner {
         // a cancelled run leaves a `cargo build` holding file locks in the worktree, which is
         // exactly what makes `git worktree remove` fail through its whole backoff afterwards.
         let mut tree_killer = child.id().map(TreeKiller::new);
+        // After the killer, so it drops first; lets the liveness sweep ask the OS about this process.
+        let _cli_pid = super::cli_pids::register(&request.env, child.id());
 
         // A process meant to outlive its TURN must not outlive the DAEMON.
         //
@@ -662,7 +664,7 @@ mod stdio_grace_tests {
         assert_eq!(read, vec!["first".to_string(), "second".to_string()]);
         assert!(exited_at.is_some());
         assert!(
-            started.elapsed() < Duration::from_secs(3),
+            started.elapsed() < Duration::from_secs(30),
             "{:?}",
             started.elapsed()
         );

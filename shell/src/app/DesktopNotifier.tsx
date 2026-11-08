@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { useChats } from "../data/chats";
+import { useAllChats } from "../data/chats";
 import { EMPTY_SEEN, toastsFor, type Toast } from "../data/desktop-notify";
 import { useDesktopNotify } from "../data/desktop-notify-pref";
 import { useRecentFeed, type NotifyPolicy } from "../data/feed";
@@ -81,7 +81,7 @@ export function DesktopNotifier({ send = sendDesktopToast }: { send?: (toast: To
 
   const proposals = useProposals();
   const feed = useRecentFeed();
-  const chats = useChats();
+  const chats = useAllChats();
   const policy = useNotifyPolicy();
 
   const seen = useRef(EMPTY_SEEN);
@@ -99,6 +99,7 @@ export function DesktopNotifier({ send = sendDesktopToast }: { send?: (toast: To
       // the way in. A failed read falls to "everything passes", as the sidecar's does.
       feed: policy.isPending ? undefined : feed.data,
       chats: chats.data,
+      chatMachines: chats.answeredMachines,
       seen: seen.current,
     });
     seen.current = out.seen;
@@ -106,7 +107,7 @@ export function DesktopNotifier({ send = sendDesktopToast }: { send?: (toast: To
     for (const toast of out.toasts) void Promise.resolve(send(toast)).catch(() => {});
     const last = out.toasts[out.toasts.length - 1];
     if (last) setOutstanding({ to: last.to, title: last.title, at: Date.now() });
-  }, [front, enabled, policy.data, policy.isPending, proposals.data, feed.data, chats.data, send]);
+  }, [front, enabled, policy.data, policy.isPending, proposals.data, feed.data, chats.data, chats.answeredMachines, send]);
 
   // A stale prompt expires: it is dropped on the window's next return after ACT_ON_MS.
   useEffect(() => {

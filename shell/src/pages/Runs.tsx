@@ -23,6 +23,8 @@ import {
   type RunFilters,
   type RunSearchResult,
 } from "../data/runs";
+import { MachinePicker, useNewWorkMachine } from "../chats/MachinePicker";
+import { useMachines } from "../data/machines";
 import { useAccounts } from "../data/accounts";
 import {
   useCreatePreset,
@@ -1177,6 +1179,10 @@ function NewRunForm({
   onStarted: (id: number) => void;
 }) {
   const create = useCreateRun();
+  const [machine, setMachine] = useNewWorkMachine();
+  const machines = useMachines();
+  // Where the last run went when it was not this machine: the run list stays local for now.
+  const [startedOn, setStartedOn] = useState<string | null>(null);
   const accounts = useAccounts();
   const save = useCreatePreset();
   const kill = useKillSwitch();
@@ -1226,16 +1232,20 @@ function NewRunForm({
 
   function start() {
     if (blank || create.isPending) return;
+    setStartedOn(null);
     create.mutate(
       {
         ...body,
         steerable: draft.steerable,
+        machine,
         ...(draft.account === "auto" ? {} : { account_choice: draft.account }),
       },
       {
         onSuccess: (answer) => {
           setDraft(EMPTY_DRAFT);
-          onStarted(answer.id);
+          // The run's page reads this machine; a run created elsewhere is not on it.
+          if (machine === "here") onStarted(answer.id);
+          else setStartedOn(machines.find((entry) => entry.id === machine)?.name ?? "another machine");
         },
       },
     );
@@ -1273,6 +1283,12 @@ function NewRunForm({
             onChange={(event) => patch({ prompt: event.target.value })}
           />
         </Field>
+
+        <MachinePicker
+          value={machine}
+          onChange={setMachine}
+          project={{ machine: "here", remote: chosen?.remote ?? null }}
+        />
 
         <div className="runs-new-where">
           <Field label="Project for this run">
@@ -1379,6 +1395,9 @@ function NewRunForm({
 
         {create.isError && (
           <StartRefusal error={create.error} what="the run was not started" />
+        )}
+        {startedOn !== null && (
+          <p role="status">{`Started on ${startedOn}. Open NucleOS on that machine to follow it.`}</p>
         )}
       </form>
 
