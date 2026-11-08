@@ -2980,6 +2980,75 @@ mod tests {
         fx.assert_not_landing(JOB).await;
     }
 
+    /// The queue publishes a child's merge onto the parent's branch, which a worktree holds open:
+    /// the publish fast-forwards that worktree, so the parent's files hold the child's work and the
+    /// parent's own gate then reads it.
+    #[tokio::test]
+    async fn a_merged_childs_files_reach_its_parents_worktree() {
+        const JOB: &str = "drv-parent-worktree";
+        let fx = Fixture::new().await;
+        let holder = space_free_tempdir("nucleos-driver-parent-wt-");
+        let parent_tree = holder.path().join("api");
+        assert!(git_in(
+            &fx.repo,
+            &["worktree", "add", "-q", &parent_tree.to_string_lossy(), "tree/api"]
+        ));
+        // The child branch stands one commit above the parent's tip, in a file of its own.
+        assert!(git_in(&fx.repo, &["branch", "tree/api-x", "tree/api"]));
+        let child_tree = holder.path().join("api-x");
+        assert!(git_in(
+            &fx.repo,
+            &["worktree", "add", "-q", &child_tree.to_string_lossy(), "tree/api-x"]
+        ));
+        commit_file(&child_tree, "api-x.txt", "from the child\n", "child");
+        let child_tip = sha_of(&fx.repo, "tree/api-x");
+        let feature_before = sha_of(&fx.repo, "feat/tree");
+
+        let mut parent = code_branch("api", "building", Some("api-node"));
+        parent.worktree = Some(parent_tree.to_string_lossy().into_owned());
+        let mut child = code_branch("api-x", "green", Some("api-x-node"));
+        child.parent = Some("api".to_owned());
+        fx.seed_job(JOB, vec![parent, child], None).await;
+        fx.add_node(JOB, "api-node", "orchestrator").await;
+        fx.run_live("api-node").await;
+        fx.add_node(JOB, "api-x-node", "leaf").await;
+        fx.run_ended("api-x-node", Some("done")).await;
+        let gate = FakeGate::answering(vec![]);
+        assert!(!parent_tree.join("api-x.txt").exists());
+
+        fx.tick(JOB, &gate).await;
+        fx.drain().await;
+        fx.tick(JOB, &gate).await;
+        fx.tick(JOB, &gate).await;
+
+        let merged = fx.branch(JOB, "api-x").await;
+        assert_eq!(merged.state, "merged");
+        let sha = merged.extra["merge_sha"].as_str().expect("the merge sha");
+        assert_eq!(sha, sha_of(&fx.repo, "tree/api"), "the parent's branch moved");
+        assert_eq!(sha_of(&fx.repo, &format!("{sha}^2")), child_tip);
+        assert_eq!(
+            sha_of(&fx.repo, "feat/tree"),
+            feature_before,
+            "a child does not merge into the feature branch"
+        );
+        assert_eq!(sha_of(&parent_tree, "HEAD"), sha, "the worktree's HEAD followed the ref");
+        assert_eq!(
+            std::fs::read_to_string(parent_tree.join("api-x.txt")).unwrap(),
+            "from the child\n"
+        );
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&parent_tree)
+                .args(["status", "--porcelain"])
+                .output()
+                .unwrap()
+                .stdout
+                .is_empty(),
+            "the parent's worktree is clean after the publish"
+        );
+    }
+
     #[tokio::test]
     async fn a_root_branch_with_no_diff_is_dropped() {
         const EMPTY: &str = "drv-root-empty";
