@@ -124,7 +124,7 @@ class Config(TreeCase):
             ts.load_config()
 
     def test_nodes_limits_come_from_the_nodes_block(self):
-        self.assertEqual(ts.load_nodes_limits()["max_depth"], 3)
+        self.assertEqual(ts.load_nodes_limits()["max_depth"], 6)
         (self.root / ".nucleos" / "workflow" / "speed.yaml").write_text(
             "nodes:\n  max_depth: 2\n  subtree_verify: true\n", encoding="utf-8")
         limits = ts.load_nodes_limits()

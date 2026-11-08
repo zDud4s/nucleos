@@ -41,6 +41,9 @@ pub struct Branch {
     pub paths: Vec<String>,
     pub layer: String,
     pub base: Option<String>,
+    /// The orchestrator branch that started this one; `None` for a stem-level branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
     pub state: String,
     pub git_branch: Option<String>,
     pub worktree: Option<String>,
@@ -61,6 +64,7 @@ impl Branch {
             paths: paths.to_vec(),
             layer: layer.to_owned(),
             base: base.map(str::to_owned),
+            parent: None,
             state: "queued".to_owned(),
             git_branch: None,
             worktree: None,
@@ -192,6 +196,23 @@ mod tests {
         let rootless = Branch::new("db", &[], "data", None);
         assert_eq!(rootless.base, None);
         assert!(rootless.paths.is_empty());
+    }
+
+    #[test]
+    fn a_branch_without_a_parent_serialises_exactly_as_before() {
+        let branch = Branch::new("api", &[], "backend", None);
+        assert!(
+            serde_json::to_value(&branch)
+                .unwrap()
+                .get("parent")
+                .is_none()
+        );
+        let mut child = Branch::new("api-x", &[], "backend", None);
+        child.parent = Some("api".to_owned());
+        let value = serde_json::to_value(&child).unwrap();
+        assert_eq!(value["parent"], "api");
+        let back: Branch = serde_json::from_value(value).unwrap();
+        assert_eq!(back, child);
     }
 
     #[test]

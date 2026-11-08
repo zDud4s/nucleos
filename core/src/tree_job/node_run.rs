@@ -39,7 +39,7 @@ pub(super) fn node_prompt(node_id: &str, root_id: &str, tree_job_id: &str, task:
     };
     let report = report_format(node_id, root_id);
     format!(
-        "{NODE_PROMPT_HEADER}{node_id}.{job_line} If the work is too large for this node, split it with the tree_branch_start tool (a node run cannot open children with node_open). Finish by writing a handoff file and calling node_close. Write the handoff file as `.nucleos-report.md` in your worktree (your current directory; the daemon keeps it out of git, so do not commit it) and pass its absolute path as handoff_path.\n\n{report}\n\n{TICKET_RULES}\n\n{task}"
+        "{NODE_PROMPT_HEADER}{node_id}.{job_line} If the work is too large for this node, split it with the tree_branch_start tool (a leaf run cannot open children with node_open; an orchestrator opens only its own). Finish by writing a handoff file and calling node_close. Write the handoff file as `.nucleos-report.md` in your worktree (your current directory; the daemon keeps it out of git, so do not commit it) and pass its absolute path as handoff_path.\n\n{report}\n\n{TICKET_RULES}\n\n{task}"
     )
 }
 

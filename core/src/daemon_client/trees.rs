@@ -36,7 +36,7 @@ impl DaemonClient {
         json_or_refusal(response, &format!("abandoning tree job {id}")).await
     }
 
-    /// `POST /trees/{id}/branch_start`: body is `{name, goal, owned_paths, prompt, layer?, base?, node_id}`.
+    /// `POST /trees/{id}/branch_start`: body is `{name, goal, owned_paths, prompt, layer?, base?, node_id, kind?, estimate_tokens?}`.
     pub async fn tree_branch_start(&self, id: &str, body: &Value) -> Result<Value, String> {
         let path = format!("/trees/{}/branch_start", super::nodes::encode_segment(id));
         let response = self

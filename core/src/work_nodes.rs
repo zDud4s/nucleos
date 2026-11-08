@@ -52,6 +52,9 @@ macro_rules! select_nodes {
 // Limits
 // ---------------------------------------------------------------------------------------------
 
+/// The default `nodes.leaf_budget`, in tokens.
+pub const DEFAULT_LEAF_BUDGET: i64 = 120_000;
+
 /// How deep, how wide and how verbose a work tree may get.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
@@ -62,6 +65,9 @@ pub struct NodeLimits {
     pub max_width: i64,
     /// The longest `summary` accepted on close, in characters.
     pub summary_max: usize,
+    /// The most tokens one leaf's work may be estimated at; a larger piece becomes an
+    /// orchestrator (see `tree_job::partition`).
+    pub leaf_budget: i64,
     /// The files and directories (a `/`-ending entry) every node may edit whatever it owns; see
     /// `node_scope`.
     pub shared_files: Vec<String>,
@@ -73,6 +79,7 @@ impl Default for NodeLimits {
             max_depth: None,
             max_width: 6,
             summary_max: 1500,
+            leaf_budget: DEFAULT_LEAF_BUDGET,
             shared_files: crate::node_scope::DEFAULT_SHARED_FILES
                 .iter()
                 .map(|entry| (*entry).to_owned())
@@ -109,6 +116,9 @@ impl NodeLimits {
         }
         if let Some(value) = pick("summary_max").and_then(|v| usize::try_from(v).ok()) {
             limits.summary_max = value;
+        }
+        if let Some(value) = pick("leaf_budget").and_then(|v| i64::try_from(v).ok()) {
+            limits.leaf_budget = value;
         }
         // A sequence of strings replaces the default list; anything else (a scalar, a mapping, a
         // sequence holding a non-string) leaves it.
@@ -1438,6 +1448,18 @@ mod tests {
     }
 
     #[test]
+    fn limits_read_leaf_budget_from_the_nodes_block() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(NodeLimits::load(Some(dir.path())).leaf_budget, 120_000);
+        std::fs::create_dir_all(dir.path().join(".nucleos/workflow")).unwrap();
+        let file = dir.path().join(".nucleos/workflow/speed.yaml");
+        std::fs::write(&file, "nodes:\n  leaf_budget: 90000\n").unwrap();
+        assert_eq!(NodeLimits::load(Some(dir.path())).leaf_budget, 90_000);
+        std::fs::write(&file, "nodes:\n  max_width: 2\n").unwrap();
+        assert_eq!(NodeLimits::load(Some(dir.path())).leaf_budget, 120_000);
+    }
+
+    #[test]
     fn limits_read_shared_files_from_speed_yaml_and_default_to_the_list() {
         let defaults: Vec<String> = crate::node_scope::DEFAULT_SHARED_FILES
             .iter()
@@ -1539,6 +1561,28 @@ mod tests {
             matches!(refused, Err(NodeError::Conflict(_))),
             "{refused:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn open_accepts_depth_six_and_refuses_seven_with_max_depth_six() {
+        let pool = test_pool().await;
+        let limits = NodeLimits {
+            max_depth: Some(6),
+            ..NodeLimits::default()
+        };
+        let mut parent = open(&pool, None, &limits, &root_args()).await.unwrap().id;
+        for depth in 1..=6 {
+            let title = format!("o{depth}");
+            let args = child_args(&parent, "orchestrator", &title, &[]);
+            parent = open(&pool, None, &limits, &args).await.unwrap().id;
+        }
+        let deep = child_args(&parent, "leaf", "deep", &[]);
+        match open(&pool, None, &limits, &deep).await {
+            Err(NodeError::Conflict(message)) => {
+                assert_eq!(message, "depth 7 exceeds the limit of 6");
+            }
+            other => panic!("expected a depth conflict, got {other:?}"),
+        }
     }
 
     #[tokio::test]

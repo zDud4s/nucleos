@@ -84,6 +84,13 @@ pub(super) struct TreeBranchStartParams {
     pub(super) base: Option<String>,
     /// Your own work node: the new branch's node becomes its child.
     pub(super) node_id: String,
+    /// `leaf` (the default) or `orchestrator`. Use `orchestrator` only for a piece whose estimate
+    /// exceeds the leaf budget; it will split itself again. The daemon makes a leaf of an
+    /// orchestrator that does not need or cannot have children.
+    pub(super) kind: Option<String>,
+    /// Your estimate of the tokens building this piece takes: a positive number. Pass it on every
+    /// piece; it decides leaf or orchestrator and is kept on the branch.
+    pub(super) estimate_tokens: Option<i64>,
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]

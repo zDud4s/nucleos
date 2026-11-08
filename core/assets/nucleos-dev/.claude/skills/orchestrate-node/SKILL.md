@@ -21,8 +21,11 @@ Routing and the "One controller per node" rules live in `dispatch.md`; read it o
    `leaf_budget`. Estimate a leaf by reading with exact line ranges: a big file read whole
    does not justify a split, a split that cannot cut the reading does not help.
 3. **Respect the limits.** Children sit at your depth + 1, which must stay within `max_depth`;
-   no more than `max_width` open siblings. If the task needs more, merge parts or sequence
-   them rather than widen.
+   no more than `max_width` open siblings. A piece that exceeds `leaf_budget` becomes a
+   sub-orchestrator one level down (`kind` orchestrator) and is split again there. Fold pieces
+   under 25% of `leaf_budget` into a neighbour (`tree.py partition --pieces <file>` does the
+   fold and marks each piece leaf or orchestrator). Stop at `max_depth`: make the best leaf you
+   can and say in the summary that it exceeded the budget.
 4. **Open each child** with `node_open` (`parent_id` = your node, `kind` orchestrator or leaf,
    `title`, `goal`, `owned_paths`, `budget_tokens`). Siblings that run concurrently own
    **disjoint** paths; overlapping parts run in sequence or become one child.
@@ -49,7 +52,7 @@ Routing and the "One controller per node" rules live in `dispatch.md`; read it o
 
 ## Boundaries
 
-- Direct children only, and only `wf-orchestrator`, `wf-planner`, `wf-executor`, `wf-reviewer` (in a tree driven by `tree.py`, a leaf `execute` goes through `wf-leaf`; both `wf-orchestrator` and `wf-tree-orchestrator` may dispatch it, and `wf-tree-orchestrator`, the top of the branch, never dispatches itself).
+- Direct children only, and only `wf-orchestrator`, `wf-planner`, `wf-leaf`, `wf-executor`, `wf-reviewer` (in a tree driven by `tree.py`, a leaf `execute` goes through `wf-leaf`; both `wf-orchestrator` and `wf-tree-orchestrator` may dispatch it, and `wf-tree-orchestrator`, the top of the branch, never dispatches itself).
 - No build, test or verify run. In a tree driven by `tree.py` that is absolute: `subtree_verify` is
   ignored and only the controller gates. Outside a tree, with `subtree_verify` true, a branch-scoped
   `mcp__nucleos__verify` for your own branch is allowed; otherwise the root controller's single
@@ -80,8 +83,10 @@ prompt block is the single source; if they differ, the prompt wins.
   hand-formatting. List the exact commands you would have run
   under `## Commands for the root`; the controller runs them. The controller commits for you.
 - **Partition by report.** If your prompt says you do not launch children, return `Outcome: split`
-  with each child's piece (goal, files, line hints, contract sections, budget) in `## What was done`
-  and open no node.
+  with each child's piece (goal, files, line hints, contract sections, budget, and its kind) in
+  `## What was done` and open no node. A piece over `leaf_budget` is an orchestrator piece, not a
+  leaf: the controller opens it as an orchestrator and it is split again one level down. The
+  controller, not you, runs `tree.py prompt` for each piece (cockpits have no Bash).
 
 ## Red flags
 

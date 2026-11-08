@@ -412,7 +412,7 @@ pub fn check_may_merge(manifest: &Manifest, branch: &str) -> Result<MergeDecisio
     }
     Ok(MergeDecision::Proceed {
         source,
-        target: manifest.feature_branch.clone(),
+        target: super::nesting::merge_target(manifest, branch).map_err(LandingError::Refused)?,
     })
 }
 
@@ -1809,6 +1809,50 @@ mod tests {
             check_may_merge(&manifest, "notes"),
             Err(LandingError::Refused(_))
         ));
+    }
+
+    fn child_of(parent_state: &str) -> Manifest {
+        let mut child = branch_at("api-x", "green");
+        child.parent = Some("api".to_owned());
+        manifest_with(vec![branch_at("api", parent_state), child])
+    }
+
+    #[test]
+    fn a_child_merges_into_its_parents_git_branch_not_the_feature() {
+        let manifest = child_of("building");
+
+        assert_eq!(
+            check_may_merge(&manifest, "api-x").unwrap(),
+            MergeDecision::Proceed {
+                source: "tree/api-x".to_owned(),
+                target: "tree/api".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_child_of_a_dropped_parent_refuses_to_merge_and_names_the_parent() {
+        for state in ["dropped", "parked"] {
+            let error = check_may_merge(&child_of(state), "api-x").unwrap_err();
+
+            assert!(
+                matches!(&error, LandingError::Refused(text) if text.contains("parent branch api")),
+                "{state}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_parentless_branch_still_targets_the_feature_branch() {
+        let manifest = manifest_with(vec![branch_at("api", "green")]);
+
+        assert_eq!(
+            check_may_merge(&manifest, "api").unwrap(),
+            MergeDecision::Proceed {
+                source: "tree/api".to_owned(),
+                target: "feat/tree".to_owned(),
+            }
+        );
     }
 
     #[test]

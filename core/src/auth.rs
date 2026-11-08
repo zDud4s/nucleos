@@ -1094,9 +1094,11 @@ fn tree_route_id<'a>(path: &'a str, head: &str, tail: &str) -> Option<&'a str> {
 /// Whether a run key bound to a tree node may use a tree or node route: the autonomous tree run's
 /// own door. Admits exactly `POST /trees/{id}/branch_start` for the tree its node belongs to, and
 /// `PATCH /nodes/{id}` / `POST /nodes/{id}/close` for the node the run is bound to
-/// (`work_nodes.run_id`, text). Everything else on those families stays refused, including
-/// `POST /trees`, `POST /nodes` and `GET /nodes/active`, and so does every error or a run bound to
-/// no node: the binding is the credential. `grants` stays pure and lists none of these.
+/// (`work_nodes.run_id`, text), and `POST /nodes` when that node is an orchestrator (the handler
+/// then requires `parent_id` to be that same node). Everything else on those families stays
+/// refused, including `POST /trees`, `POST /nodes` from a leaf-bound run and `GET /nodes/active`,
+/// and so does every error or a run bound to no node: the binding is the credential. `grants`
+/// stays pure and lists none of these.
 async fn tree_run_admits(
     pool: &sqlx::SqlitePool,
     scope: &Scope,
@@ -1110,22 +1112,28 @@ async fn tree_run_admits(
     let tree_route = *method == Method::POST && matched == "/trees/{id}/branch_start";
     let update_route = *method == Method::PATCH && matched == "/nodes/{id}";
     let close_route = *method == Method::POST && matched == "/nodes/{id}/close";
-    if !(tree_route || update_route || close_route) {
+    let open_route = *method == Method::POST && matched == "/nodes";
+    if !(tree_route || update_route || close_route || open_route) {
         return false;
     }
-    let bound: Result<Vec<(String, String)>, sqlx::Error> =
-        sqlx::query_as("SELECT id, root_id FROM work_nodes WHERE run_id = ?")
+    let bound: Result<Vec<(String, String, String)>, sqlx::Error> =
+        sqlx::query_as("SELECT id, root_id, kind FROM work_nodes WHERE run_id = ?")
             .bind(run_id.to_string())
             .fetch_all(pool)
             .await;
     let Ok(bound) = bound else {
         return false;
     };
+    if open_route {
+        return bound
+            .iter()
+            .any(|(_, _, kind)| kind == crate::work_nodes::KIND_ORCHESTRATOR);
+    }
     if tree_route {
         let Some(tree) = tree_route_id(path, "/trees/", "/branch_start") else {
             return false;
         };
-        for (_, root_id) in &bound {
+        for (_, root_id, _) in &bound {
             let owns: Result<Option<i64>, sqlx::Error> =
                 sqlx::query_scalar("SELECT 1 FROM tree_jobs WHERE id = ? AND root_node_id = ?")
                     .bind(tree)
@@ -1143,7 +1151,7 @@ async fn tree_run_admits(
     } else {
         tree_route_id(path, "/nodes/", "/close")
     };
-    node.is_some_and(|node| bound.iter().any(|(id, _)| id == node))
+    node.is_some_and(|node| bound.iter().any(|(id, _, _)| id == node))
 }
 
 /// The chat turn a browser request was admitted for. `require_token` inserts it as a request
@@ -3730,6 +3738,58 @@ mod tests {
             status_with_json(&app, "POST", "/nodes/no-such-node/close", &key).await,
             StatusCode::FORBIDDEN,
             "close a node that does not exist"
+        );
+    }
+
+    /// A run bound to a node of kind `orchestrator` reaches `POST /nodes`; the handler then pins
+    /// the parent to that node.
+    #[tokio::test]
+    async fn an_orchestrator_run_key_may_post_nodes() {
+        let state = test_state("owner-token").await;
+        let app = protected_router(state.clone());
+        seed_tree(&state, "tree-x", "root-x").await;
+        let key = tree_run_key(&state, "orch-x", "root-x", "tree-x").await;
+        sqlx::query("UPDATE work_nodes SET kind = 'orchestrator' WHERE id = 'orch-x'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            status_with_json(&app, "POST", "/nodes", &key).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status_with_json(&app, "GET", "/nodes/active", &key).await,
+            StatusCode::FORBIDDEN,
+            "only POST /nodes opens, the listing stays closed"
+        );
+    }
+
+    /// A leaf cannot open nodes (Spec acceptance 4).
+    #[tokio::test]
+    async fn a_leaf_run_key_may_not_post_nodes() {
+        let state = test_state("owner-token").await;
+        let app = protected_router(state.clone());
+        seed_tree(&state, "tree-x", "root-x").await;
+        let key = tree_run_key(&state, "leaf-x", "root-x", "tree-x").await;
+
+        assert_eq!(
+            status_with_json(&app, "POST", "/nodes", &key).await,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    /// A run bound to no node never opens nodes, whatever its bearer.
+    #[tokio::test]
+    async fn a_run_key_bound_to_no_node_may_not_post_nodes() {
+        let state = test_state("owner-token").await;
+        let app = protected_router(state.clone());
+        seed_tree(&state, "tree-x", "root-x").await;
+        let (_, unbound) = running_run_with_token(&state).await;
+
+        assert_eq!(
+            status_with_json(&app, "POST", "/nodes", &unbound).await,
+            StatusCode::FORBIDDEN
         );
     }
 
