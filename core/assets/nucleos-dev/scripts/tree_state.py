@@ -26,7 +26,7 @@ DEFAULTS = {"floor_gb": 15, "max_live_branches": 4, "seed_gb_per_layer": 8,
             "lock_wait_minutes": 10, "stale_minutes": 30, "report_max_lines": 60}
 PROJECT_DEFAULTS = {"worktrees_dir": ".nucleos/worktrees", "links": [], "heavy": None,
                     "base_branch": "master"}
-NODES_DEFAULTS = {"max_depth": 3, "max_width": 6, "leaf_budget": 120000,
+NODES_DEFAULTS = {"max_depth": 6, "max_width": 6, "leaf_budget": 120000,
                   "orchestrator_budget": 150000, "ceiling": 200000, "subtree_verify": False}
 
 BRANCH_STATES = ("queued", "open", "building", "gating", "green", "red", "reviewing", "fixing",

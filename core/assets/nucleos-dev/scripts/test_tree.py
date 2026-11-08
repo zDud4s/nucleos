@@ -309,7 +309,7 @@ class Prompt(CliCase):
         text = out["prompt"]
         for line in ("Node ID: n-5", "Root ID: root-1", "Parent ID: n-3", "Task ID: T9", "Kind: leaf",
                      "Owned paths: core/src/wheel.rs", "Budget tokens: 120000", "Current depth: 2",
-                     "Max depth: 3", "Max width: 6", "Ceiling: 200000", "Subtree verify: false",
+                     "Max depth: 6", "Max width: 6", "Ceiling: 200000", "Subtree verify: false",
                      "Add the wheel", "core/src/wheel.rs:222-275 - the loop", "## Rules", "## Tree",
                      "Branch: core", "Role: leaf", "## Report", "at most 60 lines", "## Constraints"):
             self.assertIn(line, text)
