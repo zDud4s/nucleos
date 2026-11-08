@@ -1259,6 +1259,8 @@ async fn daemon_main() -> std::process::ExitCode {
     // conflict up afterwards.
     if scheduled_routines_wanted {
         tokio::spawn(resolver::run_resolution_loop(state.clone()));
+        // A ticket nobody took gets a run after ten minutes, at most twice per key, then a decision.
+        tokio::spawn(task_claims::launch::run_launch_loop(state.clone()));
     }
     // Only when a local model is already configured, and reusing the triage one rather than adding
     // a key: this reads mail-derived text, which is the text that model was chosen for, and

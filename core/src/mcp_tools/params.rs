@@ -580,6 +580,9 @@ pub(super) struct NodeUpdateParams {
     pub(super) decision: Option<String>,
     /// The peak context size, in tokens, this node has reached.
     pub(super) context_peak: Option<i64>,
+    /// Globs you need beyond your owned paths; accepted unless a sibling owns them. A glob you
+    /// already own, or a shared file, is dropped.
+    pub(super) widen_paths: Option<Vec<String>>,
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
@@ -634,11 +637,43 @@ pub(super) struct TaskClaimParams {
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub(super) struct TaskReportParams {
+    /// What is wrong: `master-red`, `test:<path>::<name>`, `file:<path>`, `spec-item:<spec>#<n>` or `topic:<slug>`. The same key adds a report to the same ticket.
+    pub(super) key: String,
+    /// One line saying what is wrong. Defaults to the key.
+    pub(super) title: Option<String>,
+    /// Paths (relative to the repo root) where the problem shows. They only hint; a report never blocks a land.
+    pub(super) paths: Option<Vec<String>>,
+    /// Tests that show the problem.
+    pub(super) tests: Option<Vec<String>>,
+    /// What you saw: it is added to the ticket's reports.
+    pub(super) detail: Option<String>,
+    /// True when your own work waits for the fix: you are told when the ticket closes.
+    pub(super) blocking: Option<bool>,
+    /// Id of a related ticket of this project (a pointer only).
+    pub(super) linked_to: Option<i64>,
+    /// Filled in by the NucleOS hook. Leave empty.
+    pub(super) session_id: Option<String>,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 pub(super) struct TaskCloseParams {
     /// The task id `task_list` or `task_claim` gave back.
     pub(super) id: i64,
     /// Why: it is the task history.
     pub(super) note: String,
+    /// Filled in by the NucleOS hook. Leave empty.
+    pub(super) session_id: Option<String>,
+}
+
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub(super) struct TaskDeclineParams {
+    /// The id of the ticket you were offered.
+    pub(super) id: i64,
+    /// Why you cannot take it: it goes into the ticket history.
+    pub(super) message: String,
+    /// The session you think fits better, if you know one. A hint only.
+    pub(super) suggest_session_id: Option<String>,
     /// Filled in by the NucleOS hook. Leave empty.
     pub(super) session_id: Option<String>,
 }

@@ -17,6 +17,10 @@ pub(super) const LAUNCH: &str = "launch";
 
 const NODE_PROMPT_HEADER: &str = "You are the agent for NucleOS tree node ";
 
+/// What every node, root included, is told about problems outside its owned paths (spec
+/// 2026-11-06, tickets globais). Appended once by `node_prompt` and by `root_prompt`.
+pub(super) const TICKET_RULES: &str = "Problems outside your owned paths are not yours to fix. Report them with mcp__nucleos__task_report (key, title, paths) and carry on with your own work; wait only if your work depends on the fix, and then wait for the ticket-closed notice. If you truly need a path you do not own, ask your parent with node_update widen_paths; if a sibling owns it you are refused: report a ticket and it goes to that sibling. Shared files (core/AGENTS.md, ask_daemon.py, core/migrations/) you may edit. A repeated migration number or an unresolved conflict at land is a ticket, not yours to renumber or resolve twice. When a ticket is offered to you and it is independent of your work, claim it and start a branch (a leaf) for it with tree_branch_start, then carry on. The daemon launches a new tree for a ticket nobody claims; it never starts a leaf for one you hold.";
+
 /// Gives a tree node the protocol it needs to split work and report its result.
 ///
 /// A relaunch receives the already stored prompt, so the marker must make this a no-op after the
@@ -35,7 +39,7 @@ pub(super) fn node_prompt(node_id: &str, root_id: &str, tree_job_id: &str, task:
     };
     let report = report_format(node_id, root_id);
     format!(
-        "{NODE_PROMPT_HEADER}{node_id}.{job_line} If the work is too large for this node, split it with the tree_branch_start tool (a node run cannot open children with node_open). Finish by writing a handoff file and calling node_close. Write the handoff file as `.nucleos-report.md` in your worktree (your current directory; the daemon keeps it out of git, so do not commit it) and pass its absolute path as handoff_path.\n\n{report}\n\n{task}"
+        "{NODE_PROMPT_HEADER}{node_id}.{job_line} If the work is too large for this node, split it with the tree_branch_start tool (a node run cannot open children with node_open). Finish by writing a handoff file and calling node_close. Write the handoff file as `.nucleos-report.md` in your worktree (your current directory; the daemon keeps it out of git, so do not commit it) and pass its absolute path as handoff_path.\n\n{report}\n\n{TICKET_RULES}\n\n{task}"
     )
 }
 
@@ -1291,5 +1295,35 @@ mod tests {
         assert!(prompt.contains("Outcome:"), "{prompt}");
         assert!(prompt.contains("Contract used:"), "{prompt}");
         assert!(prompt.contains("## Summary"), "{prompt}");
+    }
+
+    #[test]
+    fn a_node_prompt_carries_the_ticket_rules_once() {
+        let first = node_prompt("node-abc-123", "root-9", "job-1", "Implement the parser.");
+        assert_eq!(first.matches(TICKET_RULES).count(), 1, "{first}");
+        let report_at = first.find("## Summary").expect("report format");
+        let rules_at = first.find(TICKET_RULES).expect("rules");
+        let task_at = first.find("Implement the parser.").expect("task");
+        assert!(report_at < rules_at && rules_at < task_at, "{first}");
+        let relaunch = node_prompt("node-abc-123", "root-9", "job-1", &first);
+        assert_eq!(relaunch, first);
+        assert_eq!(relaunch.matches(TICKET_RULES).count(), 1);
+    }
+
+    #[test]
+    fn the_rules_name_only_tools_that_exist() {
+        let mut seen = 0;
+        for part in TICKET_RULES.split("mcp__nucleos__").skip(1) {
+            let name: String = part
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            assert!(
+                crate::mcp_tools::TASK_TOOL_NAMES.contains(&name.as_str()),
+                "unknown tool {name}"
+            );
+            seen += 1;
+        }
+        assert!(seen >= 1);
     }
 }

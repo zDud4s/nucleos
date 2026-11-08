@@ -534,7 +534,8 @@ impl NucleosTools {
 
     #[tool(
         description = "Update a work node: its status, a decision to record, or the peak context \
-                       size it has reached. Only the fields you pass change."
+                       size it has reached. Only the fields you pass change. widen_paths: globs \
+                       you need beyond your owned paths; accepted unless a sibling owns them."
     )]
     pub(super) async fn node_update(
         &self,
@@ -543,6 +544,7 @@ impl NucleosTools {
             status,
             decision,
             context_peak,
+            widen_paths,
         }): Parameters<NodeUpdateParams>,
     ) -> String {
         json_result(
@@ -553,6 +555,7 @@ impl NucleosTools {
                         "status": status,
                         "decision": decision,
                         "context_peak": context_peak,
+                        "widen_paths": widen_paths,
                     }),
                 )
                 .await,

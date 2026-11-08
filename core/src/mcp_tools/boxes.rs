@@ -174,6 +174,8 @@ pub const JOB_NODE_TOOLS: &[&str] = &[
     "task_claim",
     "task_release",
     "task_done",
+    "task_report",
+    "task_decline",
 ];
 
 /// The members of `JOB_NODE_TOOLS` that `McpBox::All` serves as well. A chat or a plain run has a
@@ -189,11 +191,20 @@ pub const EVERY_BOX_TOOLS: &[&str] = &[
     "task_claim",
     "task_release",
     "task_done",
+    "task_report",
+    "task_decline",
 ];
 
 /// The task-claim tools (spec 2026-10-22, section 4). A claim is a row in the daemon's own table,
 /// so they ride with `verify` into every box that has a worktree or a run behind it.
-pub const TASK_TOOL_NAMES: [&str; 4] = ["task_list", "task_claim", "task_release", "task_done"];
+pub const TASK_TOOL_NAMES: [&str; 6] = [
+    "task_list",
+    "task_claim",
+    "task_release",
+    "task_done",
+    "task_report",
+    "task_decline",
+];
 
 /// What an interactive (IDE/terminal) session's worktree box serves: `EVERY_BOX_TOOLS` plus the five
 /// work-node tools, so the `orchestrate` skill can run a node tree there, and the five launch tools
@@ -234,9 +245,11 @@ pub const WORKTREE_BOX_TOOLS: &[&str] = &[
     "spec_backlog",
     "spec_finish",
     "task_claim",
+    "task_decline",
     "task_done",
     "task_list",
     "task_release",
+    "task_report",
     "tree_abandon",
     "tree_branch_start",
     "tree_launch",
@@ -284,9 +297,11 @@ pub const JOB_NODE_BASE: &[&str] = &[
     "record",
     "request_tool",
     "task_claim",
+    "task_decline",
     "task_done",
     "task_list",
     "task_release",
+    "task_report",
     "verify",
     "verify_status",
 ];

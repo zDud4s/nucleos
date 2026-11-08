@@ -11,6 +11,9 @@
 //! | `file:<path>` | a bug localised in a file |
 //! | `spec-item:<spec>#<n>` | an item of a spec checklist |
 //! | `topic:<slug>` | last resort |
+//! | `migration:<target>:<NNNN>` | two files with one migration number (daemon only) |
+//! | `fmt:<target>:<crate>` | red formatting on the target (daemon only) |
+//! | `conflict:<source>-><target>` | a branch that no longer merges (daemon only) |
 
 use std::path::Path;
 
@@ -27,6 +30,14 @@ impl TaskKey {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// True for the keys only the daemon opens: `master-red` and `migration:`, `fmt:`, `conflict:`.
+    pub fn is_machine(&self) -> bool {
+        matches!(
+            self.prefix(),
+            "master-red" | "migration" | "fmt" | "conflict"
+        )
     }
 
     /// The part before the first `:` (the whole key for `master-red`).
@@ -71,7 +82,7 @@ impl std::fmt::Display for KeyError {
             Self::Empty => write!(formatter, "empty task key"),
             Self::UnknownPrefix(prefix) => write!(
                 formatter,
-                "unknown task key prefix '{prefix}' (use master-red, test:, file:, spec-item: or topic:)"
+                "unknown task key prefix '{prefix}' (use master-red, test:, file:, spec-item:, topic:, migration:, fmt: or conflict:)"
             ),
             Self::Malformed { prefix, expected } => {
                 write!(formatter, "malformed '{prefix}' key: expected {expected}")
@@ -145,6 +156,48 @@ pub fn normalize(raw: &str, project_root: &Path) -> Result<TaskKey, KeyError> {
             "topic:{}",
             slug(body).ok_or_else(|| malformed("topic", "a slug with letters or digits"))?
         ),
+        "migration" => {
+            const SHAPE: &str = "migration:<target>:<NNNN> with a numeric migration number";
+            let (target, number) = body
+                .rsplit_once(':')
+                .ok_or_else(|| malformed("migration", SHAPE))?;
+            let target = target.trim();
+            let number: u32 = number
+                .trim()
+                .parse()
+                .map_err(|_| malformed("migration", SHAPE))?;
+            if target.is_empty() {
+                return Err(malformed("migration", SHAPE));
+            }
+            format!("migration:{target}:{number:04}")
+        }
+        "fmt" => {
+            const SHAPE: &str = "fmt:<target>:<crate> with a crate of [a-z0-9_-]";
+            let (target, krate) = body
+                .rsplit_once(':')
+                .ok_or_else(|| malformed("fmt", SHAPE))?;
+            let target = target.trim();
+            let krate = krate.trim().to_ascii_lowercase();
+            let valid = !krate.is_empty()
+                && krate
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
+            if target.is_empty() || !valid {
+                return Err(malformed("fmt", SHAPE));
+            }
+            format!("fmt:{target}:{krate}")
+        }
+        "conflict" => {
+            const SHAPE: &str = "conflict:<source>-><target>";
+            let (source, target) = body
+                .split_once("->")
+                .ok_or_else(|| malformed("conflict", SHAPE))?;
+            let (source, target) = (source.trim(), target.trim());
+            if source.is_empty() || target.is_empty() {
+                return Err(malformed("conflict", SHAPE));
+            }
+            format!("conflict:{source}->{target}")
+        }
         other => return Err(KeyError::UnknownPrefix(other.to_owned())),
     };
     Ok(TaskKey(key))
@@ -346,6 +399,46 @@ mod tests {
         assert_eq!((red.prefix(), red.path()), ("master-red", None));
         let spec = normalize("spec-item:s.md#2", Path::new("/repo")).unwrap();
         assert_eq!(spec.path(), Some("s.md"));
+    }
+
+    #[test]
+    fn machine_keys_normalise_to_their_fixed_shape() {
+        assert_eq!(
+            key("MIGRATION: master : 276").unwrap(),
+            "migration:master:0276"
+        );
+        assert_eq!(key("fmt:master:Core").unwrap(), "fmt:master:core");
+        assert_eq!(
+            key("conflict: fix/a -> master ").unwrap(),
+            "conflict:fix/a->master"
+        );
+    }
+
+    #[test]
+    fn malformed_machine_keys_say_what_is_expected() {
+        assert!(matches!(
+            key("migration:master:abc"),
+            Err(KeyError::Malformed { .. })
+        ));
+        assert!(matches!(
+            key("fmt:master:"),
+            Err(KeyError::Malformed { .. })
+        ));
+        assert!(matches!(
+            key("conflict:fix/a"),
+            Err(KeyError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn is_machine_is_true_only_for_daemon_kinds() {
+        let machine = |raw: &str| normalize(raw, Path::new("/repo")).unwrap().is_machine();
+        assert!(machine("master-red"));
+        assert!(machine("migration:master:276"));
+        assert!(machine("fmt:master:core"));
+        assert!(machine("conflict:a->master"));
+        assert!(!machine("file:core/a.rs"));
+        assert!(!machine("topic:x"));
     }
 
     #[test]

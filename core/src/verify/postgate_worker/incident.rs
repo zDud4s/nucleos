@@ -201,6 +201,46 @@ pub(super) fn failures_of_ticket(ticket: &crate::verify::plan::Ticket) -> RedFai
     )
 }
 
+/// Opens (or reports again) `fmt:<target>:<group>` for every failed unit of the confirmed red's
+/// `ticket` that is a format step (`machine::fmt_unit_key`), once per group, at the red sha.
+/// Fail-open like the incident: the gate owns the red, so a claims error is only logged.
+pub(super) async fn open_fmt_tickets(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+    state: &State,
+    ticket: &crate::verify::plan::Ticket,
+) {
+    let groups: std::collections::BTreeSet<&str> = ticket
+        .units
+        .iter()
+        .filter(|unit| unit.status == "failed")
+        .filter_map(|unit| {
+            let group = unit.group.as_deref()?;
+            task_claims::machine::fmt_unit_key(group, &unit.argv).map(|_| group)
+        })
+        .collect();
+    let sha = state.red_sha.as_deref().unwrap_or_default();
+    for group in groups {
+        if let Err(error) = task_claims::machine::open_fmt_ticket(
+            pool,
+            project_id,
+            &state.target,
+            group,
+            sha,
+            Utc::now(),
+        )
+        .await
+        {
+            tracing::warn!(
+                project = project_id,
+                group,
+                %error,
+                "postgate: cannot open the fmt ticket"
+            );
+        }
+    }
+}
+
 /// Creates the `master-red` incident for the confirmed red in `state`, or adopts the live one (a
 /// verify probe may have opened it first) and brings its `detail` up to date. Idempotent: it runs
 /// on the flake-check ticket that confirms the red (with `failures`) and again on every bisection
@@ -546,6 +586,21 @@ pub(super) async fn close_if_green(
     let Some(green) = state.last_green_sha.as_deref() else {
         return;
     };
+    // The `fmt:` tickets close here, before the incident's own checks: one can be live with no
+    // `master-red` at all, and no ancestor check is needed, since a green gate means the format
+    // check passed on the sha it gated, whichever red opened the ticket.
+    if let Err(error) = task_claims::machine::close_fmt_tickets(
+        pool,
+        project_id,
+        &state.target,
+        &[],
+        green,
+        Utc::now(),
+    )
+    .await
+    {
+        tracing::warn!(project = project_id, %error, "postgate: cannot close the fmt tickets");
+    }
     let Some(row) = live_master_red(pool, project_id).await else {
         return;
     };
@@ -680,6 +735,186 @@ mod tests {
             fold_failures([(None, no_files.as_slice())]),
             RedFailures::default(),
             "no ids from the runner, nothing to guard"
+        );
+    }
+
+    const RED_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+    const GREEN_SHA: &str = "fedcba9876543210fedcba9876543210fedcba98";
+
+    /// The postgate state of `master`: red in `red_groups` at [`RED_SHA`] when there are any,
+    /// green at `green` otherwise.
+    fn gate_state(red_groups: &[&str], green: Option<&str>) -> State {
+        let red = !red_groups.is_empty();
+        State {
+            project_id: "proj".to_owned(),
+            target: "master".to_owned(),
+            last_green_sha: green.map(str::to_owned),
+            last_attempted_sha: None,
+            running_sha: None,
+            running_request_id: None,
+            red_groups: red_groups.iter().map(|g| (*g).to_owned()).collect(),
+            red_since_sha: red.then(|| RED_SHA.to_owned()),
+            red_phase: None,
+            red_sha: red.then(|| RED_SHA.to_owned()),
+            red_base_sha: None,
+            probe_sha: None,
+            probe_request_id: None,
+            probes: Vec::new(),
+            reported_sha: None,
+            culprit_sha: None,
+            candidates: Vec::new(),
+            also_suspect: Vec::new(),
+            revert_merge_sha: None,
+            revert_request_id: None,
+            revert_sha: None,
+            fix_branch: None,
+            fix_run_id: None,
+            covered_sha: None,
+            held_note: None,
+            unmeasured_runs: 0,
+        }
+    }
+
+    fn unit(group: &str, argv: &[&str], status: &str) -> crate::verify::plan::UnitReport {
+        crate::verify::plan::UnitReport {
+            group: Some(group.to_owned()),
+            argv: argv.iter().map(|a| (*a).to_owned()).collect(),
+            why: String::new(),
+            status: status.to_owned(),
+            duration_ms: None,
+            exit_code: None,
+            output_tail: None,
+            skipped_reason: None,
+            run_id: None,
+            cached_from: None,
+            already_failing: None,
+            failed_tests: None,
+            failed_files: Vec::new(),
+            inherited: None,
+            pending: None,
+            not_inherited: None,
+        }
+    }
+
+    fn gate_ticket(units: Vec<crate::verify::plan::UnitReport>) -> crate::verify::plan::Ticket {
+        crate::verify::plan::Ticket {
+            ticket: 1,
+            done: true,
+            verdict: Some("failed".to_owned()),
+            project_id: "proj".to_owned(),
+            worktree: "C:/repo-postgate".to_owned(),
+            kind: "postgate".to_owned(),
+            scope: "all".to_owned(),
+            base: None,
+            note: None,
+            unclaimed: Vec::new(),
+            progress: crate::verify::plan::Progress {
+                total: units.len(),
+                finished: units.len(),
+                queued: 0,
+                running: Vec::new(),
+            },
+            units,
+            inherited_task_ids: Vec::new(),
+        }
+    }
+
+    const CARGO_FMT: &[&str] = &["cargo", "fmt", "--all", "--", "--check"];
+
+    async fn live_fmt(pool: &sqlx::SqlitePool, key: &str) -> Option<TaskRow> {
+        task_claims::store::list_live(pool, "proj", Utc::now())
+            .await
+            .expect("list the live tickets")
+            .into_iter()
+            .find(|row| row.key.as_str() == key)
+    }
+
+    #[tokio::test]
+    async fn a_red_master_whose_failed_unit_is_a_fmt_step_also_opens_the_fmt_ticket_for_its_group()
+    {
+        let pool = crate::testdb::fresh_pool().await;
+        let state = gate_state(&["core"], None);
+        let ticket = gate_ticket(vec![
+            unit("core", CARGO_FMT, "failed"),
+            unit("core", &["cargo", "nextest", "run"], "passed"),
+        ]);
+        open_fmt_tickets(&pool, "proj", &state, &ticket).await;
+        let row = live_fmt(&pool, "fmt:master:core")
+            .await
+            .expect("a live fmt ticket for core");
+        assert_eq!(row.detail["target"], json!("master"));
+        assert_eq!(row.detail["group"], json!("core"));
+        assert_eq!(row.detail["sha"], json!(RED_SHA));
+        assert!(row.hint_paths.is_empty());
+        assert_eq!(row.title, "master fails the format check in core");
+    }
+
+    #[tokio::test]
+    async fn a_red_master_whose_failed_unit_is_a_test_opens_no_fmt_ticket() {
+        let pool = crate::testdb::fresh_pool().await;
+        let state = gate_state(&["core"], None);
+        let ticket = gate_ticket(vec![
+            unit("core", &["cargo", "nextest", "run"], "failed"),
+            unit("echo", &["gofmt", "-l", "."], "passed"),
+        ]);
+        open_fmt_tickets(&pool, "proj", &state, &ticket).await;
+        let tickets: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_claims")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            tickets, 0,
+            "a failed test and a passed format step open nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_green_master_closes_the_fmt_ticket_with_the_sha() {
+        let pool = crate::testdb::fresh_pool().await;
+        let row = task_claims::machine::open_fmt_ticket(
+            &pool,
+            "proj",
+            "master",
+            "core",
+            RED_SHA,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        // No `master-red` is live, so `close_if_green` never reaches git and the root is unused.
+        let green = gate_state(&[], Some(GREEN_SHA));
+        close_if_green(&pool, "proj", Path::new("C:/repo"), &green).await;
+        assert!(live_fmt(&pool, "fmt:master:core").await.is_none());
+        let status: String = sqlx::query_scalar("SELECT status FROM task_claims WHERE id = ?")
+            .bind(row.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, Status::Done.as_str());
+        let note: String = sqlx::query_scalar(
+            "SELECT note FROM task_claim_events WHERE task_id = ? AND event = 'done'",
+        )
+        .bind(row.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            note.contains(&GREEN_SHA[..12]),
+            "the note names the green sha: {note}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_red_master_with_fmt_still_red_keeps_the_fmt_ticket_open() {
+        let pool = crate::testdb::fresh_pool().await;
+        task_claims::machine::open_fmt_ticket(&pool, "proj", "master", "core", RED_SHA, Utc::now())
+            .await
+            .unwrap();
+        let red = gate_state(&["core"], Some(GREEN_SHA));
+        close_if_green(&pool, "proj", Path::new("C:/repo"), &red).await;
+        assert!(
+            live_fmt(&pool, "fmt:master:core").await.is_some(),
+            "a red gate closes no fmt ticket"
         );
     }
 

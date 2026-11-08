@@ -85,8 +85,11 @@ new agent continues from your report. If you cannot proceed, report Status `bloc
 /// The prompt of the root run: the goal, then the protocol, then the ids the report header needs.
 fn root_prompt(job: &TreeJob) -> String {
     format!(
-        "{}\n\n{ROOT_PROTOCOL}\n\nYour Node ID and your Root ID are both {}. The tree job id is {}: pass it as `id` to `tree_branch_start` (not your Node ID), with your Node ID as `node_id`.",
-        job.goal, job.root_node_id, job.id
+        "{}\n\n{ROOT_PROTOCOL}\n\n{}\n\nYour Node ID and your Root ID are both {}. The tree job id is {}: pass it as `id` to `tree_branch_start` (not your Node ID), with your Node ID as `node_id`.",
+        job.goal,
+        super::node_run::TICKET_RULES,
+        job.root_node_id,
+        job.id
     )
 }
 
@@ -598,6 +601,35 @@ mod tests {
         assert!(
             !tracked.contains("AGENTS.md") && !tracked.contains(".agents"),
             "{tracked:?}"
+        );
+    }
+
+    #[test]
+    fn the_root_prompt_carries_the_ticket_rules() {
+        let job = super::TreeJob {
+            id: "proof-slugify-3".to_owned(),
+            root_node_id: "9f1c2d3e-root-node-uuid".to_owned(),
+            project_id: None,
+            feature_branch: Some("feat/tree".to_owned()),
+            goal: GOAL.to_owned(),
+            state: "open".to_owned(),
+            manifest: crate::tree_job::model::Manifest::new(
+                "proof-slugify-3",
+                "feat/tree",
+                GOAL,
+                "C:/Projects/nucleos",
+                &[],
+            ),
+            contract: None,
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+            updated_at: "2026-01-01T00:00:00Z".to_owned(),
+        };
+
+        let prompt = super::root_prompt(&job);
+
+        assert!(
+            prompt.contains(crate::tree_job::node_run::TICKET_RULES),
+            "{prompt}"
         );
     }
 

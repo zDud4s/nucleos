@@ -223,7 +223,7 @@ impl DaemonClient {
 /// The route of one task operation, or `None` for a name that is not one. Every path is literal so
 /// that `auth::TASK_ROUTES` can list them.
 fn task_path(op: &str) -> Option<String> {
-    ["list", "claim", "release", "done"]
+    ["list", "claim", "release", "done", "report", "decline"]
         .contains(&op)
         .then(|| format!("/tasks/{op}"))
 }
@@ -233,8 +233,8 @@ mod task_path_tests {
     use super::task_path;
 
     #[test]
-    fn the_task_paths_are_the_four_literal_routes_a_run_key_reaches() {
-        for op in ["list", "claim", "release", "done"] {
+    fn the_task_paths_are_the_six_literal_routes_a_run_key_reaches() {
+        for op in ["list", "claim", "release", "done", "report", "decline"] {
             assert_eq!(
                 task_path(op).as_deref(),
                 Some(format!("/tasks/{op}").as_str())

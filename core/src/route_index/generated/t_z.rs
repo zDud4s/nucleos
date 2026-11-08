@@ -12,6 +12,13 @@ pub(super) const ROUTES: &[RouteEntry] = &[
     },
     RouteEntry {
         method: "POST",
+        path: "/tasks/decline",
+        purpose: "Post decline.",
+        body: Body::Shapeless("DeclineBody"),
+        handler: "post_decline",
+    },
+    RouteEntry {
+        method: "POST",
         path: "/tasks/done",
         purpose: "Post done.",
         body: Body::Shapeless("CloseBody"),
@@ -30,6 +37,13 @@ pub(super) const ROUTES: &[RouteEntry] = &[
         purpose: "Post release.",
         body: Body::Shapeless("CloseBody"),
         handler: "post_release",
+    },
+    RouteEntry {
+        method: "POST",
+        path: "/tasks/report",
+        purpose: "Post report.",
+        body: Body::Shapeless("ReportBody"),
+        handler: "post_report",
     },
     RouteEntry {
         method: "POST",

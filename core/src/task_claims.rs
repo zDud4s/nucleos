@@ -7,11 +7,20 @@
 //!
 //! `keys` normalises task keys, `store` is the SQL and the compare-and-swap (with `is_live`, the one
 //! helper every consumer asks whether a claim is alive), and `sessions` registers interactive sessions
-//! and tells them what happened to their claims.
+//! and tells them what happened to their claims. `offers` routes an `open` ticket to its most
+//! competent holder and handles a decline. `launch` starts a run for a ticket nobody took (capped,
+//! then parked into an ownerless decision).
 
 use serde::Serialize;
 
+pub mod competence;
+pub mod detect;
 pub mod keys;
+pub mod launch;
+pub mod machine;
+pub mod offers;
+pub mod probes;
+pub mod reports;
 pub mod sessions;
 pub mod store;
 
@@ -121,6 +130,20 @@ pub struct TaskRow {
     pub claimed_at: Option<String>,
     pub closed_at: Option<String>,
     pub close_note: Option<String>,
+    /// A plain pointer at another ticket of the project; it never copies guard paths.
+    pub linked_to: Option<i64>,
+    /// All-time number of reports (the stored report rows are capped).
+    pub report_count: i64,
+    /// The holder the daemon routed this `open` ticket to (`offers::route`). Advisory: an offered
+    /// ticket is still `open`, anyone may claim it, and the claim clears the offer.
+    pub offered_to: Option<Holder>,
+    pub offered_at: Option<String>,
+    /// How many runs the daemon launched for this ticket (`launch`); capped, then the ticket parks.
+    pub launch_attempts: i64,
+    pub last_launch_at: Option<String>,
+    /// Set when the launch cap parked the ticket into an ownerless decision. A parked ticket stays
+    /// claimable; claiming it clears this.
+    pub parked_at: Option<String>,
 }
 
 impl TaskRow {
@@ -173,13 +196,40 @@ pub struct FailedProbe {
     pub guard_paths: Vec<String>,
 }
 
+/// Who reports a problem. `Daemon(label)` is a daemon-side detector (`postgate`, ...): it is stored
+/// as kind `daemon` and its event carries no holder.
+#[derive(Debug, Clone, Copy)]
+pub enum Reporter<'a> {
+    Holder(&'a Holder),
+    Daemon(&'a str),
+}
+
+/// What `store::report` did: the ticket, whether this report created it, the total number of reports
+/// on it and the live tickets that look like it.
+#[derive(Debug, Clone)]
+pub struct ReportOutcome {
+    pub task: TaskRow,
+    pub created: bool,
+    pub reports: i64,
+    pub similar: Vec<TaskRow>,
+}
+
 /// Who closes a task. `Holder`: the owner, by `task_done`. `Green`: the master went green at `sha`
 /// (any path: revert, a session's fix, a re-proof). `Reconcile`: the startup sweep.
 #[derive(Debug, Clone)]
 pub enum Closer<'a> {
     Holder(&'a Holder),
-    Green { sha: String },
+    Green {
+        sha: String,
+    },
     Reconcile,
+    /// The event that proves a machine ticket resolved (a branch renumbered, a conflict gone).
+    Resolved,
+}
+
+/// The note of a `done` event closed by [`Closer::Resolved`], without its `resolved: ` prefix.
+pub fn resolved_note(note: &str) -> Option<&str> {
+    note.strip_prefix("resolved: ")
 }
 
 /// What the hook tells a session on its next tool call.
@@ -191,6 +241,15 @@ pub enum Notice {
     IncidentClosed { task: TaskRow, sha: Option<String> },
     /// To the sessions whose verify inherited the incident: "rebase and re-verify". Produced by chunk 4.
     InheritedClosed { task: TaskRow, sha: Option<String> },
+    /// A ticket closed by resolution, or one this session reported as blocking: "stop or rebase".
+    TicketClosed { task: TaskRow, note: String },
+    /// To the holder an `open` ticket was routed to ("this ticket is yours"): `note` says who offered
+    /// it and why, `context` is `competence::context` at delivery time.
+    Offered {
+        task: TaskRow,
+        note: String,
+        context: serde_json::Value,
+    },
 }
 
 #[cfg(test)]
@@ -279,6 +338,13 @@ mod tests {
             claimed_at: None,
             closed_at: None,
             close_note: None,
+            linked_to: None,
+            report_count: 0,
+            offered_to: None,
+            offered_at: None,
+            launch_attempts: 0,
+            last_launch_at: None,
+            parked_at: None,
         }
     }
 
@@ -332,6 +398,13 @@ pub mod testing {
             claimed_at: None,
             closed_at: None,
             close_note: None,
+            linked_to: None,
+            report_count: 0,
+            offered_to: None,
+            offered_at: None,
+            launch_attempts: 0,
+            last_launch_at: None,
+            parked_at: None,
         }
     }
 

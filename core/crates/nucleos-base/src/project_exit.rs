@@ -186,6 +186,8 @@ const VIA_PARENT: &[(&str, &str, &str)] = &[
     // A task claim's event log (migration 0250): who held it, and when. It belongs to the project only
     // through its task, like the two run tables above.
     ("task_claim_events", "task_id", "task_claims"),
+    // The reports filed on a task (migration 0286): same ownership as its event log.
+    ("task_claim_reports", "task_id", "task_claims"),
 ];
 
 /// What a project has on record, in the nouns somebody would recognise.

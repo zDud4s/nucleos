@@ -62,6 +62,9 @@ pub struct NodeLimits {
     pub max_width: i64,
     /// The longest `summary` accepted on close, in characters.
     pub summary_max: usize,
+    /// The files and directories (a `/`-ending entry) every node may edit whatever it owns; see
+    /// `node_scope`.
+    pub shared_files: Vec<String>,
 }
 
 impl Default for NodeLimits {
@@ -70,6 +73,10 @@ impl Default for NodeLimits {
             max_depth: None,
             max_width: 6,
             summary_max: 1500,
+            shared_files: crate::node_scope::DEFAULT_SHARED_FILES
+                .iter()
+                .map(|entry| (*entry).to_owned())
+                .collect(),
         }
     }
 }
@@ -102,6 +109,22 @@ impl NodeLimits {
         }
         if let Some(value) = pick("summary_max").and_then(|v| usize::try_from(v).ok()) {
             limits.summary_max = value;
+        }
+        // A sequence of strings replaces the default list; anything else (a scalar, a mapping, a
+        // sequence holding a non-string) leaves it.
+        let shared = doc
+            .get("nodes")
+            .and_then(|nodes| nodes.get("shared_files"))
+            .or_else(|| doc.get("shared_files"))
+            .and_then(serde_yaml::Value::as_sequence)
+            .and_then(|items| {
+                items
+                    .iter()
+                    .map(|item| item.as_str().map(str::to_owned))
+                    .collect::<Option<Vec<String>>>()
+            });
+        if let Some(shared) = shared {
+            limits.shared_files = shared;
         }
         limits
     }
@@ -393,7 +416,7 @@ pub fn path_contained(child: &str, parent: &str) -> bool {
 /// A parent with no globs imposes no limit when it is the root, which owns everything, and is
 /// otherwise only allowed children with no globs. A malformed child glob (`..`, absolute, blank) is
 /// `Invalid`; a well-formed one outside the parent is `Conflict`.
-fn check_containment(parent: &Node, child_paths: &[String]) -> Result<(), NodeError> {
+pub(crate) fn check_containment(parent: &Node, child_paths: &[String]) -> Result<(), NodeError> {
     let children = child_paths
         .iter()
         .map(|path| normalise_glob(path))
@@ -620,10 +643,21 @@ pub struct UpdateArgs {
     pub decision: Option<String>,
     #[serde(default)]
     pub context_peak: Option<i64>,
+    /// Globs the node needs beyond its `owned_paths`; see [`widen`].
+    #[serde(default)]
+    pub widen_paths: Option<Vec<String>>,
 }
 
-/// Changes a node's status, appends a decision, and/or raises its context peak (kept as the max).
-pub async fn update(pool: &SqlitePool, id: &str, args: &UpdateArgs) -> Result<Node, NodeError> {
+/// Changes a node's status, appends a decision, raises its context peak (kept as the max), and/or
+/// widens its `owned_paths` (`widen_paths`, judged as [`widen`] does against
+/// `limits.shared_files`). Every check runs before the one write, so a refused widen or a bad
+/// status leaves the node exactly as it was: both apply or neither does.
+pub async fn update(
+    pool: &SqlitePool,
+    id: &str,
+    limits: &NodeLimits,
+    args: &UpdateArgs,
+) -> Result<Node, NodeError> {
     let node = get(pool, id).await?;
     let status = match args.status.as_deref().map(str::trim) {
         Some(status) if !STATUSES.contains(&status) => {
@@ -635,11 +669,23 @@ pub async fn update(pool: &SqlitePool, id: &str, args: &UpdateArgs) -> Result<No
         Some(status) => status.to_owned(),
         None => node.status.clone(),
     };
-    let mut decisions = node.decisions.clone();
-    if let Some(decision) = args.decision.as_deref().map(str::trim) {
-        if decision.is_empty() {
-            return Err(NodeError::Invalid("decision may not be blank".to_owned()));
+    let decision = match args.decision.as_deref().map(str::trim) {
+        Some("") => return Err(NodeError::Invalid("decision may not be blank".to_owned())),
+        other => other,
+    };
+    let added = match args.widen_paths.as_deref() {
+        Some(wanted) if !wanted.is_empty() => {
+            widen_additions(pool, &node, wanted, &limits.shared_files).await?
         }
+        _ => Vec::new(),
+    };
+    let mut owned = node.owned_paths.clone();
+    let mut decisions = node.decisions.clone();
+    if !added.is_empty() {
+        decisions.push(widen_decision(&added));
+        owned.extend(added);
+    }
+    if let Some(decision) = decision {
         decisions.push(decision.to_owned());
     }
     let peak = match (node.context_peak, args.context_peak) {
@@ -647,12 +693,115 @@ pub async fn update(pool: &SqlitePool, id: &str, args: &UpdateArgs) -> Result<No
         (old, new) => old.or(new),
     };
     sqlx::query(
-        "UPDATE work_nodes SET status = ?, decisions = ?, context_peak = ?, updated_at = ? \
-         WHERE id = ?",
+        "UPDATE work_nodes SET status = ?, owned_paths = ?, decisions = ?, context_peak = ?, \
+         updated_at = ? WHERE id = ?",
     )
     .bind(&status)
+    .bind(serde_json::to_string(&owned).unwrap_or_else(|_| "[]".to_owned()))
     .bind(serde_json::to_string(&decisions).unwrap_or_else(|_| "[]".to_owned()))
     .bind(peak)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(id)
+    .execute(pool)
+    .await?;
+    get(pool, id).await
+}
+
+// ---------------------------------------------------------------------------------------------
+// Widen
+// ---------------------------------------------------------------------------------------------
+
+/// The sentence a widen refused for a running sibling's path ends with.
+const WIDEN_SIBLING_TAIL: &str =
+    "Report it instead with mcp__nucleos__task_report; the ticket goes to that sibling.";
+
+/// The decision line a widen leaves on the node.
+fn widen_decision(added: &[String]) -> String {
+    format!("widened owned_paths: +{}", added.join(", "))
+}
+
+/// The globs a widen of `node` by `wanted` adds, normalised and in request order; empty when each
+/// one is already owned by the node or covered by `shared`. Reads only, so a caller can refuse
+/// before writing anything. A malformed glob or a root node is `Invalid`; a glob the parent does
+/// not own, or one overlapping a running sibling's, is `Conflict`.
+async fn widen_additions(
+    pool: &SqlitePool,
+    node: &Node,
+    wanted: &[String],
+    shared: &[String],
+) -> Result<Vec<String>, NodeError> {
+    let Some(parent_id) = node.parent_id.as_deref() else {
+        return Err(NodeError::Invalid(
+            "the root has no parent to widen its owned_paths".to_owned(),
+        ));
+    };
+    let cleaned = wanted
+        .iter()
+        .map(|glob| normalise_glob(glob))
+        .collect::<Result<Vec<_>, _>>()?;
+    // An owned glob that does not normalise contains nothing, as in `check_containment`.
+    let owned: Vec<String> = node
+        .owned_paths
+        .iter()
+        .filter_map(|glob| normalise_glob(glob).ok())
+        .collect();
+    let mut added: Vec<String> = Vec::new();
+    for glob in cleaned {
+        let already = owned.iter().any(|mine| path_contained(&glob, mine))
+            || crate::node_scope::shared_covers_glob(shared, &glob)
+            || added.contains(&glob);
+        if !already {
+            added.push(glob);
+        }
+    }
+    if added.is_empty() {
+        return Ok(added);
+    }
+    let parent = get(pool, parent_id).await?;
+    check_containment(&parent, &added)?;
+    let siblings: Vec<NodeRow> = sqlx::query_as(select_nodes!(
+        "WHERE parent_id = ? AND id <> ? AND status = 'running'"
+    ))
+    .bind(parent_id)
+    .bind(&node.id)
+    .fetch_all(pool)
+    .await?;
+    for sibling in siblings.into_iter().map(Node::from) {
+        if let Some((mine, theirs)) = sets_overlap(&added, &sibling.owned_paths) {
+            return Err(NodeError::Conflict(format!(
+                "owned path {mine:?} overlaps {theirs:?}, owned by running sibling {:?} ({}). \
+                 {WIDEN_SIBLING_TAIL}",
+                sibling.title, sibling.id
+            )));
+        }
+    }
+    Ok(added)
+}
+
+/// Widens a node's `owned_paths` by the globs in `wanted` its parent owns and no running sibling
+/// does, and records "widened owned_paths: +<globs>" as a decision. A glob the node already owns,
+/// or one `shared` covers, is dropped; when none remains nothing changes. Any refused glob
+/// refuses the whole request and changes nothing (see `widen_additions` for the error kinds).
+pub async fn widen(
+    pool: &SqlitePool,
+    id: &str,
+    wanted: &[String],
+    shared: &[String],
+) -> Result<Node, NodeError> {
+    let node = get(pool, id).await?;
+    let added = widen_additions(pool, &node, wanted, shared).await?;
+    if added.is_empty() {
+        return Ok(node);
+    }
+    let mut decisions = node.decisions.clone();
+    decisions.push(widen_decision(&added));
+    let mut owned = node.owned_paths.clone();
+    owned.extend(added);
+    sqlx::query(
+        "UPDATE work_nodes SET owned_paths = ?, decisions = ?, updated_at = ? WHERE id = ?",
+    )
+    .bind(serde_json::to_string(&owned).unwrap_or_else(|_| "[]".to_owned()))
+    .bind(serde_json::to_string(&decisions).unwrap_or_else(|_| "[]".to_owned()))
     .bind(chrono::Utc::now().to_rfc3339())
     .bind(id)
     .execute(pool)
@@ -1288,6 +1437,42 @@ mod tests {
         assert_eq!(NodeLimits::load(Some(dir.path())), NodeLimits::default());
     }
 
+    #[test]
+    fn limits_read_shared_files_from_speed_yaml_and_default_to_the_list() {
+        let defaults: Vec<String> = crate::node_scope::DEFAULT_SHARED_FILES
+            .iter()
+            .map(|entry| (*entry).to_owned())
+            .collect();
+        assert_eq!(NodeLimits::default().shared_files, defaults);
+        assert_eq!(NodeLimits::load(None).shared_files, defaults);
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".nucleos/workflow")).unwrap();
+        let file = dir.path().join(".nucleos/workflow/speed.yaml");
+
+        std::fs::write(
+            &file,
+            "nodes:\n  shared_files:\n    - Cargo.lock\n    - docs/\n",
+        )
+        .unwrap();
+        assert_eq!(
+            NodeLimits::load(Some(dir.path())).shared_files,
+            vec!["Cargo.lock".to_owned(), "docs/".to_owned()]
+        );
+
+        std::fs::write(&file, "shared_files: [README.md]\n").unwrap();
+        assert_eq!(
+            NodeLimits::load(Some(dir.path())).shared_files,
+            vec!["README.md".to_owned()]
+        );
+
+        std::fs::write(&file, "shared_files: README.md\n").unwrap();
+        assert_eq!(NodeLimits::load(Some(dir.path())).shared_files, defaults);
+
+        std::fs::write(&file, "shared_files: [README.md, 3]\n").unwrap();
+        assert_eq!(NodeLimits::load(Some(dir.path())).shared_files, defaults);
+    }
+
     #[tokio::test]
     async fn open_root_and_child() {
         let pool = test_pool().await;
@@ -1707,7 +1892,7 @@ mod tests {
             context_peak: Some(190_000),
             ..UpdateArgs::default()
         };
-        update(&pool, &leaf.id, &peak).await.unwrap();
+        update(&pool, &leaf.id, &limits, &peak).await.unwrap();
         let (_file, path) = handoff_file();
         let args = close_args("ran out", &path, "handoff");
         close(&pool, &leaf.id, &limits, &args).await.unwrap();
@@ -1733,9 +1918,14 @@ mod tests {
             status: None,
             decision: Some(decision.to_owned()),
             context_peak: Some(peak),
+            widen_paths: None,
         };
-        update(&pool, &root.id, &up(500, "first")).await.unwrap();
-        let node = update(&pool, &root.id, &up(300, "second")).await.unwrap();
+        update(&pool, &root.id, &limits, &up(500, "first"))
+            .await
+            .unwrap();
+        let node = update(&pool, &root.id, &limits, &up(300, "second"))
+            .await
+            .unwrap();
         assert_eq!(node.context_peak, Some(500));
         assert_eq!(
             node.decisions,
@@ -1746,13 +1936,205 @@ mod tests {
             ..UpdateArgs::default()
         };
         assert!(matches!(
-            update(&pool, &root.id, &weird).await,
+            update(&pool, &root.id, &limits, &weird).await,
             Err(NodeError::Invalid(_))
         ));
         assert!(matches!(
-            update(&pool, "nope", &up(1, "x")).await,
+            update(&pool, "nope", &limits, &up(1, "x")).await,
             Err(NodeError::NotFound)
         ));
+    }
+
+    /// A root owning `core/**` with two running leaves: A owns `core/a/**`, B owns `core/b/**`.
+    /// Returns `(root, a, b)` ids.
+    async fn widen_tree(pool: &SqlitePool) -> (String, String, String) {
+        let limits = NodeLimits::default();
+        let root_with_paths = OpenArgs {
+            owned_paths: vec!["core/**".to_owned()],
+            ..root_args()
+        };
+        let root = open(pool, None, &limits, &root_with_paths).await.unwrap();
+        let a = child_args(&root.id, "leaf", "A", &["core/a/**"]);
+        let a = open(pool, None, &limits, &a).await.unwrap();
+        let b = child_args(&root.id, "leaf", "B", &["core/b/**"]);
+        let b = open(pool, None, &limits, &b).await.unwrap();
+        (root.id, a.id, b.id)
+    }
+
+    fn shared() -> Vec<String> {
+        NodeLimits::default().shared_files
+    }
+
+    #[tokio::test]
+    async fn widening_into_a_path_no_sibling_owns_is_accepted_and_recorded() {
+        let pool = test_pool().await;
+        let (_, _, b) = widen_tree(&pool).await;
+        let wanted = strings(&["core/c/x.rs", "./core/d/**"]);
+        let node = widen(&pool, &b, &wanted, &shared()).await.unwrap();
+        assert_eq!(
+            node.owned_paths,
+            strings(&["core/b/**", "core/c/x.rs", "core/d/**"])
+        );
+        assert_eq!(
+            node.decisions,
+            strings(&["widened owned_paths: +core/c/x.rs, core/d/**"])
+        );
+        assert_eq!(get(&pool, &b).await.unwrap(), node);
+    }
+
+    #[tokio::test]
+    async fn widening_into_a_running_siblings_path_is_refused_naming_the_sibling() {
+        let pool = test_pool().await;
+        let (_, a, b) = widen_tree(&pool).await;
+        let before = get(&pool, &b).await.unwrap();
+        let refused = widen(&pool, &b, &strings(&["core/a/x.rs"]), &shared()).await;
+        let message = match refused {
+            Err(NodeError::Conflict(message)) => message,
+            other => panic!("expected a conflict, got {other:?}"),
+        };
+        assert!(message.contains("\"A\""), "{message}");
+        assert!(message.contains(&a), "{message}");
+        assert!(
+            message.ends_with(
+                "Report it instead with mcp__nucleos__task_report; the ticket goes to that \
+                 sibling."
+            ),
+            "{message}"
+        );
+        assert_eq!(get(&pool, &b).await.unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn a_planned_or_done_sibling_does_not_block_a_widen() {
+        let pool = test_pool().await;
+        let limits = NodeLimits::default();
+        let (root, a, b) = widen_tree(&pool).await;
+        let c = child_args(&root, "leaf", "C", &["core/c/**"]);
+        let c = open(&pool, None, &limits, &c).await.unwrap();
+        let planned = UpdateArgs {
+            status: Some("planned".into()),
+            ..UpdateArgs::default()
+        };
+        update(&pool, &c.id, &limits, &planned).await.unwrap();
+        let (_file, path) = handoff_file();
+        close(&pool, &a, &limits, &close_args("ok", &path, "done"))
+            .await
+            .unwrap();
+
+        let node = widen(
+            &pool,
+            &b,
+            &strings(&["core/c/y.rs", "core/a/z.rs"]),
+            &shared(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            node.owned_paths,
+            strings(&["core/b/**", "core/c/y.rs", "core/a/z.rs"])
+        );
+    }
+
+    #[tokio::test]
+    async fn widening_beyond_what_the_parent_owns_is_refused() {
+        let pool = test_pool().await;
+        let (_, _, b) = widen_tree(&pool).await;
+        let before = get(&pool, &b).await.unwrap();
+        let refused = widen(&pool, &b, &strings(&["shell/src/x.tsx"]), &shared()).await;
+        assert!(
+            matches!(refused, Err(NodeError::Conflict(_))),
+            "{refused:?}"
+        );
+        assert_eq!(get(&pool, &b).await.unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn widening_to_a_shared_or_already_owned_path_changes_nothing() {
+        let pool = test_pool().await;
+        let (_, _, b) = widen_tree(&pool).await;
+        let before = get(&pool, &b).await.unwrap();
+        let wanted = strings(&[
+            "core/b/x.rs",
+            "core/b/**",
+            "core/AGENTS.md",
+            "core/migrations/0099_x.sql",
+        ]);
+        let node = widen(&pool, &b, &wanted, &shared()).await.unwrap();
+        assert_eq!(node, before);
+        assert_eq!(get(&pool, &b).await.unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_glob_is_invalid_and_changes_nothing() {
+        let pool = test_pool().await;
+        let (_, _, b) = widen_tree(&pool).await;
+        let before = get(&pool, &b).await.unwrap();
+        for bad in ["core/../etc/x", "/abs/x", "  "] {
+            let wanted = strings(&["core/c/x.rs", bad]);
+            let refused = widen(&pool, &b, &wanted, &shared()).await;
+            assert!(
+                matches!(refused, Err(NodeError::Invalid(_))),
+                "{bad:?}: {refused:?}"
+            );
+        }
+        assert_eq!(get(&pool, &b).await.unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn the_root_cannot_widen() {
+        let pool = test_pool().await;
+        let (root, _, _) = widen_tree(&pool).await;
+        let before = get(&pool, &root).await.unwrap();
+        let refused = widen(&pool, &root, &strings(&["shell/**"]), &shared()).await;
+        assert!(matches!(refused, Err(NodeError::Invalid(_))), "{refused:?}");
+        assert_eq!(get(&pool, &root).await.unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn update_with_widen_and_status_applies_both_or_neither() {
+        let pool = test_pool().await;
+        let limits = NodeLimits::default();
+        let (_, _, b) = widen_tree(&pool).await;
+        let before = get(&pool, &b).await.unwrap();
+
+        // A good widen with a bad status: nothing changes.
+        let bad_status = UpdateArgs {
+            status: Some("weird".into()),
+            widen_paths: Some(strings(&["core/c/x.rs"])),
+            ..UpdateArgs::default()
+        };
+        let refused = update(&pool, &b, &limits, &bad_status).await;
+        assert!(matches!(refused, Err(NodeError::Invalid(_))), "{refused:?}");
+        assert_eq!(get(&pool, &b).await.unwrap(), before);
+
+        // A refused widen with a good status: nothing changes.
+        let bad_widen = UpdateArgs {
+            status: Some("blocked".into()),
+            decision: Some("need a".into()),
+            widen_paths: Some(strings(&["core/a/x.rs"])),
+            ..UpdateArgs::default()
+        };
+        let refused = update(&pool, &b, &limits, &bad_widen).await;
+        assert!(
+            matches!(refused, Err(NodeError::Conflict(_))),
+            "{refused:?}"
+        );
+        assert_eq!(get(&pool, &b).await.unwrap(), before);
+
+        // Both good: both apply, the widen recorded before the caller's decision.
+        let both = UpdateArgs {
+            status: Some("blocked".into()),
+            decision: Some("need c".into()),
+            widen_paths: Some(strings(&["core/c/x.rs"])),
+            ..UpdateArgs::default()
+        };
+        let node = update(&pool, &b, &limits, &both).await.unwrap();
+        assert_eq!(node.status, "blocked");
+        assert_eq!(node.owned_paths, strings(&["core/b/**", "core/c/x.rs"]));
+        assert_eq!(
+            node.decisions,
+            strings(&["widened owned_paths: +core/c/x.rs", "need c"])
+        );
     }
 
     #[tokio::test]

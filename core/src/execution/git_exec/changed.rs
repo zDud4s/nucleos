@@ -68,6 +68,31 @@ pub async fn changed_since_merge_base(
     Ok(nul_paths(&listed.stdout))
 }
 
+/// The entry names directly under `dir` at `rev` (`git ls-tree --name-only <rev>:<dir>`). An error
+/// when `rev` or `dir` does not exist there: the caller decides whether that is fatal.
+pub async fn list_dir_names(
+    project_root: &std::path::Path,
+    rev: &str,
+    dir: &str,
+    deadline: std::time::Instant,
+) -> Result<Vec<String>, String> {
+    let spec = format!("{rev}:{dir}");
+    let listed = git_read(project_root, &["ls-tree", "--name-only", &spec], deadline).await?;
+    if !listed.succeeded() {
+        return Err(format!(
+            "could not list {dir} at {rev}: {}",
+            listed.output_tail
+        ));
+    }
+    Ok(listed
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
 /// The worktree that has `branch` checked out, if any (the main checkout counts).
 pub async fn worktree_of_branch(
     project_root: &std::path::Path,

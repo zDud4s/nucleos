@@ -71,6 +71,7 @@ pub mod map {
 pub mod mcp_tools;
 pub use nucleos_base::mentions;
 pub mod models;
+pub mod node_scope;
 pub use nucleos_base::notes;
 pub use nucleos_base::notify_policy;
 pub mod onboarding;
