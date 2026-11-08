@@ -173,15 +173,25 @@ func TestMissingExecutableOrProfileIsRefused(t *testing.T) {
 	}
 }
 
-// TestTheDebuggingPortIsChosenByTheOS. A fixed port collides the moment two sessions run at once,
-// and the real port is read back from DevToolsActivePort.
-func TestTheDebuggingPortIsChosenByTheOS(t *testing.T) {
-	args, err := Args(agentOptions())
-	if err != nil {
-		t.Fatalf("args: %v", err)
-	}
-	if !slices.Contains(args, "--remote-debugging-port=0") {
-		t.Fatalf("expected port 0, got %v", args)
+// TestNoDevToolsPortIsOpened. The browser is driven over the DevTools pipe, so no TCP port that any
+// local process could connect to is ever opened.
+func TestNoDevToolsPortIsOpened(t *testing.T) {
+	human := agentOptions()
+	human.Mode = browser.ModeHuman
+	visible := agentOptions()
+	visible.Visible = true
+	cases := map[string]Options{"agent": agentOptions(), "human": human, "visible agent": visible}
+	for name, opts := range cases {
+		args, err := Args(opts)
+		if err != nil {
+			t.Fatalf("%s args: %v", name, err)
+		}
+		if has(args, "--remote-debugging-port") {
+			t.Errorf("%s: a debugging port argument is present in %v", name, args)
+		}
+		if !slices.Contains(args, "--remote-debugging-pipe") {
+			t.Errorf("%s: --remote-debugging-pipe missing from %v", name, args)
+		}
 	}
 }
 

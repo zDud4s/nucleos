@@ -3,26 +3,32 @@
 package launch
 
 import (
+	"bufio"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
+	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
-	"strconv"
-	"strings"
+	"slices"
 	"sync"
 	"time"
 )
 
-// Process is a running Chromium and the debugging port it reported.
+// Process is a running Chromium and the DevTools pipe it is driven over.
+//
+// There is no debugging port: the browser listens on nothing, so only the process holding the pipe
+// ends can drive it. The consequence is by design — an external DevTools attach (chrome://inspect,
+// remote debugging by a person) is not possible on the sidecar's browser.
 type Process struct {
-	cmd  *exec.Cmd
-	Port int
+	cmd *exec.Cmd
 	// ProfileDir is kept so Stop knows which tree it is reaping.
 	ProfileDir string
+
+	// pipes holds the parent's ends (nil in tests that build a bare Process). reader wraps the read
+	// end and outlives the probe, so no byte the browser sent after its first reply is lost.
+	pipes  *devtoolsPipes
+	reader *bufio.Reader
 
 	// stopOnce makes Stop idempotent: the first call waits the child, which frees its pid, so any later
 	// call would signal a pid the OS may already have handed to an unrelated program.
@@ -32,19 +38,23 @@ type Process struct {
 // killGroupFn is killGroup behind a variable so tests can count signals without sending any.
 var killGroupFn = killGroup
 
-// portFile is where Chromium writes the port it actually chose.
-const portFile = "DevToolsActivePort"
-
 // ErrInheritedInstance means the launch did not start a browser of its own.
 //
 // SPIKE FINDING, and it cost a whole phase of the spike before anyone noticed. Starting Chromium
 // over a profile that another instance still holds does NOT fail: the new process hands off to the
 // survivor and exits, so the caller sees a successful spawn and then drives somebody else's
-// browser — one that may have no fence attached. Detecting it is why DevToolsActivePort is deleted
-// before the launch and required to reappear after: only a genuinely new instance writes it.
+// browser — one that may have no fence attached. With the DevTools pipe the signal is that the
+// launched process exits, and the pipe reads EOF, before the first successful reply: only a genuinely
+// new instance answers on the pipe it was given.
 var ErrInheritedInstance = errors.New("launch: chromium did not start a new instance; the profile is held by a surviving process")
 
-// Start launches Chromium and waits for it to report its debugging port.
+// errNoPipeReply means the browser stayed up but never answered on the pipe within the wait.
+var errNoPipeReply = errors.New("launch: the browser never answered on the DevTools pipe")
+
+// probeRequest is the first message sent: it proves the pipe is live and the browser is ours.
+const probeRequest = `{"id":1,"method":"Browser.getVersion"}`
+
+// Start launches Chromium and waits for it to answer on the DevTools pipe.
 func Start(ctx context.Context, opts Options, wait time.Duration) (*Process, error) {
 	args, err := Args(opts)
 	if err != nil {
@@ -60,80 +70,92 @@ func Start(ctx context.Context, opts Options, wait time.Duration) (*Process, err
 	if err := applyWebRTCPolicy(opts.ProfileDir, opts.Mode); err != nil {
 		return nil, err
 	}
-	marker := filepath.Join(opts.ProfileDir, portFile)
-	// Delete first. See ErrInheritedInstance: a stale file would make an inherited instance look
-	// like a fresh one, which is the failure this whole dance exists to catch.
-	if err := os.Remove(marker); err != nil && !os.IsNotExist(err) {
-		return nil, fmt.Errorf("clearing %s: %w", portFile, err)
-	}
+	return StartArgs(ctx, opts.ExecutablePath, args, opts.ProfileDir, wait)
+}
 
-	cmd := exec.CommandContext(ctx, opts.ExecutablePath, args...)
+// StartArgs launches exe with args, wires the DevTools pipe to it and probes it with a first command.
+// Start is this plus argv and profile setup. --remote-debugging-pipe is appended here when args does
+// not already carry it (Args puts it there itself), so the browser always has a DevTools transport;
+// the caller's slice is never mutated.
+func StartArgs(ctx context.Context, exe string, args []string, profileDir string, wait time.Duration) (*Process, error) {
+	pipes, err := newDevtoolsPipes()
+	if err != nil {
+		return nil, fmt.Errorf("creating the devtools pipes: %w", err)
+	}
+	full := slices.Clone(args)
+	if !slices.Contains(full, "--remote-debugging-pipe") {
+		full = append(full, "--remote-debugging-pipe")
+	}
+	cmd := exec.CommandContext(ctx, exe, full...)
 	// Its own process group on Unix, so Stop can take every helper it spawns at once.
 	ownProcessGroup(cmd)
 	// Suspended on Windows, so joinJob can put it in this sidecar's kill-on-close job before it has
 	// spawned a single helper: see job_windows.go. A no-op elsewhere.
 	startSuspended(cmd)
-	if err := cmd.Start(); err != nil {
+	// After both of the above: on Unix ownProcessGroup replaces SysProcAttr, on Windows startSuspended
+	// sets the CreationFlags that wire must preserve.
+	cmd.Args = append(cmd.Args, pipes.wire(cmd)...)
+
+	err = cmd.Start()
+	// The browser has its own copies now (or never will). Closing ours is what makes its exit
+	// observable as EOF on the read end.
+	_ = pipes.browserRead.Close()
+	_ = pipes.browserWrite.Close()
+	if err != nil {
+		_ = pipes.parentWrite.Close()
+		_ = pipes.parentRead.Close()
 		return nil, fmt.Errorf("starting chromium: %w", err)
 	}
 	if err := joinJob(cmd); err != nil {
 		// Never resumed, so it has spawned nothing: the pid is the whole tree.
 		_ = cmd.Process.Kill()
 		_, _ = cmd.Process.Wait()
+		_ = pipes.parentWrite.Close()
+		_ = pipes.parentRead.Close()
 		return nil, err
 	}
 
-	process := &Process{cmd: cmd, ProfileDir: opts.ProfileDir}
-	port, err := waitForPort(marker, wait)
-	if err != nil {
+	process := &Process{cmd: cmd, ProfileDir: profileDir, pipes: pipes, reader: bufio.NewReader(pipes.parentRead)}
+	if err := process.probe(ctx, wait); err != nil {
 		// Reap whatever did start, so a failed launch does not leave a browser behind holding the
 		// profile — which would make the NEXT launch inherit it.
 		process.Stop()
 		return nil, err
 	}
-	process.Port = port
 	return process, nil
 }
 
-func waitForPort(marker string, wait time.Duration) (int, error) {
-	deadline := time.Now().Add(wait)
-	for time.Now().Before(deadline) {
-		raw, err := os.ReadFile(marker)
-		if err == nil {
-			lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
-			if port, err := strconv.Atoi(strings.TrimSpace(lines[0])); err == nil && port > 0 {
-				return port, nil
-			}
+// probe sends one command and waits for the first reply.
+func (p *Process) probe(ctx context.Context, wait time.Duration) error {
+	result := make(chan error, 1)
+	go func() {
+		if _, err := p.pipes.parentWrite.Write(append([]byte(probeRequest), 0)); err != nil {
+			result <- err
+			return
 		}
-		time.Sleep(50 * time.Millisecond)
+		_, err := p.reader.ReadBytes(0)
+		result <- err
+	}()
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case err := <-result:
+		if err != nil {
+			// The pipe broke before any reply: the process we started is gone.
+			return ErrInheritedInstance
+		}
+		return nil
+	case <-timer.C:
+		return errNoPipeReply
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	return 0, ErrInheritedInstance
 }
 
-// DebuggerURL asks the browser where its WebSocket endpoint is.
-//
-// Deliberately with Proxy: nil. This is our own control channel to a port that asks for no token at
-// all, and it is the one thing on loopback the fence refuses to let a page reach (spec §6.2). Sending
-// it through the fence's own proxy would either fail or, worse, make the proxy the thing that decides
-// whether the driver can talk to its browser.
-func DebuggerURL(port int, timeout time.Duration) (string, error) {
-	// One-shot call: keep-alives off so the connection is not left idle in a discarded transport.
-	client := &http.Client{Timeout: timeout, Transport: &http.Transport{Proxy: nil, DisableKeepAlives: true}}
-	response, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/json/version", port))
-	if err != nil {
-		return "", fmt.Errorf("asking the browser for its debugger url: %w", err)
-	}
-	defer response.Body.Close()
-	var payload struct {
-		WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
-	}
-	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
-		return "", fmt.Errorf("reading the browser's version payload: %w", err)
-	}
-	if payload.WebSocketDebuggerURL == "" {
-		return "", errors.New("launch: the browser reported no debugger url")
-	}
-	return payload.WebSocketDebuggerURL, nil
+// Pipe returns the parent's ends of the DevTools pipe: the browser's output (buffered, already past the
+// probe reply) and the writer for commands. Hand them to cdp.NewPipe.
+func (p *Process) Pipe() (io.Reader, io.WriteCloser) {
+	return p.reader, p.pipes.parentWrite
 }
 
 // Stop reaps the whole process tree.
@@ -150,6 +172,8 @@ func (p *Process) Stop() {
 }
 
 func (p *Process) stop() {
+	// After the tree is dead, so a reader blocked on the pipe is released by EOF as well as by Close.
+	defer p.closePipes()
 	if p.cmd == nil || p.cmd.Process == nil {
 		return
 	}
@@ -163,4 +187,13 @@ func (p *Process) stop() {
 	killGroupFn(pid)
 	_ = p.cmd.Process.Kill()
 	_, _ = p.cmd.Process.Wait()
+}
+
+// closePipes closes the parent's ends; nil-safe for a Process built without pipes.
+func (p *Process) closePipes() {
+	if p.pipes == nil {
+		return
+	}
+	_ = p.pipes.parentWrite.Close()
+	_ = p.pipes.parentRead.Close()
 }
