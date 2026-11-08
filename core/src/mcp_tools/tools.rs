@@ -729,8 +729,13 @@ impl NucleosTools {
                        (default `code`) and `base` are optional. Calling it again with the same \
                        `name` repeats nothing and finishes any step an earlier call did not reach. \
                        Refused when the job is finished, `node_id` is not a node of this tree, or \
-                       the branch is not admitted for disk or slots. Returns {branch, node_id, \
-                       run_id, worktree, replayed}."
+                       the branch is not admitted for disk or slots. `node_id` must be your OWN \
+                       node (a node opens only its own children). `kind` is `leaf` (default) or \
+                       `orchestrator`: start a piece as an orchestrator only when its \
+                       `estimate_tokens` exceeds the leaf budget (120000); pass `estimate_tokens` \
+                       on every piece. The daemon opens a leaf instead when an orchestrator is \
+                       pointless or refused, and says why in `degraded`. Returns {branch, node_id, \
+                       run_id, worktree, replayed, kind, depth, parent, degraded}."
     )]
     pub(super) async fn tree_branch_start(
         &self,
@@ -743,6 +748,8 @@ impl NucleosTools {
             layer,
             base,
             node_id,
+            kind,
+            estimate_tokens,
         }): Parameters<TreeBranchStartParams>,
     ) -> String {
         json_result(
@@ -757,6 +764,8 @@ impl NucleosTools {
                         "layer": layer,
                         "base": base,
                         "node_id": node_id,
+                        "kind": kind,
+                        "estimate_tokens": estimate_tokens,
                     }),
                 )
                 .await,

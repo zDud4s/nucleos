@@ -1,8 +1,129 @@
 //! Nested branches: an orchestrator branch is the parent of the branches its node starts. Pure
-//! reads over the manifest; nothing here touches the database or git.
+//! reads over the manifest, plus `ancestor_chain`, the one read of the node table that the
+//! structural guard of `branch_start` needs; nothing here touches git.
 
 use super::model::{Branch, Manifest};
+use super::partition::Kind;
 use super::root::ROOT_BRANCH;
+use crate::conductor::depth::{AncestorView, DepthRefusal};
+use crate::work_nodes::{self, NodeError};
+
+/// The kind a start ends up with, and why it is not the one asked for when it differs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Decision {
+    pub kind: Kind,
+    /// Set when an orchestrator was asked for and a leaf was opened instead.
+    pub degraded: Option<String>,
+}
+
+/// The words of a structural refusal; the same text `POST /nodes` answers with.
+pub fn refusal_text(refusal: &DepthRefusal) -> &'static str {
+    match refusal {
+        DepthRefusal::SameScopeAsParent => "child has the same scope as its parent",
+        DepthRefusal::SingleChildChain => {
+            "child has the same scope as its parent and would only extend the chain"
+        }
+        DepthRefusal::RepeatedGoal => "child repeats the goal of an ancestor (repeated goal)",
+        DepthRefusal::TreeNodeCeiling => "tree has reached its node ceiling",
+    }
+}
+
+/// An orchestrator becomes a leaf, with the reason, when `check_child` refused it, when its
+/// estimate fits `leaf_budget` (splitting it would only add a level), or when `child_depth` is the
+/// last level allowed (its own children could not exist). No estimate keeps the orchestrator. A
+/// leaf is always a leaf.
+pub fn decide_kind(
+    requested: Kind,
+    estimate: Option<i64>,
+    leaf_budget: i64,
+    child_depth: i64,
+    max_depth: Option<i64>,
+    refusal: Option<DepthRefusal>,
+) -> Decision {
+    if requested == Kind::Leaf {
+        return Decision {
+            kind: Kind::Leaf,
+            degraded: None,
+        };
+    }
+    let reason = if let Some(refusal) = refusal {
+        Some(format!(
+            "{}: opened as a leaf, over budget if need be",
+            refusal_text(&refusal)
+        ))
+    } else if let Some(estimate) = estimate.filter(|estimate| *estimate <= leaf_budget) {
+        Some(format!(
+            "estimate of {estimate} tokens fits leaf_budget {leaf_budget}: opened as a leaf"
+        ))
+    } else {
+        max_depth
+            .filter(|max| child_depth >= *max)
+            .map(|max| {
+                format!(
+                    "depth {child_depth} is the limit of {max}, its children could not exist: opened as a leaf"
+                )
+            })
+    };
+    match reason {
+        Some(reason) => Decision {
+            kind: Kind::Leaf,
+            degraded: Some(reason),
+        },
+        None => Decision {
+            kind: Kind::Orchestrator,
+            degraded: None,
+        },
+    }
+}
+
+/// The ids of the work nodes a run is bound to (`work_nodes.run_id`, kept as text).
+pub async fn run_bound_nodes(
+    pool: &sqlx::SqlitePool,
+    run_id: i64,
+) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar("SELECT id FROM work_nodes WHERE run_id = ?")
+        .bind(run_id.to_string())
+        .fetch_all(pool)
+        .await
+}
+
+/// How many nodes the tree rooted at `root_id` holds, the number `check_child` weighs against the
+/// node ceiling.
+pub async fn tree_node_count(pool: &sqlx::SqlitePool, root_id: &str) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar("SELECT COUNT(*) FROM work_nodes WHERE root_id = ?")
+        .bind(root_id)
+        .fetch_one(pool)
+        .await
+}
+
+/// The root-first ancestor chain of `node` (the node last) that `check_child` reads. A copy of the
+/// private one in `http/nodes.rs`: the bin cannot be reached from the lib.
+pub async fn ancestor_chain(
+    pool: &sqlx::SqlitePool,
+    mut node: work_nodes::Node,
+) -> Result<Vec<AncestorView>, NodeError> {
+    let mut chain = Vec::new();
+    loop {
+        let open_children: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM work_nodes \
+             WHERE parent_id = ? AND status IN ('planned', 'running')",
+        )
+        .bind(&node.id)
+        .fetch_one(pool)
+        .await?;
+        chain.push(AncestorView {
+            owned_paths: node.owned_paths.clone(),
+            goal: node.goal.clone(),
+            open_children,
+        });
+        let Some(parent_id) = node.parent_id else {
+            break;
+        };
+        node = work_nodes::get(pool, &parent_id).await?;
+    }
+    chain.reverse();
+    Ok(chain)
+}
 
 /// The branch bound to `caller_node`, or `None` when that is the stem branch (`root`) or no branch
 /// is bound, so a stem-level start stays unparented.
@@ -113,6 +234,68 @@ mod tests {
             manifest.branches.insert((*name).to_owned(), branch);
         }
         manifest
+    }
+
+    const BUDGET: i64 = 120_000;
+
+    fn decide(estimate: Option<i64>, depth: i64, refusal: Option<DepthRefusal>) -> Decision {
+        decide_kind(Kind::Orchestrator, estimate, BUDGET, depth, Some(6), refusal)
+    }
+
+    #[test]
+    fn an_orchestrator_above_the_budget_stays_an_orchestrator() {
+        let decision = decide(Some(180_000), 2, None);
+        assert_eq!(decision.kind, Kind::Orchestrator);
+        assert_eq!(decision.degraded, None);
+    }
+
+    #[test]
+    fn an_orchestrator_at_or_below_the_budget_becomes_a_leaf_with_a_reason() {
+        for estimate in [BUDGET, 40_000] {
+            let decision = decide(Some(estimate), 2, None);
+            assert_eq!(decision.kind, Kind::Leaf, "{estimate}");
+            let reason = decision.degraded.expect("a reason");
+            assert!(reason.contains(&estimate.to_string()), "{reason}");
+            assert!(reason.contains("leaf_budget 120000"), "{reason}");
+        }
+    }
+
+    #[test]
+    fn an_orchestrator_without_an_estimate_is_kept() {
+        let decision = decide(None, 2, None);
+        assert_eq!(decision.kind, Kind::Orchestrator);
+        assert_eq!(decision.degraded, None);
+    }
+
+    #[test]
+    fn an_orchestrator_at_max_depth_becomes_a_leaf() {
+        let decision = decide(Some(500_000), 6, None);
+        assert_eq!(decision.kind, Kind::Leaf);
+        assert!(decision.degraded.unwrap().contains("depth 6"));
+        assert_eq!(decide(Some(500_000), 5, None).kind, Kind::Orchestrator);
+        let unlimited = decide_kind(Kind::Orchestrator, None, BUDGET, 40, None, None);
+        assert_eq!(unlimited.kind, Kind::Orchestrator);
+    }
+
+    #[test]
+    fn a_check_child_refusal_degrades_an_orchestrator_and_names_it() {
+        let decision = decide(Some(500_000), 2, Some(DepthRefusal::RepeatedGoal));
+        assert_eq!(decision.kind, Kind::Leaf);
+        assert!(decision.degraded.unwrap().contains("repeated goal"));
+    }
+
+    #[test]
+    fn a_leaf_request_is_never_changed() {
+        let decision = decide_kind(
+            Kind::Leaf,
+            Some(900_000),
+            BUDGET,
+            6,
+            Some(6),
+            Some(DepthRefusal::RepeatedGoal),
+        );
+        assert_eq!(decision.kind, Kind::Leaf);
+        assert_eq!(decision.degraded, None);
     }
 
     #[test]

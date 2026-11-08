@@ -18,7 +18,7 @@ use axum::Json;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::http::{Request, StatusCode};
 use axum::routing::post;
 use chrono::Utc;
@@ -28,9 +28,15 @@ use tower::ServiceExt;
 
 use super::http::{job_lock, refuse};
 use super::model::JOB_TERMINAL_STATE;
+use super::nested_prompt;
+use super::nesting;
 use super::node_run::{self, NodeRunError};
 use super::open::{self, OpenError};
+use super::partition::Kind;
+use super::start_log::{self, StartShape};
 use super::store::{self, StoreError, launch_recovering};
+use crate::auth::Scope;
+use crate::conductor::depth::{self, ChildArgs, TreeLimits};
 use crate::execution::runs::CreateRunError;
 use crate::state::AppState;
 use crate::tree_cost::budget::{self, Permit};
@@ -57,6 +63,22 @@ struct StartBody {
     layer: Option<String>,
     base: Option<String>,
     node_id: Option<String>,
+    /// `leaf` (the default) or `orchestrator`.
+    kind: Option<String>,
+    /// What the branch is estimated to take to build, in tokens.
+    estimate_tokens: Option<i64>,
+}
+
+/// The kind a start asks for: `leaf` when left out, else `leaf` or `orchestrator`.
+fn requested_kind(kind: Option<&str>) -> Result<Kind, Refusal> {
+    match kind.map(str::trim) {
+        None | Some("") | Some("leaf") => Ok(Kind::Leaf),
+        Some("orchestrator") => Ok(Kind::Orchestrator),
+        Some(other) => Err(refuse(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("kind {other:?} must be \"leaf\" or \"orchestrator\""),
+        )),
+    }
 }
 
 fn required(field: &str, value: Option<String>) -> Result<String, Refusal> {
@@ -179,14 +201,43 @@ async fn existing_node(
     name: &str,
 ) -> Result<Option<String>, Refusal> {
     sqlx::query_scalar(
-        "SELECT id FROM work_nodes WHERE parent_id = ? AND kind = 'leaf' AND title = ?
-         ORDER BY created_at, id LIMIT 1",
+        "SELECT id FROM work_nodes WHERE parent_id = ? AND kind IN ('leaf', 'orchestrator')
+         AND title = ? ORDER BY created_at, id LIMIT 1",
     )
     .bind(caller)
     .bind(name)
     .fetch_optional(&state.pool)
     .await
     .map_err(db_refusal)
+}
+
+/// The kind of the node a branch already has (bound, or made by an earlier call), if any: a replay
+/// keeps it, whatever the guards would say now.
+async fn known_kind(
+    state: &AppState,
+    bound: Option<&str>,
+    caller: &str,
+    name: &str,
+) -> Result<Option<Kind>, Refusal> {
+    let node = match bound {
+        Some(bound) => Some(bound.to_owned()),
+        None => existing_node(state, caller, name).await?,
+    };
+    let Some(node) = node else {
+        return Ok(None);
+    };
+    let kind: Option<String> = sqlx::query_scalar("SELECT kind FROM work_nodes WHERE id = ?")
+        .bind(node)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(db_refusal)?;
+    Ok(kind.map(|kind| {
+        if kind == "orchestrator" {
+            Kind::Orchestrator
+        } else {
+            Kind::Leaf
+        }
+    }))
 }
 
 /// 409 when the tree's budget does not permit one more node.
@@ -205,7 +256,7 @@ async fn report_soft(state: &AppState, root_id: &str) {
     }
 }
 
-/// The node already made for branch `name` under `caller`, else a new `leaf` for it. The job lock
+/// The node already made for branch `name` under `caller`, else a new one of `kind`. The job lock
 /// makes the lookup and the insert one step; nothing in `work_nodes::open` takes that lock. A new
 /// node is opened only while the tree's budget permits one; finding one costs nothing.
 #[allow(clippy::too_many_arguments)]
@@ -218,6 +269,7 @@ async fn find_or_open_node(
     name: &str,
     goal: &str,
     paths: &[String],
+    kind: Kind,
 ) -> Result<(String, bool), Refusal> {
     let lock = job_lock(job_id);
     let _guard = lock.lock().await;
@@ -238,7 +290,7 @@ async fn find_or_open_node(
         &limits,
         &OpenArgs {
             parent_id: Some(caller.to_owned()),
-            kind: "leaf".to_owned(),
+            kind: kind.as_str().to_owned(),
             title: name.to_owned(),
             goal: goal.to_owned(),
             owned_paths: paths.to_vec(),
@@ -276,6 +328,10 @@ struct PendingStart<'a> {
     base: Option<&'a str>,
     /// Set when the start waits for this base branch to merge rather than for the disk.
     waits_for_base: Option<&'a str>,
+    /// The kind asked for (not the one decided): the replay decides again.
+    kind: Kind,
+    estimate: Option<i64>,
+    parent: Option<&'a str>,
 }
 
 /// The base a queued branch waits on: named, in the tree and not merged yet. The same test
@@ -334,6 +390,9 @@ async fn remember_pending_start(
         "layer": pending.layer,
         "base": pending.base,
         "waits_for_base": pending.waits_for_base,
+        "kind": pending.kind.as_str(),
+        "estimate_tokens": pending.estimate,
+        "parent": pending.parent,
     });
     let slot = job
         .manifest
@@ -497,6 +556,10 @@ pub(super) async fn start_pending(
         "layer": record["layer"],
         "base": record["base"],
         "node_id": record["caller"],
+        // Records written before nesting carry neither: a leaf with no estimate. The parent is
+        // worked out again from the caller.
+        "kind": record["kind"],
+        "estimate_tokens": record["estimate_tokens"],
     });
     call(
         routes(),
@@ -518,10 +581,56 @@ pub(super) async fn start_pending(
 async fn post_branch_start(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    scope: Option<Extension<Scope>>,
     body: Result<Json<StartBody>, JsonRejection>,
 ) -> Result<Json<Value>, Refusal> {
-    let Json(body) =
-        body.map_err(|rejection| refuse(StatusCode::BAD_REQUEST, rejection.body_text()))?;
+    let body = body
+        .map(|Json(body)| body)
+        .map_err(|rejection| refuse(StatusCode::BAD_REQUEST, rejection.body_text()));
+    let asked = body.as_ref().ok().and_then(|body| body.name.clone());
+    let outcome = match body {
+        Ok(body) => start_branch(&state, &id, scope.map(|Extension(scope)| scope), body).await,
+        Err(refusal) => Err(refusal),
+    };
+    if let Err((status, Json(refusal))) = &outcome {
+        let reason = refusal["error"].as_str().unwrap_or("no reason given");
+        start_log::record_refusal(&state, &id, asked.as_deref(), status.as_u16(), reason).await;
+    }
+    outcome
+}
+
+/// 403 when the request carries a run key bound to nodes that do not include `caller`: a node opens
+/// only its own children. No key (the control token, an Admin key, the driver's replay) opens any
+/// node of the tree.
+async fn check_own_node(
+    state: &AppState,
+    scope: Option<&Scope>,
+    caller: &str,
+) -> Result<(), Refusal> {
+    let Some(Scope::Run(run_id)) = scope else {
+        return Ok(());
+    };
+    let bound = nesting::run_bound_nodes(&state.pool, *run_id)
+        .await
+        .map_err(db_refusal)?;
+    if bound.iter().any(|node| node == caller) {
+        return Ok(());
+    }
+    Err(refuse(
+        StatusCode::FORBIDDEN,
+        format!("a node opens only its own children: node_id {caller} is not the node this run is bound to"),
+    ))
+}
+
+/// The steps of `post_branch_start`, apart from recording its refusals.
+async fn start_branch(
+    state: &AppState,
+    id: &str,
+    scope: Option<Scope>,
+    body: StartBody,
+) -> Result<Json<Value>, Refusal> {
+    let state = state.clone();
+    let id = id.to_owned();
     let name = required("name", body.name)?;
     let goal = required("goal", body.goal)?;
     let prompt = required("prompt", body.prompt)?;
@@ -534,6 +643,15 @@ async fn post_branch_start(
         .filter(|layer| !layer.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_LAYER.to_owned());
     let base = body.base.filter(|base| !base.trim().is_empty());
+    let kind_omitted = body.kind.as_deref().is_none_or(|kind| kind.trim().is_empty());
+    let requested = requested_kind(body.kind.as_deref())?;
+    let estimate = body.estimate_tokens;
+    if estimate.is_some_and(|estimate| estimate <= 0) {
+        return Err(refuse(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "estimate_tokens must be a positive number of tokens",
+        ));
+    }
     for (what, value) in [("tree id", &id), ("branch name", &name)] {
         if !valid_name(value) {
             return Err(refuse(
@@ -561,6 +679,7 @@ async fn post_branch_start(
     if caller_node.root_id != job.root_node_id {
         return Err(not_in_tree());
     }
+    check_own_node(&state, scope.as_ref(), &caller).await?;
     if job.state == JOB_TERMINAL_STATE {
         return Err(refuse(
             StatusCode::CONFLICT,
@@ -590,6 +709,92 @@ async fn post_branch_start(
         ));
     }
 
+    // The kind and the parent, decided before anything is stored. A branch that already has a node
+    // keeps its kind and parent (a replay), whatever the guards would say now.
+    let limits = NodeLimits::load(Some(FsPath::new(&job.manifest.project_root)));
+    let child_depth = caller_node.depth + 1;
+    if let Some(max) = limits.max_depth
+        && child_depth > max
+    {
+        return Err(refuse(
+            StatusCode::CONFLICT,
+            format!("depth {child_depth} exceeds the limit of {max}"),
+        ));
+    }
+    let nested = caller != job.root_node_id && !docs;
+    let existing = job.manifest.branches.get(&name);
+    let parent = match existing {
+        Some(existing) => existing.parent.clone(),
+        None if nested => nesting::parent_branch_of(&job.manifest, &caller),
+        None => None,
+    };
+    let known = known_kind(
+        &state,
+        existing.and_then(|branch| branch.node_id.as_deref()),
+        &caller,
+        &name,
+    )
+    .await?;
+    let decision = match known {
+        Some(kind) => nesting::Decision {
+            kind,
+            degraded: None,
+        },
+        None => {
+            let refusal = if nested {
+                let chain = nesting::ancestor_chain(&state.pool, caller_node)
+                    .await
+                    .map_err(node_refusal)?;
+                let total = nesting::tree_node_count(&state.pool, &job.root_node_id)
+                    .await
+                    .map_err(db_refusal)?;
+                let args = ChildArgs {
+                    owned_paths: paths.clone(),
+                    goal: goal.clone(),
+                };
+                depth::check_child(&chain, &args, total, &TreeLimits::default()).err()
+            } else {
+                None
+            };
+            if requested == Kind::Leaf
+                && let Some(refusal) = &refusal
+            {
+                return Err(refuse(StatusCode::CONFLICT, nesting::refusal_text(refusal)));
+            }
+            if docs && requested == Kind::Orchestrator {
+                nesting::Decision {
+                    kind: Kind::Leaf,
+                    degraded: Some("a docs branch is never an orchestrator: opened as a leaf".to_owned()),
+                }
+            } else {
+                nesting::decide_kind(
+                    requested,
+                    estimate,
+                    limits.leaf_budget,
+                    child_depth,
+                    limits.max_depth,
+                    refusal,
+                )
+            }
+        }
+    };
+    let kind = decision.kind;
+    let shape = StartShape {
+        name: &name,
+        kind,
+        depth: child_depth,
+        estimate,
+        leaf_budget: limits.leaf_budget,
+        degraded: decision.degraded.as_deref(),
+        kind_omitted,
+    };
+    let shape_json = json!({
+        "kind": kind.as_str(),
+        "depth": child_depth,
+        "parent": parent,
+        "degraded": decision.degraded,
+    });
+
     // A branch with no node yet will need a new one at step 3. Refuse now when the budget does not
     // permit it, so that a refused call has not added a branch or opened a worktree the driver could
     // pick up. Step 3 checks again under the job lock.
@@ -608,7 +813,7 @@ async fn post_branch_start(
         super::http::routes(),
         &state,
         format!("/trees/{id}/branches"),
-        json!({ "name": name, "paths": paths, "layer": layer, "base": base }),
+        json!({ "name": name, "paths": paths, "layer": layer, "base": base, "parent": parent }),
     )
     .await
     {
@@ -627,6 +832,9 @@ async fn post_branch_start(
                     layer: &layer,
                     base: base.as_deref(),
                     waits_for_base: None,
+                    kind: requested,
+                    estimate,
+                    parent: parent.as_deref(),
                 };
                 remember_pending_start(&state, &id, &name, &pending).await;
             }
@@ -634,6 +842,9 @@ async fn post_branch_start(
         }
     };
     let mut replayed = added["replayed"].as_bool().unwrap_or(false);
+    // The shape of the start goes on the branch before its node exists, so that a crash between
+    // the two leaves it and the replay does not write it twice.
+    start_log::record_start(&state, &id, &shape).await;
 
     // 2. The worktree. A branch past `queued` was opened by an earlier call.
     let job = store::load(&state.pool, &id)
@@ -660,14 +871,20 @@ async fn post_branch_start(
             layer: &layer,
             base: Some(base),
             waits_for_base: Some(base),
+            kind: requested,
+            estimate,
+            parent: parent.as_deref(),
         };
         remember_pending_start(&state, &id, &name, &pending).await;
-        return Ok(Json(json!({
-            "branch": name,
-            "queued": true,
-            "waiting_for": base,
-            "replayed": false,
-        })));
+        return Ok(Json(with_shape(
+            json!({
+                "branch": name,
+                "queued": true,
+                "waiting_for": base,
+                "replayed": false,
+            }),
+            &shape_json,
+        )));
     }
     let worktree = if branch.state == "queued" {
         let opened = call(
@@ -698,6 +915,7 @@ async fn post_branch_start(
                 &name,
                 &goal,
                 &paths,
+                kind,
             )
             .await?;
             replayed &= found;
@@ -714,6 +932,21 @@ async fn post_branch_start(
     // 5. The agent, once per branch name.
     let key = format!("branch-{name}");
     replayed &= launch_recorded(&state, &node_id, &key).await?;
+    // An orchestrator's agent is told what it is on top of its task; the daemon enforces the same
+    // rules whatever it does with them.
+    let prompt = if kind == Kind::Orchestrator {
+        let preamble = nested_prompt::orchestrator_preamble(
+            child_depth,
+            limits.max_depth,
+            limits.leaf_budget,
+            nested_prompt::DEFAULT_ORCHESTRATOR_BUDGET,
+            &node_id,
+            &id,
+        );
+        format!("{preamble}\n\n{prompt}")
+    } else {
+        prompt
+    };
     let run_id = launch_recovering(
         &state,
         &node_id,
@@ -726,13 +959,26 @@ async fn post_branch_start(
     .await
     .map_err(run_refusal)?;
 
-    Ok(Json(json!({
-        "branch": name,
-        "node_id": node_id,
-        "run_id": run_id,
-        "worktree": worktree,
-        "replayed": replayed,
-    })))
+    Ok(Json(with_shape(
+        json!({
+            "branch": name,
+            "node_id": node_id,
+            "run_id": run_id,
+            "worktree": worktree,
+            "replayed": replayed,
+        }),
+        &shape_json,
+    )))
+}
+
+/// `response` with the `kind`, `depth`, `parent` and `degraded` of the start added.
+fn with_shape(mut response: Value, shape: &Value) -> Value {
+    if let (Some(response), Some(shape)) = (response.as_object_mut(), shape.as_object()) {
+        for (key, value) in shape {
+            response.insert(key.clone(), value.clone());
+        }
+    }
+    response
 }
 
 #[cfg(test)]
@@ -1343,5 +1589,381 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mode, "worktree");
+    }
+
+    // ----- kind, estimate and nesting -----
+
+    fn code_body(caller: &str, name: &str, goal: &str, paths: &[&str]) -> Value {
+        json!({
+            "name": name,
+            "goal": goal,
+            "owned_paths": paths,
+            "prompt": format!("Build {name}."),
+            "layer": "core",
+            "node_id": caller,
+        })
+    }
+
+    fn with(mut body: Value, key: &str, value: Value) -> Value {
+        body[key] = value;
+        body
+    }
+
+    async fn post_as(app: &Router, body: Value, scope: Scope) -> (StatusCode, Value) {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri(uri())
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        request.extensions_mut().insert(scope);
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    async fn job_of(state: &AppState) -> crate::tree_job::store::TreeJob {
+        crate::tree_job::store::load(&state.pool, TREE)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn kind_of(state: &AppState, node: &str) -> String {
+        sqlx::query_scalar("SELECT kind FROM work_nodes WHERE id = ?")
+            .bind(node)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn descents(state: &AppState) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM feed WHERE kind = 'work_tree_descent'")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    /// A stem orchestrator `api` owning `core/**`; returns the id of its node.
+    async fn stem_orchestrator(app: &Router, caller: &str) -> String {
+        let body = with(
+            code_body(caller, "api", "Build the api", &["core/**"]),
+            "kind",
+            json!("orchestrator"),
+        );
+        let (status, response) = post(app, &uri(), with(body, "estimate_tokens", json!(400_000))).await;
+        assert_eq!(status, StatusCode::OK, "{response:?}");
+        response["node_id"].as_str().unwrap().to_owned()
+    }
+
+    fn nested_body(api_node: &str) -> Value {
+        with(
+            with(
+                code_body(api_node, "api-x", "Build the x half", &["core/x/**"]),
+                "kind",
+                json!("orchestrator"),
+            ),
+            "estimate_tokens",
+            json!(180_000),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_start_without_kind_opens_a_leaf_exactly_as_before() {
+        let (state, app, caller, _repo) = tree().await;
+        let body = code_body(&caller, "api", "Build the api", &["core/**"]);
+
+        let (status, response) = post(&app, &uri(), body).await;
+
+        assert_eq!(status, StatusCode::OK, "{response:?}");
+        assert_eq!(response["kind"], "leaf");
+        assert_eq!(response["parent"], Value::Null);
+        assert_eq!(response["degraded"], Value::Null);
+        assert_eq!(response["depth"], 1);
+        assert_eq!(kind_of(&state, response["node_id"].as_str().unwrap()).await, "leaf");
+        let job = job_of(&state).await;
+        let branch = &job.manifest.branches["api"];
+        assert_eq!(branch.parent, None);
+        assert!(!branch.extra.contains_key("descent"));
+        assert!(!branch.extra.contains_key("degraded"));
+        assert_eq!(branch.extra["kind_reason"], "kind omitted: opened as a leaf");
+        assert_eq!(descents(&state).await, 0);
+    }
+
+    #[tokio::test]
+    async fn an_orchestrator_start_opens_an_orchestrator_node_with_a_parentless_branch_at_the_stem() {
+        let (state, app, caller, _repo) = tree().await;
+
+        let api_node = stem_orchestrator(&app, &caller).await;
+
+        assert_eq!(kind_of(&state, &api_node).await, "orchestrator");
+        let job = job_of(&state).await;
+        let branch = &job.manifest.branches["api"];
+        assert_eq!(branch.parent, None, "the stem is not nested");
+        assert_eq!(branch.extra["estimate_tokens"], 400_000);
+        assert_eq!(branch.extra["descent"]["kind"], "orchestrator");
+        assert_eq!(descents(&state).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_nested_start_records_parent_depth_and_the_descent_reason() {
+        let (state, app, caller, _repo) = tree().await;
+        let api_node = stem_orchestrator(&app, &caller).await;
+
+        let (status, response) = post(&app, &uri(), nested_body(&api_node)).await;
+
+        assert_eq!(status, StatusCode::OK, "{response:?}");
+        assert_eq!(response["kind"], "orchestrator");
+        assert_eq!(response["parent"], "api");
+        assert_eq!(response["depth"], 2);
+        let job = job_of(&state).await;
+        let child = &job.manifest.branches["api-x"];
+        assert_eq!(child.parent.as_deref(), Some("api"));
+        assert_eq!(
+            child.extra["descent"]["reason"],
+            "piece api-x estimated 180000 tokens > leaf_budget 120000"
+        );
+        assert_eq!(child.extra["descent"]["depth"], 2);
+        assert_eq!(kind_of(&state, response["node_id"].as_str().unwrap()).await, "orchestrator");
+    }
+
+    #[tokio::test]
+    async fn a_nested_start_replayed_adds_one_node_and_one_descent() {
+        let (state, app, caller, _repo) = tree().await;
+        let api_node = stem_orchestrator(&app, &caller).await;
+        let first = post(&app, &uri(), nested_body(&api_node)).await;
+        assert_eq!(first.0, StatusCode::OK, "{:?}", first.1);
+        let nodes = count(&state, "work_nodes").await;
+        let runs = count(&state, "runs").await;
+        let lines = descents(&state).await;
+
+        let second = post(&app, &uri(), nested_body(&api_node)).await;
+
+        assert_eq!(second.0, StatusCode::OK, "{:?}", second.1);
+        assert_eq!(second.1["node_id"], first.1["node_id"]);
+        assert_eq!(second.1["replayed"], true);
+        assert_eq!(second.1["kind"], "orchestrator");
+        assert_eq!(count(&state, "work_nodes").await, nodes);
+        assert_eq!(count(&state, "runs").await, runs);
+        assert_eq!(descents(&state).await, lines, "no second descent line");
+        let job = job_of(&state).await;
+        assert_eq!(crate::tree_job::nesting::children(&job.manifest, "api").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_disk_queued_nested_start_keeps_kind_estimate_and_parent_when_the_driver_retries_it() {
+        let (state, app, caller, _repo) = tree().await;
+        let api_node = stem_orchestrator(&app, &caller).await;
+        let pending = PendingStart {
+            caller: &api_node,
+            goal: "Build the x half",
+            prompt: "Build api-x.",
+            paths: &["core/x/**".to_owned()],
+            layer: "core",
+            base: None,
+            waits_for_base: Some("api"),
+            kind: Kind::Orchestrator,
+            estimate: Some(180_000),
+            parent: Some("api"),
+        };
+        remember_pending_start(&state, TREE, "api-x", &pending).await;
+        let record = job_of(&state).await.manifest.extra["pending_starts"]["api-x"].clone();
+        assert_eq!(record["kind"], "orchestrator");
+        assert_eq!(record["estimate_tokens"], 180_000);
+        assert_eq!(record["parent"], "api");
+
+        let started = start_pending(&state, TREE, "api-x", &record).await.unwrap();
+
+        assert_eq!(started["kind"], "orchestrator");
+        assert_eq!(started["parent"], "api");
+        let job = job_of(&state).await;
+        let child = &job.manifest.branches["api-x"];
+        assert_eq!(child.parent.as_deref(), Some("api"));
+        assert_eq!(child.extra["estimate_tokens"], 180_000);
+        assert_eq!(kind_of(&state, started["node_id"].as_str().unwrap()).await, "orchestrator");
+    }
+
+    #[tokio::test]
+    async fn a_nested_leaf_with_a_repeated_ancestor_goal_is_409_but_an_orchestrator_degrades_to_a_leaf() {
+        let (state, app, caller, _repo) = tree().await;
+        let api_node = stem_orchestrator(&app, &caller).await;
+        let repeated = |name: &str, kind: &str| {
+            with(
+                with(
+                    code_body(&api_node, name, "Build the api", &["core/y/**"]),
+                    "kind",
+                    json!(kind),
+                ),
+                "estimate_tokens",
+                json!(500_000),
+            )
+        };
+
+        let (status, refused) = post(&app, &uri(), repeated("api-leaf", "leaf")).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused:?}");
+        assert!(refused.to_string().contains("repeated goal"), "{refused:?}");
+
+        let (status, degraded) = post(&app, &uri(), repeated("api-orch", "orchestrator")).await;
+        assert_eq!(status, StatusCode::OK, "{degraded:?}");
+        assert_eq!(degraded["kind"], "leaf");
+        assert!(degraded["degraded"].as_str().unwrap().contains("repeated goal"));
+        assert_eq!(kind_of(&state, degraded["node_id"].as_str().unwrap()).await, "leaf");
+        let job = job_of(&state).await;
+        let branch = &job.manifest.branches["api-orch"];
+        assert!(branch.extra["degraded"].as_str().unwrap().contains("repeated goal"));
+        assert_eq!(branch.extra["descent"]["kind"], "leaf");
+    }
+
+    /// Inserts a running node of the tree, to stand where a deep tree would put one.
+    async fn deep_node(state: &AppState, root: &str, id: &str, depth: i64) {
+        sqlx::query(
+            "INSERT INTO work_nodes (id, root_id, parent_id, depth, kind, title, goal, status, \
+             owned_paths, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, 'orchestrator', ?, ?, 'running', '[\"core/**\"]', \
+             '2026-11-08T10:00:00+00:00', '2026-11-08T10:00:00+00:00')",
+        )
+        .bind(id)
+        .bind(root)
+        .bind(root)
+        .bind(depth)
+        .bind(id)
+        .bind(format!("goal of {id}"))
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_child_at_depth_seven_is_409() {
+        let (state, app, caller, repo) = tree().await;
+        std::fs::write(
+            repo.path.join(".nucleos/workflow/speed.yaml"),
+            "tree:\n  floor_gb: 0\nnodes:\n  max_depth: 6\n",
+        )
+        .unwrap();
+        deep_node(&state, &caller, "deep-6", 6).await;
+        deep_node(&state, &caller, "deep-5", 5).await;
+        let nodes = count(&state, "work_nodes").await;
+
+        let (status, refused) = post(
+            &app,
+            &uri(),
+            code_body("deep-6", "too-deep", "Too deep", &["core/z/**"]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused:?}");
+        assert!(refused.to_string().contains("depth 7"), "{refused:?}");
+        assert_eq!(count(&state, "work_nodes").await, nodes);
+
+        // At depth 6 an orchestrator is asked for and a leaf is made.
+        let body = with(
+            with(
+                code_body("deep-5", "last-level", "Last level", &["core/y/**"]),
+                "kind",
+                json!("orchestrator"),
+            ),
+            "estimate_tokens",
+            json!(900_000),
+        );
+        let (status, last) = post(&app, &uri(), body).await;
+        assert_eq!(status, StatusCode::OK, "{last:?}");
+        assert_eq!(last["kind"], "leaf");
+        assert_eq!(last["depth"], 6);
+        assert!(last["degraded"].as_str().unwrap().contains("depth 6"));
+    }
+
+    #[tokio::test]
+    async fn estimate_zero_negative_and_unknown_kind_are_422() {
+        let (state, app, caller, _repo) = tree().await;
+        let nodes = count(&state, "work_nodes").await;
+        let base = code_body(&caller, "api", "Build the api", &["core/**"]);
+        for (key, value) in [
+            ("estimate_tokens", json!(0)),
+            ("estimate_tokens", json!(-5)),
+            ("kind", json!("branch")),
+        ] {
+            let (status, refused) = post(&app, &uri(), with(base.clone(), key, value)).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{key}: {refused:?}");
+        }
+        assert_eq!(count(&state, "work_nodes").await, nodes);
+    }
+
+    #[tokio::test]
+    async fn a_run_bound_caller_cannot_start_branches_for_another_node() {
+        let (state, app, caller, _repo) = tree().await;
+        let api_node = stem_orchestrator(&app, &caller).await;
+        let (status, web) = post(&app, &uri(), code_body(&caller, "web", "Build the web", &["web/**"])).await;
+        assert_eq!(status, StatusCode::OK, "{web:?}");
+        let web_node = web["node_id"].as_str().unwrap().to_owned();
+        sqlx::query("UPDATE work_nodes SET run_id = '4242' WHERE id = ?")
+            .bind(&api_node)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let nodes = count(&state, "work_nodes").await;
+
+        // The root and a sibling are not the node the run is bound to.
+        for other in [caller.as_str(), web_node.as_str()] {
+            let body = code_body(other, "stolen", "Not mine", &["core/s/**"]);
+            let (status, refused) = post_as(&app, body, Scope::Run(4242)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{other}: {refused:?}");
+            assert!(
+                refused.to_string().contains("only its own children"),
+                "{refused:?}"
+            );
+        }
+        assert_eq!(count(&state, "work_nodes").await, nodes);
+
+        // Its own node is fine, and so is the control token for any node of the tree.
+        let own = code_body(&api_node, "api-own", "Build the own half", &["core/o/**"]);
+        let (status, ok) = post_as(&app, own, Scope::Run(4242)).await;
+        assert_eq!(status, StatusCode::OK, "{ok:?}");
+        let (status, ok) = post_as(
+            &app,
+            code_body(&web_node, "web-child", "Build the web child", &["web/c/**"]),
+            Scope::Control,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{ok:?}");
+    }
+
+    #[tokio::test]
+    async fn a_refused_start_leaves_a_recorded_refusal_naming_the_reason() {
+        let (state, app, caller, _repo) = tree().await;
+        let (status, _) = post(&app, &uri(), code_body(&caller, "a", "Build a", &["core/**"])).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, refused) = post(&app, &uri(), code_body(&caller, "b", "Build b", &["core/**"])).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused:?}");
+
+        let job = job_of(&state).await;
+        let list = job.manifest.extra[start_log::REFUSALS_KEY].as_array().unwrap();
+        let last = list.last().unwrap();
+        assert_eq!(last["job"], TREE);
+        assert_eq!(last["branch"], "b");
+        assert_eq!(last["status"], 409);
+        assert!(last["reason"].as_str().unwrap().contains("overlap"), "{last:?}");
+    }
+
+    #[tokio::test]
+    async fn the_estimate_survives_a_reload_of_the_manifest() {
+        let (state, app, caller, _repo) = tree().await;
+        let body = with(
+            code_body(&caller, "api", "Build the api", &["core/**"]),
+            "estimate_tokens",
+            json!(50_000),
+        );
+        let (status, response) = post(&app, &uri(), body).await;
+        assert_eq!(status, StatusCode::OK, "{response:?}");
+
+        let job = job_of(&state).await;
+        let text = serde_json::to_string(&job.manifest).unwrap();
+        let reloaded: crate::tree_job::model::Manifest = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(reloaded.branches["api"].extra["estimate_tokens"], 50_000);
+        assert_eq!(job.manifest.branches["api"].extra["estimate_tokens"], 50_000);
     }
 }
