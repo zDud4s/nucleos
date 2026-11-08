@@ -55,7 +55,10 @@ func TestAVisibleSessionShowsItsPanel(t *testing.T) {
 
 			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 			defer cancel()
-			driver, err := chrome.Connect(ctx, dial(t, process.Port), policy)
+			// One pipe, one connection: the page watcher attaches over the driver's own connection.
+			conn := cdp.NewPipe(process.Pipe())
+			t.Cleanup(func() { _ = conn.Close() })
+			driver, err := chrome.Connect(ctx, conn, policy)
 			if err != nil {
 				t.Fatalf("attaching the fence: %v", err)
 			}
@@ -64,7 +67,7 @@ func TestAVisibleSessionShowsItsPanel(t *testing.T) {
 				t.Fatalf("open: %v", err)
 			}
 
-			watcher := dial(t, process.Port)
+			watcher := conn
 			session := attachTo(t, watcher, server.URL+path)
 			deadline := time.Now().Add(10 * time.Second)
 			for {
@@ -82,14 +85,12 @@ func TestAVisibleSessionShowsItsPanel(t *testing.T) {
 }
 
 // attachTo attaches a second connection to the page already showing url.
+// The page's URL is still empty right after Open returns, so the target list is polled until it shows up.
 func attachTo(t *testing.T, conn *cdp.Conn, url string) cdp.SessionID {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	raw, err := conn.Call(ctx, cdp.BrowserSession, "Target.getTargets", nil)
-	if err != nil {
-		t.Fatalf("targets: %v", err)
-	}
+	deadline := time.Now().Add(15 * time.Second)
 	var targets struct {
 		TargetInfos []struct {
 			TargetID string `json:"targetId"`
@@ -97,27 +98,37 @@ func attachTo(t *testing.T, conn *cdp.Conn, url string) cdp.SessionID {
 			URL      string `json:"url"`
 		} `json:"targetInfos"`
 	}
-	if err := json.Unmarshal(raw, &targets); err != nil {
-		t.Fatalf("targets: %v", err)
-	}
-	for _, target := range targets.TargetInfos {
-		if target.Type != "page" || target.URL != url {
-			continue
-		}
-		attached, err := conn.Call(ctx, cdp.BrowserSession, "Target.attachToTarget", map[string]any{
-			"targetId": target.TargetID,
-			"flatten":  true,
-		})
+	for {
+		raw, err := conn.Call(ctx, cdp.BrowserSession, "Target.getTargets", nil)
 		if err != nil {
-			t.Fatalf("attaching: %v", err)
+			t.Fatalf("targets: %v", err)
 		}
-		var session struct {
-			SessionID cdp.SessionID `json:"sessionId"`
+		if err := json.Unmarshal(raw, &targets); err != nil {
+			t.Fatalf("targets: %v", err)
 		}
-		if err := json.Unmarshal(attached, &session); err != nil {
-			t.Fatalf("session id: %v", err)
+		for _, target := range targets.TargetInfos {
+			if target.Type != "page" || target.URL != url {
+				continue
+			}
+			attached, err := conn.Call(ctx, cdp.BrowserSession, "Target.attachToTarget", map[string]any{
+				"targetId": target.TargetID,
+				"flatten":  true,
+			})
+			if err != nil {
+				t.Fatalf("attaching: %v", err)
+			}
+			var session struct {
+				SessionID cdp.SessionID `json:"sessionId"`
+			}
+			if err := json.Unmarshal(attached, &session); err != nil {
+				t.Fatalf("session id: %v", err)
+			}
+			return session.SessionID
 		}
-		return session.SessionID
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
 	t.Fatalf("no page at %s among %+v", url, targets.TargetInfos)
 	return ""

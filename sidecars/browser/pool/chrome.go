@@ -27,7 +27,7 @@ type ChromeLauncher struct {
 	ExecutablePath string
 	// CacheMB caps the profile's disk cache. Zero takes launch.DefaultCacheMB.
 	CacheMB int
-	// StartTimeout bounds how long the browser has to report its debugging port.
+	// StartTimeout bounds how long the browser has to answer on the DevTools pipe.
 	StartTimeout time.Duration
 }
 
@@ -78,16 +78,7 @@ func (l ChromeLauncher) launch(ctx context.Context, dir string, policy fence.Pol
 	}
 	instance.process = process
 
-	wsURL, err := launch.DebuggerURL(process.Port, l.startTimeout())
-	if err != nil {
-		instance.stop(ctx)
-		return nil, err
-	}
-	conn, err := cdp.Dial(wsURL, l.startTimeout())
-	if err != nil {
-		instance.stop(ctx)
-		return nil, fmt.Errorf("dialling the browser: %w", err)
-	}
+	conn := cdp.NewPipe(process.Pipe())
 	instance.conn = conn
 
 	driver, err := chrome.Connect(ctx, conn, policy)
@@ -131,16 +122,7 @@ func (l ChromeLauncher) LaunchHuman(ctx context.Context, dir string) (Instance, 
 	}
 	instance.process = process
 
-	wsURL, err := launch.DebuggerURL(process.Port, l.startTimeout())
-	if err != nil {
-		instance.stop(ctx)
-		return nil, err
-	}
-	conn, err := cdp.Dial(wsURL, l.startTimeout())
-	if err != nil {
-		instance.stop(ctx)
-		return nil, fmt.Errorf("dialling the browser: %w", err)
-	}
+	conn := cdp.NewPipe(process.Pipe())
 	instance.conn = conn
 
 	human, err := chrome.ConnectHuman(ctx, conn)

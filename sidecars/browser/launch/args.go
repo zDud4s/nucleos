@@ -68,9 +68,11 @@ func Args(opts Options) ([]string, error) {
 	}
 
 	args := []string{
-		// Port 0 makes the OS choose; the real port is read back from DevToolsActivePort in the
-		// profile directory. A fixed port would collide the moment two sessions run at once.
-		"--remote-debugging-port=0",
+		// The browser is driven over the DevTools pipe, so no TCP port is opened at all: only this
+		// process holds the pipe ends, and no other local process can attach and bypass the fence.
+		// Windows additionally needs --remote-debugging-io-pipes=<read>,<write>, which names handles
+		// that exist only after the pipes are made; launch adds it at start (see wirePipes).
+		"--remote-debugging-pipe",
 		"--user-data-dir=" + opts.ProfileDir,
 		// In bytes, and applied in BOTH modes. A cap that only held while the agent drove would be a
 		// cap on the half of the profile's life that writes least: the person's headful session is

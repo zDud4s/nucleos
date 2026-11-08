@@ -14,10 +14,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -926,7 +924,8 @@ func fenced(t *testing.T, policy fence.Policy) (*chrome.Driver, string) {
 	}
 	t.Cleanup(process.Stop)
 
-	conn := dial(t, process.Port)
+	conn := cdp.NewPipe(process.Pipe())
+	t.Cleanup(func() { _ = conn.Close() })
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 	driver, err := chrome.Connect(ctx, conn, policy)
@@ -979,10 +978,8 @@ func findOnDisk(t *testing.T, profile, name string) string {
 func control(t *testing.T) *cdp.Conn {
 	t.Helper()
 	profile := t.TempDir()
-	marker := filepath.Join(profile, "DevToolsActivePort")
-	cmd := exec.Command(chromium(t),
-		"--remote-debugging-port=0",
-		"--user-data-dir="+profile,
+	process, err := launch.StartArgs(context.Background(), chromium(t), []string{
+		"--user-data-dir=" + profile,
 		"--headless=new",
 		"--no-first-run",
 		"--no-default-browser-check",
@@ -992,43 +989,13 @@ func control(t *testing.T) *cdp.Conn {
 		// control has to be MORE permissive than production or it proves nothing: without this the
 		// popup test would pass because Chrome blocked the popup, not because the fence did.
 		"--disable-popup-blocking",
-	)
-	if err := cmd.Start(); err != nil {
+	}, profile, 45*time.Second)
+	if err != nil {
 		t.Fatalf("starting the control browser: %v", err)
 	}
-	t.Cleanup(func() {
-		if runtime.GOOS == "windows" {
-			_ = exec.Command("taskkill", "/T", "/F", "/PID", strconv.Itoa(cmd.Process.Pid)).Run()
-		}
-		_ = cmd.Process.Kill()
-		_, _ = cmd.Process.Wait()
-	})
+	t.Cleanup(process.Stop)
 
-	deadline := time.Now().Add(45 * time.Second)
-	for time.Now().Before(deadline) {
-		raw, err := os.ReadFile(marker)
-		if err == nil {
-			line := strings.SplitN(strings.TrimSpace(string(raw)), "\n", 2)[0]
-			if port, err := strconv.Atoi(strings.TrimSpace(line)); err == nil && port > 0 {
-				return dial(t, port)
-			}
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	t.Fatal("the control browser never reported a debugging port")
-	return nil
-}
-
-func dial(t *testing.T, port int) *cdp.Conn {
-	t.Helper()
-	wsURL, err := launch.DebuggerURL(port, 10*time.Second)
-	if err != nil {
-		t.Fatalf("finding the debugger url: %v", err)
-	}
-	conn, err := cdp.Dial(wsURL, 20*time.Second)
-	if err != nil {
-		t.Fatalf("dialling cdp: %v", err)
-	}
+	conn := cdp.NewPipe(process.Pipe())
 	t.Cleanup(func() { _ = conn.Close() })
 	return conn
 }

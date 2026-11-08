@@ -63,7 +63,7 @@ type message struct {
 
 // Conn is one connection to a browser, multiplexing every session over it.
 type Conn struct {
-	ws *wsConn
+	ws transport
 
 	nextID atomic.Int64
 
@@ -107,14 +107,29 @@ func (c *Conn) Refuse(match func(method string) bool) {
 	c.mu.Unlock()
 }
 
+// transport carries whole CDP messages in both directions. The WebSocket and the DevTools pipe
+// differ only in framing, so Conn does not care which one it has.
+type transport interface {
+	// readMessage blocks for the next complete message; any error ends the connection.
+	readMessage() ([]byte, error)
+	// writeText sends one message. It must be safe for concurrent use.
+	writeText([]byte) error
+	Close() error
+}
+
 // Dial connects to a browser's WebSocket debugger url.
 func Dial(wsURL string, timeout time.Duration) (*Conn, error) {
 	ws, err := dialWS(wsURL, timeout)
 	if err != nil {
 		return nil, err
 	}
+	return newConn(ws), nil
+}
+
+// newConn wraps a transport and starts the read and dispatch goroutines.
+func newConn(t transport) *Conn {
 	conn := &Conn{
-		ws:       ws,
+		ws:       t,
 		pending:  map[int64]chan *message{},
 		handlers: map[int]func(Event){},
 		done:     make(chan struct{}),
@@ -122,7 +137,7 @@ func Dial(wsURL string, timeout time.Duration) (*Conn, error) {
 	conn.queueCond = sync.NewCond(&conn.mu)
 	go conn.readLoop()
 	go conn.dispatchLoop()
-	return conn, nil
+	return conn
 }
 
 // dispatchLoop runs handlers, in order, on a goroutine that is not the read loop. See the queue
