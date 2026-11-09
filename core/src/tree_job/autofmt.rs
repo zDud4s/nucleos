@@ -61,7 +61,9 @@ fn tool_of(label: &str) -> Option<(&str, Tool)> {
     if let Some(prefix) = label.strip_suffix(": gofmt") {
         return Some((prefix, Tool::GoFmt));
     }
-    label.strip_suffix(": fmt").map(|prefix| (prefix, Tool::CargoFmt))
+    label
+        .strip_suffix(": fmt")
+        .map(|prefix| (prefix, Tool::CargoFmt))
 }
 
 /// True when the findings fail on formatter steps only: at least one, and nothing else (no other
@@ -162,14 +164,22 @@ pub(super) fn blocked_asks_only_formatter(handoff: &str) -> bool {
     }
     section(handoff, "Commands for the root")
         .lines()
-        .map(|line| line.trim().trim_start_matches(['-', '*', ' ']).to_lowercase())
+        .map(|line| {
+            line.trim()
+                .trim_start_matches(['-', '*', ' '])
+                .to_lowercase()
+        })
         .filter(|line| !line.is_empty() && line != "none")
         .all(|line| line.contains("fmt") || line.contains("format"))
 }
 
 /// Formatter runs already spent on the branch.
 pub(super) fn runs(branch: &Branch) -> i64 {
-    branch.extra.get(RUNS_KEY).and_then(Value::as_i64).unwrap_or(0)
+    branch
+        .extra
+        .get(RUNS_KEY)
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
 }
 
 pub(super) fn allowed(branch: &Branch) -> bool {
@@ -259,23 +269,34 @@ pub(super) async fn heal_red(branch: &Branch, findings: &str) -> bool {
         return false;
     };
     let steps = steps_from_findings(findings, dir_probe(worktree));
-    matches!(format_worktree(worktree, &steps).await, Ok(true))
+    match format_worktree(worktree, &steps).await {
+        Ok(changed) => changed,
+        Err(error) => {
+            tracing::warn!(%error, worktree = %worktree.display(), "heal_red: formatter failed");
+            false
+        }
+    }
 }
 
-/// Formats the Rust paths a branch owns before its gate. Best effort: an error only means the gate
-/// will say so. True when a commit was made.
-pub(super) async fn format_owned(branch: &Branch) -> bool {
+/// Formats the Rust paths a branch owns before its gate. `Ok(true)` when a commit was made,
+/// `Ok(false)` when nothing ran (no worktree, not allowed, no steps) or nothing changed, `Err`
+/// when the formatter failed (also logged).
+pub(super) async fn format_owned(branch: &Branch) -> Result<bool, String> {
     let Some(worktree) = branch.worktree.as_deref().map(Path::new) else {
-        return false;
+        return Ok(false);
     };
     if !allowed(branch) {
-        return false;
+        return Ok(false);
     }
     let steps = steps_for_paths(&branch.paths, manifest_probe(worktree));
     if steps.is_empty() {
-        return false;
+        return Ok(false);
     }
-    matches!(format_worktree(worktree, &steps).await, Ok(true))
+    let result = format_worktree(worktree, &steps).await;
+    if let Err(error) = &result {
+        tracing::warn!(%error, worktree = %worktree.display(), "format_owned: formatter failed");
+    }
+    result
 }
 
 #[cfg(test)]
@@ -292,9 +313,15 @@ mod tests {
 
     #[test]
     fn a_red_with_another_failure_is_not_fmt_only() {
-        assert!(!fmt_only("FAIL core: clippy\ngates FAILED:\n  core: clippy"));
-        assert!(!fmt_only("FAIL core: fmt\nFAIL core: test\ngates FAILED:\n  core: fmt\n  core: test"));
-        assert!(!fmt_only("gates FAILED:\n  core: fmt\nerror[E0432]: unresolved import"));
+        assert!(!fmt_only(
+            "FAIL core: clippy\ngates FAILED:\n  core: clippy"
+        ));
+        assert!(!fmt_only(
+            "FAIL core: fmt\nFAIL core: test\ngates FAILED:\n  core: fmt\n  core: test"
+        ));
+        assert!(!fmt_only(
+            "gates FAILED:\n  core: fmt\nerror[E0432]: unresolved import"
+        ));
         assert!(!fmt_only("note: run fmt later"));
     }
 
@@ -306,9 +333,18 @@ mod tests {
         assert_eq!(
             steps,
             vec![
-                Step { dir: String::new(), tool: Tool::CargoFmt },
-                Step { dir: "shell/src-tauri".into(), tool: Tool::CargoFmt },
-                Step { dir: "sidecars/x".into(), tool: Tool::GoFmt },
+                Step {
+                    dir: String::new(),
+                    tool: Tool::CargoFmt
+                },
+                Step {
+                    dir: "shell/src-tauri".into(),
+                    tool: Tool::CargoFmt
+                },
+                Step {
+                    dir: "sidecars/x".into(),
+                    tool: Tool::GoFmt
+                },
             ]
         );
     }

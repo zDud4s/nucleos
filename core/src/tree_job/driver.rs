@@ -363,14 +363,18 @@ async fn at_work(
                 && handoff
                     .as_deref()
                     .is_some_and(autofmt::blocked_asks_only_formatter);
+            let mut formatted = false;
             if asks_formatter && autofmt::allowed(branch) {
-                if autofmt::format_owned(branch).await
-                    && let Some(held) = job.manifest.branches.get_mut(name)
-                {
+                let result = autofmt::format_owned(branch).await;
+                // Every attempt is counted, whatever its result, so the budget bounds retries.
+                if let Some(held) = job.manifest.branches.get_mut(name) {
                     autofmt::count_run(held);
                     persist(pool, job).await?;
                 }
-            } else {
+                // A formatter that errored falls through to the rescue/park branch below.
+                formatted = result.is_ok();
+            }
+            if !formatted {
                 // One rescue run with the failure in its prompt, then the owner is asked.
                 if let Some(run) = &report.run_id {
                     let suffix = rescue::stopped_suffix(outcome, handoff.as_deref());
@@ -390,7 +394,7 @@ async fn at_work(
     if let Some(branch) = job.manifest.branches.get(name)
         && branch.layer != "docs"
         && autofmt::allowed(branch)
-        && autofmt::format_owned(branch).await
+        && matches!(autofmt::format_owned(branch).await, Ok(true))
         && let Some(held) = job.manifest.branches.get_mut(name)
     {
         autofmt::count_run(held);
