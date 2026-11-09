@@ -60,15 +60,37 @@ pub fn extract(output: &str) -> Option<Failures> {
     if output.trim_start().starts_with(TRUNCATION_MARK) {
         return None;
     }
+    // The gate wraps each step's output in a left indent and the runner may colour it: both hid every
+    // marker from the readers below, which anchor on the start of a line.
+    let output = strip_ansi(output);
     let mut found = Failures::default();
     for reader in [libtest as Reader, nextest, pytest, vitest, go] {
-        match reader(output) {
+        match reader(&output) {
             Reading::Absent => {}
             Reading::Incomplete => return None,
             Reading::Ids(ids) => found.merge(&ids),
         }
     }
     (!found.tests.is_empty()).then_some(found)
+}
+
+/// Drops ANSI CSI escape sequences (`ESC [ ... <final byte>`), e.g. colour codes.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for next in chars.by_ref() {
+                if ('\u{40}'..='\u{7e}').contains(&next) {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// libtest: `test <path> ... FAILED` lines, confirmed by the sum of `N failed` over the
@@ -78,7 +100,7 @@ fn libtest(output: &str) -> Reading {
     let mut seen = 0usize;
     let mut reported = 0usize;
     for line in output.lines() {
-        let line = line.trim_end();
+        let line = line.trim();
         if let Some(rest) = line.strip_prefix("test ") {
             if let Some(name) = rest.strip_suffix(" ... FAILED") {
                 found.tests.insert(name.to_owned());
@@ -221,7 +243,7 @@ fn pytest(output: &str) -> Reading {
     let mut seen = 0usize;
     let mut footer: Option<usize> = None;
     for line in output.lines() {
-        let line = line.trim_end();
+        let line = line.trim();
         if let Some(rest) = line
             .strip_prefix("FAILED ")
             .or_else(|| line.strip_prefix("ERROR "))
@@ -304,13 +326,12 @@ fn go(output: &str) -> Reading {
     let mut found = Failures::default();
     let mut pending: Vec<String> = Vec::new();
     for line in output.lines() {
-        let line = line.trim_end();
-        let trimmed = line.trim_start();
+        let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("--- FAIL: ") {
             if let Some(name) = rest.split_whitespace().next() {
                 pending.push(name.to_owned());
             }
-        } else if let Some(rest) = line.strip_prefix("FAIL\t") {
+        } else if let Some(rest) = trimmed.strip_prefix("FAIL\t") {
             let package = rest.split_whitespace().next().unwrap_or_default();
             if !package.is_empty() {
                 for name in pending.drain(..) {
@@ -341,6 +362,29 @@ fn go_file(line: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a gate step really records: every line indented, nextest coloured.
+    #[test]
+    fn indented_coloured_gate_output_still_yields_ids() {
+        let nextest = "      \u{1b}[1;31m        FAIL\u{1b}[0m [   0.010s] \u{1b}[35mnucleos-daemon\u{1b}[0m workflows::param_file::tests::quotes\n\
+                       \u{1b}[31m      Summary\u{1b}[0m [   1.0s] 5 tests run: 4 passed, 1 failed, 0 skipped\n";
+        let got = extract(nextest).expect("nextest ids");
+        assert_eq!(ids(&got), ["workflows::param_file::tests::quotes"]);
+
+        let libtest = "      test a::ok ... ok\n      test verify::boom ... FAILED\n      \
+                       test result: FAILED. 1 passed; 1 failed; 0 ignored\n";
+        assert_eq!(ids(&extract(libtest).expect("libtest ids")), ["verify::boom"]);
+    }
+
+    /// The ids come from the whole output, not from the 4000-character tail kept in the row.
+    #[test]
+    fn ids_survive_a_failure_far_before_the_tail() {
+        let mut out = String::from(
+            "test early::boom ... FAILED\ntest result: FAILED. 0 passed; 1 failed\n",
+        );
+        out.push_str(&"x".repeat(10_000));
+        assert_eq!(ids(&extract(&out).expect("ids")), ["early::boom"]);
+    }
 
     fn ids(failures: &Failures) -> Vec<&str> {
         failures.tests.iter().map(String::as_str).collect()
