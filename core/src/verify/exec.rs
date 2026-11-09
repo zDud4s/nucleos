@@ -243,6 +243,11 @@ impl Executor {
         })
     }
 
+    /// The pool this executor's writes go through: the daemon's write queue, else its own pool.
+    fn writes(&self) -> SqlitePool {
+        crate::write_pool::for_writes(&self.pool)
+    }
+
     /// Draw units from the runs' heavy-command budget too, and get woken when it frees up.
     pub fn share_budget(&self, book: Arc<AdmissionBook>) {
         book.set_verify_wake(self.wake.clone());
@@ -286,7 +291,7 @@ impl Executor {
         if request.timeout_ms <= 0 {
             request.timeout_ms = seconds_to_ms(self.limits.unit_timeout_seconds());
         }
-        let submitted = verify_runs::enqueue(&self.pool, &request, now_ms()).await?;
+        let submitted = verify_runs::enqueue(&self.writes(), &request, now_ms()).await?;
         self.wake.notify_one();
         Ok(submitted)
     }
@@ -300,7 +305,7 @@ impl Executor {
         let aging_ms = seconds_to_ms(self.config.aging_seconds);
         let mut started = 0;
         // Units whose asking run ended or is gone fail fast, loudly, before they take a slot.
-        match verify_runs::cancel_orphaned_queued(&self.pool).await {
+        match verify_runs::cancel_orphaned_queued(&self.writes()).await {
             Ok(orphans) => {
                 for (unit, ticket) in orphans {
                     tracing::warn!(
@@ -396,7 +401,7 @@ impl Executor {
                 dirs: Vec::new(),
                 _admission: grant,
             };
-            let claimed = match verify_runs::claim(&self.pool, id).await {
+            let claimed = match verify_runs::claim(&self.writes(), id).await {
                 Ok(Some(claimed)) => claimed,
                 // Taken by another pass: the reservation drops and the loop looks again.
                 Ok(None) => continue,
@@ -523,13 +528,13 @@ async fn run_unit(executor: Arc<Executor>, claimed: Claimed, mut reservation: Re
     if status == verify_runs::STATUS_FAILED
         && let Some(failures) = crate::verify::failures::extract(&outcome.tail)
         && let Err(error) =
-            verify_runs::set_failed_tests(&executor.pool, claimed.id, &failures).await
+            verify_runs::set_failed_tests(&executor.writes(), claimed.id, &failures).await
     {
         tracing::warn!(%error, id = claimed.id, "verify executor: cannot record the failed test ids");
     }
     let duration_ms = i64::try_from(outcome.duration.as_millis()).unwrap_or(i64::MAX);
     if let Err(error) = verify_runs::finish(
-        &executor.pool,
+        &executor.writes(),
         claimed.id,
         status,
         exit_code,

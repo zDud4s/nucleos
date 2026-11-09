@@ -217,6 +217,16 @@ async fn daemon_main() -> std::process::ExitCode {
         }
     };
 
+    // The verify executor's and the quota history's writes queue on one connection of their own, so
+    // a burst of them cannot starve the runs and trees reading through the shared pool.
+    match storage::open_background(&db_path).await {
+        Ok(writes) => write_pool::install(writes),
+        Err(error) => tracing::warn!(
+            %error,
+            "could not open the write queue; verify and quota writes share the main pool"
+        ),
+    }
+
     startup::reconcile_after_restart(&pool).await;
     // After the runs were reconciled and before the server or any loop can call `launch`: it clears
     // the empty launch reservations of unfinished tree jobs. It relaunches below, after AppState exists.
