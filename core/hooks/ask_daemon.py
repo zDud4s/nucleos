@@ -1066,12 +1066,14 @@ CONDUCTOR_REFUSAL = (
     "This session is a conductor: launch an agent (`Agent`, `create_run`) or a tree (`tree_launch`) "
     "instead of doing this by hand. The root may itself run `scripts/gates.sh`, "
     "`python scripts/heavy.py cargo|go|npx|npm ...`, read-only git, `nucleos-core.exe --land` / "
-    "`--verify-ticket N`, `scripts/run-daemon.ps1`, and Read/Grep/Glob up to ~3k tokens per call. "
-    "If you are the owner, start the prompt with `manual:` for what neither the root nor an agent may do."
+    "`--verify-ticket N`, `scripts/run-daemon.ps1`, Read/Grep/Glob up to ~15k tokens per call, and small "
+    "Edit/Write changes (at most 2 files and 40 changed lines per owner prompt). "
+    "If you are the owner, start the prompt with `manual:` (one prompt) or `manual:on` (until "
+    "`manual:off`) for what neither the root nor an agent may do."
 )
 CONDUCTOR_ENV_REFUSAL = (
     f"{CONDUCTOR_ENV} is for the project's owner at their own terminal, not for an agent. "
-    "Launch an agent or a tree instead; the owner can start the prompt with `manual:`."
+    "Launch an agent or a tree instead; the owner can start the prompt with `manual:` or `manual:on`."
 )
 
 
@@ -1156,6 +1158,16 @@ def _conductor_manual(payload, state):
     return isinstance(loaded, dict) and loaded.get("manual") is True
 
 
+def _conductor_flag_sticky(path):
+    """Whether the flag file at `path` was written by `manual:on`. An unreadable file is not sticky."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            loaded = json.load(handle)
+    except Exception:
+        return False
+    return isinstance(loaded, dict) and loaded.get("sticky") is True
+
+
 CONDUCTOR_AUTOMATIC_PROMPTS = ("<task-notification>", "Another Claude session sent a message")
 CONDUCTOR_REMINDER_PREFIX = re.compile(r"(?:<system-reminder>.*?</system-reminder>\s*)+", re.DOTALL)
 
@@ -1174,6 +1186,7 @@ def _conductor_automatic_prompt(prompt):
 def conductor_prompt(payload, state):
     """The owner's escape: `manual:` opens this prompt to manual work, any other prompt closes it.
 
+    `manual:on` keeps it open (a `sticky` flag) across later prompts until a `manual:off` prompt.
     Only UserPromptSubmit reaches the file, which is what an agent cannot produce; the verdict
     refuses it `Write`, `Edit` and any shell redirection. Silent on every error.
     """
@@ -1187,7 +1200,7 @@ def conductor_prompt(payload, state):
         # the owner did not write them: they neither set nor clear `manual:`, nor reset the budget.
         if _conductor_automatic_prompt(payload.get("prompt")):
             return
-        # A new prompt starts a new read budget.
+        # A new prompt starts a new edit budget.
         try:
             budget = _conductor_budget_path(payload.get("session_id"), state)
             if budget is not None and os.path.exists(budget):
@@ -1195,14 +1208,21 @@ def conductor_prompt(payload, state):
         except Exception:
             pass  # never keep the `manual:` flag below from being handled
         prompt = payload.get("prompt")
-        if not isinstance(prompt, str) or not prompt.strip().lower().startswith("manual:"):
+        head = prompt.strip().lower() if isinstance(prompt, str) else ""
+        if head.startswith("manual:off"):
             if os.path.exists(path):
                 os.remove(path)
             return
+        if not head.startswith("manual:"):
+            # A sticky `manual:on` survives ordinary prompts; a one-prompt `manual:` does not.
+            if os.path.exists(path) and not _conductor_flag_sticky(path):
+                os.remove(path)
+            return
+        sticky = head.startswith("manual:on")
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = f"{path}.{os.getpid()}.tmp"
         with open(tmp, "w", encoding="utf-8") as handle:
-            json.dump({"manual": True, "prompt_at": time.time()}, handle)
+            json.dump({"manual": True, "sticky": sticky, "prompt_at": time.time()}, handle)
         os.replace(tmp, path)
     except Exception:
         pass
@@ -1245,11 +1265,12 @@ def _conductor_material(target, state, cwd):
     return False
 
 
-# What a root read may cost, in estimated tokens. Measured 2026-10-31: delegating a read costs
-# about $0.07 whatever its size, a read in the root about $0.0167 per 1k tokens, so the break-even
-# is ~4k tokens; a single call stays under it, and a prompt's worth stays under two of them.
-CONDUCTOR_READ_CALL_TOKENS = 3000
-CONDUCTOR_READ_PROMPT_TOKENS = 6000
+# What a root read may cost, in estimated tokens per call. Raised to 15k by the owner (2026-11-09);
+# there is no per-prompt read budget any more.
+CONDUCTOR_READ_CALL_TOKENS = 15000
+# What the root may edit itself per owner prompt: distinct files and changed lines, cumulative.
+CONDUCTOR_EDIT_FILES = 2
+CONDUCTOR_EDIT_LINES = 40
 CONDUCTOR_READ_BYTES_PER_TOKEN = 4
 CONDUCTOR_READ_TOKENS_PER_LINE = 12
 CONDUCTOR_GREP_LIST_TOKENS = 300
@@ -1258,9 +1279,13 @@ CONDUCTOR_GREP_MAX_HEAD_LIMIT = 60
 CONDUCTOR_UNPAGEABLE = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".pdf", ".ipynb")
 CONDUCTOR_TOO_BIG = (
     f"This read is too big for the root session (limit {CONDUCTOR_READ_CALL_TOKENS} estimated tokens a "
-    f"call, {CONDUCTOR_READ_PROMPT_TOKENS} a prompt). Narrow it with offset/limit/head_limit, or "
-    "delegate it to `Explore`/`worker`. If you are the owner and want manual work, start the prompt "
-    "with `manual:`."
+    "call). Narrow it with offset/limit/head_limit, or delegate it to `Explore`/`worker`. If you are "
+    "the owner and want manual work, start the prompt with `manual:`."
+)
+CONDUCTOR_EDIT_TOO_BIG = (
+    f"The root session may edit at most {CONDUCTOR_EDIT_FILES} files and {CONDUCTOR_EDIT_LINES} changed "
+    "lines per owner prompt, and this change goes over. Delegate it to `worker` (`Agent`) or a tree "
+    "(`tree_launch`). The owner can start a prompt with `manual:on` for manual work."
 )
 
 
@@ -1305,39 +1330,58 @@ def _conductor_grep_cost(tool_input, over):
 
 
 def _conductor_budget_path(session_id, state):
-    """This session's running read total, beside its `manual:` flag; reset by `conductor_prompt`."""
+    """This session's running edit total, beside its `manual:` flag; reset by `conductor_prompt`."""
     flag = conductor_flag_path(session_id, state)
-    return None if flag is None else flag[: -len(".json")] + ".budget.json"
+    return None if flag is None else flag[: -len(".json")] + ".edits.json"
 
 
-def _conductor_charge(session_id, state, cost):
-    """Adds `cost` to the prompt's total and returns True, or False when it would pass the limit.
-    None when the state cannot be read or written: the new allowance fails closed."""
+def _conductor_changed_lines(tool, tool_input):
+    """Lines this edit changes: new text only. MultiEdit counts every edit's `new_string`."""
+
+    def count(text):
+        return text.count("\n") + 1 if isinstance(text, str) and text else 0
+
+    if tool == "Edit":
+        return count(tool_input.get("new_string"))
+    if tool == "MultiEdit":
+        edits = tool_input.get("edits")
+        if not isinstance(edits, list):
+            return 0
+        return sum(count(e.get("new_string")) for e in edits if isinstance(e, dict))
+    if tool == "NotebookEdit":
+        return count(tool_input.get("new_source"))
+    return count(tool_input.get("content"))  # Write
+
+
+def _conductor_charge_edit(session_id, state, target, lines):
+    """Adds this edit to the prompt's totals. True when within the limits (or when the state is
+    unusable: fail-open), False when it would pass them; a refused edit is not recorded."""
     path = _conductor_budget_path(session_id, state)
     if path is None:
-        return None
+        return True
     try:
         try:
             with open(path, encoding="utf-8") as handle:
-                spent = json.load(handle)["tokens"]
+                loaded = json.load(handle)
+            files, spent = list(loaded["files"]), int(loaded["lines"])
         except FileNotFoundError:
-            spent = 0
-        if not isinstance(spent, int) or isinstance(spent, bool) or spent < 0:
-            return None
-        if spent + cost > CONDUCTOR_READ_PROMPT_TOKENS:
+            files, spent = [], 0
+        if target not in files:
+            files.append(target)
+        if len(files) > CONDUCTOR_EDIT_FILES or spent + lines > CONDUCTOR_EDIT_LINES:
             return False
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = f"{path}.{os.getpid()}.tmp"
         with open(tmp, "w", encoding="utf-8") as handle:
-            json.dump({"tokens": spent + cost}, handle)
+            json.dump({"files": files, "lines": spent + lines}, handle)
         os.replace(tmp, path)
         return True
     except Exception:
-        return None
+        return True
 
 
 def _conductor_small_read_refusal(tool, tool_input, state, cwd, session_id):
-    """The root may read small things itself, within a per-call and a per-prompt budget."""
+    """The root may read small things itself, within a per-call budget."""
     path = tool_input.get("file_path") if tool == "Read" else (tool_input.get("path") or cwd)
     if not isinstance(path, str) or not path:
         return CONDUCTOR_REFUSAL
@@ -1349,10 +1393,7 @@ def _conductor_small_read_refusal(tool, tool_input, state, cwd, session_id):
         return CONDUCTOR_REFUSAL
     if cost > CONDUCTOR_READ_CALL_TOKENS:
         return CONDUCTOR_TOO_BIG
-    charged = _conductor_charge(session_id, state, cost)
-    if charged is None:
-        return CONDUCTOR_REFUSAL
-    return "" if charged else CONDUCTOR_TOO_BIG
+    return ""
 
 
 def _conductor_read_refusal(tool, tool_input, state, cwd, session_id=None):
@@ -1383,8 +1424,8 @@ def _conductor_material_read_refusal(tool, tool_input, state, cwd):
     return "" if _conductor_material(_conductor_path(path, cwd), state, cwd) else CONDUCTOR_REFUSAL
 
 
-def _conductor_write_refusal(tool_input, state, cwd):
-    path = tool_input.get("file_path")
+def _conductor_write_refusal(tool, tool_input, state, cwd, session_id=None):
+    path = tool_input.get("notebook_path") if tool == "NotebookEdit" else tool_input.get("file_path")
     if not isinstance(path, str) or not path:
         return ""  # malformed: the tool itself refuses it
     target = _conductor_path(path, cwd)
@@ -1401,7 +1442,14 @@ def _conductor_write_refusal(tool_input, state, cwd):
         or target.split(os.sep)[-len(WORKFLOW_POINTER):] == [os.path.normcase(p) for p in WORKFLOW_POINTER]
     ):
         return CONDUCTOR_REFUSAL
-    return "" if _conductor_material(target, state, cwd) else CONDUCTOR_REFUSAL
+    if _conductor_material(target, state, cwd):
+        return ""
+    # Small edits to the project's own files: inside the project, and within the per-prompt budget.
+    if not any(_under(target, _conductor_path(folder, cwd)) for folder in _conductor_project_folders(cwd)):
+        return CONDUCTOR_REFUSAL
+    if _conductor_charge_edit(session_id, state, target, _conductor_changed_lines(tool, tool_input)):
+        return ""
+    return CONDUCTOR_EDIT_TOO_BIG
 
 
 CONDUCTOR_BASH_NAMES = ("bash", "bash.exe")
@@ -1777,8 +1825,8 @@ def _conductor_refusal(tool, tool_input, state, cwd, session_id=None):
         return _conductor_command_refusal(tool_input.get("command"), cwd, state)
     if tool in ("Read", "Grep", "Glob"):
         return _conductor_read_refusal(tool, tool_input, state, cwd, session_id)
-    if tool in ("Write", "Edit"):
-        return _conductor_write_refusal(tool_input, state, cwd)
+    if tool in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
+        return _conductor_write_refusal(tool, tool_input, state, cwd, session_id)
     return CONDUCTOR_REFUSAL
 
 

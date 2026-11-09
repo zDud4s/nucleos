@@ -6,8 +6,9 @@ description: Use when you are a top-level session (IDE, tunnel, terminal) given 
 # Conduct
 
 **The top-level session does not execute: it launches.** Your job is to pick the route, hand the
-work to a dispatched agent or to the daemon, and report. You do not edit source, run builds or
-read implementation files to do the work yourself.
+work to a dispatched agent or to the daemon, and report. You may make small edits yourself (at most
+2 files and 40 changed lines per owner prompt, cumulative; over that the hook refuses) and read up
+to ~15k tokens per call; anything bigger, and any build, goes to an agent or a tree.
 
 ## Route by size
 
@@ -27,7 +28,8 @@ For "finish everything", call `spec_finish` with `project_root` set to the sessi
 ## Escape
 
 The owner starts a prompt with `manual:` to opt out of the conductor's routing for that one
-prompt. Only an owner prompt can set it; never write the flag yourself.
+prompt. `manual:on` keeps the opt-out across later prompts until a prompt that starts with
+`manual:off`. Only an owner prompt can set it; never write the flag yourself.
 
 ## Waiting
 

@@ -2,7 +2,7 @@
 """Cover the conductor policy in `core/hooks/ask_daemon.py` (plan 2026-10-30, chunk B-HOOK).
 
 A top-level session (no `NUCLEOS_RUN_ID`, no `agent_id` in the payload) is a conductor: it launches
-agents and trees and does not edit source by hand. The policy is `conductor_verdict(payload, state)`,
+agents and trees; it may read up to 15k tokens a call and edit at most 2 files / 40 lines per owner prompt. The policy is `conductor_verdict(payload, state)`,
 called first thing in `interactive_session`, local, fail-open, and driven by `<state_dir>/conductor.json`.
 
 Imports the SOURCE `core/hooks/ask_daemon.py`, like `scripts/test-hook-filter.py`.
@@ -21,8 +21,9 @@ The interface these tests fix (the implementation must match it):
     still True; "off": always "allow", `would_deny` False.
   - allowed without consulting the rules: `NUCLEOS_RUN_ID` set, `agent_id` in the payload, a manual flag.
 * `conductor_prompt(payload, state)`: acts on UserPromptSubmit only. A prompt that starts with
-  `manual:` (stripped, case-insensitive) writes the flag file `{"manual": true, "prompt_at": ...}`;
-  any other prompt deletes it.
+  `manual:` (stripped, case-insensitive) writes the flag file `{"manual": true, "sticky": false,
+  "prompt_at": ...}`; `manual:on` writes it with `sticky: true`, which later prompts leave alone until
+  a `manual:off` prompt deletes it; any other prompt deletes a non-sticky flag.
 * `interactive_session(payload)` resolves its state from `NUCLEOS_CONDUCTOR_STATE_DIR` and
   `NUCLEOS_CONDUCTOR_TMP_DIR`, prints a block on "deny", and on a would-deny in observe mode posts one
   light request to the daemon whose body carries the feed kind `conductor_would_deny` (failures are
@@ -268,6 +269,7 @@ def test_conductor_tools_are_allowed_when_on():
             ("mcp__nucleos__wait_advice", {}),
         ):
             allow(fx.verdict(tool, tool_input), tool)
+        # No project marker in the fixture, so these paths lie outside "the project": still refused.
         source = fx.path("core", "src", "lib.rs")
         for tool, tool_input in (
             ("NotebookEdit", {"notebook_path": source}),
@@ -300,12 +302,66 @@ def test_run_with_run_id_env_unaffected():
             allow(fx.verdict("Bash", {"command": "cargo test"}), "cargo inside a daemon run")
 
 
-def test_edit_of_source_denied():
+def _project(fx):
+    """Make the fixture's cwd a project (the gate script marks it), as `.nucleos/workflow/project.json` would."""
+    os.makedirs(fx.path("scripts"), exist_ok=True)
+    with open(fx.path("scripts", "gates.sh"), "w", encoding="utf-8") as handle:
+        handle.write("#!/usr/bin/env bash\n")
+
+
+def _edit(fx, name, lines=1, tool="Edit", session="sess-1"):
+    """A verdict for an Edit/Write of `lines` new lines to `src/<name>` in the project."""
+    target = fx.path("src", name)
+    text = "\n".join("x" for _ in range(lines))
+    if tool == "Write":
+        return fx.verdict("Write", {"file_path": target, "content": text}, session=session)
+    return fx.verdict("Edit", {"file_path": target, "old_string": "a", "new_string": text}, session=session)
+
+
+def test_small_edit_of_source_allowed():
     with fixture("on") as fx:
-        target = fx.path("core", "src", "lib.rs")
-        deny(fx.verdict("Edit", {"file_path": target, "old_string": "a", "new_string": "b"}), "Edit")
-        deny(fx.verdict("Write", {"file_path": target, "content": "x"}), "Write")
-        deny(fx.verdict("Write", {"file_path": fx.path("README.md"), "content": "x"}), "tracked doc")
+        _project(fx)
+        allow(_edit(fx, "lib.rs", 3), "small Edit")
+        allow(_edit(fx, "other.rs", 5, tool="Write"), "small Write of a second file")
+        allow(_edit(fx, "lib.rs", 2), "the same file again is not a new file")
+        allow(
+            fx.verdict(
+                "MultiEdit",
+                {"file_path": fx.path("src", "lib.rs"), "edits": [{"new_string": "a\nb"}, {"new_string": "c"}]},
+            ),
+            "MultiEdit counts its edits",
+        )
+        deny(fx.verdict("Edit", {"file_path": fx.path("..", "elsewhere.rs"), "new_string": "b"}), "outside the project")
+        # What decided the policy is still protected, even inside the project.
+        deny(fx.verdict("Write", {"file_path": fx.flag("sess-1"), "content": "x"}), "the flag")
+        deny(fx.verdict("Edit", {"file_path": os.path.join(fx.state_dir, "conductor.json"), "new_string": "x"}), "conductor.json")
+
+
+def test_third_file_refused():
+    with fixture("on") as fx:
+        _project(fx)
+        allow(_edit(fx, "a.rs"), "first file")
+        allow(_edit(fx, "b.rs"), "second file")
+        result = deny(_edit(fx, "c.rs"), "third file")
+        for needle in ("worker", "manual:on"):
+            if needle not in result["reason"]:
+                raise AssertionError(f"the refusal should mention {needle!r}, got {result['reason']!r}")
+        allow(_edit(fx, "a.rs"), "a refused edit was not recorded, and the first file stays editable")
+        allow(_edit(fx, "a.rs", session="sess-2"), "another session has its own budget")
+
+
+def test_more_than_forty_lines_refused():
+    with fixture("on") as fx:
+        _project(fx)
+        deny(_edit(fx, "a.rs", 41), "41 lines at once")
+        allow(_edit(fx, "a.rs", 30), "30 lines")
+        deny(_edit(fx, "a.rs", 11), "30 + 11 crosses 40")
+        allow(_edit(fx, "a.rs", 10), "30 + 10 is exactly 40")
+        deny(_edit(fx, "a.rs", 1, tool="Write"), "the 41st line")
+        deny(
+            fx.verdict("MultiEdit", {"file_path": fx.path("src", "z.rs"), "edits": [{"new_string": "a\nb"}] * 25}),
+            "MultiEdit sums its edits",
+        )
 
 
 def test_write_to_state_dir_allowed():
@@ -834,7 +890,9 @@ def test_refusal_says_what_the_root_may_do_itself():
             "--verify-ticket",
             "run-daemon.ps1",
             "Read/Grep/Glob",
-            "3k tokens",
+            "15k tokens",
+            "Edit/Write",
+            "`manual:on`",
             "neither the root nor an agent may do",
             "`manual:`",
         ):
@@ -912,7 +970,7 @@ def _prompt(fx, text, session="sess-1", event="UserPromptSubmit"):
 def test_manual_prefix_lets_the_owner_work_by_hand():
     with fixture("on") as fx:
         target = fx.path("core", "src", "lib.rs")
-        deny(fx.verdict("Edit", {"file_path": target, "old_string": "a", "new_string": "b"}), "control")
+        deny(fx.verdict("Bash", {"command": f"{G} push"}), "control")
         _prompt(fx, "manual: fix the typo in lib.rs")
         allow(
             fx.verdict("Edit", {"file_path": target, "old_string": "a", "new_string": "b"}),
@@ -939,8 +997,8 @@ def test_manual_prefix_enables_until_next_prompt():
             raise AssertionError(f"no flag file at {fx.flag('sess-1')}")
         with open(fx.flag("sess-1"), encoding="utf-8") as handle:
             body = json.load(handle)
-        if body.get("manual") is not True or "prompt_at" not in body:
-            raise AssertionError(f"flag body should be {{manual: true, prompt_at}}, got {body!r}")
+        if body.get("manual") is not True or body.get("sticky") is not False or "prompt_at" not in body:
+            raise AssertionError(f"flag body should be {{manual: true, sticky: false, prompt_at}}, got {body!r}")
         allow(fx.verdict("Read", source), "Read while the flag stands")
         deny(fx.verdict("Read", source, session="sess-2"), "another session is not released")
         _prompt(fx, "now do the next thing")
@@ -949,8 +1007,46 @@ def test_manual_prefix_enables_until_next_prompt():
         deny(fx.verdict("Read", source), "Read after the next prompt")
 
 
+def test_manual_on_survives_ordinary_prompts_until_manual_off():
+    with fixture("on") as fx:
+        source = {"file_path": fx.path("core", "src", "lib.rs")}
+        deny(fx.verdict("Read", {"file_path": _sized(fx, "big.rs", 80000)}), "control before manual:on")
+        _prompt(fx, "  Manual:ON keep going by hand")
+        with open(fx.flag("sess-1"), encoding="utf-8") as handle:
+            if json.load(handle).get("sticky") is not True:
+                raise AssertionError("manual:on must write a sticky flag")
+        allow(fx.verdict("Read", source), "Read under manual:on")
+        _prompt(fx, "a perfectly ordinary prompt")
+        allow(fx.verdict("Read", source), "manual:on survives an ordinary prompt")
+        _prompt(fx, "<task-notification>\n<task-id>x</task-id>")
+        allow(fx.verdict("Read", source), "and a notification")
+        _prompt(fx, "manual: one prompt only")  # a plain manual: after manual:on rewrites the flag as not sticky
+        _prompt(fx, "ordinary again")
+        deny(fx.verdict("Read", source), "a plain manual: replaced the sticky flag, so the next prompt cleared it")
+        _prompt(fx, "manual:on again")
+        _prompt(fx, "manual:off")
+        if os.path.exists(fx.flag("sess-1")):
+            raise AssertionError("manual:off must delete the flag")
+        deny(fx.verdict("Read", source), "Read after manual:off")
+        _prompt(fx, "manual:off", session="sess-2")  # nothing to clear is not an error
+        # Only a UserPromptSubmit sets it, as with plain manual:.
+        _prompt(fx, "manual:on please", event="PreToolUse")
+        if os.path.exists(fx.flag("sess-1")):
+            raise AssertionError("a non-UserPromptSubmit event created the sticky flag")
+
+
+def test_plain_manual_is_still_one_prompt():
+    with fixture("on") as fx:
+        source = {"file_path": fx.path("core", "src", "lib.rs")}
+        _prompt(fx, "manual: just this")
+        allow(fx.verdict("Read", source), "manual: opens the prompt")
+        _prompt(fx, "the next one")
+        deny(fx.verdict("Read", source), "and the next prompt closes it")
+
+
 def test_agent_cannot_write_manual_flag():
     with fixture("on") as fx:
+        _project(fx)  # the flag is refused even where small edits are allowed
         flag = fx.flag("sess-1")
         deny(fx.verdict("Write", {"file_path": flag, "content": '{"manual": true}'}), "Write the flag")
         deny(fx.verdict("Edit", {"file_path": flag, "old_string": "a", "new_string": "b"}), "Edit the flag")
@@ -1142,25 +1238,16 @@ def _sized(fx, name, size):
     return path
 
 
-def _spent(fx, session="sess-1"):
-    """Tokens charged so far to this session, from the budget file beside the `manual:` flag."""
-    path = os.path.join(fx.tmp_dir, "nucleos-conductor", f"{session}.budget.json")
-    if not os.path.exists(path):
-        return 0
-    with open(path, encoding="utf-8") as handle:
-        return json.load(handle)["tokens"]
-
-
 def test_small_read_allowed_large_read_denied():
     with fixture("on") as fx:
         allow(fx.verdict("Read", {"file_path": _sized(fx, "small.rs", 400)}), "small Read")
-        big = _sized(fx, "big.rs", 40000)
+        big = _sized(fx, "big.rs", 80000)  # 20000 tokens
         result = deny(fx.verdict("Read", {"file_path": big}), "large Read")
-        for needle in ("3000", "Explore", "manual:"):
+        for needle in ("15000", "Explore", "manual:"):
             if needle not in result["reason"]:
                 raise AssertionError(f"the refusal should mention {needle!r}, got {result['reason']!r}")
         allow(fx.verdict("Read", {"file_path": big, "limit": 100}), "large Read with a small limit")
-        deny(fx.verdict("Read", {"file_path": big, "limit": 400}), "limit that still exceeds the call budget")
+        deny(fx.verdict("Read", {"file_path": big, "limit": 1500}), "limit that still exceeds the call budget")
         deny(fx.verdict("Read", {"file_path": fx.path("src", "missing.rs")}), "unreadable path")
         image = _sized(fx, "shot.png", 100)
         deny(fx.verdict("Read", {"file_path": image}), "image")
@@ -1193,28 +1280,21 @@ def test_grep_context_flags_are_charged():
         _sized(fx, "a.rs", 10)
         base = {"pattern": "x", "path": fx.path("src"), "output_mode": "content", "head_limit": 20}
         allow(fx.verdict("Grep", {**base, "-C": 2}), "content with -C 2")
-        if _spent(fx) != 20 * 12 * 3:
-            raise AssertionError(f"head_limit 20 with -C 2 should cost 720, spent {_spent(fx)}")
-        deny(fx.verdict("Grep", {**base, "head_limit": 60, "-A": 5}), "head_limit 60 with -A 5 is over 3000")
-        if _spent(fx) != 720:
-            raise AssertionError("a refused call must not be charged")
+        allow(fx.verdict("Grep", {**base, "head_limit": 60, "-A": 5}), "head_limit 60 with -A 5 is 4320")
+        deny(fx.verdict("Grep", {**base, "head_limit": 60, "-A": 20}), "head_limit 60 with -A 20 is over 15000")
 
 
-def test_glob_allowed_and_flat_charge():
+def test_glob_allowed():
     with fixture("on") as fx:
         _sized(fx, "a.rs", 10)
         allow(fx.verdict("Glob", {"pattern": "*.rs", "path": fx.path("src")}), "Glob")
-        if _spent(fx) != 100:
-            raise AssertionError(f"Glob should cost 100, spent {_spent(fx)}")
 
 
 def test_grep_and_glob_on_a_file_cost_like_a_read():
     with fixture("on") as fx:
         small = _sized(fx, "small.rs", 400)
-        big = _sized(fx, "big.rs", 40000)
+        big = _sized(fx, "big.rs", 80000)
         allow(fx.verdict("Grep", {"pattern": "x", "path": small}), "Grep list mode on a small file")
-        if _spent(fx) != 100:
-            raise AssertionError(f"a 400 byte file costs 100 tokens, spent {_spent(fx)}")
         allow(fx.verdict("Grep", {"pattern": "x", "path": small, "output_mode": "content"}), "content, small file")
         allow(fx.verdict("Glob", {"pattern": "*", "path": small}), "Glob with a file path")
         content = {"pattern": "x", "path": big, "output_mode": "content"}
@@ -1226,83 +1306,65 @@ def test_grep_and_glob_on_a_file_cost_like_a_read():
         deny(fx.verdict("Grep", {"pattern": "x", "path": fx.path("src", "missing.rs")}), "missing file")
 
 
-def test_budget_accumulates_and_the_crossing_call_is_denied():
+def test_new_prompt_resets_the_edit_budget():
     with fixture("on") as fx:
-        mid = {"file_path": _sized(fx, "mid.rs", 11000)}  # 2750 tokens
-        allow(fx.verdict("Read", mid), "first")
-        allow(fx.verdict("Read", mid), "second")
-        result = deny(fx.verdict("Read", mid), "third crosses 6000")
-        if "6000" not in result["reason"]:
-            raise AssertionError(f"the refusal should name the prompt budget, got {result['reason']!r}")
-        if _spent(fx) != 5500:
-            raise AssertionError(f"the refused call must not be charged, spent {_spent(fx)}")
-        allow(fx.verdict("Glob", {"pattern": "*", "path": fx.path("src")}), "a small call still fits")
-        deny(fx.verdict("Read", mid, session="sess-1"), "still over")
-        allow(fx.verdict("Read", mid, session="sess-2"), "another session has its own budget")
-
-
-def test_new_prompt_resets_the_budget():
-    with fixture("on") as fx:
-        mid = {"file_path": _sized(fx, "mid.rs", 11000)}
-        allow(fx.verdict("Read", mid), "first")
-        allow(fx.verdict("Read", mid), "second")
-        deny(fx.verdict("Read", mid), "third")
+        _project(fx)
+        allow(_edit(fx, "a.rs", 30), "30 lines")
+        deny(_edit(fx, "a.rs", 11), "over 40")
         _prompt(fx, "go on")
-        if _spent(fx) != 0:
-            raise AssertionError("the next prompt must clear the budget")
-        allow(fx.verdict("Read", mid), "after the reset")
+        allow(_edit(fx, "a.rs", 40), "after the reset")
+        deny(_edit(fx, "a.rs", 1), "budget used again")
         _prompt(fx, "manual: do it by hand")
-        if _spent(fx) != 0:
-            raise AssertionError("a manual prompt must clear the budget too")
+        _prompt(fx, "and now back to the root")
+        allow(_edit(fx, "b.rs", 40), "a manual prompt and the next one reset it too")
 
 
-def test_manual_bypasses_the_budget_and_writes_stay_denied():
+def test_manual_bypasses_the_edit_budget():
     with fixture("on") as fx:
-        big = _sized(fx, "big.rs", 40000)
-        edit = {"file_path": big, "old_string": "a", "new_string": "b"}
-        deny(fx.verdict("Edit", edit), "Edit")
-        deny(fx.verdict("Write", {"file_path": big, "content": "x"}), "Write")
-        deny(fx.verdict("Read", {"file_path": big}), "large Read")
-        _prompt(fx, "manual: read it")
-        allow(fx.verdict("Read", {"file_path": big}), "manual Read")
+        _project(fx)
+        deny(_edit(fx, "a.rs", 41), "over the budget")
+        _prompt(fx, "manual: do it")
+        allow(_edit(fx, "a.rs", 41), "manual Edit, however large")
+        allow(_edit(fx, "c.rs", 1), "manual, third file")
 
 
-def test_allow_listed_paths_are_not_charged():
+def test_allow_listed_paths_are_not_budgeted():
     with fixture("on") as fx:
+        _project(fx)
         os.makedirs(fx.path(".ai", "specs"), exist_ok=True)
         spec = fx.path(".ai", "specs", "x.md")
         with open(spec, "wb") as handle:
             handle.write(b"x" * 400000)
         for _ in range(3):
             allow(fx.verdict("Read", {"file_path": spec}), "allow-listed Read, however large")
-        if _spent(fx) != 0:
-            raise AssertionError(f"allow-listed reads must not be charged, spent {_spent(fx)}")
+        for index in range(4):  # material writes use no file or line budget
+            allow(
+                fx.verdict("Write", {"file_path": fx.path(".ai", f"n{index}.md"), "content": "x\n" * 100}),
+                "allow-listed Write",
+            )
 
 
-def test_state_failure_fails_closed_for_the_new_allowance():
-    small = None
+def test_state_failure_fails_open():
     with fixture("on") as fx:
-        small = _sized(fx, "small.rs", 400)
+        _project(fx)
         folder = os.path.join(fx.tmp_dir, "nucleos-conductor")
         with open(folder, "w", encoding="utf-8") as handle:  # a file where the directory should be
             handle.write("x")
-        deny(fx.verdict("Read", {"file_path": small}), "state cannot be written")
-        # What the allow-list already permits is never blocked by it.
-        os.makedirs(fx.path(".ai"), exist_ok=True)
-        allow(fx.verdict("Read", {"file_path": fx.path(".ai", "x.md")}), "allow-listed path")
+        allow(_edit(fx, "a.rs"), "the budget cannot be written")
+        allow(fx.verdict("Read", {"file_path": _sized(fx, "small.rs", 400)}), "reads need no state")
     with fixture("on") as fx:
-        small = _sized(fx, "small.rs", 400)
+        _project(fx)
         folder = os.path.join(fx.tmp_dir, "nucleos-conductor")
         os.makedirs(folder)
-        with open(os.path.join(folder, "sess-1.budget.json"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(folder, "sess-1.edits.json"), "w", encoding="utf-8") as handle:
             handle.write("{not json")
-        deny(fx.verdict("Read", {"file_path": small}), "unreadable state")
-        deny(fx.verdict("Read", {"file_path": small}, session="bad/id"), "unsafe session id")
+        allow(_edit(fx, "a.rs"), "unreadable budget file")
+        allow(_edit(fx, "a.rs", session="bad/id"), "unsafe session id")
 
 
 def test_observe_mode_still_only_observes_a_big_read():
     with fixture("observe") as fx:
-        result = fx.verdict("Read", {"file_path": _sized(fx, "big.rs", 40000)})
+        result = fx.verdict("Read", {"file_path": _sized(fx, "big.rs", 80000)})
         allow(result, "observe")
         if not result.get("would_deny"):
             raise AssertionError("observe should still flag the big read")
@@ -1334,30 +1396,26 @@ def test_notifications_neither_set_nor_clear_manual():
             deny(fx.verdict("Read", source), f"a notification never sets manual {text[:30]!r}")
 
 
-def test_notifications_do_not_reset_the_read_budget():
+def test_notifications_do_not_reset_the_edit_budget():
     with fixture("on") as fx:
-        mid = {"file_path": _sized(fx, "mid.rs", 11000)}
-        allow(fx.verdict("Read", mid), "first")
-        allow(fx.verdict("Read", mid), "second")
+        _project(fx)
+        allow(_edit(fx, "a.rs", 30), "30 lines")
         for text in NOTIFICATIONS:
             _prompt(fx, text)
-        if _spent(fx) != 5500:
-            raise AssertionError(f"notifications must keep the budget, spent {_spent(fx)}")
-        deny(fx.verdict("Read", mid), "third still crosses 6000")
+        deny(_edit(fx, "a.rs", 11), "notifications keep the budget, so 30 + 11 still crosses 40")
         _prompt(fx, "go on")
-        allow(fx.verdict("Read", mid), "a real prompt resets it")
+        allow(_edit(fx, "a.rs", 11), "a real prompt resets it")
 
 
 TESTS = [
     test_small_read_allowed_large_read_denied,
     test_grep_modes_and_head_limit,
     test_grep_context_flags_are_charged,
-    test_glob_allowed_and_flat_charge,
-    test_budget_accumulates_and_the_crossing_call_is_denied,
-    test_new_prompt_resets_the_budget,
-    test_manual_bypasses_the_budget_and_writes_stay_denied,
-    test_allow_listed_paths_are_not_charged,
-    test_state_failure_fails_closed_for_the_new_allowance,
+    test_glob_allowed,
+    test_new_prompt_resets_the_edit_budget,
+    test_manual_bypasses_the_edit_budget,
+    test_allow_listed_paths_are_not_budgeted,
+    test_state_failure_fails_open,
     test_observe_mode_still_only_observes_a_big_read,
     test_top_level_read_of_source_denied,
     test_read_of_ai_specs_allowed,
@@ -1379,11 +1437,15 @@ TESTS = [
     test_land_refused_when_widened_or_elsewhere,
     test_git_commit_with_explicit_paths_allowed,
     test_git_push_denied,
-    test_edit_of_source_denied,
+    test_small_edit_of_source_allowed,
+    test_third_file_refused,
+    test_more_than_forty_lines_refused,
     test_write_to_state_dir_allowed,
     test_manual_prefix_lets_the_owner_work_by_hand,
     test_escape_is_only_at_the_start_of_the_prompt,
     test_manual_prefix_enables_until_next_prompt,
+    test_manual_on_survives_ordinary_prompts_until_manual_off,
+    test_plain_manual_is_still_one_prompt,
     test_agent_cannot_write_manual_flag,
     test_conductor_env_mention_in_command_denied,
     test_default_mode_is_on_when_probe_confirmed,
@@ -1401,7 +1463,7 @@ TESTS = [
     test_small_read_only_commands_and_list_agents,
     test_refusal_says_what_the_root_may_do_itself,
     test_notifications_neither_set_nor_clear_manual,
-    test_notifications_do_not_reset_the_read_budget,
+    test_notifications_do_not_reset_the_edit_budget,
 ]
 
 

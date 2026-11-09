@@ -26,11 +26,11 @@ The top-level session does not execute: it launches. Pick the route by task size
 
 `tree.py` is retiring. It is not removed yet; it goes once the tree launch path (`tree_launch`) is in production.
 
-Top-level sessions of a project are conductors by default: they launch agents and do not edit by hand. A prompt starting with `manual:` lets the owner work by hand for that prompt.
+Top-level sessions of a project are conductors by default: they launch agents; they may only make small edits by hand (at most 2 files and 40 changed lines per owner prompt) and read up to ~15k tokens per call. A prompt starting with `manual:` lets the owner work by hand for that prompt; `manual:on` keeps it until a `manual:off` prompt.
 
 A node forced to wrap closes as `handoff`. For runs the daemon owns, it opens a sibling with the same scope to continue, at most 3 in a chain.
 
-The owner can opt out of the routing for one prompt by starting it with `manual:`. Before a long wait, call `wait_advice` (if available). To resume a session, ask the daemon (`POST /conductor/resume`); never `claude --resume`.
+The owner can opt out of the routing for one prompt by starting it with `manual:` (`manual:on` to keep it until `manual:off`). Before a long wait, call `wait_advice` (if available). To resume a session, ask the daemon (`POST /conductor/resume`); never `claude --resume`.
 
 Execution rules (a short copy for readers without hooks; `workflow.md` is the authority):
 1. Prefer the smallest correct change; touch only relevant files; do not broaden scope silently.
