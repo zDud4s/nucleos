@@ -87,7 +87,7 @@ async fn readable_document(
 /// The first gate of every write: the stop wins over everything, even over a request it cannot parse. A stop
 /// that cannot be read counts as engaged. The global stop is asked before the scope is parsed, because only the
 /// stop of one project needs a valid scope.
-async fn writable_scope(state: &AppState, scope: &str) -> Result<Scope, Refused> {
+pub(super) async fn writable_scope(state: &AppState, scope: &str) -> Result<Scope, Refused> {
     let locked = || refusal(StatusCode::LOCKED, "kill_switch");
     if autopilot::kill_switch_engaged(&state.pool)
         .await
