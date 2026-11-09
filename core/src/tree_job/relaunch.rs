@@ -267,18 +267,27 @@ async fn resumable_session(
         return None;
     }
     let run_id = dead_run.parse::<i64>().ok()?;
-    let row: Option<(String, Option<String>, Option<i64>, Option<i64>)> = sqlx::query_as(
-        "SELECT status, session_id, COALESCE(context_fill, context_peak), successor_run_id
-         FROM runs WHERE id = ?",
-    )
-    .bind(run_id)
-    .fetch_optional(&state.pool)
-    .await
-    .ok()
-    .flatten();
-    let (status, session, fill, successor) = row?;
+    let row: Option<(String, Option<String>, Option<i64>, Option<i64>, Option<String>)> =
+        sqlx::query_as(
+            "SELECT status, session_id, COALESCE(context_fill, context_peak), successor_run_id, runner
+             FROM runs WHERE id = ?",
+        )
+        .bind(run_id)
+        .fetch_optional(&state.pool)
+        .await
+        .ok()
+        .flatten();
+    let (status, session, fill, successor, runner) = row?;
     let session = session.filter(|session| !session.is_empty())?;
     if status != "interrupted" || successor.is_some() {
+        return None;
+    }
+    // `claude -p --resume` only understands a session the claude runner wrote: a codex or agy id
+    // fails with no cold-start fallback. NULL means "not recorded" (a run that was never routed,
+    // which the default claude runner served), so it still resumes. The account is not compared: the
+    // relaunch re-picks it at launch, after this decision, and a session id is looked up in whichever
+    // account's config dir the new run lands in.
+    if runner.as_deref().is_some_and(|runner| runner != "claude") {
         return None;
     }
     let limits = crate::node_scope::project_limits(&state.pool, launch.project_id.as_deref()).await;
@@ -1057,6 +1066,31 @@ mod tests {
                 "run {run}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_run_of_another_runner_restarts_cold() {
+        let (state, _runner) = crate::execution::runs::testkit::test_state_with_runner(
+            Some(Duration::from_secs(60)),
+            Duration::from_secs(600),
+        )
+        .await;
+        for (run, runner) in [(87, "codex"), (88, "agy"), (89, "claude")] {
+            seed_resume_run(&state.pool, run, "interrupted", Some(10_000)).await;
+            sqlx::query("UPDATE runs SET runner = ? WHERE id = ?")
+                .bind(runner)
+                .bind(run)
+                .execute(&state.pool)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(resumable_session(&state, &worktree_launch(), "87").await, None);
+        assert_eq!(resumable_session(&state, &worktree_launch(), "88").await, None);
+        assert_eq!(
+            resumable_session(&state, &worktree_launch(), "89").await.as_deref(),
+            Some("sess-abc")
+        );
     }
 
     #[tokio::test]
