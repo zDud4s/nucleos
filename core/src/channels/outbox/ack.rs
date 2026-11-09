@@ -7,6 +7,8 @@
 //! Contract 1.1: an ack echoes the `lease_generation` of the delivery it settles. One that no longer
 //! matches an open row is the late ack of a lease that expired and was handed out again; it is
 //! ignored (409 `not_leased`), so it neither settles nor re-pends the row under the new lease.
+//! Contract 1.2: a renewal may echo it too, with the same outcome. Both are counted per channel in
+//! `channel_outbox_stale`, so the count survives a restart.
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -156,7 +158,9 @@ pub async fn ack(
         }
     }
     if let Some(generation) = generation.filter(|g| *g != current) {
-        state.channels.outbox.note_stale_ack();
+        // Committed before answering: dropping the transaction would roll the count back.
+        note_stale(&mut tx, channel, StaleKind::Ack, now).await?;
+        tx.commit().await?;
         tracing::warn!(
             channel,
             id,
@@ -313,42 +317,114 @@ pub struct Renewed {
 pub enum RenewError {
     NotFound,
     NotLeased,
+    /// The renewal echoed a lease generation the open row no longer holds.
+    Stale,
     Db(sqlx::Error),
 }
 
-/// Extends the lease of a row still `leased` on this channel by 60 s from `now`.
+/// Which call a stale generation was caught on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StaleKind {
+    Ack,
+    Renew,
+}
+
+/// Adds one to the persisted stale count of `channel` for `kind`, creating the row on the first one.
+async fn note_stale(
+    conn: &mut sqlx::SqliteConnection,
+    channel: &str,
+    kind: StaleKind,
+    now: DateTime<Utc>,
+) -> sqlx::Result<()> {
+    let (acks, renews) = match kind {
+        StaleKind::Ack => (1_i64, 0_i64),
+        StaleKind::Renew => (0, 1),
+    };
+    sqlx::query(
+        "INSERT INTO channel_outbox_stale (channel, stale_acks, stale_renews, last_at) \
+         VALUES (?, ?, ?, ?) \
+         ON CONFLICT(channel) DO UPDATE SET \
+             stale_acks = stale_acks + excluded.stale_acks, \
+             stale_renews = stale_renews + excluded.stale_renews, \
+             last_at = excluded.last_at",
+    )
+    .bind(channel)
+    .bind(acks)
+    .bind(renews)
+    .bind(stamp(now))
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// The persisted stale counts of one channel as `(acks, renewals)`; zeros when none was ever stale.
+pub async fn stale_counts(pool: &sqlx::SqlitePool, channel: &str) -> sqlx::Result<(i64, i64)> {
+    let row: Option<(i64, i64)> = sqlx::query_as(
+        "SELECT stale_acks, stale_renews FROM channel_outbox_stale WHERE channel = ?",
+    )
+    .bind(channel)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.unwrap_or((0, 0)))
+}
+
+/// Extends the lease of a row still `leased` on this channel by 60 s from `now`. `generation` is
+/// the lease generation the renewal echoes (`None`: an adapter older than contract 1.2, renewed
+/// without the check); on an open row whose `lease_generation` differs it is `Stale`, logged,
+/// counted and changes nothing.
 pub async fn renew(
     pool: &sqlx::SqlitePool,
     channel: &str,
     id: i64,
+    generation: Option<i64>,
     now: DateTime<Utc>,
 ) -> Result<Renewed, RenewError> {
     let until = now + RENEW;
     let updated = sqlx::query(
         "UPDATE channel_outbox SET lease_until = ? \
-         WHERE id = ? AND channel = ? AND state = 'leased'",
+         WHERE id = ? AND channel = ? AND state = 'leased' \
+           AND (? IS NULL OR lease_generation = ?)",
     )
     .bind(stamp(until))
     .bind(id)
     .bind(channel)
+    .bind(generation)
+    .bind(generation)
     .execute(pool)
     .await
     .map_err(RenewError::Db)?;
     if updated.rows_affected() > 0 {
         return Ok(Renewed { lease_until: until });
     }
-    let exists: Option<i64> =
-        sqlx::query_scalar("SELECT id FROM channel_outbox WHERE id = ? AND channel = ?")
-            .bind(id)
-            .bind(channel)
-            .fetch_optional(pool)
+    let row: Option<(String, i64)> = sqlx::query_as(
+        "SELECT state, lease_generation FROM channel_outbox WHERE id = ? AND channel = ?",
+    )
+    .bind(id)
+    .bind(channel)
+    .fetch_optional(pool)
+    .await
+    .map_err(RenewError::Db)?;
+    let Some((row_state, current)) = row else {
+        return Err(RenewError::NotFound);
+    };
+    // Only an open row has a newer lease to be stale against; a settled one is just not leased.
+    if let (Some(generation), "leased" | "pending") =
+        (generation.filter(|g| *g != current), row_state.as_str())
+    {
+        let mut conn = pool.acquire().await.map_err(RenewError::Db)?;
+        note_stale(&mut conn, channel, StaleKind::Renew, now)
             .await
             .map_err(RenewError::Db)?;
-    Err(if exists.is_some() {
-        RenewError::NotLeased
-    } else {
-        RenewError::NotFound
-    })
+        tracing::warn!(
+            channel,
+            id,
+            generation,
+            current,
+            "outbox renew ignored: its lease expired and the action was leased again"
+        );
+        return Err(RenewError::Stale);
+    }
+    Err(RenewError::NotLeased)
 }
 
 #[cfg(test)]
@@ -855,7 +931,7 @@ mod tests {
         assert_eq!(generation_of(&state.pool, id).await, 1);
         deliver(&state, at(61)).await; // expired; B: generation 2, lease until 121
         assert_eq!(generation_of(&state.pool, id).await, 2);
-        let before = state.channels.outbox.stale_acks();
+        assert_eq!(stale_counts(&state.pool, "fake").await.unwrap(), (0, 0));
 
         let late = ack(
             &state,
@@ -878,7 +954,7 @@ mod tests {
         assert_eq!((st.as_str(), attempts), ("leased", 2));
         assert_eq!(lease_until, Some(stamp(at(121))));
         assert_eq!((reason, settled), (None, None));
-        assert_eq!(state.channels.outbox.stale_acks(), before + 1);
+        assert_eq!(stale_counts(&state.pool, "fake").await.unwrap(), (1, 0));
 
         // B's own ack still settles it.
         assert_eq!(
@@ -924,7 +1000,7 @@ mod tests {
             settle_as(&state, id, failed(true, None, "network"), Some(9), at(2)).await,
             outcome(ActionState::Done, true)
         );
-        assert_eq!(state.channels.outbox.stale_acks(), 0);
+        assert_eq!(stale_counts(&state.pool, "fake").await.unwrap(), (0, 0));
     }
 
     #[tokio::test]
@@ -934,9 +1010,66 @@ mod tests {
         deliver(&state, at(0)).await;
         assert_eq!(row(&state.pool, id).await.3, Some(stamp(at(60))));
 
-        let renewed = renew(&state.pool, "fake", id, at(30)).await.unwrap();
+        let renewed = renew(&state.pool, "fake", id, None, at(30)).await.unwrap();
         assert_eq!(renewed.lease_until, at(90));
         assert_eq!(row(&state.pool, id).await.3, Some(stamp(at(90))));
+    }
+
+    /// A renewal echoing the generation the row holds extends the lease; one echoing an older
+    /// generation (the lease expired and the row was leased again) changes nothing and is counted.
+    #[tokio::test]
+    async fn a_stale_renew_is_not_leased_and_counted() {
+        let state = crate::channels::testkit::state().await;
+        let id = push(&state).await;
+        deliver(&state, at(0)).await; // A: generation 1, lease until 60
+        deliver(&state, at(61)).await; // expired; B: generation 2, lease until 121
+
+        assert!(matches!(
+            renew(&state.pool, "fake", id, Some(1), at(62)).await,
+            Err(RenewError::Stale)
+        ));
+        assert_eq!(row(&state.pool, id).await.3, Some(stamp(at(121))));
+        assert_eq!(stale_counts(&state.pool, "fake").await.unwrap(), (0, 1));
+
+        let renewed = renew(&state.pool, "fake", id, Some(2), at(70))
+            .await
+            .unwrap();
+        assert_eq!(renewed.lease_until, at(130));
+        assert_eq!(stale_counts(&state.pool, "fake").await.unwrap(), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn a_stale_generation_renew_on_a_settled_row_is_plain_not_leased() {
+        let state = crate::channels::testkit::state().await;
+        let id = push(&state).await;
+        deliver(&state, at(0)).await;
+        settle_as(&state, id, ok(&["1"]), Some(1), at(1)).await;
+
+        assert!(matches!(
+            renew(&state.pool, "fake", id, Some(9), at(2)).await,
+            Err(RenewError::NotLeased)
+        ));
+        assert_eq!(stale_counts(&state.pool, "fake").await.unwrap(), (0, 0));
+    }
+
+    /// The count lives in the database: acks and renewals add up per channel.
+    #[tokio::test]
+    async fn stale_acks_and_renews_accumulate_in_the_table() {
+        let state = crate::channels::testkit::state().await;
+        let id = push(&state).await;
+        deliver(&state, at(0)).await;
+        deliver(&state, at(61)).await;
+        for n in 0..2 {
+            let late = ack(&state, "fake", id, ok(&["1"]), Some(1), at(62 + n))
+                .await
+                .unwrap();
+            assert!(matches!(late, Some(Acked::Stale { .. })));
+        }
+        renew(&state.pool, "fake", id, Some(1), at(65))
+            .await
+            .unwrap_err();
+        assert_eq!(stale_counts(&state.pool, "fake").await.unwrap(), (2, 1));
+        assert_eq!(stale_counts(&state.pool, "other").await.unwrap(), (0, 0));
     }
 
     #[tokio::test]
@@ -947,11 +1080,11 @@ mod tests {
         settle(&state, id, ok(&["1"]), at(1)).await;
 
         assert!(matches!(
-            renew(&state.pool, "fake", id, at(2)).await,
+            renew(&state.pool, "fake", id, None, at(2)).await,
             Err(RenewError::NotLeased)
         ));
         assert!(matches!(
-            renew(&state.pool, "fake", id + 100, at(2)).await,
+            renew(&state.pool, "fake", id + 100, None, at(2)).await,
             Err(RenewError::NotFound)
         ));
     }

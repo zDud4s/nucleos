@@ -1007,6 +1007,47 @@ mod tests {
         );
     }
 
+    /// The shell reads two of its diagnostics here: the in-memory `drops.unknown_sender_limited`
+    /// and the persisted `outbox.stale_acks` / `outbox.stale_renews`.
+    #[tokio::test]
+    async fn route_channels_list_carries_the_limited_and_stale_counters() {
+        let st = state().await;
+        let now = chrono::Utc::now();
+        for _ in 0..=crate::channels::inbound_limit::PER_SENDER_LIMIT {
+            st.channels
+                .presence
+                .allow_unknown_sender("fake", "stranger", now);
+        }
+        sqlx::query(
+            "INSERT INTO channel_outbox_stale (channel, stale_acks, stale_renews, last_at) \
+             VALUES ('fake', 3, 2, '2026-11-08T10:00:00Z')",
+        )
+        .execute(&st.pool)
+        .await
+        .unwrap();
+
+        let (status, body) = call(&st, CONTROL_KEY, "GET", "/channels", "").await;
+        assert_eq!(status, StatusCode::OK);
+        let fake = body["channels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == "fake")
+            .unwrap();
+        assert_eq!(fake["drops"]["unknown_sender_limited"], 1);
+        assert_eq!(fake["outbox"]["stale_acks"], 3);
+        assert_eq!(fake["outbox"]["stale_renews"], 2);
+        // A channel that was never stale reads zero, not absent.
+        let other = body["channels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] != "fake")
+            .unwrap();
+        assert_eq!(other["outbox"]["stale_acks"], 0);
+        assert_eq!(other["outbox"]["stale_renews"], 0);
+    }
+
     #[tokio::test]
     async fn route_identities_list_groups_by_sender() {
         let st = state().await;

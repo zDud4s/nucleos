@@ -5,11 +5,10 @@ mod ack;
 mod degrade;
 mod lease;
 
-pub use ack::{AckOutcome, Acked, ActionState, RenewError, Renewed, ack, renew};
+pub use ack::{AckOutcome, Acked, ActionState, RenewError, Renewed, ack, renew, stale_counts};
 pub use lease::lease;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
@@ -391,8 +390,11 @@ pub async fn counts(pool: &SqlitePool, channel: &str) -> sqlx::Result<registry::
     .bind(stamp(Utc::now() - RETENTION))
     .fetch_one(pool)
     .await?;
+    let (stale_acks, stale_renews) = stale_counts(pool, channel).await?;
     let mut counts = registry::OutboxCounts {
         failed: failed as u32,
+        stale_acks: u32::try_from(stale_acks).unwrap_or(u32::MAX),
+        stale_renews: u32::try_from(stale_renews).unwrap_or(u32::MAX),
         ..registry::OutboxCounts::default()
     };
     for (state, n, oldest) in open {
@@ -520,34 +522,47 @@ async fn post_ack(
     }
 }
 
-/// `POST /channels/{channel}/outbox/{id}/renew` (section 6.1). The body, if any, is ignored.
+/// `POST /channels/{channel}/outbox/{id}/renew` (section 6.1). The body is optional: contract 1.2
+/// adapters send `{"generation": n}`, older ones nothing (an empty body renews without the check).
 async fn post_renew(
     State(state): State<AppState>,
     Extension(scope): Extension<Scope>,
     Path((named, id)): Path<(String, i64)>,
+    body: Bytes,
 ) -> Response {
     let channel = match own_channel(&scope, &named) {
         Ok(channel) => channel,
         Err(refusal) => return refusal,
     };
-    match renew(&state.pool, channel, id, Utc::now()).await {
+    let generation = if body.is_empty() {
+        None
+    } else {
+        match contract::decode::<contract::RenewShape>(&body) {
+            Ok(decoded) => decoded.generation,
+            Err(error) => return contract_error(error),
+        }
+    };
+    match renew(&state.pool, channel, id, generation, Utc::now()).await {
         Ok(renewed) => Json(contract::RenewAnswer {
             // Second precision, like the stored value and the contract's `date-time`.
             lease_until: stamp(renewed.lease_until),
         })
         .into_response(),
         Err(RenewError::NotLeased) => named_error(StatusCode::CONFLICT, "not_leased", None),
+        Err(RenewError::Stale) => named_error(
+            StatusCode::CONFLICT,
+            "not_leased",
+            Some("the renewal's lease generation was superseded by a newer lease"),
+        ),
         Err(RenewError::NotFound) => not_found(),
         Err(RenewError::Db(error)) => database_failure(&error, channel, "renew"),
     }
 }
 
-/// Per-channel long-poll wakers, the ephemeral set (`typing`, memory only) and the count of acks
-/// ignored for a superseded lease generation.
+/// Per-channel long-poll wakers and the ephemeral set (`typing`, memory only).
 pub struct Waiters {
     wakers: HashMap<&'static str, Arc<Notify>>,
     typing: Mutex<HashSet<(String, String)>>,
-    stale_acks: AtomicU64,
 }
 
 impl Default for Waiters {
@@ -558,7 +573,6 @@ impl Default for Waiters {
                 .map(|m| (m.id, Arc::new(Notify::new())))
                 .collect(),
             typing: Mutex::default(),
-            stale_acks: AtomicU64::new(0),
         }
     }
 }
@@ -575,16 +589,6 @@ impl Waiters {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert((channel.to_string(), conversation.to_string()));
-    }
-
-    fn note_stale_ack(&self) {
-        self.stale_acks.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// How many acks were ignored because they echoed a lease generation the row no longer held
-    /// (since the daemon started).
-    pub fn stale_acks(&self) -> u64 {
-        self.stale_acks.load(Ordering::Relaxed)
     }
 
     /// Removes and returns the conversations the channel should show as typing.
@@ -1534,7 +1538,7 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["error"], "not_leased");
         assert_eq!(state_of(&st.pool, id).await.0, "leased");
-        assert_eq!(st.channels.outbox.stale_acks(), 1);
+        assert_eq!(stale_counts(&st.pool, "fake").await.unwrap(), (1, 0));
 
         let (status, body) = call(
             &st,
@@ -1566,6 +1570,41 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let bytes = serde_json::to_vec(&body).unwrap();
         contract::decode::<contract::RenewResponseShape>(&bytes).expect("renew_response shape");
+    }
+
+    #[tokio::test]
+    async fn route_renew_with_a_stale_generation_is_409_not_leased_and_counted() {
+        let st = crate::channels::testkit::state().await;
+        let token = fake_key(&st).await;
+        let id = leased(&st, &token).await; // generation 1
+        let path = format!("/channels/fake/outbox/{id}/renew");
+
+        let (status, body) = call(&st, &token, "POST", &path, r#"{"generation":7}"#).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "not_leased");
+        assert_eq!(stale_counts(&st.pool, "fake").await.unwrap(), (0, 1));
+
+        let (status, _) = call(&st, &token, "POST", &path, r#"{"generation":1}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        // An empty body (an adapter of contract 1.1) renews without the check.
+        let (status, _) = call(&st, &token, "POST", &path, "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(stale_counts(&st.pool, "fake").await.unwrap(), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn route_renew_with_a_malformed_body_is_400() {
+        let st = crate::channels::testkit::state().await;
+        let token = fake_key(&st).await;
+        let id = leased(&st, &token).await;
+        let path = format!("/channels/fake/outbox/{id}/renew");
+
+        let (status, body) = call(&st, &token, "POST", &path, r#"{"generation":0}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body,
+            serde_json::json!({"error": "range", "at": "/generation"})
+        );
     }
 
     #[tokio::test]

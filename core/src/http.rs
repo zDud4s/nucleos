@@ -21082,6 +21082,54 @@ mod tests {
         assert_eq!(entries[0]["summary"], "project a summary");
     }
 
+    /// The shell lists a job's transient-retry notices through the feed: `kind` picks them out of
+    /// every project's lines and `limit` bounds the answer, newest first.
+    #[tokio::test]
+    async fn feed_kind_query_lists_job_item_retry_notices_newest_first() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        for (project, kind, summary, job) in [
+            ("project-a", "job_item_retry", "retry 1 of 3", 57),
+            ("project-a", "job_started", "started", 57),
+            ("project-b", "job_item_retry", "retry 2 of 3", 58),
+        ] {
+            crate::feed::append(
+                &pool,
+                Some(project),
+                kind,
+                summary,
+                None,
+                Some(&crate::feed::Subject::Job(job)),
+            )
+            .await
+            .unwrap();
+        }
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/feed?scope=all&kind=job_item_retry&limit=10")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let entries = parsed.as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["summary"], "retry 2 of 3");
+        assert_eq!(entries[0]["subject"], "job:58");
+        assert_eq!(entries[1]["summary"], "retry 1 of 3");
+        assert!(entries.iter().all(|e| e["kind"] == "job_item_retry"));
+    }
+
     #[tokio::test]
     async fn feed_without_query_returns_only_global_rows() {
         let state = test_state().await;

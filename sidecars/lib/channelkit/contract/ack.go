@@ -183,6 +183,44 @@ func DecodeAckResponse(b []byte) (AckResponse, error) {
 	return AckResponse{State: *r.State, Ignored: r.Ignored}, nil
 }
 
+type renewRaw struct {
+	Generation *uint64 `json:"generation,omitempty"`
+}
+
+// Validate checks that a generation, when present, is at least 1.
+func (r *renewRaw) Validate() *Error {
+	if r.Generation != nil && *r.Generation == 0 {
+		return errRange("/generation")
+	}
+	return nil
+}
+
+// Renew is the body of a lease renewal (contract 1.2). Generation echoes the
+// lease generation of the delivery being renewed; the core refuses a renewal
+// whose generation is no longer the row's with 409 not_leased. Zero means
+// absent: a 1.1 adapter sends no body at all, and the core renews without the
+// check.
+type Renew struct {
+	Generation uint64 `json:"generation,omitempty"`
+}
+
+// Marshal returns the wire form of the renewal.
+func (r Renew) Marshal() ([]byte, error) { return json.Marshal(r) }
+
+// DecodeRenew decodes a renew request strictly (an input shape). The core
+// treats an empty body as "no generation" before it gets here.
+func DecodeRenew(b []byte) (Renew, error) {
+	r, err := DecodeStrict[renewRaw](b)
+	if err != nil {
+		return Renew{}, err
+	}
+	var out Renew
+	if r.Generation != nil {
+		out.Generation = *r.Generation
+	}
+	return out, nil
+}
+
 type renewResponseRaw struct {
 	LeaseUntil *string `json:"lease_until" kit:"required"`
 }

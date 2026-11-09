@@ -572,6 +572,11 @@ pub struct OutboxCounts {
     pub leased: u32,
     pub failed: u32,
     pub oldest_due_at: Option<DateTime<Utc>>,
+    /// Acks refused (409 `not_leased`) for echoing a lease generation the row no longer held.
+    /// Persisted (`channel_outbox_stale`), so it survives a restart, unlike `Drops`.
+    pub stale_acks: u32,
+    /// The same for renewals (contract 1.2).
+    pub stale_renews: u32,
 }
 
 #[derive(Debug, serde::Serialize)]

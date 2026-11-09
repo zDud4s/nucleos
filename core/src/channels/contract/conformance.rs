@@ -92,6 +92,7 @@ fn decode_as(shape: &str, bytes: &[u8]) -> Option<Result<Value, ContractError>> 
         "action" => run::<OutActionShape>(bytes),
         "ack" => run::<AckShape>(bytes),
         "ack_response" => run::<AckResponseShape>(bytes),
+        "renew" => run::<RenewShape>(bytes),
         "renew_response" => run::<RenewResponseShape>(bytes),
         "scenario" => return None,
         other => panic!("index.json names an unknown shape {other:?}"),

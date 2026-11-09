@@ -101,7 +101,7 @@ const DAEMON_TOKEN_VAR: &str = "NUCLEOS_DAEMON_TOKEN";
 
 /// The request's environment without the daemon key, and the key. Case-insensitive like agy's
 /// filter, because Windows reads environment names that way. An empty key is no key.
-fn split_daemon_token(env: &[(String, String)]) -> (Vec<&(String, String)>, Option<&str>) {
+pub(super) fn split_daemon_token(env: &[(String, String)]) -> (Vec<&(String, String)>, Option<&str>) {
     let mut token = None;
     let mut rest = Vec::with_capacity(env.len());
     for entry in env {
@@ -127,12 +127,12 @@ fn split_daemon_token(env: &[(String, String)]) -> (Vec<&(String, String)>, Opti
 /// Administrators), under a name with a fresh UUID so no other run can guess it, created with
 /// `create_new` so a file planted at that name is refused rather than reused, and `0600` off
 /// Windows. Outside every worktree, so it can never be committed.
-struct RunTokenFile {
-    path: PathBuf,
+pub(super) struct RunTokenFile {
+    pub(super) path: PathBuf,
 }
 
 impl RunTokenFile {
-    fn write(token: &str) -> std::io::Result<Self> {
+    pub(super) fn write(token: &str) -> std::io::Result<Self> {
         let path = std::env::temp_dir().join(format!(
             "nucleos-run-token-{}-{}",
             std::process::id(),

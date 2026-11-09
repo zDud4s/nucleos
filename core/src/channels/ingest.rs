@@ -973,6 +973,62 @@ mod tests {
         assert_eq!(identities, 0);
     }
 
+    /// `/pair` from an unknown sender goes through the same limit as any other message: the
+    /// attempt past `PER_SENDER_LIMIT` is dropped and counted before `access::pair` runs.
+    #[tokio::test]
+    async fn pair_attempts_count_in_the_unknown_sender_limit() {
+        let st = state().await;
+        // A live code, so the attempts reach verification and each answers `PairInvalid`.
+        let minted = access::mint_pairing_code(&st.pool, "telegram", now())
+            .await
+            .unwrap();
+        let correct = minted.command.clone();
+        let wrong = if minted.code == "000000" {
+            "/pair 000001"
+        } else {
+            "/pair 000000"
+        };
+        for n in 0..PER_SENDER_LIMIT {
+            let reply = ingest_event(
+                &st,
+                "telegram",
+                text_event(&format!("ev-pair-{n}"), "newbie", "pair-flood-chat", wrong),
+                now(),
+            )
+            .await;
+            assert_eq!(reply, IngestReply::Accepted);
+        }
+        let written = event_rows(&st.pool).await;
+        let replies = outbox_rows(&st.pool).await.len();
+        assert_eq!(written, i64::from(PER_SENDER_LIMIT));
+
+        // Even the right code is limited: it never reaches verification, so nothing is paired.
+        let reply = ingest_event(
+            &st,
+            "telegram",
+            text_event("ev-pair-over", "newbie", "pair-flood-chat", &correct),
+            now(),
+        )
+        .await;
+        assert_eq!(reply, IngestReply::Dropped);
+        assert_eq!(event_rows(&st.pool).await, written, "no row past the limit");
+        assert_eq!(outbox_rows(&st.pool).await.len(), replies, "no answer either");
+        let identities: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM channel_identities")
+            .fetch_one(&st.pool)
+            .await
+            .unwrap();
+        assert_eq!(identities, 0);
+        let paired: Option<String> =
+            sqlx::query_scalar("SELECT paired_at FROM channel_pairing_codes")
+                .fetch_one(&st.pool)
+                .await
+                .unwrap();
+        assert_eq!(paired, None);
+        let drops = st.channels.presence.drops("telegram");
+        assert_eq!(drops.unknown_sender_limited, 1);
+        assert_eq!(drops.pairing_failures, u64::from(PER_SENDER_LIMIT));
+    }
+
     #[tokio::test]
     async fn pair_with_garbage_is_silent() {
         let st = state().await;
@@ -1442,7 +1498,7 @@ mod tests {
         let key = fake_key(&st).await;
         let (status, body) = call(&st, &key, "PUT", "/channels/fake/hello", HELLO).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body, serde_json::json!({"contract_version": "1.1.0"}));
+        assert_eq!(body, serde_json::json!({"contract_version": "1.2.0"}));
     }
 
     #[tokio::test]
@@ -1456,7 +1512,7 @@ mod tests {
             body,
             serde_json::json!({
                 "error": "contract_version",
-                "contract_version": "1.1.0",
+                "contract_version": "1.2.0",
                 "detail": "adapter speaks 2.0.0"
             })
         );

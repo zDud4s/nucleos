@@ -475,6 +475,34 @@ impl Shape for AckShape {
     }
 }
 
+// ---- renew --------------------------------------------------------------------------------
+
+/// The renew request body (contract 1.2). Optional as a whole: an adapter of contract 1.1 or older
+/// sends no body, and the lease is then extended without the generation check.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RenewBody {
+    /// The lease generation of the delivery whose lease is renewed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<i64>,
+}
+
+pub struct RenewShape;
+
+impl Shape for RenewShape {
+    type Wire = RenewBody;
+    type Valid = RenewBody;
+
+    fn validate(body: RenewBody) -> Result<RenewBody, ContractError> {
+        check(
+            body.generation.is_none_or(|g| g >= 1),
+            ErrorCode::Range,
+            "/generation",
+        )?;
+        Ok(body)
+    }
+}
+
 // ---- ack_response, renew_response ---------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -880,6 +908,10 @@ mod tests {
             r#"{"state":"failed","ignored":false}"#,
             json!({"state": "failed"}),
         );
+        round_trips::<RenewShape>(r#"{"generation":3}"#, json!({"generation": 3}));
+        round_trips::<RenewShape>("{}", json!({}));
+        assert_fails::<RenewShape>(r#"{"generation":0}"#, ErrorCode::Range, Some("/generation"));
+        assert_fails::<RenewShape>(r#"{"gen":1}"#, ErrorCode::Decode, None);
         round_trips::<RenewResponseShape>(
             r#"{"lease_until":"2026-10-19T10:31:30Z"}"#,
             json!({"lease_until": "2026-10-19T10:31:30Z"}),
@@ -942,7 +974,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             serde_json::to_value(ErrorResponse::contract_version(&hello)).unwrap(),
-            json!({"error": "contract_version", "contract_version": "1.1.0",
+            json!({"error": "contract_version", "contract_version": "1.2.0",
                 "detail": "adapter speaks 2.0.0"})
         );
     }

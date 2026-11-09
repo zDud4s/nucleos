@@ -71,6 +71,7 @@ type Core struct {
 	outbox     *queue            // guarded by mu; created by mountOutbox
 	polls      int               // outbox long-polls being served right now; guarded by mu
 	staleAcks  int               // acks refused because their lease generation was superseded
+	staleRenews int               // renewals refused for the same reason
 	ackGens    map[uint64]uint64 // generation carried by the last accepted ack, by id
 	fallback   func(reason string, failed contract.Action)
 }

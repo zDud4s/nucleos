@@ -1,10 +1,10 @@
-{ "contract_version": "1.1.0",
+{ "contract_version": "1.2.0",
   "tags": ["hello", "hello_response", "error_response", "media_response",
            "event", "conversation", "event.action", "event_response",
            "part_in.text", "part_in.audio", "part_in.image", "part_in.file", "part_in.unsupported",
            "outbox_response", "ephemeral", "action", "action.send", "action.edit", "action.answer_action",
            "part_out.text", "part_out.image", "part_out.file", "part_out.audio", "buttons",
-           "ack.ok", "ack.failed", "ack_response", "renew_response"],
+           "ack.ok", "ack.failed", "ack_response", "renew", "renew_response"],
   "fixtures": [
     {"file": "hello/telegram-full.json", "shape": "hello", "covers": ["hello"], "valid": true, "compatible": true, "expect": {"/kind": "telegram", "/capabilities/max_text": 4096, "/capabilities/media_out/1": "file"}},
     {"file": "hello/minimal.json", "shape": "hello", "covers": ["hello"], "valid": true, "expect": {"/capabilities/max_text": 2000}},
@@ -19,7 +19,7 @@
     {"file": "hello/unknown-media-kind.json", "shape": "hello", "covers": ["hello"], "valid": false, "error": {"code": "decode"}},
     {"file": "hello/duplicate-media-kind.json", "shape": "hello", "covers": ["hello"], "valid": false, "error": {"code": "unique", "at": "/capabilities/media_out/1"}},
     {"file": "hello/unknown-capability.json", "shape": "hello", "covers": ["hello"], "valid": false, "error": {"code": "decode"}},
-    {"file": "hello/response.json", "shape": "hello_response", "covers": ["hello_response"], "valid": true, "expect": {"/contract_version": "1.1.0"}},
+    {"file": "hello/response.json", "shape": "hello_response", "covers": ["hello_response"], "valid": true, "expect": {"/contract_version": "1.2.0"}},
     {"file": "hello/response-bad-version.json", "shape": "hello_response", "covers": ["hello_response"], "valid": false, "error": {"code": "grammar", "at": "/contract_version"}},
 
     {"file": "errors/contract-version.json", "shape": "error_response", "covers": ["error_response"], "valid": true, "expect": {"/error": "contract_version"}},
@@ -122,6 +122,9 @@
     {"file": "acks/response-bad-state.json", "shape": "ack_response", "covers": ["ack_response"], "valid": false, "error": {"code": "decode"}},
     {"file": "acks/response-ignored-pending.json", "shape": "ack_response", "covers": ["ack_response"], "valid": false, "error": {"code": "forbidden", "at": "/ignored"}},
 
+    {"file": "renew/request-with-generation.json", "shape": "renew", "covers": ["renew"], "valid": true, "expect": {"/generation": 3}},
+    {"file": "renew/request-empty.json", "shape": "renew", "covers": ["renew"], "valid": true},
+    {"file": "renew/request-generation-zero.json", "shape": "renew", "covers": ["renew"], "valid": false, "error": {"code": "range", "at": "/generation"}},
     {"file": "renew/response.json", "shape": "renew_response", "covers": ["renew_response"], "valid": true},
     {"file": "renew/response-bad-time.json", "shape": "renew_response", "covers": ["renew_response"], "valid": false, "error": {"code": "grammar", "at": "/lease_until"}},
 

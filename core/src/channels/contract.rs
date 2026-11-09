@@ -38,7 +38,8 @@ pub fn fixtures_dir() -> std::path::PathBuf {
 }
 
 /// 1.1 adds the lease generation: on every delivered action and, echoed back, on every ack.
-pub const CONTRACT_VERSION: &str = "1.1.0";
+/// 1.2 has the renew request echo it too (`{"generation": n}`, optional as a whole).
+pub const CONTRACT_VERSION: &str = "1.2.0";
 
 /// The largest `retry_after_ms` an adapter may report (24 h). Shared with the adapter kit.
 pub const MAX_RETRY_AFTER_MS: u64 = 86_400_000;
@@ -477,8 +478,9 @@ mod tests {
         assert!(compatible("1.0.0"));
         assert!(compatible("1.0.9"));
         assert!(compatible("1.1.0"));
+        assert!(compatible("1.2.0"));
         for bad in [
-            "1.2.0", "2.0.0", "0.9.0", "v1", "1.0", "1.0.0.0", "1.x.0", "", "1..0",
+            "1.3.0", "2.0.0", "0.9.0", "v1", "1.0", "1.0.0.0", "1.x.0", "", "1..0",
         ] {
             assert!(!compatible(bad), "{bad}");
         }

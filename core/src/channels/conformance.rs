@@ -54,7 +54,7 @@ mod tests {
         let adapter = FakeAdapter::new(st, "fake").await;
         let reply = adapter.hello(capabilities()).await;
         assert_eq!(reply.status, StatusCode::OK);
-        assert_eq!(reply.json(), json!({"contract_version": "1.1.0"}));
+        assert_eq!(reply.json(), json!({"contract_version": "1.2.0"}));
         adapter
     }
 

@@ -61,6 +61,14 @@ func (c *Core) StaleAcks() int {
 	return c.staleAcks
 }
 
+// StaleRenews reports how many lease renewals were refused with 409 not_leased
+// because they carried the generation of a lease that had since been superseded.
+func (c *Core) StaleRenews() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.staleRenews
+}
+
 // Generation returns the lease generation of an outbox entry: how many times it
 // was leased (0 = never; ok is false for an unknown id).
 func (c *Core) Generation(id uint64) (gen uint64, ok bool) {
