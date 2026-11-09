@@ -3899,7 +3899,9 @@ pub(super) mod tests {
         const JOB: &str = "drv-pending-no-slot";
         let fx = Fixture::new().await;
         let mut live = crate::tree_job::model::Branch::new("other", &[], PENDING_LAYER, None);
-        live.state = "running".to_owned();
+        // `open` holds a slot (`LIVE_STATES`) and the driver leaves it alone; `running` is no branch
+        // state, so it would not count and the cap of 1 would never refuse.
+        live.state = "open".to_owned();
         fx.seed_job(JOB, vec![live], None).await;
         let workflow = fx.repo.join(".nucleos").join("workflow");
         std::fs::create_dir_all(&workflow).unwrap();
