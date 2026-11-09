@@ -267,13 +267,15 @@ async fn resumable_session(
         return None;
     }
     let run_id = dead_run.parse::<i64>().ok()?;
-    let row: Option<(
+    // status, session_id, fill, successor_run_id, runner
+    type RunRow = (
         String,
         Option<String>,
         Option<i64>,
         Option<i64>,
         Option<String>,
-    )> = sqlx::query_as(
+    );
+    let row: Option<RunRow> = sqlx::query_as(
         "SELECT status, session_id, COALESCE(context_fill, context_peak), successor_run_id, runner
              FROM runs WHERE id = ?",
     )

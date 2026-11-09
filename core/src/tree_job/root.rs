@@ -311,6 +311,19 @@ async fn start_steps(state: &AppState, job: &TreeJob) -> Result<i64, String> {
     let id = job.id.as_str();
     add_root_branch(state, id).await?;
     let config = open::open_config(&job.manifest.project_root).await;
+    // While the root is still `queued` a worktree at its path is an earlier attempt's orphan. An
+    // `open` root owns its worktree (the replay of a start that failed later): leave it alone.
+    let queued = match store::load(&state.pool, id).await {
+        Ok(Some(fresh)) => fresh
+            .manifest
+            .branches
+            .get(ROOT_BRANCH)
+            .is_some_and(|branch| branch.state == "queued"),
+        _ => false,
+    };
+    if queued {
+        super::root_orphan::clear(&job.manifest.project_root, id, &config.links).await;
+    }
     let opened = match open::open_branch(&state.pool, id, ROOT_BRANCH, &config).await {
         Ok(opened) => opened,
         Err(error) => {
