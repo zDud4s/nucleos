@@ -3815,7 +3815,10 @@ pub(super) mod tests {
             .expect("the branch is recorded, so the failure is visible");
         assert_eq!(branch.state, "dropped");
         let reason = branch.extra["drop_reason"].as_str().unwrap();
-        assert!(reason.contains("mid") && reason.contains("done"), "{reason}");
+        assert!(
+            reason.contains("mid") && reason.contains("done"),
+            "{reason}"
+        );
         let after = (
             count_of(&fx, "feed").await,
             count_of(&fx, "work_nodes").await,
@@ -3857,8 +3860,9 @@ pub(super) mod tests {
         job_with_a_done_parent(&fx, JOB).await;
         let wait_of = |job: TreeJob| {
             let record = pending_starts(&job)[PENDING_NAME].clone();
-            let at = chrono::DateTime::parse_from_rfc3339(record["next_attempt_at"].as_str().unwrap())
-                .unwrap();
+            let at =
+                chrono::DateTime::parse_from_rfc3339(record["next_attempt_at"].as_str().unwrap())
+                    .unwrap();
             (
                 record["attempts"].as_u64().unwrap(),
                 (at.with_timezone(&chrono::Utc) - chrono::Utc::now()).num_seconds(),

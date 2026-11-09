@@ -39,9 +39,12 @@ pub(super) async fn clear(project_root: &str, tree_id: &str, links: &[String]) {
     let _ = open::git(project_root, &["worktree", "prune"]).await;
     let branch = open::git_branch_name(tree_id, ROOT_BRANCH);
     let reference = format!("refs/heads/{branch}");
-    if open::git(project_root, &["rev-parse", "--verify", "--quiet", &reference])
-        .await
-        .is_ok()
+    if open::git(
+        project_root,
+        &["rev-parse", "--verify", "--quiet", &reference],
+    )
+    .await
+    .is_ok()
         && let Err(error) = open::git(project_root, &["branch", "-D", &branch]).await
     {
         tracing::warn!(%error, "orphan root worktree: branch not removed");
@@ -111,7 +114,10 @@ mod tests {
         clear(&root, "job-1", &["shell/node_modules".to_owned()]).await;
 
         assert!(worktree.symlink_metadata().is_err(), "the worktree is gone");
-        assert!(modules.join("kept.txt").exists(), "the link target is intact");
+        assert!(
+            modules.join("kept.txt").exists(),
+            "the link target is intact"
+        );
         let branches = git_text(&repo, &["branch", "--list", "tree/job-1/root"]);
         assert!(branches.is_empty(), "the root branch is gone: {branches}");
         assert!(
