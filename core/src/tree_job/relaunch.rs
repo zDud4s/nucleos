@@ -217,7 +217,17 @@ async fn start_again(
     key: &str,
     prompt: String,
 ) -> Result<i64, String> {
-    store::launch_recovering(
+    start_again_resuming(state, launch, key, prompt, None).await
+}
+
+async fn start_again_resuming(
+    state: &AppState,
+    launch: &StoredLaunch,
+    key: &str,
+    prompt: String,
+    resume: Option<super::node_run::ResumeFrom>,
+) -> Result<i64, String> {
+    store::launch_recovering_resuming(
         state,
         &launch.node_id,
         key,
@@ -225,9 +235,63 @@ async fn start_again(
         launch.project_id.clone(),
         launch.cwd.clone(),
         &launch.mode,
+        resume,
     )
     .await
     .map_err(|error| error.to_string())
+}
+
+/// What an interrupted node's session is given when it is continued rather than restarted: the
+/// session already holds the node packet and everything done so far.
+const CONTINUE_PROMPT: &str = "The daemon restarted while you were working, which interrupted \
+    your run. Your session is continued as it was: carry on from where you stopped, do not start \
+    over, and check the worktree for what you already did.";
+
+/// Whether a transcript of `fill` tokens is small enough to continue: strictly below half of the
+/// leaf budget, so the continued session keeps room to finish. The rest restarts cold.
+pub(super) fn fits_for_resume(fill: i64, leaf_budget: i64) -> bool {
+    fill > 0 && fill * 2 < leaf_budget
+}
+
+/// The session to continue for the node whose run `dead_run` was interrupted, or `None` when the
+/// node restarts cold: the run did not end `interrupted` (a failed run's session may be the reason
+/// it failed), it has no session or no measured fill, it handed over to a successor (a WRAPPED
+/// node, whose context was already full), or its transcript is not below half the leaf budget.
+async fn resumable_session(
+    state: &AppState,
+    launch: &StoredLaunch,
+    dead_run: &str,
+) -> Option<String> {
+    // Only a launch that `node_run` runs as a tree run has a session to continue.
+    if launch.mode != "worktree" || launch.project_id.is_none() || launch.cwd.is_none() {
+        return None;
+    }
+    let run_id = dead_run.parse::<i64>().ok()?;
+    let row: Option<(String, Option<String>, Option<i64>, Option<i64>, Option<String>)> =
+        sqlx::query_as(
+            "SELECT status, session_id, COALESCE(context_fill, context_peak), successor_run_id, runner
+             FROM runs WHERE id = ?",
+        )
+        .bind(run_id)
+        .fetch_optional(&state.pool)
+        .await
+        .ok()
+        .flatten();
+    let (status, session, fill, successor, runner) = row?;
+    let session = session.filter(|session| !session.is_empty())?;
+    if status != "interrupted" || successor.is_some() {
+        return None;
+    }
+    // `claude -p --resume` only understands a session the claude runner wrote: a codex or agy id
+    // fails with no cold-start fallback. NULL means "not recorded" (a run that was never routed,
+    // which the default claude runner served), so it still resumes. The account is not compared: the
+    // relaunch re-picks it at launch, after this decision, and a session id is looked up in whichever
+    // account's config dir the new run lands in.
+    if runner.as_deref().is_some_and(|runner| runner != "claude") {
+        return None;
+    }
+    let limits = crate::node_scope::project_limits(&state.pool, launch.project_id.as_deref()).await;
+    fits_for_resume(fill?, limits.leaf_budget).then_some(session)
 }
 
 async fn cached_job<'a>(
@@ -408,7 +472,17 @@ pub(super) async fn relaunch_node(
                 Some(suffix) => format!("{}{suffix}", launch.prompt),
                 None => launch.prompt.clone(),
             };
-            start_again(state, &launch, key, prompt).await
+            // Only the boot's relaunch of an interrupted node (`resume-<dead run>`, no suffix)
+            // continues the session; wrap, died, fix and rescue relaunches carry their own sentence
+            // and start cold, as a WRAPPED node's full context is the reason they exist.
+            let resume = if prompt_suffix.is_none() && key.starts_with(RESUME_PREFIX) {
+                resumable_session(state, &launch, dead_run)
+                    .await
+                    .map(|session| (session, CONTINUE_PROMPT.to_owned()))
+            } else {
+                None
+            };
+            start_again_resuming(state, &launch, key, prompt, resume).await
         }
         Ok(None) => Err(format!("run {dead_run} is gone and no launch was stored")),
         Err(error) => Err(error.to_string()),
@@ -920,5 +994,116 @@ mod tests {
         assert!(asked[0].to_lowercase().contains("budget"), "{:?}", asked[0]);
         let stored = store::load(pool, JOB).await.unwrap().unwrap();
         assert_eq!(stored.manifest.branches["branch"].state, "parked");
+    }
+
+    #[test]
+    fn a_transcript_below_half_the_leaf_budget_fits_a_resume() {
+        assert!(fits_for_resume(59_999, 120_000));
+        assert!(!fits_for_resume(60_000, 120_000));
+        assert!(!fits_for_resume(0, 120_000));
+        assert!(!fits_for_resume(-5, 120_000));
+    }
+
+    async fn seed_resume_run(pool: &SqlitePool, run: i64, status: &str, fill: Option<i64>) {
+        sqlx::query(
+            "INSERT INTO runs (id, prompt, status, session_id, context_fill, created_at) \
+             VALUES (?, 'p', ?, 'sess-abc', ?, ?)",
+        )
+        .bind(run)
+        .bind(status)
+        .bind(fill)
+        .bind(CREATED)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    fn worktree_launch() -> StoredLaunch {
+        StoredLaunch {
+            node_id: NODE.to_owned(),
+            key: "initial".to_owned(),
+            prompt: "original prompt".to_owned(),
+            project_id: Some("proj".to_owned()),
+            cwd: Some("C:/nowhere".to_owned()),
+            mode: "worktree".to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_run_with_a_small_transcript_resumes_its_session() {
+        let (state, _runner) = crate::execution::runs::testkit::test_state_with_runner(
+            Some(Duration::from_secs(60)),
+            Duration::from_secs(600),
+        )
+        .await;
+        seed_resume_run(&state.pool, 81, "interrupted", Some(40_000)).await;
+
+        let session = resumable_session(&state, &worktree_launch(), "81").await;
+
+        assert_eq!(session.as_deref(), Some("sess-abc"));
+    }
+
+    #[tokio::test]
+    async fn a_full_failed_unmeasured_or_wrapped_run_restarts_cold() {
+        let (state, _runner) = crate::execution::runs::testkit::test_state_with_runner(
+            Some(Duration::from_secs(60)),
+            Duration::from_secs(600),
+        )
+        .await;
+        seed_resume_run(&state.pool, 82, "interrupted", Some(90_000)).await;
+        seed_resume_run(&state.pool, 83, "failed", Some(10_000)).await;
+        seed_resume_run(&state.pool, 84, "interrupted", None).await;
+        seed_resume_run(&state.pool, 85, "interrupted", Some(10_000)).await;
+        sqlx::query("UPDATE runs SET successor_run_id = 82 WHERE id = 85")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        for run in ["82", "83", "84", "85"] {
+            assert_eq!(
+                resumable_session(&state, &worktree_launch(), run).await,
+                None,
+                "run {run}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_run_of_another_runner_restarts_cold() {
+        let (state, _runner) = crate::execution::runs::testkit::test_state_with_runner(
+            Some(Duration::from_secs(60)),
+            Duration::from_secs(600),
+        )
+        .await;
+        for (run, runner) in [(87, "codex"), (88, "agy"), (89, "claude")] {
+            seed_resume_run(&state.pool, run, "interrupted", Some(10_000)).await;
+            sqlx::query("UPDATE runs SET runner = ? WHERE id = ?")
+                .bind(runner)
+                .bind(run)
+                .execute(&state.pool)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(resumable_session(&state, &worktree_launch(), "87").await, None);
+        assert_eq!(resumable_session(&state, &worktree_launch(), "88").await, None);
+        assert_eq!(
+            resumable_session(&state, &worktree_launch(), "89").await.as_deref(),
+            Some("sess-abc")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_launch_that_is_not_a_tree_run_never_resumes() {
+        let (state, _runner) = crate::execution::runs::testkit::test_state_with_runner(
+            Some(Duration::from_secs(60)),
+            Duration::from_secs(600),
+        )
+        .await;
+        seed_resume_run(&state.pool, 86, "interrupted", Some(10_000)).await;
+        let mut launch = worktree_launch();
+        launch.mode = "shadow".to_owned();
+
+        assert_eq!(resumable_session(&state, &launch, "86").await, None);
     }
 }

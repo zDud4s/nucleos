@@ -330,11 +330,11 @@ impl CommandRunner for ClaudeCliRunner {
         // restarts left 31 orphaned sidecars, each holding the loopback port its own replacement
         // then died trying to bind.
         //
-        // A one-turn run is already bounded by its turn and is not enrolled. A CLI held idle
-        // between a conversation's turns is exactly the shape of thing that incident was about.
-        if turn_events.is_some()
-            && let Some(pid) = child.id()
-        {
+        // Every run is enrolled, one-turn ones included: a turn is bounded only while the daemon is
+        // alive to enforce it, and a hard-killed daemon left the CLI (and its cargo/git) running
+        // against a worktree the next boot then reused. `KEPT_ALIVE` is a `Litter`, so the kernel
+        // takes the whole tree down when this process goes; `TreeKiller` keeps its disarm semantics.
+        if let Some(pid) = child.id() {
             KEPT_ALIVE.adopt(pid);
         }
 

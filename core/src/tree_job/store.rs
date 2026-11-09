@@ -271,6 +271,22 @@ pub async fn launch_recovering(
     cwd: Option<String>,
     mode: &str,
 ) -> Result<i64, super::node_run::NodeRunError> {
+    launch_recovering_resuming(state, node_id, key, prompt, project_id, cwd, mode, None).await
+}
+
+/// [`launch_recovering`] that continues a session when `resume` is given. The stored launch keeps
+/// the FULL `prompt`, so a later cold relaunch of the node still has the whole packet.
+#[allow(clippy::too_many_arguments)]
+pub async fn launch_recovering_resuming(
+    state: &crate::state::AppState,
+    node_id: &str,
+    key: &str,
+    prompt: String,
+    project_id: Option<String>,
+    cwd: Option<String>,
+    mode: &str,
+    resume: Option<super::node_run::ResumeFrom>,
+) -> Result<i64, super::node_run::NodeRunError> {
     // Stored before the run is created: a crash between the two would otherwise leave a key with
     // nothing to start it again from. The first write per key stays, as the launch itself does.
     super::open::save_launch(
@@ -285,7 +301,9 @@ pub async fn launch_recovering(
         },
     )
     .await?;
-    let outcome = super::node_run::launch(state, node_id, key, prompt, project_id, cwd, mode).await;
+    let outcome =
+        super::node_run::launch_resuming(state, node_id, key, prompt, project_id, cwd, mode, resume)
+            .await;
     if let Err(super::node_run::NodeRunError::Create(_)) = &outcome {
         // Best effort: the create error is the answer, and a failed clear only leaves the old
         // behaviour (the key stays spent until the next boot).

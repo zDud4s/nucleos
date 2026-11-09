@@ -664,6 +664,7 @@ pub async fn create_run(
                 provisioning: None,
                 permission_mode: req.permission_mode,
                 account_choice,
+                resume_session_id: None,
             },
         )
         .await

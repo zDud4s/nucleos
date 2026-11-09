@@ -373,6 +373,10 @@ impl CommandRunner for AgyCliRunner {
         // Declared after the child so it drops first; see `TreeKiller`.
         let mut tree_killer = child.id().map(TreeKiller::new);
         let _cli_pid = super::cli_pids::register(&request.env, child.id());
+        // Held by the kernel so a hard-killed daemon takes the CLI's whole tree with it.
+        if let Some(pid) = child.id() {
+            KEPT_ALIVE.adopt(pid);
+        }
 
         let stdout = child.stdout.take().expect("stdout piped above");
         let stderr = child.stderr.take().expect("stderr piped above");

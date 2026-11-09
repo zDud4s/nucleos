@@ -98,6 +98,7 @@ async fn create_run_inner_with_mcp_box(
             provisioning: None,
             permission_mode: None,
             account_choice: None,
+            resume_session_id: None,
         },
         None,
         worktree_mcp_box,
@@ -222,6 +223,21 @@ pub async fn create_tree_node_run(
         true,
     )
     .await
+}
+
+/// [`create_tree_node_run`] that continues `resume_session_id` headless (`-p --resume`) instead of
+/// starting a session of its own. The caller has already decided the session fits.
+pub async fn create_tree_node_run_resuming(
+    state: &AppState,
+    prompt: String,
+    project_id: String,
+    project_root: String,
+    tree: TreeWorktree,
+    resume_session_id: Option<String>,
+) -> Result<i64, CreateRunError> {
+    let mut run = NewRun::provisioned(prompt, project_id, project_root, Provisioning::Tree(tree));
+    run.resume_session_id = resume_session_id;
+    create_run_with_policy(state, run, None, true).await
 }
 
 /// What a run is handed to start from, when it is handed anything at all.
@@ -399,6 +415,8 @@ pub(super) struct NewRun<'a> {
     pub(super) permission_mode: Option<crate::chats::PermissionMode>,
     /// What the caller asked for in the account pool; NULL = the settings default.
     pub(super) account_choice: Option<crate::accounts::AccountChoice>,
+    /// The CLI session this run continues headless (`-p --resume <id>`), or `None` for a fresh one.
+    pub(super) resume_session_id: Option<String>,
 }
 
 impl NewRun<'static> {
@@ -433,6 +451,7 @@ impl NewRun<'static> {
             provisioning: Some(provisioning),
             permission_mode: None,
             account_choice: None,
+            resume_session_id: None,
         }
     }
 }
@@ -468,6 +487,7 @@ pub async fn create_no_tools_run(
             provisioning: None,
             permission_mode: None,
             account_choice: None,
+            resume_session_id: None,
         },
         Some(crate::execution::runner::ToolPolicy::None),
         false,
@@ -492,6 +512,7 @@ async fn create_run_with_policy(
         provisioning,
         permission_mode,
         account_choice,
+        resume_session_id,
     } = run;
     let node = provisioning.as_ref().and_then(Provisioning::node);
     let resolution = provisioning.as_ref().and_then(Provisioning::resolution);
@@ -1045,7 +1066,7 @@ async fn create_run_with_policy(
                 .or(resolution.map(|_| crate::execution::runner::RESOLVE_STAGE))
                 .map(str::to_owned),
             item: item_context,
-            resume: false,
+            resume: resume_session_id.is_some(),
             restrict_runners: restrict_by_account(
                 &state.pool,
                 id,
@@ -1124,7 +1145,7 @@ async fn create_run_with_policy(
         project_id,
         spawn_cwd,
         permission,
-        None,
+        resume_session_id,
         session_id,
         false,
         completion_feed,
