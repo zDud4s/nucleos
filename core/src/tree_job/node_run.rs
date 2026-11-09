@@ -372,6 +372,27 @@ pub async fn launch(
     cwd: Option<String>,
     mode: &str,
 ) -> Result<i64, NodeRunError> {
+    launch_resuming(state, node_id, key, prompt, project_id, cwd, mode, None).await
+}
+
+/// A session to continue instead of starting a cold one: the CLI session id, and the short prompt
+/// the continued session is given (it already holds the node packet).
+pub type ResumeFrom = (String, String);
+
+/// [`launch`], continuing `resume` headless (`-p --resume`) when the node runs as a tree run. A
+/// launch that is not one (no tree row, no worktree) has no session to continue in and starts cold
+/// from the full `prompt`, so a resume is never given only the short continuation.
+#[allow(clippy::too_many_arguments)]
+pub async fn launch_resuming(
+    state: &AppState,
+    node_id: &str,
+    key: &str,
+    prompt: String,
+    project_id: Option<String>,
+    cwd: Option<String>,
+    mode: &str,
+    resume: Option<ResumeFrom>,
+) -> Result<i64, NodeRunError> {
     let pool = &state.pool;
     let exists: Option<String> = sqlx::query_scalar("SELECT id FROM work_nodes WHERE id = ?")
         .bind(node_id)
@@ -425,12 +446,17 @@ pub async fn launch(
     };
     let run_id = match tree_run {
         Some((project_id, project_root, tree)) => {
-            crate::execution::runs::create_tree_node_run(
+            let (prompt, session) = match resume {
+                Some((session, continuation)) => (continuation, Some(session)),
+                None => (prompt, None),
+            };
+            crate::execution::runs::create_tree_node_run_resuming(
                 state,
                 prompt,
                 project_id,
                 project_root,
                 tree,
+                session,
             )
             .await?
         }

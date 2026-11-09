@@ -620,6 +620,10 @@ impl CommandRunner for CodexCliRunner {
         // a build still holding locks inside the worktree the run was supposed to release.
         let mut tree_killer = child.id().map(TreeKiller::new);
         let _cli_pid = super::cli_pids::register(&request.env, child.id());
+        // Held by the kernel so a hard-killed daemon takes the CLI's whole tree with it.
+        if let Some(pid) = child.id() {
+            KEPT_ALIVE.adopt(pid);
+        }
 
         // The prompt, then EOF, from its own task so a large one cannot block the stdout loop. The
         // writer drops at the end of the task, which is the EOF `codex exec` waits for.
