@@ -734,6 +734,31 @@ def test_composition_of_accepted_parts_and_closing_tails():
         deny(fx.verdict("PowerShell", {"command": f"cd {inside} ; & {G} status"}), "call operator on git")
 
 
+def test_spec_loop_start_allowed_only_from_the_bundle_dir():
+    with fixture("on") as fx:
+        bundle = os.path.join(os.path.dirname(fx.cwd), "bundle", "1.0")
+        os.makedirs(os.path.join(fx.cwd, ".nucleos", "workflow"), exist_ok=True)
+        with open(os.path.join(fx.cwd, ".nucleos", "workflow", "project.json"), "w", encoding="utf-8") as handle:
+            json.dump({"state_dir": fx.state_dir, "bundle_dir": bundle}, handle)
+        script = os.path.join(bundle, "scripts", "spec_loop.py").replace("\\", "/")
+        for command in (
+            f'python "{script}" start docs/spec.md "C9"',
+            f"python {script} start docs/spec.md",
+        ):
+            allow(fx.verdict("Bash", {"command": command}), repr(command))
+        other = os.path.join(fx.cwd, "spec_loop.py").replace("\\", "/")
+        for command in (
+            f'python "{script}" tick',
+            f'python "{script}" --stop-hook',
+            f'python "{script}"',
+            f'python "{other}" start docs/spec.md',
+            f'python "{script}.evil" start x',
+            f'python "{script}" start x; rm y',
+            'python scripts/spec_loop.py start x',
+        ):
+            deny(fx.verdict("Bash", {"command": command}), repr(command))
+
+
 def test_broker_runs_cargo_go_node_and_status():
     with fixture("on") as fx:
         for command in (
@@ -1458,6 +1483,7 @@ TESTS = [
     test_grep_and_glob_on_a_file_cost_like_a_read,
     test_git_bash_drive_paths_are_understood_on_windows,
     test_composition_of_accepted_parts_and_closing_tails,
+    test_spec_loop_start_allowed_only_from_the_bundle_dir,
     test_broker_runs_cargo_go_node_and_status,
     test_daemon_script_and_verify_ticket_accepted,
     test_small_read_only_commands_and_list_agents,
