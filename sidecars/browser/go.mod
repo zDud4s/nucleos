@@ -1,6 +1,6 @@
 module nucleosbrowser
 
-go 1.26
+go 1.26.0
 
 // Pinned, not left to whatever the machine has. `go 1.26` above is a language floor and says nothing
 // about which stdlib gets compiled in, and the stdlib is where this process's exposure lives:
@@ -15,7 +15,7 @@ toolchain go1.26.6
 // The first dependency, for one package: x/net/publicsuffix, which the ferry needs to tell whether a
 // request is same-site (SameSite cookies). A site is a registrable domain, and that cannot be
 // computed without the public suffix list.
-require golang.org/x/net v0.57.0
+require golang.org/x/net v0.62.0
 
 require nucleoschannelkit v0.0.0
 

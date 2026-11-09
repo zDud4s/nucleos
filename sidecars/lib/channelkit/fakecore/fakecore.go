@@ -53,27 +53,27 @@ type Core struct {
 	srv *httptest.Server
 	mux *http.ServeMux
 
-	mu         sync.Mutex
-	changed    chan struct{}
-	down       bool
-	faults     map[string][]*fault
-	calls      map[string]int
-	lastCall   map[string]time.Time
-	hello      *contract.Hello
-	helloCount int
-	onHello    func(contract.Hello)
-	events     []contract.Event
-	seen       map[string]bool
-	invalid    []string
-	media      map[string]storedMedia
-	mediaSeq   int
-	mediaLimit int64
-	outbox     *queue            // guarded by mu; created by mountOutbox
-	polls      int               // outbox long-polls being served right now; guarded by mu
-	staleAcks  int               // acks refused because their lease generation was superseded
+	mu          sync.Mutex
+	changed     chan struct{}
+	down        bool
+	faults      map[string][]*fault
+	calls       map[string]int
+	lastCall    map[string]time.Time
+	hello       *contract.Hello
+	helloCount  int
+	onHello     func(contract.Hello)
+	events      []contract.Event
+	seen        map[string]bool
+	invalid     []string
+	media       map[string]storedMedia
+	mediaSeq    int
+	mediaLimit  int64
+	outbox      *queue            // guarded by mu; created by mountOutbox
+	polls       int               // outbox long-polls being served right now; guarded by mu
+	staleAcks   int               // acks refused because their lease generation was superseded
 	staleRenews int               // renewals refused for the same reason
-	ackGens    map[uint64]uint64 // generation carried by the last accepted ack, by id
-	fallback   func(reason string, failed contract.Action)
+	ackGens     map[uint64]uint64 // generation carried by the last accepted ack, by id
+	fallback    func(reason string, failed contract.Action)
 }
 
 // New starts the fake core; it is closed when the test ends. clk is the same

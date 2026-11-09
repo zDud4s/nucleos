@@ -703,6 +703,9 @@ const REMOTE_ADMIN_SEGMENTS: &[&str] = &[
     "voice",
     "waiting",
     "web",
+    // Admin-only on a paired device: the machine-default mode of a workflow parameter, the
+    // owner door beside `settings` (the per-project routes live under `projects`).
+    "workflow-params",
     "workflows",
     "worktrees",
 ];

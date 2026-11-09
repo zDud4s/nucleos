@@ -1568,9 +1568,21 @@ mod tests {
         let long_b = format!("{}b", "x".repeat(100));
         let a = dir_leaf(TREE, &long_a);
         assert_eq!(a.chars().count(), MAX_DIR_LEAF, "{a}");
-        assert_eq!(a, dir_leaf(TREE, &long_a), "the same name, the same directory");
-        assert_ne!(a, dir_leaf(TREE, &long_b), "a shared prefix must not collide");
-        assert_eq!(dir_leaf(TREE, BRANCH), "job-1-api", "a short name is untouched");
+        assert_eq!(
+            a,
+            dir_leaf(TREE, &long_a),
+            "the same name, the same directory"
+        );
+        assert_ne!(
+            a,
+            dir_leaf(TREE, &long_b),
+            "a shared prefix must not collide"
+        );
+        assert_eq!(
+            dir_leaf(TREE, BRANCH),
+            "job-1-api",
+            "a short name is untouched"
+        );
         assert!(
             worktree_path(Path::new("/r"), TREE, &long_a)
                 .to_string_lossy()

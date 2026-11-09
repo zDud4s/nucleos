@@ -629,9 +629,7 @@ pub fn land_target_admits(pattern: &str, branch: &str) -> bool {
                 }
                 false
             }
-            Some(byte) => {
-                text.first() == Some(byte) && glob(&pattern[1..], &text[1..])
-            }
+            Some(byte) => text.first() == Some(byte) && glob(&pattern[1..], &text[1..]),
         }
     }
     if !pattern.contains('*') {
@@ -645,12 +643,12 @@ pub fn land_target_admits(pattern: &str, branch: &str) -> bool {
 /// a wildcard-everything target, and the typo guard in `land::resolve_target` depends on it.
 pub fn check_land_target_entry(entry: &str) -> Result<(), String> {
     let entry = entry.trim();
-    if let Some(star) = entry.find('*') {
-        if !entry[..star].contains('/') {
-            return Err(format!(
-                "land target pattern {entry:?} needs a literal prefix ending in a path segment, such as feat/*"
-            ));
-        }
+    if let Some(star) = entry.find('*')
+        && !entry[..star].contains('/')
+    {
+        return Err(format!(
+            "land target pattern {entry:?} needs a literal prefix ending in a path segment, such as feat/*"
+        ));
     }
     Ok(())
 }
@@ -1461,10 +1459,16 @@ mod tests {
     async fn a_bare_wildcard_land_target_is_refused_at_declare() {
         let pool = pool().await;
         for bad in ["*", "**", "fe*"] {
-            assert!(declare_land_target(&pool, "alpha", bad).await.is_err(), "{bad}");
+            assert!(
+                declare_land_target(&pool, "alpha", bad).await.is_err(),
+                "{bad}"
+            );
         }
         declare_land_target(&pool, "alpha", "feat/*").await.unwrap();
-        assert_eq!(land_targets(&pool, "alpha").await, vec!["feat/*".to_owned()]);
+        assert_eq!(
+            land_targets(&pool, "alpha").await,
+            vec!["feat/*".to_owned()]
+        );
     }
 
     #[tokio::test]

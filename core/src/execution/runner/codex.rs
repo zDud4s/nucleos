@@ -926,7 +926,10 @@ mod tests {
         );
         let args = codex_cli_args(&request, "gpt-5.6-terra", &CodexStaged::default()).unwrap();
         assert_eq!(args.last().map(String::as_str), Some("-"), "{args:?}");
-        assert!(!args.iter().any(|a| a.contains("run the tests")), "{args:?}");
+        assert!(
+            !args.iter().any(|a| a.contains("run the tests")),
+            "{args:?}"
+        );
         // The prompt now travels on stdin; this is the text the caller writes there.
         let sent = prompt_with_filter_rule(&request);
         assert!(sent.starts_with("run the tests"), "{sent}");

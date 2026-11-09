@@ -689,7 +689,7 @@ mod tests {
 
         assert_eq!(args.first().map(String::as_str), Some("-p"));
         assert!(
-            !args.iter().any(|arg| *arg == request.prompt),
+            !args.contains(&request.prompt),
             "the prompt goes on stdin, never argv (os error 206): {args:?}"
         );
         assert_eq!(args.get(1).map(String::as_str), Some("--model"), "{args:?}");
@@ -1030,6 +1030,12 @@ mod tests {
         );
     }
 
+    thread_local! {
+        /// The wrapper program `fake_cli` last wrote on this thread, taken by `FakeClaudeBin::set`.
+        static FAKE_CLI_WRAPPER: std::cell::RefCell<Option<String>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
     /// Points `NUCLEOS_CLAUDE_BIN` at a program for as long as it lives, and puts the previous value
     /// back on drop.
     ///
@@ -1045,6 +1051,11 @@ mod tests {
         fn set(program: &str) -> Self {
             let lock = crate::execution::worktree::test_env_lock();
             let previous = std::env::var_os("NUCLEOS_CLAUDE_BIN");
+            // The wrapper `fake_cli` wrote on this thread, when there is one: the runner now sends
+            // the prompt on stdin, so `sh` cannot be the program itself (it would be handed
+            // `-p --model ...` and reject `--model`).
+            let wrapper = FAKE_CLI_WRAPPER.with(|slot| slot.borrow_mut().take());
+            let program = wrapper.as_deref().unwrap_or(program);
             unsafe { std::env::set_var("NUCLEOS_CLAUDE_BIN", program) };
             Self {
                 previous,
@@ -1075,19 +1086,41 @@ mod tests {
         script
     }
 
-    /// A request whose CLI is `script`, spawned through the real runner loop with `sh` as the
-    /// program — so the test holds a [`FakeClaudeBin`] set to `"sh"`.
+    /// A request whose CLI is `script`, spawned through the real runner loop. The test then holds a
+    /// [`FakeClaudeBin`] (`set("sh")`), which points `NUCLEOS_CLAUDE_BIN` at a tiny wrapper written
+    /// here that runs the script with `sh`.
     ///
-    /// It works because of where the runner puts things: `-p` first and a non-steerable run's
-    /// prompt second, so a prompt that is the script's path makes `sh -p <script> <flags...>` run
-    /// it, every flag after arriving as a positional argument it ignores. `-p` is `sh`'s own
-    /// privileged-mode switch and harmless here. One script for every platform where a `.bat` would
-    /// serve one, and `sh` is the program the gate tests already need.
+    /// A wrapper because the runner sends the prompt on stdin and puts only flags on argv
+    /// (`-p --model ...`), so `sh` itself cannot be the program: it would reject `--model`. The
+    /// wrapper ignores every flag and stdin and just runs the script. A `.cmd` on Windows (a program
+    /// `Command` can spawn), an executable `#!/bin/sh` file elsewhere.
     fn fake_cli(dir: &std::path::Path, script: &str) -> RunRequest {
         let path = dir.join("fake-claude.sh");
         std::fs::write(&path, script).expect("write the fake CLI");
         // Forward slashes: on Windows `sh` is MSYS, which reads `C:/...` reliably.
-        test_run_request(&path.display().to_string().replace('\\', "/"))
+        let script_path = path.display().to_string().replace('\\', "/");
+        let wrapper = if cfg!(windows) {
+            let wrapper = dir.join("fake-claude.cmd");
+            std::fs::write(
+                &wrapper,
+                format!("@echo off\r\nsh \"{script_path}\"\r\nexit /b %ERRORLEVEL%\r\n"),
+            )
+            .expect("write the fake CLI wrapper");
+            wrapper
+        } else {
+            let wrapper = dir.join("fake-claude-wrapper.sh");
+            std::fs::write(&wrapper, format!("#!/bin/sh\nexec sh \"{script_path}\"\n"))
+                .expect("write the fake CLI wrapper");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+                    .expect("make the wrapper executable");
+            }
+            wrapper
+        };
+        FAKE_CLI_WRAPPER.with(|slot| *slot.borrow_mut() = Some(wrapper.display().to_string()));
+        test_run_request(&script_path)
     }
 
     fn claude_runner() -> ClaudeCliRunner {
@@ -4056,11 +4089,7 @@ mod tests {
         assert_eq!(&args[..2], ["exec", "resume"], "{args:?}");
         assert!(!args.iter().any(|arg| arg == "-C"), "{args:?}");
         assert!(!args.iter().any(|arg| arg == "--add-dir"), "{args:?}");
-        assert_eq!(
-            &args[args.len() - 2..],
-            ["sess-1", "-"],
-            "{args:?}"
-        );
+        assert_eq!(&args[args.len() - 2..], ["sess-1", "-"], "{args:?}");
     }
 
     #[test]
@@ -4214,11 +4243,7 @@ mod tests {
                 "{args:?}"
             );
         }
-        assert_eq!(
-            args.last().map(String::as_str),
-            Some("-"),
-            "{args:?}"
-        );
+        assert_eq!(args.last().map(String::as_str), Some("-"), "{args:?}");
 
         let too_few = CodexStaged {
             mcp_overrides: Vec::new(),

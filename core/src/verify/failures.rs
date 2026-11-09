@@ -373,15 +373,17 @@ mod tests {
 
         let libtest = "      test a::ok ... ok\n      test verify::boom ... FAILED\n      \
                        test result: FAILED. 1 passed; 1 failed; 0 ignored\n";
-        assert_eq!(ids(&extract(libtest).expect("libtest ids")), ["verify::boom"]);
+        assert_eq!(
+            ids(&extract(libtest).expect("libtest ids")),
+            ["verify::boom"]
+        );
     }
 
     /// The ids come from the whole output, not from the 4000-character tail kept in the row.
     #[test]
     fn ids_survive_a_failure_far_before_the_tail() {
-        let mut out = String::from(
-            "test early::boom ... FAILED\ntest result: FAILED. 0 passed; 1 failed\n",
-        );
+        let mut out =
+            String::from("test early::boom ... FAILED\ntest result: FAILED. 0 passed; 1 failed\n");
         out.push_str(&"x".repeat(10_000));
         assert_eq!(ids(&extract(&out).expect("ids")), ["early::boom"]);
     }

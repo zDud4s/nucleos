@@ -346,7 +346,7 @@ impl CommandRunner for ClaudeCliRunner {
         // whole of the lifetime rule: with no channel it ends after the opening turn, which is the
         // one-turn run the argv path performs; with one it ends when the sender is dropped, or when
         // the abort below reaps it.
-        let mut steering_task = None;
+        let mut steering_task;
         if !request.steerable {
             // Plain-text prompt, then EOF. In its own task so a prompt larger than the pipe buffer
             // cannot block the stdout loop; dropping the writer at the end of the task is the EOF.

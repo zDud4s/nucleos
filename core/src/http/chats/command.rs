@@ -804,10 +804,10 @@ mod tests {
         // The prompt no longer rides on argv: codex reads it from stdin via the trailing `-`, and
         // claude's args carry no prompt either. Both runners are handed `request.prompt` verbatim.
         assert_eq!(args.last().map(String::as_str), Some("-"), "{args:?}");
-        assert!(!args.iter().any(|a| *a == claude), "{args:?}");
+        assert!(!args.contains(&claude), "{args:?}");
         let codex = request.prompt.clone();
         let claude_args = crate::execution::runner::cli_args(&request, "sonnet");
-        assert!(!claude_args.iter().any(|a| *a == claude), "{claude_args:?}");
+        assert!(!claude_args.contains(&claude), "{claude_args:?}");
 
         let local = local_input(crate::chats::Brain::Local, dir.path()).await;
         let openrouter = local_input(crate::chats::Brain::OpenRouter, dir.path()).await;

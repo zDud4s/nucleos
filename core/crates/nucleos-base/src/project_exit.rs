@@ -150,6 +150,7 @@ const PROJECT_SCOPED: &[&str] = &[
     // project (`project_id` NULL) never match a project id, so they stay.
     "work_nodes",
     // The workflow ledgers a project's tasks wrote are that project's history too.
+    "workflow_param_history",
     "workflow_records",
     "worktree_touched_paths",
     "worktrees",

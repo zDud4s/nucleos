@@ -1,6 +1,6 @@
 module nucleosweb
 
-go 1.26
+go 1.26.0
 
 // Pinned, not left to whatever the machine has. The `go` line above is a language floor and says
 // nothing about which stdlib gets compiled in, and the stdlib is where this process's exposure
@@ -16,7 +16,7 @@ require github.com/mackee/go-readability v0.3.1
 // were in golang.org/x/net/html, reached by extract.Extract -> readability.ParseHTML -> html.Parse:
 // this sidecar's whole job is running that parser over HTML a stranger wrote, so a parser DoS is
 // the one class of bug it is guaranteed to be handed.
-require golang.org/x/net v0.55.0 // indirect
+require golang.org/x/net v0.62.0 // indirect
 
 require nucleoschannelkit v0.0.0
 

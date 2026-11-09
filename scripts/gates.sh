@@ -612,12 +612,20 @@ if [ "$target" = security ]; then
     echo "cargo-audit missing — run cargo install cargo-audit --locked first" >&2
     failures="$failures  security: cargo-audit not installed"$'\n'
   else
-    # Advisories the project has consciously accepted, one `--ignore <ID>` per entry. Empty on
+    # Advisories the project has consciously accepted, one `--ignore <ID>` per entry. Kept short on
     # purpose: a silent ignore hides a real finding, so every ID added here needs a reason beside it.
     # TODO(controller): after a real `cargo audit` run, list the RUSTSEC ids of the unmaintained
     # gtk3-family crates (pulled in by tauri/wry on Linux) here, each with a one-line reason and a
     # revisit date. Do not guess ids.
-    audit_ignore=()
+    audit_ignore=(
+      # RUSTSEC-2026-0459: libsqlite3-sys 0.37.0 bundles a C SQLite with CVE-2026-119375 (medium,
+      # 6.8); fixed in libsqlite3-sys >=0.39.0. Not fixable yet: it arrives only through sqlx 0.9.0,
+      # whose sqlx-sqlite caps libsqlite3-sys at <0.38 (sqlx main widens that to <0.40, unreleased).
+      # Accepted for now: exploiting it needs the app to open an attacker-written .db together with
+      # a -wal of a different page size, and NucleOS opens only databases it created itself.
+      # Remove once sqlx releases a version allowing libsqlite3-sys >=0.39; review by 2026-12-09.
+      RUSTSEC-2026-0459
+    )
     audit_args=()
     for id in ${audit_ignore[@]+"${audit_ignore[@]}"}; do audit_args+=(--ignore "$id"); done
     run "security: deps" . cargo audit ${audit_args[@]+"${audit_args[@]}"}

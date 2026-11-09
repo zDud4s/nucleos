@@ -494,9 +494,12 @@ mod tests {
             answer.contains("\\n") && !answer.contains('\n'),
             "the fixture is not a rendered document, so it would prove nothing: {answer}"
         );
-        let result = answer
+        let rmcp::model::CallToolResponse::Complete(result) = answer
             .into_call_tool_result()
-            .expect("a String is never an error result");
+            .expect("a String is never an error result")
+        else {
+            panic!("a String no longer becomes a finished result");
+        };
         assert!(
             result.structured_content.is_none(),
             "rmcp now fills the structured half for a String, so the text block is no longer the \
@@ -2901,8 +2904,11 @@ mod tests {
         )
     }
 
-    fn reached_the_daemon(answer: &Result<rmcp::model::CallToolResult, rmcp::ErrorData>) -> bool {
-        answer.as_ref().is_ok_and(|result| {
+    fn reached_the_daemon(answer: &Result<rmcp::model::CallToolResponse, rmcp::ErrorData>) -> bool {
+        answer.as_ref().is_ok_and(|response| {
+            let rmcp::model::CallToolResponse::Complete(result) = response else {
+                return false;
+            };
             result.content.iter().any(|block| {
                 matches!(block, rmcp::model::ContentBlock::Text(text)
                     if text.text.contains("error sending request"))
@@ -2911,18 +2917,19 @@ mod tests {
     }
 
     fn refusal_names(
-        answer: &Result<rmcp::model::CallToolResult, rmcp::ErrorData>,
+        answer: &Result<rmcp::model::CallToolResponse, rmcp::ErrorData>,
         name: &str,
     ) -> bool {
         match answer {
             Err(error) => error.message.contains(name),
-            Ok(result) => {
+            Ok(rmcp::model::CallToolResponse::Complete(result)) => {
                 result.is_error == Some(true)
                     && result.content.iter().any(|block| {
                         matches!(block, rmcp::model::ContentBlock::Text(text)
                             if text.text.contains(name))
                     })
             }
+            Ok(_) => false,
         }
     }
 
@@ -3262,14 +3269,18 @@ mod tests {
                 .clone(),
             )
         };
-        let reached_the_daemon = |answer: &Result<rmcp::model::CallToolResult, rmcp::ErrorData>| {
-            answer.as_ref().is_ok_and(|result| {
-                result.content.iter().any(|block| {
-                    matches!(block, rmcp::model::ContentBlock::Text(text)
+        let reached_the_daemon =
+            |answer: &Result<rmcp::model::CallToolResponse, rmcp::ErrorData>| {
+                answer.as_ref().is_ok_and(|response| {
+                    let rmcp::model::CallToolResponse::Complete(result) = response else {
+                        return false;
+                    };
+                    result.content.iter().any(|block| {
+                        matches!(block, rmcp::model::ContentBlock::Text(text)
                         if text.text.contains("error sending request"))
+                    })
                 })
-            })
-        };
+            };
 
         let answer = unboxed_server().call_tool(request(), context.clone()).await;
         assert!(
@@ -3279,13 +3290,14 @@ mod tests {
         );
         let refusal_is_visible = match &answer {
             Err(error) => error.message.contains("note_finding"),
-            Ok(result) => {
+            Ok(rmcp::model::CallToolResponse::Complete(result)) => {
                 result.is_error == Some(true)
                     && result.content.iter().any(|block| {
                         matches!(block, rmcp::model::ContentBlock::Text(text)
                             if text.text.contains("note_finding"))
                     })
             }
+            Ok(_) => false,
         };
         assert!(
             refusal_is_visible,

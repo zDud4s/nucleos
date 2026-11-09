@@ -119,6 +119,9 @@ const FORWARDED: Record<string, Record<string, string[]>> = {
   // A test-only module (`#[cfg(test)] mod port_tests_commands;`): its `feed_line` helper forwards
   // the kind each test passes, so it writes no kind of the product's own.
   "channels/port_tests_commands.rs": { kind: [] },
+  // `param_store::append` appends a parameter's history row, not a feed line; its third argument is
+  // the bundle, so it names no kind (the store's own `feed::append_on` writes the kinds).
+  "workflows/param_service.rs": { "ctx.bundle": [] },
   "governance/triage.rs": { 'format!("email_{}",verdict.class)': [] },
   // `announce_close` writes the kind `work_nodes::feed_line` picked for the closed node.
   "http/nodes.rs": { kind: ["work_tree_parked", "work_tree_finished"] },

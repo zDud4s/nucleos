@@ -46,6 +46,10 @@ func TestCapsHello(t *testing.T) {
 		t.Fatalf("DecodeStrict: %v", err)
 	}
 	want, _ := contract.DecodeStrict[contract.Hello](helloFixture(t))
+	// The fixture pins the contract version it was written against (a compatible
+	// older minor), while the adapter always announces contract.Version, so the
+	// version is asserted above and left out of this comparison.
+	want.Version = h.Version
 	if !reflect.DeepEqual(h, want) {
 		t.Fatalf("hello differs from fixture")
 	}

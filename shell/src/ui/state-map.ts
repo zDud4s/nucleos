@@ -330,6 +330,9 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     // because it is a thing somebody is asked to look at; nothing was started on its account.
     health_breach_intent: { tone: "pending", label: "health breach recorded" },
     workflow_changed: { tone: "info", label: "workflow changed" },
+    // A workflow parameter's new value, or its mode set or cleared (`workflows/param_store.rs`).
+    workflow_param_written: { tone: "info", label: "workflow parameter written" },
+    workflow_param_mode: { tone: "info", label: "workflow parameter mode changed" },
     command_finished: { tone: "info", label: "project command finished" },
     action_authorized: { tone: "info", label: "action authorised by a grant" },
     proposal_record_failed: { tone: "danger", label: "proposal not recorded" },

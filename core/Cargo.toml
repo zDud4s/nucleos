@@ -62,7 +62,7 @@ rand = "0.10.2"
 # `multipart` is for `transcribe.rs`'s resident transcriber: whisper.cpp's server takes the audio
 # as a file upload, which is its contract and not ours to choose.
 reqwest = { version = "0.13", default-features = false, features = ["json", "multipart", "native-tls"] }
-rmcp = { version = "2.2", features = ["server", "macros", "transport-io"] }
+rmcp = { version = "3.9", features = ["server", "macros", "transport-io"] }
 # `route_index` only. Same 1.x line rmcp already resolves, so the lock keeps one copy; `derive` is a default feature.
 schemars = "1.2"
 serde = { version = "1.0.228", features = ["derive"] }

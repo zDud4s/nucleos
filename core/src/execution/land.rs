@@ -363,7 +363,8 @@ async fn resolve_target(
     if recorded
         .iter()
         .any(|entry| crate::project::policy::land_target_admits(entry, requested))
-        || escalation_target == Some(requested) {
+        || escalation_target == Some(requested)
+    {
         // Validated BEFORE it reaches git, because `declare_land_target` trims a branch name but
         // does not check it: a name `Branch::new` rejects would otherwise be told it does not
         // exist, which sends the caller looking for a missing branch when the problem is the name
@@ -1700,8 +1701,15 @@ mod tests {
             .await
             .expect("feat/one matches feat/* and exists");
         assert_eq!(admitted.as_str(), "feat/one");
-        let refused =
-            resolve_target(&pool, "alpha", &repo, Some("feat/one/deep"), None, deadline()).await;
+        let refused = resolve_target(
+            &pool,
+            "alpha",
+            &repo,
+            Some("feat/one/deep"),
+            None,
+            deadline(),
+        )
+        .await;
         assert!(refused.is_err());
     }
 

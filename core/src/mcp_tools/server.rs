@@ -136,8 +136,8 @@ impl ServerHandler for NucleosTools {
     /// are siblings rather than nested, and no marker can enclose one — so for a picture the
     /// boundary announces rather than delimits, and the only thing that can close that gap is
     /// saying so.
-    fn get_info(&self) -> rmcp::model::ServerInfo {
-        rmcp::model::ServerInfo::new(
+    fn get_info(&self) -> rmcp::model::ServerConfig {
+        rmcp::model::ServerConfig::new(
             rmcp::model::ServerCapabilities::builder()
                 .enable_tools()
                 .build(),
@@ -164,14 +164,15 @@ impl ServerHandler for NucleosTools {
         &self,
         request: rmcp::model::CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
-    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+    ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
         if !self.serves(&request.name) {
-            return Ok(rmcp::model::CallToolResult::error(vec![
-                rmcp::model::ContentBlock::text(format!(
+            return Ok(
+                rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(format!(
                     "{} is not a tool this box can use",
                     request.name,
-                )),
-            ]));
+                ))])
+                .into(),
+            );
         }
         // `serves` reads the table by name. The worktree box can also launch work and nothing marks
         // its session as having read a stranger's words, so a call that would read them is refused.
@@ -187,28 +188,48 @@ impl ServerHandler for NucleosTools {
                          a triage run's output, and this box can also start work",
                         request.name,
                     )),
-                ]));
+                ])
+                .into());
             }
         }
         // Read before the request is moved into the context, and that is the whole of this line:
         // `filter_outgoing` has to know WHICH tool answered, and by the line below the name is gone.
         let called = request.name.clone();
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        let result = Self::tool_router().call(tcc).await?;
-        Ok(filter_outgoing(&called, result, &self.nonce))
+        match Self::tool_router().call(tcc).await? {
+            rmcp::model::CallToolResponse::Complete(result) => {
+                Ok(filter_outgoing(&called, result, &self.nonce).into())
+            }
+            // rmcp 3 lets a tool answer with an input request or a task instead of a result. No
+            // tool here does — each returns `String` or a `CallToolResult` — and `filter_outgoing`
+            // only knows how to redact and fence a finished result. So any other shape fails
+            // closed rather than crossing unfiltered: a carrier the filter cannot read is a
+            // carrier nothing redacts.
+            _ => Ok(
+                rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(format!(
+                    "{called} answered with a result shape this server does not filter",
+                ))])
+                .into(),
+            ),
+        }
     }
 
     /// What this instance announces, which is the whole router unless it is serving a box.
     ///
     /// Hand-written for the reason `call_tool` above is: `#[tool_handler]` builds its list from the
     /// static `Self::tool_router()` and cannot see instance state, so a per-instance box is not
-    /// something the macro can express. The list is otherwise the macro's own, cursor included.
+    /// something the macro can express. The list is otherwise the macro's own, cursor and cache
+    /// hints included: `ttl_ms` 0 for a client on the 2026-07-28 protocol, as rmcp 3's macro sets.
     async fn list_tools(
         &self,
         _request: Option<rmcp::model::PaginatedRequestParams>,
-        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
+        let supports_cache_hints = context
+            .protocol_version()
+            .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28);
         Ok(rmcp::model::ListToolsResult {
+            result_type: Some(rmcp::model::ResultType::COMPLETE),
             tools: Self::tool_router()
                 .list_all()
                 .into_iter()
@@ -216,6 +237,8 @@ impl ServerHandler for NucleosTools {
                 .collect(),
             meta: None,
             next_cursor: None,
+            ttl_ms: supports_cache_hints.then_some(0),
+            cache_scope: supports_cache_hints.then_some(rmcp::model::CacheScope::Public),
         })
     }
 }
