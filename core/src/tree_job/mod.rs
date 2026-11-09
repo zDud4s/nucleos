@@ -34,6 +34,7 @@ mod rescue;
 mod retry;
 pub mod root;
 mod root_disk;
+mod root_orphan;
 pub mod root_pending;
 pub mod start_log;
 pub mod store;
