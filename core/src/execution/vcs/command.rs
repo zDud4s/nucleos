@@ -185,6 +185,8 @@ pub fn directed_segments(command: &str) -> Vec<DirectedSegment> {
                 .join(" ");
         }
 
+        let parsed = without_quiet_redirects(&parsed);
+
         let dir = match lost.clone().or(own_lost) {
             Some(how) => SegmentDir::Unfollowable(how),
             None if steps.is_empty() && own_steps.is_empty() => SegmentDir::Session,
@@ -196,6 +198,36 @@ pub fn directed_segments(command: &str) -> Vec<DirectedSegment> {
         });
     }
     out
+}
+/// Redirections that only decide where a command's OUTPUT goes. An agent appends them to nearly every
+/// git call (`git rebase master 2>&1 | tail -5`); the pipe already splits off, but `2>&1` stays in
+/// the segment, makes it one token too long for the exact-shape parsers, and the call was refused
+/// with the "unreadable spelling" wording although the command itself is the plain one.
+const QUIET_REDIRECTS: &[&str] = &[
+    "2>&1",
+    ">/dev/null",
+    "1>/dev/null",
+    "2>/dev/null",
+    "&>/dev/null",
+];
+
+/// PURE: `git merge`/`git rebase` with trailing output redirections (`QUIET_REDIRECTS`) removed, the
+/// rest untouched. Only those two verbs: the queue answers the caller through the refusal text, so
+/// where the output would have gone is irrelevant to them, and every other verb keeps its strict
+/// shape (`git branch -d x 2>&1` stays refused, pinned by `a_branch_deletion_is_queued_or_refused…`).
+fn without_quiet_redirects(segment: &str) -> String {
+    let mut tokens: Vec<&str> = segment.split_whitespace().collect();
+    let governed = tokens.first().is_some_and(|t| t.eq_ignore_ascii_case("git"))
+        && tokens.get(1).is_some_and(|verb| {
+            verb.eq_ignore_ascii_case("merge") || verb.eq_ignore_ascii_case("rebase")
+        });
+    if !governed {
+        return segment.to_owned();
+    }
+    while tokens.len() > 2 && tokens.last().is_some_and(|t| QUIET_REDIRECTS.contains(t)) {
+        tokens.pop();
+    }
+    tokens.join(" ")
 }
 /// PURE: a `cd`/`-C` target this reader can follow without a shell, unquoted, or `None`.
 pub(super) fn followable_dir(raw: &str) -> Option<String> {
@@ -750,7 +782,9 @@ pub fn unqueueable_but_shared(command: &str) -> Option<String> {
              spelling is not one the queue can perform. It queues `git merge <branch>` and `git \
              merge --no-ff <branch>`, and nothing carrying a message: the queue writes its own \
              (`merge <source> into <target>`), so accepting `-m` would drop yours in silence and \
-             still report success. To deliver this branch, `nucleos-core --land` asks the queue to \
+             still report success. Run `git merge --no-ff <branch>` (no -m) from the worktree, or \
+             `git -C <worktree> merge --no-ff <branch>`; a single leading `cd <worktree> &&` and a \
+             trailing `2>&1` are read too. To deliver this branch, `nucleos-core --land` asks the queue to \
              merge it into the branch the project is on, in order."
                 .to_owned(),
         ),
@@ -759,7 +793,8 @@ pub fn unqueueable_but_shared(command: &str) -> Option<String> {
              hold, and the queue performs `git rebase <onto>` only. `-i` wants an editor nobody is \
              sitting at, `--onto` names a third ref the queue's two-field row cannot hold, and \
              bare `git rebase` replays onto an upstream configured in a repository the daemon does \
-             not control."
+             not control. Run `git rebase <onto>` from the worktree, or `git -C <worktree> rebase \
+             <onto>`; a single leading `cd <worktree> &&` and a trailing `2>&1` are read too."
                 .to_owned(),
         ),
         "fetch" if !carries(args, &["--dry-run"]) => Some(
