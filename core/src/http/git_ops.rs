@@ -555,6 +555,16 @@ pub(super) async fn post_project_land_target(
         )
     })?;
 
+    crate::project::policy::check_land_target_entry(branch.as_str()).map_err(|why| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "refusal": "unusable_branch",
+                "detail": why,
+            })),
+        )
+    })?;
+
     crate::project::policy::declare_land_target(&state.pool, &id, branch.as_str())
         .await
         .map_err(|error| {

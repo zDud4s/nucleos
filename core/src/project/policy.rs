@@ -606,7 +606,57 @@ pub async fn land_targets(pool: &SqlitePool, project_id: &str) -> Vec<String> {
     })
 }
 
-/// Opens one more landing target for this project. Unlike `declare_shell_rule`, there is no verdict
+/// Whether a recorded land-target entry admits `branch`.
+///
+/// An entry with no `*` is a literal name and matches exactly, which is the behaviour before
+/// patterns existed. Otherwise it is a path-style glob: `*` matches any run of characters EXCEPT
+/// `/` (so `feat/*` admits `feat/x` but not `feat/x/y`), and `**` matches any run including `/`
+/// (so `feat/**` admits both). No character classes, no `?`, no dependency.
+pub fn land_target_admits(pattern: &str, branch: &str) -> bool {
+    fn glob(pattern: &[u8], text: &[u8]) -> bool {
+        match pattern.first() {
+            None => text.is_empty(),
+            Some(b'*') => {
+                let deep = pattern.starts_with(b"**");
+                let rest = &pattern[pattern.iter().take_while(|byte| **byte == b'*').count()..];
+                for skipped in 0..=text.len() {
+                    if glob(rest, &text[skipped..]) {
+                        return true;
+                    }
+                    if skipped < text.len() && !deep && text[skipped] == b'/' {
+                        break;
+                    }
+                }
+                false
+            }
+            Some(byte) => {
+                text.first() == Some(byte) && glob(&pattern[1..], &text[1..])
+            }
+        }
+    }
+    if !pattern.contains('*') {
+        return pattern == branch;
+    }
+    glob(pattern.as_bytes(), branch.as_bytes())
+}
+
+/// Refuses a land-target entry that would admit "any branch". An entry with a `*` needs a literal
+/// prefix containing a `/` (`feat/*`), so `*`, `**` and `fe*` alone are refused: the owner rejected
+/// a wildcard-everything target, and the typo guard in `land::resolve_target` depends on it.
+pub fn check_land_target_entry(entry: &str) -> Result<(), String> {
+    let entry = entry.trim();
+    if let Some(star) = entry.find('*') {
+        if !entry[..star].contains('/') {
+            return Err(format!(
+                "land target pattern {entry:?} needs a literal prefix ending in a path segment, such as feat/*"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Opens one more landing target for this project. An entry may be a glob pattern (see
+/// [`land_target_admits`]) but not a bare wildcard (see [`check_land_target_entry`]). Unlike `declare_shell_rule`, there is no verdict
 /// or note attached to a target — presence in the table IS the grant, and the pair the unique index
 /// names is still the identity, so a repeat declaration finds a row already saying what it came to
 /// say. `DO NOTHING` leaves that row, and its original `created_at`, exactly as it was; `DO UPDATE`
@@ -618,6 +668,7 @@ pub async fn declare_land_target(
     project_id: &str,
     branch: &str,
 ) -> Result<(), String> {
+    check_land_target_entry(branch)?;
     sqlx::query(
         "INSERT INTO project_land_targets (project_id, branch, created_at)
          VALUES (?, ?, datetime('now'))
@@ -1391,6 +1442,29 @@ mod tests {
         assert!(shell_rules(&pool, "alpha").await.unwrap().is_empty());
         assert!(github_ops(&pool, "alpha").await.is_empty());
         assert!(land_targets(&pool, "alpha").await.is_empty());
+    }
+
+    #[test]
+    fn land_target_patterns_match_like_path_globs() {
+        assert!(land_target_admits("release", "release"));
+        assert!(!land_target_admits("release", "release2"));
+        assert!(land_target_admits("feat/*", "feat/x"));
+        assert!(!land_target_admits("feat/*", "feat/x/y"));
+        assert!(!land_target_admits("feat/*", "fet/x"));
+        assert!(land_target_admits("feat/**", "feat/x/y"));
+        assert!(land_target_admits("feat/**", "feat/x"));
+        assert!(land_target_admits("feat/a*", "feat/abc"));
+        assert!(!land_target_admits("feat/a*", "feat/bc"));
+    }
+
+    #[tokio::test]
+    async fn a_bare_wildcard_land_target_is_refused_at_declare() {
+        let pool = pool().await;
+        for bad in ["*", "**", "fe*"] {
+            assert!(declare_land_target(&pool, "alpha", bad).await.is_err(), "{bad}");
+        }
+        declare_land_target(&pool, "alpha", "feat/*").await.unwrap();
+        assert_eq!(land_targets(&pool, "alpha").await, vec!["feat/*".to_owned()]);
     }
 
     #[tokio::test]

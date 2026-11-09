@@ -306,6 +306,11 @@ pub async fn integration_branch_reading(
 /// inferred is not the same as said — but a typo that happens to name a real branch would be, so a
 /// named target has to be admitted before it is anything else.
 ///
+/// **Entries may be glob patterns** (`feat/*`, see `policy::land_target_admits`). The typo guard
+/// still holds: a pattern needs a literal prefix (a bare `*` is refused at declare time), the
+/// requested name still goes through `Branch::new`, and it must still exist as `refs/heads/<name>`
+/// — a pattern widens which real branches are admitted, never what counts as a branch.
+///
 /// The integration branch is admissible whether or not the table names it. An empty table has to
 /// mean "only the usual place"; reading it as "nowhere" would break every project that never opens
 /// the page.
@@ -355,7 +360,10 @@ async fn resolve_target(
     };
 
     let recorded = crate::project::policy::land_targets(pool, project_id).await;
-    if recorded.iter().any(|branch| branch == requested) || escalation_target == Some(requested) {
+    if recorded
+        .iter()
+        .any(|entry| crate::project::policy::land_target_admits(entry, requested))
+        || escalation_target == Some(requested) {
         // Validated BEFORE it reaches git, because `declare_land_target` trims a branch name but
         // does not check it: a name `Branch::new` rejects would otherwise be told it does not
         // exist, which sends the caller looking for a missing branch when the problem is the name
@@ -1675,6 +1683,26 @@ mod tests {
             .await
             .unwrap();
         assert!(args.contains(r#""target":"release""#), "{args}");
+    }
+
+    /// A declared `feat/*` pattern admits an existing `feat/one` and refuses `feat/one/deep`.
+    #[tokio::test]
+    async fn a_glob_target_admits_a_matching_existing_branch() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let pool = test_pool().await;
+        let (_container, repo) = repo_parked_off_target("nucleos-land-glob-", "chore/other");
+        assert!(git_in(&repo, &["branch", "feat/one", "master"]));
+        seed_project(&pool, "alpha", &repo, Some("master")).await;
+        crate::project::policy::declare_land_target(&pool, "alpha", "feat/*")
+            .await
+            .unwrap();
+        let admitted = resolve_target(&pool, "alpha", &repo, Some("feat/one"), None, deadline())
+            .await
+            .expect("feat/one matches feat/* and exists");
+        assert_eq!(admitted.as_str(), "feat/one");
+        let refused =
+            resolve_target(&pool, "alpha", &repo, Some("feat/one/deep"), None, deadline()).await;
+        assert!(refused.is_err());
     }
 
     /// Alçada §4.1: a target the project admits but git no longer has is refused HERE, not three
