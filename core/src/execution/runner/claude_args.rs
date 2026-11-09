@@ -159,12 +159,12 @@ pub fn cli_args(request: &RunRequest, model: &str) -> Vec<String> {
     // reverse ordering would leave a per-run choice unexpressible.
     let model = request.model.as_deref().unwrap_or(model);
     let mut args = vec!["-p".to_string()];
-    // A steerable run's prompt is written to stdin instead. Measured against CLI 2.1.198,
-    // `-p <prompt> --input-format stream-json` reads the positional AND waits on stdin, so leaving
-    // the prompt here as well would enqueue the same instruction twice.
-    if !request.steerable {
-        args.push(request.prompt.clone());
-    }
+    // The prompt never rides on the command line, steerable or not. Windows caps a whole command
+    // line at 32767 characters and a long prompt failed every spawn with `os error 206`. A steerable
+    // run writes it to stdin as a stream-json user line; any other run writes it as plain text and
+    // closes stdin, which `claude -p` reads as the prompt when no positional is given. (Measured
+    // against CLI 2.1.198, `-p <prompt> --input-format stream-json` would read the positional AND
+    // wait on stdin, so it must not appear here as well.)
     args.push("--model".to_string());
     args.push(model.to_string());
     // Beside `--model`, and conditional like the session flags below it rather than up with

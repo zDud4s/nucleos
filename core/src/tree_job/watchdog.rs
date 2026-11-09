@@ -171,7 +171,9 @@ pub(super) async fn record_failure(
     .execute(pool)
     .await
     .map_err(|e| e.to_string())?;
-    if failures < FAILURE_CAP {
+    // A permanent spawn error (`os error 206`/`267`) repeats on every try, so it is not given the
+    // second chance a passing fault gets: the branch parks on its first occurrence, with the reason.
+    if failures < FAILURE_CAP && !super::retry::is_permanent_spawn_error(error) {
         return Ok(());
     }
     let question = format!(
@@ -473,6 +475,34 @@ mod tests {
         .unwrap();
         assert_eq!(open.0, NODE);
         assert!(open.1.contains("no launch was stored"), "{}", open.1);
+    }
+
+    #[tokio::test]
+    async fn a_permanent_spawn_error_parks_the_branch_at_the_first_failure() {
+        let state = state().await;
+        seed_node(&state, None).await;
+
+        record_failure(
+            &state.pool,
+            JOB,
+            NODE,
+            "failed to spawn claude: The filename or extension is too long. (os error 206)",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(failures(&state).await, 1);
+        assert_eq!(branch_state(&state).await, "parked");
+    }
+
+    #[test]
+    fn only_the_two_windows_spawn_errors_are_permanent() {
+        use super::super::retry::{is_load_reason, is_permanent_spawn_error};
+        assert!(is_permanent_spawn_error("spawn failed (os error 206)"));
+        assert!(is_permanent_spawn_error("spawn failed (OS error 267)"));
+        assert!(!is_permanent_spawn_error("spawn failed (os error 2)"));
+        assert!(is_load_reason("failed to spawn cargo"));
+        assert!(!is_load_reason("failed to spawn cargo (os error 206)"));
     }
 
     #[tokio::test]

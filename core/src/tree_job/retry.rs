@@ -39,8 +39,23 @@ pub(super) const GATE_BACKOFF_UNTIL: &str = "gate_backoff_until";
 /// The key of `Branch.extra` with the last load reason, for whoever reads the manifest.
 pub(super) const GATE_LOAD_REASON: &str = "gate_load_reason";
 
+/// Whether an error says a process can never be spawned the way it was asked to be, however often
+/// it is tried: Windows `os error 206` (the file name or command line is too long) and `267` (the
+/// directory name is invalid). A wait does not undo either, so none of the retry loops may take
+/// them for a passing fault: they fail the branch, or ask the owner, at the first occurrence.
+pub(super) fn is_permanent_spawn_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    ["os error 206", "os error 267"]
+        .iter()
+        .any(|marker| error.contains(marker))
+}
+
 /// Whether a reason for an unmeasured gate says the machine was too busy, not that the gate is broken.
 pub(super) fn is_load_reason(reason: &str) -> bool {
+    // "failed to spawn ... (os error 206)" would otherwise read as load and be waited out for ever.
+    if is_permanent_spawn_error(reason) {
+        return false;
+    }
     let reason = reason.to_ascii_lowercase();
     [
         "pool timed out",

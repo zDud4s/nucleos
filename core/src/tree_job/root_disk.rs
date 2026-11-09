@@ -40,7 +40,11 @@ pub(super) fn parse_disk_refusal(error: &str) -> Option<DiskRefusal> {
 
 /// Failed starts allowed before the owner is asked, for this last error.
 pub(super) fn start_cap(error: &str, default_cap: u64) -> u64 {
-    if parse_disk_refusal(error).is_some() {
+    // A spawn that Windows refuses (`os error 206`/`267`) fails the same way on every try: ask at
+    // the first failure instead of repeating it every sweep.
+    if super::retry::is_permanent_spawn_error(error) {
+        1
+    } else if parse_disk_refusal(error).is_some() {
         DISK_START_CAP.min(default_cap)
     } else {
         default_cap
@@ -100,6 +104,15 @@ mod tests {
         assert_eq!(start_cap(REFUSAL, 5), 2);
         assert_eq!(start_cap("no such repository", 5), 5);
         assert_eq!(start_cap(REFUSAL, 1), 1);
+    }
+
+    #[test]
+    fn a_permanent_spawn_error_asks_the_owner_at_the_first_failure() {
+        let long = "failed to spawn claude: The filename or extension is too long. (os error 206)";
+        let bad_dir = "failed to spawn claude: The directory name is invalid. (os error 267)";
+        assert_eq!(start_cap(long, 5), 1);
+        assert_eq!(start_cap(bad_dir, 5), 1);
+        assert_eq!(start_cap("failed to spawn claude: busy", 5), 5);
     }
 
     #[test]
