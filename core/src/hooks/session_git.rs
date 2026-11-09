@@ -57,6 +57,12 @@ pub struct SessionGitPayload {
     pub tool_input: Value,
     /// Where the session is standing. Not necessarily a repository root — see `git_exec::toplevel`.
     pub cwd: String,
+    /// The subagent making the call and its type, from the hook. Absent for a top-level call.
+    /// Carried for the role policy; no decision reads them yet.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub agent_type: Option<String>,
 }
 
 /// The decision for a session nobody launched: a person's own editor, in a worktree, with no run
@@ -99,6 +105,7 @@ pub(super) async fn session_git_decision_within(
     settle_wait: Duration,
 ) -> Json<SessionGitDecision> {
     let started = Instant::now();
+    tracing::debug!(agent_id = ?payload.agent_id, agent_type = ?payload.agent_type, "session git: caller");
     let no_opinion = || {
         Json(SessionGitDecision::from(Decision {
             decision: "allow".to_owned(),

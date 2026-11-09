@@ -2021,6 +2021,103 @@ def scope_fence_cases():
     return cases
 
 
+def agent_identity_cases():
+    """D10: a subagent's `agent_id`/`agent_type` ride to the three daemon calls and into `node_open`;
+    a call without them leaves every body exactly as it was."""
+    cases = []
+    who = {"agent_id": "a1b2c3", "agent_type": "wf-leaf"}
+    edit = {
+        "hook_event_name": "PreToolUse",
+        "session_id": "ident1",
+        "cwd": "/work/repo",
+        "tool_name": "Edit",
+        "tool_input": {"file_path": "/work/repo/shell/x.ts", "old_string": "a", "new_string": "b"},
+    }
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _code, _printed, calls = _run_scope(tmp, dict(edit, **who), {"allowed": True})
+        body = calls[0][0] if calls else {}
+        good = body.get("agent_id") == "a1b2c3" and body.get("agent_type") == "wf-leaf"
+        cases.append(("agent ids, scope_forwards_both", "" if good else repr(calls)))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _code, _printed, calls = _run_scope(tmp, dict(edit, agent_id="  ", agent_type=7), {"allowed": True})
+        body = calls[0][0] if calls else {"agent_id": "?"}
+        good = "agent_id" not in body and "agent_type" not in body
+        cases.append(("agent ids, scope_drops_blank_and_non_string_values", "" if good else repr(calls)))
+
+    git = {
+        "session_id": "ident2",
+        "tool_name": "Bash",
+        "tool_input": {"command": "git merge feature"},
+        "cwd": "/repo",
+    }
+    for label, extra in (("with", who), ("without", {})):
+        seen = []
+
+        def post(request, timeout=None, seen=seen):
+            if request.full_url.endswith("/hooks/session-git-decision"):
+                seen.append(json.loads(request.data))
+            return _Reply({"decision": "allow", "reason": "ok"})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            _run_interactive(tmp, dict(git, **extra), post)
+        good = len(seen) == 1 and (
+            (seen[0].get("agent_id"), seen[0].get("agent_type")) == (extra.get("agent_id"), extra.get("agent_type"))
+        ) and (bool(extra) or set(seen[0]) == {"tool_name", "tool_input", "cwd"})
+        cases.append((f"agent ids, session_git_{label}_ids", "" if good else repr(seen)))
+
+    for label, extra in (("with", who), ("without", {})):
+        seen = []
+
+        def urlopen(request, timeout=None, seen=seen):
+            seen.append(json.loads(request.data))
+            return _Reply({"decision": "allow", "reason": "ok"})
+
+        payload = dict(
+            {"hook_event_name": "PreToolUse", "session_id": "r", "tool_name": "Bash",
+             "tool_input": {"command": "ls"}, "cwd": "/work/repo"},
+            **extra,
+        )
+        env = {"NUCLEOS_RUN_ID": "7", "NUCLEOS_DAEMON_URL": "http://127.0.0.1:1", "NUCLEOS_DAEMON_TOKEN": "tok"}
+        with mock.patch.dict(os.environ, env):
+            with mock.patch("sys.stdin", io.StringIO(json.dumps(payload))):
+                with mock.patch.object(hook.urllib.request, "urlopen", side_effect=urlopen):
+                    with mock.patch("sys.stdout", io.StringIO()):
+                        try:
+                            hook.main()
+                        except SystemExit:
+                            pass
+        first = seen[0] if seen else {}
+        good = (first.get("agent_id"), first.get("agent_type")) == (extra.get("agent_id"), extra.get("agent_type"))
+        good = good and (bool(extra) or set(first) == {"run_id", "tool_name", "tool_input"})
+        cases.append((f"agent ids, run_decision_{label}_ids", "" if good else repr(seen)))
+
+    node_open = {
+        "session_id": "ident3",
+        "tool_name": "mcp__nucleos__node_open",
+        "tool_input": {"kind": "leaf", "title": "t", "goal": "g", "agent_id": "forged"},
+        "cwd": "/repo",
+    }
+    for label, extra, want in (
+        ("stamps_the_callers_id_over_a_forged_one", who, {"kind": "leaf", "title": "t", "goal": "g", "agent_id": "a1b2c3"}),
+        ("strips_a_forged_id_when_the_caller_has_none", {}, {"kind": "leaf", "title": "t", "goal": "g"}),
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, printed = _run_interactive(tmp, dict(node_open, **extra), lambda *_a, **_k: _Reply({"registered": False}))
+        special = _special_of(printed)
+        good = special is not None and special.get("updatedInput") == want
+        cases.append((f"agent ids, node_open_{label}", "" if good else f"{code!r} {printed!r}"))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        clean = dict(node_open, tool_input={"kind": "leaf", "title": "t", "goal": "g"})
+        code, printed = _run_interactive(tmp, clean, lambda *_a, **_k: _Reply({"registered": False}))
+        special = _special_of(printed)
+        good = special is None or "updatedInput" not in special
+        cases.append(("agent ids, node_open_without_any_id_is_left_alone", "" if good else f"{code!r} {printed!r}"))
+    return cases
+
+
 def main() -> int:
     failures = 0
     for command, want in CASES:
@@ -2069,6 +2166,7 @@ def main() -> int:
         + claimed_land_override_cases()
         + stop_timer_cases()
         + scope_fence_cases()
+        + agent_identity_cases()
     ):
         total += 1
         if failure:

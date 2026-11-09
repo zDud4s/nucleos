@@ -19,6 +19,7 @@ pub async fn pretooluse_decision(
     };
     let tool_name = payload.tool_name.clone();
     let tool_input = payload.tool_input.clone();
+    tracing::debug!(run_id, agent_id = ?payload.agent_id, agent_type = ?payload.agent_type, "pretooluse: caller");
     let Json(decision) =
         pretooluse_decision_from(state.clone(), scope, payload, Instant::now()).await;
     let updated_input = if matches!(decision.decision.as_str(), "allow" | "asking") {
@@ -1430,6 +1431,8 @@ mod tests {
             run_id,
             tool_name: tool.to_owned(),
             tool_input: input,
+            agent_id: None,
+            agent_type: None,
         }
     }
 

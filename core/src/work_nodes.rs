@@ -484,6 +484,9 @@ pub struct OpenArgs {
     pub chat_id: Option<String>,
     #[serde(default)]
     pub run_id: Option<String>,
+    /// The subagent that opened the node, stamped by the hook. Recorded, not yet read.
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -615,8 +618,8 @@ pub async fn open_linked(
         "INSERT INTO work_nodes \
          (id, project_id, root_id, parent_id, depth, kind, title, goal, status, owned_paths, \
           budget_tokens, run_id, session_id, chat_id, task_id, tree_job_id, continues_node_id, \
-          created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          agent_id, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&project)
@@ -634,6 +637,7 @@ pub async fn open_linked(
     .bind(&task_id)
     .bind(links.tree_job_id)
     .bind(links.continues_node_id)
+    .bind(&args.agent_id)
     .bind(&now)
     .bind(&now)
     .execute(pool)

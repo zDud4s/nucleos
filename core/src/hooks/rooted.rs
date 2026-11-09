@@ -496,6 +496,8 @@ pub async fn reconsider_asks(
             run_id,
             tool_name,
             tool_input: call.tool_input,
+            agent_id: None,
+            agent_type: None,
         };
         let permission = effective_permission(call.snapshot, chosen);
         let verdict = rooted_verdict(
