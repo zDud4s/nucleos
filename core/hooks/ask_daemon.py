@@ -1065,7 +1065,8 @@ CONDUCTOR_HEAVY_PROGRAMS = ("cargo", "cargo.exe", "go", "go.exe", "npx", "npx.cm
 CONDUCTOR_REFUSAL = (
     "This session is a conductor: launch an agent (`Agent`, `create_run`) or a tree (`tree_launch`) "
     "instead of doing this by hand. The root may itself run `scripts/gates.sh`, "
-    "`python scripts/heavy.py cargo|go|npx|npm ...`, read-only git, `nucleos-core.exe --land` / "
+    "`python scripts/heavy.py cargo|go|npx|npm ...`, `python <workflow bundle>/scripts/spec_loop.py start ...`, "
+    "read-only git, `nucleos-core.exe --land` / "
     "`--verify-ticket N`, `scripts/run-daemon.ps1`, Read/Grep/Glob up to ~15k tokens per call, and small "
     "Edit/Write changes (at most 2 files and 40 changed lines per owner prompt). "
     "If you are the owner, start the prompt with `manual:` (one prompt) or `manual:on` (until "
@@ -1533,6 +1534,36 @@ def _conductor_project_script(path, name, cwd):
     return any(script == _conductor_path(os.path.join(f, "scripts", name), cwd) for f in _ancestors(cwd))
 
 
+def _conductor_bundle_dir(cwd):
+    """The `bundle_dir` of the nearest workflow pointer at or above `cwd`, or None."""
+    try:
+        for folder in _ancestors(cwd):
+            pointer = os.path.join(folder, *WORKFLOW_POINTER)
+            if os.path.isfile(pointer):
+                with open(pointer, encoding="utf-8") as handle:
+                    loaded = json.load(handle)
+                found = loaded.get("bundle_dir") if isinstance(loaded, dict) else None
+                return found if isinstance(found, str) and found else None
+    except Exception:
+        pass
+    return None
+
+
+def _conductor_spec_loop_accepts(tokens, cwd):
+    """`python <bundle_dir>/scripts/spec_loop.py start <args>`: the spec-session starter the prompt
+    hook tells the session to run. Only the project's own bundle copy and only its `start` verb
+    (the script's `--stop-hook` / `--prompt-hook` are run by the harness, never from a Bash call)."""
+    if len(tokens) < 3 or tokens[0].lower() not in ("python", "python.exe", "python3", "py"):
+        return False
+    if tokens[2] != "start":
+        return False
+    bundle = _conductor_bundle_dir(cwd)
+    if not bundle:
+        return False
+    expected = _conductor_path(os.path.join(bundle, "scripts", "spec_loop.py"), cwd)
+    return _conductor_path(tokens[1], cwd) == expected
+
+
 def _conductor_daemon_accepts(tokens, cwd):
     """`<project>/scripts/run-daemon.ps1` and nothing after it, run directly or as `pwsh -File <path>`."""
     if len(tokens) == 3 and tokens[0].lower() in CONDUCTOR_POWERSHELLS and tokens[1].lower() == "-file":
@@ -1770,6 +1801,7 @@ def _conductor_part_accepts(part, cwd):
         return False, cwd
     return (
         _conductor_heavy_accepts(tokens, cwd)
+        or _conductor_spec_loop_accepts(tokens, cwd)
         or _conductor_env_prefix_accepts(tokens, cwd)
         or _conductor_git_accepts(tokens, cwd)
         or _conductor_small_accepts(tokens)
