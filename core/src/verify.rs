@@ -11,6 +11,7 @@ pub mod batch;
 pub mod bisect;
 pub mod exec;
 pub mod failures;
+pub mod flake;
 pub mod fingerprint;
 pub mod flaky;
 pub mod guard;

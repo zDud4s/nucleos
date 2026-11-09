@@ -607,7 +607,47 @@ async fn contains(
 /// Such a red is the base's, not the branch's. No proof is started and nothing is stored: a unit
 /// without ids, an errored unit, no incident (or one being proved) and an unreadable ancestry all
 /// answer `None`, so the red stays the branch's own.
+///
+/// A red the master incident does not hold may still not be the branch's: every failed test also
+/// failed in two or more other worktrees whose diffs do not touch it (`flake::quarantine_note`),
+/// which quarantines it for this gate and opens a global ticket.
 pub async fn inherited_red(
+    pool: &SqlitePool,
+    ticket: &Ticket,
+    now: DateTime<Utc>,
+) -> Option<String> {
+    if let Some(note) = master_red_note(pool, ticket, now).await {
+        return Some(note);
+    }
+    let failed = failed_test_ids(ticket)?;
+    super::flake::quarantine_note(pool, ticket, &failed, now).await
+}
+
+/// Every test id of a done, failed `ticket` whose failed units all printed ids; `None` when a unit
+/// errored, a failed unit has no ids, or nothing failed.
+fn failed_test_ids(ticket: &Ticket) -> Option<BTreeSet<String>> {
+    if !ticket.done
+        || ticket.verdict.as_deref() != Some("failed")
+        || ticket
+            .units
+            .iter()
+            .any(|unit| matches!(unit.status.as_str(), "errored" | "unknown"))
+    {
+        return None;
+    }
+    let mut ids = BTreeSet::new();
+    for unit in ticket
+        .units
+        .iter()
+        .filter(|unit| unit.status == verify_runs::STATUS_FAILED)
+    {
+        let unit_ids = unit.failed_tests.as_ref().filter(|ids| !ids.is_empty())?;
+        ids.extend(unit_ids.iter().cloned());
+    }
+    (!ids.is_empty()).then_some(ids)
+}
+
+async fn master_red_note(
     pool: &SqlitePool,
     ticket: &Ticket,
     now: DateTime<Utc>,
