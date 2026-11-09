@@ -49,25 +49,9 @@ type Human struct {
 
 	unsubscribe func()
 
-	// windowUp closes when the browser's own startup page first reports its state (targetInfoChanged for
-	// a page). Merely being created is not enough: measured, a tab made right after that still loses
-	// the race.
-	windowUp   chan struct{}
-	windowOnce sync.Once
-	// reported holds the page targets that have reported their state at least once. Guarded by mu.
-	reported map[string]bool
+	// tabs waits for the browser's own window and checks a new tab came alive. See tabWatch.
+	tabs *tabWatch
 }
-
-// openLoadWait is how long a freshly created tab has to report anything before it is judged lost, and
-// openAttempts how many tabs Open will make. Variables so tests can shorten them.
-var (
-	openLoadWait = 5 * time.Second
-	openAttempts = 3
-)
-
-// startupWindowWait bounds how long Open waits for the browser's own startup window. A variable so a
-// test can shorten it; a browser that never shows one is opened into anyway after this long.
-var startupWindowWait = 15 * time.Second
 
 // ConnectHuman attaches to a headful browser and starts recording where the person goes.
 //
@@ -76,7 +60,7 @@ var startupWindowWait = 15 * time.Second
 // mode precisely because of what they can do, and a chain recorded only from the first tab would miss
 // the identity provider — which is the one host §5.3a exists to capture.
 func ConnectHuman(ctx context.Context, conn *cdp.Conn) (*Human, error) {
-	human := &Human{conn: conn, windowUp: make(chan struct{}), reported: map[string]bool{}}
+	human := &Human{conn: conn, tabs: newTabWatch()}
 	human.unsubscribe = conn.OnEvent(human.onEvent)
 	if _, err := conn.Call(ctx, cdp.BrowserSession, "Target.setDiscoverTargets", map[string]any{
 		"discover": true,
@@ -112,10 +96,7 @@ func (h *Human) onEvent(event cdp.Event) {
 		return
 	}
 	if event.Method == "Target.targetInfoChanged" && params.TargetInfo.Type == "page" {
-		h.windowOnce.Do(func() { close(h.windowUp) })
-		h.mu.Lock()
-		h.reported[params.TargetInfo.TargetID] = true
-		h.mu.Unlock()
+		h.tabs.observe(event)
 	}
 	if params.TargetInfo.Type != "page" || params.TargetInfo.URL == "" {
 		return
@@ -140,21 +121,32 @@ func (h *Human) Chain() []string { return h.rec.Chain() }
 // Over the DevTools pipe the browser answers its first command long before it has built its startup
 // window (a debugging port used to make Start wait for that, by accident). A tab created in the gap
 // shows up as a target and never loads: the gate saw the headful window reach nothing at all. So the
-// tab is created only once the browser's own first page has reported its state, bounded by startupWindowWait.
+// tab is created only once the browser's own first page has reported its state, and a tab that then
+// reports nothing is made again. See tabWatch, which the agent's pages share.
 func (h *Human) Open(ctx context.Context, req browser.OpenRequest) (browser.Session, error) {
-	select {
-	case <-h.windowUp:
-	case <-time.After(startupWindowWait):
-	case <-ctx.Done():
-		return browser.Session{}, ctx.Err()
-	}
-	target, err := h.createLoadedTarget(ctx, req.URL)
+	targetID, err := h.tabs.makeLive(ctx, func(ctx context.Context) (string, error) {
+		created, err := h.conn.Call(ctx, cdp.BrowserSession, "Target.createTarget", map[string]any{
+			"url": req.URL,
+		})
+		if err != nil {
+			return "", fmt.Errorf("opening the person's window: %w", err)
+		}
+		var target struct {
+			TargetID string `json:"targetId"`
+		}
+		if err := json.Unmarshal(created, &target); err != nil {
+			return "", err
+		}
+		return target.TargetID, nil
+	}, func(ctx context.Context, id string) {
+		_, _ = h.conn.Call(ctx, cdp.BrowserSession, "Target.closeTarget", map[string]any{"targetId": id})
+	})
 	if err != nil {
 		return browser.Session{}, err
 	}
 
 	attached, err := h.conn.Call(ctx, cdp.BrowserSession, "Target.attachToTarget", map[string]any{
-		"targetId": target.TargetID,
+		"targetId": targetID,
 		"flatten":  true,
 	})
 	if err != nil {
@@ -169,7 +161,7 @@ func (h *Human) Open(ctx context.Context, req browser.OpenRequest) (browser.Sess
 
 	h.mu.Lock()
 	h.id = browser.SessionID("h1")
-	h.target = target.TargetID
+	h.target = targetID
 	h.cdp = session.SessionID
 	id := h.id
 	h.mu.Unlock()
@@ -185,50 +177,6 @@ func (h *Human) Open(ctx context.Context, req browser.OpenRequest) (browser.Sess
 		RequestedURL: req.URL,
 		FinalURL:     req.URL,
 	}, nil
-}
-
-// createLoadedTarget creates the tab and makes sure it is alive.
-//
-// Even after the browser's own window exists, a tab created in the first moments of its life can be
-// lost without any error: Target.createTarget succeeds, the target exists, and it never reports a
-// title or loads (measured on the gate, a few runs in five on a loaded machine). The one observable
-// is that a live tab reports its state at once, so a tab that says nothing within openLoadWait is
-// closed and made again, up to openAttempts times; the last one is kept whatever it does.
-func (h *Human) createLoadedTarget(ctx context.Context, url string) (struct{ TargetID string }, error) {
-	var target struct{ TargetID string }
-	for attempt := 1; ; attempt++ {
-		created, err := h.conn.Call(ctx, cdp.BrowserSession, "Target.createTarget", map[string]any{
-			"url": url,
-		})
-		if err != nil {
-			return target, fmt.Errorf("opening the person's window: %w", err)
-		}
-		target = struct{ TargetID string }{}
-		if err := json.Unmarshal(created, &target); err != nil {
-			return target, err
-		}
-		if attempt >= openAttempts || h.waitReported(ctx, target.TargetID) {
-			return target, ctx.Err()
-		}
-		_, _ = h.conn.Call(ctx, cdp.BrowserSession, "Target.closeTarget", map[string]any{"targetId": target.TargetID})
-	}
-}
-
-// waitReported waits for a target to report its state, up to openLoadWait.
-func (h *Human) waitReported(ctx context.Context, targetID string) bool {
-	deadline := time.Now().Add(openLoadWait)
-	for {
-		h.mu.Lock()
-		ok := h.reported[targetID]
-		h.mu.Unlock()
-		if ok {
-			return true
-		}
-		if time.Now().After(deadline) || ctx.Err() != nil {
-			return false
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
 }
 
 // Close ends the person's window.

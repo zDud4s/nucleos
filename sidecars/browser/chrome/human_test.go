@@ -256,6 +256,7 @@ func TestOpenGoesAheadWhenTheBrowserShowsNoWindow(t *testing.T) {
 // reports anything. Open must notice, drop it and make another.
 func TestOpenRemakesATabThatNeverReportsAnything(t *testing.T) {
 	fake, conn := dial(t)
+	remakeTabs(t, 3)
 	human := humanOn(t, fake, conn)
 	var created int
 	var closed []string
