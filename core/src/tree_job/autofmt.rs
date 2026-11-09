@@ -121,7 +121,10 @@ pub(super) fn steps_for_paths(paths: &[String], has_manifest: impl Fn(&str) -> b
             }
         }
         let Some(dir) = found else { continue };
-        if !is_rust && !has_manifest(dir) {
+        // A file other than Rust source or a manifest is not the formatter's business; a
+        // directory (an owned `core/**`) may hold Rust, so it still counts.
+        let leaf = path.rsplit('/').next().unwrap_or(path);
+        if !is_rust && leaf.contains('.') {
             continue;
         }
         let step = Step {
