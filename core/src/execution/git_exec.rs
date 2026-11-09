@@ -21,6 +21,8 @@ mod ops;
 mod publish;
 mod repo;
 mod resolution;
+mod step_renumber;
+mod steps;
 mod transport;
 mod worktrees;
 
@@ -31,6 +33,7 @@ use self::ops::*;
 pub use self::publish::*;
 pub use self::repo::*;
 pub use self::resolution::*;
+pub use self::steps::*;
 pub use self::transport::*;
 pub use self::worktrees::*;
 
@@ -1018,6 +1021,368 @@ gate_command: git rev-parse --verify nao-existe
             .await
     }
 
+    // ---- Integration steps wired into the executor (plan 2026-11-09, P4) -----------------------
+
+    /// `feat/x` into `master` through the real executor, with the knobs the step tests turn: a
+    /// database (for the feed), the integration branch the request names and the approved token.
+    async fn land_with(
+        repo: &Path,
+        pool: Option<sqlx::SqlitePool>,
+        integration_branch: Option<&str>,
+        approved_map_blob: Option<&str>,
+    ) -> Outcome {
+        use crate::execution::vcs::VcsExecutor;
+        crate::project::rules::testing::hold_shared();
+        GitExecutor {
+            pool,
+            ..GitExecutor::default()
+        }
+        .execute(&crate::execution::vcs::ClaimedRequest {
+            id: 1,
+            op: crate::execution::vcs::Op::Merge {
+                source: "feat/x".into(),
+                target: "master".into(),
+            },
+            project_id: "alpha".to_owned(),
+            project_root: repo.to_string_lossy().into_owned(),
+            from_resolution: false,
+            run_id: None,
+            approved_map_blob: approved_map_blob.map(str::to_owned),
+            integration_branch: integration_branch.map(Into::into),
+        })
+        .await
+    }
+
+    /// Rules with a gate that only a moved `feature.txt` satisfies, and one step that moves it.
+    const MOVE_STEP_RULES: &str = "gate_command: git cat-file -e HEAD:moved.txt
+integration_steps:
+  - id: mv
+    kind: program
+    program: git
+    args: [\"mv\", \"feature.txt\", \"moved.txt\"]
+";
+
+    fn git_stdout(repo: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("git should start");
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    }
+
+    #[tokio::test]
+    async fn a_project_with_steps_refuses_to_land_without_a_gate_command() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-steps-nogate-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        // `gate_before_publish` is off: the step alone forces the gate.
+        write_autopilot_rules(
+            "integration_steps:
+  - id: mv
+    kind: program
+    program: git
+    args: [\"mv\", \"feature.txt\", \"moved.txt\"]
+",
+        );
+        let before = sha_of(&repo, "master");
+
+        match land_with(&repo, None, None, None).await {
+            Outcome::Failed { reason, .. } => assert!(reason.contains("gate_command"), "{reason}"),
+            other => panic!("a step with no gate must refuse, got {other:?}"),
+        }
+        assert_eq!(sha_of(&repo, "master"), before, "master moved");
+    }
+
+    #[tokio::test]
+    async fn the_gate_measures_the_integrate_commit_and_that_commit_is_published() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-steps-green-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        write_autopilot_rules(MOVE_STEP_RULES);
+        let before = sha_of(&repo, "master");
+
+        let published = match land_with(&repo, None, None, None).await {
+            Outcome::Succeeded { sha, .. } => sha.expect("a merge names the commit it published"),
+            other => panic!("the gate passes only on the integrate commit, got {other:?}"),
+        };
+        assert_ne!(sha_of(&repo, "master"), before, "nothing was published");
+        assert_eq!(sha_of(&repo, "master"), published);
+        assert!(
+            git_stdout(&repo, &["log", "-1", "--format=%s", "master"]).starts_with("integrate:"),
+            "the published tip is the integrate commit"
+        );
+        assert_eq!(
+            git_stdout(&repo, &["cat-file", "-t", "master:moved.txt"]),
+            "blob"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_red_gate_after_a_step_publishes_nothing() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-steps-red-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        write_autopilot_rules(
+            "gate_command: git cat-file -e HEAD:never-there.txt
+integration_steps:
+  - id: mv
+    kind: program
+    program: git
+    args: [\"mv\", \"feature.txt\", \"moved.txt\"]
+",
+        );
+        let before = sha_of(&repo, "master");
+
+        let outcome = land_with(&repo, None, None, None).await;
+
+        assert!(matches!(outcome, Outcome::Failed { .. }), "{outcome:?}");
+        assert_eq!(sha_of(&repo, "master"), before, "master moved");
+    }
+
+    #[tokio::test]
+    async fn a_failing_step_is_terminal_and_not_a_moved_target() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-steps-fail-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        write_autopilot_rules(
+            "gate_command: git --version
+integration_steps:
+  - id: broken
+    kind: program
+    program: git
+    args: [\"no-such-subcommand-zz\"]
+",
+        );
+        let before = sha_of(&repo, "master");
+
+        match land_with(&repo, None, None, None).await {
+            Outcome::Failed { reason, .. } => {
+                assert!(reason.contains("broken"), "{reason}");
+                assert!(
+                    !reason.contains("moved while the merge was being computed"),
+                    "a step failure must not be retried as a moved target: {reason}"
+                );
+            }
+            other => panic!("a failing step must fail the land, got {other:?}"),
+        }
+        assert_eq!(sha_of(&repo, "master"), before, "master moved");
+    }
+
+    /// A step that reads `feature.txt` (its `config_file`), which `feat/x` adds.
+    const WATCHING_STEP_RULES: &str = "gate_command: git --version
+integration_steps:
+  - id: watcher
+    kind: program
+    program: git
+    args: [\"--version\"]
+    config_file: feature.txt
+";
+
+    #[tokio::test]
+    async fn a_branch_that_changes_a_step_waits_for_the_owner() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-steps-wait-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        write_autopilot_rules(WATCHING_STEP_RULES);
+        let before = sha_of(&repo, "master");
+
+        match land_with(&repo, None, None, None).await {
+            Outcome::AwaitingOwner { reason, map_blob } => {
+                assert!(reason.contains("feature.txt"), "{reason}");
+                assert!(reason.contains("integration step"), "{reason}");
+                assert!(!map_blob.is_empty());
+            }
+            other => panic!("a changed step input must wait for the owner, got {other:?}"),
+        }
+        assert_eq!(sha_of(&repo, "master"), before, "master moved");
+    }
+
+    #[tokio::test]
+    async fn an_approved_step_change_lands() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-steps-approved-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        write_autopilot_rules(WATCHING_STEP_RULES);
+        let before = sha_of(&repo, "master");
+        let token = match land_with(&repo, None, None, None).await {
+            Outcome::AwaitingOwner { map_blob, .. } => map_blob,
+            other => panic!("premise: the first run waits, got {other:?}"),
+        };
+
+        let outcome = land_with(&repo, None, None, Some(&token)).await;
+
+        assert!(matches!(outcome, Outcome::Succeeded { .. }), "{outcome:?}");
+        assert_ne!(sha_of(&repo, "master"), before, "nothing was published");
+    }
+
+    #[tokio::test]
+    async fn a_branch_changing_a_step_input_and_the_map_waits_once_for_one_combined_token() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-steps-both-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        write_autopilot_rules(WATCHING_STEP_RULES);
+        // `feat/x` already adds `feature.txt` (the step's config file); it changes the map too.
+        git_stdout(&repo, &["checkout", "feat/x"]);
+        std::fs::write(
+            repo.join(crate::tests_map::MAP_FILE),
+            "version: 1\ntests:\n  groups: {}\n",
+        )
+        .expect("write the map");
+        git_stdout(&repo, &["add", "-A"]);
+        git_stdout(&repo, &["commit", "--no-verify", "-m", "map"]);
+        git_stdout(&repo, &["checkout", "master"]);
+        let before = sha_of(&repo, "master");
+
+        let token = match land_with(&repo, None, None, None).await {
+            Outcome::AwaitingOwner { reason, map_blob } => {
+                assert!(reason.contains("feature.txt"), "{reason}");
+                assert!(reason.contains(crate::tests_map::MAP_FILE), "{reason}");
+                assert!(
+                    map_blob.starts_with("steps:") && map_blob.contains('+'),
+                    "{map_blob}"
+                );
+                map_blob
+            }
+            other => panic!("a changed step input and map must wait, got {other:?}"),
+        };
+        assert_eq!(sha_of(&repo, "master"), before, "master moved");
+
+        let outcome = land_with(&repo, None, None, Some(&token)).await;
+
+        assert!(matches!(outcome, Outcome::Succeeded { .. }), "{outcome:?}");
+        assert_ne!(sha_of(&repo, "master"), before, "nothing was published");
+    }
+
+    #[tokio::test]
+    async fn a_merge_into_a_non_integration_branch_ignores_the_step_forced_gate() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-steps-nogate-off-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        // Steps, `gate_before_publish` off and no gate_command: the steps do not apply to a merge
+        // into `master` when the integration branch is `develop`, so nothing forces a gate.
+        write_autopilot_rules(
+            "integration_steps:
+  - id: mv
+    kind: program
+    program: git
+    args: [\"mv\", \"feature.txt\", \"moved.txt\"]
+",
+        );
+
+        let outcome = land_with(&repo, None, Some("develop"), None).await;
+
+        assert!(matches!(outcome, Outcome::Succeeded { .. }), "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn a_merge_into_another_branch_runs_no_steps() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-steps-other-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        // The gate would be red if it ran on a tree without `moved.txt`; the integration branch
+        // is another one, so no step runs and the gate is the project's own `git --version`.
+        write_autopilot_rules(
+            "gate_command: git --version
+integration_steps:
+  - id: mv
+    kind: program
+    program: git
+    args: [\"mv\", \"feature.txt\", \"moved.txt\"]
+",
+        );
+
+        let published = match land_with(&repo, None, Some("develop"), None).await {
+            Outcome::Succeeded { sha, .. } => sha.expect("a merge names the commit it published"),
+            other => panic!("a merge into another branch lands as before, got {other:?}"),
+        };
+
+        assert_eq!(sha_of(&repo, "master"), published);
+        assert!(
+            !git_stdout(&repo, &["log", "-1", "--format=%s", "master"]).starts_with("integrate:"),
+            "no step ran, so there is no integrate commit"
+        );
+        assert_eq!(
+            git_stdout(&repo, &["cat-file", "-t", "master:feature.txt"]),
+            "blob",
+            "feature.txt was not moved"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_step_that_changed_files_leaves_one_feed_line_each() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-steps-feed-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        write_autopilot_rules(
+            "gate_command: git cat-file -e HEAD:moved2.txt
+integration_steps:
+  - id: first
+    kind: program
+    program: git
+    args: [\"mv\", \"feature.txt\", \"moved.txt\"]
+  - id: second
+    kind: program
+    program: git
+    args: [\"mv\", \"moved.txt\", \"moved2.txt\"]
+",
+        );
+        let pool = crate::testdb::fresh_pool().await;
+
+        let outcome = land_with(&repo, Some(pool.clone()), None, None).await;
+
+        assert!(matches!(outcome, Outcome::Succeeded { .. }), "{outcome:?}");
+        let lines: Vec<String> = sqlx::query_scalar(
+            "SELECT summary FROM feed WHERE kind = 'integration_step' ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("`first`"), "{lines:?}");
+        assert!(lines[0].contains("moved.txt"), "{lines:?}");
+        assert!(lines[1].contains("`second`"), "{lines:?}");
+        assert!(lines[1].contains("moved2.txt"), "{lines:?}");
+    }
+
+    #[tokio::test]
+    async fn a_project_without_steps_lands_exactly_as_before() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-steps-none-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        // No steps and the gate switch off: nothing is measured, and nothing is added to the merge.
+        write_autopilot_rules("gate_command: git rev-parse --verify nao-existe\n");
+        let pool = crate::testdb::fresh_pool().await;
+
+        let published = match land_with(&repo, Some(pool.clone()), None, None).await {
+            Outcome::Succeeded { sha, .. } => sha.expect("a merge names the commit it published"),
+            other => panic!("an ungated project lands, got {other:?}"),
+        };
+
+        assert_eq!(sha_of(&repo, "master"), published);
+        assert!(
+            !git_stdout(&repo, &["log", "-1", "--format=%s", "master"]).starts_with("integrate:")
+        );
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM feed WHERE kind = 'integration_step'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, 0);
+    }
+
     // ---- F3-6: `gate_before_publish` combined with `gate_after_land` ----------------------------
     //
     // Every fixture pairs a RED `gate_command` with a GREEN map group (or the reverse), so the
@@ -1074,7 +1439,7 @@ gate_command: git rev-parse --verify nao-existe
         .expect("roster alpha");
     }
 
-    async fn land_with(
+    async fn land_gated(
         repo: &Path,
         pool: Option<sqlx::SqlitePool>,
         verify: Option<std::sync::Arc<crate::verify::exec::Executor>>,
@@ -1136,7 +1501,8 @@ gate_command: git rev-parse --verify nao-existe
         let executor = verify_executor(&pool, container.path());
         let before = sha_of(&repo, "master");
 
-        let outcome = land_with(&repo, Some(pool.clone()), Some(executor), Some("master"), 7).await;
+        let outcome =
+            land_gated(&repo, Some(pool.clone()), Some(executor), Some("master"), 7).await;
 
         assert!(matches!(outcome, Outcome::Failed { .. }), "{outcome:?}");
         assert!(request_callers(&pool).await.is_empty(), "no verify request");
@@ -1163,7 +1529,8 @@ gate_command: git rev-parse --verify nao-existe
         roster(&pool, &repo).await;
         let executor = verify_executor(&pool, container.path());
 
-        let outcome = land_with(&repo, Some(pool.clone()), Some(executor), Some("master"), 7).await;
+        let outcome =
+            land_gated(&repo, Some(pool.clone()), Some(executor), Some("master"), 7).await;
 
         assert!(matches!(outcome, Outcome::Succeeded { .. }), "{outcome:?}");
         assert_eq!(request_callers(&pool).await, vec!["merge:7".to_owned()]);
@@ -1191,7 +1558,8 @@ gate_command: git rev-parse --verify nao-existe
         let executor = verify_executor(&pool, container.path());
         let before = sha_of(&repo, "master");
 
-        let outcome = land_with(&repo, Some(pool.clone()), Some(executor), Some("master"), 7).await;
+        let outcome =
+            land_gated(&repo, Some(pool.clone()), Some(executor), Some("master"), 7).await;
 
         assert!(matches!(outcome, Outcome::Failed { .. }), "{outcome:?}");
         assert_eq!(request_callers(&pool).await, vec!["merge:7".to_owned()]);
@@ -1211,7 +1579,8 @@ gate_command: git rev-parse --verify nao-existe
         roster(&pool, &repo).await;
         let executor = verify_executor(&pool, container.path());
 
-        let outcome = land_with(&repo, Some(pool.clone()), Some(executor), Some("master"), 7).await;
+        let outcome =
+            land_gated(&repo, Some(pool.clone()), Some(executor), Some("master"), 7).await;
 
         let published = match outcome {
             Outcome::Succeeded { sha, .. } => sha.expect("a merge names the commit it published"),
@@ -1239,7 +1608,8 @@ gate_command: git rev-parse --verify nao-existe
         let executor = verify_executor(&pool, container.path());
         let before = sha_of(&repo, "master");
 
-        let outcome = land_with(&repo, Some(pool.clone()), Some(executor), Some("master"), 7).await;
+        let outcome =
+            land_gated(&repo, Some(pool.clone()), Some(executor), Some("master"), 7).await;
 
         assert!(matches!(outcome, Outcome::Failed { .. }), "{outcome:?}");
         assert_eq!(sha_of(&repo, "master"), before);
@@ -1266,7 +1636,8 @@ gate_command: git rev-parse --verify nao-existe
         // No roster row on purpose.
         let executor = verify_executor(&pool, container.path());
 
-        let outcome = land_with(&repo, Some(pool.clone()), Some(executor), Some("master"), 7).await;
+        let outcome =
+            land_gated(&repo, Some(pool.clone()), Some(executor), Some("master"), 7).await;
 
         let published = match outcome {
             Outcome::Succeeded { sha, .. } => sha.expect("a merge names the commit it published"),
@@ -1313,6 +1684,7 @@ gate_command: git rev-parse --verify nao-existe
             Duration::from_millis(300),
             Some("master"),
             Some(&executor),
+            true,
         )
         .await;
 
@@ -1353,6 +1725,7 @@ gate_command: git rev-parse --verify nao-existe
             Duration::from_millis(300),
             Some("master"),
             Some(&executor),
+            true,
         )
         .await;
 
@@ -1416,6 +1789,7 @@ gate_command: git rev-parse --verify nao-existe
             Duration::from_secs(30),
             Some("master"),
             Some(&executor),
+            true,
         )
         .await;
 
@@ -1458,6 +1832,7 @@ gate_command: git rev-parse --verify nao-existe
             Duration::from_secs(30),
             Some("master"),
             Some(&executor),
+            true,
         )
         .await;
 
@@ -1483,7 +1858,7 @@ gate_command: git rev-parse --verify nao-existe
         roster(&pool, &repo).await;
         let executor = verify_executor(&pool, container.path());
 
-        let outcome = land_with(&repo, Some(pool.clone()), Some(executor), Some("main"), 7).await;
+        let outcome = land_gated(&repo, Some(pool.clone()), Some(executor), Some("main"), 7).await;
 
         assert!(matches!(outcome, Outcome::Failed { .. }), "{outcome:?}");
         assert!(request_callers(&pool).await.is_empty(), "no verify request");
@@ -3277,6 +3652,255 @@ gate_command: git rev-parse --verify nao-existe
         );
     }
 
+    /// The key the `reference-transaction` hook reads is written to the repository's LOCAL config,
+    /// read back by git itself; a directory outside every repository is refused rather than written
+    /// to a global file. The non-repo half uses `tempfile::tempdir()` and not `space_free_tempdir`
+    /// for the reason `a_directory_outside_every_repository_has_no_branch` gives: the latter can sit
+    /// inside this very checkout, and `--local` there would write into it.
+    #[tokio::test]
+    async fn set_integration_config_writes_the_local_key_and_refuses_a_non_repo() {
+        let (_container, repo) = init_contained_repo("nucleos-gitexec-integ-config-");
+
+        set_integration_config(&repo, "master", deadline())
+            .await
+            .expect("a repository accepts the key");
+
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["config", "--local", "--get", "nucleos.integrationBranch"])
+            .output()
+            .expect("git should start");
+        assert!(output.status.success(), "the key was not written");
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "master");
+
+        let outside = tempfile::tempdir().expect("create a temp directory outside the checkout");
+        let error = set_integration_config(outside.path(), "master", deadline())
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("could not record the integration branch"),
+            "unexpected error: {error}"
+        );
+    }
+
+    // ---- master is closed: the queue's own writers pass the real `reference-transaction` hook ----
+
+    /// The `reference-transaction` hook exactly as `scripts/install-hooks.sh` writes it, taken from
+    /// the installer's heredoc so these tests break if the shipped text stops letting the queue by.
+    fn closed_master_hook_text() -> String {
+        const INSTALLER: &str = include_str!("../../../scripts/install-hooks.sh");
+        const START: &str = "cat > \"$target/reference-transaction\" <<'HOOK_EOF'\n";
+        let installer = INSTALLER.replace("\r\n", "\n");
+        let body = installer
+            .split_once(START)
+            .expect("the installer writes a reference-transaction hook")
+            .1;
+        let end = body
+            .find("\nHOOK_EOF\n")
+            .expect("the reference-transaction heredoc is terminated");
+        format!("{}\n", &body[..end])
+    }
+
+    /// Installs the real hook for `repo` only (a hooks directory beside it, never this checkout's
+    /// `.githooks`) and names `master` as the branch it keeps closed. git for Windows runs the hook
+    /// with its own `sh`, so nothing here depends on a `bash` on PATH.
+    fn close_master(repo: &Path) {
+        let hooks = repo
+            .parent()
+            .expect("a contained repository has a parent")
+            .join("closed-master-hooks");
+        std::fs::create_dir_all(&hooks).expect("create hooks directory");
+        let hook = hooks.join("reference-transaction");
+        std::fs::write(&hook, closed_master_hook_text()).expect("write hook");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))
+                .expect("make hook executable");
+        }
+        git_must_os(
+            repo,
+            &[
+                OsStr::new("config"),
+                OsStr::new("core.hooksPath"),
+                hooks.as_os_str(),
+            ],
+        );
+        git_must(repo, &["config", "nucleos.integrationBranch", "master"]);
+    }
+
+    fn git_must_os(repo: &Path, args: &[&OsStr]) {
+        assert!(git_ok(repo, args), "git {args:?} failed in {repo:?}");
+    }
+
+    /// git as a human would run it: neither the queue's marker nor the escape hatch, whatever the
+    /// environment the test binary was started from carries.
+    fn git_by_hand(repo: &Path, args: &[&str]) -> bool {
+        Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .env_remove(QUEUE_MARKER)
+            .env_remove("NUCLEOS_ALLOW_DIRECT_GIT")
+            .output()
+            .expect("git should start")
+            .status
+            .success()
+    }
+
+    /// The control every queue-writer test below ends on: the same hook still refuses a hand-made
+    /// move of `master`, so a hook that never ran cannot turn those tests green. Also checks the
+    /// queue's write was not logged as a bypass.
+    fn assert_master_is_still_closed(repo: &Path) {
+        let tip = sha_of(repo, "refs/heads/master");
+        let parent = sha_of(repo, "refs/heads/master^1");
+        assert!(
+            !git_by_hand(repo, &["update-ref", "refs/heads/master", &parent]),
+            "the hook let a hand-made update-ref of master through, so it is not installed"
+        );
+        assert_eq!(
+            sha_of(repo, "refs/heads/master"),
+            tip,
+            "master moved by hand"
+        );
+        assert!(
+            !repo.join(".git").join("nucleos-direct-writes.log").exists(),
+            "a queue write carries the marker and is never logged as a bypass"
+        );
+    }
+
+    /// Nobody has `master` open, so the publish is `update-ref` in the project root.
+    #[tokio::test]
+    async fn a_publish_by_update_ref_passes_the_closed_master_hook() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-closed-cas-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        // The main checkout lets go of master, so `worktree_holding` finds no holder.
+        git_must(&repo, &["checkout", "--detach", "master"]);
+        close_master(&repo);
+
+        let computed = compute_merge(&repo, "feat/x", "master", deadline())
+            .await
+            .expect("compute");
+        let new = computed.new.clone();
+        let outcome = publish(&repo, "master", computed, deadline()).await;
+
+        match outcome {
+            Outcome::Succeeded { sha, .. } => assert_eq!(sha.as_deref(), Some(new.as_str())),
+            other => panic!("the queue's update-ref was refused by the hook: {other:?}"),
+        }
+        assert_eq!(sha_of(&repo, "refs/heads/master"), new, "master advanced");
+        assert_master_is_still_closed(&repo);
+    }
+
+    /// `master` open in the main checkout — the common case — so the publish is `merge --ff-only`
+    /// there, and the checkout's files move with the ref.
+    #[tokio::test]
+    async fn a_publish_by_fast_forward_passes_the_closed_master_hook() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-closed-ff-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        close_master(&repo);
+        assert!(!repo.join("feature.txt").exists());
+
+        let computed = compute_merge(&repo, "feat/x", "master", deadline())
+            .await
+            .expect("compute");
+        let new = computed.new.clone();
+        let outcome = publish(&repo, "master", computed, deadline()).await;
+
+        match outcome {
+            Outcome::Succeeded { sha, .. } => assert_eq!(sha.as_deref(), Some(new.as_str())),
+            other => panic!("the queue's fast-forward was refused by the hook: {other:?}"),
+        }
+        assert_eq!(sha_of(&repo, "refs/heads/master"), new, "master advanced");
+        assert!(
+            repo.join("feature.txt").exists(),
+            "the checkout standing on master moved with it"
+        );
+        assert_master_is_still_closed(&repo);
+    }
+
+    /// `Op::Revert` through the real executor: a merge landed by the queue, then reverted by it,
+    /// both under the closed-master hook.
+    #[tokio::test]
+    async fn a_revert_publish_passes_the_closed_master_hook() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-closed-revert-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        close_master(&repo);
+
+        let landed = match land_ordinarily(&repo).await {
+            Outcome::Succeeded { sha, .. } => sha.expect("a merge names what it published"),
+            other => panic!("the queue's merge was refused by the hook: {other:?}"),
+        };
+        let reverted = match revert_through_the_queue(&repo, &landed).await {
+            Outcome::Succeeded { sha, .. } => sha.expect("a revert names what it published"),
+            other => panic!("the queue's revert was refused by the hook: {other:?}"),
+        };
+
+        assert_ne!(reverted, landed);
+        assert_eq!(
+            sha_of(&repo, "refs/heads/master"),
+            reverted,
+            "master points at the revert"
+        );
+        assert!(
+            !repo.join("feature.txt").exists(),
+            "the checkout standing on master moved with the revert"
+        );
+        assert_master_is_still_closed(&repo);
+    }
+
+    /// The merge is computed on a detached HEAD in the integration worktree, so it never writes
+    /// `refs/heads/master` and gives the hook nothing to judge before the publish.
+    #[tokio::test]
+    async fn compute_merge_leaves_the_target_ref_alone_and_the_hook_unseen() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-closed-compute-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        close_master(&repo);
+        let before = sha_of(&repo, "refs/heads/master");
+
+        let computed = compute_merge(&repo, "feat/x", "master", deadline())
+            .await
+            .expect("the compute is not refused by the hook");
+
+        assert_eq!(computed.old, before);
+        assert_ne!(computed.new, before, "there was something to merge");
+        assert_eq!(
+            sha_of(&repo, "refs/heads/master"),
+            before,
+            "computing a merge must not move the target"
+        );
+        let integration = integration_worktree(&repo);
+        assert_eq!(sha_of(&integration, "HEAD"), computed.new);
+        assert!(
+            !git_by_hand(&integration, &["symbolic-ref", "-q", "HEAD"]),
+            "the integration worktree's HEAD is detached, not on a branch"
+        );
+    }
+
+    /// The other half of the convention: `git commit` on master by hand, without the marker or the
+    /// escape, is refused and the ref does not move.
+    #[tokio::test]
+    async fn a_hand_made_commit_on_the_target_is_refused_by_the_closed_master_hook() {
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-closed-hand-");
+        close_master(&repo);
+        let before = sha_of(&repo, "refs/heads/master");
+
+        assert!(
+            !git_by_hand(&repo, &["commit", "--allow-empty", "-m", "by hand"]),
+            "a hand-made commit on master must be refused"
+        );
+        assert_eq!(sha_of(&repo, "refs/heads/master"), before, "master moved");
+    }
+
     /// A spent budget refuses before spawning, which is what puts this on `run_git`'s sanctioned
     /// list at all.
     #[tokio::test]
@@ -4694,5 +5318,124 @@ gate_command: git rev-parse --verify nao-existe
             refused.contains("not a merge commit"),
             "the refusal has to say which commit it could not walk: {refused}"
         );
+    }
+
+    // ---- The `renumber-sequence` builtin through the executor (plan 2026-11-09, P6) -----------
+
+    /// Writes `files` (path, contents) and commits them on `branch`, then goes back to `master`.
+    fn commit_on(repo: &Path, branch: &str, files: &[(&str, &str)], message: &str) {
+        let run = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .expect("git should start");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["checkout", branch]);
+        for (path, contents) in files {
+            let target = repo.join(path);
+            std::fs::create_dir_all(target.parent().expect("a parent")).expect("mkdir");
+            std::fs::write(&target, contents).expect("write");
+        }
+        run(&["add", "-A"]);
+        run(&["commit", "--no-verify", "-m", message]);
+        run(&["checkout", "master"]);
+    }
+
+    /// Rules with the factory renumber step over `core/migrations`, and a gate that always passes.
+    const RENUMBER_RULES: &str = "gate_command: git --version
+integration_steps:
+  - id: renumber
+    kind: builtin:renumber-sequence
+    config: { dir: core/migrations, pattern: \"{N:4}_*.sql\", references: [\"core/src/**/*.rs\", \"core/migrations/*.sql\"] }
+";
+
+    #[tokio::test]
+    async fn the_renumber_step_fixes_a_colliding_land_end_to_end() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-renumber-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        commit_on(
+            &repo,
+            "master",
+            &[
+                ("core/migrations/0001_a.sql", "-- a\n"),
+                ("core/migrations/0002_b.sql", "-- b\n"),
+            ],
+            "base migrations",
+        );
+        commit_on(
+            &repo,
+            "feat/x",
+            &[
+                ("core/migrations/0002_c.sql", "-- c\n"),
+                ("core/src/uses.rs", "const MIGRATION: &str = \"0002_c\";\n"),
+            ],
+            "branch migration",
+        );
+        write_autopilot_rules(RENUMBER_RULES);
+
+        let published = match land_ordinarily(&repo).await {
+            Outcome::Succeeded { sha, .. } => sha.expect("a merge names the commit it published"),
+            other => panic!("the renumbered land must succeed, got {other:?}"),
+        };
+
+        assert_eq!(sha_of(&repo, "master"), published);
+        let listing = git_stdout(
+            &repo,
+            &["ls-tree", "--name-only", "master:core/migrations/"],
+        );
+        let names: Vec<&str> = listing.lines().collect();
+        assert_eq!(
+            names,
+            ["0001_a.sql", "0002_b.sql", "0003_c.sql"],
+            "{listing}"
+        );
+        let reference = git_stdout(&repo, &["show", "master:core/src/uses.rs"]);
+        assert!(reference.contains("0003_c"), "{reference}");
+        assert!(!reference.contains("0002_c"), "{reference}");
+        assert!(
+            git_stdout(&repo, &["log", "-1", "--format=%s", "master"]).starts_with("integrate:"),
+            "the published tip is the integrate commit"
+        );
+        let merge_parents = git_stdout(&repo, &["rev-list", "--parents", "-n", "1", "master^"]);
+        assert_eq!(
+            merge_parents.split_whitespace().count(),
+            3,
+            "the integrate commit sits on the merge: {merge_parents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_renumber_step_with_a_bad_config_fails_the_land() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-renumber-bad-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        write_autopilot_rules(
+            "gate_command: git --version
+integration_steps:
+  - id: renumber
+    kind: builtin:renumber-sequence
+    config: {}
+",
+        );
+        let before = sha_of(&repo, "master");
+
+        match land_ordinarily(&repo).await {
+            Outcome::Failed { reason, .. } => {
+                assert!(reason.contains("renumber"), "{reason}");
+                assert!(reason.contains("nothing was published"), "{reason}");
+            }
+            other => panic!("a bad step config must fail the land, got {other:?}"),
+        }
+        assert_eq!(sha_of(&repo, "master"), before, "master moved");
     }
 }

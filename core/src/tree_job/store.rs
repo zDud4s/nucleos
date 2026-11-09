@@ -301,9 +301,10 @@ pub async fn launch_recovering_resuming(
         },
     )
     .await?;
-    let outcome =
-        super::node_run::launch_resuming(state, node_id, key, prompt, project_id, cwd, mode, resume)
-            .await;
+    let outcome = super::node_run::launch_resuming(
+        state, node_id, key, prompt, project_id, cwd, mode, resume,
+    )
+    .await;
     if let Err(super::node_run::NodeRunError::Create(_)) = &outcome {
         // Best effort: the create error is the answer, and a failed clear only leaves the old
         // behaviour (the key stays spent until the next boot).

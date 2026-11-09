@@ -59,6 +59,13 @@ impl<F: std::future::Future + Unpin> std::future::Future for CatchUnwind<F> {
 /// in a row is somebody writing to it directly, outside the queue, and the row's failure reason
 /// says that rather than "resubmit" — there being nobody left to resubmit it.
 pub(super) const MOVED_TARGET_RETRY_CEILING: i64 = 3;
+/// The feed line for a request parked for the owner. The `reason` carries what is being approved
+/// (the test map, or a file an integration step runs), so the line names it instead of assuming
+/// the test map.
+pub(super) fn awaiting_owner_summary(id: i64, reason: &str) -> String {
+    format!("vcs request {id} waits for your approval — {reason}")
+}
+
 /// Whether `outcome` is `publish`'s answer to a target that moved between computing a merge and
 /// writing it — `git_exec::publish_by_update_ref` and `publish_by_fast_forward` both phrase it
 /// identically, so matching the phrase is matching the case rather than duplicating a constant
@@ -407,9 +414,7 @@ pub async fn drain_once(
                 Outcome::Escalated { reason, .. } => {
                     format!("vcs request {id} escalated — {reason}")
                 }
-                Outcome::AwaitingOwner { .. } => {
-                    format!("vcs request {id} changes the test map and waits for your approval")
-                }
+                Outcome::AwaitingOwner { reason, .. } => awaiting_owner_summary(id, reason),
                 Outcome::AwaitingGate { reason, .. } => {
                     format!("vcs request {id} parked — {reason}")
                 }

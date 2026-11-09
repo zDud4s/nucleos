@@ -1,4 +1,5 @@
-//! Daemon-side openers and closers for machine tickets (`migration:`, `fmt:`, `conflict:`). An agent
+//! Daemon-side openers and closers for machine tickets (`migration:`, `fmt:`, `conflict:`,
+//! `direct-write:`). An agent
 //! cannot declare these keys (`store::report` refuses them); the daemon opens them when a detector
 //! sees the problem and closes them when the detector sees it gone.
 
@@ -297,6 +298,76 @@ pub async fn close_fmt_tickets(
     Ok(closed)
 }
 
+/// Why the target moved without the queue: a write the hook did not see (`Violation`) or one it
+/// let through because `NUCLEOS_ALLOW_DIRECT_GIT` was set (`Bypass`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectWriteKind {
+    Violation,
+    Bypass,
+}
+
+impl DirectWriteKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Violation => "violation",
+            Self::Bypass => "bypass",
+        }
+    }
+}
+
+/// The key `direct-write:<target>`, through the one normaliser every key goes through. It has no
+/// path in it, so the project root plays no part.
+pub fn direct_write_key(target: &str) -> Option<TaskKey> {
+    keys::normalize(&format!("direct-write:{target}"), Path::new("")).ok()
+}
+
+/// Opens (or reports again) `direct-write:<target>`: the target advanced outside the queue. The
+/// title and `detail.kind` tell a violation from a bypass; `detail` also gets `target`. A non-object
+/// `detail` is kept under `detail.detail`. The ticket is never auto-launched (`launch::due`): the
+/// owner resolves it.
+pub async fn open_direct_write_ticket(
+    pool: &SqlitePool,
+    project_id: &str,
+    target: &str,
+    kind: DirectWriteKind,
+    detail: Value,
+    now: DateTime<Utc>,
+) -> sqlx::Result<TaskRow> {
+    let Some(key) = direct_write_key(target) else {
+        return Err(sqlx::Error::Protocol(format!(
+            "no direct-write ticket key for target '{target}'"
+        )));
+    };
+    let target = target.trim();
+    let title = match kind {
+        DirectWriteKind::Violation => format!("{target} advanced outside the queue"),
+        DirectWriteKind::Bypass => {
+            format!("{target} advanced outside the queue through NUCLEOS_ALLOW_DIRECT_GIT")
+        }
+    };
+    let mut fields = match detail {
+        Value::Object(fields) => fields,
+        Value::Null => serde_json::Map::new(),
+        other => {
+            let mut fields = serde_json::Map::new();
+            fields.insert("detail".to_owned(), other);
+            fields
+        }
+    };
+    fields.insert("kind".to_owned(), json!(kind.as_str()));
+    fields.insert("target".to_owned(), json!(target));
+    open_machine_ticket(
+        pool,
+        project_id,
+        key,
+        title,
+        Value::Object(fields),
+        Vec::new(),
+        now,
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -559,5 +630,65 @@ mod tests {
             Some((HolderKind::Session, "s1")),
             "a new machine ticket is offered to its competent live holder"
         );
+    }
+
+    #[tokio::test]
+    async fn a_direct_write_ticket_is_one_per_target_and_carries_its_kind() {
+        let pool = crate::testdb::fresh_pool().await;
+        let now = Utc.with_ymd_and_hms(2026, 11, 9, 10, 0, 0).unwrap();
+        let first = open_direct_write_ticket(
+            &pool,
+            "proj",
+            "master",
+            DirectWriteKind::Violation,
+            json!({ "old": "a1", "new": "b2" }),
+            now,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.key.as_str(), "direct-write:master");
+        assert!(first.key.is_machine());
+        assert_eq!(first.title, "master advanced outside the queue");
+        assert_eq!(first.detail["kind"], json!("violation"));
+        assert_eq!(first.detail["target"], json!("master"));
+        assert_eq!(first.detail["new"], json!("b2"));
+
+        let again = open_direct_write_ticket(
+            &pool,
+            "proj",
+            "master",
+            DirectWriteKind::Violation,
+            json!({ "old": "b2", "new": "c3" }),
+            now,
+        )
+        .await
+        .unwrap();
+        assert_eq!(again.id, first.id, "the same target is one ticket");
+        let key = direct_write_key("master").expect("a direct-write key");
+        let live = store::live_by_key(&pool, "proj", &key, now)
+            .await
+            .unwrap()
+            .expect("the ticket is live");
+        assert_eq!(live.report_count, 2);
+
+        let bypass = open_direct_write_ticket(
+            &pool,
+            "proj",
+            "main",
+            DirectWriteKind::Bypass,
+            json!({ "new": "d4" }),
+            now,
+        )
+        .await
+        .unwrap();
+        assert_ne!(bypass.id, first.id, "another target is another ticket");
+        assert_eq!(bypass.key.as_str(), "direct-write:main");
+        assert_eq!(
+            bypass.title,
+            "main advanced outside the queue through NUCLEOS_ALLOW_DIRECT_GIT"
+        );
+        assert_eq!(bypass.detail["kind"], json!("bypass"));
+        assert_eq!(ticket_count(&pool).await, 2);
+        assert!(direct_write_key("  ").is_none(), "no target, no key");
     }
 }

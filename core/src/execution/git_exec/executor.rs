@@ -33,7 +33,7 @@ impl Default for GitExecutor {
 /// and owes the post-merge gate a cover mark when the FULL gate ran on a merge it would repeat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MergeGate {
-    /// `gate_before_publish` is off: nothing was measured.
+    /// `gate_before_publish` is off and no integration step is active: nothing was measured.
     Skipped,
     /// The full `gate_command` ran and passed; the post-merge gate is not in play.
     Full,
@@ -136,17 +136,98 @@ impl crate::execution::vcs::VcsExecutor for GitExecutor {
                 }
                 match compute_merge(project_root, source.as_str(), target.as_str(), deadline).await
                 {
-                    Ok(computed) => {
+                    Ok(mut computed) => {
+                        // Integration steps (plan 2026-11-09): only a merge INTO the integration
+                        // branch runs them, and only when it moved the target. A project with no
+                        // active step passes through here untouched.
+                        let steps = match integration_steps_of(&request.project_id) {
+                            Ok(steps) => steps,
+                            Err(outcome) => return outcome,
+                        };
+                        let mut step_reports: Vec<StepReport> = Vec::new();
+                        let mut deadline = deadline;
+                        // The map blob a combined step-and-map approval already covered.
+                        let mut map_approved_with_steps: Option<String> = None;
+                        if !steps.is_empty()
+                            && computed.new != computed.old
+                            && lands_on_the_integration_branch(request, target)
+                        {
+                            // A branch that changes what a step runs waits for the owner, before
+                            // anything it changed is executed. `approved_map_blob` carries the
+                            // approved content token, as it does for the test map.
+                            match changed_step_inputs(project_root, &steps, &computed, deadline)
+                                .await
+                            {
+                                Err(outcome) => return outcome,
+                                Ok(Some(pin)) => {
+                                    // The one approval slot cannot hold two tokens: a branch that
+                                    // also changes the test map waits once, for `<pin>+<blob>`.
+                                    let map_now =
+                                        match map_change(project_root, &computed, deadline).await {
+                                            Ok(blob) => blob,
+                                            Err(outcome) => return outcome,
+                                        };
+                                    let (token, files) = match &map_now {
+                                        Some(blob) => (
+                                            format!("{}+{blob}", pin.token),
+                                            format!(
+                                                "{}, {}",
+                                                pin.files.join(", "),
+                                                crate::tests_map::MAP_FILE
+                                            ),
+                                        ),
+                                        None => (pin.token.clone(), pin.files.join(", ")),
+                                    };
+                                    if request.approved_map_blob.as_deref() != Some(token.as_str())
+                                    {
+                                        return Outcome::AwaitingOwner {
+                                            reason: format!(
+                                                "this merge changes {files} which an integration step runs; it lands once the owner approves it"
+                                            ),
+                                            map_blob: token,
+                                        };
+                                    }
+                                    map_approved_with_steps = map_now;
+                                }
+                                Ok(None) => {}
+                            }
+                            let done = match run_integration_steps(
+                                &StepRun {
+                                    integration: &integration_worktree(project_root),
+                                    base: &computed.old,
+                                    merge: &computed.new,
+                                    source: source.as_str(),
+                                    target: target.as_str(),
+                                },
+                                &steps,
+                                self.timeout,
+                            )
+                            .await
+                            {
+                                Ok(done) => done,
+                                Err(outcome) => return outcome,
+                            };
+                            if let Some(sha) = done.commit {
+                                computed.new = sha;
+                            }
+                            step_reports = done.reports;
+                            // Steps may outlast the git budget fixed at the start: the git
+                            // commands that follow get a fresh one, as they do after the gate.
+                            deadline = std::time::Instant::now() + self.timeout;
+                        }
                         // Spec 2026-10-05 §3.4, defence 1: a merge that changes the test map
                         // waits for the owner, before the gate, which is the very thing the map
                         // configures. Passes only when the owner approved exactly this content.
                         // Only a merge INTO the integration branch asks: master merged into an
-                        // agent's branch carries a map the owner already approved.
+                        // agent's branch carries a map the owner already approved. Judged on the
+                        // tip AFTER the steps, so a step that edits the map asks too.
                         match map_change(project_root, &computed, deadline).await {
                             Err(outcome) => return outcome,
                             Ok(Some(blob))
                                 if lands_on_the_integration_branch(request, target)
                                     && request.approved_map_blob.as_deref()
+                                        != Some(blob.as_str())
+                                    && map_approved_with_steps.as_deref()
                                         != Some(blob.as_str()) =>
                             {
                                 return Outcome::AwaitingOwner {
@@ -185,6 +266,7 @@ impl crate::execution::vcs::VcsExecutor for GitExecutor {
                             crate::state::DEFAULT_GATE_TIMEOUT,
                             land_target,
                             self.verify.as_ref(),
+                            !steps.is_empty() && lands_on_the_integration_branch(request, target),
                         )
                         .await
                         {
@@ -227,6 +309,41 @@ impl crate::execution::vcs::VcsExecutor for GitExecutor {
                                 "could not mark the published merge as covered; the post-merge \
                                  gate will run again"
                             );
+                        }
+                        // One feed line per step that changed files, only for a land that went
+                        // through. Best effort, like every feed row here.
+                        if matches!(outcome, Outcome::Succeeded { .. })
+                            && let Some(pool) = self.pool.as_ref()
+                        {
+                            for report in step_reports.iter().filter(|r| !r.changed.is_empty()) {
+                                let listed = report
+                                    .changed
+                                    .iter()
+                                    .take(5)
+                                    .cloned()
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                let more = report.changed.len().saturating_sub(5);
+                                let files = if more > 0 {
+                                    format!("{listed} +{more}")
+                                } else {
+                                    listed
+                                };
+                                let _ = crate::feed::append(
+                                    pool,
+                                    Some(request.project_id.as_str()),
+                                    "integration_step",
+                                    &format!(
+                                        "integration step `{}` changed {} file(s) for {}: {files}",
+                                        report.id,
+                                        report.changed.len(),
+                                        source.as_str()
+                                    ),
+                                    request.run_id,
+                                    Some(&crate::feed::Subject::Vcs(request.id)),
+                                )
+                                .await;
+                            }
                         }
                         outcome
                     }
@@ -435,6 +552,7 @@ pub(super) async fn gate_the_merge(
     scope_wait: Duration,
     land_target: Option<&str>,
     verify: Option<&std::sync::Arc<crate::verify::exec::Executor>>,
+    steps_apply: bool,
 ) -> Result<MergeGate, Outcome> {
     let refuse = |reason: String| Outcome::Failed {
         reason,
@@ -453,13 +571,21 @@ pub(super) async fn gate_the_merge(
             )));
         }
     };
-    if !rules.gate_before_publish {
+    // An active integration step forces the gate: its output must never be published unmeasured.
+    // Only a merge the steps actually apply to is forced; any other keeps `gate_before_publish`.
+    let required = if steps_apply {
+        rules.merge_gate_required()
+    } else {
+        rules.gate_before_publish
+    };
+    if !required {
         return Ok(MergeGate::Skipped);
     }
     let Some(command) = rules.gate_command else {
         return Err(refuse(format!(
-            "{rules_path} asks for merges to be gated and names no gate_command, so there is \
-             nothing to measure this merge with and nothing was published"
+            "{rules_path} asks for merges to be gated (or declares an integration step, which \
+             forces the gate) and names no gate_command, so there is nothing to measure this \
+             merge with and nothing was published"
         )));
     };
 

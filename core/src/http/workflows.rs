@@ -1282,6 +1282,7 @@ pub(super) async fn post_workflow_sync(
             detail,
         )
     })?;
+    record_integration_branch(&state, &project_id, &root).await;
 
     let said: Vec<String> = outcomes
         .iter()
@@ -1304,6 +1305,44 @@ pub(super) async fn post_workflow_sync(
         project_id,
         outcomes,
     }))
+}
+
+/// Writes the project's integration branch into its repository's local git config
+/// (`nucleos.integrationBranch`), where the `reference-transaction` hook reads which branch only the
+/// queue may move.
+///
+/// **Fail-open, and only a branch that is known.** A sync that placed its files is not undone by a
+/// config write that failed, so every failure is a `warn!` and nothing more. A `Stale` or `Unknown`
+/// reading writes nothing: closing a branch is only right when it is the branch work actually lands
+/// on, and a wrong name would close the wrong one while leaving the real target open.
+///
+/// `integration_branch_reading` and not `integration_branch`: a sync must not pin the roster column
+/// as a side effect, for the reason that function's doc gives for a GET.
+async fn record_integration_branch(state: &AppState, project_id: &str, root: &std::path::Path) {
+    let deadline = std::time::Instant::now() + DETECT_GIT_BUDGET;
+    let branch = match crate::execution::land::integration_branch_reading(
+        &state.pool,
+        project_id,
+        deadline,
+    )
+    .await
+    {
+        Ok(crate::execution::land::IntegrationBranch::Declared { branch })
+        | Ok(crate::execution::land::IntegrationBranch::Derived { branch }) => branch,
+        Ok(other) => {
+            tracing::warn!(project_id, reading = ?other, "the integration branch is not known, so it was not recorded in git config");
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(%error, project_id, "reading the integration branch failed, so it was not recorded in git config");
+            return;
+        }
+    };
+    if let Err(error) =
+        crate::execution::git_exec::set_integration_config(root, &branch, deadline).await
+    {
+        tracing::warn!(%error, project_id, branch = %branch, "recording the integration branch in git config failed");
+    }
 }
 
 /// One feed line, after the fact and loudly on failure.
@@ -1990,6 +2029,66 @@ mod tests {
         let (status, answer) = sync(state, fixture.repo.path()).await;
         assert_eq!(status, StatusCode::OK, "{answer}");
         assert_eq!(answer["project_id"], "alpha");
+    }
+
+    /// `nucleos.integrationBranch` from the repository's LOCAL config, or `None` when it is unset.
+    fn integration_config(repo: &std::path::Path) -> Option<String> {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["config", "--local", "--get", "nucleos.integrationBranch"])
+            .output()
+            .expect("git should start");
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    }
+
+    /// Plan master-fechado-3 C: a sync records the branch the `reference-transaction` hook closes,
+    /// in the repository's local config. The roster column is empty, so the branch is the derived
+    /// one (`master`, no `origin`), and the column stays empty: a sync reads, it does not pin.
+    #[tokio::test]
+    async fn a_workflow_sync_records_the_integration_branch_in_git_config() {
+        let fixture = stale_project().await;
+        let state = &fixture.state;
+        git(fixture.repo.path(), &["branch", "-M", "master"]);
+        let (status, answer) = repair(state, "alpha", &fixture.repo.path().to_string_lossy()).await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        assert_eq!(integration_config(fixture.repo.path()), None);
+
+        let (status, answer) = sync(state, fixture.repo.path()).await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+
+        assert_eq!(
+            integration_config(fixture.repo.path()).as_deref(),
+            Some("master")
+        );
+        let column: Option<String> = sqlx::query_scalar(
+            "SELECT integration_branch FROM autopilot_state WHERE project_id = 'alpha'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(column, None, "a sync must not pin the roster column");
+    }
+
+    /// A branch the daemon cannot name is not written: a guessed one would close the wrong branch.
+    /// The sync itself still succeeds, because the config write is fail-open.
+    #[tokio::test]
+    async fn a_workflow_sync_leaves_the_config_alone_when_the_branch_is_unknown() {
+        let fixture = stale_project().await;
+        let state = &fixture.state;
+        // No `origin`, and neither `master` nor `main`: nothing to derive the branch from.
+        git(fixture.repo.path(), &["branch", "-M", "trunk"]);
+        let (status, answer) = repair(state, "alpha", &fixture.repo.path().to_string_lossy()).await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+
+        let (status, answer) = sync(state, fixture.repo.path()).await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        assert_eq!(answer["project_id"], "alpha");
+
+        assert_eq!(integration_config(fixture.repo.path()), None);
     }
 
     /// The session repairing can die. Its lease ends the wait, and what the sync then says is the

@@ -1065,7 +1065,10 @@ mod tests {
         );
         assert_eq!(
             read("git -C C:/Projects/wt merge --no-ff aut/s6 2>&1"),
-            vec![(steps(&["C:/Projects/wt"]), "git merge --no-ff aut/s6".to_owned())]
+            vec![(
+                steps(&["C:/Projects/wt"]),
+                "git merge --no-ff aut/s6".to_owned()
+            )]
         );
         assert_eq!(
             read("git -C wt branch -d old 2>&1"),
@@ -2322,9 +2325,15 @@ mod tests {
             );
         }
         let refusal = unqueueable_but_shared("git merge --no-ff a -m x").unwrap();
-        assert!(refusal.contains("git -C <worktree> merge --no-ff <branch>"), "{refusal}");
+        assert!(
+            refusal.contains("git -C <worktree> merge --no-ff <branch>"),
+            "{refusal}"
+        );
         let refusal = unqueueable_but_shared("git rebase -i a").unwrap();
-        assert!(refusal.contains("git -C <worktree> rebase <onto>"), "{refusal}");
+        assert!(
+            refusal.contains("git -C <worktree> rebase <onto>"),
+            "{refusal}"
+        );
     }
 
     /// `git fetch <remote>` exactly, and every neighbouring spelling is a different operation.
@@ -5861,5 +5870,25 @@ mod tests {
 
         assert_eq!(sweep_awaiting_gate(&pool).await, 1);
         assert_eq!(status_of(&pool, id).await, "queued");
+    }
+
+    #[test]
+    fn the_awaiting_owner_summary_names_the_reason() {
+        let step = awaiting_owner_summary(
+            7,
+            "this merge changes scripts/fix.sh which an integration step runs; it lands once the owner approves it",
+        );
+        assert!(
+            step.contains("vcs request 7 waits for your approval"),
+            "{step}"
+        );
+        assert!(
+            step.contains("scripts/fix.sh which an integration step runs"),
+            "{step}"
+        );
+        assert!(
+            !step.contains("test map"),
+            "a step approval is not a test-map one: {step}"
+        );
     }
 }

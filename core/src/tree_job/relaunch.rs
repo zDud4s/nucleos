@@ -267,16 +267,21 @@ async fn resumable_session(
         return None;
     }
     let run_id = dead_run.parse::<i64>().ok()?;
-    let row: Option<(String, Option<String>, Option<i64>, Option<i64>, Option<String>)> =
-        sqlx::query_as(
-            "SELECT status, session_id, COALESCE(context_fill, context_peak), successor_run_id, runner
+    let row: Option<(
+        String,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT status, session_id, COALESCE(context_fill, context_peak), successor_run_id, runner
              FROM runs WHERE id = ?",
-        )
-        .bind(run_id)
-        .fetch_optional(&state.pool)
-        .await
-        .ok()
-        .flatten();
+    )
+    .bind(run_id)
+    .fetch_optional(&state.pool)
+    .await
+    .ok()
+    .flatten();
     let (status, session, fill, successor, runner) = row?;
     let session = session.filter(|session| !session.is_empty())?;
     if status != "interrupted" || successor.is_some() {
@@ -1085,10 +1090,18 @@ mod tests {
                 .unwrap();
         }
 
-        assert_eq!(resumable_session(&state, &worktree_launch(), "87").await, None);
-        assert_eq!(resumable_session(&state, &worktree_launch(), "88").await, None);
         assert_eq!(
-            resumable_session(&state, &worktree_launch(), "89").await.as_deref(),
+            resumable_session(&state, &worktree_launch(), "87").await,
+            None
+        );
+        assert_eq!(
+            resumable_session(&state, &worktree_launch(), "88").await,
+            None
+        );
+        assert_eq!(
+            resumable_session(&state, &worktree_launch(), "89")
+                .await
+                .as_deref(),
             Some("sess-abc")
         );
     }
