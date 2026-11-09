@@ -1,5 +1,8 @@
 //! Tree jobs: the daemon-side driver of a tree of work nodes, from manifest to landing.
 
+mod autofmt;
+#[cfg(test)]
+mod autofmt_driver_tests;
 pub mod branch_start;
 pub mod budget;
 pub mod checklist;

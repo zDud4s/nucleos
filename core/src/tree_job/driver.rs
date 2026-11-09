@@ -26,6 +26,7 @@ use chrono::{SecondsFormat, Utc};
 use serde_json::Value;
 use sqlx::SqlitePool;
 
+use super::autofmt;
 use super::decisions;
 use super::engine::{apply_transition, branch_node_may_close};
 use super::http::job_lock;
@@ -355,21 +356,53 @@ async fn at_work(
     match report.result.as_deref() {
         Some("done") => {}
         Some(outcome @ ("blocked" | "failed")) => {
-            // One rescue run with the failure in its prompt, then the owner is asked.
-            if let Some(run) = &report.run_id {
-                let handoff = rescue::handoff_text(pool, &node).await;
-                let suffix = rescue::stopped_suffix(outcome, handoff.as_deref());
-                if rescue::attempt(state, &node, run, &suffix).await? {
-                    return Ok(());
+            let handoff = rescue::handoff_text(pool, &node).await;
+            // A leaf that only asks the controller to run the formatter is not blocked: the daemon
+            // formats and the branch goes on to its gate.
+            let asks_formatter = outcome == "blocked"
+                && handoff
+                    .as_deref()
+                    .is_some_and(autofmt::blocked_asks_only_formatter);
+            let mut formatted = false;
+            if asks_formatter && autofmt::allowed(branch) {
+                let result = autofmt::format_owned(branch).await;
+                // Every attempt is counted, whatever its result, so the budget bounds retries.
+                if let Some(held) = job.manifest.branches.get_mut(name) {
+                    autofmt::count_run(held);
+                    persist(pool, job).await?;
                 }
+                // A formatter that errored falls through to the rescue/park branch below.
+                formatted = result.is_ok();
             }
-            let question = stopped_question(&node, Some(name), outcome)
-                + &super::gate_summary::reason_suffix(pool, &node).await;
-            parks.push((node.clone(), question));
-            return Ok(());
+            if !formatted {
+                // One rescue run with the failure in its prompt, then the owner is asked.
+                if let Some(run) = &report.run_id {
+                    let suffix = rescue::stopped_suffix(outcome, handoff.as_deref());
+                    if rescue::attempt(state, &node, run, &suffix).await? {
+                        return Ok(());
+                    }
+                }
+                let question = stopped_question(&node, Some(name), outcome)
+                    + &super::gate_summary::reason_suffix(pool, &node).await;
+                parks.push((node.clone(), question));
+                return Ok(());
+            }
         }
         _ => return Ok(()),
     }
+    // Rust the branch owns is formatted before its gate, so a rustfmt red does not happen.
+    if let Some(branch) = job.manifest.branches.get(name)
+        && branch.layer != "docs"
+        && autofmt::allowed(branch)
+        && matches!(autofmt::format_owned(branch).await, Ok(true))
+        && let Some(held) = job.manifest.branches.get_mut(name)
+    {
+        autofmt::count_run(held);
+        persist(pool, job).await?;
+    }
+    let Some(branch) = job.manifest.branches.get(name) else {
+        return Ok(());
+    };
 
     if branch.layer == "docs" {
         if branch.state == "building" {
@@ -621,6 +654,19 @@ async fn red(
             .branches
             .get_mut(name)
             .ok_or("branch vanished")?;
+        apply_transition(held, "fixing").map_err(|e| e.to_string())?;
+        return persist(pool, job).await;
+    }
+
+    // A rustfmt-only red is deterministic: the daemon formats the branch itself and re-gates the new
+    // HEAD (next tick, `at_work` sees the finished run). No leaf run, so no fix is counted.
+    if autofmt::heal_red(branch, &findings).await {
+        let held = job
+            .manifest
+            .branches
+            .get_mut(name)
+            .ok_or("branch vanished")?;
+        autofmt::count_run(held);
         apply_transition(held, "fixing").map_err(|e| e.to_string())?;
         return persist(pool, job).await;
     }

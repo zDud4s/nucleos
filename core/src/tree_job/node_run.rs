@@ -30,6 +30,10 @@ const NODE_PROMPT_HEADER: &str = "You are the agent for NucleOS tree node ";
 /// 2026-11-06, tickets globais). Appended once by `node_prompt` and by `root_prompt`.
 pub(super) const TICKET_RULES: &str = "Problems outside your owned paths are not yours to fix. Report them with mcp__nucleos__task_report (key, title, paths) and carry on with your own work; wait only if your work depends on the fix, and then wait for the ticket-closed notice. If you truly need a path you do not own, ask your parent with node_update widen_paths; if a sibling owns it you are refused: report a ticket and it goes to that sibling. Shared files (core/AGENTS.md, ask_daemon.py, core/migrations/) you may edit. A repeated migration number or an unresolved conflict at land is a ticket, not yours to renumber or resolve twice. When a ticket is offered to you and it is independent of your work, claim it and start a branch (a leaf) for it with tree_branch_start, then carry on. The daemon launches a new tree for a ticket nobody claims; it never starts a leaf for one you hold.";
 
+/// What every node is told about cargo and formatting (the daemon-built prompt carried no cargo rule
+/// at all, so a leaf asked to format concluded it could not and ended `blocked`).
+pub(super) const FORMAT_RULES: &str = "You do not run cargo (build, test, check, clippy), and you never hand-format or run bare `rustfmt`. Formatting is not yours to block on: the daemon runs the formatter on the Rust you own before the gate and again if the gate finds only formatting. After editing Rust you may run `cargo fmt -p <crate>` (no other flags, from the worktree root, no `cd`, no pipes), but never report `blocked` because you could not format.";
+
 /// Gives a tree node the protocol it needs to split work and report its result.
 ///
 /// A relaunch receives the already stored prompt, so the marker must make this a no-op after the
@@ -70,6 +74,8 @@ pub(super) fn node_prompt(
 {report}
 
 {ticket_rules}
+
+{FORMAT_RULES}
 
 {task}"
     )
