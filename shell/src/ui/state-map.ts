@@ -170,6 +170,9 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     // keeps one tone on both pages — the same reasoning `reverted` follows.
     job_item_conflicted: { tone: "paused", label: "job item did not merge" },
     job_item_orphaned: { tone: "off", label: "job item never attempted" },
+    // A node failed on a transient API error and its item runs again after a backoff
+    // (`execution/job/ingest.rs`). Stated Blue, as `job_node_retried` is: the job retries on its own.
+    job_item_retry: { tone: "info", label: "job item retried" },
     job_gate_failed: { tone: "danger", label: "job gate failed" },
     job_gate_scoped: { tone: "info", label: "job gated by scope" },
     // The graph walker's own lines (`execution/job/drive.rs`, `engine.rs`): a node that failed, a
@@ -222,6 +225,8 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     work_tree_root_start_failed: { tone: "danger", label: "node tree root did not start" },
     work_tree_root_started: { tone: "info", label: "node tree root started" },
     work_tree_relaunch_skipped: { tone: "info", label: "node relaunch skipped" },
+    // A branch started as a new orchestrator, or was degraded to a leaf (`tree_job/start_log.rs`): a fact, said once.
+    work_tree_descent: { tone: "info", label: "node tree descended" },
     // The audit before a spec's tree could not run (`spec_backlog/finish.rs`): the spec went on unaudited, said once.
     spec_audit_unavailable: { tone: "info", label: "spec audit unavailable" },
     // Runs.
@@ -240,6 +245,12 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     run_on_api_key: { tone: "paused", label: "runs billed to an API key" },
     run_on_subscription: { tone: "info", label: "runs back on the subscription" },
     run_rate_limited: { tone: "danger", label: "usage limit reached" },
+    // Accounts (`core/src/accounts/`). A login that expired waits on a hand, so it is a question
+    // put to the reader. An account at its limit is held until its window resets while new work
+    // goes to the others, so Ember and not red. A removed account's chats going back to Auto is a fact.
+    account_needs_login: { tone: "pending", label: "account needs a new login" },
+    account_limit_hit: { tone: "paused", label: "account hit its limit" },
+    account_unpinned: { tone: "info", label: "chats moved back to Auto" },
     token_efficiency: { tone: "info", label: "efficiency observation" },
     // A provider's usage window crossed one of the owner's thresholds (`core/src/quota.rs`, design
     // D11). Held Ember and not Stated Blue: unlike a slot, this one waits on a hand — the reader

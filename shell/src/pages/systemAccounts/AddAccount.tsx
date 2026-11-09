@@ -174,7 +174,7 @@ function AddAccountStep({
       {hint !== null ? <p id="ac-add-hint" className="ac-hint">{hint}</p> : null}
       {failed.isError ? (
         <div role="alert" className="ac-error">
-          {isApiRefusal(failed.error) ? (failed.error.detail || failed.error.code) : "the daemon did not answer"}
+          {isApiRefusal(failed.error) ? (failed.error.detail || failed.error.code) : "the background service is not responding"}
         </div>
       ) : null}
     </form>
@@ -227,7 +227,7 @@ export function LoginPanel({ initial, onClose }: { initial: LoginView; onClose: 
       ) : null}
       {submit.isError ? (
         <div role="alert" className="ac-error">
-          {isApiRefusal(submit.error) ? (submit.error.detail || submit.error.code) : "the daemon did not answer"}
+          {isApiRefusal(submit.error) ? (submit.error.detail || submit.error.code) : "the background service is not responding"}
         </div>
       ) : null}
       {finished ? (

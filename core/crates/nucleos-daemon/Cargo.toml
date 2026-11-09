@@ -28,6 +28,9 @@ base64 = "0.23.0"
 chrono = { version = "0.4.45", features = ["serde"] }
 directories = "6.0.0"
 notify = "8"
+# `http/accounts/token.rs`: the random suffix of a token account's id. Same version as
+# `nucleos-core`'s, already in the lock file.
+rand = "0.10.2"
 # Same features as `nucleos-core`'s, which explains why `native-tls` must stay.
 reqwest = { version = "0.13", default-features = false, features = ["json", "multipart", "native-tls"] }
 schemars = "1.2"

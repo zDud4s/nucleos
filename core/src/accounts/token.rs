@@ -4,8 +4,9 @@
 //! a `Debug` output.
 //!
 //! The credential store is synchronous, so every access here hops to a blocking thread (like
-//! `judge/client.rs`). Under `cfg(test)` the store is an in-process map: a test never touches the
-//! desktop's real credentials.
+//! `judge/client.rs`). Under `cfg(test)`, and with the `testkit` feature (the tests of the crates
+//! above, e.g. `nucleos-daemon`'s HTTP tests), the store is an in-process map: a test never touches
+//! the desktop's real credentials.
 
 use super::AccountId;
 
@@ -34,7 +35,7 @@ pub fn clean_token(token: &str) -> Option<String> {
     Some(token.to_owned())
 }
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "testkit")))]
 mod backend {
     pub fn store(key: &str, value: &str) -> Result<(), String> {
         crate::secrets::store_secret(key, value).map_err(|error| error.to_string())
@@ -47,7 +48,7 @@ mod backend {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 mod backend {
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -95,8 +96,8 @@ pub async fn delete(id: &AccountId) -> Result<(), String> {
     joined(tokio::task::spawn_blocking(move || backend::delete(&key)).await)
 }
 
-/// The stored token, read synchronously. Tests only.
-#[cfg(test)]
+/// The stored token, read synchronously. Tests only (here, and above through `testkit`).
+#[cfg(any(test, feature = "testkit"))]
 pub fn peek(id: &AccountId) -> Option<String> {
     backend::load(&secret_key(id)).unwrap()
 }

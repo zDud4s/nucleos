@@ -83,7 +83,7 @@ function AccountCard({ account, onLogin }: { account: PoolAccount; onLogin: (vie
   const [replacing, setReplacing] = useState<string | null>(null);
   const isToken = account.kind === "token";
 
-  const fail = (e: unknown) => setError(isApiRefusal(e) ? e.code : "the daemon did not answer");
+  const fail = (e: unknown) => setError(isApiRefusal(e) ? e.code : "the background service is not responding");
   const signIn = () =>
     isToken ? setReplacing("") : relogin.mutate(account.id, { onSuccess: onLogin, onError: fail });
 

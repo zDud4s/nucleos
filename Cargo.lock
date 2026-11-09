@@ -1884,6 +1884,7 @@ dependencies = [
  "notify",
  "nucleos-app",
  "nucleos-core",
+ "rand",
  "reqwest",
  "schemars",
  "serde",

@@ -135,6 +135,36 @@ function modulePath(name: string): string {
   return `crate::${name.replace(/\.rs$/, "").replace(/\/mod$/, "").replace(/\//g, "::")}`;
 }
 
+/** The module a `super::` path names from `name`: the parent of the file's own module. */
+function parentModule(name: string): string {
+  return modulePath(name).replace(/::\w+$/, "");
+}
+
+/** `super::X` / `self::X` as a `crate::` path, so a constant one module up is read like any other. */
+function absolutePath(name: string, path: string): string {
+  if (path.startsWith("super::")) return `${parentModule(name)}::${path.slice("super::".length)}`;
+  if (path.startsWith("self::")) return `${modulePath(name)}::${path.slice("self::".length)}`;
+  return path;
+}
+
+/**
+ * The constants a file imports by name (`use super::{A, NEEDS_LOGIN_KIND};`,
+ * `use crate::accounts::UNPINNED_KIND;`), each mapped to its absolute path, so a bare constant the
+ * file did not declare itself is read from the module that did. Flat braces only; a glob is skipped.
+ */
+function importedConstants(name: string, body: string): Map<string, string> {
+  const imports = new Map<string, string>();
+  for (const [, base, list] of body.matchAll(/\buse\s+((?:crate|super|self)(?:::\w+)*)::\{([^{}]*)\}/g)) {
+    for (const item of list.split(",").map((part) => part.trim())) {
+      if (/^[A-Z][A-Z0-9_]*$/.test(item)) imports.set(item, absolutePath(name, `${base}::${item}`));
+    }
+  }
+  for (const [, base, item] of body.matchAll(/\buse\s+((?:crate|super|self)(?:::\w+)*)::([A-Z][A-Z0-9_]*)\s*;/g)) {
+    imports.set(item, absolutePath(name, `${base}::${item}`));
+  }
+  return imports;
+}
+
 /**
  * `main.rs` and the top-level files of the modules it declares (`mod startup;`): the binary's side,
  * where the lib is in scope by glob and a bare module path names the lib's module.
@@ -156,6 +186,7 @@ function writtenFeedKinds(): { kinds: Set<string>; files: number; unresolved: st
   for (const { name, source } of files) {
     const body = withoutTestModule(source);
     const constants = stringConstants(body);
+    const imports = importedConstants(name, body);
     for (const writer of WRITERS) {
       const call = new RegExp(`(?<![A-Za-z0-9_])${writer.name}\\s*\\(`, "g");
       for (const match of body.matchAll(call)) {
@@ -168,7 +199,10 @@ function writtenFeedKinds(): { kinds: Set<string>; files: number; unresolved: st
           continue;
         }
         if (/^[A-Z][A-Z0-9_]*$/.test(argument)) {
-          const value = constants.get(argument);
+          // Declared in this file, or imported by name from the module that declares it.
+          const imported = imports.get(argument);
+          const owner = imported === undefined ? undefined : /^(crate(?:::\w+)+)::[A-Z][A-Z0-9_]*$/.exec(imported);
+          const value = constants.get(argument) ?? (owner ? byModule.get(owner[1])?.get(argument) : undefined);
           if (value === undefined) unresolved.push(`${name}: ${argument}`);
           else kinds.add(value);
           continue;
@@ -176,7 +210,7 @@ function writtenFeedKinds(): { kinds: Set<string>; files: number; unresolved: st
         // `main.rs` is the binary over the lib (`use nucleos_core::*`), and so is every module it
         // declares (`startup.rs` reads `use super::*`): a bare `onboarding::X` there, or a
         // `nucleos_core::onboarding::X` anywhere, is the lib's `crate::onboarding::X`.
-        let path = argument.replace(/\s+/g, "").replace(/^nucleos_core::/, "crate::");
+        let path = absolutePath(name, argument.replace(/\s+/g, "").replace(/^nucleos_core::/, "crate::"));
         if (BINARY_FILES.has(name) && !path.startsWith("crate::")) path = `crate::${path}`;
         const qualified = /^(crate(?:::\w+)+)::([A-Z][A-Z0-9_]*)$/.exec(path);
         if (qualified) {
