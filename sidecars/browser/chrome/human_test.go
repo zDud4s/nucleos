@@ -25,11 +25,7 @@ func humanOn(t *testing.T, fake *cdptest.Browser, conn *cdp.Conn) *Human {
 	t.Cleanup(human.Detach)
 	_ = fake
 	// Most tests have no browser window to wait for; the ones about the wait set their own.
-	previous := startupWindowWait
-	startupWindowWait = 20 * time.Millisecond
-	previousLoad := openLoadWait
-	openLoadWait = 20 * time.Millisecond
-	t.Cleanup(func() { startupWindowWait = previous; openLoadWait = previousLoad })
+	human.tabs.tune(20*time.Millisecond, 20*time.Millisecond, 0)
 	return human
 }
 
@@ -198,7 +194,7 @@ func handleOpen(fake *cdptest.Browser) {
 func TestOpenWaitsForTheBrowsersOwnWindow(t *testing.T) {
 	fake, conn := dial(t)
 	human := humanOn(t, fake, conn)
-	startupWindowWait = 10 * time.Second
+	human.tabs.tune(10*time.Second, 0, 0)
 	handleOpen(fake)
 
 	done := make(chan error, 1)
@@ -256,8 +252,8 @@ func TestOpenGoesAheadWhenTheBrowserShowsNoWindow(t *testing.T) {
 // reports anything. Open must notice, drop it and make another.
 func TestOpenRemakesATabThatNeverReportsAnything(t *testing.T) {
 	fake, conn := dial(t)
-	remakeTabs(t, 3)
 	human := humanOn(t, fake, conn)
+	remakeTabs(human.tabs, 3)
 	var created int
 	var closed []string
 	var mu sync.Mutex

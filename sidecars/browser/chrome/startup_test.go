@@ -17,7 +17,7 @@ import (
 
 // TestMain keeps the startup waits short for every test: the fakes here have no startup window to wait
 // for, and making a tab again is not what most tests are about. The tests that are about it call
-// remakeTabs and set their own waits.
+// remakeTabs or tune their own driver's watch.
 func TestMain(m *testing.M) {
 	startupWindowWait = 20 * time.Millisecond
 	openLoadWait = 20 * time.Millisecond
@@ -26,11 +26,9 @@ func TestMain(m *testing.M) {
 }
 
 // remakeTabs lets a test see the remake: up to attempts tabs are made, each given a short time to report.
-func remakeTabs(t *testing.T, attempts int) {
-	t.Helper()
-	previous := openAttempts
-	openAttempts = attempts
-	t.Cleanup(func() { openAttempts = previous })
+// It tunes the watch itself, so it is safe once the driver's sweep is running.
+func remakeTabs(tabs *tabWatch, attempts int) {
+	tabs.tune(0, 0, attempts)
 }
 
 // attachingFake answers createTarget with a new target id each time (T1, T2, ...) and raises its attach
@@ -116,8 +114,7 @@ func TestAgentOpenWaitsForTheBrowsersOwnWindow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
-	startupWindowWait = 10 * time.Second
-	t.Cleanup(func() { startupWindowWait = 20 * time.Millisecond })
+	driver.tabs.tune(10*time.Second, 0, 0)
 
 	done := make(chan error, 1)
 	go func() {
@@ -169,13 +166,13 @@ func TestAgentOpenGoesAheadWhenTheBrowserShowsNoWindow(t *testing.T) {
 // reports anything. createPage must notice, drop it and make another.
 func TestAgentOpenRemakesAPageThatNeverReportsAnything(t *testing.T) {
 	fake, conn := dial(t)
-	remakeTabs(t, 3)
 	created, closed, mark := attachingFake(fake, func(n int) bool { return n == 2 })
 	driver, err := Connect(context.Background(), conn, projectPolicy())
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
 	sweptAndClosed(t, fake, driver)
+	remakeTabs(driver.tabs, 3)
 	mark()
 	if _, err := driver.Open(context.Background(), browser.OpenRequest{URL: "https://example.org/"}); err != nil {
 		t.Fatalf("open: %v", err)
@@ -191,13 +188,13 @@ func TestAgentOpenRemakesAPageThatNeverReportsAnything(t *testing.T) {
 // The last attempt is kept whatever it does, so a browser that never reports still opens a page.
 func TestAgentOpenKeepsTheLastPageWhenNoneReports(t *testing.T) {
 	fake, conn := dial(t)
-	remakeTabs(t, 3)
 	created, closed, mark := attachingFake(fake, func(int) bool { return false })
 	driver, err := Connect(context.Background(), conn, projectPolicy())
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
 	sweptAndClosed(t, fake, driver)
+	remakeTabs(driver.tabs, 3)
 	mark()
 	if _, err := driver.Open(context.Background(), browser.OpenRequest{URL: "https://example.org/"}); err != nil {
 		t.Fatalf("open: %v", err)
