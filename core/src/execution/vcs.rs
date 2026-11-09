@@ -1055,6 +1055,22 @@ mod tests {
             read("Set-Location C:/Projects/wt; git branch -d old"),
             vec![(steps(&["C:/Projects/wt"]), "git branch -d old".to_owned())]
         );
+        // Trailing output redirections are dropped for merge and rebase only.
+        assert_eq!(
+            read("cd /c/Projects/wt && git rebase master 2>&1 | tail -5"),
+            vec![
+                (steps(&["/c/Projects/wt"]), "git rebase master".to_owned()),
+                (steps(&["/c/Projects/wt"]), "tail -5".to_owned()),
+            ]
+        );
+        assert_eq!(
+            read("git -C C:/Projects/wt merge --no-ff aut/s6 2>&1"),
+            vec![(steps(&["C:/Projects/wt"]), "git merge --no-ff aut/s6".to_owned())]
+        );
+        assert_eq!(
+            read("git -C wt branch -d old 2>&1"),
+            vec![(steps(&["wt"]), "git branch -d old 2>&1".to_owned())]
+        );
         // Other global flags are left where they are, so the parsers still refuse the spelling.
         assert_eq!(
             read("git -c a=b merge master"),
@@ -2260,6 +2276,55 @@ mod tests {
         ] {
             assert_eq!(rebase_from_command(command, "feat/x"), None, "{command}");
         }
+    }
+
+    /// Through the segment reader: the shapes an agent actually types around a rebase or merge are
+    /// queueable, and the ones that carry a message, an editor or a third ref stay refused.
+    #[test]
+    fn rebase_and_merge_read_through_dash_c_cd_and_quiet_redirects() {
+        let queued = |command: &str| {
+            directed_segments(command).iter().any(|segment| {
+                merge_from_command(&segment.command, "feat/x").is_some()
+                    || rebase_from_command(&segment.command, "feat/x").is_some()
+            })
+        };
+        for command in [
+            "git rebase master",
+            "cd /c/Projects/wt && git rebase master",
+            "cd /c/Projects/wt; git rebase master",
+            "cd /c/Projects/wt && git rebase master 2>&1 | tail -5",
+            "git -C C:/Projects/nucleos/.claude/worktrees/aut-feat merge --no-ff aut/s6",
+            "git -C ../wt rebase master",
+            "git merge --no-ff aut/s6 2>&1",
+        ] {
+            assert!(queued(command), "{command}");
+        }
+        for command in [
+            "git merge --no-ff aut/s6 -m \"msg\"",
+            "git -C wt merge --no-ff aut/s6 -m msg",
+            "git rebase -i master",
+            "git -C wt rebase --onto master feature",
+            "cd wt && git rebase --onto master feature 2>&1",
+            "cd a && cd b && git rebase master extra",
+        ] {
+            assert!(!queued(command), "{command}");
+        }
+        for command in [
+            "git merge --no-ff aut/s6 -m msg",
+            "git -C wt rebase -i master",
+            "git rebase --onto master feature",
+        ] {
+            assert!(
+                shell_segments(command)
+                    .into_iter()
+                    .any(|segment| unqueueable_but_shared(segment).is_some()),
+                "{command}"
+            );
+        }
+        let refusal = unqueueable_but_shared("git merge --no-ff a -m x").unwrap();
+        assert!(refusal.contains("git -C <worktree> merge --no-ff <branch>"), "{refusal}");
+        let refusal = unqueueable_but_shared("git rebase -i a").unwrap();
+        assert!(refusal.contains("git -C <worktree> rebase <onto>"), "{refusal}");
     }
 
     /// `git fetch <remote>` exactly, and every neighbouring spelling is a different operation.
