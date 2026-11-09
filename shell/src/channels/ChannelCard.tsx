@@ -62,6 +62,11 @@ export function ChannelCard({ channel, primary }: { channel: Channel; primary: s
               <li>
                 outbox: {outbox.pending} pending, {outbox.leased} leased, {outbox.failed} failed
               </li>
+              {outbox.stale_acks !== undefined || outbox.stale_renews !== undefined ? (
+                <li>
+                  stale: {outbox.stale_acks ?? 0} acks, {outbox.stale_renews ?? 0} renews
+                </li>
+              ) : null}
               {outbox.pending > 0 && outbox.oldest_due_at !== null ? (
                 <li>
                   oldest waiting <RelativeTime at={outbox.oldest_due_at} />
@@ -70,6 +75,12 @@ export function ChannelCard({ channel, primary }: { channel: Channel; primary: s
               <li>
                 {drops.unknown_sender} from unknown senders since <RelativeTime at={drops.counted_since} />
               </li>
+              {drops.unknown_sender_limited !== undefined ? (
+                <li>
+                  {drops.unknown_sender_limited} rate-limited unknown senders since{" "}
+                  <RelativeTime at={drops.counted_since} />
+                </li>
+              ) : null}
               {drops.pairing_failures > 0 ? <li>{drops.pairing_failures} failed pairing attempts</li> : null}
             </ul>
           </>

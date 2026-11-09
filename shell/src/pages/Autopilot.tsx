@@ -32,6 +32,7 @@ import {
   type ClassTally,
 } from "../data/autopilot";
 import { useCancelSlotOwner, useCreateJob, useLiveJobs, type Job } from "../data/fleet";
+import { useFeed } from "../data/feed";
 import {
   useBudget,
   useKillSwitch,
@@ -1919,6 +1920,8 @@ function JobsPanel({
         </ul>
       )}
 
+      <JobRetries />
+
       <div className="ap-form">
         <label className="ap-field-label" htmlFor="ap-job-prompt">
           What should {selected ?? "a project"} do?
@@ -1987,6 +1990,48 @@ function JobsPanel({
       </div>
       {create.isError && <JobError error={create.error} />}
     </Panel>
+  );
+}
+
+/** How many `job_item_retry` notices the jobs panel asks for. */
+const JOB_RETRY_LIMIT = "10";
+
+/**
+ * Recent `job_item_retry` notices: an item of a job was started again. Filtered by kind here as
+ * well as in the query, so a daemon that ignores the filter cannot put other lines under this head.
+ */
+function JobRetries() {
+  const retries = useFeed({ kind: "job_item_retry", limit: JOB_RETRY_LIMIT });
+  const rows = (retries.data ?? []).filter((entry) => entry.kind === "job_item_retry");
+  return (
+    <div className="ap-retries">
+      <h3 className="ap-field-label">Recent item retries</h3>
+      {retries.isError && retries.data === undefined && <ListError error={retries.error} what="the retries" />}
+      {!retries.isError && retries.data === undefined && (
+        <Skeleton label="Reading the retries" variant="block" height="2.5rem" />
+      )}
+      {retries.data !== undefined && rows.length === 0 && <Quiet compact says="No job item has been retried lately." />}
+      {rows.length > 0 && (
+        <ul className="ap-list" aria-label="Job item retries">
+          {rows.map((entry) => {
+            const jobId = entry.subject?.startsWith("job:") ? entry.subject.slice(4) : null;
+            return (
+              <li key={entry.id} className="ap-meta">
+                {entry.summary} <RelativeTime at={entry.created_at} />
+                {jobId !== null && (
+                  <>
+                    {" "}
+                    <Link className="ap-link" to="/fleet">
+                      job {jobId} in Fleet
+                    </Link>
+                  </>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </div>
   );
 }
 

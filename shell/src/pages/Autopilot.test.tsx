@@ -874,6 +874,36 @@ describe("Autopilot - the trigger brakes say which of them the núcleo reads", (
     expect(within(list).getByText(/Infra, up to 3 at once/)).toBeDefined();
   });
 
+  it("lists recent job item retries with a link to the job, and says so when there are none", async () => {
+    const entry = (id: number, kind: string, subject: string | null): FeedEntry => ({
+      id,
+      project_id: "alpha",
+      kind,
+      summary: `summary ${id}`,
+      run_id: null,
+      subject,
+      created_at: "2026-08-21T09:00:00Z",
+    });
+    const world = cockpitWorld({
+      projects: [project({ project_id: "alpha" })],
+      feed: [entry(1, "job_item_retry", "job:41"), entry(2, "run_finished", "run:9")],
+    });
+    daemon.apiFetch.mockImplementation(cockpitFetch(world));
+
+    const first = await renderCockpit();
+
+    const list = await screen.findByRole("list", { name: "Job item retries" });
+    expect(within(list).getByText(/summary 1/)).toBeDefined();
+    expect(within(list).queryByText(/summary 2/)).toBeNull();
+    expect(within(list).getByRole("link", { name: "job 41 in Fleet" }).getAttribute("href")).toBe("/fleet");
+    expect(daemon.apiFetch).toHaveBeenCalledWith("/feed?scope=all&kind=job_item_retry&limit=10");
+    first.unmount();
+
+    daemon.apiFetch.mockImplementation(cockpitFetch(cockpitWorld({ projects: [project({ project_id: "alpha" })] })));
+    await renderCockpit();
+    expect(await screen.findByText("No job item has been retried lately.")).toBeDefined();
+  });
+
   it("holds and releases the team trigger scope", async () => {
     const world = cockpitWorld({ projects: [project({ project_id: "alpha" })] });
     daemon.apiFetch.mockImplementation(cockpitFetch(world));

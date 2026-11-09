@@ -46,8 +46,22 @@ export interface Channel {
   home: ChannelHome | null;
   identities: { senders: number; conversations: number };
   pairing: { expires_at: string; attempts_left: number } | null;
-  outbox: { pending: number; leased: number; failed: number; oldest_due_at: string | null };
-  drops: { unknown_sender: number; pairing_failures: number; counted_since: string };
+  outbox: {
+    pending: number;
+    leased: number;
+    failed: number;
+    oldest_due_at: string | null;
+    /** Persisted counts; absent on a daemon that predates them. */
+    stale_acks?: number;
+    stale_renews?: number;
+  };
+  drops: {
+    unknown_sender: number;
+    /** In-memory since `counted_since`; absent on a daemon that predates it. */
+    unknown_sender_limited?: number;
+    pairing_failures: number;
+    counted_since: string;
+  };
 }
 
 export interface ChannelsReadout {

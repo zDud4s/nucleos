@@ -89,6 +89,25 @@ describe("ChannelCard", () => {
     expect(link.getAttribute("href")).toBe("/system/health");
   });
 
+  it("shows stale acks, stale renews and rate-limited senders only when the daemon sends them", async () => {
+    const first = await renderWithRouter(<ChannelCard channel={telegram} primary={null} />);
+    expect(screen.queryByText(/stale:/)).toBeNull();
+    expect(screen.queryByText(/rate-limited/)).toBeNull();
+    first.unmount();
+    await renderWithRouter(
+      <ChannelCard
+        channel={{
+          ...telegram,
+          outbox: { ...telegram.outbox, stale_acks: 2, stale_renews: 5 },
+          drops: { ...telegram.drops, unknown_sender_limited: 7 },
+        }}
+        primary={null}
+      />,
+    );
+    expect(screen.getByText("stale: 2 acks, 5 renews")).toBeTruthy();
+    expect(screen.getByText(/7 rate-limited unknown senders since/)).toBeTruthy();
+  });
+
   it("restarts the sidecar behind a confirmation", async () => {
     await renderWithRouter(<ChannelCard channel={telegram} primary="telegram" />);
     fireEvent.click(screen.getByRole("button", { name: "Restart" }));
