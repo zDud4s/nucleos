@@ -39,16 +39,43 @@ const BYTES_PER_GB: f64 = 1_073_741_824.0;
 
 // ----- names and paths -----
 
-/// `<root>/.claude/worktrees/<tree>-<branch>`.
+/// Longest leaf directory name `worktree_path` and `target_dir` produce, in characters.
+///
+/// A tree branch is named after its work, and a long name stacks up in a checkout path that
+/// Windows then trips over (`MAX_PATH`, and `os error 206` once such a path rides on a command
+/// line). 60 leaves room for the project prefix and the files inside the tree.
+pub const MAX_DIR_LEAF: usize = 60;
+
+/// `<tree>-<branch>`, capped at `MAX_DIR_LEAF` characters. A name that fits is returned as it
+/// is, so every existing checkout keeps its path; a longer one is cut and ends in a hash of the
+/// whole name, so two long names sharing a prefix still get different directories, and the same
+/// name always gets the same one.
+pub fn dir_leaf(tree_id: &str, branch: &str) -> String {
+    let full = format!("{tree_id}-{branch}");
+    if full.chars().count() <= MAX_DIR_LEAF {
+        return full;
+    }
+    // FNV-1a, written out because `DefaultHasher` makes no promise to stay the same across
+    // releases and this name has to find the same directory after an upgrade.
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in full.bytes() {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    let kept: String = full.chars().take(MAX_DIR_LEAF - 9).collect();
+    format!("{kept}-{hash:08x}")
+}
+
+/// `<root>/.claude/worktrees/<tree>-<branch>` (see `dir_leaf` for the length cap).
 pub fn worktree_path(root: &Path, tree_id: &str, branch: &str) -> PathBuf {
-    root.join(WORKTREES_DIR).join(format!("{tree_id}-{branch}"))
+    root.join(WORKTREES_DIR).join(dir_leaf(tree_id, branch))
 }
 
 /// `<dev home>/cargo-target/<tree>-<branch>`: one cargo target dir per branch, off the project.
 pub fn target_dir(dev_home: &Path, tree_id: &str, branch: &str) -> PathBuf {
     dev_home
         .join("cargo-target")
-        .join(format!("{tree_id}-{branch}"))
+        .join(dir_leaf(tree_id, branch))
 }
 
 /// The git branch a tree branch works on.
@@ -1532,6 +1559,30 @@ mod tests {
         assert_eq!(
             fwd(target_dir(Path::new("/dev/home"), TREE, BRANCH)),
             "/dev/home/cargo-target/job-1-api"
+        );
+    }
+
+    #[test]
+    fn a_long_branch_name_gets_a_capped_stable_distinct_directory() {
+        let long_a = format!("{}a", "x".repeat(100));
+        let long_b = format!("{}b", "x".repeat(100));
+        let a = dir_leaf(TREE, &long_a);
+        assert_eq!(a.chars().count(), MAX_DIR_LEAF, "{a}");
+        assert_eq!(a, dir_leaf(TREE, &long_a), "the same name, the same directory");
+        assert_ne!(a, dir_leaf(TREE, &long_b), "a shared prefix must not collide");
+        assert_eq!(dir_leaf(TREE, BRANCH), "job-1-api", "a short name is untouched");
+        assert!(
+            worktree_path(Path::new("/r"), TREE, &long_a)
+                .to_string_lossy()
+                .len()
+                < 100
+        );
+        assert_eq!(
+            target_dir(Path::new("/d"), TREE, &long_a)
+                .file_name()
+                .unwrap()
+                .to_string_lossy(),
+            a
         );
     }
 

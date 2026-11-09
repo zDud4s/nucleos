@@ -270,9 +270,10 @@ pub fn codex_cli_args(
     if let Some(session_id) = &request.resume_session_id {
         args.push(session_id.clone());
     }
-    // Trailing positional, after every flag that takes a value, so a prompt can never be consumed as
-    // the argument of the option before it.
-    args.push(prompt_with_filter_rule(request));
+    // Trailing positional, after every flag that takes a value. `-` tells `codex exec` to read the
+    // prompt from stdin: the text itself never rides on the command line, where Windows caps the
+    // whole line at 32767 characters (`os error 206`). The caller writes `prompt_with_filter_rule`.
+    args.push("-".to_string());
     Ok(args)
 }
 
@@ -602,9 +603,9 @@ impl CommandRunner for CodexCliRunner {
         if let Some(dir) = &request.cwd {
             cmd.current_dir(dir);
         }
-        // Nothing steerable survives `codex_cli_args`, so stdin is always closed here: there is then
-        // no channel for a second author to arrive on.
-        cmd.stdin(Stdio::null());
+        // Nothing steerable survives `codex_cli_args`. Stdin carries the prompt (the `-` positional)
+        // and is closed right after it, so there is still no channel for a second author.
+        cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
         cmd.kill_on_drop(true);
@@ -619,6 +620,15 @@ impl CommandRunner for CodexCliRunner {
         // a build still holding locks inside the worktree the run was supposed to release.
         let mut tree_killer = child.id().map(TreeKiller::new);
         let _cli_pid = super::cli_pids::register(&request.env, child.id());
+
+        // The prompt, then EOF, from its own task so a large one cannot block the stdout loop. The
+        // writer drops at the end of the task, which is the EOF `codex exec` waits for.
+        if let Some(mut stdin) = child.stdin.take() {
+            let prompt = prompt_with_filter_rule(&request);
+            tokio::spawn(async move {
+                let _ = stdin.write_all(prompt.as_bytes()).await;
+            });
+        }
 
         let stdout = child.stdout.take().expect("stdout piped above");
         let stderr = child.stderr.take().expect("stderr piped above");

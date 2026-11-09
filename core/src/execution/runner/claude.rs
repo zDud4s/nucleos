@@ -288,13 +288,11 @@ impl CommandRunner for ClaudeCliRunner {
         if let Some(dir) = &request.cwd {
             cmd.current_dir(dir);
         }
-        // A closed stdin for every run that did not opt in: there is then no channel for a second
-        // author to arrive on, which is the property the email pillar's triage runs depend on.
-        if request.steerable {
-            cmd.stdin(Stdio::piped());
-        } else {
-            cmd.stdin(Stdio::null());
-        }
+        // Always piped: the prompt travels on stdin, never argv (`os error 206` on Windows). A run
+        // that did not opt in to steering gets its stdin closed right after the prompt is written,
+        // so there is still no channel for a second author to arrive on, which is the property the
+        // email pillar's triage runs depend on.
+        cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
         // kill_on_drop turns an aborted awaiting-task (cancel/timeout, Task 4) into the OS `claude`
@@ -349,7 +347,15 @@ impl CommandRunner for ClaudeCliRunner {
         // one-turn run the argv path performs; with one it ends when the sender is dropped, or when
         // the abort below reaps it.
         let mut steering_task = None;
-        if request.steerable {
+        if !request.steerable {
+            // Plain-text prompt, then EOF. In its own task so a prompt larger than the pipe buffer
+            // cannot block the stdout loop; dropping the writer at the end of the task is the EOF.
+            let mut stdin = child.stdin.take().expect("stdin piped above");
+            let prompt = request.prompt.clone();
+            steering_task = Some(tokio::spawn(async move {
+                let _ = stdin.write_all(prompt.as_bytes()).await;
+            }));
+        } else {
             let mut stdin = child
                 .stdin
                 .take()

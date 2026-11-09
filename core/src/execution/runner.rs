@@ -143,9 +143,11 @@ mod tests {
         let args = cli_args(&request, "sonnet");
 
         assert_eq!(args[0], "-p");
-        assert_eq!(args[1], "test prompt", "the prompt moved: {args:?}");
-        let at = args.iter().position(|a| a == "--add-dir").unwrap();
-        assert!(at > 1, "--add-dir was written above the prompt: {args:?}");
+        assert!(
+            !args.iter().any(|a| a == "test prompt"),
+            "the prompt must not ride on argv: {args:?}"
+        );
+        assert!(args.iter().any(|a| a == "--add-dir"), "{args:?}");
     }
 
     #[test]
@@ -663,22 +665,34 @@ mod tests {
         );
     }
 
-    /// The regression guard for every path that did not ask to be steerable — the email pillar's
-    /// triage runs among them. Whatever the opt-in adds, a run without it keeps today's argument
-    /// vector: `-p <prompt>`, no `--input-format`, and therefore a stdin nothing can write to.
+    /// A 40 KB prompt must not grow the command line: Windows caps it at 32767 characters.
     #[test]
-    fn a_non_steerable_run_keeps_the_argv_prompt() {
+    fn a_huge_prompt_adds_nothing_to_the_command_line() {
+        let mut request = baseline_run_request();
+        request.prompt = "x".repeat(40_000);
+        let claude = cli_args(&request, "sonnet");
+        let codex = codex_cli_args(&request, "gpt-5.5", &CodexStaged::default()).unwrap();
+        for args in [claude, codex] {
+            let total: usize = args.iter().map(|a| a.len() + 1).sum();
+            assert!(total < 8_000, "argv grew with the prompt: {total} bytes");
+        }
+    }
+
+    /// The regression guard for every path that did not ask to be steerable — the email pillar's
+    /// triage runs among them: no `--input-format`, and a prompt that travels on stdin, not argv.
+    #[test]
+    fn a_non_steerable_run_keeps_its_prompt_off_argv() {
         let request = baseline_run_request();
         assert!(!request.steerable, "the baseline must not opt in");
 
         let args = cli_args(&request, "sonnet");
 
         assert_eq!(args.first().map(String::as_str), Some("-p"));
-        assert_eq!(
-            args.get(1).map(String::as_str),
-            Some(request.prompt.as_str()),
-            "the prompt must stay the argv positional it is today: {args:?}"
+        assert!(
+            !args.iter().any(|arg| *arg == request.prompt),
+            "the prompt goes on stdin, never argv (os error 206): {args:?}"
         );
+        assert_eq!(args.get(1).map(String::as_str), Some("--model"), "{args:?}");
         assert!(
             !args.iter().any(|arg| arg == "--input-format"),
             "a run that did not opt in must keep its stdin closed: {args:?}"
@@ -4044,7 +4058,7 @@ mod tests {
         assert!(!args.iter().any(|arg| arg == "--add-dir"), "{args:?}");
         assert_eq!(
             &args[args.len() - 2..],
-            ["sess-1", "test prompt"],
+            ["sess-1", "-"],
             "{args:?}"
         );
     }
@@ -4202,7 +4216,7 @@ mod tests {
         }
         assert_eq!(
             args.last().map(String::as_str),
-            Some("test prompt"),
+            Some("-"),
             "{args:?}"
         );
 
@@ -4616,13 +4630,13 @@ mod tests {
             );
             assert_eq!(
                 args.last().map(String::as_str),
-                Some("test prompt"),
-                "the prompt stays the trailing positional: {args:?}"
+                Some("-"),
+                "the prompt is read from stdin via the trailing `-`: {args:?}"
             );
         }
         assert_eq!(
             &resumed[resumed.len() - 2..],
-            ["123e4567-e89b-42d3-a456-426614174002", "test prompt"],
+            ["123e4567-e89b-42d3-a456-426614174002", "-"],
             "{resumed:?}"
         );
     }
@@ -4678,8 +4692,8 @@ mod tests {
         assert!(pins(&pinned, live), "{pinned:?}");
         assert_eq!(
             pinned.last().map(String::as_str),
-            Some("test prompt"),
-            "the prompt stays the trailing positional"
+            Some("-"),
+            "the prompt is read from stdin via the trailing `-`"
         );
 
         let bare =
