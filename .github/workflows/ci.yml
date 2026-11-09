@@ -190,7 +190,7 @@ jobs:
       # Node 24, the major the shell is developed on. `npm ci` needs a lockfile written by a
       # current npm: older npm 11 releases (11.6) drop the nested @emnapi entries of
       # @tailwindcss/oxide-wasm32-wasi, and every newer npm then reads the lock as out of sync.
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
           cache: npm
