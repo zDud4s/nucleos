@@ -101,7 +101,9 @@ const DAEMON_TOKEN_VAR: &str = "NUCLEOS_DAEMON_TOKEN";
 
 /// The request's environment without the daemon key, and the key. Case-insensitive like agy's
 /// filter, because Windows reads environment names that way. An empty key is no key.
-pub(super) fn split_daemon_token(env: &[(String, String)]) -> (Vec<&(String, String)>, Option<&str>) {
+pub(super) fn split_daemon_token(
+    env: &[(String, String)],
+) -> (Vec<&(String, String)>, Option<&str>) {
     let mut token = None;
     let mut rest = Vec::with_capacity(env.len());
     for entry in env {

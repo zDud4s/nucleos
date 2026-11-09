@@ -352,11 +352,7 @@ pub fn codex_extract_usage(stdout: &str) -> RunUsage {
 /// The Codex child's run environment: the daemon key is removed from whatever the child would
 /// inherit, the stale key-file path too, then the request's entries (already without the key, see
 /// `split_daemon_token`) are set and, when a key file was written, its path alone.
-fn apply_run_env(
-    cmd: &mut Command,
-    child_env: Vec<&(String, String)>,
-    token_file: Option<&Path>,
-) {
+fn apply_run_env(cmd: &mut Command, child_env: Vec<&(String, String)>, token_file: Option<&Path>) {
     cmd.env_remove("NUCLEOS_DAEMON_TOKEN");
     cmd.env_remove(crate::daemon_client::TOKEN_FILE_VAR);
     for (k, v) in child_env {

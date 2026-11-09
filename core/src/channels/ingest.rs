@@ -1012,7 +1012,11 @@ mod tests {
         .await;
         assert_eq!(reply, IngestReply::Dropped);
         assert_eq!(event_rows(&st.pool).await, written, "no row past the limit");
-        assert_eq!(outbox_rows(&st.pool).await.len(), replies, "no answer either");
+        assert_eq!(
+            outbox_rows(&st.pool).await.len(),
+            replies,
+            "no answer either"
+        );
         let identities: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM channel_identities")
             .fetch_one(&st.pool)
             .await
