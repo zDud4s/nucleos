@@ -84,7 +84,9 @@ type Driver struct {
 	// swept closes when the profile has been cleared of service workers, and sweepErr says whether
 	// that succeeded. Open waits on it — see waitForSweep. sweepErr is written before the close and
 	// read only after it, which is what makes it safe without a lock.
-	swept    chan struct{}
+	swept chan struct{}
+	// tabs waits for the browser's own window and checks a new page came alive. See tabWatch.
+	tabs     *tabWatch
 	sweepErr error
 
 	// How long a page is given to arrive, and how long after its load event it is given to go
@@ -257,6 +259,9 @@ func armBrowserFence(ctx context.Context, conn *cdp.Conn, autoAttach bool) error
 	}
 
 	if autoAttach {
+		// Discovery is what makes the browser say when a page has come alive (targetInfoChanged), which
+		// createPage waits on. Best effort: without it a page is made after the wait times out.
+		_, _ = conn.Call(ctx, cdp.BrowserSession, "Target.setDiscoverTargets", map[string]any{"discover": true})
 		// waitForDebuggerOnStart is what closes the TOCTOU window of spec §5.4: a new target is born
 		// paused, with an empty url, and the interception is already on before it may navigate.
 		if _, err := conn.Call(ctx, cdp.BrowserSession, "Target.setAutoAttach", map[string]any{
@@ -294,6 +299,7 @@ func newDriver(conn *cdp.Conn, policy fence.Policy) *Driver {
 		contexts:     map[contextKey]executionContext{},
 		casts:        map[cdp.SessionID]*screencast{},
 		swept:        make(chan struct{}),
+		tabs:         newTabWatch(),
 		readyWithin:  readyDeadline,
 		idleGrace:    idleGrace,
 		settleWithin: settleGrace,
@@ -302,6 +308,7 @@ func newDriver(conn *cdp.Conn, policy fence.Policy) *Driver {
 		promptTimeout: promptTimeoutDefault,
 	}
 	conn.OnEvent(driver.onEvent)
+	conn.OnEvent(driver.tabs.observe)
 	conn.OnEvent(driver.onFetchPaused)
 	conn.OnEvent(driver.onAuthRequired)
 	conn.OnEvent(driver.onLogEntry)
@@ -716,24 +723,31 @@ func (d *Driver) createPage(ctx context.Context) (string, cdp.SessionID, error) 
 	})
 	defer cancel()
 
-	created, err := d.conn.Call(ctx, cdp.BrowserSession, "Target.createTarget", map[string]any{
-		"url": "about:blank",
+	// The same startup race as the person's window has: over the pipe a tab made before the browser's
+	// own window exists never loads. See tabWatch.
+	var session cdp.SessionID
+	targetID, err := d.tabs.makeLive(ctx, func(ctx context.Context) (string, error) {
+		created, err := d.conn.Call(ctx, cdp.BrowserSession, "Target.createTarget", map[string]any{
+			"url": "about:blank",
+		})
+		if err != nil {
+			return "", fmt.Errorf("creating target: %w", err)
+		}
+		var target struct {
+			TargetID string `json:"targetId"`
+		}
+		if err := json.Unmarshal(created, &target); err != nil {
+			return "", err
+		}
+		session, err = d.sessionFor(ctx, target.TargetID, attached)
+		return target.TargetID, err
+	}, func(ctx context.Context, id string) {
+		_, _ = d.conn.Call(ctx, cdp.BrowserSession, "Target.closeTarget", map[string]any{"targetId": id})
 	})
 	if err != nil {
-		return "", "", fmt.Errorf("creating target: %w", err)
-	}
-	var target struct {
-		TargetID string `json:"targetId"`
-	}
-	if err := json.Unmarshal(created, &target); err != nil {
 		return "", "", err
 	}
-
-	session, err := d.sessionFor(ctx, target.TargetID, attached)
-	if err != nil {
-		return "", "", err
-	}
-	return target.TargetID, session, nil
+	return targetID, session, nil
 }
 
 // sessionFor waits for the auto-attach of a target we just created. It does NOT call

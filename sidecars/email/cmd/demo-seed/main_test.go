@@ -175,3 +175,24 @@ func headerValue(headers map[string]string, name string) string {
 	}
 	return ""
 }
+
+// The token is sent to this URL, so a non-loopback host must be refused before any request is made.
+func TestDaemonURLFromEnvRefusesAnythingOffLoopback(t *testing.T) {
+	for _, raw := range []string{"http://example.com:8791", "http://10.0.0.2:8791", "ftp://127.0.0.1:8791"} {
+		t.Setenv("NUCLEOS_DAEMON_URL", raw)
+		if _, err := daemonURLFromEnv(); err == nil || !strings.Contains(err.Error(), "NUCLEOS_DAEMON_URL") {
+			t.Errorf("accepted %q (err = %v)", raw, err)
+		}
+	}
+	for _, raw := range []string{"http://127.0.0.1:8791", "http://[::1]:8791", "http://localhost:8791"} {
+		t.Setenv("NUCLEOS_DAEMON_URL", raw)
+		got, err := daemonURLFromEnv()
+		if err != nil || got != raw {
+			t.Errorf("%q: got %q, err %v", raw, got, err)
+		}
+	}
+	t.Setenv("NUCLEOS_DAEMON_URL", "")
+	if got, err := daemonURLFromEnv(); err != nil || got != defaultDaemonURL {
+		t.Errorf("unset: got %q, err %v", got, err)
+	}
+}

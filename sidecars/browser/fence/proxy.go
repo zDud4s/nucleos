@@ -35,7 +35,7 @@ import (
 //
 // Loopback. Agent mode is launched with --proxy-bypass-list=<-loopback> so that this process sees
 // requests to 127.0.0.1 at all, and the consequence is that a page can address the núcleo's API, the
-// other sidecars, and the browser's own debugging port. [DecideTunnel] refuses them unless the
+// other sidecars (the browser has no debugging port: it is driven over a pipe). [DecideTunnel] refuses them unless the
 // profile's Loopback list names them. The CDP layer refuses the same thing for plain HTTP, so a
 // change to one of the two is not a hole in the other.
 //

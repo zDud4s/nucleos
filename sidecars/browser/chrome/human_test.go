@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,6 +24,8 @@ func humanOn(t *testing.T, fake *cdptest.Browser, conn *cdp.Conn) *Human {
 	}
 	t.Cleanup(human.Detach)
 	_ = fake
+	// Most tests have no browser window to wait for; the ones about the wait set their own.
+	human.tabs.tune(20*time.Millisecond, 20*time.Millisecond, 0)
 	return human
 }
 
@@ -172,4 +176,123 @@ func waitForChain(t *testing.T, human *Human, want int) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("the chain never reached %d entries: %v", want, human.Chain())
+}
+
+func handleOpen(fake *cdptest.Browser) {
+	fake.Handle("Target.createTarget", func(cdptest.Call) (any, error) {
+		return map[string]any{"targetId": "T1"}, nil
+	})
+	fake.Handle("Target.attachToTarget", func(cdptest.Call) (any, error) {
+		return map[string]any{"sessionId": "S1"}, nil
+	})
+}
+
+// Root cause of the gate's "the person's window never loaded the page". Over the DevTools pipe the
+// browser answers its first command long before it has built its startup window, and a tab created in
+// that gap is lost: it appears as a target and never loads. Open therefore waits for the browser's own
+// first page before it creates one.
+func TestOpenWaitsForTheBrowsersOwnWindow(t *testing.T) {
+	fake, conn := dial(t)
+	human := humanOn(t, fake, conn)
+	human.tabs.tune(10*time.Second, 0, 0)
+	handleOpen(fake)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := human.Open(context.Background(), browser.OpenRequest{URL: "https://jira.example.org/login"})
+		done <- err
+	}()
+
+	time.Sleep(150 * time.Millisecond)
+	if fake.IndexOf("Target.createTarget") >= 0 {
+		t.Fatal("createTarget was sent before the browser had a window of its own")
+	}
+	// Not a page: the browser's UI surfaces and workers show up first and do not count.
+	fake.Emit("", "Target.targetCreated", map[string]any{
+		"targetInfo": map[string]any{"targetId": "U1", "type": "browser_ui", "url": "chrome://webui-toolbar.top-chrome/"},
+	})
+	time.Sleep(100 * time.Millisecond)
+	if fake.IndexOf("Target.createTarget") >= 0 {
+		t.Fatal("a browser_ui target was taken for the startup window")
+	}
+	// Created is not enough: the page has to have reported its state.
+	fake.Emit("", "Target.targetCreated", map[string]any{
+		"targetInfo": map[string]any{"targetId": "NTP", "type": "page", "url": "chrome://newtab/"},
+	})
+	time.Sleep(100 * time.Millisecond)
+	if fake.IndexOf("Target.createTarget") >= 0 {
+		t.Fatal("a freshly created page was taken for a ready startup window")
+	}
+	fake.Emit("", "Target.targetInfoChanged", map[string]any{
+		"targetInfo": map[string]any{"targetId": "NTP", "type": "page", "title": "New Tab", "url": "chrome://newtab/"},
+	})
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("open did not proceed once the window existed")
+	}
+	if fake.IndexOf("Target.createTarget") < 0 {
+		t.Fatal("createTarget was never sent")
+	}
+}
+
+func TestOpenGoesAheadWhenTheBrowserShowsNoWindow(t *testing.T) {
+	fake, conn := dial(t)
+	human := humanOn(t, fake, conn)
+	handleOpen(fake)
+	if _, err := human.Open(context.Background(), browser.OpenRequest{URL: "https://jira.example.org/login"}); err != nil {
+		t.Fatalf("open: %v", err)
+	}
+}
+
+// A tab created in the browser's first moments can be lost without an error: it exists and never
+// reports anything. Open must notice, drop it and make another.
+func TestOpenRemakesATabThatNeverReportsAnything(t *testing.T) {
+	fake, conn := dial(t)
+	human := humanOn(t, fake, conn)
+	remakeTabs(human.tabs, 3)
+	var created int
+	var closed []string
+	var mu sync.Mutex
+	fake.Handle("Target.createTarget", func(cdptest.Call) (any, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		created++
+		id := fmt.Sprintf("T%d", created)
+		if created == 2 {
+			// The second tab is alive: it reports at once.
+			go fake.Emit("", "Target.targetInfoChanged", map[string]any{
+				"targetInfo": map[string]any{"targetId": id, "type": "page", "title": "form", "url": "https://jira.example.org/login"},
+			})
+		}
+		return map[string]any{"targetId": id}, nil
+	})
+	fake.Handle("Target.closeTarget", func(call cdptest.Call) (any, error) {
+		var p struct {
+			TargetID string `json:"targetId"`
+		}
+		_ = json.Unmarshal(call.Params, &p)
+		mu.Lock()
+		closed = append(closed, p.TargetID)
+		mu.Unlock()
+		return map[string]any{"success": true}, nil
+	})
+	fake.Handle("Target.attachToTarget", func(cdptest.Call) (any, error) {
+		return map[string]any{"sessionId": "S1"}, nil
+	})
+
+	if _, err := human.Open(context.Background(), browser.OpenRequest{URL: "https://jira.example.org/login"}); err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if created != 2 {
+		t.Fatalf("tabs created = %d, want 2 (the silent one, then a live one)", created)
+	}
+	if len(closed) != 1 || closed[0] != "T1" {
+		t.Fatalf("closed = %v, want only the silent T1", closed)
+	}
 }

@@ -430,8 +430,8 @@ const (
 	// and an act landing in that gap would touch a page the person is about to inherit.
 	ConsequenceWheelRequested Consequence = "wheel-requested"
 	// ConsequenceLoopback — this machine's own services. Separate from off-allowlist because it is
-	// the only refusal aimed at US: the núcleo's HTTP API, the sidecars, and the browser's own
-	// debugging port all live on loopback behind a bearer token, and agent mode is launched with
+	// the only refusal aimed at US: the núcleo's HTTP API and the sidecars
+	// live on loopback behind a bearer token (the browser has no debugging port), and agent mode is launched with
 	// --proxy-bypass-list=<-loopback> so that the fence sees loopback at all rather than letting the
 	// page reach it directly.
 	ConsequenceLoopback Consequence = "loopback"

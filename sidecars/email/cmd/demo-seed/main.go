@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 
+	"nucleoschannelkit/netguard"
 	"nucleosemail/daemon"
 )
 
@@ -42,9 +43,9 @@ func main() {
 		log.Fatal("NUCLEOS_DAEMON_TOKEN is required to deliver the demo mailbox")
 	}
 
-	daemonURL := os.Getenv("NUCLEOS_DAEMON_URL")
-	if daemonURL == "" {
-		daemonURL = defaultDaemonURL
+	daemonURL, err := daemonURLFromEnv()
+	if err != nil {
+		log.Fatal(err)
 	}
 
 	client := daemon.New(daemonURL, token)
@@ -55,6 +56,19 @@ func main() {
 		}
 		printJSON(result)
 	}
+}
+
+// daemonURLFromEnv reads NUCLEOS_DAEMON_URL. The bearer token is sent there, so it must stay on this
+// machine: the same loopback check the sidecar's own config applies.
+func daemonURLFromEnv() (string, error) {
+	daemonURL := os.Getenv("NUCLEOS_DAEMON_URL")
+	if daemonURL == "" {
+		daemonURL = defaultDaemonURL
+	}
+	if err := netguard.RequireLoopbackURL(daemonURL); err != nil {
+		return "", fmt.Errorf("NUCLEOS_DAEMON_URL: %w", err)
+	}
+	return daemonURL, nil
 }
 
 // batchesToSeed returns what the demo delivers, in the order it must be delivered.

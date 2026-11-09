@@ -58,9 +58,9 @@ func policyFor(placement browser.Placement, validate func(fence.Policy) error) (
 		Origins:  placement.Origins,
 		Writable: placement.Writable,
 		// Loopback stays empty, which means the fence admits none of it. Spec §6.2's loopback rule
-		// exists because this machine's own services — the núcleo's API, the other sidecars, and the
-		// browser's own token-less debugging port — are reachable from a page unless something
-		// refuses them. Nothing the núcleo can send opens that list today, and that is deliberate:
+		// exists because this machine's own services — the núcleo's API, the other sidecars — are
+		// reachable from a page unless something refuses them. (The browser has no debugging port
+		// to reach: it is driven over a pipe.) Nothing the núcleo can send opens that list today, and that is deliberate:
 		// there is no browsing reason to reach them, so the list is a seam and not a setting.
 	}
 	if err := validate(policy); err != nil {

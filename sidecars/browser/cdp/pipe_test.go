@@ -97,3 +97,25 @@ func TestPipeConnClosesWhenPeerHangsUp(t *testing.T) {
 		t.Fatalf("got %v, want ErrClosed", err)
 	}
 }
+
+func TestPipeConnSkipsAnEmptyFrame(t *testing.T) {
+	conn, _, out := pipePair(t)
+	events := make(chan Event, 1)
+	conn.OnEvent(func(e Event) { events <- e })
+
+	go func() {
+		// A bare NUL, then a real message.
+		_, _ = out.Write([]byte("\x00" + `{"method":"Page.loadEventFired","params":{}}` + "\x00"))
+	}()
+
+	select {
+	case e := <-events:
+		if e.Method != "Page.loadEventFired" {
+			t.Fatalf("event = %+v", e)
+		}
+	case <-conn.Done():
+		t.Fatal("an empty frame ended the connection")
+	case <-time.After(5 * time.Second):
+		t.Fatal("no event delivered after the empty frame")
+	}
+}

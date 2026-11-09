@@ -48,6 +48,9 @@ type Human struct {
 	rec chainRecorder
 
 	unsubscribe func()
+
+	// tabs waits for the browser's own window and checks a new tab came alive. See tabWatch.
+	tabs *tabWatch
 }
 
 // ConnectHuman attaches to a headful browser and starts recording where the person goes.
@@ -57,7 +60,7 @@ type Human struct {
 // mode precisely because of what they can do, and a chain recorded only from the first tab would miss
 // the identity provider — which is the one host §5.3a exists to capture.
 func ConnectHuman(ctx context.Context, conn *cdp.Conn) (*Human, error) {
-	human := &Human{conn: conn}
+	human := &Human{conn: conn, tabs: newTabWatch()}
 	human.unsubscribe = conn.OnEvent(human.onEvent)
 	if _, err := conn.Call(ctx, cdp.BrowserSession, "Target.setDiscoverTargets", map[string]any{
 		"discover": true,
@@ -84,12 +87,16 @@ func (h *Human) onEvent(event cdp.Event) {
 	}
 	var params struct {
 		TargetInfo struct {
-			Type string `json:"type"`
-			URL  string `json:"url"`
+			TargetID string `json:"targetId"`
+			Type     string `json:"type"`
+			URL      string `json:"url"`
 		} `json:"targetInfo"`
 	}
 	if err := json.Unmarshal(event.Params, &params); err != nil {
 		return
+	}
+	if event.Method == "Target.targetInfoChanged" && params.TargetInfo.Type == "page" {
+		h.tabs.observe(event)
 	}
 	if params.TargetInfo.Type != "page" || params.TargetInfo.URL == "" {
 		return
@@ -108,22 +115,38 @@ func (h *Human) Chain() []string { return h.rec.Chain() }
 // Unlike the agent's Open there is no pause-arm-navigate dance, because there is nothing to arm. The
 // target is created at the destination directly, which is also what makes the window appear at the
 // page the person was asked about rather than at a blank tab that then moves.
+//
+// # It waits for the browser's own window first
+//
+// Over the DevTools pipe the browser answers its first command long before it has built its startup
+// window (a debugging port used to make Start wait for that, by accident). A tab created in the gap
+// shows up as a target and never loads: the gate saw the headful window reach nothing at all. So the
+// tab is created only once the browser's own first page has reported its state, and a tab that then
+// reports nothing is made again. See tabWatch, which the agent's pages share.
 func (h *Human) Open(ctx context.Context, req browser.OpenRequest) (browser.Session, error) {
-	created, err := h.conn.Call(ctx, cdp.BrowserSession, "Target.createTarget", map[string]any{
-		"url": req.URL,
+	targetID, err := h.tabs.makeLive(ctx, func(ctx context.Context) (string, error) {
+		created, err := h.conn.Call(ctx, cdp.BrowserSession, "Target.createTarget", map[string]any{
+			"url": req.URL,
+		})
+		if err != nil {
+			return "", fmt.Errorf("opening the person's window: %w", err)
+		}
+		var target struct {
+			TargetID string `json:"targetId"`
+		}
+		if err := json.Unmarshal(created, &target); err != nil {
+			return "", err
+		}
+		return target.TargetID, nil
+	}, func(ctx context.Context, id string) {
+		_, _ = h.conn.Call(ctx, cdp.BrowserSession, "Target.closeTarget", map[string]any{"targetId": id})
 	})
 	if err != nil {
-		return browser.Session{}, fmt.Errorf("opening the person's window: %w", err)
-	}
-	var target struct {
-		TargetID string `json:"targetId"`
-	}
-	if err := json.Unmarshal(created, &target); err != nil {
 		return browser.Session{}, err
 	}
 
 	attached, err := h.conn.Call(ctx, cdp.BrowserSession, "Target.attachToTarget", map[string]any{
-		"targetId": target.TargetID,
+		"targetId": targetID,
 		"flatten":  true,
 	})
 	if err != nil {
@@ -138,7 +161,7 @@ func (h *Human) Open(ctx context.Context, req browser.OpenRequest) (browser.Sess
 
 	h.mu.Lock()
 	h.id = browser.SessionID("h1")
-	h.target = target.TargetID
+	h.target = targetID
 	h.cdp = session.SessionID
 	id := h.id
 	h.mu.Unlock()
