@@ -925,9 +925,12 @@ mod tests {
             vec![("NUCLEOS_RUN_ID".to_string(), "42".to_string())],
         );
         let args = codex_cli_args(&request, "gpt-5.6-terra", &CodexStaged::default()).unwrap();
-        let last = args.last().unwrap();
-        assert!(last.starts_with("run the tests"), "{last}");
-        assert!(last.contains("--filter-run"), "{last}");
+        assert_eq!(args.last().map(String::as_str), Some("-"), "{args:?}");
+        assert!(!args.iter().any(|a| a.contains("run the tests")), "{args:?}");
+        // The prompt now travels on stdin; this is the text the caller writes there.
+        let sent = prompt_with_filter_rule(&request);
+        assert!(sent.starts_with("run the tests"), "{sent}");
+        assert!(sent.contains("--filter-run"), "{sent}");
     }
 
     #[test]
@@ -937,6 +940,7 @@ mod tests {
             vec![("NUCLEOS_RUN_ID".to_string(), "42".to_string())],
         );
         let args = codex_cli_args(&request, "gpt-5.6-terra", &CodexStaged::default()).unwrap();
-        assert_eq!(args.last().unwrap(), "run the tests");
+        assert_eq!(args.last().map(String::as_str), Some("-"), "{args:?}");
+        assert_eq!(prompt_with_filter_rule(&request), "run the tests");
     }
 }
