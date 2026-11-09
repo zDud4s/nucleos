@@ -154,6 +154,8 @@ const LANE_OF: Record<string, FeedLane> = {
   project_onboarded: "machine",
   health_breach_intent: "machine",
   workflow_changed: "machine",
+  workflow_param_written: "machine",
+  workflow_param_mode: "machine",
   command_finished: "machine",
   action_authorized: "machine",
   proposal_record_failed: "machine",

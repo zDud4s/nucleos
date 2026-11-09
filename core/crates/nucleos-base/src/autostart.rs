@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 #[cfg(not(target_os = "macos"))]
 use std::process::Command;
 
-#[cfg(any(windows, test))]
+// Compiled everywhere, like the scheduled-task helpers that read it (`task_is_absent`,
+// `at_boot_create_args`): only Windows calls them, but every platform compiles them.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 const TASK_NAME: &str = "NucleOS Daemon";
 
 /// PURE: an AppImage runs from a temporary mount, so registering that path would leave a dead
