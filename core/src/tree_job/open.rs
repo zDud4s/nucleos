@@ -277,7 +277,7 @@ impl From<sqlx::Error> for OpenError {
 // ----- git and links -----
 
 /// Runs `git -C <root> <args>` and answers its trimmed stdout, or its stderr as the error.
-async fn git(root: &str, args: &[&str]) -> Result<String, String> {
+pub(super) async fn git(root: &str, args: &[&str]) -> Result<String, String> {
     let output = tokio::process::Command::new("git")
         // A repo-local `core.fsmonitor` would run a command on any call that reads the index.
         .args(["-c", "core.fsmonitor="])
@@ -350,13 +350,13 @@ async fn exclude_reports(root: &str) -> Result<(), String> {
 
 /// Removes a link without following it: a junction or a directory symlink goes with `remove_dir`
 /// (Windows), a symlink with `remove_file`. The directory it points at is never touched.
-fn unlink(link: &Path) -> std::io::Result<()> {
+pub(super) fn unlink(link: &Path) -> std::io::Result<()> {
     std::fs::remove_dir(link).or_else(|_| std::fs::remove_file(link))
 }
 
 /// A junction on Windows (it needs no privilege), a symlink elsewhere. An existing path at `link`
 /// is an error: a tracked directory of the worktree must not be shadowed.
-fn make_link(source: &Path, link: &Path) -> Result<(), String> {
+pub(super) fn make_link(source: &Path, link: &Path) -> Result<(), String> {
     if link.symlink_metadata().is_ok() {
         return Err(format!("{} already exists in the worktree", link.display()));
     }
