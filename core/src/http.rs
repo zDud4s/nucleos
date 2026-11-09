@@ -68,6 +68,7 @@ mod stepup;
 mod tasks;
 mod team;
 mod themes;
+mod workflow_params;
 mod workflows;
 
 #[cfg(test)]
@@ -162,6 +163,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(run_queue::routes())
         .merge(engines::routes())
         .merge(settings::routes())
+        .merge(workflow_params::routes())
         .merge(crate::route_index::routes())
         .merge(team::routes())
         .merge(themes::routes())
