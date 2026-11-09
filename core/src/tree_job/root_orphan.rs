@@ -102,7 +102,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_orphan_root_worktree_is_removed_and_its_linked_node_modules_survive() {
-        let container = space_free_tempdir();
+        let container = space_free_tempdir("tree-root-orphan-");
         let repo = container.path().join("repo");
         initialize_repo(&repo);
         let (worktree, modules) = orphan(&repo);
@@ -122,7 +122,7 @@ mod tests {
 
     #[tokio::test]
     async fn clearing_with_no_worktree_does_nothing() {
-        let container = space_free_tempdir();
+        let container = space_free_tempdir("tree-root-orphan-");
         let repo = container.path().join("repo");
         initialize_repo(&repo);
         clear(&repo.to_string_lossy().replace('\\', "/"), "job-1", &[]).await;
