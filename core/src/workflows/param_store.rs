@@ -293,7 +293,7 @@ pub async fn set_mode(
 }
 
 async fn mode_row(
-    pool: &SqlitePool,
+    conn: &mut SqliteConnection,
     scope: &Scope,
     bundle: &str,
     param: &str,
@@ -304,7 +304,7 @@ async fn mode_row(
     .bind(scope.to_string())
     .bind(bundle)
     .bind(param)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?;
     text.map(|t| {
         Mode::from_str(&t)
@@ -320,10 +320,22 @@ pub async fn effective_mode(
     bundle: &str,
     param: &str,
 ) -> sqlx::Result<(Mode, ModeSource)> {
-    if let Some(m) = mode_row(pool, &Scope::project(project_id), bundle, param).await? {
+    let mut conn = pool.acquire().await?;
+    effective_mode_on(&mut conn, project_id, bundle, param).await
+}
+
+/// `effective_mode` on the caller's connection, so a check inside a transaction sees that
+/// transaction's view (and cannot deadlock a one-connection pool).
+pub async fn effective_mode_on(
+    conn: &mut SqliteConnection,
+    project_id: &str,
+    bundle: &str,
+    param: &str,
+) -> sqlx::Result<(Mode, ModeSource)> {
+    if let Some(m) = mode_row(conn, &Scope::project(project_id), bundle, param).await? {
         return Ok((m, ModeSource::Project));
     }
-    if let Some(m) = mode_row(pool, &Scope::Machine, bundle, param).await? {
+    if let Some(m) = mode_row(conn, &Scope::Machine, bundle, param).await? {
         return Ok((m, ModeSource::Machine));
     }
     Ok((Mode::Auto, ModeSource::Default))

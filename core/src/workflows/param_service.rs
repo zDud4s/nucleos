@@ -377,8 +377,46 @@ async fn apply(
     }
     let target = guarded_target(ctx, decl)?;
 
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.map_err(db)?;
-    let before = read_text(&target)?;
+    let tx = pool.begin_with("BEGIN IMMEDIATE").await.map_err(db)?;
+    write_locked(
+        tx,
+        ctx,
+        decl,
+        &value,
+        actor,
+        reason,
+        kind,
+        rolled_back_to,
+        &target,
+    )
+    .await
+}
+
+/// The part of `apply` that runs under the write lock. The effective mode is read again here, on
+/// the transaction's own connection: the pre-check above ran against the pool and the owner may
+/// have flipped the mode to `fixed` since. This check is the authoritative one.
+#[allow(clippy::too_many_arguments)]
+async fn write_locked(
+    mut tx: sqlx::Transaction<'_, sqlx::Sqlite>,
+    ctx: &Ctx,
+    decl: &ParamDecl,
+    value: &Value,
+    actor: &Actor,
+    reason: &str,
+    kind: Kind,
+    rolled_back_to: Option<i64>,
+    target: &Path,
+) -> Result<Row, Refusal> {
+    let name = decl.name.as_str();
+    if actor.autonomous() {
+        let (mode, _) = param_store::effective_mode_on(&mut tx, &ctx.project_id, &ctx.bundle, name)
+            .await
+            .map_err(db)?;
+        if mode == Mode::Fixed {
+            return Err(Refusal::FixedByOwner);
+        }
+    }
+    let before = read_text(target)?;
     let file_value = param_file::read(&before, &decl.key).map_err(not_a_scalar)?;
     let seen = observed(&file_value, decl);
     match latest_value_on(&mut tx, ctx, name).await? {
@@ -445,7 +483,7 @@ async fn apply(
         &ctx.project_id,
         &ctx.bundle,
         name,
-        &value,
+        value,
         kind,
         &actor_text,
         reason,
@@ -467,12 +505,12 @@ async fn apply(
         .await
         .map_err(db)?;
     }
-    let after = param_file::write(&before, &decl.key, &value).map_err(not_a_scalar)?;
+    let after = param_file::write(&before, &decl.key, value).map_err(not_a_scalar)?;
     let written_at = written_at_on(&mut tx, ctx, name, version).await?;
-    project::state::write_atomically(&target, &after)
+    project::state::write_atomically(target, &after)
         .map_err(|error| Refusal::FileUnsafe(format!("cannot write: {error}")))?;
     if let Err(error) = tx.commit().await {
-        if let Err(restore) = project::state::write_atomically(&target, &before) {
+        if let Err(restore) = project::state::write_atomically(target, &before) {
             tracing::error!(bundle = %ctx.bundle, param = name, %restore,
                 "a parameter file could not be restored after a failed commit");
         }
@@ -480,7 +518,7 @@ async fn apply(
     }
     Ok(Row {
         version,
-        value,
+        value: value.clone(),
         kind,
         actor: actor_text,
         reason: reason.to_string(),
@@ -1102,13 +1140,132 @@ beta:
         assert!(f.history("alpha.size").await.is_empty());
     }
 
-    #[cfg(unix)]
+    /// Links `link` to `original`; false (after a note) when the platform refuses, e.g. Windows
+    /// without the symlink privilege.
+    fn try_symlink(original: &Path, link: &Path, dir: bool) -> bool {
+        #[cfg(unix)]
+        let made = {
+            let _ = dir;
+            std::os::unix::fs::symlink(original, link)
+        };
+        #[cfg(windows)]
+        let made = if dir {
+            std::os::windows::fs::symlink_dir(original, link)
+        } else {
+            std::os::windows::fs::symlink_file(original, link)
+        };
+        if let Err(error) = &made {
+            eprintln!("skipped: cannot create a symlink here: {error}");
+        }
+        made.is_ok()
+    }
+
+    /// Links the directory `link` to `original`: a symlink on unix, a junction on Windows, which
+    /// needs no privilege. False (after a note) when the platform refuses.
+    fn try_dir_link(original: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            try_symlink(original, link, true)
+        }
+        #[cfg(windows)]
+        {
+            let status = std::process::Command::new("cmd")
+                .arg("/C")
+                .arg("mklink")
+                .arg("/J")
+                .arg(link.as_os_str())
+                .arg(original.as_os_str())
+                .output();
+            match status {
+                Ok(out) if out.status.success() => true,
+                other => {
+                    eprintln!("skipped: cannot create a junction here: {other:?}");
+                    false
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_mode_flipped_to_fixed_after_the_precheck_still_refuses_the_tuner() {
+        let f = Fixture::new().await;
+        let decl = declared(&f.ctx, "alpha.size").unwrap();
+        let target = guarded_target(&f.ctx, &decl).unwrap();
+        // The pre-check in `apply` has passed (mode auto); the owner flips the mode before the
+        // transaction takes the write lock, which is the state `write_locked` starts from.
+        let mut tx = f.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        param_store::set_mode_on(
+            &mut tx,
+            &Scope::project(PROJECT),
+            BUNDLE,
+            "alpha.size",
+            Some(Mode::Fixed),
+            "owner:me",
+        )
+        .await
+        .unwrap();
+        let refusal = write_locked(
+            tx,
+            &f.ctx,
+            &decl,
+            &json!(5),
+            &tuner(),
+            "test",
+            Kind::Set,
+            None,
+            &target,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refusal, Refusal::FixedByOwner);
+        assert_eq!(f.text(), STATE);
+        assert!(f.history("alpha.size").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_symlinked_parent_directory_outside_the_state_directory_is_file_unsafe() {
+        let f = Fixture::new().await;
+        let manifest = "description: synthetic
+params:
+  - name: gamma.size
+    type: int
+    min: 1
+    max: 10
+    tier: 1
+    file: sub/q.yaml
+    key: gamma.size
+";
+        let ctx = f.version("2.0", manifest);
+        let outside = f.temp.path().join("outside-dir");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("q.yaml"), "gamma:\n  size: 3\n").unwrap();
+        if !try_dir_link(&outside, &ctx.state_dir.join("sub")) {
+            return;
+        }
+        let refusal = set_value(&f.pool, &ctx, "gamma.size", &json!(4), &owner(), "test")
+            .await
+            .unwrap_err();
+        assert_eq!(refusal.code(), "file_unsafe");
+        assert_eq!(
+            std::fs::read_to_string(outside.join("q.yaml")).unwrap(),
+            "gamma:\n  size: 3\n"
+        );
+        assert!(
+            history(&f.pool, &ctx, "gamma.size")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     #[tokio::test]
     async fn a_symlinked_target_outside_the_state_directory_is_file_unsafe() {
         let f = Fixture::with_state(None).await;
         let outside = f.temp.path().join("outside.yaml");
         std::fs::write(&outside, STATE).unwrap();
-        std::os::unix::fs::symlink(&outside, f.file()).unwrap();
+        if !try_symlink(&outside, &f.file(), false) {
+            return;
+        }
         let refusal = f.set("alpha.size", json!(4), &owner()).await.unwrap_err();
         assert_eq!(refusal.code(), "file_unsafe");
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), STATE);
