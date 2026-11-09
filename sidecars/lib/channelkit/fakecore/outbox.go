@@ -130,7 +130,32 @@ func (c *Core) handleRenew(w http.ResponseWriter, r *http.Request) {
 		c.writeFixture(w, http.StatusBadRequest, "errors/bad-request.json")
 		return
 	}
+	// The body is optional: a 1.1 adapter sends none and is renewed without the
+	// generation check, like a 1.0 ack.
+	body, err := readBody(r, 1<<20)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	var gen uint64
+	if len(body) > 0 {
+		renew, derr := contract.DecodeRenew(body)
+		if derr != nil {
+			writeContractError(w, derr)
+			return
+		}
+		gen = renew.Generation
+	}
 	c.mu.Lock()
+	c.outbox.Expire(c.clk.Now())
+	if c.outbox.Stale(id, gen) {
+		// The lease this renewal was sent for expired and the row was leased again:
+		// renewing would extend the lease of the delivery that holds it now.
+		c.staleRenews++
+		c.mu.Unlock()
+		c.writeFixture(w, http.StatusConflict, "errors/not-leased.json")
+		return
+	}
 	until, err := c.outbox.Renew(id, c.clk.Now())
 	if err == nil {
 		// The next wake instant moved; let parked polls recompute it.

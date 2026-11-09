@@ -3,6 +3,7 @@ package kit
 import (
 	"context"
 	"errors"
+	"io"
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
@@ -179,14 +180,17 @@ type renewServer struct {
 	mu      sync.Mutex
 	n       int
 	routes  []string
+	bodies  []string
 	respond func(n int) (int, string)
 }
 
 func (s *renewServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	raw, _ := io.ReadAll(r.Body)
 	s.mu.Lock()
 	s.n++
 	n := s.n
 	s.routes = append(s.routes, r.Method+" "+r.URL.Path)
+	s.bodies = append(s.bodies, string(raw))
 	s.mu.Unlock()
 	status, body := s.respond(n)
 	if status == 0 { // simulate a dropped connection
@@ -346,5 +350,45 @@ func TestRenewerContextCancelStops(t *testing.T) {
 	case <-lease.Lost():
 		t.Fatal("cancellation is not a lost lease")
 	default:
+	}
+}
+
+func (s *renewServer) bodyOf(i int) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.bodies[i]
+}
+
+// A renewal names the lease generation it extends, so the núcleo can refuse the
+// one of a lease that expired and was handed out again.
+func TestRenewerSendsTheGenerationItHolds(t *testing.T) {
+	r, rs, clk := newRenewer(t, func(int) (int, string) { return 200, renewOK })
+	gen := uint64(3)
+	lease := r.StartWithGeneration(context.Background(), 9, func() uint64 { return gen })
+	clk.BlockUntil(1)
+	clk.Advance(30 * time.Second)
+	waitCount(t, rs, 1)
+	if got := rs.bodyOf(0); got != `{"generation":3}` {
+		t.Fatalf("first renew body = %q, want the generation 3", got)
+	}
+	gen = 4 // the row was redelivered: the next renewal carries the new generation
+	clk.BlockUntil(1)
+	clk.Advance(30 * time.Second)
+	waitCount(t, rs, 2)
+	lease.Stop()
+	if got := rs.bodyOf(1); got != `{"generation":4}` {
+		t.Fatalf("second renew body = %q, want the generation 4", got)
+	}
+}
+
+func TestRenewerWithoutAGenerationSendsNoBody(t *testing.T) {
+	r, rs, clk := newRenewer(t, func(int) (int, string) { return 200, renewOK })
+	lease := r.Start(context.Background(), 9)
+	clk.BlockUntil(1)
+	clk.Advance(30 * time.Second)
+	waitCount(t, rs, 1)
+	lease.Stop()
+	if got := rs.bodyOf(0); got != "" {
+		t.Fatalf("renew body = %q, want none", got)
 	}
 }

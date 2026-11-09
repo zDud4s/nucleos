@@ -35,8 +35,9 @@ func (r *Runner) shutdownGrace() time.Duration {
 // The caller releases the Inflight entry when runAction returns, i.e. after the
 // ack settled, whatever the outcome (panic included).
 //
-// Every ack echoes the lease generation of the delivery it settles (contract 1.1):
-// the action's own, or a newer one recorded by a redelivery skipped meanwhile.
+// Every ack, and since contract 1.2 every lease renewal, echoes the lease generation
+// of the delivery it settles: the action's own, or a newer one recorded by a
+// redelivery skipped meanwhile.
 func (r *Runner) runAction(ctx, hard context.Context, client *Client, caps contract.Capabilities, a contract.Action) {
 	id := a.ActionID()
 	gen := a.LeaseGeneration()
@@ -49,7 +50,7 @@ func (r *Runner) runAction(ctx, hard context.Context, client *Client, caps contr
 			return
 		}
 	}
-	lease := NewRenewer(client).Start(hard, id)
+	lease := NewRenewer(client).StartWithGeneration(hard, id, func() uint64 { return r.generationOf(id, gen) })
 	r.trackLease(id, lease)
 	defer r.untrackLease(id)
 	defer lease.Stop()

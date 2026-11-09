@@ -1,7 +1,9 @@
 package kit
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"net/http"
 	"strconv"
 	"sync"
@@ -24,10 +26,20 @@ func NewRenewer(c *Client) *Renewer { return &Renewer{client: c} }
 
 // Start begins renewing the lease of action id every RenewInterval
 // (POST /channels/{channel}/outbox/{id}/renew) until ctx ends, Stop is called, or the
-// core says the action is no longer leased (Lost).
+// core says the action is no longer leased (Lost). The renewals carry no lease
+// generation; see StartWithGeneration.
 func (r *Renewer) Start(ctx context.Context, id uint64) *Lease {
+	return r.StartWithGeneration(ctx, id, nil)
+}
+
+// StartWithGeneration is Start with the lease generation the renewals echo
+// (contract 1.2). generation is called before each renewal, so a redelivery that
+// raised the generation meanwhile is followed; nil, or a zero result (a 1.0/1.1
+// core handed out none), sends the renewal without one. The core answers 409
+// not_leased to a renewal of a superseded generation, and the lease is then lost.
+func (r *Renewer) StartWithGeneration(ctx context.Context, id uint64, generation func() uint64) *Lease {
 	lctx, cancel := context.WithCancel(ctx)
-	l := &Lease{r: r, id: id, ctx: lctx, cancel: cancel}
+	l := &Lease{r: r, id: id, generation: generation, ctx: lctx, cancel: cancel}
 	l.mu.Lock()
 	l.startLocked()
 	l.mu.Unlock()
@@ -41,6 +53,9 @@ type Lease struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+
+	// generation yields the lease generation to echo; nil sends none.
+	generation func() uint64
 
 	mu      sync.Mutex
 	active  bool
@@ -120,7 +135,21 @@ func (l *Lease) finish(lost chan struct{}) {
 func (l *Lease) renewOnce() bool {
 	c := l.r.client
 	path := c.channelPath("/outbox/" + strconv.FormatUint(l.id, 10) + "/renew")
-	body, status, err := c.doBounded(l.ctx, http.MethodPost, path, nil, "")
+	var (
+		payload     io.Reader
+		contentType string
+	)
+	if l.generation != nil {
+		if gen := l.generation(); gen > 0 {
+			b, merr := contract.Renew{Generation: gen}.Marshal()
+			if merr != nil {
+				logf("channelkit: renew %d: %v", l.id, merr)
+				return true
+			}
+			payload, contentType = bytes.NewReader(b), "application/json"
+		}
+	}
+	body, status, err := c.doBounded(l.ctx, http.MethodPost, path, payload, contentType)
 	if err != nil {
 		return true
 	}

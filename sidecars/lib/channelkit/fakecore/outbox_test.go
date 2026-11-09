@@ -247,3 +247,53 @@ func TestOutboxRoutesEnforceChannelIsolation(t *testing.T) {
 		t.Fatalf("got %d %s", status, body)
 	}
 }
+
+func TestOutboxRenewWithTheCurrentGenerationExtendsTheLease(t *testing.T) {
+	c := newCore(t)
+	id := c.Enqueue(textSend("c1"))
+	awaitPoll(t, startPoll(c, 0))
+	status, body := call(t, c, "POST", renewPath(c, id), "application/json", []byte(`{"generation":1}`))
+	if status != 200 {
+		t.Fatalf("renew with the current generation: %d %s", status, body)
+	}
+	if n := c.StaleRenews(); n != 0 {
+		t.Fatalf("StaleRenews = %d, want 0", n)
+	}
+}
+
+// The race of rel-channels#1 on renew: A's lease expires, B leases the row again,
+// then A's renewal arrives. It must not extend B's lease.
+func TestOutboxRenewOfASupersededLeaseIsNotLeasedAndCounted(t *testing.T) {
+	c := newCore(t)
+	id := c.Enqueue(textSend("c1"))
+	deliver(t, c) // A: generation 1
+	c.Clock().Advance(fakecore.LeaseTTL)
+	if got := deliverActions(t, c); len(got) != 1 || got[0].LeaseGeneration() != 2 {
+		t.Fatalf("redelivery = %+v, want generation 2", got) // B
+	}
+	status, body := call(t, c, "POST", renewPath(c, id), "application/json", []byte(`{"generation":1}`))
+	if status != 409 || !strings.Contains(body, `"not_leased"`) {
+		t.Fatalf("stale renew = %d %s, want 409 not_leased", status, body)
+	}
+	if n := c.StaleRenews(); n != 1 {
+		t.Fatalf("StaleRenews = %d, want 1", n)
+	}
+	wantState(t, c, id, fakecore.StateLeased, 2)
+
+	// B's own renewal, and one without a generation, still succeed.
+	if status, body = call(t, c, "POST", renewPath(c, id), "application/json", []byte(`{"generation":2}`)); status != 200 {
+		t.Fatalf("renew with generation 2: %d %s", status, body)
+	}
+	if status, body = call(t, c, "POST", renewPath(c, id), "", nil); status != 200 {
+		t.Fatalf("renew without a body: %d %s", status, body)
+	}
+}
+
+func TestOutboxRenewWithAMalformedBodyIsRejected(t *testing.T) {
+	c := newCore(t)
+	id := c.Enqueue(textSend("c1"))
+	awaitPoll(t, startPoll(c, 0))
+	if status, body := call(t, c, "POST", renewPath(c, id), "application/json", []byte(`{"generation":0}`)); status != 400 {
+		t.Fatalf("renew with generation 0: %d %s, want 400", status, body)
+	}
+}

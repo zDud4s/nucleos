@@ -35,14 +35,14 @@ func TestIndexLoads(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Index(): %v", err)
 	}
-	if idx.ContractVersion != "1.1.0" {
-		t.Errorf("contract_version = %q, want 1.1.0", idx.ContractVersion)
+	if idx.ContractVersion != "1.2.0" {
+		t.Errorf("contract_version = %q, want 1.2.0", idx.ContractVersion)
 	}
-	if got := len(idx.Fixtures); got != 120 {
-		t.Errorf("fixtures = %d, want 120", got)
+	if got := len(idx.Fixtures); got != 123 {
+		t.Errorf("fixtures = %d, want 123", got)
 	}
-	if got := len(idx.Tags); got != 28 {
-		t.Errorf("tags = %d, want 28", got)
+	if got := len(idx.Tags); got != 29 {
+		t.Errorf("tags = %d, want 29", got)
 	}
 }
 

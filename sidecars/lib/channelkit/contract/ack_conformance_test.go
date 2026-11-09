@@ -23,6 +23,13 @@ func init() {
 		}
 		return v, nil
 	})
+	register("renew", func(b []byte) (any, error) {
+		v, err := contract.DecodeRenew(b)
+		if err != nil {
+			return nil, err
+		}
+		return v, nil
+	})
 	register("renew_response", func(b []byte) (any, error) {
 		v, err := contract.DecodeRenewResponse(b)
 		if err != nil {
@@ -109,4 +116,23 @@ func TestAckMissingRetryable(t *testing.T) {
 func TestAckOneOf(t *testing.T) {
 	wantAckErr(t, "acks/empty.json", contract.CodeOneOf, "")
 	wantAckErr(t, "acks/ok-and-failed.json", contract.CodeOneOf, "")
+}
+
+func TestRenewRoundTrip(t *testing.T) {
+	b, err := contract.Renew{Generation: 3}.Marshal()
+	if err != nil || string(b) != `{"generation":3}` {
+		t.Fatalf("Marshal = %s, %v", b, err)
+	}
+	got, err := contract.DecodeRenew(b)
+	if err != nil || got.Generation != 3 {
+		t.Fatalf("DecodeRenew = %+v, %v", got, err)
+	}
+	if got, err = contract.DecodeRenew([]byte(`{}`)); err != nil || got.Generation != 0 {
+		t.Fatalf("DecodeRenew({}) = %+v, %v", got, err)
+	}
+	for _, bad := range []string{`{"generation":0}`, `{"generation":-1}`, `{"gen":1}`} {
+		if _, err := contract.DecodeRenew([]byte(bad)); err == nil {
+			t.Fatalf("DecodeRenew(%s) accepted", bad)
+		}
+	}
 }

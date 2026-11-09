@@ -5,7 +5,10 @@ package contract
 import "strconv"
 
 // Version is the contract version this kit implements.
-const Version = "1.1.0"
+//
+// 1.1 added the lease generation (on each delivered action, echoed by each ack);
+// 1.2 has the renew request echo it too.
+const Version = "1.2.0"
 
 // Compatible reports whether an adapter built against adapterVersion can talk
 // to a core implementing Version: same MAJOR, and the adapter's MINOR must not

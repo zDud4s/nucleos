@@ -349,6 +349,24 @@ pub fn codex_extract_usage(stdout: &str) -> RunUsage {
     usage
 }
 
+/// The Codex child's run environment: the daemon key is removed from whatever the child would
+/// inherit, the stale key-file path too, then the request's entries (already without the key, see
+/// `split_daemon_token`) are set and, when a key file was written, its path alone.
+fn apply_run_env(
+    cmd: &mut Command,
+    child_env: Vec<&(String, String)>,
+    token_file: Option<&Path>,
+) {
+    cmd.env_remove("NUCLEOS_DAEMON_TOKEN");
+    cmd.env_remove(crate::daemon_client::TOKEN_FILE_VAR);
+    for (k, v) in child_env {
+        cmd.env(k, v);
+    }
+    if let Some(path) = token_file {
+        cmd.env(crate::daemon_client::TOKEN_FILE_VAR, path);
+    }
+}
+
 /// The second agent CLI, reached only when configuration names it.
 ///
 /// A separate `CommandRunner` rather than a mode on `ClaudeCliRunner`, for the reason `OllamaRunner`
@@ -497,6 +515,19 @@ impl CommandRunner for CodexCliRunner {
         // mutation", and that is precisely true of a launch that did not happen.
         // `codex_cli_args` honours MCP config, effort, and extra directories; partial messages
         // degrade because the reply arrives when the turn completes.
+        //
+        // The run's daemon key never enters the Codex child's environment, from the request or
+        // inherited, for the reason `ClaudeCliRunner` spells out: every shell command the agent
+        // runs inherits that environment. It goes to a per-run file and the child gets only the
+        // path (`NUCLEOS_DAEMON_TOKEN_FILE`), which the MCP server reads (`DaemonClient::from_env`).
+        // Written before anything else is spawned or staged, so a failure to write is the `Err`
+        // that means the CLI never ran; the file lives until this function returns, after the CLI
+        // has been reaped.
+        let (child_env, daemon_token) = super::claude::split_daemon_token(&request.env);
+        let token_file = match daemon_token {
+            Some(token) => Some(super::claude::RunTokenFile::write(token)?),
+            None => None,
+        };
         let (mcp_overrides, mcp_env) = match &request.mcp_config {
             Some(path) => {
                 let contents = std::fs::read(path).map_err(|error| {
@@ -505,8 +536,13 @@ impl CommandRunner for CodexCliRunner {
                 let config = serde_json::from_slice(&contents).map_err(|error| {
                     std::io::Error::other(format!("codex exec cannot honour mcp_config: {error}"))
                 })?;
+                // The names the MCP server may inherit: the request's own, minus the key (which
+                // is no longer in the environment), plus the path of the key file.
                 let mut env_names: Vec<String> =
-                    request.env.iter().map(|(name, _)| name.clone()).collect();
+                    child_env.iter().map(|(name, _)| name.clone()).collect();
+                if token_file.is_some() {
+                    env_names.push(crate::daemon_client::TOKEN_FILE_VAR.to_string());
+                }
                 env_names.sort();
                 let refuse = |why: String| {
                     std::io::Error::other(format!("codex exec cannot honour mcp_config: {why}"))
@@ -558,9 +594,11 @@ impl CommandRunner for CodexCliRunner {
         let codex_bin = codex_program().unwrap_or_else(|| std::path::PathBuf::from("codex"));
         let mut cmd = Command::new(&codex_bin);
         cmd.args(args);
-        for (k, v) in &request.env {
-            cmd.env(k, v);
-        }
+        apply_run_env(
+            &mut cmd,
+            child_env,
+            token_file.as_ref().map(|file| file.path.as_path()),
+        );
         // The registry servers' env values: only here, in the child env, never in an argument.
         for (k, v) in &mcp_env {
             cmd.env(k, v);
@@ -731,6 +769,55 @@ impl CommandRunner for CodexCliRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Codex child's environment carries the path of the key file, never the key itself.
+    #[test]
+    fn the_codex_child_env_carries_no_daemon_key() {
+        let request_env = vec![
+            (
+                "NUCLEOS_DAEMON_TOKEN".to_string(),
+                "7.request-secret".to_string(),
+            ),
+            ("NUCLEOS_RUN_ID".to_string(), "42".to_string()),
+        ];
+        let (child_env, token) = super::super::claude::split_daemon_token(&request_env);
+        assert_eq!(token, Some("7.request-secret"));
+        let file = super::super::claude::RunTokenFile::write(token.unwrap()).unwrap();
+        let path = file.path.clone();
+
+        let mut cmd = Command::new("codex");
+        apply_run_env(&mut cmd, child_env, Some(path.as_path()));
+        let envs: std::collections::HashMap<String, Option<String>> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            envs.get("NUCLEOS_DAEMON_TOKEN"),
+            Some(&None),
+            "the key must be explicitly removed from the child: {envs:?}"
+        );
+        assert!(
+            !envs
+                .values()
+                .flatten()
+                .any(|value| value.contains("7.request-secret")),
+            "no env value may carry the key: {envs:?}"
+        );
+        assert_eq!(envs.get("NUCLEOS_RUN_ID"), Some(&Some("42".to_string())));
+        assert_eq!(
+            envs.get(crate::daemon_client::TOKEN_FILE_VAR),
+            Some(&Some(path.display().to_string()))
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "7.request-secret");
+        drop(file);
+        assert!(!path.exists(), "the key file must not outlive the run");
+    }
 
     fn touch(path: &Path) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
