@@ -3746,6 +3746,193 @@ pub(super) mod tests {
         assert_eq!(origin.as_deref(), Some("owner"));
     }
 
+    // ---- pending start: terminal parent, backoff, no slot ----------------------------------------
+
+    /// A job whose pending start of `PENDING_NAME` names a non-root caller, `mid`, that is already
+    /// `done`: a condition no later sweep can satisfy. The disk would admit the branch.
+    async fn job_with_a_done_parent(fx: &Fixture, job: &str) {
+        fx.seed_job(job, Vec::new(), None).await;
+        let workflow = fx.repo.join(".nucleos").join("workflow");
+        std::fs::create_dir_all(&workflow).unwrap();
+        std::fs::write(
+            workflow.join("speed.yaml"),
+            "tree:\n  base_branch: master\n  floor_gb: 0\n",
+        )
+        .unwrap();
+        fx.add_node(job, "mid", "orchestrator").await;
+        sqlx::query("UPDATE work_nodes SET status = 'done' WHERE id = 'mid'")
+            .execute(&fx.state.pool)
+            .await
+            .unwrap();
+        let mut stored = fx.job(job).await;
+        stored.manifest.extra.insert(
+            "pending_starts".to_owned(),
+            json!({ PENDING_NAME: {
+                "caller": "mid",
+                "goal": "Do the work",
+                "prompt": "Do not run.",
+                "paths": ["late/**"],
+                "layer": PENDING_LAYER,
+                "base": null,
+            }}),
+        );
+        store::update(&fx.state.pool, &stored).await.unwrap();
+    }
+
+    async fn set_record_field(fx: &Fixture, job: &str, key: &str, value: Value) {
+        let mut stored = fx.job(job).await;
+        stored
+            .manifest
+            .extra
+            .get_mut("pending_starts")
+            .and_then(Value::as_object_mut)
+            .and_then(|pending| pending.get_mut(PENDING_NAME))
+            .and_then(Value::as_object_mut)
+            .expect("the record is there")
+            .insert(key.to_owned(), value);
+        store::update(&fx.state.pool, &stored).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_pending_start_under_a_done_parent_fails_the_branch_with_a_reason_and_never_loops() {
+        const JOB: &str = "drv-pending-done-parent";
+        let fx = Fixture::new().await;
+        job_with_a_done_parent(&fx, JOB).await;
+        let gate = FakeGate::answering(vec![]);
+
+        fx.tick(JOB, &gate).await;
+
+        let stored = fx.job(JOB).await;
+        assert!(
+            pending_starts(&stored).get(PENDING_NAME).is_none(),
+            "the record is consumed: {:?}",
+            pending_starts(&stored)
+        );
+        let branch = stored
+            .manifest
+            .branches
+            .get(PENDING_NAME)
+            .expect("the branch is recorded, so the failure is visible");
+        assert_eq!(branch.state, "dropped");
+        let reason = branch.extra["drop_reason"].as_str().unwrap();
+        assert!(reason.contains("mid") && reason.contains("done"), "{reason}");
+        let after = (
+            count_of(&fx, "feed").await,
+            count_of(&fx, "work_nodes").await,
+        );
+
+        fx.tick(JOB, &gate).await;
+        fx.tick(JOB, &gate).await;
+
+        assert_eq!(
+            (
+                count_of(&fx, "feed").await,
+                count_of(&fx, "work_nodes").await
+            ),
+            after,
+            "later sweeps do nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pending_start_inside_its_backoff_window_is_not_retried() {
+        const JOB: &str = "drv-pending-backoff-wait";
+        let fx = Fixture::new().await;
+        job_with_a_done_parent(&fx, JOB).await;
+        let later = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        set_record_field(&fx, JOB, "next_attempt_at", json!(later)).await;
+        let before = pending_starts(&fx.job(JOB).await);
+
+        fx.tick(JOB, &FakeGate::answering(vec![])).await;
+
+        let stored = fx.job(JOB).await;
+        assert_eq!(pending_starts(&stored), before, "the record is untouched");
+        assert!(stored.manifest.branches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_retry_doubles_the_wait_up_to_a_cap() {
+        const JOB: &str = "drv-pending-backoff-grow";
+        let fx = Fixture::new().await;
+        job_with_a_done_parent(&fx, JOB).await;
+        let wait_of = |job: TreeJob| {
+            let record = pending_starts(&job)[PENDING_NAME].clone();
+            let at = chrono::DateTime::parse_from_rfc3339(record["next_attempt_at"].as_str().unwrap())
+                .unwrap();
+            (
+                record["attempts"].as_u64().unwrap(),
+                (at.with_timezone(&chrono::Utc) - chrono::Utc::now()).num_seconds(),
+            )
+        };
+
+        crate::tree_job::pending_start::record_failure(&fx.state.pool, JOB, PENDING_NAME, "boom")
+            .await
+            .unwrap();
+        let (first_attempts, first_wait) = wait_of(fx.job(JOB).await);
+        crate::tree_job::pending_start::record_failure(&fx.state.pool, JOB, PENDING_NAME, "boom")
+            .await
+            .unwrap();
+        let (second_attempts, second_wait) = wait_of(fx.job(JOB).await);
+
+        assert_eq!((first_attempts, second_attempts), (1, 2));
+        assert!(second_wait > first_wait, "{first_wait} then {second_wait}");
+        for _ in 0..12 {
+            crate::tree_job::pending_start::record_failure(
+                &fx.state.pool,
+                JOB,
+                PENDING_NAME,
+                "boom",
+            )
+            .await
+            .unwrap();
+        }
+        let (_, capped) = wait_of(fx.job(JOB).await);
+        assert!(capped <= 3600, "{capped}");
+        assert_eq!(
+            pending_starts(&fx.job(JOB).await)[PENDING_NAME]["last_error"],
+            "boom"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pending_start_refused_for_lack_of_a_slot_keeps_its_record() {
+        const JOB: &str = "drv-pending-no-slot";
+        let fx = Fixture::new().await;
+        let mut live = crate::tree_job::model::Branch::new("other", &[], PENDING_LAYER, None);
+        // `open` holds a slot (`LIVE_STATES`) and the driver leaves it alone; `running` is no branch
+        // state, so it would not count and the cap of 1 would never refuse.
+        live.state = "open".to_owned();
+        fx.seed_job(JOB, vec![live], None).await;
+        let workflow = fx.repo.join(".nucleos").join("workflow");
+        std::fs::create_dir_all(&workflow).unwrap();
+        std::fs::write(
+            workflow.join("speed.yaml"),
+            "tree:\n  base_branch: master\n  floor_gb: 0\n  max_live_branches: 1\n",
+        )
+        .unwrap();
+        let mut stored = fx.job(JOB).await;
+        stored.manifest.extra.insert(
+            "pending_starts".to_owned(),
+            json!({ PENDING_NAME: {
+                "caller": root_node_of(JOB),
+                "goal": "Do the work",
+                "prompt": "Do not run.",
+                "paths": ["late/**"],
+                "layer": PENDING_LAYER,
+                "base": null,
+            }}),
+        );
+        store::update(&fx.state.pool, &stored).await.unwrap();
+        let before = pending_starts(&fx.job(JOB).await);
+
+        fx.tick(JOB, &FakeGate::answering(vec![])).await;
+        fx.tick(JOB, &FakeGate::answering(vec![])).await;
+
+        let stored = fx.job(JOB).await;
+        assert_eq!(pending_starts(&stored), before, "the record is kept");
+        assert!(!stored.manifest.branches.contains_key(PENDING_NAME));
+    }
+
     // ---- pending start crash windows ---------------------------------------------------------------
 
     /// What a crash right after the manifest record leaves: the record is stored, no decision was
