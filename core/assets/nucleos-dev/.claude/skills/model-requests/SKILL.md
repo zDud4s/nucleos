@@ -90,6 +90,7 @@ prediction). It gained on dev only and was never replicated on heldout.
 | "Have a human, or a strong LLM given the full eventual transcript, rate difficulty" | The reference gets the same state only (R2); otherwise it measures leakage, not the ceiling, and the conclusion is wrong. |
 | "Answer YES only for loss of untracked, non-regenerable data ... Deleting gitignored build output (target/, node_modules/, dist/) ... is NO." | A measured rewording along these lines (2026-11) did not move cleanup allows (R3); measure on a fixed heldout before assuming the wording is the cause. |
 | "Make the threshold per question. Keep 0.85 on `safe` and relax `scope` to about 0.7." | Set thresholds from the margin on labelled negatives (R4), never by feel; a feel-set line lets a negative through unnoticed. |
+| "Calibrate the probabilities before feeding the cards." | For a router, the tier choice is set by the cards and the ladder; measured calibration moved tier agreement by +5 points with an interval that includes 0, so a week of calibration leaves the cost where it was. |
 
 ## Failure modes
 

@@ -38,8 +38,26 @@ touched). Open: describing who acts and when the work ends (dev-only gain).
 
 ## Router
 
-Not yet measured. Apply R1-R4 and build its eval from shadow-mode route decisions (the router
-runs and logs, the existing route still acts) before changing any wording.
+Measured (2026-11). Setup: a capabilities router asks 10 `noul` questions on the last user
+turn; per-tier success = product over requirements of (1 - normalized_p * miss[level]); pick
+the cheapest tier with P >= target. 80 real tasks (dev 28, heldout 52); ceiling = consensus of
+two chat models (Sonnet and codex) given the same packet with no tools.
+
+- Ranking is good: heldout AUC >= 0.90 on 6 of 7 informative questions (ambiguity 0.69). Jev
+  is within the noise between the two ceiling models, but reads high on some questions (niche
+  +0.29, math +0.13 vs consensus).
+- Effect on tiers: replacing consensus with Jev's probabilities changes the tier on 12/52
+  heldout cases, always to the stronger tier (42/52 to the top tier vs 35/52).
+- Calibration does not fix it: isotonic per-question calibration gained +5.0 points
+  [-1.3, +12.5] of tier agreement (the interval includes 0); one global floor/scale knob
+  +1.2. Dropping the math question changed 1/80 decisions.
+- Lesson: when a router over-routes to strong tiers, the lever is the capability cards and
+  the tier ladder (the miss table and levels), checked against real outcomes (did the cheaper
+  tier succeed), not the question wording and not calibrating probabilities. First log
+  per-request probabilities, per-tier P(success) and the outcome. Shadow mode (the router
+  runs and logs, the existing route still acts) is how you get outcomes.
+- Caveat: one corpus, the ladder was chosen by us, and the ceiling is chat models, not
+  outcomes.
 
 ## Compaction
 
