@@ -217,7 +217,9 @@ const QUIET_REDIRECTS: &[&str] = &[
 /// shape (`git branch -d x 2>&1` stays refused, pinned by `a_branch_deletion_is_queued_or_refused…`).
 fn without_quiet_redirects(segment: &str) -> String {
     let mut tokens: Vec<&str> = segment.split_whitespace().collect();
-    let governed = tokens.first().is_some_and(|t| t.eq_ignore_ascii_case("git"))
+    let governed = tokens
+        .first()
+        .is_some_and(|t| t.eq_ignore_ascii_case("git"))
         && tokens.get(1).is_some_and(|verb| {
             verb.eq_ignore_ascii_case("merge") || verb.eq_ignore_ascii_case("rebase")
         });
