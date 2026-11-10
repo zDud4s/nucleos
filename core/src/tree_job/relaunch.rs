@@ -354,7 +354,8 @@ pub(super) async fn budget_refusal(pool: &SqlitePool, node_id: &str) -> Option<S
         .ok()
         .flatten();
     match budget::permits_next_node(pool, &root?).await {
-        Permit::Yes => None,
+        // A budget that could not be read is no limit: it is not a refusal to park on (B9).
+        Permit::Yes | Permit::Retry { .. } => None,
         Permit::No { reason } => Some(reason),
     }
 }

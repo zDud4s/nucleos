@@ -865,9 +865,9 @@ async fn merge(
         let before = conflict_attempts(job, name);
         // Past the tree's budget no resolution is paid for: the conflict is claimed (so the
         // resolver never picks it up) and the owner is asked at once.
-        let claim = !matches!(
+        let claim = matches!(
             tree_budget::permits_next_node(pool, &job.root_node_id).await,
-            Permit::Yes
+            Permit::No { .. }
         );
         let settled = settle_merge(pool, job, name, Duration::ZERO, claim)
             .await
