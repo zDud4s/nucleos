@@ -10,6 +10,7 @@
 //! - `git_queue`: a session's `merge`/`rebase` goes through the queue (`session_git.rs`).
 //! - `open_children`: who may open child nodes (`tree_job/branch_start.rs`: "a leaf does not open
 //!   branches").
+//!
 //! A governed run keeps its own rules in `pretool.rs`; its role comes from the node its `run_id` is
 //! bound to.
 //!
@@ -107,11 +108,17 @@ pub struct Caller {
 
 impl Caller {
     fn agent_id(&self) -> Option<&str> {
-        self.agent_id.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        self.agent_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
     }
 
     fn agent_type(&self) -> Option<&str> {
-        self.agent_type.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        self.agent_type
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
     }
 
     /// Whether anything says this call comes from a subagent.
@@ -195,7 +202,10 @@ mod tests {
             assert!(held.node_fence >= root.node_fence, "{role:?} node fence");
             assert!(held.git_queue >= root.git_queue, "{role:?} git queue");
             // A permission the role holds, the root holds too.
-            assert!(root.open_children >= held.open_children, "{role:?} open children");
+            assert!(
+                root.open_children >= held.open_children,
+                "{role:?} open children"
+            );
         }
         assert!(!policy(Role::Leaf).conductor_fence);
         assert!(!policy(Role::Leaf).open_children);
@@ -208,7 +218,10 @@ mod tests {
             assert!(!policy(role).conductor_fence, "{role:?}");
         }
         for role in ROLES {
-            assert!(policy(role).node_fence && policy(role).git_queue, "{role:?}");
+            assert!(
+                policy(role).node_fence && policy(role).git_queue,
+                "{role:?}"
+            );
         }
         assert!(policy(Role::Orchestrator).open_children);
         assert!(!policy(Role::Leaf).open_children && !policy(Role::Reviewer).open_children);
@@ -239,16 +252,31 @@ mod tests {
     fn without_a_node_only_a_call_with_no_subagent_marker_is_the_root() {
         assert_eq!(role_without_node(&caller(None, None, false)), Role::Root);
         // Blank fields are not markers.
-        assert_eq!(role_without_node(&caller(Some(" "), Some(""), false)), Role::Root);
+        assert_eq!(
+            role_without_node(&caller(Some(" "), Some(""), false)),
+            Role::Root
+        );
         // D12: a marker without a usable agent_id is not the root.
-        assert_eq!(role_without_node(&caller(None, None, true)), most_restricted());
-        assert_eq!(role_without_node(&caller(None, Some("general-purpose"), false)), most_restricted());
-        assert_eq!(role_without_node(&caller(Some("a1"), None, false)), most_restricted());
+        assert_eq!(
+            role_without_node(&caller(None, None, true)),
+            most_restricted()
+        );
+        assert_eq!(
+            role_without_node(&caller(None, Some("general-purpose"), false)),
+            most_restricted()
+        );
+        assert_eq!(
+            role_without_node(&caller(Some("a1"), None, false)),
+            most_restricted()
+        );
     }
 
     #[test]
     fn agent_type_is_a_hint_that_never_raises_a_caller_past_a_leaf() {
-        assert_eq!(role_without_node(&caller(Some("a1"), Some("wf-leaf"), false)), Role::Leaf);
+        assert_eq!(
+            role_without_node(&caller(Some("a1"), Some("wf-leaf"), false)),
+            Role::Leaf
+        );
         for chosen in ["root", "wf-orchestrator", "orchestrator", "wf-reviewer"] {
             let role = role_without_node(&caller(Some("a1"), Some(chosen), false));
             assert_eq!(role, most_restricted(), "{chosen}");
@@ -264,7 +292,14 @@ mod tests {
         state.pool.clone()
     }
 
-    async fn node(pool: &SqlitePool, id: &str, kind: &str, owned: &str, agent: Option<&str>, run: Option<&str>) {
+    async fn node(
+        pool: &SqlitePool,
+        id: &str,
+        kind: &str,
+        owned: &str,
+        agent: Option<&str>,
+        run: Option<&str>,
+    ) {
         sqlx::query(
             "INSERT INTO work_nodes (id, root_id, depth, kind, title, goal, status, owned_paths, \
              agent_id, run_id, created_at, updated_at) \
@@ -284,17 +319,34 @@ mod tests {
     #[tokio::test]
     async fn the_role_comes_from_the_node_row_and_not_from_the_type_the_caller_chose() {
         let pool = pool().await;
-        node(&pool, "n-leaf", "leaf", r#"["core/src/a/**"]"#, Some("a-leaf"), None).await;
+        node(
+            &pool,
+            "n-leaf",
+            "leaf",
+            r#"["core/src/a/**"]"#,
+            Some("a-leaf"),
+            None,
+        )
+        .await;
         node(&pool, "n-orch", "orchestrator", "[]", Some("a-orch"), None).await;
         node(&pool, "n-rev", "leaf", "[]", None, Some("42")).await;
         // A leaf that names itself an orchestrator stays a leaf.
         let liar = caller(Some("a-leaf"), Some("wf-orchestrator"), false);
         assert_eq!(resolve(&pool, &liar, None).await, Role::Leaf);
-        assert_eq!(resolve(&pool, &caller(Some("a-orch"), None, false), None).await, Role::Orchestrator);
+        assert_eq!(
+            resolve(&pool, &caller(Some("a-orch"), None, false), None).await,
+            Role::Orchestrator
+        );
         // The run's node, when there is no agent id.
-        assert_eq!(resolve(&pool, &Caller::default(), Some(42)).await, Role::Reviewer);
+        assert_eq!(
+            resolve(&pool, &Caller::default(), Some(42)).await,
+            Role::Reviewer
+        );
         // An agent id with no node falls to the hint, never to the root.
-        assert_eq!(resolve(&pool, &caller(Some("unknown"), None, false), None).await, most_restricted());
+        assert_eq!(
+            resolve(&pool, &caller(Some("unknown"), None, false), None).await,
+            most_restricted()
+        );
         // Nothing at all: the root.
         assert_eq!(resolve(&pool, &Caller::default(), None).await, Role::Root);
     }

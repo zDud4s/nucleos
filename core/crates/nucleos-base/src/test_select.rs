@@ -171,6 +171,44 @@ fn filtered(group: &Group, claimed: &[String]) -> Option<Vec<String>> {
     Some(argv)
 }
 
+/// The most test ids one recheck names; a longer list is not worth a filter expression.
+const RECHECK_MAX_IDS: usize = 200;
+
+/// The group's `select` filled to run exactly the tests `ids` name (a fix re-gate re-measures what
+/// failed before it measures anything else), or `None` when the group cannot do that: no `select`
+/// with a `{filter}` marker, no ids, too many, or an id that is not a plain test path. An id comes
+/// out of a runner's output, so it is checked rather than trusted: only `[A-Za-z0-9_:]` passes.
+pub fn recheck_argv(group: &Group, ids: &[String]) -> Option<Vec<String>> {
+    let template = group.select.as_deref()?;
+    if ids.is_empty() || ids.len() > RECHECK_MAX_IDS {
+        return None;
+    }
+    let plain = |id: &String| {
+        !id.is_empty()
+            && id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+    };
+    if !ids.iter().all(plain) {
+        return None;
+    }
+    let expr = ids
+        .iter()
+        .map(|id| format!("test(={id})"))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let words = crate::gate::split_command(template).ok()?;
+    if !words.iter().any(|word| word == FILTER) {
+        return None;
+    }
+    Some(
+        words
+            .into_iter()
+            .map(|word| if word == FILTER { expr.clone() } else { word })
+            .collect(),
+    )
+}
+
 /// A template's words with each marker replaced by its paths, every one prefixed `./` so none
 /// can begin with `-` (spec §3.2, rule 2). `{dirs}` is each path's directory once, `.` for the
 /// root.
@@ -414,6 +452,33 @@ tests:
         select(map, &paths(list), &all_fillable(list), filters).units[0]
             .argv
             .clone()
+    }
+
+    #[test]
+    fn a_recheck_runs_the_select_with_exactly_the_failed_tests() {
+        let map = filtered_map();
+        let group = &map.tests.groups["core"];
+        let ids = vec!["verify::tests::a".to_owned(), "verify::tests::b".to_owned()];
+        let argv = recheck_argv(group, &ids).expect("core has a select");
+        assert_eq!(
+            argv.last().map(String::as_str),
+            Some("test(=verify::tests::a) | test(=verify::tests::b)")
+        );
+        assert_eq!(argv[0], "cargo");
+    }
+
+    #[test]
+    fn a_recheck_is_refused_without_a_select_or_with_an_unsafe_id() {
+        let map = filtered_map();
+        let ok = vec!["a::b".to_owned()];
+        assert_eq!(recheck_argv(&map.tests.groups["go"], &ok), None);
+        let core = &map.tests.groups["core"];
+        assert_eq!(recheck_argv(core, &[]), None);
+        for bad in ["a b", "a::b) | test(c", "x\"y", ""] {
+            assert_eq!(recheck_argv(core, &[bad.to_owned()]), None, "{bad:?}");
+        }
+        let many: Vec<String> = (0..201).map(|n| format!("t::n{n}")).collect();
+        assert_eq!(recheck_argv(core, &many), None);
     }
 
     #[test]

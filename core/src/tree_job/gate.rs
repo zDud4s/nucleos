@@ -33,6 +33,12 @@ const KEY: &str = "gate_ticket";
 /// The key of `Branch.extra` that holds the ticket of the branch's build check, same shape.
 const CHECK_KEY: &str = "gate_check_ticket";
 
+/// The key of `Branch.extra` that holds the ticket of a fix's recheck of the failed tests.
+const RECHECK_KEY: &str = "gate_recheck_ticket";
+
+/// The key of `Branch.extra` that holds `{group: [test ids]}` the branch's last red gate failed.
+const FAILED_KEY: &str = "gate_red_tests";
+
 /// The ticket a branch's gate submitted, and the HEAD it measures.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Stored {
@@ -52,15 +58,21 @@ pub(super) trait GateIo {
     async fn inherited(&self, ticket: &Ticket) -> Option<String>;
     /// Submits a new scope ticket and answers its id.
     async fn submit(&self) -> Result<i64, String>;
+    /// Remembers which tests the finished `ticket` failed (`red`) or forgets them (a green): a fix's
+    /// re-gate measures those first. Nothing by default; only the production queue keeps them.
+    async fn record_failures(&self, _ticket: &Ticket, _red: bool) {}
 }
 
 /// The verdict of a finished ticket; a red is asked whether the base already has it.
 async fn verdict_from(io: &impl GateIo, ticket: &Ticket) -> Result<GateVerdict, NotMeasured> {
     let verdict = verdict_of(scope_outcome(ticket));
-    if let Ok(GateVerdict::Red { .. }) = verdict
-        && let Some(note) = io.inherited(ticket).await
-    {
-        return Ok(GateVerdict::Inherited { note });
+    if let Ok(GateVerdict::Red { .. }) = verdict {
+        if let Some(note) = io.inherited(ticket).await {
+            return Ok(GateVerdict::Inherited { note });
+        }
+        io.record_failures(ticket, true).await;
+    } else if let Ok(GateVerdict::Green) = verdict {
+        io.record_failures(ticket, false).await;
     }
     verdict
 }
@@ -143,6 +155,26 @@ pub(super) async fn gate_at_head(
     verdict
 }
 
+/// A fix's re-gate in three steps (spec A7): the build, then only the tests that failed in the
+/// previous gate (`recheck`), then the scope's tests (`test`) once those pass. A recheck that ran
+/// nothing (no recorded failure it can name) goes straight on to the scope's tests.
+pub(super) async fn gate_rechecked_then_tested(
+    check: &impl GateIo,
+    recheck: &impl GateIo,
+    test: &impl GateIo,
+    head: &str,
+    wait: Duration,
+) -> Result<GateVerdict, NotMeasured> {
+    match gate_unless_stale(check, head, wait).await? {
+        GateVerdict::Green | GateVerdict::NothingRan => {}
+        red => return Ok(red),
+    }
+    match gate_unless_stale(recheck, head, wait).await? {
+        GateVerdict::Green | GateVerdict::NothingRan => gate_unless_stale(test, head, wait).await,
+        red => Ok(red),
+    }
+}
+
 /// Gates a branch's HEAD in two steps: its build (`check`, the groups' clippy over all targets)
 /// first, its tests only once that is not red. Leaves may not run cargo, so a test helper that no
 /// longer compiles used to reach the gate unseen; here it is a red carrying the compiler's output,
@@ -192,6 +224,8 @@ struct VerifyIo<'a> {
     key: &'static str,
     /// `Kind::Check` for the build step, `Kind::Test` for the tests.
     kind: Kind,
+    /// The test step of a fix's re-gate that runs only the tests that failed before.
+    recheck: bool,
     executor: &'a Arc<Executor>,
     pool: &'a sqlx::SqlitePool,
     job_id: &'a str,
@@ -217,11 +251,53 @@ impl VerifyIo<'_> {
                 &held.extra,
                 self.executor.unit_timeout_seconds(),
             ),
+            recheck: self
+                .recheck
+                .then(|| held.extra.get(FAILED_KEY).map(failures_from_extra))
+                .flatten(),
         }
     }
 }
 
 impl GateIo for VerifyIo<'_> {
+    async fn record_failures(&self, ticket: &Ticket, red: bool) {
+        if self.kind != Kind::Test {
+            return;
+        }
+        let failed = if red {
+            failed_tests_of(ticket)
+        } else if self.recheck {
+            // A green recheck says the fixed tests pass, not that the branch is green: the record
+            // stays for the scope gate that follows, which replaces or clears it.
+            return;
+        } else {
+            Vec::new()
+        };
+        let lock = job_lock(self.job_id);
+        let _guard = lock.lock().await;
+        let Ok(Some(mut job)) = store::load(self.pool, self.job_id).await else {
+            return;
+        };
+        let Some(held) = job.manifest.branches.get_mut(self.branch) else {
+            return;
+        };
+        if failed.is_empty() {
+            if held.extra.remove(FAILED_KEY).is_none() {
+                return;
+            }
+        } else {
+            let map: serde_json::Map<String, serde_json::Value> = failed
+                .into_iter()
+                .map(|(group, ids)| (group, json!(ids)))
+                .collect();
+            held.extra
+                .insert(FAILED_KEY.to_owned(), serde_json::Value::Object(map));
+        }
+        if let Err(error) = store::update(self.pool, &job).await {
+            tracing::warn!(%error, job = self.job_id, branch = self.branch, "gate: cannot record the failed tests");
+        }
+    }
+
     async fn stored(&self) -> Result<Option<Stored>, String> {
         let job = store::load(self.pool, self.job_id)
             .await
@@ -344,22 +420,96 @@ pub(super) async fn gate_branch(
     wait: Duration,
 ) -> Result<GateVerdict, NotMeasured> {
     let head = head_of(worktree).await?;
-    let io = |key, kind| VerifyIo {
+    let io = |key, kind, recheck| VerifyIo {
         key,
         kind,
+        recheck,
         executor,
         pool,
         job_id,
         branch,
         worktree,
     };
+    if recorded_failures(pool, job_id, branch, true)
+        .await
+        .is_some()
+    {
+        return gate_rechecked_then_tested(
+            &io(CHECK_KEY, Kind::Check, false),
+            &io(RECHECK_KEY, Kind::Test, true),
+            &io(KEY, Kind::Test, false),
+            &head,
+            wait,
+        )
+        .await;
+    }
     gate_compiled_then_tested(
-        &io(CHECK_KEY, Kind::Check),
-        &io(KEY, Kind::Test),
+        &io(CHECK_KEY, Kind::Check, false),
+        &io(KEY, Kind::Test, false),
         &head,
         wait,
     )
     .await
+}
+
+/// The tests that failed in the branch's last red gate, per group, when the branch is in `fixing`
+/// (`only_fixing`) or whatever its state; `None` when none were recorded or the branch is gone.
+async fn recorded_failures(
+    pool: &sqlx::SqlitePool,
+    job_id: &str,
+    branch: &str,
+    only_fixing: bool,
+) -> Option<Vec<(String, Vec<String>)>> {
+    let job = store::load(pool, job_id).await.ok()??;
+    let held = job.manifest.branches.get(branch)?;
+    if only_fixing && held.state != "fixing" {
+        return None;
+    }
+    let failures = failures_from_extra(held.extra.get(FAILED_KEY)?);
+    (!failures.is_empty()).then_some(failures)
+}
+
+/// `{group: [test ids]}` back into pairs; anything malformed is dropped.
+fn failures_from_extra(value: &serde_json::Value) -> Vec<(String, Vec<String>)> {
+    let Some(map) = value.as_object() else {
+        return Vec::new();
+    };
+    map.iter()
+        .filter_map(|(group, ids)| {
+            let ids: Vec<String> = ids
+                .as_array()?
+                .iter()
+                .filter_map(|id| id.as_str().map(str::to_owned))
+                .collect();
+            (!ids.is_empty()).then(|| (group.clone(), ids))
+        })
+        .collect()
+}
+
+/// The failed tests of a finished red ticket, per group: its own failed units that carry test ids
+/// and do not belong to an incident (an inherited red is not the branch's to re-measure).
+pub(super) fn failed_tests_of(ticket: &Ticket) -> Vec<(String, Vec<String>)> {
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    for unit in &ticket.units {
+        if unit.status != "failed" || unit.inherited.is_some() {
+            continue;
+        }
+        let (Some(group), Some(ids)) = (&unit.group, &unit.failed_tests) else {
+            continue;
+        };
+        if ids.is_empty() {
+            continue;
+        }
+        match out.iter_mut().find(|(name, _)| name == group) {
+            Some((_, held)) => held.extend(ids.iter().cloned()),
+            None => out.push((group.clone(), ids.clone())),
+        }
+    }
+    for (_, ids) in &mut out {
+        ids.sort();
+        ids.dedup();
+    }
+    out
 }
 
 #[cfg(test)]
