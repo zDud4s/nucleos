@@ -1126,6 +1126,8 @@ async fn daemon_main() -> std::process::ExitCode {
         tokio::spawn(execution::scheduler::run_scheduler(state.clone()));
     }
     background::spawn_conductor_liveness_loop(state.clone());
+    // Closes a tree node the moment its run ends; the sweep above stays as the backstop.
+    tree_job::run_end::spawn_listener(state.clone());
     if scheduled_routines_wanted {
         // Its own loop, not a step inside the scheduler's: a job pass can sit inside `run_gate` for the
         // whole gate timeout, and sharing a loop would stall every scheduled rule in the daemon behind

@@ -33,6 +33,7 @@ pub mod report;
 mod rescue;
 mod retry;
 pub mod root;
+pub mod run_end;
 mod root_disk;
 mod root_orphan;
 pub mod root_pending;

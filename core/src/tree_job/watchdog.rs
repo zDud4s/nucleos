@@ -6,7 +6,9 @@
 //! forever. A run whose row says live while nothing has moved for hours was never noticed either.
 //! This module closes both gaps and counts the relaunches that fail:
 //!
-//! - an orphan (a running branch node with no run) is started again from its stored launch;
+//! - an orphan (a running branch node or leaf with no run) is started again from its stored launch
+//!   (a leaf only once it is [`ORPHAN_GRACE_SECS`] old, and a leaf that keeps failing fails, as it has
+//!   no branch to park);
 //! - a live run whose lease (its last sign of life) is older than [`LEASE_TTL_SECS`] is ended as
 //!   `interrupted`, so `wrap` starts the node again under its `died-` chain;
 //! - a relaunch that fails (here or in `wrap`) sets a backoff (60 s, doubling, at most 30 min) during
@@ -34,6 +36,8 @@ pub(super) const LEASE_TTL_SECS: i64 = 2 * 60 * 60;
 const FIRST_BACKOFF_SECS: i64 = 60;
 const MAX_BACKOFF_SECS: i64 = 30 * 60;
 const PARKED: &str = "parked";
+/// A running leaf with no run is left alone this long after it was created (its launch may be on its way).
+const ORPHAN_GRACE_SECS: i64 = 5 * 60;
 
 /// The wait after `failures` failed relaunches in a row.
 pub(super) fn backoff(failures: i64) -> Duration {
@@ -142,6 +146,19 @@ async fn reset_if_answered(pool: &SqlitePool, node_id: &str) -> Result<(), Strin
     Ok(())
 }
 
+/// Whether `node_id` is a leaf of the job: neither its root nor the top of a branch.
+async fn is_leaf(pool: &SqlitePool, job_id: &str, node_id: &str) -> bool {
+    let Ok(Some(job)) = store::load(pool, job_id).await else {
+        return false;
+    };
+    job.root_node_id != node_id
+        && !job
+            .manifest
+            .branches
+            .values()
+            .any(|branch| branch.node_id.as_deref() == Some(node_id))
+}
+
 /// Counts one more failed relaunch of `node_id`, sets the backoff, and at [`FAILURE_CAP`] parks the
 /// branch (or asks on the root) with a decision that carries the last error.
 pub(super) async fn record_failure(
@@ -175,6 +192,11 @@ pub(super) async fn record_failure(
     // second chance a passing fault gets: the branch parks on its first occurrence, with the reason.
     if failures < FAILURE_CAP && !super::retry::is_permanent_spawn_error(error) {
         return Ok(());
+    }
+    if is_leaf(pool, job_id, node_id).await {
+        // No branch to park: the leaf fails, which frees its slot and tells its parent.
+        let reason = format!("{failures} failed relaunches in a row, last error: {error}");
+        return fail_leaf(pool, node_id, &reason).await;
     }
     let question = format!(
         "Node {node_id} could not be started again {failures} times in a row (last error: \
@@ -224,17 +246,23 @@ async fn check_node(state: &AppState, node_id: &str, job_id: &str) -> Result<(),
     let Some(job) = store::load(pool, job_id).await.map_err(|e| e.to_string())? else {
         return Ok(());
     };
-    // The root is looked after by `wrap` and `root::retry_failed_starts`.
-    let Some(branch) = job
+    let branch = job
         .manifest
         .branches
         .values()
-        .find(|branch| branch.node_id.as_deref() == Some(node_id))
-    else {
+        .find(|branch| branch.node_id.as_deref() == Some(node_id));
+    if job.state == JOB_TERMINAL_STATE {
         return Ok(());
-    };
-    if job.state == JOB_TERMINAL_STATE || branch.state == PARKED || branch_node_may_close(branch) {
-        return Ok(());
+    }
+    match branch {
+        Some(branch) if branch.state == PARKED || branch_node_may_close(branch) => {
+            return Ok(());
+        }
+        Some(_) => {}
+        // The root is looked after by `wrap` and `root::retry_failed_starts`.
+        None if job.root_node_id == node_id => return Ok(()),
+        // A leaf (a node that tops no branch) is looked after here too.
+        None => {}
     }
     let waiting: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM decisions WHERE node_id = ? AND status = ?")
@@ -255,7 +283,14 @@ async fn check_node(state: &AppState, node_id: &str, job_id: &str) -> Result<(),
             .map_err(|e| e.to_string())?;
     match run_id {
         None => Ok(()),
-        Some(None) => relaunch_orphan(state, job_id, node_id).await,
+        Some(None) => {
+            // A leaf is opened and launched in two steps (`node_open`, then the launch), so one with
+            // no run yet may be mid-launch: it is an orphan only once it has waited a while.
+            if branch.is_none() && opened_within(pool, node_id, ORPHAN_GRACE_SECS).await {
+                return Ok(());
+            }
+            relaunch_orphan(state, job_id, node_id, branch.is_none()).await
+        }
         Some(Some(run_id)) => {
             if !run_is_live(pool, &run_id)
                 .await
@@ -288,9 +323,17 @@ async fn check_node(state: &AppState, node_id: &str, job_id: &str) -> Result<(),
 }
 
 /// Starts a running branch node that has no run from its latest stored launch.
-async fn relaunch_orphan(state: &AppState, job_id: &str, node_id: &str) -> Result<(), String> {
+async fn relaunch_orphan(
+    state: &AppState,
+    job_id: &str,
+    node_id: &str,
+    leaf: bool,
+) -> Result<(), String> {
     let pool = &state.pool;
     if let Some(reason) = budget_refusal(pool, node_id).await {
+        if leaf {
+            return fail_leaf(pool, node_id, &reason).await;
+        }
         let question = refusal_question(node_id, &reason);
         decisions::park_or_ask(pool, job_id, node_id, &question)
             .await
@@ -314,6 +357,37 @@ async fn relaunch_orphan(state: &AppState, job_id: &str, node_id: &str) -> Resul
         }
         Err(error) => record_failure(pool, job_id, node_id, &error).await,
     }
+}
+
+/// Whether `node_id` was created less than `secs` ago. A row that cannot be read counts as old.
+async fn opened_within(pool: &SqlitePool, node_id: &str, secs: i64) -> bool {
+    let created: Option<String> =
+        sqlx::query_scalar("SELECT created_at FROM work_nodes WHERE id = ?")
+            .bind(node_id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+    created
+        .and_then(|at| DateTime::parse_from_rfc3339(&at).ok())
+        .is_some_and(|at| Utc::now() < at.with_timezone(&Utc) + Duration::seconds(secs))
+}
+
+/// Ends a leaf that cannot be started: there is no branch to park, so the node itself fails with
+/// the reason, and the sweep's feed announces it.
+async fn fail_leaf(pool: &SqlitePool, node_id: &str, reason: &str) -> Result<(), String> {
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        "UPDATE work_nodes SET status = 'failed', summary = ?, closed_at = ?, updated_at = ? WHERE id = ? AND status = 'running'",
+    )
+    .bind(format!("Watchdog: the leaf has no run and could not be started: {reason}"))
+    .bind(&now)
+    .bind(&now)
+    .bind(node_id)
+    .execute(pool)
+    .await
+    .map(|_| ())
+    .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -557,6 +631,122 @@ mod tests {
         sweep(&state).await;
 
         assert_ne!(status(&state).await, "running");
+    }
+
+    const LEAF: &str = "wd-leaf";
+
+    /// A leaf of the job (it tops no branch), `running`, created at `created_at`.
+    async fn seed_leaf(state: &AppState, run_id: Option<i64>, created_at: &str) {
+        sqlx::query(
+            "INSERT INTO work_nodes (id, root_id, parent_id, depth, kind, title, goal, status, run_id, \
+                                     tree_job_id, created_at, updated_at) \
+             VALUES (?, 'wd-root', NULL, 1, 'leaf', 't', 'g', 'running', ?, ?, ?, ?)",
+        )
+        .bind(LEAF)
+        .bind(run_id.map(|id| id.to_string()))
+        .bind(JOB)
+        .bind(created_at)
+        .bind(created_at)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+
+    async fn leaf_row(state: &AppState) -> (String, Option<String>, Option<String>) {
+        sqlx::query_as("SELECT status, run_id, summary FROM work_nodes WHERE id = ?")
+            .bind(LEAF)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn save_leaf_launch(state: &AppState) {
+        open::save_launch(
+            &state.pool,
+            &StoredLaunch {
+                node_id: LEAF.to_owned(),
+                key: "initial".to_owned(),
+                prompt: "leaf prompt".to_owned(),
+                project_id: None,
+                cwd: None,
+                mode: "shadow".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_running_leaf_with_no_run_is_relaunched_from_its_stored_launch() {
+        let state = state().await;
+        seed_node(&state, None).await;
+        seed_leaf(&state, None, OLD).await;
+        save_leaf_launch(&state).await;
+
+        sweep(&state).await;
+
+        assert!(leaf_row(&state).await.1.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_leaf_opened_a_moment_ago_is_not_taken_for_an_orphan() {
+        let state = state().await;
+        seed_node(&state, None).await;
+        seed_leaf(&state, None, &Utc::now().to_rfc3339()).await;
+        save_leaf_launch(&state).await;
+
+        sweep(&state).await;
+
+        assert!(leaf_row(&state).await.1.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_leaf_that_cannot_be_relaunched_twice_fails_instead_of_parking() {
+        let state = state().await;
+        seed_node(&state, None).await;
+        seed_leaf(&state, None, OLD).await; // no launch stored: the relaunch fails
+
+        sweep(&state).await;
+        sqlx::query("UPDATE node_watchdog SET next_at = ? WHERE node_id = ?")
+            .bind(OLD)
+            .bind(LEAF)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sweep(&state).await;
+
+        let (status, _, summary) = leaf_row(&state).await;
+        assert_eq!(status, "failed");
+        assert!(summary.unwrap().contains("no launch was stored"));
+        let decisions: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM decisions WHERE node_id = ?")
+                .bind(LEAF)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(decisions, 0);
+    }
+
+    #[tokio::test]
+    async fn a_live_leaf_run_with_an_expired_lease_is_ended() {
+        let state = state().await;
+        seed_node(&state, None).await;
+        seed_leaf(&state, Some(52), OLD).await;
+        sqlx::query(
+            "INSERT INTO runs (id, prompt, status, created_at) VALUES (52, 'p', 'running', ?)",
+        )
+        .bind(OLD)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        sweep(&state).await;
+
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = 52")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_ne!(status, "running");
     }
 
     #[test]
