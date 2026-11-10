@@ -13,7 +13,7 @@
 //! Each action rewrites the job, which restarts the quiet time, so the rungs are `STALL_SECS` apart.
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use serde_json::{Value, json};
+use serde_json::json;
 
 use super::decisions;
 use super::http::job_lock;
@@ -79,14 +79,13 @@ async fn has_live_run(state: &AppState, job: &TreeJob) -> Result<bool, String> {
 }
 
 async fn has_open_decision(state: &AppState, job: &TreeJob) -> Result<bool, String> {
-    let open: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM decisions WHERE tree_id = ? AND status = ?",
-    )
-    .bind(&job.id)
-    .bind(decisions::STATUS_OPEN)
-    .fetch_one(&state.pool)
-    .await
-    .map_err(|e| e.to_string())?;
+    let open: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM decisions WHERE tree_id = ? AND status = ?")
+            .bind(&job.id)
+            .bind(decisions::STATUS_OPEN)
+            .fetch_one(&state.pool)
+            .await
+            .map_err(|e| e.to_string())?;
     Ok(open > 0)
 }
 
@@ -120,9 +119,15 @@ async fn check(state: &AppState, job_id: &str, now: DateTime<Utc>) -> Result<(),
             job.goal,
             spent + 1
         );
-        if let Err(error) =
-            crate::feed::append(pool, job.project_id.as_deref(), "work_tree_stalled", &line, None, None)
-                .await
+        if let Err(error) = crate::feed::append(
+            pool,
+            job.project_id.as_deref(),
+            "work_tree_stalled",
+            &line,
+            None,
+            None,
+        )
+        .await
         {
             tracing::warn!(job = job_id, %error, "could not announce the stalled tree");
         }
@@ -290,9 +295,13 @@ mod tests {
     #[tokio::test]
     async fn after_the_nudges_one_diagnose_run_starts_and_then_the_owner_is_asked() {
         let fx = Fixture::new().await;
-        fx.seed_job(JOB, vec![code_branch("api", "green", Some("stall-api"))], None)
-            .await;
-        fx.add_node(JOB, "stall-api", "code").await;
+        fx.seed_job(
+            JOB,
+            vec![code_branch("api", "green", Some("stall-api"))],
+            None,
+        )
+        .await;
+        fx.add_node(JOB, "stall-api", "leaf").await;
         fx.save_launch("stall-api").await;
         fx.run_ended("stall-api", None).await;
 
@@ -348,7 +357,13 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_owned(),
             updated_at: "2026-01-01T00:00:00Z".to_owned(),
         };
-        record(&mut job, 2, DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z").unwrap().into());
+        record(
+            &mut job,
+            2,
+            DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                .unwrap()
+                .into(),
+        );
         assert_eq!(nudges_spent(&job), 2);
         job.updated_at = "2026-01-01T01:00:00Z".to_owned();
         assert_eq!(nudges_spent(&job), 0);

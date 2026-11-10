@@ -10,10 +10,10 @@
 //!   Each failed merge request is one attempt (`conflict_attempts`); past the ladder's attempts the
 //!   owner is asked.
 
-use std::collections::BTreeMap;
 use chrono::Utc;
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
+use std::collections::BTreeMap;
 
 use super::driver::{Park, persist};
 use super::engine::apply_transition;
@@ -118,7 +118,9 @@ pub(super) async fn on_not_merged(
         Step::Retry { after } => {
             let until = Utc::now() + chrono::Duration::from_std(after).unwrap_or_default();
             if let Some(branch) = job.manifest.branches.get_mut(name) {
-                branch.extra.insert(MERGE_RETRIES.to_owned(), json!(retries + 1));
+                branch
+                    .extra
+                    .insert(MERGE_RETRIES.to_owned(), json!(retries + 1));
                 branch.extra.insert(
                     MERGE_BACKOFF_UNTIL.to_owned(),
                     json!(until.to_rfc3339_opts(chrono::SecondsFormat::Secs, false)),

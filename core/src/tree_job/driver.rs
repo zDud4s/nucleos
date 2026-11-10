@@ -244,11 +244,7 @@ async fn pass(
 /// (spec B6); only when that is spent too is the owner asked, on the root itself. `park_or_ask` asks
 /// once while the decision is open, and the job stays unfinished and unlanded because the root is
 /// not `done`.
-async fn root_step(
-    state: &AppState,
-    job: &TreeJob,
-    parks: &mut Vec<Park>,
-) -> Result<(), String> {
+async fn root_step(state: &AppState, job: &TreeJob, parks: &mut Vec<Park>) -> Result<(), String> {
     let pool = &state.pool;
     let root = &job.root_node_id;
     // A root with no node row has no run to report; `landing_step` is where that is an error.
@@ -4802,7 +4798,8 @@ pub(super) mod tests {
                 .fetch_one(&fx.state.pool)
                 .await
                 .unwrap();
-        assert_eq!(announced, 1);
+        // The conflict's own announcement, then the resolve-conflict run's.
+        assert_eq!(announced, 2);
     }
 
     #[tokio::test]
