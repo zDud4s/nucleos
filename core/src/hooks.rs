@@ -7843,6 +7843,7 @@ mod tests {
                 cwd: cwd.to_string_lossy().into_owned(),
                 agent_id: None,
                 agent_type: None,
+                subagent: false,
             },
             Duration::ZERO,
         )
@@ -8406,6 +8407,7 @@ mod tests {
                 cwd: repo.path().to_string_lossy().into_owned(),
                 agent_id: None,
                 agent_type: None,
+                subagent: false,
             },
             Duration::from_secs(60),
         )

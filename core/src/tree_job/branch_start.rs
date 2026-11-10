@@ -623,7 +623,8 @@ async fn check_own_node(
             ),
         ));
     }
-    if caller.kind == work_nodes::KIND_LEAF {
+    let role = crate::role_policy::role_of_node(&caller.kind, &caller.owned_paths);
+    if !crate::role_policy::policy(role).open_children {
         return Err(refuse(
             StatusCode::FORBIDDEN,
             "a leaf does not open branches; report that the work exceeds the leaf budget",

@@ -1,6 +1,7 @@
 //! Deciding a session's own git operations: whether a queue operation may run, and why not.
 
 use super::*;
+use crate::role_policy;
 
 /// The answer of the session-git route: a [`Decision`] plus, when the operation was queued, which
 /// request it became and whether that request had reached a final state by the time of the answer.
@@ -63,6 +64,9 @@ pub struct SessionGitPayload {
     pub agent_id: Option<String>,
     #[serde(default)]
     pub agent_type: Option<String>,
+    /// The hook saw subagent markers on a call that has no usable `agent_id` (D12).
+    #[serde(default)]
+    pub subagent: bool,
 }
 
 /// The decision for a session nobody launched: a person's own editor, in a worktree, with no run
@@ -119,6 +123,16 @@ pub(super) async fn session_git_decision_within(
     let Some(command) = payload.tool_input.get("command").and_then(Value::as_str) else {
         return no_opinion();
     };
+    // The role table decides whether this caller is held to the queue at all. Every role is today.
+    let caller = role_policy::Caller {
+        agent_id: payload.agent_id.clone(),
+        agent_type: payload.agent_type.clone(),
+        subagent: payload.subagent,
+    };
+    let role = role_policy::resolve(&state.pool, &caller, None).await;
+    if !role_policy::policy(role).git_queue {
+        return no_opinion();
+    }
 
     // One deadline for the whole decision. A hook runs in front of every tool call, so this path
     // spends git subprocesses on a person's keystrokes — which is why the caller filters first and

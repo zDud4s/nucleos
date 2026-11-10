@@ -89,6 +89,7 @@ pub mod relaunch;
 pub mod remote;
 pub mod repo_trigger;
 pub mod resolver;
+pub mod role_policy;
 pub mod restart_cli;
 pub use nucleos_base::router_client;
 pub use nucleos_base::search;
