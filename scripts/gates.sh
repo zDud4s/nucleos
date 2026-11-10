@@ -593,6 +593,7 @@ if [ "$target" = hooks ] || [ "$target" = all ]; then
     run "migrate: ai layout" . "$py" scripts/test-migrate-ai-layout.py
     # One version for shell, core and sidecars: every manifest must agree with VERSION.
     run "release: versions" . "$py" scripts/bump-version.py --check
+    run "git: reference-transaction" . "$py" scripts/test-reference-transaction.py
     run "release: bump"     . "$py" scripts/test-bump-version.py
     run "release: manifest" . "$py" scripts/test-release-manifest.py
     run "release: install"  . "$py" scripts/test-install-scripts.py

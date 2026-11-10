@@ -20,6 +20,21 @@ fn key_for(target: &str, number: &str) -> Option<TaskKey> {
     task_claims::keys::normalize(&format!("migration:{target}:{number}"), Path::new("")).ok()
 }
 
+/// Whether an active `renumber-sequence` step renumbers `dir`: the land fixes a colliding number
+/// itself, so refusing it would only push the work back to the branch owner.
+fn renumber_step_covers(rules: &crate::config::AutopilotRules, dir: &str) -> bool {
+    rules.active_integration_steps().into_iter().any(|step| {
+        step.kind == "builtin:renumber-sequence"
+            && step
+                .config
+                .get("dir")
+                .and_then(|value| value.as_str())
+                .is_some_and(|configured| {
+                    configured.replace('\\', "/").trim_end_matches('/') == dir
+                })
+    })
+}
+
 pub async fn check(
     pool: &sqlx::SqlitePool,
     landing: &Landing<'_>,
@@ -27,6 +42,12 @@ pub async fn check(
     now: DateTime<Utc>,
 ) -> Verdict {
     if landing.exempt {
+        return Verdict::Clear;
+    }
+    // Unreadable rules take the normal path: the gate stays on.
+    if let Ok(rules) = crate::project::rules::autopilot(landing.project_id)
+        && renumber_step_covers(&rules, MIGRATIONS_DIR)
+    {
         return Verdict::Clear;
     }
     let (source, target) = (landing.source.as_str(), landing.target.as_str());
@@ -211,6 +232,8 @@ mod tests {
         source: &str,
         exempt: bool,
     ) -> Verdict {
+        // `check` reads the project's rules: hold the shared side (a no-op after a `publish_rules`).
+        crate::project::rules::testing::hold_shared();
         let (source, target) = (Branch::new(source).unwrap(), Branch::new("master").unwrap());
         let landing = Landing {
             project_id: PROJECT,
@@ -344,6 +367,7 @@ mod tests {
         branch_adding(&repo, "feat/a", "0276_a.sql");
         branch_adding(&repo, "feat/b", "0276_b.sql");
         let pool = crate::testdb::fresh_pool().await;
+        crate::project::rules::testing::hold_shared();
         let master = Branch::new("master").unwrap();
         let ask = |name: &str| {
             let op = Op::Merge {
@@ -375,5 +399,55 @@ mod tests {
             "{held}"
         );
         assert!(held.contains("migration:master:0276"), "{held}");
+    }
+
+    /// Rules with one `renumber-sequence` step over `dir`, enabled or not.
+    fn renumber_rules(dir: &str, enabled: bool) -> String {
+        format!(
+            "gate_command: git --version
+integration_steps:
+  - id: renumber
+    kind: builtin:renumber-sequence
+    enabled: {enabled}
+    config: {{ dir: \"{dir}\", pattern: \"{{N:4}}_*.sql\" }}
+"
+        )
+    }
+
+    /// A colliding `0276` on `feat/a`, checked after `rules` were published for the project.
+    async fn collision_verdict_under(rules: &str) -> Verdict {
+        let (_keep, repo) = repo();
+        add_migration(&repo, "0276_target.sql");
+        branch_adding(&repo, "feat/a", "0276_branch.sql");
+        let pool = crate::testdb::fresh_pool().await;
+        crate::project::rules::testing::publish_rules(PROJECT, rules);
+        let verdict = run_check(&pool, &repo, "feat/a", false).await;
+        if matches!(verdict, Verdict::Clear) {
+            assert_eq!(count(&pool, "SELECT COUNT(*) FROM task_claims").await, 0);
+        }
+        verdict
+    }
+
+    #[tokio::test]
+    async fn an_active_renumber_step_for_the_migrations_dir_lets_a_colliding_number_through() {
+        // A trailing slash is the same directory.
+        for dir in ["core/migrations", "core/migrations/"] {
+            let verdict = collision_verdict_under(&renumber_rules(dir, true)).await;
+            assert!(matches!(verdict, Verdict::Clear), "dir {dir}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_renumber_step_for_another_dir_keeps_the_migration_gate() {
+        let verdict = collision_verdict_under(&renumber_rules("db/migrations", true)).await;
+        let message = refusal(verdict);
+        assert!(message.contains("migration:master:0276"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_disabled_renumber_step_keeps_the_migration_gate() {
+        let verdict = collision_verdict_under(&renumber_rules("core/migrations", false)).await;
+        let message = refusal(verdict);
+        assert!(message.contains("migration:master:0276"), "{message}");
     }
 }

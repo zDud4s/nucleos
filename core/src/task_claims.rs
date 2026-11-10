@@ -9,12 +9,14 @@
 //! helper every consumer asks whether a claim is alive), and `sessions` registers interactive sessions
 //! and tells them what happened to their claims. `offers` routes an `open` ticket to its most
 //! competent holder and handles a decline. `launch` starts a run for a ticket nobody took (capped,
-//! then parked into an ownerless decision).
+//! then parked into an ownerless decision). `direct_write` opens `direct-write:<target>` when the
+//! integration branch moves outside the queue.
 
 use serde::Serialize;
 
 pub mod competence;
 pub mod detect;
+pub mod direct_write;
 pub mod keys;
 pub mod launch;
 pub mod machine;

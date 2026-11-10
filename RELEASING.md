@@ -74,11 +74,18 @@ requirement.
 ## Cutting a release
 
 ```bash
+git switch -c release/X.Y.Z master
 python scripts/bump-version.py X.Y.Z
 git commit -am "chore: release X.Y.Z"
+nucleos-core --land          # the queue merges release/X.Y.Z into master
+git switch master            # once the land is done: master now carries the bump
 git tag vX.Y.Z
 git push origin master vX.Y.Z
 ```
+
+Master only advances through the queue: a commit made directly on master is refused by the local
+`reference-transaction` hook (`scripts/install-hooks.sh`), so the bump goes on a branch and is
+delivered with `nucleos-core --land`, and the tag goes on master only after the land.
 
 The tag must equal `VERSION`; the workflow checks it. Watch the run: the `publish` job downloads
 the assets the three legs uploaded, `scripts/release-manifest.py verify` checks that each platform

@@ -218,6 +218,40 @@ fi
 exit 0
 HOOK_EOF
 
+cat > "$target/reference-transaction" <<'HOOK_EOF'
+#!/bin/sh
+# Master is closed: nothing but the queue moves refs/heads/<integration branch>.
+# git runs this at "prepared" (exit != 0 aborts the whole ref transaction), "committed" and
+# "aborted"; stdin carries "<old> <new> <ref>" per ref. Needs git >= 2.28. --no-verify does NOT skip
+# it. A convention like nucleos-queue-guard, not a boundary: the daemon detects a write that got past
+# it (core/src/task_claims/direct_write.rs). Covered by scripts/test-reference-transaction.py.
+state="$1"
+case "$state" in prepared|committed) ;; *) exit 0 ;; esac
+target="$(git config --get nucleos.integrationBranch 2>/dev/null)"
+[ -n "$target" ] || exit 0
+ref="refs/heads/$target"
+hit=""
+while read -r old new name; do
+  [ "$name" = "$ref" ] && hit="$old $new"
+done
+[ -n "$hit" ] || exit 0
+# Every git process the queue starts carries the marker (QUEUE_MARKER in
+# core/src/execution/git_exec/transport.rs): merge, publish (update-ref or ff-only), revert.
+[ -n "$NUCLEOS_QUEUE_EXEC" ] && exit 0
+if [ -n "$NUCLEOS_ALLOW_DIRECT_GIT" ]; then
+  if [ "$state" = "committed" ]; then
+    common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" &&
+      printf 'bypass %s %s %s\n' "$(date +%s)" "$hit" "$ref" >> "$common/nucleos-direct-writes.log"
+  fi
+  exit 0
+fi
+[ "$state" = "prepared" ] || exit 0
+echo "blocked: $target only advances through the VCS queue, not by hand." >&2
+echo "  to deliver a branch:  nucleos-core --land" >&2
+echo "  to act as yourself, deliberately (the daemon records it):  NUCLEOS_ALLOW_DIRECT_GIT=1 git ..." >&2
+exit 1
+HOOK_EOF
+
 cat > "$target/nucleos-queue-guard" <<'HOOK_EOF'
 # Sourced by pre-merge-commit, pre-push and pre-rebase. Not a hook itself, and not executable.
 #
@@ -293,9 +327,30 @@ fi
 
 # nucleos-queue-guard is sourced, not run, so it is deliberately left non-executable.
 chmod +x "$target"/pre-commit "$target"/commit-msg "$target"/pre-merge-commit \
-  "$target"/pre-push "$target"/pre-rebase "$target"/post-checkout
+  "$target"/pre-push "$target"/pre-rebase "$target"/post-checkout "$target"/reference-transaction
+
+# The branch reference-transaction keeps closed. An explicit NUCLEOS_INTEGRATION_BRANCH wins; then
+# the remote's default branch; then master, then main. Repository config, so every worktree shares it.
+branch="${NUCLEOS_INTEGRATION_BRANCH:-}"
+if [ -z "$branch" ]; then
+  branch="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+  branch="${branch#origin/}"
+fi
+if [ -z "$branch" ]; then
+  if git show-ref --verify --quiet refs/heads/master; then
+    branch="master"
+  elif git show-ref --verify --quiet refs/heads/main; then
+    branch="main"
+  fi
+fi
+if [ -n "$branch" ]; then
+  git config nucleos.integrationBranch "$branch"
+  echo "nucleos.integrationBranch = $branch"
+else
+  echo "warning: no integration branch found (set NUCLEOS_INTEGRATION_BRANCH and re-run); reference-transaction guards nothing until nucleos.integrationBranch is set" >&2
+fi
 
 git config core.hooksPath "$hooks_dir"
 
-echo "installed: .githooks/{pre-commit,commit-msg,pre-merge-commit,pre-push,pre-rebase,post-checkout,nucleos-queue-guard}"
+echo "installed: .githooks/{pre-commit,commit-msg,pre-merge-commit,pre-push,pre-rebase,post-checkout,reference-transaction,nucleos-queue-guard}"
 echo "core.hooksPath = $(git config core.hooksPath)"

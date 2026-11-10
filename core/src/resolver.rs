@@ -33,6 +33,11 @@ const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 /// is all they share — the last runs even when the
 /// others have been stopped, which is deliberate and argued at `record_discards`.
 ///
+/// The tick also carries one pass that is not about conflicts: `scan_direct_writes`
+/// (`task_claims::direct_write::scan_all`) notices an integration branch that moved without the
+/// queue and opens its `direct-write:` ticket. It shares the tick for the cadence only, runs last,
+/// is bounded like the other row-local steps, and fails open.
+///
 /// Stopping comes before starting, and the order is the point rather than a preference: a tick that
 /// minted before it cancelled would be a tick that could spend on a project already at its ceiling
 /// because of work that is about to be cancelled for being pointless.
@@ -54,6 +59,11 @@ pub async fn run_resolution_loop(state: AppState) {
         land_finished(&state.pool, &mut refused).await;
         step_with_timeout("record_discards", record_discards(&state.pool)).await;
         step_with_timeout("settle_moot", settle_moot(&state.pool)).await;
+        step_with_timeout(
+            "scan_direct_writes",
+            crate::task_claims::direct_write::scan_all(&state.pool),
+        )
+        .await;
     }
 }
 

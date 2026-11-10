@@ -7,7 +7,8 @@
 //! a run; a key that already had two launches in seven days is parked instead: `parked_at` is set and
 //! the owner is asked, through an ownerless decision, to pick an owner or close it. The cap counts
 //! every row of the key, closed ones included, so a problem that keeps coming back is not relaunched
-//! forever. `master-red` and `migration:` tickets have their own owners and are never touched here.
+//! forever. `master-red`, `migration:` and `direct-write:` tickets have their own owners and are never
+//! touched here.
 //!
 //! A launch is a single flight on `launch_attempts`: the attempt is counted before the launcher runs,
 //! and a launch that fails still counts.
@@ -36,6 +37,8 @@ const HISTORY_DAYS: i64 = 7;
 const LOOP_INTERVAL: StdDuration = StdDuration::from_secs(60);
 /// Keys whose owners are fixed elsewhere: the land gate's migration tickets.
 const MIGRATION_PREFIX: &str = "migration:";
+/// Keys the owner resolves by hand: the target advanced outside the queue.
+const DIRECT_WRITE_PREFIX: &str = "direct-write:";
 /// Keys that belong to a spec's own tree.
 const SPEC_ITEM_PREFIX: &str = "spec-item:";
 
@@ -106,9 +109,11 @@ pub fn launch_kind(task: &TaskRow) -> LaunchKind {
 }
 
 /// False for the keys whose owners are decided elsewhere: `master-red` (verify and the postgate) and
-/// `migration:` (the branch the land gate refused).
+/// `migration:` (the branch the land gate refused) and `direct-write:` (the owner resolves it).
 pub fn auto_launchable(key: &str) -> bool {
-    key != MASTER_RED_KEY && !key.starts_with(MIGRATION_PREFIX)
+    key != MASTER_RED_KEY
+        && !key.starts_with(MIGRATION_PREFIX)
+        && !key.starts_with(DIRECT_WRITE_PREFIX)
 }
 
 fn parse(at: &str) -> Option<DateTime<Utc>> {
@@ -570,6 +575,18 @@ mod tests {
         let key = "migration:master:0286";
         assert!(!auto_launchable(key));
         assert!(auto_launchable("file:core/a.rs"));
+        let row = ticket_row(key, t0() - Duration::days(1));
+        assert_eq!(due(&row, &never(), true, t0()), Due::No);
+        assert_eq!(
+            due(&row, &launched(2, t0() - mins(60)), true, t0()),
+            Due::No
+        );
+    }
+
+    #[test]
+    fn a_direct_write_ticket_is_never_auto_launched() {
+        let key = "direct-write:master";
+        assert!(!auto_launchable(key));
         let row = ticket_row(key, t0() - Duration::days(1));
         assert_eq!(due(&row, &never(), true, t0()), Due::No);
         assert_eq!(

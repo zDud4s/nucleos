@@ -193,6 +193,13 @@ pub(super) const ROUTES: &[RouteEntry] = &[
         handler: "get_active",
     },
     RouteEntry {
+        method: "POST",
+        path: "/nodes/scope",
+        purpose: "Post scope.",
+        body: Body::Shapeless("ScopeBody"),
+        handler: "post_scope",
+    },
+    RouteEntry {
         method: "GET",
         path: "/nodes/tree/{root_id}",
         purpose: "Get tree.",

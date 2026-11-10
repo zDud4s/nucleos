@@ -247,6 +247,44 @@ pub struct JudgeConfig {
     pub deny_at: Option<f64>,
 }
 
+/// How long one integration step may run when its `timeout_secs` is absent.
+pub const DEFAULT_STEP_TIMEOUT_SECS: u64 = 600;
+/// Names a `builtin:<name>` step may carry. The daemon knows nothing else.
+pub const KNOWN_BUILTIN_STEPS: &[&str] = &["renumber-sequence"];
+
+/// One step the VCS queue runs on the merged tree, after the merge and before the gate (spec
+/// 2026-11-09 passos de integracao §3). Steps run in the order they are declared.
+#[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct IntegrationStep {
+    /// Stable id: names the step in the feed and in the `integrate:` commit.
+    pub id: String,
+    /// `program`, or `builtin:<name>` (one of `KNOWN_BUILTIN_STEPS`).
+    pub kind: String,
+    /// `kind: program` only: a path relative to the repo root (run from the merged tree) or a
+    /// bare command on PATH.
+    #[serde(default)]
+    pub program: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Free object handed to the step (`NUCLEOS_STEP_CONFIG`, JSON). `null` means `{}`.
+    #[serde(default)]
+    pub config: serde_json::Value,
+    /// A repo-relative file the step reads; a branch that changes it waits for the owner.
+    #[serde(default)]
+    pub config_file: Option<String>,
+    /// Absent means `DEFAULT_STEP_TIMEOUT_SECS`. Zero is refused.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    /// Off keeps the declaration but runs nothing and forces no gate.
+    #[serde(default = "step_enabled")]
+    pub enabled: bool,
+}
+
+fn step_enabled() -> bool {
+    true
+}
+
 /// Spec B D4: the resolver's thresholds for this project. All absent means 0.85 everywhere.
 #[derive(Debug, Clone, Default, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -342,6 +380,12 @@ pub struct AutopilotRules {
     /// `git_exec::gate_the_merge`, which is the only reader.
     #[serde(default)]
     pub gate_before_publish: bool,
+    /// Steps the VCS queue runs, in order, on a merge into the integration branch, after the
+    /// merge and before the gate. Absent means none, and a project that says nothing lands exactly
+    /// as before this key existed. One active step forces the gate before publish: read through
+    /// `active_integration_steps()` and `merge_gate_required()`.
+    #[serde(default)]
+    pub integration_steps: Vec<IntegrationStep>,
     /// Whether the daemon runs the full gate on the target after a merge lands (spec
     /// 2026-10-05 §6.1). Off by default — a project that says nothing behaves exactly as before
     /// this key existed. Read by the post-merge worker (`verify_postgate_worker`) and by
@@ -433,6 +477,20 @@ impl AutopilotRules {
     /// off the struct would skip the full gate with no post-merge gate behind it.
     pub fn scoped_final(&self) -> bool {
         self.scoped_final_gate && self.gate_after_land
+    }
+
+    /// The integration steps that run, in declaration order.
+    pub fn active_integration_steps(&self) -> Vec<&IntegrationStep> {
+        self.integration_steps
+            .iter()
+            .filter(|s| s.enabled)
+            .collect()
+    }
+
+    /// A reader and not a field read: with one active step the merge is gated whatever
+    /// `gate_before_publish` says, because a step's output must never be published unmeasured.
+    pub fn merge_gate_required(&self) -> bool {
+        self.gate_before_publish || self.integration_steps.iter().any(|s| s.enabled)
     }
 
     /// Whether the attention brake applies, resolving the unconfigured case to ON.
@@ -534,6 +592,7 @@ pub(crate) fn validate_rules(rules: &AutopilotRules) -> std::io::Result<()> {
              every unit — leave the key out to use the machine default",
         ));
     }
+    validate_integration_steps(&rules.integration_steps)?;
     for rule in &rules.schedules {
         let invalid = |reason: &str| {
             std::io::Error::new(
@@ -600,6 +659,97 @@ pub(crate) fn validate_rules(rules: &AutopilotRules) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Refuses an integration step list the queue could not run as written. Refused rather than
+/// skipped, on `validate_rules`'s reasoning: a step that silently did not run is a land that
+/// published something the project meant to fix first.
+fn validate_integration_steps(steps: &[IntegrationStep]) -> std::io::Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for step in steps {
+        let invalid = |reason: &str| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("step `{}`: {reason}", step.id),
+            )
+        };
+        if step.id.is_empty() {
+            return Err(invalid("needs a non-empty id"));
+        }
+        if !step
+            .id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+        {
+            return Err(invalid(
+                "the id may hold only letters, digits, `_`, `.` and `-`",
+            ));
+        }
+        // Disabled steps count too: switching one back on must not make the file invalid.
+        if !seen.insert(step.id.as_str()) {
+            return Err(invalid("the id is declared twice; ids must be unique"));
+        }
+        if step.kind == "program" {
+            match step.program.as_deref() {
+                Some(program) if !program.trim().is_empty() => {
+                    if let Some(fault) = repo_relative_fault(program) {
+                        return Err(invalid(&format!("program: {fault}")));
+                    }
+                }
+                _ => return Err(invalid("kind: program needs a non-empty program:")),
+            }
+        } else if let Some(name) = step.kind.strip_prefix("builtin:") {
+            if !KNOWN_BUILTIN_STEPS.contains(&name) {
+                return Err(invalid(&format!(
+                    "unknown builtin `{name}`; known: {}",
+                    KNOWN_BUILTIN_STEPS.join(", ")
+                )));
+            }
+            if step.program.is_some() || !step.args.is_empty() {
+                return Err(invalid(
+                    "a builtin step takes no program: and no args:; its settings go in config:",
+                ));
+            }
+        } else {
+            return Err(invalid(&format!(
+                "unknown kind `{}`; use `program` or `builtin:<name>`",
+                step.kind
+            )));
+        }
+        if let Some(config_file) = step.config_file.as_deref() {
+            if config_file.trim().is_empty() {
+                return Err(invalid("config_file: must not be empty; leave the key out"));
+            }
+            if let Some(fault) = repo_relative_fault(config_file) {
+                return Err(invalid(&format!("config_file: {fault}")));
+            }
+        }
+        if step.timeout_secs == Some(0) {
+            return Err(invalid(
+                "timeout_secs must be at least 1; leave the key out to use the default",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Why `path` is not a plain repo-relative path, or `None` when it is. A bare command name passes:
+/// it has no separator and so cannot leave the repository.
+fn repo_relative_fault(path: &str) -> Option<&'static str> {
+    if path.contains('\\') {
+        return Some("use `/` as the separator, not `\\`");
+    }
+    if path.starts_with('/') {
+        return Some("must be relative to the repo root, not absolute");
+    }
+    let bytes = path.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return Some("must be relative to the repo root, not carry a drive prefix");
+    }
+    if path.split('/').any(|part| part == "..") {
+        return Some("must not climb out of the repo with `..`");
+    }
+    None
 }
 
 #[cfg(test)]
@@ -2679,6 +2829,199 @@ resolve_effort: \"  \"
                 "{contents:?} must leave the switch off"
             );
         }
+    }
+
+    #[test]
+    fn a_rules_file_without_integration_steps_has_none() {
+        assert!(AutopilotRules::default().integration_steps.is_empty());
+        let rules = parse_schedule_rules("gate_command: x\n").unwrap();
+        assert!(rules.integration_steps.is_empty());
+        assert!(rules.active_integration_steps().is_empty());
+        assert!(!rules.merge_gate_required());
+    }
+
+    #[test]
+    fn a_program_step_and_a_builtin_step_parse_with_their_defaults() {
+        let rules = parse_schedule_rules(
+            "gate_command: x\n\
+             integration_steps:\n\
+             \x20 - id: fmt\n\
+             \x20   kind: program\n\
+             \x20   program: scripts/fmt.sh\n\
+             \x20 - id: renumber\n\
+             \x20   kind: builtin:renumber-sequence\n\
+             \x20   config:\n\
+             \x20     dir: core/migrations\n\
+             \x20   config_file: .nucleos/renumber.json\n\
+             \x20   timeout_secs: 30\n",
+        )
+        .unwrap();
+        let [program, builtin] = rules.integration_steps.as_slice() else {
+            panic!("two steps, got {:?}", rules.integration_steps);
+        };
+        assert_eq!(program.id, "fmt");
+        assert_eq!(program.kind, "program");
+        assert_eq!(program.program.as_deref(), Some("scripts/fmt.sh"));
+        assert!(program.args.is_empty());
+        assert_eq!(program.config, serde_json::Value::Null);
+        assert_eq!(program.config_file, None);
+        assert_eq!(program.timeout_secs, None);
+        assert!(program.enabled, "a step is on unless it says otherwise");
+
+        assert_eq!(builtin.id, "renumber");
+        assert_eq!(builtin.kind, "builtin:renumber-sequence");
+        assert_eq!(builtin.program, None);
+        assert_eq!(
+            builtin.config,
+            serde_json::json!({ "dir": "core/migrations" })
+        );
+        assert_eq!(
+            builtin.config_file.as_deref(),
+            Some(".nucleos/renumber.json")
+        );
+        assert_eq!(builtin.timeout_secs, Some(30));
+        assert!(builtin.enabled);
+        assert_eq!(DEFAULT_STEP_TIMEOUT_SECS, 600);
+    }
+
+    #[test]
+    fn a_step_with_a_duplicate_id_is_refused() {
+        let err = parse_schedule_rules(
+            "integration_steps:\n\
+             \x20 - id: fmt\n\
+             \x20   kind: program\n\
+             \x20   program: fmt\n\
+             \x20 - id: fmt\n\
+             \x20   kind: program\n\
+             \x20   program: other\n\
+             \x20   enabled: false\n",
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("step `fmt`"), "{err}");
+
+        let bad_id = parse_schedule_rules(
+            "integration_steps:\n  - id: \"a b\"\n    kind: program\n    program: fmt\n",
+        )
+        .unwrap_err();
+        assert_eq!(bad_id.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn a_builtin_step_with_an_unknown_name_is_refused() {
+        let err = parse_schedule_rules(
+            "integration_steps:\n  - id: s1\n    kind: builtin:no-such-step\n",
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("no-such-step"), "{err}");
+
+        let other_kind =
+            parse_schedule_rules("integration_steps:\n  - id: s1\n    kind: script\n").unwrap_err();
+        assert_eq!(other_kind.kind(), std::io::ErrorKind::InvalidData);
+        assert!(other_kind.to_string().contains("step `s1`"), "{other_kind}");
+    }
+
+    #[test]
+    fn a_program_step_that_escapes_the_repo_is_refused() {
+        for program in [
+            "../outside.sh",
+            "scripts/../../outside.sh",
+            "/usr/bin/fmt",
+            "C:/tools/fmt.exe",
+            "scripts\\\\fmt.sh",
+        ] {
+            let contents = format!(
+                "integration_steps:\n  - id: s1\n    kind: program\n    program: \"{program}\"\n"
+            );
+            let err = parse_schedule_rules(&contents)
+                .err()
+                .unwrap_or_else(|| panic!("{program:?} must be refused"));
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{program:?}");
+            assert!(err.to_string().contains("step `s1`"), "{err}");
+        }
+        let config_file = parse_schedule_rules(
+            "integration_steps:\n  - id: s1\n    kind: program\n    program: fmt\n    config_file: ../x.json\n",
+        )
+        .unwrap_err();
+        assert_eq!(config_file.kind(), std::io::ErrorKind::InvalidData);
+
+        let empty = parse_schedule_rules(
+            "integration_steps:\n  - id: s1\n    kind: program\n    program: \"\"\n",
+        )
+        .unwrap_err();
+        assert_eq!(empty.kind(), std::io::ErrorKind::InvalidData);
+
+        let zero_timeout = parse_schedule_rules(
+            "integration_steps:\n  - id: s1\n    kind: program\n    program: fmt\n    timeout_secs: 0\n",
+        )
+        .unwrap_err();
+        assert_eq!(zero_timeout.kind(), std::io::ErrorKind::InvalidData);
+
+        // A bare command on PATH and a nested repo path are both fine.
+        parse_schedule_rules(
+            "integration_steps:\n  - id: s1\n    kind: program\n    program: python\n    args: [scripts/x.py]\n  - id: s2\n    kind: program\n    program: scripts/steps/x.sh\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_builtin_step_that_names_a_program_is_refused() {
+        let with_program = parse_schedule_rules(
+            "integration_steps:\n  - id: s1\n    kind: builtin:renumber-sequence\n    program: fmt\n",
+        )
+        .unwrap_err();
+        assert_eq!(with_program.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            with_program.to_string().contains("step `s1`"),
+            "{with_program}"
+        );
+
+        let with_args = parse_schedule_rules(
+            "integration_steps:\n  - id: s1\n    kind: builtin:renumber-sequence\n    args: [x]\n",
+        )
+        .unwrap_err();
+        assert_eq!(with_args.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn a_disabled_step_is_not_active_and_does_not_force_the_gate() {
+        let rules = parse_schedule_rules(
+            "integration_steps:\n  - id: s1\n    kind: program\n    program: fmt\n    enabled: false\n",
+        )
+        .unwrap();
+        assert_eq!(rules.integration_steps.len(), 1);
+        assert!(rules.active_integration_steps().is_empty());
+        assert!(!rules.merge_gate_required());
+
+        let gated = AutopilotRules {
+            gate_before_publish: true,
+            ..rules
+        };
+        assert!(gated.merge_gate_required());
+    }
+
+    #[test]
+    fn an_active_step_forces_the_merge_gate() {
+        let rules = parse_schedule_rules(
+            "gate_command: x\n\
+             integration_steps:\n\
+             \x20 - id: off\n\
+             \x20   kind: program\n\
+             \x20   program: fmt\n\
+             \x20   enabled: false\n\
+             \x20 - id: on\n\
+             \x20   kind: builtin:renumber-sequence\n",
+        )
+        .unwrap();
+        assert!(!rules.gate_before_publish);
+        assert!(rules.merge_gate_required());
+        let active: Vec<&str> = rules
+            .active_integration_steps()
+            .iter()
+            .map(|s| s.id.as_str())
+            .collect();
+        assert_eq!(active, ["on"]);
     }
 
     #[test]

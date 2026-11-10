@@ -72,6 +72,67 @@
       },
       "type": "object"
     },
+    "IntegrationStep": {
+      "additionalProperties": false,
+      "description": "One step the VCS queue runs on the merged tree, after the merge and before the gate (spec\n2026-11-09 passos de integracao §3). Steps run in the order they are declared.",
+      "properties": {
+        "args": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "config": {
+          "default": null,
+          "description": "Free object handed to the step (`NUCLEOS_STEP_CONFIG`, JSON). `null` means `{}`."
+        },
+        "config_file": {
+          "default": null,
+          "description": "A repo-relative file the step reads; a branch that changes it waits for the owner.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "enabled": {
+          "default": true,
+          "description": "Off keeps the declaration but runs nothing and forces no gate.",
+          "type": "boolean"
+        },
+        "id": {
+          "description": "Stable id: names the step in the feed and in the `integrate:` commit.",
+          "type": "string"
+        },
+        "kind": {
+          "description": "`program`, or `builtin:<name>` (one of `KNOWN_BUILTIN_STEPS`).",
+          "type": "string"
+        },
+        "program": {
+          "default": null,
+          "description": "`kind: program` only: a path relative to the repo root (run from the merged tree) or a\nbare command on PATH.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timeout_secs": {
+          "default": null,
+          "description": "Absent means `DEFAULT_STEP_TIMEOUT_SECS`. Zero is refused.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "kind"
+      ],
+      "type": "object"
+    },
     "JudgeConfig": {
       "additionalProperties": false,
       "description": "Spec A D7: the judge's thresholds for this project. Both absent means the measured defaults.",
@@ -270,6 +331,14 @@
       "default": false,
       "description": "Whether a breached health readout should be written as a new intent record.\n\n**Absent and off by default**: a repository that says nothing behaves exactly as it did\nbefore this key existed. `deny_unknown_fields` above means a misspelling is a startup error,\nrather than a silently ignored line.\n\nTurning this on records the breach as a line in the project's feed for an operator to\nreview; it does not enqueue a job, start a run, or touch the approval queue. The\n`schedules` and `repo_triggers` lists stay empty because the file's own doctrine is\n\"Creating this file must not start anything\"; this key does not overrule that doctrine.",
       "type": "boolean"
+    },
+    "integration_steps": {
+      "default": [],
+      "description": "Steps the VCS queue runs, in order, on a merge into the integration branch, after the\nmerge and before the gate. Absent means none, and a project that says nothing lands exactly\nas before this key existed. One active step forces the gate before publish: read through\n`active_integration_steps()` and `merge_gate_required()`.",
+      "items": {
+        "$ref": "#/$defs/IntegrationStep"
+      },
+      "type": "array"
     },
     "judge": {
       "$ref": "#/$defs/JudgeConfig",

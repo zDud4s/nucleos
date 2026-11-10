@@ -294,6 +294,12 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     postgate_red: { tone: "danger", label: "target went red after a merge" },
     // The post-merge gate did not run, and says why: a daemon verification already passed on the same tree, waiting for the interval, or waiting for an idle machine (`verify/postgate.rs`). A fact, not a question.
     postgate_held: { tone: "info", label: "post-merge gate held" },
+    // The target branch moved with nothing in the queue behind it: the hook was missing, skipped or beaten (`task_claims/direct_write.rs`).
+    direct_write_violation: { tone: "danger", label: "target moved outside the queue" },
+    // The same move, but through the `NUCLEOS_ALLOW_DIRECT_GIT` escape, which the owner took on purpose. No "warning" tone exists, so paused.
+    direct_write_bypass: { tone: "paused", label: "target moved through the direct-git escape" },
+    // After a successful publish: one line per integration step that changed files (`execution/git_exec/executor.rs`). A fact.
+    integration_step: { tone: "info", label: "an integration step changed files" },
     // A run that asked for a verification was not resumed with its verdict (`execution/runs/
     // verify_wake.rs`): no slot, a non-completed origin, or a ticket that never finished. The
     // verdict stays readable with verify_status, so it is a fact, not a failure.

@@ -536,6 +536,13 @@ pub(super) const ROUTES: &[RouteEntry] = &[
         handler: "post_webhook_push",
     },
     RouteEntry {
+        method: "PUT",
+        path: "/workflow-params/{bundle}/{name}/mode",
+        purpose: "Set machine mode.",
+        body: Body::Shapeless("Value"),
+        handler: "set_machine_mode",
+    },
+    RouteEntry {
         method: "POST",
         path: "/workflow/records",
         purpose: "The `record` tool's route sits beside `verify` because it is reached by the same keys and resolves the caller's worktree the same way; POST for the same literal-path reason.",

@@ -1,4 +1,4 @@
-//! Read-only questions about a repository: toplevel, origin and HEAD, branches, ancestry, first-parent history, the repository key and the current branch.
+//! Read-only questions about a repository: toplevel, origin and HEAD, branches, ancestry, first-parent history, the repository key and the current branch — plus one config write, `set_integration_config`, which touches no ref.
 
 use super::*;
 
@@ -426,6 +426,50 @@ pub async fn default_remote_branch(
         .and_then(|line| line.trim().strip_prefix("refs/remotes/origin/"))
         .filter(|branch| !branch.is_empty())
         .map(str::to_owned))
+}
+
+/// Writes `nucleos.integrationBranch = <branch>` into the repository's LOCAL git config, which is
+/// where the `reference-transaction` hook reads the branch it closes to anything but the queue.
+///
+/// **The one write in this module, and it writes no ref.** It is config, not history: the hook it
+/// feeds watches `refs/heads/<branch>`, and a config write never enters a reference transaction.
+/// `--local` rather than the default scope so that a path outside every repository is refused by
+/// git ("--local can only be used inside a git repository") instead of landing in a global file.
+/// The local config is shared by every worktree of the repository, so one write covers them all.
+///
+/// Another sanctioned entry to `run_git`, for the reason the others are: it computes what is left of
+/// the budget and refuses before spawning.
+pub async fn set_integration_config(
+    repo: &Path,
+    branch: &str,
+    deadline: std::time::Instant,
+) -> Result<(), String> {
+    let budget = deadline.saturating_duration_since(std::time::Instant::now());
+    if budget.is_zero() {
+        return Err(
+            "the operation ran out of time before the integration branch could be recorded"
+                .to_owned(),
+        );
+    }
+    let result = run_git(
+        repo,
+        &[
+            OsStr::new("config"),
+            OsStr::new("--local"),
+            OsStr::new("nucleos.integrationBranch"),
+            OsStr::new(branch),
+        ],
+        budget,
+    )
+    .await?;
+    if !result.succeeded() {
+        return Err(format!(
+            "could not record the integration branch in {}: {}",
+            repo.display(),
+            result.output_tail.trim()
+        ));
+    }
+    Ok(())
 }
 
 /// A third sanctioned entry to `run_git` (see its doc comment, which names all three): it

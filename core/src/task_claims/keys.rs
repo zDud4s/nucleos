@@ -14,6 +14,7 @@
 //! | `migration:<target>:<NNNN>` | two files with one migration number (daemon only) |
 //! | `fmt:<target>:<crate>` | red formatting on the target (daemon only) |
 //! | `conflict:<source>-><target>` | a branch that no longer merges (daemon only) |
+//! | `direct-write:<target>` | the target advanced outside the queue (daemon only) |
 
 use std::path::Path;
 
@@ -32,11 +33,12 @@ impl TaskKey {
         &self.0
     }
 
-    /// True for the keys only the daemon opens: `master-red` and `migration:`, `fmt:`, `conflict:`.
+    /// True for the keys only the daemon opens: `master-red` and `migration:`, `fmt:`, `conflict:`,
+    /// `direct-write:`.
     pub fn is_machine(&self) -> bool {
         matches!(
             self.prefix(),
-            "master-red" | "migration" | "fmt" | "conflict"
+            "master-red" | "migration" | "fmt" | "conflict" | "direct-write"
         )
     }
 
@@ -82,7 +84,7 @@ impl std::fmt::Display for KeyError {
             Self::Empty => write!(formatter, "empty task key"),
             Self::UnknownPrefix(prefix) => write!(
                 formatter,
-                "unknown task key prefix '{prefix}' (use master-red, test:, file:, spec-item:, topic:, migration:, fmt: or conflict:)"
+                "unknown task key prefix '{prefix}' (use master-red, test:, file:, spec-item:, topic:, migration:, fmt:, conflict: or direct-write:)"
             ),
             Self::Malformed { prefix, expected } => {
                 write!(formatter, "malformed '{prefix}' key: expected {expected}")
@@ -197,6 +199,12 @@ pub fn normalize(raw: &str, project_root: &Path) -> Result<TaskKey, KeyError> {
                 return Err(malformed("conflict", SHAPE));
             }
             format!("conflict:{source}->{target}")
+        }
+        "direct-write" => {
+            if body.is_empty() {
+                return Err(malformed("direct-write", "direct-write:<target>"));
+            }
+            format!("direct-write:{body}")
         }
         other => return Err(KeyError::UnknownPrefix(other.to_owned())),
     };
@@ -447,6 +455,25 @@ mod tests {
         assert!(machine("conflict:a->master"));
         assert!(!machine("file:core/a.rs"));
         assert!(!machine("topic:x"));
+    }
+
+    #[test]
+    fn direct_write_keys_normalise_and_are_machine_keys() {
+        assert_eq!(
+            key("DIRECT-WRITE:  master ").unwrap(),
+            "direct-write:master"
+        );
+        assert!(matches!(
+            key("direct-write:"),
+            Err(KeyError::Malformed { .. })
+        ));
+        assert!(matches!(
+            key("direct-write:   "),
+            Err(KeyError::Malformed { .. })
+        ));
+        let written = normalize("direct-write:main", Path::new("/repo")).unwrap();
+        assert_eq!((written.prefix(), written.path()), ("direct-write", None));
+        assert!(written.is_machine());
     }
 
     #[test]
