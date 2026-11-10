@@ -716,19 +716,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_leaf_that_cannot_be_relaunched_twice_fails_instead_of_parking() {
+    async fn a_leaf_that_cannot_be_relaunched_past_the_ladder_fails_instead_of_parking() {
         let state = state().await;
         seed_node(&state, None).await;
         seed_leaf(&state, None, OLD).await; // no launch stored: the relaunch fails
 
-        sweep(&state).await;
-        sqlx::query("UPDATE node_watchdog SET next_at = ? WHERE node_id = ?")
-            .bind(OLD)
-            .bind(LEAF)
-            .execute(&state.pool)
-            .await
-            .unwrap();
-        sweep(&state).await;
+        // Sweep past the ladder's whole allowance, skipping each backoff.
+        for _ in 0..10 {
+            sweep(&state).await;
+            sqlx::query("UPDATE node_watchdog SET next_at = ? WHERE node_id = ?")
+                .bind(OLD)
+                .bind(LEAF)
+                .execute(&state.pool)
+                .await
+                .unwrap();
+        }
 
         let (status, _, summary) = leaf_row(&state).await;
         assert_eq!(status, "failed");

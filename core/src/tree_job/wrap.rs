@@ -627,7 +627,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_handoff_chain_past_its_ladder_cap_with_its_diagnose_run_spent_parks_with_one_feed_line() {
+    async fn a_handoff_chain_past_its_ladder_cap_with_its_diagnose_run_spent_parks_with_one_feed_line()
+     {
         let state = state().await;
         seed_node(&state, Some("building"), "open", NODE, Some(43)).await;
         seed_run(&state, 43, "interrupted").await;
@@ -672,8 +673,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_run_that_died_without_a_report_is_relaunched_up_to_the_cap_then_diagnosed_once_then_parked(
-    ) {
+    async fn a_run_that_died_without_a_report_is_relaunched_up_to_the_cap_then_diagnosed_once_then_parked()
+     {
         let state = state().await;
         seed_node(&state, Some("building"), "open", NODE, Some(44)).await;
         seed_run(&state, 44, "interrupted").await;

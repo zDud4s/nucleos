@@ -30,6 +30,7 @@ use super::autofmt;
 use super::decisions;
 use super::engine::{apply_transition, branch_node_may_close};
 use super::http::job_lock;
+use super::ladder::{self, Kind, Spent, Step};
 use super::landing::{
     self, LandingError, MergeSettlement, check_may_land, check_may_merge, land_job, settle_land,
     settle_merge, submit_merge,
@@ -37,7 +38,6 @@ use super::landing::{
 use super::model::{JOB_TERMINAL_STATE, Manifest};
 use super::open::{FIX_PREFIX, relaunch_node, run_is_live};
 use super::relaunch::{budget_refusal, refusal_question};
-use super::ladder::{self, Kind, Spent, Step};
 use super::rescue;
 use super::store::{self, TreeJob};
 use crate::execution::git_exec::OPERATION_TIMEOUT;
@@ -1853,7 +1853,11 @@ pub(super) mod tests {
             let held = fx.branch(JOB, "api").await;
             assert!(gate_backing_off(&held.extra), "attempt {attempt}");
             fx.tick(JOB, &gate).await;
-            assert_eq!(gate.calls().len(), attempt as usize, "gated inside the backoff");
+            assert_eq!(
+                gate.calls().len(),
+                attempt as usize,
+                "gated inside the backoff"
+            );
             skip_gate_backoff(&fx, JOB, "api").await;
         }
         fx.tick(JOB, &gate).await;
