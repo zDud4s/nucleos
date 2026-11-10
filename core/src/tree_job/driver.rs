@@ -35,6 +35,7 @@ use super::landing::{
     self, LandingError, MergeSettlement, check_may_land, check_may_merge, land_job, settle_land,
     settle_merge, submit_merge,
 };
+use super::merge_recovery;
 use super::model::{JOB_TERMINAL_STATE, Manifest};
 use super::open::{FIX_PREFIX, relaunch_node, run_is_live};
 use super::relaunch::{budget_refusal, refusal_question};
@@ -111,6 +112,8 @@ pub async fn tick(state: &AppState) {
     let gate = production_gate(state);
     for job in jobs {
         advance(state, &job.id, gate.clone()).await;
+        // After the pass, so a job the pass just moved is not taken for a quiet one.
+        super::stalled::check_job(state, &job.id).await;
     }
 }
 
@@ -233,14 +236,20 @@ async fn pass(
         }
     }
 
-    root_step(pool, &job, parks).await?;
+    root_step(state, &job, parks).await?;
     landing_step(state, &mut job, parks).await
 }
 
-/// A root whose run is over and reported `blocked` or `failed` has nobody else to ask: the owner is
-/// asked on the root itself. `park_or_ask` asks once while the decision is open, and the job stays
-/// unfinished and unlanded because the root is not `done`.
-async fn root_step(pool: &SqlitePool, job: &TreeJob, parks: &mut Vec<Park>) -> Result<(), String> {
+/// A root whose run is over and reported `blocked` or `failed` gets the one rescue run a branch gets
+/// (spec B6); only when that is spent too is the owner asked, on the root itself. `park_or_ask` asks
+/// once while the decision is open, and the job stays unfinished and unlanded because the root is
+/// not `done`.
+async fn root_step(
+    state: &AppState,
+    job: &TreeJob,
+    parks: &mut Vec<Park>,
+) -> Result<(), String> {
+    let pool = &state.pool;
     let root = &job.root_node_id;
     // A root with no node row has no run to report; `landing_step` is where that is an error.
     let Ok(node) = work_nodes::get(pool, root).await else {
@@ -252,6 +261,18 @@ async fn root_step(pool: &SqlitePool, job: &TreeJob, parks: &mut Vec<Park>) -> R
     let report = node_report(pool, root).await?;
     if let (false, Some(outcome @ ("blocked" | "failed"))) = (report.live, report.result.as_deref())
     {
+        if let Some(run) = &report.run_id {
+            let handoff = rescue::handoff_text(pool, root).await;
+            let suffix = rescue::stopped_suffix(outcome, handoff.as_deref());
+            // A rescue that cannot start (no stored launch, say) is a rescue spent: ask the owner.
+            match rescue::attempt(state, root, run, &suffix).await {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(job = %job.id, %error, "tree driver could not rescue the root");
+                }
+            }
+        }
         let question = stopped_question(root, None, outcome)
             + &super::gate_summary::reason_suffix(pool, root).await;
         parks.push((root.clone(), question));
@@ -787,15 +808,17 @@ fn note_unclaimed_conflict(job: &mut TreeJob, name: &str) -> (bool, bool) {
 
 /// A conflict left to the resolver that no resolver run picked up within [`RESOLVER_GRACE`] (quota
 /// pause, kill switch, resolver loop down) is claimed, so a late resolver never spends on it, and
-/// parked on a question for the owner. Inside the grace it only keeps the stamp.
+/// resolved inside the tree by a resolve-conflict run of the branch's node (`merge_recovery`); the
+/// owner is asked only when that cannot run. Inside the grace it only keeps the stamp.
 async fn park_if_unclaimed(
-    pool: &SqlitePool,
+    state: &AppState,
     job: &mut TreeJob,
     name: &str,
     node: Option<&str>,
     reason: &str,
     parks: &mut Vec<Park>,
 ) -> Result<(), String> {
+    let pool = &state.pool;
     let (stamped, overdue) = note_unclaimed_conflict(job, name);
     if !overdue {
         if stamped {
@@ -810,9 +833,14 @@ async fn park_if_unclaimed(
     let settled = settle_merge(pool, job, name, Duration::ZERO, true)
         .await
         .map_err(|e| e.to_string())?;
-    if matches!(settled, MergeSettlement::NotMerged { .. })
+    if let MergeSettlement::NotMerged { reason: queue_said } = &settled
         && let Some(node) = node
     {
+        // The tree resolves it itself with a resolve-conflict run (B4); the owner is asked only
+        // when that cannot start or its attempts are spent.
+        if merge_recovery::resolve_in_tree(state, job, name, node, queue_said).await? {
+            return Ok(());
+        }
         parks.push((
             node.to_owned(),
             format!(
@@ -851,10 +879,8 @@ async fn merge(
         match settled {
             MergeSettlement::NotMerged { reason } => {
                 tracing::warn!(job = %job.id, branch = name, %reason, "the queue did not merge the branch");
-                // Resubmitting a conflicted branch would conflict again: an owner decides.
-                if let Some(node) = node {
-                    parks.push((node, format!("The merge of branch {name} failed: {reason}")));
-                }
+                // A passing cause backs off on the ladder; anything else asks the owner (B4).
+                merge_recovery::on_not_merged(pool, job, name, node, &reason, claim, parks).await?;
             }
             MergeSettlement::Conflicted {
                 reason,
@@ -883,7 +909,7 @@ async fn merge(
                     }
                 }
                 if !resolution_failed {
-                    park_if_unclaimed(pool, job, name, node.as_deref(), &reason, parks).await?;
+                    park_if_unclaimed(state, job, name, node.as_deref(), &reason, parks).await?;
                 }
                 // `attempts` counts merge requests, the first included, so the retries are one
                 // fewer. The resolver is an external run: the ladder's diagnose rung is a park.
@@ -906,11 +932,20 @@ async fn merge(
                     ));
                 }
             }
-            _ => {}
+            MergeSettlement::Merged { .. } => {
+                if merge_recovery::clear(job, name) {
+                    persist(pool, job).await?;
+                }
+            }
+            MergeSettlement::Pending => {}
         }
         return Ok(());
     }
 
+    // A passing refusal of the queue waits out its backoff before the branch is submitted again.
+    if merge_recovery::backing_off(&branch.extra) {
+        return Ok(());
+    }
     // Not mergeable yet (its base waits, a finding is open): a base that is parked or dropped is
     // said once; anything else waits silently for this pass.
     if check_may_merge(&job.manifest, name).is_err() {
@@ -3651,6 +3686,35 @@ pub(super) mod tests {
         assert_eq!(rows, 1, "the old report asked nothing a second time");
     }
 
+    /// Spec B6: the root gets the one rescue run a branch gets before the owner is asked.
+    #[tokio::test]
+    async fn a_blocked_root_gets_one_rescue_run_before_the_owner_is_asked() {
+        const JOB: &str = "drv-root-rescue";
+        let fx = Fixture::new().await;
+        fx.seed_job(JOB, vec![merged_branch("api", None)], Some("integration"))
+            .await;
+        let root = root_node_of(JOB);
+        fx.save_launch(&root).await;
+        fx.run_ended(&root, Some("blocked")).await;
+        let gate = FakeGate::answering(vec![]);
+
+        fx.tick(JOB, &gate).await;
+
+        assert_eq!(fx.launches(&root, "rescue-").await, 1);
+        assert!(fx.open_questions(JOB, &root).await.is_empty());
+        let prompt = fx.prompt_of(fx.current_run(&root).await).await;
+        assert!(prompt.contains("ended blocked"), "{prompt:?}");
+
+        // The rescue ends failed too: the owner is asked, once, and no second rescue starts.
+        fx.relaunched_run_reports(&root, "failed").await;
+        for _ in 0..3 {
+            fx.tick(JOB, &gate).await;
+        }
+        assert_eq!(fx.launches(&root, "rescue-").await, 1);
+        assert_eq!(fx.open_questions(JOB, &root).await.len(), 1);
+        fx.assert_not_landing(JOB).await;
+    }
+
     /// The root's question is answered like a branch's: the answer starts the root again, under
     /// `decision-<id>`, and its new run is not parked again by the old report.
     #[tokio::test]
@@ -3661,6 +3725,8 @@ pub(super) mod tests {
             .await;
         let root = root_node_of(JOB);
         fx.save_launch(&root).await;
+        // The root's one rescue is already spent, so it asks.
+        fx.save_launch_keyed(&root, "rescue-0").await;
         let dead = fx.run_ended(&root, Some("blocked")).await;
         let gate = FakeGate::answering(vec![]);
         fx.tick(JOB, &gate).await;
@@ -4711,6 +4777,32 @@ pub(super) mod tests {
             "the request is claimed so a late resolver never spends on it"
         );
         assert_eq!(fx.requests().await, 1, "no further attempt was queued");
+    }
+
+    /// Spec B4: an unclaimed conflict is not left to the owner while the node can be started
+    /// again: a resolve-conflict run starts in the tree and the branch goes back to `fixing`.
+    #[tokio::test]
+    async fn a_conflict_no_resolver_picks_up_starts_a_resolve_run_in_the_tree() {
+        let fx = Fixture::new().await;
+        conflicting_job(&fx).await;
+        fx.save_launch(CLASH_NODE).await;
+        let gate = FakeGate::answering(vec![]);
+        conflict_left_unclaimed(&fx, &gate).await;
+
+        age_the_conflict(&fx, 16).await;
+        fx.tick(CLASH_JOB, &gate).await;
+
+        assert_eq!(fx.launches(CLASH_NODE, "resolve-").await, 1);
+        assert_eq!(fx.branch(CLASH_JOB, "api").await.state, "fixing");
+        assert!(fx.open_questions(CLASH_JOB, CLASH_NODE).await.is_empty());
+        let prompt = fx.prompt_of(fx.current_run(CLASH_NODE).await).await;
+        assert!(prompt.contains("resolve-conflict"), "{prompt:?}");
+        let announced: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM feed WHERE kind = 'work_tree_conflict'")
+                .fetch_one(&fx.state.pool)
+                .await
+                .unwrap();
+        assert_eq!(announced, 1);
     }
 
     #[tokio::test]
