@@ -58,7 +58,10 @@
 use crate::map::{Reader, reader_for};
 use serde::Serialize;
 
+mod shape;
 mod typescript;
+pub use shape::{Member, MemberKind, Use};
+use shape::{rust_uses, shape_members};
 use typescript::ts_items;
 
 /// What kind of thing a declaration is, at the resolution a reader cares about.
@@ -140,6 +143,12 @@ pub struct Items {
     /// told the owner something false about their own code, and the only thing standing between
     /// this drawing and that is a sentence saying which forty it could not see.
     pub missed: Vec<String>,
+    /// Struct fields and enum variants of the shapes above (Rust only; empty for TypeScript).
+    /// `owner` is the id of a [`Item`] in `items`.
+    pub members: Vec<Member>,
+    /// Every path this file `use`s, flattened one per leaf (Rust only; empty for TypeScript).
+    /// Resolving a path to a file is the caller's business, as one level up.
+    pub uses: Vec<Use>,
 }
 
 /// Everything `path` declares, and which of those things use each other.
@@ -155,12 +164,29 @@ pub fn items(path: &str, source: &str) -> Items {
         None => (Vec::new(), Vec::new()),
     };
     let references = references(source, &found, reader == Some(Reader::Rust));
+    let (members, uses) = if reader == Some(Reader::Rust) {
+        let masked = mask(source, true);
+        let mut members = shape_members(&masked);
+        // A type declared inside a function is not an item, so neither are its members.
+        members.retain(|member| {
+            found.iter().any(|entry| {
+                entry.item.kind == ItemKind::Shape
+                    && entry.item.container.is_none()
+                    && entry.item.id == member.owner
+            })
+        });
+        (members, rust_uses(&masked))
+    } else {
+        (Vec::new(), Vec::new())
+    };
     Items {
         path: path.to_string(),
         reader,
         items: found.into_iter().map(|entry| entry.item).collect(),
         references,
         missed,
+        members,
+        uses,
     }
 }
 
@@ -1405,6 +1431,126 @@ mod tests {
         assert_eq!(found.reader, None);
         assert!(found.items.is_empty());
         assert!(found.references.is_empty());
+    }
+
+    fn members(found: &Items, owner: &str) -> Vec<String> {
+        found
+            .members
+            .iter()
+            .filter(|member| member.owner == owner)
+            .map(|member| match &member.ty {
+                Some(ty) => format!("{}: {ty}", member.name),
+                None => member.name.clone(),
+            })
+            .collect()
+    }
+
+    fn used(found: &Items) -> Vec<&str> {
+        found.uses.iter().map(|u| u.path.as_str()).collect()
+    }
+
+    #[test]
+    fn a_struct_exposes_its_fields_with_type_and_visibility() {
+        let found = items(
+            "core/src/a.rs",
+            "pub struct Door {\n    /// Width.\n    pub width: u32,\n    #[serde(skip)]\n    name: String,\n    pub(crate) map: HashMap<String, Vec<u8>>,\n}\n",
+        );
+        assert_eq!(
+            members(&found, "Door"),
+            vec![
+                "width: u32",
+                "name: String",
+                "map: HashMap<String, Vec<u8>>"
+            ]
+        );
+        let exported: Vec<bool> = found.members.iter().map(|m| m.exported).collect();
+        assert_eq!(exported, vec![true, false, true]);
+        assert_eq!(found.members[0].kind, MemberKind::Field);
+        assert_eq!(found.members[0].line, 3);
+    }
+
+    #[test]
+    fn a_tuple_struct_names_its_fields_by_position_and_a_unit_struct_has_none() {
+        let found = items(
+            "core/src/a.rs",
+            "struct Pair(pub u8, String);\nstruct Marker;\nstruct Wrap<T: Clone>(T);\n",
+        );
+        assert_eq!(members(&found, "Pair"), vec!["0: u8", "1: String"]);
+        assert!(members(&found, "Marker").is_empty());
+        assert_eq!(members(&found, "Wrap"), vec!["0: T"]);
+    }
+
+    #[test]
+    fn an_enum_exposes_its_variants_whatever_their_shape() {
+        let found = items(
+            "core/src/a.rs",
+            "pub enum Mode {\n    Idle,\n    Busy(u8, String),\n    Failed { code: i32 },\n    Fixed = 3,\n}\n",
+        );
+        assert_eq!(
+            members(&found, "Mode"),
+            vec!["Idle", "Busy: (u8, String)", "Failed: { code: i32 }", "Fixed"]
+        );
+        assert!(
+            found
+                .members
+                .iter()
+                .all(|m| m.kind == MemberKind::Variant && !m.exported)
+        );
+    }
+
+    #[test]
+    fn a_type_inside_a_function_is_not_an_item_and_its_members_are_not_exposed() {
+        let found = items(
+            "core/src/a.rs",
+            "fn run() {\n    struct Local {\n        x: u8,\n    }\n}\n",
+        );
+        assert!(found.members.is_empty());
+    }
+
+    #[test]
+    fn a_member_inside_a_comment_or_a_string_is_not_a_member() {
+        let found = items(
+            "core/src/a.rs",
+            "struct A {\n    // ghost: u8,\n    real: u8,\n}\n",
+        );
+        assert_eq!(members(&found, "A"), vec!["real: u8"]);
+    }
+
+    #[test]
+    fn a_use_tree_is_flattened_one_path_a_leaf() {
+        let found = items(
+            "core/src/a.rs",
+            "use crate::map::{Reader, items::{self, Item}};\npub use super::b::C as D;\nuse std::io::*;\n",
+        );
+        assert_eq!(
+            used(&found),
+            vec![
+                "crate::map::Reader",
+                "crate::map::items",
+                "crate::map::items::Item",
+                "super::b::C",
+                "std::io::*"
+            ]
+        );
+        assert_eq!(found.uses[3].line, 2);
+    }
+
+    #[test]
+    fn typescript_has_no_members_and_no_uses_yet() {
+        let found = items("shell/src/a.ts", "export class A { x = 1 }\n");
+        assert!(found.members.is_empty());
+        assert!(found.uses.is_empty());
+    }
+
+    #[test]
+    fn the_class_diagram_fields_keep_their_wire_names() {
+        let found = items("core/src/a.rs", "use a::B;\nenum E {\n    V(u8),\n}\n");
+        let json = serde_json::to_value(&found).expect("serialises");
+        assert_eq!(
+            json["members"][0],
+            serde_json::json!({"owner": "E", "name": "V", "kind": "variant", "ty": "(u8)", "exported": false, "line": 3})
+        );
+        assert_eq!(json["uses"][0], serde_json::json!({"path": "a::B", "line": 1}));
     }
 
     #[test]
