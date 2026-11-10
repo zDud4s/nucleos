@@ -111,7 +111,8 @@ mod tests {
     async fn seed(links: usize) -> AppState {
         let state = crate::channels::testkit::state().await;
         let created = Utc::now().to_rfc3339();
-        let mut manifest = Manifest::new("job-1", "feat/tree", "Ship it", "C:/Projects/nucleos", &[]);
+        let mut manifest =
+            Manifest::new("job-1", "feat/tree", "Ship it", "C:/Projects/nucleos", &[]);
         manifest.state = "open".to_owned();
         let mut branch = Branch::new("api", &["api/**".to_owned()], "backend", None);
         branch.state = "building".to_owned();
@@ -137,7 +138,14 @@ mod tests {
         node(&state, "parent", None, "running", None).await;
         for n in 0..links {
             let previous = (n > 0).then(|| format!("link-{}", n - 1));
-            node(&state, &format!("link-{n}"), Some("parent"), "handoff", previous).await;
+            node(
+                &state,
+                &format!("link-{n}"),
+                Some("parent"),
+                "handoff",
+                previous,
+            )
+            .await;
         }
         state
     }
@@ -192,10 +200,7 @@ mod tests {
         let rows = decision_rows(&state).await;
         assert_eq!(rows.len(), 1);
         assert!(rows[0].0.contains("link-3"));
-        assert_eq!(
-            rows[0].1.as_deref(),
-            Some("split_remaining_into_new_nodes")
-        );
+        assert_eq!(rows[0].1.as_deref(), Some("split_remaining_into_new_nodes"));
     }
 
     #[tokio::test]
@@ -203,8 +208,12 @@ mod tests {
         let state = seed(4).await;
         let now = Utc::now();
 
-        sweep::tick(&state, &[], &Limits::default(), now).await.unwrap();
-        sweep::tick(&state, &[], &Limits::default(), now).await.unwrap();
+        sweep::tick(&state, &[], &Limits::default(), now)
+            .await
+            .unwrap();
+        sweep::tick(&state, &[], &Limits::default(), now)
+            .await
+            .unwrap();
 
         assert_eq!(decision_rows(&state).await.len(), 1);
     }

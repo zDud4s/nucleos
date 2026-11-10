@@ -5,12 +5,12 @@ use std::sync::{LazyLock, Mutex};
 
 use chrono::{DateTime, Duration, Utc};
 
-use crate::tree_job::handoff_park::{self, Cause, Outcome};
 use crate::conductor::continuation::{ContinuationError, awaiting_continuation, continue_node};
 use crate::conductor::liveness::{Limits, Observation, SubjectStatus, Veredicto, classify};
 use crate::execution::runs::{finalize_termination, run_timeout_for_mode};
 use crate::feed::Subject;
 use crate::state::AppState;
+use crate::tree_job::handoff_park::{self, Cause, Outcome};
 
 pub const SPAWN_GRACE_SECS: i64 = 60;
 pub const TERMINAL_LOOKBACK_HOURS: i64 = 24;
@@ -229,7 +229,7 @@ async fn continue_handoffs(
                 };
                 tracing::warn!(node = %node_id, %reason, "the handed-off node cannot be continued");
                 let subject = format!("node:{node_id}");
-                let summary = refusal_summary(&reason);
+                let summary = refusal_summary(reason);
                 if insert_feed(
                     state,
                     CONTINUATION_REFUSED,
