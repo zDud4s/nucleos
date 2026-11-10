@@ -209,7 +209,14 @@ mod tests {
 
         let listed = list_directory_with_caps(temporary.path().to_path_buf(), 1, 100).unwrap();
 
-        assert_eq!(listed.dirs, ["alpha"]);
+        // The cap keeps whichever directory read_dir yields first, and that order is the
+        // filesystem's (APFS gives "beta" first): only the count is fixed.
+        assert_eq!(listed.dirs.len(), 1, "{:?}", listed.dirs);
+        assert!(
+            listed.dirs[0] == "alpha" || listed.dirs[0] == "beta",
+            "{:?}",
+            listed.dirs
+        );
         assert!(listed.truncated);
     }
 
