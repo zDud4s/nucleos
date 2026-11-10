@@ -25,8 +25,7 @@ use super::model::JOB_TERMINAL_STATE;
 use super::open::{DIED_PREFIX, WRAP_PREFIX, latest_launch, relaunch_node, run_is_live};
 use super::relaunch::{
     DECISION_PREFIX, QUOTA_PREFIX, TRANSIENT_PREFIX, WATCHDOG_PREFIX, budget_refusal,
-    refusal_question,
-    successor_key,
+    refusal_question, successor_key,
 };
 use super::rescue;
 use super::store;
@@ -91,6 +90,7 @@ const WATCHDOG: Chain = Chain {
     prefix: WATCHDOG_PREFIX,
     kind: Some(Kind::WatchdogFailure),
     question: watchdog_question,
+    own_cap: 0,
 };
 /// The relaunches of a run that died on a transient API error. With the backoff below, sixteen
 /// links wait about six hours in all, past a subscription's usage window.
