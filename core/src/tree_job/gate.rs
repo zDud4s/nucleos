@@ -430,7 +430,10 @@ pub(super) async fn gate_branch(
         branch,
         worktree,
     };
-    if recorded_failures(pool, job_id, branch, true).await.is_some() {
+    if recorded_failures(pool, job_id, branch, true)
+        .await
+        .is_some()
+    {
         return gate_rechecked_then_tested(
             &io(CHECK_KEY, Kind::Check, false),
             &io(RECHECK_KEY, Kind::Test, true),

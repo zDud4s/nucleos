@@ -297,10 +297,7 @@ pub fn plan_groups(map: &MapState, kind: Kind, names: &[String]) -> Result<Plan,
 /// `select` narrowed to exactly those tests. A group the map lacks, or one that cannot be narrowed
 /// to ids (`test_select::recheck_argv`), contributes no unit: the full scope gate that follows a
 /// green recheck measures it anyway. No unit at all is an empty plan, which reads `nothing_ran`.
-pub fn plan_recheck(
-    map: &MapState,
-    failed: &[(String, Vec<String>)],
-) -> Result<Plan, PlanError> {
+pub fn plan_recheck(map: &MapState, failed: &[(String, Vec<String>)]) -> Result<Plan, PlanError> {
     let map = match map {
         MapState::Invalid(errors) => return Err(PlanError::InvalidMap(errors.clone())),
         MapState::Absent => {
@@ -319,7 +316,10 @@ pub fn plan_recheck(
             Some(PlannedUnit {
                 group: Some(name.clone()),
                 argv,
-                why: format!("recheck of the {} test(s) that failed before the fix", ids.len()),
+                why: format!(
+                    "recheck of the {} test(s) that failed before the fix",
+                    ids.len()
+                ),
                 fingerprint: None,
                 cacheable: false,
                 run_id: None,
@@ -556,7 +556,7 @@ tests:
     fn plan_recheck_narrows_a_group_with_a_filter_select_and_skips_the_rest() {
         let map = MapState::Valid(
             crate::tests_map::parse(
-                "version: 1\ntests:\n  groups:\n    core:\n      paths: [core/]\n      command: cargo nextest run\n      select: cargo nextest run -E {filter}\n    py:\n      paths: ['**/*.py']\n      command: pytest\n      select: pytest -q -- {files}\n",
+                "version: 1\ntests:\n  groups:\n    core:\n      paths: [core/]\n      command: cargo nextest run\n      select: cargo nextest run -E {filter}\n      filters:\n        - paths: [core/a.rs]\n          expr: 'test(/^a::/)'\n    py:\n      paths: ['**/*.py']\n      command: pytest\n      select: pytest -q -- {files}\n",
             )
             .unwrap(),
         );
