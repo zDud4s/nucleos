@@ -25,6 +25,7 @@ use serde_json::{Value, json};
 use std::path::Path as FsPath;
 
 use super::*;
+use crate::hooks::role_policy;
 use crate::conductor::depth::{self, AncestorView, ChildArgs, DepthRefusal, TreeLimits};
 use crate::tree_cost::budget::{self, Permit};
 use crate::work_nodes::{self, CloseArgs, NodeError, NodeLimits, OpenArgs, UpdateArgs, View};
@@ -459,10 +460,12 @@ struct ScopeBody {
     tool_name: Option<String>,
     #[serde(default)]
     tool_input: Value,
-    /// Who is calling, from the hook: the subagent id and its type. Threaded and logged only;
-    /// the role policy that decides on them is a later step.
+    /// Who is calling, from the hook: the subagent id and its type, and whether the hook saw
+    /// subagent markers on a call with no usable id. The role policy reads them.
     agent_id: Option<String>,
     agent_type: Option<String>,
+    #[serde(default)]
+    subagent: bool,
 }
 
 /// `POST /nodes/scope {session_id, cwd, tool_name, tool_input}`: whether the interactive session
@@ -489,19 +492,46 @@ async fn scope_refusal(state: &AppState, body: ScopeBody) -> Option<String> {
     let tool_name = body.tool_name?;
     tracing::debug!(agent_id = ?body.agent_id, agent_type = ?body.agent_type, "node scope: caller");
     let file = crate::node_scope::edited_path(&tool_name, &body.tool_input)?;
-    let found: Option<(String, Option<String>)> = match sqlx::query_as(
-        "SELECT owned_paths, project_id FROM work_nodes \
-         WHERE session_id = ? AND status = 'running' ORDER BY created_at DESC, id DESC LIMIT 1",
-    )
-    .bind(&session_id)
-    .fetch_optional(&state.pool)
-    .await
-    {
-        Ok(found) => found,
-        Err(error) => {
-            tracing::warn!(%error, "node scope: could not read the session's node, not fencing");
-            return None;
-        }
+    let caller = role_policy::Caller {
+        agent_id: body.agent_id.clone(),
+        agent_type: body.agent_type.clone(),
+        subagent: body.subagent,
+    };
+    let role = role_policy::resolve(&state.pool, &caller, None).await;
+    if !role_policy::policy(role).node_fence {
+        return None;
+    }
+    // A leaf and its orchestrator share the session id, so the session alone cannot say whose edit
+    // this is: the caller's own node (by the agent id the hook read) goes first, the session's
+    // newest running node is the fallback.
+    let own_node = match caller.agent_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(agent_id) => sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT owned_paths, project_id FROM work_nodes \
+             WHERE agent_id = ? AND status = 'running' ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(agent_id)
+        .fetch_optional(&state.pool)
+        .await
+        .ok()
+        .flatten(),
+        None => None,
+    };
+    let found: Option<(String, Option<String>)> = match own_node {
+        Some(found) => Some(found),
+        None => match sqlx::query_as(
+            "SELECT owned_paths, project_id FROM work_nodes \
+             WHERE session_id = ? AND status = 'running' ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(&session_id)
+        .fetch_optional(&state.pool)
+        .await
+        {
+            Ok(found) => found,
+            Err(error) => {
+                tracing::warn!(%error, "node scope: could not read the session's node, not fencing");
+                return None;
+            }
+        },
     };
     let (owned_json, project_id) = found?;
     let owned: Vec<String> = serde_json::from_str(&owned_json).ok()?;
@@ -1248,6 +1278,61 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(root_agent, None);
+    }
+
+    #[tokio::test]
+    async fn the_scope_route_fences_a_leaf_by_its_own_node_not_its_orchestrators() {
+        let (app, pool) = session_bound_leaf("s-shared-session").await;
+        // An orchestrator running in the same session, newer than the leaf.
+        sqlx::query(
+            "INSERT INTO work_nodes (id, root_id, depth, kind, title, goal, status, owned_paths, \
+             session_id, agent_id, created_at, updated_at) \
+             SELECT 'orch-later', root_id, 1, 'orchestrator', 'O', 'g', 'running', \
+             '[\"core/src/**\"]', 's-shared-session', 'a-orch', '2999-01-01T00:00:00Z', \
+             '2999-01-01T00:00:00Z' FROM work_nodes WHERE session_id = 's-shared-session'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE work_nodes SET agent_id = 'a-leaf' WHERE kind = 'leaf'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let edit = |agent: Option<&'static str>| {
+            let app = app.clone();
+            async move {
+                let mut body = json!({
+                    "session_id": "s-shared-session", "cwd": "/work/repo", "tool_name": "Edit",
+                    "tool_input": { "file_path": "/work/repo/core/src/b/c.rs" },
+                });
+                if let Some(agent) = agent {
+                    body["agent_id"] = json!(agent);
+                }
+                call(&app, "POST", "/nodes/scope", Some(body)).await.1["allowed"].clone()
+            }
+        };
+        // The leaf owns core/src/a/** only; the session's newest node would have let this through.
+        assert_eq!(edit(Some("a-leaf")).await, json!(false));
+        assert_eq!(edit(Some("a-orch")).await, json!(true));
+        // No agent id: the old behaviour, the session's newest running node.
+        assert_eq!(edit(None).await, json!(true));
+    }
+
+    #[tokio::test]
+    async fn a_subagent_without_an_agent_id_is_still_fenced_by_the_session_node() {
+        let (app, _pool) = session_bound_leaf("s-markers").await;
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/nodes/scope",
+            Some(json!({
+                "session_id": "s-markers", "cwd": "/work/repo", "tool_name": "Edit",
+                "tool_input": { "file_path": "/work/repo/shell/x.ts" }, "subagent": true,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["allowed"], false, "{body}");
     }
 
     #[tokio::test]

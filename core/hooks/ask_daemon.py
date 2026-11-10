@@ -1872,7 +1872,7 @@ def conductor_verdict(payload, state):
     try:
         if not isinstance(payload, dict) or not isinstance(state, dict):
             return allowed
-        if os.environ.get("NUCLEOS_RUN_ID") is not None or payload.get("agent_id"):
+        if os.environ.get("NUCLEOS_RUN_ID") is not None or not is_root_call(payload):
             return allowed
         mode = conductor_mode(state)
         if mode == "off" or _conductor_manual(payload, state):
@@ -1984,12 +1984,47 @@ def _scope_tool_input(tool_input, cwd, root):
     return fixed
 
 
+def subagent_signals(payload):
+    """Whether a PreToolUse input says its call comes from a subagent, whatever `agent_id` holds.
+
+    The root is not "the call without an agent_id": a subagent call whose `agent_id` is missing or
+    unusable must not be taken for it (spec D12). The signals, none of which the model writes:
+    - an `agent_id` key that is present but blank or not a string;
+    - a usable `agent_type` (a top-level call carries none);
+    - a `transcript_path` that points into a `subagents` folder or at an `agent-*` transcript,
+      the layout Claude Code gives a subagent's own transcript. Not confirmed against live traffic
+      here: `agent_type` is the signal that was probed (D10), this one only widens the net.
+    """
+    if not isinstance(payload, dict):
+        return False
+    if "agent_id" in payload and payload.get("agent_id") is not None:
+        value = payload.get("agent_id")
+        if not (isinstance(value, str) and value.strip()):
+            return True
+    agent_type = payload.get("agent_type")
+    if isinstance(agent_type, str) and agent_type.strip():
+        return True
+    transcript = payload.get("transcript_path")
+    if isinstance(transcript, str) and transcript.strip():
+        parts = [p for p in re.split(r"[\\/]+", transcript) if p]
+        if "subagents" in parts[:-1] or (parts and parts[-1].startswith("agent-")):
+            return True
+    return False
+
+
+def is_root_call(payload):
+    """Whether the call is the root's: no usable `agent_id` AND no sign of a subagent. Anything
+    else is a subagent, or fails closed to the most restricted role (the daemon's role table)."""
+    return not agent_fields(payload).get("agent_id") and not subagent_signals(payload)
+
+
 def agent_fields(payload):
     """`agent_id` and `agent_type` of a PreToolUse input, for the daemon calls that decide on it.
 
     Claude Code puts both in the input of a subagent's call; the model cannot write them. Only the
-    present, non-blank string ones are returned, so a call without them (a top-level call, or a CLI
-    that does not send them) leaves the request body exactly as it was.
+    present, non-blank string ones are returned, so a top-level call (or a CLI that does not send
+    them) leaves the request body exactly as it was. A call with subagent markers but no usable
+    `agent_id` also gets `subagent: true`, so the daemon does not resolve it to the root (D12).
     """
     found = {}
     if not isinstance(payload, dict):
@@ -1998,6 +2033,8 @@ def agent_fields(payload):
         value = payload.get(key)
         if isinstance(value, str) and value.strip():
             found[key] = value
+    if "agent_id" not in found and subagent_signals(payload):
+        found["subagent"] = True
     return found
 
 

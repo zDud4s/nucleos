@@ -2093,6 +2093,31 @@ def agent_identity_cases():
         good = good and (bool(extra) or set(first) == {"run_id", "tool_name", "tool_input"})
         cases.append((f"agent ids, run_decision_{label}_ids", "" if good else repr(seen)))
 
+    # D12: markers of a subagent without a usable agent_id are never read as the root.
+    markers = (
+        ("blank_agent_id", {"agent_id": "  "}),
+        ("agent_type_only", {"agent_type": "general-purpose"}),
+        ("subagent_transcript_folder", {"transcript_path": "/h/.claude/projects/p/sess/subagents/agent-ab12.jsonl"}),
+        ("subagent_transcript_file_windows", {"transcript_path": r"C:\h\p\agent-ab12.jsonl"}),
+    )
+    for label, extra in markers:
+        good = hook.subagent_signals(dict(edit, **extra)) and not hook.is_root_call(dict(edit, **extra))
+        good = good and hook.agent_fields(dict(edit, **extra)).get("subagent") is True
+        cases.append((f"agent ids, d12_{label}_is_not_the_root", "" if good else repr(extra)))
+    for label, extra in (
+        ("top_level_transcript", {"transcript_path": "/h/.claude/projects/p/sess.jsonl"}),
+        ("no_markers", {}),
+    ):
+        good = hook.is_root_call(dict(edit, **extra)) and "subagent" not in hook.agent_fields(dict(edit, **extra))
+        cases.append((f"agent ids, d12_{label}_is_the_root", "" if good else repr(extra)))
+    good = not hook.is_root_call(dict(edit, **who)) and "subagent" not in hook.agent_fields(dict(edit, **who))
+    cases.append(("agent ids, d12_a_usable_agent_id_needs_no_flag", "" if good else "flagged"))
+    with tempfile.TemporaryDirectory() as tmp:
+        _code, _printed, calls = _run_scope(tmp, dict(edit, agent_type="general-purpose"), {"allowed": True})
+        body = calls[0][0] if calls else {}
+        good = body.get("subagent") is True and "agent_id" not in body
+        cases.append(("agent ids, d12_scope_forwards_the_flag", "" if good else repr(calls)))
+
     node_open = {
         "session_id": "ident3",
         "tool_name": "mcp__nucleos__node_open",

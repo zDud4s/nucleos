@@ -1231,6 +1231,24 @@ def test_fail_open_on_internal_error():
         )
 
 
+def test_subagent_markers_without_agent_id_are_not_the_root():
+    """D12: a call that carries subagent markers but no usable agent_id is not the root's, so the
+    conductor rules (root-only) do not claim it; a plain top-level call still is the root."""
+    with fixture("on") as fx:
+        source = {"file_path": fx.path("core", "src", "lib.rs")}
+        deny(fx.verdict("Read", source), "control: top-level call, no markers")
+        deny(
+            fx.verdict("Read", source, transcript_path="/h/.claude/projects/p/sess.jsonl"),
+            "a top-level transcript path is no marker",
+        )
+        for extra in (
+            {"agent_type": "general-purpose"},
+            {"agent_id": ""},
+            {"transcript_path": "/h/.claude/projects/p/sess/subagents/agent-ab12.jsonl"},
+        ):
+            allow(fx.verdict("Read", source, **extra), f"markers {extra!r}")
+
+
 def test_probe_writes_payload_keys():
     with fixture("on") as fx:
         probe = os.path.join(fx.tmp_dir, "probe.jsonl")
@@ -1474,6 +1492,7 @@ TESTS = [
     test_agent_tool_allowed,
     test_conductor_tools_are_allowed_when_on,
     test_subagent_payload_with_agent_id_unaffected,
+    test_subagent_markers_without_agent_id_are_not_the_root,
     test_run_with_run_id_env_unaffected,
     test_heavy_py_cargo_allowed,
     test_gates_script_allowed_from_the_root_session,
