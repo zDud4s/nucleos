@@ -11,6 +11,12 @@ pub struct PreToolUsePayload {
     pub tool_name: String,
     #[serde(default)]
     pub tool_input: Value,
+    // Who made the call, as the hook read it from the CLI's input: the subagent id and its type.
+    // Absent on a top-level call. Carried for the role policy; no decision reads them yet.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub agent_type: Option<String>,
 }
 
 /// What arrives with a `PostToolUse`/`PostToolUseFailure` report: the OUTCOME of a call this

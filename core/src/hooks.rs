@@ -1514,6 +1514,8 @@ mod tests {
                 run_id,
                 tool_name: "Bash".to_owned(),
                 tool_input: serde_json::json!({"command": "cargo test --workspace | tee t.log"}),
+                agent_id: None,
+                agent_type: None,
             },
             started,
         )
@@ -4060,6 +4062,8 @@ mod tests {
                 run_id,
                 tool_name: "Bash".to_owned(),
                 tool_input: serde_json::json!({"command": "git push origin main"}),
+                agent_id: None,
+                agent_type: None,
             }),
         ));
 
@@ -7803,6 +7807,32 @@ mod tests {
         dir
     }
 
+    #[test]
+    fn hook_payloads_take_the_caller_identity_and_tolerate_its_absence() {
+        let with: SessionGitPayload = serde_json::from_value(serde_json::json!({
+            "tool_name": "Bash", "tool_input": {}, "cwd": "/r",
+            "agent_id": "a1", "agent_type": "wf-leaf",
+        }))
+        .unwrap();
+        assert_eq!(with.agent_id.as_deref(), Some("a1"));
+        assert_eq!(with.agent_type.as_deref(), Some("wf-leaf"));
+        let without: SessionGitPayload = serde_json::from_value(
+            serde_json::json!({ "tool_name": "Bash", "tool_input": {}, "cwd": "/r" }),
+        )
+        .unwrap();
+        assert!(without.agent_id.is_none() && without.agent_type.is_none());
+
+        let run: PreToolUsePayload = serde_json::from_value(serde_json::json!({
+            "run_id": 7, "tool_name": "Bash", "agent_id": "a1", "agent_type": "wf-leaf",
+        }))
+        .unwrap();
+        assert_eq!(run.agent_id.as_deref(), Some("a1"));
+        assert_eq!(run.agent_type.as_deref(), Some("wf-leaf"));
+        let bare: PreToolUsePayload =
+            serde_json::from_value(serde_json::json!({ "run_id": 7, "tool_name": "Bash" })).unwrap();
+        assert!(bare.agent_id.is_none() && bare.agent_type.is_none());
+    }
+
     async fn session_decision(state: &AppState, command: &str, cwd: &Path) -> SessionGitDecision {
         session_git_decision_within(
             state,
@@ -7810,6 +7840,8 @@ mod tests {
                 tool_name: "Bash".to_owned(),
                 tool_input: serde_json::json!({ "command": command }),
                 cwd: cwd.to_string_lossy().into_owned(),
+                agent_id: None,
+                agent_type: None,
             },
             Duration::ZERO,
         )
@@ -8371,6 +8403,8 @@ mod tests {
                 tool_name: "Bash".to_owned(),
                 tool_input: serde_json::json!({ "command": "git merge feature" }),
                 cwd: repo.path().to_string_lossy().into_owned(),
+                agent_id: None,
+                agent_type: None,
             },
             Duration::from_secs(60),
         )

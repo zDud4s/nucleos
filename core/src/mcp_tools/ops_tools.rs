@@ -513,6 +513,7 @@ impl NucleosTools {
             task_id,
             session_id,
             chat_id,
+            agent_id,
         }): Parameters<NodeOpenParams>,
     ) -> String {
         json_result(
@@ -527,6 +528,7 @@ impl NucleosTools {
                     "task_id": task_id,
                     "session_id": session_id,
                     "chat_id": chat_id,
+                    "agent_id": agent_id,
                 }))
                 .await,
         )

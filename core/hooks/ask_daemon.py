@@ -762,6 +762,9 @@ def claims_exchange(payload, want_incidents=False, force=False, now=None):
 
 
 # Equals mcp_tools::TASK_TOOL_NAMES behind the server prefix; a test compares the two.
+# `node_open` records the agent that opened the node. The model cannot write `agent_id` into a hook
+# input, so the hook stamps it into the tool call itself, over whatever the model passed.
+NODE_OPEN_TOOL = "mcp__nucleos__node_open"
 TASK_TOOLS = tuple(f"mcp__nucleos__task_{name}" for name in ("list", "claim", "release", "done", "report", "decline"))
 INCIDENTS_HEADER = (
     "Live incidents in this project. Before fixing anything outside your own task, claim it with "
@@ -1981,6 +1984,23 @@ def _scope_tool_input(tool_input, cwd, root):
     return fixed
 
 
+def agent_fields(payload):
+    """`agent_id` and `agent_type` of a PreToolUse input, for the daemon calls that decide on it.
+
+    Claude Code puts both in the input of a subagent's call; the model cannot write them. Only the
+    present, non-blank string ones are returned, so a call without them (a top-level call, or a CLI
+    that does not send them) leaves the request body exactly as it was.
+    """
+    found = {}
+    if not isinstance(payload, dict):
+        return found
+    for key in ("agent_id", "agent_type"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            found[key] = value
+    return found
+
+
 def scope_refusal(payload):
     """The daemon's refusal of an edit outside the paths of this session's work node, or None.
 
@@ -2017,6 +2037,7 @@ def scope_refusal(payload):
                     "cwd": root,
                     "tool_name": payload.get("tool_name"),
                     "tool_input": _scope_tool_input(tool_input, cwd, root),
+                    **agent_fields(payload),
                 }
             ).encode(),
             headers={
@@ -2075,6 +2096,15 @@ def interactive_session(payload: dict) -> None:
             {**tool_input, "session_id": session_id},
             claims or None,
         )
+    if tool == NODE_OPEN_TOOL and isinstance(tool_input, dict):
+        stamped = {k: v for k, v in tool_input.items() if k != "agent_id"}
+        agent_id = agent_fields(payload).get("agent_id")
+        if agent_id:
+            stamped["agent_id"] = agent_id
+        if stamped != tool_input:
+            # Same safety argument as the task tools above: the call only writes a node row, and the
+            # only thing rewritten is the caller's own identity.
+            approve("nodes: node_open records the calling agent", stamped, claims or None)
     command = (payload.get("tool_input") or {}).get("command")
     if (
         payload.get("tool_name") not in ("Bash", "PowerShell")
@@ -2095,6 +2125,7 @@ def interactive_session(payload: dict) -> None:
             "tool_name": payload.get("tool_name", ""),
             "tool_input": payload.get("tool_input", {}),
             "cwd": cwd,
+            **agent_fields(payload),
         }
     ).encode()
     token = control_token(cwd)
@@ -2323,6 +2354,7 @@ def main() -> None:
             "run_id": run_id,
             "tool_name": payload.get("tool_name", ""),
             "tool_input": payload.get("tool_input", {}),
+            **agent_fields(payload),
         }
     ).encode()
     request = urllib.request.Request(

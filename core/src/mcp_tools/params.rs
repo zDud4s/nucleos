@@ -575,6 +575,10 @@ pub(super) struct NodeOpenParams {
     pub(super) session_id: Option<String>,
     /// The chat this tree belongs to, so `node_active` can find it again.
     pub(super) chat_id: Option<String>,
+    /// Stamped by the hook with the calling subagent's id; not part of the tool's schema.
+    #[serde(default)]
+    #[schemars(skip)]
+    pub(super) agent_id: Option<String>,
 }
 
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]

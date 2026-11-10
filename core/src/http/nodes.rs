@@ -90,6 +90,8 @@ struct OpenBody {
     task_id: Option<String>,
     session_id: Option<String>,
     chat_id: Option<String>,
+    /// The calling subagent, stamped by the hook into the tool call.
+    agent_id: Option<String>,
 }
 
 fn required(field: &str, value: Option<String>) -> Result<String, Refusal> {
@@ -178,6 +180,7 @@ async fn post_node(
         session_id: present(body.session_id),
         chat_id: present(body.chat_id),
         run_id: None,
+        agent_id: present(body.agent_id),
     };
     let parent = match args.parent_id.as_deref() {
         // A missing parent is refused by `open` itself, with the same 404.
@@ -456,6 +459,10 @@ struct ScopeBody {
     tool_name: Option<String>,
     #[serde(default)]
     tool_input: Value,
+    /// Who is calling, from the hook: the subagent id and its type. Threaded and logged only;
+    /// the role policy that decides on them is a later step.
+    agent_id: Option<String>,
+    agent_type: Option<String>,
 }
 
 /// `POST /nodes/scope {session_id, cwd, tool_name, tool_input}`: whether the interactive session
@@ -480,6 +487,7 @@ async fn scope_refusal(state: &AppState, body: ScopeBody) -> Option<String> {
     let session_id = present(body.session_id)?;
     let root = present(body.cwd)?;
     let tool_name = body.tool_name?;
+    tracing::debug!(agent_id = ?body.agent_id, agent_type = ?body.agent_type, "node scope: caller");
     let file = crate::node_scope::edited_path(&tool_name, &body.tool_input)?;
     let found: Option<(String, Option<String>)> = match sqlx::query_as(
         "SELECT owned_paths, project_id FROM work_nodes \
@@ -1179,6 +1187,67 @@ mod tests {
         assert_eq!(nobody, json!({ "allowed": true }));
         let blank = scope(&app, "", "Edit", "/work/repo/shell/x.ts").await;
         assert_eq!(blank, json!({ "allowed": true }));
+    }
+
+    #[tokio::test]
+    async fn the_scope_route_takes_the_caller_identity_and_decides_the_same() {
+        let (app, _pool) = session_bound_leaf("s-agent").await;
+        for (file, allowed) in [
+            ("/work/repo/shell/x.ts", false),
+            ("/work/repo/core/src/a/b.rs", true),
+        ] {
+            let (status, body) = call(
+                &app,
+                "POST",
+                "/nodes/scope",
+                Some(json!({
+                    "session_id": "s-agent",
+                    "cwd": "/work/repo",
+                    "tool_name": "Edit",
+                    "tool_input": { "file_path": file },
+                    "agent_id": "a1b2c3",
+                    "agent_type": "wf-leaf",
+                })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["allowed"], allowed, "{file}: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn node_open_records_the_agent_id_and_leaves_it_null_without_one() {
+        let (app, pool) = app_and_pool().await;
+        let root = open_root(&app, "s-agent-open").await;
+        let (status, with) = call(
+            &app,
+            "POST",
+            "/nodes",
+            Some(json!({
+                "parent_id": root, "kind": "leaf", "title": "With", "goal": "Do a part",
+                "owned_paths": ["core/src/a/**"], "agent_id": "a1b2c3",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{with}");
+        let (status, without) = open_leaf(&app, &root, "Without", &["core/src/b/**"]).await;
+        assert_eq!(status, StatusCode::OK, "{without}");
+        for (opened, want) in [(&with, Some("a1b2c3")), (&without, None)] {
+            let stored: Option<String> =
+                sqlx::query_scalar("SELECT agent_id FROM work_nodes WHERE id = ?")
+                    .bind(opened["id"].as_str().unwrap())
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(stored.as_deref(), want);
+        }
+        let root_agent: Option<String> =
+            sqlx::query_scalar("SELECT agent_id FROM work_nodes WHERE id = ?")
+                .bind(&root)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(root_agent, None);
     }
 
     #[tokio::test]
