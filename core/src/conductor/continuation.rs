@@ -197,8 +197,11 @@ async fn check_guards(
     };
     depth::check_child(&chain, &child, tree_total, &TreeLimits::default())
         .map_err(|refusal| ContinuationError::Refused(format!("{refusal:?}")))?;
-    if let Permit::No { reason } = budget::permits_next_node(pool, &source.root_id).await {
-        return Err(ContinuationError::Budget(reason));
+    match budget::permits_next_node(pool, &source.root_id).await {
+        Permit::Yes => {}
+        Permit::No { reason } => return Err(ContinuationError::Budget(reason)),
+        // Not a limit: the sweep asks again next tick and parks nothing.
+        Permit::Retry { reason } => return Err(ContinuationError::Db(reason)),
     }
     Ok(())
 }

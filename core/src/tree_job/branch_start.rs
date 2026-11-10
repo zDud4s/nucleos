@@ -245,6 +245,7 @@ async fn check_tree_budget(state: &AppState, root_id: &str) -> Result<(), Refusa
     match budget::permits_next_node(&state.pool, root_id).await {
         Permit::Yes => Ok(()),
         Permit::No { reason } => Err(refuse(StatusCode::CONFLICT, reason)),
+        Permit::Retry { reason } => Err(refuse(StatusCode::SERVICE_UNAVAILABLE, reason)),
     }
 }
 

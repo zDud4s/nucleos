@@ -18,6 +18,9 @@ const DEFAULT_SOFT_PCT: f64 = 80.0;
 pub enum Permit {
     Yes,
     No { reason: String },
+    /// The budget could not be read (a database error): not a limit, so the caller tries again
+    /// later and never parks the tree on it.
+    Retry { reason: String },
 }
 
 /// A tree's spend against its budget. With no limit, nothing can be crossed.
@@ -64,6 +67,25 @@ pub async fn tree_spend(
     })
 }
 
+/// A rough estimate of what the tree's unfinished nodes will still cost: one per-run reserve each.
+/// Empty when no node is open.
+async fn estimate_rest(pool: &SqlitePool, root_id: &str) -> sqlx::Result<String> {
+    let open: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM work_nodes WHERE root_id = ? AND kind != 'root'          AND status NOT IN ('done', 'failed', 'handoff', 'blocked', 'cancelled')",
+    )
+    .bind(root_id)
+    .fetch_one(pool)
+    .await?;
+    if open == 0 {
+        return Ok(String::new());
+    }
+    let reserve = load_budget_config(pool).await?.per_run_reserve_usd;
+    Ok(format!(
+        "; estimated ${:.2} for the {open} node(s) still open",
+        reserve * open as f64
+    ))
+}
+
 /// Reads the limit first, so a tree with no ceiling is permitted without pricing anything: only a
 /// tree that has a limit can be refused over what it spent.
 async fn evaluate_next_node(
@@ -78,7 +100,10 @@ async fn evaluate_next_node(
     let spent = tree_cost(pool, root_id, now).await?.total_usd;
     if spent >= limit {
         return Ok(Permit::No {
-            reason: format!("tree budget reached: spent ${spent:.2} of the ${limit:.2} limit"),
+            reason: format!(
+                "tree budget reached: spent ${spent:.2} of the ${limit:.2} limit{}",
+                estimate_rest(pool, root_id).await?
+            ),
         });
     }
     // The same strict rule as the global ceiling in `governance::budget::evaluate_budget`.
@@ -86,20 +111,21 @@ async fn evaluate_next_node(
     if spent + reserve > limit {
         return Ok(Permit::No {
             reason: format!(
-                "tree budget: spent ${spent:.2} + ${reserve:.2} reserve would exceed the ${limit:.2} limit"
+                "tree budget: spent ${spent:.2} + ${reserve:.2} reserve would exceed the ${limit:.2} limit{}",
+                estimate_rest(pool, root_id).await?
             ),
         });
     }
     Ok(Permit::Yes)
 }
 
-/// Whether the tree's budget permits opening its next node. Fails closed on any database error, as
-/// `governance::budget::budget_permits_new_run` does.
+/// Whether the tree's budget permits opening its next node. A database error is `Retry`, not `No`:
+/// it still opens nothing, but it is no reason to park the tree (spec B9).
 pub async fn permits_next_node(pool: &SqlitePool, root_id: &str) -> Permit {
     match evaluate_next_node(pool, root_id, Utc::now()).await {
         Ok(permit) => permit,
-        Err(error) => Permit::No {
-            reason: format!("tree budget check failed, refusing to be safe: {error}"),
+        Err(error) => Permit::Retry {
+            reason: format!("tree budget check failed, will retry: {error}"),
         },
     }
 }
@@ -361,13 +387,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn database_error_refuses_next_node() {
+    async fn database_error_asks_to_retry_instead_of_refusing() {
         let pool = crate::testdb::fresh_pool().await;
         set_budget(&pool, "root-1", Some(1024.0), 80.0).await;
         pool.close().await;
 
-        // Even a tree far below its limit: an unreadable budget fails closed.
-        assert_refused_over_budget(permits_next_node(&pool, "root-1").await);
+        // An unreadable budget is not a limit: the caller tries again, and never parks on it.
+        match permits_next_node(&pool, "root-1").await {
+            Permit::Retry { reason } => assert!(reason.contains("budget"), "{reason}"),
+            other => panic!("expected a retry, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_real_limit_names_the_spend_and_the_estimate_of_the_rest() {
+        let pool = crate::testdb::fresh_pool().await;
+        set_reserve(&pool, 0.5).await;
+        set_budget(&pool, "root-1", Some(2.0), 80.0).await;
+        spend(&pool, "n1", "root-1", 2.0).await;
+        insert_node(&pool, "n2", "root-1", "pending", 0).await;
+        insert_node(&pool, "n3", "root-1", "running", 0).await;
+
+        let Permit::No { reason } = permits_next_node(&pool, "root-1").await else {
+            panic!("expected a refusal");
+        };
+        assert!(reason.contains("spent $"), "{reason}");
+        assert!(
+            reason.contains("estimated $1.00 for the 2 node(s) still open"),
+            "{reason}"
+        );
     }
 
     #[tokio::test]
