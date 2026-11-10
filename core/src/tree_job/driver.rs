@@ -1921,6 +1921,41 @@ pub(super) mod tests {
         assert_eq!(count_of(&fx, "decisions").await, 0, "nobody was asked");
     }
 
+    #[tokio::test]
+    async fn a_gate_that_hit_the_time_ceiling_is_remeasured_bigger_and_counts_as_nothing() {
+        const JOB: &str = "drv-time-ceiling";
+        const NODE: &str = "api-node";
+        let fx = Fixture::new().await;
+        gated_job(&fx, JOB, NODE).await;
+        let hit = Err(NotMeasured::Failed(crate::verify::time_ceiling_reason(
+            1800, 4,
+        )));
+        let gate = FakeGate::scripted(vec![hit]);
+
+        fx.tick(JOB, &gate).await;
+        wait_calls(&gate, 1).await;
+        let mut api = fx.branch(JOB, "api").await;
+        for _ in 0..300 {
+            api = fx.branch(JOB, "api").await;
+            if api.extra.contains_key("gate_ceiling_hits") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(api.extra["gate_ceiling_hits"], json!(1), "{:?}", api.extra);
+        assert_eq!(api.extra["gate_ceiling_units"], json!(4));
+        assert_eq!(api.state, "building", "not a red");
+        assert!(
+            !api.extra.contains_key(GATE_FAILURES),
+            "not an attempt either"
+        );
+        assert!(fx.open_questions(JOB, NODE).await.is_empty());
+        assert_eq!(
+            crate::tree_job::retry::branch_ceiling_secs(&api.extra, 1800),
+            5400
+        );
+    }
+
     #[test]
     fn load_reasons_are_told_from_genuine_failures() {
         use super::super::retry::is_load_reason;

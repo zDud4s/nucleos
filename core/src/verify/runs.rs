@@ -39,9 +39,13 @@ pub const STATUS_SKIPPED_CACHED: &str = "skipped_cached";
 pub const STATUS_QUEUED: &str = "queued";
 pub const STATUS_RUNNING: &str = "running";
 
+/// Lower is served first (`verify_sched::pick`). The order is the autonomy-trees spec A7: a person
+/// at the keyboard, then the re-gate of a fix (the branch is already late and a person's clock is
+/// running on it), then the gate of a new branch, then the daemon's own background measurements.
 pub const PRIORITY_INTERACTIVE: i64 = 0;
-pub const PRIORITY_AUTONOMOUS: i64 = 1;
-pub const PRIORITY_POSTGATE: i64 = 2;
+pub const PRIORITY_FIX_REGATE: i64 = 1;
+pub const PRIORITY_AUTONOMOUS: i64 = 2;
+pub const PRIORITY_POSTGATE: i64 = 3;
 
 /// A row interrupted by this many daemon restarts is given up on, so a request that brings the
 /// daemon down does not loop forever.

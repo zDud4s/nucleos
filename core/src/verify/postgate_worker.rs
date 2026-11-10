@@ -6,7 +6,7 @@
 //! tick reads the rules file and stops, which is the default for all of them.
 //!
 //! The gate it runs is the full one (`verify` scope `full`, the project's `gate_command`), as
-//! `Caller::Postgate` at priority 2, in the `postgate-<project>` worktree checked out at the land
+//! `Caller::Postgate` at `PRIORITY_POSTGATE`, in the `postgate-<project>` worktree checked out at the land
 //! target's tip. The cache is never consulted.
 //!
 //! A red (F3-3, spec §6.2) is handled in two persisted phases, one action per tick, and by default

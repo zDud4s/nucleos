@@ -40,6 +40,43 @@ pub(super) const GATE_BACKOFF_UNTIL: &str = "gate_backoff_until";
 pub(super) const GATE_LOAD_REASON: &str = "gate_load_reason";
 /// The key of `Branch.extra` summing (in seconds) the backoffs the branch's gate has waited out.
 pub(super) const GATE_LOAD_WAITED_SECS: &str = "gate_load_waited_secs";
+/// The key of `Branch.extra` counting the gates in a row whose units hit the time ceiling.
+pub(super) const GATE_CEILING_HITS: &str = "gate_ceiling_hits";
+/// The key of `Branch.extra` with the runnable units the last ceiling hit measured.
+pub(super) const GATE_CEILING_UNITS: &str = "gate_ceiling_units";
+/// The most a re-measured unit may be given, as a multiple of the configured unit ceiling (1800 s
+/// by default, so 2 h): twice the post-merge gate's own ceiling, beyond which a gate that still
+/// times out is not slow but stuck, and the 6 h wait cap hands it to the owner.
+pub(super) const CEILING_MAX_FACTOR: u64 = 4;
+
+/// The per-unit ceiling, in seconds, for the gate that follows `hits` time-ceiling hits over a
+/// scope of `units` runnable units, on top of the configured `base_secs`. 0 (keep the configured
+/// one) before any hit. The factor is one step per two units in the scope (a scope of many test
+/// units runs them longer in one process tree) plus one step per hit already seen, so a gate that
+/// hit the ceiling always gets more than before; it is held between 2 and [`CEILING_MAX_FACTOR`].
+pub(super) fn scoped_ceiling_secs(base_secs: u64, units: u64, hits: u64) -> u64 {
+    if hits == 0 {
+        return 0;
+    }
+    let factor = units
+        .div_ceil(2)
+        .max(1)
+        .saturating_add(hits)
+        .clamp(2, CEILING_MAX_FACTOR);
+    base_secs.saturating_mul(factor)
+}
+
+/// The unit ceiling a branch's next gate asks for, from what its last gates left on the branch.
+pub(super) fn branch_ceiling_secs(extra: &BTreeMap<String, Value>, base_secs: u64) -> u64 {
+    let get = |key: &str| {
+        extra
+            .get(key)
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
+    scoped_ceiling_secs(base_secs, get(GATE_CEILING_UNITS), get(GATE_CEILING_HITS))
+}
+
 /// How long a gate may wait in total on infrastructure before the owner is asked (autonomy-trees
 /// spec A1; the B1 ladder takes over from this park once it exists).
 pub(super) const GATE_LOAD_CAP_SECS: i64 = 6 * 3600;
@@ -79,6 +116,9 @@ pub(super) fn is_load_reason(reason: &str) -> bool {
         "queue is exhausted",
         "ended errored",
         "without a verdict",
+        // A unit cut off at its time ceiling measured nothing either; the gate is re-measured with
+        // a ceiling sized to the scope (`scoped_ceiling_secs`), not counted as a red or an attempt.
+        crate::verify::TIME_CEILING_MARKER,
     ]
     .iter()
     .any(|marker| reason.contains(marker))
@@ -123,6 +163,8 @@ fn clear_load_wait(extra: &mut BTreeMap<String, Value>) {
     extra.remove(GATE_BACKOFF_UNTIL);
     extra.remove(GATE_LOAD_REASON);
     extra.remove(GATE_LOAD_WAITED_SECS);
+    extra.remove(GATE_CEILING_HITS);
+    extra.remove(GATE_CEILING_UNITS);
 }
 
 /// What a gate starved by infrastructure does next, after `waits` earlier waits that added up to
@@ -213,6 +255,17 @@ pub(super) async fn apply_gate_answer(
                 .get(GATE_LOAD_WAITED_SECS)
                 .and_then(Value::as_i64)
                 .unwrap_or(0);
+            if let Some((_, units)) = crate::verify::parse_time_ceiling(&reason) {
+                let hits = held
+                    .extra
+                    .get(GATE_CEILING_HITS)
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                held.extra
+                    .insert(GATE_CEILING_HITS.to_owned(), json!(hits + 1));
+                held.extra
+                    .insert(GATE_CEILING_UNITS.to_owned(), json!(units));
+            }
             match load_step(waits, waited) {
                 LoadStep::Wait(delay) => {
                     let until = Utc::now()
@@ -581,10 +634,35 @@ mod tests {
         ] {
             assert!(is_load_reason(reason), "{reason}");
         }
+        assert!(is_load_reason(&crate::verify::time_ceiling_reason(1800, 3)));
         assert!(!is_load_reason("the scope gate could not be submitted"));
         assert!(!is_load_reason(
             "scope verification ended errored (os error 206)"
         ));
+    }
+
+    #[test]
+    fn a_gate_that_hit_the_time_ceiling_is_remeasured_with_a_bigger_one() {
+        // Nothing to size before the first hit: the configured ceiling stands.
+        assert_eq!(scoped_ceiling_secs(1800, 6, 0), 0);
+        // One unit, one hit: twice the base. Many units start higher. Never past the maximum.
+        assert_eq!(scoped_ceiling_secs(1800, 1, 1), 3600);
+        assert_eq!(scoped_ceiling_secs(1800, 4, 1), 5400);
+        assert_eq!(scoped_ceiling_secs(1800, 40, 1), 1800 * CEILING_MAX_FACTOR);
+        // Each further hit asks for more, up to the maximum.
+        assert!(scoped_ceiling_secs(1800, 1, 2) > scoped_ceiling_secs(1800, 1, 1));
+        assert_eq!(scoped_ceiling_secs(1800, 1, 9), 1800 * CEILING_MAX_FACTOR);
+    }
+
+    #[test]
+    fn the_ceiling_a_branch_asks_for_follows_the_hits_on_its_extra() {
+        let mut extra = BTreeMap::new();
+        assert_eq!(branch_ceiling_secs(&extra, 1800), 0);
+        extra.insert(GATE_CEILING_HITS.to_owned(), json!(1));
+        extra.insert(GATE_CEILING_UNITS.to_owned(), json!(2));
+        assert_eq!(branch_ceiling_secs(&extra, 1800), 3600);
+        clear_load_wait(&mut extra);
+        assert_eq!(branch_ceiling_secs(&extra, 1800), 0);
     }
 
     #[test]

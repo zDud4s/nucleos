@@ -97,6 +97,9 @@ fn tail_of(outcome: &ArgvOutcome) -> String {
     };
     match head {
         Some(head) if outcome.tail.is_empty() => head,
+        // A row keeps only the last characters of its tail, so a timeout is also said at the end:
+        // the gate reads it there to tell a time ceiling from a crash (`TIME_CEILING_MARKER`).
+        Some(head) if outcome.timed_out => format!("{head}\n{}\n[{head}]", outcome.tail),
         Some(head) => format!("{head}\n{}", outcome.tail),
         None => outcome.tail.clone(),
     }
@@ -263,6 +266,11 @@ impl Executor {
 
     fn capacity(&self) -> i64 {
         self.limits.capacity()
+    }
+
+    /// The configured ceiling of one unit, in seconds, as the settings hold it now.
+    pub(crate) fn unit_timeout_seconds(&self) -> u64 {
+        self.limits.unit_timeout_seconds()
     }
 
     /// The sweep's guard: grants `dir` for removal unless a unit holds it, and keeps units off it
@@ -855,6 +863,10 @@ mod tests {
             status_of(&outcome(None, false, None), false),
             (verify_runs::STATUS_ERRORED, None)
         );
+        // A long output pushes the head out of the recorded tail; the timeout is said at the end too.
+        let text = tail_of(&timed);
+        assert!(text.starts_with("timed out after 3s\nout"), "{text}");
+        assert!(text.ends_with("[timed out after 3s]"), "{text}");
         assert_eq!(tail_of(&outcome(Some(0), false, None)), "out");
     }
 
