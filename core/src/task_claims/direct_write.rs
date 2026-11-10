@@ -8,7 +8,7 @@
 //! `core.hooksPath`, git older than 2.28, or a deleted hook and nothing refuses), so this scan is
 //! what makes every write that got past it visible.
 //!
-//! One row per project and target in `target_watch` (migration 0297) holds the last tip accounted
+//! One row per project and target in `target_watch` (migration 0298) holds the last tip accounted
 //! for. A tick that finds the branch elsewhere lists the first-parent commits since; the queue's
 //! merges are always `--no-ff`, so every commit it puts on that line is one succeeded request's
 //! `result_sha`, and anything else is direct. The row advances only once the move is accounted for.
