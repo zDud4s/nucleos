@@ -91,12 +91,9 @@ const fn backoff_secs(kind: Kind) -> (u64, u64) {
     match kind {
         // A handoff is progress, not a failure; a fix reacts to new evidence; the landing queue
         // and the resolver pace themselves. None of them waits.
-        Kind::Wrapped
-        | Kind::Fix
-        | Kind::FinalFix
-        | Kind::Conflict
-        | Kind::Land
-        | Kind::Rescue => (0, 0),
+        Kind::Wrapped | Kind::Fix | Kind::FinalFix | Kind::Conflict | Kind::Land | Kind::Rescue => {
+            (0, 0)
+        }
         Kind::Died | Kind::Gate => (2 * 60, 30 * 60),
         Kind::WatchdogFailure => (60, 30 * 60),
         Kind::GateLoadWait => (30, 10 * 60),

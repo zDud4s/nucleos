@@ -3397,7 +3397,11 @@ pub(super) mod tests {
         let prompt = fx.prompt_of(fx.current_run(&root).await).await;
         assert!(prompt.contains("tests::boom"), "{prompt}");
         assert!(prompt.contains("integrated tip"), "{prompt}");
-        assert_eq!(land_attempts(&fx, JOB).await, None, "a red is not a counted landing");
+        assert_eq!(
+            land_attempts(&fx, JOB).await,
+            None,
+            "a red is not a counted landing"
+        );
         assert!(fx.open_questions(JOB, &root).await.is_empty());
         assert_eq!(fx.requests().await, 1, "the landing waits for the fix run");
 
@@ -3444,7 +3448,11 @@ pub(super) mod tests {
         assert_eq!(land_attempts(&fx, JOB).await, Some(LAND_ATTEMPTS));
         let requests = fx.requests().await;
         fx.tick(JOB, &gate).await;
-        assert_eq!(fx.requests().await, requests, "the same tip is not landed again");
+        assert_eq!(
+            fx.requests().await,
+            requests,
+            "the same tip is not landed again"
+        );
     }
 
     #[tokio::test]
