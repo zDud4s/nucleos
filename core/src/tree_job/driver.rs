@@ -989,6 +989,10 @@ async fn landing_step(
     parks: &mut Vec<Park>,
 ) -> Result<(), String> {
     let pool = &state.pool;
+    // A red final verify starts a fix run of the integrated tip; the landing waits for it.
+    if super::final_verify::step(state, job, parks).await? {
+        return Ok(());
+    }
     if let Some(request) = job.manifest.extra.get("land_id").and_then(Value::as_i64) {
         let settled = settle_land(pool, job, Duration::ZERO)
             .await
@@ -3353,23 +3357,17 @@ pub(super) mod tests {
         assert!(fx.open_questions(JOB, "api-node").await.is_empty());
     }
 
-    #[tokio::test]
-    async fn a_land_the_final_verify_refused_asks_at_once_with_the_failing_tests() {
-        const JOB: &str = "drv-land-red";
-        let fx = Fixture::new().await;
-        landable_job(&fx, JOB).await;
-        let gate = FakeGate::answering(vec![]);
-        let root = root_node_of(JOB);
-
-        fx.tick(JOB, &gate).await;
+    /// The landing of `job` ends red on the final verify, with `FAIL core: tests::boom` as the
+    /// failing output, and the driver settles it.
+    async fn red_final_verify(fx: &Fixture, job: &str, gate: &FakeGate) {
         end_the_landing(
-            &fx,
-            JOB,
+            fx,
+            job,
             "failed",
             "the merge does not pass this project's gate, so nothing was published.",
         )
         .await;
-        let id = fx.job(JOB).await.manifest.extra["land_id"]
+        let id = fx.job(job).await.manifest.extra["land_id"]
             .as_i64()
             .unwrap();
         sqlx::query("UPDATE vcs_requests SET output_tail = ? WHERE id = ?")
@@ -3378,15 +3376,83 @@ pub(super) mod tests {
             .execute(&fx.state.pool)
             .await
             .unwrap();
-        for _ in 0..3 {
-            fx.tick(JOB, &gate).await;
-        }
+        // Settles the landing (the fix is asked for), then starts the fix run.
+        fx.tick(job, gate).await;
+        fx.tick(job, gate).await;
+    }
 
-        assert_eq!(land_attempts(&fx, JOB).await, Some(LAND_ATTEMPTS));
+    #[tokio::test]
+    async fn a_red_final_verify_starts_a_fix_run_of_the_integrated_tip_instead_of_asking() {
+        const JOB: &str = "drv-land-red";
+        let fx = Fixture::new().await;
+        landable_job(&fx, JOB).await;
+        let gate = FakeGate::answering(vec![]);
+        let root = root_node_of(JOB);
+        fx.save_launch(&root).await;
+
+        fx.tick(JOB, &gate).await;
+        red_final_verify(&fx, JOB, &gate).await;
+
+        assert_eq!(fx.launches(&root, "finalfix-").await, 1);
+        let prompt = fx.prompt_of(fx.current_run(&root).await).await;
+        assert!(prompt.contains("tests::boom"), "{prompt}");
+        assert!(prompt.contains("integrated tip"), "{prompt}");
+        assert_eq!(
+            land_attempts(&fx, JOB).await,
+            None,
+            "a red is not a counted landing"
+        );
+        assert!(fx.open_questions(JOB, &root).await.is_empty());
+        assert_eq!(fx.requests().await, 1, "the landing waits for the fix run");
+
+        // The fix run ends: the landing goes again and the final verify measures the new tip.
+        fx.relaunched_run_reports_done(&root).await;
+        fx.tick(JOB, &gate).await;
+        assert_eq!(fx.requests().await, 2);
+    }
+
+    #[tokio::test]
+    async fn a_final_verify_that_stays_red_asks_only_after_the_ladder_with_the_failing_tests() {
+        const JOB: &str = "drv-land-red-cap";
+        let fx = Fixture::new().await;
+        landable_job(&fx, JOB).await;
+        let gate = FakeGate::answering(vec![]);
+        let root = root_node_of(JOB);
+        fx.save_launch(&root).await;
+        fx.tick(JOB, &gate).await;
+        red_final_verify(&fx, JOB, &gate).await;
+
+        // The retries of the ladder, then its one rescue run.
+        for _ in 1..FIX_CAP {
+            fx.relaunched_run_reports_done(&root).await;
+            fx.tick(JOB, &gate).await;
+            red_final_verify(&fx, JOB, &gate).await;
+        }
+        assert_eq!(fx.launches(&root, "finalfix-").await, FIX_CAP);
+        assert_eq!(fx.launches(&root, "rescue-").await, 0);
+        assert!(fx.open_questions(JOB, &root).await.is_empty());
+        fx.relaunched_run_reports_done(&root).await;
+        fx.tick(JOB, &gate).await;
+        red_final_verify(&fx, JOB, &gate).await;
+        assert_eq!(fx.launches(&root, "rescue-").await, 1);
+        assert!(fx.open_questions(JOB, &root).await.is_empty());
+
+        // The rescue run is red too: now the owner is asked, with the failing tests.
+        fx.relaunched_run_reports_done(&root).await;
+        fx.tick(JOB, &gate).await;
+        red_final_verify(&fx, JOB, &gate).await;
+
         let questions = fx.open_questions(JOB, &root).await;
         assert_eq!(questions.len(), 1, "{questions:?}");
         assert!(questions[0].contains("tests::boom"), "{:?}", questions[0]);
-        assert_eq!(fx.requests().await, 1, "the same tip is not landed again");
+        assert_eq!(land_attempts(&fx, JOB).await, Some(LAND_ATTEMPTS));
+        let requests = fx.requests().await;
+        fx.tick(JOB, &gate).await;
+        assert_eq!(
+            fx.requests().await,
+            requests,
+            "the same tip is not landed again"
+        );
     }
 
     #[tokio::test]

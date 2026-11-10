@@ -25,6 +25,7 @@ import difflib
 import json
 import os
 import shutil
+import stat
 import sys
 
 WARNING = "stop the daemon before --apply (it scans specs and reads memory)"
@@ -56,7 +57,15 @@ def _is_link(path):
     if os.path.islink(path):
         return True
     isjunction = getattr(os.path, "isjunction", None)
-    return bool(isjunction and isjunction(path))
+    if isjunction is not None:
+        return bool(isjunction(path))
+    # os.path.isjunction is Python 3.12+; before it, a Windows junction is a reparse point that
+    # islink does not report.
+    try:
+        attrs = getattr(os.lstat(path), "st_file_attributes", 0)
+    except OSError:
+        return False
+    return bool(attrs & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
 
 
 def _norm(path):
