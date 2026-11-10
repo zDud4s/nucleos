@@ -12,7 +12,7 @@ use sqlx::SqlitePool;
 
 use super::decisions::{ROOT_PARK_KEY, STATUS_OPEN};
 use super::driver::{GateVerdict, NotMeasured, Park, RESOLVER_GRACE};
-use super::final_verify::is_gate_red;
+use super::final_verify::{FINAL_FIX_KEY, is_gate_red};
 use super::ladder::{self, Kind, Spent, Step};
 use super::landing::{LandSettlement, apply_gate_verdict, claim_land};
 use super::store::{self, TreeJob};
@@ -375,7 +375,7 @@ fn land_record(job: &TreeJob) -> serde_json::Map<String, Value> {
         .unwrap_or_default()
 }
 
-fn land_question(count: i64, reason: &str) -> String {
+pub(super) fn land_question(count: i64, reason: &str) -> String {
     if is_gate_red(reason) {
         return format!(
             "The final verify of the tree is red at the tip being landed, so nothing was published; {reason}
@@ -396,16 +396,17 @@ pub(super) async fn count_land_attempt(
     parks: &mut Vec<Park>,
 ) -> Result<(), String> {
     // A red final verify is about a tip that has not changed: trying again repeats it, so the
-    // allowance is spent at once and the owner is asked.
-    let count = if is_gate_red(reason) {
-        LAND_ATTEMPTS
-    } else {
-        land_record(job)
-            .get("count")
-            .and_then(Value::as_i64)
-            .unwrap_or(0)
-            + 1
-    };
+    // landing is not counted. A fix run of the integrated tip is asked for instead, and the owner
+    // only once the ladder's rungs for it are spent (`final_verify::step`).
+    if is_gate_red(reason) {
+        super::final_verify::request(job, reason);
+        return persist(pool, job).await;
+    }
+    let count = land_record(job)
+        .get("count")
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        + 1;
     set_land_record(job, count, reason);
     persist(pool, job).await?;
     if count >= LAND_ATTEMPTS {
@@ -414,7 +415,7 @@ pub(super) async fn count_land_attempt(
     Ok(())
 }
 
-fn set_land_record(job: &mut TreeJob, count: i64, reason: &str) {
+pub(super) fn set_land_record(job: &mut TreeJob, count: i64, reason: &str) {
     job.manifest.extra.insert(
         LAND_ATTEMPTS_KEY.to_owned(),
         json!({ "count": count, "at": now(), "reason": reason }),
@@ -456,6 +457,8 @@ pub(super) async fn land_allowed(
             Some(STATUS_OPEN) => {}
             Some(_) => {
                 job.manifest.extra.remove(LAND_ATTEMPTS_KEY);
+                // The answer is a fresh allowance for the fix of the integrated tip too.
+                job.manifest.extra.remove(FINAL_FIX_KEY);
                 persist(pool, job).await?;
                 return Ok(true);
             }

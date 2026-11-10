@@ -29,6 +29,8 @@ pub(super) enum Kind {
     Fix,
     /// Merge requests the conflict resolver is given (`driver`).
     Conflict,
+    /// Fix runs of the integrated tip after the final verify went red (`final_verify`).
+    FinalFix,
     /// The diagnose run itself: no retries, one run per allowance (`rescue`).
     Rescue,
     /// Gates of a branch in a row that measured nothing (`retry`).
@@ -73,6 +75,7 @@ pub(super) const fn retry_cap(kind: Kind) -> i64 {
         Kind::Died
         | Kind::WatchdogFailure
         | Kind::Fix
+        | Kind::FinalFix
         | Kind::Conflict
         | Kind::Gate
         | Kind::Land => 4,
@@ -88,7 +91,12 @@ const fn backoff_secs(kind: Kind) -> (u64, u64) {
     match kind {
         // A handoff is progress, not a failure; a fix reacts to new evidence; the landing queue
         // and the resolver pace themselves. None of them waits.
-        Kind::Wrapped | Kind::Fix | Kind::Conflict | Kind::Land | Kind::Rescue => (0, 0),
+        Kind::Wrapped
+        | Kind::Fix
+        | Kind::FinalFix
+        | Kind::Conflict
+        | Kind::Land
+        | Kind::Rescue => (0, 0),
         Kind::Died | Kind::Gate => (2 * 60, 30 * 60),
         Kind::WatchdogFailure => (60, 30 * 60),
         Kind::GateLoadWait => (30, 10 * 60),
@@ -128,11 +136,12 @@ pub(super) fn next_step(kind: Kind, spent: Spent) -> Step {
 mod tests {
     use super::*;
 
-    const ALL: [Kind; 9] = [
+    const ALL: [Kind; 10] = [
         Kind::Wrapped,
         Kind::Died,
         Kind::WatchdogFailure,
         Kind::Fix,
+        Kind::FinalFix,
         Kind::Conflict,
         Kind::Rescue,
         Kind::Gate,
@@ -154,6 +163,7 @@ mod tests {
             Kind::Died,
             Kind::WatchdogFailure,
             Kind::Fix,
+            Kind::FinalFix,
             Kind::Conflict,
             Kind::Gate,
             Kind::Land,
@@ -176,6 +186,7 @@ mod tests {
         assert_eq!(retry_cap(Kind::Died), 4);
         assert_eq!(retry_cap(Kind::WatchdogFailure), 4);
         assert_eq!(retry_cap(Kind::Fix), 4);
+        assert_eq!(retry_cap(Kind::FinalFix), retry_cap(Kind::Fix));
         assert_eq!(retry_cap(Kind::Conflict), 4);
         assert_eq!(retry_cap(Kind::Gate), 4);
         assert_eq!(retry_cap(Kind::Land), 4);
@@ -245,6 +256,7 @@ mod tests {
         for kind in [
             Kind::Wrapped,
             Kind::Fix,
+            Kind::FinalFix,
             Kind::Conflict,
             Kind::Land,
             Kind::Rescue,
