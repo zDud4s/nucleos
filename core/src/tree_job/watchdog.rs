@@ -209,9 +209,19 @@ pub(super) async fn record_failure(
         "Node {node_id} could not be started again {failures} times in a row (last error: \
          {error}). Fix the cause and answer to try again, or say how the branch should go on."
     );
-    let asked = decisions::park_or_ask(pool, job_id, node_id, &question)
-        .await
-        .map_err(|e| e.to_string())?;
+    // Starting the node again with fresh context is the one safe default for a node that would
+    // not start (spec B2): nothing is thrown away and nothing unverified is merged.
+    let evidence = format!("{failures} failed relaunches in a row, last error: {error}");
+    let asked = super::auto_default::park_or_ask_with_default(
+        pool,
+        job_id,
+        node_id,
+        &question,
+        super::auto_default::DefaultAction::RelaunchFreshWithDiagnosis,
+        &evidence,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     if let Some(asked) = asked {
         sqlx::query("UPDATE node_watchdog SET decision_id = ? WHERE node_id = ?")
             .bind(asked.id)

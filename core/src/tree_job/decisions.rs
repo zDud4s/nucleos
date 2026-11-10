@@ -799,6 +799,10 @@ mod tests {
             ("origin", 0, 0),
             ("at", 1, 0),
             ("status", 1, 0),
+            // Migration 0301, the default answer of `auto_default`.
+            ("default_action", 0, 0),
+            ("default_due", 0, 0),
+            ("default_evidence", 0, 0),
         ]
         .into_iter()
         .map(|(name, not_null, pk)| (name.to_owned(), "TEXT".to_owned(), not_null, pk))
