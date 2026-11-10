@@ -135,13 +135,14 @@ pub fn role_without_node(caller: &Caller) -> Role {
 
 type NodeRow = (String, String);
 
-async fn role_from_row(pool: &SqlitePool, column: &str, value: &str) -> Option<Role> {
-    let sql = format!(
+async fn role_from_row(pool: &SqlitePool, column: &'static str, value: &str) -> Option<Role> {
+    // `AssertSqlSafe`: `column` is one of two literal column names, and the value is bound.
+    let sql = sqlx::AssertSqlSafe(format!(
         "SELECT kind, owned_paths FROM work_nodes WHERE {column} = ? \
          ORDER BY (status = 'running') DESC, created_at DESC, id DESC LIMIT 1"
-    );
+    ));
     let found: Result<Option<NodeRow>, _> =
-        sqlx::query_as(&sql).bind(value).fetch_optional(pool).await;
+        sqlx::query_as(sql).bind(value).fetch_optional(pool).await;
     match found {
         Ok(Some((kind, owned))) => {
             let owned: Vec<String> = serde_json::from_str(&owned).unwrap_or_default();
