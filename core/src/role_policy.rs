@@ -10,6 +10,7 @@
 //! - `git_queue`: a session's `merge`/`rebase` goes through the queue (`session_git.rs`).
 //! - `open_children`: who may open child nodes (`tree_job/branch_start.rs`: "a leaf does not open
 //!   branches").
+//!
 //! A governed run keeps its own rules in `pretool.rs`; its role comes from the node its `run_id` is
 //! bound to.
 //!
