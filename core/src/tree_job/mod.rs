@@ -16,6 +16,7 @@ pub mod engine;
 mod final_verify;
 mod gate;
 mod gate_summary;
+pub mod handoff_park;
 #[cfg(test)]
 mod gate_tests;
 pub mod http;
