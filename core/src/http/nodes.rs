@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 use std::path::Path as FsPath;
 
 use super::*;
-use crate::hooks::role_policy;
+use crate::role_policy;
 use crate::conductor::depth::{self, AncestorView, ChildArgs, DepthRefusal, TreeLimits};
 use crate::tree_cost::budget::{self, Permit};
 use crate::work_nodes::{self, CloseArgs, NodeError, NodeLimits, OpenArgs, UpdateArgs, View};

@@ -20,7 +20,6 @@ mod posttool;
 mod pretool;
 mod proposals;
 mod rooted;
-pub(crate) mod role_policy;
 mod rules;
 mod session_git;
 mod skip;

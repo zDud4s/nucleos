@@ -1,6 +1,7 @@
 //! Deciding a session's own git operations: whether a queue operation may run, and why not.
 
 use super::*;
+use crate::role_policy;
 
 /// The answer of the session-git route: a [`Decision`] plus, when the operation was queued, which
 /// request it became and whether that request had reached a final state by the time of the answer.
