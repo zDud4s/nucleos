@@ -58,7 +58,8 @@ use crate::verify::plan::{self as verify_plan, Kind, PlanError, ScopeArg, Ticket
 use crate::verify::postgate as verify_postgate;
 use crate::verify::postgate_worker as verify_postgate_worker;
 use crate::verify::runs::{
-    self as verify_runs, ORIGIN_VERIFY, PRIORITY_AUTONOMOUS, PRIORITY_INTERACTIVE,
+    self as verify_runs, ORIGIN_VERIFY, PRIORITY_AUTONOMOUS, PRIORITY_FIX_REGATE,
+    PRIORITY_INTERACTIVE,
 };
 use crate::verify::store::{self as verify_store, CacheKey, NewRequest, PlannedUnit};
 use crate::workflow_records;
@@ -160,6 +161,38 @@ pub enum Caller {
 /// The post-merge gate runs the whole gate as one unit: run 86 took 1746 s and run 83 was cut at
 /// the 1800 s default, so this is about twice the observed time.
 pub const POSTGATE_UNIT_TIMEOUT: Duration = Duration::from_secs(3600);
+
+/// What a daemon gate asks of the queue beyond who it is (autonomy-trees spec A7).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GateTerms {
+    /// The gate re-measures a fix of a red: served before the gate of a new branch.
+    pub fix: bool,
+    /// A ceiling per unit, in seconds, replacing the executor's configured one; 0 keeps it. Set by
+    /// a gate whose last attempt hit the time ceiling.
+    pub unit_timeout_secs: u64,
+}
+
+impl GateTerms {
+    /// The priority the request is queued at: a fix's re-gate outranks the caller's own level, but
+    /// never the owner's.
+    pub fn priority(self, caller: Caller) -> i64 {
+        let own = caller.priority();
+        if self.fix && own > PRIORITY_FIX_REGATE {
+            PRIORITY_FIX_REGATE
+        } else {
+            own
+        }
+    }
+
+    /// The unit timeout in ms: the terms' own when set, else the caller's.
+    pub fn unit_timeout_ms(self, caller: Caller) -> i64 {
+        if self.unit_timeout_secs > 0 {
+            i64::try_from(self.unit_timeout_secs.saturating_mul(1000)).unwrap_or(i64::MAX)
+        } else {
+            caller.unit_timeout_ms()
+        }
+    }
+}
 
 impl Caller {
     /// Every other key is refused: a sidecar, a team run or a narrower API token has no worktree
@@ -351,6 +384,16 @@ pub async fn submit_narrowed(
     caller: Caller,
     args: &VerifyArgs,
 ) -> Result<i64, VerifyError> {
+    submit_narrowed_with(executor, caller, args, GateTerms::default()).await
+}
+
+/// `submit_narrowed` with the queue terms of the gate: a fix's re-gate, a scoped time ceiling.
+pub async fn submit_narrowed_with(
+    executor: &Arc<Executor>,
+    caller: Caller,
+    args: &VerifyArgs,
+    terms: GateTerms,
+) -> Result<i64, VerifyError> {
     if !matches!(caller, Caller::Job(_))
         || !matches!(args.kind, Kind::Test | Kind::Check)
         || args.scope != ScopeArg::Scope
@@ -360,7 +403,7 @@ pub async fn submit_narrowed(
             "only a tree branch's test or check scope gate may be narrowed".into(),
         ));
     }
-    let (id, _) = submit_with(executor, caller, args, true).await?;
+    let (id, _) = submit_with(executor, caller, args, true, terms).await?;
     Ok(id)
 }
 
@@ -392,7 +435,7 @@ async fn submit_checked(
     caller: Caller,
     args: &VerifyArgs,
 ) -> Result<(i64, bool), VerifyError> {
-    submit_with(executor, caller, args, false).await
+    submit_with(executor, caller, args, false, GateTerms::default()).await
 }
 
 /// `submit_checked`; `narrow` lets the groups' `filters` narrow a gate (`submit_narrowed`).
@@ -401,6 +444,7 @@ async fn submit_with(
     caller: Caller,
     args: &VerifyArgs,
     narrow: bool,
+    terms: GateTerms,
 ) -> Result<(i64, bool), VerifyError> {
     let pool = &executor.pool;
     // Naming groups is the daemon's probe alone: refused before any row or git read.
@@ -578,7 +622,7 @@ async fn submit_with(
     let worktree = root.to_string_lossy().into_owned();
     let scope = args.scope.as_str();
     let kind = args.kind.as_str();
-    let priority = caller.priority();
+    let priority = terms.priority(caller);
     let label = caller.label();
     let id = verify_store::insert_request(
         pool,
@@ -733,7 +777,7 @@ async fn submit_with(
                 priority,
                 // Zero lets the executor derive both from the argv and its own config.
                 weight: 0,
-                timeout_ms: caller.unit_timeout_ms(),
+                timeout_ms: terms.unit_timeout_ms(caller),
             })
             .await;
         let submitted = match submitted {
@@ -1473,6 +1517,33 @@ tests:
     }
 
     #[test]
+    fn a_fix_regate_is_served_before_a_new_branch_gate_and_after_the_owner() {
+        let job = Caller::Job(5);
+        let fix = GateTerms {
+            fix: true,
+            ..GateTerms::default()
+        };
+        assert_eq!(GateTerms::default().priority(job), PRIORITY_AUTONOMOUS);
+        assert_eq!(fix.priority(job), PRIORITY_FIX_REGATE);
+        assert!(fix.priority(job) < GateTerms::default().priority(job));
+        // Background measurements stay behind both; the owner stays ahead of a fix.
+        assert!(GateTerms::default().priority(job) < Caller::Postgate.priority());
+        assert!(fix.priority(Caller::Owner) == PRIORITY_INTERACTIVE);
+        assert!(fix.priority(Caller::Postgate) == PRIORITY_FIX_REGATE);
+    }
+
+    #[test]
+    fn a_scoped_ceiling_replaces_the_callers_unit_timeout() {
+        let job = Caller::Job(5);
+        assert_eq!(GateTerms::default().unit_timeout_ms(job), 0);
+        let scoped = GateTerms {
+            fix: false,
+            unit_timeout_secs: 3600,
+        };
+        assert_eq!(scoped.unit_timeout_ms(job), 3_600_000);
+    }
+
+    #[test]
     fn caller_priority_is_interactive_for_the_owner_and_autonomous_for_a_run() {
         assert_eq!(Caller::Owner.priority(), PRIORITY_INTERACTIVE);
         assert_eq!(Caller::Run(7).priority(), PRIORITY_AUTONOMOUS);
@@ -1709,6 +1780,31 @@ tests:
             scope_outcome(&errored),
             ScopeVerdict::Measured(GateOutcome::Errored { .. })
         ));
+
+        // A unit cut off at its ceiling is told apart from a crash, with the ceiling and the scope.
+        let cut = ticket(
+            true,
+            Some("errored"),
+            vec![
+                unit(
+                    Some("core"),
+                    "errored",
+                    None,
+                    Some(
+                        "out
+[timed out after 1800s]",
+                    ),
+                ),
+                unit(Some("py"), "passed", Some(0), None),
+            ],
+        );
+        match scope_outcome(&cut) {
+            ScopeVerdict::Measured(GateOutcome::Errored { reason }) => {
+                assert_eq!(scope_gate::parse_time_ceiling(&reason), Some((1800, 2)));
+            }
+            other => panic!("expected a time ceiling, got {other:?}"),
+        }
+        assert_eq!(scope_gate::parse_time_ceiling("ended errored"), None);
 
         // A ticket that is not done has no verdict to translate: that is a measurement that did
         // not finish, not a pass.

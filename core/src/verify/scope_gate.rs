@@ -14,6 +14,51 @@ pub enum ScopeVerdict {
     Unavailable,
 }
 
+/// What an executor writes in the tail of a unit it cut off at its ceiling (`exec::tail_of`).
+const TIMED_OUT_MARKER: &str = "timed out after ";
+
+/// The words of the reason of a gate that hit the unit time ceiling, which the tree driver reads
+/// (`tree_job::retry`) to re-measure with a larger ceiling instead of counting a red or an attempt.
+pub const TIME_CEILING_MARKER: &str = "hit the time ceiling of ";
+
+/// The reason of a scope gate whose units were cut off after `secs` seconds, over `units` runnable
+/// units. [`parse_time_ceiling`] reads it back.
+pub fn time_ceiling_reason(secs: u64, units: usize) -> String {
+    format!(
+        "scope verification {TIME_CEILING_MARKER}{secs}s ({units} units in scope); nothing was measured"
+    )
+}
+
+/// `(seconds, units)` out of a [`time_ceiling_reason`], `None` for any other reason.
+pub fn parse_time_ceiling(reason: &str) -> Option<(u64, usize)> {
+    let rest = &reason[reason.find(TIME_CEILING_MARKER)? + TIME_CEILING_MARKER.len()..];
+    let (secs, rest) = rest.split_once("s (")?;
+    let (units, _) = rest.split_once(" units in scope)")?;
+    Some((secs.parse().ok()?, units.parse().ok()?))
+}
+
+/// `(ceiling seconds, runnable units)` of an errored ticket when a unit was cut off by its time
+/// ceiling; `None` when no unit was (a crash or a spawn failure is not a ceiling).
+fn time_ceiling_hit(ticket: &Ticket) -> Option<(u64, usize)> {
+    let secs = ticket
+        .units
+        .iter()
+        .filter(|unit| unit.status == "errored")
+        .filter_map(|unit| {
+            let tail = unit.output_tail.as_deref()?;
+            let after = &tail[tail.rfind(TIMED_OUT_MARKER)? + TIMED_OUT_MARKER.len()..];
+            let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+            digits.parse::<u64>().ok()
+        })
+        .max()?;
+    let units = ticket
+        .units
+        .iter()
+        .filter(|unit| unit.skipped_reason.is_none() && !unit.status.starts_with("skipped"))
+        .count();
+    Some((secs, units))
+}
+
 /// Translates a ticket into the outcome an item gate records. A failed ticket carries the tail of
 /// each failed unit, so the retry prompt still receives the end of the output as it does today.
 pub fn scope_outcome(ticket: &Ticket) -> ScopeVerdict {
@@ -58,6 +103,12 @@ pub fn scope_outcome(ticket: &Ticket) -> ScopeVerdict {
 ",
                 );
             ScopeVerdict::Measured(GateOutcome::Failed { exit_code, output })
+        }
+        Some("errored") if time_ceiling_hit(ticket).is_some() => {
+            let (secs, units) = time_ceiling_hit(ticket).unwrap_or((0, 0));
+            ScopeVerdict::Measured(GateOutcome::Errored {
+                reason: time_ceiling_reason(secs, units),
+            })
         }
         Some("inherited") => ScopeVerdict::Measured(GateOutcome::Errored {
             reason: "every red unit is inherited from a master incident; wait for it to close"

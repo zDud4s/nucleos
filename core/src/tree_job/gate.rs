@@ -21,10 +21,11 @@ use serde_json::json;
 use super::driver::{GateVerdict, NotMeasured, verdict_of};
 use super::http::job_lock;
 use super::landing::scope_caller_id;
+use super::retry::branch_ceiling_secs;
 use super::store;
 use crate::verify::exec::Executor;
 use crate::verify::plan::{Kind, ScopeArg, Ticket};
-use crate::verify::{Caller, VerifyArgs, scope_outcome};
+use crate::verify::{Caller, GateTerms, VerifyArgs, scope_outcome};
 
 /// The key of `Branch.extra` that holds the ticket of the branch's gate.
 const KEY: &str = "gate_ticket";
@@ -198,6 +199,28 @@ struct VerifyIo<'a> {
     worktree: &'a str,
 }
 
+impl VerifyIo<'_> {
+    /// The queue terms of this branch's next ticket (spec A7): a branch in `fixing` re-gates a fix,
+    /// which the queue serves before a new branch's gate; one whose last gate hit the unit time
+    /// ceiling is measured again with a ceiling sized to its scope. A branch that cannot be read
+    /// gets the defaults, which is what every gate got before.
+    async fn terms(&self) -> GateTerms {
+        let Ok(Some(job)) = store::load(self.pool, self.job_id).await else {
+            return GateTerms::default();
+        };
+        let Some(held) = job.manifest.branches.get(self.branch) else {
+            return GateTerms::default();
+        };
+        GateTerms {
+            fix: held.state == "fixing",
+            unit_timeout_secs: branch_ceiling_secs(
+                &held.extra,
+                self.executor.unit_timeout_seconds(),
+            ),
+        }
+    }
+}
+
 impl GateIo for VerifyIo<'_> {
     async fn stored(&self) -> Result<Option<Stored>, String> {
         let job = store::load(self.pool, self.job_id)
@@ -279,7 +302,8 @@ impl GateIo for VerifyIo<'_> {
             groups: None,
         };
         let caller = Caller::Job(scope_caller_id(self.job_id));
-        crate::verify::submit_narrowed(self.executor, caller, &args)
+        let terms = self.terms().await;
+        crate::verify::submit_narrowed_with(self.executor, caller, &args, terms)
             .await
             .map_err(|e| e.message().to_owned())
     }

@@ -71,6 +71,15 @@ mod tests {
     }
 
     #[test]
+    fn a_fix_regate_goes_before_a_new_branch_gate_before_background_work() {
+        // 0 owner, 1 fix re-gate, 2 new branch gate, 3 background (`verify::runs::PRIORITY_*`).
+        let cs = [cand(1, "a", 3, 0), cand(2, "a", 2, 1), cand(3, "a", 1, 2)];
+        assert_eq!(pick(&cs, 4, &HashMap::new(), 3, AGING), Some(3));
+        let cs = [cand(1, "a", 3, 0), cand(2, "a", 2, 1)];
+        assert_eq!(pick(&cs, 4, &HashMap::new(), 3, AGING), Some(2));
+    }
+
+    #[test]
     fn the_interactive_request_goes_first() {
         let cs = [cand(1, "a", 2, 0), cand(2, "a", 0, 10), cand(3, "a", 1, 5)];
         assert_eq!(pick(&cs, 4, &HashMap::new(), 10, AGING), Some(2));
