@@ -7829,7 +7829,8 @@ mod tests {
         assert_eq!(run.agent_id.as_deref(), Some("a1"));
         assert_eq!(run.agent_type.as_deref(), Some("wf-leaf"));
         let bare: PreToolUsePayload =
-            serde_json::from_value(serde_json::json!({ "run_id": 7, "tool_name": "Bash" })).unwrap();
+            serde_json::from_value(serde_json::json!({ "run_id": 7, "tool_name": "Bash" }))
+                .unwrap();
         assert!(bare.agent_id.is_none() && bare.agent_type.is_none());
     }
 
