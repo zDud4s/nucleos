@@ -20,7 +20,8 @@ use crate::gate::GateOutcome;
 use crate::verify::ScopeVerdict;
 
 /// Gates of one branch in a row that may end without measuring anything before the owner is asked:
-/// the first, and the ladder's retries of it.
+/// the first, and the ladder's retries of it. The code asks the ladder itself; tests count with this.
+#[cfg(test)]
 pub(super) const GATE_ATTEMPTS: i64 = ladder::retry_cap(Kind::Gate) + 1;
 /// The key of `Branch.extra` that counts those gates.
 pub(super) const GATE_FAILURES: &str = "gate_failures";
@@ -208,7 +209,7 @@ async fn persist(pool: &SqlitePool, job: &mut TreeJob) -> Result<(), String> {
 /// unmeasured: no unit agrees with the diff, so nothing could fail, and the entry says so.
 /// `Inherited` is green too, with the base's incident on the entry: its red is master's, so it is
 /// neither blamed on the branch nor spent from the fix cap. A gate
-/// that ended without measuring counts one; at [`GATE_ATTEMPTS`] the answer is a park, which the
+/// that ended without measuring counts one; at `GATE_ATTEMPTS` the answer is a park, which the
 /// caller asks outside the lock. A ticket still running is never counted. A branch that moved on
 /// while the gate ran (parked, dropped) takes nothing.
 pub(super) async fn apply_gate_answer(

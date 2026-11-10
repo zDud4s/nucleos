@@ -94,6 +94,7 @@ type NodeRow = (String, String, Option<String>, Option<String>);
 pub async fn tick(state: &AppState) {
     wrap_running_nodes(state).await;
     super::watchdog::sweep(state).await;
+    super::auto_default::sweep(state).await;
     super::root::retry_failed_starts(state).await;
 }
 
@@ -433,9 +434,22 @@ async fn relaunch_or_stop(
     // A branch is parked; a root that tops no branch is asked on itself, so the job never waits
     // in silence. `park_or_ask` takes the job's lock itself, so none is held here.
     let question = (chain.question)(node_id, chain.cap());
-    decisions::park_or_ask(pool, job_id, node_id, &question)
-        .await
-        .map_err(|e| e.to_string())?;
+    // The chain stopped on a node that kept ending: one more start with fresh context and the
+    // diagnosis is the safe default if the owner stays silent (spec B2).
+    let evidence = format!(
+        "the node ended {} times in a row without finishing",
+        chain.cap()
+    );
+    super::auto_default::park_or_ask_with_default(
+        pool,
+        job_id,
+        node_id,
+        &question,
+        super::auto_default::DefaultAction::RelaunchFreshWithDiagnosis,
+        &evidence,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     Ok(true)
 }
 
