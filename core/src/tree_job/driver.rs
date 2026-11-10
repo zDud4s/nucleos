@@ -1863,9 +1863,16 @@ pub(super) mod tests {
 
         let questions = fx.open_questions(JOB, NODE).await;
         assert_eq!(questions.len(), 1, "{questions:?}");
-        assert!(questions[0].contains("database is locked"), "{:?}", questions[0]);
+        assert!(
+            questions[0].contains("database is locked"),
+            "{:?}",
+            questions[0]
+        );
         let parked = fx.branch(JOB, "api").await;
-        assert!(!parked.extra.contains_key(GATE_FAILURES), "no attempt was spent");
+        assert!(
+            !parked.extra.contains_key(GATE_FAILURES),
+            "no attempt was spent"
+        );
         assert!(!parked.extra.contains_key("gate_load_waited_secs"));
     }
 

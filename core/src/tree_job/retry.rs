@@ -582,7 +582,9 @@ mod tests {
             assert!(is_load_reason(reason), "{reason}");
         }
         assert!(!is_load_reason("the scope gate could not be submitted"));
-        assert!(!is_load_reason("scope verification ended errored (os error 206)"));
+        assert!(!is_load_reason(
+            "scope verification ended errored (os error 206)"
+        ));
     }
 
     #[test]

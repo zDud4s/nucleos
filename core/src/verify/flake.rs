@@ -132,8 +132,7 @@ pub async fn quarantine_note(
         if other.files.is_empty() || touches(&own_changed, &other.files) {
             continue;
         }
-        let Ok(changed) =
-            resolve::changed_paths(Path::new(&other.worktree), &base, deadline).await
+        let Ok(changed) = resolve::changed_paths(Path::new(&other.worktree), &base, deadline).await
         else {
             continue;
         };
@@ -169,18 +168,13 @@ pub async fn quarantine_note(
             "test {id} fails in {} worktrees whose diffs do not touch it",
             worktrees.len()
         );
-        let task = machine::open_machine_ticket(
-            pool,
-            &ticket.project_id,
-            key,
-            title,
-            detail,
-            files,
-            now,
-        )
-        .await
-        .inspect_err(|error| tracing::warn!(%error, "verify: cannot open the flaky-test ticket"))
-        .ok()?;
+        let task =
+            machine::open_machine_ticket(pool, &ticket.project_id, key, title, detail, files, now)
+                .await
+                .inspect_err(
+                    |error| tracing::warn!(%error, "verify: cannot open the flaky-test ticket"),
+                )
+                .ok()?;
         opened.push(format!("#{}", task.id));
     }
     Some(format!(
@@ -209,7 +203,10 @@ mod tests {
 
     #[test]
     fn two_other_worktrees_with_the_test_make_it_a_flake() {
-        let others = [elsewhere("w1", &["a::t"]), elsewhere("w2", &["a::t", "b::u"])];
+        let others = [
+            elsewhere("w1", &["a::t"]),
+            elsewhere("w2", &["a::t", "b::u"]),
+        ];
         assert!(failed_elsewhere(&set(&["a::t"]), &others));
     }
 
@@ -281,6 +278,11 @@ mod tests {
         let pool = crate::testdb::fresh_pool().await;
         let now = Utc::now();
         seed(&pool, "w1", &["a::t"], now).await;
-        assert!(recent_reds(&pool, "q", "own", now).await.unwrap().is_empty());
+        assert!(
+            recent_reds(&pool, "q", "own", now)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }

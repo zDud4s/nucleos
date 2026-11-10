@@ -647,11 +647,7 @@ fn failed_test_ids(ticket: &Ticket) -> Option<BTreeSet<String>> {
     (!ids.is_empty()).then_some(ids)
 }
 
-async fn master_red_note(
-    pool: &SqlitePool,
-    ticket: &Ticket,
-    now: DateTime<Utc>,
-) -> Option<String> {
+async fn master_red_note(pool: &SqlitePool, ticket: &Ticket, now: DateTime<Utc>) -> Option<String> {
     let units = &ticket.units;
     if !ticket.done
         || ticket.verdict.as_deref() != Some("failed")
