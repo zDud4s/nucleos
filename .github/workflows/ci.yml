@@ -42,12 +42,15 @@ jobs:
           MACOS_ON_EVERY_PUSH: "true"
           EVENT: ${{ github.event_name }}
           REF: ${{ github.ref }}
+        # Windows only for now, by the owner's decision (2026-11-10): the ubuntu and macOS legs are
+        # paused until master is green, and go back by restoring the branches kept commented below.
         run: |
-          if [ "$MACOS_ON_EVERY_PUSH" = true ] || [ "$EVENT" = pull_request ] || [ "$REF" = refs/heads/master ]; then
-            echo 'os=["windows-latest","ubuntu-latest","macos-latest"]' >> "$GITHUB_OUTPUT"
-          else
-            echo 'os=["windows-latest","ubuntu-latest"]' >> "$GITHUB_OUTPUT"
-          fi
+          echo 'os=["windows-latest"]' >> "$GITHUB_OUTPUT"
+          # if [ "$MACOS_ON_EVERY_PUSH" = true ] || [ "$EVENT" = pull_request ] || [ "$REF" = refs/heads/master ]; then
+          #   echo 'os=["windows-latest","ubuntu-latest","macos-latest"]' >> "$GITHUB_OUTPUT"
+          # else
+          #   echo 'os=["windows-latest","ubuntu-latest"]' >> "$GITHUB_OUTPUT"
+          # fi
 
   core:
     needs: plan
