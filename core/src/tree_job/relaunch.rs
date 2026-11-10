@@ -120,8 +120,10 @@ pub(super) const FINAL_FIX_PREFIX: &str = "finalfix-";
 pub(super) const TRANSIENT_PREFIX: &str = "transient-";
 /// The in-tree resolve-conflict run of a branch whose merge conflicts (`merge_recovery`).
 pub(super) const RESOLVE_PREFIX: &str = "resolve-";
+/// The relaunch of a run the watchdog ended for want of a sign of life (`wrap`'s `WATCHDOG` chain).
+pub(super) const WATCHDOG_PREFIX: &str = "watchdog-";
 const RESUME_PREFIX: &str = "resume-";
-const SUFFIXED_KEY_PREFIXES: [&str; 8] = [
+const SUFFIXED_KEY_PREFIXES: [&str; 9] = [
     WRAP_PREFIX,
     DIED_PREFIX,
     FIX_PREFIX,
@@ -129,6 +131,7 @@ const SUFFIXED_KEY_PREFIXES: [&str; 8] = [
     FINAL_FIX_PREFIX,
     TRANSIENT_PREFIX,
     RESOLVE_PREFIX,
+    WATCHDOG_PREFIX,
     RESUME_PREFIX,
 ];
 /// Key prefix of the relaunch an owner's answer starts (`relaunch_after_answer`).

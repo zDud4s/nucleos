@@ -24,7 +24,8 @@ use super::ladder::{Kind, Spent, Step, next_step, retry_cap};
 use super::model::JOB_TERMINAL_STATE;
 use super::open::{DIED_PREFIX, WRAP_PREFIX, latest_launch, relaunch_node, run_is_live};
 use super::relaunch::{
-    DECISION_PREFIX, TRANSIENT_PREFIX, budget_refusal, refusal_question, successor_key,
+    DECISION_PREFIX, TRANSIENT_PREFIX, WATCHDOG_PREFIX, budget_refusal, refusal_question,
+    successor_key,
 };
 use super::rescue;
 use super::store;
@@ -54,6 +55,12 @@ fn ended_question(node_id: &str, cap: i64) -> String {
     )
 }
 
+fn watchdog_question(node_id: &str, cap: i64) -> String {
+    format!(
+        "Node {node_id} gave no sign of life and was ended by the watchdog {cap} times in a row;          how should the branch go on?"
+    )
+}
+
 fn transient_question(node_id: &str, cap: i64) -> String {
     format!(
         "Node {node_id} died on a transient API error (a rate limit, or the service busy or \
@@ -72,6 +79,13 @@ const DIED: Chain = Chain {
     prefix: DIED_PREFIX,
     kind: Some(Kind::Died),
     question: ended_question,
+};
+/// The relaunches of a run the watchdog ended because the node gave no sign of life: a hang, not a
+/// death of the node's work, so it spends nothing of the `DIED` cap (spec B5).
+const WATCHDOG: Chain = Chain {
+    prefix: WATCHDOG_PREFIX,
+    kind: Some(Kind::WatchdogFailure),
+    question: watchdog_question,
 };
 /// The relaunches of a run that died on a transient API error. With the backoff below, sixteen
 /// links wait about six hours in all, past a subscription's usage window.
@@ -242,6 +256,9 @@ async fn wrap_node(
             relaunch_or_stop(state, &job.id, node_id, &run_id, &WRAPPED, suffix).await
         }
         (false, Some(_)) => Ok(false),
+        (false, None) if super::watchdog::ended_by_watchdog(pool, node_id, &run_id).await => {
+            relaunch_or_stop(state, &job.id, node_id, &run_id, &WATCHDOG, None).await
+        }
         (false, None) => match transient_death(pool, &run_id).await? {
             Some(ended) => relaunch_after_backoff(state, &job.id, node_id, &run_id, ended).await,
             None => relaunch_or_stop(state, &job.id, node_id, &run_id, &DIED, None).await,
@@ -1195,6 +1212,51 @@ mod tests {
         let (branch, asked) = parked_and_asked(&state).await;
         assert_eq!(branch, "building", "not parked: {asked:?}");
         assert!(asked.is_empty(), "{asked:?}");
+    }
+
+    /// A hang the watchdog ended is not a real death (spec B5): its relaunch is a `watchdog-` link,
+    /// so a node whose died cap is already spent is still started again.
+    #[tokio::test]
+    async fn a_watchdog_death_is_relaunched_without_spending_the_died_cap() {
+        let state = state().await;
+        seed_node(&state, Some("building"), "open", NODE, Some(63)).await;
+        seed_launch(&state, NODE).await;
+        chain_links(&state, NODE, "died-old", retry_cap(Kind::Died)).await;
+        seed_run(&state, 63, "interrupted").await;
+        sqlx::query(
+            "INSERT INTO tree_transitions (node_id, transition, key, result, created_at) \
+             VALUES (?, 'watchdog_end', '63', NULL, ?)",
+        )
+        .bind(NODE)
+        .bind(CREATED)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        tick(&state).await;
+
+        assert_eq!(
+            launches(&state, NODE, "died-").await,
+            retry_cap(Kind::Died),
+            "no died link spent"
+        );
+        assert_eq!(launches(&state, NODE, "watchdog-").await, 1);
+        let (branch, asked) = parked_and_asked(&state).await;
+        assert_eq!(branch, "building", "not parked: {asked:?}");
+    }
+
+    /// The same death without the watchdog's mark is a real one and spends the died cap.
+    #[tokio::test]
+    async fn the_same_death_without_the_watchdogs_mark_spends_the_died_cap() {
+        let state = state().await;
+        seed_node(&state, Some("building"), "open", NODE, Some(64)).await;
+        seed_launch(&state, NODE).await;
+        seed_run(&state, 64, "interrupted").await;
+
+        tick(&state).await;
+
+        assert_eq!(launches(&state, NODE, "died-").await, 1);
+        assert_eq!(launches(&state, NODE, "watchdog-").await, 0);
     }
 
     /// A rate limit lasts a while: the relaunch waits a backoff after the run ended, so the sweep

@@ -10,7 +10,8 @@
 //!   (a leaf only once it is [`ORPHAN_GRACE_SECS`] old, and a leaf that keeps failing fails, as it has
 //!   no branch to park);
 //! - a live run whose lease (its last sign of life) is older than [`LEASE_TTL_SECS`] is ended as
-//!   `interrupted`, so `wrap` starts the node again under its `died-` chain;
+//!   `interrupted`, so `wrap` starts the node again under its own `watchdog-` chain (a hang is not
+//!   a death: it spends nothing of the `died-` cap). The lease is renewed by `heartbeat`;
 //! - a relaunch that fails (here or in `wrap`) sets a backoff (60 s, doubling, at most 30 min) during
 //!   which the node is left alone, and the failure that ends the ladder's retries
 //!   (`ladder::Kind::WatchdogFailure`) parks the branch with an owner decision
@@ -31,8 +32,11 @@ use super::open::{latest_launch, relaunch_node, run_is_live};
 use super::relaunch::{budget_refusal, refusal_question};
 use super::store;
 
-/// A live run with no sign of life for this long has lost its session.
-pub(super) const LEASE_TTL_SECS: i64 = 2 * 60 * 60;
+/// A live run with no sign of life for this long has lost its session. Safe to keep short because
+/// the lease is renewed from the run's own events and every hook call (`heartbeat`, spec B5).
+pub(super) const LEASE_TTL_SECS: i64 = 30 * 60;
+/// The `tree_transitions` row (`key` = the run) that says the watchdog ended that run.
+const ENDED_TRANSITION: &str = "watchdog_end";
 const PARKED: &str = "parked";
 /// A running leaf with no run is left alone this long after it was created (its launch may be on its way).
 const ORPHAN_GRACE_SECS: i64 = 5 * 60;
@@ -74,6 +78,37 @@ pub async fn beat(pool: &SqlitePool, node_id: &str) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await
     .map(|_| ())
+}
+
+/// Whether the watchdog is what ended `run_id` of `node_id`. `wrap` relaunches such a run under its
+/// own chain, so a hang does not spend the `DIED` cap of real deaths (spec B5).
+pub(super) async fn ended_by_watchdog(pool: &SqlitePool, node_id: &str, run_id: &str) -> bool {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM tree_transitions WHERE node_id = ? AND transition = ? AND key = ?",
+    )
+    .bind(node_id)
+    .bind(ENDED_TRANSITION)
+    .bind(run_id)
+    .fetch_one(pool)
+    .await
+    .is_ok_and(|count| count > 0)
+}
+
+/// Records that the watchdog ended `run_id`, before the run is ended: `wrap` may look at the dead
+/// run the moment it is, and must find the mark by then.
+async fn mark_ended(pool: &SqlitePool, node_id: &str, run_id: &str) -> Result<(), String> {
+    sqlx::query(
+        "INSERT OR IGNORE INTO tree_transitions (node_id, transition, key, result, created_at) \
+         VALUES (?, ?, ?, NULL, ?)",
+    )
+    .bind(node_id)
+    .bind(ENDED_TRANSITION)
+    .bind(run_id)
+    .bind(Utc::now().to_rfc3339())
+    .execute(pool)
+    .await
+    .map(|_| ())
+    .map_err(|e| e.to_string())
 }
 
 /// The latest sign of life of `node_id`: its renewed lease, a transition it wrote, a change of its
@@ -322,6 +357,7 @@ async fn check_node(state: &AppState, node_id: &str, job_id: &str) -> Result<(),
                 .await
                 .is_some_and(|at| Utc::now() > at + Duration::seconds(LEASE_TTL_SECS));
             if expired && let Ok(number) = run_id.parse::<i64>() {
+                mark_ended(pool, node_id, &run_id).await?;
                 // Ending it makes it a run that died without a report: `wrap` starts the node again.
                 // With no task handle in this process (a run left from before a restart) the
                 // termination is a no-op, so the row is closed directly: first writer wins.
@@ -712,6 +748,51 @@ mod tests {
         sweep(&state).await;
 
         assert_eq!(leaf_row(&state).await.1, None);
+    }
+
+    /// The lease is half an hour now that something really renews it (spec B5).
+    #[tokio::test]
+    async fn the_lease_is_half_an_hour_and_the_end_it_causes_is_marked_as_the_watchdogs() {
+        assert_eq!(LEASE_TTL_SECS, 30 * 60);
+        let state = state().await;
+        seed_node(&state, Some(53)).await;
+        sqlx::query(
+            "INSERT INTO runs (id, prompt, status, created_at) VALUES (53, 'p', 'running', ?)",
+        )
+        .bind(OLD)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let beat_ago = |minutes: i64| (Utc::now() - Duration::minutes(minutes)).to_rfc3339();
+        beat(&state.pool, NODE).await.unwrap();
+
+        sqlx::query("UPDATE node_watchdog SET beat_at = ? WHERE node_id = ?")
+            .bind(beat_ago(29))
+            .bind(NODE)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sweep(&state).await;
+        assert!(
+            !ended_by_watchdog(&state.pool, NODE, "53").await,
+            "29 minutes is alive"
+        );
+
+        sqlx::query("UPDATE node_watchdog SET beat_at = ? WHERE node_id = ?")
+            .bind(beat_ago(31))
+            .bind(NODE)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sweep(&state).await;
+        assert!(
+            ended_by_watchdog(&state.pool, NODE, "53").await,
+            "31 minutes is not"
+        );
+        assert!(
+            !ended_by_watchdog(&state.pool, NODE, "54").await,
+            "only that run"
+        );
     }
 
     const LEAF: &str = "wd-leaf";
