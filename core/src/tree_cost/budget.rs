@@ -17,10 +17,14 @@ const DEFAULT_SOFT_PCT: f64 = 80.0;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Permit {
     Yes,
-    No { reason: String },
+    No {
+        reason: String,
+    },
     /// The budget could not be read (a database error): not a limit, so the caller tries again
     /// later and never parks the tree on it.
-    Retry { reason: String },
+    Retry {
+        reason: String,
+    },
 }
 
 /// A tree's spend against its budget. With no limit, nothing can be crossed.
@@ -265,7 +269,7 @@ mod tests {
                 reason.to_lowercase().contains("budget"),
                 "the reason must mention the budget: {reason}"
             ),
-            Permit::Yes => panic!("expected a refusal"),
+            other => panic!("expected a refusal, got {other:?}"),
         }
     }
 
@@ -405,7 +409,7 @@ mod tests {
         set_reserve(&pool, 0.5).await;
         set_budget(&pool, "root-1", Some(2.0), 80.0).await;
         spend(&pool, "n1", "root-1", 2.0).await;
-        insert_node(&pool, "n2", "root-1", "pending", 0).await;
+        insert_node(&pool, "n2", "root-1", "planned", 0).await;
         insert_node(&pool, "n3", "root-1", "running", 0).await;
 
         let Permit::No { reason } = permits_next_node(&pool, "root-1").await else {
