@@ -5,6 +5,7 @@ use std::path::Path;
 use sqlx::SqlitePool;
 
 use crate::conductor::depth::{self, AncestorView, ChildArgs, TreeLimits};
+use crate::conductor::unresolved;
 use crate::state::AppState;
 use crate::tree_cost::budget::{self, Permit};
 use crate::tree_job::close::tree_job_of;
@@ -333,10 +334,11 @@ async fn launch_sibling(
     handoff: &str,
     launch: StoredLaunch,
 ) -> Result<Option<i64>, ContinuationError> {
+    let key = format!("continue-{source_id}");
     let launched = store::launch_recovering(
         state,
         sibling,
-        &format!("continue-{source_id}"),
+        &key,
         with_handoff(&launch.prompt, handoff),
         launch.project_id,
         launch.cwd,
@@ -344,8 +346,18 @@ async fn launch_sibling(
     )
     .await;
     match launched {
-        Ok(run_id) => Ok(Some(run_id)),
-        Err(NodeRunError::Unresolved { .. }) => Ok(None),
+        Ok(run_id) => {
+            let _ = unresolved::reset(&state.pool, sibling).await;
+            Ok(Some(run_id))
+        }
+        // Counted, not skipped in silence: past `UNRESOLVED_CAP` ticks the reservation is cleared
+        // (with a feed line), and the next tick launches again.
+        Err(NodeRunError::Unresolved { .. }) => {
+            if let Err(error) = unresolved::note(&state.pool, sibling, &key).await {
+                tracing::warn!(node = sibling, %error, "could not count the unresolved launch");
+            }
+            Ok(None)
+        }
         Err(error) => Err(ContinuationError::Launch(error.to_string())),
     }
 }
@@ -630,6 +642,90 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(runs, 1);
+    }
+
+    /// A continuation sibling with no run whose launch key is reserved with an empty result.
+    async fn seed_stuck_sibling(state: &AppState) {
+        seed_job(state).await;
+        seed_node(state, "root", None, "root", 0, "running", None, None).await;
+        seed_tree_handoff(state, "handoff").await;
+        seed_node(
+            state,
+            "sib",
+            Some("root"),
+            "root",
+            1,
+            "running",
+            Some("job-1"),
+            None,
+        )
+        .await;
+        sqlx::query("UPDATE work_nodes SET continues_node_id = 'handoff' WHERE id = 'sib'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        save_launch(
+            &state.pool,
+            &StoredLaunch {
+                node_id: "handoff".to_owned(),
+                key: "key-1".to_owned(),
+                prompt: "do it".to_owned(),
+                project_id: None,
+                cwd: None,
+                mode: "shadow".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO tree_transitions (node_id, transition, key, result, created_at) \
+             VALUES ('sib', 'launch', 'continue-handoff', '', ?)",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+
+    async fn stuck_reservations(state: &AppState) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tree_transitions WHERE node_id = 'sib' AND transition = 'launch'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_unresolved_launch_is_kept_below_the_cap() {
+        let state = state().await;
+        seed_stuck_sibling(&state).await;
+
+        for _ in 1..unresolved::UNRESOLVED_CAP {
+            let continuation = continue_node(&state, "handoff").await.unwrap();
+            assert_eq!(continuation.run_id, None);
+        }
+
+        assert_eq!(stuck_reservations(&state).await, 1);
+    }
+
+    #[tokio::test]
+    async fn an_unresolved_launch_is_cleared_with_a_feed_line_at_the_cap() {
+        let state = state().await;
+        seed_stuck_sibling(&state).await;
+
+        for _ in 0..unresolved::UNRESOLVED_CAP {
+            continue_node(&state, "handoff").await.unwrap();
+        }
+
+        assert_eq!(stuck_reservations(&state).await, 0);
+        let lines: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM feed WHERE kind = ? AND subject = 'node:sib'")
+                .bind(unresolved::UNRESOLVED_CLEARED)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(lines, 1);
     }
 
     #[tokio::test]

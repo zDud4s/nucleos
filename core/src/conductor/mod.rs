@@ -7,3 +7,4 @@ pub mod http;
 pub mod liveness;
 pub mod resume;
 pub mod sweep;
+mod unresolved;

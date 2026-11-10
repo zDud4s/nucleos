@@ -373,8 +373,9 @@ the contract, not a snapshot.
 | `tree_job/root.rs` | The root node of a tree job: its worktree on `tree/<id>/root`, and the run that plans the job. |
 | `tree_job/root_disk.rs` | What the root start does with a refusal the disk alone caused: parse the figures out of the error, retry, and after `DISK_START_CAP` refusals ask the owner once with the GB needed. No database. |
 | `tree_job/root_orphan.rs` | The worktree a failed root start left behind: `clear` takes its links off without following them, then removes it before the retry. |
+| `tree_job/run_end.rs` | Settles a tree node on the end of its run: a listener on the `Topic::Runs` wake runs `reconcile_running` a moment after any run ends, so the node closes with its run. The sweep keeps calling `reconcile_running` as the backstop. |
 | `tree_job/wrap.rs` | Wrapping up a node run that already reported, and starting a branch node again when its run ended with a handoff or died without a report. |
-| `tree_job/watchdog.rs` | Keeps a running node from being left without a session: starts a branch node that has no run from its stored launch, ends a live run whose lease (last sign of life) expired so `wrap` relaunches it, backs off failed relaunches (60 s doubling to 30 min, table `node_watchdog`), and after 2 failures in a row parks the branch with an owner decision. Also gates the root start retry after an admission refusal. |
+| `tree_job/watchdog.rs` | Keeps a running node from being left without a session: starts a branch node that has no run from its stored launch, ends a live run whose lease (last sign of life) expired so `wrap` relaunches it, backs off failed relaunches (60 s doubling to 30 min, table `node_watchdog`), and after 2 failures in a row parks the branch with an owner decision. A leaf (a node topping no branch) is covered too: a leaf with no run for 5 minutes is relaunched, and after 2 failures it fails instead of parking. Also gates the root start retry after an admission refusal. |
 | `tree_job/decisions.rs` | Parking a branch on a decision for the owner (`park`), resuming it on the answer (`answer`, which only moves state: call `open::answer_and_relaunch` to also start the node again), and the single list of decisions. Both hold the job lock. `ask_ownerless` opens a decision tied to no tree job (`tree_id`/`node_id` NULL, caller-chosen id, insert-or-ignore), e.g. a ticket the launch cap parked. |
 | `tree_job/gate.rs` | The production gate of a tree branch: at most one verify ticket per branch and HEAD, remembered on the branch and read or awaited by the next gate instead of submitting again. |
 | `tree_job/gate_summary.rs` | What the owner's inbox shows about a stopped branch: the failing lines of a gate log (taken from the whole log, not its tail) and the reason a node gave for stopping (taken from its report). |
@@ -398,6 +399,7 @@ the contract, not a snapshot.
 | `conductor/continuation.rs` | Stub, not implemented yet: continuation of a handed-off node. |
 | `conductor/resume.rs` | Stub, not implemented yet: run resume after a stop. |
 | `conductor/sweep.rs` | Stub, not implemented yet: the liveness sweep. |
+| `conductor/unresolved.rs` | Counts the sweep ticks a handoff continuation's launch key stays reserved without a run (`node_watchdog.unresolved_ticks`); at 3 it clears the reservation and writes a feed line. |
 | `conductor/http.rs` | Stub, not implemented yet: the conductor's HTTP routes. |
 | `spec_backlog/mod.rs` | Spec backlog (migration 0264): a registry of spec files, their criteria, dependencies and owner questions. Module root; declares the submodules. |
 | `spec_backlog/model.rs` | The spec backlog's closed vocabularies, the stable spec id and the registry's row types. |

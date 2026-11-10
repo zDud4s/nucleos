@@ -36,6 +36,7 @@ pub mod root;
 mod root_disk;
 mod root_orphan;
 pub mod root_pending;
+pub mod run_end;
 pub mod start_log;
 pub mod store;
 pub mod watchdog;
