@@ -904,6 +904,67 @@ def test_small_read_only_commands_and_list_agents():
             deny(fx.verdict("PowerShell", {"command": command}), repr(command))
 
 
+def test_conductor_watch_tools_allowed():
+    # The root's own way of watching trees: wakeups, cron, a monitor, stopping a background task.
+    with fixture("on") as fx:
+        for tool in ("ScheduleWakeup", "CronCreate", "CronDelete", "CronList", "Monitor", "TaskStop"):
+            allow(fx.verdict(tool, {}), tool)
+
+
+def _tool_results(*parts):
+    return os.path.join(os.path.expanduser("~"), ".claude", "projects", "c--proj", "sess-1", *parts)
+
+
+def test_read_only_shell_reads_of_state_files_allowed():
+    with fixture("on") as fx:
+        result = _tool_results("tool-results", "toolu_1.txt")
+        state_md = os.path.join(fx.state_dir, "handoffs", "n1.md")
+        for tool, command in (
+            ("Bash", "cat .nucleos/workflow/project.json"),
+            ("Bash", f"cat '{fx.path('.nucleos', 'workflow', 'project.json')}'"),
+            ("Bash", "head -n 20 .nucleos/workflow/project.json"),
+            ("Bash", f"tail -50 '{state_md}'"),
+            ("Bash", "cat .nucleos/workflow/project.json | tail -5"),
+            ("Bash", f"cat .nucleos/workflow/project.json && {G} status"),
+            ("Bash", f"cat '{result}'"),
+            ("PowerShell", "type .nucleos/workflow/project.json"),
+            ("PowerShell", f"Get-Content -Raw '{result}'"),
+            ("PowerShell", f"Get-Content '{result}' -TotalCount 40"),
+            ("PowerShell", f"(Get-Content -Raw '{result}').Substring(0, 2000)"),
+            ("PowerShell", f"(Get-Content '{result}' -Raw).Substring(12000)"),
+            ("PowerShell", f"Select-String -Pattern 'error' -Path '{result}'"),
+            ("PowerShell", f"Select-String error '{state_md}'"),
+        ):
+            allow(fx.verdict(tool, {"command": command}), f"{tool}: {command!r}")
+
+
+def test_shell_reads_that_write_chain_or_leave_state_stay_refused():
+    with fixture("on") as fx:
+        result = _tool_results("tool-results", "toolu_1.txt")
+        for tool, command in (
+            ("Bash", "cat .nucleos/workflow/project.json > y"),
+            ("Bash", f"cat .nucleos/workflow/project.json > '{os.path.join(fx.tmp_dir, 'copy.json')}'"),
+            ("Bash", "cat .nucleos/workflow/project.json >> y"),
+            ("Bash", "cat .nucleos/workflow/project.json && rm y"),
+            ("Bash", "cat .nucleos/workflow/project.json; rm y"),
+            ("Bash", "cat .nucleos/workflow/project.json | tee y"),
+            ("Bash", "cat .nucleos/x core/src/lib.rs"),
+            ("Bash", "cat core/src/lib.rs"),
+            ("Bash", "cat .nucleos/../core/src/lib.rs"),
+            ("Bash", "cat .nucleos/*"),
+            ("Bash", "cat"),
+            ("Bash", "tail -f .nucleos/workflow/project.json"),
+            ("Bash", f"cat '{_tool_results('s.jsonl')}'"),
+            ("PowerShell", f"Get-Content '{result}' | Set-Content y"),
+            ("PowerShell", f"Get-Content -Wait '{result}'"),
+            ("PowerShell", "(Get-Content -Raw 'core/src/lib.rs').Substring(0, 10)"),
+            ("PowerShell", f"(Get-Content -Raw '{result}').Remove(0)"),
+            ("PowerShell", "Select-String -Pattern x"),
+            ("PowerShell", "Select-String fn core/src/lib.rs"),
+        ):
+            deny(fx.verdict(tool, {"command": command}), f"{tool}: {command!r}")
+
+
 def test_refusal_says_what_the_root_may_do_itself():
     with fixture("on") as fx:
         reason = deny(fx.verdict("Bash", {"command": f"{G} push"}), "push")["reason"]
@@ -1531,6 +1592,9 @@ TESTS = [
     test_broker_runs_cargo_go_node_and_status,
     test_daemon_script_and_verify_ticket_accepted,
     test_small_read_only_commands_and_list_agents,
+    test_conductor_watch_tools_allowed,
+    test_read_only_shell_reads_of_state_files_allowed,
+    test_shell_reads_that_write_chain_or_leave_state_stay_refused,
     test_refusal_says_what_the_root_may_do_itself,
     test_notifications_neither_set_nor_clear_manual,
     test_notifications_do_not_reset_the_edit_budget,
