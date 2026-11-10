@@ -10,6 +10,7 @@ use crate::conductor::liveness::{Limits, Observation, SubjectStatus, Veredicto, 
 use crate::execution::runs::{finalize_termination, run_timeout_for_mode};
 use crate::feed::Subject;
 use crate::state::AppState;
+use crate::tree_job::handoff_park::{self, Cause, Outcome};
 
 pub const SPAWN_GRACE_SECS: i64 = 60;
 pub const TERMINAL_LOOKBACK_HOURS: i64 = 24;
@@ -214,13 +215,21 @@ async fn continue_handoffs(
                         .reported
                         .push((CONTINUATION_STOPPED.to_owned(), subject));
                 }
+                // The parent would otherwise stay `running` with nothing left to continue it.
+                park_chain(state, &node_id, Cause::TooManyHandoffs).await;
             }
             // A refusal that asking again will not change (the tree's budget, a guard): without a
             // feed line the tree sits waiting and only a warn every minute says why.
-            Err(ContinuationError::Budget(reason) | ContinuationError::Refused(reason)) => {
+            Err(error) => {
+                let (ContinuationError::Budget(reason) | ContinuationError::Refused(reason)) =
+                    &error
+                else {
+                    tracing::warn!(node = %node_id, error = ?error, "could not continue the handed-off node");
+                    continue;
+                };
                 tracing::warn!(node = %node_id, %reason, "the handed-off node cannot be continued");
                 let subject = format!("node:{node_id}");
-                let summary = refusal_summary(&reason);
+                let summary = refusal_summary(reason);
                 if insert_feed(
                     state,
                     CONTINUATION_REFUSED,
@@ -236,13 +245,28 @@ async fn continue_handoffs(
                         .reported
                         .push((CONTINUATION_REFUSED.to_owned(), subject));
                 }
-            }
-            Err(error) => {
-                tracing::warn!(node = %node_id, ?error, "could not continue the handed-off node");
+                // Only the budget is parked on: a guard or a missing launch is not the owner's call.
+                if let ContinuationError::Budget(reason) = &error {
+                    park_chain(state, &node_id, Cause::Budget(reason)).await;
+                }
             }
         }
     }
     Ok(())
+}
+
+/// Parks the parent of a handed-off node whose chain cannot go on (spec B7). Best effort: a failure
+/// is logged and the next tick asks again.
+async fn park_chain(state: &AppState, node_id: &str, cause: Cause<'_>) {
+    match handoff_park::park_chain(&state.pool, node_id, cause).await {
+        Ok(Outcome::NoAncestor) => {
+            tracing::warn!(node = %node_id, "no branch or root to park for the stopped handoff chain");
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(node = %node_id, %error, "could not park the stopped handoff chain");
+        }
+    }
 }
 
 fn feed_kind(verdict: Veredicto) -> Option<&'static str> {
