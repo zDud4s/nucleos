@@ -53,6 +53,8 @@ tests:
         # Writes .githooks/ (gitignored); the post-checkout hook it writes is run by the test.
         - scripts/install-hooks.sh
         - scripts/test-post-checkout.py
+        - scripts/migrate-ai-layout.py
+        - scripts/test-migrate-ai-layout.py
         - core/assets/nucleos-dev/scripts/
         # One version across manifests (gates.sh hooks: "release: *").
         - VERSION

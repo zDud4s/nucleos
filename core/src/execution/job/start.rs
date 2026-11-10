@@ -446,10 +446,11 @@ pub async fn start(state: &AppState, request: &StartRequest<'_>) -> JobStart {
         };
     let path = info.path.to_string_lossy().into_owned();
 
-    // The project's workflow, into the tree its nodes will read it from. `.ai/`, `.claude/` and
-    // their like are usually gitignored, so a fresh worktree has none of them; without this every
-    // job ran without the rules its project pinned, and nothing said so. Fail-soft: a missing
-    // workflow is a feed line, never a failed job (`workflow_materialize::into_worktree`).
+    // The project's workflow, into the tree its nodes will read it from. `.nucleos/workflow/`,
+    // `.claude/` and their like are usually gitignored, so a fresh worktree has none of them;
+    // without this every job ran without the rules its project pinned, and nothing said so.
+    // Fail-soft: a missing workflow is a feed line, never a failed job
+    // (`workflow_materialize::into_worktree`).
     //
     // BEFORE the tree is recorded, not after: the record is what makes the tree visible to the
     // tick, and a tick landing between the two would start the first node in a tree with no rules.

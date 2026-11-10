@@ -1,7 +1,8 @@
 //! §spec autopilot-modo-juiz
 //!
-//! The autopilot's judge (spec A, `.ai/specs/2026-09-26-autopilot-modo-juiz-design.md`): a model
-//! given the chance to decide one tool call the classifier left open, with the Jev in the post.
+//! The autopilot's judge (spec A, `<state_dir>/specs/2026-09-26-autopilot-modo-juiz-design.md`): a
+//! model given the chance to decide one tool call the classifier left open, with the Jev in the
+//! post.
 //!
 //! This file starts as the PURE half: what is asked, how the answer is read, what the judge may
 //! never approve, which calls it is asked about, and the text it is shown. The client, the rows

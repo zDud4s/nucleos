@@ -4,9 +4,9 @@ use super::*;
 
 /// One line of `--input-format stream-json` stdin that interrupts the running turn.
 ///
-/// Measured in `.ai/spikes/2026-10-05-chat-cli-control.md` (a): the CLI ends the turn in about 30 ms
-/// and the process and session survive. Every request carries an id of its own, because
-/// `control_response` echoes it and two interrupts sharing one could not be told apart.
+/// Measured in `<state_dir>/spikes/2026-10-05-chat-cli-control.md` (a): the CLI ends the turn
+/// in about 30 ms and the process and session survive. Every request carries an id of its own,
+/// because `control_response` echoes it and two interrupts sharing one could not be told apart.
 pub fn interrupt_line() -> String {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

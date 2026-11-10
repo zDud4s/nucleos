@@ -1,6 +1,6 @@
 //! Configuration kept in the database: one row per document and scope, a history row per write, and an
 //! in-memory snapshot the rest of the daemon reads synchronously. Design:
-//! `.ai/specs/2026-10-11-configuracao-na-base-de-dados-design.md`.
+//! `<state_dir>/specs/2026-10-11-configuracao-na-base-de-dados-design.md`.
 
 use std::fmt;
 use std::sync::{Arc, LazyLock, PoisonError, RwLock};

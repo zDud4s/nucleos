@@ -1,7 +1,7 @@
 //! Capture requests: when a job went wrong, the distiller asks the owner, once, what only they
 //! know about it. The questions go out in a daily digest (`digest`) and stay answerable for a few
 //! days; they never hold the distiller's queue.
-//! Design: .ai/specs/2026-10-07-pedidos-captura-design.md.
+//! Design: <state_dir>/specs/2026-10-07-pedidos-captura-design.md.
 //!
 //! The question is a fixed template (no model, spec P5) and is redacted before it is written. An
 //! answer is known here only as a note id: composing the note is http.rs's job (spec 5.3).

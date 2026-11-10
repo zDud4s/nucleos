@@ -146,7 +146,7 @@ mod tests {
         Spec {
             id: "spec-1".to_owned(),
             project_id: Some("project-1".to_owned()),
-            path: ".ai/specs/thing.md".to_owned(),
+            path: "<state_dir>/specs/thing.md".to_owned(),
             title: "Thing".to_owned(),
             content_sha: SHA.to_owned(),
             kind,

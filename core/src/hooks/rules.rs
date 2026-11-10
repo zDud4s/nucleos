@@ -248,10 +248,10 @@ pub(super) async fn shell_rules_of(state: &AppState, project_id: Option<&str>) -
 /// the project's declared operations laid over it, read at decision time and never cached.
 ///
 /// The sentence `shell_rules_of` makes, about the other table, and §4.4 of
-/// `.ai/specs/2026-09-03-alcada-por-projecto-design.md` is where it was decided for both. The run's
-/// project comes off the row that already named it — one more column on a query that already ran —
-/// and never off `vcs::project_for_worktree`, which spawns a `git rev-parse` in front of a person's
-/// keystrokes.
+/// `<state_dir>/specs/2026-09-03-alcada-por-projecto-design.md` is where it was decided for both.
+/// The run's project comes off the row that already named it — one more column on a query that
+/// already ran — and never off `vcs::project_for_worktree`, which spawns a `git rev-parse` in front
+/// of a person's keystrokes.
 ///
 /// **A failed read costs autonomy and can cost nothing else, which is why the SWALLOWING reader is
 /// the right one here and there is no `ProjectRules::Unreadable` shape to go with it.**

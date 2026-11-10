@@ -23,6 +23,9 @@ pub struct ScanReport {
     pub new: usize,
     pub changed: usize,
     pub unchanged: usize,
+    /// `<state_dir>/specs/X` paths whose legacy `.ai/specs/X` row (or one of its `spec-item:`
+    /// claims) could not be re-keyed because the new key was already taken.
+    pub rekey_conflicts: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -41,6 +44,168 @@ impl From<StoreError> for ScanError {
     fn from(error: StoreError) -> Self {
         Self::Store(error)
     }
+}
+
+impl From<sqlx::Error> for ScanError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Store(StoreError::from(error))
+    }
+}
+
+const LEGACY_SPECS_PREFIX: &str = ".ai/specs/";
+const STATE_SPECS_PREFIX: &str = "<state_dir>/specs/";
+const LEGACY_CLAIM_PREFIX: &str = "spec-item:.ai/specs/";
+const UNRESOLVED_CLAIM_STATUSES: [&str; 3] = ["probing", "open", "claimed"];
+
+fn push_conflict(conflicts: &mut Vec<String>, path: &str) {
+    if !conflicts.iter().any(|known| known == path) {
+        conflicts.push(path.to_owned());
+    }
+}
+
+/// Moves every legacy `.ai/specs/X` row of the project to the `<state_dir>/specs/X` id and path,
+/// together with its criteria, deps (both sides), questions, extraction runs and `spec-item:`
+/// claims, in one transaction. A spec is moved only once its file lives in the state dir and the
+/// legacy file is gone. An existing new-path row with no children is replaced; one with children
+/// is left alone, as is the legacy row, and the new path is reported as a conflict. Returns the
+/// conflicts. A moved row no longer has a legacy path, so running it again moves nothing twice.
+async fn rekey_legacy_specs(
+    pool: &SqlitePool,
+    project_id: Option<&str>,
+    roots: &ScanRoots,
+) -> Result<Vec<String>, ScanError> {
+    let mut conflicts = Vec::new();
+    if roots.state_dir.is_none() {
+        return Ok(conflicts);
+    }
+    // Candidates are read through the pool before the transaction opens: the test pool has a
+    // single connection, which the transaction then holds.
+    let mut candidates = Vec::new();
+    for spec in super::store::list_specs_by_project(pool, project_id).await? {
+        let Some(name) = spec.path.strip_prefix(LEGACY_SPECS_PREFIX) else {
+            continue;
+        };
+        let new_path = format!("{STATE_SPECS_PREFIX}{name}");
+        let state_file_exists = resolve_stored_path(roots, &new_path).is_some_and(|p| p.is_file());
+        let legacy_file_exists =
+            resolve_stored_path(roots, &spec.path).is_some_and(|p| p.is_file());
+        if state_file_exists && !legacy_file_exists {
+            candidates.push((spec.id.clone(), name.to_owned(), new_path));
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(conflicts);
+    }
+
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    for (old_id, name, new_path) in candidates {
+        // Re-check under the write lock: an overlapping scan may already have moved this row,
+        // and deleting the "taken" new-path row would then delete the moved spec itself.
+        let still_legacy: Option<String> =
+            sqlx::query_scalar("SELECT id FROM specs WHERE id = ? AND path = ?")
+                .bind(&old_id)
+                .bind(format!("{LEGACY_SPECS_PREFIX}{name}"))
+                .fetch_optional(&mut *tx)
+                .await?;
+        if still_legacy.is_none() {
+            continue;
+        }
+        let new_id = super::model::spec_id(project_id, &new_path);
+        let taken: Option<String> = sqlx::query_scalar("SELECT id FROM specs WHERE id = ?")
+            .bind(&new_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if taken.is_some() {
+            let children: i64 = sqlx::query_scalar(
+                "SELECT (SELECT COUNT(*) FROM spec_criteria WHERE spec_id = ?1) \
+                 + (SELECT COUNT(*) FROM spec_deps WHERE spec_id = ?1 OR depends_on = ?1) \
+                 + (SELECT COUNT(*) FROM spec_questions WHERE spec_id = ?1) \
+                 + (SELECT COUNT(*) FROM spec_extraction_runs WHERE spec_id = ?1)",
+            )
+            .bind(&new_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if children > 0 {
+                tracing::warn!(
+                    legacy = %format!("{LEGACY_SPECS_PREFIX}{name}"),
+                    new = %new_path,
+                    "spec re-key skipped: the state_dir row already has children"
+                );
+                push_conflict(&mut conflicts, &new_path);
+                continue;
+            }
+            sqlx::query("DELETE FROM specs WHERE id = ?")
+                .bind(&new_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        sqlx::query("UPDATE specs SET id = ?, path = ? WHERE id = ?")
+            .bind(&new_id)
+            .bind(&new_path)
+            .bind(&old_id)
+            .execute(&mut *tx)
+            .await?;
+        for statement in [
+            "UPDATE spec_criteria SET spec_id = ? WHERE spec_id = ?",
+            "UPDATE spec_questions SET spec_id = ? WHERE spec_id = ?",
+            "UPDATE spec_extraction_runs SET spec_id = ? WHERE spec_id = ?",
+            "UPDATE spec_deps SET spec_id = ? WHERE spec_id = ?",
+            "UPDATE spec_deps SET depends_on = ? WHERE depends_on = ?",
+        ] {
+            sqlx::query(statement)
+                .bind(&new_id)
+                .bind(&old_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        // Claims carry a NOT NULL project, so a project-less scan has none to move.
+        let Some(project) = project_id else {
+            continue;
+        };
+        let claims: Vec<(i64, String, String)> = sqlx::query_as(
+            "SELECT id, task_key, status FROM task_claims \
+             WHERE project_id = ? AND task_key LIKE 'spec-item:.ai/specs/%'",
+        )
+        .bind(project)
+        .fetch_all(&mut *tx)
+        .await?;
+        let own_prefix = format!("{LEGACY_CLAIM_PREFIX}{name}#");
+        for (claim_id, task_key, status) in claims {
+            let Some(item) = task_key.strip_prefix(own_prefix.as_str()) else {
+                continue;
+            };
+            let new_key = format!("spec-item:{new_path}#{item}");
+            if UNRESOLVED_CLAIM_STATUSES.contains(&status.as_str()) {
+                let holder: Option<i64> = sqlx::query_scalar(
+                    "SELECT id FROM task_claims WHERE project_id = ? AND task_key = ? \
+                     AND status IN ('probing', 'open', 'claimed') AND id != ?",
+                )
+                .bind(project)
+                .bind(&new_key)
+                .bind(claim_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+                if holder.is_some() {
+                    tracing::warn!(
+                        claim = %task_key,
+                        new = %new_key,
+                        "claim re-key skipped: an unresolved claim already holds the new key"
+                    );
+                    push_conflict(&mut conflicts, &new_path);
+                    continue;
+                }
+            }
+            sqlx::query("UPDATE task_claims SET task_key = ? WHERE id = ?")
+                .bind(&new_key)
+                .bind(claim_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
+    tx.commit().await?;
+    Ok(conflicts)
 }
 
 pub fn content_sha(bytes: &[u8]) -> String {
@@ -80,6 +245,9 @@ pub async fn scan(
     project_id: Option<&str>,
     roots: &ScanRoots,
 ) -> Result<ScanReport, ScanError> {
+    // Ahead of discovery and of the abandon pass, so a moved spec keeps its row instead of being
+    // abandoned under the old path and registered afresh under the new one.
+    let rekey_conflicts = rekey_legacy_specs(pool, project_id, roots).await?;
     let mut files = Vec::new();
     if let Some(root) = &roots.project_root {
         files.push((root.join(".ai").join("specs"), ".ai/specs/".to_owned()));
@@ -114,6 +282,7 @@ pub async fn scan(
         new: 0,
         changed: 0,
         unchanged: 0,
+        rekey_conflicts,
     };
     let found: std::collections::HashSet<String> = discovered
         .iter()
@@ -725,5 +894,382 @@ mod tests {
         .unwrap();
 
         assert_eq!(stored(&pool, &other).await.status, SpecStatus::Extracted);
+    }
+
+    // ---- re-key of legacy `.ai/specs/X` rows to `<state_dir>/specs/X` ----
+
+    use crate::spec_backlog::model::DepSource;
+    use crate::spec_backlog::store::{
+        add_dep, add_question, list_deps, list_questions, list_specs_by_project,
+    };
+
+    const SPEC_BODY: &[u8] = b"# Alpha\nbody\n";
+    const OTHER_PROJECT: Option<&str> = Some("proj-2");
+
+    fn legacy_path(name: &str) -> String {
+        format!(".ai/specs/{name}")
+    }
+
+    fn state_path(name: &str) -> String {
+        format!("<state_dir>/specs/{name}")
+    }
+
+    /// Writes `.ai/specs/<name>`, scans, and returns the id of the legacy row.
+    async fn seed_legacy(
+        pool: &SqlitePool,
+        project: &Path,
+        state: &Path,
+        owner: Option<&str>,
+        name: &str,
+    ) -> String {
+        write_file(&project_specs(project), name, SPEC_BODY);
+        scan(pool, owner, &roots_at(project, state)).await.unwrap();
+        spec_id(owner, &legacy_path(name))
+    }
+
+    /// The migration: the legacy file is gone and the same-named file sits in the state dir.
+    fn move_to_state(project: &Path, state: &Path, name: &str) {
+        fs::remove_file(project_specs(project).join(name)).unwrap();
+        write_file(&state_specs(state), name, SPEC_BODY);
+    }
+
+    async fn insert_claim(pool: &SqlitePool, project_id: &str, key: &str, status: &str) {
+        sqlx::query(
+            "INSERT INTO task_claims (project_id, task_key, kind, title, status, created_at) \
+             VALUES (?, ?, 'declared', 'item', ?, '2026-11-09T00:00:00Z')",
+        )
+        .bind(project_id.to_owned())
+        .bind(key.to_owned())
+        .bind(status.to_owned())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn claim_keys(pool: &SqlitePool, project_id: &str) -> Vec<String> {
+        sqlx::query_scalar(
+            "SELECT task_key FROM task_claims WHERE project_id = ? ORDER BY task_key",
+        )
+        .bind(project_id.to_owned())
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn insert_run(pool: &SqlitePool, id: &str, run_id: &str) {
+        sqlx::query(
+            "INSERT INTO spec_extraction_runs (spec_id, run_id, created_at) \
+             VALUES (?, ?, '2026-11-09T00:00:00Z')",
+        )
+        .bind(id.to_owned())
+        .bind(run_id.to_owned())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn run_count(pool: &SqlitePool, id: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM spec_extraction_runs WHERE spec_id = ?")
+            .bind(id.to_owned())
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn rows_named(pool: &SqlitePool, owner: Option<&str>, name: &str) -> usize {
+        list_specs_by_project(pool, owner)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|spec| spec.path.ends_with(&format!("/specs/{name}")))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn rekey_moves_a_legacy_spec_with_all_its_children_to_the_state_dir_id() {
+        let pool = crate::testdb::fresh_pool().await;
+        let project = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let old = seed_legacy(&pool, project.path(), state.path(), PROJECT, "alpha.md").await;
+        let other = seed_legacy(&pool, project.path(), state.path(), PROJECT, "beta.md").await;
+        mark_extracted(&pool, &old).await;
+        replace_criteria(&pool, &old, "sha", &open_items(&["one", "two"]))
+            .await
+            .unwrap();
+        add_dep(&pool, &old, &other, DepSource::Owner)
+            .await
+            .unwrap();
+        add_dep(&pool, &other, &old, DepSource::Owner)
+            .await
+            .unwrap();
+        add_question(&pool, &old, "why?").await.unwrap();
+        insert_run(&pool, &old, "run-1").await;
+        insert_claim(&pool, "proj-1", "spec-item:.ai/specs/alpha.md#1", "open").await;
+        insert_claim(&pool, "proj-1", "spec-item:.ai/specs/beta.md#1", "open").await;
+        move_to_state(project.path(), state.path(), "alpha.md");
+
+        let report = scan(&pool, PROJECT, &roots_at(project.path(), state.path()))
+            .await
+            .unwrap();
+
+        let new = spec_id(PROJECT, &state_path("alpha.md"));
+        assert_ne!(new, old);
+        assert!(report.rekey_conflicts.is_empty());
+        assert!(get_spec(&pool, &old).await.unwrap().is_none());
+        let moved = stored(&pool, &new).await;
+        assert_eq!(moved.path, state_path("alpha.md"));
+        assert_eq!(moved.status, SpecStatus::Extracted, "not abandoned");
+        assert_eq!(list_criteria(&pool, &new).await.unwrap().len(), 2);
+        assert!(list_criteria(&pool, &old).await.unwrap().is_empty());
+        let as_spec: Vec<String> = list_deps(&pool, &new)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|dep| dep.depends_on)
+            .collect();
+        assert_eq!(as_spec, vec![other.clone()]);
+        let as_dependency: Vec<String> = list_deps(&pool, &other)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|dep| dep.depends_on)
+            .collect();
+        assert_eq!(as_dependency, vec![new.clone()]);
+        assert_eq!(list_questions(&pool, &new).await.unwrap().len(), 1);
+        assert!(list_questions(&pool, &old).await.unwrap().is_empty());
+        assert_eq!(run_count(&pool, &new).await, 1);
+        assert_eq!(run_count(&pool, &old).await, 0);
+        assert_eq!(
+            claim_keys(&pool, "proj-1").await,
+            vec![
+                "spec-item:.ai/specs/beta.md#1".to_owned(),
+                "spec-item:<state_dir>/specs/alpha.md#1".to_owned(),
+            ]
+        );
+        let untouched = stored(&pool, &other).await;
+        assert_eq!(untouched.path, legacy_path("beta.md"));
+        assert_eq!(untouched.status, SpecStatus::Discovered);
+    }
+
+    #[tokio::test]
+    async fn rekey_replaces_an_empty_row_already_at_the_new_path() {
+        let pool = crate::testdb::fresh_pool().await;
+        let project = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        // Both files exist for the first scan, so both rows are created.
+        write_file(&state_specs(state.path()), "alpha.md", SPEC_BODY);
+        let old = seed_legacy(&pool, project.path(), state.path(), PROJECT, "alpha.md").await;
+        let new = spec_id(PROJECT, &state_path("alpha.md"));
+        assert_eq!(rows_named(&pool, PROJECT, "alpha.md").await, 2);
+        mark_extracted(&pool, &old).await;
+        replace_criteria(&pool, &old, "sha", &open_items(&["one", "two"]))
+            .await
+            .unwrap();
+        fs::remove_file(project_specs(project.path()).join("alpha.md")).unwrap();
+
+        let report = scan(&pool, PROJECT, &roots_at(project.path(), state.path()))
+            .await
+            .unwrap();
+
+        assert!(report.rekey_conflicts.is_empty());
+        assert_eq!(rows_named(&pool, PROJECT, "alpha.md").await, 1);
+        assert!(get_spec(&pool, &old).await.unwrap().is_none());
+        let kept = stored(&pool, &new).await;
+        assert_eq!(kept.path, state_path("alpha.md"));
+        assert_eq!(kept.status, SpecStatus::Extracted);
+        assert_eq!(list_criteria(&pool, &new).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn rekey_leaves_both_rows_when_the_new_path_row_has_children() {
+        let pool = crate::testdb::fresh_pool().await;
+        let project = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        write_file(&state_specs(state.path()), "alpha.md", SPEC_BODY);
+        let old = seed_legacy(&pool, project.path(), state.path(), PROJECT, "alpha.md").await;
+        let new = spec_id(PROJECT, &state_path("alpha.md"));
+        replace_criteria(&pool, &old, "sha", &open_items(&["one", "two"]))
+            .await
+            .unwrap();
+        replace_criteria(&pool, &new, "sha", &open_items(&["only"]))
+            .await
+            .unwrap();
+        fs::remove_file(project_specs(project.path()).join("alpha.md")).unwrap();
+
+        let report = scan(&pool, PROJECT, &roots_at(project.path(), state.path()))
+            .await
+            .unwrap();
+
+        assert_eq!(report.rekey_conflicts, vec![state_path("alpha.md")]);
+        assert_eq!(stored(&pool, &old).await.path, legacy_path("alpha.md"));
+        assert_eq!(stored(&pool, &new).await.path, state_path("alpha.md"));
+        assert_eq!(list_criteria(&pool, &old).await.unwrap().len(), 2);
+        assert_eq!(list_criteria(&pool, &new).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rekey_is_idempotent_across_scans() {
+        let pool = crate::testdb::fresh_pool().await;
+        let project = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let old = seed_legacy(&pool, project.path(), state.path(), PROJECT, "alpha.md").await;
+        replace_criteria(&pool, &old, "sha", &open_items(&["one"]))
+            .await
+            .unwrap();
+        insert_claim(&pool, "proj-1", "spec-item:.ai/specs/alpha.md#1", "open").await;
+        move_to_state(project.path(), state.path(), "alpha.md");
+        let roots = roots_at(project.path(), state.path());
+
+        scan(&pool, PROJECT, &roots).await.unwrap();
+        let rows = list_specs_by_project(&pool, PROJECT).await.unwrap().len();
+        let second = scan(&pool, PROJECT, &roots).await.unwrap();
+
+        let new = spec_id(PROJECT, &state_path("alpha.md"));
+        assert!(second.rekey_conflicts.is_empty());
+        assert_eq!(second.specs.len(), 1);
+        assert_eq!(second.specs[0].id, new);
+        assert_eq!(
+            list_specs_by_project(&pool, PROJECT).await.unwrap().len(),
+            rows
+        );
+        assert_eq!(list_criteria(&pool, &new).await.unwrap().len(), 1);
+        assert_eq!(
+            claim_keys(&pool, "proj-1").await,
+            vec!["spec-item:<state_dir>/specs/alpha.md#1".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn rekey_skips_a_spec_with_no_file_in_the_state_dir() {
+        let pool = crate::testdb::fresh_pool().await;
+        let project = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let old = seed_legacy(&pool, project.path(), state.path(), PROJECT, "alpha.md").await;
+        insert_claim(&pool, "proj-1", "spec-item:.ai/specs/alpha.md#1", "open").await;
+        fs::remove_file(project_specs(project.path()).join("alpha.md")).unwrap();
+        fs::create_dir_all(state_specs(state.path())).unwrap();
+
+        let report = scan(&pool, PROJECT, &roots_at(project.path(), state.path()))
+            .await
+            .unwrap();
+
+        assert!(report.rekey_conflicts.is_empty());
+        let row = stored(&pool, &old).await;
+        assert_eq!(row.path, legacy_path("alpha.md"));
+        assert_eq!(row.id, old);
+        assert!(
+            get_spec(&pool, &spec_id(PROJECT, &state_path("alpha.md")))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            claim_keys(&pool, "proj-1").await,
+            vec!["spec-item:.ai/specs/alpha.md#1".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn rekey_skips_when_the_legacy_file_still_exists() {
+        let pool = crate::testdb::fresh_pool().await;
+        let project = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let old = seed_legacy(&pool, project.path(), state.path(), PROJECT, "alpha.md").await;
+        replace_criteria(&pool, &old, "sha", &open_items(&["one"]))
+            .await
+            .unwrap();
+        insert_claim(&pool, "proj-1", "spec-item:.ai/specs/alpha.md#1", "open").await;
+        // The state-dir copy exists but the `.ai` file has not been moved away yet.
+        write_file(&state_specs(state.path()), "alpha.md", SPEC_BODY);
+
+        let report = scan(&pool, PROJECT, &roots_at(project.path(), state.path()))
+            .await
+            .unwrap();
+
+        assert!(report.rekey_conflicts.is_empty());
+        assert_eq!(stored(&pool, &old).await.path, legacy_path("alpha.md"));
+        assert_eq!(list_criteria(&pool, &old).await.unwrap().len(), 1);
+        let new = spec_id(PROJECT, &state_path("alpha.md"));
+        assert_eq!(stored(&pool, &new).await.path, state_path("alpha.md"));
+        assert!(list_criteria(&pool, &new).await.unwrap().is_empty());
+        assert_eq!(
+            claim_keys(&pool, "proj-1").await,
+            vec!["spec-item:.ai/specs/alpha.md#1".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn rekey_leaves_another_projects_rows_and_claims_alone() {
+        let pool = crate::testdb::fresh_pool().await;
+        let project = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let mine = seed_legacy(&pool, project.path(), state.path(), PROJECT, "alpha.md").await;
+        let theirs = seed_legacy(
+            &pool,
+            project.path(),
+            state.path(),
+            OTHER_PROJECT,
+            "alpha.md",
+        )
+        .await;
+        assert_ne!(mine, theirs);
+        replace_criteria(&pool, &theirs, "sha", &open_items(&["one"]))
+            .await
+            .unwrap();
+        insert_claim(&pool, "proj-1", "spec-item:.ai/specs/alpha.md#1", "open").await;
+        insert_claim(&pool, "proj-2", "spec-item:.ai/specs/alpha.md#1", "open").await;
+        move_to_state(project.path(), state.path(), "alpha.md");
+
+        scan(&pool, PROJECT, &roots_at(project.path(), state.path()))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stored(&pool, &theirs).await.path,
+            legacy_path("alpha.md"),
+            "the other project's row keeps its legacy path and id"
+        );
+        assert_eq!(list_criteria(&pool, &theirs).await.unwrap().len(), 1);
+        assert_eq!(
+            claim_keys(&pool, "proj-2").await,
+            vec!["spec-item:.ai/specs/alpha.md#1".to_owned()]
+        );
+        assert_eq!(
+            claim_keys(&pool, "proj-1").await,
+            vec!["spec-item:<state_dir>/specs/alpha.md#1".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn rekey_keeps_a_claim_whose_new_key_is_already_unresolved() {
+        let pool = crate::testdb::fresh_pool().await;
+        let project = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let old = seed_legacy(&pool, project.path(), state.path(), PROJECT, "alpha.md").await;
+        insert_claim(&pool, "proj-1", "spec-item:.ai/specs/alpha.md#1", "open").await;
+        insert_claim(
+            &pool,
+            "proj-1",
+            "spec-item:<state_dir>/specs/alpha.md#1",
+            "open",
+        )
+        .await;
+        move_to_state(project.path(), state.path(), "alpha.md");
+
+        let report = scan(&pool, PROJECT, &roots_at(project.path(), state.path()))
+            .await
+            .unwrap();
+
+        assert_eq!(report.rekey_conflicts, vec![state_path("alpha.md")]);
+        assert_eq!(
+            claim_keys(&pool, "proj-1").await,
+            vec![
+                "spec-item:.ai/specs/alpha.md#1".to_owned(),
+                "spec-item:<state_dir>/specs/alpha.md#1".to_owned(),
+            ]
+        );
+        let new = spec_id(PROJECT, &state_path("alpha.md"));
+        assert!(get_spec(&pool, &old).await.unwrap().is_none());
+        assert_eq!(stored(&pool, &new).await.path, state_path("alpha.md"));
     }
 }

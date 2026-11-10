@@ -1259,7 +1259,12 @@ mod tests {
     }
 
     fn docs(name: &str, state: &str) -> Branch {
-        let mut branch = Branch::new(name, &[format!(".ai/plans/{name}.md")], "docs", None);
+        let mut branch = Branch::new(
+            name,
+            &[format!("<state_dir>/plans/{name}.md")],
+            "docs",
+            None,
+        );
         branch.state = state.to_owned();
         branch
     }

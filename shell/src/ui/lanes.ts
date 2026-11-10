@@ -243,7 +243,7 @@ export function feedGravityTone(gravity: Exclude<FeedGravity, "routine">): Badge
  *   started, a council stage, a conflict resolution started — are open only because nothing has
  *   been written after them yet; the next line from the same subject closes or continues them.
  * - a correction started (`judge_correction_started`) is open until its own run ends it —
- *   `worktree_run_completed` or `judge_correction_failed` (spec .ai/specs/2026-09-27-autopilot-juiz-resolve-bloqueios-design.md, D7).
+ *   `worktree_run_completed` or `judge_correction_failed` (spec <state_dir>/specs/2026-09-27-autopilot-juiz-resolve-bloqueios-design.md, D7).
  */
 const OPEN_KINDS: ReadonlySet<string> = new Set([
   "job_started",

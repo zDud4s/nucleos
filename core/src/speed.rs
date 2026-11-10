@@ -1,11 +1,11 @@
 //! The speed profile: `normal | fast | thorough`, and what each one buys.
 //!
-//! Spec: `.ai/specs/2026-09-23-perfil-de-velocidade-design.md`. This is the daemon's half only:
-//! the speed's NAME and the CAPACITY it buys (`team_multiplier`, bounded by the ceiling). What a
-//! speed means for the process — reasoning effort, the fast path, review, waves — belongs to the
-//! workflow, which is a portable bundle the daemon does not read. The daemon hands a session the
-//! two facts it owns through [`Capacity::env`], under neutral names, and the workflow decides the
-//! rest on its own side.
+//! Spec: `<state_dir>/specs/2026-09-23-perfil-de-velocidade-design.md`. This is the daemon's half
+//! only: the speed's NAME and the CAPACITY it buys (`team_multiplier`, bounded by the ceiling).
+//! What a speed means for the process — reasoning effort, the fast path, review, waves — belongs
+//! to the workflow, which is a portable bundle the daemon does not read. The daemon hands a
+//! session the two facts it owns through [`Capacity::env`], under neutral names, and the workflow
+//! decides the rest on its own side.
 //!
 //! `normal` is today's behaviour, by definition and by test. Speed never creates capacity: every
 //! width computed here is bounded by `MAX_PARALLEL_CEILING`, whatever the workflow later does

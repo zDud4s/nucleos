@@ -269,7 +269,7 @@ export interface JudgeReadiness {
 export interface JudgeStatus {
   project_id: string;
   judge: JudgeMode;
-  /** Review item G: why the project's `.ai/autopilot.yaml` cannot be read — the judge is without effect then. */
+  /** Review item G: why the project's `autopilot.yaml` cannot be read — the judge is without effect then. */
   rules_error: string | null;
   readiness: JudgeReadiness;
 }
@@ -416,7 +416,7 @@ export function useSetProjectJudge() {
 /* ------------------------------------------------------------ the resolver -- */
 
 /**
- * Spec B D11 (`.ai/specs/2026-09-27-autopilot-juiz-resolve-bloqueios-design.md`), in the words
+ * Spec B D11 (`<state_dir>/specs/2026-09-27-autopilot-juiz-resolve-bloqueios-design.md`), in the words
  * the owner reads BEFORE turning it on. The resolver sends TypeSafe what the judge alone never
  * sends; the switch is an opt-in because of this sentence.
  */

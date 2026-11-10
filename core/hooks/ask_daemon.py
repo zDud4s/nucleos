@@ -1057,7 +1057,7 @@ WORKFLOW_POINTER = (".nucleos", "workflow", "project.json")
 CONDUCTOR_TOOLS = ("Agent", "Task", "Skill", "TodoWrite", "AskUserQuestion", "ExitPlanMode", "ToolSearch",
                    "TaskOutput", "BashOutput", "SendMessage", "LSP", "Monitor", "TaskStop",
                    "TaskCreate", "TaskList", "TaskGet", "TaskUpdate", "ListAgents")
-CONDUCTOR_MATERIAL_DIRS = (".ai", ".nucleos")
+CONDUCTOR_MATERIAL_DIRS = (".nucleos",)
 CONDUCTOR_METACHARACTERS = (";", "&", "|", "<", ">", "`", "$(", "\n", "\r")
 CONDUCTOR_GIT_READS = ("status", "log", "diff", "show", "rev-parse", "ls-tree", "cat-file")
 CONDUCTOR_HEAVY_VALUE_FLAGS = ("--prio", "--agent", "--kind", "--wait-max")
@@ -1248,10 +1248,11 @@ def _under(target, root):
 
 
 def _conductor_material(target, state, cwd):
-    """Whether a resolved path is summary material: state dir, `.ai`, `.nucleos`, user memory.
+    """Whether a resolved path is summary material: state dir, `.nucleos`, user memory.
 
-    `.ai` and `.nucleos` count at the working directory and above it, so a session in a linked
-    worktree under the main checkout still reaches the main checkout's plans.
+    `.nucleos` counts at the working directory and above it, so a session in a linked worktree
+    under the main checkout still reaches the main checkout's workflow files. `.ai` is the
+    retired layout and is no longer conductor material.
     """
     state_dir = state.get("state_dir")
     if isinstance(state_dir, str) and state_dir and _under(target, _conductor_path(state_dir, cwd)):

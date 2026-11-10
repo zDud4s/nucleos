@@ -1,5 +1,5 @@
 /**
- * The fleet wire format, mirrored from `.ai/plans/2026-10-20-fleet-arvore-viva/contract.md` §4
+ * The fleet wire format, mirrored from `<state_dir>/plans/2026-10-20-fleet-arvore-viva/contract.md` §4
  * (serde snake_case on the daemon side). Hand-written like every other `data/*.ts` shape.
  */
 export type NodeState = "busy" | "idle" | "done" | "lost";

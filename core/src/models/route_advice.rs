@@ -1,5 +1,5 @@
 //! The llm-router as an adviser: which model and effort should run the agent the daemon is about to
-//! launch. Plan: `.ai/plans/2026-09-30-router-como-conselheiro.md`.
+//! launch. Plan: `<state_dir>/plans/2026-09-30-router-como-conselheiro.md`.
 //!
 //! **The daemon decides; the router suggests.** The router never runs anything for us — it answers
 //! one `POST /v1/route` (`router_client.rs`) and the daemon keeps the final word. Its rules travel

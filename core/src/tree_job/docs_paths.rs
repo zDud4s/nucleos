@@ -1,6 +1,9 @@
 //! Rules of a docs branch (spec R6): the paths it may write and the states it may end in.
 
-/// The only directories under `.ai/` a docs branch may write to.
+/// The literal token that stands for the project's state dir in a docs branch's paths.
+const STATE_DIR_TOKEN: &str = "<state_dir>";
+
+/// The only directories under [`STATE_DIR_TOKEN`] a docs branch may write to.
 const DOCS_DIRS: [&str; 4] = ["specs", "spikes", "plans", "notes"];
 
 /// True when `path` matches an owned docs-path glob. `*` stays within one path segment and `**`
@@ -58,16 +61,18 @@ fn owned_glob_segment_matches(glob: &str, path: &str) -> bool {
     remainder.is_empty()
 }
 
-/// True when `path` names a file below one of [`DOCS_DIRS`], relative to the repository root.
+/// True when `path` names a file below one of [`DOCS_DIRS`] of the state dir, written as
+/// `<state_dir>/<dir>/<rest>` with the literal [`STATE_DIR_TOKEN`] as its first segment.
 ///
 /// The check is purely lexical and fails closed. Backslashes count as separators, the match is
 /// case-sensitive even on Windows, and any `..` is refused, including one that would resolve
-/// back inside an allowed directory. A directory named without a file is refused too.
+/// back inside an allowed directory. A directory named without a file is refused too, and so is
+/// the retired `.ai/` layout.
 pub fn is_allowed_docs_path(path: &str) -> bool {
     let normalized = path.replace('\\', "/");
     let segments: Vec<&str> = normalized.split('/').collect();
     match segments.as_slice() {
-        [".ai", dir, rest @ ..] if !rest.is_empty() => {
+        [token, dir, rest @ ..] if *token == STATE_DIR_TOKEN && !rest.is_empty() => {
             DOCS_DIRS.contains(dir) && rest.iter().all(|segment| is_plain_segment(segment))
         }
         _ => false,
@@ -80,7 +85,7 @@ fn is_plain_segment(segment: &str) -> bool {
     !segment.trim_end_matches(['.', ' ']).is_empty() && !segment.contains(':')
 }
 
-/// A docs branch only writes gitignored files, so it runs without a worktree or a cost.
+/// A docs branch only writes files outside git, so it runs without a worktree or a cost.
 pub fn docs_branch_needs_worktree() -> bool {
     false
 }
@@ -101,49 +106,85 @@ mod tests {
 
     #[test]
     fn docs_glob_matches_declared_paths_and_rejects_traversal() {
-        assert!(owned_glob_matches(".ai/notes/**", ".ai/notes/design.md"));
         assert!(owned_glob_matches(
-            ".ai/notes/**",
-            ".ai/notes/nested/design.md"
+            "<state_dir>/notes/**",
+            "<state_dir>/notes/design.md"
         ));
-        assert!(owned_glob_matches(".ai/specs/*.md", ".ai/specs/design.md"));
-        assert!(!owned_glob_matches(
-            ".ai/specs/*.md",
-            ".ai/specs/nested/design.md"
+        assert!(owned_glob_matches(
+            "<state_dir>/notes/**",
+            "<state_dir>/notes/nested/design.md"
+        ));
+        assert!(owned_glob_matches(
+            "<state_dir>/specs/*.md",
+            "<state_dir>/specs/design.md"
         ));
         assert!(!owned_glob_matches(
-            ".ai/notes/**",
-            ".ai/notes/../specs/design.md"
+            "<state_dir>/specs/*.md",
+            "<state_dir>/specs/nested/design.md"
         ));
         assert!(!owned_glob_matches(
-            ".ai/notes/**",
-            "../.ai/notes/design.md"
+            "<state_dir>/notes/**",
+            "<state_dir>/notes/../specs/design.md"
+        ));
+        assert!(!owned_glob_matches(
+            "<state_dir>/notes/**",
+            "../<state_dir>/notes/design.md"
+        ));
+    }
+
+    #[test]
+    fn docs_glob_matches_a_state_dir_token_glob() {
+        assert!(owned_glob_matches(
+            "<state_dir>/notes/**",
+            "<state_dir>/notes/a/b.md"
+        ));
+        assert!(!owned_glob_matches(
+            "<state_dir>/notes/**",
+            "<state_dir>/specs/a.md"
+        ));
+        assert!(!owned_glob_matches(
+            "<state_dir>/notes/**",
+            "<state_dir>/notes/../specs/a.md"
+        ));
+        assert!(!owned_glob_matches(
+            "<state_dir>/notes/**",
+            "<state_dir>/notes/a/../../b.md"
         ));
     }
 
     #[test]
     fn docs_glob_anchors_the_last_piece_of_a_segment() {
-        assert!(owned_glob_matches(".ai/specs/*.md", ".ai/specs/design.md"));
         assert!(owned_glob_matches(
-            ".ai/specs/*.md",
-            ".ai/specs/design.md.md"
+            "<state_dir>/specs/*.md",
+            "<state_dir>/specs/design.md"
+        ));
+        assert!(owned_glob_matches(
+            "<state_dir>/specs/*.md",
+            "<state_dir>/specs/design.md.md"
         ));
         assert!(!owned_glob_matches(
-            ".ai/specs/*.md",
-            ".ai/specs/design.mdx"
+            "<state_dir>/specs/*.md",
+            "<state_dir>/specs/design.mdx"
         ));
     }
 
     #[test]
     fn docs_path_allows_a_file_under_each_of_the_four_directories() {
         for path in [
-            ".ai/specs/design.md",
-            ".ai/spikes/probe.md",
-            ".ai/plans/plan.md",
-            ".ai/notes/note.md",
-            ".ai/plans/nested/deeper/plan.md",
+            "<state_dir>/specs/design.md",
+            "<state_dir>/spikes/probe.md",
+            "<state_dir>/plans/plan.md",
+            "<state_dir>/notes/note.md",
+            "<state_dir>/plans/nested/deeper/plan.md",
         ] {
             assert!(is_allowed_docs_path(path), "should allow {path}");
+        }
+    }
+
+    #[test]
+    fn docs_path_refuses_the_retired_ai_layout() {
+        for path in [".ai/specs/x.md", r".ai\plans\x.md", ".ai/notes/n.md"] {
+            assert!(!is_allowed_docs_path(path), "should refuse {path}");
         }
     }
 
@@ -157,11 +198,11 @@ mod tests {
     #[test]
     fn docs_path_refuses_a_sibling_prefix_of_an_allowed_directory() {
         for path in [
-            ".ai/specs-old/x.md",
-            ".ai/specsx.md",
-            ".ai/plans.md",
-            ".ai/notes2/x.md",
-            "nested/.ai/specs/x.md",
+            "<state_dir>/specs-old/x.md",
+            "<state_dir>/specsx.md",
+            "<state_dir>/plans.md",
+            "<state_dir>/notes2/x.md",
+            "nested/<state_dir>/specs/x.md",
         ] {
             assert!(!is_allowed_docs_path(path), "should refuse {path}");
         }
@@ -169,7 +210,13 @@ mod tests {
 
     #[test]
     fn docs_path_refuses_the_ai_directory_itself_and_its_other_children() {
-        for path in [".ai", ".ai/", ".ai/memory.md", ".ai/scripts/tool.py", ""] {
+        for path in [
+            "<state_dir>",
+            "<state_dir>/",
+            "<state_dir>/memory.md",
+            "<state_dir>/scripts/tool.py",
+            "",
+        ] {
             assert!(!is_allowed_docs_path(path), "should refuse {path:?}");
         }
     }
@@ -177,11 +224,11 @@ mod tests {
     #[test]
     fn docs_path_refuses_parent_traversal_out_of_an_allowed_directory() {
         for path in [
-            ".ai/specs/..",
-            ".ai/specs/../memory.md",
-            ".ai/specs/../../core/src/lib.rs",
-            ".ai/notes/deep/../../../core/src/lib.rs",
-            ".ai/plans/../../../outside.md",
+            "<state_dir>/specs/..",
+            "<state_dir>/specs/../memory.md",
+            "<state_dir>/specs/../../core/src/lib.rs",
+            "<state_dir>/notes/deep/../../../core/src/lib.rs",
+            "<state_dir>/plans/../../../outside.md",
         ] {
             assert!(!is_allowed_docs_path(path), "should refuse {path}");
         }
@@ -191,11 +238,11 @@ mod tests {
     fn docs_path_refuses_absolute_paths() {
         for path in [
             "/etc/passwd",
-            "/.ai/specs/x.md",
-            "C:/Projects/nucleos/.ai/specs/x.md",
-            r"C:\Projects\nucleos\.ai\specs\x.md",
-            r"\.ai\specs\x.md",
-            r"\\server\share\.ai\specs\x.md",
+            "/<state_dir>/specs/x.md",
+            "C:/Projects/nucleos/<state_dir>/specs/x.md",
+            r"C:\Projects\nucleos\<state_dir>\specs\x.md",
+            r"\<state_dir>\specs\x.md",
+            r"\\server\share\<state_dir>\specs\x.md",
         ] {
             assert!(!is_allowed_docs_path(path), "should refuse {path}");
         }
@@ -204,19 +251,19 @@ mod tests {
     #[test]
     fn docs_path_treats_windows_backslashes_as_the_same_path() {
         for path in [
-            r".ai\specs\design.md",
-            r".ai\spikes\probe.md",
-            r".ai\plans\nested\plan.md",
-            r".ai\notes\note.md",
+            r"<state_dir>\specs\design.md",
+            r"<state_dir>\spikes\probe.md",
+            r"<state_dir>\plans\nested\plan.md",
+            r"<state_dir>\notes\note.md",
         ] {
             assert!(is_allowed_docs_path(path), "should allow {path}");
         }
         for path in [
             r"core\src\lib.rs",
-            r".ai\specs-old\x.md",
-            r".ai\",
-            r".ai\specs\..\..\core\src\lib.rs",
-            r".ai/specs\../../core/src/lib.rs",
+            r"<state_dir>\specs-old\x.md",
+            r"<state_dir>\",
+            r"<state_dir>\specs\..\..\core\src\lib.rs",
+            r"<state_dir>/specs\../../core/src/lib.rs",
         ] {
             assert!(!is_allowed_docs_path(path), "should refuse {path}");
         }

@@ -1646,8 +1646,9 @@ mod tests {
         );
         assert_eq!(section_number("## #11 — O tecto"), None);
 
-        // The collision is live in one document: `.ai/specs/2026-08-16-alcada-por-equipa-design.md`
-        // carries both of these, eleven lines apart. They must not answer the same thing.
+        // The collision is live in one document:
+        // `<state_dir>/specs/2026-08-16-alcada-por-equipa-design.md` carries both of these, eleven
+        // lines apart. They must not answer the same thing.
         let real = section_number("## 1. Contexto e problema");
         let item = section_number("### #1 — A alçada vive numa **tabela**, não num ficheiro");
         assert_eq!(real, Some("1".to_string()));

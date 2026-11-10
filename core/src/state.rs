@@ -136,7 +136,7 @@ pub const ROOTED_CHAT_PROGRESS_TIMEOUT_MULTIPLIER: u32 = 2;
 
 /// The total ceiling of a chat turn bound to a project root, as a multiple of `run_timeout`:
 /// 24 x 600 s = 4 h. A backstop only; silence is what catches a hung turn (spec
-/// `.ai/specs/2026-10-04-chats-como-ambiente-de-desenvolvimento.md`, P1).
+/// `<state_dir>/specs/2026-10-04-chats-como-ambiente-de-desenvolvimento.md`, P1).
 pub const ROOTED_CHAT_RUN_TIMEOUT_MULTIPLIER: u32 = 24;
 
 /// Production default for how long a repository verification gate may run.

@@ -3,9 +3,9 @@
 //! The workflow library, the pin a project keeps, and how far the two have drifted apart.
 //!
 //! A workflow is not a file. §6.1 of the design counts five pieces — the graph, the node bodies,
-//! the contracts, the scripts and the model assignments — and this repository's own `.ai/` harness
-//! has all five, spread across a dozen files that never say they are one thing. So a **bundle** is
-//! a directory, and the library is a directory of them:
+//! the contracts, the scripts and the model assignments — and this repository's former `.ai/`
+//! harness had all five, spread across a dozen files that never said they were one thing. So a
+//! **bundle** is a directory, and the library is a directory of them:
 //!
 //! ```text
 //! ~/.nucleos/workflows/<name>/<version>/
@@ -901,11 +901,11 @@ pub(crate) fn apply_eject(
 
 /// Record a folder this project already has as its workflow, copying nothing.
 ///
-/// **§9's second step, and the reason it exists.** A project that already develops a certain way has
-/// that way written down somewhere — this repository's `.ai/` is the case in point, and it built
-/// NucleOS. Asking somebody to recreate it in a graph editor before the app will admit it exists is
-/// how a tool becomes hostile to what is already working. So this writes one pin and touches nothing
-/// inside the folder: no manifest, no rewrite, no copy.
+/// **§9's second step, and the reason it exists.** A project that already develops a certain way
+/// has that way written down somewhere — this repository's former `.ai/` harness was the case in
+/// point, and it built NucleOS. Asking somebody to recreate it in a graph editor before the app
+/// will admit it exists is how a tool becomes hostile to what is already working. So this writes
+/// one pin and touches nothing inside the folder: no manifest, no rewrite, no copy.
 ///
 /// It is recorded as **ejected from birth**, which is the honest description: it has no origin in
 /// any library, so it receives nothing and never will until somebody publishes it. The origin

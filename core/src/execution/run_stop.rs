@@ -1,5 +1,5 @@
 //! Pure, DB-free derivation logic for `GET /runs/{id}/stop` (spec
-//! `.ai/specs/2026-08-29-porque-parou-design.md` §7): "porque parou" — why a run stopped.
+//! `<state_dir>/specs/2026-08-29-porque-parou-design.md` §7): "porque parou" — why a run stopped.
 //!
 //! `runs.rs` is over 3900 lines and `http.rs` is over 11000; nothing about this report belongs in
 //! either. This module is responsible for the parts that take state and times in and hand a verdict

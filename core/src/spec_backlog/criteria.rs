@@ -173,8 +173,8 @@ mod tests {
     use crate::spec_backlog::model::{CriterionKind, CriterionStatus, SpecKind};
     use crate::spec_backlog::prompts::{MAX_SPEC_CHARS, extraction_prompt, split_sections};
 
-    const KNOWN_DEP: &str = ".ai/specs/known.md";
-    const UNKNOWN_DEP: &str = ".ai/specs/ghost.md";
+    const KNOWN_DEP: &str = "<state_dir>/specs/known.md";
+    const UNKNOWN_DEP: &str = "<state_dir>/specs/ghost.md";
 
     // `Extraction` pins no derives, so tests compare fields and go through these two helpers
     // rather than `assert_eq!` on the whole `Result` or `unwrap_err`.
@@ -238,7 +238,7 @@ mod tests {
             {"text": "The README names the route", "kind": "doc", "verify_hint": null},
             {"text": "The owner chose the limit", "kind": "decision", "verify_hint": null}
         ],
-        "depends_on": [".ai/specs/known.md"],
+        "depends_on": ["<state_dir>/specs/known.md"],
         "questions": ["Which branch lands this?"]
     }"#;
 
@@ -289,7 +289,7 @@ mod tests {
     fn unknown_depends_on_becomes_question() {
         let raw = r#"{"kind": "spec", "criteria": [
             {"text": "Fine", "kind": "behavior", "verify_hint": null}
-        ], "depends_on": [".ai/specs/known.md", ".ai/specs/ghost.md"],
+        ], "depends_on": ["<state_dir>/specs/known.md", "<state_dir>/specs/ghost.md"],
         "questions": ["Which branch lands this?"]}"#;
 
         let extraction = parse_ok(raw, &known());
@@ -462,7 +462,7 @@ mod tests {
 
     #[test]
     fn prompt_embeds_spec_text_and_forbids_edits() {
-        let rel_path = ".ai/specs/2026-10-30-sample.md";
+        let rel_path = "<state_dir>/specs/2026-10-30-sample.md";
         let section = "## Sample section\nThe marker-zebra behaviour must hold.\n";
 
         let prompt = extraction_prompt(rel_path, section, None);
@@ -476,7 +476,7 @@ mod tests {
 
     #[test]
     fn prompt_appends_the_previous_error_on_retry() {
-        let rel_path = ".ai/specs/2026-10-30-sample.md";
+        let rel_path = "<state_dir>/specs/2026-10-30-sample.md";
         let section = "## Sample section\nbody\n";
         let err = "previous attempt failed: marker-quokka";
 

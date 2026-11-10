@@ -367,8 +367,8 @@ mod tests {
     #[test]
     fn spec_item_keys_carry_a_numeric_index() {
         assert_eq!(
-            key("spec-item:.ai/specs/x.md#03").unwrap(),
-            "spec-item:.ai/specs/x.md#3"
+            key("spec-item:<state_dir>/specs/x.md#03").unwrap(),
+            "spec-item:<state_dir>/specs/x.md#3"
         );
         assert!(matches!(
             key("spec-item:x.md#a"),
@@ -378,6 +378,14 @@ mod tests {
             key("spec-item:x.md"),
             Err(KeyError::Malformed { .. })
         ));
+    }
+
+    #[test]
+    fn spec_item_key_keeps_a_state_dir_token_path() {
+        assert_eq!(
+            key("spec-item:<state_dir>/specs/x.md#03").unwrap(),
+            "spec-item:<state_dir>/specs/x.md#3"
+        );
     }
 
     #[test]

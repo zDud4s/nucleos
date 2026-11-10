@@ -1071,8 +1071,8 @@ pub(super) struct DetectQuery {
 /// What is already in a folder somebody is about to add.
 ///
 /// **§9's second step.** A project worth adding has a history, commands its people type, and often a
-/// written-down way of working — this repository's is `.ai/`, and it built NucleOS. This reports all
-/// of it so the wizard can propose rather than interrogate.
+/// written-down way of working — this repository's was its former `.ai/` harness, which built
+/// NucleOS. This reports all of it so the wizard can propose rather than interrogate.
 ///
 /// The git half runs even when the folder turns out not to be a repository: `is_git` is a finding
 /// and not a refusal, because `set_project_mode` only insists on a repository for `active`, and a

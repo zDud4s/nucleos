@@ -655,8 +655,9 @@ pub(super) async fn get_project_workflow_graph(
             .ok_or(crate::workflows::Refused::NotInstalled)?;
 
         // `copy_path` and not `ejected_path`: an adopted workflow's copy is the folder the project
-        // already had — `.ai/` here — rather than the one an eject would have created. Reading the
-        // library instead would draw somebody else's bundle and label it as this project's.
+        // already had — this repository's former `.ai/` harness was one — rather than the one an
+        // eject would have created. Reading the library instead would draw somebody else's bundle
+        // and label it as this project's.
         let mine = crate::workflows::copy_path(&root, &pinned).filter(|path| path.is_dir());
         let (source, from) = match mine {
             Some(path) => ("project", path),

@@ -1,7 +1,7 @@
 //! §spec autopilot-juiz-resolve-bloqueios
 //!
-//! Spec B (`.ai/specs/2026-09-27-autopilot-juiz-resolve-bloqueios-design.md`): deciding how a
-//! block in an unattended worktree run is resolved. Three events — a hard refusal (E1), a park
+//! Spec B (`<state_dir>/specs/2026-09-27-autopilot-juiz-resolve-bloqueios-design.md`): deciding how
+//! a block in an unattended worktree run is resolved. Three events — a hard refusal (E1), a park
 //! (E3), a failed gate after the run finished (E4) — and four fixed outcomes, of which the default
 //! for each event is exactly today's behaviour (D1). A hard refusal is never run: the judge only
 //! ever chooses between refusing and explaining, telling the owner, and stopping.

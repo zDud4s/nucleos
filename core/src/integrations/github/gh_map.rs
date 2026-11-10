@@ -194,7 +194,7 @@ pub(super) fn gh_forms() -> &'static [GhForm] {
 /// PURE: which operation a `gh` command line asks for, or `None` for a line no operation builds.
 ///
 /// **This is the map decision #4 moves into the code** —
-/// `.ai/specs/2026-09-03-alcada-por-projecto-design.md`, §1.2 for the defect and §2 for the
+/// `<state_dir>/specs/2026-09-03-alcada-por-projecto-design.md`, §1.2 for the defect and §2 for the
 /// decision. The pillar has two doors and each was governed in its own vocabulary: `ACTION_CEILING`
 /// and `action_is_autonomous` speak operation KINDS, `READ_CEILING` and `read_is_autonomous` speak
 /// `gh` PREFIXES. Two vocabularies for one question is how the two doors came to answer it

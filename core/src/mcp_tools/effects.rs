@@ -149,7 +149,7 @@ pub(super) const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     // So the honest statement is: this line is the weakest thing on this page, it is held up by the
     // grant being per-origin and human-given, by the act having to cause the submission, and by
     // `browser_writes` recording every one that leaves. Whoever attacks this design should attack
-    // here. See `.ai/specs` for the argument in full and `fence/policy.go` for the rule.
+    // here. See `<state_dir>/specs` for the argument in full and `fence/policy.go` for the rule.
     //
     // `browser_handoff` is here rather than `ReadsOwn`, and that is a correction worth keeping: it
     // spends a person's attention and proposes a host chosen by an agent whose context is full of

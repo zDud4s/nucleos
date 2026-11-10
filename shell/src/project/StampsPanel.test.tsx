@@ -27,7 +27,7 @@ import { StampsPanel } from "./StampsPanel";
  * One approved decision. The anchor rarely matters here — this panel reads the verdict axis.
  *
  * **Portuguese on purpose, and it is the row a real daemon would send.** The documents under
- * `.ai/specs/` are Portuguese by the owner's rule, so a decision parsed out of one arrives with a
+ * `<state_dir>/specs/` are Portuguese by the owner's rule, so a decision parsed out of one arrives with a
  * Portuguese slug, a Portuguese heading and a Portuguese sentence. Translating the `text` alone
  * would leave an English sentence under `§7 O carimbo e a sua caducidade` inside a document called
  * `mapa-do-projeto` — a fixture testing a shape production cannot produce.

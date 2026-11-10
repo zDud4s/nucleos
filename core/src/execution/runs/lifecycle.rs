@@ -78,7 +78,7 @@ pub(super) fn elapsed_seconds_since_created(
     Some((end - created).num_seconds())
 }
 
-/// `GET /runs/{id}/stop` (spec `.ai/specs/2026-08-29-porque-parou-design.md` §4): why a run
+/// `GET /runs/{id}/stop` (spec `<state_dir>/specs/2026-08-29-porque-parou-design.md` §4): why a run
 /// stopped, in one call. `404` if the run does not exist; `200` — never `204` — for every run that
 /// does, including one still `running` (spec §4, §11 item 5).
 ///

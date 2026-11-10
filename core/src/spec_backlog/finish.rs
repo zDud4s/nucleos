@@ -962,7 +962,7 @@ mod tests {
     const SHA: &str = "sha-1";
 
     fn path_of(name: &str) -> String {
-        format!(".ai/specs/2026-01-01-{name}.md")
+        format!("<state_dir>/specs/2026-01-01-{name}.md")
     }
 
     /// Registers a spec in `status` and returns its id.
@@ -1552,7 +1552,7 @@ mod tests {
             assert_eq!(request.project_root, "/repo");
             assert_eq!(request.round, 1);
             assert!(
-                request.goal.contains(".ai/specs/2026-01-01-"),
+                request.goal.contains("<state_dir>/specs/2026-01-01-"),
                 "goal names the spec file"
             );
         }
@@ -2952,7 +2952,7 @@ mod tests {
         Spec {
             id: "s".to_owned(),
             project_id: None,
-            path: ".ai/specs/a.md".to_owned(),
+            path: "<state_dir>/specs/a.md".to_owned(),
             title: "A".to_owned(),
             content_sha: SHA.to_owned(),
             kind: SpecKind::Spec,

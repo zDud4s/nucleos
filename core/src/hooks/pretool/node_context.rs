@@ -184,10 +184,14 @@ pub(super) async fn docs_write_decision(
         return None;
     }
 
+    // A docs branch writes its declared files into the project's state directory, outside the
+    // checkout, so an absolute path under it is mapped back to the `<state_dir>/...` spelling the
+    // manifest declares.
+    let state_dir = crate::agents::prefix::state_dir_for(Path::new(&manifest.project_root));
     let paths: Vec<Option<String>> = ["file_path", "notebook_path"]
         .iter()
         .filter_map(|key| payload.tool_input.get(*key).and_then(Value::as_str))
-        .map(|path| docs_relative_path(path, cwd))
+        .map(|path| docs_relative_path(path, cwd, state_dir.as_deref()))
         .collect();
     let allowed = !paths.is_empty()
         && paths.iter().all(|path| {
@@ -199,8 +203,26 @@ pub(super) async fn docs_write_decision(
                         .any(|glob| crate::tree_job::docs_paths::owned_glob_matches(glob, path))
             })
         });
-    (!allowed).then(|| docs_write_deny(&docs_branch.paths))
+    if !allowed {
+        return Some(docs_write_deny(&docs_branch.paths));
+    }
+    // A declared state_dir file lies outside the workspace, where the node scope fence and the
+    // classifier below cannot answer for a tree run, so the hook allows it itself.
+    let into_state_dir = paths.iter().all(|path| {
+        path.as_deref()
+            .is_some_and(|path| path.starts_with(STATE_DIR_PREFIX))
+    });
+    into_state_dir.then(|| {
+        Json(Decision {
+            decision: "allow".to_owned(),
+            reason: "a docs branch may write its declared state_dir files".to_owned(),
+        })
+    })
 }
+
+/// The spelling of a path inside the project's state directory, as a docs manifest declares it.
+const STATE_DIR_TOKEN: &str = "<state_dir>";
+const STATE_DIR_PREFIX: &str = "<state_dir>/";
 
 fn docs_shell_deny() -> Json<Decision> {
     Json(Decision {
@@ -301,15 +323,17 @@ fn docs_write_deny(paths: &[String]) -> Json<Decision> {
     Json(Decision {
         decision: "deny".to_owned(),
         reason: format!(
-            "docs branches may write only declared paths ({declared}); close the node blocked if you need another path"
+            "docs branches may write only declared paths ({declared}), each by its absolute path under `<state_dir>` and with Write/Edit, not the shell; close the node blocked if you need another path"
         ),
     })
 }
 
-/// Returns a lexical path relative to the checkout root. The docs policy must not resolve a
-/// traversal before checking it, because a spelling that leaves and re-enters the checkout is not
-/// a declared docs path.
-fn docs_relative_path(path: &str, cwd: Option<&Path>) -> Option<String> {
+/// Returns a lexical path relative to the checkout root, or `<state_dir>/<rest>` for an absolute
+/// path under the project's state directory. The docs policy must not resolve a traversal before
+/// checking it, because a spelling that leaves and re-enters the checkout (or the state directory)
+/// is not a declared docs path. The `<state_dir>` token itself is never valid input: spelled as a
+/// path it would name a directory of that name inside the checkout.
+fn docs_relative_path(path: &str, cwd: Option<&Path>, state_dir: Option<&Path>) -> Option<String> {
     let cwd = cwd?;
     let path = path.replace('\\', "/");
     let cwd = cwd.to_string_lossy().replace('\\', "/");
@@ -317,10 +341,110 @@ fn docs_relative_path(path: &str, cwd: Option<&Path>) -> Option<String> {
     let path = docs_clean_path(&path)?;
     let cwd = docs_clean_path(&cwd)?;
     if absolute {
-        strip_root_prefix(&path, &cwd, cfg!(windows)).map(str::to_owned)
+        let state_dir =
+            state_dir.and_then(|dir| docs_clean_path(&dir.to_string_lossy().replace('\\', "/")));
+        if let Some(rest) = state_dir
+            .as_deref()
+            .and_then(|dir| strip_root_prefix(&path, dir, cfg!(windows)))
+        {
+            return Some(format!("{STATE_DIR_PREFIX}{rest}"));
+        }
+        let relative = strip_root_prefix(&path, &cwd, cfg!(windows))?;
+        (!names_state_dir_token(relative)).then(|| relative.to_owned())
     } else {
-        Some(path)
+        (!names_state_dir_token(&path)).then_some(path)
     }
+}
+
+/// Whether a cleaned checkout-relative path starts with the literal `<state_dir>` segment.
+fn names_state_dir_token(relative: &str) -> bool {
+    relative.split('/').next() == Some(STATE_DIR_TOKEN)
+}
+
+/// Whether `path` names a file under the retired `.ai/` directory at one of `roots` (the run's
+/// checkout and the project's main checkout). Backslashes read as slashes, and the path is cleaned
+/// lexically: a `..` that stays inside is resolved, one that climbs above the start is not a match.
+/// Only the root `.ai` counts, never a nested `x/.ai` nor a lookalike such as `.aix`.
+fn names_legacy_ai_dir(path: &str, roots: &[std::path::PathBuf]) -> bool {
+    let path = path.replace('\\', "/");
+    let absolute = crate::governance::classifier::is_absolute_path(&path);
+    let Some(path) = resolve_clean_path(&path) else {
+        return false;
+    };
+    let under_ai = |relative: &str| {
+        let mut segments = relative.split('/');
+        let first = segments.next().unwrap_or_default();
+        let is_ai = if cfg!(windows) {
+            first.eq_ignore_ascii_case(".ai")
+        } else {
+            first == ".ai"
+        };
+        is_ai && segments.next().is_some()
+    };
+    if !absolute {
+        // A relative path is taken from each root alike, so the root itself does not matter.
+        return !roots.is_empty() && under_ai(&path);
+    }
+    roots.iter().any(|root| {
+        resolve_clean_path(&root.to_string_lossy().replace('\\', "/"))
+            .and_then(|root| strip_root_prefix(&path, &root, cfg!(windows)).map(under_ai))
+            .unwrap_or(false)
+    })
+}
+
+/// A lexical clean that resolves `..` against the segments before it. `None` when a `..` climbs
+/// above the first segment or nothing is left. The leading `/` is dropped, as `docs_clean_path`
+/// does, so the result compares only with another path cleaned the same way.
+fn resolve_clean_path(path: &str) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => continue,
+            ".." => {
+                parts.pop()?;
+            }
+            _ => parts.push(part),
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
+/// Refuses a Write/Edit under the project's retired `.ai/` directory, pointing at `<state_dir>`.
+/// `None` for any other tool and for a run not in flight (no `cwd`): fail-open, like the node
+/// scope fence.
+pub(super) fn legacy_ai_write_decision(
+    payload: &PreToolUsePayload,
+    cwd: Option<&Path>,
+) -> Option<Json<Decision>> {
+    let tool = payload.tool_name.as_str();
+    if !crate::governance::classifier::WRITE_TOOLS.contains(&tool) && tool != "MultiEdit" {
+        return None;
+    }
+    let cwd = cwd?;
+    let project_root = crate::agents::prefix::project_root_from(cwd);
+    let mut roots = vec![cwd.to_path_buf()];
+    if let Some(root) = &project_root
+        && root.as_path() != cwd
+    {
+        roots.push(root.clone());
+    }
+    let hits = ["file_path", "notebook_path"]
+        .iter()
+        .filter_map(|key| payload.tool_input.get(*key).and_then(Value::as_str))
+        .any(|path| names_legacy_ai_dir(path, &roots));
+    if !hits {
+        return None;
+    }
+    let state_dir = crate::agents::prefix::state_dir_for(project_root.as_deref().unwrap_or(cwd));
+    let resolved = state_dir
+        .map(|dir| format!(" ({})", dir.to_string_lossy()))
+        .unwrap_or_default();
+    Some(Json(Decision {
+        decision: "deny".to_owned(),
+        reason: format!(
+            "`.ai/` is the retired agent-material layout and takes no new writes. Write plans, specs, notes, spikes and handoffs under `{STATE_DIR_TOKEN}`{resolved} instead"
+        ),
+    }))
 }
 
 fn strip_root_prefix<'a>(path: &'a str, root: &str, case_insensitive: bool) -> Option<&'a str> {
@@ -376,5 +500,127 @@ mod tests {
             plan.iter().any(|row| row.3.contains("USING INDEX")),
             "no index on work_nodes.run_id: {plan:?}"
         );
+    }
+
+    #[test]
+    fn docs_relative_path_maps_an_absolute_state_dir_path_to_the_token() {
+        let cwd = Some(Path::new("/repo"));
+        let state_dir = Some(Path::new("/state"));
+
+        assert_eq!(
+            docs_relative_path("/state/notes/x.md", cwd, state_dir).as_deref(),
+            Some("<state_dir>/notes/x.md")
+        );
+        assert_eq!(
+            docs_relative_path("\\state\\notes\\x.md", cwd, state_dir).as_deref(),
+            Some("<state_dir>/notes/x.md")
+        );
+        // An absolute path in the checkout keeps the checkout-relative spelling.
+        assert_eq!(
+            docs_relative_path("/repo/docs/x.md", cwd, state_dir).as_deref(),
+            Some("docs/x.md")
+        );
+        // Without a known state_dir an outside absolute path maps to nothing.
+        assert_eq!(docs_relative_path("/state/notes/x.md", cwd, None), None);
+    }
+
+    #[test]
+    fn docs_relative_path_refuses_the_token_spelled_relatively() {
+        let cwd = Some(Path::new("/repo"));
+
+        for state_dir in [Some(Path::new("/state")), None] {
+            assert_eq!(
+                docs_relative_path("<state_dir>/notes/x.md", cwd, state_dir),
+                None
+            );
+            assert_eq!(
+                docs_relative_path("./<state_dir>/notes/x.md", cwd, state_dir),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn docs_relative_path_refuses_state_dir_traversal() {
+        let cwd = Some(Path::new("/repo"));
+        let state_dir = Some(Path::new("/state"));
+
+        assert_eq!(
+            docs_relative_path("/state/notes/../memory.md", cwd, state_dir),
+            None
+        );
+        assert_eq!(docs_relative_path("/state/../x", cwd, state_dir), None);
+    }
+
+    fn write_payload(tool: &str, path: &str) -> PreToolUsePayload {
+        PreToolUsePayload {
+            run_id: 1,
+            tool_name: tool.to_owned(),
+            tool_input: serde_json::json!({"file_path": path, "content": "x"}),
+        }
+    }
+
+    #[test]
+    fn legacy_ai_names_a_file_under_the_root_dot_ai() {
+        let roots = [std::path::PathBuf::from("/repo")];
+
+        assert!(names_legacy_ai_dir("/repo/.ai/specs/x.md", &roots));
+        assert!(names_legacy_ai_dir(".ai/specs/x.md", &roots));
+        assert!(names_legacy_ai_dir(".ai\\specs\\x.md", &roots));
+        assert!(names_legacy_ai_dir("\\repo\\.ai\\specs\\x.md", &roots));
+        assert!(names_legacy_ai_dir("src/../.ai/x", &roots));
+    }
+
+    #[test]
+    fn legacy_ai_does_not_name_lookalikes_or_other_roots() {
+        let roots = [std::path::PathBuf::from("/repo")];
+
+        assert!(!names_legacy_ai_dir(".aix/x", &roots));
+        assert!(!names_legacy_ai_dir(".ai-old/x", &roots));
+        assert!(!names_legacy_ai_dir("docs/.ai/x", &roots));
+        assert!(!names_legacy_ai_dir("/other/.ai/x", &roots));
+        assert!(!names_legacy_ai_dir(".ai", &roots));
+        assert!(!names_legacy_ai_dir("../.ai/x", &roots));
+    }
+
+    #[test]
+    fn legacy_ai_deny_names_the_state_dir_from_project_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        let state = dir.path().join("state-dir");
+        std::fs::create_dir_all(root.join(".nucleos/workflow")).unwrap();
+        std::fs::write(
+            root.join(".nucleos/workflow/project.json"),
+            serde_json::json!({"state_dir": state.to_str().unwrap()}).to_string(),
+        )
+        .unwrap();
+        let target = root.join(".ai").join("notes").join("x.md");
+        let payload = write_payload("Write", target.to_str().unwrap());
+
+        let Json(decision) =
+            legacy_ai_write_decision(&payload, Some(root.as_path())).expect("a deny");
+
+        assert_eq!(decision.decision, "deny", "{}", decision.reason);
+        assert!(
+            decision.reason.contains("<state_dir>"),
+            "got {:?}",
+            decision.reason
+        );
+        assert!(
+            decision.reason.contains(state.to_string_lossy().as_ref()),
+            "the reason must carry the resolved state dir, got {:?}",
+            decision.reason
+        );
+    }
+
+    #[test]
+    fn legacy_ai_write_decision_ignores_reads_and_a_run_that_is_not_in_flight() {
+        let root = Path::new("/repo");
+
+        let read = write_payload("Read", "/repo/.ai/x.md");
+        assert!(legacy_ai_write_decision(&read, Some(root)).is_none());
+
+        let write = write_payload("Write", "/repo/.ai/x.md");
+        assert!(legacy_ai_write_decision(&write, None).is_none());
     }
 }

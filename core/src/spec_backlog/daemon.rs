@@ -835,7 +835,7 @@ mod tests {
             ("proj-a", "second"),
             ("proj-b", "only"),
         ] {
-            let path = format!(".ai/specs/2026-01-01-{name}.md");
+            let path = format!("<state_dir>/specs/2026-01-01-{name}.md");
             let spec = store::upsert_by_path(&pool, Some(project), &path, name, "sha-1")
                 .await
                 .unwrap();
@@ -849,7 +849,7 @@ mod tests {
         let idle = store::upsert_by_path(
             &pool,
             Some("proj-c"),
-            ".ai/specs/2026-01-01-idle.md",
+            "<state_dir>/specs/2026-01-01-idle.md",
             "idle",
             "sha-1",
         )
@@ -871,7 +871,7 @@ mod tests {
         let spec = store::upsert_by_path(
             &pool,
             Some("proj-null-tree"),
-            ".ai/specs/2026-01-01-null-tree.md",
+            "<state_dir>/specs/2026-01-01-null-tree.md",
             "null-tree",
             "sha-1",
         )
@@ -900,7 +900,7 @@ mod tests {
         let spec = store::upsert_by_path(
             &pool,
             Some("launch-recorded"),
-            ".ai/specs/2026-01-01-launch-recorded.md",
+            "<state_dir>/specs/2026-01-01-launch-recorded.md",
             "launch-recorded",
             "sha-1",
         )
@@ -1069,7 +1069,7 @@ mod tests {
         store::upsert_by_path(
             pool,
             Some("proj-audit"),
-            &format!(".ai/specs/2026-01-01-{name}.md"),
+            &format!("<state_dir>/specs/2026-01-01-{name}.md"),
             name,
             "sha-1",
         )
@@ -1211,7 +1211,7 @@ mod tests {
         let waiting = store::upsert_by_path(
             pool,
             Some("proj-ans-a"),
-            ".ai/specs/2026-01-01-ans-a.md",
+            "<state_dir>/specs/2026-01-01-ans-a.md",
             "ans-a",
             "sha-1",
         )
@@ -1227,7 +1227,7 @@ mod tests {
         let running = store::upsert_by_path(
             pool,
             Some("proj-ans-b"),
-            ".ai/specs/2026-01-01-ans-b.md",
+            "<state_dir>/specs/2026-01-01-ans-b.md",
             "ans-b",
             "sha-1",
         )
@@ -1623,7 +1623,7 @@ mod tests {
         let spec = store::upsert_by_path(
             &state.pool,
             Some("proj-boot-intent"),
-            ".ai/specs/2026-01-01-boot-intent.md",
+            "<state_dir>/specs/2026-01-01-boot-intent.md",
             "boot-intent",
             "sha-1",
         )

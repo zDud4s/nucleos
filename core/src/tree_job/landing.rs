@@ -973,7 +973,7 @@ mod tests {
     }
 
     fn docs_branch_at(name: &str, state: &str) -> Branch {
-        let mut branch = Branch::new(name, &[format!(".ai/{name}/**")], "docs", None);
+        let mut branch = Branch::new(name, &[format!("<state_dir>/{name}/**")], "docs", None);
         branch.state = state.to_owned();
         branch
     }

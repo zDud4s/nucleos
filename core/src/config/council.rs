@@ -8,8 +8,8 @@ use super::*;
 /// cap. Here it is the roster cap and the parallelism cap at once, because the roster IS the
 /// parallelism: every seat of phase 1 is launched together, so a ninth seat would be a ninth agent
 /// process and a ninth cloud bill for one question. A number in this file may lower the fan-out and
-/// may not raise it, exactly as `MAX_ITEMS_CEILING` may not — `.ai/` is gitignored, so nobody
-/// reviews what is written here.
+/// may not raise it, exactly as `MAX_ITEMS_CEILING` may not — `~/.nucleos/council.yaml` lives
+/// outside any repository, so nobody reviews what is written here.
 pub const MAX_COUNCIL_SEATS: usize = 8;
 
 /// The wall clock one seat gets, when the file does not say.

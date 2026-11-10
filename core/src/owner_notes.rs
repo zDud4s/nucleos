@@ -5,7 +5,7 @@
 //! module. `brief`, `knowledge` and `mcp_tools` never touch these tables, so a note reaches no
 //! prompt unless a person deliberately teaches it (a separate, proposal-gated step). The one
 //! exception is `distill.rs`, which reads project-linked notes as dossier context only
-//! (`.ai/specs/2026-10-05-destilador-design.md` D4).
+//! (`<state_dir>/specs/2026-10-05-destilador-design.md` D4).
 //!
 //! This module owns the `owner_notes*` SQL. The vocabularies below are checked here, before the
 //! write, because the migration carries no CHECK constraints (the house rule of 0143).
@@ -652,10 +652,10 @@ fn sql_table(kind: &str) -> Option<&'static str> {
 /// note once even when it is linked to both.
 ///
 /// This exists solely for the distiller's dossier, under D4 of
-/// `.ai/specs/2026-10-05-destilador-design.md` - the one sanctioned exception to the rule that
-/// agents never read owner notes. The text is context for the dossier and must never be injected
-/// into a prompt run or quoted into knowledge; the only direct note -> knowledge door stays
-/// `teach`.
+/// `<state_dir>/specs/2026-10-05-destilador-design.md` - the one sanctioned exception to the rule
+/// that agents never read owner notes. The text is context for the dossier and must never be
+/// injected into a prompt run or quoted into knowledge; the only direct note -> knowledge door
+/// stays `teach`.
 pub async fn active_note_texts_for_project(
     pool: &SqlitePool,
     project_id: &str,
@@ -1781,8 +1781,9 @@ use crate::{needle}s;"
             running_in.display(),
         );
         // `distill.rs` is the one sanctioned exception, and only for its single call to
-        // `active_note_texts_for_project`: D4 of `.ai/specs/2026-10-05-destilador-design.md` lets the
-        // distiller's dossier read the notes linked to a project, as context only.
+        // `active_note_texts_for_project`: D4 of
+        // `<state_dir>/specs/2026-10-05-destilador-design.md` lets the distiller's dossier read
+        // the notes linked to a project, as context only.
         // `capture.rs` is the other: one call, `create_linked_to_job_in`. A channel capture answer is
         // the owner writing a note; `capture.rs` only forwards it and never reads notes back.
         // `channels/commands.rs` is the third: one call, `create(`, for `/note`. That command is the

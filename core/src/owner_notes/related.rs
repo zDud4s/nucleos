@@ -1,8 +1,8 @@
 //! Reading a note's surroundings: the notes pinned to a target, and the notes that resemble one.
 //!
-//! Part of the owner-notes boundary (`.ai/specs/2026-10-02-second-brain-design.md` §5): this module
-//! reads `owner_notes*` and nothing else on the agent's side does. It never logs, and nothing it
-//! returns reaches a prompt.
+//! Part of the owner-notes boundary (`<state_dir>/specs/2026-10-02-second-brain-design.md` §5):
+//! this module reads `owner_notes*` and nothing else on the agent's side does. It never logs, and
+//! nothing it returns reaches a prompt.
 
 use std::collections::HashMap;
 

@@ -204,11 +204,10 @@ def test_top_level_read_of_source_denied():
             raise AssertionError(f"the reason must name the escape, got {reason!r}")
 
 
-def test_read_of_ai_specs_allowed():
+def test_read_of_material_allowed():
     with fixture("on") as fx:
-        allow(fx.verdict("Read", {"file_path": fx.path(".ai", "specs", "x.md")}), "Read .ai/specs")
-        allow(fx.verdict("Read", {"file_path": os.path.join(".ai", "specs", "x.md")}), "relative .ai")
-        allow(fx.verdict("Grep", {"pattern": "R-A", "path": fx.path(".ai")}), "Grep .ai")
+        allow(fx.verdict("Read", {"file_path": os.path.join(fx.state_dir, "specs", "x.md")}), "Read state dir specs")
+        allow(fx.verdict("Grep", {"pattern": "R-A", "path": fx.state_dir}), "Grep state dir")
         allow(fx.verdict("Glob", {"pattern": "*.md", "path": fx.path(".nucleos")}), "Glob .nucleos")
         allow(
             fx.verdict("Read", {"file_path": os.path.join(fx.state_dir, "handoffs", "n1.md")}),
@@ -251,10 +250,10 @@ def test_agent_tool_allowed():
 
 def test_conductor_tools_are_allowed_when_on():
     with fixture("on") as fx:
-        material = fx.path(".ai")
+        material = fx.state_dir
         for tool, tool_input in (
             ("Agent", {}),
-            ("Read", {"file_path": fx.path(".ai", "plans", "p.md")}),
+            ("Read", {"file_path": os.path.join(fx.state_dir, "plans", "p.md")}),
             ("Glob", {"pattern": "*.md", "path": material}),
             ("Grep", {"pattern": "B-DEFAULT", "path": material}),
             ("ToolSearch", {}),
@@ -371,7 +370,10 @@ def test_write_to_state_dir_allowed():
             "Write in the state dir",
         )
         allow(
-            fx.verdict("Edit", {"file_path": fx.path(".ai", "plans", "p.md"), "old_string": "a", "new_string": "b"}),
+            fx.verdict(
+                "Edit",
+                {"file_path": os.path.join(fx.state_dir, "plans", "p.md"), "old_string": "a", "new_string": "b"},
+            ),
             "Edit a plan",
         )
         deny(fx.verdict("Write", {"file_path": fx.path("core", "src", "lib.rs"), "content": "x"}), "control: source")
@@ -1255,7 +1257,7 @@ def test_probe_writes_payload_keys():
 
 
 def _sized(fx, name, size):
-    """A file of `size` bytes under the project, outside `.ai`; its path."""
+    """A file of `size` bytes under the project, outside the state dir; its path."""
     path = fx.path("src", name)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "wb") as handle:
@@ -1356,17 +1358,39 @@ def test_manual_bypasses_the_edit_budget():
 def test_allow_listed_paths_are_not_budgeted():
     with fixture("on") as fx:
         _project(fx)
-        os.makedirs(fx.path(".ai", "specs"), exist_ok=True)
-        spec = fx.path(".ai", "specs", "x.md")
+        os.makedirs(os.path.join(fx.state_dir, "specs"), exist_ok=True)
+        spec = os.path.join(fx.state_dir, "specs", "x.md")
         with open(spec, "wb") as handle:
             handle.write(b"x" * 400000)
         for _ in range(3):
             allow(fx.verdict("Read", {"file_path": spec}), "allow-listed Read, however large")
         for index in range(4):  # material writes use no file or line budget
             allow(
-                fx.verdict("Write", {"file_path": fx.path(".ai", f"n{index}.md"), "content": "x\n" * 100}),
+                fx.verdict(
+                    "Write",
+                    {"file_path": os.path.join(fx.state_dir, "specs", f"n{index}.md"), "content": "x\n" * 100},
+                ),
                 "allow-listed Write",
             )
+
+
+def test_ai_is_no_longer_conductor_material():
+    with fixture("on") as fx:
+        _project(fx)
+        deny(
+            fx.verdict("Write", {"file_path": fx.path(".ai", "n.md"), "content": "x\n" * 100}),
+            "a 100-line Write under .ai hits the edit budget",
+        )
+        os.makedirs(fx.path(".ai", "specs"), exist_ok=True)
+        spec = fx.path(".ai", "specs", "x.md")
+        with open(spec, "wb") as handle:
+            handle.write(b"x" * 400000)
+        deny(fx.verdict("Read", {"file_path": spec}), "a large Read under .ai is too big")
+        # Control: the same Write under the state dir is material and stays allowed.
+        allow(
+            fx.verdict("Write", {"file_path": os.path.join(fx.state_dir, "n.md"), "content": "x\n" * 100}),
+            "control: Write under the state dir",
+        )
 
 
 def test_state_failure_fails_open():
@@ -1440,10 +1464,11 @@ TESTS = [
     test_new_prompt_resets_the_edit_budget,
     test_manual_bypasses_the_edit_budget,
     test_allow_listed_paths_are_not_budgeted,
+    test_ai_is_no_longer_conductor_material,
     test_state_failure_fails_open,
     test_observe_mode_still_only_observes_a_big_read,
     test_top_level_read_of_source_denied,
-    test_read_of_ai_specs_allowed,
+    test_read_of_material_allowed,
     test_mcp_nucleos_tool_allowed,
     test_mcp_nucleos_double_segment_denied,
     test_agent_tool_allowed,

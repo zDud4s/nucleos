@@ -250,12 +250,12 @@ pub async fn approved(pool: &sqlx::SqlitePool, project_id: &str) -> sqlx::Result
 /// Every document this project has decided anything about, whatever is on disk today.
 ///
 /// **The filesystem is not the register of which documents a project has, and treating it as one is
-/// what makes this feature rot.** `map_intent::specs_in` answers *which files are in `.ai/specs`
-/// right now* — a question about a folder the owner archives, renames and reorganises, and whose
-/// contents are gitignored working material by standing policy. A decision row, by contrast, copied
-/// its slug, its heading and its text at extraction and keeps them for as long as the row exists.
-/// So the durable answer to *which documents does this project have* is here, in the table, and the
-/// folder is a second source that can only ever add to it.
+/// what makes this feature rot.** `map_intent::specs_in` answers *which files are in the project's
+/// spec folders right now* — a question about folders the owner archives, renames and reorganises,
+/// and whose contents are gitignored working material by standing policy. A decision row, by
+/// contrast, copied its slug, its heading and its text at extraction and keeps them for as long as
+/// the row exists. So the durable answer to *which documents does this project have* is here, in
+/// the table, and the folder is a second source that can only ever add to it.
 ///
 /// Concretely, the failure this replaces: `spec_slug` is a filename without its extension and these
 /// filenames carry dates. Rename `2026-08-24-mapa-do-projeto-design.md` and every approved decision

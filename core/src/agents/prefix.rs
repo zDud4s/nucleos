@@ -163,7 +163,7 @@ pub fn prefix_dir_for(project_root: &Path) -> Option<PathBuf> {
 }
 
 /// The `state_dir` key of `<project_root>/.nucleos/workflow/project.json`, if any.
-fn state_dir_for(project_root: &Path) -> Option<PathBuf> {
+pub fn state_dir_for(project_root: &Path) -> Option<PathBuf> {
     let text = std::fs::read_to_string(project_root.join(".nucleos/workflow/project.json")).ok()?;
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
     let state_dir = value.get("state_dir")?.as_str().filter(|s| !s.is_empty())?;

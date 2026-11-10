@@ -907,8 +907,8 @@ mod tests {
     };
     use sqlx::SqlitePool;
 
-    const PATH: &str = ".ai/specs/2026-01-01-alpha.md";
-    const OTHER_PATH: &str = ".ai/specs/2026-01-02-beta.md";
+    const PATH: &str = "<state_dir>/specs/2026-01-01-alpha.md";
+    const OTHER_PATH: &str = "<state_dir>/specs/2026-01-02-beta.md";
     /// Every upsert path must hold for both: the unique index over a nullable `project_id` treats
     /// NULLs as distinct, so it catches nothing in the `None` case.
     const PROJECTS: [Option<&str>; 2] = [Some("proj-1"), None];
@@ -1350,9 +1350,9 @@ mod tests {
     #[tokio::test]
     async fn deps_roundtrip() {
         let pool = crate::testdb::fresh_pool().await;
-        let a = seed(&pool, None, ".ai/specs/a.md").await.id;
-        let b = seed(&pool, None, ".ai/specs/b.md").await.id;
-        let c = seed(&pool, None, ".ai/specs/c.md").await.id;
+        let a = seed(&pool, None, "<state_dir>/specs/a.md").await.id;
+        let b = seed(&pool, None, "<state_dir>/specs/b.md").await.id;
+        let c = seed(&pool, None, "<state_dir>/specs/c.md").await.id;
         add_dep(&pool, &a, &b, DepSource::Extracted).await.unwrap();
         add_dep(&pool, &a, &c, DepSource::Owner).await.unwrap();
 

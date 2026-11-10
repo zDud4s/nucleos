@@ -1,9 +1,9 @@
 //! The distiller: a durable queue of closed jobs and runs whose text is worth reading once, and
 //! the worker that turns each one into project-scoped learnings.
 //!
-//! Design source of truth: `.ai/specs/2026-10-05-destilador-design.md` (§3 is the queue schema,
-//! §4 the causes and the worker). Phase A, packet P1 covers the queue, the cause vocabulary and
-//! the in-transaction enqueue helpers; nothing here reads a job's text yet.
+//! Design source of truth: `<state_dir>/specs/2026-10-05-destilador-design.md` (§3 is the queue
+//! schema, §4 the causes and the worker). Phase A, packet P1 covers the queue, the cause vocabulary
+//! and the in-transaction enqueue helpers; nothing here reads a job's text yet.
 
 pub mod chats;
 pub mod model;

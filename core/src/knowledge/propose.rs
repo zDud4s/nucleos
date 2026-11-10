@@ -545,7 +545,7 @@ pub async fn note_near_duplicate_in(
 }
 
 /// The note of an event that says a distilled learning quoted the owner's text, so it was proposed
-/// rather than recorded (`.ai/specs/2026-10-07-fronteira-prompts-design.md` section 4.3).
+/// rather than recorded (`<state_dir>/specs/2026-10-07-fronteira-prompts-design.md` section 4.3).
 pub const NOTE_QUOTED_OWNER_TEXT: &str = "quoted_owner_text";
 
 /// Say, in a same-status event, that `knowledge_id` quoted the owner's text.

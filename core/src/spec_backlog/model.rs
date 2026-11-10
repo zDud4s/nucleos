@@ -33,7 +33,7 @@ macro_rules! vocabulary {
 }
 
 vocabulary! {
-    /// What a file under `.ai/specs` turned out to be.
+    /// What a file under a specs directory turned out to be.
     SpecKind {
         Spec => "spec",
         Review => "review",
@@ -283,23 +283,26 @@ mod tests {
     #[test]
     fn spec_id_is_stable_and_separator_blind() {
         for project in [None, Some("proj-1")] {
-            let id = spec_id(project, ".ai/specs/alpha.md");
+            let id = spec_id(project, "<state_dir>/specs/alpha.md");
             assert!(!id.is_empty());
-            assert_eq!(spec_id(project, ".ai/specs/alpha.md"), id);
-            assert_eq!(spec_id(project, ".ai\\specs\\alpha.md"), id);
-            assert_eq!(spec_id(project, ".ai/specs\\alpha.md"), id);
+            assert_eq!(spec_id(project, "<state_dir>/specs/alpha.md"), id);
+            assert_eq!(spec_id(project, "<state_dir>\\specs\\alpha.md"), id);
+            assert_eq!(spec_id(project, "<state_dir>/specs\\alpha.md"), id);
         }
     }
 
     #[test]
     fn spec_id_differs_between_projects_and_paths() {
-        let path = ".ai/specs/alpha.md";
+        let path = "<state_dir>/specs/alpha.md";
         assert_ne!(spec_id(None, path), spec_id(Some("proj-1"), path));
         assert_ne!(spec_id(Some("proj-1"), path), spec_id(Some("proj-2"), path));
-        assert_ne!(spec_id(None, path), spec_id(None, ".ai/specs/beta.md"));
+        assert_ne!(
+            spec_id(None, path),
+            spec_id(None, "<state_dir>/specs/beta.md")
+        );
         assert_ne!(
             spec_id(Some("proj-1"), path),
-            spec_id(Some("proj-1"), ".ai/specs/beta.md")
+            spec_id(Some("proj-1"), "<state_dir>/specs/beta.md")
         );
 
         // The project and the path must not simply run together before hashing.

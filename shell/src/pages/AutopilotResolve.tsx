@@ -23,7 +23,7 @@ import { Badge, Button, ConfirmButton, Count, ErrorNote, Inset, Panel, Quiet, Re
 import { DecisionDialog } from "./AutopilotJudge";
 
 /**
- * Spec B (`.ai/specs/2026-09-27-autopilot-juiz-resolve-bloqueios-design.md`, D11), one project:
+ * Spec B (`<state_dir>/specs/2026-09-27-autopilot-juiz-resolve-bloqueios-design.md`, D11), one project:
  * whether the resolver observes or decides, how far it is from its bar, and the queue that gets
  * it there. The data warning comes first and is not folded away; the enforce risk (section 5) is
  * on screen whenever enforce could be chosen, and the button names it.

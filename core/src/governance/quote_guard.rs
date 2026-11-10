@@ -1,9 +1,10 @@
 //! Whether a text repeats a run of words from any of a set of sources.
 //!
-//! Spec `.ai/specs/2026-10-07-fronteira-prompts-design.md` §3. The distiller asks this about every
-//! new learning against the owner's text that went into its dossier, so that a quotation reaches no
-//! prompt without the owner's yes. It catches quotation only, never paraphrase: deterministic,
-//! cheap, and testable in a table. PURE: knows no notes, no store, no SQL.
+//! Spec `<state_dir>/specs/2026-10-07-fronteira-prompts-design.md` §3. The distiller asks this
+//! about every new learning against the owner's text that went into its dossier, so that a
+//! quotation reaches no prompt without the owner's yes. It catches quotation only, never
+//! paraphrase: deterministic, cheap, and testable in a table. PURE: knows no notes, no store, no
+//! SQL.
 
 use std::collections::HashSet;
 

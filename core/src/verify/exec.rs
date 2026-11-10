@@ -1,7 +1,7 @@
 //! The daemon's verification executor: a persisted queue of verification units
 //! (`verify_runs`), scheduled by [`verify_sched::pick`] under a machine-wide weight capacity,
 //! each run with its project's warm state — spec
-//! `.ai/specs/2026-10-05-selecao-de-testes-design.md` §4.6.
+//! `<state_dir>/specs/2026-10-05-selecao-de-testes-design.md` §4.6.
 //!
 //! [`Executor::submit`] queues (or joins) a unit and wakes the worker; [`run_executor`] is the
 //! worker loop; [`Executor::start_ready`] is one scheduling pass. Weight and in-use warm dirs are

@@ -81,10 +81,10 @@ pub(super) fn routes() -> Router<AppState> {
 /// Which documents this project has, from the table first and the folder second.
 ///
 /// **The union, and the order of the two words is the whole argument.** `map::intent::specs_in`
-/// answers *what is in `.ai/specs` right now*; `map::store::slugs` answers *what this project has
-/// ever extracted decisions from*. Only the second is durable — spec files are gitignored working
-/// material that gets archived, renamed and reorganised, and the slug is the FILENAME, so a rename
-/// silently retires every slug the approved rows still carry.
+/// answers *what is in the project's spec folders right now*; `map::store::slugs` answers *what
+/// this project has ever extracted decisions from*. Only the second is durable — spec files are
+/// gitignored working material that gets archived, renamed and reorganised, and the slug is the
+/// FILENAME, so a rename silently retires every slug the approved rows still carry.
 ///
 /// What the list is for is [`crate::map::join::evidence`]'s one refusal: a citation whose candidate
 /// names a DIFFERENT document of this project is evidence against, and is skipped rather than

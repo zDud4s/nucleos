@@ -1,5 +1,5 @@
 //! Claude Code as a fleet source: sessions registry + transcripts + subagents + daemon-run roots.
-//! Spec `.ai/specs/2026-10-20-fleet-arvore-viva-design.md` §3-§4.
+//! Spec `<state_dir>/specs/2026-10-20-fleet-arvore-viva-design.md` §3-§4.
 
 #[cfg(test)]
 mod fixture;

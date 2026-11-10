@@ -17,7 +17,8 @@
 //! spelling [`crate::ownership::normalise`] accepts — no `..`, nothing absolute, no backslash — and
 //! it names either a FILE in the bundle or a DIRECTORY of it, in which case every file under it is
 //! provided. A trailing slash is accepted and changes nothing. The bundle directory mirrors the
-//! project: the bundle's `.ai/workflow/workflow.md` is the project's `.ai/workflow/workflow.md`.
+//! project: the bundle's `.nucleos/workflow/workflow.md` is the project's
+//! `.nucleos/workflow/workflow.md`.
 //!
 //! This module still parses nothing but the manifest. Which files a workflow consists of is the
 //! bundle's to say; how they are copied is decided by their hashes alone.

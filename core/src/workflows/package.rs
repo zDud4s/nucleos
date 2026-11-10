@@ -7,8 +7,8 @@
 //!
 //! The library (`workflows.rs`) could list, pin, eject and drift bundles, and the only way one got
 //! INTO it was the daemon seeding its own autopilot. A workflow a person already works by — this
-//! repository's `.ai/` harness is the case in point — had no way in short of copying files by hand
-//! into a directory whose layout nothing documented.
+//! repository's former `.ai/` harness was the case in point — had no way in short of copying
+//! files by hand into a directory whose layout nothing documented.
 //!
 //! # The manifest says what the workflow is, and nothing here second-guesses it
 //!

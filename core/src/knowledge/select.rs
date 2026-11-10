@@ -427,8 +427,8 @@ pub(super) fn select_pass<'a>(
 /// observation count. `recall` shares this rule with briefing admission rather than inventing a
 /// second meaning for `active`. A third exception is opened deliberately, by owner decision D3: a
 /// distilled episode (`source = 'distiller'`, active on trial) reaches a node unapproved, spec
-/// `.ai/specs/2026-10-05-destilador-design.md` section 4.6. This function must NOT be narrowed to
-/// say so: a distilled semantic or procedural row a person approved is `active` with
+/// `<state_dir>/specs/2026-10-05-destilador-design.md` section 4.6. This function must NOT be
+/// narrowed to say so: a distilled semantic or procedural row a person approved is `active` with
 /// `source = 'distiller'` too, and it is approved. A proposed one never gets here. The other named
 /// exception is not approval: `admitted` separately requires a same-job working row with
 /// well-tagged evidence.
@@ -447,7 +447,7 @@ pub fn approved(row: &Known) -> bool {
 // reaches a prompt unapproved makes the approval decorative, which is the entire mechanism.
 // The named exceptions are a measured consolidator observation, a working fact with well-tagged
 // evidence read inside the same job, and -- opened deliberately by owner decision D3, spec
-// `.ai/specs/2026-10-05-destilador-design.md` section 4.6 -- a distilled episode (`source =
+// `<state_dir>/specs/2026-10-05-destilador-design.md` section 4.6 -- a distilled episode (`source =
 // 'distiller'`) active on trial, which `approved` already lets through; spelling their complete
 // shapes here keeps a fourth one out.
 pub(super) fn admitted(row: &Known, context: &Context) -> bool {

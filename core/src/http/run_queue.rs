@@ -26,8 +26,8 @@ pub(super) fn routes() -> Router<AppState> {
         .route("/runs/{id}/tail", get(crate::execution::runs::get_run_tail))
         // Why it stopped, not how it is doing: reads the run row plus, for a `gate` or `timeout`
         // kind only, the `shadow_decisions` leading up to it (spec
-        // `.ai/specs/2026-08-29-porque-parou-design.md` §4, §7). Read-only front to back — see
-        // `run_stop.rs`.
+        // `<state_dir>/specs/2026-08-29-porque-parou-design.md` §4, §7). Read-only front to back —
+        // see `run_stop.rs`.
         .route("/runs/{id}/stop", get(crate::execution::runs::get_run_stop))
         .route("/runs/{id}/knowledge", get(get_run_knowledge))
         .route("/runs/{id}/cancel", post(cancel_run))

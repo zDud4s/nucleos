@@ -188,7 +188,7 @@ pub(super) const ROUTES: &[RouteEntry] = &[
     RouteEntry {
         method: "GET",
         path: "/runs/{id}/stop",
-        purpose: "Why it stopped, not how it is doing: reads the run row plus, for a `gate` or `timeout` kind only, the `shadow_decisions` leading up to it (spec `.ai/specs/2026-08-29-porque-parou-design.md` §4, §7).",
+        purpose: "Why it stopped, not how it is doing: reads the run row plus, for a `gate` or `timeout` kind only, the `shadow_decisions` leading up to it (spec `<state_dir>/specs/2026-08-29-porque-parou-design.md` §4, §7).",
         body: Body::None,
         handler: "get_run_stop",
     },

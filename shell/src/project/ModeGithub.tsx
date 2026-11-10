@@ -55,8 +55,8 @@ import { Settings } from "./Settings";
  * its own — this project's authority, which is four tables (GitHub operations, git operations,
  * shell rules, landing targets) and not a setting — and a shape of its own, a status line over five
  * sections read top to bottom rather than a grid of panels. §5 of
- * `.ai/specs/2026-09-03-alcada-por-projecto-design.md` and §7 of
- * `.ai/specs/2026-09-06-git-ops-declaraveis-design.md` fix the order and the reason for it: the
+ * `<state_dir>/specs/2026-09-03-alcada-por-projecto-design.md` and §7 of
+ * `<state_dir>/specs/2026-09-06-git-ops-declaraveis-design.md` fix the order and the reason for it: the
  * remote first, because that is what somebody arrives to look at, and the government under it.
  *
  * **The tab was called "GitHub" and only its first section was.** Four of the five sections govern

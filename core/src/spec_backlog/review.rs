@@ -328,7 +328,7 @@ mod tests {
         Spec {
             id: "spec-1".to_owned(),
             project_id: None,
-            path: ".ai/specs/example.md".to_owned(),
+            path: "<state_dir>/specs/example.md".to_owned(),
             title: "Example".to_owned(),
             content_sha: "sha-1".to_owned(),
             kind: SpecKind::Spec,

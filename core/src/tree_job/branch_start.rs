@@ -1104,7 +1104,7 @@ mod tests {
         json!({
             "name": "notes",
             "goal": "Write the branch notes",
-            "owned_paths": [".ai/notes/**"],
+            "owned_paths": ["<state_dir>/notes/**"],
             "prompt": "Write the notes.",
             "layer": "docs",
             "node_id": caller,
@@ -1183,7 +1183,7 @@ mod tests {
         json!({
             "name": "later",
             "goal": "Write the later notes",
-            "owned_paths": [".ai/plans/**"],
+            "owned_paths": ["<state_dir>/plans/**"],
             "prompt": "Write the later notes.",
             "layer": "docs",
             "base": "notes",
@@ -1328,7 +1328,7 @@ mod tests {
         let added = post(
             &app,
             &format!("/trees/{TREE}/branches"),
-            json!({ "name": "notes", "paths": [".ai/notes/**"], "layer": "docs" }),
+            json!({ "name": "notes", "paths": ["<state_dir>/notes/**"], "layer": "docs" }),
         )
         .await;
         assert_eq!(added.0, StatusCode::OK, "{:?}", added.1);

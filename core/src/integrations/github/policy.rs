@@ -3,8 +3,8 @@
 use super::*;
 
 // **Where the map is going: `gh` in Bash stops being autonomous, and `REFUSED_READ_FLAGS` goes with
-// it.** Decision #6 of `.ai/specs/2026-09-03-alcada-por-projecto-design.md`, written down here as
-// the destination and deliberately not taken.
+// it.** Decision #6 of `<state_dir>/specs/2026-09-03-alcada-por-projecto-design.md`, written down
+// here as the destination and deliberately not taken.
 //
 // **It is not a refusal.** A `gh` line an agent needs can still be ASKED for: it becomes a
 // `pending_approval` like every other command this house has no opinion about, and a person
@@ -199,8 +199,8 @@ pub fn every_op() -> Vec<OpStanding> {
 /// `project_github_ops` and returns a NEW `Policy` with the project's operations laid over the
 /// machine default; the value handed to a decision is built for that decision and thrown away
 /// after. The immutability above survives intact — what changed is that there is now more than one
-/// of these, and §4.4 of `.ai/specs/2026-09-03-alcada-por-projecto-design.md` is where that was
-/// decided and where the "read at the moment of the decision, with no cache" rule is argued.
+/// of these, and §4.4 of `<state_dir>/specs/2026-09-03-alcada-por-projecto-design.md` is where that
+/// was decided and where the "read at the moment of the decision, with no cache" rule is argued.
 ///
 /// **Every list here is an intersection with a compiled ceiling, and never a union with one.**
 /// Configuration chooses inside what the code fixes, and a project's table is configuration exactly

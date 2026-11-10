@@ -977,8 +977,8 @@ mod tests {
     const NODE: &str = "node-api";
     const KEY: &str = "key-1";
     /// A file a docs branch may own, so that the routes admit its branch whatever the disk holds.
-    const SHARED: &str = ".ai/plans/shared.md";
-    const OTHER_DOCS: &str = ".ai/plans/other.md";
+    const SHARED: &str = "<state_dir>/plans/shared.md";
+    const OTHER_DOCS: &str = "<state_dir>/plans/other.md";
     const CODE_PATH: &str = "core/src/shared.rs";
     const OTHER_CODE_PATH: &str = "core/src/other.rs";
 
@@ -2511,7 +2511,7 @@ mod tests {
         let before = loaded(&state.pool, JOB).await.manifest;
 
         for body in [
-            json!({ "name": "notes", "paths": [".ai/plans/third.md"], "layer": DOCS }),
+            json!({ "name": "notes", "paths": ["<state_dir>/plans/third.md"], "layer": DOCS }),
             json!({ "name": "notes", "paths": [SHARED], "layer": FREE_LAYER }),
             json!({ "name": "notes", "paths": [SHARED], "layer": DOCS, "base": "base" }),
         ] {
@@ -2854,6 +2854,46 @@ mod tests {
             assert_error_naming(&response, StatusCode::UNPROCESSABLE_ENTITY, CODE_PATH);
         }
         assert!(loaded(&state.pool, JOB).await.manifest.branches.is_empty());
+    }
+
+    /// The retired `.ai/` layout is no longer a path a docs branch may write.
+    #[tokio::test]
+    async fn post_branch_of_the_docs_layer_with_a_retired_ai_path_is_422() {
+        let state = test_state().await;
+        let app = app(&state);
+        seed_job(&state.pool, JOB, "open", Vec::new(), &[]).await;
+
+        let retired = ".ai/plans/x.md";
+        let response = post(
+            &app,
+            &branches_uri(JOB),
+            docs_branch_body("notes", &[retired]),
+        )
+        .await;
+
+        assert_error_naming(&response, StatusCode::UNPROCESSABLE_ENTITY, retired);
+        assert!(loaded(&state.pool, JOB).await.manifest.branches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn post_branch_of_the_docs_layer_accepts_a_state_dir_token_path() {
+        let state = test_state().await;
+        let app = app(&state);
+        seed_job(&state.pool, JOB, "open", Vec::new(), &[]).await;
+
+        let response = post(
+            &app,
+            &branches_uri(JOB),
+            docs_branch_body("notes", &["<state_dir>/plans/new.md"]),
+        )
+        .await;
+
+        assert_first_call(&response);
+        let (status, read) = get(&app, &format!("/trees/{JOB}")).await;
+        assert_eq!(status, StatusCode::OK, "{read:?}");
+        let added = &read["manifest"]["branches"]["notes"];
+        assert_eq!(added["state"], json!("queued"));
+        assert_eq!(added["paths"], json!(["<state_dir>/plans/new.md"]));
     }
 
     /// A layer measured beyond any real disk, so this refusal holds whatever the machine has free.

@@ -2,7 +2,7 @@
 //!
 //! One file, two readers: `output.md` is sent to the model verbatim (prompt layer 6) and parsed here
 //! into the validator's spec, so there is no second source for what "valid" means. The format is
-//! documented in `.ai/plans/2026-10-20-agentes/b1-launch.md` section 1:
+//! documented in `<state_dir>/plans/2026-10-20-agentes/b1-launch.md` section 1:
 //!
 //! - each `## Heading` is a required section, in this order; text before the first one is
 //!   instruction only;

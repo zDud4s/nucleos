@@ -336,6 +336,14 @@ pub(super) async fn pretooluse_decision_from(
         return decision;
     }
 
+    // The retired `.ai/` layout takes no new writes from any run: its material lives under
+    // `<state_dir>` now. Before the docs rule, so a docs run is told where to write instead.
+    if let Some(decision) =
+        node_context::legacy_ai_write_decision(&payload, cwd.as_deref().map(Path::new))
+    {
+        return decision;
+    }
+
     if let Some(decision) =
         node_context::docs_write_decision(&state, &payload, run_id, cwd.as_deref().map(Path::new))
             .await
@@ -1367,12 +1375,27 @@ mod tests {
     /// A tree branch whose node is bound to a running `worktree` run. It does not launch an
     /// agent; the run is the test fixture's inert row.
     async fn seed_tree_branch_run(state: &AppState, layer: &str, owned_paths: &[&str]) -> i64 {
+        seed_tree_branch_run_in(state, layer, owned_paths, Path::new(r"C:\work\repo")).await
+    }
+
+    /// `seed_tree_branch_run` for a manifest whose `project_root` is `project_root`.
+    async fn seed_tree_branch_run_in(
+        state: &AppState,
+        layer: &str,
+        owned_paths: &[&str],
+        project_root: &Path,
+    ) -> i64 {
         let (run_id, node_id, root_id) =
             seed_node_run(state, "worktree", "leaf", Some(1_000)).await;
         let tree_id = format!("tree-{run_id}");
         let paths: Vec<String> = owned_paths.iter().map(|path| (*path).to_owned()).collect();
-        let mut manifest =
-            Manifest::new(&tree_id, "feature/docs", "Write docs", r"C:\work\repo", &[]);
+        let mut manifest = Manifest::new(
+            &tree_id,
+            "feature/docs",
+            "Write docs",
+            project_root.to_str().unwrap(),
+            &[],
+        );
         let mut branch = Branch::new("docs", &paths, layer, None);
         branch.node_id = Some(node_id.clone());
         manifest.branches.insert("docs".to_owned(), branch);
@@ -1794,17 +1817,55 @@ mod tests {
         );
     }
 
-    /// Regression guard: a docs branch may write a declared file in an allowed docs directory.
+    /// A project whose `project.json` points at a state directory outside the checkout: the temp
+    /// dir guard, the checkout root and the state directory. Both are created.
+    fn state_dir_project() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        let state_dir = tmp.path().join("state");
+        std::fs::create_dir_all(root.join(".nucleos/workflow")).unwrap();
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(
+            root.join(".nucleos/workflow/project.json"),
+            json!({"state_dir": state_dir.to_str().unwrap()}).to_string(),
+        )
+        .unwrap();
+        (tmp, root, state_dir)
+    }
+
+    /// A docs run behind `owned_paths`, working in the checkout of a `state_dir_project`.
+    async fn seed_docs_run_in_state_dir(
+        state: &AppState,
+        owned_paths: &[&str],
+    ) -> (
+        i64,
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let (tmp, root, state_dir) = state_dir_project();
+        let run_id = seed_tree_branch_run_in(state, "docs", owned_paths, &root).await;
+        sqlx::query("UPDATE runs SET cwd = ? WHERE id = ?")
+            .bind(root.to_str().unwrap())
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        (run_id, tmp, root, state_dir)
+    }
+
+    /// A docs branch may write a declared `<state_dir>` file, by its absolute path.
     #[tokio::test]
     async fn docs_run_write_inside_declared_paths_is_allowed() {
         let state = test_state().await;
-        let run_id = seed_tree_branch_run(&state, "docs", &[".ai/notes/**"]).await;
+        let (run_id, _tmp, _root, state_dir) =
+            seed_docs_run_in_state_dir(&state, &["<state_dir>/notes/**"]).await;
 
         let decision = decide(
             &state,
             run_id,
             "Write",
-            write_input(Path::new(r"C:\work\repo\.ai\notes\design.md")),
+            write_input(&state_dir.join("notes").join("design.md")),
         )
         .await;
 
@@ -1814,39 +1875,35 @@ mod tests {
     #[tokio::test]
     async fn docs_run_absolute_unix_path_inside_declared_paths_is_allowed() {
         let state = test_state().await;
-        let run_id = seed_tree_branch_run(&state, "docs", &[".ai/notes/**"]).await;
-        sqlx::query("UPDATE runs SET cwd = '/repo' WHERE id = ?")
-            .bind(run_id)
-            .execute(&state.pool)
-            .await
-            .unwrap();
+        let (run_id, _tmp, _root, state_dir) =
+            seed_docs_run_in_state_dir(&state, &["<state_dir>/notes/**"]).await;
+        // The forward-slash spelling of the same absolute path.
+        let slashed = format!(
+            "{}/notes/design.md",
+            state_dir.to_str().unwrap().replace('\\', "/")
+        );
 
-        let decision = decide(
-            &state,
-            run_id,
-            "Write",
-            write_input(Path::new("/repo/.ai/notes/design.md")),
-        )
-        .await;
+        let decision = decide(&state, run_id, "Write", write_input(Path::new(&slashed))).await;
 
         assert_allowed(
             &decision,
-            "an absolute Unix path under the declared docs path",
+            "a forward-slash absolute path under the declared docs path",
         );
     }
 
     #[tokio::test]
     async fn docs_run_path_differing_only_in_case_follows_the_platform() {
         let state = test_state().await;
-        let run_id = seed_tree_branch_run(&state, "docs", &[".ai/notes/**"]).await;
+        let (run_id, _tmp, _root, state_dir) =
+            seed_docs_run_in_state_dir(&state, &["<state_dir>/notes/**"]).await;
+        let shouted = format!(
+            "{}{}notes{}design.md",
+            state_dir.to_str().unwrap().to_uppercase(),
+            std::path::MAIN_SEPARATOR,
+            std::path::MAIN_SEPARATOR
+        );
 
-        let decision = decide(
-            &state,
-            run_id,
-            "Write",
-            write_input(Path::new(r"C:\WORK\REPO\.ai\notes\design.md")),
-        )
-        .await;
+        let decision = decide(&state, run_id, "Write", write_input(Path::new(&shouted))).await;
 
         assert_eq!(
             decision.decision,
@@ -1859,13 +1916,14 @@ mod tests {
     #[tokio::test]
     async fn docs_run_write_outside_declared_paths_is_denied_not_parked() {
         let state = test_state().await;
-        let run_id = seed_tree_branch_run(&state, "docs", &[".ai/notes/**"]).await;
+        let (run_id, _tmp, root, _state_dir) =
+            seed_docs_run_in_state_dir(&state, &["<state_dir>/notes/**"]).await;
 
         let decision = decide(
             &state,
             run_id,
             "Write",
-            write_input(Path::new(r"C:\work\repo\.ai\specs\design.md")),
+            write_input(&root.join("src").join("design.md")),
         )
         .await;
 
@@ -1878,17 +1936,158 @@ mod tests {
     #[tokio::test]
     async fn docs_run_write_to_an_allowed_dir_but_undeclared_file_is_denied() {
         let state = test_state().await;
-        let run_id = seed_tree_branch_run(&state, "docs", &[".ai/notes/declared.md"]).await;
+        let (run_id, _tmp, _root, state_dir) =
+            seed_docs_run_in_state_dir(&state, &["<state_dir>/notes/declared.md"]).await;
 
         let decision = decide(
             &state,
             run_id,
             "Write",
-            write_input(Path::new(r"C:\work\repo\.ai\notes\undeclared.md")),
+            write_input(&state_dir.join("notes").join("undeclared.md")),
         )
         .await;
 
         assert_eq!(decision.decision, "deny", "got {:?}", decision.reason);
+    }
+
+    /// The hook answers `allow` itself: falling through would reach the node scope fence and the
+    /// classifier, which cannot answer for a path outside the workspace in a tree run.
+    #[tokio::test]
+    async fn docs_run_write_into_the_state_dir_is_allowed() {
+        let state = test_state().await;
+        let (run_id, _tmp, _root, state_dir) =
+            seed_docs_run_in_state_dir(&state, &["<state_dir>/notes/**"]).await;
+
+        let decision = decide(
+            &state,
+            run_id,
+            "Write",
+            write_input(&state_dir.join("notes").join("x.md")),
+        )
+        .await;
+
+        assert_eq!(decision.decision, "allow", "got {:?}", decision.reason);
+        assert!(
+            decision.reason.contains("state_dir"),
+            "the hook itself must answer, got {:?}",
+            decision.reason
+        );
+        let (status, approvals) = run_status_and_action_approvals(&state, run_id).await;
+        assert_eq!(status, "running");
+        assert_eq!(approvals, 0);
+    }
+
+    #[tokio::test]
+    async fn docs_run_write_to_an_undeclared_state_dir_subdirectory_is_denied() {
+        let state = test_state().await;
+        let (run_id, _tmp, _root, state_dir) =
+            seed_docs_run_in_state_dir(&state, &["<state_dir>/notes/**"]).await;
+
+        let decision = decide(
+            &state,
+            run_id,
+            "Write",
+            write_input(&state_dir.join("specs").join("x.md")),
+        )
+        .await;
+
+        assert_eq!(decision.decision, "deny", "got {:?}", decision.reason);
+        let (status, approvals) = run_status_and_action_approvals(&state, run_id).await;
+        assert_eq!(status, "running");
+        assert_eq!(approvals, 0);
+    }
+
+    /// Even a branch that declares the whole state directory (injected here, past the manifest
+    /// validation) may not write its root files: `memory.md` and `decisions.md` are not docs.
+    #[tokio::test]
+    async fn docs_run_write_to_state_dir_root_files_is_denied() {
+        let state = test_state().await;
+        let (run_id, _tmp, _root, state_dir) =
+            seed_docs_run_in_state_dir(&state, &["<state_dir>/**"]).await;
+
+        let decision = decide(
+            &state,
+            run_id,
+            "Write",
+            write_input(&state_dir.join("memory.md")),
+        )
+        .await;
+
+        assert_eq!(decision.decision, "deny", "got {:?}", decision.reason);
+    }
+
+    #[tokio::test]
+    async fn docs_run_write_under_the_retired_ai_dir_is_denied() {
+        let state = test_state().await;
+        let (run_id, _tmp, root, _state_dir) =
+            seed_docs_run_in_state_dir(&state, &["<state_dir>/notes/**"]).await;
+
+        let decision = decide(
+            &state,
+            run_id,
+            "Write",
+            write_input(&root.join(".ai").join("notes").join("x.md")),
+        )
+        .await;
+
+        assert_eq!(decision.decision, "deny", "got {:?}", decision.reason);
+    }
+
+    /// The token is never valid input: spelled relatively it would create a directory named
+    /// `<state_dir>` in the checkout.
+    #[tokio::test]
+    async fn docs_run_literal_state_dir_token_as_a_relative_path_is_denied() {
+        let state = test_state().await;
+        let (run_id, _tmp, _root, _state_dir) =
+            seed_docs_run_in_state_dir(&state, &["<state_dir>/notes/**"]).await;
+
+        let decision = decide(
+            &state,
+            run_id,
+            "Write",
+            json!({"file_path": "<state_dir>/notes/x.md", "content": "x"}),
+        )
+        .await;
+
+        assert_eq!(decision.decision, "deny", "got {:?}", decision.reason);
+        let (status, approvals) = run_status_and_action_approvals(&state, run_id).await;
+        assert_eq!(status, "running");
+        assert_eq!(approvals, 0);
+    }
+
+    /// A worktree run that writes under the retired `.ai/` is refused at once, pointing at the
+    /// state directory, and is never parked for an approval nobody answers.
+    #[tokio::test]
+    async fn a_run_writing_under_dot_ai_is_denied_not_parked() {
+        let state = test_state().await;
+        for (tool, input) in [
+            (
+                "Write",
+                json!({"file_path": r"C:\work\repo\.ai\notes\x.md", "content": "x"}),
+            ),
+            (
+                "Edit",
+                json!({
+                    "file_path": r"C:\work\repo\.ai\specs\x.md",
+                    "old_string": "a",
+                    "new_string": "b",
+                }),
+            ),
+        ] {
+            let (run_id, _, _) = seed_node_run(&state, "worktree", "leaf", Some(1_000)).await;
+
+            let decision = decide(&state, run_id, tool, input).await;
+
+            assert_eq!(decision.decision, "deny", "{tool}: {:?}", decision.reason);
+            assert!(
+                decision.reason.contains("<state_dir>"),
+                "{tool}: the reason must point at the state dir, got {:?}",
+                decision.reason
+            );
+            let (status, approvals) = run_status_and_action_approvals(&state, run_id).await;
+            assert_eq!(status, "running", "{tool}");
+            assert_eq!(approvals, 0, "{tool}");
+        }
     }
 
     /// Regression guard: the docs-only write restriction must not change code branches.
@@ -1913,7 +2112,7 @@ mod tests {
     /// reaches the classifier, and a refusal from there (a tree run's converted park) names no docs
     /// branch, so this helper fails on it.
     async fn assert_docs_run_refuses_shell(state: &AppState, command: &str, what: &str) {
-        let run_id = seed_tree_branch_run(state, "docs", &[".ai/notes/**"]).await;
+        let run_id = seed_tree_branch_run(state, "docs", &["<state_dir>/notes/**"]).await;
         let decision = decide(state, run_id, "Bash", json!({"command": command})).await;
         assert_eq!(
             decision.decision, "deny",
@@ -1967,7 +2166,7 @@ mod tests {
             "cp a ./b",
             "touch ./f",
         ] {
-            let run_id = seed_tree_branch_run(&state, "docs", &[".ai/notes/**"]).await;
+            let run_id = seed_tree_branch_run(&state, "docs", &["<state_dir>/notes/**"]).await;
             let decision = decide(&state, run_id, "Bash", json!({"command": command})).await;
 
             assert_eq!(
@@ -2008,7 +2207,7 @@ mod tests {
     #[tokio::test]
     async fn docs_run_cargo_fmt_check_is_allowed() {
         let state = test_state().await;
-        let run_id = seed_tree_branch_run(&state, "docs", &[".ai/notes/**"]).await;
+        let run_id = seed_tree_branch_run(&state, "docs", &["<state_dir>/notes/**"]).await;
 
         let decision = decide(
             &state,
@@ -2071,7 +2270,7 @@ mod tests {
     #[tokio::test]
     async fn docs_run_powershell_quoted_semicolon_fails_closed() {
         let state = test_state().await;
-        let run_id = seed_tree_branch_run(&state, "docs", &[".ai/notes/**"]).await;
+        let run_id = seed_tree_branch_run(&state, "docs", &["<state_dir>/notes/**"]).await;
 
         let decision = decide(
             &state,
@@ -2090,7 +2289,7 @@ mod tests {
     #[tokio::test]
     async fn docs_run_cd_then_git_status_is_allowed() {
         let state = test_state().await;
-        let run_id = seed_tree_branch_run(&state, "docs", &[".ai/notes/**"]).await;
+        let run_id = seed_tree_branch_run(&state, "docs", &["<state_dir>/notes/**"]).await;
 
         let decision = decide(
             &state,
@@ -2122,7 +2321,7 @@ mod tests {
     #[tokio::test]
     async fn docs_run_powershell_set_location_is_allowed() {
         let state = test_state().await;
-        let run_id = seed_tree_branch_run(&state, "docs", &[".ai/notes/**"]).await;
+        let run_id = seed_tree_branch_run(&state, "docs", &["<state_dir>/notes/**"]).await;
 
         let decision = decide(
             &state,
@@ -2177,7 +2376,7 @@ mod tests {
     #[tokio::test]
     async fn docs_run_heavy_wrapper_options_cargo_fmt_check_passes_the_docs_guard() {
         let state = test_state().await;
-        let run_id = seed_tree_branch_run(&state, "docs", &[".ai/notes/**"]).await;
+        let run_id = seed_tree_branch_run(&state, "docs", &["<state_dir>/notes/**"]).await;
 
         let decision = decide(
             &state,
@@ -2218,7 +2417,7 @@ mod tests {
     #[tokio::test]
     async fn docs_run_plain_read_is_allowed() {
         let state = test_state().await;
-        let run_id = seed_tree_branch_run(&state, "docs", &[".ai/notes/**"]).await;
+        let run_id = seed_tree_branch_run(&state, "docs", &["<state_dir>/notes/**"]).await;
 
         let decision = decide(&state, run_id, "Bash", json!({"command": "git status"})).await;
 

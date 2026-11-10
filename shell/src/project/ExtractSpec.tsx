@@ -79,8 +79,7 @@ export function ExtractSpec({ projectId }: ExtractSpecProps) {
           is the whole map it can have, and it is not wrong, only thin.
         </p>
         <p className="max-w-prose text-xs text-text-faint">
-          The {DAEMON_NAME} looks in <span className="font-mono">.ai/specs/</span>,{" "}
-          <span className="font-mono">docs/specs/</span> and{" "}
+          The {DAEMON_NAME} looks in <span className="font-mono">docs/specs/</span> and{" "}
           <span className="font-mono">docs/superpowers/specs/</span>. One document in any of them is
           all this needs.
         </p>

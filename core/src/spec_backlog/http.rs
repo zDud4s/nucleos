@@ -810,7 +810,7 @@ mod tests {
         let spec = store::upsert_by_path(
             &state.pool,
             Some(project),
-            ".ai/specs/2026-01-01-one.md",
+            "<state_dir>/specs/2026-01-01-one.md",
             "one",
             "sha-1",
         )
@@ -871,7 +871,7 @@ mod tests {
             .execute(&state.pool).await.unwrap();
         sqlx::query(
             "INSERT INTO specs (id, project_id, path, title, content_sha, created_at, updated_at) \
-             VALUES ('rootless-spec', 'rootless-spec-project', '.ai/specs/a.md', 'A', 'sha', 'now', 'now')",
+             VALUES ('rootless-spec', 'rootless-spec-project', '<state_dir>/specs/a.md', 'A', 'sha', 'now', 'now')",
         ).execute(&state.pool).await.unwrap();
         let app = app(&state);
         for route in ["/specs/nope/extract", "/specs/nope/audit"] {
@@ -888,10 +888,10 @@ mod tests {
     async fn the_owner_can_add_a_dependency() {
         let state = state().await;
         sqlx::query("INSERT INTO specs (id, path, title, content_sha, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)")
-            .bind("dep-a").bind(".ai/specs/a.md").bind("A").bind("a").bind("now").bind("now")
+            .bind("dep-a").bind("<state_dir>/specs/a.md").bind("A").bind("a").bind("now").bind("now")
             .execute(&state.pool).await.unwrap();
         sqlx::query("INSERT INTO specs (id, path, title, content_sha, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)")
-            .bind("dep-b").bind(".ai/specs/b.md").bind("B").bind("b").bind("now").bind("now")
+            .bind("dep-b").bind("<state_dir>/specs/b.md").bind("B").bind("b").bind("now").bind("now")
             .execute(&state.pool).await.unwrap();
         let app = app(&state);
         let (status, _) = request(

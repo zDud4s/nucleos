@@ -1,8 +1,9 @@
 //! The owner of the main tree: which branch a project's landings merge into, and whether a given
 //! landing may be admitted at all.
 //!
-//! Design: `.ai/specs/2026-08-27-dono-da-arvore-principal-design.md`, and — for a landing that
-//! names its own destination — `.ai/specs/2026-09-03-alcada-por-projecto-design.md` §4.1.
+//! Design: `<state_dir>/specs/2026-08-27-dono-da-arvore-principal-design.md`, and — for a
+//! landing that names its own destination —
+//! `<state_dir>/specs/2026-09-03-alcada-por-projecto-design.md` §4.1.
 //!
 //! **The two documents number their decisions separately, and both have a decision #2.** An
 //! unqualified "decision #N" anywhere in this file is the 2026-08-27 design's, which is the
