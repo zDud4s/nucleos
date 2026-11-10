@@ -590,6 +590,7 @@ if [ "$target" = hooks ] || [ "$target" = all ]; then
     # runs green on a machine with no route to OpenRouter at all.
     run "models: refresh"   . "$py" scripts/test-refresh-models.py
     run "git: worktree sync" . "$py" scripts/test-post-checkout.py
+    run "migrate: ai layout" . "$py" scripts/test-migrate-ai-layout.py
     run "git: reference-transaction" . "$py" scripts/test-reference-transaction.py
     # One version for shell, core and sidecars: every manifest must agree with VERSION.
     run "release: versions" . "$py" scripts/bump-version.py --check
