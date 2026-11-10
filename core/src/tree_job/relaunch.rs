@@ -115,13 +115,16 @@ pub(super) const WRAP_PREFIX: &str = "wrap-";
 pub(super) const DIED_PREFIX: &str = "died-";
 pub(super) const FIX_PREFIX: &str = "fix-";
 pub(super) const RESCUE_PREFIX: &str = "rescue-";
+/// The fix run of a red final verify, started on the root node (`final_verify`).
+pub(super) const FINAL_FIX_PREFIX: &str = "finalfix-";
 pub(super) const TRANSIENT_PREFIX: &str = "transient-";
 const RESUME_PREFIX: &str = "resume-";
-const SUFFIXED_KEY_PREFIXES: [&str; 6] = [
+const SUFFIXED_KEY_PREFIXES: [&str; 7] = [
     WRAP_PREFIX,
     DIED_PREFIX,
     FIX_PREFIX,
     RESCUE_PREFIX,
+    FINAL_FIX_PREFIX,
     TRANSIENT_PREFIX,
     RESUME_PREFIX,
 ];
