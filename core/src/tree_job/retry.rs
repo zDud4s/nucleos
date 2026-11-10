@@ -13,17 +13,21 @@ use sqlx::SqlitePool;
 use super::decisions::{ROOT_PARK_KEY, STATUS_OPEN};
 use super::driver::{GateVerdict, NotMeasured, Park, RESOLVER_GRACE};
 use super::final_verify::is_gate_red;
+use super::ladder::{self, Kind, Spent, Step};
 use super::landing::{LandSettlement, apply_gate_verdict, claim_land};
 use super::store::{self, TreeJob};
 use crate::gate::GateOutcome;
 use crate::verify::ScopeVerdict;
 
-/// Gates of one branch in a row that may end without measuring anything before the owner is asked.
-pub(super) const GATE_ATTEMPTS: i64 = 3;
+/// Gates of one branch in a row that may end without measuring anything before the owner is asked:
+/// the first, and the ladder's retries of it.
+pub(super) const GATE_ATTEMPTS: i64 = ladder::retry_cap(Kind::Gate) + 1;
 /// The key of `Branch.extra` that counts those gates.
 pub(super) const GATE_FAILURES: &str = "gate_failures";
-/// Landings of one job that may fail in the queue or be refused before the owner is asked.
-pub(super) const LAND_ATTEMPTS: i64 = 3;
+/// Landings of one job that may fail in the queue or be refused before the owner is asked: the
+/// first, and the ladder's retries of it. The landing queue paces its own retries, and there is no
+/// per-job "not before" for them, so this kind has no backoff of its own.
+pub(super) const LAND_ATTEMPTS: i64 = ladder::retry_cap(Kind::Land) + 1;
 /// The key of `Manifest.extra` that counts them: `{count, at, reason, decision_id?}`.
 pub(super) const LAND_ATTEMPTS_KEY: &str = "land_attempts";
 /// The key of `Manifest.extra` stamping (RFC 3339) when an escalated landing was first seen
@@ -72,9 +76,9 @@ pub(super) fn branch_ceiling_secs(extra: &BTreeMap<String, Value>, base_secs: u6
     scoped_ceiling_secs(base_secs, get(GATE_CEILING_UNITS), get(GATE_CEILING_HITS))
 }
 
-/// How long a gate may wait in total on infrastructure before the owner is asked (autonomy-trees
-/// spec A1; the B1 ladder takes over from this park once it exists).
-pub(super) const GATE_LOAD_CAP_SECS: i64 = 6 * 3600;
+/// How long a gate may wait in total on infrastructure before it leaves the retry rung of the
+/// ladder (autonomy-trees spec A1); a gate has no agent to diagnose it, so the next rung is the park.
+pub(super) const GATE_LOAD_CAP_SECS: i64 = ladder::LOAD_CAP_SECS;
 
 /// Whether an error says a process can never be spawned the way it was asked to be, however often
 /// it is tried: Windows `os error 206` (the file name or command line is too long) and `267` (the
@@ -147,12 +151,6 @@ pub(super) fn infrastructure_failure(output: &str) -> Option<String> {
     )
 }
 
-/// How long a gate starved by load waits after `waits` earlier waits: 30 s doubling, capped at 10 min.
-pub(super) fn load_backoff(waits: i64) -> Duration {
-    let exp = u32::try_from(waits.clamp(0, 5)).unwrap_or(5);
-    Duration::from_secs((30u64 << exp).min(600))
-}
-
 fn clear_load_wait(extra: &mut BTreeMap<String, Value>) {
     extra.remove(GATE_LOAD_WAITS);
     extra.remove(GATE_BACKOFF_UNTIL);
@@ -173,12 +171,15 @@ pub(super) enum LoadStep {
 }
 
 pub(super) fn load_step(waits: i64, waited_secs: i64) -> LoadStep {
-    let delay = load_backoff(waits);
-    let next = waited_secs.saturating_add(i64::try_from(delay.as_secs()).unwrap_or(i64::MAX));
-    if next > GATE_LOAD_CAP_SECS {
-        LoadStep::CapReached
-    } else {
-        LoadStep::Wait(delay)
+    let spent = Spent {
+        retries: waits,
+        waited_secs,
+        diagnosed: false,
+    };
+    match ladder::next_step(Kind::GateLoadWait, spent) {
+        Step::Retry { after } => LoadStep::Wait(after),
+        // No agent can diagnose a starved gate, so the rung after the retries is the park.
+        Step::Diagnose | Step::Park => LoadStep::CapReached,
     }
 }
 
@@ -303,19 +304,39 @@ pub(super) async fn apply_gate_answer(
                 .and_then(Value::as_i64)
                 .unwrap_or(0)
                 + 1;
-            if count >= GATE_ATTEMPTS {
-                // The owner's answer is a fresh allowance, so the count starts again.
-                held.extra.remove(GATE_FAILURES);
-                if let Some(node) = held.node_id.clone() {
-                    park = Some((
-                        node,
-                        format!(
-                            "The gate of branch {branch} ended {count} times in a row without measuring anything; last reason: {reason}"
-                        ),
-                    ));
+            // `count` includes the gate that just ended; the retries so far are one fewer.
+            let step = ladder::next_step(
+                Kind::Gate,
+                Spent {
+                    retries: count - 1,
+                    ..Spent::default()
+                },
+            );
+            match step {
+                Step::Retry { after } => {
+                    // The next gate waits minutes, so a verify queue that is down is not hammered.
+                    let until = Utc::now()
+                        + chrono::Duration::from_std(after)
+                            .unwrap_or_else(|_| chrono::Duration::minutes(30));
+                    held.extra.insert(
+                        GATE_BACKOFF_UNTIL.to_owned(),
+                        json!(until.to_rfc3339_opts(SecondsFormat::Secs, false)),
+                    );
+                    held.extra.insert(GATE_FAILURES.to_owned(), json!(count));
                 }
-            } else {
-                held.extra.insert(GATE_FAILURES.to_owned(), json!(count));
+                // No agent can diagnose a gate that measures nothing: the diagnose rung is a park.
+                Step::Diagnose | Step::Park => {
+                    // The owner's answer is a fresh allowance, so the count starts again.
+                    held.extra.remove(GATE_FAILURES);
+                    if let Some(node) = held.node_id.clone() {
+                        park = Some((
+                            node,
+                            format!(
+                                "The gate of branch {branch} ended {count} times in a row without measuring anything; last reason: {reason}"
+                            ),
+                        ));
+                    }
+                }
             }
         }
         answer => {

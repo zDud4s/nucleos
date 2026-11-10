@@ -1,16 +1,18 @@
 //! One bounded autonomous rescue before the driver asks the owner.
 //!
 //! A branch is parked when its node ended `blocked` or `failed`, or when its gate stayed red after
-//! `FIX_CAP` fixes. Before that question goes out, the node is started once more with the evidence
-//! of the failure in its prompt (key `rescue-<dead run>`). The allowance is counted in
-//! `tree_launches`, the way fixes are: one rescue per node since the owner's last answer
-//! (`decision-<id>` launch), so an answer is a fresh allowance and a rescue that fails too falls
-//! through to the park as before.
+//! the ladder's fix retries (`ladder::Kind::Fix`), or when a chain of relaunches ran out of
+//! retries (`wrap`). Before that question goes out, the node is started once more with the evidence
+//! of the failure in its prompt (key `rescue-<dead run>`): this is the ladder's "diagnose and
+//! decide" rung. The allowance is counted in `tree_launches`, the way fixes are: one rescue per
+//! node since the owner's last answer (`decision-<id>` launch), so an answer is a fresh allowance
+//! and a rescue that fails too falls through to the park as before.
 
 use std::path::Path;
 
 use sqlx::SqlitePool;
 
+use super::ladder::{Kind, Spent, Step, next_step};
 use super::relaunch::{RESCUE_PREFIX, budget_refusal, relaunch_node};
 use crate::state::AppState;
 use crate::work_nodes;
@@ -86,7 +88,15 @@ pub(super) async fn attempt(
     suffix: &str,
 ) -> Result<bool, String> {
     let key = format!("{RESCUE_PREFIX}{dead_run}");
-    if spent(&state.pool, node_id, &key).await? >= 1 {
+    let diagnosed = spent(&state.pool, node_id, &key).await? >= 1;
+    let rung = next_step(
+        Kind::Rescue,
+        Spent {
+            diagnosed,
+            ..Spent::default()
+        },
+    );
+    if rung != Step::Diagnose {
         return Ok(false);
     }
     if budget_refusal(&state.pool, node_id).await.is_some() {
