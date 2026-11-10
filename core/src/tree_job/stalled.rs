@@ -237,7 +237,7 @@ mod tests {
         check(&fx.state, JOB, Utc::now()).await.unwrap();
 
         assert_eq!(feed_lines(&fx).await, 0);
-        assert!(fx.job(JOB).await.manifest.extra.get(RECORD_KEY).is_none());
+        assert!(!fx.job(JOB).await.manifest.extra.contains_key(RECORD_KEY));
     }
 
     #[tokio::test]
