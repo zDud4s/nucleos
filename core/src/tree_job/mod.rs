@@ -18,6 +18,7 @@ mod gate_summary;
 #[cfg(test)]
 mod gate_tests;
 pub mod http;
+mod ladder;
 pub mod landing;
 pub mod model;
 pub mod nested_prompt;

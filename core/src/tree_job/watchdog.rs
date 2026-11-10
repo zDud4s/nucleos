@@ -12,8 +12,9 @@
 //! - a live run whose lease (its last sign of life) is older than [`LEASE_TTL_SECS`] is ended as
 //!   `interrupted`, so `wrap` starts the node again under its `died-` chain;
 //! - a relaunch that fails (here or in `wrap`) sets a backoff (60 s, doubling, at most 30 min) during
-//!   which the node is left alone, and the [`FAILURE_CAP`]th failure in a row parks the branch with
-//!   an owner decision (`decisions::park_or_ask`). Its answer is a fresh allowance.
+//!   which the node is left alone, and the failure that ends the ladder's retries
+//!   (`ladder::Kind::WatchdogFailure`) parks the branch with an owner decision
+//!   (`decisions::park_or_ask`). Its answer is a fresh allowance.
 
 use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
@@ -24,25 +25,22 @@ use crate::state::AppState;
 
 use super::decisions;
 use super::engine::branch_node_may_close;
+use super::ladder::{self, Kind, Spent, Step};
 use super::model::JOB_TERMINAL_STATE;
 use super::open::{latest_launch, relaunch_node, run_is_live};
 use super::relaunch::{budget_refusal, refusal_question};
 use super::store;
 
-/// Failed relaunches in a row after which the owner is asked.
-pub(super) const FAILURE_CAP: i64 = 2;
 /// A live run with no sign of life for this long has lost its session.
 pub(super) const LEASE_TTL_SECS: i64 = 2 * 60 * 60;
-const FIRST_BACKOFF_SECS: i64 = 60;
-const MAX_BACKOFF_SECS: i64 = 30 * 60;
 const PARKED: &str = "parked";
 /// A running leaf with no run is left alone this long after it was created (its launch may be on its way).
 const ORPHAN_GRACE_SECS: i64 = 5 * 60;
 
 /// The wait after `failures` failed relaunches in a row.
 pub(super) fn backoff(failures: i64) -> Duration {
-    let doubled = FIRST_BACKOFF_SECS.saturating_mul(1_i64 << (failures - 1).clamp(0, 20));
-    Duration::seconds(doubled.min(MAX_BACKOFF_SECS))
+    let wait = ladder::backoff(Kind::WatchdogFailure, failures - 1);
+    Duration::seconds(i64::try_from(wait.as_secs()).unwrap_or(i64::MAX))
 }
 
 /// Whether a failed root start recorded in `manifest.extra` (`root::ROOT_START_KEY`) must still wait
@@ -159,7 +157,7 @@ async fn is_leaf(pool: &SqlitePool, job_id: &str, node_id: &str) -> bool {
             .any(|branch| branch.node_id.as_deref() == Some(node_id))
 }
 
-/// Counts one more failed relaunch of `node_id`, sets the backoff, and at [`FAILURE_CAP`] parks the
+/// Counts one more failed relaunch of `node_id`, sets the backoff, and when the ladder has no retry left parks the
 /// branch (or asks on the root) with a decision that carries the last error.
 pub(super) async fn record_failure(
     pool: &SqlitePool,
@@ -190,7 +188,16 @@ pub(super) async fn record_failure(
     .map_err(|e| e.to_string())?;
     // A permanent spawn error (`os error 206`/`267`) repeats on every try, so it is not given the
     // second chance a passing fault gets: the branch parks on its first occurrence, with the reason.
-    if failures < FAILURE_CAP && !super::retry::is_permanent_spawn_error(error) {
+    // `failures` counts the first try, so the retries so far are one fewer. A relaunch that cannot
+    // even spawn has no agent to diagnose it: the diagnose rung is a park.
+    let step = ladder::next_step(
+        Kind::WatchdogFailure,
+        Spent {
+            retries: failures - 1,
+            ..Spent::default()
+        },
+    );
+    if matches!(step, Step::Retry { .. }) && !super::retry::is_permanent_spawn_error(error) {
         return Ok(());
     }
     if is_leaf(pool, job_id, node_id).await {
@@ -485,6 +492,18 @@ mod tests {
             .unwrap_or(0)
     }
 
+    /// The failure that ends the ladder's retries: one more than the retries it allows.
+    const PARKING_FAILURE: i64 = ladder::retry_cap(Kind::WatchdogFailure) + 1;
+
+    /// Sweeps a node whose relaunch cannot succeed (no launch stored) until the watchdog parks it,
+    /// stepping over each backoff.
+    async fn fail_until_parked(state: &AppState) {
+        for _ in 0..PARKING_FAILURE {
+            sweep(state).await;
+            past_backoff(state).await;
+        }
+    }
+
     async fn past_backoff(state: &AppState) {
         sqlx::query("UPDATE node_watchdog SET next_at = ? WHERE node_id = ?")
             .bind(OLD)
@@ -530,15 +549,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn two_failed_relaunches_in_a_row_park_the_branch_with_an_open_decision() {
+    async fn the_ladders_failed_relaunches_in_a_row_park_the_branch_with_an_open_decision() {
         let state = state().await;
         seed_node(&state, None).await;
 
-        sweep(&state).await;
-        past_backoff(&state).await;
-        sweep(&state).await;
+        fail_until_parked(&state).await;
 
-        assert_eq!(failures(&state).await, 2);
+        assert_eq!(failures(&state).await, PARKING_FAILURE);
         assert_eq!(branch_state(&state).await, "parked");
         let open: (String, String) = sqlx::query_as(
             "SELECT node_id, question FROM decisions WHERE status = 'open' AND tree_id = ?",
@@ -583,9 +600,7 @@ mod tests {
     async fn an_answered_decision_gives_the_node_a_fresh_allowance() {
         let state = state().await;
         seed_node(&state, None).await;
-        sweep(&state).await;
-        past_backoff(&state).await;
-        sweep(&state).await;
+        fail_until_parked(&state).await;
         sqlx::query("UPDATE decisions SET status = 'answered', answer = 'retry' WHERE node_id = ?")
             .bind(NODE)
             .execute(&state.pool)
@@ -701,19 +716,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_leaf_that_cannot_be_relaunched_twice_fails_instead_of_parking() {
+    async fn a_leaf_that_cannot_be_relaunched_past_the_ladder_fails_instead_of_parking() {
         let state = state().await;
         seed_node(&state, None).await;
         seed_leaf(&state, None, OLD).await; // no launch stored: the relaunch fails
 
-        sweep(&state).await;
-        sqlx::query("UPDATE node_watchdog SET next_at = ? WHERE node_id = ?")
-            .bind(OLD)
-            .bind(LEAF)
-            .execute(&state.pool)
-            .await
-            .unwrap();
-        sweep(&state).await;
+        // Sweep past the ladder's whole allowance, skipping each backoff.
+        for _ in 0..10 {
+            sweep(&state).await;
+            sqlx::query("UPDATE node_watchdog SET next_at = ? WHERE node_id = ?")
+                .bind(OLD)
+                .bind(LEAF)
+                .execute(&state.pool)
+                .await
+                .unwrap();
+        }
 
         let (status, _, summary) = leaf_row(&state).await;
         assert_eq!(status, "failed");

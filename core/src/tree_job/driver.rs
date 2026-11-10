@@ -30,6 +30,7 @@ use super::autofmt;
 use super::decisions;
 use super::engine::{apply_transition, branch_node_may_close};
 use super::http::job_lock;
+use super::ladder::{self, Kind, Spent, Step};
 use super::landing::{
     self, LandingError, MergeSettlement, check_may_land, check_may_merge, land_job, settle_land,
     settle_merge, submit_merge,
@@ -49,10 +50,6 @@ use crate::work_nodes::{self, CLOSE_STATUSES, CloseArgs, NodeLimits};
 
 /// How long the production gate waits for the verify queue.
 const GATE_WAIT: Duration = Duration::from_secs(900);
-/// Cap of the relaunches that follow a red gate (key prefix `FIX_PREFIX`).
-const FIX_CAP: i64 = 2;
-/// Merge requests of one branch that the conflict resolver is given before the owner is asked.
-const CONFLICT_ATTEMPTS: i64 = 2;
 /// How long a conflict may wait for a resolver run before the owner is asked instead.
 pub(super) const RESOLVER_GRACE: Duration = Duration::from_secs(15 * 60);
 /// Longest tail of the gate's findings that goes into a relaunch prompt.
@@ -687,8 +684,15 @@ async fn red(
     .fetch_one(pool)
     .await
     .map_err(|e| e.to_string())?;
-    if prior >= FIX_CAP {
-        // The last automatic try: a rescue run, and only if that fails too the owner is asked.
+    let step = ladder::next_step(
+        Kind::Fix,
+        Spent {
+            retries: prior,
+            ..Spent::default()
+        },
+    );
+    if !matches!(step, Step::Retry { .. }) {
+        // The ladder's diagnose rung: a rescue run, and only if that fails too the owner is asked.
         let suffix = rescue::red_suffix(&fix_suffix(&findings));
         if rescue::attempt(state, &node, &run, &suffix).await? {
             let held = job
@@ -702,7 +706,7 @@ async fn red(
         parks.push((
             node,
             format!(
-                "The gate of branch {name} failed after {FIX_CAP} automatic fixes; last findings:\n{findings}"
+                "The gate of branch {name} failed after {prior} automatic fixes and a rescue run; last findings:\n{findings}"
             ),
         ));
         return Ok(());
@@ -881,8 +885,17 @@ async fn merge(
                 if !resolution_failed {
                     park_if_unclaimed(pool, job, name, node.as_deref(), &reason, parks).await?;
                 }
+                // `attempts` counts merge requests, the first included, so the retries are one
+                // fewer. The resolver is an external run: the ladder's diagnose rung is a park.
+                let conflict_step = ladder::next_step(
+                    Kind::Conflict,
+                    Spent {
+                        retries: attempts - 1,
+                        ..Spent::default()
+                    },
+                );
                 if resolution_failed
-                    && attempts >= CONFLICT_ATTEMPTS
+                    && !matches!(conflict_step, Step::Retry { .. })
                     && let Some(node) = node
                 {
                     parks.push((
@@ -1064,6 +1077,11 @@ pub(super) mod tests {
 
     use super::*;
 
+    /// Fix relaunches before the rescue run, and conflict merge requests before the park, as the
+    /// ladder sets them.
+    const FIX_CAP: i64 = ladder::retry_cap(Kind::Fix);
+    const CONFLICT_ATTEMPTS: i64 = ladder::retry_cap(Kind::Conflict) + 1;
+
     #[test]
     fn a_fmt_finding_adds_the_formatter_hint() {
         let findings = "gates FAILED:\n  core: fmt\n      Diff in x.rs";
@@ -1123,6 +1141,7 @@ pub(super) mod tests {
     use crate::tree_job::open::{self, StoredLaunch};
     use crate::tree_job::retry::{
         GATE_ATTEMPTS, GATE_FAILURES, LAND_ATTEMPTS, LAND_ATTEMPTS_KEY, LAND_ESCALATED_SINCE,
+        gate_backing_off,
     };
     use crate::tree_job::store::{self, TreeJob};
     use crate::work_nodes;
@@ -1790,6 +1809,19 @@ pub(super) mod tests {
         tokio::time::sleep(Duration::from_millis(30)).await;
     }
 
+    /// Ends the backoff an unmeasured gate left on the branch, so the next tick gates at once.
+    async fn skip_gate_backoff(fx: &Fixture, job: &str, name: &str) {
+        let mut stored = fx.job(job).await;
+        stored
+            .manifest
+            .branches
+            .get_mut(name)
+            .expect("the branch is in the manifest")
+            .extra
+            .remove("gate_backoff_until");
+        store::update(&fx.state.pool, &stored).await.unwrap();
+    }
+
     /// A branch at work with a `done` report, gated on every tick.
     async fn gated_job(fx: &Fixture, job: &str, node: &str) {
         fx.seed_job(job, vec![code_branch("api", "building", Some(node))], None)
@@ -1809,7 +1841,7 @@ pub(super) mod tests {
                 "the scope gate could not be submitted: queue-down".to_owned(),
             ))
         };
-        let gate = FakeGate::scripted(vec![unavailable(), unavailable(), unavailable()]);
+        let gate = FakeGate::scripted((0..GATE_ATTEMPTS).map(|_| unavailable()).collect());
 
         for attempt in 1..GATE_ATTEMPTS {
             fx.tick(JOB, &gate).await;
@@ -1817,6 +1849,16 @@ pub(super) mod tests {
             wait_gate_failures(&fx, JOB, "api", attempt).await;
             assert_eq!(fx.branch(JOB, "api").await.state, "building");
             assert!(fx.open_questions(JOB, NODE).await.is_empty());
+            // Each unmeasured gate leaves a backoff of minutes; further ticks inside it do not gate.
+            let held = fx.branch(JOB, "api").await;
+            assert!(gate_backing_off(&held.extra), "attempt {attempt}");
+            fx.tick(JOB, &gate).await;
+            assert_eq!(
+                gate.calls().len(),
+                attempt as usize,
+                "gated inside the backoff"
+            );
+            skip_gate_backoff(&fx, JOB, "api").await;
         }
         fx.tick(JOB, &gate).await;
         wait_calls(&gate, GATE_ATTEMPTS as usize).await;
@@ -2108,7 +2150,7 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
-    async fn a_red_gate_relaunches_twice_then_rescues_once_and_then_parks() {
+    async fn a_red_gate_relaunches_up_to_the_ladder_cap_then_rescues_once_and_then_parks() {
         const JOB: &str = "drv-fix";
         const NODE: &str = "api-node";
         let fx = Fixture::new().await;
@@ -2117,14 +2159,14 @@ pub(super) mod tests {
         fx.add_node(JOB, NODE, "orchestrator").await;
         fx.run_ended(NODE, Some("done")).await;
         fx.save_launch(NODE).await;
-        let gate = FakeGate::answering(vec![
-            red("first failure: boom-1"),
-            red("second failure: boom-2"),
-            red("third failure: boom-3"),
-            red("fourth failure: boom-4"),
-        ]);
+        let cap = FIX_CAP as usize;
+        let gate = FakeGate::answering(
+            (1..=cap + 2)
+                .map(|n| red(&format!("failure: boom-{n}-end")))
+                .collect(),
+        );
 
-        for (attempt, finding) in [(1, "boom-1"), (2, "boom-2")] {
+        for attempt in 1..=cap {
             fx.tick(JOB, &gate).await;
             wait_calls(&gate, attempt).await;
             fx.wait_branch_state(JOB, "api", "red").await;
@@ -2135,15 +2177,15 @@ pub(super) mod tests {
             assert_eq!(fx.launches(NODE, "fix-").await, attempt as i64);
             let prompt = fx.prompt_of(fx.current_run(NODE).await).await;
             assert!(
-                prompt.contains(finding),
+                prompt.contains(&format!("boom-{attempt}-end")),
                 "the relaunch carries the findings: {prompt:?}"
             );
             fx.relaunched_run_reports_done(NODE).await;
         }
 
-        // The third red is past the cap: one rescue run with the failure in its prompt, no park.
+        // The next red is past the cap: one rescue run with the failure in its prompt, no park.
         fx.tick(JOB, &gate).await;
-        wait_calls(&gate, 3).await;
+        wait_calls(&gate, cap + 1).await;
         fx.wait_branch_state(JOB, "api", "red").await;
         fx.tick(JOB, &gate).await;
 
@@ -2152,25 +2194,25 @@ pub(super) mod tests {
         assert!(fx.open_questions(JOB, NODE).await.is_empty());
         let prompt = fx.prompt_of(fx.current_run(NODE).await).await;
         assert!(
-            prompt.contains("boom-3"),
+            prompt.contains(&format!("boom-{}-end", cap + 1)),
             "the rescue carries the failure: {prompt:?}"
         );
         fx.relaunched_run_reports_done(NODE).await;
 
         // The rescue's work is red too: now the owner is asked, and no second rescue starts.
         fx.tick(JOB, &gate).await;
-        wait_calls(&gate, 4).await;
+        wait_calls(&gate, cap + 2).await;
         fx.wait_branch_state(JOB, "api", "red").await;
         fx.tick(JOB, &gate).await;
 
         assert_eq!(fx.branch(JOB, "api").await.state, "parked");
         assert_eq!(
             fx.launches(NODE, "fix-").await,
-            2,
-            "the cap is two relaunches"
+            FIX_CAP,
+            "the cap is the ladder's fix retries"
         );
         assert_eq!(fx.launches(NODE, "rescue-").await, 1, "one rescue only");
-        assert_eq!(gate.calls().len(), 4);
+        assert_eq!(gate.calls().len(), cap + 2);
         let open: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM decisions WHERE tree_id = ? AND node_id = ? AND status = ?",
         )
@@ -2187,10 +2229,13 @@ pub(super) mod tests {
                 .fetch_one(&fx.state.pool)
                 .await
                 .unwrap();
-        assert!(question.contains("boom-4"), "{question:?}");
+        assert!(
+            question.contains(&format!("boom-{}-end", cap + 2)),
+            "{question:?}"
+        );
     }
 
-    /// Drives `api` through two red gates and two fixes, then a third red gate that parks it on the
+    /// Drives `api` through the ladder's fix retries, a rescue run, then one more red gate that parks it on the
     /// fix-cap question; answers that question and returns the run the answer started.
     async fn answered_after_the_fix_cap(
         fx: &Fixture,
@@ -2203,7 +2248,7 @@ pub(super) mod tests {
         fx.add_node(job, node, "orchestrator").await;
         fx.run_ended(node, Some("done")).await;
         fx.save_launch(node).await;
-        for attempt in 1..=2 {
+        for attempt in 1..=FIX_CAP as usize {
             fx.tick(job, gate).await;
             wait_calls(gate, attempt).await;
             fx.wait_branch_state(job, "api", "red").await;
@@ -2211,15 +2256,15 @@ pub(super) mod tests {
             assert_eq!(fx.branch(job, "api").await.state, "fixing");
             fx.relaunched_run_reports_done(node).await;
         }
-        // The third red gets its one rescue; the fourth parks.
+        // The next red gets its one rescue; the one after parks.
         fx.tick(job, gate).await;
-        wait_calls(gate, 3).await;
+        wait_calls(gate, FIX_CAP as usize + 1).await;
         fx.wait_branch_state(job, "api", "red").await;
         fx.tick(job, gate).await;
         assert_eq!(fx.branch(job, "api").await.state, "fixing");
         fx.relaunched_run_reports_done(node).await;
         fx.tick(job, gate).await;
-        wait_calls(gate, 4).await;
+        wait_calls(gate, FIX_CAP as usize + 2).await;
         fx.wait_branch_state(job, "api", "red").await;
         fx.tick(job, gate).await;
         assert_eq!(fx.branch(job, "api").await.state, "parked");
@@ -2235,25 +2280,29 @@ pub(super) mod tests {
             .expect("the answer relaunched the node")
     }
 
+    /// The verdicts `answered_after_the_fix_cap` consumes (a red per fix, the rescue's and the
+    /// parking one), then `after` for the gate that follows the owner's answer.
+    fn fix_cap_reds(after: GateVerdict) -> Vec<GateVerdict> {
+        let mut verdicts: Vec<GateVerdict> = (1..=FIX_CAP + 2)
+            .map(|n| red(&format!("boom-{n}")))
+            .collect();
+        verdicts.push(after);
+        verdicts
+    }
+
     /// An answered fix-cap park must not park again: the relaunched node's `done` report is gated.
     #[tokio::test]
     async fn an_answered_fix_cap_park_gates_the_relaunched_nodes_work() {
         const JOB: &str = "drv-fix-answered";
         const NODE: &str = "api-node";
         let fx = Fixture::new().await;
-        let gate = FakeGate::answering(vec![
-            red("boom-1"),
-            red("boom-2"),
-            red("boom-3"),
-            red("boom-3b"),
-            GateVerdict::Green,
-        ]);
+        let gate = FakeGate::answering(fix_cap_reds(GateVerdict::Green));
         answered_after_the_fix_cap(&fx, JOB, NODE, &gate).await;
         fx.relaunched_run_reports_done(NODE).await;
 
         fx.tick(JOB, &gate).await;
 
-        wait_calls(&gate, 5).await;
+        wait_calls(&gate, FIX_CAP as usize + 3).await;
         fx.wait_branch_state(JOB, "api", "green").await;
         assert!(
             fx.open_questions(JOB, NODE).await.is_empty(),
@@ -2267,23 +2316,17 @@ pub(super) mod tests {
         const JOB: &str = "drv-fix-fresh";
         const NODE: &str = "api-node";
         let fx = Fixture::new().await;
-        let gate = FakeGate::answering(vec![
-            red("boom-1"),
-            red("boom-2"),
-            red("boom-3"),
-            red("boom-3b"),
-            red("boom-4"),
-        ]);
+        let gate = FakeGate::answering(fix_cap_reds(red("boom-after")));
         answered_after_the_fix_cap(&fx, JOB, NODE, &gate).await;
         fx.relaunched_run_reports_done(NODE).await;
         fx.tick(JOB, &gate).await;
-        wait_calls(&gate, 5).await;
+        wait_calls(&gate, FIX_CAP as usize + 3).await;
         fx.wait_branch_state(JOB, "api", "red").await;
 
         fx.tick(JOB, &gate).await;
 
         assert_eq!(fx.branch(JOB, "api").await.state, "fixing");
-        assert_eq!(fx.launches(NODE, "fix-").await, 3);
+        assert_eq!(fx.launches(NODE, "fix-").await, FIX_CAP + 1);
         assert!(fx.open_questions(JOB, NODE).await.is_empty());
     }
 
@@ -4428,7 +4471,7 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
-    async fn a_second_failed_resolution_parks_once() {
+    async fn the_last_failed_resolution_of_the_ladder_parks_once() {
         let fx = Fixture::new().await;
         conflicting_job(&fx).await;
         let gate = FakeGate::answering(vec![]);
@@ -4438,17 +4481,19 @@ pub(super) mod tests {
         fx.drain().await;
         fx.tick(CLASH_JOB, &gate).await;
         assert_eq!(conflict_attempts(&fx).await, Some(1));
-        resolution_ends_without_landing(&fx).await;
-        // The driver drops the dead request and resubmits (in this pass or the next).
-        fx.tick(CLASH_JOB, &gate).await;
-        fx.tick(CLASH_JOB, &gate).await;
-        assert!(fx.open_questions(CLASH_JOB, CLASH_NODE).await.is_empty());
+        for attempt in 2..=CONFLICT_ATTEMPTS {
+            resolution_ends_without_landing(&fx).await;
+            // The driver drops the dead request and resubmits (in this pass or the next).
+            fx.tick(CLASH_JOB, &gate).await;
+            fx.tick(CLASH_JOB, &gate).await;
+            assert!(fx.open_questions(CLASH_JOB, CLASH_NODE).await.is_empty());
 
-        // Attempt 2: the queue escalates again, the resolver fails again.
-        run_queue(&fx).await;
-        fx.tick(CLASH_JOB, &gate).await;
-        assert_eq!(conflict_attempts(&fx).await, Some(2));
-        assert!(fx.open_questions(CLASH_JOB, CLASH_NODE).await.is_empty());
+            // The queue escalates again, the resolver fails again.
+            run_queue(&fx).await;
+            fx.tick(CLASH_JOB, &gate).await;
+            assert_eq!(conflict_attempts(&fx).await, Some(attempt));
+            assert!(fx.open_questions(CLASH_JOB, CLASH_NODE).await.is_empty());
+        }
         resolution_ends_without_landing(&fx).await;
 
         // At the limit the conflict is claimed and the owner is asked, once.
@@ -4458,7 +4503,11 @@ pub(super) mod tests {
 
         assert_eq!(fx.branch(CLASH_JOB, "api").await.state, "parked");
         assert_eq!(fx.open_questions(CLASH_JOB, CLASH_NODE).await.len(), 1);
-        assert_eq!(fx.requests().await, 2, "no third attempt was queued");
+        assert_eq!(
+            fx.requests().await,
+            CONFLICT_ATTEMPTS,
+            "no further attempt was queued"
+        );
     }
 
     #[tokio::test]

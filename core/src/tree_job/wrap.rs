@@ -7,6 +7,9 @@
 //! A run that died on an API error a later attempt can get past (a 429 rate limit, the service busy
 //! or unreachable) is not a death of the node's work: it is started again after a backoff, under a
 //! chain and a cap of its own, and spends nothing of the died cap that is there for real deaths.
+//!
+//! The caps of the other two chains, the backoff of a died one and the diagnose run that follows a
+//! spent chain come from the shared ladder (`ladder`).
 
 use chrono::{DateTime, Utc};
 
@@ -17,23 +20,32 @@ use crate::state::AppState;
 
 use super::decisions;
 use super::engine::branch_node_may_close;
+use super::ladder::{Kind, Spent, Step, next_step, retry_cap};
 use super::model::JOB_TERMINAL_STATE;
 use super::open::{DIED_PREFIX, WRAP_PREFIX, latest_launch, relaunch_node, run_is_live};
 use super::relaunch::{
     DECISION_PREFIX, TRANSIENT_PREFIX, budget_refusal, refusal_question, successor_key,
 };
+use super::rescue;
 use super::store;
 
 /// Nodes one tick acts on, oldest first; nodes it leaves alone do not count.
 const MAX_NODES_PER_TICK: usize = 20;
 const PARKED: &str = "parked";
 
-/// One kind of automatic relaunch: the key prefix of its links, how many may follow one another
-/// since the owner's last answer, and what the owner is asked when that many did.
+/// One kind of automatic relaunch: the key prefix of its links, the ladder kind that sets how many
+/// may follow one another since the owner's last answer (none: the chain has a cap of its own), and
+/// what the owner is asked when that many did.
 struct Chain {
     prefix: &'static str,
-    cap: i64,
+    kind: Option<Kind>,
     question: fn(&str, i64) -> String,
+}
+
+impl Chain {
+    fn cap(&self) -> i64 {
+        self.kind.map_or(TRANSIENT_CAP, retry_cap)
+    }
 }
 
 fn ended_question(node_id: &str, cap: i64) -> String {
@@ -52,22 +64,23 @@ fn transient_question(node_id: &str, cap: i64) -> String {
 /// The relaunches that follow a `handoff` report.
 const WRAPPED: Chain = Chain {
     prefix: WRAP_PREFIX,
-    cap: 3,
+    kind: Some(Kind::Wrapped),
     question: ended_question,
 };
 /// The relaunches of a run that died without a report.
 const DIED: Chain = Chain {
     prefix: DIED_PREFIX,
-    cap: 2,
+    kind: Some(Kind::Died),
     question: ended_question,
 };
 /// The relaunches of a run that died on a transient API error. With the backoff below, sixteen
 /// links wait about six hours in all, past a subscription's usage window.
 const TRANSIENT: Chain = Chain {
     prefix: TRANSIENT_PREFIX,
-    cap: 16,
+    kind: None,
     question: transient_question,
 };
+const TRANSIENT_CAP: i64 = 16;
 /// The wait after a transient death before its relaunch: the first, doubled per earlier link of
 /// the chain, and never more than the last.
 const TRANSIENT_FIRST_BACKOFF_SECS: i64 = 60;
@@ -284,10 +297,29 @@ async fn relaunch_after_backoff(
 ) -> Result<bool, String> {
     let key = format!("{}{dead_run}", TRANSIENT.prefix);
     let prior = links_since_answer(&state.pool, node_id, TRANSIENT.prefix, &key).await?;
-    if prior < TRANSIENT.cap && Utc::now() < ended + transient_backoff(prior) {
+    if prior < TRANSIENT.cap() && Utc::now() < ended + transient_backoff(prior) {
         return Ok(false);
     }
     relaunch_or_stop(state, job_id, node_id, dead_run, &TRANSIENT, None).await
+}
+
+/// When `run_id` ended: its completion time, else its creation, else long ago (nothing holds a
+/// relaunch back for a time that cannot be read).
+async fn run_ended_at(pool: &sqlx::SqlitePool, run_id: &str) -> DateTime<Utc> {
+    let Ok(number) = run_id.parse::<i64>() else {
+        return DateTime::<Utc>::default();
+    };
+    let row: Result<Option<(Option<String>, String)>, _> =
+        sqlx::query_as("SELECT completed_at, created_at FROM runs WHERE id = ?")
+            .bind(number)
+            .fetch_optional(pool)
+            .await;
+    let Ok(Some((completed_at, created_at))) = row else {
+        return DateTime::<Utc>::default();
+    };
+    DateTime::parse_from_rfc3339(&completed_at.unwrap_or(created_at))
+        .map(|at| at.with_timezone(&Utc))
+        .unwrap_or_default()
 }
 
 /// The links of `prefix` the node has had since the owner's last answer (its latest `decision-`
@@ -329,7 +361,26 @@ async fn relaunch_or_stop(
     let pool = &state.pool;
     let key = format!("{}{dead_run}", chain.prefix);
     let prior = links_since_answer(pool, node_id, chain.prefix, &key).await?;
-    if prior < chain.cap {
+    let step = match chain.kind {
+        Some(kind) => next_step(
+            kind,
+            Spent {
+                retries: prior,
+                ..Spent::default()
+            },
+        ),
+        // The transient chain has its own cap and wait (see `relaunch_after_backoff`), and a rate
+        // limit says nothing about the node's work, so there is nothing for a diagnose run to read.
+        None if prior < TRANSIENT_CAP => Step::Retry {
+            after: std::time::Duration::ZERO,
+        },
+        None => Step::Park,
+    };
+    if let Step::Retry { after } = step {
+        // A relaunch the ladder spaces out waits for the end of the run it follows.
+        if !after.is_zero() && Utc::now() < run_ended_at(pool, dead_run).await + after {
+            return Ok(false);
+        }
         if let Some(reason) = budget_refusal(pool, node_id).await {
             // An automatic relaunch spends: past the tree's limit the owner is asked once (the
             // parked branch, or the root's open decision, ends every later pass at `wrap_node`).
@@ -345,6 +396,18 @@ async fn relaunch_or_stop(
             .map_err(|e| e.to_string())?;
         relaunch_node(state, node_id, dead_run, &key, suffix.as_deref()).await?;
         return Ok(true);
+    }
+
+    // The ladder's last rung before the park: a fresh run of the node that reads the evidence of
+    // the chain (its last handoff) and decides. It is spent once per owner answer; when it was
+    // spent, or the tree's budget refuses it, the owner is asked as before.
+    if step == Step::Diagnose {
+        let handoff = rescue::handoff_text(pool, node_id).await;
+        let outcome = format!("{} times in a row without finishing", chain.cap());
+        let suffix = rescue::stopped_suffix(&outcome, handoff.as_deref());
+        if rescue::attempt(state, node_id, dead_run, &suffix).await? {
+            return Ok(true);
+        }
     }
 
     let subject = format!("node:{node_id}");
@@ -369,7 +432,7 @@ async fn relaunch_or_stop(
     }
     // A branch is parked; a root that tops no branch is asked on itself, so the job never waits
     // in silence. `park_or_ask` takes the job's lock itself, so none is held here.
-    let question = (chain.question)(node_id, chain.cap);
+    let question = (chain.question)(node_id, chain.cap());
     decisions::park_or_ask(pool, job_id, node_id, &question)
         .await
         .map_err(|e| e.to_string())?;
@@ -564,15 +627,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_fourth_handoff_link_of_a_chain_stops_with_one_feed_line_and_parks_the_branch() {
+    async fn a_handoff_chain_past_its_ladder_cap_with_its_diagnose_run_spent_parks_with_one_feed_line()
+     {
         let state = state().await;
         seed_node(&state, Some("building"), "open", NODE, Some(43)).await;
         seed_run(&state, 43, "interrupted").await;
         seed_launch(&state, NODE).await;
         report(&state, NODE, 43, "handoff").await;
-        for key in ["wrap-old-1", "wrap-old-2", "wrap-old-3"] {
-            prior_link(&state, NODE, key).await;
-        }
+        chain_links(&state, NODE, "wrap-old", retry_cap(Kind::Wrapped)).await;
+        // The diagnose run was spent too.
+        prior_link(&state, NODE, "rescue-old").await;
 
         tick(&state).await;
 
@@ -595,40 +659,41 @@ mod tests {
         assert_eq!(feed, 1);
     }
 
+    /// Ends the node's current run as if it died, long enough ago for the died backoff to be over.
+    async fn kill_current_run(state: &AppState) {
+        sqlx::query(
+            "UPDATE runs SET status = 'interrupted', completed_at = ? \
+             WHERE id = (SELECT CAST(run_id AS INTEGER) FROM work_nodes WHERE id = ?)",
+        )
+        .bind((chrono::Utc::now() - chrono::Duration::hours(3)).to_rfc3339())
+        .bind(NODE)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
-    async fn a_run_that_died_without_a_report_is_relaunched_twice_and_then_parked() {
+    async fn a_run_that_died_without_a_report_is_relaunched_up_to_the_cap_then_diagnosed_once_then_parked()
+     {
         let state = state().await;
         seed_node(&state, Some("building"), "open", NODE, Some(44)).await;
         seed_run(&state, 44, "interrupted").await;
         seed_launch(&state, NODE).await;
 
+        for spent in 1..=retry_cap(Kind::Died) {
+            tick(&state).await;
+            assert_eq!(launches(&state, NODE, "died-").await, spent);
+            kill_current_run(&state).await;
+        }
+        // Past the cap: one diagnose run, not a died link.
         tick(&state).await;
-        assert_eq!(launches(&state, NODE, "died-44").await, 1);
-        let first: i64 =
-            sqlx::query_scalar("SELECT CAST(run_id AS INTEGER) FROM work_nodes WHERE id = ?")
-                .bind(NODE)
-                .fetch_one(&state.pool)
-                .await
-                .unwrap();
-        sqlx::query("UPDATE runs SET status = 'interrupted' WHERE id = ?")
-            .bind(first)
-            .execute(&state.pool)
-            .await
-            .unwrap();
+        assert_eq!(launches(&state, NODE, "died-").await, retry_cap(Kind::Died));
+        assert_eq!(launches(&state, NODE, "rescue-").await, 1);
+        assert_eq!(parked_and_asked(&state).await.0, "building");
+        kill_current_run(&state).await;
+        // The diagnose run died too: now the owner is asked.
         tick(&state).await;
-        assert_eq!(launches(&state, NODE, "died-").await, 2);
-        let second: i64 =
-            sqlx::query_scalar("SELECT CAST(run_id AS INTEGER) FROM work_nodes WHERE id = ?")
-                .bind(NODE)
-                .fetch_one(&state.pool)
-                .await
-                .unwrap();
-        sqlx::query("UPDATE runs SET status = 'interrupted' WHERE id = ?")
-            .bind(second)
-            .execute(&state.pool)
-            .await
-            .unwrap();
-        tick(&state).await;
+        assert_eq!(launches(&state, NODE, "rescue-").await, 1);
 
         let parked = store::load(&state.pool, JOB)
             .await
@@ -639,6 +704,27 @@ mod tests {
             .state
             .clone();
         assert_eq!(parked, "parked");
+    }
+
+    /// A death waits minutes before the relaunch, so a node that dies at once is not hammered.
+    #[tokio::test]
+    async fn a_run_that_died_waits_the_died_backoff_before_its_relaunch() {
+        let state = state().await;
+        seed_node(&state, Some("building"), "open", NODE, Some(46)).await;
+        seed_launch(&state, NODE).await;
+        sqlx::query(
+            "INSERT INTO runs (id, prompt, status, created_at, completed_at) \
+             VALUES (46, 'original prompt', 'interrupted', ?, ?)",
+        )
+        .bind(CREATED)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        tick(&state).await;
+
+        assert_eq!(all_launches(&state, NODE).await, 0, "still backing off");
     }
 
     #[tokio::test]
@@ -1033,6 +1119,13 @@ mod tests {
             .unwrap();
     }
 
+    /// `count` earlier links of one chain, `<prefix>-1` to `<prefix>-<count>`.
+    async fn chain_links(state: &AppState, node_id: &str, prefix: &str, count: i64) {
+        for n in 1..=count {
+            prior_link(state, node_id, &format!("{prefix}-{n}")).await;
+        }
+    }
+
     /// The last line of a `claude -p` run the API refused with a 429, as the runner stores it.
     const RATE_LIMITED_STDOUT: &str = r#"{"type":"result","subtype":"success","is_error":true,"terminal_reason":"api_error","api_error_status":429,"result":"API Error: 429"}"#;
 
@@ -1070,18 +1163,21 @@ mod tests {
         let state = state().await;
         seed_node(&state, Some("building"), "open", NODE, Some(61)).await;
         seed_launch(&state, NODE).await;
-        prior_link(&state, NODE, "died-old-1").await;
-        prior_link(&state, NODE, "died-old-2").await;
+        chain_links(&state, NODE, "died-old", retry_cap(Kind::Died)).await;
         seed_rate_limited_run(&state, 61, chrono::Duration::hours(2)).await;
 
         tick(&state).await;
 
         assert_eq!(
             launches(&state, NODE, "died-").await,
-            2,
+            retry_cap(Kind::Died),
             "no died link spent"
         );
-        assert_eq!(all_launches(&state, NODE).await, 3, "one new launch");
+        assert_eq!(
+            all_launches(&state, NODE).await,
+            retry_cap(Kind::Died) + 1,
+            "one new launch"
+        );
         let (branch, asked) = parked_and_asked(&state).await;
         assert_eq!(branch, "building", "not parked: {asked:?}");
         assert!(asked.is_empty(), "{asked:?}");
@@ -1151,8 +1247,7 @@ mod tests {
         let state = state().await;
         seed_node(&state, Some("building"), "open", NODE, Some(64)).await;
         seed_launch(&state, NODE).await;
-        prior_link(&state, NODE, "died-old-1").await;
-        prior_link(&state, NODE, "died-old-2").await;
+        chain_links(&state, NODE, "died-old", retry_cap(Kind::Died)).await;
         prior_link(&state, NODE, "decision-d-answered").await;
         seed_run(&state, 64, "interrupted").await;
 
@@ -1168,14 +1263,8 @@ mod tests {
         let state = state().await;
         seed_node(&state, Some("building"), "open", NODE, Some(65)).await;
         seed_launch(&state, NODE).await;
-        for key in [
-            "wrap-old-1",
-            "wrap-old-2",
-            "wrap-old-3",
-            "decision-d-answered",
-        ] {
-            prior_link(&state, NODE, key).await;
-        }
+        chain_links(&state, NODE, "wrap-old", retry_cap(Kind::Wrapped)).await;
+        prior_link(&state, NODE, "decision-d-answered").await;
         seed_run(&state, 65, "interrupted").await;
         report(&state, NODE, 65, "handoff").await;
 
@@ -1194,8 +1283,8 @@ mod tests {
         seed_node(&state, None, "open", "wrap-root", Some(66)).await;
         seed_run(&state, 66, "interrupted").await;
         seed_launch(&state, "wrap-root").await;
-        prior_link(&state, "wrap-root", "died-old-1").await;
-        prior_link(&state, "wrap-root", "died-old-2").await;
+        chain_links(&state, "wrap-root", "died-old", retry_cap(Kind::Died)).await;
+        prior_link(&state, "wrap-root", "rescue-old").await;
 
         tick(&state).await;
         tick(&state).await;
