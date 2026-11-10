@@ -59,6 +59,19 @@ def _is_link(path):
     return bool(isjunction and isjunction(path))
 
 
+def _norm(path):
+    return os.path.normcase(os.path.realpath(os.path.abspath(path)))
+
+
+def _inside(child, parent):
+    """True when `child` is `parent` or lies under it (normalized, links resolved)."""
+    child, parent = _norm(child), _norm(parent)
+    try:
+        return os.path.commonpath([child, parent]) == parent
+    except ValueError:  # different drives
+        return False
+
+
 def _same_bytes(a, b):
     with open(a, "rb") as fa, open(b, "rb") as fb:
         return fa.read() == fb.read()
@@ -140,19 +153,35 @@ def build_plan(repo, state_dir, archive):
     return plan
 
 
+class PartialApply(Exception):
+    """A move/archive failed mid-apply; carries what went and what is left."""
+
+    def __init__(self, error, moved, remaining):
+        super().__init__(str(error))
+        self.error = error
+        self.moved = moved
+        self.remaining = remaining
+
+
 def apply(plan, ai):
     """Perform every move/archive, then prune the emptied directories under `ai`.
 
-    Returns the paths still left under `ai` (empty when everything went).
+    Returns the paths still left under `ai` (empty when everything went). Stops at the first
+    failed step and raises `PartialApply`; nothing already moved is rolled back.
     """
     for action in plan:
         if action.verb == "refuse":
             raise ValueError(f"refusing to apply a plan with a refusal: {action.line()}")
-    for action in plan:
-        if os.path.lexists(action.dst):
-            raise FileExistsError(f"destination appeared since planning: {action.dst}")
-        os.makedirs(os.path.dirname(action.dst), exist_ok=True)
-        shutil.move(action.src, action.dst)
+    moved = []
+    for index, action in enumerate(plan):
+        try:
+            if os.path.lexists(action.dst):
+                raise FileExistsError(f"destination appeared since planning: {action.dst}")
+            os.makedirs(os.path.dirname(action.dst), exist_ok=True)
+            shutil.move(action.src, action.dst)
+        except OSError as exc:
+            raise PartialApply(exc, moved, plan[index:]) from None
+        moved.append(action)
     for dirpath, _dirnames, _filenames in os.walk(ai, topdown=False):
         try:
             os.rmdir(dirpath)
@@ -204,9 +233,20 @@ def main(argv):
     archive = os.path.abspath(args.archive) if args.archive else _default_archive()
 
     ai = os.path.join(repo, ".ai")
+    # A linked `.ai` is refused outright: walking it would move the link target's files.
+    if os.path.lexists(ai) and _is_link(ai):
+        print(f"refuse {ai}: .ai is a symlink or junction; nothing changed")
+        return 1
     if not os.path.isdir(ai):
         print("nothing to migrate")
         return 0
+
+    # The archive or state dir inside `.ai` (or `.ai` inside either) would make the moves
+    # feed the walk or empty the destination.
+    for label, other in (("archive", archive), ("state_dir", state_dir)):
+        if _inside(other, ai) or _inside(ai, other):
+            print(f"refuse: {label} {other} and {ai} are inside one another; nothing changed")
+            return 1
 
     plan = build_plan(repo, state_dir, archive)
     counts = {"move": 0, "archive": 0, "refuse": 0}
@@ -224,7 +264,18 @@ def main(argv):
         print(DRY_RUN_LAST)
         return 0
 
-    left = apply(plan, ai)
+    try:
+        left = apply(plan, ai)
+    except PartialApply as failure:
+        print(f"apply stopped: {failure.error}")
+        print(f"moved ({len(failure.moved)}):")
+        for action in failure.moved:
+            print(f"  {action.src} -> {action.dst}")
+        print(f"left under .ai ({len(failure.remaining)}):")
+        for action in failure.remaining:
+            print(f"  {action.src}")
+        print("close the program holding the file and re-run (dry-run first)")
+        return 1
     if left:
         print("left under .ai after apply:")
         for path in left:

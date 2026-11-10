@@ -66,9 +66,12 @@ fn push_conflict(conflicts: &mut Vec<String>, path: &str) {
 /// Moves every legacy `.ai/specs/X` row of the project to the `<state_dir>/specs/X` id and path,
 /// together with its criteria, deps (both sides), questions, extraction runs and `spec-item:`
 /// claims, in one transaction. A spec is moved only once its file lives in the state dir and the
-/// legacy file is gone. An existing new-path row with no children is replaced; one with children
-/// is left alone, as is the legacy row, and the new path is reported as a conflict. Returns the
-/// conflicts. A moved row no longer has a legacy path, so running it again moves nothing twice.
+/// legacy file is gone. An existing new-path row with no children and no state of its own (status
+/// `discovered`, no `status_reason`, no `tree_id`, `tree_launched` unset) is replaced; one with
+/// children or state is left alone, as is the legacy row, and the new path is reported as a
+/// conflict. A legacy `spec-item:` claim left behind by an earlier scan, whose spec has no legacy
+/// row but does have a state-dir row, is moved the same way. Returns the conflicts. A moved row no
+/// longer has a legacy path, so running it again moves nothing twice.
 async fn rekey_legacy_specs(
     pool: &SqlitePool,
     project_id: Option<&str>,
@@ -93,11 +96,25 @@ async fn rekey_legacy_specs(
             candidates.push((spec.id.clone(), name.to_owned(), new_path));
         }
     }
-    if candidates.is_empty() {
+    let legacy_claims: i64 = match project_id {
+        Some(project) => {
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM task_claims \
+                 WHERE project_id = ? AND task_key LIKE 'spec-item:.ai/specs/%'",
+            )
+            .bind(project)
+            .fetch_one(pool)
+            .await?
+        }
+        None => 0,
+    };
+    if candidates.is_empty() && legacy_claims == 0 {
         return Ok(conflicts);
     }
 
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    // Names moved by this scan; their claims were already handled with the row.
+    let mut moved = std::collections::HashSet::new();
     for (old_id, name, new_path) in candidates {
         // Re-check under the write lock: an overlapping scan may already have moved this row,
         // and deleting the "taken" new-path row would then delete the moved spec itself.
@@ -125,11 +142,19 @@ async fn rekey_legacy_specs(
             .bind(&new_id)
             .fetch_one(&mut *tx)
             .await?;
-            if children > 0 {
+            // A row that moved past discovery, or was tied to a tree, has a state of its own.
+            let own_state: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM specs WHERE id = ? AND (status != 'discovered' \
+                 OR status_reason IS NOT NULL OR tree_id IS NOT NULL OR tree_launched != 0)",
+            )
+            .bind(&new_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if children > 0 || own_state > 0 {
                 tracing::warn!(
                     legacy = %format!("{LEGACY_SPECS_PREFIX}{name}"),
                     new = %new_path,
-                    "spec re-key skipped: the state_dir row already has children"
+                    "spec re-key skipped: the state_dir row already has children or state"
                 );
                 push_conflict(&mut conflicts, &new_path);
                 continue;
@@ -160,52 +185,108 @@ async fn rekey_legacy_specs(
                 .await?;
         }
 
+        moved.insert(name.clone());
         // Claims carry a NOT NULL project, so a project-less scan has none to move.
-        let Some(project) = project_id else {
-            continue;
-        };
-        let claims: Vec<(i64, String, String)> = sqlx::query_as(
-            "SELECT id, task_key, status FROM task_claims \
+        if let Some(project) = project_id {
+            rekey_spec_claims(&mut tx, project, &name, &new_path, &mut conflicts).await?;
+        }
+    }
+
+    // Claims an earlier scan left behind: the spec row already lives at the state-dir path and
+    // no legacy row remains, yet a `spec-item:.ai/specs/X#…` claim still exists.
+    if let Some(project) = project_id {
+        let keys: Vec<String> = sqlx::query_scalar(
+            "SELECT task_key FROM task_claims \
              WHERE project_id = ? AND task_key LIKE 'spec-item:.ai/specs/%'",
         )
         .bind(project)
         .fetch_all(&mut *tx)
         .await?;
-        let own_prefix = format!("{LEGACY_CLAIM_PREFIX}{name}#");
-        for (claim_id, task_key, status) in claims {
-            let Some(item) = task_key.strip_prefix(own_prefix.as_str()) else {
+        let mut names: Vec<String> = keys
+            .iter()
+            .filter_map(|key| key.strip_prefix(LEGACY_CLAIM_PREFIX))
+            .filter_map(|rest| rest.rsplit_once('#').map(|(name, _)| name.to_owned()))
+            .filter(|name| !moved.contains(name))
+            .collect();
+        names.sort();
+        names.dedup();
+        for name in names {
+            let legacy_row: Option<String> =
+                sqlx::query_scalar("SELECT id FROM specs WHERE project_id = ? AND path = ?")
+                    .bind(project)
+                    .bind(format!("{LEGACY_SPECS_PREFIX}{name}"))
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if legacy_row.is_some() {
                 continue;
-            };
-            let new_key = format!("spec-item:{new_path}#{item}");
-            if UNRESOLVED_CLAIM_STATUSES.contains(&status.as_str()) {
-                let holder: Option<i64> = sqlx::query_scalar(
-                    "SELECT id FROM task_claims WHERE project_id = ? AND task_key = ? \
-                     AND status IN ('probing', 'open', 'claimed') AND id != ?",
-                )
-                .bind(project)
-                .bind(&new_key)
-                .bind(claim_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-                if holder.is_some() {
-                    tracing::warn!(
-                        claim = %task_key,
-                        new = %new_key,
-                        "claim re-key skipped: an unresolved claim already holds the new key"
-                    );
-                    push_conflict(&mut conflicts, &new_path);
-                    continue;
-                }
             }
-            sqlx::query("UPDATE task_claims SET task_key = ? WHERE id = ?")
-                .bind(&new_key)
-                .bind(claim_id)
-                .execute(&mut *tx)
-                .await?;
+            let new_path = format!("{STATE_SPECS_PREFIX}{name}");
+            let new_row: Option<String> =
+                sqlx::query_scalar("SELECT id FROM specs WHERE project_id = ? AND path = ?")
+                    .bind(project)
+                    .bind(&new_path)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if new_row.is_none() {
+                continue;
+            }
+            rekey_spec_claims(&mut tx, project, &name, &new_path, &mut conflicts).await?;
         }
     }
     tx.commit().await?;
     Ok(conflicts)
+}
+
+/// Moves the project's `spec-item:.ai/specs/<name>#…` claims to `spec-item:<new_path>#…`. An
+/// unresolved claim is left in place, and `new_path` reported as a conflict, when another
+/// unresolved claim already holds its new key.
+async fn rekey_spec_claims(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    project: &str,
+    name: &str,
+    new_path: &str,
+    conflicts: &mut Vec<String>,
+) -> Result<(), ScanError> {
+    let claims: Vec<(i64, String, String)> = sqlx::query_as(
+        "SELECT id, task_key, status FROM task_claims \
+         WHERE project_id = ? AND task_key LIKE 'spec-item:.ai/specs/%'",
+    )
+    .bind(project)
+    .fetch_all(&mut **tx)
+    .await?;
+    let own_prefix = format!("{LEGACY_CLAIM_PREFIX}{name}#");
+    for (claim_id, task_key, status) in claims {
+        let Some(item) = task_key.strip_prefix(own_prefix.as_str()) else {
+            continue;
+        };
+        let new_key = format!("spec-item:{new_path}#{item}");
+        if UNRESOLVED_CLAIM_STATUSES.contains(&status.as_str()) {
+            let holder: Option<i64> = sqlx::query_scalar(
+                "SELECT id FROM task_claims WHERE project_id = ? AND task_key = ? \
+                 AND status IN ('probing', 'open', 'claimed') AND id != ?",
+            )
+            .bind(project)
+            .bind(&new_key)
+            .bind(claim_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+            if holder.is_some() {
+                tracing::warn!(
+                    claim = %task_key,
+                    new = %new_key,
+                    "claim re-key skipped: an unresolved claim already holds the new key"
+                );
+                push_conflict(conflicts, new_path);
+                continue;
+            }
+        }
+        sqlx::query("UPDATE task_claims SET task_key = ? WHERE id = ?")
+            .bind(&new_key)
+            .bind(claim_id)
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(())
 }
 
 pub fn content_sha(bytes: &[u8]) -> String {
@@ -327,7 +408,16 @@ pub async fn scan(
             let read = read_prefixes
                 .iter()
                 .any(|prefix| spec.path.starts_with(prefix.as_str()));
+            // A legacy row left behind by a re-key conflict waits for its owner, not the abandon.
+            let in_conflict = spec
+                .path
+                .strip_prefix(LEGACY_SPECS_PREFIX)
+                .is_some_and(|name| {
+                    let new_path = format!("{STATE_SPECS_PREFIX}{name}");
+                    report.rekey_conflicts.contains(&new_path)
+                });
             if read
+                && !in_conflict
                 && !found.contains(&spec.path)
                 && !matches!(spec.status, SpecStatus::Done | SpecStatus::Abandoned)
             {
@@ -1271,5 +1361,61 @@ mod tests {
         let new = spec_id(PROJECT, &state_path("alpha.md"));
         assert!(get_spec(&pool, &old).await.unwrap().is_none());
         assert_eq!(stored(&pool, &new).await.path, state_path("alpha.md"));
+    }
+
+    #[tokio::test]
+    async fn rekey_leaves_both_rows_when_the_new_path_row_has_its_own_state() {
+        let pool = crate::testdb::fresh_pool().await;
+        let project = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        // Both files exist for the first scan, so both rows are created.
+        write_file(&state_specs(state.path()), "alpha.md", SPEC_BODY);
+        let old = seed_legacy(&pool, project.path(), state.path(), PROJECT, "alpha.md").await;
+        let new = spec_id(PROJECT, &state_path("alpha.md"));
+        assert_eq!(rows_named(&pool, PROJECT, "alpha.md").await, 2);
+        // The new-path row has no children, but it carries a state of its own.
+        mark_extracted(&pool, &new).await;
+        fs::remove_file(project_specs(project.path()).join("alpha.md")).unwrap();
+
+        let report = scan(&pool, PROJECT, &roots_at(project.path(), state.path()))
+            .await
+            .unwrap();
+
+        assert_eq!(report.rekey_conflicts, vec![state_path("alpha.md")]);
+        assert_eq!(rows_named(&pool, PROJECT, "alpha.md").await, 2);
+        let legacy = stored(&pool, &old).await;
+        assert_eq!(legacy.path, legacy_path("alpha.md"));
+        assert_eq!(legacy.status, SpecStatus::Discovered);
+        let kept = stored(&pool, &new).await;
+        assert_eq!(kept.path, state_path("alpha.md"));
+        assert_eq!(kept.status, SpecStatus::Extracted, "its own state survives");
+    }
+
+    #[tokio::test]
+    async fn rekey_moves_a_legacy_claim_left_behind_by_an_earlier_scan() {
+        let pool = crate::testdb::fresh_pool().await;
+        let project = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        // The spec row already lives at the state-dir path; no legacy row exists.
+        write_file(&state_specs(state.path()), "alpha.md", SPEC_BODY);
+        let roots = roots_at(project.path(), state.path());
+        scan(&pool, PROJECT, &roots).await.unwrap();
+        let new = spec_id(PROJECT, &state_path("alpha.md"));
+        assert_eq!(stored(&pool, &new).await.path, state_path("alpha.md"));
+        assert!(
+            get_spec(&pool, &spec_id(PROJECT, &legacy_path("alpha.md")))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        insert_claim(&pool, "proj-1", "spec-item:.ai/specs/alpha.md#1", "open").await;
+
+        let report = scan(&pool, PROJECT, &roots).await.unwrap();
+
+        assert!(report.rekey_conflicts.is_empty());
+        assert_eq!(
+            claim_keys(&pool, "proj-1").await,
+            vec!["spec-item:<state_dir>/specs/alpha.md#1".to_owned()]
+        );
     }
 }

@@ -36,6 +36,7 @@ import re
 import sys
 import tempfile
 import traceback
+import unittest
 from unittest import mock
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -77,6 +78,50 @@ def run(argv, env=None):
             rc = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
     lines = [line for line in out.getvalue().splitlines()]
     return rc, lines
+
+
+def run_full(argv, env=None):
+    """Like `run`, but also returns stderr lines: (rc, stdout lines, stderr lines)."""
+    module = _load()
+    out, err = io.StringIO(), io.StringIO()
+    with mock.patch.dict(os.environ, dict(env or {})), contextlib.redirect_stdout(
+        out
+    ), contextlib.redirect_stderr(err):
+        try:
+            rc = module.main(list(argv))
+        except SystemExit as exc:
+            rc = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
+    return rc, out.getvalue().splitlines(), err.getvalue().splitlines()
+
+
+def make_dir_link(target, link):
+    """A directory link at `link` -> `target`: a junction on Windows, else a symlink.
+
+    Returns False when neither can be created (Windows without the symlink privilege).
+    """
+    if os.name == "nt":
+        try:
+            import _winapi
+
+            _winapi.CreateJunction(target, link)
+            return True
+        except Exception:  # noqa: BLE001 - fall back to a symlink
+            pass
+    try:
+        os.symlink(target, link, target_is_directory=True)
+        return True
+    except (OSError, NotImplementedError, AttributeError):
+        return False
+
+
+def remove_dir_link(link):
+    """Drop the link itself (never its target), best effort."""
+    for remove in (os.unlink, os.rmdir):
+        try:
+            remove(link)
+            return
+        except OSError:
+            continue
 
 
 def write(path, data):
@@ -422,6 +467,105 @@ def test_first_line_warns_to_stop_the_daemon():
             assert lines and lines[0] == WARNING, f"first line ({argv[-1]}): {lines[:1]!r}"
 
 
+def test_refuses_when_ai_itself_is_a_link():
+    with tempfile.TemporaryDirectory() as tmp:
+        lay = Layout(tmp)
+        target = os.path.join(tmp, "real-ai")
+        write(os.path.join(target, "specs", "x.md"), "x\n")
+        if not make_dir_link(target, lay.ai):
+            raise unittest.SkipTest("cannot create a directory junction or symlink here")
+        try:
+            target_before = snapshot(target)
+            state_before = snapshot(lay.state)
+            for argv in (lay.argv(), lay.argv("--apply")):
+                rc, lines = run(argv, isolated_env(tmp))
+                assert rc == 1, f".ai as a link must return 1 ({argv[-1]}), got {rc}: {lines!r}"
+                assert any(
+                    ".ai" in line
+                    and ("link" in line.lower() or "junction" in line.lower())
+                    for line in lines
+                ), f".ai not reported as a link ({argv[-1]}): {lines!r}"
+                assert snapshot(target) == target_before, f"link target changed ({argv[-1]})"
+                assert snapshot(lay.state) == state_before, f"state changed ({argv[-1]})"
+                assert not os.path.lexists(lay.archive), f"archive created ({argv[-1]})"
+        finally:
+            remove_dir_link(lay.ai)
+
+
+def test_refuses_an_archive_or_state_dir_inside_ai():
+    with tempfile.TemporaryDirectory() as tmp:
+        lay = Layout(tmp)
+        lay.ai_file("specs/a.md", "a\n")
+        lay.ai_file("TODO.md", "todo\n")
+        cases = [
+            (
+                "archive inside .ai",
+                ["--repo", lay.repo, "--state-dir", lay.state, "--archive", lay.at(lay.ai, "arch")],
+            ),
+            (
+                "state_dir inside .ai",
+                ["--repo", lay.repo, "--state-dir", lay.at(lay.ai, "state"), "--archive", lay.archive],
+            ),
+            (
+                ".ai inside the archive",
+                ["--repo", lay.repo, "--state-dir", lay.state, "--archive", lay.repo],
+            ),
+        ]
+        for label, base in cases:
+            for argv in (base, base + ["--apply"]):
+                before = snapshot(tmp)
+                rc, lines = run(argv, isolated_env(tmp))
+                assert rc in (1, 2), f"{label} ({argv[-1]}) must refuse (1 or 2), got {rc}: {lines!r}"
+                assert any(
+                    line.startswith("refuse") or "inside" in line.lower() for line in lines
+                ), f"{label} ({argv[-1]}): refusal not reported: {lines!r}"
+                assert snapshot(tmp) == before, f"{label} ({argv[-1]}) changed the filesystem"
+
+
+def test_apply_reports_a_partial_failure_and_exits_1():
+    with tempfile.TemporaryDirectory() as tmp:
+        lay = Layout(tmp)
+        for name in ("a.md", "b.md", "c.md"):
+            lay.ai_file(f"specs/{name}", f"{name}\n")
+        module = _load()
+        real_move = module.shutil.move
+        calls = []
+
+        def flaky_move(src, dst, *args, **kwargs):
+            calls.append(src)
+            if len(calls) == 2:
+                raise PermissionError(13, "Access is denied", src)
+            return real_move(src, dst, *args, **kwargs)
+
+        with mock.patch.object(module.shutil, "move", side_effect=flaky_move):
+            try:
+                rc, out, err = run_full(lay.argv("--apply"), isolated_env(tmp))
+            except Exception as exc:  # noqa: BLE001 - the point is that nothing escapes
+                raise AssertionError(
+                    f"a failed move escaped main(): {type(exc).__name__}: {exc}"
+                ) from None
+        assert rc == 1, f"a partial apply must return 1, got {rc}: {out!r} {err!r}"
+        assert len(calls) >= 2, f"the failing move was never reached: {calls!r}"
+        first = os.path.relpath(calls[0], lay.ai).replace(os.sep, "/")
+        rest = [r for r in ("specs/a.md", "specs/b.md", "specs/c.md") if r != first]
+        assert os.path.isfile(lay.at(lay.state, first)), f"{first} not at its destination"
+        assert not os.path.exists(lay.at(lay.ai, first)), f"{first} still under .ai"
+        for rel in rest:
+            assert os.path.isfile(lay.at(lay.ai, rel)), f"{rel} no longer under .ai"
+            assert not os.path.exists(lay.at(lay.state, rel)), f"{rel} reached state"
+        # The report comes after the plan's summary line (or on stderr).
+        idx = next((i for i, line in enumerate(out) if SUMMARY.search(line)), -1)
+        report = "\n".join(out[idx + 1 :] + err)
+        low = report.lower()
+        assert "moved" in low, f"report does not say what was moved: {report!r}"
+        assert "left" in low, f"report does not say what is left: {report!r}"
+        assert "re-run" in low, f"report does not say to re-run: {report!r}"
+        assert os.path.basename(first) in report, f"report does not name {first}: {report!r}"
+        for rel in rest:
+            assert os.path.basename(rel) in report, f"report does not name {rel}: {report!r}"
+        assert "Traceback" not in report, f"a traceback was printed: {report!r}"
+
+
 TESTS = [
     test_dry_run_lists_actions_and_changes_nothing,
     test_apply_moves_specs_html_plans_notes_spikes_handoffs_keeping_subpaths,
@@ -438,14 +582,21 @@ TESTS = [
     test_no_ai_dir_is_a_no_op,
     test_archive_default_honours_nucleos_dev_home,
     test_first_line_warns_to_stop_the_daemon,
+    test_refuses_when_ai_itself_is_a_link,
+    test_refuses_an_archive_or_state_dir_inside_ai,
+    test_apply_reports_a_partial_failure_and_exits_1,
 ]
 
 
 def main():
     failed = []
+    skipped = 0
     for test in TESTS:
         try:
             test()
+        except unittest.SkipTest as exc:
+            skipped += 1
+            print(f"skip {test.__name__}: {exc}")
         except AssertionError as exc:
             failed.append(test.__name__)
             print(f"FAIL {test.__name__}: {exc}")
@@ -455,7 +606,7 @@ def main():
             traceback.print_exc(limit=3)
         else:
             print(f"ok   {test.__name__}")
-    print(f"\n{len(TESTS) - len(failed)}/{len(TESTS)} passed")
+    print(f"\n{len(TESTS) - len(failed) - skipped}/{len(TESTS)} passed, {skipped} skipped")
     sys.exit(1 if failed else 0)
 
 

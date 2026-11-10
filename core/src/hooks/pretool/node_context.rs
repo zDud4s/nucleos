@@ -364,9 +364,11 @@ fn names_state_dir_token(relative: &str) -> bool {
 /// Whether `path` names a file under the retired `.ai/` directory at one of `roots` (the run's
 /// checkout and the project's main checkout). Backslashes read as slashes, and the path is cleaned
 /// lexically: a `..` that stays inside is resolved, one that climbs above the start is not a match.
-/// Only the root `.ai` counts, never a nested `x/.ai` nor a lookalike such as `.aix`.
+/// Only the root `.ai` counts, never a nested `x/.ai` nor a lookalike such as `.aix`. On Windows a
+/// verbatim `\\?\` prefix is dropped first, and the segment is compared with the trailing dots and
+/// spaces Win32 strips trimmed off, case-insensitively.
 fn names_legacy_ai_dir(path: &str, roots: &[std::path::PathBuf]) -> bool {
-    let path = path.replace('\\', "/");
+    let path = strip_verbatim_prefix(path.replace('\\', "/"));
     let absolute = crate::governance::classifier::is_absolute_path(&path);
     let Some(path) = resolve_clean_path(&path) else {
         return false;
@@ -375,7 +377,9 @@ fn names_legacy_ai_dir(path: &str, roots: &[std::path::PathBuf]) -> bool {
         let mut segments = relative.split('/');
         let first = segments.next().unwrap_or_default();
         let is_ai = if cfg!(windows) {
-            first.eq_ignore_ascii_case(".ai")
+            first
+                .trim_end_matches(['.', ' '])
+                .eq_ignore_ascii_case(".ai")
         } else {
             first == ".ai"
         };
@@ -386,10 +390,28 @@ fn names_legacy_ai_dir(path: &str, roots: &[std::path::PathBuf]) -> bool {
         return !roots.is_empty() && under_ai(&path);
     }
     roots.iter().any(|root| {
-        resolve_clean_path(&root.to_string_lossy().replace('\\', "/"))
-            .and_then(|root| strip_root_prefix(&path, &root, cfg!(windows)).map(under_ai))
-            .unwrap_or(false)
+        resolve_clean_path(&strip_verbatim_prefix(
+            root.to_string_lossy().replace('\\', "/"),
+        ))
+        .and_then(|root| strip_root_prefix(&path, &root, cfg!(windows)).map(under_ai))
+        .unwrap_or(false)
     })
+}
+
+/// Drops a Windows verbatim prefix from a slash-separated path: `//?/C:/x` becomes `C:/x` and
+/// `//?/UNC/server/share` becomes `//server/share`. Any other path, and every path off Windows,
+/// is returned unchanged.
+fn strip_verbatim_prefix(path: String) -> String {
+    if !cfg!(windows) {
+        return path;
+    }
+    let Some(rest) = path.strip_prefix("//?/") else {
+        return path;
+    };
+    match rest.get(..4) {
+        Some(unc) if unc.eq_ignore_ascii_case("UNC/") => format!("//{}", &rest[4..]),
+        _ => rest.to_owned(),
+    }
 }
 
 /// A lexical clean that resolves `..` against the segments before it. `None` when a `..` climbs
@@ -422,16 +444,31 @@ pub(super) fn legacy_ai_write_decision(
     }
     let cwd = cwd?;
     let project_root = crate::agents::prefix::project_root_from(cwd);
-    let mut roots = vec![cwd.to_path_buf()];
-    if let Some(root) = &project_root
-        && root.as_path() != cwd
-    {
+    // The cwd is a root only when it is a checkout of its own (or nothing better is known): a run
+    // in `<root>/core` writing `.ai/x.md` writes `core/.ai`, not the root's `.ai`.
+    let mut roots = Vec::new();
+    if project_root.is_none() || cwd.join(".git").exists() {
+        roots.push(cwd.to_path_buf());
+    }
+    if let Some(root) = &project_root {
         roots.push(root.clone());
     }
+    let cwd_text = cwd.to_string_lossy().replace('\\', "/");
     let hits = ["file_path", "notebook_path"]
         .iter()
         .filter_map(|key| payload.tool_input.get(*key).and_then(Value::as_str))
-        .any(|path| names_legacy_ai_dir(path, &roots));
+        .any(|path| {
+            // A relative path is the cwd's: join it there, so the roots judge one absolute path.
+            let path = path.replace('\\', "/");
+            if crate::governance::classifier::is_absolute_path(&path) {
+                names_legacy_ai_dir(&path, &roots)
+            } else {
+                names_legacy_ai_dir(
+                    &format!("{}/{path}", cwd_text.trim_end_matches('/')),
+                    &roots,
+                )
+            }
+        });
     if !hits {
         return None;
     }
@@ -624,5 +661,44 @@ mod tests {
 
         let write = write_payload("Write", "/repo/.ai/x.md");
         assert!(legacy_ai_write_decision(&write, None).is_none());
+    }
+
+    #[test]
+    fn legacy_ai_resolves_a_relative_path_against_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        let core = root.join("core");
+        std::fs::create_dir_all(root.join(".nucleos/workflow")).unwrap();
+        std::fs::create_dir_all(&core).unwrap();
+        std::fs::write(
+            root.join(".nucleos/workflow/project.json"),
+            serde_json::json!({"state_dir": dir.path().join("state").to_str().unwrap()})
+                .to_string(),
+        )
+        .unwrap();
+
+        // From the root, a spelling that leaves and re-enters the root still names its `.ai`.
+        let reentering = write_payload("Write", "../repo/.ai/specs/x.md");
+        let Json(decision) = legacy_ai_write_decision(&reentering, Some(root.as_path()))
+            .expect("`../repo/.ai/...` from the root names the root's `.ai`");
+        assert_eq!(decision.decision, "deny", "{}", decision.reason);
+
+        // From `<root>/core`, a relative `.ai/x.md` is `core/.ai`, not the root's `.ai`.
+        let nested = write_payload("Write", ".ai/x.md");
+        assert!(
+            legacy_ai_write_decision(&nested, Some(core.as_path())).is_none(),
+            "`.ai/x.md` from `<root>/core` is `core/.ai/x.md`"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn legacy_ai_names_verbatim_and_trailing_dot_spellings() {
+        let roots = [std::path::PathBuf::from(r"C:\repo")];
+
+        assert!(names_legacy_ai_dir(r"\\?\C:\repo\.ai\x.md", &roots));
+        // Win32 strips a trailing dot or space from a path segment, so these open `.ai` too.
+        assert!(names_legacy_ai_dir(r"C:\repo\.ai.\x.md", &roots));
+        assert!(names_legacy_ai_dir(r"C:\repo\.ai \x.md", &roots));
     }
 }
