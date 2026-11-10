@@ -679,6 +679,19 @@ mod tests {
             );
             return;
         }
+        // The worktree is a checkout of the commit, so the link must be in the commit to be there.
+        assert!(git_command_ok(
+            &repo,
+            &[OsStr::new("add"), OsStr::new("linked")]
+        ));
+        assert!(git_command_ok(
+            &repo,
+            &[
+                OsStr::new("commit"),
+                OsStr::new("-m"),
+                OsStr::new("add a link")
+            ]
+        ));
         let mut package = code(head(&repo).await);
         package.files.push(CodeFile {
             path: "linked/escaped.txt".into(),

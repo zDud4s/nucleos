@@ -249,7 +249,14 @@ fn escapes_through_a_link(
     let Ok(real_cwd) = std::fs::canonicalize(cwd) else {
         return false;
     };
-    let mut ancestor = Some(Path::new(normalized));
+    // `normalize_path` joins components with `/` and so drops the root of a Unix path
+    // (`/tmp/ws/x` -> `tmp/ws/x`); canonicalizing that would look under the process's cwd.
+    let rooted = if cwd.to_string_lossy().starts_with('/') && !normalized.starts_with('/') {
+        format!("/{normalized}")
+    } else {
+        normalized.to_owned()
+    };
+    let mut ancestor = Some(Path::new(&rooted));
     while let Some(candidate) = ancestor {
         if let Ok(real) = std::fs::canonicalize(candidate) {
             let plain = |path: &Path| {
