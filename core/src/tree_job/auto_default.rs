@@ -260,11 +260,15 @@ pub async fn sweep(state: &AppState) {
     }
 }
 
-async fn applied_count(pool: &SqlitePool, column: &str, value: &str) -> Result<i64, sqlx::Error> {
-    // `column` is one of two literals below.
-    sqlx::query_scalar(&format!(
+async fn applied_count(
+    pool: &SqlitePool,
+    column: &'static str,
+    value: &str,
+) -> Result<i64, sqlx::Error> {
+    // `AssertSqlSafe`: `column` is one of two literal column names, and the value is bound.
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT COUNT(*) FROM decisions WHERE origin = ? AND {column} = ?"
-    ))
+    )))
     .bind(ORIGIN)
     .bind(value)
     .fetch_one(pool)
@@ -277,7 +281,10 @@ async fn apply_one(state: &AppState, row: Expired) -> Result<(), String> {
     let (Some(tree_id), Some(node_id)) = (tree_id, node_id) else {
         return Ok(());
     };
-    let Some(job) = store::load(pool, &tree_id).await.map_err(|e| e.to_string())? else {
+    let Some(job) = store::load(pool, &tree_id)
+        .await
+        .map_err(|e| e.to_string())?
+    else {
         return Ok(());
     };
     let config = Config::load(&job.manifest.project_root);
@@ -323,9 +330,16 @@ async fn apply_one(state: &AppState, row: Expired) -> Result<(), String> {
         job.goal,
         action.describe()
     );
-    crate::feed::append(pool, job.project_id.as_deref(), FEED_KIND, &line, None, None)
-        .await
-        .map_err(|e| e.to_string())?;
+    crate::feed::append(
+        pool,
+        job.project_id.as_deref(),
+        FEED_KIND,
+        &line,
+        None,
+        None,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -371,7 +385,10 @@ mod tests {
                 per_job: 5
             }
         );
-        assert_eq!(Config::from_yaml("nodes:\n  max_depth: 3\n"), Config::default());
+        assert_eq!(
+            Config::from_yaml("nodes:\n  max_depth: 3\n"),
+            Config::default()
+        );
         assert_eq!(Config::from_yaml(": : :"), Config::default());
         let mistyped = Config::from_yaml("autonomy:\n  auto_default: maybe\n");
         assert!(mistyped.enabled);
@@ -380,7 +397,10 @@ mod tests {
     #[test]
     fn the_verdict_applies_a_relaunch_under_the_caps() {
         let config = Config::default();
-        assert_eq!(verdict(&config, "relaunch_fresh_with_diagnosis", 0, 2), Verdict::Apply);
+        assert_eq!(
+            verdict(&config, "relaunch_fresh_with_diagnosis", 0, 2),
+            Verdict::Apply
+        );
     }
 
     #[test]
@@ -406,8 +426,16 @@ mod tests {
     #[test]
     fn a_split_or_an_unknown_action_is_not_applied() {
         let config = Config::default();
-        for action in ["split_remaining_into_new_nodes", "drop_branch", "accept_flaky"] {
-            assert_eq!(verdict(&config, action, 0, 0), Verdict::NotApplicable, "{action}");
+        for action in [
+            "split_remaining_into_new_nodes",
+            "drop_branch",
+            "accept_flaky",
+        ] {
+            assert_eq!(
+                verdict(&config, action, 0, 0),
+                Verdict::NotApplicable,
+                "{action}"
+            );
         }
     }
 
@@ -458,12 +486,14 @@ mod tests {
 
     async fn seed_applied(pool: &SqlitePool, id: &str, node: &str) {
         seed_open(pool, id, node, None, RELAUNCH).await;
-        sqlx::query("UPDATE decisions SET status = 'answered', origin = ?, answer = 'x' WHERE id = ?")
-            .bind(ORIGIN)
-            .bind(id)
-            .execute(pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE decisions SET status = 'answered', origin = ?, answer = 'x' WHERE id = ?",
+        )
+        .bind(ORIGIN)
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     async fn status_of(pool: &SqlitePool, id: &str) -> (String, Option<String>, Option<String>) {
@@ -497,12 +527,22 @@ mod tests {
         seed_job(&pool).await;
         seed_open(&pool, "d-1", NODE, None, RELAUNCH).await;
 
-        let first = attach(&pool, "d-1", DefaultAction::RelaunchFreshWithDiagnosis, "evidence")
-            .await
-            .unwrap();
-        let again = attach(&pool, "d-1", DefaultAction::SplitRemainingIntoNewNodes, "other")
-            .await
-            .unwrap();
+        let first = attach(
+            &pool,
+            "d-1",
+            DefaultAction::RelaunchFreshWithDiagnosis,
+            "evidence",
+        )
+        .await
+        .unwrap();
+        let again = attach(
+            &pool,
+            "d-1",
+            DefaultAction::SplitRemainingIntoNewNodes,
+            "other",
+        )
+        .await
+        .unwrap();
 
         assert!(first);
         assert!(!again, "a decision keeps its first default");
@@ -524,11 +564,31 @@ mod tests {
         let pool = crate::testdb::fresh_pool().await;
         seed_job(&pool).await;
         seed_applied(&pool, "d-done", NODE).await;
-        decisions::ask_ownerless(&pool, "ticket-1", "park?").await.unwrap();
+        decisions::ask_ownerless(&pool, "ticket-1", "park?")
+            .await
+            .unwrap();
 
-        let answered = attach(&pool, "d-done", DefaultAction::RelaunchFreshWithDiagnosis, "e").await;
-        let ownerless = attach(&pool, "ticket-1", DefaultAction::RelaunchFreshWithDiagnosis, "e").await;
-        let unknown = attach(&pool, "nope", DefaultAction::RelaunchFreshWithDiagnosis, "e").await;
+        let answered = attach(
+            &pool,
+            "d-done",
+            DefaultAction::RelaunchFreshWithDiagnosis,
+            "e",
+        )
+        .await;
+        let ownerless = attach(
+            &pool,
+            "ticket-1",
+            DefaultAction::RelaunchFreshWithDiagnosis,
+            "e",
+        )
+        .await;
+        let unknown = attach(
+            &pool,
+            "nope",
+            DefaultAction::RelaunchFreshWithDiagnosis,
+            "e",
+        )
+        .await;
 
         assert!(!answered.unwrap());
         assert!(!ownerless.unwrap());
@@ -544,7 +604,10 @@ mod tests {
         sweep(&state).await;
 
         let (status, origin, _) = status_of(&state.pool, "d-1").await;
-        assert_eq!((status.as_str(), origin.as_deref()), ("answered", Some(ORIGIN)));
+        assert_eq!(
+            (status.as_str(), origin.as_deref()),
+            ("answered", Some(ORIGIN))
+        );
         let lines = auto_default_lines(&state.pool).await;
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("which way?"), "{}", lines[0]);
@@ -556,7 +619,14 @@ mod tests {
     async fn the_sweep_leaves_a_default_that_is_not_due_yet() {
         let state = state().await;
         seed_job(&state.pool).await;
-        seed_open(&state.pool, "d-1", NODE, Some("2999-01-01T00:00:00+00:00"), RELAUNCH).await;
+        seed_open(
+            &state.pool,
+            "d-1",
+            NODE,
+            Some("2999-01-01T00:00:00+00:00"),
+            RELAUNCH,
+        )
+        .await;
 
         sweep(&state).await;
 
@@ -609,7 +679,14 @@ mod tests {
     async fn the_sweep_keeps_a_split_default_for_the_owner() {
         let state = state().await;
         seed_job(&state.pool).await;
-        seed_open(&state.pool, "d-1", NODE, Some(OLD), "split_remaining_into_new_nodes").await;
+        seed_open(
+            &state.pool,
+            "d-1",
+            NODE,
+            Some(OLD),
+            "split_remaining_into_new_nodes",
+        )
+        .await;
 
         sweep(&state).await;
 
@@ -623,7 +700,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let workflow = root.path().join(".nucleos/workflow");
         std::fs::create_dir_all(&workflow).unwrap();
-        std::fs::write(workflow.join("speed.yaml"), "autonomy:\n  auto_default: false\n").unwrap();
+        std::fs::write(
+            workflow.join("speed.yaml"),
+            "autonomy:\n  auto_default: false\n",
+        )
+        .unwrap();
         let mut manifest = Manifest::new(
             TREE,
             "feat/ad",
@@ -658,7 +739,9 @@ mod tests {
         let state = state().await;
         seed_job(&state.pool).await;
         seed_open(&state.pool, "d-1", NODE, Some(OLD), RELAUNCH).await;
-        decisions::answer(&state.pool, "d-1", "do it my way", "owner").await.unwrap();
+        decisions::answer(&state.pool, "d-1", "do it my way", "owner")
+            .await
+            .unwrap();
 
         sweep(&state).await;
 

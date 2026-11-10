@@ -436,7 +436,10 @@ async fn relaunch_or_stop(
     let question = (chain.question)(node_id, chain.cap());
     // The chain stopped on a node that kept ending: one more start with fresh context and the
     // diagnosis is the safe default if the owner stays silent (spec B2).
-    let evidence = format!("the node ended {} times in a row without finishing", chain.cap());
+    let evidence = format!(
+        "the node ended {} times in a row without finishing",
+        chain.cap()
+    );
     super::auto_default::park_or_ask_with_default(
         pool,
         job_id,
