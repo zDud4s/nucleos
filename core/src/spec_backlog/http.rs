@@ -622,9 +622,13 @@ mod tests {
 
     #[tokio::test]
     async fn scan_reads_the_projects_real_specs() {
-        let state = state().await;
+        let mut state = state().await;
         let root = tempfile::tempdir().unwrap();
-        let specs = root.path().join(".ai/specs");
+        let machine = tempfile::tempdir().unwrap();
+        state.machine_config_root = Some(machine.path().to_path_buf());
+        let project_state =
+            crate::project::state::dir(machine.path(), "scan-real-project").unwrap();
+        let specs = project_state.join("specs");
         std::fs::create_dir_all(&specs).unwrap();
         std::fs::write(specs.join("a.md"), "# A\n").unwrap();
         sqlx::query(
@@ -653,7 +657,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|spec| spec["path"] == ".ai/specs/a.md")
+                .any(|spec| spec["path"] == "<state_dir>/specs/a.md")
         );
     }
 

@@ -2709,16 +2709,17 @@ mod tests {
     async fn finish_discovers_a_spec_written_since_the_last_scan() {
         let pool = crate::testdb::fresh_pool().await;
         let project = tempfile::tempdir().unwrap();
-        let specs = project.path().join(".ai/specs");
+        let state = tempfile::tempdir().unwrap();
+        let specs = state.path().join("specs");
         std::fs::create_dir_all(&specs).unwrap();
         std::fs::write(specs.join("new.md"), "# New\n").unwrap();
-        let expected = spec_id(Some("finish-scan-project"), ".ai/specs/new.md");
+        let expected = spec_id(Some("finish-scan-project"), "<state_dir>/specs/new.md");
         let log = Log::default();
         let launcher = FakeLauncher::new(&log);
         let prep = FakePreparer::new(&pool, &log, &[]);
         let mut config = cfg();
         config.project_root = project.path().to_string_lossy().to_string();
-        config.state_dir = None;
+        config.state_dir = Some(state.path().to_path_buf());
 
         finish_with(
             &pool,

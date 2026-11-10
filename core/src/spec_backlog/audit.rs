@@ -299,7 +299,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::SystemTime;
 
-    const SPEC_PATH: &str = ".ai/specs/2026-01-01-alpha.md";
+    const SPEC_PATH: &str = "<state_dir>/specs/2026-01-01-alpha.md";
+    /// The spec file on disk, relative to the worktree, which doubles as the state dir here.
+    const SPEC_FILE: &str = "specs/2026-01-01-alpha.md";
     const SHA: &str = "sha-1";
     const NEW_SHA: &str = "sha-2";
     const LIB_RS: &str = "pub fn first() {}\n\n#[test]\nfn some_test() {}\n";
@@ -387,8 +389,8 @@ mod tests {
     fn populate(root: &Path) {
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), LIB_RS).unwrap();
-        fs::create_dir_all(root.join(".ai/specs")).unwrap();
-        fs::write(root.join(SPEC_PATH), "# Alpha\n").unwrap();
+        fs::create_dir_all(root.join("specs")).unwrap();
+        fs::write(root.join(SPEC_FILE), "# Alpha\n").unwrap();
     }
 
     fn worktree() -> tempfile::TempDir {
@@ -980,7 +982,7 @@ mod tests {
         let fx = Fixture::new(&["the widget renders"]).await;
         let root = fx.worktree.path();
         let before = snapshot_tree(root);
-        assert!(before.contains_key(&root.join(SPEC_PATH)));
+        assert!(before.contains_key(&root.join(SPEC_FILE)));
         assert!(before.contains_key(&root.join("src/lib.rs")));
         let reviewer = FakeReviewer::answering("review-1", None, vec![met(1, GOOD)]);
         let verify = FakeVerify::new(VerifyState::Green);

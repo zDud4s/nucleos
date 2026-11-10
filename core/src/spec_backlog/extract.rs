@@ -202,14 +202,16 @@ mod tests {
         fenced(json!({"kind": kind, "criteria": [], "depends_on": [], "questions": []}))
     }
 
+    /// The temp dir is both the project and its state dir, so specs live in `<dir>/specs`.
     fn roots_at(project: &Path) -> ScanRoots {
         ScanRoots {
             project_root: Some(project.to_path_buf()),
-            state_dir: None,
+            state_dir: Some(project.to_path_buf()),
         }
     }
 
-    /// Writes the file under `.ai/specs` and registers it with its true sha. Returns the file too.
+    /// Writes the file under `<state_dir>/specs` and registers it with its true sha. Returns the
+    /// file too.
     async fn register_in(
         pool: &SqlitePool,
         root: &Path,
@@ -217,14 +219,14 @@ mod tests {
         name: &str,
         text: &str,
     ) -> (Spec, PathBuf) {
-        let specs = root.join(".ai").join("specs");
+        let specs = root.join("specs");
         fs::create_dir_all(&specs).unwrap();
         let file = specs.join(name);
         fs::write(&file, text).unwrap();
         let spec = upsert_by_path(
             pool,
             project,
-            &format!(".ai/specs/{name}"),
+            &format!("<state_dir>/specs/{name}"),
             "Title",
             &content_sha(text.as_bytes()),
         )
@@ -295,9 +297,9 @@ mod tests {
         for project in [PROJECT, None] {
             let pool = crate::testdb::fresh_pool().await;
             let dir = tempfile::tempdir().unwrap();
-            let target_path = ".ai/specs/target.md";
-            let ghost_path = ".ai/specs/ghost.md";
-            let elsewhere_path = ".ai/specs/elsewhere.md";
+            let target_path = "<state_dir>/specs/target.md";
+            let ghost_path = "<state_dir>/specs/ghost.md";
+            let elsewhere_path = "<state_dir>/specs/elsewhere.md";
             register_in(&pool, dir.path(), project, "target.md", "# Target\n").await;
             // Registered, but in another project: as unknown here as the ghost.
             upsert_by_path(&pool, Some("proj-2"), elsewhere_path, "Elsewhere", "sha-e")
@@ -362,7 +364,7 @@ mod tests {
         let (c, _) = register(&pool, dir.path(), "c.md", "# C\n").await;
         let names_b = fenced(json!({
             "kind": "spec", "criteria": [criterion("first")],
-            "depends_on": [".ai/specs/b.md"], "questions": []
+            "depends_on": ["<state_dir>/specs/b.md"], "questions": []
         }));
         let runner = FakeRunner::answering(&[names_b, spec_answer(&["second"])]);
 
