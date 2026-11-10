@@ -907,7 +907,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(permission(&pool, "alpha", id).await.unwrap(), Permission::default());
+        assert_eq!(
+            permission(&pool, "alpha", id).await.unwrap(),
+            Permission::default()
+        );
 
         let wanted = Permission {
             roles: Some(vec![Role::Root, Role::Orchestrator]),
@@ -919,7 +922,11 @@ mod tests {
         assert!(read.allows(Role::Orchestrator, 1) && !read.allows(Role::Leaf, 1));
 
         // Another project's id changes nothing.
-        assert!(!set_permission(&pool, "beta", id, &Permission::default()).await.unwrap());
+        assert!(
+            !set_permission(&pool, "beta", id, &Permission::default())
+                .await
+                .unwrap()
+        );
         assert_eq!(permission(&pool, "alpha", id).await.unwrap(), wanted);
     }
 

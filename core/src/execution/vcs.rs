@@ -4886,7 +4886,11 @@ mod tests {
 
         for origin in [Origin::Run(7), Origin::Job(7)] {
             assert!(submit(&pool, &repo, &push(), origin).await.is_err());
-            assert!(submit_declared(&pool, &repo, &push(), origin).await.is_err());
+            assert!(
+                submit_declared(&pool, &repo, &push(), origin)
+                    .await
+                    .is_err()
+            );
         }
         let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vcs_requests")
             .fetch_one(&pool)
