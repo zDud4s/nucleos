@@ -68,12 +68,7 @@ pub(super) fn scoped_ceiling_secs(base_secs: u64, units: u64, hits: u64) -> u64 
 
 /// The unit ceiling a branch's next gate asks for, from what its last gates left on the branch.
 pub(super) fn branch_ceiling_secs(extra: &BTreeMap<String, Value>, base_secs: u64) -> u64 {
-    let get = |key: &str| {
-        extra
-            .get(key)
-            .and_then(Value::as_u64)
-            .unwrap_or(0)
-    };
+    let get = |key: &str| extra.get(key).and_then(Value::as_u64).unwrap_or(0);
     scoped_ceiling_secs(base_secs, get(GATE_CEILING_UNITS), get(GATE_CEILING_HITS))
 }
 

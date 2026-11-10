@@ -1786,8 +1786,15 @@ tests:
             true,
             Some("errored"),
             vec![
-                unit(Some("core"), "errored", None, Some("out
-[timed out after 1800s]")),
+                unit(
+                    Some("core"),
+                    "errored",
+                    None,
+                    Some(
+                        "out
+[timed out after 1800s]",
+                    ),
+                ),
                 unit(Some("py"), "passed", Some(0), None),
             ],
         );
