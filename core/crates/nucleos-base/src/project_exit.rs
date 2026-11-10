@@ -127,6 +127,9 @@ const PROJECT_SCOPED: &[&str] = &[
     // and no foreign key, so neither this list nor VIA_PARENT reaches them: they are written out in
     // `remove`, ahead of the loop.
     "specs",
+    // The last integration-branch tip the daemon accounted for, per target (migration 0298): a
+    // project that is forgotten has no branch left to watch.
+    "target_watch",
     // The project's unresolved and past task claims (migration 0250) and the sessions registered for it:
     // working history, so forgetting the project takes them. Their event log hangs off task_claims
     // (VIA_PARENT below).
