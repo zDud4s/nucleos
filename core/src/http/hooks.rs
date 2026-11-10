@@ -50,6 +50,7 @@ pub(super) struct AskWaitRequest {
 /// Refuses on every path that is not a clear yes: nobody answered, the question is gone, this run
 /// has none. A turn that cannot be allowed is refused, never allowed by default.
 pub(super) async fn post_ask_wait(
+    State(state): State<AppState>,
     Extension(scope): Extension<crate::auth::Scope>,
     Json(body): Json<AskWaitRequest>,
 ) -> Json<crate::hooks::Decision> {
@@ -60,7 +61,9 @@ pub(super) async fn post_ask_wait(
         _ => body.run_id,
     };
 
-    match crate::hooks::wait_for_run(run_id, crate::hooks::ASK_WINDOW).await {
+    // A run parked on a question is waiting, not lost: the wait keeps its node's lease renewed.
+    let wait = crate::hooks::wait_for_run(run_id, crate::hooks::ASK_WINDOW);
+    match crate::tree_job::heartbeat::while_waiting(&state.pool, run_id, wait).await {
         Some(true) => Json(crate::hooks::Decision {
             decision: "allow".to_owned(),
             reason: "you allowed this".to_owned(),
@@ -133,6 +136,7 @@ pub(super) async fn post_admit(
     {
         return Json(AdmitAnswer::none());
     }
+    crate::tree_job::heartbeat::beat_run(&state.pool, run_id).await;
     let Some(book) = crate::execution::admission::installed() else {
         return Json(AdmitAnswer::none());
     };

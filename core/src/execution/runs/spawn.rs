@@ -590,6 +590,12 @@ pub(super) fn spawn_run(
             // the iteration stops it on every path out of the body, abort included.
             let _live_context_fill =
                 mirror_context_fill(&pool, id, std::sync::Arc::clone(&context_fill));
+            // Renews the tree node's lease from the run's stdout events and open tools (spec B5).
+            let _watch = crate::tree_job::heartbeat::watch_run(
+                &pool,
+                id,
+                std::sync::Arc::clone(&transcript),
+            );
             let mut request = crate::execution::runner::RunRequest {
                 prompt: prompt.clone(),
                 // A background run carries no pictures: nobody is here to attach one.

@@ -20,6 +20,8 @@ pub async fn pretooluse_decision(
     let tool_name = payload.tool_name.clone();
     let tool_input = payload.tool_input.clone();
     tracing::debug!(run_id, agent_id = ?payload.agent_id, agent_type = ?payload.agent_type, "pretooluse: caller");
+    // Every tool call is a sign of life of the node that owns the run (spec B5), throttled inside.
+    crate::tree_job::heartbeat::beat_run(&state.pool, run_id).await;
     let Json(decision) =
         pretooluse_decision_from(state.clone(), scope, payload, Instant::now()).await;
     let updated_input = if matches!(decision.decision.as_str(), "allow" | "asking") {
