@@ -1357,9 +1357,9 @@ mod tests {
         // the command existed.
         let pool = test_pool().await;
         let repo = repo_for("alpha");
-        let op = Op::Push {
+        // Not a push: a push is the root role's alone and no run may queue one (spec 2026-11-09 §6).
+        let op = Op::Fetch {
             remote: Remote::new("origin").unwrap(),
-            branch: Branch::new("feat/x").unwrap(),
         };
         let id = submit_declared(&pool, &repo, &op, Origin::Run(7))
             .await
@@ -4870,6 +4870,33 @@ mod tests {
         );
         assert_eq!(ticket.status, "succeeded");
         assert_eq!(ticket.result_sha.as_deref(), Some("cafe"));
+    }
+
+    /// Spec 2026-11-09 §6: a push is the root role's alone, so `admit` refuses it to a run and a
+    /// job (neither is the root) and writes no row. Human and Shell origins
+    /// still reach it: the app is the root, and the hook applies the role check itself.
+    #[tokio::test]
+    async fn a_push_from_a_run_or_job_origin_is_refused_and_writes_no_row() {
+        let pool = test_pool().await;
+        let repo = ResolvedRepo::synthetic("alpha", "C:/repo", "alpha");
+        let push = || Op::Push {
+            remote: Remote::new("origin").unwrap(),
+            branch: Branch::new("feat/x").unwrap(),
+        };
+
+        for origin in [Origin::Run(7), Origin::Job(7)] {
+            assert!(submit(&pool, &repo, &push(), origin).await.is_err());
+            assert!(submit_declared(&pool, &repo, &push(), origin).await.is_err());
+        }
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vcs_requests")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "a refused push leaves nothing in the queue");
+
+        submit(&pool, &repo, &push(), Origin::Human)
+            .await
+            .expect("the app, which is the root, may still queue a push");
     }
 
     /// F3-10: a revert is the daemon's own operation (spec 2026-10-05 §6.2). `admit` is the one

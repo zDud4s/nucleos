@@ -60,7 +60,9 @@ impl Origin {
     /// Whether this origin may queue `op`. The daemon-only kinds (`DAEMON_OP_KINDS`) are refused to
     /// the autonomous origins: a run or a job asking for a revert would be an agent undoing a merge.
     pub(super) fn may_queue(self, op: &Op) -> bool {
-        !(matches!(self, Origin::Run(_) | Origin::Job(_)) && DAEMON_OP_KINDS.contains(&op.kind()))
+        let autonomous = matches!(self, Origin::Run(_) | Origin::Job(_));
+        // Spec 2026-11-09 §6: a push is the root role's alone. A run or job is never the root.
+        !(autonomous && (DAEMON_OP_KINDS.contains(&op.kind()) || matches!(op, Op::Push { .. })))
     }
 
     /// `run_id` is populated only for `Origin::Run`. A job id written into a column named

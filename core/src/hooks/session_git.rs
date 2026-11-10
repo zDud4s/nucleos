@@ -215,6 +215,12 @@ pub(super) async fn session_git_decision_within(
         }
         Err(_) => return no_opinion(),
     };
+    // Spec 2026-11-09 §6: a push is accepted only from the root role; anyone else is told who can.
+    if probe.kind() == "push"
+        && let Some(reason) = role_policy::push_refusal(role)
+    {
+        return Json(deny_with(&reason).into());
+    }
     let Some(op) = queue_op(&segment.command, &branch) else {
         // The shape matched with the stand-in and not with the real branch: the parsers refuse only
         // a detached HEAD on that ground, and it names no branch the queue could move.
