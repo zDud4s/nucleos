@@ -1,12 +1,4 @@
-# Speed # Autonomy trees (spec B2): a question to the owner may carry a default answer that the sweep
-# applies after the deadline with no reply. Read by the daemon (tree_job/auto_default.rs).
-# auto_default: false switches every default off.
-autonomy:
-  auto_default: true
-  auto_default_deadline_minutes: 120
-  auto_default_per_node: 1
-  auto_default_per_job: 3
-profiles: what `normal`, `fast` and `thorough` buy.
+# Speed profiles: what `normal`, `fast` and `thorough` buy.
 #
 # Read by <bundle_dir>/scripts/resolve_speed.py, and by nothing else: a harness that runs
 # sessions hands down only the speed's NAME (WORKFLOW_SPEED) and its own capacity
@@ -22,6 +14,14 @@ profiles: what `normal`, `fast` and `thorough` buy.
 # Invariant (II): speed never creates capacity. How much parallel work may run is
 # the harness's number (WORKFLOW_PARALLEL_CEILING); this table can only narrow to it.
 default: normal
+# Autonomy trees (spec B2): a question to the owner may carry a default answer that the sweep
+# applies after the deadline with no reply. Read by the daemon (tree_job/auto_default.rs).
+# auto_default: false switches every default off.
+autonomy:
+  auto_default: true
+  auto_default_deadline_minutes: 120
+  auto_default_per_node: 1
+  auto_default_per_job: 3
 # Node trees (hierarchical orchestration). The daemon enforces depth, width and summary size;
 # the budgets are planning targets for the decomposition. subtree_verify: see workflow.md.
 nodes:

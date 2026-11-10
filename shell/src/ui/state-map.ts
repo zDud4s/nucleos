@@ -227,6 +227,8 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     work_tree_relaunch_skipped: { tone: "info", label: "node relaunch skipped" },
     // A branch started as a new orchestrator, or was degraded to a leaf (`tree_job/start_log.rs`): a fact, said once.
     work_tree_descent: { tone: "info", label: "node tree descended" },
+    // An expired default answer was applied to an owner question (`tree_job/auto_default.rs`): a fact, said once.
+    work_tree_auto_default: { tone: "info", label: "default answer applied" },
     // The audit before a spec's tree could not run (`spec_backlog/finish.rs`): the spec went on unaudited, said once.
     spec_audit_unavailable: { tone: "info", label: "spec audit unavailable" },
     // Runs.
