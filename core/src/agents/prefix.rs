@@ -117,14 +117,10 @@ pub fn render_json(p: &CodexPrefix) -> String {
 
 /// The project files a prefix may point at, only those that exist: instructions are `AGENTS.md`,
 /// else `CLAUDE.md`; memory and decisions are `<state_dir>/memory.md` and `<state_dir>/decisions.md`
-/// when the workflow pointer names a state directory, else the legacy `<root>/.ai/` copies.
+/// when the workflow pointer names a state directory; with no state copy there is no ref.
 pub fn context_refs_for(project_root: &Path) -> ContextRefs {
     let existing = |path: PathBuf| path.is_file().then_some(path);
-    let state = |file: &str| {
-        state_dir_for(project_root)
-            .and_then(|dir| existing(dir.join(file)))
-            .or_else(|| existing(project_root.join(".ai").join(file)))
-    };
+    let state = |file: &str| state_dir_for(project_root).and_then(|dir| existing(dir.join(file)));
     ContextRefs {
         instructions: existing(project_root.join("AGENTS.md"))
             .or_else(|| existing(project_root.join("CLAUDE.md"))),
@@ -440,24 +436,18 @@ mod tests {
             "BODY",
         );
         let project = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(project.path().join(".ai")).unwrap();
+        let state = project.path().join("st");
+        std::fs::create_dir_all(&state).unwrap();
+        write_pointer(project.path(), &state);
         let big = format!("MEMORY-MARKER {}", "m".repeat(50_000));
-        std::fs::write(project.path().join(".ai/memory.md"), &big).unwrap();
+        std::fs::write(state.join("memory.md"), &big).unwrap();
         let refs = context_refs_for(project.path());
         let pkg = load(home.path(), "x", "1.0.0");
         let p = codex_prefix(&pkg, &refs).unwrap();
         assert!(!p.prefix.contains("MEMORY-MARKER"));
         assert!(p.prefix.len() < 5_000);
-        assert!(
-            p.prefix.contains(
-                &project
-                    .path()
-                    .join(".ai")
-                    .join("memory.md")
-                    .display()
-                    .to_string()
-            )
-        );
+        let memory = state.join("memory.md").display().to_string();
+        assert!(p.prefix.contains(&memory));
     }
 
     #[test]
@@ -628,7 +618,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_and_decisions_come_from_the_state_dir_before_the_legacy_copy() {
+    fn memory_and_decisions_come_only_from_the_state_dir() {
         let project = tempfile::tempdir().unwrap();
         let state = project.path().join("st");
         std::fs::create_dir_all(&state).unwrap();
@@ -639,11 +629,8 @@ mod tests {
         std::fs::write(project.path().join(".ai").join("decisions.md"), "old").unwrap();
         let refs = context_refs_for(project.path());
         assert_eq!(refs.memory, Some(state.join("memory.md")));
-        // No state copy: the legacy file is still pointed at.
-        assert_eq!(
-            refs.decisions,
-            Some(project.path().join(".ai").join("decisions.md"))
-        );
+        // No state copy: the retired `.ai/` file is not pointed at.
+        assert_eq!(refs.decisions, None);
     }
 
     #[test]
