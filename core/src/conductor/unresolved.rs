@@ -35,7 +35,9 @@ pub(crate) async fn note(pool: &SqlitePool, node_id: &str, key: &str) -> sqlx::R
     if ticks < UNRESOLVED_CAP {
         return Ok(false);
     }
-    let cleared = clear_spent_launch(pool, node_id, key).await.unwrap_or(false);
+    let cleared = clear_spent_launch(pool, node_id, key)
+        .await
+        .unwrap_or(false);
     reset(pool, node_id).await?;
     if cleared {
         sqlx::query(
@@ -56,11 +58,13 @@ pub(crate) async fn note(pool: &SqlitePool, node_id: &str, key: &str) -> sqlx::R
 
 /// Forgets the count of `node_id`: its launch resolved.
 pub(crate) async fn reset(pool: &SqlitePool, node_id: &str) -> sqlx::Result<()> {
-    sqlx::query("UPDATE node_watchdog SET unresolved_ticks = 0 WHERE node_id = ? AND unresolved_ticks <> 0")
-        .bind(node_id)
-        .execute(pool)
-        .await
-        .map(|_| ())
+    sqlx::query(
+        "UPDATE node_watchdog SET unresolved_ticks = 0 WHERE node_id = ? AND unresolved_ticks <> 0",
+    )
+    .bind(node_id)
+    .execute(pool)
+    .await
+    .map(|_| ())
 }
 
 #[cfg(test)]
@@ -80,11 +84,13 @@ mod tests {
     }
 
     async fn reservations(pool: &SqlitePool, node_id: &str) -> i64 {
-        sqlx::query_scalar("SELECT COUNT(*) FROM tree_transitions WHERE node_id = ? AND transition = 'launch'")
-            .bind(node_id)
-            .fetch_one(pool)
-            .await
-            .unwrap()
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tree_transitions WHERE node_id = ? AND transition = 'launch'",
+        )
+        .bind(node_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
     }
 
     async fn feed_lines(pool: &SqlitePool, node_id: &str) -> i64 {

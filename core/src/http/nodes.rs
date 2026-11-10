@@ -25,8 +25,8 @@ use serde_json::{Value, json};
 use std::path::Path as FsPath;
 
 use super::*;
-use crate::role_policy;
 use crate::conductor::depth::{self, AncestorView, ChildArgs, DepthRefusal, TreeLimits};
+use crate::role_policy;
 use crate::tree_cost::budget::{self, Permit};
 use crate::work_nodes::{self, CloseArgs, NodeError, NodeLimits, OpenArgs, UpdateArgs, View};
 
@@ -504,7 +504,12 @@ async fn scope_refusal(state: &AppState, body: ScopeBody) -> Option<String> {
     // A leaf and its orchestrator share the session id, so the session alone cannot say whose edit
     // this is: the caller's own node (by the agent id the hook read) goes first, the session's
     // newest running node is the fallback.
-    let own_node = match caller.agent_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    let own_node = match caller
+        .agent_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         Some(agent_id) => sqlx::query_as::<_, (String, Option<String>)>(
             "SELECT owned_paths, project_id FROM work_nodes \
              WHERE agent_id = ? AND status = 'running' ORDER BY created_at DESC, id DESC LIMIT 1",

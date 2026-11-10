@@ -718,12 +718,11 @@ mod tests {
         let (status, _, summary) = leaf_row(&state).await;
         assert_eq!(status, "failed");
         assert!(summary.unwrap().contains("no launch was stored"));
-        let decisions: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM decisions WHERE node_id = ?")
-                .bind(LEAF)
-                .fetch_one(&state.pool)
-                .await
-                .unwrap();
+        let decisions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM decisions WHERE node_id = ?")
+            .bind(LEAF)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
         assert_eq!(decisions, 0);
     }
 

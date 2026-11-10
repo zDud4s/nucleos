@@ -74,12 +74,14 @@ mod tests {
             updated_at: AT.to_owned(),
         };
         save(pool, &job).await.unwrap();
-        sqlx::query("INSERT INTO runs (id, prompt, status, created_at) VALUES (9001, 'node', ?, ?)")
-            .bind(run_status)
-            .bind(AT)
-            .execute(pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO runs (id, prompt, status, created_at) VALUES (9001, 'node', ?, ?)",
+        )
+        .bind(run_status)
+        .bind(AT)
+        .execute(pool)
+        .await
+        .unwrap();
         sqlx::query(
             "INSERT INTO work_nodes (id, root_id, depth, kind, title, goal, status, run_id, \
                                      tree_job_id, created_at, updated_at) \

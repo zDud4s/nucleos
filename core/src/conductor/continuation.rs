@@ -4,8 +4,8 @@ use std::path::Path;
 
 use sqlx::SqlitePool;
 
-use crate::conductor::unresolved;
 use crate::conductor::depth::{self, AncestorView, ChildArgs, TreeLimits};
+use crate::conductor::unresolved;
 use crate::state::AppState;
 use crate::tree_cost::budget::{self, Permit};
 use crate::tree_job::close::tree_job_of;
@@ -719,13 +719,12 @@ mod tests {
         }
 
         assert_eq!(stuck_reservations(&state).await, 0);
-        let lines: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM feed WHERE kind = ? AND subject = 'node:sib'",
-        )
-        .bind(unresolved::UNRESOLVED_CLEARED)
-        .fetch_one(&state.pool)
-        .await
-        .unwrap();
+        let lines: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM feed WHERE kind = ? AND subject = 'node:sib'")
+                .bind(unresolved::UNRESOLVED_CLEARED)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
         assert_eq!(lines, 1);
     }
 
