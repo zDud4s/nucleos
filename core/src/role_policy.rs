@@ -130,6 +130,15 @@ impl Permission {
         Permission { roles, max_depth }
     }
 
+    /// The two columns `from_columns` reads: `roles` as a JSON list of names.
+    pub fn to_columns(&self) -> (Option<String>, Option<i64>) {
+        let roles = self.roles.as_ref().map(|roles| {
+            let names: Vec<&str> = roles.iter().map(|role| role.as_str()).collect();
+            serde_json::to_string(&names).unwrap_or_else(|_| "[]".to_owned())
+        });
+        (roles, self.max_depth)
+    }
+
     /// Whether a caller of `role` at `depth` may invoke the rule.
     pub fn allows(&self, role: Role, depth: i64) -> bool {
         let role_ok = self
