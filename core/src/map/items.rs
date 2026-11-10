@@ -1488,7 +1488,12 @@ mod tests {
         );
         assert_eq!(
             members(&found, "Mode"),
-            vec!["Idle", "Busy: (u8, String)", "Failed: { code: i32 }", "Fixed"]
+            vec![
+                "Idle",
+                "Busy: (u8, String)",
+                "Failed: { code: i32 }",
+                "Fixed"
+            ]
         );
         assert!(
             found
@@ -1550,7 +1555,10 @@ mod tests {
             json["members"][0],
             serde_json::json!({"owner": "E", "name": "V", "kind": "variant", "ty": "(u8)", "exported": false, "line": 3})
         );
-        assert_eq!(json["uses"][0], serde_json::json!({"path": "a::B", "line": 1}));
+        assert_eq!(
+            json["uses"][0],
+            serde_json::json!({"path": "a::B", "line": 1})
+        );
     }
 
     #[test]

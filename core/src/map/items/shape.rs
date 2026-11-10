@@ -235,9 +235,7 @@ fn split_top(masked: &[char], from: usize, to: usize) -> Vec<(usize, usize)> {
             '(' | '[' | '{' => round += 1,
             ')' | ']' | '}' => round -= 1,
             '<' => angle += 1,
-            '>' if angle > 0 && i > 0 && masked[i - 1] != '-' && masked[i - 1] != '=' => {
-                angle -= 1
-            }
+            '>' if angle > 0 && i > 0 && masked[i - 1] != '-' && masked[i - 1] != '=' => angle -= 1,
             ',' if round == 0 && angle == 0 => {
                 out.push((start, i));
                 start = i + 1;
