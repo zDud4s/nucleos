@@ -293,6 +293,48 @@ pub fn plan_groups(map: &MapState, kind: Kind, names: &[String]) -> Result<Plan,
     })
 }
 
+/// A fix's re-gate, first step (spec A7): each `(group, test ids)` that failed before runs its
+/// `select` narrowed to exactly those tests. A group the map lacks, or one that cannot be narrowed
+/// to ids (`test_select::recheck_argv`), contributes no unit: the full scope gate that follows a
+/// green recheck measures it anyway. No unit at all is an empty plan, which reads `nothing_ran`.
+pub fn plan_recheck(
+    map: &MapState,
+    failed: &[(String, Vec<String>)],
+) -> Result<Plan, PlanError> {
+    let map = match map {
+        MapState::Invalid(errors) => return Err(PlanError::InvalidMap(errors.clone())),
+        MapState::Absent => {
+            return Ok(Plan {
+                units: Vec::new(),
+                unclaimed: Vec::new(),
+                note: Some("no test map: nothing to recheck".into()),
+            });
+        }
+        MapState::Valid(map) => map,
+    };
+    let units = failed
+        .iter()
+        .filter_map(|(name, ids)| {
+            let argv = crate::test_select::recheck_argv(map.tests.groups.get(name)?, ids)?;
+            Some(PlannedUnit {
+                group: Some(name.clone()),
+                argv,
+                why: format!("recheck of the {} test(s) that failed before the fix", ids.len()),
+                fingerprint: None,
+                cacheable: false,
+                run_id: None,
+                cached_from: None,
+                skipped: None,
+            })
+        })
+        .collect();
+    Ok(Plan {
+        units,
+        unclaimed: Vec::new(),
+        note: Some("recheck: only the tests that failed in the previous gate".into()),
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Progress {
     pub total: usize,
@@ -508,6 +550,30 @@ tests:
             plan_groups(&MapState::Invalid(vec!["x".into()]), Kind::Test, &names),
             Err(PlanError::InvalidMap(_))
         ));
+    }
+
+    #[test]
+    fn plan_recheck_narrows_a_group_with_a_filter_select_and_skips_the_rest() {
+        let map = MapState::Valid(
+            crate::tests_map::parse(
+                "version: 1\ntests:\n  groups:\n    core:\n      paths: [core/]\n      command: cargo nextest run\n      select: cargo nextest run -E {filter}\n    py:\n      paths: ['**/*.py']\n      command: pytest\n      select: pytest -q -- {files}\n",
+            )
+            .unwrap(),
+        );
+        let failed = vec![
+            ("core".to_owned(), vec!["a::b".to_owned()]),
+            ("py".to_owned(), vec!["t::x".to_owned()]),
+            ("gone".to_owned(), vec!["t::y".to_owned()]),
+        ];
+        let plan = plan_recheck(&map, &failed).unwrap();
+        assert_eq!(plan.units.len(), 1, "{:?}", plan.units);
+        assert_eq!(plan.units[0].group.as_deref(), Some("core"));
+        assert_eq!(
+            plan.units[0].argv,
+            ["cargo", "nextest", "run", "-E", "test(=a::b)"]
+        );
+        assert!(!plan.units[0].cacheable);
+        assert!(plan_recheck(&map, &[]).unwrap().units.is_empty());
     }
 
     fn paths(list: &[&str]) -> Vec<String> {

@@ -4,8 +4,11 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use super::driver::{GateVerdict, NotMeasured};
-use super::gate::{GateIo, Stored, gate_at_head, gate_compiled_then_tested};
-use crate::verify::plan::{Progress, Ticket};
+use super::gate::{
+    GateIo, Stored, failed_tests_of, gate_at_head, gate_compiled_then_tested,
+    gate_rechecked_then_tested,
+};
+use crate::verify::plan::{Progress, Ticket, UnitReport};
 
 const WAIT: Duration = Duration::from_millis(1);
 
@@ -120,6 +123,85 @@ async fn a_head_that_compiles_goes_on_to_its_tests() {
         matches!(verdict, Ok(GateVerdict::Red { .. })),
         "{verdict:?}"
     );
+}
+
+fn failed_unit(group: &str, tests: Option<&[&str]>, inherited: Option<&str>) -> UnitReport {
+    UnitReport {
+        group: Some(group.to_owned()),
+        argv: Vec::new(),
+        why: String::new(),
+        status: "failed".to_owned(),
+        duration_ms: None,
+        exit_code: Some(1),
+        output_tail: None,
+        skipped_reason: None,
+        run_id: None,
+        cached_from: None,
+        already_failing: None,
+        failed_tests: tests.map(|t| t.iter().map(|s| (*s).to_owned()).collect()),
+        failed_files: Vec::new(),
+        inherited: inherited.map(str::to_owned),
+        pending: None,
+        not_inherited: None,
+    }
+}
+
+#[test]
+fn the_failed_tests_of_a_red_ticket_are_its_own_ids_grouped_and_deduplicated() {
+    let mut red = ticket(1, true, Some("failed"));
+    red.units = vec![
+        failed_unit("core", Some(&["b::t", "a::t"]), None),
+        failed_unit("core", Some(&["a::t"]), None),
+        failed_unit("py", None, None),
+        failed_unit("shell", Some(&["x::y"]), Some("incident #3")),
+    ];
+    assert_eq!(
+        failed_tests_of(&red),
+        vec![(
+            "core".to_owned(),
+            vec!["a::t".to_owned(), "b::t".to_owned()]
+        )]
+    );
+}
+
+#[tokio::test]
+async fn a_fix_regate_rechecks_the_failed_tests_before_the_scope_tests() {
+    let check = Fake::default();
+    let recheck = Fake::default();
+    let test = Fake::default();
+    let go = || gate_rechecked_then_tested(&check, &recheck, &test, "h2", WAIT);
+    assert!(go().await.is_err());
+    check.set(ticket(100, true, Some("passed")));
+    assert!(go().await.is_err());
+    assert_eq!(recheck.submits(), 1);
+    assert_eq!(test.submits(), 0, "the scope waits for the recheck");
+
+    // The recheck is still red: the fix is not done, and the scope is never spent.
+    recheck.set(ticket(100, true, Some("failed")));
+    let verdict = go().await;
+    assert!(
+        matches!(verdict, Ok(GateVerdict::Red { .. })),
+        "{verdict:?}"
+    );
+    assert_eq!(test.submits(), 0);
+
+    // A later fix passes the recheck, and only then the scope's tests are submitted.
+    assert!(go().await.is_err());
+    recheck.set(ticket(101, true, Some("passed")));
+    assert!(go().await.is_err());
+    assert_eq!(test.submits(), 1);
+}
+
+#[tokio::test]
+async fn a_recheck_that_ran_nothing_goes_on_to_the_scope_tests() {
+    let (check, recheck, test) = (Fake::default(), Fake::default(), Fake::default());
+    let go = || gate_rechecked_then_tested(&check, &recheck, &test, "h2", WAIT);
+    assert!(go().await.is_err());
+    check.set(ticket(100, true, Some("nothing_ran")));
+    assert!(go().await.is_err());
+    recheck.set(ticket(100, true, Some("nothing_ran")));
+    assert!(go().await.is_err());
+    assert_eq!(test.submits(), 1);
 }
 
 #[tokio::test]

@@ -163,19 +163,22 @@ pub enum Caller {
 pub const POSTGATE_UNIT_TIMEOUT: Duration = Duration::from_secs(3600);
 
 /// What a daemon gate asks of the queue beyond who it is (autonomy-trees spec A7).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GateTerms {
     /// The gate re-measures a fix of a red: served before the gate of a new branch.
     pub fix: bool,
     /// A ceiling per unit, in seconds, replacing the executor's configured one; 0 keeps it. Set by
     /// a gate whose last attempt hit the time ceiling.
     pub unit_timeout_secs: u64,
+    /// A `test` request that runs only these `(group, test ids)` instead of the diff's scope: the
+    /// first step of a fix's re-gate (`plan::plan_recheck`).
+    pub recheck: Option<Vec<(String, Vec<String>)>>,
 }
 
 impl GateTerms {
     /// The priority the request is queued at: a fix's re-gate outranks the caller's own level, but
     /// never the owner's.
-    pub fn priority(self, caller: Caller) -> i64 {
+    pub fn priority(&self, caller: Caller) -> i64 {
         let own = caller.priority();
         if self.fix && own > PRIORITY_FIX_REGATE {
             PRIORITY_FIX_REGATE
@@ -185,7 +188,7 @@ impl GateTerms {
     }
 
     /// The unit timeout in ms: the terms' own when set, else the caller's.
-    pub fn unit_timeout_ms(self, caller: Caller) -> i64 {
+    pub fn unit_timeout_ms(&self, caller: Caller) -> i64 {
         if self.unit_timeout_secs > 0 {
             i64::try_from(self.unit_timeout_secs.saturating_mul(1000)).unwrap_or(i64::MAX)
         } else {
@@ -403,6 +406,11 @@ pub async fn submit_narrowed_with(
             "only a tree branch's test or check scope gate may be narrowed".into(),
         ));
     }
+    if terms.recheck.is_some() && args.kind != Kind::Test {
+        return Err(VerifyError::BadRequest(
+            "a recheck of failed tests is a test request".into(),
+        ));
+    }
     let (id, _) = submit_with(executor, caller, args, true, terms).await?;
     Ok(id)
 }
@@ -587,8 +595,9 @@ async fn submit_with(
 
     // `true` until a project can declare that it gates after landing (there is no
     // `gate_after_land` yet); the planner already knows how to refuse `full` once there is.
-    let planned = match (caller, args.groups.as_deref()) {
-        (Caller::Probe, Some(groups)) => verify_plan::plan_groups(&map, args.kind, groups),
+    let planned = match (caller, args.groups.as_deref(), terms.recheck.as_deref()) {
+        (Caller::Probe, Some(groups), _) => verify_plan::plan_groups(&map, args.kind, groups),
+        (_, _, Some(failed)) => verify_plan::plan_recheck(&map, failed),
         _ => verify_plan::plan(
             &map,
             args.kind,
@@ -1539,6 +1548,7 @@ tests:
         let scoped = GateTerms {
             fix: false,
             unit_timeout_secs: 3600,
+            recheck: None,
         };
         assert_eq!(scoped.unit_timeout_ms(job), 3_600_000);
     }
