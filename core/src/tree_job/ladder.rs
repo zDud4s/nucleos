@@ -40,6 +40,12 @@ pub(super) enum Kind {
     /// The accumulated wait of a gate starved by infrastructure: a time cap, not a count
     /// (spec A1).
     GateLoadWait,
+    /// Merges of a branch the queue refused for a passing cause: a lock, a fetch, the queue itself
+    /// (`merge_recovery`, spec B4).
+    Merge,
+    /// Detections of a tree that stood still with nothing running and nobody asked (`stalled`,
+    /// spec B8).
+    Stalled,
 }
 
 /// How long a starved gate may wait in total before it leaves rung 1 (autonomy-trees spec A1).
@@ -78,6 +84,8 @@ pub(super) const fn retry_cap(kind: Kind) -> i64 {
         | Kind::FinalFix
         | Kind::Conflict
         | Kind::Gate
+        | Kind::Merge
+        | Kind::Stalled
         | Kind::Land => 4,
         // The diagnose run is the rung after the retries: it has none of its own.
         Kind::Rescue => 0,
@@ -94,8 +102,10 @@ const fn backoff_secs(kind: Kind) -> (u64, u64) {
         Kind::Wrapped | Kind::Fix | Kind::FinalFix | Kind::Conflict | Kind::Land | Kind::Rescue => {
             (0, 0)
         }
+        // A stalled tree is detected once per quiet window already: that window is its wait.
+        Kind::Stalled => (0, 0),
         Kind::Died | Kind::Gate => (2 * 60, 30 * 60),
-        Kind::WatchdogFailure => (60, 30 * 60),
+        Kind::WatchdogFailure | Kind::Merge => (60, 30 * 60),
         Kind::GateLoadWait => (30, 10 * 60),
     }
 }
@@ -133,7 +143,7 @@ pub(super) fn next_step(kind: Kind, spent: Spent) -> Step {
 mod tests {
     use super::*;
 
-    const ALL: [Kind; 10] = [
+    const ALL: [Kind; 12] = [
         Kind::Wrapped,
         Kind::Died,
         Kind::WatchdogFailure,
@@ -144,6 +154,8 @@ mod tests {
         Kind::Gate,
         Kind::Land,
         Kind::GateLoadWait,
+        Kind::Merge,
+        Kind::Stalled,
     ];
 
     fn spent(retries: i64) -> Spent {
@@ -164,6 +176,8 @@ mod tests {
             Kind::Conflict,
             Kind::Gate,
             Kind::Land,
+            Kind::Merge,
+            Kind::Stalled,
         ] {
             let cap = retry_cap(kind);
             assert!((4..=5).contains(&cap), "{kind:?}: {cap}");
@@ -246,6 +260,13 @@ mod tests {
                 .collect::<Vec<_>>(),
             [60, 120, 240, 480, 960, 1800, 1800]
         );
+        // A refused merge backs off like a failed relaunch: a minute, doubling to half an hour.
+        assert_eq!(
+            (0..7)
+                .map(|n| backoff(Kind::Merge, n).as_secs())
+                .collect::<Vec<_>>(),
+            [60, 120, 240, 480, 960, 1800, 1800]
+        );
     }
 
     #[test]
@@ -257,6 +278,7 @@ mod tests {
             Kind::Conflict,
             Kind::Land,
             Kind::Rescue,
+            Kind::Stalled,
         ] {
             for retries in 0..8 {
                 assert_eq!(backoff(kind, retries), Duration::ZERO, "{kind:?}");

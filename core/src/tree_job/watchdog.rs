@@ -276,8 +276,9 @@ async fn check_node(state: &AppState, node_id: &str, job_id: &str) -> Result<(),
             return Ok(());
         }
         Some(_) => {}
-        // The root is looked after by `wrap` and `root::retry_failed_starts`.
-        None if job.root_node_id == node_id => return Ok(()),
+        // The root has the lease too (spec B6); its start and relaunches stay with `wrap` and
+        // `root::retry_failed_starts`, so only a live run is looked at below.
+        None if job.root_node_id == node_id => {}
         // A leaf (a node that tops no branch) is looked after here too.
         None => {}
     }
@@ -300,6 +301,8 @@ async fn check_node(state: &AppState, node_id: &str, job_id: &str) -> Result<(),
             .map_err(|e| e.to_string())?;
     match run_id {
         None => Ok(()),
+        // A root with no run is mid-start: `root_pending` and `wrap` own that.
+        Some(None) if job.root_node_id == node_id => Ok(()),
         Some(None) => {
             // A leaf is opened and launched in two steps (`node_open`, then the launch), so one with
             // no run yet may be mid-launch: it is an orphan only once it has waited a while.
@@ -656,6 +659,59 @@ mod tests {
         sweep(&state).await;
 
         assert_ne!(status(&state).await, "running");
+    }
+
+    /// Makes the leaf row the job's root node (the root has no branch either).
+    async fn make_leaf_the_root(state: &AppState) {
+        sqlx::query("UPDATE tree_jobs SET root_node_id = ? WHERE id = ?")
+            .bind(LEAF)
+            .bind(JOB)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_root_whose_live_run_lost_its_lease_is_ended_too() {
+        let state = state().await;
+        seed_node(&state, None).await;
+        seed_leaf(&state, Some(53), OLD).await;
+        make_leaf_the_root(&state).await;
+        sqlx::query(
+            "INSERT INTO runs (id, prompt, status, created_at) VALUES (53, 'p', 'running', ?)",
+        )
+        .bind(OLD)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        beat(&state.pool, LEAF).await.unwrap();
+        sqlx::query("UPDATE node_watchdog SET beat_at = ? WHERE node_id = ?")
+            .bind(OLD)
+            .bind(LEAF)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        sweep(&state).await;
+
+        let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = 53")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_ne!(status, "running");
+    }
+
+    #[tokio::test]
+    async fn a_root_with_no_run_is_left_to_its_own_start_retry() {
+        let state = state().await;
+        seed_node(&state, None).await;
+        seed_leaf(&state, None, OLD).await;
+        make_leaf_the_root(&state).await;
+        save_leaf_launch(&state).await;
+
+        sweep(&state).await;
+
+        assert_eq!(leaf_row(&state).await.1, None);
     }
 
     const LEAF: &str = "wd-leaf";

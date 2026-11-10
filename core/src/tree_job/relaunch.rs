@@ -118,14 +118,17 @@ pub(super) const RESCUE_PREFIX: &str = "rescue-";
 /// The fix run of a red final verify, started on the root node (`final_verify`).
 pub(super) const FINAL_FIX_PREFIX: &str = "finalfix-";
 pub(super) const TRANSIENT_PREFIX: &str = "transient-";
+/// The in-tree resolve-conflict run of a branch whose merge conflicts (`merge_recovery`).
+pub(super) const RESOLVE_PREFIX: &str = "resolve-";
 const RESUME_PREFIX: &str = "resume-";
-const SUFFIXED_KEY_PREFIXES: [&str; 7] = [
+const SUFFIXED_KEY_PREFIXES: [&str; 8] = [
     WRAP_PREFIX,
     DIED_PREFIX,
     FIX_PREFIX,
     RESCUE_PREFIX,
     FINAL_FIX_PREFIX,
     TRANSIENT_PREFIX,
+    RESOLVE_PREFIX,
     RESUME_PREFIX,
 ];
 /// Key prefix of the relaunch an owner's answer starts (`relaunch_after_answer`).
