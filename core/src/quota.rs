@@ -472,7 +472,8 @@ async fn live_report(
     // Recorded before answering, and a write that fails does NOT fail the answer: the table is a
     // fallback, so losing it costs the next reader a fresh figure and must not cost this one the
     // figure already in hand.
-    if let Err(error) = record(pool, &providers, now).await {
+    let writes = crate::write_pool::for_writes(pool);
+    if let Err(error) = record(&writes, &providers, now).await {
         tracing::warn!(%error, "the quota reading could not be stored");
     }
     let providers = degrade_to_last_good(pool, providers, now).await;

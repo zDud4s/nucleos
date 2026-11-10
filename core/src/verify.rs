@@ -12,6 +12,7 @@ pub mod bisect;
 pub mod exec;
 pub mod failures;
 pub mod fingerprint;
+pub mod flake;
 pub mod flaky;
 pub mod guard;
 pub mod ide_box;

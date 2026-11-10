@@ -129,6 +129,7 @@ pub mod wip;
 pub mod work_nodes;
 pub mod workflow_records;
 pub mod workflows;
+pub mod write_pool;
 
 // The module-map check only reads files, so it runs inside this library's test binary. As an
 // integration test under `tests/` it made every `cargo test` build the daemon executable too, a

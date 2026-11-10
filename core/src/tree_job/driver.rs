@@ -1841,6 +1841,42 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
+    async fn a_gate_starved_past_the_six_hour_cap_parks_and_asks_once() {
+        const JOB: &str = "drv-load-cap";
+        const NODE: &str = "api-node";
+        let fx = Fixture::new().await;
+        let mut branch = code_branch("api", "building", Some(NODE));
+        branch.extra.insert(
+            "gate_load_waited_secs".to_owned(),
+            json!(crate::tree_job::retry::GATE_LOAD_CAP_SECS - 1),
+        );
+        fx.seed_job(JOB, vec![branch], None).await;
+        fx.add_node(JOB, NODE, "orchestrator").await;
+        fx.run_ended(NODE, Some("done")).await;
+        let gate = FakeGate::scripted(vec![Err(NotMeasured::Failed(
+            "database is locked".to_owned(),
+        ))]);
+
+        fx.tick(JOB, &gate).await;
+        wait_calls(&gate, 1).await;
+        fx.wait_branch_state(JOB, "api", "parked").await;
+
+        let questions = fx.open_questions(JOB, NODE).await;
+        assert_eq!(questions.len(), 1, "{questions:?}");
+        assert!(
+            questions[0].contains("database is locked"),
+            "{:?}",
+            questions[0]
+        );
+        let parked = fx.branch(JOB, "api").await;
+        assert!(
+            !parked.extra.contains_key(GATE_FAILURES),
+            "no attempt was spent"
+        );
+        assert!(!parked.extra.contains_key("gate_load_waited_secs"));
+    }
+
+    #[tokio::test]
     async fn a_gate_starved_by_load_backs_off_without_spending_attempts_or_asking() {
         const JOB: &str = "drv-load-backoff";
         const NODE: &str = "api-node";

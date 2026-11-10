@@ -38,6 +38,11 @@ pub(super) const GATE_LOAD_WAITS: &str = "gate_load_waits";
 pub(super) const GATE_BACKOFF_UNTIL: &str = "gate_backoff_until";
 /// The key of `Branch.extra` with the last load reason, for whoever reads the manifest.
 pub(super) const GATE_LOAD_REASON: &str = "gate_load_reason";
+/// The key of `Branch.extra` summing (in seconds) the backoffs the branch's gate has waited out.
+pub(super) const GATE_LOAD_WAITED_SECS: &str = "gate_load_waited_secs";
+/// How long a gate may wait in total on infrastructure before the owner is asked (autonomy-trees
+/// spec A1; the B1 ladder takes over from this park once it exists).
+pub(super) const GATE_LOAD_CAP_SECS: i64 = 6 * 3600;
 
 /// Whether an error says a process can never be spawned the way it was asked to be, however often
 /// it is tried: Windows `os error 206` (the file name or command line is too long) and `267` (the
@@ -67,6 +72,13 @@ pub(super) fn is_load_reason(reason: &str) -> bool {
         "spawn failure",
         "sccache",
         "infrastructure failure",
+        // The verify queue's own storage and verdict plumbing (autonomy-trees spec A1): the code
+        // was not measured, so the gate is neither attempted nor counted.
+        "database is locked",
+        "queue exhausted",
+        "queue is exhausted",
+        "ended errored",
+        "without a verdict",
     ]
     .iter()
     .any(|marker| reason.contains(marker))
@@ -110,6 +122,27 @@ fn clear_load_wait(extra: &mut BTreeMap<String, Value>) {
     extra.remove(GATE_LOAD_WAITS);
     extra.remove(GATE_BACKOFF_UNTIL);
     extra.remove(GATE_LOAD_REASON);
+    extra.remove(GATE_LOAD_WAITED_SECS);
+}
+
+/// What a gate starved by infrastructure does next, after `waits` earlier waits that added up to
+/// `waited_secs`.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum LoadStep {
+    /// Wait this long, then gate again.
+    Wait(Duration),
+    /// The accumulated wait would pass [`GATE_LOAD_CAP_SECS`]: ask the owner.
+    CapReached,
+}
+
+pub(super) fn load_step(waits: i64, waited_secs: i64) -> LoadStep {
+    let delay = load_backoff(waits);
+    let next = waited_secs.saturating_add(i64::try_from(delay.as_secs()).unwrap_or(i64::MAX));
+    if next > GATE_LOAD_CAP_SECS {
+        LoadStep::CapReached
+    } else {
+        LoadStep::Wait(delay)
+    }
 }
 
 /// Whether the branch's gate is still inside a load backoff.
@@ -175,18 +208,44 @@ pub(super) async fn apply_gate_answer(
                 .get(GATE_LOAD_WAITS)
                 .and_then(Value::as_i64)
                 .unwrap_or(0);
-            let delay = load_backoff(waits);
-            let until = Utc::now()
-                + chrono::Duration::from_std(delay)
-                    .unwrap_or_else(|_| chrono::Duration::minutes(10));
-            held.extra
-                .insert(GATE_LOAD_WAITS.to_owned(), json!(waits + 1));
-            held.extra.insert(
-                GATE_BACKOFF_UNTIL.to_owned(),
-                json!(until.to_rfc3339_opts(SecondsFormat::Secs, false)),
-            );
-            held.extra
-                .insert(GATE_LOAD_REASON.to_owned(), json!(reason));
+            let waited = held
+                .extra
+                .get(GATE_LOAD_WAITED_SECS)
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            match load_step(waits, waited) {
+                LoadStep::Wait(delay) => {
+                    let until = Utc::now()
+                        + chrono::Duration::from_std(delay)
+                            .unwrap_or_else(|_| chrono::Duration::minutes(10));
+                    held.extra
+                        .insert(GATE_LOAD_WAITS.to_owned(), json!(waits + 1));
+                    held.extra.insert(
+                        GATE_LOAD_WAITED_SECS.to_owned(),
+                        json!(waited + i64::try_from(delay.as_secs()).unwrap_or(0)),
+                    );
+                    held.extra.insert(
+                        GATE_BACKOFF_UNTIL.to_owned(),
+                        json!(until.to_rfc3339_opts(SecondsFormat::Secs, false)),
+                    );
+                    held.extra
+                        .insert(GATE_LOAD_REASON.to_owned(), json!(reason));
+                }
+                LoadStep::CapReached => {
+                    // The owner's answer is a fresh allowance, so the wait starts again.
+                    clear_load_wait(&mut held.extra);
+                    if let Some(node) = held.node_id.clone() {
+                        park = Some((
+                            node,
+                            format!(
+                                "The gate of branch {branch} waited {} h in total on infrastructure                                  without measuring anything (the cap is {} h); last reason: {reason}",
+                                waited / 3600,
+                                GATE_LOAD_CAP_SECS / 3600
+                            ),
+                        ));
+                    }
+                }
+            }
         }
         Err(NotMeasured::Failed(reason)) => {
             clear_load_wait(&mut held.extra);
@@ -504,5 +563,43 @@ pub(super) async fn note_blocked_base(
             Ok(())
         }
         _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn infrastructure_failures_are_load_reasons() {
+        for reason in [
+            "database is locked",
+            "error returned from database: (code: 5) database is locked",
+            "the verify queue exhausted: queue exhausted",
+            "scope verification ended errored",
+            "scope verification ended without a verdict",
+        ] {
+            assert!(is_load_reason(reason), "{reason}");
+        }
+        assert!(!is_load_reason("the scope gate could not be submitted"));
+        assert!(!is_load_reason(
+            "scope verification ended errored (os error 206)"
+        ));
+    }
+
+    #[test]
+    fn the_wait_stops_at_six_hours_accumulated() {
+        assert_eq!(load_step(0, 0), LoadStep::Wait(Duration::from_secs(30)));
+        // Backoff is capped at 10 minutes, so ten-minute steps add up to the cap.
+        let mut waited = 0;
+        let mut waits = 0;
+        while let LoadStep::Wait(delay) = load_step(waits, waited) {
+            waited += i64::try_from(delay.as_secs()).unwrap();
+            waits += 1;
+            assert!(waits < 100, "the wait must end");
+        }
+        assert!(waited <= GATE_LOAD_CAP_SECS);
+        assert!(waited > GATE_LOAD_CAP_SECS - 600, "{waited}");
+        assert_eq!(load_step(waits, waited), LoadStep::CapReached);
     }
 }
