@@ -122,8 +122,12 @@ pub(super) const TRANSIENT_PREFIX: &str = "transient-";
 pub(super) const RESOLVE_PREFIX: &str = "resolve-";
 /// The relaunch of a run the watchdog ended for want of a sign of life (`wrap`'s `WATCHDOG` chain).
 pub(super) const WATCHDOG_PREFIX: &str = "watchdog-";
+/// The relaunch after the weekly quota reset (`wrap`, spec B10); it replays the prompt like the
+/// transient one and spends no allowance.
+pub(super) const QUOTA_PREFIX: &str = "quota-";
 const RESUME_PREFIX: &str = "resume-";
-const SUFFIXED_KEY_PREFIXES: [&str; 9] = [
+const SUFFIXED_KEY_PREFIXES: [&str; 10] = [
+    QUOTA_PREFIX,
     WRAP_PREFIX,
     DIED_PREFIX,
     FIX_PREFIX,

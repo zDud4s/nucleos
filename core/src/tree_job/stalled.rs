@@ -58,6 +58,31 @@ fn subject_node(job: &TreeJob) -> String {
         .unwrap_or_else(|| job.root_node_id.clone())
 }
 
+/// Whether a node of the job is paused on the weekly quota until a reset still to come (spec B10):
+/// that wait lasts days and is not a stall.
+async fn paused_on_quota(
+    state: &AppState,
+    job: &TreeJob,
+    now: DateTime<Utc>,
+) -> Result<bool, String> {
+    let runs: Vec<Option<String>> =
+        sqlx::query_scalar("SELECT run_id FROM work_nodes WHERE tree_job_id = ? OR id = ?")
+            .bind(&job.id)
+            .bind(&job.root_node_id)
+            .fetch_all(&state.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    for run in runs.into_iter().flatten() {
+        if super::wrap::quota_resume_at(&state.pool, &run)
+            .await?
+            .is_some_and(|resume| now < resume)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Whether any node of the job has a live run.
 async fn has_live_run(state: &AppState, job: &TreeJob) -> Result<bool, String> {
     let runs: Vec<Option<String>> =
@@ -108,6 +133,7 @@ async fn check(state: &AppState, job_id: &str, now: DateTime<Utc>) -> Result<(),
             || !quiet(&job, now)
             || has_live_run(state, &job).await?
             || has_open_decision(state, &job).await?
+            || paused_on_quota(state, &job, now).await?
         {
             return Ok(());
         }
