@@ -224,6 +224,119 @@ pub fn failed_on_rate_limit(stdout: &str) -> bool {
         == Some(429)
 }
 
+/// Whether the run ended on the subscription's WEEKLY limit (autonomy-trees spec B10), and when it
+/// resets. `None`: it did not. `Some(None)`: it did, and the message names no reset this can read.
+///
+/// Read from the LAST `result` event, which must be `is_error: true` and whose text names a "weekly
+/// limit" ("You've hit your weekly limit · resets Nov 14, 9am (Europe/Lisbon)"). The reset is read
+/// from the text after "resets": an optional `Mon D` date or weekday, a `H[:MM]am|pm` time and an
+/// optional `(Zone)` (UTC when absent). A time without a date is the first such time after `now`,
+/// which callers pass as the moment the run ended, so the answer does not drift as the clock does.
+pub fn weekly_limit_reset(
+    stdout: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<Option<chrono::DateTime<chrono::Utc>>> {
+    let result = stdout.lines().rev().find_map(|line| {
+        serde_json::from_str::<serde_json::Value>(line.trim())
+            .ok()
+            .filter(|event| event.get("type").and_then(|kind| kind.as_str()) == Some("result"))
+    })?;
+    if result.get("is_error").and_then(|flag| flag.as_bool()) != Some(true) {
+        return None;
+    }
+    let text = result.get("result").and_then(|text| text.as_str())?;
+    if !text.to_ascii_lowercase().contains("weekly limit") {
+        return None;
+    }
+    Some(parse_reset(text, now))
+}
+
+fn parse_reset(
+    text: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    use chrono::{Datelike, NaiveDate, TimeZone};
+    let lower = text.to_ascii_lowercase();
+    let start = lower.find("resets")? + "resets".len();
+    let rest = &text[start..];
+    let (spec, zone) = match (rest.find('('), rest.find(')')) {
+        (Some(open), Some(close)) if open < close => (&rest[..open], Some(&rest[open + 1..close])),
+        _ => (rest, None),
+    };
+    let tz: chrono_tz::Tz = zone
+        .and_then(|zone| zone.trim().parse().ok())
+        .unwrap_or(chrono_tz::UTC);
+
+    const MONTHS: [&str; 12] = [
+        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+    ];
+    const DAYS: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+    let (mut month, mut day, mut weekday, mut time) = (None, None, None, None);
+    for token in spec
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != ':')
+        .filter(|token| !token.is_empty())
+    {
+        let token = token.to_ascii_lowercase();
+        let digits = token.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+        let suffix = &token[digits.len()..];
+        if (suffix == "am" || suffix == "pm") && !digits.is_empty() {
+            let (hour, minute) = digits.split_once(':').unwrap_or((digits, "0"));
+            let hour: u32 = hour.parse().ok()?;
+            let minute: u32 = minute.parse().ok()?;
+            if !(1..=12).contains(&hour) || minute > 59 {
+                return None;
+            }
+            time = Some(((hour % 12) + if suffix == "pm" { 12 } else { 0 }, minute));
+        } else if token.chars().all(|c| c.is_ascii_digit()) {
+            day = token.parse::<u32>().ok();
+        } else if token.len() >= 3 && token.is_char_boundary(3) {
+            let head = &token[..3];
+            if let Some(index) = MONTHS.iter().position(|m| *m == head) {
+                month = Some(index as u32 + 1);
+            } else if let Some(index) = DAYS.iter().position(|d| *d == head) {
+                weekday = Some(index as u32);
+            }
+        }
+    }
+    let (hour, minute) = time?;
+    let at = |date: NaiveDate| {
+        tz.from_local_datetime(&date.and_hms_opt(hour, minute, 0)?)
+            .earliest()
+            .map(|moment| moment.with_timezone(&chrono::Utc))
+    };
+    let today = now.with_timezone(&tz).date_naive();
+    match (month, day, weekday) {
+        (Some(month), Some(day), _) => {
+            let first = at(NaiveDate::from_ymd_opt(today.year(), month, day)?)?;
+            if first > now {
+                Some(first)
+            } else {
+                at(NaiveDate::from_ymd_opt(today.year() + 1, month, day)?)
+            }
+        }
+        (_, _, Some(weekday)) => {
+            let mut date = today;
+            while date.weekday().num_days_from_monday() != weekday {
+                date = date.succ_opt()?;
+            }
+            let first = at(date)?;
+            if first > now {
+                Some(first)
+            } else {
+                at(date + chrono::Duration::days(7))
+            }
+        }
+        _ => {
+            let first = at(today)?;
+            if first > now {
+                Some(first)
+            } else {
+                at(today.succ_opt()?)
+            }
+        }
+    }
+}
+
 /// The LAST `result` event, when it says `is_error: true` with `terminal_reason: "api_error"`.
 pub(super) fn final_api_error(stdout: &str) -> Option<serde_json::Value> {
     let result = stdout.lines().rev().find_map(|line| {

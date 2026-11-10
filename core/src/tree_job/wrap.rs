@@ -24,8 +24,8 @@ use super::ladder::{Kind, Spent, Step, next_step, retry_cap};
 use super::model::JOB_TERMINAL_STATE;
 use super::open::{DIED_PREFIX, WRAP_PREFIX, latest_launch, relaunch_node, run_is_live};
 use super::relaunch::{
-    DECISION_PREFIX, TRANSIENT_PREFIX, WATCHDOG_PREFIX, budget_refusal, refusal_question,
-    successor_key,
+    DECISION_PREFIX, QUOTA_PREFIX, TRANSIENT_PREFIX, WATCHDOG_PREFIX, budget_refusal,
+    refusal_question, successor_key,
 };
 use super::rescue;
 use super::store;
@@ -41,11 +41,13 @@ struct Chain {
     prefix: &'static str,
     kind: Option<Kind>,
     question: fn(&str, i64) -> String,
+    /// The cap of a chain with no ladder kind.
+    own_cap: i64,
 }
 
 impl Chain {
     fn cap(&self) -> i64 {
-        self.kind.map_or(TRANSIENT_CAP, retry_cap)
+        self.kind.map_or(self.own_cap, retry_cap)
     }
 }
 
@@ -73,12 +75,14 @@ const WRAPPED: Chain = Chain {
     prefix: WRAP_PREFIX,
     kind: Some(Kind::Wrapped),
     question: ended_question,
+    own_cap: 0,
 };
 /// The relaunches of a run that died without a report.
 const DIED: Chain = Chain {
     prefix: DIED_PREFIX,
     kind: Some(Kind::Died),
     question: ended_question,
+    own_cap: 0,
 };
 /// The relaunches of a run the watchdog ended because the node gave no sign of life: a hang, not a
 /// death of the node's work, so it spends nothing of the `DIED` cap (spec B5).
@@ -86,6 +90,7 @@ const WATCHDOG: Chain = Chain {
     prefix: WATCHDOG_PREFIX,
     kind: Some(Kind::WatchdogFailure),
     question: watchdog_question,
+    own_cap: 0,
 };
 /// The relaunches of a run that died on a transient API error. With the backoff below, sixteen
 /// links wait about six hours in all, past a subscription's usage window.
@@ -93,7 +98,20 @@ const TRANSIENT: Chain = Chain {
     prefix: TRANSIENT_PREFIX,
     kind: None,
     question: transient_question,
+    own_cap: TRANSIENT_CAP,
 };
+/// The relaunches after a weekly quota reset (spec B10): the wait is the reset itself, so the chain
+/// has no cap and spends nothing.
+const QUOTA: Chain = Chain {
+    prefix: QUOTA_PREFIX,
+    kind: None,
+    question: transient_question,
+    own_cap: i64::MAX,
+};
+/// How long a weekly limit whose message names no readable reset is waited, from the run's end.
+const QUOTA_UNKNOWN_RESET_WAIT_SECS: i64 = 3600;
+/// Added to the named reset, so the relaunch does not land in the second the limit lifts.
+const QUOTA_RESET_MARGIN_SECS: i64 = 60;
 const TRANSIENT_CAP: i64 = 16;
 /// The wait after a transient death before its relaunch: the first, doubled per earlier link of
 /// the chain, and never more than the last.
@@ -259,11 +277,53 @@ async fn wrap_node(
         (false, None) if super::watchdog::ended_by_watchdog(pool, node_id, &run_id).await => {
             relaunch_or_stop(state, &job.id, node_id, &run_id, &WATCHDOG, None).await
         }
-        (false, None) => match transient_death(pool, &run_id).await? {
-            Some(ended) => relaunch_after_backoff(state, &job.id, node_id, &run_id, ended).await,
-            None => relaunch_or_stop(state, &job.id, node_id, &run_id, &DIED, None).await,
-        },
+        (false, None) => {
+            // The weekly quota (spec B10) comes first: it also reads as a 429, but it lifts at the
+            // reset it names, not after a backoff, and it spends no allowance.
+            if let Some(resume) = quota_resume_at(pool, &run_id).await? {
+                if Utc::now() < resume {
+                    return Ok(false);
+                }
+                return relaunch_or_stop(state, &job.id, node_id, &run_id, &QUOTA, None).await;
+            }
+            match transient_death(pool, &run_id).await? {
+                Some(ended) => {
+                    relaunch_after_backoff(state, &job.id, node_id, &run_id, ended).await
+                }
+                None => relaunch_or_stop(state, &job.id, node_id, &run_id, &DIED, None).await,
+            }
+        }
     }
+}
+
+/// When the node whose run `run_id` ended `failed` on the weekly quota may start again: the reset
+/// its message names (read against the run's end) plus a margin, else an hour after the run ended.
+/// `None` when the run did not end on the weekly limit. Also read by the stalled-tree detector, so
+/// a tree paused for days is not taken for a stalled one.
+pub(super) async fn quota_resume_at(
+    pool: &sqlx::SqlitePool,
+    run_id: &str,
+) -> Result<Option<DateTime<Utc>>, String> {
+    let Ok(number) = run_id.parse::<i64>() else {
+        return Ok(None);
+    };
+    let stdout: Option<Option<String>> =
+        sqlx::query_scalar("SELECT stdout FROM runs WHERE id = ? AND status = 'failed'")
+            .bind(number)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    let Some(Some(stdout)) = stdout else {
+        return Ok(None);
+    };
+    let ended = run_ended_at(pool, run_id).await;
+    let Some(reset) = crate::execution::runner::weekly_limit_reset(&stdout, ended) else {
+        return Ok(None);
+    };
+    Ok(Some(match reset {
+        Some(reset) => reset + chrono::Duration::seconds(QUOTA_RESET_MARGIN_SECS),
+        None => ended + chrono::Duration::seconds(QUOTA_UNKNOWN_RESET_WAIT_SECS),
+    }))
 }
 
 /// When `run_id` ended `failed` on an API error a later attempt can get past (a 429 rate limit,
@@ -389,7 +449,7 @@ async fn relaunch_or_stop(
         ),
         // The transient chain has its own cap and wait (see `relaunch_after_backoff`), and a rate
         // limit says nothing about the node's work, so there is nothing for a diagnose run to read.
-        None if prior < TRANSIENT_CAP => Step::Retry {
+        None if prior < chain.cap() => Step::Retry {
             after: std::time::Duration::ZERO,
         },
         None => Step::Park,
@@ -1288,6 +1348,119 @@ mod tests {
             "relaunched once it passed"
         );
         assert_eq!(launches(&state, NODE, "died-").await, 0);
+    }
+
+    /// A run that ended `failed` on the weekly limit at `ended`, whose message says it resets at
+    /// `reset` (to the minute, in UTC).
+    async fn seed_weekly_limit_run(
+        state: &AppState,
+        id: i64,
+        ended: chrono::DateTime<chrono::Utc>,
+        reset: chrono::DateTime<chrono::Utc>,
+    ) {
+        let message = format!(
+            "You've hit your weekly limit · resets {} (UTC)",
+            reset.format("%I:%M%P")
+        );
+        let stdout = serde_json::json!({
+            "type": "result", "subtype": "success", "is_error": true,
+            "terminal_reason": "api_error", "api_error_status": 429, "result": message,
+        })
+        .to_string();
+        sqlx::query(
+            "INSERT INTO runs (id, prompt, status, stdout, created_at, completed_at) \
+             VALUES (?, 'original prompt', 'failed', ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(stdout)
+        .bind(CREATED)
+        .bind(ended.to_rfc3339())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+
+    /// B10: the weekly limit pauses the node until the reset it names: no relaunch before, nothing
+    /// spent, nobody asked.
+    #[tokio::test]
+    async fn a_weekly_limit_death_waits_for_the_reset_and_asks_nobody() {
+        let state = state().await;
+        seed_node(&state, Some("building"), "open", NODE, Some(66)).await;
+        seed_launch(&state, NODE).await;
+        let now = chrono::Utc::now();
+        let (ended, reset) = (
+            now - chrono::Duration::hours(1),
+            now + chrono::Duration::hours(3),
+        );
+        seed_weekly_limit_run(&state, 66, ended, reset).await;
+
+        // Many ticks, far past the transient chain's backoffs: still paused.
+        for _ in 0..3 {
+            tick(&state).await;
+        }
+
+        assert_eq!(
+            all_launches(&state, NODE).await,
+            0,
+            "paused until the reset"
+        );
+        let (branch, asked) = parked_and_asked(&state).await;
+        assert_eq!(branch, "building", "{asked:?}");
+        assert!(asked.is_empty(), "{asked:?}");
+        assert!(quota_resume_at(&state.pool, "66").await.unwrap().is_some());
+    }
+
+    /// Once the reset has passed the node starts again by itself, and the relaunch spends none of
+    /// the died or transient allowances, however many were spent before.
+    #[tokio::test]
+    async fn after_the_reset_the_node_resumes_without_spending_attempts() {
+        let state = state().await;
+        seed_node(&state, Some("building"), "open", NODE, Some(67)).await;
+        seed_launch(&state, NODE).await;
+        chain_links(&state, NODE, "died-old", retry_cap(Kind::Died)).await;
+        for n in 0..16 {
+            prior_link(&state, NODE, &format!("transient-old-{n}")).await;
+        }
+        let now = chrono::Utc::now();
+        let (ended, reset) = (
+            now - chrono::Duration::hours(5),
+            now - chrono::Duration::hours(4),
+        );
+        seed_weekly_limit_run(&state, 67, ended, reset).await;
+
+        tick(&state).await;
+
+        assert_eq!(launches(&state, NODE, "quota-").await, 1, "resumed once");
+        assert_eq!(launches(&state, NODE, "died-").await, retry_cap(Kind::Died));
+        assert_eq!(launches(&state, NODE, "transient-").await, 16);
+        let (branch, asked) = parked_and_asked(&state).await;
+        assert_eq!(branch, "building", "{asked:?}");
+        assert!(asked.is_empty(), "{asked:?}");
+        let resume = quota_resume_at(&state.pool, "67").await.unwrap().unwrap();
+        assert!(resume < now);
+    }
+
+    /// A weekly limit whose message names no reset is re-checked an hour after the run ended.
+    #[tokio::test]
+    async fn a_weekly_limit_without_a_reset_time_waits_an_hour() {
+        let state = state().await;
+        let stdout =
+            r#"{"type":"result","is_error":true,"result":"You've hit your weekly limit."}"#;
+        let ended = chrono::Utc::now() - chrono::Duration::minutes(10);
+        sqlx::query(
+            "INSERT INTO runs (id, prompt, status, stdout, created_at, completed_at) \
+             VALUES (68, 'p', 'failed', ?, ?, ?)",
+        )
+        .bind(stdout)
+        .bind(CREATED)
+        .bind(ended.to_rfc3339())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let resume = quota_resume_at(&state.pool, "68").await.unwrap().unwrap();
+        assert_eq!(resume, ended + chrono::Duration::hours(1));
+        assert!(quota_resume_at(&state.pool, "999").await.unwrap().is_none());
     }
 
     /// Still bounded: a node that keeps dying on the limit is parked with a question at last.

@@ -2395,6 +2395,69 @@ mod tests {
         }
     }
 
+    fn weekly_limit_stdout(message: &str) -> String {
+        serde_json::json!({
+            "type": "result", "subtype": "success", "is_error": true,
+            "api_error_status": 429, "result": message,
+        })
+        .to_string()
+    }
+
+    fn utc(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> chrono::DateTime<chrono::Utc> {
+        use chrono::TimeZone;
+        chrono::Utc.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap()
+    }
+
+    /// A weekly-limit message names its reset; a limit of any other kind, or a run that is not an
+    /// error, is not one.
+    #[test]
+    fn a_weekly_limit_result_is_read_with_its_reset_time() {
+        let now = utc(2026, 11, 10, 12, 0);
+        let stdout = weekly_limit_stdout(
+            "You've hit your weekly limit · resets Nov 14, 9am (Europe/Lisbon)",
+        );
+        assert_eq!(
+            weekly_limit_reset(&stdout, now),
+            Some(Some(utc(2026, 11, 14, 9, 0)))
+        );
+        let session = weekly_limit_stdout("5-hour limit reached · resets 3pm");
+        assert_eq!(weekly_limit_reset(&session, now), None);
+        let fine = r#"{"type":"result","is_error":false,"result":"weekly limit is a topic"}"#;
+        assert_eq!(weekly_limit_reset(fine, now), None);
+        assert_eq!(weekly_limit_reset("", now), None);
+    }
+
+    /// A time with no date is the next such time after the run ended; a weekday names the day.
+    #[test]
+    fn a_weekly_limit_reset_without_a_date_is_the_next_such_time() {
+        let now = utc(2026, 11, 10, 12, 0); // a Tuesday
+        let today = weekly_limit_stdout("You've hit your weekly limit · resets 3:30pm (UTC)");
+        assert_eq!(
+            weekly_limit_reset(&today, now),
+            Some(Some(utc(2026, 11, 10, 15, 30)))
+        );
+        let tomorrow = weekly_limit_stdout("You've hit your weekly limit · resets 9am (UTC)");
+        assert_eq!(
+            weekly_limit_reset(&tomorrow, now),
+            Some(Some(utc(2026, 11, 11, 9, 0)))
+        );
+        let friday = weekly_limit_stdout("You've hit your weekly limit · resets Fri 10am (UTC)");
+        assert_eq!(
+            weekly_limit_reset(&friday, now),
+            Some(Some(utc(2026, 11, 13, 10, 0)))
+        );
+    }
+
+    /// A weekly limit whose reset cannot be read is still a weekly limit.
+    #[test]
+    fn a_weekly_limit_with_an_unreadable_reset_has_none() {
+        let stdout = weekly_limit_stdout("You've hit your weekly limit.");
+        assert_eq!(
+            weekly_limit_reset(&stdout, utc(2026, 11, 10, 12, 0)),
+            Some(None)
+        );
+    }
+
     /// Only a 429 is a rate limit: an overloaded service (529), no status at all, or a turn that
     /// ended for another reason is not the subscription being held.
     #[test]
