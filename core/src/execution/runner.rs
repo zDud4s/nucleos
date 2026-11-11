@@ -1427,6 +1427,48 @@ mod tests {
         drop(tool.await.unwrap());
     }
 
+    /// D6: an open tool is exempt from the ordinary deadline, but not forever. A tool that stays
+    /// silent past its own (longer) deadline is cut off, and the error names that deadline.
+    #[tokio::test]
+    async fn an_open_tool_call_silent_past_its_own_deadline_is_cut_off() {
+        let silence = std::time::Duration::from_millis(20);
+        let open_silence = std::time::Duration::from_millis(100);
+        let (mut cli, stdout) = tokio::io::duplex(4096);
+        let mut lines = BufReader::new(stdout).lines();
+        let mut open = std::collections::HashSet::new();
+        cli.write_all(format!("{TOOL_USE_LINE}\n").as_bytes())
+            .await
+            .unwrap();
+        let opened = next_line_unless_silent_with(&mut lines, Some(silence), &open, open_silence)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        track_open_tools(&opened, &mut open);
+        assert!(!open.is_empty());
+
+        let read =
+            next_line_unless_silent_with(&mut lines, Some(silence), &open, open_silence).await;
+        assert_eq!(read.err(), Some(open_silence));
+        drop(cli);
+    }
+
+    /// The ceiling a Bash call gets must outlast `heavy.py`'s ten-minute stall watchdog and cover
+    /// the ten-minute retry timeout its exit 75 asks for.
+    #[test]
+    fn the_bash_timeouts_are_coherent_with_heavy_py() {
+        let env = bash_timeout_env();
+        let get = |name: &str| -> u64 {
+            env.iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| v.parse().unwrap())
+                .unwrap()
+        };
+        assert_eq!(get("BASH_DEFAULT_TIMEOUT_MS"), 600_000);
+        assert!(get("BASH_MAX_TIMEOUT_MS") > 600_000);
+        assert!(get("BASH_MAX_TIMEOUT_MS") >= get("BASH_DEFAULT_TIMEOUT_MS"));
+    }
+
     /// The other half: with nothing open, quiet past the deadline is still a stalled run.
     #[tokio::test]
     async fn a_one_shot_turn_with_no_open_tool_call_is_cut_off_for_silence() {
