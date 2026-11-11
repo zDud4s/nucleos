@@ -521,7 +521,7 @@ the contract, not a snapshot.
 | `channels/access/identities.rs` | Identities: list, forget and home conversation. |
 | `channels/access/pairing.rs` | Pairing codes: mint, status, cancel and redeem. |
 | `channels/bus.rs` | `ChannelsBus` and `Cadence`: the channel hub's change and tick sources. |
-| `channels/commands.rs` | Chat commands: the `Intent` type and the router that maps a chat message to one. |
+| `channels/commands.rs` | Chat commands: the `Intent` type and the router that maps a chat message to one. `/note <text>` (also `/note@Bot`) files an owner note with origin `channel:<name>`: the text goes through `governance::redact::redact_secrets` before `owner_notes::create`, the reply is `Noted (#id).`, a bare or blank `/note` gets the usage line, and the text never reaches a log or an error reply. A voice note that says "note ..." is refused, never filed. |
 | `channels/conformance.rs` | Test-only: contract conformance scenarios. |
 | `channels/contract.rs` | Channel contract types: the shapes adapters and the núcleo exchange. |
 | `channels/contract/conformance.rs` | Test-only: runs every fixture of the shared contract tree (`sidecars/lib/channelkit/contract/fixtures/index.json`) through the strict decoders: index vs tree, coverage, and valid/invalid conformance. |
