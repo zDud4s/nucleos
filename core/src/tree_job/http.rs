@@ -464,14 +464,135 @@ async fn post_tree(
     Ok(Json(summary(&job, false)))
 }
 
-/// `GET /trees/{id}`: the job with its manifest.
+/// The words of a park question asked after a node's run ended again and again (`wrap.rs`'s
+/// relaunch chains): beside such a question the status shows how the last run ended.
+const ENDED_IN_A_ROW: &str = "times in a row";
+
+/// How the last run of node `node_id` ended: `{run_id, status, exit_code, completed_at}` of the
+/// run `work_nodes.run_id` names. The runs table keeps no end reason, so the status and the exit
+/// code are what there is. Null when the node names no run or the run is not found; best effort.
+async fn last_run_of(pool: &sqlx::SqlitePool, node_id: &str) -> Value {
+    let run_id: Option<Option<String>> =
+        match sqlx::query_scalar("SELECT run_id FROM work_nodes WHERE id = ?")
+            .bind(node_id)
+            .fetch_optional(pool)
+            .await
+        {
+            Ok(run_id) => run_id,
+            Err(error) => {
+                tracing::warn!(node = node_id, %error, "could not read the node's last run");
+                return Value::Null;
+            }
+        };
+    let Some(run_id) = run_id.flatten().and_then(|id| id.parse::<i64>().ok()) else {
+        return Value::Null;
+    };
+    let run: Option<(String, Option<i64>, Option<String>)> = match sqlx::query_as(
+        "SELECT status, exit_code, completed_at FROM runs WHERE id = ?",
+    )
+    .bind(run_id)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(run) => run,
+        Err(error) => {
+            tracing::warn!(node = node_id, run_id, %error, "could not read the node's last run");
+            return Value::Null;
+        }
+    };
+    match run {
+        Some((status, exit_code, completed_at)) => json!({
+            "run_id": run_id,
+            "status": status,
+            "exit_code": exit_code,
+            "completed_at": completed_at,
+        }),
+        None => Value::Null,
+    }
+}
+
+/// Puts each parked branch's question, read from the decisions table, into `manifest` (the
+/// serialized `job.manifest`) as `park.question`, with `park.last_run` beside a question asked after
+/// repeated ends, and answers the tree's open decisions as `[{id, branch, node_id, question}]`. The
+/// branch of a decision is the one parked on it, else the one its node is bound to, else null.
+async fn decisions_view(
+    pool: &sqlx::SqlitePool,
+    job: &TreeJob,
+    manifest: &mut Value,
+) -> Result<Value, Refusal> {
+    let decisions = crate::tree_job::decisions::for_tree(pool, &job.id)
+        .await
+        .map_err(|error| refuse(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let parked_on = |branch: &Branch| {
+        branch
+            .park
+            .as_ref()
+            .and_then(|park| park.get("decision_id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    for (name, branch) in &job.manifest.branches {
+        let Some(decision_id) = parked_on(branch) else {
+            continue;
+        };
+        let Some(decision) = decisions.iter().find(|decision| decision.id == decision_id) else {
+            continue;
+        };
+        let last_run = match branch.node_id.as_deref() {
+            Some(node) if decision.question.contains(ENDED_IN_A_ROW) => {
+                Some(last_run_of(pool, node).await)
+            }
+            _ => None,
+        };
+        let Some(park) = manifest
+            .get_mut("branches")
+            .and_then(|branches| branches.get_mut(name.as_str()))
+            .and_then(|branch| branch.get_mut("park"))
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        park.insert("question".to_owned(), json!(decision.question));
+        if let Some(last_run) = last_run {
+            park.insert("last_run".to_owned(), last_run);
+        }
+    }
+    let open = decisions
+        .iter()
+        .filter(|decision| decision.status == crate::tree_job::decisions::STATUS_OPEN)
+        .map(|decision| {
+            let parked = job
+                .manifest
+                .branches
+                .iter()
+                .find(|(_, branch)| parked_on(branch).as_deref() == Some(decision.id.as_str()));
+            let bound = || {
+                job.manifest.branches.iter().find(|(_, branch)| {
+                    decision.node_id.is_some() && branch.node_id == decision.node_id
+                })
+            };
+            let branch = parked.or_else(bound).map(|(name, _)| name.clone());
+            json!({
+                "id": decision.id,
+                "branch": branch,
+                "node_id": decision.node_id,
+                "question": decision.question,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!(open))
+}
+
+/// `GET /trees/{id}`: the job with its manifest, each parked branch's question (`park.question`,
+/// and `park.last_run` after repeated ends) and the tree's `open_decisions`.
 async fn get_tree(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, Refusal> {
     let job = load_job(&state, &id).await?;
-    let manifest = serde_json::to_value(&job.manifest)
+    let mut manifest = serde_json::to_value(&job.manifest)
         .map_err(|error| refuse(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let open_decisions = decisions_view(&state.pool, &job, &mut manifest).await?;
     let nodes = crate::tree_job::nesting::describe_nodes(&state.pool, &job.manifest)
         .await
         .map_err(|error| refuse(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
@@ -495,6 +616,7 @@ async fn get_tree(
         "manifest": manifest,
         "nodes": nodes,
         "start_refusals": start_refusals,
+        "open_decisions": open_decisions,
     })))
 }
 
@@ -504,6 +626,12 @@ async fn get_tree(
 struct AbandonBody {
     reason: Option<String>,
     force: Option<bool>,
+}
+
+/// An opened branch that no node was ever bound to (a start refused after its open): nothing runs
+/// in it, so it is no live work and abandon drops it like a queued one.
+fn never_bound(branch: &Branch) -> bool {
+    branch.state == "open" && branch.node_id.is_none()
 }
 
 /// Ends a stuck job: the job becomes `finished` with `finish.status = "abandoned"` (no new column,
@@ -539,7 +667,7 @@ async fn post_abandon(
         .manifest
         .branches
         .values()
-        .filter(|branch| LIVE_STATES.contains(&branch.state.as_str()))
+        .filter(|branch| LIVE_STATES.contains(&branch.state.as_str()) && !never_bound(branch))
         .map(|branch| branch.name.clone())
         .collect();
     if !live.is_empty() && !force {
@@ -555,7 +683,7 @@ async fn post_abandon(
     let at = now();
     let mut dropped = Vec::new();
     for branch in job.manifest.branches.values_mut() {
-        if branch.state == "queued" {
+        if branch.state == "queued" || never_bound(branch) {
             branch.state = "dropped".to_owned();
             branch.extra.insert("drop_reason".to_owned(), json!(reason));
             branch.extra.insert("dropped_at".to_owned(), json!(at));
@@ -601,6 +729,9 @@ struct BranchBody {
     layer: Option<String>,
     base: Option<String>,
     parent: Option<String>,
+    /// The node whose start adds the branch (`branch_start` sends it); kept on the branch so that
+    /// a later start of the same caller may replace it if no node is ever bound to it.
+    caller: Option<String>,
 }
 
 /// `POST /trees/{id}/branches`: adds a `queued` branch. Checked in this order: replay, finished
@@ -618,6 +749,7 @@ async fn post_branch(
     let layer = required("layer", body.layer)?;
     let base = body.base.filter(|base| !base.trim().is_empty());
     let parent = body.parent.filter(|parent| !parent.trim().is_empty());
+    let caller = body.caller.filter(|caller| !caller.trim().is_empty());
 
     let lock = job_lock(&id);
     let _guard = lock.lock().await;
@@ -723,6 +855,12 @@ async fn post_branch(
 
     let mut branch = Branch::new(&name, &paths, &layer, base.as_deref());
     branch.parent = parent.clone();
+    if let Some(caller) = caller {
+        branch.extra.insert(
+            super::branch_start::START_CALLER_KEY.to_owned(),
+            json!(caller),
+        );
+    }
     let queued = branch.state.clone();
     job.manifest.branches.insert(name.clone(), branch);
     job.updated_at = now();
@@ -2364,6 +2502,100 @@ mod tests {
         assert_eq!(body["start_refusals"], json!([refusal]));
     }
 
+    async fn seed_decision(pool: &SqlitePool, id: &str, node: &str, question: &str, status: &str) {
+        sqlx::query(
+            "INSERT INTO decisions (id, tree_id, node_id, question, answer, origin, at, status)
+             VALUES (?, ?, ?, ?, NULL, 'agent', ?, ?)",
+        )
+        .bind(id)
+        .bind(JOB)
+        .bind(node)
+        .bind(question)
+        .bind(CREATED)
+        .bind(status)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// Parks the branch `BRANCH` on decision `decision`, as `decisions::park` leaves it.
+    async fn park_on(pool: &SqlitePool, decision: &str) {
+        let mut job = loaded(pool, JOB).await;
+        let branch = job.manifest.branches.get_mut(BRANCH).unwrap();
+        branch.state = "parked".to_owned();
+        branch.park = Some(json!({ "prev_state": "building", "decision_id": decision }));
+        store::update(pool, &job).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_tree_shows_a_parked_branch_question_and_the_open_decisions() {
+        let state = test_state().await;
+        seed_one_branch(&state.pool, "queued").await;
+        let question = "Should the api keep the old route?";
+        seed_decision(&state.pool, "d-api", NODE, question, "open").await;
+        seed_decision(&state.pool, "d-old", NODE, "An answered one", "answered").await;
+        park_on(&state.pool, "d-api").await;
+
+        let (status, body) = get(&app(&state), &format!("/trees/{JOB}")).await;
+
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        let park = &body["manifest"]["branches"][BRANCH]["park"];
+        assert_eq!(park["decision_id"], json!("d-api"));
+        assert_eq!(park["question"], json!(question));
+        assert!(park.get("last_run").is_none(), "{park:?}");
+        assert_eq!(
+            body["open_decisions"],
+            json!([{ "id": "d-api", "branch": BRANCH, "node_id": NODE, "question": question }])
+        );
+    }
+
+    #[tokio::test]
+    async fn get_tree_shows_how_the_last_run_ended_beside_a_repeated_end_park() {
+        let state = test_state().await;
+        seed_one_branch(&state.pool, "queued").await;
+        sqlx::query(
+            "INSERT INTO runs (id, prompt, status, exit_code, created_at, completed_at)
+             VALUES (41, 'node', 'failed', 137, ?, ?)",
+        )
+        .bind(CREATED)
+        .bind(CREATED)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE work_nodes SET run_id = '41' WHERE id = ?")
+            .bind(NODE)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let question = format!(
+            "Node {NODE} ended 3 times in a row without finishing; how should the branch go on?"
+        );
+        seed_decision(&state.pool, "d-ended", NODE, &question, "open").await;
+        park_on(&state.pool, "d-ended").await;
+
+        let (status, body) = get(&app(&state), &format!("/trees/{JOB}")).await;
+
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        let park = &body["manifest"]["branches"][BRANCH]["park"];
+        assert_eq!(park["question"], json!(question));
+        assert_eq!(park["last_run"]["run_id"], json!(41));
+        assert_eq!(park["last_run"]["status"], json!("failed"));
+        assert_eq!(park["last_run"]["exit_code"], json!(137));
+        assert_eq!(body["open_decisions"][0]["id"], json!("d-ended"));
+    }
+
+    #[tokio::test]
+    async fn get_tree_of_a_tree_with_no_decisions_has_an_empty_open_list() {
+        let state = test_state().await;
+        seed_one_branch(&state.pool, "queued").await;
+
+        let (status, body) = get(&app(&state), &format!("/trees/{JOB}")).await;
+
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert_eq!(body["open_decisions"], json!([]));
+        assert_eq!(body["manifest"]["branches"][BRANCH]["park"], Value::Null);
+    }
+
     #[tokio::test]
     async fn get_tree_of_an_unknown_id_is_404() {
         let state = test_state().await;
@@ -2795,6 +3027,50 @@ mod tests {
         assert_eq!(job.state, "finished");
         assert_eq!(job.manifest.extra["finish"]["forced"], json!(true));
         assert_eq!(job.manifest.branches["busy"].state, "building");
+    }
+
+    #[tokio::test]
+    async fn abandon_takes_an_open_branch_with_no_node_as_no_live_work_and_drops_it() {
+        let state = test_state().await;
+        let app = app(&state);
+        // A start refused after its open left this one: opened, never bound to a node.
+        let branches = vec![branch("ghost", "open", CORE, &[CODE_PATH], None)];
+        seed_job(&state.pool, JOB, "open", branches, &[]).await;
+
+        let (status, body) = post(
+            &app,
+            &format!("/trees/{JOB}/abandon"),
+            json!({ "reason": "stuck" }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert_eq!(body["live_branches_left"], json!([]));
+        assert_eq!(body["dropped_branches"], json!(["ghost"]));
+        let job = loaded(&state.pool, JOB).await;
+        assert_eq!(job.manifest.branches["ghost"].state, "dropped");
+        assert_eq!(job.manifest.extra["finish"]["forced"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn post_branch_keeps_the_caller_that_added_the_branch() {
+        let state = test_state().await;
+        let app = app(&state);
+        seed_job(&state.pool, JOB, "open", Vec::new(), &[]).await;
+
+        let (status, body) = post(
+            &app,
+            &branches_uri(JOB),
+            json!({ "name": "notes", "paths": [SHARED], "layer": DOCS, "caller": "node-x" }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        let job = loaded(&state.pool, JOB).await;
+        assert_eq!(
+            job.manifest.branches["notes"].extra["start_caller"],
+            json!("node-x")
+        );
     }
 
     #[tokio::test]
