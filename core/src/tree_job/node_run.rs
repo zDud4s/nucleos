@@ -1467,7 +1467,10 @@ mod tests {
     #[test]
     fn an_orchestrator_prompt_reads_only_one_section_of_dispatch() {
         let prompt = node_prompt("node-abc-123", "root-9", "job-1", "orchestrator", "Task.");
-        assert!(prompt.contains("\"One controller per node\" section"), "{prompt}");
+        assert!(
+            prompt.contains("\"One controller per node\" section"),
+            "{prompt}"
+        );
         assert!(prompt.contains("core/MODULE_MAP.md"), "{prompt}");
         assert!(!prompt.contains("red_expected"), "{prompt}");
     }
