@@ -323,7 +323,11 @@ mod tests {
             check(&fx.state, JOB, at).await.unwrap();
         }
         assert_eq!(feed_lines(&fx).await, 0);
-        assert_eq!(nudges_spent(&fx.job(JOB).await), 0, "the pause spends nothing");
+        assert_eq!(
+            nudges_spent(&fx.job(JOB).await),
+            0,
+            "the pause spends nothing"
+        );
 
         // Past the reset the pause is over: a tree still not moving is stalled as any other.
         check(&fx.state, JOB, now + chrono::Duration::hours(5))

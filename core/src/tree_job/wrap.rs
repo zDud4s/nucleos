@@ -1148,7 +1148,11 @@ mod tests {
         let (branch, asked) = parked_and_asked(&state).await;
         assert_eq!(branch, "parked");
         assert_eq!(asked.len(), 1, "{asked:?}");
-        assert!(asked[0].contains("spent $5.00 of the $1.00 limit"), "{:?}", asked[0]);
+        assert!(
+            asked[0].contains("spent $5.00 of the $1.00 limit"),
+            "{:?}",
+            asked[0]
+        );
         assert!(asked[0].contains("estimated $"), "{:?}", asked[0]);
         assert!(asked[0].contains("node(s) still open"), "{:?}", asked[0]);
     }

@@ -1167,10 +1167,23 @@ mod tests {
     #[test]
     fn only_fix_rescue_and_wrap_relaunches_continue_a_session() {
         for key in ["fix-1", "rescue-1", "wrap-1"] {
-            assert!(CONTINUING_PREFIXES.iter().any(|p| key.starts_with(p)), "{key}");
+            assert!(
+                CONTINUING_PREFIXES.iter().any(|p| key.starts_with(p)),
+                "{key}"
+            );
         }
-        for key in ["died-1", "watchdog-1", "transient-1", "quota-1", "finalfix-1", "resume-1"] {
-            assert!(!CONTINUING_PREFIXES.iter().any(|p| key.starts_with(p)), "{key}");
+        for key in [
+            "died-1",
+            "watchdog-1",
+            "transient-1",
+            "quota-1",
+            "finalfix-1",
+            "resume-1",
+        ] {
+            assert!(
+                !CONTINUING_PREFIXES.iter().any(|p| key.starts_with(p)),
+                "{key}"
+            );
         }
     }
 
@@ -1218,6 +1231,9 @@ mod tests {
         let mut launch = worktree_launch();
         launch.mode = "shadow".to_owned();
 
-        assert_eq!(resumable_session(&state, &launch, "86", &["interrupted"]).await, None);
+        assert_eq!(
+            resumable_session(&state, &launch, "86", &["interrupted"]).await,
+            None
+        );
     }
 }
