@@ -8405,6 +8405,42 @@ mod tests {
         assert_eq!(queued_rows(&state).await.len(), 1);
     }
 
+    /// D9(b): the readable `git rebase <onto>` from a subagent is converted into a queue request,
+    /// not refused by the gate. What the subagent saw on 2026-11-09 as a refusal is the queue's own
+    /// `blocked` outcome (the branch is checked out in the caller's worktree, so the executor will
+    /// not rewrite it); the gate's part is only to admit it, and to say so in the answer.
+    #[tokio::test]
+    async fn a_subagent_rebase_onto_master_is_queued_not_refused_by_the_gate() {
+        let state = test_state().await;
+        let repo = rostered_repo(&state, "hook-session-subagent-rebase").await;
+
+        let decision = session_git_decision_within(
+            &state,
+            SessionGitPayload {
+                tool_name: "Bash".to_owned(),
+                tool_input: serde_json::json!({ "command": "git rebase master" }),
+                cwd: repo.path().to_string_lossy().into_owned(),
+                agent_id: Some("a1".to_owned()),
+                agent_type: Some("wf-leaf".to_owned()),
+                subagent: true,
+            },
+            Duration::ZERO,
+        )
+        .await
+        .0;
+
+        assert!(
+            decision.reason.contains("queued as vcs request"),
+            "{}",
+            decision.reason
+        );
+        assert_eq!(decision.request_id, Some(1), "{}", decision.reason);
+        assert_eq!(
+            queued_rows(&state).await,
+            vec![("rebase".to_owned(), "shell".to_owned())]
+        );
+    }
+
     fn ticket(
         status: &str,
         sha: Option<&str>,
