@@ -254,6 +254,27 @@ pub fn window_env(request: &RunRequest) -> Option<(&'static str, String)> {
         .map(|window| ("CLAUDE_CODE_AUTO_COMPACT_WINDOW", window.to_string()))
 }
 
+/// `BASH_DEFAULT_TIMEOUT_MS`: what a Bash call gets when it names no timeout. The CLI's own default
+/// is two minutes, which kills a `python scripts/heavy.py` call that is only waiting for a slot.
+/// Ten minutes is the timeout `heavy.py` tells its caller to retry with after its exit 75.
+pub const BASH_DEFAULT_TIMEOUT_MS: &str = "600000";
+
+/// `BASH_MAX_TIMEOUT_MS`: the most a Bash call may ask for. Above `heavy.py`'s ten-minute stall
+/// watchdog (exit 76) on purpose, so that the watchdog fires, and leaves its thread dump, before the
+/// CLI's own timeout kills the shell and the evidence with it.
+pub const BASH_MAX_TIMEOUT_MS: &str = "720000";
+
+/// The environment that bounds a Bash call coherently with `scripts/heavy.py` (75 = retry with
+/// timeout 600000, 76 = stalled and killed). Set before `request.env` at the spawn site, like
+/// [`window_env`], so an explicit entry still wins. Spelled once, here, for the reason `window_env`
+/// gives: a typo in a variable name fails silently.
+pub fn bash_timeout_env() -> [(&'static str, &'static str); 2] {
+    [
+        ("BASH_DEFAULT_TIMEOUT_MS", BASH_DEFAULT_TIMEOUT_MS),
+        ("BASH_MAX_TIMEOUT_MS", BASH_MAX_TIMEOUT_MS),
+    ]
+}
+
 /// The environment that takes background tasks away from a run nothing can wake, or nothing for a
 /// run something can.
 ///

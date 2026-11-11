@@ -29,25 +29,52 @@ pub(super) async fn next_line_unless_silent<R>(
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
-    unless_silent(lines.next_line(), silence, open_tools).await
+    unless_silent(lines.next_line(), silence, open_tools, OPEN_TOOL_SILENCE).await
 }
 
+/// `next_line_unless_silent` with the open-tool deadline named, so a test can shrink it.
+#[cfg(test)]
+pub(super) async fn next_line_unless_silent_with<R>(
+    lines: &mut tokio::io::Lines<R>,
+    silence: Option<Duration>,
+    open_tools: &std::collections::HashSet<String>,
+    open_tool_silence: Duration,
+) -> Result<std::io::Result<Option<String>>, Duration>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    unless_silent(lines.next_line(), silence, open_tools, open_tool_silence).await
+}
+
+/// How long an open tool call (a Bash, an Agent) may print nothing before the run is cut off.
+///
+/// An open tool call is exempt from the ordinary progress deadline because a long build streams
+/// nothing until its result. Exempt without bound, though, a hung tool (a wedged shell, a command
+/// waiting on input nobody gives) holds the run until its wall clock, and says nothing. This is its
+/// own, longer deadline: 30 minutes without a stdout line (spec D6). It sits well above the
+/// child's own Bash ceiling (`bash_timeout_env`), so a tool that honours its timeout never meets it.
+pub(super) const OPEN_TOOL_SILENCE: Duration = Duration::from_secs(30 * 60);
+
 /// `read`, given up after `silence` unless a tool call is open — the rule of
-/// `next_line_unless_silent`, for any read of the next line.
+/// `next_line_unless_silent`, for any read of the next line. With a tool open the deadline is
+/// `open_tool_silence` instead, and only for a run that has a silence deadline at all.
 async fn unless_silent<F, T>(
     read: F,
     silence: Option<Duration>,
     open_tools: &std::collections::HashSet<String>,
+    open_tool_silence: Duration,
 ) -> Result<T, Duration>
 where
     F: std::future::Future<Output = T>,
 {
-    match silence {
-        Some(deadline) if open_tools.is_empty() => tokio::time::timeout(deadline, read)
-            .await
-            .map_err(|_| deadline),
-        _ => Ok(read.await),
-    }
+    let deadline = match silence {
+        Some(deadline) if open_tools.is_empty() => deadline,
+        Some(_) => open_tool_silence,
+        None => return Ok(read.await),
+    };
+    tokio::time::timeout(deadline, read)
+        .await
+        .map_err(|_| deadline)
 }
 
 /// The stage name a conflict resolution is routed by. Not a job stage — no node carries it — but
@@ -252,6 +279,11 @@ impl CommandRunner for ClaudeCliRunner {
         }
         // Read now, while `request.messages` is still there to be asked about: the steering task
         // takes it once the process is running.
+        if !request.background_tasks {
+            for (name, value) in bash_timeout_env() {
+                cmd.env(name, value);
+            }
+        }
         let background_off = background_env(&request);
         if let Some((name, value)) = background_off {
             cmd.env(name, value);
@@ -464,7 +496,14 @@ impl CommandRunner for ClaudeCliRunner {
                 &mut child_exited_at,
                 CHILD_EXIT_STDIO_GRACE,
             );
-            let next_line = match unless_silent(read, request.progress_timeout, &open_tools).await {
+            let next_line = match unless_silent(
+                read,
+                request.progress_timeout,
+                &open_tools,
+                OPEN_TOOL_SILENCE,
+            )
+            .await
+            {
                 Ok(result) => result,
                 Err(deadline) => {
                     progress_timeout_elapsed = Some(deadline);
