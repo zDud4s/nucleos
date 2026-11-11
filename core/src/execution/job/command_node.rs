@@ -172,6 +172,26 @@ async fn resolve_project(state: &AppState, job: &JobRow, node: &Node, name: &str
                      run does not run it"
                 ));
             }
+            if found.permission != crate::role_policy::Permission::default() {
+                // A job has no run and no node row of its own: it is the engine acting for the
+                // owner, so it asks as the top-level session.
+                let who = crate::role_policy::resolve_requester(
+                    &state.pool,
+                    &crate::role_policy::Caller {
+                        agent_id: None,
+                        agent_type: None,
+                        subagent: false,
+                    },
+                    None,
+                )
+                .await;
+                if !found.permission.admits(&who) {
+                    return Resolved::Refused(format!(
+                        "`project:{name}` may be run only by {}",
+                        found.permission.who_may()
+                    ));
+                }
+            }
             Resolved::Run {
                 argv: found.command,
                 cwd: node.cwd.clone().or(found.cwd),
@@ -416,6 +436,7 @@ mod tests {
             is_gate: name == "gate",
             pass_exit_code: pass,
             runnable_by: by,
+            permission: Default::default(),
         }
     }
 

@@ -1089,6 +1089,41 @@ mod tests {
         db.close().await;
     }
 
+    /// A push is accepted only from the owner's top-level session: a run scope gets a 403 that says
+    /// who may, and nothing is queued.
+    #[tokio::test]
+    async fn a_run_scoped_push_request_is_refused_as_push_root_only() {
+        let (state, db) = file_test_state().await;
+        let pool = state.pool.clone();
+        let app = Router::new()
+            .route("/vcs/requests", post(submit_vcs_request))
+            .layer(Extension(Scope::Run(7)))
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/vcs/requests")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"project_id":"alpha","operation":{"op":"push","remote":"origin","branch":"master"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["refusal"], "push_root_only");
+        assert_eq!(body["detail"], crate::role_policy::PUSH_REFUSAL);
+        assert!(vcs::list(&pool, None).await.unwrap().is_empty());
+        db.close().await;
+    }
+
     /// The sibling of the 404 above, and the other half of what keeps a caller from pointing the
     /// daemon's git somewhere it should not go: the project IS registered, and the root recorded for
     /// it is an ordinary directory rather than a repository.
@@ -10416,6 +10451,80 @@ mod tests {
         // about WHO is asking rather than about the command.
         assert_eq!(
             run_command(state, "alpha", mine["id"].as_i64().unwrap())
+                .await
+                .0,
+            StatusCode::ACCEPTED
+        );
+    }
+
+    /// A command's declared roles and depth are enforced against the node behind the run's key; the
+    /// owner's token is the top-level session and passes; a command with no permission is as before.
+    #[tokio::test]
+    async fn a_command_with_a_depth_ceiling_refuses_a_deeper_run_and_admits_the_owner() {
+        let state = test_state().await;
+        let _dir = project_with_rules(&state, "alpha", "gate_command: make check\n").await;
+        sqlx::query(
+            "INSERT INTO work_nodes (id, root_id, depth, kind, title, goal, status, owned_paths, \
+             run_id, created_at, updated_at) \
+             VALUES ('n-deep', 'n-deep', 2, 'leaf', 't', 'g', 'running', '[\"a/**\"]', '7', \
+             '2026-11-10T00:00:00Z', '2026-11-10T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let (status, limited) = declare_command(
+            state.clone(),
+            "alpha",
+            serde_json::json!({
+                "name": "limited",
+                "command": "git --version",
+                "runnable_by": "agent",
+                "roles": ["root", "leaf"],
+                "max_depth": 1,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, plain) = declare_command(
+            state.clone(),
+            "alpha",
+            serde_json::json!({
+                "name": "plain",
+                "command": "git --version",
+                "runnable_by": "agent",
+            }),
+        )
+        .await;
+        let (negative, _) = declare_command(
+            state.clone(),
+            "alpha",
+            serde_json::json!({ "name": "bad", "command": "git --version", "max_depth": -1 }),
+        )
+        .await;
+        assert_eq!(negative, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let refused = post_project_command_run(
+            State(state.clone()),
+            Extension(crate::auth::Scope::Run(7)),
+            Path(("alpha".to_owned(), limited["id"].as_i64().unwrap())),
+        )
+        .await
+        .expect_err("a leaf at depth 2 is past max_depth 1");
+        assert_eq!(refused.0, StatusCode::FORBIDDEN);
+        assert_eq!(refused.1.0["refusal"], "role_not_permitted");
+
+        let allowed = post_project_command_run(
+            State(state.clone()),
+            Extension(crate::auth::Scope::Run(7)),
+            Path(("alpha".to_owned(), plain["id"].as_i64().unwrap())),
+        )
+        .await
+        .expect("a command with no permission is unchanged");
+        assert_eq!(allowed, StatusCode::ACCEPTED);
+
+        assert_eq!(
+            run_command(state, "alpha", limited["id"].as_i64().unwrap())
                 .await
                 .0,
             StatusCode::ACCEPTED
