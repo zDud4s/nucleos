@@ -1116,6 +1116,59 @@ def run_unavailable_cases():
     return cases
 
 
+def run_timeout_cases():
+    """D5: a gate timeout is retried once, and told apart from a refusal."""
+    import socket
+
+    cases = []
+    allow = {"decision": "allow", "reason": "ok"}
+    slow = socket.timeout("timed out")
+
+    code, printed = _run_main_gate([slow, allow])
+    special = _special_of(printed)
+    cases.append((
+        "one gate timeout is retried and the allow that follows is honoured",
+        _verdict(
+            special is not None and special.get("permissionDecision") == "allow",
+            f"{code!r} {printed!r}",
+        ),
+    ))
+
+    code, printed = _run_main_gate([slow, urllib.error.URLError(slow), allow])
+    reason = json.loads(printed).get("reason", "") if printed else ""
+    cases.append((
+        "a gate that times out twice says transient and repeat the same call, not a refusal",
+        _verdict(
+            "transient" in reason and "repeat the same call" in reason
+            and "failing closed" not in reason,
+            f"{code!r} {printed!r}",
+        ),
+    ))
+
+    code, printed = _run_main_gate([OSError("connection refused"), allow])
+    reason = json.loads(printed).get("reason", "") if printed else ""
+    cases.append((
+        "a refused connection is still reported as unreachable, with no retry",
+        _verdict("failing closed" in reason, f"{code!r} {printed!r}"),
+    ))
+
+    code, printed = _run_interactive(
+        tempfile.gettempdir(),
+        {"session_id": "s", "tool_name": "Bash",
+         "tool_input": {"command": "git merge --no-ff feat/x"}, "cwd": "/work/repo"},
+        socket.timeout("timed out"),
+    )
+    cases.append((
+        "a session-git timeout is transient, is not retried and does not call the request lost",
+        _verdict(
+            "transient" in printed and "may already be in the queue" in printed
+            and "failing closed" not in printed,
+            f"{code!r} {printed!r}",
+        ),
+    ))
+    return cases
+
+
 def run_rewrite_cases():
     """A run's allow forwards the daemon's `updated_input` as `updatedInput`; nothing else does."""
     cases = []
@@ -2181,6 +2234,7 @@ def main() -> int:
         + verify_hint_cases()
         + run_rewrite_cases()
         + run_unavailable_cases()
+        + run_timeout_cases()
         + run_ask_wait_cases()
         + admit_cases()
         + one_source_cases()
