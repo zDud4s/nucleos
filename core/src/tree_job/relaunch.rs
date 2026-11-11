@@ -381,14 +381,17 @@ pub(super) enum BudgetGate {
 
 /// [`budget_refusal`] that keeps a database error apart from "permitted".
 pub(super) async fn budget_gate(pool: &SqlitePool, node_id: &str) -> BudgetGate {
-    let root: Option<String> = sqlx::query_scalar("SELECT root_id FROM work_nodes WHERE id = ?")
-        .bind(node_id)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten();
-    let Some(root) = root else {
-        return BudgetGate::Open;
+    let root: Result<Option<String>, _> =
+        sqlx::query_scalar("SELECT root_id FROM work_nodes WHERE id = ?")
+            .bind(node_id)
+            .fetch_optional(pool)
+            .await;
+    let root = match root {
+        Ok(Some(root)) => root,
+        // No tree row: no budget to apply.
+        Ok(None) => return BudgetGate::Open,
+        // A read that failed is not "no row": the budget is unknown, not open.
+        Err(_) => return BudgetGate::Unreadable,
     };
     match budget::permits_next_node(pool, &root).await {
         Permit::Yes => BudgetGate::Open,
@@ -831,6 +834,16 @@ mod tests {
     const NODE: &str = "relaunch-node";
     const ROOT: &str = "relaunch-root";
     const CREATED: &str = "2026-10-31T00:00:00+00:00";
+
+    #[tokio::test]
+    async fn a_failed_node_read_leaves_the_budget_unreadable_not_open() {
+        let pool = crate::testdb::fresh_pool().await;
+        assert_eq!(budget_gate(&pool, NODE).await, BudgetGate::Open);
+
+        pool.close().await;
+
+        assert_eq!(budget_gate(&pool, NODE).await, BudgetGate::Unreadable);
+    }
 
     #[tokio::test]
     async fn successor_key_first_proposal_wins() {
