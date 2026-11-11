@@ -1,5 +1,7 @@
 # >>> AI WORKFLOW MANAGED BLOCK >>>
 
+**Headless node rule (`NODE_PROMPT_HEADER`).** If your prompt starts with "You are the agent for NucleOS tree node ", you are a headless node of a tree: ignore the conductor routing, `manual:`, `/compact` and `wait_advice`; that prompt and your cockpit are your instructions.
+
 ## AI workflow integration
 
 This repository uses an AI workflow. See `.nucleos/workflow/workflow.md` for full pipeline details.
@@ -35,7 +37,7 @@ The owner can opt out of the routing for one prompt by starting it with `manual:
 Execution rules (a short copy for readers without hooks; `workflow.md` is the authority):
 1. Prefer the smallest correct change; touch only relevant files; do not broaden scope silently.
 2. If blocked, stop and report the blocker.
-3. Fill the Handoff section before declaring done, with one evidence block (exit code + output tail) per validation command. Do not run tests or build tools: the controller runs the single final verification through the daemon's `verify`.
+3. Fill the Handoff section before declaring done, with one evidence block (exit code + output tail) per validation command. A leaf runs only `cargo fmt -p <crate>` and `python scripts/check_invariants.py` before closing, via `python scripts/heavy.py`, failing open; never `cargo check`, `test`, `build`, `clippy` or `--workspace`. The rest is the gate's. With `autonomy.leaf_self_check: true` it may add one `cargo check -p <crate> --tests`. Run no other test or build tool: the controller runs the single final verification through the daemon's `verify`.
 4. After implementation, report: summary, files changed, validation, risks, assumptions.
 5. Never execute delete or mass-removal commands (rm -rf, rmdir, del, Remove-Item, git clean). List required deletions in Handoff `Pending deletions` — the orchestrator executes them after review.
 6. Never commit/push history; the orchestrator owns that after review.

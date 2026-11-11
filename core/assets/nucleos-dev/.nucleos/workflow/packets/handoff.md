@@ -4,7 +4,7 @@
   Written by the node to `<state_dir>/nodes/<root_id>/<node_id>.md` BEFORE it calls
   mcp__nucleos__node_close (the daemon refuses a close whose handoff file does not exist).
   The parent never reads this file unless Status is `blocked` or `failed`.
-  In an orchestration tree this file IS the node's report: `tree.py record` validates it.
+  In an orchestration tree this file IS the node's report: the daemon's `node_close` parser (and `tree.py record` in a `tree.py` tree) validates it. It is the one handoff format; `Commands for the root` is the one validation field.
   At most `tree.report_max_lines` (60) lines, not counting HTML comments. -->
 
 Node ID: <!-- as in the node packet -->

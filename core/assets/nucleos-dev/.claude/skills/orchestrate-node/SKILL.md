@@ -1,6 +1,6 @@
 ---
 name: orchestrate-node
-description: Use when you are a node controller of a node tree — dispatched through the `wf-orchestrator` or `wf-tree-orchestrator` cockpit with a node packet (`packets/node.md`) as a non-leaf node, or the root controller deciding to decompose a task that will not fit one leaf budget; also when a leaf or orchestrator of a tree driven by `tree.py` has to write its report.
+description: Use when you are a node controller of a node tree — dispatched through the `wf-orchestrator` or `wf-tree-orchestrator` cockpit with a node packet (`packets/node.md`) as a non-leaf node, or the root controller deciding to decompose a task that will not fit one leaf budget; also when a leaf or orchestrator of a tree driven by `tree.py` (only those trees; the `tree.py` protocol is retiring) has to write its report.
 ---
 
 # Orchestrate node
@@ -46,41 +46,44 @@ Routing and the "One controller per node" rules live in `dispatch.md`; read it o
    stop opening children: write your handoff file, `node_close` with status `handoff`.
 10. **Close.** `node_close` with `status` (`done`, `blocked`, `handoff`, `failed`), `summary`
     (at most 1500 characters: what landed, what is open, decisions) and `handoff_path`. The
-    handoff file is `<state_dir>/nodes/<root_id>/<node_id>.md`, shaped by
-    `packets/handoff.md`. For the root's verification, list the test and build commands for
-    your branch in it; do not run them.
+    handoff file is the path your prompt names (in a daemon-run node, `.nucleos-report.md` in
+    your worktree), shaped by `packets/handoff.md`: the one handoff format. For the root's
+    verification, list the test and build commands for your branch under `## Commands for the
+    root`, the one validation field the `node_close` parser accepts; do not run them.
 
 ## Boundaries
 
 - Direct children only, and only `wf-orchestrator`, `wf-planner`, `wf-leaf`, `wf-executor`, `wf-reviewer` (in a tree driven by `tree.py`, a leaf `execute` goes through `wf-leaf`; both `wf-orchestrator` and `wf-tree-orchestrator` may dispatch it, and `wf-tree-orchestrator`, the top of the branch, never dispatches itself).
-- No build, test or verify run. In a tree driven by `tree.py` that is absolute: `subtree_verify` is
-  ignored and only the controller gates. Outside a tree, with `subtree_verify` true, a branch-scoped
-  `mcp__nucleos__verify` for your own branch is allowed; otherwise the root controller's single
-  final verification is the only one.
+- No build, test or verify run, and your cockpit has no `verify` tool: `subtree_verify` is
+  ignored and only the controller gates; its single final verification is the only one.
 - No edits to source. A part that needs editing is a leaf for `wf-executor`.
 
-## In a tree (`tree.py`)
+## In a tree (`tree.py`) — only for `tree.py` trees
+
+Everything in this section, and every `node_open`/`tree.py` mention above, applies only to trees
+driven by `tree.py`. In a daemon-run tree (`tree_launch`, `spec_finish`) the node prompt, the node
+packet and `packets/handoff.md` are the whole protocol; skip this section.
 
 When your prompt came from `tree.py prompt`, its rules block and these rules both bind you. The
 prompt block is the single source; if they differ, the prompt wins.
 
 - **The top-of-branch orchestrator does not close its node.** Dispatched through `wf-tree-orchestrator`, you return the report and your node stays `running` until the controller merges the branch (`tree.py merge` returns the `node_close`). Orchestrators below the top of a branch, and the fix-tree ones, close as in step 10.
 - **A leaf closes its own node.** Leaves run in `wf-leaf`: they write their own handoff, `node_close` their own node (only that one) and never open nodes. Do not close a leaf's node for it unless it died `running`.
-- **Your report is your handoff.** Write `<state_dir>/nodes/<root_id>/<node_id>.md` (a reviewer
+- **Your report is your handoff.** Write the path your prompt names (in a `tree.py` tree `<state_dir>/nodes/<root_id>/<node_id>.md`) (a reviewer
   without `Write` returns the same text as its final message; the controller stores it). The
   report format and the per-role rules are in the `## Report format` and `## Rules by role` sections of the prompt `tree.py prompt`
   rendered for you; follow it.
-- **A gap in the contract is a request, not a decision.** Stop, fill `## Contract request` with what
-  is missing and the options, and close with `Outcome: contract_request`. Use only contract ids
-  that exist in the file.
+- **Decide and record; request only for shared interfaces.** A gap in the contract that is internal
+  to your own files: pick the smallest reading, do it, and record the choice under `## Decisions`
+  (and `node_update`). Send a contract request only when the choice changes an interface shared
+  with a sibling: then stop, fill `## Contract request` with what is missing and the options, and
+  close with `Outcome: contract_request`. Use only contract ids that exist in the file.
 - **Ownership is by file.** Globs, never line ranges (ranges are reading hints only). Live leaves
   own disjoint files; a file two pieces need goes to one piece, or to two successive waves. A new
   file belongs to the piece that declares it.
 - **Only leaves edit, and only in their own files.** An orchestrator that touches a file is reverted
   and its node fails.
-- **No cargo, no commit, no merge, no stash, no push.** One exception: a leaf that edited Rust runs
-  `cargo fmt -p <crate>` from the worktree root (no other flags, no `cd`), never bare `rustfmt` or
-  hand-formatting. List the exact commands you would have run
+- **No commit, no merge, no stash, no push; cargo only as follows.** A leaf runs only `cargo fmt -p <crate>` and `python scripts/check_invariants.py` before closing, via `python scripts/heavy.py`, failing open; never `cargo check`, `test`, `build`, `clippy` or `--workspace`. The rest is the gate's. With `autonomy.leaf_self_check: true` it may add one `cargo check -p <crate> --tests`. Orchestrators run no cargo at all. List the exact commands you would have run
   under `## Commands for the root`; the controller runs them. The controller commits for you.
 - **Partition by report.** If your prompt says you do not launch children, return `Outcome: split`
   with each child's piece (goal, files, line hints, contract sections, budget, and its kind) in
@@ -100,7 +103,7 @@ prompt block is the single source; if they differ, the prompt wins.
 | "I'll read the child's handoff to be safe" | Read it only if the child closed `blocked` or `failed`; reading every handoff rebuilds the child's context in yours. |
 | "I have budget left, one more child" | At about 80% of the budget you write the handoff and close `handoff`; the ceiling is a wall, not a target. |
 | "I'll run the tests to check my branch" | Only the controller verifies; outside a tree, you only when `subtree_verify` is true; a second test run is unmeasured and slows the tree. |
-| "The contract is silent, so I'll pick the signature and note it" | Only the controller writes the contract; a silent choice splits siblings onto different interfaces. Close `contract_request` with the options. |
+| "The contract is silent, so I'll pick the signature and note it" | Inside your own files, do exactly that: pick the smallest reading and record it in Decisions. If the choice changes an interface shared with a sibling, a silent pick splits siblings onto different interfaces: close `contract_request` with the options. |
 | "My child needs one file outside my paths, close enough" | The daemon refuses a child outside your `owned_paths`; widen nothing, send a `contract_request` or merge the pieces. |
 | "I own lines 40-90 of that file, my sibling the rest" | Ownership is by file in a tree; ranges are reading hints. Give the file to one piece or run the two in successive waves. |
 | "`subtree_verify` is true, so I'll verify my branch" | In a tree only the controller gates; `tree.py gate` is the record, and a second run is unmeasured. |

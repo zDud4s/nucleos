@@ -118,6 +118,8 @@ If `auto_select.enabled: true`, after receiving the planner output: locate the `
 
 ### Large tasks: run a node tree
 
+**`tree.py` trees only.** The `tree.py` protocol below is retiring. A daemon-run tree (`tree_launch`, `spec_finish`) does not use it: the node prompt, `packets/node.md` and the one handoff format `packets/handoff.md` (`## Commands for the root` is its validation field) are the whole protocol. Follow this section only when you are driving a `tree.py` tree.
+
 When Size is `large`, or the plan would not fit one controller within `nodes.orchestrator_budget` (speed.yaml), you are the **controller** and the root node of a tree. Small and medium tasks skip this section and run Phase 2 unchanged.
 
 **Who does what.** Only you run cargo, gates, commits and merges, and only you write the contract. Every other node edits (a leaf, in the `wf-leaf` cockpit, inside its own files, and it closes its own node) or splits (an orchestrator, without editing). The engine is `python <bundle_dir>/scripts/tree.py <verb>`: `init`, `branch add|bind|drop`, `budget`, `open`, `prompt`, `record`, `gate`, `review`, `merge`, `close`, `park`, `status`, `finish`. Each verb has `--help`. `--tree <id>` or the env var `NUCLEOS_TREE_ID` selects the tree for every verb except `init`. It prints JSON; exit 2 is a refusal, so read its `error` and fix the input instead of retrying. It never calls MCP: when a verb returns `{"mcp": [...]}`, make those calls in that order. The tree's state is `tree.json` and `node_tree`, never your context. Node-side rules live in `orchestrate-node`; the decomposition rules are in workflow.md ("Decomposition (node trees)").
