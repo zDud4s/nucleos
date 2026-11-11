@@ -509,7 +509,10 @@ pub(super) async fn pretooluse_decision_from(
         cwd.as_deref().map(Path::new),
         policy.as_ref(),
         rules.declared(),
-        run_cache::unrecognized(facts.as_ref().ok().and_then(|found| found.as_deref()), &mode),
+        run_cache::unrecognized(
+            facts.as_ref().ok().and_then(|found| found.as_deref()),
+            &mode,
+        ),
     ));
     if leaf_self_check_admitted(&state, &payload, run_id, cwd.as_deref(), &classification).await {
         classification = classifier::Classification {

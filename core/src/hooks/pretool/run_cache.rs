@@ -99,7 +99,9 @@ fn pool_id(pool: &SqlitePool) -> usize {
 }
 
 fn lock() -> std::sync::MutexGuard<'static, HashMap<Key, Entry>> {
-    CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Whether the daemon still holds a task for `run_id`.

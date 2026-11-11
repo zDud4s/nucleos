@@ -1583,8 +1583,8 @@ mod tests {
         // Budget - margin - 1.6 s spent = 1.6 s left, well under the 3 s `JUDGE_DEADLINE` cap, and
         // 1.1 s above `JUDGE_FLOOR`, so a slow machine still reaches the enforced wait.
         let left = Duration::from_millis(1_600);
-        let started = Instant::now()
-            - (super::rules::HOOK_BUDGET - super::rules::AFTER_JUDGE_MARGIN - left);
+        let started =
+            Instant::now() - (super::rules::HOOK_BUDGET - super::rules::AFTER_JUDGE_MARGIN - left);
         let waited = Instant::now();
 
         let decision = decide_started(&state, run_id, started).await;
