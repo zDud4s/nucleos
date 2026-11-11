@@ -3179,14 +3179,22 @@ mod tests {
         ] {
             let got = classify("Bash", &json!({"command": command}), None);
             assert_eq!(got.decision.decision, "pending_approval", "{command}");
-            assert!(got.reason.contains(alternative), "{command}: {}", got.reason);
+            assert!(
+                got.reason.contains(alternative),
+                "{command}: {}",
+                got.reason
+            );
             for absent in ["Agent", "Task", "WebSearch", "WebFetch"] {
                 assert!(!got.reason.contains(absent), "{command}: {}", got.reason);
             }
         }
         let tool = classify("SomeNewTool", &json!({}), None);
         assert_eq!(tool.action_class, "unrecognized-tool");
-        assert!(tool.reason.contains("tools your run was given"), "{}", tool.reason);
+        assert!(
+            tool.reason.contains("tools your run was given"),
+            "{}",
+            tool.reason
+        );
         assert!(!tool.reason.contains("WebSearch"), "{}", tool.reason);
     }
 
@@ -3285,9 +3293,15 @@ mod tests {
         let fmt = "python scripts/heavy.py -- cargo fmt -p core";
         let invariants = "python scripts/heavy.py -- python scripts/check_invariants.py";
         assert!(leaf_self_check_scripts_intact(&tree, fmt));
-        assert!(leaf_self_check_scripts_intact(&tree.join("scripts"), invariants));
+        assert!(leaf_self_check_scripts_intact(
+            &tree.join("scripts"),
+            invariants
+        ));
         std::fs::write(tree.join("scripts/check_invariants.py"), "rewritten").unwrap();
-        assert!(leaf_self_check_scripts_intact(&tree, fmt), "not the one it runs");
+        assert!(
+            leaf_self_check_scripts_intact(&tree, fmt),
+            "not the one it runs"
+        );
         assert!(!leaf_self_check_scripts_intact(&tree, invariants));
         std::fs::write(tree.join("scripts/heavy.py"), "rewritten").unwrap();
         assert!(!leaf_self_check_scripts_intact(&tree, fmt));
