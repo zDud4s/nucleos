@@ -48,7 +48,7 @@ Rules that apply everywhere:
 - **Respect the invariants.** Only the daemon writes SQLite. Secrets go through the OS credential
   store. The local API binds to localhost. Each integration runs as its own sidecar.
 - **Add new modules to the module map.** A new file in `core/src/` must be listed in the map in
-  `core/AGENTS.md`, and `core/tests/module_map.rs` fails until it is.
+  `core/MODULE_MAP.md`, and `core/tests/module_map.rs` fails until it is.
 - **Edit the classifier hook in one place.** `core/hooks/ask_daemon.py` is the source, and it is
   compiled into the daemon. `.claude/hooks/ask_daemon.py` is a byte-for-byte copy, and
   `scripts/test-hook-filter.py` keeps the two equal. Edit the source, then copy it over.

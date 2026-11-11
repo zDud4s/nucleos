@@ -80,7 +80,7 @@ trail.
 - The local API binds to localhost and requires a bearer token.
 - Each integration is its own process and fails on its own.
 
-The module map and extension points are documented in [`core/AGENTS.md`](core/AGENTS.md). The
+The module map and extension points are documented in [`core/MODULE_MAP.md`](core/MODULE_MAP.md) and [`core/AGENTS.md`](core/AGENTS.md). The
 threat model is in [`THREAT_MODEL.md`](THREAT_MODEL.md).
 
 ## Getting started
