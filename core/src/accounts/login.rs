@@ -684,7 +684,10 @@ mod tests {
             .unwrap();
         let done = reach(&logins, &started.login_id, LoginPhase::Done).await;
         assert_eq!(done.device_code.as_deref(), Some("ABCD-EFGH"));
-        assert_eq!(done.auth_url.as_deref(), Some("https://auth.example/device"));
+        assert_eq!(
+            done.auth_url.as_deref(),
+            Some("https://auth.example/device")
+        );
         let account_id = AccountId(started.account_id.clone());
         assert!(store::get(&db, &account_id).await.unwrap().is_some());
     }
