@@ -46,18 +46,27 @@ fn is_orchestrator(kind: &str) -> bool {
     matches!(kind, "orchestrator" | "root")
 }
 
+/// The defaults of `nodes.leaf_budget` and `nodes.orchestrator_budget` in `speed.yaml`.
+const DEFAULT_LEAF_BUDGET: i64 = 120_000;
+const DEFAULT_ORCHESTRATOR_BUDGET: i64 = 150_000;
+
+/// The limits a budget gives: warn at 80% of it, wrap at 100%.
+fn limits_for_budget(budget: i64, block: i64) -> ContextLimits {
+    ContextLimits {
+        warn: budget / 5 * 4,
+        wrap: budget,
+        block,
+    }
+}
+
 /// The default limits for a node kind.
 pub fn limits(kind: &str) -> ContextLimits {
-    let (warn, wrap) = if is_orchestrator(kind) {
-        (100_000, 125_000)
+    let budget = if is_orchestrator(kind) {
+        DEFAULT_ORCHESTRATOR_BUDGET
     } else {
-        (80_000, 100_000)
+        DEFAULT_LEAF_BUDGET
     };
-    ContextLimits {
-        warn,
-        wrap,
-        block: DEFAULT_BLOCK,
-    }
+    limits_for_budget(budget, DEFAULT_BLOCK)
 }
 
 /// The verdict for `fill` against the default limits of `kind`.
@@ -81,8 +90,9 @@ pub fn verdict_against(limits: &ContextLimits, fill: Option<i64>) -> Fill {
     }
 }
 
-/// The limits of `kind` with the `nodes:` mapping of a `speed.yaml` over the defaults. A missing
-/// or non-integer key keeps its default; empty, malformed or `nodes`-less text gives
+/// The limits of `kind` from the `nodes:` mapping of a `speed.yaml`: the kind's budget
+/// (`leaf_budget` or `orchestrator_budget`) warns at 80% and wraps at 100%, and `ceiling` blocks. A
+/// missing or non-integer key keeps its default; empty, malformed or `nodes`-less text gives
 /// `limits(kind)`.
 pub fn limits_from_speed_yaml(text: &str, kind: &str) -> ContextLimits {
     let defaults = limits(kind);
@@ -92,10 +102,10 @@ pub fn limits_from_speed_yaml(text: &str, kind: &str) -> ContextLimits {
     let Some(nodes) = doc.get("nodes") else {
         return defaults;
     };
-    let (warn_key, wrap_key) = if is_orchestrator(kind) {
-        ("orchestrator_warn", "orchestrator_wrap")
+    let (budget_key, default_budget) = if is_orchestrator(kind) {
+        ("orchestrator_budget", DEFAULT_ORCHESTRATOR_BUDGET)
     } else {
-        ("leaf_warn", "leaf_wrap")
+        ("leaf_budget", DEFAULT_LEAF_BUDGET)
     };
     let read = |key: &str, default: i64| {
         nodes
@@ -103,11 +113,10 @@ pub fn limits_from_speed_yaml(text: &str, kind: &str) -> ContextLimits {
             .and_then(serde_yaml::Value::as_i64)
             .unwrap_or(default)
     };
-    ContextLimits {
-        warn: read(warn_key, defaults.warn),
-        wrap: read(wrap_key, defaults.wrap),
-        block: read("ceiling", defaults.block),
-    }
+    limits_for_budget(
+        read(budget_key, default_budget),
+        read("ceiling", defaults.block),
+    )
 }
 
 /// Turns a model window into the highest safe block threshold.
@@ -200,28 +209,28 @@ mod tests {
     const KINDS: [&str; 2] = ["leaf", "orchestrator"];
 
     #[test]
-    fn leaf_warns_at_80k() {
-        assert_eq!(limits("leaf").warn, 80_000);
-        assert_eq!(verdict("leaf", Some(79_999)), Fill::Ok);
-        assert_eq!(verdict("leaf", Some(80_000)), Fill::Warn);
+    fn leaf_warns_at_80_percent_of_its_budget() {
+        assert_eq!(limits("leaf").warn, 96_000);
+        assert_eq!(verdict("leaf", Some(95_999)), Fill::Ok);
+        assert_eq!(verdict("leaf", Some(96_000)), Fill::Warn);
     }
 
     #[test]
-    fn leaf_wraps_at_100k() {
-        assert_eq!(limits("leaf").wrap, 100_000);
-        assert_eq!(verdict("leaf", Some(99_999)), Fill::Warn);
-        assert_eq!(verdict("leaf", Some(100_000)), Fill::Wrap);
+    fn leaf_wraps_at_its_budget() {
+        assert_eq!(limits("leaf").wrap, 120_000);
+        assert_eq!(verdict("leaf", Some(119_999)), Fill::Warn);
+        assert_eq!(verdict("leaf", Some(120_000)), Fill::Wrap);
     }
 
     #[test]
-    fn orchestrator_warns_at_100k_wraps_at_125k() {
+    fn orchestrator_warns_at_120k_wraps_at_150k() {
         let limits = limits("orchestrator");
-        assert_eq!(limits.warn, 100_000);
-        assert_eq!(limits.wrap, 125_000);
-        assert_eq!(verdict("orchestrator", Some(99_999)), Fill::Ok);
-        assert_eq!(verdict("orchestrator", Some(100_000)), Fill::Warn);
-        assert_eq!(verdict("orchestrator", Some(124_999)), Fill::Warn);
-        assert_eq!(verdict("orchestrator", Some(125_000)), Fill::Wrap);
+        assert_eq!(limits.warn, 120_000);
+        assert_eq!(limits.wrap, 150_000);
+        assert_eq!(verdict("orchestrator", Some(119_999)), Fill::Ok);
+        assert_eq!(verdict("orchestrator", Some(120_000)), Fill::Warn);
+        assert_eq!(verdict("orchestrator", Some(149_999)), Fill::Warn);
+        assert_eq!(verdict("orchestrator", Some(150_000)), Fill::Wrap);
     }
 
     #[test]
@@ -235,24 +244,22 @@ mod tests {
     fn limits_read_from_speed_yaml_nodes_mapping() {
         let yaml = "\
 nodes:
-  leaf_warn: 70000
-  leaf_wrap: 90000
-  orchestrator_warn: 110000
-  orchestrator_wrap: 130000
+  leaf_budget: 100000
+  orchestrator_budget: 130000
   ceiling: 190000
 ";
         assert_eq!(
             limits_from_speed_yaml(yaml, "leaf"),
             ContextLimits {
-                warn: 70_000,
-                wrap: 90_000,
+                warn: 80_000,
+                wrap: 100_000,
                 block: 190_000,
             }
         );
         assert_eq!(
             limits_from_speed_yaml(yaml, "orchestrator"),
             ContextLimits {
-                warn: 110_000,
+                warn: 104_000,
                 wrap: 130_000,
                 block: 190_000,
             }
@@ -307,11 +314,12 @@ nodes:
 
     #[test]
     fn missing_speed_yaml_keys_keep_defaults() {
-        let only_leaf_warn = "nodes:\n  leaf_warn: 70000\n";
+        let only_leaf_warn = "nodes:\n  leaf_budget: 50000\n";
         assert_eq!(
             limits_from_speed_yaml(only_leaf_warn, "leaf"),
             ContextLimits {
-                warn: 70_000,
+                warn: 40_000,
+                wrap: 50_000,
                 ..limits("leaf")
             }
         );
@@ -346,8 +354,8 @@ nodes:
     #[test]
     fn malformed_speed_yaml_gives_defaults() {
         for yaml in [
-            "nodes: {leaf_warn: 70000",
-            "nodes:\n  leaf_warn: [unclosed\n",
+            "nodes: {leaf_budget: 70000",
+            "nodes:\n  leaf_budget: [unclosed\n",
         ] {
             for kind in KINDS {
                 assert_eq!(
@@ -408,7 +416,7 @@ nodes:
     #[tokio::test]
     async fn verdict_for_run_reads_fill_and_node_kind() {
         let pool = crate::testdb::fresh_pool().await;
-        let run_id = seed_run(&pool, Some(100_000)).await;
+        let run_id = seed_run(&pool, Some(120_000)).await;
         seed_node(&pool, "the-node", "leaf", run_id).await;
 
         let verdict = verdict_for_run(&pool, run_id, None, None).await.unwrap();
@@ -457,7 +465,7 @@ nodes:
         let pool = crate::testdb::fresh_pool().await;
         let run_id = seed_run(&pool, Some(25)).await;
         seed_node(&pool, "the-node", "leaf", run_id).await;
-        let yaml = "nodes:\n  leaf_warn: 10\n  leaf_wrap: 20\n  ceiling: 30\n";
+        let yaml = "nodes:\n  leaf_budget: 20\n  ceiling: 30\n";
 
         assert_eq!(fill_of(&pool, run_id, Some(yaml), None).await, Fill::Wrap);
         assert_eq!(fill_of(&pool, run_id, None, None).await, Fill::Ok);
@@ -466,13 +474,13 @@ nodes:
     #[tokio::test]
     async fn verdict_for_run_uses_orchestrator_limits_for_an_orchestrator_node() {
         let pool = crate::testdb::fresh_pool().await;
-        // Past a leaf's wrap and short of an orchestrator's.
+        // At a leaf's wrap and short of an orchestrator's.
         for (node_id, kind, expected) in [
             ("a-leaf", "leaf", Fill::Wrap),
             ("an-orchestrator", "orchestrator", Fill::Warn),
             ("a-root", "root", Fill::Warn),
         ] {
-            let run_id = seed_run(&pool, Some(110_000)).await;
+            let run_id = seed_run(&pool, Some(120_000)).await;
             seed_node(&pool, node_id, kind, run_id).await;
             assert_eq!(fill_of(&pool, run_id, None, None).await, expected, "{kind}");
         }

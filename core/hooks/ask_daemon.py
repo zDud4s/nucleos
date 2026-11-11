@@ -50,6 +50,7 @@ import json
 import os
 import re
 import shlex
+import socket
 import subprocess
 import sys
 import tempfile
@@ -121,6 +122,20 @@ ASK_WAIT_TIMEOUT_SECONDS = 2_590_200
 # up (a locked or exhausted database), which says nothing about the key. Three tries in all, about
 # 1.5 s of waiting, and the last 503 still fails closed like any other error.
 GATE_UNAVAILABLE_RETRY_DELAYS_SECONDS = (0.5, 1.0)
+# One attempt at the run gate waits this long for the daemon (D5; it was 5 s, which a daemon busy
+# with a build cut off and the call was refused as if the daemon had said no). A timeout is retried
+# once and, if it repeats, reported as transient rather than as a refusal.
+GATE_TIMEOUT_SECONDS = 15
+GATE_TIMEOUT_RETRIES = 1
+
+
+def is_timeout(exc) -> bool:
+    """Whether `exc` is the daemon not answering in time, as opposed to answering no or being down."""
+    if isinstance(exc, (socket.timeout, TimeoutError)):
+        return True
+    return isinstance(exc, urllib.error.URLError) and isinstance(
+        exc.reason, (socket.timeout, TimeoutError)
+    )
 
 
 def governed_git_verb(command: str) -> str:
@@ -2179,6 +2194,15 @@ def interactive_session(payload: dict) -> None:
         with urllib.request.urlopen(request, timeout=30) as response:
             decision = json.loads(response.read())
     except Exception as exc:
+        if is_timeout(exc):
+            # Not retried: the daemon submits the declared git request BEFORE it waits for it, so a
+            # second send could queue it twice, and this one may already be in the queue.
+            deny(
+                "the daemon did not answer in time - transient, not a refusal. The git request "
+                "this call declared may already be in the queue: do not run it another way. A "
+                "later action of this session reports how it ended; if nothing is reported, "
+                "repeat the same call"
+            )
         # Fails closed, and the wording matters: with the daemon down there is no queue to
         # order anything, so letting the command through is the one outcome that breaks the
         # guarantee silently.
@@ -2404,8 +2428,13 @@ def main() -> None:
         method="POST",
     )
     try:
-        decision = open_json_retrying_unavailable(request, timeout=5)
+        decision = open_json_retrying_unavailable(request, timeout=GATE_TIMEOUT_SECONDS)
     except Exception as exc:
+        if is_timeout(exc):
+            deny(
+                f"the daemon did not answer within {GATE_TIMEOUT_SECONDS} s, twice - this is "
+                "transient and not a refusal of the call: repeat the same call"
+            )
         deny(f"daemon unreachable or errored ({exc}) - failing closed")
 
     if not isinstance(decision, dict):
@@ -2436,12 +2465,23 @@ def open_json_retrying_unavailable(request, timeout):
     """
     for delay in GATE_UNAVAILABLE_RETRY_DELAYS_SECONDS + (None,):
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                return json.loads(response.read())
+            return _open_json_retrying_timeout(request, timeout)
         except urllib.error.HTTPError as exc:
             if exc.code != 503 or delay is None:
                 raise
         time.sleep(delay)
+
+
+def _open_json_retrying_timeout(request, timeout):
+    """One send of `request`, repeated GATE_TIMEOUT_RETRIES times when the daemon did not answer in
+    time. Only for a decision that has no side effect: the run gate decides, it never submits."""
+    for attempt in range(GATE_TIMEOUT_RETRIES + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return json.loads(response.read())
+        except Exception as exc:
+            if not is_timeout(exc) or attempt == GATE_TIMEOUT_RETRIES:
+                raise
 
 
 def wait_for_answer(daemon_url, token, run_id):

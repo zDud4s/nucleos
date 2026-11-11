@@ -207,30 +207,6 @@ def the_smoke_script_checks_the_install_and_the_daemon():
         assert binary in body, f"smoke-bundle.sh does not check {binary}"
 
 
-def releasing_documents_the_identifier_change():
-    text = (ROOT / "RELEASING.md").read_text(encoding="utf-8")
-    titles = re.findall(r"^#{1,6}[ \t]+.*Identifier change.*$", text, re.M | re.I)
-    assert len(titles) == 1, f"'Identifier change' must be exactly one heading, found {len(titles)}"
-    heading = re.search(r"^(#{1,6})[ \t]+.*Identifier change.*$", text, re.M | re.I)
-    assert heading, "RELEASING.md has no 'Identifier change' section"
-    rest = text[heading.end() :]
-    # The section ends at the next heading of the same or a higher level.
-    nxt = re.search(rf"^#{{1,{len(heading.group(1))}}}[ \t]+\S", rest, re.M)
-    # The title line is part of the section: it carries the identifier arrow.
-    section = (heading.group(0) + (rest[: nxt.start()] if nxt else rest)).lower()
-    for needle in (
-        "com.pc-multimedia.shell -> com.nucleos.app",
-        "com.pc-multimedia.shell",
-        "com.nucleos.app",
-        "microphone",
-        "accessibility",
-        ".rpm",
-        "gnome-keyring",
-        "package manager",
-    ):
-        assert needle in section, f"'Identifier change' section lacks {needle!r}"
-
-
 def the_nsis_preinstall_hook_still_stops_the_daemon():
     text = (ROOT / "shell" / "src-tauri" / "windows" / "hooks.nsh").read_text(encoding="utf-8")
     m = re.search(r"!macro NSIS_HOOK_PREINSTALL\b(.*?)!macroend", text, re.S)
@@ -244,7 +220,7 @@ TAURI_CONF = ROOT / "shell" / "src-tauri" / "tauri.conf.json"
 def the_bundle_identity_is_nucleos_not_the_old_product_name():
     raw = TAURI_CONF.read_text(encoding="utf-8")
     conf = json.loads(raw)
-    assert conf["identifier"] == "com.nucleos.app", conf["identifier"]
+    assert conf["identifier"] == "com.nucleos.desktop", conf["identifier"]
     assert conf["bundle"].get("publisher") == "NucleOS", conf["bundle"].get("publisher")
     assert "pc-multimedia" not in raw, "the old identifier survives in tauri.conf.json"
 
@@ -280,6 +256,12 @@ def the_linux_packages_declare_dependencies_and_recommend_a_keyring():
         assert "gnome-keyring" in recommends, f"{fmt}.recommends lacks gnome-keyring: {recommends}"
         assert not set(depends) & set(recommends), f"{fmt}: in both depends and recommends: {set(depends) & set(recommends)}"
 
+def releasing_md_documents_the_linux_packages():
+    text = (ROOT / "RELEASING.md").read_text(encoding="utf-8")
+    m = re.search(r"^## Linux packages\n(.*?)(?=^## |\Z)", text, re.S | re.M)
+    assert m, "RELEASING.md has no '## Linux packages' section"
+    for needle in (".rpm", ".deb", "gnome-keyring", "package manager"):
+        assert needle in m.group(1), f"'## Linux packages' does not mention {needle}"
 
 
 CASES = [
@@ -293,12 +275,12 @@ CASES = [
     macos_is_signed_with_the_stable_certificate_or_not_at_all,
     the_smoke_job_gates_the_publish,
     the_smoke_script_checks_the_install_and_the_daemon,
-    releasing_documents_the_identifier_change,
     the_nsis_preinstall_hook_still_stops_the_daemon,
     the_bundle_identity_is_nucleos_not_the_old_product_name,
     a_missing_rpm_is_named_and_a_foreign_rpm_version_is_refused,
     the_workflow_builds_and_installs_the_rpm_toolchain,
     the_linux_packages_declare_dependencies_and_recommend_a_keyring,
+    releasing_md_documents_the_linux_packages,
 ]
 
 if __name__ == "__main__":

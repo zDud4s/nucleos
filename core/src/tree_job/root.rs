@@ -85,9 +85,12 @@ new agent continues from your report. If you cannot proceed, report Status `bloc
 /// The prompt of the root run: the goal, then the protocol, then the ids the report header needs.
 fn root_prompt(job: &TreeJob) -> String {
     format!(
-        "{}\n\n{ROOT_PROTOCOL}\n\n{}\n\nYour Node ID and your Root ID are both {}. The tree job id is {}: pass it as `id` to `tree_branch_start` (not your Node ID), with your Node ID as `node_id`.",
+        "{}\n\n{}\n\n{ROOT_PROTOCOL}\n\n{}\n\n{}\n\n{}\n\nYour Node ID and your Root ID are both {}. The tree job id is {}: pass it as `id` to `tree_branch_start` (not your Node ID), with your Node ID as `node_id`.",
+        super::node_run::HEADLESS_PREAMBLE,
         job.goal,
         super::node_run::TICKET_RULES,
+        super::node_run::FORMAT_RULES,
+        super::node_run::ORCHESTRATOR_READING_RULES,
         job.root_node_id,
         job.id
     )
@@ -642,6 +645,10 @@ mod tests {
 
         assert!(
             prompt.contains(crate::tree_job::node_run::TICKET_RULES),
+            "{prompt}"
+        );
+        assert!(
+            prompt.starts_with(crate::tree_job::node_run::HEADLESS_PREAMBLE),
             "{prompt}"
         );
     }

@@ -403,11 +403,18 @@ pub(super) fn classifier_governs_tools(
 /// CLI's barrier down for it. The opt-in stays the root's: a root that does not wire the hook
 /// leaves its trees unwired, and a tree that already wires it is not touched. The script already
 /// in the tree is kept, because a project may track its own copy.
-pub(super) fn inherit_classifier_hook(project_root: &std::path::Path, worktree: &std::path::Path) {
+///
+/// `Err` carries the reason when the root wires the hook and the tree still does not after the
+/// attempt. A node start turns that into a failed start instead of letting the run fall back to the
+/// `manual` permission mode in silence (spec D7); other callers may only log it.
+pub(super) fn inherit_classifier_hook(
+    project_root: &std::path::Path,
+    worktree: &std::path::Path,
+) -> Result<(), String> {
     if !crate::governance::autopilot::classifier_hook_is_wired(project_root)
         || crate::governance::autopilot::classifier_hook_is_wired(worktree)
     {
-        return;
+        return Ok(());
     }
     if let Err(error) = crate::governance::autopilot::wire_classifier_hook_keeping_script(worktree)
     {
@@ -416,6 +423,18 @@ pub(super) fn inherit_classifier_hook(project_root: &std::path::Path, worktree: 
             %error,
             "could not give a provisioned worktree the classifier hook its project root wires"
         );
+        return Err(format!(
+            "the classifier hook is not wired in the provisioned worktree {} and could not be: {error}",
+            worktree.display()
+        ));
+    }
+    if crate::governance::autopilot::classifier_hook_is_wired(worktree) {
+        Ok(())
+    } else {
+        Err(format!(
+            "the classifier hook is still not wired in the provisioned worktree {} after wiring it",
+            worktree.display()
+        ))
     }
 }
 
@@ -458,6 +477,43 @@ pub fn progress_timeout_for_mode(base: std::time::Duration, mode: &str) -> std::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_root_that_wires_the_hook_hands_it_to_the_tree_and_the_start_goes_on() {
+        let root = tempfile::tempdir().unwrap();
+        let tree = tempfile::tempdir().unwrap();
+        crate::governance::autopilot::wire_classifier_hook(root.path()).unwrap();
+        assert_eq!(inherit_classifier_hook(root.path(), tree.path()), Ok(()));
+        assert!(crate::governance::autopilot::classifier_hook_is_wired(
+            tree.path()
+        ));
+    }
+
+    #[test]
+    fn a_root_without_the_hook_leaves_the_tree_alone_and_is_not_an_error() {
+        let root = tempfile::tempdir().unwrap();
+        let tree = tempfile::tempdir().unwrap();
+        assert_eq!(inherit_classifier_hook(root.path(), tree.path()), Ok(()));
+        assert!(!crate::governance::autopilot::classifier_hook_is_wired(
+            tree.path()
+        ));
+    }
+
+    #[test]
+    fn a_tree_that_cannot_take_the_hook_fails_with_a_reason() {
+        let root = tempfile::tempdir().unwrap();
+        let tree = tempfile::tempdir().unwrap();
+        crate::governance::autopilot::wire_classifier_hook(root.path()).unwrap();
+        // Unparsable settings: the wiring refuses to touch them, so the tree stays unwired.
+        std::fs::create_dir_all(tree.path().join(".claude")).unwrap();
+        std::fs::write(
+            tree.path().join(".claude").join("settings.json"),
+            "{not json",
+        )
+        .unwrap();
+        let reason = inherit_classifier_hook(root.path(), tree.path()).unwrap_err();
+        assert!(reason.contains("classifier hook"), "{reason}");
+    }
 
     #[test]
     fn a_loadout_with_engine_builtins_never_turns_them_into_nucleos_tool_names() {

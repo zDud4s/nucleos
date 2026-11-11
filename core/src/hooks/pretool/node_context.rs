@@ -69,10 +69,19 @@ pub(super) async fn is_tree_run(state: &AppState, run_id: i64) -> bool {
 /// other tool. `None` for a run without a node or below the warn band.
 pub(super) async fn warn_hint(state: &AppState, run_id: i64) -> Option<String> {
     match node_verdict(state, run_id).await {
+        // A leaf opens no branches, so only an orchestrator is told it may split the rest.
+        Some(v) if v.fill == Fill::Warn && matches!(v.kind.as_str(), "orchestrator" | "root") => {
+            Some(
+                "Your context is filling up. Finish the step in hand, then write your handoff and \
+                 close the node (node_close), or split the rest into child nodes, before the \
+                 hard limit refuses every other tool."
+                    .to_owned(),
+            )
+        }
         Some(v) if v.fill == Fill::Warn => Some(
             "Your context is filling up. Finish the step in hand, then write your handoff and \
-             close the node (node_close), or split the rest into child nodes, before the \
-             hard limit refuses every other tool."
+             close the node (node_close) before the hard limit refuses every other tool. If \
+             the work is not finished, say so in the handoff."
                 .to_owned(),
         ),
         _ => None,

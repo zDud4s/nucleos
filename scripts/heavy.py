@@ -23,6 +23,12 @@ a busy mutex is contention, not a bug, and is answered with exit 75.
 Exit 76: the command's process tree used no CPU for NUCLEOS_HEAVY_STALL_SECS (default 600, 0 = off),
 so it deadlocked or waited on something and was killed: do not re-run it blindly, read the thread
 dump named on stderr.
+Per-kind cap: at most NUCLEOS_HEAVY_CAP_MAX (default 2, 0 = off) concurrent brokers whose
+`--agent` starts with NUCLEOS_HEAVY_CAP_PREFIX (default `leaf-`, empty = off) are in flight at
+once, so leaf self-checks never take every target slot and one stays free for the gate. A capped
+request waits for a place BEFORE it queues for a token (so it cannot block the queue head), within
+the usual wait cap, and then exits 75 like any queue timeout. Places are `cap/<pid>` records in
+the state dir, reaped when their owner dies; fail-open. Nested calls take no second place.
 Disk pressure (dynamic mode only, Windows only via PDH; elsewhere there is no signal and no
 gating): while something is held and a physical disk of the target dir or cwd is at least
 NUCLEOS_HEAVY_DISK_BUSY_PCT busy (default 90, 0 = off), the head of the queue waits (rule
@@ -83,6 +89,10 @@ EXIT_STALLED = 76
 EXIT_SPAWN_FAILED = 71  # sysexits EX_OSERR; core/src/verify/exec.rs reads it
 SPAWN_FAILED_MARKER = "heavy: spawn failed: "
 DEFAULT_STALL_S = 600.0
+# Per-kind cap: at most DEFAULT_CAP_MAX brokers whose --agent starts with DEFAULT_CAP_PREFIX in
+# flight at once (leaf self-checks), so one target slot stays free for the gate.
+DEFAULT_CAP_PREFIX = "leaf-"
+DEFAULT_CAP_MAX = 2
 # The stall watcher's thread dump: this machine's gdb goes first (NUCLEOS_HEAVY_GDB overrides it),
 # deepest processes first, because the stuck one is a test binary under cargo, never cargo.
 GDB_FIXED_PATH = r"C:\Projects\mingw64\bin\gdb.exe"
@@ -3151,7 +3161,87 @@ def _warm_should_yield(directory: Path, lock_hash: str | None) -> bool:
 _PREEMPTED = object()  # `_broker_attempt` stopped a running warm for a real request
 
 
+def cap_prefix() -> str:
+    """`--agent` prefix the per-kind cap counts; "" (NUCLEOS_HEAVY_CAP_PREFIX=) turns it off."""
+    return os.environ.get("NUCLEOS_HEAVY_CAP_PREFIX", DEFAULT_CAP_PREFIX)
+
+
+def cap_max() -> int:
+    """Most concurrent brokers one prefix may have in flight; 0 turns the cap off."""
+    try:
+        return max(0, int(os.environ.get("NUCLEOS_HEAVY_CAP_MAX", DEFAULT_CAP_MAX)))
+    except ValueError:
+        return DEFAULT_CAP_MAX
+
+
+def cap_applies(agent) -> bool:
+    return bool(agent) and bool(cap_prefix()) and cap_max() > 0 and agent.startswith(cap_prefix())
+
+
+def acquire_cap(directory: Path, agent: str, wait_cap: float) -> tuple[bool, float]:
+    """Take one of the `cap_max()` in-flight places of this agent prefix, waiting up to
+    `wait_cap` seconds. A place is a `cap/<pid>` record, reaped when its owner dies. The cap is
+    separate from the token queue on purpose: a capped request waits BEFORE queueing, so it
+    never sits at the head of the queue blocking a gate behind it. Returns (taken, waited_s)."""
+    cap_dir = directory / "cap"
+    me = os.getpid()
+    _, ctime = proc_identity(me)
+    poll = _env_float("NUCLEOS_HEAVY_POLL_S", 0.5)
+    t0 = time.time()
+    while True:
+        with Mutex(directory):
+            cap_dir.mkdir(parents=True, exist_ok=True)
+            mine = [r for _, r in _entries(cap_dir)
+                    if str(r.get("agent") or "").startswith(cap_prefix())]
+            if len(mine) < cap_max():
+                (cap_dir / str(me)).write_text(
+                    json.dumps({"pid": me, "ctime": ctime, "agent": agent}), encoding="utf-8")
+                return True, time.time() - t0
+        if time.time() - t0 >= wait_cap:
+            return False, time.time() - t0
+        time.sleep(poll)
+
+
+def release_cap(directory: Path) -> None:
+    try:
+        _unlink(directory / "cap" / str(os.getpid()))
+    except OSError:
+        pass
+
+
 def broker_run(args: list[str], held: bool = False) -> int:
+    """The per-kind cap around `_broker_run`: at most `cap_max()` brokers whose `--agent` starts
+    with `cap_prefix()` are in flight at once, so one target slot stays free for the gate.
+    Fail-open: a cap that cannot be read or written never blocks the command. A nested call
+    (under a token or a held worktree) takes no second place; its parent has one."""
+    directory = None
+    try:
+        opts, argv = parse_args(args)
+        agent = opts["agent"] or os.environ.get("NUCLEOS_HEAVY_AGENT")
+        if (argv and cap_applies(agent) and not held and os.environ.get("NUCLEOS_HEAVY") != "0"
+                and not os.environ.get("NUCLEOS_HEAVY_TOKEN")
+                and not os.environ.get("NUCLEOS_HEAVY_HELD")):
+            directory = state_dir()
+            directory.mkdir(parents=True, exist_ok=True)
+            took, waited = acquire_cap(
+                directory, agent, wait_max_s(opts["wait-max"], opts["agent"]))
+            if not took:
+                directory = None
+                sys.stderr.write(
+                    f"heavy: {int(waited)}s waiting for one of {cap_max()} in-flight places for "
+                    f"agents named {cap_prefix()}*; nothing was compiled - try again, re-run "
+                    "with the Bash tool timeout set to 600000\n")
+                return EXIT_QUEUE_TIMEOUT
+    except Exception:
+        directory = None
+    try:
+        return _broker_run(args, held)
+    finally:
+        if directory is not None:
+            release_cap(directory)
+
+
+def _broker_run(args: list[str], held: bool = False) -> int:
     """One attempt, or several: a warm that a real request preempted queues again behind it,
     within the wait it was given at the start."""
     deadline = None

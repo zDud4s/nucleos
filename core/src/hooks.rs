@@ -8325,6 +8325,18 @@ mod tests {
     }
 
     #[test]
+    fn a_blocked_rebase_says_a_retry_cannot_help_and_names_the_merge() {
+        let why = Some("feat/x is checked out in C:/wt");
+        let rebase = session_git_reason(7, "rebase", &ticket("blocked", None, why), true);
+        assert!(rebase.contains("checked out in C:/wt"), "{rebase}");
+        assert!(rebase.contains("cannot succeed"), "{rebase}");
+        assert!(rebase.contains("git merge --no-ff <onto>"), "{rebase}");
+
+        let merge = session_git_reason(7, "merge", &ticket("blocked", None, why), true);
+        assert!(merge.contains("run the same command again"), "{merge}");
+    }
+
+    #[test]
     fn a_request_held_for_the_owner_says_so_and_forbids_a_retry() {
         let text = session_git_reason(7, "merge", &ticket("awaiting_owner", None, None), false);
 

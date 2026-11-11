@@ -1378,10 +1378,10 @@ mod tests {
     };
     use serde_json::json;
 
-    /// `limits("leaf")`: warn 80k, wrap 100k. `limits("orchestrator")`: wrap 125k. Block is 200k.
-    const LEAF_IN_WARN: i64 = 90_000;
-    const LEAF_OVER_WRAP: i64 = 110_000;
-    const ORCHESTRATOR_OVER_WRAP: i64 = 130_000;
+    /// `limits("leaf")`: warn 96k, wrap 120k. `limits("orchestrator")`: wrap 150k. Block is 200k.
+    const LEAF_IN_WARN: i64 = 100_000;
+    const LEAF_OVER_WRAP: i64 = 125_000;
+    const ORCHESTRATOR_OVER_WRAP: i64 = 155_000;
     const AT_BLOCK: i64 = 200_000;
 
     /// A tree node's run is `shadow` unless its launch names `worktree` (`tree_job::http::launch`).
@@ -1653,6 +1653,7 @@ mod tests {
             .additional_context
             .expect("a warn must reach the agent");
         assert!(context.contains("handoff"), "got {context:?}");
+        assert!(!context.contains("split the rest"), "got {context:?}");
     }
 
     /// An `open` ticket of the test project guarding `core/a.rs`, routed to the run whose node owns
