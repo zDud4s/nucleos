@@ -1074,7 +1074,9 @@ CONDUCTOR_FEED_TIMEOUT_SECONDS = 1
 WORKFLOW_POINTER = (".nucleos", "workflow", "project.json")
 CONDUCTOR_TOOLS = ("Agent", "Task", "Skill", "TodoWrite", "AskUserQuestion", "ExitPlanMode", "ToolSearch",
                    "TaskOutput", "BashOutput", "SendMessage", "LSP", "Monitor", "TaskStop",
-                   "TaskCreate", "TaskList", "TaskGet", "TaskUpdate", "ListAgents")
+                   "TaskCreate", "TaskList", "TaskGet", "TaskUpdate", "ListAgents",
+                   # How the root watches its trees: wakeups and cron jobs that re-prompt it.
+                   "ScheduleWakeup", "CronCreate", "CronDelete", "CronList")
 CONDUCTOR_MATERIAL_DIRS = (".nucleos",)
 CONDUCTOR_METACHARACTERS = (";", "&", "|", "<", ">", "`", "$(", "\n", "\r")
 CONDUCTOR_GIT_READS = ("status", "log", "diff", "show", "rev-parse", "ls-tree", "cat-file")
@@ -1797,8 +1799,89 @@ def _conductor_env_prefix_accepts(tokens, cwd):
     )
 
 
-def _conductor_part_accepts(part, cwd):
-    """`(accepted, folder afterwards)` for one `&&` / `;` part; only `cd` moves the folder."""
+# Read-only file readers the root may point at its own state: `{name: (switches, valued flags,
+# whether the first positional is a pattern)}`. No follow mode (`tail -f`, `Get-Content -Wait`).
+CONDUCTOR_STATE_READERS = {
+    "cat": (("-n",), (), False),
+    "type": ((), (), False),
+    "head": ((), ("-n",), False),
+    "tail": ((), ("-n",), False),
+    "get-content": (("-raw",), ("-path", "-literalpath", "-totalcount", "-head", "-first", "-tail",
+                                "-last", "-encoding"), False),
+    "select-string": (("-simplematch", "-casesensitive", "-quiet", "-list", "-notmatch", "-raw"),
+                      ("-pattern", "-path", "-literalpath", "-context", "-encoding"), True),
+}
+# `(<reader>).Substring(N[, M])`, the PowerShell way to page a big tool-results file.
+CONDUCTOR_SUBSTRING = re.compile(
+    r"\(\s*(?P<inner>[^()]+?)\s*\)\.substring\(\s*[0-9]+\s*(?:,\s*[0-9]+\s*)?\)", re.IGNORECASE
+)
+
+
+def _conductor_state_read_target(path, state, cwd):
+    """Whether a reader's file lies in conductor material or a Claude Code `tool-results` folder.
+    No wildcards: what they expand to is not the path checked here."""
+    if not path or any(mark in path for mark in "*?["):
+        return False
+    target = _conductor_path(path, cwd)
+    if _conductor_material(target, state, cwd):
+        return True
+    claude_projects = _conductor_path(os.path.join("~", ".claude", "projects"), cwd)
+    if not _under(target, claude_projects) or target == claude_projects:
+        return False
+    return "tool-results" in os.path.relpath(target, claude_projects).split(os.sep)[:-1]
+
+
+def _conductor_state_read_accepts(tokens, state, cwd):
+    """`cat|type|head|tail|Get-Content|Select-String <file>...` whose every file is state.
+
+    The caller has already refused redirects, pipes (but a closing `| tail|head -N`) and any
+    other metacharacter, so a reader accepted here only prints.
+    """
+    name, args = tokens[0].lower(), tokens[1:]
+    spec = CONDUCTOR_STATE_READERS.get(name)
+    if spec is None:
+        return False
+    switches, valued, pattern_first = spec
+    paths, pattern_seen, index = [], not pattern_first, 0
+    while index < len(args):
+        arg, low = args[index], args[index].lower()
+        if name in ("head", "tail") and re.fullmatch(r"-[0-9]+", arg):
+            index += 1
+            continue
+        if low.startswith("-") and len(low) > 1:
+            if low in switches:
+                index += 1
+                continue
+            if low not in valued or index + 1 >= len(args):
+                return False
+            value = args[index + 1]
+            if low in ("-path", "-literalpath"):
+                paths.append(value)
+            elif low == "-pattern":
+                pattern_seen = True
+            elif low == "-encoding":
+                if not re.fullmatch(r"[A-Za-z0-9-]+", value):
+                    return False
+            elif not re.fullmatch(r"[0-9][0-9,]*", value):
+                return False
+            index += 2
+            continue
+        if pattern_seen:
+            paths.append(arg)
+        else:
+            pattern_seen = True
+        index += 1
+    return bool(paths) and all(_conductor_state_read_target(path, state, cwd) for path in paths)
+
+
+def _conductor_part_accepts(part, cwd, state=None, reads=True):
+    """`(accepted, folder afterwards)` for one `&&` / `;` part; only `cd` moves the folder.
+    `reads` is False when the command was redirected: a state read must only print."""
+    state = state or {}
+    substring = CONDUCTOR_SUBSTRING.fullmatch(part)
+    if substring:
+        tokens = _conductor_part_tokens(substring.group("inner"))
+        return bool(reads and tokens and _conductor_state_read_accepts(tokens, state, cwd)), cwd
     # A PowerShell call operator, for the quoted program path: not for the broker, git or a `cd`.
     called = re.match(r"&\s+(?=\S)", part)
     if called:
@@ -1824,11 +1907,14 @@ def _conductor_part_accepts(part, cwd):
         or _conductor_env_prefix_accepts(tokens, cwd)
         or _conductor_git_accepts(tokens, cwd)
         or _conductor_small_accepts(tokens)
+        or (reads and _conductor_state_read_accepts(tokens, state, cwd))
     ), cwd
 
 
 def _conductor_strip_tails(command, state, cwd):
-    """`(command without its closing `| tail -N` / `| head -N` and output redirects, ok)`."""
+    """`(command without its closing `| tail -N` / `| head -N` and output redirects, ok, any
+    redirect seen)`."""
+    seen = False
     while True:
         pipe = CONDUCTOR_PIPE_TAIL.search(command)
         if pipe:
@@ -1836,20 +1922,21 @@ def _conductor_strip_tails(command, state, cwd):
             continue
         stripped, ok, redirected = _conductor_strip_redirects(command, state, cwd)
         if not ok:
-            return command, False
+            return command, False, True
         if not redirected:
-            return command, True
+            return command, True, seen
+        seen = True
         command = stripped
 
 
 def _conductor_command_accepted(command, state, cwd):
     """Whether every `&&` / `;` part of `command` is accepted on its own, after the tails are cut."""
-    command, ok = _conductor_strip_tails(command.strip(), state, cwd)
+    command, ok, redirected = _conductor_strip_tails(command.strip(), state, cwd)
     parts = CONDUCTOR_JOIN.split(command)
     if not ok or len(parts) > CONDUCTOR_MAX_PARTS:
         return False
     for part in parts:
-        accepted, cwd = _conductor_part_accepts(part.strip(), cwd)
+        accepted, cwd = _conductor_part_accepts(part.strip(), cwd, state, reads=not redirected)
         if not accepted:
             return False
     return True

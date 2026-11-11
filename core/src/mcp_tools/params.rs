@@ -103,6 +103,43 @@ pub(super) struct SpecFinishParams {
     pub(super) project_root: Option<String>,
 }
 
+/// What `spec_backlog` answers: a summary by default, one spec in full, or the full list.
+#[derive(Default, serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub(super) struct SpecBacklogParams {
+    /// Only the specs in this status (e.g. `blocked`, `in_progress`, `done`).
+    pub(super) status: Option<String>,
+    /// One spec, by id, in full. Wins over `status` and `full`.
+    pub(super) spec_id: Option<String>,
+    /// The full list of specs (one per line) instead of the summary; `status` still filters it.
+    pub(super) full: Option<bool>,
+}
+
+/// The body of `POST /backlog/finish/cancel`: at least one of the two.
+#[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub(super) struct SpecFinishCancelParams {
+    /// Cancel the pending finish work of every spec of the project with this root.
+    pub(super) project_root: Option<String>,
+    /// Cancel the pending finish work of these specs.
+    pub(super) spec_ids: Option<Vec<String>>,
+}
+
+impl SpecFinishCancelParams {
+    /// PURE: the route's body, holding only the fields given; refused when it names nothing.
+    pub(super) fn into_body(self) -> Result<serde_json::Value, String> {
+        let mut body = serde_json::Map::new();
+        if let Some(root) = self.project_root.filter(|root| !root.trim().is_empty()) {
+            body.insert("project_root".to_owned(), serde_json::Value::String(root));
+        }
+        if let Some(ids) = self.spec_ids.filter(|ids| !ids.is_empty()) {
+            body.insert("spec_ids".to_owned(), serde_json::json!(ids));
+        }
+        if body.is_empty() {
+            return Err("spec_finish_cancel needs `project_root` or `spec_ids`".to_owned());
+        }
+        Ok(serde_json::Value::Object(body))
+    }
+}
+
 #[derive(serde::Deserialize, rmcp::schemars::JsonSchema)]
 pub(super) struct JobParams {
     pub(super) project_id: String,

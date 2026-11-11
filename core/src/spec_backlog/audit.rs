@@ -8,7 +8,7 @@ use sqlx::SqlitePool;
 
 use super::model::{Criterion, CriterionStatus, Question, Spec, SpecKind, SpecStatus};
 use super::store::{self, StoreError};
-use super::verdict::{ReviewFacts, ReviewerRun, Verdict, VerifyState, done};
+use super::verdict::{ReviewFacts, ReviewerRun, Verdict, VerifyState, done, weigh_doubts};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CriterionReview {
@@ -133,6 +133,19 @@ pub fn evidence_exists(worktree: &Path, evidence: &str) -> bool {
 /// other code, and the audit leaves them alone.
 const DOUBT_QUESTION_PREFIX: &str = "Owner decision needed for criterion: ";
 
+/// The wording of the one question an inconclusive audit puts to the owner about the whole spec.
+const INCONCLUSIVE_QUESTION_PREFIX: &str = "Owner decision needed for an inconclusive spec: ";
+
+/// How an audit runs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AuditMode {
+    /// False before any tree exists: a criterion's doubt there means the work was not started, so
+    /// no per-criterion question is raised. An inconclusive verdict asks the owner either way.
+    pub raise_questions: bool,
+    /// The spec file's header declares it implemented (`verdict::declares_implemented`).
+    pub declared_implemented: bool,
+}
+
 pub async fn audit(
     pool: &SqlitePool,
     spec_id: &str,
@@ -141,11 +154,16 @@ pub async fn audit(
     reviewer: &dyn ReviewerRunner,
     verify: &dyn VerifyRunner,
 ) -> Result<AuditReport, AuditError> {
-    audit_with(pool, spec_id, worktree, lineage, reviewer, verify, true).await
+    let mode = AuditMode {
+        raise_questions: true,
+        declared_implemented: false,
+    };
+    audit_with_mode(pool, spec_id, worktree, lineage, reviewer, verify, mode).await
 }
 
 /// `audit`, before any tree exists: criteria are reviewed and a Done verdict counts, but a doubt here means the
-/// work was not started, so no owner question is raised or settled.
+/// work was not started, so no per-criterion question is raised or settled. An inconclusive verdict
+/// still puts its one question to the owner.
 pub async fn audit_before_tree(
     pool: &SqlitePool,
     spec_id: &str,
@@ -154,17 +172,29 @@ pub async fn audit_before_tree(
     reviewer: &dyn ReviewerRunner,
     verify: &dyn VerifyRunner,
 ) -> Result<AuditReport, AuditError> {
-    audit_with(pool, spec_id, worktree, lineage, reviewer, verify, false).await
+    audit_with_mode(
+        pool,
+        spec_id,
+        worktree,
+        lineage,
+        reviewer,
+        verify,
+        AuditMode::default(),
+    )
+    .await
 }
 
-async fn audit_with(
+/// `audit` or `audit_before_tree` (by `mode.raise_questions`), also told what the spec's header
+/// says. A verdict held back by doubt alone is `Inconclusive`: the spec goes to `needs_owner` with
+/// one owner question, and no tree is worth opening for it.
+pub async fn audit_with_mode(
     pool: &SqlitePool,
     spec_id: &str,
     worktree: &Path,
     lineage: &SpecLineage,
     reviewer: &dyn ReviewerRunner,
     verify: &dyn VerifyRunner,
-    raise_questions: bool,
+    mode: AuditMode,
 ) -> Result<AuditReport, AuditError> {
     let spec = store::get_spec(pool, spec_id)
         .await?
@@ -248,7 +278,7 @@ async fn audit_with(
             doubts.push(format!("{DOUBT_QUESTION_PREFIX}{}", criterion.text));
         }
     }
-    if raise_questions {
+    if mode.raise_questions {
         store::settle_questions(pool, spec_id, DOUBT_QUESTION_PREFIX, &doubts).await?;
     }
     let reviewed = store::list_criteria(pool, spec_id).await?;
@@ -265,12 +295,30 @@ async fn audit_with(
         reviewers: vec![answer.run.clone()],
         existing_evidence,
     };
-    let verdict = done(&spec, &reviewed, verify_state, &facts);
-    let status = if verdict == Verdict::Done {
-        SpecStatus::Done
-    } else {
-        SpecStatus::Audited
+    let verdict = weigh_doubts(
+        done(&spec, &reviewed, verify_state, &facts),
+        mode.declared_implemented,
+    );
+    let status = match verdict {
+        Verdict::Done => SpecStatus::Done,
+        Verdict::Inconclusive(_) => SpecStatus::NeedsOwner,
+        Verdict::NotDone(_) => SpecStatus::Audited,
     };
+    // One open question while the audit is inconclusive, closed by the first audit that is not.
+    let inconclusive = matches!(verdict, Verdict::Inconclusive(_)).then(|| {
+        format!(
+            "{INCONCLUSIVE_QUESTION_PREFIX}{} ({}). Every unsettled criterion is in doubt, none \
+             is a clear miss, so another tree would not settle it. Is the spec done?",
+            spec.path, spec.title
+        )
+    });
+    store::settle_questions(
+        pool,
+        spec_id,
+        INCONCLUSIVE_QUESTION_PREFIX,
+        inconclusive.as_slice(),
+    )
+    .await?;
     let reason = (status != SpecStatus::Done).then(|| format!("{verdict:?}"));
     store::set_audit_result(pool, spec_id, status, reason.as_deref(), &spec.content_sha)
         .await
@@ -545,7 +593,152 @@ mod tests {
         match verdict {
             Verdict::NotDone(reasons) => reasons,
             Verdict::Done => panic!("expected NotDone, got Done"),
+            Verdict::Inconclusive(reasons) => {
+                panic!("expected NotDone, got Inconclusive({reasons:?})")
+            }
         }
+    }
+
+    async fn run_with_mode(
+        fx: &Fixture,
+        reviewer: &FakeReviewer,
+        verify: &FakeVerify,
+        mode: AuditMode,
+    ) -> Result<AuditReport, AuditError> {
+        audit_with_mode(
+            &fx.pool,
+            &fx.id,
+            fx.worktree.path(),
+            &SpecLineage::default(),
+            reviewer,
+            verify,
+            mode,
+        )
+        .await
+    }
+
+    fn open_inconclusive_questions(questions: &[Question]) -> usize {
+        questions
+            .iter()
+            .filter(|q| q.status == "open" && q.question.starts_with(INCONCLUSIVE_QUESTION_PREFIX))
+            .count()
+    }
+
+    /// The 2026-11-10 foundation-spec audit: every criterion in doubt, verify not green. Before any
+    /// tree that is inconclusive, never NotDone: the spec goes to the owner with one question.
+    #[tokio::test]
+    async fn only_doubts_and_verify_not_green_go_to_the_owner() {
+        let fx = Fixture::new(&["the widget renders", "the widget resizes"]).await;
+        let reviewer = FakeReviewer::answering(
+            "review-1",
+            None,
+            vec![
+                review(1, CriterionStatus::Doubt, Some(GOOD)),
+                review(2, CriterionStatus::Doubt, None),
+            ],
+        );
+        let verify = FakeVerify::new(VerifyState::Unknown);
+
+        let report = fx.run_before_tree(&reviewer, &verify).await.unwrap();
+
+        let Verdict::Inconclusive(reasons) = &report.verdict else {
+            panic!("expected Inconclusive, got {:?}", report.verdict);
+        };
+        assert!(
+            reasons.contains(&NotDoneReason::VerifyNotGreen),
+            "{reasons:?}"
+        );
+        assert!(
+            !reasons.contains(&NotDoneReason::DeclaredImplemented),
+            "{reasons:?}"
+        );
+        assert_eq!(report.status, SpecStatus::NeedsOwner);
+        let spec = fx.spec().await;
+        assert_eq!(spec.status, SpecStatus::NeedsOwner);
+        assert!(
+            spec.status_reason
+                .as_deref()
+                .is_some_and(|r| r.starts_with("Inconclusive")),
+            "{:?}",
+            spec.status_reason
+        );
+        let questions = fx.questions().await;
+        // One spec-level question, and none per criterion before a tree.
+        assert_eq!(questions.len(), 1, "{questions:?}");
+        assert_eq!(open_inconclusive_questions(&questions), 1);
+
+        // Asked once across audits, and closed by the first audit that is not inconclusive.
+        let again = FakeReviewer::answering(
+            "review-2",
+            None,
+            vec![
+                review(1, CriterionStatus::Doubt, Some(GOOD)),
+                review(2, CriterionStatus::Doubt, None),
+            ],
+        );
+        fx.run_before_tree(&again, &verify).await.unwrap();
+        assert_eq!(open_inconclusive_questions(&fx.questions().await), 1);
+        let done = FakeReviewer::answering("review-3", None, vec![met(1, GOOD), met(2, GOOD)]);
+        let green = FakeVerify::new(VerifyState::Green);
+        let report = fx.run_before_tree(&done, &green).await.unwrap();
+        assert_eq!(report.verdict, Verdict::Done);
+        assert_eq!(open_inconclusive_questions(&fx.questions().await), 0);
+    }
+
+    #[tokio::test]
+    async fn a_clear_miss_beside_doubts_stays_not_done() {
+        let fx = Fixture::new(&["the widget renders", "the widget resizes"]).await;
+        let reviewer = FakeReviewer::answering(
+            "review-1",
+            None,
+            vec![
+                review(1, CriterionStatus::Doubt, None),
+                review(2, CriterionStatus::Unmet, None),
+            ],
+        );
+        let verify = FakeVerify::new(VerifyState::Unknown);
+
+        let report = fx.run_before_tree(&reviewer, &verify).await.unwrap();
+
+        assert!(
+            matches!(report.verdict, Verdict::NotDone(_)),
+            "{:?}",
+            report.verdict
+        );
+        assert_eq!(report.status, SpecStatus::Audited);
+        assert_eq!(open_inconclusive_questions(&fx.questions().await), 0);
+    }
+
+    /// A header saying `Estado: implementado` weighs green doubts toward inconclusive too, and the
+    /// verdict says why.
+    #[tokio::test]
+    async fn a_header_declaring_it_implemented_makes_green_doubts_inconclusive() {
+        let fx = Fixture::new(&["the widget renders"]).await;
+        let reviewer = FakeReviewer::answering(
+            "review-1",
+            None,
+            vec![review(1, CriterionStatus::Doubt, None)],
+        );
+        let verify = FakeVerify::new(VerifyState::Green);
+        let mode = AuditMode {
+            raise_questions: false,
+            declared_implemented: true,
+        };
+
+        let report = run_with_mode(&fx, &reviewer, &verify, mode).await.unwrap();
+
+        assert_eq!(
+            report.verdict,
+            Verdict::Inconclusive(vec![
+                NotDoneReason::Unresolved {
+                    ordinal: 1,
+                    status: CriterionStatus::Doubt,
+                },
+                NotDoneReason::DeclaredImplemented,
+            ])
+        );
+        assert_eq!(fx.spec().await.status, SpecStatus::NeedsOwner);
+        assert_eq!(open_inconclusive_questions(&fx.questions().await), 1);
     }
 
     fn has_reason_text(spec: &Spec) -> bool {

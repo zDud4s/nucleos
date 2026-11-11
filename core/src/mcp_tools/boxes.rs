@@ -244,6 +244,7 @@ pub const WORKTREE_BOX_TOOLS: &[&str] = &[
     "record",
     "spec_backlog",
     "spec_finish",
+    "spec_finish_cancel",
     "task_claim",
     "task_decline",
     "task_done",

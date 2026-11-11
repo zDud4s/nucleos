@@ -136,6 +136,8 @@ pub struct FinishReport {
     /// Still queued because the disk was below the floor; the finish intent stays, and the sweeper
     /// runs another pass later.
     pub deferred: Vec<String>,
+    /// Not launched because the owner cancelled their finish (`POST /backlog/finish/cancel`).
+    pub cancelled: Vec<String>,
     pub cycles: Vec<Cycle>,
 }
 
@@ -370,6 +372,11 @@ async fn prepare(
         Ok(report) if report.status == SpecStatus::Done && report.verdict == Verdict::Done => {
             Prepared::Done
         }
+        // Doubt alone: a tree cannot settle it, so the owner decides and no tree is opened.
+        Ok(report) if matches!(report.verdict, Verdict::Inconclusive(_)) => {
+            mark_needs_owner(pool, &spec.id, &inconclusive_reason(&report)).await?;
+            Prepared::NeedsOwner
+        }
         Ok(_) => Prepared::Ready,
         Err(reason) => {
             // Said once in the feed, so a spec that went to its tree unaudited is not silent.
@@ -412,6 +419,15 @@ async fn goal_for(
         ));
     }
     Ok(goal)
+}
+
+/// The `needs_owner` reason of a spec whose audit is inconclusive.
+fn inconclusive_reason(report: &AuditReport) -> String {
+    format!(
+        "the audit is inconclusive ({:?}): every unsettled criterion is in doubt, so no tree is \
+         opened; the owner decides whether the spec is done",
+        report.verdict
+    )
 }
 
 /// How many criteria are in doubt when doubt is all that keeps the spec from done.
@@ -529,6 +545,13 @@ async fn drive_spec(
                     finished: true,
                 });
             }
+            Ok(report) if matches!(report.verdict, Verdict::Inconclusive(_)) => {
+                mark_needs_owner(pool, &spec.id, &inconclusive_reason(&report)).await?;
+                return Ok(SpecRun {
+                    trees,
+                    finished: false,
+                });
+            }
             Ok(report) => {
                 if let Some(doubts) = only_doubts_left(&report) {
                     mark_needs_owner(
@@ -629,6 +652,13 @@ pub async fn finish_with<'a>(
         if spec.status == SpecStatus::Abandoned
             || matches!(spec.kind, SpecKind::Review | SpecKind::Note)
         {
+            continue;
+        }
+        // Cancelled by the owner: neither prepared nor launched, and what waits on it is blocked.
+        // A tree a restart would adopt is already open, and a cancel never touches one.
+        if adoptable_tree(&spec).is_none() && store::finish_cancelled(pool, &spec.id).await? {
+            stopped.insert(spec.id.clone());
+            report.cancelled.push(spec.id);
             continue;
         }
         match spec.status {
@@ -792,6 +822,20 @@ pub async fn finish_with<'a>(
                     index += 1;
                     continue;
                 }
+                // A cancel that arrived while this pass ran still holds the launch back. It is read
+                // only while no tree runs: the running futures are not polled while this loop
+                // awaits, so a read here could wait forever on a connection one of them holds (a
+                // one-connection pool deadlocks outright). With trees running, the check waits for
+                // the next launch made from an idle loop, or the next pass.
+                if running.is_empty()
+                    && adoptable_tree(&queue[index].spec).is_none()
+                    && store::finish_cancelled(pool, &queue[index].spec.id).await?
+                {
+                    let cancelled = queue.remove(index);
+                    stopped.insert(cancelled.spec.id.clone());
+                    report.cancelled.push(cancelled.spec.id);
+                    continue;
+                }
                 let Waiting { spec, owned, .. } = queue.remove(index);
                 let id = spec.id.clone();
                 running_paths.push((id.clone(), owned));
@@ -844,6 +888,7 @@ pub async fn finish_with<'a>(
         &mut report.refused,
         &mut report.blocked,
         &mut report.deferred,
+        &mut report.cancelled,
     ] {
         list.sort();
         list.dedup();
@@ -936,6 +981,79 @@ pub fn claim_project(project_id: &str) -> Option<FinishClaim> {
     claims.insert(project_id.to_owned()).then(|| FinishClaim {
         project_id: project_id.to_owned(),
     })
+}
+
+/// What a finish cancel names: every spec of a project, some specs by id, or both.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CancelTarget {
+    pub project_id: Option<String>,
+    pub spec_ids: Vec<String>,
+}
+
+/// How a finish cancel landed, each list sorted.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct CancelReport {
+    /// No finish pass launches these until a later finish request names them again.
+    pub cancelled: Vec<String>,
+    /// Already have an open tree, which the cancel leaves alone.
+    pub already_launched: Vec<String>,
+}
+
+/// Stops every finish pass, the running one and the sweeper's included, from launching the named
+/// specs that have no tree yet. A spec with an open tree is only reported. A project cancel takes
+/// its done, abandoned, review and note specs out of the count (none is ever launched) and drops
+/// the project's finish intent, so the sweeper does not come back for it. An unknown spec id is
+/// refused before anything is written.
+pub async fn cancel_finish(
+    pool: &SqlitePool,
+    target: &CancelTarget,
+) -> Result<CancelReport, StoreError> {
+    let mut specs: Vec<Spec> = Vec::new();
+    if let Some(project_id) = &target.project_id {
+        for spec in store::list_specs_by_project(pool, Some(project_id)).await? {
+            if !matches!(spec.status, SpecStatus::Done | SpecStatus::Abandoned)
+                && !matches!(spec.kind, SpecKind::Review | SpecKind::Note)
+            {
+                specs.push(spec);
+            }
+        }
+    }
+    for spec_id in &target.spec_ids {
+        let spec = store::get_spec(pool, spec_id)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("spec {spec_id}")))?;
+        specs.push(spec);
+    }
+    let mut report = CancelReport::default();
+    for spec in specs {
+        if adoptable_tree(&spec).is_some() {
+            report.already_launched.push(spec.id);
+        } else {
+            report.cancelled.push(spec.id);
+        }
+    }
+    for list in [&mut report.cancelled, &mut report.already_launched] {
+        list.sort();
+        list.dedup();
+    }
+    store::cancel_finish(pool, &report.cancelled).await?;
+    if let Some(project_id) = &target.project_id {
+        store::drop_finish_intent(pool, project_id).await?;
+    }
+    Ok(report)
+}
+
+/// Lifts the finish cancel of the specs a new finish request names: the one spec, or every spec of
+/// the project. Only a request lifts it; a sweeper pass never does.
+pub async fn lift_cancel(pool: &SqlitePool, scope: &FinishScope) -> Result<(), StoreError> {
+    match scope {
+        FinishScope::All { project_id } => {
+            store::clear_project_finish_cancels(pool, project_id.as_deref()).await
+        }
+        FinishScope::One { spec_id } => {
+            store::clear_finish_cancels(pool, std::slice::from_ref(spec_id)).await
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1506,6 +1624,241 @@ mod tests {
         .unwrap();
 
         assert_eq!(launcher.requests().len(), 2);
+    }
+
+    /// Every unsettled criterion in doubt and verify not green: what `audit` turns into.
+    fn inconclusive() -> Verdict {
+        Verdict::Inconclusive(vec![
+            NotDoneReason::VerifyNotGreen,
+            NotDoneReason::Unresolved {
+                ordinal: 2,
+                status: CriterionStatus::Doubt,
+            },
+        ])
+    }
+
+    /// Extracts like the real one and audits every time as inconclusive.
+    struct InconclusivePreparer {
+        pool: SqlitePool,
+        audits: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl SpecPreparer for InconclusivePreparer {
+        async fn extract(&self, spec_id: &str) -> Result<(), String> {
+            store::set_extraction_result(
+                &self.pool,
+                spec_id,
+                SpecKind::Spec,
+                SpecStatus::Extracted,
+                None,
+            )
+            .await
+            .map_err(|error| error.to_string())
+        }
+
+        async fn audit(
+            &self,
+            _spec_id: &str,
+            _lineage: &SpecLineage,
+        ) -> Result<AuditReport, String> {
+            self.audits.fetch_add(1, Ordering::SeqCst);
+            Ok(AuditReport {
+                reviewer_run_id: "reviewer-1".to_owned(),
+                verify: VerifyState::Unknown,
+                verdict: inconclusive(),
+                status: SpecStatus::NeedsOwner,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn an_inconclusive_audit_before_the_tree_opens_no_tree() {
+        let pool = crate::testdb::fresh_pool().await;
+        let id = add_spec(&pool, "inconclusive-before", SpecStatus::Discovered).await;
+        let log = Log::default();
+        let launcher = FakeLauncher::new(&log);
+        let prep = InconclusivePreparer {
+            pool: pool.clone(),
+            audits: AtomicUsize::new(0),
+        };
+        let mut config = cfg();
+        config.owned_paths = disjoint(&[&id]);
+
+        let report = finish_with(
+            &pool,
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &prep,
+            },
+            &config,
+            scope_all(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            launcher.requests().len(),
+            0,
+            "a doubt is not paid with a tree"
+        );
+        assert_eq!(prep.audits.load(Ordering::SeqCst), 1);
+        assert_eq!(report.needs_owner, vec![id.clone()]);
+        let spec = store::get_spec(&pool, &id).await.unwrap().unwrap();
+        assert_eq!(spec.status, SpecStatus::NeedsOwner);
+        assert!(
+            spec.status_reason
+                .unwrap_or_default()
+                .contains("inconclusive")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_inconclusive_audit_after_a_tree_opens_no_second_tree() {
+        let pool = crate::testdb::fresh_pool().await;
+        let id = add_spec(&pool, "inconclusive-after", SpecStatus::Extracted).await;
+        seed_criteria(&pool, &id, &[CriterionStatus::Met, CriterionStatus::Doubt]).await;
+        let log = Log::default();
+        let launcher = FakeLauncher::new(&log);
+        let prep = ScriptedAuditPreparer {
+            verify: VerifyState::Red,
+            verdict: inconclusive(),
+        };
+        let mut config = cfg();
+        config.max_rounds = 3;
+        config.owned_paths = disjoint(&[&id]);
+
+        finish_with(
+            &pool,
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &prep,
+            },
+            &config,
+            scope_all(),
+        )
+        .await
+        .unwrap();
+
+        // Red verify alone would pay for another round; an inconclusive verdict does not.
+        assert_eq!(launcher.requests().len(), 1);
+        let spec = store::get_spec(&pool, &id).await.unwrap().unwrap();
+        assert_eq!(spec.status, SpecStatus::NeedsOwner);
+        assert!(
+            spec.status_reason
+                .unwrap_or_default()
+                .contains("inconclusive")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_spec_is_not_launched_and_an_open_tree_is_left_alone() {
+        let pool = crate::testdb::fresh_pool().await;
+        let held = add_spec(&pool, "held", SpecStatus::Extracted).await;
+        let free = add_spec(&pool, "free", SpecStatus::Extracted).await;
+        let open = add_spec(&pool, "open", SpecStatus::Extracted).await;
+        let open_tree = "tree-open";
+        store::set_status(&pool, &open, SpecStatus::InProgress, None)
+            .await
+            .unwrap();
+        store::set_tree_id(&pool, &open, open_tree).await.unwrap();
+        store::cancel_finish(&pool, &[held.clone(), open.clone()])
+            .await
+            .unwrap();
+        let log = Log::default();
+        let launcher = FakeLauncher::new(&log);
+        let prep = FakePreparer::new(&pool, &log, &[&free, &open]);
+        let mut config = cfg();
+        config.owned_paths = disjoint(&[&held, &free, &open]);
+
+        let report = finish_with(
+            &pool,
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &prep,
+            },
+            &config,
+            scope_all(),
+        )
+        .await
+        .unwrap();
+
+        let launched: Vec<String> = launcher
+            .requests()
+            .iter()
+            .map(|request| request.spec_id.clone())
+            .collect();
+        assert_eq!(launched, vec![free.clone()]);
+        assert_eq!(launcher.waited_tree_ids(), vec![open_tree]);
+        assert_eq!(report.cancelled, vec![held.clone()]);
+        assert_eq!(status_of(&pool, &held).await, SpecStatus::Extracted);
+        assert_eq!(status_of(&pool, &open).await, SpecStatus::Done);
+        assert!(
+            store::finish_cancelled(&pool, &held).await.unwrap(),
+            "only a new finish request lifts a cancel"
+        );
+    }
+
+    /// Cancels every other spec the first time it runs a tree, like a cancel arriving mid-pass.
+    struct CancellingLauncher {
+        inner: FakeLauncher,
+        pool: SqlitePool,
+        specs: Vec<String>,
+        cancelled: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl TreeLauncher for CancellingLauncher {
+        async fn run_tree(&self, request: &TreeRequest) -> Result<TreeOutcome, String> {
+            if self.cancelled.fetch_add(1, Ordering::SeqCst) == 0 {
+                let others: Vec<String> = self
+                    .specs
+                    .iter()
+                    .filter(|id| **id != request.spec_id)
+                    .cloned()
+                    .collect();
+                store::cancel_finish(&self.pool, &others).await.unwrap();
+            }
+            self.inner.run_tree(request).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cancel_that_arrives_mid_pass_holds_back_the_next_launch() {
+        let pool = crate::testdb::fresh_pool().await;
+        let a = add_spec(&pool, "first", SpecStatus::Extracted).await;
+        let b = add_spec(&pool, "second", SpecStatus::Extracted).await;
+        let log = Log::default();
+        let launcher = CancellingLauncher {
+            inner: FakeLauncher::new(&log),
+            pool: pool.clone(),
+            specs: vec![a.clone(), b.clone()],
+            cancelled: AtomicUsize::new(0),
+        };
+        let prep = FakePreparer::new(&pool, &log, &[&a, &b]);
+        let mut config = cfg();
+        config.max_parallel = 1;
+        config.owned_paths = disjoint(&[&a, &b]);
+
+        let report = finish_with(
+            &pool,
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &prep,
+            },
+            &config,
+            scope_all(),
+        )
+        .await
+        .unwrap();
+
+        let requests = launcher.inner.requests();
+        assert_eq!(requests.len(), 1, "the second spec is never launched");
+        let launched = requests[0].spec_id.clone();
+        let held = if launched == a { b } else { a };
+        assert_eq!(report.cancelled, vec![held.clone()]);
+        assert_eq!(report.done, vec![launched]);
+        assert_eq!(status_of(&pool, &held).await, SpecStatus::Extracted);
     }
 
     #[tokio::test]

@@ -558,6 +558,17 @@ pub async fn open(pool: &SqlitePool) -> Result<Vec<Decision>, DecisionError> {
     Ok(rows)
 }
 
+/// Every decision of tree `tree_id`, open or answered, oldest first: what `GET /trees/{id}` reads
+/// to show a parked branch's question and the decisions still waiting.
+pub async fn for_tree(pool: &SqlitePool, tree_id: &str) -> Result<Vec<Decision>, DecisionError> {
+    let rows: Vec<Decision> =
+        sqlx::query_as(select_decisions!("WHERE tree_id = ? ORDER BY at, id"))
+            .bind(tree_id)
+            .fetch_all(pool)
+            .await?;
+    Ok(rows)
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::{DateTime, FixedOffset};
@@ -1127,6 +1138,32 @@ mod tests {
             rows[0].clone(),
         ];
         assert_eq!(listed, expected);
+    }
+
+    #[tokio::test]
+    async fn for_tree_lists_only_the_rows_of_that_tree_oldest_first() {
+        let pool = crate::testdb::fresh_pool().await;
+        for decision in &mixed_rows() {
+            seed_decision(&pool, decision).await;
+        }
+        let mut elsewhere = row("e-elsewhere", T1, STATUS_OPEN, None, Some(ORIGIN_AGENT));
+        elsewhere.tree_id = Some("another-tree".to_owned());
+        seed_decision(&pool, &elsewhere).await;
+        let mut ownerless = row("f-ownerless", T1, STATUS_OPEN, None, Some(ORIGIN_AGENT));
+        ownerless.tree_id = None;
+        seed_decision(&pool, &ownerless).await;
+
+        let listed = for_tree(&pool, TREE).await.unwrap();
+
+        assert_eq!(
+            ids(&listed),
+            ["a-answered", "b-answered", "d-open", "c-open"]
+        );
+        assert_eq!(
+            ids(&for_tree(&pool, "another-tree").await.unwrap()),
+            ["e-elsewhere"]
+        );
+        assert!(for_tree(&pool, "no-such-tree").await.unwrap().is_empty());
     }
 
     #[tokio::test]

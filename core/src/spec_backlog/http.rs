@@ -22,6 +22,13 @@ struct FinishRequest {
     project_root: Option<String>,
 }
 
+/// `POST /backlog/finish/cancel`: a project root, spec ids, or both; at least one.
+#[derive(Debug, Deserialize)]
+struct CancelRequest {
+    project_root: Option<String>,
+    spec_ids: Option<Vec<String>>,
+}
+
 #[derive(Debug, Deserialize)]
 struct ScanRequest {
     project_id: Option<String>,
@@ -65,6 +72,7 @@ pub fn routes() -> Router<AppState> {
         .route("/specs/{id}/deps", post(post_deps))
         .route("/backlog", get(get_backlog))
         .route("/backlog/finish", post(post_finish))
+        .route("/backlog/finish/cancel", post(post_finish_cancel))
         .route("/decisions", get(get_decisions))
         .route("/decisions/{id}", post(post_decision))
 }
@@ -257,6 +265,10 @@ async fn post_finish(State(state): State<AppState>, Json(request): Json<FinishRe
     if let Err(error) = finish::resolve_project(&state, &project_id).await {
         return refuse(StatusCode::UNPROCESSABLE_ENTITY, error);
     }
+    // A new request is the owner asking again: it lifts the cancel of the specs it names.
+    if let Err(error) = finish::lift_cancel(&state.pool, &scope).await {
+        return failed("could not lift the finish cancel", error);
+    }
     // A whole-project request writes its intent before the claim is tried: a request refused with a
     // 409 is not lost, the sweeper runs it once the live pass ends. A pass for one spec writes none
     // up front; it leaves one behind only if it defers something.
@@ -281,6 +293,58 @@ async fn post_finish(State(state): State<AppState>, Json(request): Json<FinishRe
         finish::settle_intent(&state.pool, &project_id, &requested_at, &scope, &result).await;
     });
     (StatusCode::ACCEPTED, Json(json!({ "accepted": true })))
+}
+
+/// Stops spec finish from launching the named specs that have no tree yet; open trees are left
+/// alone. Answers `200 {"cancelled": [..], "already_launched": [..]}`.
+async fn post_finish_cancel(
+    State(state): State<AppState>,
+    Json(request): Json<CancelRequest>,
+) -> Answer {
+    let spec_ids: Vec<String> = request
+        .spec_ids
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|id| !id.trim().is_empty())
+        .collect();
+    let root = non_empty(request.project_root);
+    if root.is_none() && spec_ids.is_empty() {
+        return refuse(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "name a project_root or at least one spec_id",
+        );
+    }
+    let project_id = match root {
+        None => None,
+        Some(root) => match finish::project_id_for_root(&state.pool, &root).await {
+            Ok(Some(project_id)) => Some(project_id),
+            Ok(None) => {
+                return refuse(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("no project has the root {root}"),
+                );
+            }
+            Err(error) => return failed("could not look the project up", error),
+        },
+    };
+    let target = finish::CancelTarget {
+        project_id,
+        spec_ids,
+    };
+    match finish::cancel_finish(&state.pool, &target).await {
+        Ok(report) => (
+            StatusCode::OK,
+            Json(json!({
+                "cancelled": report.cancelled,
+                "already_launched": report.already_launched,
+            })),
+        ),
+        Err(store::StoreError::NotFound(what)) => refuse(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("{what} not found"),
+        ),
+        Err(error) => failed("could not cancel the finish", error),
+    }
 }
 
 #[derive(Deserialize)]
@@ -866,6 +930,105 @@ mod tests {
             store::finish_intents(&state.pool).await.unwrap().is_empty(),
             "only a whole-project pass settles the intent away"
         );
+    }
+
+    #[tokio::test]
+    async fn finish_cancel_holds_back_unlaunched_specs_and_reports_open_trees() {
+        use crate::spec_backlog::model::SpecStatus;
+        use crate::spec_backlog::store;
+
+        let state = state().await;
+        let project = "finish-cancel-project";
+        let root = seed_rooted_project(&state, project).await;
+        store::write_finish_intent(&state.pool, project)
+            .await
+            .unwrap();
+        let mut ids = Vec::new();
+        for (name, status) in [
+            ("queued", SpecStatus::Audited),
+            ("running", SpecStatus::InProgress),
+            ("done", SpecStatus::Done),
+        ] {
+            let spec = store::upsert_by_path(
+                &state.pool,
+                Some(project),
+                &format!("<state_dir>/specs/2026-01-01-{name}.md"),
+                name,
+                "sha-1",
+            )
+            .await
+            .unwrap();
+            store::set_status(&state.pool, &spec.id, status, None)
+                .await
+                .unwrap();
+            if status == SpecStatus::InProgress {
+                store::set_tree_id(&state.pool, &spec.id, "spec-tree-1")
+                    .await
+                    .unwrap();
+            }
+            ids.push(spec.id);
+        }
+        let (queued, running, done) = (&ids[0], &ids[1], &ids[2]);
+        let app = app(&state);
+
+        let (status, body) = request(
+            &app,
+            "POST",
+            "/backlog/finish/cancel",
+            json!({"project_root": root.path().to_string_lossy()}),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body,
+            json!({"cancelled": [queued], "already_launched": [running]})
+        );
+        assert!(store::finish_cancelled(&state.pool, queued).await.unwrap());
+        assert!(!store::finish_cancelled(&state.pool, running).await.unwrap());
+        assert!(
+            store::finish_intents(&state.pool).await.unwrap().is_empty(),
+            "a cancelled project leaves the sweeper nothing to come back for"
+        );
+
+        // By id: a done spec has no tree, so it is cancelled like any other.
+        let (status, body) = request(
+            &app,
+            "POST",
+            "/backlog/finish/cancel",
+            json!({"spec_ids": [done, running]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body,
+            json!({"cancelled": [done], "already_launched": [running]})
+        );
+
+        // A later finish naming the spec lifts its cancel, and only its.
+        let (status, _) = request(&app, "POST", "/backlog/finish", json!({"spec_id": done})).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        wait_for_the_pass(project).await;
+        assert!(!store::finish_cancelled(&state.pool, done).await.unwrap());
+        assert!(store::finish_cancelled(&state.pool, queued).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn finish_cancel_refuses_what_it_cannot_name() {
+        let state = state().await;
+        let app = app(&state);
+        for body in [
+            json!({}),
+            json!({"spec_ids": []}),
+            json!({"project_root": "  "}),
+            json!({"project_root": "C:/nowhere"}),
+            json!({"spec_ids": ["no-such-spec"]}),
+        ] {
+            let (status, answer) =
+                request(&app, "POST", "/backlog/finish/cancel", body.clone()).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}: {answer}");
+            assert!(answer["error"].is_string(), "{body}: {answer}");
+        }
     }
 
     #[tokio::test]

@@ -433,6 +433,48 @@ async fn roll_back(
     }
 }
 
+/// Removes the worktree and the git branch of an opened branch that no node was ever bound to (a
+/// start refused after its open), so that a new start of the same name opens afresh. The project's
+/// links go first, without following them; when one of them is still there the worktree stays on
+/// disk, since `git worktree remove --force` would follow a junction into the project. Best effort:
+/// every failure is logged, and a worktree left behind makes the next open answer
+/// `WorktreeExists`.
+pub(super) async fn discard_unbound_worktree(
+    project_root: &str,
+    worktree: &str,
+    git_branch: Option<&str>,
+) {
+    let path = PathBuf::from(worktree);
+    if path.symlink_metadata().is_ok() {
+        let (_, links) = project_tree_config(project_root).await;
+        for name in links.iter().filter(|name| safe_relative(name)) {
+            let link = path.join(name);
+            if link.symlink_metadata().is_ok()
+                && let Err(error) = unlink(&link)
+            {
+                tracing::warn!(link = %link.display(), %error, "unbound worktree: link not removed");
+            }
+            if link.symlink_metadata().is_ok() {
+                tracing::warn!(
+                    worktree,
+                    "unbound worktree kept: one of its links is still there"
+                );
+                return;
+            }
+        }
+        let text = path_text(&path);
+        if let Err(error) = git(project_root, &["worktree", "remove", "--force", &text]).await {
+            tracing::warn!(worktree, %error, "unbound worktree not removed");
+            return;
+        }
+    }
+    if let Some(git_branch) = git_branch
+        && let Err(error) = git(project_root, &["branch", "-D", git_branch]).await
+    {
+        tracing::warn!(git_branch, %error, "unbound worktree's git branch not removed");
+    }
+}
+
 // ----- open -----
 
 fn opened_from(branch: &Branch, replayed: bool, skipped_links: Vec<String>) -> Opened {

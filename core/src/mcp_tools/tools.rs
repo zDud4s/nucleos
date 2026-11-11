@@ -806,9 +806,24 @@ impl NucleosTools {
         json_result(self.client.tree_status(&id).await)
     }
 
-    #[tool(description = "List the spec backlog: the specs waiting to be built, with their state.")]
-    pub(super) async fn spec_backlog(&self) -> String {
-        json_result(self.client.spec_backlog().await)
+    #[tool(
+        description = "Read the spec backlog: the specs waiting to be built, with their state. By \
+                       default answers a SUMMARY: {counts: {<status>: n}, total, with_tree: \
+                       [{spec_id, status, tree_id}], with_error: [{spec_id, status, error}]}. \
+                       `status` keeps only the specs in that status (e.g. `blocked`). `spec_id` \
+                       answers that one spec in full. `full: true` answers the full list instead, \
+                       one spec per line, still filtered by `status`. When no spec was ever \
+                       discovered it answers {never_discovered: true, hint}: that is NOT \"nothing \
+                       pending\"; run `spec_finish` (or POST /specs/scan) to discover them."
+    )]
+    pub(super) async fn spec_backlog(
+        &self,
+        Parameters(query): Parameters<SpecBacklogParams>,
+    ) -> String {
+        match self.client.spec_backlog().await {
+            Ok(backlog) => backlog_answer(backlog, &query),
+            Err(msg) => error_json(msg),
+        }
     }
 
     #[tool(
@@ -835,6 +850,23 @@ impl NucleosTools {
                 }))
                 .await,
         )
+    }
+
+    #[tool(
+        description = "Cancel pending `spec_finish` work: the finishes not yet launched as trees \
+                       for the specs in `spec_ids`, or for every spec of the project at \
+                       `project_root`. Name at least one of the two. A tree already launched is \
+                       not stopped (use `tree_abandon` for that). Returns {cancelled: [..], \
+                       already_launched: [..]}."
+    )]
+    pub(super) async fn spec_finish_cancel(
+        &self,
+        Parameters(params): Parameters<SpecFinishCancelParams>,
+    ) -> String {
+        match params.into_body() {
+            Ok(body) => json_result(self.client.spec_finish_cancel(&body).await),
+            Err(msg) => error_json(msg),
+        }
     }
 
     #[tool(

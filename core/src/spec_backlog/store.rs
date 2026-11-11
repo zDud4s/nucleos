@@ -728,6 +728,70 @@ pub async fn delete_finish_intent(
     Ok(())
 }
 
+/// Deletes the intent of `project_id` whatever its `created_at`: the owner cancelled its finish.
+pub async fn drop_finish_intent(pool: &SqlitePool, project_id: &str) -> Result<(), StoreError> {
+    sqlx::query("DELETE FROM spec_finish_intents WHERE project_id = ?")
+        .bind(project_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Records that no finish pass may launch these specs; one already recorded keeps its row.
+pub async fn cancel_finish(pool: &SqlitePool, spec_ids: &[String]) -> Result<(), StoreError> {
+    let mut tx = pool.begin().await?;
+    for spec_id in spec_ids {
+        sqlx::query(
+            "INSERT OR IGNORE INTO spec_finish_cancels (spec_id, created_at) VALUES (?, ?)",
+        )
+        .bind(spec_id)
+        .bind(now())
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Lifts the finish cancel of these specs.
+pub async fn clear_finish_cancels(
+    pool: &SqlitePool,
+    spec_ids: &[String],
+) -> Result<(), StoreError> {
+    for spec_id in spec_ids {
+        sqlx::query("DELETE FROM spec_finish_cancels WHERE spec_id = ?")
+            .bind(spec_id)
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Lifts the finish cancel of every spec of `project_id` (`None` is the namespace without one).
+pub async fn clear_project_finish_cancels(
+    pool: &SqlitePool,
+    project_id: Option<&str>,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "DELETE FROM spec_finish_cancels WHERE spec_id IN \
+         (SELECT id FROM specs WHERE project_id IS ?)",
+    )
+    .bind(project_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Whether a finish cancel stands for the spec.
+pub async fn finish_cancelled(pool: &SqlitePool, spec_id: &str) -> Result<bool, StoreError> {
+    let found: Option<String> =
+        sqlx::query_scalar("SELECT spec_id FROM spec_finish_cancels WHERE spec_id = ?")
+            .bind(spec_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(found.is_some())
+}
+
 /// Lists this audit's answered owner questions, oldest first.
 pub async fn answered_audit_questions(
     pool: &SqlitePool,
