@@ -102,8 +102,8 @@ async fn leaf_self_check_admitted(
     let caller = crate::role_policy::Caller {
         agent_id: payload.agent_id.clone(),
         agent_type: payload.agent_type.clone(),
-        // The pretool payload carries no subagent marker of its own: `agent_id` is the signal here.
-        subagent: false,
+        // A call with subagent markers but no usable `agent_id` must not resolve to a leaf (D12).
+        subagent: payload.subagent,
     };
     matches!(
         crate::role_policy::resolve(&state.pool, &caller, Some(run_id)).await,
@@ -1614,7 +1614,20 @@ mod tests {
             tool_input: input,
             agent_id: None,
             agent_type: None,
+            subagent: false,
         }
+    }
+
+    #[test]
+    fn the_subagent_marker_defaults_to_false_and_is_read_from_the_body() {
+        let plain: PreToolUsePayload =
+            serde_json::from_str(r#"{"run_id":1,"tool_name":"Bash"}"#).unwrap();
+        assert!(!plain.subagent);
+        // No agent_id, but the hook saw subagent markers: `leaf_self_check_admitted` hands this
+        // flag to the role policy, which never resolves such a caller to a leaf.
+        let marked: PreToolUsePayload =
+            serde_json::from_str(r#"{"run_id":1,"tool_name":"Bash","subagent":true}"#).unwrap();
+        assert!(marked.subagent && marked.agent_id.is_none());
     }
 
     async fn decide(state: &AppState, run_id: i64, tool: &str, input: Value) -> Decision {

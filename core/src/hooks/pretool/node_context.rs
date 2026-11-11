@@ -605,6 +605,7 @@ mod tests {
             tool_input: serde_json::json!({"file_path": path, "content": "x"}),
             agent_id: None,
             agent_type: None,
+            subagent: false,
         }
     }
 
