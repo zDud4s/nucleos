@@ -24,7 +24,7 @@ use super::ladder::{Kind, Spent, Step, next_step, retry_cap};
 use super::model::JOB_TERMINAL_STATE;
 use super::open::{DIED_PREFIX, WRAP_PREFIX, latest_launch, relaunch_node, run_is_live};
 use super::relaunch::{
-    DECISION_PREFIX, QUOTA_PREFIX, TRANSIENT_PREFIX, WATCHDOG_PREFIX, budget_refusal,
+    BudgetGate, DECISION_PREFIX, QUOTA_PREFIX, TRANSIENT_PREFIX, WATCHDOG_PREFIX, budget_gate,
     refusal_question, successor_key,
 };
 use super::rescue;
@@ -459,14 +459,20 @@ async fn relaunch_or_stop(
         if !after.is_zero() && Utc::now() < run_ended_at(pool, dead_run).await + after {
             return Ok(false);
         }
-        if let Some(reason) = budget_refusal(pool, node_id).await {
+        match budget_gate(pool, node_id).await {
             // An automatic relaunch spends: past the tree's limit the owner is asked once (the
             // parked branch, or the root's open decision, ends every later pass at `wrap_node`).
-            let question = refusal_question(node_id, &reason);
-            decisions::park_or_ask(pool, job_id, node_id, &question)
-                .await
-                .map_err(|e| e.to_string())?;
-            return Ok(true);
+            BudgetGate::Refused(reason) => {
+                let question = refusal_question(node_id, &reason);
+                decisions::park_or_ask(pool, job_id, node_id, &question)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                return Ok(true);
+            }
+            // A budget that cannot be read is no limit to park on, but nothing is spent on it
+            // either: the node is left alone and the next tick asks again (spec B9).
+            BudgetGate::Unreadable => return Ok(false),
+            BudgetGate::Open => {}
         }
         // The boot relaunch may have claimed this dead run first: its key is then ours too.
         let key = successor_key(pool, node_id, dead_run, &key)
@@ -1084,6 +1090,67 @@ mod tests {
         assert_eq!(branch, "parked");
         assert_eq!(asked.len(), 1, "the owner is told once: {asked:?}");
         assert!(asked[0].to_lowercase().contains("budget"), "{:?}", asked[0]);
+    }
+
+    /// B9: a budget that cannot be read is no limit. The node is not parked and nobody is asked,
+    /// but nothing is spent on it either; the next tick asks again and relaunches once it reads.
+    #[tokio::test]
+    async fn an_unreadable_budget_is_retried_on_the_next_tick_and_parks_nothing() {
+        let state = state().await;
+        seed_node(&state, Some("building"), "open", NODE, Some(53)).await;
+        seed_run(&state, 53, "interrupted").await;
+        seed_launch(&state, NODE).await;
+        sqlx::query("ALTER TABLE tree_budgets RENAME TO tree_budgets_away")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+
+        tick(&state).await;
+        tick(&state).await;
+
+        assert_eq!(all_launches(&state, NODE).await, 0, "nothing was spent");
+        let (branch, asked) = parked_and_asked(&state).await;
+        assert_eq!(branch, "building", "not parked: {asked:?}");
+        assert!(asked.is_empty(), "nobody is asked: {asked:?}");
+
+        sqlx::query("ALTER TABLE tree_budgets_away RENAME TO tree_budgets")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        tick(&state).await;
+
+        assert_eq!(launches(&state, NODE, "died-").await, 1, "retried");
+        let (branch, asked) = parked_and_asked(&state).await;
+        assert_eq!(branch, "building", "{asked:?}");
+    }
+
+    /// B9: a real limit parks, and the question carries the spend and the estimate of the rest.
+    #[tokio::test]
+    async fn a_real_limit_parks_with_the_spend_and_the_estimate_in_the_question() {
+        let state = state().await;
+        seed_node(&state, Some("building"), "open", NODE, Some(54)).await;
+        seed_run(&state, 54, "interrupted").await;
+        seed_launch(&state, NODE).await;
+        exhaust_budget(&state, 54).await;
+        // One more open node of the tree, so there is a rest to estimate.
+        sqlx::query(
+            "INSERT INTO work_nodes (id, root_id, depth, kind, title, goal, status, created_at, updated_at) \
+             VALUES ('wrap-open', 'wrap-root', 1, 'leaf', 't', 'g', 'planned', ?, ?)",
+        )
+        .bind(CREATED)
+        .bind(CREATED)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        tick(&state).await;
+
+        let (branch, asked) = parked_and_asked(&state).await;
+        assert_eq!(branch, "parked");
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert!(asked[0].contains("spent $5.00 of the $1.00 limit"), "{:?}", asked[0]);
+        assert!(asked[0].contains("estimated $"), "{:?}", asked[0]);
+        assert!(asked[0].contains("node(s) still open"), "{:?}", asked[0]);
     }
 
     // ---- the boot race -----------------------------------------------------------------------------

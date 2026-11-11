@@ -351,16 +351,40 @@ async fn branch_is_parked(
 /// Why the tree budget refuses an automatic relaunch of `node_id`, or `None` when it permits one
 /// (or the node has no tree row). The owner's answer relaunch does not ask: the owner decided.
 pub(super) async fn budget_refusal(pool: &SqlitePool, node_id: &str) -> Option<String> {
+    match budget_gate(pool, node_id).await {
+        // A budget that could not be read is no limit: it is not a refusal to park on (B9).
+        BudgetGate::Open | BudgetGate::Unreadable => None,
+        BudgetGate::Refused(reason) => Some(reason),
+    }
+}
+
+/// What the tree budget says about an automatic relaunch of a node.
+#[derive(Debug, PartialEq)]
+pub(super) enum BudgetGate {
+    /// Permitted, or the node has no tree row.
+    Open,
+    /// A real limit, with the reason it gave.
+    Refused(String),
+    /// The budget could not be read: no limit, so nothing to park on, but nothing to spend either.
+    /// The caller leaves the node alone and the next tick asks again (spec B9).
+    Unreadable,
+}
+
+/// [`budget_refusal`] that keeps a database error apart from "permitted".
+pub(super) async fn budget_gate(pool: &SqlitePool, node_id: &str) -> BudgetGate {
     let root: Option<String> = sqlx::query_scalar("SELECT root_id FROM work_nodes WHERE id = ?")
         .bind(node_id)
         .fetch_optional(pool)
         .await
         .ok()
         .flatten();
-    match budget::permits_next_node(pool, &root?).await {
-        // A budget that could not be read is no limit: it is not a refusal to park on (B9).
-        Permit::Yes | Permit::Retry { .. } => None,
-        Permit::No { reason } => Some(reason),
+    let Some(root) = root else {
+        return BudgetGate::Open;
+    };
+    match budget::permits_next_node(pool, &root).await {
+        Permit::Yes => BudgetGate::Open,
+        Permit::Retry { .. } => BudgetGate::Unreadable,
+        Permit::No { reason } => BudgetGate::Refused(reason),
     }
 }
 
