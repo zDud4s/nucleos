@@ -331,6 +331,16 @@ pub(super) fn session_git_reason(
         "escalated" => "it hit a conflict and was escalated to a person. Do not retry it or \
                         resolve it by hand; the resolution arrives as a new request."
             .to_owned(),
+        // A session's rebase always names the branch its own worktree has checked out, and the
+        // executor never rewrites a checked-out branch, so this blocks every time: retrying the same
+        // command cannot help, and the advice that can is the merge the queue does perform (D9).
+        "blocked" if kind == "rebase" => format!(
+            "the queue refused to start it: {why}. Nothing was changed. Retrying the same rebase \
+             cannot succeed: the queue does not rewrite a branch a worktree has checked out, and \
+             this command always names yours. Bring the base in with `git merge --no-ff <onto>` \
+             (queued, from the same worktree), or ask for the rebase from a worktree that does not \
+             hold the branch."
+        ),
         "blocked" => format!(
             "the queue refused to start it: {why}. Nothing was changed. Clear what that names, \
              then run the same command again to queue it anew."
