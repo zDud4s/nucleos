@@ -438,6 +438,8 @@ the contract, not a snapshot.
 | `accounts/switch.rs` | `switch_cost`: what moving a session to another account would cost. |
 | `accounts/inter.rs` | Engines left without headroom across the pool. |
 | `accounts/login.rs` | The guided login state machine (`Logins`). Not available in the skeleton. |
+| `accounts/login/notty.rs` | Production-only resolution of the no-TTY login executable: `NUCLEOS_<PROGRAM>_BIN` override or a PATH lookup, and a clear "CLI not found" error. Used by `process.rs`, so the state-machine tests keep their scripted spawner. |
+| `accounts/login/process.rs` | The login process I/O of the no-TTY path: spawns the CLI with piped stdio, merges stdout and stderr into ANSI-free lines, keeps stdin open for a pasted code. |
 | `accounts/usage.rs` | The usage feed that fills the pool's per-account windows from the quota sidecar. |
 | `accounts/watch.rs` | The auth watch: notices a credential that changed or went away. |
 | `accounts/launch_run.rs` | The pick and the after-run bookkeeping for a run launch. |
