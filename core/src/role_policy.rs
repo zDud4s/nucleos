@@ -185,11 +185,7 @@ async fn node_from_row(
 }
 
 /// The node bound to the caller: by `agent_id`, then by `run_id`.
-async fn find_node(
-    pool: &SqlitePool,
-    caller: &Caller,
-    run_id: Option<i64>,
-) -> Option<(Role, i64)> {
+async fn find_node(pool: &SqlitePool, caller: &Caller, run_id: Option<i64>) -> Option<(Role, i64)> {
     if let Some(agent_id) = caller.agent_id()
         && let Some(found) = node_from_row(pool, "agent_id", agent_id).await
     {
@@ -300,7 +296,10 @@ pub fn parse_allowed_roles(raw: Option<String>) -> Option<Vec<Role>> {
 }
 
 /// The permission stored in an `allowed_roles` / `max_depth` column pair.
-pub fn permission_from_columns(allowed_roles: Option<String>, max_depth: Option<i64>) -> Permission {
+pub fn permission_from_columns(
+    allowed_roles: Option<String>,
+    max_depth: Option<i64>,
+) -> Permission {
     Permission {
         roles: parse_allowed_roles(allowed_roles),
         max_depth,

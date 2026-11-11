@@ -123,7 +123,10 @@ fn command_runs_git_push(command: &str) -> bool {
                 return false;
             }
             while let Some(word) = words.next() {
-                if matches!(word, "-c" | "-C" | "--git-dir" | "--work-tree" | "--namespace") {
+                if matches!(
+                    word,
+                    "-c" | "-C" | "--git-dir" | "--work-tree" | "--namespace"
+                ) {
                     words.next();
                 } else if !word.starts_with('-') {
                     return word == "push";
@@ -828,12 +831,9 @@ pub(super) async fn pretooluse_decision_from(
                         // As at the leaf self-check: `agent_id` is the signal here.
                         subagent: false,
                     };
-                    let who = crate::role_policy::resolve_requester(
-                        &state.pool,
-                        &caller,
-                        Some(run_id),
-                    )
-                    .await;
+                    let who =
+                        crate::role_policy::resolve_requester(&state.pool, &caller, Some(run_id))
+                            .await;
                     if !permission.admits(&who) {
                         return None;
                     }

@@ -1749,11 +1749,7 @@ mod tests {
         let app = test_router(state.clone());
         let granted = decide(
             &app,
-            &call(
-                run_id,
-                "Bash",
-                serde_json::json!({"command": "git tag v1"}),
-            ),
+            &call(run_id, "Bash", serde_json::json!({"command": "git tag v1"})),
         )
         .await;
         assert_eq!(granted.decision, "allow");
@@ -7473,7 +7469,11 @@ mod tests {
         for command in ["git push origin main", "git -C sub push --force origin x"] {
             let decision = run_git_decision(&app, run_id, command).await;
             assert_eq!(decision.decision, "deny", "{command}");
-            assert_eq!(decision.reason, crate::role_policy::PUSH_REFUSAL, "{command}");
+            assert_eq!(
+                decision.reason,
+                crate::role_policy::PUSH_REFUSAL,
+                "{command}"
+            );
         }
         // The grant was not spent on the refusals.
         let consumed: Option<String> =

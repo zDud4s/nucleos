@@ -551,7 +551,10 @@ pub(super) async fn submit_vcs_request(
     // A push is accepted only from the owner's top-level session: the owner's control / admin
     // token. A run (or anything else that reaches this route) is refused with who may.
     if matches!(body.operation, vcs::Op::Push { .. })
-        && !matches!(scope, Scope::Control | Scope::ApiToken(ApiTokenLevel::Admin))
+        && !matches!(
+            scope,
+            Scope::Control | Scope::ApiToken(ApiTokenLevel::Admin)
+        )
     {
         return Err((
             StatusCode::FORBIDDEN,

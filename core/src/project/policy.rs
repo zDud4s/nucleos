@@ -1586,7 +1586,10 @@ mod tests {
         declare_git_op(&pool, "alpha", "merge").await.unwrap();
         assert_eq!(
             git_ops(&pool, "alpha").await,
-            vec![("merge".to_owned(), crate::role_policy::Permission::default())]
+            vec![(
+                "merge".to_owned(),
+                crate::role_policy::Permission::default()
+            )]
         );
     }
 
