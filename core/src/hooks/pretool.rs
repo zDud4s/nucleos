@@ -102,7 +102,8 @@ async fn leaf_self_check_admitted(
     let caller = crate::role_policy::Caller {
         agent_id: payload.agent_id.clone(),
         agent_type: payload.agent_type.clone(),
-        subagent: payload.subagent,
+        // The pretool payload carries no subagent marker of its own: `agent_id` is the signal here.
+        subagent: false,
     };
     matches!(
         crate::role_policy::resolve(&state.pool, &caller, Some(run_id)).await,
@@ -1395,7 +1396,9 @@ mod tests {
         assert!(!leaf_self_check_from_yaml(
             "autonomy:\n  leaf_self_check: false\n"
         ));
-        assert!(!leaf_self_check_from_yaml("autonomy:\n  auto_default: true\n"));
+        assert!(!leaf_self_check_from_yaml(
+            "autonomy:\n  auto_default: true\n"
+        ));
         assert!(!leaf_self_check_from_yaml(
             "autonomy:\n  leaf_self_check: yes please\n"
         ));
