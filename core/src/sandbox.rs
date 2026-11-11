@@ -200,8 +200,9 @@ pub fn profile_for(scope: &RunScope) -> Profile {
     if let Some(checkout) = &scope.main_checkout {
         writable.retain(|path| !under(path, checkout));
         // The object store sits under the checkout's `.git` and is the one granted read there.
-        readable
-            .retain(|path| !under(path, checkout) || scope.main_repo_objects.as_ref() == Some(path));
+        readable.retain(|path| {
+            !under(path, checkout) || scope.main_repo_objects.as_ref() == Some(path)
+        });
     }
     let domains = sorted_unique(domains);
     Profile {
@@ -407,10 +408,19 @@ mod tests {
         let p = profile_for(&scope(RunMode::Worktree));
         assert_eq!(
             p.writable,
-            vec![PathBuf::from("/units/u1"), PathBuf::from("/units/u1/target")]
+            vec![
+                PathBuf::from("/units/u1"),
+                PathBuf::from("/units/u1/target")
+            ]
         );
-        assert!(p.readable.contains(&PathBuf::from("/owner/repo/.git/objects")));
-        assert_eq!(p.egress, Egress::Allow(vec!["api.anthropic.com".to_owned()]));
+        assert!(
+            p.readable
+                .contains(&PathBuf::from("/owner/repo/.git/objects"))
+        );
+        assert_eq!(
+            p.egress,
+            Egress::Allow(vec!["api.anthropic.com".to_owned()])
+        );
     }
 
     #[test]
@@ -457,20 +467,33 @@ mod tests {
     #[test]
     fn the_profile_is_the_same_whatever_engine_the_domains_came_from() {
         // The scope carries domains, not an engine: the same scope gives the same profile.
-        assert_eq!(profile_for(&scope(RunMode::Real)), profile_for(&scope(RunMode::Real)));
+        assert_eq!(
+            profile_for(&scope(RunMode::Real)),
+            profile_for(&scope(RunMode::Real))
+        );
     }
 
     #[test]
     fn the_env_is_an_allow_list_with_home_and_temp_inside_the_unit() {
         let mut s = scope(RunMode::Worktree);
-        s.inherit.insert("SystemRoot".to_owned(), "C:\\Windows".to_owned());
-        s.run_env.insert("NUCLEOS_RUN_ID".to_owned(), "r1".to_owned());
-        s.run_env.insert("AWS_SECRET_ACCESS_KEY".to_owned(), "leak".to_owned());
+        s.inherit
+            .insert("SystemRoot".to_owned(), "C:\\Windows".to_owned());
+        s.run_env
+            .insert("NUCLEOS_RUN_ID".to_owned(), "r1".to_owned());
+        s.run_env
+            .insert("AWS_SECRET_ACCESS_KEY".to_owned(), "leak".to_owned());
         let env = profile_for(&s).env;
         assert_eq!(env["SystemRoot"], "C:\\Windows");
         assert_eq!(env["NUCLEOS_RUN_ID"], "r1");
         assert!(!env.contains_key("AWS_SECRET_ACCESS_KEY"));
-        for key in ["HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "TEMP", "TMP"] {
+        for key in [
+            "HOME",
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "TEMP",
+            "TMP",
+        ] {
             assert!(
                 Path::new(&env[key]).starts_with("/units/u1"),
                 "{key} = {}",
@@ -492,7 +515,8 @@ mod tests {
     #[test]
     fn the_control_token_never_enters_a_sandbox_env() {
         let mut s = scope(RunMode::Worktree);
-        s.run_env.insert(CONTROL_TOKEN_VAR.to_owned(), "secret".to_owned());
+        s.run_env
+            .insert(CONTROL_TOKEN_VAR.to_owned(), "secret".to_owned());
         s.inherit.insert("PATH_ELSE".to_owned(), "x".to_owned());
         let env = profile_for(&s).env;
         assert!(!env.contains_key(CONTROL_TOKEN_VAR));
@@ -534,7 +558,10 @@ mod tests {
             reason: "no account".to_owned(),
         };
         assert!(refused.refuses_runs());
-        assert_eq!(SandboxStatus::NoBackend.banner().as_deref(), Some("sandbox por implementar"));
+        assert_eq!(
+            SandboxStatus::NoBackend.banner().as_deref(),
+            Some("sandbox por implementar")
+        );
         assert_eq!(SandboxStatus::Armed.banner(), None);
         assert_eq!(refused.banner().as_deref(), Some("no account"));
     }
@@ -580,7 +607,9 @@ mod tests {
     async fn an_empty_argv_is_refused_before_anything_starts() {
         let dir = tempfile::tempdir().unwrap();
         let profile = profile_for(&scope(RunMode::Scratch));
-        let err = spawn(&[], dir.path(), &profile).err().expect("empty argv fails");
+        let err = spawn(&[], dir.path(), &profile)
+            .err()
+            .expect("empty argv fails");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 

@@ -71,7 +71,9 @@ fn the_detector_sees_a_spawn_and_ignores_a_comment() {
     assert!(spawns_in("spawn_in_own_group(&mut cmd);"));
     assert!(spawns_in("    let k = TreeKiller::new(pid);"));
     assert!(spawns_in("let c = Command::new(\"codex\");"));
-    assert!(!spawns_in("// spawn_in_own_group(&mut cmd) is the door's job"));
+    assert!(!spawns_in(
+        "// spawn_in_own_group(&mut cmd) is the door's job"
+    ));
     assert!(!spawns_in("let c = Command::new(\"git\");"));
     assert!(!spawns_in("fn spawn_in_own_group_tests() {}"));
 }
@@ -113,7 +115,10 @@ fn nothing_outside_the_sandbox_names_the_switch() {
             offenders.push(module);
         }
     }
-    assert!(offenders.is_empty(), "these modules touch the sandbox switch: {offenders:?}");
+    assert!(
+        offenders.is_empty(),
+        "these modules touch the sandbox switch: {offenders:?}"
+    );
 }
 
 #[test]

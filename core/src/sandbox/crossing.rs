@@ -28,7 +28,10 @@ pub enum CrossingError {
     /// The path, once every link in it is resolved, is not inside any granted directory.
     Outside(PathBuf),
     /// The file is bigger than the ceiling the caller asked for.
-    TooLarge { path: PathBuf, limit: u64 },
+    TooLarge {
+        path: PathBuf,
+        limit: u64,
+    },
     /// Not a regular file (a directory, or a path with no file name).
     NotAFile(PathBuf),
     Io(io::Error),
@@ -185,7 +188,9 @@ pub fn read_crossing(
     }
     // The file may have grown since `metadata`: read one byte past the ceiling to notice.
     let mut bytes = Vec::new();
-    (&mut file).take(max_bytes.saturating_add(1)).read_to_end(&mut bytes)?;
+    (&mut file)
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > max_bytes {
         return Err(CrossingError::TooLarge {
             path: path.to_path_buf(),
@@ -232,7 +237,10 @@ impl CrossingWriter for InProcessWriter {
             name.to_string_lossy(),
             std::process::id()
         ));
-        let mut file = OpenOptions::new().write(true).create_new(true).open(&temp)?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
         let written = file.write_all(bytes).and_then(|()| file.sync_all());
         drop(file);
         let renamed = written.and_then(|()| std::fs::rename(&temp, &target));
@@ -309,7 +317,8 @@ mod tests {
         std::fs::write(elsewhere.path().join("secret.txt"), b"owner data").unwrap();
         let link = granted.path().join("hop");
         link_dir(&link, elsewhere.path());
-        let err = read_crossing(&link.join("secret.txt"), &grant(granted.path()), 1024).unwrap_err();
+        let err =
+            read_crossing(&link.join("secret.txt"), &grant(granted.path()), 1024).unwrap_err();
         assert!(matches!(err, CrossingError::Outside(_)), "{err}");
     }
 
@@ -341,9 +350,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("big.bin");
         std::fs::write(&file, [7u8; 10]).unwrap();
-        assert_eq!(read_crossing(&file, &grant(dir.path()), 10).unwrap().as_bytes().len(), 10);
+        assert_eq!(
+            read_crossing(&file, &grant(dir.path()), 10)
+                .unwrap()
+                .as_bytes()
+                .len(),
+            10
+        );
         let err = read_crossing(&file, &grant(dir.path()), 9).unwrap_err();
-        assert!(matches!(err, CrossingError::TooLarge { limit: 9, .. }), "{err}");
+        assert!(
+            matches!(err, CrossingError::TooLarge { limit: 9, .. }),
+            "{err}"
+        );
     }
 
     #[test]
