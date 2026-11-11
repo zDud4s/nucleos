@@ -34,10 +34,10 @@ const NODE_PROMPT_HEADER: &str = HEADLESS_PREAMBLE;
 const DONE_RULES: &str = "Done = every deliverable of the goal is in your files and you re-read the diff against the goal. When node_close answers `recorded: true`, stop. Start your report Summary with `Decisions affecting siblings:` (or `Decisions affecting siblings: none`) within its first 500 characters.";
 
 /// What a leaf reads before adding a module, and what it does not need to read.
-const LEAF_READING_RULES: &str = "Before adding a module, read only core/MODULE_MAP.md, never core/AGENTS.md. You do not need .nucleos/workflow/workflow.md or dispatch.md.";
+const LEAF_READING_RULES: &str = "Before adding a module, Grep core/MODULE_MAP.md for the module or file you need and never read it whole (it is large); never open core/AGENTS.md. You do not need .nucleos/workflow/workflow.md or dispatch.md.";
 
 /// What an orchestrator, root included, reads.
-pub(super) const ORCHESTRATOR_READING_RULES: &str = "Before adding a module, read only core/MODULE_MAP.md, never core/AGENTS.md. Of dispatch.md read only the \"One controller per node\" section; you do not need the rest of it.";
+pub(super) const ORCHESTRATOR_READING_RULES: &str = "Before adding a module, Grep core/MODULE_MAP.md for the module or file you need and never read it whole (it is large); never open core/AGENTS.md. Of dispatch.md read only the \"One controller per node\" section; you do not need the rest of it.";
 
 /// What a leaf is told when it writes tests the gate must see red (spec S4).
 const RED_EXPECTED_RULE: &str = "If you write tests that the gate must see red (the RED half of RED/GREEN), close with `red_expected: [<test names>]` in your report: the gate of that commit must be red on exactly those tests, which counts as success and spends no fix. You never run the tests yourself.";
@@ -48,7 +48,7 @@ pub(super) const TICKET_RULES: &str = "Problems outside your owned paths are not
 
 /// What every node is told about cargo and formatting: the one leaf cargo rule (contract E4),
 /// verbatim.
-pub(super) const FORMAT_RULES: &str = "A leaf runs only `cargo fmt -p <crate>` and `python scripts/check_invariants.py` before closing, via `python scripts/heavy.py`, failing open; never `cargo check`, `test`, `build`, `clippy` or `--workspace`. The rest is the gate's. With `autonomy.leaf_self_check: true` it may add one `cargo check -p <crate> --tests`.";
+pub(super) const FORMAT_RULES: &str = "A leaf runs only `cargo fmt -p <crate>` and `python scripts/check_invariants.py` before closing, via `python scripts/heavy.py --agent leaf-<node id> ...`, failing open; never `cargo check`, `test`, `build`, `clippy` or `--workspace`. The rest is the gate's. With `autonomy.leaf_self_check: true` it may add one `cargo check -p <crate> --tests`.";
 
 /// Gives a tree node the protocol it needs to split work and report its result.
 ///

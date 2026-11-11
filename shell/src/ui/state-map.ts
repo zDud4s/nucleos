@@ -229,6 +229,9 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     work_tree_descent: { tone: "info", label: "node tree descended" },
     // An expired default answer was applied to an owner question (`tree_job/auto_default.rs`): a fact, said once.
     work_tree_auto_default: { tone: "info", label: "default answer applied" },
+    // A tree with no live run, no open decision and no change for 30 minutes (`tree_job/stalled.rs`):
+    // it walks a retry ladder, then asks the owner, so it is held.
+    work_tree_stalled: { tone: "paused", label: "node tree stalled" },
     // The audit before a spec's tree could not run (`spec_backlog/finish.rs`): the spec went on unaudited, said once.
     spec_audit_unavailable: { tone: "info", label: "spec audit unavailable" },
     // Runs.

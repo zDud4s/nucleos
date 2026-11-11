@@ -16,7 +16,7 @@ Manager / Task Scheduler; run with `-- --include-ignored` on an interactive desk
 
 ## Module map — the structural invariant (spec §3.2)
 
-The module map (one row per `.rs` file; the contract, not a snapshot) lives in `core/MODULE_MAP.md`. A new module needs a row there.
+The module map (one row per `.rs` file; the contract, not a snapshot) lives in `core/MODULE_MAP.md`, a large file: Grep it for the module or file you need and never read it whole. A new module needs a row there.
 
 ## Autopilot extends, it does NOT restructure (spec §3.2 / §9)
 

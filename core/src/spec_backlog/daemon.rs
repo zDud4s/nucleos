@@ -340,12 +340,25 @@ impl DaemonPreparer<'_> {
             caller_id: crate::tree_job::landing::scope_caller_id(spec_id),
         };
         let pool = &self.state.pool;
-        let report = if before_tree {
-            audit::audit_before_tree(pool, spec_id, &worktree, lineage, &reviewer, &verify).await
-        } else {
-            audit::audit(pool, spec_id, &worktree, lineage, &reviewer, &verify).await
+        let mode = audit::AuditMode {
+            raise_questions: !before_tree,
+            declared_implemented: self.declares_implemented(&spec),
         };
-        report.map_err(|error| format!("{error:?}"))
+        audit::audit_with_mode(pool, spec_id, &worktree, lineage, &reviewer, &verify, mode)
+            .await
+            .map_err(|error| format!("{error:?}"))
+    }
+
+    /// Whether the spec file's header says it is implemented; a file that cannot be found or read
+    /// says nothing.
+    fn declares_implemented(&self, spec: &Spec) -> bool {
+        let roots = ScanRoots {
+            project_root: Some(self.project_root.clone()),
+            state_dir: self.state_dir.clone(),
+        };
+        super::scan::resolve_stored_path(&roots, &spec.path)
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .is_some_and(|text| super::verdict::declares_implemented(&text))
     }
 }
 

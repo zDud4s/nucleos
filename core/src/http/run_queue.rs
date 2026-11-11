@@ -546,8 +546,35 @@ pub(super) async fn submit_vcs_request(
     State(state): State<AppState>,
     Extension(scope): Extension<Scope>,
     Json(body): Json<VcsRequestBody>,
+) -> Result<Json<vcs::Ticket>, axum::response::Response> {
+    let origin = vcs_origin(&scope).map_err(IntoResponse::into_response)?;
+    // A push is accepted only from the owner's top-level session: the owner's control / admin
+    // token. A run (or anything else that reaches this route) is refused with who may.
+    if matches!(body.operation, vcs::Op::Push { .. })
+        && !matches!(
+            scope,
+            Scope::Control | Scope::ApiToken(ApiTokenLevel::Admin)
+        )
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "refusal": "push_root_only",
+                "detail": crate::role_policy::PUSH_REFUSAL,
+            })),
+        )
+            .into_response());
+    }
+    submit_vcs_request_inner(state, origin, body)
+        .await
+        .map_err(IntoResponse::into_response)
+}
+
+async fn submit_vcs_request_inner(
+    state: AppState,
+    origin: vcs::Origin,
+    body: VcsRequestBody,
 ) -> Result<Json<vcs::Ticket>, StatusCode> {
-    let origin = vcs_origin(&scope)?;
     let repo = vcs::resolve_repo(&state.pool, &body.project_id)
         .await
         .map_err(|error| match error {

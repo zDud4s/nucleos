@@ -47,9 +47,12 @@ impl ProviderAdapter for FakeAdapter {
             needs_tty: false,
         })
     }
-    /// The scripted login lines: `URL <url>`, `CODE?`, `OK`, `FAIL <why>`.
+    /// The scripted login lines: `URL <url>`, `DEVICE <code>`, `CODE?`, `OK`, `FAIL <why>`.
     fn parse_login_line(&self, line: &str) -> Option<LoginEvent> {
         let line = line.trim();
+        if let Some(code) = line.strip_prefix("DEVICE ") {
+            return Some(LoginEvent::DeviceCode(code.to_owned()));
+        }
         if let Some(url) = line.strip_prefix("URL ") {
             return Some(LoginEvent::AuthUrl(url.to_owned()));
         }

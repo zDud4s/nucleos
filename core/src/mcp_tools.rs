@@ -2,6 +2,7 @@ use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::{ServerHandler, ServiceExt, schemars, tool, tool_handler, tool_router};
 use serde::Serialize;
 
+mod backlog_view;
 mod boxes;
 mod effects;
 mod fence;
@@ -12,6 +13,7 @@ mod server;
 mod task_tools;
 mod tools;
 
+use self::backlog_view::*;
 pub use self::boxes::*;
 pub use self::effects::*;
 use self::fence::*;
@@ -1094,6 +1096,7 @@ mod tests {
                 "shadow_scoreboard",
                 "spec_backlog",
                 "spec_finish",
+                "spec_finish_cancel",
                 "suggest_model",
                 "task_claim",
                 "task_decline",
@@ -2797,6 +2800,7 @@ mod tests {
                 "record",
                 "spec_backlog",
                 "spec_finish",
+                "spec_finish_cancel",
                 "task_claim",
                 "task_decline",
                 "task_done",
@@ -3035,6 +3039,7 @@ mod tests {
                 "create_job",
                 "create_run",
                 "spec_finish",
+                "spec_finish_cancel",
                 "tree_abandon",
                 "tree_branch_start",
                 "tree_launch",
@@ -3065,6 +3070,7 @@ mod tests {
                 "record",
                 "spec_backlog",
                 "spec_finish",
+                "spec_finish_cancel",
                 "task_claim",
                 "task_decline",
                 "task_done",
@@ -3117,6 +3123,7 @@ mod tests {
         for name in [
             "spec_backlog",
             "spec_finish",
+            "spec_finish_cancel",
             "tree_launch",
             "tree_status",
             "wait_advice",
@@ -3226,6 +3233,111 @@ mod tests {
         for field in ["spec_id", "project_id", "project_root"] {
             assert!(properties.contains_key(field), "missing {field}: {schema}");
         }
+    }
+
+    #[test]
+    fn spec_backlog_takes_status_spec_id_and_full() {
+        let schema = rmcp::schemars::schema_for!(SpecBacklogParams);
+        let schema = serde_json::to_value(schema).unwrap();
+        let properties = schema["properties"].as_object().expect("properties");
+
+        for field in ["status", "spec_id", "full"] {
+            assert!(properties.contains_key(field), "missing {field}: {schema}");
+        }
+        let empty: SpecBacklogParams =
+            serde_json::from_value(serde_json::json!({})).expect("every field is optional");
+        assert!(empty.status.is_none() && empty.spec_id.is_none() && empty.full.is_none());
+    }
+
+    /// A caller that sends no arguments at all, as every client did before the params existed,
+    /// still reaches the daemon.
+    #[tokio::test]
+    async fn spec_backlog_without_arguments_still_reaches_the_daemon() {
+        let (_running, context) = served_request_context().await;
+
+        let answer = worktree_server("/work/a")
+            .call_tool(
+                rmcp::model::CallToolRequestParams::new("spec_backlog"),
+                context,
+            )
+            .await;
+        assert!(reached_the_daemon(&answer), "{answer:?}");
+    }
+
+    #[test]
+    fn spec_finish_cancel_is_acts_and_served_in_the_worktree_box() {
+        assert_eq!(tool_effect("spec_finish_cancel"), ToolEffect::Acts);
+        assert!(WORKTREE_BOX_TOOLS.contains(&"spec_finish_cancel"));
+        assert!(served_in_box(
+            &McpBox::Worktree("/work/a".to_owned()),
+            "spec_finish_cancel"
+        ));
+    }
+
+    #[test]
+    fn spec_finish_cancel_takes_a_project_root_or_spec_ids() {
+        let schema = rmcp::schemars::schema_for!(SpecFinishCancelParams);
+        let schema = serde_json::to_value(schema).unwrap();
+        let properties = schema["properties"].as_object().expect("properties");
+        for field in ["project_root", "spec_ids"] {
+            assert!(properties.contains_key(field), "missing {field}: {schema}");
+        }
+
+        let params = |value: serde_json::Value| -> SpecFinishCancelParams {
+            serde_json::from_value(value).expect("the arguments parse")
+        };
+        assert_eq!(
+            params(serde_json::json!({ "project_root": "C:/p" })).into_body(),
+            Ok(serde_json::json!({ "project_root": "C:/p" }))
+        );
+        assert_eq!(
+            params(serde_json::json!({ "spec_ids": ["a", "b"] })).into_body(),
+            Ok(serde_json::json!({ "spec_ids": ["a", "b"] }))
+        );
+        assert_eq!(
+            params(serde_json::json!({ "project_root": "C:/p", "spec_ids": ["a"] })).into_body(),
+            Ok(serde_json::json!({ "project_root": "C:/p", "spec_ids": ["a"] }))
+        );
+        for nothing in [
+            serde_json::json!({}),
+            serde_json::json!({ "project_root": " ", "spec_ids": [] }),
+        ] {
+            assert!(params(nothing).into_body().is_err());
+        }
+    }
+
+    fn spec_finish_cancel_request(
+        arguments: serde_json::Value,
+    ) -> rmcp::model::CallToolRequestParams {
+        let arguments = arguments
+            .as_object()
+            .expect("the fixture is an object")
+            .clone();
+        rmcp::model::CallToolRequestParams::new("spec_finish_cancel").with_arguments(arguments)
+    }
+
+    #[tokio::test]
+    async fn spec_finish_cancel_dispatches_to_the_daemon() {
+        let (_running, context) = served_request_context().await;
+
+        let answer = worktree_server("/work/a")
+            .call_tool(
+                spec_finish_cancel_request(serde_json::json!({ "spec_ids": ["a"] })),
+                context,
+            )
+            .await;
+        assert!(reached_the_daemon(&answer), "{answer:?}");
+    }
+
+    #[tokio::test]
+    async fn spec_finish_cancel_naming_nothing_is_refused_before_the_daemon() {
+        let (_running, context) = served_request_context().await;
+
+        let answer = worktree_server("/work/a")
+            .call_tool(spec_finish_cancel_request(serde_json::json!({})), context)
+            .await;
+        assert!(!reached_the_daemon(&answer), "{answer:?}");
+        assert!(format!("{answer:?}").contains("spec_ids"), "{answer:?}");
     }
 
     #[test]

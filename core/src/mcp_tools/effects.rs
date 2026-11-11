@@ -343,6 +343,8 @@ pub(super) const TOOL_EFFECTS: &[(&str, ToolEffect)] = &[
     // paid run follows, and `spec_finish` closes a spec out of the backlog.
     ("spec_backlog", ToolEffect::ReadsOwn),
     ("spec_finish", ToolEffect::Acts),
+    // `Acts`: it drops pending finish work; a tree already launched is left alone.
+    ("spec_finish_cancel", ToolEffect::Acts),
     ("suggest_model", ToolEffect::ReadsOwn),
     // `WritesOwn`: a row in this machine's own claim table, keyed to the caller; nothing leaves the
     // machine and nothing is acted on. A claim is advisory until the land gate reads it.

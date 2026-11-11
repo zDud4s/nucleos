@@ -11,6 +11,7 @@ import { ExtractSpec } from "./ExtractSpec";
 import { JunctionPanel } from "./JunctionPanel";
 import { DecisionsWaiting } from "./DecisionsWaiting";
 import { TriagePanel } from "./TriagePanel";
+import { ClassesView } from "./ClassesView";
 import { SequenceView } from "./SequenceView";
 import { StatesView } from "./StatesView";
 import { Button, ErrorNote, StaleNote, StatCard, relativeText } from "../ui";
@@ -76,6 +77,7 @@ const VIEWS = [
   "sequence",
   "unread",
   "states",
+  "classes",
 ] as const;
 type MapView = (typeof VIEWS)[number];
 
@@ -89,6 +91,7 @@ const VIEW_LABEL: Record<MapView, string> = {
   sequence: "Sequence",
   unread: "Not read",
   states: "States",
+  classes: "Classes",
 };
 
 export function ModeMap({ projectId }: ModeMapProps) {
@@ -160,6 +163,8 @@ export function ModeMap({ projectId }: ModeMapProps) {
         </div>
       ) : view === "states" ? (
         <StatesView projectId={projectId} />
+      ) : view === "classes" ? (
+        <ClassesView projectId={projectId} modules={(map.data?.modules ?? []).map((m) => m.path)} />
       ) : map.isError && map.data === undefined ? (
         <ErrorNote onRetry={readAgain} retryLabel="read it again">
           The {DAEMON_NAME} could not read this project&rsquo;s map: its folder may have moved.
@@ -380,6 +385,10 @@ function Views({
       of: null,
       means: "Lifecycles the code's UPDATE … SET status statements draw.",
     },
+    classes: {
+      of: null,
+      means: "The structs, enums and traits a Rust file declares, with their fields and variants.",
+    },
   };
 
   /*
@@ -392,6 +401,7 @@ function Views({
       candidate === "layers" ||
       candidate === "specs" ||
       candidate === "states" ||
+      candidate === "classes" ||
       candidate === view ||
       (counts[candidate].of ?? 0) > 0 ||
       (candidate !== "unread" && counts[candidate].of !== null),
