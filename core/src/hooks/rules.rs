@@ -289,9 +289,12 @@ pub(super) async fn github_policy_of<'a>(
     }
 }
 
-/// What `core/hooks/ask_daemon.py` gives the daemon for the whole call (its `urlopen(..., timeout=5)`
-/// on `/hooks/pretooluse-decision`); past it the hook refuses, "failing closed", and whatever the
-/// daemon decided afterwards is never delivered. Keep in step with that file.
+/// The time this daemon spends on one decision request, counted from when the request began.
+/// `core/hooks/ask_daemon.py` waits longer than this: `GATE_TIMEOUT_SECONDS` (15 s) per attempt on
+/// `/hooks/pretooluse-decision`, with `GATE_TIMEOUT_RETRIES` (one) retry as a fresh request. Past
+/// the hook's timeout it refuses ("fails closed") and an answer decided afterwards is never
+/// delivered. The budget stays well inside the hook's wait on purpose, so a slow judge or git
+/// probe is cut short here and the decision still arrives; keep it below `GATE_TIMEOUT_SECONDS`.
 pub(super) const HOOK_BUDGET: Duration = Duration::from_secs(5);
 
 /// What still has to happen after the judge returns: pausing for approval, recording, answering.
