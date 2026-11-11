@@ -89,9 +89,9 @@ pub fn decide_rollback(input: &RollbackInput) -> Option<String> {
         }
     }
     match (input.live_fraction, input.control_fraction) {
-        (Some(live), Some(control)) if live > 0.0 && live >= control * WORSE_RATIO => Some(format!(
-            "{REASON_AVOIDABLE_WORSE}:live={live:.3},control={control:.3}"
-        )),
+        (Some(live), Some(control)) if live > 0.0 && live >= control * WORSE_RATIO => Some(
+            format!("{REASON_AVOIDABLE_WORSE}:live={live:.3},control={control:.3}"),
+        ),
         _ => None,
     }
 }
@@ -156,9 +156,8 @@ async fn fraction_for_sessions(
     if sessions.is_empty() {
         return Ok(None);
     }
-    let mut qb = sqlx::QueryBuilder::new(
-        "SELECT COALESCE(SUM(active_ms), 0) FROM devtime_turn_stats WHERE",
-    );
+    let mut qb =
+        sqlx::QueryBuilder::new("SELECT COALESCE(SUM(active_ms), 0) FROM devtime_turn_stats WHERE");
     push_in(&mut qb, " session_id", sessions);
     let active: i64 = qb.build_query_scalar().fetch_one(pool).await?;
     if active <= 0 {
@@ -425,7 +424,12 @@ mod tests {
         v.push(d("accepted", None));
         let reason = decide_rollback(&input("propose", v)).unwrap();
         assert!(reason.starts_with(REASON_REJECTED_IGNORED), "{reason}");
-        let ok = vec![d("rejected", None), d("accepted", None), d("accepted", None), d("ignored", None)];
+        let ok = vec![
+            d("rejected", None),
+            d("accepted", None),
+            d("accepted", None),
+            d("ignored", None),
+        ];
         assert_eq!(decide_rollback(&input("propose", ok)), None);
     }
 
@@ -437,7 +441,11 @@ mod tests {
 
     #[test]
     fn two_noise_marks_in_a_row_roll_back_even_in_a_short_window() {
-        let v = vec![d("hit", Some("noise")), d("hit", None), d("miss", Some("noise"))];
+        let v = vec![
+            d("hit", Some("noise")),
+            d("hit", None),
+            d("miss", Some("noise")),
+        ];
         let reason = decide_rollback(&input("inject", v)).unwrap();
         assert_eq!(reason, REASON_NOISE_STREAK);
     }
@@ -548,7 +556,10 @@ mod tests {
     }
 
     async fn mode_of(pool: &SqlitePool) -> ActionStateRow {
-        st::get_action_state(pool, "inject", "D3").await.unwrap().unwrap()
+        st::get_action_state(pool, "inject", "D3")
+            .await
+            .unwrap()
+            .unwrap()
     }
 
     /// Three resolved live decisions in sessions `l0..l2`, promoted 10 days ago.
@@ -577,7 +588,10 @@ mod tests {
         live_world(&pool).await;
         assert_eq!(run_rollback_pass(&pool, &cfg(), NOW_MS).await.unwrap(), 1);
         let s = mode_of(&pool).await;
-        assert_eq!((s.mode.as_str(), s.changed_by.as_str()), ("shadow", "rollback"));
+        assert_eq!(
+            (s.mode.as_str(), s.changed_by.as_str()),
+            ("shadow", "rollback")
+        );
         assert_eq!(s.reason.as_deref(), Some(REASON_NOT_ELIGIBLE));
         assert_eq!(s.since, ts(NOW_MS));
     }
@@ -587,7 +601,12 @@ mod tests {
         let pool = pool().await;
         live_world(&pool).await;
         assert_eq!(run_rollback_pass(&pool, &cfg(), NOW_MS).await.unwrap(), 1);
-        assert_eq!(run_rollback_pass(&pool, &cfg(), NOW_MS + HOUR_MS).await.unwrap(), 0);
+        assert_eq!(
+            run_rollback_pass(&pool, &cfg(), NOW_MS + HOUR_MS)
+                .await
+                .unwrap(),
+            0
+        );
         assert_eq!(mode_of(&pool).await.since, ts(NOW_MS));
     }
 
@@ -657,9 +676,19 @@ mod tests {
     async fn reentry_is_not_blocked_for_a_pair_that_was_never_rolled_back() {
         let pool = pool().await;
         let c = cfg().actions;
-        assert_eq!(reentry_blocked(&pool, &c, "inject", "D3", NOW_MS).await.unwrap(), None);
+        assert_eq!(
+            reentry_blocked(&pool, &c, "inject", "D3", NOW_MS)
+                .await
+                .unwrap(),
+            None
+        );
         state(&pool, "shadow", "owner", NOW_MS - DAY_MS).await;
-        assert_eq!(reentry_blocked(&pool, &c, "inject", "D3", NOW_MS).await.unwrap(), None);
+        assert_eq!(
+            reentry_blocked(&pool, &c, "inject", "D3", NOW_MS)
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
@@ -668,7 +697,9 @@ mod tests {
         let c = cfg().actions;
         state(&pool, "shadow", "rollback", NOW_MS - 10 * DAY_MS).await;
         assert_eq!(
-            reentry_blocked(&pool, &c, "inject", "D3", NOW_MS).await.unwrap(),
+            reentry_blocked(&pool, &c, "inject", "D3", NOW_MS)
+                .await
+                .unwrap(),
             Some(ReentryBlock::TooSoon { days_left: 4 })
         );
     }
@@ -680,11 +711,22 @@ mod tests {
         let since = NOW_MS - 15 * DAY_MS;
         state(&pool, "shadow", "rollback", since).await;
         for i in 0..29 {
-            decision(&pool, &format!("n{i}"), "s", "shadow", since + (i + 1) * HOUR_MS, |_| {}).await;
+            decision(
+                &pool,
+                &format!("n{i}"),
+                "s",
+                "shadow",
+                since + (i + 1) * HOUR_MS,
+                |_| {},
+            )
+            .await;
         }
         // Not counted: before the rollback, another version, still pending.
         decision(&pool, "old", "s", "shadow", since - HOUR_MS, |_| {}).await;
-        decision(&pool, "v0", "s", "shadow", since + 40 * HOUR_MS, |r| r.action_version = ACTION_VERSION + 1).await;
+        decision(&pool, "v0", "s", "shadow", since + 40 * HOUR_MS, |r| {
+            r.action_version = ACTION_VERSION + 1
+        })
+        .await;
         decision(&pool, "p0", "s", "shadow", since + 41 * HOUR_MS, |r| {
             r.outcome_state = "pending".into();
             r.outcome = None;
@@ -692,10 +734,17 @@ mod tests {
         })
         .await;
         assert_eq!(
-            reentry_blocked(&pool, &c, "inject", "D3", NOW_MS).await.unwrap(),
+            reentry_blocked(&pool, &c, "inject", "D3", NOW_MS)
+                .await
+                .unwrap(),
             Some(ReentryBlock::TooFewDecisions { have: 29 })
         );
         decision(&pool, "n29", "s", "shadow", since + 42 * HOUR_MS, |_| {}).await;
-        assert_eq!(reentry_blocked(&pool, &c, "inject", "D3", NOW_MS).await.unwrap(), None);
+        assert_eq!(
+            reentry_blocked(&pool, &c, "inject", "D3", NOW_MS)
+                .await
+                .unwrap(),
+            None
+        );
     }
 }
