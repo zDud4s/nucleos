@@ -11697,13 +11697,13 @@ mod tests {
     /// its own doc that everything the queue performs is something a project may declare, in
     /// lockstep, so this is an exact-set assertion rather than a `contains`.
     #[tokio::test]
-    async fn the_git_op_catalogue_names_six_operations() {
+    async fn the_git_op_catalogue_names_the_declarable_git_ops() {
         let state = test_state().await;
 
         let (status, listed) = reach_request(state, "GET", "/vcs/declarable-ops", None).await;
         assert_eq!(status, StatusCode::OK);
         let served = listed.as_array().unwrap();
-        assert_eq!(served.len(), 6, "{listed}");
+        assert_eq!(served.len(), 7, "{listed}");
 
         let mut names: Vec<&str> = served
             .iter()
@@ -11797,9 +11797,9 @@ mod tests {
         assert_eq!(refused["refusal"], "invalid");
     }
 
-    /// An operation outside `GIT_OP_KINDS` is refused, and the refusal names all six.
+    /// An operation outside `GIT_OP_KINDS` is refused, and the refusal names every declarable kind.
     #[tokio::test]
-    async fn an_unknown_git_op_kind_is_refused_naming_the_six() {
+    async fn an_unknown_git_op_kind_is_refused_naming_every_kind() {
         let state = test_state().await;
         project_on_the_roster(&state, "alpha").await;
 

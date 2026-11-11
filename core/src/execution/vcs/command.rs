@@ -415,9 +415,9 @@ pub fn tag_from_command(command: &str, current_branch: &str) -> Option<Op> {
 /// perform it by hand either. That is the right default and not a gap — the branch the queue would
 /// rewrite is the one a paused run resumes onto.
 ///
-/// **Two modes, chosen per project.** With the project's `rebase_in_own_worktree` setting off (the
-/// default) nothing changes: the rebase blocks and the message names the setting and the
-/// `git merge --no-ff <onto>` that does work. With it on, the session hook stamps the result with
+/// **Two modes, chosen per project.** Without the project's `rebase-own-worktree` git permission (the
+/// default) nothing changes: the rebase blocks and the message names the grant and the
+/// `git merge --no-ff <onto>` that does work. With it, the session hook stamps the result with
 /// the requester's worktree (`Op::Rebase::worktree`, which this pure parser leaves `None`), and the
 /// executor rebases inside that worktree when it is clean, aborting and leaving it untouched on a
 /// conflict. A branch held by any other worktree stays blocked in both modes. The publishing half

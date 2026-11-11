@@ -421,13 +421,6 @@ pub struct AutopilotRules {
     /// daemon sets it.
     #[serde(default)]
     pub postgate_idle_command: Option<String>,
-    /// Whether the VCS queue may rebase a branch inside the worktree of the session that asked for
-    /// it, when that worktree is clean. Off by default — a project that says nothing behaves
-    /// exactly as before this key existed, and every such rebase is blocked. A branch held by any
-    /// other worktree is blocked either way. Turning it on is the owner's decision; nothing in
-    /// the daemon sets it.
-    #[serde(default)]
-    pub rebase_in_own_worktree: bool,
     /// Whether a job asks if the owner is at the keyboard before it starts its next node.
     ///
     /// `Option`, and the absent case is the brake ON. That is deliberately not the same as

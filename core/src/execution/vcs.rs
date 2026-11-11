@@ -174,12 +174,13 @@ pub enum Op {
     /// worktree, is refused — and refusing it is right rather than merely safe, since rewriting a
     /// branch under a paused run is what would corrupt its state on resume.
     ///
-    /// **One owned exception, off unless the project turns it on.** `worktree` is the checkout the
+    /// **One owned exception, off unless the project grants it.** `worktree` is the checkout the
     /// REQUESTER asked from, recorded by the session hook (`hooks::session_git`) and by nothing
     /// else — the flat tool parameters and `rebase_from_command` leave it `None`. When the project's
-    /// `rebase_in_own_worktree` setting is on and that checkout is the one holding `branch`, the
-    /// executor rebases there, because the requester owns that directory and asked for exactly this.
-    /// Any other holder stays `Blocked`, setting or not.
+    /// project has declared `rebase-own-worktree` ([`REBASE_OWN_WORKTREE`], in its git permissions)
+    /// and that checkout is the one holding `branch`, the executor rebases there, because the
+    /// requester owns that directory and asked for exactly this. Any other holder stays `Blocked`,
+    /// grant or not.
     Rebase {
         branch: Branch,
         onto: Branch,
@@ -549,7 +550,25 @@ impl Op {
 /// `every_op_kind_is_in_the_declarable_catalogue`, which builds one of each variant and asks: a
 /// seventh operation that never reached this list would be one the queue performs and no project
 /// can declare, and nothing else in the tree would say so.
-pub const GIT_OP_KINDS: [&str; 6] = ["merge", "push", "tag", "fetch", "rebase", "branch-delete"];
+///
+/// **Seven entries, six of them operations.** [`REBASE_OWN_WORKTREE`] is a grant, not an `Op`: it
+/// widens what a `rebase` may do (rebase in the requester's own worktree) and is declared like an
+/// operation so the owner grants and withdraws it in the same place. It is listed in
+/// [`GRANT_ONLY_KINDS`], which is what the catalogue test subtracts.
+pub const GIT_OP_KINDS: [&str; 7] = [
+    "merge",
+    "push",
+    "tag",
+    "fetch",
+    "rebase",
+    "branch-delete",
+    REBASE_OWN_WORKTREE,
+];
+/// The declarable grant that lets a requester's `rebase` run inside its own clean worktree. Distinct
+/// from the `rebase` operation grant, which stays as it was.
+pub const REBASE_OWN_WORKTREE: &str = "rebase-own-worktree";
+/// The entries of `GIT_OP_KINDS` that are grants and no `Op::kind()`.
+pub const GRANT_ONLY_KINDS: [&str; 1] = [REBASE_OWN_WORKTREE];
 /// The operation kinds only the daemon queues. They are outside `GIT_OP_KINDS` on purpose: no
 /// project declares them, the picker never draws them and `Op::from_request` refuses them.
 /// `every_op_kind_is_in_the_declarable_catalogue` requires every kind to sit in one list or the
@@ -563,7 +582,7 @@ pub const DAEMON_OP_KINDS: [&str; 1] = ["revert"];
 /// change of value and not a change of wire.
 ///
 /// **Not a reuse of `github::OpStanding`/`DeclarableOpView`**: those carry `half`, which separates
-/// a read that is in force from an action that is recorded and inert. These six are all writes the
+/// a read that is in force from an action that is recorded and inert. These seven are the six writes the
 /// queue performs the same way, and a `half` here would be a field with no meaning.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DeclarableGitOp {
@@ -1199,8 +1218,15 @@ mod tests {
                 op.kind()
             );
         }
+        // Every declarable entry is an operation or a named grant, and nothing else.
+        for kind in GIT_OP_KINDS {
+            assert!(
+                GRANT_ONLY_KINDS.contains(&kind) || one_of_each.iter().any(|op| op.kind() == kind),
+                "{kind} is declarable but is neither an operation nor a listed grant"
+            );
+        }
         assert_eq!(
-            GIT_OP_KINDS.len() + DAEMON_OP_KINDS.len(),
+            GIT_OP_KINDS.len() - GRANT_ONLY_KINDS.len() + DAEMON_OP_KINDS.len(),
             one_of_each.len()
         );
     }

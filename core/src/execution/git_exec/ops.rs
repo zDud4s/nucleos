@@ -16,7 +16,7 @@ async fn same_directory(left: &Path, right: &Path) -> bool {
 
 /// Rebases `branch` onto `onto` INSIDE `worktree`, the requester's own checkout that holds it.
 ///
-/// Reached only when the project's `rebase_in_own_worktree` setting is on and the holder is the
+/// Reached only when the project has declared `rebase-own-worktree` and the holder is the
 /// requester's worktree. The promise is that this never leaves that directory worse than it found
 /// it: a dirty tree or a rebase/merge already in progress is `Blocked` before any command that
 /// writes; a rebase that fails is aborted and HEAD is verified back at the original sha, and the
@@ -155,8 +155,8 @@ async fn rebase_in_own_worktree(
 
 /// Replays `branch` onto `onto`, on a detached HEAD in the integration worktree.
 ///
-/// **Two modes, per project.** With `rebase_in_own_worktree` off, `own_worktree` is `None` and the
-/// paragraphs below are the whole story. With it on, `own_worktree` is the checkout the requester
+/// **Two modes, per project.** Without the `rebase-own-worktree` grant, `own_worktree` is `None` and
+/// the paragraphs below are the whole story. With it, `own_worktree` is the checkout the requester
 /// asked from, and when THAT is the worktree holding `branch` the rebase runs there
 /// (`rebase_in_own_worktree`) instead of being blocked — the requester owns that directory. A
 /// holder that is any other worktree is blocked in both modes.
@@ -186,12 +186,12 @@ pub(super) async fn rebase(
             {
                 return rebase_in_own_worktree(&holder, branch, onto, deadline).await;
             }
-            // Only the OFF mode names the setting: with it on, the holder is somebody else's
-            // checkout and flipping the setting would change nothing.
+            // Only the ungranted mode names the grant: with it given, the holder is somebody else's
+            // checkout and granting it again would change nothing.
             let hint = if own_worktree.is_none() {
-                " To have a session's own rebase performed in its worktree, turn on \
-                 `rebase_in_own_worktree` in the project's autopilot settings; or bring the base \
-                 in with `git merge --no-ff <onto>`."
+                " To have a session's own rebase performed in its worktree, grant \
+                 `rebase-own-worktree` in the project's git permissions; or bring the base in \
+                 with `git merge --no-ff <onto>`."
             } else {
                 ""
             };

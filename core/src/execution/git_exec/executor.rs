@@ -373,14 +373,21 @@ impl crate::execution::vcs::VcsExecutor for GitExecutor {
                 onto,
                 worktree,
             } => {
-                // The project's rules are read only when the requester named a worktree, so a
-                // rebase that cannot use the setting never depends on it. Unreadable rules mean
-                // "off": the setting widens what the queue does, so it never opens on a guess.
-                let own_worktree = worktree.as_deref().filter(|_| {
-                    crate::project::rules::autopilot(&request.project_id)
-                        .map(|rules| rules.rebase_in_own_worktree)
-                        .unwrap_or(false)
-                });
+                // The project's permissions are read only when the requester named a worktree, so
+                // a rebase that cannot use the grant never depends on it. `git_ops` fails closed
+                // (unreadable = nothing declared), and no database means no grant: the grant widens
+                // what the queue does, so it never opens on a guess. Who the declaration covers
+                // (roles, depth) was judged by the hook, which withdrew the stamp otherwise.
+                let granted = match (worktree.as_ref(), self.pool.as_ref()) {
+                    (Some(_), Some(pool)) => {
+                        crate::project::policy::git_ops(pool, &request.project_id)
+                            .await
+                            .iter()
+                            .any(|(kind, _)| kind == crate::execution::vcs::REBASE_OWN_WORKTREE)
+                    }
+                    _ => false,
+                };
+                let own_worktree = worktree.as_deref().filter(|_| granted);
                 rebase(
                     project_root,
                     branch.as_str(),

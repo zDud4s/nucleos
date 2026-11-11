@@ -4418,6 +4418,7 @@ integration_steps:
                 op: crate::execution::vcs::Op::Rebase {
                     branch: "feat/x".into(),
                     onto: "master".into(),
+                    worktree: None,
                 },
                 project_id: "alpha".to_owned(),
                 project_root: repo.to_string_lossy().into_owned(),
@@ -4513,6 +4514,7 @@ integration_steps:
                 op: crate::execution::vcs::Op::Rebase {
                     branch: "feat/x".into(),
                     onto: "master".into(),
+                    worktree: None,
                 },
                 project_id: "alpha".to_owned(),
                 project_root: repo.to_string_lossy().into_owned(),
@@ -4573,6 +4575,7 @@ integration_steps:
                 op: crate::execution::vcs::Op::Rebase {
                     branch: "feat/x".into(),
                     onto: "master".into(),
+                    worktree: None,
                 },
                 project_id: "alpha".to_owned(),
                 project_root: repo.to_string_lossy().into_owned(),
@@ -4734,7 +4737,7 @@ integration_steps:
 
     /// ON, but the worktree holding the branch is not the requester's: blocked as ever.
     #[tokio::test]
-    async fn a_rebase_whose_holder_is_another_worktree_stays_blocked_with_the_setting_on() {
+    async fn a_rebase_whose_holder_is_another_worktree_stays_blocked_with_the_grant_given() {
         let _lock = crate::execution::worktree::test_env_lock();
         let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-rebase-other-");
         let holder = own_worktree_behind_master(&repo, container.path());
@@ -4751,8 +4754,8 @@ integration_steps:
                     "{reason}"
                 );
                 assert!(
-                    !reason.contains("rebase_in_own_worktree"),
-                    "the setting would not help here: {reason}"
+                    !reason.contains("rebase-own-worktree"),
+                    "the grant would not help here: {reason}"
                 );
             }
             other => panic!("another worktree's branch must be blocked, got {other:?}"),
@@ -4760,10 +4763,28 @@ integration_steps:
         assert_eq!(sha_of(&holder, "HEAD"), before);
     }
 
-    /// OFF (no stored rules): the requester's own worktree is still refused, and the message names
-    /// the setting and the merge that does work.
+    /// A rebase request stamped with `worktree`, as the session hook stamps it.
+    fn own_worktree_request(repo: &Path, holder: &Path) -> crate::execution::vcs::ClaimedRequest {
+        crate::execution::vcs::ClaimedRequest {
+            id: 1,
+            op: crate::execution::vcs::Op::Rebase {
+                branch: "feat/x".into(),
+                onto: "master".into(),
+                worktree: Some(holder.to_string_lossy().into_owned()),
+            },
+            project_id: "alpha".to_owned(),
+            project_root: repo.to_string_lossy().into_owned(),
+            from_resolution: false,
+            run_id: None,
+            approved_map_blob: None,
+            integration_branch: None,
+        }
+    }
+
+    /// Without the `rebase-own-worktree` declaration the requester's own worktree is still refused,
+    /// and the message names the grant and the merge that does work.
     #[tokio::test]
-    async fn with_the_setting_off_an_own_worktree_rebase_is_blocked_and_names_the_setting() {
+    async fn without_the_grant_an_own_worktree_rebase_is_blocked_and_names_the_grant() {
         use crate::execution::vcs::VcsExecutor;
 
         let _lock = crate::execution::worktree::test_env_lock();
@@ -4771,24 +4792,15 @@ integration_steps:
         let _env = WorktreeRootEnv::set(&container.path().join("roots"));
         let holder = own_worktree_behind_master(&repo, container.path());
         let before = sha_of(&holder, "HEAD");
-        crate::project::rules::testing::hold_shared();
+        let pool = crate::testdb::fresh_pool().await;
+        roster(&pool, &repo).await;
 
-        let outcome = GitExecutor::default()
-            .execute(&crate::execution::vcs::ClaimedRequest {
-                id: 1,
-                op: crate::execution::vcs::Op::Rebase {
-                    branch: "feat/x".into(),
-                    onto: "master".into(),
-                    worktree: Some(holder.to_string_lossy().into_owned()),
-                },
-                project_id: "alpha".to_owned(),
-                project_root: repo.to_string_lossy().into_owned(),
-                from_resolution: false,
-                run_id: None,
-                approved_map_blob: None,
-                integration_branch: None,
-            })
-            .await;
+        let outcome = GitExecutor {
+            pool: Some(pool),
+            ..GitExecutor::default()
+        }
+        .execute(&own_worktree_request(&repo, &holder))
+        .await;
 
         match &outcome {
             Outcome::Blocked { reason, .. } => {
@@ -4796,7 +4808,7 @@ integration_steps:
                     reason.contains("will not reset a worktree it does not own"),
                     "{reason}"
                 );
-                assert!(reason.contains("rebase_in_own_worktree"), "{reason}");
+                assert!(reason.contains("rebase-own-worktree"), "{reason}");
                 assert!(reason.contains("git merge --no-ff <onto>"), "{reason}");
             }
             other => panic!("the default must stay blocked, got {other:?}"),
@@ -4804,53 +4816,63 @@ integration_steps:
         assert_eq!(sha_of(&holder, "HEAD"), before, "nothing was touched");
     }
 
-    /// ON through the executor: the stored setting is what lets the request through, and a merge
-    /// still lands exactly as before.
+    /// Declared through the project's git permissions: the request goes through and a merge still
+    /// lands exactly as before. Withdrawing the declaration (the row is deleted) blocks it again.
     #[tokio::test]
-    async fn the_stored_setting_enables_the_own_worktree_rebase_and_merges_still_land() {
+    async fn the_declared_grant_enables_the_own_worktree_rebase_until_it_is_withdrawn() {
         use crate::execution::vcs::VcsExecutor;
 
         let _lock = crate::execution::worktree::test_env_lock();
         let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-rebase-on-");
         let _env = WorktreeRootEnv::set(&container.path().join("roots"));
-        let _home = crate::project::rules::testing::Home::new();
-        write_autopilot_rules("rebase_in_own_worktree: true\n");
         let holder = own_worktree_behind_master(&repo, container.path());
         let before = sha_of(&holder, "HEAD");
+        let pool = crate::testdb::fresh_pool().await;
+        roster(&pool, &repo).await;
+        let executor = GitExecutor {
+            pool: Some(pool.clone()),
+            ..GitExecutor::default()
+        };
 
-        let outcome = GitExecutor::default()
-            .execute(&crate::execution::vcs::ClaimedRequest {
-                id: 1,
-                op: crate::execution::vcs::Op::Rebase {
-                    branch: "feat/x".into(),
-                    onto: "master".into(),
-                    worktree: Some(holder.to_string_lossy().into_owned()),
-                },
-                project_id: "alpha".to_owned(),
-                project_root: repo.to_string_lossy().into_owned(),
-                from_resolution: false,
-                run_id: None,
-                approved_map_blob: None,
-                integration_branch: None,
-            })
+        crate::project::policy::declare_git_op(&pool, "alpha", "rebase-own-worktree")
+            .await
+            .expect("declare the grant");
+        let outcome = executor
+            .execute(&own_worktree_request(&repo, &holder))
             .await;
         match outcome {
             Outcome::Succeeded { sha: Some(sha), .. } => {
                 assert_ne!(sha, before);
                 assert_eq!(sha_of(&holder, "HEAD"), sha);
             }
-            other => panic!("the setting is on, so the rebase must run, got {other:?}"),
+            other => panic!("the grant is declared, so the rebase must run, got {other:?}"),
         }
 
-        // A merge of the (now rebased) branch is untouched by the setting.
+        // A merge of the (now rebased) branch is untouched by the grant.
         let master_before = sha_of(&repo, "master");
         match land_ordinarily(&repo).await {
             Outcome::Succeeded { sha: Some(sha), .. } => {
                 assert_ne!(sha, master_before);
                 assert_eq!(sha_of(&repo, "master"), sha);
             }
-            other => panic!("a merge must still land with the setting on, got {other:?}"),
+            other => panic!("a merge must still land with the grant declared, got {other:?}"),
         }
+
+        // Withdrawn: a second rebase, asked from the same worktree, is blocked again.
+        assert!(
+            crate::project::policy::forget_git_op(&pool, "alpha", "rebase-own-worktree")
+                .await
+                .expect("withdraw the grant")
+        );
+        let held = sha_of(&holder, "HEAD");
+        let outcome = executor
+            .execute(&own_worktree_request(&repo, &holder))
+            .await;
+        assert!(
+            matches!(outcome, Outcome::Blocked { .. }),
+            "withdrawn means blocked again, got {outcome:?}"
+        );
+        assert_eq!(sha_of(&holder, "HEAD"), held, "nothing was touched");
     }
 
     /// A fetch moves the tracking ref and reports NO object id.

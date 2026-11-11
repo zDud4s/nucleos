@@ -382,11 +382,6 @@
       "minimum": 0,
       "type": "integer"
     },
-    "rebase_in_own_worktree": {
-      "default": false,
-      "description": "Whether the VCS queue may rebase a branch inside the worktree of the session that asked for\nit, when that worktree is clean. Off by default — a project that says nothing behaves\nexactly as before this key existed, and every such rebase is blocked. A branch held by any\nother worktree is blocked either way. Turning it on is the owner's decision; nothing in\nthe daemon sets it.",
-      "type": "boolean"
-    },
     "repo_triggers": {
       "default": [],
       "items": {
