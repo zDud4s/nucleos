@@ -13,7 +13,11 @@ import { ClassesView } from "./ClassesView";
 import { createAppQueryClient } from "../app/queryClient";
 import type { FileItems } from "../data/project-map";
 
-beforeEach(() => daemon.apiFetch.mockReset());
+// Braces on purpose: a `beforeEach` that returns a function has it run as its teardown, and
+// `mockReset()` returns the mock itself, so the arrow form would call the failing mock after the test.
+beforeEach(() => {
+  daemon.apiFetch.mockReset();
+});
 
 const item = (id: string, kind: string, over: object = {}) => ({
   id,
