@@ -4745,6 +4745,46 @@ integration_steps:
         );
     }
 
+    /// The path `rebase_in_own_worktree` takes when the `git rebase` call itself errors (deadline
+    /// kill) with a rebase half done: the shared abort puts HEAD back and clears the rebase state.
+    /// The half-done rebase is made by hand, since a killed call cannot be provoked portably.
+    #[tokio::test]
+    async fn the_abort_after_a_killed_rebase_restores_head_and_clears_the_state() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-rebase-killed-");
+        let holder = container.path().join("holder");
+        assert!(git_ok(
+            &repo,
+            &[
+                OsStr::new("worktree"),
+                OsStr::new("add"),
+                holder.as_os_str(),
+                OsStr::new("feat/x")
+            ]
+        ));
+        commit_file(&repo, "feature.txt", "from master\n");
+        let before = sha_of(&holder, "HEAD");
+        // Stops on the conflict and leaves the rebase in progress, as a killed call would.
+        assert!(!git_ok(&holder, &[OsStr::new("rebase"), OsStr::new("master")]));
+        let git_dir = Command::new("git")
+            .arg("-C")
+            .arg(&holder)
+            .args(["rev-parse", "--absolute-git-dir"])
+            .output()
+            .expect("git should start");
+        let git_dir = PathBuf::from(String::from_utf8_lossy(&git_dir.stdout).trim());
+        assert!(
+            git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists(),
+            "the fixture must leave a rebase in progress"
+        );
+
+        assert!(abort_restores(&holder, &git_dir, &before, rebase_deadline()).await);
+
+        assert_eq!(sha_of(&holder, "HEAD"), before);
+        assert!(!git_dir.join("rebase-merge").exists());
+        assert!(!git_dir.join("rebase-apply").exists());
+    }
+
     /// ON, but the worktree holding the branch is not the requester's: blocked as ever.
     #[tokio::test]
     async fn a_rebase_whose_holder_is_another_worktree_stays_blocked_with_the_grant_given() {

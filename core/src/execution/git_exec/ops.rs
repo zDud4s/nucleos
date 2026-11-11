@@ -14,6 +14,27 @@ async fn same_directory(left: &Path, right: &Path) -> bool {
     }
 }
 
+/// `git rebase --abort` in `worktree`, then whether HEAD is back at `old` with no rebase directory
+/// left. The deadline may be spent by the rebase itself and the abort is the one command that must
+/// still run, so it gets a fresh short budget of its own.
+pub(super) async fn abort_restores(
+    worktree: &Path,
+    git_dir: &Path,
+    old: &str,
+    deadline: std::time::Instant,
+) -> bool {
+    let abort_deadline = std::cmp::max(
+        deadline,
+        std::time::Instant::now() + std::time::Duration::from_secs(60),
+    );
+    let _ = git(worktree, &["rebase", "--abort"], abort_deadline).await;
+    let restored = revision(worktree, "HEAD", abort_deadline).await.ok();
+    let in_progress = ["rebase-merge", "rebase-apply"]
+        .iter()
+        .any(|marker| git_dir.join(marker).exists());
+    restored.as_deref() == Some(old) && !in_progress
+}
+
 /// Rebases `branch` onto `onto` INSIDE `worktree`, the requester's own checkout that holds it.
 ///
 /// Reached only when the project has declared `rebase-own-worktree` and the holder is the
@@ -93,7 +114,22 @@ async fn rebase_in_own_worktree(
     };
     let rebased = match git(worktree, &["rebase", "--end-of-options", onto], deadline).await {
         Ok(rebased) => rebased,
-        Err(outcome) => return outcome,
+        // The call itself failed (deadline kill, spawn failure) and may have left a rebase half
+        // done in the requester's directory: abort it the same way the non-zero path does.
+        Err(outcome) => {
+            if abort_restores(worktree, &git_dir, &old, deadline).await {
+                return outcome;
+            }
+            return Outcome::Failed {
+                reason: format!(
+                    "the rebase of {branch} onto {onto} in {} did not finish and THE ABORT DID NOT \
+                     RESTORE {branch} to {old}: check it by hand.",
+                    worktree.display()
+                ),
+                exit_code: None,
+                output_tail: String::new(),
+            };
+        }
     };
     if !rebased.succeeded() {
         // Named BEFORE the abort, which discards the index entries that say which files conflicted.
@@ -113,23 +149,13 @@ async fn rebase_in_own_worktree(
                 .join(", "),
             Err(_) => String::new(),
         };
-        // The deadline may be spent by the rebase itself; the abort is the one command that must
-        // still run, so it gets a fresh short budget of its own.
-        let abort_deadline = std::cmp::max(
-            deadline,
-            std::time::Instant::now() + std::time::Duration::from_secs(60),
-        );
-        let _ = git(worktree, &["rebase", "--abort"], abort_deadline).await;
-        let restored = revision(worktree, "HEAD", abort_deadline).await.ok();
-        let in_progress = ["rebase-merge", "rebase-apply"]
-            .iter()
-            .any(|marker| git_dir.join(marker).exists());
+        let restored = abort_restores(worktree, &git_dir, &old, deadline).await;
         let named = if conflicts.is_empty() {
             "no conflicting file could be read".to_owned()
         } else {
             format!("conflicting files: {conflicts}")
         };
-        let state = if restored.as_deref() == Some(old.as_str()) && !in_progress {
+        let state = if restored {
             format!("It was aborted and {branch} is back at {old}.")
         } else {
             format!(

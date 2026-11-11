@@ -565,9 +565,48 @@ pub(super) async fn submit_vcs_request(
         )
             .into_response());
     }
+    let mut body = body;
+    forget_client_worktree(&mut body.operation);
     submit_vcs_request_inner(state, origin, body)
         .await
         .map_err(IntoResponse::into_response)
+}
+
+/// A rebase's `worktree` is the requester's own checkout, stamped by the session hook
+/// (`hooks::session_git`), which submits through `vcs::submit` and never through this route. A value
+/// arriving here is a claim the caller makes about itself, and the executor trusts that field to
+/// rewrite a checked-out branch under the `rebase-own-worktree` grant — so it is dropped, and the
+/// rebase is judged as if asked from nowhere in particular (blocked while a worktree holds it).
+fn forget_client_worktree(operation: &mut vcs::Op) {
+    if let vcs::Op::Rebase { worktree, .. } = operation {
+        *worktree = None;
+    }
+}
+
+#[cfg(test)]
+mod forged_worktree_tests {
+    use super::*;
+
+    #[test]
+    fn a_client_supplied_rebase_worktree_is_dropped() {
+        let body: VcsRequestBody = serde_json::from_value(serde_json::json!({
+            "project_id": "p",
+            "operation": {
+                "op": "rebase", "branch": "feat/x", "onto": "master", "worktree": "C:/somebody-else"
+            },
+        }))
+        .unwrap();
+        let mut operation = body.operation;
+        assert!(
+            matches!(&operation, vcs::Op::Rebase { worktree: Some(_), .. }),
+            "the forged field must deserialize, or this test proves nothing: {operation:?}"
+        );
+        forget_client_worktree(&mut operation);
+        assert!(matches!(
+            operation,
+            vcs::Op::Rebase { worktree: None, .. }
+        ));
+    }
 }
 
 async fn submit_vcs_request_inner(

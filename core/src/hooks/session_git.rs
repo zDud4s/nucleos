@@ -51,6 +51,22 @@ pub(super) fn queue_op(segment: &str, branch: &str) -> Option<crate::execution::
         .or_else(|| crate::execution::vcs::rebase_from_command(segment, branch))
 }
 
+/// Whether `target` (the checkout a command names) is the checkout the session itself stands in.
+/// Fails closed: a session cwd that is not a working tree, or a path that cannot be compared,
+/// is not "own".
+async fn own_checkout(target: &Path, session_cwd: &Path, deadline: Instant) -> bool {
+    let Ok(own) = crate::execution::git_exec::toplevel(session_cwd, deadline).await else {
+        return false;
+    };
+    match (
+        tokio::fs::canonicalize(target).await,
+        tokio::fs::canonicalize(&own).await,
+    ) {
+        (Ok(target), Ok(own)) => target == own,
+        _ => false,
+    }
+}
+
 #[derive(Deserialize)]
 pub struct SessionGitPayload {
     pub tool_name: String,
@@ -232,7 +248,14 @@ pub(super) async fn session_git_decision_within(
     // checkout from somebody else's when the project grants `rebase-own-worktree`. Only this hook
     // stamps it, and it withdraws the stamp below when the grant's roles or depth do not cover the
     // requester.
-    if let crate::execution::vcs::Op::Rebase { worktree, .. } = &mut op {
+    //
+    // **Stamped only when the command targets the session's OWN checkout** (the top level of the
+    // session's cwd). `git -C <another worktree> rebase ...` names somebody else's directory, and
+    // stamping that would let the executor rewrite it as "the requester's own"; it is left `None`
+    // so the normal holder block applies.
+    if let crate::execution::vcs::Op::Rebase { worktree, .. } = &mut op
+        && own_checkout(&root, Path::new(&payload.cwd), deadline).await
+    {
         *worktree = Some(root.to_string_lossy().into_owned());
     }
 

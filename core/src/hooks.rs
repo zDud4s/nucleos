@@ -8467,6 +8467,57 @@ mod tests {
         );
     }
 
+    /// The own-worktree stamp names the SESSION's checkout only: a rebase aimed at another worktree
+    /// with `git -C` is queued unstamped, so the executor never treats it as the requester's own.
+    #[tokio::test]
+    async fn a_rebase_aimed_at_another_worktree_is_not_stamped_as_the_sessions_own() {
+        let state = test_state().await;
+        let repo = rostered_repo(&state, "hook-session-rebase-stamp").await;
+        crate::project::policy::declare_git_op(
+            &state.pool,
+            "p",
+            crate::execution::vcs::REBASE_OWN_WORKTREE,
+        )
+        .await
+        .unwrap();
+        let holder =
+            crate::execution::git_exec::testkit::space_free_tempdir("hook-session-rebase-wt");
+        let worktree = holder.path().join("wt");
+        assert!(crate::execution::git_exec::testkit::git_ok(
+            repo.path(),
+            &[
+                std::ffi::OsStr::new("worktree"),
+                std::ffi::OsStr::new("add"),
+                std::ffi::OsStr::new("-b"),
+                std::ffi::OsStr::new("side"),
+                worktree.as_os_str(),
+            ]
+        ));
+        let there = worktree.display().to_string().replace('\\', "/");
+
+        // The session stands in the main checkout and names the other worktree.
+        session_decision(
+            &state,
+            &format!("git -C {there} rebase master"),
+            repo.path(),
+        )
+        .await;
+        // The same command from the session's own checkout is stamped.
+        session_decision(&state, "git rebase master", repo.path()).await;
+
+        let stamps: Vec<Option<String>> = queued_ops(&state)
+            .await
+            .into_iter()
+            .map(|op| match op {
+                crate::execution::vcs::Op::Rebase { worktree, .. } => worktree,
+                other => panic!("not a rebase: {other:?}"),
+            })
+            .collect();
+        assert_eq!(stamps.len(), 2, "{stamps:?}");
+        assert_eq!(stamps[0], None, "a foreign worktree was stamped as own");
+        assert!(stamps[1].is_some(), "the session's own checkout lost its stamp");
+    }
+
     fn ticket(
         status: &str,
         sha: Option<&str>,
