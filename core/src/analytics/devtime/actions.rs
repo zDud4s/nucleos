@@ -327,6 +327,13 @@ pub async fn promote_pair(
     if !before.report.ready {
         return Err(ActionError::NotReady);
     }
+    // A pair rolled back to shadow waits for `reentry_days` and 30 new shadow decisions.
+    if crate::devtime::actions::rollback::reentry_blocked(pool, &cfg.actions, action, rule_id, now_ms)
+        .await?
+        .is_some()
+    {
+        return Err(ActionError::NotReady);
+    }
     store::set_action_state(
         pool,
         &store::ActionStateRow {

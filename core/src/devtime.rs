@@ -1082,6 +1082,11 @@ pub async fn run_ingest_loop(pool: SqlitePool, cfg: DevtimeConfig, projects_dir:
             if let Err(error) = close_due_outcomes(&pool, now_ms).await {
                 tracing::warn!(%error, "devtime: closing the actions' outcomes failed");
             }
+            if let Err(error) =
+                devtime_actions::rollback::run_rollback_pass(&pool, &live, now_ms).await
+            {
+                tracing::warn!(%error, "devtime: the actions' rollback pass failed");
+            }
         }
         let row = status_row(true, &cfg, &stats, &totals);
         if let Err(error) = devtime_store::write_ingest_status(&pool, &row).await {
