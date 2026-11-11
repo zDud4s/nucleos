@@ -24,15 +24,31 @@ const CLAIM_TICKET_LEAF: &str = "When a ticket is offered to you and it is indep
 /// What a leaf is told when its work is too large: it opens no branch.
 const LEAF_TOO_LARGE: &str = "You are a leaf and a leaf does not open branches. If the work is too large for this node, make the best leaf you can and say in your report summary that the work exceeded the leaf budget.";
 
-const NODE_PROMPT_HEADER: &str = "You are the agent for NucleOS tree node ";
+/// The first line of every node prompt, the root's included, and the marker that makes
+/// `node_prompt` a no-op on a stored prompt.
+pub(super) const HEADLESS_PREAMBLE: &str = "You are a headless node of a tree: ignore conductor routing, `manual:`, `/compact` and `wait_advice`; this prompt and your cockpit are your instructions.";
+
+const NODE_PROMPT_HEADER: &str = HEADLESS_PREAMBLE;
+
+/// The "done" criterion every node is told, and the shape of a summary its parent reads.
+const DONE_RULES: &str = "Done = every deliverable of the goal is in your files and you re-read the diff against the goal. When node_close answers `recorded: true`, stop. Start your report Summary with `Decisions affecting siblings:` (or `Decisions affecting siblings: none`) within its first 500 characters.";
+
+/// What a leaf reads before adding a module, and what it does not need to read.
+const LEAF_READING_RULES: &str = "Before adding a module, read only core/MODULE_MAP.md, never core/AGENTS.md. You do not need .nucleos/workflow/workflow.md or dispatch.md.";
+
+/// What an orchestrator, root included, reads.
+pub(super) const ORCHESTRATOR_READING_RULES: &str = "Before adding a module, read only core/MODULE_MAP.md, never core/AGENTS.md. Of dispatch.md read only the \"One controller per node\" section; you do not need the rest of it.";
+
+/// What a leaf is told when it writes tests the gate must see red (spec S4).
+const RED_EXPECTED_RULE: &str = "If you write tests that the gate must see red (the RED half of RED/GREEN), close with `red_expected: [<test names>]` in your report: the gate of that commit must be red on exactly those tests, which counts as success and spends no fix. You never run the tests yourself.";
 
 /// What every node, root included, is told about problems outside its owned paths (spec
 /// 2026-11-06, tickets globais). Appended once by `node_prompt` and by `root_prompt`.
-pub(super) const TICKET_RULES: &str = "Problems outside your owned paths are not yours to fix. Report them with mcp__nucleos__task_report (key, title, paths) and carry on with your own work; wait only if your work depends on the fix, and then wait for the ticket-closed notice. If you truly need a path you do not own, ask your parent with node_update widen_paths; if a sibling owns it you are refused: report a ticket and it goes to that sibling. Shared files (core/AGENTS.md, ask_daemon.py, core/migrations/) you may edit. A repeated migration number or an unresolved conflict at land is a ticket, not yours to renumber or resolve twice. When a ticket is offered to you and it is independent of your work, claim it and start a branch (a leaf) for it with tree_branch_start, then carry on. The daemon launches a new tree for a ticket nobody claims; it never starts a leaf for one you hold.";
+pub(super) const TICKET_RULES: &str = "Problems outside your owned paths are not yours to fix. Report them with mcp__nucleos__task_report (key, title, paths), do the part of your work that does not depend on the fix, and never wait: a headless run has nobody to wake it. If you cannot continue without the fix, close the node `blocked` and name the ticket key in `## Blocked reason`. If you truly need a path you do not own, ask your parent with node_update widen_paths; if a sibling owns it you are refused: report a ticket and it goes to that sibling. Shared files (core/AGENTS.md, ask_daemon.py, core/migrations/) you may edit. A repeated migration number or an unresolved conflict at land is a ticket, not yours to renumber or resolve twice. When a ticket is offered to you and it is independent of your work, claim it and start a branch (a leaf) for it with tree_branch_start, then carry on. The daemon launches a new tree for a ticket nobody claims; it never starts a leaf for one you hold.";
 
-/// What every node is told about cargo and formatting (the daemon-built prompt carried no cargo rule
-/// at all, so a leaf asked to format concluded it could not and ended `blocked`).
-pub(super) const FORMAT_RULES: &str = "You do not run cargo (build, test, check, clippy), and you never hand-format or run bare `rustfmt`. Formatting is not yours to block on: the daemon runs the formatter on the Rust you own before the gate and again if the gate finds only formatting. After editing Rust you may run `cargo fmt -p <crate>` (no other flags, from the worktree root, no `cd`, no pipes), but never report `blocked` because you could not format.";
+/// What every node is told about cargo and formatting: the one leaf cargo rule (contract E4),
+/// verbatim.
+pub(super) const FORMAT_RULES: &str = "A leaf runs only `cargo fmt -p <crate>` and `python scripts/check_invariants.py` before closing, via `python scripts/heavy.py`, failing open; never `cargo check`, `test`, `build`, `clippy` or `--workspace`. The rest is the gate's. With `autonomy.leaf_self_check: true` it may add one `cargo check -p <crate> --tests`.";
 
 /// Gives a tree node the protocol it needs to split work and report its result.
 ///
@@ -68,14 +84,25 @@ pub(super) fn node_prompt(
     } else {
         TICKET_RULES.to_owned()
     };
+    let (reading_rules, red_rule) = if leaf {
+        (LEAF_READING_RULES, format!("\n\n{RED_EXPECTED_RULE}"))
+    } else {
+        (ORCHESTRATOR_READING_RULES, String::new())
+    };
     format!(
-        "{NODE_PROMPT_HEADER}{node_id}.{job_line} {size_rule} Finish by writing a handoff file and calling node_close. Write the handoff file as `.nucleos-report.md` in your worktree (your current directory; the daemon keeps it out of git, so do not commit it) and pass its absolute path as handoff_path.
+        "{HEADLESS_PREAMBLE}
+
+You are the agent for NucleOS tree node {node_id}.{job_line} {size_rule} Finish by writing a handoff file and calling node_close. Write the handoff file as `.nucleos-report.md` in your worktree (your current directory; the daemon keeps it out of git, so do not commit it) and pass its absolute path as handoff_path.
+
+{DONE_RULES}
 
 {report}
 
 {ticket_rules}
 
-{FORMAT_RULES}
+{FORMAT_RULES}{red_rule}
+
+{reading_rules}
 
 {task}"
     )
@@ -1404,6 +1431,45 @@ mod tests {
         assert!(prompt.contains("Implement it."), "{prompt}");
         let relaunch = node_prompt("node-abc-123", "root-9", "job-1", "leaf", &prompt);
         assert_eq!(relaunch, prompt);
+    }
+
+    #[test]
+    fn every_node_prompt_opens_with_the_headless_preamble() {
+        for kind in ["leaf", "orchestrator"] {
+            let prompt = node_prompt("node-abc-123", "root-9", "job-1", kind, "Task.");
+            assert!(prompt.starts_with(HEADLESS_PREAMBLE), "{kind}: {prompt}");
+            assert!(prompt.contains("wait_advice"), "{kind}");
+            assert_eq!(prompt.matches(HEADLESS_PREAMBLE).count(), 1, "{kind}");
+        }
+    }
+
+    #[test]
+    fn the_ticket_rules_never_wait_and_close_blocked_naming_the_ticket() {
+        assert!(TICKET_RULES.contains("never wait"), "{TICKET_RULES}");
+        assert!(TICKET_RULES.contains("`blocked`"), "{TICKET_RULES}");
+        assert!(TICKET_RULES.contains("ticket key"), "{TICKET_RULES}");
+        assert!(!TICKET_RULES.contains("wait for the ticket-closed"));
+    }
+
+    #[test]
+    fn a_leaf_prompt_carries_the_budget_rules_the_cargo_rule_and_red_expected() {
+        let prompt = node_prompt("node-abc-123", "root-9", "job-1", "leaf", "Task.");
+        assert!(prompt.contains("core/MODULE_MAP.md"), "{prompt}");
+        assert!(!prompt.contains("read core/AGENTS.md"), "{prompt}");
+        assert!(prompt.contains("do not need .nucleos/workflow/workflow.md or dispatch.md"));
+        assert!(prompt.contains(FORMAT_RULES), "{prompt}");
+        assert!(prompt.contains("red_expected: [<test names>]"), "{prompt}");
+        assert!(prompt.contains("Done = every deliverable"), "{prompt}");
+        assert!(prompt.contains("`recorded: true`, stop"), "{prompt}");
+        assert!(prompt.contains("Decisions affecting siblings:"), "{prompt}");
+    }
+
+    #[test]
+    fn an_orchestrator_prompt_reads_only_one_section_of_dispatch() {
+        let prompt = node_prompt("node-abc-123", "root-9", "job-1", "orchestrator", "Task.");
+        assert!(prompt.contains("\"One controller per node\" section"), "{prompt}");
+        assert!(prompt.contains("core/MODULE_MAP.md"), "{prompt}");
+        assert!(!prompt.contains("red_expected"), "{prompt}");
     }
 
     #[test]
