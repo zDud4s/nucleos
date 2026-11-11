@@ -16,7 +16,11 @@ const PARTIAL_FLUSH: Duration = Duration::from_millis(300);
 
 /// The production spawner: the real CLI, output lines merged, stdin open for the code.
 pub(super) fn spawn_process(command: &LoginCommand) -> io::Result<LoginProcess> {
-    let mut process = tokio::process::Command::new(&command.program);
+    let executable = super::notty::resolve_executable(&command.program)?;
+    let mut process = tokio::process::Command::new(executable);
+    // No console window flashing over the app while the login runs.
+    #[cfg(windows)]
+    process.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     process
         .args(&command.args)
         .envs(command.env.iter().map(|(k, v)| (k, v)))

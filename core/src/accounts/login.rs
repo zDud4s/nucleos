@@ -19,6 +19,7 @@ use serde::Serialize;
 use sqlx::SqlitePool;
 use tokio::sync::{mpsc, oneshot};
 
+mod notty;
 mod process;
 
 use self::process::spawn_process;

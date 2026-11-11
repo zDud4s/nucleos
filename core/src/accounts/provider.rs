@@ -96,6 +96,8 @@ pub fn parse_cli_login_line(line: &str) -> Option<LoginEvent> {
     }
     if let Some(start) = line.find("https://") {
         let url = line[start..].split_whitespace().next().unwrap_or_default();
+        // Prose around the URL ("visit https://x/y.", "(https://x/y)") is not part of it.
+        let url = url.trim_end_matches(['.', ',', ')', ']', '>', '"', '\'']);
         return Some(LoginEvent::AuthUrl(url.to_owned()));
     }
     if is_device_code(line) {
@@ -149,6 +151,21 @@ mod tests {
         );
         assert_eq!(parse_cli_login_line("ABC-DEFG"), None);
         assert_eq!(parse_cli_login_line("ABCD-EFGH-IJKL"), None);
+    }
+
+    #[test]
+    fn sentence_punctuation_after_the_url_is_not_part_of_it() {
+        for line in [
+            "Visit https://auth.example/x?y=1.",
+            "Open (https://auth.example/x?y=1)",
+            "Browser did not open, use \"https://auth.example/x?y=1\"",
+        ] {
+            assert_eq!(
+                parse_cli_login_line(line),
+                Some(LoginEvent::AuthUrl("https://auth.example/x?y=1".into())),
+                "{line}"
+            );
+        }
     }
 
     #[test]
