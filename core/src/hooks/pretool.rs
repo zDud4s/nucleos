@@ -948,7 +948,7 @@ pub(super) async fn pretooluse_decision_from(
     //   what a person approved and spend that person's denial allowance. It also means the
     //   judge is NOT free of the declared-git branch: that branch's git probes (each allowed
     //   up to 300 s) run first and can return `None`, and the judge's wait then follows them.
-    //   Both sit inside the 5 s the hook's caller allows, so the judge is given only what
+    //   Both sit inside the `HOOK_BUDGET` the hook's caller allows, so the judge is given only what
     //   `judge_wait(started)` says is left, and below that it merely observes.
     // - OUTSIDE the `pending && in_flight` block above, because a classifier `allow` never enters
     //   it, and D6 sends writes the classifier allowed to the judge.
@@ -1414,8 +1414,8 @@ pub(super) async fn pretooluse_decision_from(
         // Only for a genuinely in-flight run_id — an unknown/stale one must not terminate anything.
         if is_in_flight {
             // In its own task, on purpose. Terminating the run kills the CLI whose hook script owns
-            // the connection this handler is answering, and that script gives up after 5s anyway
-            // (`ask_daemon.py`'s `timeout=5`) — so the request can disappear mid-handler, and a
+            // the connection this handler is answering, and that script gives up after its own
+            // `GATE_TIMEOUT_SECONDS` — so the request can disappear mid-handler, and a
             // dropped request drops the handler future exactly the way `abort()` does. Awaiting the
             // JoinHandle keeps the response as synchronous as before; dropping a JoinHandle only
             // detaches its task, so the pause still gets recorded when the request goes away.

@@ -62,6 +62,30 @@ mod tests {
         );
     }
 
+    /// The daemon's budget for one decision stays strictly below what the script waits per attempt,
+    /// or a slow answer would be cut by the script instead of by the daemon. The script's literal is
+    /// read from its source, which is the one copy the settings entry runs.
+    #[test]
+    fn the_hook_budget_is_below_the_scripts_gate_timeout() {
+        let script = include_str!("../hooks/ask_daemon.py");
+        let gate: u64 = script
+            .lines()
+            .find_map(|line| line.strip_prefix("GATE_TIMEOUT_SECONDS = "))
+            .expect("the script declares GATE_TIMEOUT_SECONDS")
+            .trim()
+            .parse()
+            .expect("GATE_TIMEOUT_SECONDS is a literal number of seconds");
+        assert!(
+            super::rules::HOOK_BUDGET < Duration::from_secs(gate),
+            "HOOK_BUDGET {:?} must stay below GATE_TIMEOUT_SECONDS {gate}",
+            super::rules::HOOK_BUDGET
+        );
+        assert!(
+            Duration::from_secs(crate::governance::autopilot::HOOK_TIMEOUT_SECONDS)
+                > Duration::from_secs(gate) * 2
+        );
+    }
+
     async fn test_state() -> AppState {
         crate::project::rules::testing::hold_shared();
         let pool = crate::testdb::fresh_pool().await;
@@ -1556,10 +1580,11 @@ mod tests {
     async fn the_judge_wait_is_bounded_by_what_remains_of_the_hook_budget() {
         let state = judged_state(VerdictJudge::slow(Duration::from_secs(120))).await;
         let run_id = judged_run(&state, "worktree", "enforce").await;
-        // 5 s - 2.4 s - 1 s margin = 1.6 s left, well under the 3 s `JUDGE_DEADLINE` cap, and
+        // Budget - margin - 1.6 s spent = 1.6 s left, well under the 3 s `JUDGE_DEADLINE` cap, and
         // 1.1 s above `JUDGE_FLOOR`, so a slow machine still reaches the enforced wait.
         let left = Duration::from_millis(1_600);
-        let started = Instant::now() - Duration::from_millis(2_400);
+        let started = Instant::now()
+            - (super::rules::HOOK_BUDGET - super::rules::AFTER_JUDGE_MARGIN - left);
         let waited = Instant::now();
 
         let decision = decide_started(&state, run_id, started).await;
@@ -4036,7 +4061,7 @@ mod tests {
     }
 
     /// Terminating the run kills the CLI whose hook script owns the very connection this handler is
-    /// serving, and that script gives up after 5s anyway (`ask_daemon.py`'s `timeout=5`). Either way
+    /// serving, and that script gives up after `GATE_TIMEOUT_SECONDS` anyway. Either way
     /// the request can vanish mid-handler, and a dropped request drops the handler future exactly the
     /// way `abort()` does — so everything sequenced after the termination is lost.
     ///

@@ -124,8 +124,12 @@ ASK_WAIT_TIMEOUT_SECONDS = 2_590_200
 GATE_UNAVAILABLE_RETRY_DELAYS_SECONDS = (0.5, 1.0)
 # One attempt at the run gate waits this long for the daemon (D5; it was 5 s, which a daemon busy
 # with a build cut off and the call was refused as if the daemon had said no). A timeout is retried
-# once and, if it repeats, reported as transient rather than as a refusal.
-GATE_TIMEOUT_SECONDS = 15
+# once and, if it repeats, reported as transient rather than as a refusal. It must stay strictly
+# above the daemon's own budget for one decision (`hooks::HOOK_BUDGET`, 15 s), so a slow judge or
+# git probe is cut short there and the decision still arrives; a test in `core/src/hooks.rs` reads
+# this literal and pins the order. Far below the CLI's own timeout on the hook entry
+# (`autopilot::HOOK_TIMEOUT_SECONDS`, thirty days), so the CLI never cuts the hook first.
+GATE_TIMEOUT_SECONDS = 20
 GATE_TIMEOUT_RETRIES = 1
 
 
@@ -2574,12 +2578,12 @@ def _open_json_retrying_timeout(request, timeout):
 def wait_for_answer(daemon_url, token, run_id):
     """Waits for the person to answer for a tool call the daemon is holding.
 
-    The gate above answers in five seconds because that is all the time a tool call
-    can spare. A call somebody has to say yes to cannot be answered in five seconds,
+    The gate above answers within `GATE_TIMEOUT_SECONDS` because that is all the time a
+    tool call can spare. A call somebody has to say yes to cannot be answered that fast,
     so the daemon says `asking` and the waiting happens here instead -- which keeps
     the ordinary call as fast as it was and confines the long timeout to the one
     case that earned it. A daemon that is simply down still fails at the first call,
-    in five seconds, exactly as before.
+    at once, exactly as before.
 
     The wait is as long as the CLI lives: the daemon holds a question for its ask window
     and this waits half an hour longer, so the daemon is what decides a question nobody
