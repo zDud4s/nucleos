@@ -906,10 +906,15 @@ pub async fn finish_with<'a>(
         report.deferred = queue.drain(..).map(|left| left.spec.id).collect();
     }
     // What waits on a spec held for a later pass waits with it: still queued, not blocked.
-    if !report.retry.is_empty() {
-        report
-            .retry
-            .extend(queue.drain(..).map(|left| left.spec.id));
+    // Only a spec that depends, directly or through another queued spec, on one held back goes
+    // with it; a spec waiting on something stopped or unresolved keeps the Blocked handling below.
+    while let Some(index) = queue.iter().position(|waiting| {
+        waiting
+            .waits_on
+            .iter()
+            .any(|dep| report.retry.contains(dep))
+    }) {
+        report.retry.push(queue.remove(index).spec.id);
     }
     // The rest were never ready: they wait on something that is neither done nor stopped.
     // Unfinished, and said so.
@@ -2561,6 +2566,54 @@ mod tests {
         assert_eq!(ids.len(), 2);
         assert_eq!(ids[0], ids[1], "the same tree id is launched again");
         assert!(second.retry.is_empty());
+    }
+
+    #[tokio::test]
+    async fn only_dependents_of_a_postponed_spec_are_retried() {
+        let pool = crate::testdb::fresh_pool().await;
+        let refused = add_spec(&pool, "postponed", SpecStatus::Extracted).await;
+        let after_refused = add_spec(&pool, "after-postponed", SpecStatus::Extracted).await;
+        let gone = add_spec(&pool, "gone", SpecStatus::Abandoned).await;
+        let stopped = add_spec(&pool, "needs-owner", SpecStatus::Extracted).await;
+        let after_stopped = add_spec(&pool, "after-needs-owner", SpecStatus::Extracted).await;
+        store::add_dep(&pool, &after_refused, &refused, DepSource::Owner)
+            .await
+            .unwrap();
+        // `stopped` waits on an abandoned spec, so it goes to the owner; `after_stopped` waits on it.
+        store::add_dep(&pool, &stopped, &gone, DepSource::Owner)
+            .await
+            .unwrap();
+        store::add_dep(&pool, &after_stopped, &stopped, DepSource::Owner)
+            .await
+            .unwrap();
+        let log = Log::default();
+        let launcher = RefusingLauncher {
+            ids: Mutex::new(Vec::new()),
+            refuse: AtomicUsize::new(1),
+        };
+        let prep = FakePreparer::new(&pool, &log, &[]);
+        let mut config = cfg();
+        config.max_rounds = 1;
+        config.owned_paths = disjoint(&[&refused, &after_refused, &stopped, &after_stopped]);
+
+        let report = finish_with(
+            &pool,
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &prep,
+            },
+            &config,
+            scope_all(),
+        )
+        .await
+        .unwrap();
+
+        let mut retry = vec![refused.clone(), after_refused.clone()];
+        retry.sort();
+        assert_eq!(report.retry, retry);
+        assert!(report.needs_owner.contains(&stopped), "{report:?}");
+        assert_eq!(report.blocked, vec![after_stopped.clone()]);
+        assert_eq!(status_of(&pool, &after_stopped).await, SpecStatus::Blocked);
     }
 
     #[tokio::test]
