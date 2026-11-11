@@ -597,6 +597,7 @@ if [ "$target" = hooks ] || [ "$target" = all ]; then
     run "release: bump"     . "$py" scripts/test-bump-version.py
     run "release: manifest" . "$py" scripts/test-release-manifest.py
     run "release: install"  . "$py" scripts/test-install-scripts.py
+    run "repo: invariants"  . "$py" scripts/test-check-invariants.py
     # The scripts of the bundled `nucleos-dev` workflow, which the daemon packages and every
     # project's controller runs from its library copy. Their tests used to run only from the
     # gitignored `.ai/` catalog, which a fresh clone does not have.

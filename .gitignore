@@ -90,7 +90,7 @@ sidecars/*/*-sidecar
 AGENTS.md
 CLAUDE.md
 
-# …except the one a TRACKED test reads. `core/AGENTS.md` is the module map, and
+# …except the one a TRACKED test reads. `core/AGENTS.md` once held the module map (now `core/MODULE_MAP.md`, not ignored), and
 # `core/tests/module_map.rs` fails when a module has no row in it — so the rule above put the guard
 # in git and left the thing it guards on one machine. What that produces is a test whose result
 # depends on where it was run from rather than on what the commit contains: green in the checkout

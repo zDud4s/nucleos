@@ -92,7 +92,7 @@ fn rust_files(dir: &Path) -> Vec<(String, PathBuf)> {
 #[test]
 fn the_module_map_matches_the_files_on_disk() {
     let manifest_dir = package_root();
-    let map_path = manifest_dir.join("AGENTS.md");
+    let map_path = manifest_dir.join("MODULE_MAP.md");
 
     // No early return for an absent map any more, and its removal is the point rather than tidying.
     // AGENTS.md used to be gitignored, so this test skipped itself wherever the file happened not

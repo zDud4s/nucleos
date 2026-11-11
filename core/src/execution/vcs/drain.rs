@@ -12,7 +12,7 @@ use super::*;
 /// subprocess printed — is process transport, and the two comparable concerns in this crate,
 /// `gate.rs` and `transcribe.rs`, are each their own module for exactly that reason. Putting it here
 /// would make one file both the queue domain and the process transport, which is the coupling
-/// `core/AGENTS.md`'s module map exists to prevent.
+/// `core/MODULE_MAP.md`'s module map exists to prevent.
 #[async_trait::async_trait]
 pub trait VcsExecutor: Send + Sync {
     /// Performs the claimed operation and reports how it ended.

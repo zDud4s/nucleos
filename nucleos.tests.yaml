@@ -66,6 +66,10 @@ tests:
         - scripts/install.ps1
         - scripts/install.sh
         - scripts/test-install-scripts.py
+        # The repo invariants (module map, file-size ceilings) without cargo; tests/module_map.rs and
+        # tests/file_size.rs stay the authority.
+        - scripts/check_invariants.py
+        - scripts/test-check-invariants.py
       command: bash scripts/gates.sh hooks
     broker:
       # The machine-wide build broker, its classifier and hook, and their tests.
