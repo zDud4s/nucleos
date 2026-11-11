@@ -47,6 +47,9 @@ pub struct RolePolicy {
     pub git_queue: bool,
     /// Permission: may open child nodes.
     pub open_children: bool,
+    /// Permission: may publish (`Op::Push`). Only the root: spec
+    /// `2026-11-09-passos-de-integracao-design` §6.
+    pub publish: bool,
 }
 
 /// The table.
@@ -57,26 +60,106 @@ pub const fn policy(role: Role) -> RolePolicy {
             node_fence: true,
             git_queue: true,
             open_children: true,
+            publish: true,
         },
         Role::Orchestrator => RolePolicy {
             conductor_fence: false,
             node_fence: true,
             git_queue: true,
             open_children: true,
+            publish: false,
         },
         Role::Leaf => RolePolicy {
             conductor_fence: false,
             node_fence: true,
             git_queue: true,
             open_children: false,
+            publish: false,
         },
         Role::Reviewer => RolePolicy {
             conductor_fence: false,
             node_fence: true,
             git_queue: true,
             open_children: false,
+            publish: false,
         },
     }
+}
+
+impl Role {
+    /// The spelling a project's declared `roles` list uses.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Role::Root => "root",
+            Role::Orchestrator => "orchestrator",
+            Role::Leaf => "leaf",
+            Role::Reviewer => "reviewer",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Role> {
+        ROLES.into_iter().find(|role| role.as_str() == name.trim())
+    }
+}
+
+/// The permission field of a rule a project declares (spec 2026-11-09 §6): `roles`, `max_depth`, or
+/// both. No field at all (`Permission::default()`) means the current policy applies, i.e. it allows.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Permission {
+    /// The roles that may invoke the rule; `None` is "any role".
+    pub roles: Option<Vec<Role>>,
+    /// The deepest node depth that may invoke it (the root is 0); `None` is "any depth".
+    pub max_depth: Option<i64>,
+}
+
+impl Permission {
+    /// Reads the two stored columns. A `roles` list that is not JSON, or that names a role the table
+    /// does not know, fails closed: it parses to an empty list, which no role satisfies.
+    pub fn from_columns(roles_json: Option<&str>, max_depth: Option<i64>) -> Permission {
+        let roles = roles_json.map(|raw| {
+            serde_json::from_str::<Vec<String>>(raw)
+                .ok()
+                .and_then(|names| {
+                    names
+                        .iter()
+                        .map(|name| Role::parse(name))
+                        .collect::<Option<Vec<Role>>>()
+                })
+                .unwrap_or_default()
+        });
+        Permission { roles, max_depth }
+    }
+
+    /// The two columns `from_columns` reads: `roles` as a JSON list of names.
+    pub fn to_columns(&self) -> (Option<String>, Option<i64>) {
+        let roles = self.roles.as_ref().map(|roles| {
+            let names: Vec<&str> = roles.iter().map(|role| role.as_str()).collect();
+            serde_json::to_string(&names).unwrap_or_else(|_| "[]".to_owned())
+        });
+        (roles, self.max_depth)
+    }
+
+    /// Whether a caller of `role` at `depth` may invoke the rule.
+    pub fn allows(&self, role: Role, depth: i64) -> bool {
+        let role_ok = self
+            .roles
+            .as_ref()
+            .is_none_or(|roles| roles.contains(&role));
+        let depth_ok = self.max_depth.is_none_or(|max| depth <= max);
+        role_ok && depth_ok
+    }
+}
+
+/// `None` when `role` may push; otherwise the refusal, which says who can (spec 2026-11-09 §6).
+pub fn push_refusal(role: Role) -> Option<String> {
+    if policy(role).publish {
+        return None;
+    }
+    Some(format!(
+        "push is refused for the {} role: only the root role, the owner's main session (IDE, \
+         tunnel or terminal), may push. Land a branch through the queue instead.",
+        role.as_str()
+    ))
 }
 
 /// The role to give a caller that cannot be placed: the last of [`ROLES`], whose permissions are a
@@ -209,6 +292,41 @@ mod tests {
         }
         assert!(!policy(Role::Leaf).conductor_fence);
         assert!(!policy(Role::Leaf).open_children);
+    }
+
+    #[test]
+    fn only_the_root_may_publish_and_the_refusal_names_who_can() {
+        for role in ROLES {
+            assert_eq!(policy(role).publish, role == Role::Root, "{role:?}");
+        }
+        assert_eq!(push_refusal(Role::Root), None);
+        for role in [Role::Orchestrator, Role::Leaf, Role::Reviewer] {
+            let reason = push_refusal(role).expect("refused");
+            assert!(reason.contains(role.as_str()) && reason.contains("only the root"));
+        }
+        assert!(!policy(most_restricted()).publish);
+    }
+
+    #[test]
+    fn a_permission_field_filters_by_role_and_depth() {
+        assert!(Permission::default().allows(Role::Leaf, 9));
+        let roles = Permission::from_columns(Some(r#"["root","orchestrator"]"#), None);
+        assert!(roles.allows(Role::Orchestrator, 3) && !roles.allows(Role::Leaf, 0));
+        let depth = Permission::from_columns(None, Some(1));
+        assert!(depth.allows(Role::Leaf, 1) && !depth.allows(Role::Leaf, 2));
+        let both = Permission::from_columns(Some(r#"["leaf"]"#), Some(2));
+        assert!(both.allows(Role::Leaf, 2));
+        assert!(!both.allows(Role::Leaf, 3) && !both.allows(Role::Root, 0));
+    }
+
+    #[test]
+    fn an_unreadable_roles_field_allows_nobody() {
+        for raw in ["not json", r#"["root","wizard"]"#, "[]"] {
+            let p = Permission::from_columns(Some(raw), None);
+            for role in ROLES {
+                assert!(!p.allows(role, 0), "{raw} {role:?}");
+            }
+        }
     }
 
     #[test]

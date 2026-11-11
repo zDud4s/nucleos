@@ -484,6 +484,47 @@ pub async fn declare(
     Ok(id)
 }
 
+/// The permission field of one of this project's commands (spec 2026-11-09 §6). A missing row reads
+/// as the default, which allows; an unreadable `roles` fails closed inside `Permission`.
+pub async fn permission(
+    pool: &SqlitePool,
+    project_id: &str,
+    id: i64,
+) -> sqlx::Result<crate::role_policy::Permission> {
+    let row: Option<(Option<String>, Option<i64>)> = sqlx::query_as(
+        "SELECT roles, max_depth FROM project_commands WHERE id = ? AND project_id = ?",
+    )
+    .bind(id)
+    .bind(project_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row
+        .map(|(roles, max_depth)| {
+            crate::role_policy::Permission::from_columns(roles.as_deref(), max_depth)
+        })
+        .unwrap_or_default())
+}
+
+/// Writes a command's permission field. `false` when the project has no such command.
+pub async fn set_permission(
+    pool: &SqlitePool,
+    project_id: &str,
+    id: i64,
+    permission: &crate::role_policy::Permission,
+) -> sqlx::Result<bool> {
+    let (roles, max_depth) = permission.to_columns();
+    let done = sqlx::query(
+        "UPDATE project_commands SET roles = ?, max_depth = ? WHERE id = ? AND project_id = ?",
+    )
+    .bind(roles)
+    .bind(max_depth)
+    .bind(id)
+    .bind(project_id)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected() > 0)
+}
+
 /// Forgets one of this project's commands. `false` when there was none to forget.
 pub async fn remove(pool: &SqlitePool, project_id: &str, id: i64) -> sqlx::Result<bool> {
     let done = sqlx::query("DELETE FROM project_commands WHERE id = ? AND project_id = ?")
@@ -843,6 +884,50 @@ mod tests {
         // Editing what `gate` runs does not unhappen the last time it ran. Blanking this would put
         // "not measured" on the panel that answers *is this green*.
         assert_eq!(rows[0].last.as_ref().unwrap().outcome, Outcome::Passed);
+    }
+
+    /// Spec 2026-11-09 §6: a command carries a permission field (`roles`, `max_depth`). A command
+    /// without one allows everybody, and a stored field reads back as written.
+    #[tokio::test]
+    async fn a_command_permission_round_trips_and_defaults_to_open() {
+        use crate::role_policy::{Permission, Role};
+        let pool = pool().await;
+        project(&pool, "alpha").await;
+        let id = declare(
+            &pool,
+            "alpha",
+            Declaration {
+                name: "gate".to_owned(),
+                command: "cargo test".to_owned(),
+                cwd: None,
+                is_gate: true,
+                pass_exit_code: 0,
+                runnable_by: RunnableBy::Person,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            permission(&pool, "alpha", id).await.unwrap(),
+            Permission::default()
+        );
+
+        let wanted = Permission {
+            roles: Some(vec![Role::Root, Role::Orchestrator]),
+            max_depth: Some(1),
+        };
+        assert!(set_permission(&pool, "alpha", id, &wanted).await.unwrap());
+        let read = permission(&pool, "alpha", id).await.unwrap();
+        assert_eq!(read, wanted);
+        assert!(read.allows(Role::Orchestrator, 1) && !read.allows(Role::Leaf, 1));
+
+        // Another project's id changes nothing.
+        assert!(
+            !set_permission(&pool, "beta", id, &Permission::default())
+                .await
+                .unwrap()
+        );
+        assert_eq!(permission(&pool, "alpha", id).await.unwrap(), wanted);
     }
 
     /// The claim is the `WHERE`. Two clicks landing together must not both spawn the suite in one
