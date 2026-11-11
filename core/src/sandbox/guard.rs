@@ -97,6 +97,17 @@ fn no_agent_or_gate_spawn_exists_outside_the_sandbox_door() {
     );
 }
 
+/// True when `needle` occurs in `source` not as the tail of a longer identifier
+/// (`kill_switch_is_off(` is not `switch_is_off(`).
+fn names_standalone(source: &str, needle: &str) -> bool {
+    source.match_indices(needle).any(|(at, _)| {
+        !source[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+    })
+}
+
 /// D7: the switch is read from the daemon's config directory and no route can change it, so no
 /// module outside the sandbox may name the file or the functions that read it.
 #[test]
@@ -110,7 +121,7 @@ fn nothing_outside_the_sandbox_names_the_switch() {
         let source = std::fs::read_to_string(&path).expect("a source file should be readable");
         if ["\"sandbox.conf\"", "switch_dir(", "switch_is_off("]
             .iter()
-            .any(|needle| source.contains(needle))
+            .any(|needle| names_standalone(&source, needle))
         {
             offenders.push(module);
         }
