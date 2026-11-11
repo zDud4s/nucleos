@@ -508,7 +508,7 @@ async fn has_diff(job: &TreeJob, branch: &super::model::Branch) -> Result<bool, 
 }
 
 /// Runs `git -C <root> <args>` and answers its trimmed stdout, or its stderr as the error.
-async fn git(root: &str, args: &[&str]) -> Result<String, String> {
+pub(super) async fn git(root: &str, args: &[&str]) -> Result<String, String> {
     let output = tokio::process::Command::new("git")
         // A repo-local `core.fsmonitor` would run a command on any call that reads the index.
         .args(["-c", "core.fsmonitor="])
@@ -947,6 +947,34 @@ async fn merge(
     if check_may_merge(&job.manifest, name).is_err() {
         return super::retry::note_blocked_base(pool, job, name, parks).await;
     }
+    // The path fence: a leaf may only merge what its declared `paths` own (and new migrations
+    // with a free number). A refusal is recorded on the branch and parks it for the owner. A git
+    // failure reading the diff fails open: the fence is a guard, and the queue's own merge reports
+    // a branch git cannot read.
+    let fenced = match job.manifest.branches.get(name) {
+        Some(held) => match super::nesting::merge_target(&job.manifest, name) {
+            Ok(target) => super::path_fence::check_branch(job, held, &target)
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!(job = %job.id, branch = name, %error, "the path fence could not read the diff");
+                    None
+                }),
+            Err(_) => None,
+        },
+        None => None,
+    };
+    if let Some(reason) = fenced {
+        tracing::warn!(job = %job.id, branch = name, %reason, "the path fence refused the merge");
+        if let Some(held) = job.manifest.branches.get_mut(name) {
+            held.extra
+                .insert("fence_refusal".to_owned(), Value::from(reason.clone()));
+        }
+        persist(pool, job).await?;
+        if let Some(node) = node {
+            parks.push((node, reason));
+        }
+        return Ok(());
+    }
     let repo = repo_of(pool, job).await?;
     submit_merge(pool, &repo, job, name, Origin::Daemon)
         .await
@@ -1243,7 +1271,13 @@ pub(super) mod tests {
     // ---- fixtures: branches ----------------------------------------------------------------------
 
     pub(crate) fn code_branch(name: &str, state: &str, node: Option<&str>) -> Branch {
-        let mut branch = Branch::new(name, &[format!("{name}/**")], "backend", None);
+        // `tree_repo` commits `<name>.txt` on each branch; the path fence needs it owned.
+        let mut branch = Branch::new(
+            name,
+            &[format!("{name}/**"), format!("{name}.txt")],
+            "backend",
+            None,
+        );
         branch.state = state.to_owned();
         branch.git_branch = Some(format!("tree/{name}"));
         branch.node_id = node.map(str::to_owned);
@@ -4512,9 +4546,9 @@ pub(super) mod tests {
     /// `tree/api` and `feat/tree` each change `feature.txt`, so merging one into the other conflicts.
     fn make_api_conflict(repo: &Path) {
         assert!(git_in(repo, &["checkout", "-q", "tree/api"]));
-        commit_file(repo, "feature.txt", "theirs\n", "theirs");
+        commit_file(repo, "api.txt", "theirs\n", "theirs");
         assert!(git_in(repo, &["checkout", "-q", "feat/tree"]));
-        commit_file(repo, "feature.txt", "ours\n", "ours");
+        commit_file(repo, "api.txt", "ours\n", "ours");
     }
 
     /// A job with one green branch `api` whose merge conflicts, behind a node that reported `done`.
