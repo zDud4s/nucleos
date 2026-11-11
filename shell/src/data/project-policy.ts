@@ -268,6 +268,17 @@ export function useProjectGithubOps(projectId: string | null) {
 }
 
 /**
+ * One declared git operation as `GET /projects/{id}/git-ops` lists it: a bare name when it is
+ * unrestricted, or an object carrying the roles and depth it covers when it names them.
+ */
+export type GitOpEntry = string | { op_kind: string; roles?: string[]; max_depth?: number };
+
+/** The operation name of an entry, whichever shape the daemon listed it in. */
+export function gitOpName(entry: GitOpEntry): string {
+  return typeof entry === "string" ? entry : entry.op_kind;
+}
+
+/**
  * Which git operations this project lets the shared queue perform for an autonomous run.
  *
  * A tick does not let the agent run the command in its shell: the tool call is still denied and
@@ -278,7 +289,7 @@ export function useProjectGithubOps(projectId: string | null) {
 export function useProjectGitOps(projectId: string | null) {
   return useQuery({
     queryKey: keys.projects.gitOps(projectId ?? ""),
-    queryFn: () => apiFetch<string[]>(`/projects/${encodeURIComponent(projectId ?? "")}/git-ops`),
+    queryFn: () => apiFetch<GitOpEntry[]>(`/projects/${encodeURIComponent(projectId ?? "")}/git-ops`),
     enabled: projectId !== null,
   });
 }

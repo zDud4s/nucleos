@@ -20,6 +20,8 @@ import {
   useForgetGithubOp,
   useForgetLandTarget,
   useForgetShellRule,
+  gitOpName,
+  type GitOpEntry,
   useProjectGitOps,
   useProjectGithubOps,
   useProjectLandTargets,
@@ -127,6 +129,7 @@ function fakeDaemon(project = "alpha") {
   const rules = new Map<string, ShellRule>();
   const ops = new Set<string>();
   const gitOps = new Set<string>();
+  const restrictedGitOps: GitOpEntry[] = [];
   const targets = new Set<string>();
   /*
     Where a landing goes with no argument. `declared`, from `autopilot_state.integration_branch` —
@@ -222,7 +225,7 @@ function fakeDaemon(project = "alpha") {
     }
 
     if (table === "git-ops") {
-      if (method === "GET") return [...gitOps].sort();
+      if (method === "GET") return [...[...gitOps].sort(), ...restrictedGitOps];
       const opKind = String(body?.op_kind ?? "");
       if (method === "POST") {
         if (!GIT_CATALOGUE.some((operation) => operation.kind === opKind)) {
@@ -279,6 +282,7 @@ function fakeDaemon(project = "alpha") {
     },
     declareOp: (opKind: string) => ops.add(opKind),
     declareGitOp: (opKind: string) => gitOps.add(opKind),
+    declareRestrictedGitOp: (entry: GitOpEntry) => restrictedGitOps.push(entry),
     declareTarget: (branch: string) => targets.add(branch),
     setIntegration: (arm: IntegrationBranch) => {
       integration = arm;
@@ -364,6 +368,16 @@ describe("the three reads", () => {
     // These are queue operation kinds, not command lines: the route records `push`, not every
     // spelling of `git push` the parser could recognize.
     expect(result.current.data).toEqual(["merge", "push"]);
+  });
+
+  it("reads a git op listed with its permission as an object beside the bare names", async () => {
+    fake.declareGitOp("merge");
+    fake.declareRestrictedGitOp({ op_kind: "push", roles: ["reviewer"], max_depth: 1 });
+
+    const { result } = renderHook(() => useProjectGitOps("alpha"), { wrapper: mount() });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(result.current.data?.map(gitOpName)).toEqual(["merge", "push"]);
   });
 
   /** Empty is a real answer: it means "nowhere but the integration branch", which needs no row. */

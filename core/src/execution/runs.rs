@@ -3252,54 +3252,33 @@ pub mod tests {
         );
     }
 
-    /// The push counterpart of `approving_a_merge_queues_it_instead_of_letting_the_run_perform_it`,
-    /// and it is not a copy of it: it pins the two halves that are push's own.
-    ///
-    /// The command names only the remote, so the BRANCH has to come from the worktree — the same
-    /// half no push command line carries that a merge's target does. And the audit note has to say
-    /// `push`, because that sentence was hard-coded to the word "merge" for as long as merge was the
-    /// only thing the queue could do; a trail that calls every operation a merge is a trail nobody
-    /// can reconstruct an approval from.
+    /// A run is never the owner's top-level session, so an approved push is neither queued with the
+    /// owner's authority nor handed back to the run: the approval answers with the refusal.
     #[tokio::test]
-    async fn approving_a_push_queues_it_and_records_which_operation_it_was() {
+    async fn an_approved_push_is_not_resumed_from_a_run() {
         let (state, _runner) =
             test_state_with_runner(Some(Duration::from_secs(5)), Duration::from_secs(600)).await;
-        let (proposal_id, branch, _container) =
+        let (proposal_id, _branch, _container) =
             seed_real_worktree_approval(&state, "git push origin").await;
 
-        let resume_id = resume_approved_run(&state, proposal_id).await.unwrap();
+        let result = resume_approved_run(&state, proposal_id).await;
 
-        let (op, args, origin, status): (String, String, String, String) = sqlx::query_as(
-            "SELECT op, args, origin, status FROM vcs_requests ORDER BY id DESC LIMIT 1",
-        )
-        .fetch_one(&state.pool)
-        .await
-        .expect("the approved push is in the queue");
-        assert_eq!(op, "push");
-        assert_eq!((origin.as_str(), status.as_str()), ("human", "queued"));
+        assert!(
+            matches!(
+                result,
+                Err(ResumeError::NotResumable(reason)) if reason == crate::role_policy::PUSH_REFUSAL
+            ),
+            "got {result:?}"
+        );
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&args).unwrap(),
-            serde_json::json!({"op": "push", "remote": "origin", "branch": branch}),
-            "the command named the remote; the branch is the one the worktree stands on"
+            count(&state.pool, "SELECT COUNT(*) FROM vcs_requests").await,
+            0,
+            "the push must not reach the queue"
         );
-
-        assert!(
-            !proposals::grant_covers_class(&state.pool, resume_id, "push-merge-deploy")
-                .await
-                .unwrap(),
-            "the queue took the push, so the run must NOT also be authorized to perform it"
-        );
-
-        let note: String = sqlx::query_scalar(
-            "SELECT note FROM proposal_events WHERE proposal_id = ? ORDER BY id DESC LIMIT 1",
-        )
-        .bind(proposal_id)
-        .fetch_one(&state.pool)
-        .await
-        .unwrap();
-        assert!(
-            note.contains("push queued as vcs request"),
-            "the trail must name the operation it queued, not the one it used to be: {note}"
+        assert_eq!(
+            count(&state.pool, "SELECT COUNT(*) FROM action_grants").await,
+            0,
+            "nor may the run be authorized to perform it"
         );
     }
 
