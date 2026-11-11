@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 
 use crate::governance::autopilot::{Mode, ProjectSummary};
 
+mod backlog;
 mod browser;
 mod delivery;
 mod nodes;
