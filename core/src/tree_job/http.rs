@@ -856,10 +856,9 @@ async fn post_branch(
     let mut branch = Branch::new(&name, &paths, &layer, base.as_deref());
     branch.parent = parent.clone();
     if let Some(caller) = caller {
-        branch.extra.insert(
-            super::branch_start::START_CALLER_KEY.to_owned(),
-            json!(caller),
-        );
+        branch
+            .extra
+            .insert(super::ghosts::START_CALLER_KEY.to_owned(), json!(caller));
     }
     let queued = branch.state.clone();
     job.manifest.branches.insert(name.clone(), branch);
