@@ -732,7 +732,10 @@ fn note_failure(project_id: &str) -> u32 {
     let delay = BACKOFF_BASE
         .saturating_mul(1u32 << (failures - 1).min(16))
         .min(BACKOFF_MAX);
-    map.insert(project_id.to_owned(), (failures, std::time::Instant::now() + delay));
+    map.insert(
+        project_id.to_owned(),
+        (failures, std::time::Instant::now() + delay),
+    );
     failures
 }
 
@@ -1684,7 +1687,10 @@ mod tests {
 
         sweep_with(&state, pass).await;
 
-        assert_eq!(intent_projects(&state).await, vec!["sweep-failing".to_owned()]);
+        assert_eq!(
+            intent_projects(&state).await,
+            vec!["sweep-failing".to_owned()]
+        );
         let lines = feed_lines(&state, "sweep-failing").await;
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].contains("no root"));

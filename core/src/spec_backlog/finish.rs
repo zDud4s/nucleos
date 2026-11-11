@@ -907,7 +907,9 @@ pub async fn finish_with<'a>(
     }
     // What waits on a spec held for a later pass waits with it: still queued, not blocked.
     if !report.retry.is_empty() {
-        report.retry.extend(queue.drain(..).map(|left| left.spec.id));
+        report
+            .retry
+            .extend(queue.drain(..).map(|left| left.spec.id));
     }
     // The rest were never ready: they wait on something that is neither done nor stopped.
     // Unfinished, and said so.
