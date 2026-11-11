@@ -2,7 +2,7 @@
 import { useState } from "react";
 import { DAEMON_NAME } from "../copy";
 import { useFileItems, type FileItems, type ItemMember } from "../data/project-map";
-import { ErrorNote } from "../ui";
+import { ErrorNote, Select } from "../ui";
 
 /**
  * The shapes one Rust file declares, drawn as boxes: a struct lists its fields, an enum its
@@ -26,13 +26,13 @@ export function ClassesView({ projectId, modules }: { projectId: string; modules
     <div className="flex flex-col gap-4">
       <label className="flex items-baseline gap-2 text-sm">
         File
-        <select value={path} onChange={(event) => setPicked(event.target.value)}>
+        <Select aria-label="File" value={path} onChange={(event) => setPicked(event.target.value)}>
           {rust.map((candidate) => (
             <option key={candidate} value={candidate}>
               {candidate}
             </option>
           ))}
-        </select>
+        </Select>
       </label>
       {items.isError && items.data === undefined ? (
         <ErrorNote>
