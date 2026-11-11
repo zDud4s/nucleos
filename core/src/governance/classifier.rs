@@ -28,7 +28,7 @@ pub use self::shell_shape::*;
 use self::write_guards::*;
 pub use self::write_guards::{heavy_wrapper_arguments, path_has_suffix, split_first_token};
 
-pub const CLASSIFIER_VERSION: u32 = 24;
+pub const CLASSIFIER_VERSION: u32 = 25;
 
 /// Tools that change nothing outside the session: they bring information in, or move the agent's own
 /// bookkeeping.
@@ -189,10 +189,11 @@ const SELF_GOVERNING_DIRS: &[&str] = &[
 /// `Cargo.toml` earns its place despite being edited often: an autonomous run adding a dependency
 /// is a supply-chain change, which is precisely the sort of thing a person should see.
 ///
-/// `package.json` stays on this list even though `npm test` is NOT in `SAFE_COMMAND_PREFIXES`. It
-/// costs an approval on a file an autonomous run has little reason to rewrite, and it buys the case
-/// where the runner is invoked some other way — a person, a script, a later widening. Guarding an
-/// input whose runner is not allowed is the harmless direction; the reverse is the one that hurts.
+/// `package.json` is on this list because `npm test` and `npx vitest run` ARE in
+/// `SAFE_COMMAND_PREFIXES` (spec `2026-11-09-arvores-autonomia-design` D4): `npm test` runs
+/// whatever string sits in `scripts.test`, so that file's CONTENTS are the policy exactly as
+/// `Cargo.toml`'s are, and the price of admitting the runner is paid here, by asking about a write
+/// to the file that decides what it runs.
 ///
 /// Lowercase: `normalize_path` case-folds, so these are compared against folded paths.
 ///
@@ -245,8 +246,6 @@ const APPROVAL_COMMAND_PATTERNS: &[&str] = &[
     "gh pr merge",
     "npm publish",
     "cargo publish",
-    "git tag",
-    "deploy",
 ];
 
 const DESTRUCTIVE_COMMAND_PATTERNS: &[&str] = &[
@@ -286,10 +285,6 @@ const VCS_LOCAL_PREFIXES: &[&str] = &["git add", "git commit"];
 /// - **bare `python` / `node`** — `python -c "..."` is arbitrary code with no file and no runner to
 ///   constrain it, and it is pinned `pending_approval` by test. Only the `-m` test-runner spellings
 ///   are here, which is why each interpreter costs three entries instead of one.
-/// - **`npm test`** — it runs `scripts.test` out of `package.json`, so that file's CONTENTS are the
-///   policy, exactly as `Cargo.toml`'s are. Guarding `package.json` is the honest price and it is
-///   edited far more often than `Cargo.toml`. Deferred until `shell/` exists and the trade can be
-///   weighed against a real repository instead of a hypothetical one.
 /// - **`go run`, `cargo run`** — they execute an arbitrary `main`, which is the `python foo.py`
 ///   shape wearing a build tool's name.
 const SAFE_COMMAND_PREFIXES: &[&str] = &[
@@ -384,14 +379,13 @@ const SAFE_COMMAND_PREFIXES: &[&str] = &[
     "go test",
     "go build",
     "go vet",
-    // `npm test` and `npx vitest run` are DELIBERATELY not here, and the two branches merged into
-    // this file disagreed about it. The harness branch allowed them as the JS spelling of the
-    // `cargo test` above; `the_interpreters_under_the_test_runners_stay_pending` pins the opposite,
-    // and the opposite is what stands. `cargo test` runs a target the toolchain defines and reaches
-    // `build.rs`, which this file guards by name; `npm test` runs whatever string sits in
-    // `scripts.test`, so the command line says "run the tests" while naming nothing that was read.
-    // Restoring them is two lines here plus that test — a decision to take deliberately, not to
-    // inherit from whichever branch merged last.
+    // `npm test` and `npx vitest run`: the JS spelling of the `cargo test` above (spec D4, which
+    // settled the disagreement between the two branches that once merged into this file). `npm
+    // test` runs whatever string sits in `scripts.test`, so `package.json` is guarded as
+    // `Cargo.toml` is (`EXECUTES_ON_NEXT_COMMAND_FILES`): the runner is admitted because the file
+    // that decides what it runs asks first.
+    "npm test",
+    "npx vitest run",
     // Says something, decides something, changes nothing. `echo` writes to stdout and `test`/`[`
     // answer a question about a path — neither runs a program, neither names a file to write, and
     // the two ways they could (`>` and `$(…)`) are refused before either is reached. Both were
@@ -720,6 +714,16 @@ pub fn classify(
         );
     }
 
+    // Reading or stopping a task the run itself started. A run cannot name another run's task, so
+    // these touch nothing outside it; refusing them parked a run that only wanted its own output.
+    if OWN_TASK_TOOLS.contains(&tool_name) {
+        return classification(
+            "allow",
+            "own-task",
+            "reading or stopping a task this run started is allowed",
+        );
+    }
+
     // Its own class, so the scoreboard shows the tree agent's calls to the daemon apart from file
     // reads and apart from the genuinely unrecognized tools.
     if TREE_AGENT_TOOLS.contains(&tool_name) {
@@ -750,7 +754,7 @@ pub fn classify(
         return classification(
             "pending_approval",
             "unrecognized-tool",
-            "unrecognized tool actions require approval",
+            &format!("unrecognized tool actions require approval. {ALT_TOOL}"),
         );
     }
 
@@ -986,10 +990,10 @@ fn classify_shell_command(
         return classification("deny", "project-denied", "this project denies this command");
     }
 
-    if texts
-        .iter()
-        .any(|text| matches_any_phrase(&normalize_command(text), APPROVAL_COMMAND_PATTERNS))
-    {
+    if texts.iter().any(|text| {
+        matches_any_phrase(&normalize_command(text), APPROVAL_COMMAND_PATTERNS)
+            || runs_an_approval_command_word(text, shell)
+    }) {
         return classification(
             "pending_approval",
             "push-merge-deploy",
@@ -1017,7 +1021,7 @@ fn classify_shell_command(
             return classification(
                 "pending_approval",
                 "unrecognized",
-                &format!("this shell line cannot be read as a sequence of commands: {reason}"),
+                &unreadable_line_reason(reason),
             );
         }
         None => match crate::command_reader::read(command, shell) {
@@ -1032,17 +1036,13 @@ fn classify_shell_command(
                 return classification(
                     "pending_approval",
                     "unrecognized",
-                    &format!("this shell line cannot be read as a sequence of commands: {reason}"),
+                    &unreadable_line_reason(reason),
                 );
             }
         },
     };
     if segments.is_empty() {
-        return classification(
-            "pending_approval",
-            "unrecognized",
-            "unrecognized shell commands and code execution require approval",
-        );
+        return classification("pending_approval", "unrecognized", &unrecognized_reason());
     }
 
     let mut touches_vcs = false;
@@ -1066,17 +1066,15 @@ fn classify_shell_command(
             });
         match classify_segment(&segment, cwd, policy, rules, shell, unrecognized) {
             Segment::Unrecognized => {
-                return classification(
-                    "pending_approval",
-                    "unrecognized",
-                    "unrecognized shell commands and code execution require approval",
-                );
+                return classification("pending_approval", "unrecognized", &unrecognized_reason());
             }
             _ if unquoted_substitution => {
                 return classification(
                     "pending_approval",
                     "unrecognized",
-                    "a command substitution outside quotes becomes several arguments",
+                    &format!(
+                        "a command substitution outside quotes becomes several arguments. {ALT_SUBSTITUTION}"
+                    ),
                 );
             }
             Segment::VcsLocal => touches_vcs = true,
@@ -1211,6 +1209,161 @@ pub enum Unrecognized {
     /// May run, if the line names at least one path and names nothing outside the workspace. See
     /// `confined_to_workspace`, which is the whole of the judgement.
     MayBeConfined,
+}
+
+/// The alternative every refusal of a substitution names: bind the value to a variable on its own
+/// line, or read the file with the tools a run always has.
+const ALT_SUBSTITUTION: &str = "Allowed instead: write the value out literally, or read it first with Read/Grep/Glob and then use it.";
+
+/// What a refused shell line is told to do instead, when the reader gave no more specific advice.
+/// Names only tools every worktree run has.
+const ALT_SHELL: &str = "Allowed instead: read with Read/Grep/Glob, change files with Edit/Write, and run one simple command per line.";
+
+/// The alternative for an unrecognized tool. It must not name a tool the run may lack.
+const ALT_TOOL: &str =
+    "Do the work with the tools your run was given; this one is not among those allowed here.";
+
+/// The tools that read or stop a task the run itself started: they act on no state outside it.
+const OWN_TASK_TOOLS: &[&str] = &["BashOutput", "TaskOutput", "KillShell", "TaskStop"];
+
+/// The refusal for a shell line the reader cannot model, carrying the reader's reason AND the
+/// allowed alternative for that specific reason.
+fn unreadable_line_reason(reason: &str) -> String {
+    let alternative = if reason.contains("PATH") {
+        "Do not set PATH: Git's bash already puts /usr/bin first."
+    } else if reason.contains("loader variable") {
+        "Run without it; set only plain variables such as CARGO_TARGET_DIR."
+    } else if reason.contains("command substitution") {
+        ALT_SUBSTITUTION
+    } else {
+        ALT_SHELL
+    };
+    format!("this shell line cannot be read as a sequence of commands: {reason}. {alternative}")
+}
+
+/// The refusal for a command no rule recognizes, with what to do instead.
+fn unrecognized_reason() -> String {
+    "unrecognized shell commands and code execution require approval. Allowed instead: read with Read/Grep/Glob, change files with Edit/Write (not `sed -i`, `tee` or redirects), and leave builds and tests beyond the allowed list to the gate.".to_owned()
+}
+
+/// PURE: whether `text`, or any simple command inside it, has an approval command word (`deploy`,
+/// `git tag`) as its COMMAND WORD. See `names_approval_command_word`.
+fn runs_an_approval_command_word(text: &str, shell: crate::command_reader::Shell) -> bool {
+    names_approval_command_word(&normalize_command(&strip_fd_duplications(text)))
+        || crate::command_reader::segments(text, shell)
+            .iter()
+            .any(|piece| {
+                names_approval_command_word(&normalize_command(&strip_fd_duplications(piece)))
+            })
+}
+
+/// PURE: whether one normalized simple command runs `deploy` or `git tag`. The program is the first
+/// word after leading `NAME=value` assignments, so `grep deploy x`, `echo deploy` and `./deploy.sh`
+/// do not match, and `git -C dir tag v1` does.
+fn names_approval_command_word(normalized: &str) -> bool {
+    let mut words = normalized
+        .split(' ')
+        .skip_while(|w| w.contains('=') && !w.starts_with('-'));
+    let Some(first) = words.next() else {
+        return false;
+    };
+    match program_name(first) {
+        "deploy" => true,
+        "git" => {
+            while let Some(word) = words.next() {
+                if matches!(word, "-c" | "--git-dir" | "--work-tree" | "--namespace") {
+                    words.next();
+                } else if !word.starts_with('-') {
+                    return word == "tag";
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// PURE: whether `command` is exactly one of the forms a leaf run may self-check with, each wrapped
+/// by `python scripts/heavy.py`: `cargo fmt -p <crate>`, `python scripts/check_invariants.py`, and
+/// (only with `self_check`) `cargo check -p <crate> --tests`. Anything with a shell metacharacter,
+/// a quote or another shape is `false`. Says nothing about whether the scripts are trustworthy:
+/// see `leaf_self_check_scripts_intact`.
+pub fn leaf_self_check_form(command: &str, self_check: bool) -> bool {
+    const FORBIDDEN: &[char] = &[
+        ';', '|', '&', '<', '>', '$', '`', '\n', '\r', '(', ')', '{', '}', '*', '?', '~', '!', '#',
+        '\'', '"',
+    ];
+    if command.contains(FORBIDDEN) {
+        return false;
+    }
+    let script_is = |token: &str, name: &str| {
+        let token = token.replace('\\', "/");
+        token.strip_prefix("./").unwrap_or(&token) == name
+    };
+    let is_python = |token: &str| {
+        let program = program_name(token).to_ascii_lowercase();
+        program.starts_with("python") || program == "py"
+    };
+    let Some((program, rest)) = split_first_token(command) else {
+        return false;
+    };
+    let Some((script, rest)) = split_first_token(rest) else {
+        return false;
+    };
+    if !is_python(&program) || !script_is(&script, "scripts/heavy.py") {
+        return false;
+    }
+    let Some(wrapped) = heavy_wrapper_arguments(rest) else {
+        return false;
+    };
+    let words: Vec<&str> = wrapped.split_whitespace().collect();
+    let crate_name_ok = |name: &str| {
+        !name.starts_with('-')
+            && !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    };
+    match words.as_slice() {
+        ["cargo", "fmt", "-p", name] => crate_name_ok(name),
+        ["cargo", "check", "-p", name, "--tests"] => self_check && crate_name_ok(name),
+        [py, script] => is_python(py) && script_is(script, "scripts/check_invariants.py"),
+        _ => false,
+    }
+}
+
+/// Whether the scripts a self-check line would run are byte-identical to the main checkout's. The
+/// worktree's copy is a file the run could have rewritten, so it is trusted only when it equals the
+/// copy the run cannot touch. Any failure to resolve or read is `false`.
+pub fn leaf_self_check_scripts_intact(cwd: &Path, command: &str) -> bool {
+    let Some(main) = main_checkout_of(cwd) else {
+        return false;
+    };
+    let Some(tree) = cwd.ancestors().find(|a| a.join(".git").exists()) else {
+        return false;
+    };
+    let (main_scripts, tree_scripts) = (Path::new(&main).join("scripts"), tree.join("scripts"));
+    let mut names = vec!["heavy.py".to_owned()];
+    if command.contains("check_invariants") {
+        names.push("check_invariants.py".to_owned());
+    }
+    if let Ok(entries) = std::fs::read_dir(&main_scripts) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("heavy_") && name.ends_with(".py") && !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    names.iter().all(|name| {
+        match (
+            std::fs::read(main_scripts.join(name)),
+            std::fs::read(tree_scripts.join(name)),
+        ) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        }
+    })
 }
 
 /// Whether `command` is exactly `nucleos-core --verify-ticket <digits>` or `nucleos-core --verify`,
@@ -2277,10 +2430,9 @@ mod tests {
     /// cargo's fell through to `pending_approval` — the gate asking a human to confirm a test run
     /// they would confirm every time. A prompt nobody can meaningfully refuse is not a control.
     ///
-    /// The JS runners were in this list and are not, which is the same decision as the comment
-    /// beside `npm test`'s absence from `SAFE_COMMAND_PREFIXES`: they name a string in
-    /// `package.json` rather than a target the toolchain defines, so the command line reads "run the
-    /// tests" while naming nothing that was read.
+    /// The JS runners are in this list since spec D4, on the condition that `package.json` is
+    /// guarded like `Cargo.toml` (`test_runner_config_files_require_approval`): `npm test` runs a
+    /// string in `package.json`, so the file may not be writable without approval.
     /// `the_interpreters_under_the_test_runners_stay_pending` holds the other side of it.
     #[test]
     fn test_runners_are_recognized_as_safe_commands() {
@@ -2288,6 +2440,8 @@ mod tests {
             "python -m pytest -q",
             "python -m unittest discover",
             "go test ./...",
+            "npm test",
+            "npx vitest run",
         ] {
             assert_classification(
                 classify("Bash", &json!({"command": command}), None),
@@ -2969,7 +3123,10 @@ mod tests {
             "npm publish",
             "cargo publish",
             "git tag v1.0.0",
-            "kubectl deploy app",
+            "git -C x tag v1",
+            "deploy app",
+            "FOO=1 deploy app",
+            "cd x && deploy app",
         ] {
             assert_classification(
                 classify("Bash", &json!({"command": command}), None),
@@ -2977,6 +3134,179 @@ mod tests {
                 "push-merge-deploy",
             );
         }
+    }
+
+    /// D2: `deploy` and `git tag` are COMMAND words. A line that only mentions them is not a deploy.
+    #[test]
+    fn deploy_and_git_tag_match_as_the_command_word_only() {
+        for command in [
+            "grep deploy notes.md",
+            "echo deploy",
+            "git commit -m \"fix deploy\"",
+            "./deploy.sh",
+            "git log --oneline",
+            "echo git tag",
+        ] {
+            let got = classify("Bash", &json!({"command": command}), None);
+            assert_ne!(got.action_class, "push-merge-deploy", "{command}");
+        }
+        assert!(names_approval_command_word("git -c a=b tag v1"));
+        assert!(!names_approval_command_word("git status"));
+        assert!(!names_approval_command_word(""));
+    }
+
+    /// D4: `package.json` stays guarded like `Cargo.toml`, in every tool that writes.
+    #[test]
+    fn package_json_is_guarded_for_every_writing_tool() {
+        let cwd = Some(Path::new(r"C:\work\repo"));
+        for tool in ["Edit", "Write"] {
+            assert_classification(
+                classify(tool, &json!({"file_path": "package.json"}), cwd),
+                "pending_approval",
+                "executes-on-next-command",
+            );
+        }
+    }
+
+    /// D1: every refusal of an unrecognized line says what to do instead, and names only tools a
+    /// worktree run always has.
+    #[test]
+    fn an_unrecognized_refusal_names_the_allowed_alternative() {
+        for (command, alternative) in [
+            ("pip install requests", "Allowed instead"),
+            ("PATH=/x ls", "Do not set PATH"),
+            ("LD_PRELOAD=/x ls", "Run without it"),
+        ] {
+            let got = classify("Bash", &json!({"command": command}), None);
+            assert_eq!(got.decision.decision, "pending_approval", "{command}");
+            assert!(
+                got.reason.contains(alternative),
+                "{command}: {}",
+                got.reason
+            );
+            for absent in ["Agent", "Task", "WebSearch", "WebFetch"] {
+                assert!(!got.reason.contains(absent), "{command}: {}", got.reason);
+            }
+        }
+        let tool = classify("SomeNewTool", &json!({}), None);
+        assert_eq!(tool.action_class, "unrecognized-tool");
+        assert!(
+            tool.reason.contains("tools your run was given"),
+            "{}",
+            tool.reason
+        );
+        assert!(!tool.reason.contains("WebSearch"), "{}", tool.reason);
+    }
+
+    #[test]
+    fn the_loader_and_path_refusals_name_their_own_alternative() {
+        assert!(unreadable_line_reason("it sets PATH").contains("Git's bash"));
+        assert!(unreadable_line_reason("a loader variable").contains("CARGO_TARGET_DIR"));
+        assert!(unreadable_line_reason("a command substitution").contains("literally"));
+        assert!(unreadable_line_reason("anything else").contains("Read/Grep/Glob"));
+    }
+
+    /// D8: a run's own task tools are allowed.
+    #[test]
+    fn the_runs_own_task_tools_are_allowed() {
+        for tool in ["BashOutput", "TaskOutput", "KillShell", "TaskStop"] {
+            assert_classification(
+                classify(tool, &json!({"shell_id": "1"}), None),
+                "allow",
+                "own-task",
+            );
+        }
+    }
+
+    /// S2: the exact forms a leaf may run, and nothing near them.
+    #[test]
+    fn the_leaf_self_check_admits_exactly_the_broker_wrapped_forms() {
+        for command in [
+            "python scripts/heavy.py -- cargo fmt -p nucleos-core",
+            "python scripts/heavy.py cargo fmt -p nucleos_core",
+            "python ./scripts/heavy.py --prio 2 -- cargo fmt -p core",
+            r"python scripts\heavy.py -- cargo fmt -p core",
+            "python3 scripts/heavy.py -- python scripts/check_invariants.py",
+            "py scripts/heavy.py -- python scripts/check_invariants.py",
+        ] {
+            assert!(leaf_self_check_form(command, false), "{command}");
+        }
+        for command in [
+            "cargo fmt -p core",
+            "python scripts/check_invariants.py",
+            "python scripts/heavy.py -- cargo fmt",
+            "python scripts/heavy.py -- cargo fmt --all",
+            "python scripts/heavy.py -- cargo fmt -p core --check",
+            "python scripts/heavy.py -- cargo fmt -p -x",
+            "python scripts/heavy.py -- cargo fmt -p core; rm x",
+            "python scripts/heavy.py -- cargo fmt -p core && ls",
+            "python scripts/heavy.py -- cargo fmt -p $(x)",
+            "python scripts/heavy.py -- cargo fmt -p \"core\"",
+            "python scripts/heavy.py -- cargo check -p core --tests",
+            "python scripts/heavy.py -- cargo test -p core",
+            "python scripts/heavy.py -- cargo clippy -p core",
+            "python scripts/heavy.py -- cargo build -p core",
+            "python scripts/heavy.py -- cargo fmt --workspace",
+            "python scripts/heavy.py -- python scripts/other.py",
+            "python scripts/heavy.py -- python scripts/check_invariants.py --fix",
+            "python tools/heavy.py -- cargo fmt -p core",
+            "python ../scripts/heavy.py -- cargo fmt -p core",
+            "node scripts/heavy.py -- cargo fmt -p core",
+            "python scripts/heavy.py",
+            "python scripts/heavy.py hold-worktree",
+            "",
+        ] {
+            assert!(!leaf_self_check_form(command, false), "{command}");
+        }
+    }
+
+    #[test]
+    fn the_leaf_cargo_check_needs_the_flag() {
+        let command = "python scripts/heavy.py -- cargo check -p nucleos-core --tests";
+        assert!(!leaf_self_check_form(command, false));
+        assert!(leaf_self_check_form(command, true));
+        for refused in [
+            "python scripts/heavy.py -- cargo check -p core",
+            "python scripts/heavy.py -- cargo check --workspace --tests",
+            "python scripts/heavy.py -- cargo check -p core --tests --release",
+            "python scripts/heavy.py -- cargo test -p core",
+        ] {
+            assert!(!leaf_self_check_form(refused, true), "{refused}");
+        }
+    }
+
+    #[test]
+    fn the_leaf_self_check_needs_the_main_checkouts_own_scripts() {
+        let dir = std::env::temp_dir().join(format!("leaf-selfcheck-{}", std::process::id()));
+        let main = dir.join("main");
+        let tree = dir.join("tree");
+        let gitdir = main.join(".git").join("worktrees").join("t");
+        for scripts in [main.join("scripts"), tree.join("scripts"), gitdir.clone()] {
+            std::fs::create_dir_all(scripts).unwrap();
+        }
+        let gitdir_text = gitdir.to_string_lossy().replace('\\', "/");
+        std::fs::write(tree.join(".git"), format!("gitdir: {gitdir_text}\n")).unwrap();
+        for root in [&main, &tree] {
+            std::fs::write(root.join("scripts/heavy.py"), "broker").unwrap();
+            std::fs::write(root.join("scripts/check_invariants.py"), "check").unwrap();
+        }
+        let fmt = "python scripts/heavy.py -- cargo fmt -p core";
+        let invariants = "python scripts/heavy.py -- python scripts/check_invariants.py";
+        assert!(leaf_self_check_scripts_intact(&tree, fmt));
+        assert!(leaf_self_check_scripts_intact(
+            &tree.join("scripts"),
+            invariants
+        ));
+        std::fs::write(tree.join("scripts/check_invariants.py"), "rewritten").unwrap();
+        assert!(
+            leaf_self_check_scripts_intact(&tree, fmt),
+            "not the one it runs"
+        );
+        assert!(!leaf_self_check_scripts_intact(&tree, invariants));
+        std::fs::write(tree.join("scripts/heavy.py"), "rewritten").unwrap();
+        assert!(!leaf_self_check_scripts_intact(&tree, fmt));
+        assert!(!leaf_self_check_scripts_intact(&dir.join("nowhere"), fmt));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -4863,7 +5193,6 @@ mod tests {
             "py setup.py install",
             "node index.js",
             "go run ./cmd/thing",
-            "npm test",
             "pip install requests",
         ] {
             assert_classification(
@@ -5385,9 +5714,12 @@ mod tests {
     /// And from 10 the number stops being enough on its own. Two machines on version 10 can decide
     /// a `gh` line differently, because that policy lives in a file — which is what
     /// `shadow_decisions.policy_digest` is for. This constant goes on meaning THE CODE.
+    ///
+    /// 25: `deploy` and `git tag` match as the command word, `npm test` and `npx vitest run` are
+    /// allowed, a run's own task tools are allowed, and refusals name their alternative.
     #[test]
     fn exposes_current_classifier_version() {
-        assert_eq!(CLASSIFIER_VERSION, 24);
+        assert_eq!(CLASSIFIER_VERSION, 25);
     }
 
     /// `(decision, action_class)` of a Bash line, with the cwd every test in this group uses.
