@@ -983,14 +983,14 @@ async fn create_run_with_policy(
     // run never enters.
     if let (Some(root), Some(tree)) = (cwd.as_deref(), spawn_cwd.as_deref()) {
         let (root, tree) = (std::path::Path::new(root), tree);
-        if root != tree {
-            if let Err(reason) = inherit_classifier_hook(root, tree) {
-                // A node is unattended and would otherwise start under the CLI's `manual` barrier
-                // with nobody to answer it; stop it with the reason instead.
-                if node.is_some() {
-                    fail_provisioning(state, id, project_id.as_deref(), &reason).await;
-                    return Err(CreateRunError::Worktree(std::io::Error::other(reason)));
-                }
+        if root != tree
+            && let Err(reason) = inherit_classifier_hook(root, tree)
+        {
+            // A node is unattended and would otherwise start under the CLI's `manual` barrier
+            // with nobody to answer it; stop it with the reason instead.
+            if node.is_some() {
+                fail_provisioning(state, id, project_id.as_deref(), &reason).await;
+                return Err(CreateRunError::Worktree(std::io::Error::other(reason)));
             }
         }
     }

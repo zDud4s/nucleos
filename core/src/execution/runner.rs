@@ -1447,8 +1447,8 @@ mod tests {
         track_open_tools(&opened, &mut open);
         assert!(!open.is_empty());
 
-        let read = next_line_unless_silent_with(&mut lines, Some(silence), &open, open_silence)
-            .await;
+        let read =
+            next_line_unless_silent_with(&mut lines, Some(silence), &open, open_silence).await;
         assert_eq!(read.err(), Some(open_silence));
         drop(cli);
     }

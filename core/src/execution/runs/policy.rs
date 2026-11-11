@@ -506,7 +506,11 @@ mod tests {
         crate::governance::autopilot::wire_classifier_hook(root.path()).unwrap();
         // Unparsable settings: the wiring refuses to touch them, so the tree stays unwired.
         std::fs::create_dir_all(tree.path().join(".claude")).unwrap();
-        std::fs::write(tree.path().join(".claude").join("settings.json"), "{not json").unwrap();
+        std::fs::write(
+            tree.path().join(".claude").join("settings.json"),
+            "{not json",
+        )
+        .unwrap();
         let reason = inherit_classifier_hook(root.path(), tree.path()).unwrap_err();
         assert!(reason.contains("classifier hook"), "{reason}");
     }
