@@ -366,6 +366,15 @@ describe("the three reads", () => {
     expect(result.current.data).toEqual(["merge", "push"]);
   });
 
+  it("reads a git op listed with its permission as an object beside the bare names", async () => {
+    mockedFetch.mockResolvedValueOnce(["merge", { op_kind: "push", roles: ["reviewer"], max_depth: 1 }]);
+
+    const { result } = renderHook(() => useProjectGitOps("alpha"), { wrapper: mount() });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(result.current.data?.map(gitOpName)).toEqual(["merge", "push"]);
+  });
+
   /** Empty is a real answer: it means "nowhere but the integration branch", which needs no row. */
   it("reads the land targets, and an empty list is not an absent one", async () => {
     const { result } = renderHook(() => useProjectLandTargets("alpha"), { wrapper: mount() });
