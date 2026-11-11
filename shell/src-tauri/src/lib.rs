@@ -10,7 +10,6 @@ pub mod daemon;
 pub mod dictation;
 /// What a drop onto the window means, and the only paths this process will read because of one.
 pub mod drop;
-mod legacy_identity;
 mod machines;
 /// Where the quota notch is drawn: inside the main window, or in a floating window of its own.
 pub mod notch;
@@ -123,7 +122,6 @@ fn get_daemon_token() -> Result<String, String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    legacy_identity::run_at_startup();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
