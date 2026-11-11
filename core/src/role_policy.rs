@@ -286,6 +286,34 @@ impl Permission {
     }
 }
 
+/// An `allowed_roles` column back into a list. Unreadable JSON fails closed: an empty list admits
+/// nobody.
+pub fn parse_allowed_roles(raw: Option<String>) -> Option<Vec<Role>> {
+    let raw = raw?;
+    match serde_json::from_str(&raw) {
+        Ok(roles) => Some(roles),
+        Err(error) => {
+            tracing::warn!(%error, "allowed_roles is not valid JSON; admitting nobody");
+            Some(Vec::new())
+        }
+    }
+}
+
+/// The permission stored in an `allowed_roles` / `max_depth` column pair.
+pub fn permission_from_columns(allowed_roles: Option<String>, max_depth: Option<i64>) -> Permission {
+    Permission {
+        roles: parse_allowed_roles(allowed_roles),
+        max_depth,
+    }
+}
+
+/// The `allowed_roles` column value for a permission's roles.
+pub fn roles_to_column(roles: &Option<Vec<Role>>) -> Option<String> {
+    roles
+        .as_ref()
+        .map(|roles| serde_json::to_string(roles).unwrap_or_else(|_| "[]".to_owned()))
+}
+
 /// Only the owner's top-level session may push.
 pub fn may_push(who: &Requester) -> bool {
     who.top_level

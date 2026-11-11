@@ -329,10 +329,31 @@ pub(super) async fn delete_project_github_op(
 pub(super) async fn get_project_git_ops(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<Vec<String>>, StatusCode> {
+) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+    // A plain name for an unrestricted declaration (the shape the shell reads), and an object
+    // carrying `roles` / `max_depth` only for one that names who it covers.
     crate::project::policy::try_git_ops(&state.pool, &id)
         .await
-        .map(Json)
+        .map(|ops| {
+            Json(
+                ops.into_iter()
+                    .map(|(op_kind, permission)| {
+                        if permission == crate::role_policy::Permission::default() {
+                            serde_json::Value::String(op_kind)
+                        } else {
+                            let mut entry = serde_json::json!({ "op_kind": op_kind });
+                            if let Some(roles) = &permission.roles {
+                                entry["roles"] = serde_json::json!(roles);
+                            }
+                            if let Some(depth) = permission.max_depth {
+                                entry["max_depth"] = serde_json::json!(depth);
+                            }
+                            entry
+                        }
+                    })
+                    .collect(),
+            )
+        })
         .map_err(|error| {
             tracing::warn!(%error, project_id = %id, "reading a project's git ops failed");
             StatusCode::INTERNAL_SERVER_ERROR
@@ -343,6 +364,12 @@ pub(super) async fn get_project_git_ops(
 #[serde(deny_unknown_fields)]
 pub(super) struct GitOpTarget {
     pub(super) op_kind: String,
+    /// Roles the declaration covers. Absent means every role. Used by declare only.
+    #[serde(default)]
+    pub(super) roles: Option<Vec<crate::role_policy::Role>>,
+    /// Deepest tree level the declaration covers. Absent means no limit. Used by declare only.
+    #[serde(default)]
+    pub(super) max_depth: Option<i64>,
 }
 
 /// Refuses a blank op kind before anything else can name it — `named_op_kind`'s own reason, worded
@@ -395,7 +422,21 @@ pub(super) async fn post_project_git_op(
         ));
     }
 
-    crate::project::policy::declare_git_op(&state.pool, &id, op_kind)
+    if body.max_depth.is_some_and(|depth| depth < 0) {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "refusal": "invalid",
+                "detail": "max_depth cannot be negative",
+            })),
+        ));
+    }
+
+    let permission = crate::role_policy::Permission {
+        roles: body.roles.clone(),
+        max_depth: body.max_depth,
+    };
+    crate::project::policy::declare_git_op_with(&state.pool, &id, op_kind, &permission)
         .await
         .map_err(|error| {
             tracing::warn!(%error, project_id = %id, "declaring a project git op failed");

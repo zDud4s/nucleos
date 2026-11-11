@@ -11752,6 +11752,51 @@ mod tests {
         assert_eq!(listed, serde_json::json!([]));
     }
 
+    /// A git declaration may name the roles and depth it covers; GET shows them, a negative depth
+    /// is refused, and an unrestricted declaration keeps the plain-name shape.
+    #[tokio::test]
+    async fn a_git_op_declared_with_roles_and_depth_lists_them() {
+        let state = test_state().await;
+        project_on_the_roster(&state, "alpha").await;
+
+        let (status, _) = reach_request(
+            state.clone(),
+            "POST",
+            "/projects/alpha/git-ops",
+            Some(serde_json::json!({ "op_kind": "merge", "roles": ["leaf"], "max_depth": 2 })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) = reach_request(
+            state.clone(),
+            "POST",
+            "/projects/alpha/git-ops",
+            Some(serde_json::json!({ "op_kind": "rebase" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (_, listed) =
+            reach_request(state.clone(), "GET", "/projects/alpha/git-ops", None).await;
+        assert_eq!(
+            listed,
+            serde_json::json!([
+                { "op_kind": "merge", "roles": ["leaf"], "max_depth": 2 },
+                "rebase"
+            ])
+        );
+
+        let (status, refused) = reach_request(
+            state,
+            "POST",
+            "/projects/alpha/git-ops",
+            Some(serde_json::json!({ "op_kind": "merge", "max_depth": -1 })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(refused["refusal"], "invalid");
+    }
+
     /// An operation outside `GIT_OP_KINDS` is refused, and the refusal names all six.
     #[tokio::test]
     async fn an_unknown_git_op_kind_is_refused_naming_the_six() {

@@ -360,18 +360,6 @@ type Row = (
     Option<i64>,
 );
 
-/// The roles column back into a list. Unreadable JSON fails closed: an empty list admits nobody.
-fn parse_roles(raw: Option<String>) -> Option<Vec<crate::role_policy::Role>> {
-    let raw = raw?;
-    match serde_json::from_str(&raw) {
-        Ok(roles) => Some(roles),
-        Err(error) => {
-            tracing::warn!(%error, "project command allowed_roles is not valid; admitting nobody");
-            Some(Vec::new())
-        }
-    }
-}
-
 fn from_row(row: Row) -> ProjectCommand {
     let (
         id,
@@ -414,7 +402,7 @@ fn from_row(row: Row) -> ProjectCommand {
         pass_exit_code,
         runnable_by: RunnableBy::from_db_str(&runnable_by),
         permission: crate::role_policy::Permission {
-            roles: parse_roles(allowed_roles),
+            roles: crate::role_policy::parse_allowed_roles(allowed_roles),
             max_depth,
         },
         source: Source::from_db_str(&source),

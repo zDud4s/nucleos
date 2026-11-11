@@ -1752,7 +1752,7 @@ mod tests {
             &call(
                 run_id,
                 "Bash",
-                serde_json::json!({"command": "git push origin main"}),
+                serde_json::json!({"command": "git tag v1"}),
             ),
         )
         .await;
@@ -7424,9 +7424,10 @@ mod tests {
             .unwrap();
         let app = test_router(state.clone());
 
-        // Two DIFFERENT pushes: same class, different input. The second is the one the old
-        // single-use, input-matched grant sent back for a second approval.
-        for command in ["git push origin main", "git push origin other"] {
+        // Two DIFFERENT tags: same class, different input. The second is the one the old
+        // single-use, input-matched grant sent back for a second approval. (Tags, not pushes: no
+        // grant lets a run push, see `a_grant_does_not_let_a_run_push`.)
+        for command in ["git tag v1", "git tag v2"] {
             let decision = decide(
                 &app,
                 &serde_json::json!({
@@ -7456,6 +7457,32 @@ mod tests {
                 "{command}"
             );
         }
+    }
+
+    /// A grant for the `push-merge-deploy` class covers tags and the like, but a run is never the
+    /// owner's top-level session, so it does not let the run push by hand.
+    #[tokio::test]
+    async fn a_grant_does_not_let_a_run_push() {
+        let state = test_state().await;
+        let run_id = in_flight_run(&state, "worktree", None, Some("C:\\work\\repo"), None).await;
+        proposals::grant_action(&state.pool, run_id, "Bash", Some("push-merge-deploy"), 1)
+            .await
+            .unwrap();
+        let app = test_router(state.clone());
+
+        for command in ["git push origin main", "git -C sub push --force origin x"] {
+            let decision = run_git_decision(&app, run_id, command).await;
+            assert_eq!(decision.decision, "deny", "{command}");
+            assert_eq!(decision.reason, crate::role_policy::PUSH_REFUSAL, "{command}");
+        }
+        // The grant was not spent on the refusals.
+        let consumed: Option<String> =
+            sqlx::query_scalar("SELECT consumed_at FROM action_grants WHERE run_id = ?")
+                .bind(run_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(consumed, None);
     }
 
     /// The other half of the class rule: covering a class for the rest of the run is only safe if
@@ -7929,6 +7956,54 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .contains_key(&run_id)
         );
+    }
+
+    /// A declaration is a grant; one whose `max_depth` does not cover the run's node does not apply,
+    /// so the merge is NOT auto-queued and goes the way it went before the declaration (the same
+    /// declaration with no permission queues it, in the test above).
+    #[tokio::test]
+    async fn a_declared_git_op_that_does_not_cover_the_runs_depth_is_not_queued() {
+        let state = test_state().await;
+        let repo = rostered_repo(&state, "hook-run-declared-merge-depth").await;
+        crate::project::policy::declare_git_op_with(
+            &state.pool,
+            "p",
+            "merge",
+            &crate::role_policy::Permission {
+                roles: None,
+                max_depth: Some(0),
+            },
+        )
+        .await
+        .unwrap();
+        let run_id = in_flight_run(
+            &state,
+            "worktree",
+            Some("p"),
+            repo.path().to_str(),
+            Some("declared-merge-depth"),
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO work_nodes (id, root_id, depth, kind, title, goal, status, run_id,
+                                     created_at, updated_at)
+             VALUES ('depth-1-node', 'depth-1-node', 1, 'leaf', 't', 'g', 'running', ?,
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(run_id.to_string())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let app = test_router(state.clone());
+
+        let decision = run_git_decision(&app, run_id, "git merge feature").await;
+
+        assert!(
+            !decision.reason.contains("git queue"),
+            "an uncovered requester must not be auto-queued: {}",
+            decision.reason
+        );
+        assert!(queued_run_rows(&state).await.is_empty());
     }
 
     /// A run is never the owner's top-level session: a declared push is refused with who may push
