@@ -143,8 +143,14 @@ pub async fn update(pool: &SqlitePool, job: &TreeJob) -> Result<(), StoreError> 
     if updated.rows_affected() == 0 {
         return Err(StoreError::NotFound(job.id.clone()));
     }
+    JOB_CHANGED.notify_waiters();
     Ok(())
 }
+
+/// Woken, process-wide, each time a job's state is written. A waiter takes `notified()` before it
+/// reads the job, so a write between the read and the wait is not lost; the waiter keeps a slow
+/// poll as a fallback for a state written some other way.
+pub static JOB_CHANGED: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
 /// The feed kind of the line that names a job whose manifest cannot be read.
 pub(super) const CORRUPT_FEED_KIND: &str = "work_tree_corrupt";
@@ -423,6 +429,22 @@ mod tests {
         assert_eq!(loaded.created_at, job.created_at);
         assert_eq!(loaded, changed);
         assert_ne!(loaded.manifest, job.manifest);
+    }
+
+    #[tokio::test]
+    async fn update_wakes_a_waiter_that_took_notified_before_it() {
+        let pool = crate::testdb::fresh_pool().await;
+        let job = sample_job("job-wake", "root-wake", "open");
+        save(&pool, &job).await.unwrap();
+        let woken = JOB_CHANGED.notified();
+
+        let mut changed = job.clone();
+        changed.state = JOB_TERMINAL_STATE.to_owned();
+        update(&pool, &changed).await.unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), woken)
+            .await
+            .expect("a job write wakes the waiter");
     }
 
     /// A job's terminal state is `finished`, not the branch list `TERMINAL_STATES`: `tree_state.py`
