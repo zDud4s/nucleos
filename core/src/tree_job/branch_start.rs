@@ -26,7 +26,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-use super::ghosts::{START_CALLER_KEY, clear_ghosts, is_ghost_of, same_shape};
+use super::ghosts::{clear_ghosts, is_ghost_of, same_shape};
 use super::http::{job_lock, refuse};
 use super::model::JOB_TERMINAL_STATE;
 use super::nested_prompt;
@@ -1052,6 +1052,8 @@ fn with_shape(mut response: Value, shape: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
+
+    use super::super::ghosts::START_CALLER_KEY;
 
     use axum::{
         Router,
