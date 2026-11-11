@@ -2046,7 +2046,11 @@ mod tests {
     }
 
     fn has_tail_clock(id: i64) -> bool {
-        TAIL_CLOCKS.lock().unwrap().keys().any(|(run, _)| *run == id)
+        TAIL_CLOCKS
+            .lock()
+            .unwrap()
+            .keys()
+            .any(|(run, _)| *run == id)
     }
 
     /// F5: the clock of a run that ended is forgotten, or the map grows with every run ever seen.
