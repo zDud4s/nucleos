@@ -32,8 +32,8 @@ they are not addressed to you — see "Leaf, never a controller" below.
    impossible as written, do not improvise around it — escalate.
 4. **Add the tests in `## Tests / To add`.** A planned test that you skip needs a concrete
    reason in `Tests added`, not silence.
-5. **Run no tests, builds or checks.** This is Rule 3 in `.nucleos/workflow/workflow.md`, in short:
-   subagents never run build or test tools, because only the controller's verification runs them.
+5. **Run no tests, builds or checks beyond the leaf self-check.** A leaf runs only `cargo fmt -p <crate>` and `python scripts/check_invariants.py` before closing, via `python scripts/heavy.py`, failing open; never `cargo check`, `test`, `build`, `clippy` or `--workspace`. The rest is the gate's. With `autonomy.leaf_self_check: true` it may add one `cargo check -p <crate> --tests`. This is Rule 3 in `.nucleos/workflow/workflow.md`, in short:
+   subagents never run any other build or test tool, because only the controller's verification runs them.
    For every command in `## Validation / Commands`, write the evidence block `$ <command>` then
    `deferred: batched` (the packet carries `Test runs: batched`). Instead of running, re-read your
    own diff against the packet — every changed hunk, every name you call, every import — and

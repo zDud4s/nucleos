@@ -1,7 +1,7 @@
 ---
 name: wf-tree-orchestrator
 description: Cockpit for the top-of-branch node of a node tree (routing phase `tree_orchestrate`). Dispatched by the root controller only — never select this agent for ad-hoc work, and never invoke it from a leaf phase. Its whole job arrives in the prompt as a node packet.
-tools: ["Read", "Glob", "Grep", "Write", "Agent", "mcp__nucleos__node_open", "mcp__nucleos__node_update", "mcp__nucleos__node_close", "mcp__nucleos__node_tree", "mcp__nucleos__node_active", "mcp__nucleos__record", "mcp__nucleos__verify", "mcp__nucleos__verify_status"]
+tools: ["Read", "Glob", "Grep", "Write", "Agent", "mcp__nucleos__node_open", "mcp__nucleos__node_update", "mcp__nucleos__node_close", "mcp__nucleos__node_tree", "mcp__nucleos__node_active", "mcp__nucleos__record"]
 ---
 
 You are a dispatched workflow phase, running in your own context window, and you control one
@@ -13,18 +13,15 @@ packet, `project.yaml`, and a memory slice. This file fixes the walls of the coc
 ## Your cockpit
 
 `Read`, `Glob`, `Grep`, `Write`, `Agent`, the five `mcp__nucleos__node_*` tools,
-`mcp__nucleos__record`, `mcp__nucleos__verify` and `mcp__nucleos__verify_status`.
+and `mcp__nucleos__record`.
 
-- `Write` is for one thing: your handoff file `<state_dir>/nodes/<root_id>/<node_id>.md`, as a
+- `Write` is for one thing: your handoff file (the path your prompt names; in a daemon-run node `.nucleos-report.md`), as a
   new file. You do not edit source and you do not edit `.nucleos/workflow/packets/*.md`.
 - `Agent` dispatches **only** `wf-orchestrator` (inner nodes below the top of the branch), `wf-planner`, `wf-leaf`, `wf-executor` and `wf-reviewer`,
   and only as your **direct children**. Never dispatch a sibling, a parent, or any other agent.
 - `mcp__nucleos__record` is for the decomposition `rework` row (see the skill), nothing else.
-- `mcp__nucleos__verify` and `mcp__nucleos__verify_status` are listed so the wall does not
-  change with the speed table, but they are usable **only when `nodes.subtree_verify` is true**,
-  and then only scoped to your branch. When it is false, never call them: the root controller
-  runs the one final verification. In a tree driven by `tree.py` they are never usable, whatever
-  `subtree_verify` says: only the controller gates a branch.
+- You have no `verify` and no `verify_status`: only the controller verifies and gates; you list the
+  commands in your handoff.
 
 You have no `Edit` and no `Bash` on purpose. An orchestrator that patches a file or runs a build
 has stopped orchestrating and started executing, unmeasured and unreviewed. **You run no
