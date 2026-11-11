@@ -17,6 +17,9 @@ pub struct PreToolUsePayload {
     pub agent_id: Option<String>,
     #[serde(default)]
     pub agent_type: Option<String>,
+    /// The hook saw subagent markers on a call that has no usable `agent_id` (D12).
+    #[serde(default)]
+    pub subagent: bool,
 }
 
 /// What arrives with a `PostToolUse`/`PostToolUseFailure` report: the OUTCOME of a call this

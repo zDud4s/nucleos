@@ -1516,6 +1516,7 @@ mod tests {
                 tool_input: serde_json::json!({"command": "cargo test --workspace | tee t.log"}),
                 agent_id: None,
                 agent_type: None,
+                subagent: false,
             },
             started,
         )
@@ -4064,6 +4065,7 @@ mod tests {
                 tool_input: serde_json::json!({"command": "git push origin main"}),
                 agent_id: None,
                 agent_type: None,
+                subagent: false,
             }),
         ));
 
