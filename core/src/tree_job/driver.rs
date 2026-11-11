@@ -468,6 +468,9 @@ async fn at_work(
                 tracing::warn!(job = %job.id, %error, "could not tell whether the root branch changed anything");
             }
         }
+    } else if parked_as_no_change(pool, job, name, parks).await? {
+        // A work branch with nothing in it is neither gated nor merged: the owner is asked.
+        return Ok(());
     }
     let backing_off = job
         .manifest
@@ -505,6 +508,110 @@ async fn has_diff(job: &TreeJob, branch: &super::model::Branch) -> Result<bool, 
     let range = format!("{}..{git_branch}", job.manifest.feature_branch);
     let counted = git(&job.manifest.project_root, &["rev-list", "--count", &range]).await?;
     Ok(counted != "0")
+}
+
+/// The record a code branch that changed nothing carries beside its park: `{"reason", "at"}`. It
+/// is not a state of its own: the branch is parked (`decisions::park`), so it is neither merged nor
+/// done, blocks the landing, and the owner's answer relaunches its node or drops it.
+pub(super) const NO_CHANGE_KEY: &str = "no_change";
+
+/// Why the branch has nothing to merge, or `None` when it changes a file. The diff is taken from
+/// the merge base with the branch it merges into (`nesting::merge_target`) to its tip, so no commit
+/// and commits that cancel out both read as no change. The worktree is checkpointed first: an
+/// implement node leaves its work uncommitted. `Err` when git cannot tell (no such branch, a parent
+/// that merges nowhere), and the caller then keeps today's path.
+async fn no_change_reason(job: &TreeJob, name: &str) -> Result<Option<String>, String> {
+    let branch = job.manifest.branches.get(name).ok_or("branch vanished")?;
+    if let Some(worktree) = &branch.worktree {
+        crate::execution::worktree::checkpoint(Path::new(worktree))
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    let Some(git_branch) = &branch.git_branch else {
+        return Ok(None);
+    };
+    let target = super::nesting::merge_target(&job.manifest, name)?;
+    let range = format!("{target}...{git_branch}");
+    let changed = git(&job.manifest.project_root, &["diff", "--name-only", &range]).await?;
+    if !changed.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "{git_branch} has no change over {target}: no commit, or commits whose diff is empty"
+    )))
+}
+
+/// Records why branch `name` changed nothing and asks for its park: it is not merged and does not
+/// count as done. Nothing is asked for a branch with no node (nothing to park), nor while its node
+/// still runs (an answer resumed a green branch and relaunched it): that run may still commit.
+async fn park_no_change(
+    pool: &SqlitePool,
+    job: &mut TreeJob,
+    name: &str,
+    reason: &str,
+    parks: &mut Vec<Park>,
+) -> Result<(), String> {
+    let node = job
+        .manifest
+        .branches
+        .get(name)
+        .and_then(|held| held.node_id.clone());
+    if let Some(node) = &node
+        && node_report(pool, node).await?.live
+    {
+        return Ok(());
+    }
+    let held = job
+        .manifest
+        .branches
+        .get_mut(name)
+        .ok_or("branch vanished")?;
+    held.extra.insert(
+        NO_CHANGE_KEY.to_owned(),
+        serde_json::json!({"reason": reason, "at": now()}),
+    );
+    persist(pool, job).await?;
+    if let Some(node) = node {
+        parks.push((
+            node,
+            format!(
+                "Branch {name} produced no change ({reason}), so nothing was merged. Answer to have its node try again, or drop the branch."
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Checks branch `name` for a change before it is gated or merged. `Ok(true)` when it changed
+/// nothing and was handed to [`park_no_change`]; a record left by an earlier empty pass is cleared
+/// once the branch changes something. A git error is logged and reads as a change.
+async fn parked_as_no_change(
+    pool: &SqlitePool,
+    job: &mut TreeJob,
+    name: &str,
+    parks: &mut Vec<Park>,
+) -> Result<bool, String> {
+    match no_change_reason(job, name).await {
+        Ok(Some(reason)) => {
+            park_no_change(pool, job, name, &reason, parks).await?;
+            Ok(true)
+        }
+        Ok(None) => {
+            let cleared = job
+                .manifest
+                .branches
+                .get_mut(name)
+                .is_some_and(|held| held.extra.remove(NO_CHANGE_KEY).is_some());
+            if cleared {
+                persist(pool, job).await?;
+            }
+            Ok(false)
+        }
+        Err(error) => {
+            tracing::warn!(job = %job.id, branch = name, %error, "could not tell whether the branch changed anything");
+            Ok(false)
+        }
+    }
 }
 
 /// Runs `git -C <root> <args>` and answers its trimmed stdout, or its stderr as the error.
@@ -946,6 +1053,11 @@ async fn merge(
     // said once; anything else waits silently for this pass.
     if check_may_merge(&job.manifest, name).is_err() {
         return super::retry::note_blocked_base(pool, job, name, parks).await;
+    }
+    // Green is not enough: a gate that measured nothing (`unmeasured`) over an empty diff, or any
+    // green over one, would merge nothing and read as done. Such a branch goes to the owner.
+    if parked_as_no_change(pool, job, name, parks).await? {
+        return Ok(());
     }
     let repo = repo_of(pool, job).await?;
     submit_merge(pool, &repo, job, name, Origin::Daemon)
@@ -3304,6 +3416,173 @@ pub(super) mod tests {
         assert_eq!(gate.calls(), vec![(FULL.to_owned(), "root".to_owned())]);
         fx.wait_branch_state(FULL, "root", "green").await;
         assert_ne!(fx.branch(FULL, "root").await.state, "dropped");
+    }
+
+    // ---- a work branch that changed nothing ------------------------------------------------------
+
+    /// Asserts `name` ended parked with its `no_change` record, nothing queued, and one open question
+    /// for `node` that names the missing change.
+    async fn assert_no_change(fx: &Fixture, job: &str, name: &str, node: &str) {
+        let branch = fx.branch(job, name).await;
+        assert_eq!(
+            branch.state, "parked",
+            "a branch that changed nothing waits on the owner"
+        );
+        assert_ne!(branch.state, "merged");
+        let record = branch
+            .extra
+            .get(NO_CHANGE_KEY)
+            .expect("the branch carries its no_change record");
+        assert!(
+            record["reason"]
+                .as_str()
+                .is_some_and(|reason| !reason.is_empty()),
+            "{record}"
+        );
+        assert!(
+            !branch.extra.contains_key("merge_sha"),
+            "nothing was merged"
+        );
+        assert_eq!(fx.requests().await, 0, "no merge was queued");
+        let questions = fx.open_questions(job, node).await;
+        assert_eq!(questions.len(), 1, "{questions:?}");
+        assert!(questions[0].contains("no change"), "{}", questions[0]);
+    }
+
+    /// A work leaf whose branch has no commit over the feature branch is never gated, never merged,
+    /// and the owner is asked about it (seen live in vigia-1110-slash-ambient-mcp).
+    #[tokio::test]
+    async fn a_work_leaf_with_no_commit_is_parked_as_no_change_instead_of_gated() {
+        const JOB: &str = "drv-no-change-leaf";
+        const NODE: &str = "ambient-node";
+        let fx = Fixture::new().await;
+        assert!(git_in(&fx.repo, &["branch", "tree/ambient", "feat/tree"]));
+        fx.seed_job(
+            JOB,
+            vec![code_branch("ambient", "building", Some(NODE))],
+            None,
+        )
+        .await;
+        fx.add_node(JOB, NODE, "leaf").await;
+        fx.run_ended(NODE, Some("done")).await;
+        let gate = FakeGate::answering(vec![GateVerdict::NothingRan]);
+
+        fx.tick(JOB, &gate).await;
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(gate.calls().is_empty(), "an empty branch is not gated");
+        assert_no_change(&fx, JOB, "ambient", NODE).await;
+
+        // A second pass asks nothing more and still merges nothing.
+        fx.tick(JOB, &gate).await;
+        assert_eq!(fx.open_questions(JOB, NODE).await.len(), 1);
+        assert_eq!(fx.requests().await, 0);
+    }
+
+    /// A green, unmeasured gate over an empty diff is not read as green for merging.
+    #[tokio::test]
+    async fn a_green_unmeasured_branch_with_an_empty_diff_is_not_merged() {
+        const JOB: &str = "drv-no-change-green";
+        const NODE: &str = "ambient-node";
+        let fx = Fixture::new().await;
+        assert!(git_in(&fx.repo, &["branch", "tree/ambient", "feat/tree"]));
+        let mut branch = code_branch("ambient", "green", Some(NODE));
+        branch.gates.push(json!({
+            "at": STAMP, "verdict": "green", "exit": 0, "unmeasured": true,
+            "reason": "no test unit agrees with the branch's diff, so nothing ran",
+        }));
+        fx.seed_job(JOB, vec![branch], None).await;
+        fx.add_node(JOB, NODE, "leaf").await;
+        fx.run_ended(NODE, Some("done")).await;
+        let gate = FakeGate::answering(vec![]);
+
+        fx.tick(JOB, &gate).await;
+
+        assert_no_change(&fx, JOB, "ambient", NODE).await;
+    }
+
+    /// Commits whose changes cancel out are an empty diff too: there is nothing to merge.
+    #[tokio::test]
+    async fn a_branch_whose_commits_cancel_out_is_no_change() {
+        const JOB: &str = "drv-no-change-reverted";
+        const NODE: &str = "ambient-node";
+        let fx = Fixture::new().await;
+        assert!(git_in(&fx.repo, &["checkout", "-q", "-b", "tree/ambient"]));
+        commit_file(&fx.repo, "ambient.txt", "added\n", "add");
+        assert!(git_in(&fx.repo, &["rm", "-q", "ambient.txt"]));
+        assert!(git_in(&fx.repo, &["commit", "-q", "-m", "revert"]));
+        assert!(git_in(&fx.repo, &["checkout", "-q", "feat/tree"]));
+        fx.seed_job(JOB, vec![code_branch("ambient", "green", Some(NODE))], None)
+            .await;
+        fx.add_node(JOB, NODE, "leaf").await;
+        fx.run_ended(NODE, Some("done")).await;
+        let gate = FakeGate::answering(vec![]);
+
+        fx.tick(JOB, &gate).await;
+
+        assert_no_change(&fx, JOB, "ambient", NODE).await;
+    }
+
+    /// The live failure end to end: the only work leaf changed nothing and the root changed nothing.
+    /// The job must not finish as if it had succeeded; it stays open on the owner's question.
+    #[tokio::test]
+    async fn a_tree_whose_only_leaf_changed_nothing_does_not_finish() {
+        const JOB: &str = "drv-no-change-tree";
+        const NODE: &str = "ambient-node";
+        let fx = Fixture::new().await;
+        assert!(git_in(&fx.repo, &["branch", "tree/ambient", "feat/tree"]));
+        let mut root = code_branch("root", "building", Some(&root_node_of(JOB)));
+        root.git_branch = Some("tree/root-empty".to_owned());
+        fx.seed_job(
+            JOB,
+            vec![code_branch("ambient", "building", Some(NODE)), root],
+            None,
+        )
+        .await;
+        fx.add_node(JOB, NODE, "leaf").await;
+        fx.run_ended(NODE, Some("done")).await;
+        fx.root_done(JOB).await;
+        let gate = FakeGate::answering(vec![GateVerdict::NothingRan]);
+
+        fx.tick(JOB, &gate).await;
+        fx.tick(JOB, &gate).await;
+
+        assert_no_change(&fx, JOB, "ambient", NODE).await;
+        let job = fx.job(JOB).await;
+        assert_ne!(
+            job.state, "finished",
+            "a tree that changed nothing is not a success"
+        );
+        assert!(
+            !job.manifest.extra.contains_key("landing"),
+            "{:?}",
+            job.manifest.extra
+        );
+        assert!(fx.open_jobs().await.contains(&JOB.to_owned()));
+    }
+
+    /// Guard: a branch with real commits keeps today's path, gate then merge, and carries no record.
+    #[tokio::test]
+    async fn a_branch_with_commits_is_gated_and_merged_as_before() {
+        const JOB: &str = "drv-change-kept";
+        const NODE: &str = "api-node";
+        let fx = Fixture::new().await;
+        gated_job(&fx, JOB, NODE).await;
+        let gate = FakeGate::answering(vec![GateVerdict::NothingRan]);
+
+        fx.tick(JOB, &gate).await;
+        wait_calls(&gate, 1).await;
+        fx.wait_branch_state(JOB, "api", "green").await;
+        fx.tick(JOB, &gate).await;
+
+        assert_eq!(fx.requests().await, 1, "the branch goes on to its merge");
+        assert!(
+            !fx.branch(JOB, "api")
+                .await
+                .extra
+                .contains_key(NO_CHANGE_KEY)
+        );
+        assert!(fx.open_questions(JOB, NODE).await.is_empty());
     }
 
     // ---- a report that is not `done` ---------------------------------------------------------------

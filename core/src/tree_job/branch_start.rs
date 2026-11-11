@@ -26,6 +26,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
+use super::ghosts::{clear_ghosts, is_ghost_of, same_shape};
 use super::http::{job_lock, refuse};
 use super::model::JOB_TERMINAL_STATE;
 use super::nested_prompt;
@@ -48,7 +49,7 @@ const DEFAULT_LAYER: &str = "code";
 /// launches in plan mode).
 const LAUNCH_MODE: &str = "worktree";
 
-type Refusal = (StatusCode, Json<Value>);
+pub(super) type Refusal = (StatusCode, Json<Value>);
 
 pub fn routes() -> Router<AppState> {
     Router::new().route("/trees/{id}/branch_start", post(post_branch_start))
@@ -110,7 +111,7 @@ fn db_refusal(error: sqlx::Error) -> Refusal {
     )
 }
 
-fn store_refusal(error: StoreError) -> Refusal {
+pub(super) fn store_refusal(error: StoreError) -> Refusal {
     let status = match &error {
         StoreError::NotFound(_) => StatusCode::NOT_FOUND,
         _ => {
@@ -195,7 +196,7 @@ async fn call(
 }
 
 /// The node already made for branch `name` under `caller`, if any.
-async fn existing_node(
+pub(super) async fn existing_node(
     state: &AppState,
     caller: &str,
     name: &str,
@@ -540,15 +541,31 @@ pub(super) async fn heal_pending_decision(
     Ok(())
 }
 
-/// Replays the stored start of a pending branch through `/branch_start`, with the body it was
-/// refused with: every step is idempotent and the launch key is `branch-<name>`, so a replay after
-/// a crash makes nothing twice. The caller must not hold the job's lock. `Err` carries the reason.
+/// [`start_pending_status`] with the refusal folded into one string, for tests that only need to
+/// know whether a replay passed.
+#[cfg(test)]
 pub(super) async fn start_pending(
     state: &AppState,
     job_id: &str,
     name: &str,
     record: &Value,
 ) -> Result<Value, String> {
+    start_pending_status(state, job_id, name, record)
+        .await
+        .map_err(|(status, reason)| format!("{status}: {reason}"))
+}
+
+/// Replays the stored start of a pending branch through `/branch_start`, with the body it was
+/// refused with: every step is idempotent and the launch key is `branch-<name>`, so a replay after
+/// a crash makes nothing twice. The caller must not hold the job's lock. The status of a refusal is
+/// kept apart from its reason, so that the driver can tell a
+/// refusal that will never pass (a bad request) from one that may pass later.
+pub(super) async fn start_pending_status(
+    state: &AppState,
+    job_id: &str,
+    name: &str,
+    record: &Value,
+) -> Result<Value, (StatusCode, String)> {
     let body = json!({
         "name": name,
         "goal": record["goal"],
@@ -571,7 +588,7 @@ pub(super) async fn start_pending(
     .await
     .map_err(|(status, Json(refusal))| {
         let reason = refusal["error"].as_str().unwrap_or("no reason given");
-        format!("{status}: {reason}")
+        (status, reason.to_owned())
     })
 }
 
@@ -737,12 +754,37 @@ async fn start_branch(
         ));
     }
     let nested = caller != job.root_node_id && !docs;
-    let existing = job.manifest.branches.get(&name);
+    let fresh_parent = if nested {
+        nesting::parent_branch_of(&job.manifest, &caller)
+    } else {
+        None
+    };
+    // A branch an earlier refused start of this caller left behind, asked for now with another
+    // shape, is replaced (`clear_ghosts`, before step 1): this start decides as a new one.
+    let existing = job.manifest.branches.get(&name).filter(|branch| {
+        !is_ghost_of(&job, branch, &caller)
+            || same_shape(
+                branch,
+                &paths,
+                &layer,
+                base.as_deref(),
+                fresh_parent.as_deref(),
+            )
+    });
     let parent = match existing {
         Some(existing) => existing.parent.clone(),
-        None if nested => nesting::parent_branch_of(&job.manifest, &caller),
-        None => None,
+        None => fresh_parent.clone(),
     };
+    // A branch with no node yet needs a new one at step 3. Whatever would refuse that node for its
+    // owned paths (an absolute path, a `..`, a path outside the caller's) refuses now, before step
+    // 1 adds the branch or step 2 opens its worktree: a refused start leaves nothing behind.
+    let needs_node = existing
+        .and_then(|branch| branch.node_id.as_deref())
+        .is_none()
+        && existing_node(&state, &caller, &name).await?.is_none();
+    if needs_node {
+        work_nodes::check_containment(&caller_node, &paths).map_err(node_refusal)?;
+    }
     let known = known_kind(
         &state,
         existing.and_then(|branch| branch.node_id.as_deref()),
@@ -815,14 +857,20 @@ async fn start_branch(
     // A branch with no node yet will need a new one at step 3. Refuse now when the budget does not
     // permit it, so that a refused call has not added a branch or opened a worktree the driver could
     // pick up. Step 3 checks again under the job lock.
-    let already_bound = job
-        .manifest
-        .branches
-        .get(&name)
-        .is_some_and(|branch| branch.node_id.is_some());
-    if !already_bound && existing_node(&state, &caller, &name).await?.is_none() {
+    if needs_node {
         check_tree_budget(&state, &job.root_node_id).await?;
     }
+    clear_ghosts(
+        &state,
+        &id,
+        &caller,
+        &name,
+        &paths,
+        &layer,
+        base.as_deref(),
+        parent.as_deref(),
+    )
+    .await?;
 
     // 1. The branch, through the route that adds one: its replay, overlap and admission checks
     // are the ones a direct call gets, and nothing is stored when it refuses.
@@ -830,7 +878,10 @@ async fn start_branch(
         super::http::routes(),
         &state,
         format!("/trees/{id}/branches"),
-        json!({ "name": name, "paths": paths, "layer": layer, "base": base, "parent": parent }),
+        json!({
+            "name": name, "paths": paths, "layer": layer, "base": base, "parent": parent,
+            "caller": caller,
+        }),
     )
     .await
     {
@@ -1001,6 +1052,8 @@ fn with_shape(mut response: Value, shape: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
+
+    use super::super::ghosts::START_CALLER_KEY;
 
     use axum::{
         Router,
@@ -2101,5 +2154,173 @@ mod tests {
             job.manifest.branches["api"].extra["estimate_tokens"],
             50_000
         );
+    }
+
+    // ----- refused starts leave nothing; their leftovers are replaced -----
+
+    /// Adds branch `name` owning `paths` as `caller` (or as nobody), then opens its worktree: what a
+    /// start refused at step 3 left behind, an open branch with no node.
+    async fn ghost(
+        state: &AppState,
+        app: &Router,
+        caller: Option<&str>,
+        name: &str,
+        paths: &[&str],
+    ) {
+        let mut add = json!({ "name": name, "paths": paths, "layer": "core" });
+        if let Some(caller) = caller {
+            add["caller"] = json!(caller);
+        }
+        let added = post(app, &format!("/trees/{TREE}/branches"), add).await;
+        assert_eq!(added.0, StatusCode::OK, "{:?}", added.1);
+        let opener = open::routes().with_state(state.clone());
+        let opened = post(
+            &opener,
+            &format!("/trees/{TREE}/branches/{name}/open"),
+            json!({}),
+        )
+        .await;
+        assert_eq!(opened.0, StatusCode::OK, "{:?}", opened.1);
+        let branch = job_of(state).await.manifest.branches[name].clone();
+        assert_eq!(branch.state, "open");
+        assert!(branch.node_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_start_refused_for_an_absolute_owned_path_writes_nothing_to_the_manifest() {
+        let (state, app, caller, repo) = tree().await;
+        let nodes = count(&state, "work_nodes").await;
+        let absolute = "C:/Users/someone/.nucleos/projects/p/specs/x.md";
+
+        let (status, refused) = post(
+            &app,
+            &uri(),
+            code_body(
+                &caller,
+                "note-core",
+                "Build the notes",
+                &["core/notes/**", absolute],
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{refused:?}");
+        let error = refused["error"].as_str().unwrap();
+        assert!(error.contains("state_dir"), "{error}");
+        let job = job_of(&state).await;
+        assert!(!job.manifest.branches.contains_key("note-core"));
+        assert!(!job.manifest.extra.contains_key("pending_starts"));
+        assert_eq!(count(&state, "work_nodes").await, nodes);
+        assert!(
+            open::worktree_path(&repo.path, TREE, "note-core")
+                .symlink_metadata()
+                .is_err(),
+            "no worktree was opened"
+        );
+
+        // The same name, and another name over the same paths, start as if nothing had happened.
+        let (status, started) = post(
+            &app,
+            &uri(),
+            code_body(&caller, "note-core", "Build the notes", &["core/notes/**"]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{started:?}");
+        assert!(started["node_id"].is_string(), "{started:?}");
+    }
+
+    #[tokio::test]
+    async fn an_open_branch_with_no_node_is_replaced_by_a_new_start_of_the_same_caller() {
+        let (state, app, caller, repo) = tree().await;
+        ghost(
+            &state,
+            &app,
+            Some(&caller),
+            "note-core",
+            &["core/notes/**", "x/**"],
+        )
+        .await;
+
+        let (status, started) = post(
+            &app,
+            &uri(),
+            code_body(&caller, "note-core", "Build the notes", &["core/notes/**"]),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{started:?}");
+        let branch = job_of(&state).await.manifest.branches["note-core"].clone();
+        assert_eq!(branch.paths, vec!["core/notes/**".to_owned()]);
+        assert_eq!(branch.node_id.as_deref(), started["node_id"].as_str());
+        assert!(
+            open::worktree_path(&repo.path, TREE, "note-core")
+                .symlink_metadata()
+                .is_ok(),
+            "the new start opened its own worktree"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_overlapping_open_branch_with_no_node_is_dropped_for_a_new_name() {
+        let (state, app, caller, _repo) = tree().await;
+        // Written before branches recorded their caller: the stem-level caller is the root.
+        ghost(&state, &app, None, "note-core", &["core/notes/**"]).await;
+
+        let (status, started) = post(
+            &app,
+            &uri(),
+            code_body(&caller, "notes", "Build the notes", &["core/notes/**"]),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{started:?}");
+        let job = job_of(&state).await;
+        assert_eq!(job.manifest.branches["note-core"].state, "dropped");
+        assert!(
+            job.manifest.branches["note-core"].extra["drop_reason"]
+                .as_str()
+                .unwrap()
+                .contains("notes")
+        );
+        assert!(job.manifest.branches["notes"].node_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_branch_with_a_node_or_another_caller_is_no_ghost() {
+        let (state, _app, caller, _repo) = tree().await;
+        let mut job = job_of(&state).await;
+        let mut open_branch = crate::tree_job::model::Branch::new("b", &[], "core", None);
+        open_branch.state = "open".to_owned();
+        open_branch
+            .extra
+            .insert(START_CALLER_KEY.to_owned(), json!(caller));
+        job.manifest
+            .branches
+            .insert("b".to_owned(), open_branch.clone());
+
+        assert!(is_ghost_of(&job, &open_branch, &caller));
+        assert!(!is_ghost_of(&job, &open_branch, "someone-else"));
+
+        let mut bound = open_branch.clone();
+        bound.node_id = Some("n".to_owned());
+        assert!(!is_ghost_of(&job, &bound, &caller));
+
+        let mut building = open_branch.clone();
+        building.state = "building".to_owned();
+        assert!(!is_ghost_of(&job, &building, &caller));
+
+        // A queued branch counts only with a recorded caller and no pending record.
+        let mut queued = crate::tree_job::model::Branch::new("b", &[], "core", None);
+        assert!(!is_ghost_of(&job, &queued, &caller));
+        queued
+            .extra
+            .insert(START_CALLER_KEY.to_owned(), json!(caller));
+        assert!(is_ghost_of(&job, &queued, &caller));
+        job.manifest.extra.insert(
+            "pending_starts".to_owned(),
+            json!({ "b": { "caller": caller } }),
+        );
+        assert!(!is_ghost_of(&job, &queued, &caller));
+        assert!(!is_ghost_of(&job, &open_branch, &caller));
     }
 }
