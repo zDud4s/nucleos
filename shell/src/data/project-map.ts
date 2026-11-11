@@ -820,6 +820,28 @@ export interface ItemReference {
   to: string;
 }
 
+/** One field of a struct, or one variant of an enum (Rust only). */
+export interface ItemMember {
+  /** The id of the {@link FileItem} this belongs to. */
+  owner: string;
+  /** The field's name (`0`, `1`… for a tuple struct) or the variant's. */
+  name: string;
+  kind: "field" | "variant";
+  /** A field's type, or a variant's payload as written; `null` for a unit variant. */
+  ty: string | null;
+  /** A field written `pub` in any form; always `false` for a variant. */
+  exported: boolean;
+  /** 1-based line of the member's name. */
+  line: number;
+}
+
+/** One path a file `use`s, flattened to one per leaf (Rust only). */
+export interface ItemUse {
+  path: string;
+  /** 1-based line of the `use` keyword. */
+  line: number;
+}
+
 /**
  * Everything one file says about itself.
  *
@@ -835,6 +857,10 @@ export interface FileItems {
   items: FileItem[];
   references: ItemReference[];
   missed: string[];
+  /** Fields and variants of the shapes in `items`; empty for TypeScript. */
+  members?: ItemMember[];
+  /** Every path the file `use`s; empty for TypeScript. */
+  uses?: ItemUse[];
 }
 
 /**
