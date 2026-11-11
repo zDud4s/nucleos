@@ -509,7 +509,7 @@ the contract, not a snapshot.
 | `channels/access/identities.rs` | Identities: list, forget and home conversation. |
 | `channels/access/pairing.rs` | Pairing codes: mint, status, cancel and redeem. |
 | `channels/bus.rs` | `ChannelsBus` and `Cadence`: the channel hub's change and tick sources. |
-| `channels/commands.rs` | Chat commands: the `Intent` type and the router that maps a chat message to one. |
+| `channels/commands.rs` | Chat commands: the `Intent` type and the router that maps a chat message to one. `/note <text>` (also `/note@Bot`) files an owner note with origin `channel:<name>`: the text goes through `governance::redact::redact_secrets` before `owner_notes::create`, the reply is `Noted (#id).`, a bare or blank `/note` gets the usage line, and the text never reaches a log or an error reply. A voice note that says "note ..." is refused, never filed. |
 | `channels/conformance.rs` | Test-only: contract conformance scenarios. |
 | `channels/contract.rs` | Channel contract types: the shapes adapters and the núcleo exchange. |
 | `channels/contract/conformance.rs` | Test-only: runs every fixture of the shared contract tree (`sidecars/lib/channelkit/contract/fixtures/index.json`) through the strict decoders: index vs tree, coverage, and valid/invalid conformance. |
@@ -797,4 +797,4 @@ the contract, not a snapshot.
 | `crates/nucleos-base/src/test_select.rs` | Which groups of a project's test map a set of changed paths activates (spec §3.2): the four rules in order, `select` templates filled with `./`-prefixed paths, and `vet`, which decides which agent-supplied paths may become arguments. Pure apart from `vet`; runs nothing. |
 | `crates/nucleos-base/src/tests_map.rs` | The test map a project keeps at its root, `nucleos.tests.yaml`: format, validation that reports every error at once, the path matcher, and `load`. Reads and checks only — runs nothing and writes nothing; a proposal comes from `detect.rs` and the owner commits it. The map itself is always a full-sweep path. |
 
-
+
