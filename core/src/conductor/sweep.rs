@@ -1,7 +1,7 @@
 //! Periodic liveness observations and their one-shot feed reports.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, Weak};
 
 use chrono::{DateTime, Duration, Utc};
 
@@ -49,9 +49,19 @@ pub struct SweepReport {
     pub marked_nodes: Vec<String>,
 }
 
-/// The tail buffer has no mtime. This process-local map gives unchanged tails a stable clock.
-type TailClocks = HashMap<(i64, usize), (String, DateTime<Utc>)>;
+/// The tail buffer has no mtime. This process-local map gives unchanged tails a stable clock. The
+/// `Weak` is the entry's lifetime: a run that ends drops its tail from `run_tails`, and
+/// `prune_tail_clocks` then forgets the entry, so the map does not grow with every run ever seen.
+type TailClocks = HashMap<(i64, usize), (String, DateTime<Utc>, Weak<Mutex<String>>)>;
 static TAIL_CLOCKS: LazyLock<Mutex<TailClocks>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Forgets the clocks of tails nothing holds any more (their run finished).
+fn prune_tail_clocks() {
+    TAIL_CLOCKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|_, (_, _, tail)| tail.strong_count() > 0);
+}
 
 pub async fn tick(
     state: &AppState,
@@ -375,6 +385,7 @@ async fn terminal_feed(
 
 pub async fn daemon_observations(state: &AppState) -> sqlx::Result<Vec<Observed>> {
     let now = Utc::now();
+    prune_tail_clocks();
     let runs: Vec<(i64, String, String, String, Option<String>)> = sqlx::query_as(
         "SELECT id, status, mode, created_at, project_id FROM runs WHERE status = 'running'",
     )
@@ -432,8 +443,7 @@ pub async fn daemon_observations(state: &AppState) -> sqlx::Result<Vec<Observed>
         let (last_transcript_write, tool_in_flight_until) =
             tail.as_ref().map_or((None, None), |tail| {
                 let text = tail.lock().unwrap().clone();
-                let written =
-                    tail_clock(id, std::sync::Arc::as_ptr(tail) as usize, text.clone(), now);
+                let written = tail_clock(id, tail, text.clone(), now);
                 (
                     if text.is_empty() { None } else { Some(written) },
                     open_tool_deadline(&text, started_at, state, &mode),
@@ -465,18 +475,23 @@ fn parse_time(value: &str) -> Option<DateTime<Utc>> {
         .map(|time| time.with_timezone(&Utc))
 }
 
-fn tail_clock(id: i64, pointer: usize, text: String, now: DateTime<Utc>) -> DateTime<Utc> {
+fn tail_clock(
+    id: i64,
+    tail: &std::sync::Arc<Mutex<String>>,
+    text: String,
+    now: DateTime<Utc>,
+) -> DateTime<Utc> {
     let mut clocks = TAIL_CLOCKS.lock().unwrap();
-    let key = (id, pointer);
+    let key = (id, std::sync::Arc::as_ptr(tail) as usize);
     match clocks.get_mut(&key) {
-        Some((old, time)) if *old == text => *time,
-        Some((old, time)) => {
+        Some((old, time, _)) if *old == text => *time,
+        Some((old, time, _)) => {
             *old = text;
             *time = now;
             now
         }
         None => {
-            clocks.insert(key, (text, now));
+            clocks.insert(key, (text, now, std::sync::Arc::downgrade(tail)));
             now
         }
     }
@@ -1982,6 +1997,30 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let moved_pass = daemon_observations(&state).await.unwrap();
         assert!(clock(&moved_pass) > first, "a new line moves the clock");
+    }
+
+    fn has_tail_clock(id: i64) -> bool {
+        TAIL_CLOCKS.lock().unwrap().keys().any(|(run, _)| *run == id)
+    }
+
+    /// F5: the clock of a run that ended is forgotten, or the map grows with every run ever seen.
+    #[tokio::test]
+    async fn the_tail_clock_of_a_finished_run_is_pruned() {
+        let state = state().await;
+        let (live, done) = (880_031, 880_032);
+        seed_live_run_with_id(&state, live, Utc::now() - minutes(60)).await;
+        seed_live_run_with_id(&state, done, Utc::now() - minutes(60)).await;
+        let _live_tail = publish_tail(&state, live, "going\n");
+        let done_tail = publish_tail(&state, done, "going\n");
+        daemon_observations(&state).await.unwrap();
+        assert!(has_tail_clock(live) && has_tail_clock(done));
+
+        // What `Registration` does when the run's task ends.
+        state.run_tails.lock().unwrap().remove(&done);
+        drop(done_tail);
+        daemon_observations(&state).await.unwrap();
+        assert!(!has_tail_clock(done), "the finished run's clock is gone");
+        assert!(has_tail_clock(live), "a live run keeps its clock");
     }
 
     /// One tool call streams nothing while it runs, and the runner exempts an open call from its
