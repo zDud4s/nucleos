@@ -1,6 +1,7 @@
 //! Guided login: a new account is created by running the provider's own login command in the
 //! account's own directory (spec section 15, B8). The daemon opens no browser: it surfaces
-//! `auth_url` and the shell opens it. A CLI that wants a code gets it through `submit_code`; a CLI
+//! `auth_url` and the shell opens it. A device-code CLI (Codex) also gets `device_code`, which the
+//! owner types into the browser. A CLI that wants a code gets it through `submit_code`; a CLI
 //! that needs a terminal is an error state (no pseudo-terminal is served).
 //!
 //! The process is behind [`Spawner`] and the provider behind [`Lookup`], so the state machine is
@@ -10,16 +11,17 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use rand::RngExt;
 use serde::Serialize;
 use sqlx::SqlitePool;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
+mod process;
+
+use self::process::spawn_process;
 use super::adapters::adapter_for;
 use super::provider::{LoginCommand, LoginEvent, ProviderAdapter};
 use super::{Account, AccountId, AccountKind, AccountState, account_dir, startup, store};
@@ -50,6 +52,9 @@ pub struct LoginView {
     pub label: String,
     pub phase: LoginPhase,
     pub auth_url: Option<String>,
+    /// The one-time code of a device-code login (Codex `--device-auth`): the owner types it into
+    /// the browser, nothing is pasted back.
+    pub device_code: Option<String>,
     pub message: Option<String>,
 }
 
@@ -68,8 +73,6 @@ pub type Lookup = fn(&str) -> Option<&'static dyn ProviderAdapter>;
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(600);
 /// How long to wait for the credential file after the CLI says it is done.
 const CREDENTIAL_GRACE: Duration = Duration::from_secs(5);
-/// A prompt without a newline ("Paste code here >") is emitted as a line after this idle time.
-const PARTIAL_FLUSH: Duration = Duration::from_millis(300);
 /// Finished logins stay readable this long.
 const KEEP_FINISHED: Duration = Duration::from_secs(3600);
 const MAX_CODE_LEN: usize = 2048;
@@ -279,6 +282,7 @@ impl Logins {
             label: account.label.clone(),
             phase: LoginPhase::Starting,
             auth_url: None,
+            device_code: None,
             message: None,
         };
         let new_dir = match &mode {
@@ -396,10 +400,17 @@ async fn drive(
             // The process ended: the credentials decide.
             Ok(None) => break verify(&shared, adapter, &account).await,
             Ok(Some(line)) => match adapter.parse_login_line(&line) {
+                // The first URL is the sign-in link; a later one (a docs link in an error
+                // text) must not replace it or move a login that is past the browser step.
                 Some(LoginEvent::AuthUrl(url)) => shared.update(&login_id, |view| {
-                    view.phase = LoginPhase::AwaitingBrowser;
-                    view.auth_url = Some(url);
+                    if view.auth_url.is_none() {
+                        view.phase = LoginPhase::AwaitingBrowser;
+                        view.auth_url = Some(url);
+                    }
                 }),
+                Some(LoginEvent::DeviceCode(code)) => {
+                    shared.update(&login_id, |view| view.device_code = Some(code));
+                }
                 Some(LoginEvent::CodePrompt) => shared.update(&login_id, |view| {
                     view.phase = LoginPhase::AwaitingCode;
                     view.message = Some("Paste the code the browser shows".into());
@@ -498,121 +509,6 @@ pub fn clean_label(label: &str) -> Result<String, String> {
 fn db_error(error: sqlx::Error) -> String {
     tracing::warn!(%error, "account login: database error");
     "the account database could not be read".to_owned()
-}
-
-/// The production spawner: the real CLI, output lines merged, stdin open for the code.
-fn spawn_process(command: &LoginCommand) -> io::Result<LoginProcess> {
-    let mut process = tokio::process::Command::new(&command.program);
-    process
-        .args(&command.args)
-        .envs(command.env.iter().map(|(k, v)| (k, v)))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    let mut child = process.spawn()?;
-    let (line_tx, lines) = mpsc::channel(64);
-    if let Some(out) = child.stdout.take() {
-        tokio::spawn(pump(out, line_tx.clone()));
-    }
-    if let Some(err) = child.stderr.take() {
-        tokio::spawn(pump(err, line_tx.clone()));
-    }
-    drop(line_tx);
-    let (stdin, mut stdin_rx) = mpsc::channel::<String>(4);
-    if let Some(mut pipe) = child.stdin.take() {
-        tokio::spawn(async move {
-            while let Some(text) = stdin_rx.recv().await {
-                if pipe.write_all(text.as_bytes()).await.is_err() || pipe.flush().await.is_err() {
-                    break;
-                }
-            }
-        });
-    }
-    let (kill, mut kill_rx) = oneshot::channel::<()>();
-    tokio::spawn(async move {
-        tokio::select! {
-            _ = &mut kill_rx => { let _ = child.kill().await; }
-            _ = child.wait() => {}
-        }
-    });
-    Ok(LoginProcess { lines, stdin, kill })
-}
-
-/// Splits a stream into lines on `\n` or `\r`. A partial line idle for [`PARTIAL_FLUSH`] is
-/// emitted as it is: CLI prompts end without a newline.
-async fn pump<R: AsyncRead + Unpin>(mut reader: R, tx: mpsc::Sender<String>) {
-    let mut chunk = [0u8; 1024];
-    let mut partial: Vec<u8> = Vec::new();
-    loop {
-        let read = if partial.is_empty() {
-            Ok(reader.read(&mut chunk).await)
-        } else {
-            tokio::time::timeout(PARTIAL_FLUSH, reader.read(&mut chunk)).await
-        };
-        let mut ready: Vec<Vec<u8>> = Vec::new();
-        let mut done = false;
-        match read {
-            Err(_) => ready.push(std::mem::take(&mut partial)),
-            Ok(Ok(0)) | Ok(Err(_)) => {
-                ready.push(std::mem::take(&mut partial));
-                done = true;
-            }
-            Ok(Ok(n)) => {
-                for &byte in &chunk[..n] {
-                    if byte == b'\n' || byte == b'\r' {
-                        ready.push(std::mem::take(&mut partial));
-                    } else {
-                        partial.push(byte);
-                    }
-                }
-            }
-        }
-        for bytes in ready {
-            if let Some(line) = clean_line(&bytes)
-                && tx.send(line).await.is_err()
-            {
-                return;
-            }
-        }
-        if done {
-            return;
-        }
-    }
-}
-
-/// UTF-8 text without ANSI escape sequences, trimmed; None when nothing is left.
-fn clean_line(bytes: &[u8]) -> Option<String> {
-    let text = String::from_utf8_lossy(bytes);
-    let mut clean = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '\u{1b}' {
-            clean.push(c);
-            continue;
-        }
-        match chars.next() {
-            // CSI: parameters up to a final byte in '@'..='~'.
-            Some('[') => {
-                for next in chars.by_ref() {
-                    if ('@'..='~').contains(&next) {
-                        break;
-                    }
-                }
-            }
-            // OSC: up to BEL or ST.
-            Some(']') => {
-                while let Some(next) = chars.next() {
-                    if next == '\u{7}' || (next == '\u{1b}' && chars.next() == Some('\\')) {
-                        break;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    let clean = clean.trim();
-    (!clean.is_empty()).then(|| clean.to_owned())
 }
 
 #[cfg(test)]
@@ -767,6 +663,30 @@ mod tests {
                 .join("fake-auth.json")
                 .exists()
         );
+    }
+
+    #[tokio::test]
+    async fn a_device_code_login_shows_url_and_code_and_needs_no_paste() {
+        let db = pool().await;
+        let data = data_dir();
+        let logins = scripted_logins(vec![
+            Step::Say("URL https://auth.example/device"),
+            Step::Say("DEVICE ABCD-EFGH"),
+            // A later link (say, a docs URL) must not replace the sign-in link.
+            Step::Say("URL https://docs.example/help"),
+            Step::WriteCredential,
+            Step::Say("OK"),
+            Step::Hang,
+        ]);
+        let started = logins
+            .start_new(&db, data.path(), "fake", "device")
+            .await
+            .unwrap();
+        let done = reach(&logins, &started.login_id, LoginPhase::Done).await;
+        assert_eq!(done.device_code.as_deref(), Some("ABCD-EFGH"));
+        assert_eq!(done.auth_url.as_deref(), Some("https://auth.example/device"));
+        let account_id = AccountId(started.account_id.clone());
+        assert!(store::get(&db, &account_id).await.unwrap().is_some());
     }
 
     #[tokio::test]
@@ -1026,22 +946,5 @@ mod tests {
             .await
             .unwrap_err();
         assert!(taken.contains("already exists"), "{taken}");
-    }
-
-    #[tokio::test]
-    async fn output_is_split_on_newlines_and_an_idle_prompt_is_flushed_without_ansi() {
-        let (mut writer, reader) = tokio::io::duplex(256);
-        let (tx, mut rx) = mpsc::channel(8);
-        tokio::spawn(pump(reader, tx));
-        writer
-            .write_all(b"\x1b[1mOpen\x1b[0m https://a.example/x\r\n\n")
-            .await
-            .unwrap();
-        assert_eq!(rx.recv().await.unwrap(), "Open https://a.example/x");
-        writer.write_all(b"Paste code here > ").await.unwrap();
-        assert_eq!(rx.recv().await.unwrap(), "Paste code here >");
-        drop(writer);
-        assert!(rx.recv().await.is_none());
-        assert_eq!(clean_line(b"\x1b]0;title\x07  \x1b[2K"), None);
     }
 }
