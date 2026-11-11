@@ -368,8 +368,27 @@ impl crate::execution::vcs::VcsExecutor for GitExecutor {
                     .map(|integration| integration.as_str());
                 branch_delete(project_root, branch.as_str(), judged_against, deadline).await
             }
-            crate::execution::vcs::Op::Rebase { branch, onto } => {
-                rebase(project_root, branch.as_str(), onto.as_str(), deadline).await
+            crate::execution::vcs::Op::Rebase {
+                branch,
+                onto,
+                worktree,
+            } => {
+                // The project's rules are read only when the requester named a worktree, so a
+                // rebase that cannot use the setting never depends on it. Unreadable rules mean
+                // "off": the setting widens what the queue does, so it never opens on a guess.
+                let own_worktree = worktree.as_deref().filter(|_| {
+                    crate::project::rules::autopilot(&request.project_id)
+                        .map(|rules| rules.rebase_in_own_worktree)
+                        .unwrap_or(false)
+                });
+                rebase(
+                    project_root,
+                    branch.as_str(),
+                    onto.as_str(),
+                    own_worktree.map(Path::new),
+                    deadline,
+                )
+                .await
             }
             // No gate here: a revert returns a tree that has been green before, and the post-merge
             // gate measures the new tip like any other. A revert that changes the test map still

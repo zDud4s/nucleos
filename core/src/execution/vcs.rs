@@ -173,9 +173,18 @@ pub enum Op {
     /// `publish_by_update_ref` already performs. A run's own branch, held by its own paused
     /// worktree, is refused — and refusing it is right rather than merely safe, since rewriting a
     /// branch under a paused run is what would corrupt its state on resume.
+    ///
+    /// **One owned exception, off unless the project turns it on.** `worktree` is the checkout the
+    /// REQUESTER asked from, recorded by the session hook (`hooks::session_git`) and by nothing
+    /// else — the flat tool parameters and `rebase_from_command` leave it `None`. When the project's
+    /// `rebase_in_own_worktree` setting is on and that checkout is the one holding `branch`, the
+    /// executor rebases there, because the requester owns that directory and asked for exactly this.
+    /// Any other holder stays `Blocked`, setting or not.
     Rebase {
         branch: Branch,
         onto: Branch,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worktree: Option<String>,
     },
     /// Undoing a merge that is already on `target` (spec 2026-10-05 §6.2, D4), **and the only
     /// operation here that the daemon queues for itself**: the post-merge gate enqueues it when a
@@ -471,6 +480,7 @@ impl Op {
             "rebase" => Ok(Op::Rebase {
                 branch: named_branch(source, "rebase", "source")?,
                 onto: named_branch(target, "rebase", "target")?,
+                worktree: None,
             }),
             // Neither unknown nor deferred: the daemon performs it, and only the daemon asks.
             "revert" => Err(
@@ -1175,6 +1185,7 @@ mod tests {
             Op::Rebase {
                 branch: Branch::new("a").unwrap(),
                 onto: Branch::new("b").unwrap(),
+                worktree: None,
             },
             Op::Revert {
                 merge_sha: CommitSha::new(&"a".repeat(40)).unwrap(),
@@ -2238,14 +2249,16 @@ mod tests {
             rebase_from_command("git rebase master", "feat/x"),
             Some(Op::Rebase {
                 branch: "feat/x".into(),
-                onto: "master".into()
+                onto: "master".into(),
+                worktree: None,
             })
         );
         assert_eq!(
             rebase_from_command("GIT REBASE Master", "feat/x"),
             Some(Op::Rebase {
                 branch: "feat/x".into(),
-                onto: "Master".into()
+                onto: "Master".into(),
+                worktree: None,
             })
         );
         // Same guard, same reason as everywhere else: a detached worktree names no branch to replay.
@@ -2595,6 +2608,7 @@ mod tests {
             Op::Rebase {
                 branch: "feat/x".into(),
                 onto: "master".into(),
+                worktree: None,
             },
             Op::Revert {
                 merge_sha: "0123456789abcdef0123456789abcdef01234567".into(),

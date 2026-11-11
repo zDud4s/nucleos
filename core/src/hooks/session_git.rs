@@ -215,7 +215,7 @@ pub(super) async fn session_git_decision_within(
         }
         Err(_) => return no_opinion(),
     };
-    let Some(op) = queue_op(&segment.command, &branch) else {
+    let Some(mut op) = queue_op(&segment.command, &branch) else {
         // The shape matched with the stand-in and not with the real branch: the parsers refuse only
         // a detached HEAD on that ground, and it names no branch the queue could move.
         return Json(
@@ -227,6 +227,13 @@ pub(super) async fn session_git_decision_within(
             .into(),
         );
     };
+
+    // A rebase carries the worktree it was asked from, so the executor can tell the requester's own
+    // checkout from somebody else's when the project allows rebasing in place
+    // (`rebase_in_own_worktree`). Only this hook stamps it.
+    if let crate::execution::vcs::Op::Rebase { worktree, .. } = &mut op {
+        *worktree = Some(root.to_string_lossy().into_owned());
+    }
 
     // A push is accepted only from the owner's top-level session.
     if matches!(op, crate::execution::vcs::Op::Push { .. }) {
@@ -339,15 +346,17 @@ pub(super) fn session_git_reason(
         "escalated" => "it hit a conflict and was escalated to a person. Do not retry it or \
                         resolve it by hand; the resolution arrives as a new request."
             .to_owned(),
-        // A session's rebase always names the branch its own worktree has checked out, and the
-        // executor never rewrites a checked-out branch, so this blocks every time: retrying the same
-        // command cannot help, and the advice that can is the merge the queue does perform (D9).
+        // A session's rebase always names the branch its own worktree has checked out. Unless the
+        // project turned on `rebase_in_own_worktree` (and the worktree is clean) the executor never
+        // rewrites a checked-out branch, so this blocks: retrying the same command cannot help
+        // until that changes, and the advice that can is the merge the queue does perform (D9).
         "blocked" if kind == "rebase" => format!(
             "the queue refused to start it: {why}. Nothing was changed. Retrying the same rebase \
-             cannot succeed: the queue does not rewrite a branch a worktree has checked out, and \
-             this command always names yours. Bring the base in with `git merge --no-ff <onto>` \
-             (queued, from the same worktree), or ask for the rebase from a worktree that does not \
-             hold the branch."
+             cannot succeed until that changes: by default the queue does not rewrite a branch a \
+             worktree has checked out, and this command always names yours. Bring the base in with \
+             `git merge --no-ff <onto>` (queued, from the same worktree), ask for the rebase from \
+             a worktree that does not hold the branch, or have the owner turn on the project's \
+             `rebase_in_own_worktree` setting."
         ),
         "blocked" => format!(
             "the queue refused to start it: {why}. Nothing was changed. Clear what that names, \
