@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -51,6 +52,51 @@ func TestNewForTokenRefusedIsReportedWithoutTheToken(t *testing.T) {
 	}
 	if strings.Contains(got.Detail, fakeToken) {
 		t.Errorf("detail leaks the token: %q", got.Detail)
+	}
+}
+
+// A setup-token carries only the inference scope, so the usage endpoint may refuse it with 403.
+// That is not a dead token: the detail says its usage is not readable, and the reading stays
+// unmeasured.
+func TestNewForTokenForbiddenSaysUsageIsNotReadable(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer srv.Close()
+	r := NewForToken(time.Second, fakeToken)
+	r.endpoint = srv.URL
+
+	got := r.Read(context.Background(), time.Now())
+
+	if !strings.Contains(got.Detail, "setup-token") || !strings.Contains(got.Detail, "403") {
+		t.Errorf("detail = %q", got.Detail)
+	}
+	if strings.Contains(got.Detail, fakeToken) {
+		t.Errorf("detail leaks the token: %q", got.Detail)
+	}
+	if len(got.Windows) != 0 {
+		t.Errorf("windows = %+v, want none", got.Windows)
+	}
+}
+
+// A dir reader keeps the plain refusal text on 403.
+func TestDirReaderForbiddenKeepsThePlainRefusal(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer srv.Close()
+	dir := t.TempDir()
+	creds := `{"claudeAiOauth":{"accessToken":"tok","expiresAt":0}}`
+	if err := os.WriteFile(filepath.Join(dir, ".credentials.json"), []byte(creds), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r := NewForDir(time.Second, dir)
+	r.endpoint = srv.URL
+
+	got := r.Read(context.Background(), time.Now())
+
+	if !strings.Contains(got.Detail, "refused the credential (403)") || strings.Contains(got.Detail, "setup-token") {
+		t.Errorf("detail = %q", got.Detail)
 	}
 }
 
