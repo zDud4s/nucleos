@@ -48,7 +48,7 @@ pub(super) const TICKET_RULES: &str = "Problems outside your owned paths are not
 
 /// What every node is told about cargo and formatting: the one leaf cargo rule (contract E4),
 /// verbatim.
-pub(super) const FORMAT_RULES: &str = "A leaf runs only `cargo fmt -p <crate>` and `python scripts/check_invariants.py` before closing, via `python scripts/heavy.py`, failing open; never `cargo check`, `test`, `build`, `clippy` or `--workspace`. The rest is the gate's. With `autonomy.leaf_self_check: true` it may add one `cargo check -p <crate> --tests`.";
+pub(super) const FORMAT_RULES: &str = "A leaf runs only `cargo fmt -p <crate>` and `python scripts/check_invariants.py` before closing, via `python scripts/heavy.py --agent leaf-<node id> ...`, failing open; never `cargo check`, `test`, `build`, `clippy` or `--workspace`. The rest is the gate's. With `autonomy.leaf_self_check: true` it may add one `cargo check -p <crate> --tests`.";
 
 /// Gives a tree node the protocol it needs to split work and report its result.
 ///

@@ -83,7 +83,7 @@ prompt block is the single source; if they differ, the prompt wins.
   file belongs to the piece that declares it.
 - **Only leaves edit, and only in their own files.** An orchestrator that touches a file is reverted
   and its node fails.
-- **No commit, no merge, no stash, no push; cargo only as follows.** A leaf runs only `cargo fmt -p <crate>` and `python scripts/check_invariants.py` before closing, via `python scripts/heavy.py`, failing open; never `cargo check`, `test`, `build`, `clippy` or `--workspace`. The rest is the gate's. With `autonomy.leaf_self_check: true` it may add one `cargo check -p <crate> --tests`. Orchestrators run no cargo at all. List the exact commands you would have run
+- **No commit, no merge, no stash, no push; cargo only as follows.** A leaf runs only `cargo fmt -p <crate>` and `python scripts/check_invariants.py` before closing, via `python scripts/heavy.py --agent leaf-<node id> ...`, failing open; never `cargo check`, `test`, `build`, `clippy` or `--workspace`. The rest is the gate's. With `autonomy.leaf_self_check: true` it may add one `cargo check -p <crate> --tests`. Orchestrators run no cargo at all. List the exact commands you would have run
   under `## Commands for the root`; the controller runs them. The controller commits for you.
 - **Partition by report.** If your prompt says you do not launch children, return `Outcome: split`
   with each child's piece (goal, files, line hints, contract sections, budget, and its kind) in
