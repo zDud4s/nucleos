@@ -10,6 +10,30 @@ use super::*;
 /// and a retry, and far too little to search a grammar with.
 pub(super) const DENIAL_LIMIT: i64 = 3;
 
+/// The allowance of a tree leaf. A leaf works unattended behind a node fence and a loader refusal
+/// teaches it by refusing, so three tries are too few for an honest run; six is still far too little
+/// to search a grammar with.
+pub(super) const TREE_LEAF_DENIAL_LIMIT: i64 = 6;
+
+/// Action classes whose `deny` is information about this project rather than evidence of probing:
+/// the project wrote the refusal down, and the reason names what it denies. They are answered, never
+/// counted toward the limit.
+const UNCOUNTED_CLASSES: &[&str] = &["project-denied"];
+
+/// PURE: the denial allowance of a run.
+pub(super) fn denial_limit(is_tree_leaf: bool) -> i64 {
+    if is_tree_leaf {
+        TREE_LEAF_DENIAL_LIMIT
+    } else {
+        DENIAL_LIMIT
+    }
+}
+
+/// PURE: whether a refusal of this action class counts toward the denial limit.
+pub(super) fn counts_toward_limit(action_class: &str) -> bool {
+    !UNCOUNTED_CLASSES.contains(&action_class)
+}
+
 /// Spec B D9: what `count_denial_and_stop_a_prober` did. `#[must_use]` is how "every caller reads
 /// the enum" is held: a caller that means to ignore it has to say `let _ =`, in view.
 #[must_use]
@@ -55,13 +79,23 @@ pub(super) async fn count_denial_and_stop_a_prober(
         }
     };
 
+    // A read error is the ordinary limit: the stricter side.
+    let is_tree_leaf: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM work_nodes
+         WHERE run_id = ? AND kind = 'leaf' AND tree_job_id IS NOT NULL)",
+    )
+    .bind(run_id.to_string())
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or(false);
+    let limit = denial_limit(is_tree_leaf);
     tracing::warn!(
         run_id,
         tool = %tool_name,
         denials,
-        "pretooluse-decision: denied action {denials}/{DENIAL_LIMIT} for this run"
+        "pretooluse-decision: denied action {denials}/{limit} for this run"
     );
-    if denials < DENIAL_LIMIT {
+    if denials < limit {
         return DenialCount::Counted(denials);
     }
 
@@ -405,6 +439,66 @@ pub(super) async fn pause_for_approval(
                 "pretooluse-decision: could not roll back an unapprovable pause — this project is blocked until restart"
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::*;
+
+    #[test]
+    fn a_tree_leaf_gets_the_wider_allowance() {
+        assert_eq!(denial_limit(false), DENIAL_LIMIT);
+        assert_eq!(denial_limit(true), TREE_LEAF_DENIAL_LIMIT);
+        assert_eq!(TREE_LEAF_DENIAL_LIMIT, 6);
+    }
+
+    #[test]
+    fn a_project_refusal_is_not_counted_but_every_other_class_is() {
+        assert!(!counts_toward_limit("project-denied"));
+        assert!(counts_toward_limit("destructive"));
+        assert!(counts_toward_limit("executes-on-next-command"));
+    }
+
+    async fn run_row(state: &AppState) -> i64 {
+        sqlx::query(
+            "INSERT INTO runs (prompt, status, mode, created_at)
+             VALUES ('x', 'running', 'worktree', '2026-11-11T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    #[tokio::test]
+    async fn a_tree_leaf_run_is_still_counted_after_the_ordinary_limit() {
+        let state = crate::channels::testkit::state().await;
+        let leaf = run_row(&state).await;
+        sqlx::query(
+            "INSERT INTO work_nodes (id, root_id, depth, kind, title, goal, status, run_id,
+                                     tree_job_id, created_at, updated_at)
+             VALUES ('n1', 'n1', 2, 'leaf', 't', 'g', 'running', ?, 'tj', 'x', 'x')",
+        )
+        .bind(leaf.to_string())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let ordinary = run_row(&state).await;
+
+        for attempt in 1..DENIAL_LIMIT {
+            let counted = count_denial_and_stop_a_prober(&state, ordinary, "Bash").await;
+            assert_eq!(counted, DenialCount::Counted(attempt));
+        }
+        let at_limit = count_denial_and_stop_a_prober(&state, ordinary, "Bash").await;
+        assert_eq!(at_limit, DenialCount::Stopped);
+
+        for attempt in 1..TREE_LEAF_DENIAL_LIMIT {
+            let counted = count_denial_and_stop_a_prober(&state, leaf, "Bash").await;
+            assert_eq!(counted, DenialCount::Counted(attempt));
+        }
+        let at_limit = count_denial_and_stop_a_prober(&state, leaf, "Bash").await;
+        assert_eq!(at_limit, DenialCount::Stopped);
     }
 }
 

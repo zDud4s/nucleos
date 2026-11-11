@@ -22,6 +22,9 @@ autonomy:
   auto_default_deadline_minutes: 120
   auto_default_per_node: 1
   auto_default_per_job: 3
+  # false: a leaf runs only `cargo fmt -p <crate>` and `python scripts/check_invariants.py` before
+  # closing (via scripts/heavy.py). true: it may add one `cargo check -p <crate> --tests`.
+  leaf_self_check: false
 # Node trees (hierarchical orchestration). The daemon enforces depth, width and summary size;
 # the budgets are planning targets for the decomposition. subtree_verify: see workflow.md.
 nodes:

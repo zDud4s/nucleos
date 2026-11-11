@@ -52,6 +52,64 @@ pub async fn pretooluse_decision(
     })
 }
 
+/// PURE: `autonomy.leaf_self_check` of a `speed.yaml` text. Absent, mistyped or unreadable is
+/// `false`, the closed side.
+pub(super) fn leaf_self_check_from_yaml(text: &str) -> bool {
+    serde_yaml::from_str::<serde_yaml::Value>(text)
+        .ok()
+        .and_then(|doc| doc.get("autonomy")?.get("leaf_self_check")?.as_bool())
+        .unwrap_or(false)
+}
+
+/// Whether the project's `speed.yaml` turns the leaf's `cargo check -p <crate> --tests` on. Read
+/// from the MAIN checkout, never from the run's own worktree: the run could flip a switch it holds.
+fn leaf_self_check_enabled(cwd: &Path) -> bool {
+    cwd.ancestors()
+        .find_map(crate::governance::autopilot::main_checkout_of)
+        .is_some_and(|main| {
+            std::fs::read_to_string(main.join(".nucleos/workflow/speed.yaml"))
+                .is_ok_and(|text| leaf_self_check_from_yaml(&text))
+        })
+}
+
+/// Whether this call is a tree leaf's self-check (S2): an `unrecognized` shell line that is exactly
+/// one of the broker-wrapped forms `classifier::leaf_self_check_form` admits, run by a `Leaf`, with
+/// the broker scripts byte-identical to the main checkout's. The cheap pure parse goes first, and
+/// the role is read only once it matched. Never lifts a `deny` or a destructive class.
+async fn leaf_self_check_admitted(
+    state: &AppState,
+    payload: &PreToolUsePayload,
+    run_id: i64,
+    cwd: Option<&str>,
+    classification: &classifier::Classification,
+) -> bool {
+    if classification.action_class != "unrecognized"
+        || !matches!(payload.tool_name.as_str(), "Bash" | "PowerShell")
+    {
+        return false;
+    }
+    let (Some(command), Some(cwd)) = (
+        payload.tool_input.get("command").and_then(Value::as_str),
+        cwd.map(Path::new),
+    ) else {
+        return false;
+    };
+    if !classifier::leaf_self_check_form(command, leaf_self_check_enabled(cwd))
+        || !classifier::leaf_self_check_scripts_intact(cwd, command)
+    {
+        return false;
+    }
+    let caller = crate::role_policy::Caller {
+        agent_id: payload.agent_id.clone(),
+        agent_type: payload.agent_type.clone(),
+        subagent: payload.subagent,
+    };
+    matches!(
+        crate::role_policy::resolve(&state.pool, &caller, Some(run_id)).await,
+        crate::role_policy::Role::Leaf
+    )
+}
+
 /// The replacement input that routes a recognized test/check/build command of an in-flight run
 /// through `--filter-run`, or `None` for anything else. Best effort: never panics, and a failure
 /// to read anything simply leaves the command untouched.
@@ -422,7 +480,7 @@ pub(super) async fn pretooluse_decision_from(
     } else {
         std::borrow::Cow::Borrowed(&state.github.policy)
     };
-    let classification = rules.downgrade_if_unreadable(classifier::classify(
+    let mut classification = rules.downgrade_if_unreadable(classifier::classify(
         &payload.tool_name,
         &payload.tool_input,
         cwd.as_deref().map(Path::new),
@@ -430,6 +488,16 @@ pub(super) async fn pretooluse_decision_from(
         rules.declared(),
         unrecognized_policy_for(&state.pool, run_id, &mode).await,
     ));
+    if leaf_self_check_admitted(&state, &payload, run_id, cwd.as_deref(), &classification).await {
+        classification = classifier::Classification {
+            decision: Decision {
+                decision: "allow".to_owned(),
+                reason: "a leaf's self-check through the broker is allowed".to_owned(),
+            },
+            action_class: "read-local",
+            reason: "a leaf's self-check through the broker is allowed".to_owned(),
+        };
+    }
     tracing::info!(
         tool_name = %payload.tool_name,
         decision = %classification.decision.decision,
@@ -986,7 +1054,14 @@ pub(super) async fn pretooluse_decision_from(
     // attempts a lexical classifier is a puzzle with a solution rather than a boundary. The two
     // verdicts were also the wrong way round in cost: `pending_approval` stopped the run and
     // fetched a human, while `deny` — the harsher judgement — cost the run nothing at all.
-    if classification.decision.decision == "deny" && is_in_flight {
+    //
+    // Not every deny is evidence of probing: a project's own written refusal is information, and the
+    // reason names what it denies, so it is answered and not counted (`counts_toward_limit`), and
+    // never put to the judge either.
+    if classification.decision.decision == "deny"
+        && is_in_flight
+        && counts_toward_limit(classification.action_class)
+    {
         let counted = count_denial_and_stop_a_prober(&state, run_id, &payload.tool_name).await;
         // Spec B E1 (D9): only on `Counted`. A spent allowance (`Stopped`) or a count that could
         // not be written (`NotCounted`) is never put to the judge: the limit exists to stop an
@@ -1311,6 +1386,34 @@ mod tests {
     /// A tree node's run is `shadow` unless its launch names `worktree` (`tree_job::http::launch`).
     const NODE_MODES: [&str; 2] = ["shadow", "worktree"];
     const PROJECT: &str = "p";
+
+    #[test]
+    fn the_leaf_self_check_flag_is_off_unless_the_yaml_says_true() {
+        assert!(leaf_self_check_from_yaml(
+            "autonomy:\n  leaf_self_check: true\n"
+        ));
+        assert!(!leaf_self_check_from_yaml(
+            "autonomy:\n  leaf_self_check: false\n"
+        ));
+        assert!(!leaf_self_check_from_yaml("autonomy:\n  auto_default: true\n"));
+        assert!(!leaf_self_check_from_yaml(
+            "autonomy:\n  leaf_self_check: yes please\n"
+        ));
+        assert!(!leaf_self_check_from_yaml("default: normal\n"));
+        assert!(!leaf_self_check_from_yaml(": not yaml ["));
+    }
+
+    #[test]
+    fn the_shipped_speed_file_carries_the_flag_switched_off() {
+        // The tracked copy; the repo's own `.nucleos/workflow/speed.yaml` is materialized from it
+        // and ignored by git.
+        let text = include_str!("../../assets/nucleos-dev/.nucleos/workflow/speed.yaml");
+        let doc: serde_yaml::Value = serde_yaml::from_str(text).unwrap();
+        assert_eq!(
+            doc["autonomy"]["leaf_self_check"],
+            serde_yaml::Value::Bool(false)
+        );
+    }
 
     async fn test_state() -> AppState {
         nucleos_core::channels::testkit::state().await
