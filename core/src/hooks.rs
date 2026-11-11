@@ -1560,7 +1560,8 @@ mod tests {
         let judge = VerdictJudge::answering(0.99, 0.99);
         let state = judged_state(judge.clone()).await;
         let run_id = judged_run(&state, "worktree", "enforce").await;
-        let started = Instant::now() - Duration::from_millis(4_200);
+        // 0.8 s short of the budget: less than the margin, so nothing is left for the judge.
+        let started = Instant::now() - (super::rules::HOOK_BUDGET - Duration::from_millis(800));
 
         let decision = decide_started(&state, run_id, started).await;
 
