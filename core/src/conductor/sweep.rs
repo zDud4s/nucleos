@@ -63,6 +63,52 @@ fn prune_tail_clocks() {
         .retain(|_, (_, _, tail)| tail.strong_count() > 0);
 }
 
+/// Wakes the sweep (and with it the tree-job driver) ahead of its periodic tick. Signalled when a
+/// run ends and when a decision is answered. `Notify` keeps one permit, so a burst of events
+/// collapses into a single early pass and an event during a pass is not lost.
+static WAKE: LazyLock<tokio::sync::Notify> = LazyLock::new(tokio::sync::Notify::new);
+
+pub fn wake() {
+    WAKE.notify_one();
+}
+
+/// Resolves when `wake` has been called since the last time it resolved.
+pub async fn woken() {
+    WAKE.notified().await;
+}
+
+/// How many tree jobs the driver advances at once. Each job is serialised by its own lock, so this
+/// only bounds how many jobs' git and database work overlap; no speed.yaml knob exists for it.
+pub(crate) const MAX_PARALLEL_JOBS: usize = 4;
+
+/// Runs `work` for every item, at most `limit` at a time, and returns when all are done. A panic in
+/// one item is logged and does not stop the others.
+pub(crate) async fn for_each_bounded<F, Fut>(items: Vec<String>, limit: usize, work: F)
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(limit.max(1)));
+    let mut tasks = tokio::task::JoinSet::new();
+    for item in items {
+        let permit = permits
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("the semaphore is never closed");
+        let future = work(item);
+        tasks.spawn(async move {
+            future.await;
+            drop(permit);
+        });
+    }
+    while let Some(joined) = tasks.join_next().await {
+        if let Err(error) = joined {
+            tracing::warn!(%error, "a bounded task ended abnormally");
+        }
+    }
+}
+
 pub async fn tick(
     state: &AppState,
     observed: &[Observed],
@@ -2021,6 +2067,44 @@ mod tests {
         daemon_observations(&state).await.unwrap();
         assert!(!has_tail_clock(done), "the finished run's clock is gone");
         assert!(has_tail_clock(live), "a live run keeps its clock");
+    }
+
+    /// F1: an event wakes the loop at once, well inside the 5 s acceptance bound and far inside
+    /// the 60 s tick. (Not asserted the other way: other tests end runs and signal the same static.)
+    #[tokio::test]
+    async fn wake_resolves_woken_without_waiting_for_a_tick() {
+        wake();
+        tokio::time::timeout(std::time::Duration::from_secs(5), woken())
+            .await
+            .expect("a signalled wake resolves at once");
+    }
+
+    /// F1: the driver's fan-out never runs more than `limit` jobs at once, and runs them all.
+    #[tokio::test]
+    async fn for_each_bounded_caps_concurrency_and_finishes_every_item() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (running, peak, done) = (
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let items: Vec<String> = (0..8).map(|n| n.to_string()).collect();
+        let (r, p, d) = (running.clone(), peak.clone(), done.clone());
+        for_each_bounded(items, 3, move |_| {
+            let (r, p, d) = (r.clone(), p.clone(), d.clone());
+            async move {
+                let now = r.fetch_add(1, Ordering::SeqCst) + 1;
+                p.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                r.fetch_sub(1, Ordering::SeqCst);
+                d.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+        .await;
+        assert_eq!(done.load(Ordering::SeqCst), 8);
+        let peak = peak.load(Ordering::SeqCst);
+        assert!(peak <= 3, "at most 3 at once, saw {peak}");
+        assert!(peak >= 2, "the items overlapped, saw {peak}");
     }
 
     /// One tool call streams nothing while it runs, and the runner exempts an open call from its

@@ -110,11 +110,23 @@ pub async fn tick(state: &AppState) {
         }
     };
     let gate = production_gate(state);
-    for job in jobs {
-        advance(state, &job.id, gate.clone()).await;
-        // After the pass, so a job the pass just moved is not taken for a quiet one.
-        super::stalled::check_job(state, &job.id).await;
-    }
+    let ids: Vec<String> = jobs.into_iter().map(|job| job.id).collect();
+    // Jobs advance side by side, a few at a time: one slow job (a gate, a git call) no longer holds
+    // the rest of the pass. Each pass still runs under its own job's lock, and `advance` shares
+    // nothing else between jobs, so two jobs moving together cannot see each other's state.
+    crate::conductor::sweep::for_each_bounded(
+        ids,
+        crate::conductor::sweep::MAX_PARALLEL_JOBS,
+        |id| {
+            let (state, gate) = (state.clone(), gate.clone());
+            async move {
+                advance(&state, &id, gate).await;
+                // After the pass, so a job the pass just moved is not taken for a quiet one.
+                super::stalled::check_job(&state, &id).await;
+            }
+        },
+    )
+    .await;
 }
 
 /// Advance one stored tree job with the production gate (`crate::verify::installed()`). Without a

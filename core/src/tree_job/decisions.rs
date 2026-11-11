@@ -500,6 +500,9 @@ pub async fn answer(
         write_manifest(&mut tx, tree_id, manifest, &at).await?;
     }
     tx.commit().await?;
+    // The branch this answer resumes is ready to move: wake the driver instead of leaving it to the
+    // next tick.
+    crate::conductor::sweep::wake();
 
     decision.answer = Some(text.to_owned());
     decision.origin = Some(origin.to_owned());
