@@ -643,6 +643,11 @@ pub(super) async fn continue_paused_run(
         // A declined push must never reach the queue carrying the owner's authority (D12).
         Continuation::Decline => None,
     };
+    // A run is never the owner's top-level session, so its push is not queued even once approved —
+    // and it is not handed back to the run to perform either: the approval answers with the refusal.
+    if let Some((_, crate::execution::vcs::Op::Push { .. })) = &queueable {
+        return Err(ResumeError::NotResumable(crate::role_policy::PUSH_REFUSAL));
+    }
 
     // The class the grant will authorize, derived before the transaction opens so a parse cannot
     // hold SQLite's write lock. Re-derived here rather than carried on the proposal because

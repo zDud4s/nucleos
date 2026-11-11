@@ -234,6 +234,14 @@ pub(super) async fn session_git_decision_within(
         );
     };
 
+    // A push is accepted only from the owner's top-level session.
+    if matches!(op, crate::execution::vcs::Op::Push { .. }) {
+        let who = role_policy::resolve_requester(&state.pool, &caller, None).await;
+        if !role_policy::may_push(&who) {
+            return Json(deny_with(role_policy::PUSH_REFUSAL).into());
+        }
+    }
+
     // From here the command IS one the queue performs, so every remaining failure refuses rather
     // than falls through. The direction is deliberately the opposite of `runs::queueable_operation`,
     // and the two are right for opposite reasons: there, a person has already approved an action and

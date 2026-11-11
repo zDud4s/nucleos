@@ -23,13 +23,29 @@ use sqlx::SqlitePool;
 
 use crate::work_nodes::{KIND_LEAF, KIND_ORCHESTRATOR, KIND_ROOT};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Role {
     Root,
     Orchestrator,
     Leaf,
     /// A leaf that owns no paths: it reads and reports.
     Reviewer,
+}
+
+impl Role {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Role::Root => "root",
+            Role::Orchestrator => "orchestrator",
+            Role::Leaf => "leaf",
+            Role::Reviewer => "reviewer",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Role> {
+        ROLES.into_iter().find(|role| role.as_str() == text)
+    }
 }
 
 /// Every role, from the most to the least permissive.
@@ -223,20 +239,25 @@ pub fn role_without_node(caller: &Caller) -> Role {
     }
 }
 
-type NodeRow = (String, String);
+type NodeRow = (String, String, i64);
 
-async fn role_from_row(pool: &SqlitePool, column: &'static str, value: &str) -> Option<Role> {
+/// The role and depth of the newest node bound to `column = value`.
+async fn node_from_row(
+    pool: &SqlitePool,
+    column: &'static str,
+    value: &str,
+) -> Option<(Role, i64)> {
     // `AssertSqlSafe`: `column` is one of two literal column names, and the value is bound.
     let sql = sqlx::AssertSqlSafe(format!(
-        "SELECT kind, owned_paths FROM work_nodes WHERE {column} = ? \
+        "SELECT kind, owned_paths, depth FROM work_nodes WHERE {column} = ? \
          ORDER BY (status = 'running') DESC, created_at DESC, id DESC LIMIT 1"
     ));
     let found: Result<Option<NodeRow>, _> =
         sqlx::query_as(sql).bind(value).fetch_optional(pool).await;
     match found {
-        Ok(Some((kind, owned))) => {
+        Ok(Some((kind, owned, depth))) => {
             let owned: Vec<String> = serde_json::from_str(&owned).unwrap_or_default();
-            Some(role_of_node(&kind, &owned))
+            Some((role_of_node(&kind, &owned), depth))
         }
         Ok(None) => None,
         Err(error) => {
@@ -246,22 +267,141 @@ async fn role_from_row(pool: &SqlitePool, column: &'static str, value: &str) -> 
     }
 }
 
+/// The node bound to the caller: by `agent_id`, then by `run_id`.
+async fn find_node(pool: &SqlitePool, caller: &Caller, run_id: Option<i64>) -> Option<(Role, i64)> {
+    if let Some(agent_id) = caller.agent_id()
+        && let Some(found) = node_from_row(pool, "agent_id", agent_id).await
+    {
+        return Some(found);
+    }
+    if let Some(run_id) = run_id
+        && let Some(found) = node_from_row(pool, "run_id", &run_id.to_string()).await
+    {
+        return Some(found);
+    }
+    None
+}
+
 /// Resolves the caller's role: the node bound to its `agent_id`, then the node bound to its
 /// `run_id`, then [`role_without_node`]. A storage error is treated as "no node" and so never
 /// resolves upwards of what the markers allow.
 pub async fn resolve(pool: &SqlitePool, caller: &Caller, run_id: Option<i64>) -> Role {
-    if let Some(agent_id) = caller.agent_id()
-        && let Some(role) = role_from_row(pool, "agent_id", agent_id).await
-    {
-        return role;
+    match find_node(pool, caller, run_id).await {
+        Some((role, _)) => role,
+        None => role_without_node(caller),
     }
-    if let Some(run_id) = run_id
-        && let Some(role) = role_from_row(pool, "run_id", &run_id.to_string()).await
-    {
-        return role;
-    }
-    role_without_node(caller)
 }
+
+/// Who is asking: the role plus what the declarable permissions need.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Requester {
+    pub role: Role,
+    /// The owner's top-level session: no node row, no run, no subagent marker. A tree's root node
+    /// has the root role but is not top-level.
+    pub top_level: bool,
+    /// Depth in the tree; `Some(0)` for the top-level session, `None` when unknown.
+    pub depth: Option<i64>,
+}
+
+/// Like [`resolve`], with the top-level flag and the depth. Fails closed: a run id or a subagent
+/// marker with no readable node is never top-level.
+pub async fn resolve_requester(
+    pool: &SqlitePool,
+    caller: &Caller,
+    run_id: Option<i64>,
+) -> Requester {
+    match find_node(pool, caller, run_id).await {
+        Some((role, depth)) => Requester {
+            role,
+            top_level: false,
+            depth: Some(depth),
+        },
+        None => {
+            let top_level = run_id.is_none() && !caller.is_subagent();
+            Requester {
+                role: role_without_node(caller),
+                top_level,
+                depth: top_level.then_some(0),
+            }
+        }
+    }
+}
+
+/// A permission a project declaration may carry: who may use it. Unset fields do not restrict.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Permission {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roles: Option<Vec<Role>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_depth: Option<i64>,
+}
+
+impl Permission {
+    /// Whether `who` may use what this permission guards. An unknown depth fails a `max_depth`.
+    pub fn admits(&self, who: &Requester) -> bool {
+        if let Some(roles) = &self.roles
+            && !roles.contains(&who.role)
+        {
+            return false;
+        }
+        if let Some(max) = self.max_depth {
+            return who.depth.is_some_and(|depth| depth <= max);
+        }
+        true
+    }
+
+    /// The rule in words, for a refusal message.
+    pub fn who_may(&self) -> String {
+        let roles = self.roles.as_ref().map(|roles| {
+            let names: Vec<&str> = roles.iter().map(|role| role.as_str()).collect();
+            format!("roles {}", names.join(", "))
+        });
+        let depth = self.max_depth.map(|max| format!("depth <= {max}"));
+        match (roles, depth) {
+            (Some(roles), Some(depth)) => format!("{roles} at {depth}"),
+            (Some(only), None) | (None, Some(only)) => only,
+            (None, None) => "any role at any depth".to_owned(),
+        }
+    }
+}
+
+/// An `allowed_roles` column back into a list. Unreadable JSON fails closed: an empty list admits
+/// nobody.
+pub fn parse_allowed_roles(raw: Option<String>) -> Option<Vec<Role>> {
+    let raw = raw?;
+    match serde_json::from_str(&raw) {
+        Ok(roles) => Some(roles),
+        Err(error) => {
+            tracing::warn!(%error, "allowed_roles is not valid JSON; admitting nobody");
+            Some(Vec::new())
+        }
+    }
+}
+
+/// The permission stored in an `allowed_roles` / `max_depth` column pair.
+pub fn permission_from_columns(
+    allowed_roles: Option<String>,
+    max_depth: Option<i64>,
+) -> Permission {
+    Permission {
+        roles: parse_allowed_roles(allowed_roles),
+        max_depth,
+    }
+}
+
+/// The `allowed_roles` column value for a permission's roles.
+pub fn roles_to_column(roles: &Option<Vec<Role>>) -> Option<String> {
+    roles
+        .as_ref()
+        .map(|roles| serde_json::to_string(roles).unwrap_or_else(|_| "[]".to_owned()))
+}
+
+/// Only the owner's top-level session may push.
+pub fn may_push(who: &Requester) -> bool {
+    who.top_level
+}
+
+pub const PUSH_REFUSAL: &str = "push is accepted only from the owner's top-level session (IDE, tunnel or terminal); a tree node, a subagent or a daemon run cannot push \u{2014} hand the branch back and the owner pushes it";
 
 #[cfg(test)]
 mod tests {
@@ -292,6 +432,15 @@ mod tests {
         }
         assert!(!policy(Role::Leaf).conductor_fence);
         assert!(!policy(Role::Leaf).open_children);
+        // An empty declared permission admits every role: it only ever narrows.
+        for role in ROLES {
+            let who = Requester {
+                role,
+                top_level: false,
+                depth: Some(1),
+            };
+            assert!(Permission::default().admits(&who), "{role:?}");
+        }
     }
 
     #[test]
@@ -467,5 +616,95 @@ mod tests {
         );
         // Nothing at all: the root.
         assert_eq!(resolve(&pool, &Caller::default(), None).await, Role::Root);
+    }
+
+    async fn node_at(pool: &SqlitePool, id: &str, kind: &str, depth: i64, agent: Option<&str>) {
+        node(pool, id, kind, r#"["a/**"]"#, agent, None).await;
+        sqlx::query("UPDATE work_nodes SET depth = ? WHERE id = ?")
+            .bind(depth)
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_requester_is_top_level_only_with_no_node_run_or_subagent_marker() {
+        let pool = pool().await;
+        node_at(&pool, "r1", "root", 0, Some("a-root")).await;
+        node_at(&pool, "l2", "leaf", 2, Some("a-leaf2")).await;
+
+        let top = resolve_requester(&pool, &Caller::default(), None).await;
+        assert_eq!(
+            top,
+            Requester {
+                role: Role::Root,
+                top_level: true,
+                depth: Some(0)
+            }
+        );
+        assert!(may_push(&top));
+
+        let root_node = resolve_requester(&pool, &caller(Some("a-root"), None, false), None).await;
+        assert_eq!(root_node.role, Role::Root);
+        assert!(!root_node.top_level && !may_push(&root_node));
+
+        let run = resolve_requester(&pool, &Caller::default(), Some(99)).await;
+        assert!(!run.top_level && run.depth.is_none());
+        let sub = resolve_requester(&pool, &caller(None, None, true), None).await;
+        assert!(!sub.top_level && sub.depth.is_none());
+
+        let leaf = resolve_requester(&pool, &caller(Some("a-leaf2"), None, false), None).await;
+        assert_eq!(
+            (leaf.role, leaf.depth, leaf.top_level),
+            (Role::Leaf, Some(2), false)
+        );
+    }
+
+    fn who(role: Role, depth: Option<i64>) -> Requester {
+        Requester {
+            role,
+            top_level: false,
+            depth,
+        }
+    }
+
+    #[test]
+    fn a_permission_admits_by_role_and_depth_and_fails_closed_on_unknown_depth() {
+        let by_role = Permission {
+            roles: Some(vec![Role::Root, Role::Orchestrator]),
+            max_depth: None,
+        };
+        assert!(by_role.admits(&who(Role::Orchestrator, None)));
+        assert!(!by_role.admits(&who(Role::Leaf, Some(0))));
+
+        let by_depth = Permission {
+            roles: None,
+            max_depth: Some(1),
+        };
+        assert!(by_depth.admits(&who(Role::Leaf, Some(1))));
+        assert!(!by_depth.admits(&who(Role::Leaf, Some(2))));
+        assert!(!by_depth.admits(&who(Role::Root, None)));
+
+        assert!(Permission::default().admits(&who(Role::Reviewer, None)));
+        let both = Permission {
+            roles: Some(vec![Role::Root, Role::Orchestrator]),
+            max_depth: Some(1),
+        };
+        assert_eq!(both.who_may(), "roles root, orchestrator at depth <= 1");
+    }
+
+    #[test]
+    fn roles_round_trip_through_text_and_serde() {
+        for role in ROLES {
+            assert_eq!(Role::parse(role.as_str()), Some(role));
+        }
+        assert_eq!(Role::parse("admin"), None);
+        let json = serde_json::to_string(&Permission {
+            roles: Some(vec![Role::Leaf]),
+            max_depth: None,
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"roles":["leaf"]}"#);
     }
 }

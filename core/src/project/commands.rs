@@ -168,6 +168,9 @@ pub struct ProjectCommand {
     pub is_gate: bool,
     pub pass_exit_code: i64,
     pub runnable_by: RunnableBy,
+    /// Who else may run it: roles and depth. Unset fields do not restrict.
+    #[serde(flatten)]
+    pub permission: crate::role_policy::Permission,
     pub source: Source,
     /// `None` for a command nobody has run yet — which is not a command that failed.
     pub last: Option<LastRun>,
@@ -337,7 +340,7 @@ pub fn caller_is_an_agent(scope: &crate::auth::Scope) -> bool {
 /* ------------------------------------------------------------------- SQL -- */
 
 const COLUMNS: &str = "id, name, command, cwd, is_gate, pass_exit_code, runnable_by, source, \
-                       last_started_at, last_ended_at, last_outcome, last_exit_code, last_output";
+                       last_started_at, last_ended_at, last_outcome, last_exit_code, last_output,                        allowed_roles, max_depth";
 
 type Row = (
     i64,
@@ -353,6 +356,8 @@ type Row = (
     Option<String>,
     Option<i64>,
     Option<String>,
+    Option<String>,
+    Option<i64>,
 );
 
 fn from_row(row: Row) -> ProjectCommand {
@@ -370,6 +375,8 @@ fn from_row(row: Row) -> ProjectCommand {
         outcome,
         exit_code,
         output,
+        allowed_roles,
+        max_depth,
     ) = row;
     // A result needs BOTH a start and a recognised outcome. A row with one and not the other is a
     // half-written record, and reporting it as a run would be reporting a measurement nobody has.
@@ -394,6 +401,10 @@ fn from_row(row: Row) -> ProjectCommand {
         is_gate: is_gate != 0,
         pass_exit_code,
         runnable_by: RunnableBy::from_db_str(&runnable_by),
+        permission: crate::role_policy::Permission {
+            roles: crate::role_policy::parse_allowed_roles(allowed_roles),
+            max_depth,
+        },
         source: Source::from_db_str(&source),
         last,
     }
@@ -437,6 +448,7 @@ pub struct Declaration {
     pub is_gate: bool,
     pub pass_exit_code: i64,
     pub runnable_by: RunnableBy,
+    pub permission: crate::role_policy::Permission,
 }
 
 /// Declares a project's own command, replacing one of the same name.
@@ -458,14 +470,17 @@ pub async fn declare(
     let now = chrono::Utc::now().to_rfc3339();
     let id: i64 = sqlx::query_scalar(
         "INSERT INTO project_commands
-             (project_id, name, command, cwd, is_gate, pass_exit_code, runnable_by, source, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             (project_id, name, command, cwd, is_gate, pass_exit_code, runnable_by, source, created_at,
+              allowed_roles, max_depth)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(project_id, source, name) DO UPDATE SET
              command = excluded.command,
              cwd = excluded.cwd,
              is_gate = excluded.is_gate,
              pass_exit_code = excluded.pass_exit_code,
-             runnable_by = excluded.runnable_by
+             runnable_by = excluded.runnable_by,
+             allowed_roles = excluded.allowed_roles,
+             max_depth = excluded.max_depth
          RETURNING id",
     )
     .bind(project_id)
@@ -479,6 +494,14 @@ pub async fn declare(
     // `from_db_str` reads back cannot drift apart in a later edit.
     .bind(Source::Project.as_db_str())
     .bind(&now)
+    .bind(
+        declaration
+            .permission
+            .roles
+            .as_ref()
+            .map(|roles| serde_json::to_string(roles).unwrap_or_else(|_| "[]".to_owned())),
+    )
+    .bind(declaration.permission.max_depth)
     .fetch_one(pool)
     .await?;
     Ok(id)
@@ -609,9 +632,50 @@ mod tests {
             is_gate,
             pass_exit_code: 0,
             runnable_by: RunnableBy::Person,
+            permission: Default::default(),
             source,
             last: None,
         }
+    }
+
+    /// Roles and depth survive a declare and a read, and an unreadable roles column admits nobody.
+    #[tokio::test]
+    async fn a_permission_round_trips_and_bad_roles_fail_closed() {
+        use crate::role_policy::{Permission, Role};
+        let pool = pool().await;
+        project(&pool, "alpha").await;
+        let id = declare(
+            &pool,
+            "alpha",
+            Declaration {
+                name: "deploy".to_owned(),
+                command: "make deploy".to_owned(),
+                cwd: None,
+                is_gate: false,
+                pass_exit_code: 0,
+                runnable_by: RunnableBy::Agent,
+                permission: Permission {
+                    roles: Some(vec![Role::Root, Role::Orchestrator]),
+                    max_depth: Some(1),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let got = get(&pool, "alpha", id).await.unwrap().unwrap();
+        assert_eq!(
+            got.permission.roles,
+            Some(vec![Role::Root, Role::Orchestrator])
+        );
+        assert_eq!(got.permission.max_depth, Some(1));
+
+        sqlx::query("UPDATE project_commands SET allowed_roles = 'not json' WHERE id = ?")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let got = get(&pool, "alpha", id).await.unwrap().unwrap();
+        assert_eq!(got.permission.roles, Some(Vec::new()));
     }
 
     /* ------------------------------------------------------------ overlay -- */
@@ -842,6 +906,7 @@ mod tests {
                 is_gate: true,
                 pass_exit_code: 0,
                 runnable_by: RunnableBy::Person,
+                permission: Default::default(),
             },
         )
         .await
@@ -870,6 +935,7 @@ mod tests {
                 is_gate: true,
                 pass_exit_code: 0,
                 runnable_by: RunnableBy::Agent,
+                permission: Default::default(),
             },
         )
         .await
@@ -946,6 +1012,7 @@ mod tests {
                 is_gate: true,
                 pass_exit_code: 0,
                 runnable_by: RunnableBy::Person,
+                permission: Default::default(),
             },
         )
         .await
@@ -985,6 +1052,7 @@ mod tests {
                 is_gate: true,
                 pass_exit_code: 0,
                 runnable_by: RunnableBy::Person,
+                permission: Default::default(),
             },
         )
         .await
@@ -1029,6 +1097,7 @@ mod tests {
                 is_gate: false,
                 pass_exit_code: 0,
                 runnable_by: RunnableBy::Person,
+                permission: Default::default(),
             },
         )
         .await
@@ -1058,6 +1127,7 @@ mod tests {
                 is_gate: true,
                 pass_exit_code: 0,
                 runnable_by: RunnableBy::Person,
+                permission: Default::default(),
             },
         )
         .await
@@ -1090,6 +1160,7 @@ mod tests {
                 is_gate: false,
                 pass_exit_code: 0,
                 runnable_by: RunnableBy::Person,
+                permission: Default::default(),
             },
         )
         .await

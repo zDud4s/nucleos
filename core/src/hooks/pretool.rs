@@ -102,13 +102,38 @@ async fn leaf_self_check_admitted(
     let caller = crate::role_policy::Caller {
         agent_id: payload.agent_id.clone(),
         agent_type: payload.agent_type.clone(),
-        // The pretool payload carries no subagent marker of its own: `agent_id` is the signal here.
-        subagent: false,
+        // A call with subagent markers but no usable `agent_id` must not resolve to a leaf (D12).
+        subagent: payload.subagent,
     };
     matches!(
         crate::role_policy::resolve(&state.pool, &caller, Some(run_id)).await,
         crate::role_policy::Role::Leaf
     )
+}
+
+/// Whether any simple command of the line is `git [global options] push ...`. Deliberately wider
+/// than the queue's own `push_from_command`, which refuses some push shapes outright: for a grant
+/// that must not cover a push, every push shape counts.
+fn command_runs_git_push(command: &str) -> bool {
+    crate::execution::vcs::directed_segments(command)
+        .iter()
+        .any(|segment| {
+            let mut words = segment.command.split_whitespace();
+            if words.next().map(|word| word.rsplit(['/', '\\']).next()) != Some(Some("git")) {
+                return false;
+            }
+            while let Some(word) = words.next() {
+                if matches!(
+                    word,
+                    "-c" | "-C" | "--git-dir" | "--work-tree" | "--namespace"
+                ) {
+                    words.next();
+                } else if !word.starts_with('-') {
+                    return word == "push";
+                }
+            }
+            false
+        })
 }
 
 /// The replacement input that routes a recognized test/check/build command of an in-flight run
@@ -793,8 +818,33 @@ pub(super) async fn pretooluse_decision_from(
                     .ok()?;
 
                 let op = queue_op(&segment.command, &branch)?;
-                if !declared.iter().any(|kind| kind == op.kind()) {
-                    return None;
+                let (_, permission) = declared.iter().find(|(kind, _)| kind == op.kind())?;
+                // The declaration is a grant. One that does not cover this requester is not a
+                // refusal: it simply does not apply, and the call takes the normal path, which
+                // means "ask as before". The push refusal below stays unconditional.
+                if *permission != crate::role_policy::Permission::default()
+                    && !matches!(op, crate::execution::vcs::Op::Push { .. })
+                {
+                    let caller = crate::role_policy::Caller {
+                        agent_id: payload.agent_id.clone(),
+                        agent_type: payload.agent_type.clone(),
+                        // As at the leaf self-check: `agent_id` is the signal here.
+                        subagent: false,
+                    };
+                    let who =
+                        crate::role_policy::resolve_requester(&state.pool, &caller, Some(run_id))
+                            .await;
+                    if !permission.admits(&who) {
+                        return None;
+                    }
+                }
+                // A run is never the owner's top-level session, so a declared push does not
+                // auto-queue: it is refused and says who may push.
+                if matches!(op, crate::execution::vcs::Op::Push { .. }) {
+                    return Some(Decision {
+                        decision: "deny".to_owned(),
+                        reason: crate::role_policy::PUSH_REFUSAL.to_owned(),
+                    });
                 }
 
                 let request_id = crate::execution::vcs::submit_declared(
@@ -823,6 +873,29 @@ pub(super) async fn pretooluse_decision_from(
                     "pretooluse-decision: admitted a project-declared git operation"
                 );
                 return Json(decision);
+            }
+
+            // A grant covers a whole class, and `push-merge-deploy` contains `git push`. A run is
+            // never the owner's top-level session, so no grant lets it push by hand either: the
+            // approval flow already refuses to queue it, and this closes the fallback where the
+            // saved grant would have let the run perform the push itself.
+            if matches!(payload.tool_name.as_str(), "Bash" | "PowerShell")
+                && let Some(command) = payload.tool_input.get("command").and_then(Value::as_str)
+                && command_runs_git_push(command)
+            {
+                let caller = crate::role_policy::Caller {
+                    agent_id: payload.agent_id.clone(),
+                    agent_type: payload.agent_type.clone(),
+                    subagent: false,
+                };
+                let who =
+                    crate::role_policy::resolve_requester(&state.pool, &caller, Some(run_id)).await;
+                if !crate::role_policy::may_push(&who) {
+                    return Json(Decision {
+                        decision: "deny".to_owned(),
+                        reason: crate::role_policy::PUSH_REFUSAL.to_owned(),
+                    });
+                }
             }
 
             match crate::proposals::grant_covers_class(
@@ -1541,7 +1614,20 @@ mod tests {
             tool_input: input,
             agent_id: None,
             agent_type: None,
+            subagent: false,
         }
+    }
+
+    #[test]
+    fn the_subagent_marker_defaults_to_false_and_is_read_from_the_body() {
+        let plain: PreToolUsePayload =
+            serde_json::from_str(r#"{"run_id":1,"tool_name":"Bash"}"#).unwrap();
+        assert!(!plain.subagent);
+        // No agent_id, but the hook saw subagent markers: `leaf_self_check_admitted` hands this
+        // flag to the role policy, which never resolves such a caller to a leaf.
+        let marked: PreToolUsePayload =
+            serde_json::from_str(r#"{"run_id":1,"tool_name":"Bash","subagent":true}"#).unwrap();
+        assert!(marked.subagent && marked.agent_id.is_none());
     }
 
     async fn decide(state: &AppState, run_id: i64, tool: &str, input: Value) -> Decision {
