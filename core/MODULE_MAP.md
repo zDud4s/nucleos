@@ -694,6 +694,8 @@ the contract, not a snapshot.
 | `devtime/actions/propose.rs` | The pure `propose` decision (`decide_propose`) for cross-session findings F1 and F2, with its `CrossCandidate` and `ProposeState` inputs. |
 | `devtime/actions/report.rs` | The shadow-to-live promotion report of one `(action, rule)` pair (`action_promotion_report`): the five criteria with their counts, rates and ms figures, and a `ready` signal; read-only, the owner promotes. |
 | `devtime/store/shadow.rs` | The SQL of `devtime_shadow` (what each action decided, why, and the human's outcome) and `devtime_action_state` (per-action, per-rule mode), plus their closed vocabularies. No message text. |
+| `devtime/store/shadow/queries.rs` | The outcome step's read queries over findings, attempt marks and proposals, and `prune_closed_before` (the 180-day retention delete of closed shadow rows). Re-exported by `shadow.rs`. |
+| `devtime/store/shadow/tests.rs` | Tests of the shadow retention prune (mounted from `shadow.rs` as `prune_tests`). |
 | `devtime/unexplained.rs` | PURE per-turn active/explained time and the listing of slow turns no rule explains. |
 | `devtime/rules/fixture.rs` | Tests only: compact session-script DSL that builds devtime rows, spans and rule facts. |
 | `consolidate.rs` | In `nucleos-app`. The periodic consolidation pass measures each project's gate history and refused-action history, then writes only episodic measurements from its two fixed-template generators. It skips any project with a live job or running run. Detection stays in SQL and the body is a template; no model interprets the histories. |
