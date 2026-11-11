@@ -1777,7 +1777,7 @@ mod tests {
             .unwrap();
         let queued = run_git_decision(&app, declared_run, "git push origin feature").await;
         assert_eq!(queued.decision, "deny");
-        assert!(queued.reason.contains("request"));
+        assert_eq!(queued.reason, crate::role_policy::PUSH_REFUSAL);
 
         settle().await;
         assert_eq!(judge.calls(), 0);
@@ -7884,8 +7884,8 @@ mod tests {
     #[tokio::test]
     async fn a_declared_git_op_is_queued_instead_of_stopping_the_run() {
         let state = test_state().await;
-        let repo = rostered_repo(&state, "hook-run-declared-push").await;
-        crate::project::policy::declare_git_op(&state.pool, "p", "push")
+        let repo = rostered_repo(&state, "hook-run-declared-merge").await;
+        crate::project::policy::declare_git_op(&state.pool, "p", "merge")
             .await
             .unwrap();
         let run_id = in_flight_run(
@@ -7893,12 +7893,12 @@ mod tests {
             "worktree",
             Some("p"),
             repo.path().to_str(),
-            Some("declared-push"),
+            Some("declared-merge"),
         )
         .await;
         let app = test_router(state.clone());
 
-        let decision = run_git_decision(&app, run_id, "git push origin feature").await;
+        let decision = run_git_decision(&app, run_id, "git merge feature").await;
 
         assert_eq!(decision.decision, "deny", "{}", decision.reason);
         assert!(
@@ -7910,7 +7910,7 @@ mod tests {
             queued_run_rows(&state).await,
             vec![(
                 1,
-                "push".to_owned(),
+                "merge".to_owned(),
                 "run".to_owned(),
                 "queued".to_owned(),
                 Some(run_id),
@@ -7929,6 +7929,32 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .contains_key(&run_id)
         );
+    }
+
+    /// A run is never the owner's top-level session: a declared push is refused with who may push
+    /// and nothing is queued.
+    #[tokio::test]
+    async fn a_declared_push_from_a_run_is_refused_and_not_queued() {
+        let state = test_state().await;
+        let repo = rostered_repo(&state, "hook-run-declared-push-refused").await;
+        crate::project::policy::declare_git_op(&state.pool, "p", "push")
+            .await
+            .unwrap();
+        let run_id = in_flight_run(
+            &state,
+            "worktree",
+            Some("p"),
+            repo.path().to_str(),
+            Some("declared-push-refused"),
+        )
+        .await;
+        let app = test_router(state.clone());
+
+        let decision = run_git_decision(&app, run_id, "git push origin feature").await;
+
+        assert_eq!(decision.decision, "deny");
+        assert_eq!(decision.reason, crate::role_policy::PUSH_REFUSAL);
+        assert!(queued_run_rows(&state).await.is_empty());
     }
 
     /// No declaration preserves the old question exactly. In particular, merely recognising a
@@ -8263,6 +8289,41 @@ mod tests {
             );
         }
         assert!(queued_rows(&state).await.is_empty());
+    }
+
+    /// A push is accepted only from the owner's top-level session: a subagent-marked caller is
+    /// refused with the text and nothing is queued, while the unmarked owner session still queues.
+    #[tokio::test]
+    async fn a_subagent_push_is_refused_and_the_owners_push_still_queues() {
+        let state = test_state().await;
+        let repo = rostered_repo(&state, "hook-session-push-roles").await;
+
+        let refused = session_git_decision_within(
+            &state,
+            SessionGitPayload {
+                tool_name: "Bash".to_owned(),
+                tool_input: serde_json::json!({ "command": "git push origin master" }),
+                cwd: repo.path().to_string_lossy().into_owned(),
+                agent_id: Some("a1".to_owned()),
+                agent_type: Some("wf-leaf".to_owned()),
+                subagent: true,
+            },
+            Duration::ZERO,
+        )
+        .await
+        .0;
+        assert_eq!(refused.decision, "deny");
+        assert_eq!(refused.reason, crate::role_policy::PUSH_REFUSAL);
+        assert!(queued_rows(&state).await.is_empty());
+
+        let owner = session_decision(&state, "git push origin master", repo.path()).await;
+        assert_eq!(owner.decision, "deny", "{}", owner.reason);
+        assert!(
+            owner.reason.contains("queued as vcs request"),
+            "{}",
+            owner.reason
+        );
+        assert_eq!(queued_rows(&state).await.len(), 1);
     }
 
     fn ticket(

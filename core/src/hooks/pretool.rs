@@ -796,6 +796,14 @@ pub(super) async fn pretooluse_decision_from(
                 if !declared.iter().any(|kind| kind == op.kind()) {
                     return None;
                 }
+                // A run is never the owner's top-level session, so a declared push does not
+                // auto-queue: it is refused and says who may push.
+                if matches!(op, crate::execution::vcs::Op::Push { .. }) {
+                    return Some(Decision {
+                        decision: "deny".to_owned(),
+                        reason: crate::role_policy::PUSH_REFUSAL.to_owned(),
+                    });
+                }
 
                 let request_id = crate::execution::vcs::submit_declared(
                     &state.pool,
