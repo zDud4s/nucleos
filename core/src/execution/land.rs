@@ -360,6 +360,12 @@ async fn resolve_target(
         return integration_branch(pool, project_id, project_root, deadline).await;
     };
 
+    // The release branch only moves by promotion: refuse it before any table is consulted.
+    refuse_release_branch(
+        crate::project::policy::release_branch_of(project_id).as_deref(),
+        requested,
+    )?;
+
     let recorded = crate::project::policy::land_targets(pool, project_id).await;
     if recorded
         .iter()
@@ -409,6 +415,17 @@ async fn resolve_target(
         "{requested} is not among the landing targets recorded for {project_id} — those are: {}",
         alternatives.join(", ")
     ))
+}
+
+/// Refuses a landing target that is the project's release branch. Unset refuses nothing.
+fn refuse_release_branch(release: Option<&str>, requested: &str) -> Result<(), String> {
+    if crate::project::policy::is_release_branch(release, requested) {
+        return Err(format!(
+            "{requested} is the release branch: it only moves by promotion of a commit the \
+             postgate proved green, so nothing may land on it"
+        ));
+    }
+    Ok(())
 }
 
 /// Admits a landing for a caller with no claims override. See [`submit_with`].
@@ -855,6 +872,35 @@ mod tests {
     use crate::task_claims::{
         self, ClaimOutcome, Holder, HolderKind, NewTask, TaskKind, TaskRow, keys,
     };
+
+    #[test]
+    fn the_release_branch_is_refused_as_a_land_target_only_when_set() {
+        let err = refuse_release_branch(Some("master"), "master").unwrap_err();
+        assert!(err.contains("release branch"), "{err}");
+        assert!(refuse_release_branch(Some("master"), "integration").is_ok());
+        assert!(refuse_release_branch(None, "master").is_ok());
+    }
+
+    #[tokio::test]
+    async fn resolve_target_refuses_the_release_branch_even_when_listed() {
+        let pool = test_pool().await;
+        let _home = crate::project::rules::testing::Home::new();
+        crate::project::rules::testing::publish_rules("alpha", "release_branch: master\n");
+        crate::project::policy::declare_land_target(&pool, "alpha", "master")
+            .await
+            .unwrap();
+        let err = resolve_target(
+            &pool,
+            "alpha",
+            Path::new("."),
+            Some("master"),
+            Some("master"),
+            deadline(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("release branch"), "{err}");
+    }
 
     async fn test_pool() -> sqlx::SqlitePool {
         // The queue's executor reads the project's rules from the settings snapshot: hold the shared side of

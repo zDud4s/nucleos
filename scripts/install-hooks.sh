@@ -228,21 +228,33 @@ cat > "$target/reference-transaction" <<'HOOK_EOF'
 state="$1"
 case "$state" in prepared|committed) ;; *) exit 0 ;; esac
 target="$(git config --get nucleos.integrationBranch 2>/dev/null)"
-[ -n "$target" ] || exit 0
-ref="refs/heads/$target"
+release="$(git config --get nucleos.releaseBranch 2>/dev/null)"
+[ -n "$target" ] || [ -n "$release" ] || exit 0
+# The release branch (when configured) is closed exactly like the integration branch.
 hit=""
+# Under the escape, every matching ref of one transaction is logged, not only the last one.
+logging=""
+if [ -z "$NUCLEOS_QUEUE_EXEC" ] && [ -n "$NUCLEOS_ALLOW_DIRECT_GIT" ] && [ "$state" = "committed" ]; then
+  logging=1
+  common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || logging=""
+fi
 while read -r old new name; do
-  [ "$name" = "$ref" ] && hit="$old $new"
+  matched=""
+  if [ -n "$target" ] && [ "$name" = "refs/heads/$target" ]; then
+    hit="$old $new"; ref="$name"; target_name="$target"; matched=1
+  elif [ -n "$release" ] && [ "$name" = "refs/heads/$release" ]; then
+    hit="$old $new"; ref="$name"; target_name="$release"; matched=1
+  fi
+  if [ -n "$matched" ] && [ -n "$logging" ]; then
+    printf 'bypass %s %s %s\n' "$(date +%s)" "$hit" "$ref" >> "$common/nucleos-direct-writes.log"
+  fi
 done
 [ -n "$hit" ] || exit 0
+target="$target_name"
 # Every git process the queue starts carries the marker (QUEUE_MARKER in
 # core/src/execution/git_exec/transport.rs): merge, publish (update-ref or ff-only), revert.
 [ -n "$NUCLEOS_QUEUE_EXEC" ] && exit 0
 if [ -n "$NUCLEOS_ALLOW_DIRECT_GIT" ]; then
-  if [ "$state" = "committed" ]; then
-    common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" &&
-      printf 'bypass %s %s %s\n' "$(date +%s)" "$hit" "$ref" >> "$common/nucleos-direct-writes.log"
-  fi
   exit 0
 fi
 [ "$state" = "prepared" ] || exit 0
@@ -348,6 +360,11 @@ if [ -n "$branch" ]; then
   echo "nucleos.integrationBranch = $branch"
 else
   echo "warning: no integration branch found (set NUCLEOS_INTEGRATION_BRANCH and re-run); reference-transaction guards nothing until nucleos.integrationBranch is set" >&2
+fi
+
+if [ -n "${NUCLEOS_RELEASE_BRANCH:-}" ]; then
+  git config nucleos.releaseBranch "$NUCLEOS_RELEASE_BRANCH"
+  echo "nucleos.releaseBranch = $NUCLEOS_RELEASE_BRANCH"
 fi
 
 git config core.hooksPath "$hooks_dir"

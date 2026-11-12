@@ -91,12 +91,52 @@ pub async fn scan_project(
     now: DateTime<Utc>,
 ) -> Result<Scan, String> {
     let deadline = Instant::now() + SCAN_BUDGET;
-    let target = match land::integration_branch_reading(pool, project_id, deadline).await? {
-        IntegrationBranch::Declared { branch } | IntegrationBranch::Derived { branch } => branch,
-        IntegrationBranch::Stale { .. } | IntegrationBranch::Unknown { .. } => {
-            return Ok(Scan::Skipped("no integration branch"));
+    let integration = match land::integration_branch_reading(pool, project_id, deadline).await? {
+        IntegrationBranch::Declared { branch } | IntegrationBranch::Derived { branch } => {
+            Some(branch)
         }
+        IntegrationBranch::Stale { .. } | IntegrationBranch::Unknown { .. } => None,
     };
+    let result = match &integration {
+        Some(target) => scan_branch(pool, project_id, root, target, false, now).await,
+        None => Ok(Scan::Skipped("no integration branch")),
+    };
+    // The release branch (rule `release_branch`) has its own watch row. Only the queue's promote
+    // moves it; a direct write there also means it left the promotion path, so the
+    // `release-diverged` ticket opens next to the direct-write one.
+    if let Some(release) = crate::project::policy::release_branch_of(project_id)
+        && integration.as_deref() != Some(release.as_str())
+    {
+        match scan_branch(pool, project_id, root, &release, true, now).await {
+            Ok(Scan::Detected { kind, shas }) => {
+                let detail =
+                    json!({ "target": &release, "shas": &shas, "kind": format!("{kind:?}") });
+                if let Err(error) =
+                    machine::open_release_diverged_ticket(pool, project_id, detail, now).await
+                {
+                    tracing::warn!(project = %project_id, %error, "direct writes: could not open release-diverged");
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(project = %project_id, %error, "direct writes: release branch scan failed");
+            }
+        }
+    }
+    result
+}
+
+/// Scans one branch against its own `target_watch` row; see the module doc for the rule.
+async fn scan_branch(
+    pool: &SqlitePool,
+    project_id: &str,
+    root: &Path,
+    target: &str,
+    is_release: bool,
+    now: DateTime<Utc>,
+) -> Result<Scan, String> {
+    let deadline = Instant::now() + SCAN_BUDGET;
+    let target = target.to_owned();
     let reference = format!("refs/heads/{target}");
     let tip = crate::verify::resolve_commit(root, &reference, deadline).await?;
 
@@ -122,6 +162,19 @@ pub async fn scan_project(
     let rewritten = !git_exec::is_ancestor(root, &previous, &tip, deadline).await?;
     let direct = if rewritten {
         vec![tip.clone()]
+    } else if is_release && promote_published(pool, project_id, &target, &tip).await? {
+        // A promote fast-forwards the release branch over every commit of the integration line,
+        // and records only its tip as `result_sha`: the whole range is the queue's.
+        Vec::new()
+    } else if is_release {
+        // Only a promote moves the release branch, so a land commit's `result_sha` excuses nothing
+        // here: any other move is a direct write.
+        let range = first_parent_range(root, &previous, &tip, deadline).await?;
+        if range.is_empty() {
+            vec![tip.clone()]
+        } else {
+            range
+        }
     } else {
         let range = first_parent_range(root, &previous, &tip, deadline).await?;
         let mut queued: HashSet<String> = HashSet::new();
@@ -246,6 +299,28 @@ async fn queue_published(pool: &SqlitePool, sha: &str) -> Result<bool, String> {
     .fetch_one(pool)
     .await
     .map_err(|error| format!("could not look up the queue's results: {error}"))
+}
+
+/// Whether a succeeded `promote` request of this project ended at `sha` on the release branch
+/// `to`. A stored promote carries `to` in its JSON args; a row without one (no real promote) is
+/// not held against the match.
+async fn promote_published(
+    pool: &SqlitePool,
+    project_id: &str,
+    to: &str,
+    sha: &str,
+) -> Result<bool, String> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM vcs_requests WHERE project_id = ? AND op = 'promote'
+           AND status = 'succeeded' AND result_sha = ?
+           AND (json_extract(args, '$.to') IS NULL OR json_extract(args, '$.to') = ?))",
+    )
+    .bind(project_id)
+    .bind(sha)
+    .bind(to)
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("could not look up the promotions: {error}"))
 }
 
 /// The first parent of `sha` when `sha` is an `integrate: ...` commit (the queue's step commit).
@@ -681,5 +756,246 @@ mod tests {
         assert_eq!(again.report_count, 2);
         assert_eq!(ticket_count(&pool).await, 1);
         assert_eq!(feed_lines(&pool).await.len(), 2);
+    }
+
+    // ---- With a `release_branch` rule: `integration` is the landing branch, `master` the release ----
+
+    /// Project `alpha` whose declared integration branch is `integration` and whose rules name
+    /// `master` as the release branch. Both branches start at the same commit.
+    async fn setup_release() -> (
+        SqlitePool,
+        tempfile::TempDir,
+        PathBuf,
+        crate::project::rules::testing::Home,
+    ) {
+        let (pool, container, repo) = setup().await;
+        git(&repo, &["branch", "integration"]);
+        sqlx::query(
+            "UPDATE autopilot_state SET integration_branch = 'integration' WHERE project_id = ?",
+        )
+        .bind(PROJECT)
+        .execute(&pool)
+        .await
+        .expect("declare the integration branch");
+        let home = crate::project::rules::testing::Home::new();
+        crate::project::rules::testing::publish_rules(PROJECT, "release_branch: master\n");
+        (pool, container, repo, home)
+    }
+
+    async fn watched_tip_of(pool: &SqlitePool, target: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT tip FROM target_watch WHERE project_id = ? AND target = ?")
+            .bind(PROJECT)
+            .bind(target)
+            .fetch_optional(pool)
+            .await
+            .expect("read the watched tip")
+    }
+
+    /// Records a baseline by hand, so a test can start from a known state of one branch alone.
+    async fn seed_watch(pool: &SqlitePool, target: &str, tip: &str) {
+        sqlx::query(
+            "INSERT INTO target_watch (project_id, target, tip, updated_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind(PROJECT)
+        .bind(target)
+        .bind(tip)
+        .bind(now().to_rfc3339())
+        .execute(pool)
+        .await
+        .expect("seed a watched tip");
+    }
+
+    #[tokio::test]
+    async fn scan_watches_the_release_branch_when_configured() {
+        let (pool, _container, repo, _home) = setup_release().await;
+        let tip = git(&repo, &["rev-parse", "refs/heads/master"]);
+
+        scan(&pool, &repo).await;
+
+        assert_eq!(
+            watched_tip_of(&pool, "integration").await.as_deref(),
+            Some(tip.as_str()),
+            "the integration branch is still watched"
+        );
+        assert_eq!(
+            watched_tip_of(&pool, "master").await.as_deref(),
+            Some(tip.as_str()),
+            "the release branch is watched too"
+        );
+        assert_eq!(ticket_count(&pool).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_promote_ff_range_is_not_a_direct_write() {
+        let (pool, _container, repo, _home) = setup_release().await;
+        let base = git(&repo, &["rev-parse", "refs/heads/master"]);
+        seed_watch(&pool, "integration", &base).await;
+        seed_watch(&pool, "master", &base).await;
+        // Two commits land on `integration`; only the last one is the promote's `result_sha`, and
+        // the fast-forward of master carries both of them.
+        git(&repo, &["checkout", "-q", "integration"]);
+        commit_on_head(&repo, "first.txt");
+        let green = commit_on_head(&repo, "second.txt");
+        git(&repo, &["checkout", "-q", "master"]);
+        git(&repo, &["merge", "--ff-only", "-q", "integration"]);
+        // The integration branch itself is where it was when watched last.
+        seed_integration_at(&pool, &green).await;
+        sqlx::query(
+            "INSERT INTO vcs_requests (op, args, project_id, project_root, origin, status, result_sha, created_at)
+             VALUES ('promote', '{}', ?, 'C:/work', 'daemon', 'succeeded', ?, '2026-11-11T00:00:00Z')",
+        )
+        .bind(PROJECT)
+        .bind(&green)
+        .execute(&pool)
+        .await
+        .expect("insert a promote request");
+
+        scan(&pool, &repo).await;
+
+        assert_eq!(ticket_count(&pool).await, 0, "a promote is the queue");
+        assert!(feed_lines(&pool).await.is_empty());
+        assert_eq!(
+            watched_tip_of(&pool, "master").await.as_deref(),
+            Some(green.as_str()),
+            "the release watch advanced to the promoted tip"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_direct_write_on_the_release_branch_opens_release_diverged() {
+        let (pool, _container, repo, _home) = setup_release().await;
+        let base = git(&repo, &["rev-parse", "refs/heads/master"]);
+        seed_watch(&pool, "integration", &base).await;
+        seed_watch(&pool, "master", &base).await;
+        let tip = commit_by_hand(&repo, "by-hand.txt");
+
+        scan(&pool, &repo).await;
+
+        let direct_key = machine::direct_write_key("master").expect("a direct-write key");
+        crate::task_claims::store::live_by_key(&pool, PROJECT, &direct_key, now())
+            .await
+            .expect("read the ticket")
+            .expect("the direct write on the release branch is reported");
+        let diverged = crate::task_claims::store::live_by_key(
+            &pool,
+            PROJECT,
+            &machine::release_diverged_key(),
+            now(),
+        )
+        .await
+        .expect("read the ticket")
+        .expect("the release branch left the promotion path: release-diverged is open");
+        assert_eq!(diverged.key.as_str(), "release-diverged");
+        assert_eq!(
+            watched_tip_of(&pool, "master").await.as_deref(),
+            Some(tip.as_str())
+        );
+    }
+
+    /// Inserts a succeeded promote of `project` to `to` that ended at `result_sha`.
+    async fn insert_promote(pool: &SqlitePool, project: &str, to: &str, result_sha: &str) {
+        let args = format!(r#"{{"op":"promote","from":"integration","to":"{to}"}}"#);
+        sqlx::query(
+            "INSERT INTO vcs_requests (op, args, project_id, project_root, origin, status, result_sha, created_at)
+             VALUES ('promote', ?, ?, 'C:/work', 'daemon', 'succeeded', ?, '2026-11-11T00:00:00Z')",
+        )
+        .bind(args)
+        .bind(project)
+        .bind(result_sha)
+        .execute(pool)
+        .await
+        .expect("insert a promote request");
+    }
+
+    async fn has_direct_ticket(pool: &SqlitePool, target: &str) -> bool {
+        let key = machine::direct_write_key(target).expect("a direct-write key");
+        crate::task_claims::store::live_by_key(pool, PROJECT, &key, now())
+            .await
+            .expect("read the ticket")
+            .is_some()
+    }
+
+    #[tokio::test]
+    async fn a_promote_result_on_the_integration_branch_does_not_hide_a_direct_write() {
+        let (pool, _container, repo, _home) = setup_release().await;
+        let base = git(&repo, &["rev-parse", "refs/heads/master"]);
+        seed_watch(&pool, "integration", &base).await;
+        seed_watch(&pool, "master", &base).await;
+        git(&repo, &["checkout", "-q", "integration"]);
+        commit_on_head(&repo, "by-hand.txt");
+        let tip = commit_on_head(&repo, "second.txt");
+        git(&repo, &["checkout", "-q", "master"]);
+        // The integration tip happens to be a promote's result_sha; the promote shortcut is for
+        // the release branch only.
+        insert_promote(&pool, PROJECT, "master", &tip).await;
+
+        scan(&pool, &repo).await;
+
+        assert!(
+            has_direct_ticket(&pool, "integration").await,
+            "the by-hand commit on the integration branch is still detected"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hand_fast_forward_of_the_release_branch_to_a_land_commit_is_a_direct_write() {
+        let (pool, _container, repo, _home) = setup_release().await;
+        let base = git(&repo, &["rev-parse", "refs/heads/master"]);
+        seed_watch(&pool, "integration", &base).await;
+        seed_watch(&pool, "master", &base).await;
+        git(&repo, &["checkout", "-q", "integration"]);
+        let land = commit_on_head(&repo, "land.txt");
+        git(&repo, &["checkout", "-q", "master"]);
+        request(&pool, "succeeded", Some(&land)).await;
+        git(&repo, &["merge", "--ff-only", "-q", "integration"]);
+        seed_integration_at(&pool, &land).await;
+
+        scan(&pool, &repo).await;
+
+        assert!(
+            has_direct_ticket(&pool, "master").await,
+            "a land's result_sha does not excuse a move of the release branch"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_promote_of_another_project_does_not_excuse_a_release_move() {
+        let (pool, _container, repo, _home) = setup_release().await;
+        let base = git(&repo, &["rev-parse", "refs/heads/master"]);
+        seed_watch(&pool, "integration", &base).await;
+        seed_watch(&pool, "master", &base).await;
+        git(&repo, &["checkout", "-q", "integration"]);
+        let green = commit_on_head(&repo, "green.txt");
+        git(&repo, &["checkout", "-q", "master"]);
+        git(&repo, &["merge", "--ff-only", "-q", "integration"]);
+        seed_integration_at(&pool, &green).await;
+        insert_promote(&pool, "other-project", "master", &green).await;
+
+        scan(&pool, &repo).await;
+
+        assert!(
+            has_direct_ticket(&pool, "master").await,
+            "only a promote of this project excuses the move"
+        );
+    }
+
+    /// Commits on the checked-out branch and returns the new tip.
+    fn commit_on_head(repo: &Path, name: &str) -> String {
+        std::fs::write(repo.join(name), format!("{name}\n")).expect("write a file");
+        git(repo, &["add", "-A"]);
+        git(repo, &["commit", "-q", "-m", name]);
+        git(repo, &["rev-parse", "HEAD"])
+    }
+
+    /// Moves the integration watch to `tip`, as if the scan had already followed its queue lands.
+    async fn seed_integration_at(pool: &SqlitePool, tip: &str) {
+        sqlx::query(
+            "UPDATE target_watch SET tip = ? WHERE project_id = ? AND target = 'integration'",
+        )
+        .bind(tip)
+        .bind(PROJECT)
+        .execute(pool)
+        .await
+        .expect("move the integration watch");
     }
 }

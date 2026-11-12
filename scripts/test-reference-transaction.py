@@ -77,9 +77,10 @@ def commit_file(repo, name, env=None, *extra):
     return git(repo, "commit", "-q", *extra, "-m", name, env=env)
 
 
-def make_repo(temp, target="master"):
+def make_repo(temp, target="master", release=None):
     """A repo on master with one commit and a branch `other` one commit ahead, then the hook armed
-    (when `target` is set). The setup commits happen before the hook exists."""
+    (when `target` is set; `release` also sets `nucleos.releaseBranch`). The setup commits happen
+    before the hook exists."""
     repo = temp / "repo"
     repo.mkdir()
     git(repo, "init", "-q", "-b", "master")
@@ -97,6 +98,8 @@ def make_repo(temp, target="master"):
     git(repo, "config", "core.hooksPath", hooks.as_posix())
     if target:
         git(repo, "config", "nucleos.integrationBranch", target)
+    if release:
+        git(repo, "config", "nucleos.releaseBranch", release)
     return repo
 
 
@@ -293,6 +296,112 @@ def test_installer_writes_config_and_hook():
         check("installer: override runs", done.returncode == 0, done.stdout + done.stderr)
         check("installer: override wins", config(repo, "nucleos.integrationBranch") == "trunk",
               config(repo, "nucleos.integrationBranch"))
+
+
+def release_repo(temp, release="master"):
+    """A repo guarded on two branches: `integration` (the queue's land target) and `release`.
+    `integration` is born through the queue marker, as the daemon does it."""
+    repo = make_repo(temp, target="integration", release=release)
+    born = git(repo, "update-ref", "refs/heads/integration", rev(repo, "master"), env=env_with(NUCLEOS_QUEUE_EXEC="1"))
+    check("release setup: integration born", born.returncode == 0, born.stderr)
+    return repo
+
+
+def test_release_branch_direct_write_is_refused():
+    with tempfile.TemporaryDirectory() as raw:
+        repo = release_repo(Path(raw))
+        before = rev(repo, "master")
+        done = commit_file(repo, "c.txt")
+        check("release: direct commit refused", done.returncode != 0, done.stderr)
+        check("release: says why", "blocked" in done.stderr, repr(done.stderr))
+        check("release: ref intact", rev(repo, "master") == before, rev(repo, "master"))
+        moved = git(repo, "update-ref", "refs/heads/master", rev(repo, "other"))
+        check("release: update-ref refused", moved.returncode != 0, moved.stderr)
+        check("release: update-ref intact", rev(repo, "master") == before, rev(repo, "master"))
+        # The integration branch stays guarded too.
+        integration = rev(repo, "integration")
+        moved = git(repo, "update-ref", "refs/heads/integration", rev(repo, "other"))
+        check("release: integration still refused", moved.returncode != 0, moved.stderr)
+        check("release: integration intact", rev(repo, "integration") == integration, rev(repo, "integration"))
+        check("release: nothing logged", log_lines(repo) == [], repr(log_lines(repo)))
+
+
+def test_release_branch_queue_marker_passes():
+    with tempfile.TemporaryDirectory() as raw:
+        repo = release_repo(Path(raw))
+        env = env_with(NUCLEOS_QUEUE_EXEC="1")
+        done = git(repo, "update-ref", "refs/heads/master", rev(repo, "other"), rev(repo, "master"), env=env)
+        check("release queue: master ff passes", done.returncode == 0, done.stderr)
+        check("release queue: master moved", rev(repo, "master") == rev(repo, "other"), rev(repo, "master"))
+        done = git(repo, "update-ref", "refs/heads/integration", rev(repo, "other"), env=env)
+        check("release queue: integration passes", done.returncode == 0, done.stderr)
+        check("release queue: nothing logged", log_lines(repo) == [], repr(log_lines(repo)))
+
+
+def test_release_branch_escape_is_logged_as_bypass():
+    with tempfile.TemporaryDirectory() as raw:
+        repo = release_repo(Path(raw))
+        before = rev(repo, "master")
+        done = commit_file(repo, "c.txt", env_with(NUCLEOS_ALLOW_DIRECT_GIT="1"))
+        after = rev(repo, "master")
+        check("release escape: commit passes", done.returncode == 0, done.stderr)
+        check("release escape: master moved", after != before, after)
+        lines = log_lines(repo)
+        check("release escape: one line logged", len(lines) == 1, repr(lines))
+        if lines:
+            parts = lines[0].split()
+            check(
+                "release escape: line shape",
+                len(parts) == 5 and parts[0] == "bypass" and parts[1].isdigit(),
+                repr(lines[0]),
+            )
+            check(
+                "release escape: old, new, ref",
+                parts[2:] == [before, after, "refs/heads/master"],
+                repr(lines[0]),
+            )
+
+
+def test_escape_logs_both_branches_in_one_transaction():
+    with tempfile.TemporaryDirectory() as raw:
+        repo = release_repo(Path(raw))
+        master_before = rev(repo, "master")
+        integration_before = rev(repo, "integration")
+        other = rev(repo, "other")
+        script = (
+            f"start\nupdate refs/heads/integration {other} {integration_before}\n"
+            f"update refs/heads/master {other} {master_before}\nprepare\ncommit\n"
+        )
+        done = subprocess.run(
+            ["git", "update-ref", "--stdin"],
+            cwd=repo,
+            env=env_with(NUCLEOS_ALLOW_DIRECT_GIT="1"),
+            input=script,
+            capture_output=True,
+            text=True,
+        )
+        check("two-ref escape: transaction passes", done.returncode == 0, done.stderr)
+        lines = log_lines(repo)
+        check("two-ref escape: two lines logged", len(lines) == 2, repr(lines))
+        refs = sorted(line.split()[-1] for line in lines)
+        check(
+            "two-ref escape: both refs logged",
+            refs == ["refs/heads/integration", "refs/heads/master"],
+            repr(lines),
+        )
+
+
+def test_no_release_key_leaves_master_open_as_before():
+    with tempfile.TemporaryDirectory() as raw:
+        # Only the integration key: master is not guarded, exactly as before the release key existed.
+        repo = make_repo(Path(raw), target="integration")
+        before = rev(repo, "master")
+        done = commit_file(repo, "c.txt")
+        check("no release key: master commit passes", done.returncode == 0, done.stderr)
+        check("no release key: master moved", rev(repo, "master") != before, rev(repo, "master"))
+        check("no release key: nothing logged", log_lines(repo) == [], repr(log_lines(repo)))
+        born = git(repo, "update-ref", "refs/heads/integration", rev(repo, "other"))
+        check("no release key: integration still guarded", born.returncode != 0, born.stderr)
 
 
 if __name__ == "__main__":

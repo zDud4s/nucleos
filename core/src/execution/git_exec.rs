@@ -3684,6 +3684,36 @@ integration_steps:
         );
     }
 
+    /// Sibling of the integration key: the release branch the hook also guards is written to the
+    /// LOCAL config as `nucleos.releaseBranch`, and a non-repo is refused rather than written to a
+    /// global file (see the integration test above for why the non-repo uses `tempfile::tempdir()`).
+    #[tokio::test]
+    async fn set_release_config_writes_the_key() {
+        let (_container, repo) = init_contained_repo("nucleos-gitexec-release-config-");
+
+        set_release_config(&repo, "master", deadline())
+            .await
+            .expect("a repository accepts the key");
+
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["config", "--local", "--get", "nucleos.releaseBranch"])
+            .output()
+            .expect("git should start");
+        assert!(output.status.success(), "the key was not written");
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "master");
+
+        let outside = tempfile::tempdir().expect("create a temp directory outside the checkout");
+        let error = set_release_config(outside.path(), "master", deadline())
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("could not record the release branch"),
+            "unexpected error: {error}"
+        );
+    }
+
     // ---- master is closed: the queue's own writers pass the real `reference-transaction` hook ----
 
     /// The `reference-transaction` hook exactly as `scripts/install-hooks.sh` writes it, taken from
@@ -4277,6 +4307,243 @@ integration_steps:
             "got {outcome:?}"
         );
         assert!(remote_has(&remote, "master"));
+    }
+
+    // ---- Red behaviour and the per-land gate with a `release_branch` (spec 2026-11-11, D7) ----------
+
+    const RELEASE_RULES: &str = "gate_command: x\ngate_after_land: true\nrelease_branch: master\n";
+
+    /// A red integration branch never reaches the release branch: `integ` has a green commit and a
+    /// red one on top, and promoting moves `master` to the green one only.
+    #[tokio::test]
+    async fn a_red_integration_leaves_master_untouched_and_promotes_the_last_green() {
+        use crate::execution::vcs::{Branch, Op};
+
+        let (_container, repo, _remote, pool) = gated_push_fixture(RELEASE_RULES).await;
+        let before = sha_of(&repo, "refs/heads/master");
+        git_stdout(&repo, &["branch", "integ"]);
+        commit_on(&repo, "integ", &[("green.txt", "green\n")], "green work");
+        let green = sha_of(&repo, "refs/heads/integ");
+        commit_on(&repo, "integ", &[("red.txt", "red\n")], "red work");
+        let red = sha_of(&repo, "refs/heads/integ");
+        assert_ne!(green, red);
+
+        crate::verify::postgate::mark_covered(&pool, "alpha", "integ", &green)
+            .await
+            .expect("the gate judged the first commit green");
+        assert!(
+            crate::verify::postgate::start(&pool, "alpha", "integ", &red, None)
+                .await
+                .expect("start the gate on the red tip")
+        );
+        assert!(
+            crate::verify::postgate::finish_red(&pool, "alpha", &red, &["core".to_owned()])
+                .await
+                .expect("the gate judged the tip red")
+        );
+        assert_eq!(
+            sha_of(&repo, "refs/heads/master"),
+            before,
+            "nothing promoted yet"
+        );
+
+        let outcome = {
+            use crate::execution::vcs::VcsExecutor;
+            GitExecutor {
+                pool: Some(pool.clone()),
+                ..GitExecutor::default()
+            }
+            .execute(&crate::execution::vcs::ClaimedRequest {
+                id: 1,
+                op: Op::Promote {
+                    from: Branch::new("integ").expect("a branch"),
+                    to: Branch::new("master").expect("a branch"),
+                },
+                project_id: "alpha".to_owned(),
+                project_root: repo.to_string_lossy().into_owned(),
+                from_resolution: false,
+                run_id: None,
+                approved_map_blob: None,
+                integration_branch: None,
+            })
+            .await
+        };
+
+        assert!(
+            matches!(&outcome, Outcome::Succeeded { .. }),
+            "the last green sha is promotable, got {outcome:?}"
+        );
+        assert_eq!(
+            sha_of(&repo, "refs/heads/master"),
+            green,
+            "master took the last green sha"
+        );
+        assert_ne!(
+            sha_of(&repo, "refs/heads/master"),
+            red,
+            "the red tip must never reach master"
+        );
+        assert_eq!(
+            sha_of(&repo, "refs/heads/integ"),
+            red,
+            "the integration branch is left as it was"
+        );
+    }
+
+    /// The claim gate guards the paths of a claimed task on the integration branch exactly as it did
+    /// on `master`: setting `release_branch` changes who is guarded by nothing.
+    #[tokio::test]
+    async fn claim_gate_is_unchanged_with_a_release_branch() {
+        use crate::execution::land::claim_gate::{Landing, Verdict, check};
+        use crate::execution::vcs::Branch;
+        use crate::task_claims::{self, ClaimOutcome, Holder, HolderKind, NewTask, TaskKind, keys};
+
+        let (_container, repo, _remote, pool) = gated_push_fixture(RELEASE_RULES).await;
+        git_stdout(&repo, &["branch", "integ"]);
+        let claimed = NewTask {
+            key: keys::normalize("file:feature.txt", &repo).expect("a file key"),
+            kind: TaskKind::Declared,
+            title: "t".to_owned(),
+            detail: serde_json::json!({}),
+            guard_paths: vec!["feature.txt".to_owned()],
+            hint_paths: vec![],
+        };
+        let holder = Holder {
+            kind: HolderKind::Session,
+            id: "s1".to_owned(),
+            worktree: "C:/elsewhere/wt".to_owned(),
+        };
+        match task_claims::store::claim(&pool, "alpha", claimed, &holder, chrono::Utc::now())
+            .await
+            .expect("claim")
+        {
+            ClaimOutcome::Won { .. } => {}
+            ClaimOutcome::Lost { .. } => panic!("the fixture claim lost"),
+        }
+        let source = Branch::new("feat/x").expect("a branch");
+        let target = Branch::new("integ").expect("a branch");
+        let landing = |exempt: bool| Landing {
+            project_id: "alpha",
+            project_root: &repo,
+            source: &source,
+            target: &target,
+            exempt,
+            run_id: None,
+        };
+
+        let verdict = check(
+            &pool,
+            &landing(false),
+            false,
+            deadline(),
+            chrono::Utc::now(),
+        )
+        .await;
+        assert!(
+            matches!(&verdict, Verdict::Refused(message) if message.contains("file:feature.txt")),
+            "a land into the integration branch crossing a guarded path is still refused"
+        );
+        let exempt = check(&pool, &landing(true), false, deadline(), chrono::Utc::now()).await;
+        assert!(
+            matches!(exempt, Verdict::Clear),
+            "and the exemption (daemon and resolver landings) is the one it always was"
+        );
+    }
+
+    /// With `release_branch` set, the gate an integration step used to force on every land does not
+    /// run: the promotion is where a sha is measured. A red `gate_command` therefore cannot stop the
+    /// land, and the step still ran.
+    #[tokio::test]
+    async fn a_land_with_steps_and_a_release_branch_does_not_run_the_per_land_gate() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-steps-release-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        write_autopilot_rules(
+            "release_branch: release
+gate_command: git cat-file -e HEAD:never-there.txt
+integration_steps:
+  - id: mv
+    kind: program
+    program: git
+    args: [\"mv\", \"feature.txt\", \"moved.txt\"]
+",
+        );
+        let before = sha_of(&repo, "master");
+
+        let published = match land_with(&repo, None, None, None).await {
+            Outcome::Succeeded { sha, .. } => sha.expect("a merge names the commit it published"),
+            other => panic!("the per-land gate must not run, got {other:?}"),
+        };
+
+        assert_ne!(sha_of(&repo, "master"), before, "nothing was published");
+        assert_eq!(sha_of(&repo, "master"), published);
+        assert_eq!(
+            git_stdout(&repo, &["cat-file", "-t", "master:moved.txt"]),
+            "blob",
+            "the step still ran on the land"
+        );
+    }
+
+    /// The mirror of the test above: a merge that publishes straight to the release branch has no
+    /// later gate, so the step-forced per-land gate stays, and a red `gate_command` stops it.
+    #[tokio::test]
+    async fn a_land_with_steps_onto_the_release_branch_itself_still_runs_the_per_land_gate() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let (_container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-steps-onto-rel-");
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        write_autopilot_rules(
+            "release_branch: master
+gate_command: git cat-file -e HEAD:never-there.txt
+integration_steps:
+  - id: mv
+    kind: program
+    program: git
+    args: [\"mv\", \"feature.txt\", \"moved.txt\"]
+",
+        );
+        let before = sha_of(&repo, "master");
+
+        let outcome = land_with(&repo, None, None, None).await;
+
+        assert!(
+            matches!(outcome, Outcome::Failed { .. }),
+            "the per-land gate must run and fail, got {outcome:?}"
+        );
+        assert_eq!(sha_of(&repo, "master"), before, "nothing was published");
+    }
+
+    /// With the release branch set the integration branch is another one, so a push of `master` is
+    /// an ordinary push: it must not park for the post-land gate. The integration branch still does.
+    #[tokio::test]
+    async fn a_push_of_master_is_not_parked_as_the_integration_branch() {
+        let (_container, repo, remote, pool) = gated_push_fixture(RELEASE_RULES).await;
+        git_stdout(&repo, &["branch", "integ"]);
+        sqlx::query(
+            "UPDATE autopilot_state SET integration_branch = 'integ' WHERE project_id = 'alpha'",
+        )
+        .execute(&pool)
+        .await
+        .expect("record the integration branch");
+
+        let outcome = execute_push(&repo, &pool, "master").await;
+
+        assert!(
+            matches!(outcome, Outcome::Succeeded { .. }),
+            "master is the release branch, not the integration branch, got {outcome:?}"
+        );
+        assert_eq!(
+            sha_of(&remote, "refs/heads/master"),
+            sha_of(&repo, "refs/heads/master")
+        );
+
+        let parked = execute_push(&repo, &pool, "integ").await;
+        assert!(
+            matches!(parked, Outcome::AwaitingGate { .. }),
+            "the integration branch still waits for the gate, got {parked:?}"
+        );
+        assert!(!remote_has(&remote, "integ"));
     }
 
     /// The whole loop through the real queue: the push parks, a parked row is not claimed (so there
@@ -5652,6 +5919,204 @@ integration_steps:
             refused.contains("not a merge commit"),
             "the refusal has to say which commit it could not walk: {refused}"
         );
+    }
+
+    // ---- `Op::Promote` through the executor (spec 2026-11-11, D3) ------------------------------
+
+    const PROMOTE_RULES: &str = "gate_command: x\ngate_after_land: true\nrelease_branch: master\n";
+
+    /// A rostered project `alpha` with `release_branch: master`, a pool, and an `integ` branch that
+    /// starts on `master`'s tip.
+    async fn promote_fixture() -> (tempfile::TempDir, PathBuf, sqlx::SqlitePool) {
+        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-promote-");
+        write_autopilot_rules(PROMOTE_RULES);
+        let pool = crate::testdb::fresh_pool().await;
+        roster(&pool, &repo).await;
+        git_stdout(&repo, &["branch", "integ"]);
+        (container, repo, pool)
+    }
+
+    async fn execute_promote(
+        repo: &Path,
+        pool: &sqlx::SqlitePool,
+        from: &str,
+        to: &str,
+    ) -> Outcome {
+        use crate::execution::vcs::VcsExecutor;
+        crate::project::rules::testing::hold_shared();
+        GitExecutor {
+            pool: Some(pool.clone()),
+            ..GitExecutor::default()
+        }
+        .execute(&crate::execution::vcs::ClaimedRequest {
+            id: 1,
+            op: crate::execution::vcs::Op::Promote {
+                from: from.into(),
+                to: to.into(),
+            },
+            project_id: "alpha".to_owned(),
+            project_root: repo.to_string_lossy().into_owned(),
+            from_resolution: false,
+            run_id: None,
+            approved_map_blob: None,
+            integration_branch: None,
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn promote_fast_forwards_master_to_the_green_sha() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        let (_container, repo, pool) = promote_fixture().await;
+        commit_on(&repo, "integ", &[("green.txt", "green\n")], "green work");
+        let green = sha_of(&repo, "refs/heads/integ");
+        commit_on(&repo, "integ", &[("red.txt", "red\n")], "red work");
+        let red = sha_of(&repo, "refs/heads/integ");
+        crate::verify::postgate::mark_covered(&pool, "alpha", "integ", &green)
+            .await
+            .expect("the gate judged the first commit green");
+
+        let outcome = execute_promote(&repo, &pool, "integ", "master").await;
+
+        assert!(
+            matches!(&outcome, Outcome::Succeeded { sha: Some(sha), .. } if *sha == green),
+            "got {outcome:?}"
+        );
+        assert_eq!(sha_of(&repo, "refs/heads/master"), green);
+        assert_ne!(sha_of(&repo, "refs/heads/master"), red);
+        assert_eq!(sha_of(&repo, "refs/heads/integ"), red, "integ is untouched");
+    }
+
+    #[tokio::test]
+    async fn promote_with_no_green_sha_parks_awaiting_gate() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        let (_container, repo, pool) = promote_fixture().await;
+        commit_on(&repo, "integ", &[("work.txt", "work\n")], "work");
+        let tip = sha_of(&repo, "refs/heads/integ");
+        let before = sha_of(&repo, "refs/heads/master");
+
+        let outcome = execute_promote(&repo, &pool, "integ", "master").await;
+
+        match outcome {
+            Outcome::AwaitingGate { sha, .. } => {
+                assert_eq!(sha, tip, "the park carries the integration tip");
+            }
+            other => panic!("expected the promote to park, got {other:?}"),
+        }
+        assert_eq!(sha_of(&repo, "refs/heads/master"), before, "master moved");
+    }
+
+    #[tokio::test]
+    async fn promote_when_master_already_equals_green_is_a_noop_success() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        let (_container, repo, pool) = promote_fixture().await;
+        let tip = sha_of(&repo, "refs/heads/master");
+        crate::verify::postgate::mark_covered(&pool, "alpha", "integ", &tip)
+            .await
+            .expect("the master tip is the green sha");
+
+        let outcome = execute_promote(&repo, &pool, "integ", "master").await;
+
+        assert!(
+            matches!(outcome, Outcome::Succeeded { .. }),
+            "idempotent, got {outcome:?}"
+        );
+        assert_eq!(sha_of(&repo, "refs/heads/master"), tip);
+    }
+
+    #[tokio::test]
+    async fn promote_refuses_when_master_diverged_and_leaves_master_untouched() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        let (_container, repo, pool) = promote_fixture().await;
+        commit_on(&repo, "integ", &[("integ.txt", "integ\n")], "integ work");
+        let green = sha_of(&repo, "refs/heads/integ");
+        commit_on(
+            &repo,
+            "master",
+            &[("direct.txt", "direct\n")],
+            "a direct commit",
+        );
+        let master = sha_of(&repo, "refs/heads/master");
+        crate::verify::postgate::mark_covered(&pool, "alpha", "integ", &green)
+            .await
+            .expect("integ is green");
+
+        let outcome = execute_promote(&repo, &pool, "integ", "master").await;
+
+        assert!(
+            matches!(outcome, Outcome::Failed { .. }),
+            "a diverged master is never overwritten, got {outcome:?}"
+        );
+        assert_eq!(sha_of(&repo, "refs/heads/master"), master, "master moved");
+        let key = crate::task_claims::machine::release_diverged_key();
+        let live = crate::task_claims::store::live_by_key(&pool, "alpha", &key, chrono::Utc::now())
+            .await
+            .expect("read the ticket");
+        assert!(live.is_some(), "the release-diverged incident is open");
+    }
+
+    #[tokio::test]
+    async fn promote_to_a_branch_other_than_the_release_branch_fails() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        let (_container, repo, pool) = promote_fixture().await;
+        git_stdout(&repo, &["branch", "other"]);
+        commit_on(&repo, "integ", &[("green.txt", "green\n")], "green work");
+        let green = sha_of(&repo, "refs/heads/integ");
+        crate::verify::postgate::mark_covered(&pool, "alpha", "integ", &green)
+            .await
+            .expect("integ is green");
+        let other_before = sha_of(&repo, "refs/heads/other");
+
+        let outcome = execute_promote(&repo, &pool, "integ", "other").await;
+
+        assert!(
+            matches!(outcome, Outcome::Failed { .. }),
+            "only the release branch is a promote target, got {outcome:?}"
+        );
+        assert_eq!(sha_of(&repo, "refs/heads/other"), other_before);
+    }
+
+    #[tokio::test]
+    async fn promote_success_queues_a_push_of_master_only() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let roots = space_free_tempdir("nucleos-gitexec-wt-");
+        let _env = WorktreeRootEnv::set(roots.path());
+        let (_container, repo, pool) = promote_fixture().await;
+        commit_on(&repo, "integ", &[("green.txt", "green\n")], "green work");
+        let green = sha_of(&repo, "refs/heads/integ");
+        crate::verify::postgate::mark_covered(&pool, "alpha", "integ", &green)
+            .await
+            .expect("integ is green");
+
+        let outcome = execute_promote(&repo, &pool, "integ", "master").await;
+        assert!(matches!(outcome, Outcome::Succeeded { .. }), "{outcome:?}");
+
+        let pushes: Vec<(String, String, String)> =
+            sqlx::query_as("SELECT op, args, origin FROM vcs_requests WHERE op = 'push'")
+                .fetch_all(&pool)
+                .await
+                .expect("read the queue");
+        assert_eq!(pushes.len(), 1, "exactly one push is queued: {pushes:?}");
+        let args: serde_json::Value = serde_json::from_str(&pushes[0].1).unwrap();
+        assert_eq!(args["branch"].as_str(), Some("master"));
+        assert_eq!(pushes[0].2, "daemon", "the daemon queued it");
+        let others: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM vcs_requests WHERE op = 'push' AND args LIKE '%integ%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(others, 0, "the integration branch is never pushed");
     }
 
     // ---- The `renumber-sequence` builtin through the executor (plan 2026-11-09, P6) -----------

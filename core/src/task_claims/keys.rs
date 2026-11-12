@@ -29,16 +29,21 @@ impl TaskKey {
         Self(super::MASTER_RED_KEY.to_owned())
     }
 
+    /// The one `release-diverged` incident key per project.
+    pub fn release_diverged() -> Self {
+        Self("release-diverged".to_owned())
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
     /// True for the keys only the daemon opens: `master-red` and `migration:`, `fmt:`, `conflict:`,
-    /// `direct-write:`.
+    /// `direct-write:` and `release-diverged`.
     pub fn is_machine(&self) -> bool {
         matches!(
             self.prefix(),
-            "master-red" | "migration" | "fmt" | "conflict" | "direct-write"
+            "master-red" | "migration" | "fmt" | "conflict" | "direct-write" | "release-diverged"
         )
     }
 
@@ -84,7 +89,7 @@ impl std::fmt::Display for KeyError {
             Self::Empty => write!(formatter, "empty task key"),
             Self::UnknownPrefix(prefix) => write!(
                 formatter,
-                "unknown task key prefix '{prefix}' (use master-red, test:, file:, spec-item:, topic:, migration:, fmt:, conflict: or direct-write:)"
+                "unknown task key prefix '{prefix}' (use master-red, test:, file:, spec-item:, topic:, migration:, fmt:, conflict:, direct-write: or release-diverged)"
             ),
             Self::Malformed { prefix, expected } => {
                 write!(formatter, "malformed '{prefix}' key: expected {expected}")
@@ -206,6 +211,12 @@ pub fn normalize(raw: &str, project_root: &Path) -> Result<TaskKey, KeyError> {
             }
             format!("direct-write:{body}")
         }
+        "release-diverged" => {
+            if !body.is_empty() {
+                return Err(malformed("release-diverged", "no body (one per project)"));
+            }
+            "release-diverged".to_owned()
+        }
         other => return Err(KeyError::UnknownPrefix(other.to_owned())),
     };
     Ok(TaskKey(key))
@@ -309,6 +320,20 @@ mod tests {
             key("master-red:abc123"),
             Err(KeyError::Malformed { .. })
         ));
+    }
+
+    #[test]
+    fn release_diverged_key_takes_no_body_and_is_machine() {
+        assert_eq!(key("release-diverged").unwrap(), "release-diverged");
+        assert_eq!(key("  RELEASE-DIVERGED ").unwrap(), "release-diverged");
+        assert!(matches!(
+            key("release-diverged:abc123"),
+            Err(KeyError::Malformed { .. })
+        ));
+        let parsed = normalize("release-diverged", Path::new("/repo")).unwrap();
+        assert!(parsed.is_machine(), "only the daemon opens it");
+        assert_eq!(parsed.prefix(), "release-diverged");
+        assert_eq!(parsed, TaskKey::release_diverged());
     }
 
     #[test]
