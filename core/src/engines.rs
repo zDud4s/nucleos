@@ -17,6 +17,11 @@ use crate::models::model_catalog::Discovered;
 
 pub mod agy;
 mod agy_setting;
+// Sibling files of this one (not under `engines/`): the descriptor data and the per-unit config dir.
+#[path = "engines_descriptor.rs"]
+pub mod descriptor;
+#[path = "engines_unit_config.rs"]
+pub mod unit_config;
 
 /// Engine ids, named once so the enums that mirror the table can match on them.
 pub const CLAUDE: &str = "claude";
@@ -422,6 +427,77 @@ mod tests {
     use crate::execution::runner::CommandRunner;
     use crate::models::model_catalog::Discovered;
     use std::sync::Arc;
+
+    #[test]
+    fn an_engine_descriptor_holds_binary_config_var_settings_flag_and_domains() {
+        let claude = descriptor::descriptor_for(CLAUDE).expect("claude has a built-in descriptor");
+        assert_eq!(claude.binary, "claude");
+        assert_eq!(claude.config_var, "CLAUDE_CONFIG_DIR");
+        assert_eq!(claude.settings_flag.as_deref(), Some("--settings"));
+        assert!(!claude.domains.is_empty());
+        let codex = descriptor::descriptor_for(CODEX).expect("codex has a built-in descriptor");
+        assert_eq!(codex.config_var, "CODEX_HOME");
+        assert_eq!(codex.settings_flag, None);
+
+        // A stored descriptor wins over the built-in, and a doc with two rows for one id is refused.
+        use crate::settings::testing::{self as settings_testing};
+        use crate::settings::{Document, Scope, Settings, Snapshot};
+        let stored = descriptor::EngineDescriptor {
+            binary: "C:/tools/claude.exe".to_owned(),
+            ..claude.clone()
+        };
+        let doc = descriptor::EngineDescriptorsDoc {
+            descriptors: vec![stored.clone()],
+        };
+        let _gate = settings_testing::install(Settings::from_snapshot(
+            Snapshot::default().with_document(&Scope::Machine, doc.clone()),
+        ));
+        assert_eq!(descriptor::descriptor_for(CLAUDE), Some(stored.clone()));
+        let twice = descriptor::EngineDescriptorsDoc {
+            descriptors: vec![stored.clone(), stored],
+        };
+        assert!(twice.finish().is_err(), "one id, one descriptor");
+    }
+
+    #[test]
+    fn a_descriptor_under_a_grant_is_refused() {
+        let grant = tempfile::TempDir::new().unwrap();
+        let binary = grant.path().join("bin").join("claude.exe");
+        std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        std::fs::write(&binary, b"").unwrap();
+        let under = descriptor::EngineDescriptor {
+            binary: binary.to_string_lossy().into_owned(),
+            ..descriptor::descriptor_for(CLAUDE).unwrap()
+        };
+        let grants = vec![grant.path().to_path_buf()];
+        let refusal = under.refuse_under_grants(&grants).unwrap_err();
+        assert!(refusal.contains("grant"), "{refusal}");
+
+        // The built-in (a bare name on PATH) and a binary elsewhere are fine.
+        let outside = tempfile::TempDir::new().unwrap();
+        let elsewhere = descriptor::EngineDescriptor {
+            binary: outside
+                .path()
+                .join("claude.exe")
+                .to_string_lossy()
+                .into_owned(),
+            ..under.clone()
+        };
+        assert!(elsewhere.refuse_under_grants(&grants).is_ok());
+        assert!(
+            descriptor::descriptor_for(CLAUDE)
+                .unwrap()
+                .refuse_under_grants(&grants)
+                .is_ok()
+        );
+
+        // Never under `.ai/`, grant or not.
+        let retired = descriptor::EngineDescriptor {
+            binary: "C:/repo/.ai/bin/claude.exe".to_owned(),
+            ..under
+        };
+        assert!(retired.refuse_under_grants(&[]).is_err());
+    }
 
     fn always_installed() -> bool {
         true
