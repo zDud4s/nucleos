@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 /// PURE: true when this decision falls in the holdout. The same inputs always give the same answer,
 /// so a recompute of a session never flips a decision in or out of the control group.
 pub fn is_held_out(d: &Decision, fraction: f64) -> bool {
-    if !(fraction > 0.0) {
+    if fraction.is_nan() || fraction <= 0.0 {
         return false;
     }
     if fraction >= 1.0 {
