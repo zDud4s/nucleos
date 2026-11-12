@@ -3,8 +3,6 @@
 //! sleeps for most of an hour, and `asyncRewake` turns its exit 2 into a wake-up instead of a
 //! refused stop.
 
-use std::path::Path;
-
 use serde_json::{Map, Value};
 
 use super::HOOK_INTERPRETER;
@@ -13,7 +11,7 @@ use super::HOOK_INTERPRETER;
 /// of its own because a worktree has to stay clean and no project tracks this file: the `.gitignore`
 /// inside hides it without a git process or an edit to anything the project owns.
 pub(super) const SCRIPT: &str = ".claude/hooks/nucleos/stop_timer.py";
-const SOURCE: &str = include_str!("../../../hooks/stop_timer.py");
+pub(super) const SOURCE: &str = include_str!("../../../hooks/stop_timer.py");
 
 /// Enforced by Claude Code on an `asyncRewake` hook, so it has to outlast the longest window the
 /// timer sleeps (55 minutes, `spec_loop_timer.py`).
@@ -38,17 +36,6 @@ pub(super) fn wire(hooks: &mut Map<String, Value>) {
             }]
         }));
     }
-}
-
-/// Runs before the settings that name the script are written: Python exits 2 on a script it cannot
-/// open, and on this entry exit 2 wakes the session, whose next stop would run it again.
-pub(super) fn write_script(dir: &Path) -> Result<(), String> {
-    let script = dir.join(SCRIPT);
-    let folder = script.parent().unwrap_or(dir);
-    std::fs::create_dir_all(folder)
-        .and_then(|()| std::fs::write(folder.join(".gitignore"), "*\n"))
-        .and_then(|()| std::fs::write(&script, SOURCE))
-        .map_err(|error| format!("could not write the stop timer: {error}"))
 }
 
 #[cfg(test)]

@@ -664,7 +664,6 @@ pub fn wire_classifier_hook_keeping_script(dir: &Path) -> Result<(), String> {
 const PROJECT_CLAUDE_PREFIX: &str = "${CLAUDE_PROJECT_DIR}/.claude/";
 
 /// The stop timer's script, written into the config dir beside the hook script.
-const STOP_TIMER_SOURCE: &str = include_str!("../../hooks/stop_timer.py");
 
 /// Where the hook, its settings and the stop timer live for the unit working in `dir`: the unit's
 /// own config dir, outside the tree (sandbox plan D4, D12). Written through the crossing with the
@@ -747,7 +746,7 @@ fn wire_hook(dir: &Path, overwrite_script: bool) -> Result<(), String> {
     unit::write_in(
         &config,
         &config.join("hooks").join("nucleos").join("stop_timer.py"),
-        STOP_TIMER_SOURCE.as_bytes(),
+        stop_timer::SOURCE.as_bytes(),
     )?;
     let body = format!(
         "{body}
