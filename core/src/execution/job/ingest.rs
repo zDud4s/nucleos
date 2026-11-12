@@ -582,7 +582,13 @@ pub const COUNCIL_FILE: &str = "council.md";
 pub(super) async fn archive_plans(worktree: &Path, round: i64) -> Vec<String> {
     let directory = worktree.join(crate::execution::worktree::ARTIFACTS_DIR);
     let archive = format!("plan-{round}.json");
-    if let Err(error) = tokio::fs::copy(directory.join(PLAN_FILE), directory.join(&archive)).await {
+    // Read and write both cross the D12 door: a link at `.nucleos` or at `plan-N.json` cannot make
+    // the owner's account copy a canary or overwrite a file outside the worktree.
+    if let Err(error) = crate::sandbox::artifacts::copy_in(
+        &directory.join(PLAN_FILE),
+        &directory.join(&archive),
+        worktree,
+    ) {
         tracing::warn!(%error, round, "could not archive a round's plan for the replan node");
     }
 
