@@ -393,16 +393,35 @@ mod tests {
         let pool = test_pool().await;
         bind_run(&pool, 7, "s-node", Some("n-leaf")).await;
         bind_run(&pool, 8, "s-plain", None).await;
-        let daemon = mapping("C:/p/proj/.nucleos/worktrees/run-7", None, None, "daemon_worktree");
+        let daemon = mapping(
+            "C:/p/proj/.nucleos/worktrees/run-7",
+            None,
+            None,
+            "daemon_worktree",
+        );
 
-        let node = tree_node_for_session(&pool, "s-node", &daemon).await.unwrap();
+        let node = tree_node_for_session(&pool, "s-node", &daemon)
+            .await
+            .unwrap();
         assert_eq!(node.mapping.kind, "tree_node");
         assert_eq!(node.mapping.project_id.as_deref(), Some("p1"));
         assert_eq!((node.run_id, node.node_id.as_str()), (7, "n-leaf"));
 
-        assert!(tree_node_for_session(&pool, "s-plain", &daemon).await.is_none());
-        assert!(tree_node_for_session(&pool, "s-unknown", &daemon).await.is_none());
+        assert!(
+            tree_node_for_session(&pool, "s-plain", &daemon)
+                .await
+                .is_none()
+        );
+        assert!(
+            tree_node_for_session(&pool, "s-unknown", &daemon)
+                .await
+                .is_none()
+        );
         let project = mapping("C:/p/proj", Some("p1"), None, "project");
-        assert!(tree_node_for_session(&pool, "s-node", &project).await.is_none());
+        assert!(
+            tree_node_for_session(&pool, "s-node", &project)
+                .await
+                .is_none()
+        );
     }
 }

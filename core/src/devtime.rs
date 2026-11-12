@@ -2250,7 +2250,10 @@ mod tests {
         .fetch_all(&h.pool)
         .await
         .unwrap();
-        assert!(findings.iter().any(|(rule, ..)| rule == "A1"), "{findings:?}");
+        assert!(
+            findings.iter().any(|(rule, ..)| rule == "A1"),
+            "{findings:?}"
+        );
         assert!(
             findings
                 .iter()

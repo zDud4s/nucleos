@@ -557,7 +557,11 @@ fn capped_for_fence(value: &Value) -> Value {
 /// Records the call the node scope fence refused as a `deny` row of `shadow_decisions`, so the
 /// refusal is read back with the call that caused it. Fail-open: a write error is logged and
 /// changes nothing about the answer the hook gives.
-pub(super) async fn record_fence_refusal(state: &AppState, run_id: i64, payload: &PreToolUsePayload) {
+pub(super) async fn record_fence_refusal(
+    state: &AppState,
+    run_id: i64,
+    payload: &PreToolUsePayload,
+) {
     let classification = crate::governance::classifier::Classification {
         decision: Decision {
             decision: "deny".to_owned(),

@@ -1773,7 +1773,11 @@ mod tests {
         let last = last.unwrap();
 
         assert_allowed(&last.decision, "the third identical read");
-        assert!(last.additional_context.is_none(), "{:?}", last.additional_context);
+        assert!(
+            last.additional_context.is_none(),
+            "{:?}",
+            last.additional_context
+        );
         assert_eq!(context_warning_rows(&state).await, 1);
         let again = answer(&state, run_id, "Read", read_input()).await;
         assert!(again.additional_context.is_none());
@@ -2763,7 +2767,11 @@ mod tests {
         assert_eq!(reason.as_deref(), Some("node_scope"));
         let stored = stored.as_deref().unwrap();
         assert!(stored.contains("shell"), "{stored}");
-        assert!(stored.len() < 3_000, "the input must be capped: {}", stored.len());
+        assert!(
+            stored.len() < 3_000,
+            "the input must be capped: {}",
+            stored.len()
+        );
     }
 
     /// F2: a warm `Read` of a node run does not read the run again. The joined read behind
