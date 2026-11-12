@@ -581,8 +581,8 @@ struct Published {
 ///
 /// Two arms, cheapest first. The table's own record (`vcs::settle_by_record`: a later identical
 /// success, a hand-off to a resolution) needs no git. The git arm then asks the repository about
-/// each open merge or rebase: a source branch that is gone settles as `source-gone`, a source
-/// already contained in its target as `merged`.
+/// each open merge or rebase: a source branch that is gone settles as `source-gone`, a target
+/// branch that is gone as `target-gone`, a source already contained in its target as `merged`.
 ///
 /// **Any git error leaves the row alone.** A repository that moved, a timeout, a missing path: none
 /// of those is evidence the work is done, and a row wrongly kept costs a glance where a row wrongly
@@ -636,15 +636,19 @@ async fn settle_moot(pool: &sqlx::SqlitePool) {
         let reason = match crate::execution::git_exec::branch_exists(root, source, deadline).await {
             Ok(false) => "source-gone",
             Ok(true) => {
+                // A target that is gone settles too: the resolver would otherwise mint a run every
+                // tick whose worktree cannot be based on it, failing before the attempt is claimed.
                 match crate::execution::git_exec::branch_exists(root, target, deadline).await {
-                    Ok(true) => {}
-                    _ => continue,
-                }
-                match crate::execution::git_exec::is_ancestor(root, ancestor, descendant, deadline)
+                    Ok(true) => match crate::execution::git_exec::is_ancestor(
+                        root, ancestor, descendant, deadline,
+                    )
                     .await
-                {
-                    Ok(true) => "merged",
-                    _ => continue,
+                    {
+                        Ok(true) => "merged",
+                        _ => continue,
+                    },
+                    Ok(false) => "target-gone",
+                    Err(_) => continue,
                 }
             }
             Err(_) => continue,
@@ -2819,6 +2823,29 @@ mod tests {
                 settlement_of(&pool, id).await.1.as_deref(),
                 Some("source-gone"),
                 "request {id} names a branch that is no longer `refs/heads/<b>`"
+            );
+        }
+    }
+
+    /// Request 513 in the field: `master` into `aut/integ`, a target that never existed. Unsettled,
+    /// the resolver minted a run every tick that failed at `git worktree add` before its attempt
+    /// was claimed, so the cap of three never applied.
+    #[tokio::test]
+    async fn a_merge_whose_target_is_gone_is_settled_as_target_gone() {
+        let (_container, repo) = moot_repo("nucleos-settle-target-gone-");
+        let pool = test_pool().await;
+        let merge = escalated_merge_into(&pool, "master", "aut/integ", false).await;
+        let rebase = escalated_rebase_of(&pool, "master", "feat/deleted-base").await;
+        rooted_at(&pool, merge, &repo).await;
+        rooted_at(&pool, rebase, &repo).await;
+
+        settle_moot(&pool).await;
+
+        for id in [merge, rebase] {
+            assert_eq!(
+                settlement_of(&pool, id).await.1.as_deref(),
+                Some("target-gone"),
+                "request {id} targets a branch that is no longer `refs/heads/<b>`"
             );
         }
     }
