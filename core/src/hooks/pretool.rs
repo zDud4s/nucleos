@@ -41,7 +41,7 @@ pub async fn pretooluse_decision(
                 tracing::warn!(run_id, %error, "pretooluse-decision: could not read the run's ticket notices");
                 Vec::new()
             });
-        parts.extend(node_context::warn_hint(&state, run_id).await);
+        parts.extend(node_context::hints(&state, run_id, &tool_name, &tool_input).await);
         (!parts.is_empty()).then(|| parts.join("\n\n"))
     } else {
         None
@@ -1741,6 +1741,96 @@ mod tests {
             .expect("a warn must reach the agent");
         assert!(context.contains("handoff"), "got {context:?}");
         assert!(!context.contains("split the rest"), "got {context:?}");
+    }
+
+    async fn context_warning_rows(state: &AppState) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM shadow_decisions WHERE reason = 'context_warning'")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn set_context_warning_mode(state: &AppState, mode: &str) {
+        sqlx::query(
+            "INSERT INTO devtime_action_state (action, rule_id, mode, since, changed_by)
+             VALUES ('inject', 'CTX', ?, '2026-11-12T00:00:00Z', 'test')",
+        )
+        .bind(mode)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_looping_node_run_in_shadow_records_the_warning_and_says_nothing() {
+        let state = test_state().await;
+        let (run_id, _, _) = seed_node_run(&state, "shadow", "leaf", Some(1_000)).await;
+
+        let mut last = None;
+        for _ in 0..3 {
+            last = Some(answer(&state, run_id, "Read", read_input()).await);
+        }
+        let last = last.unwrap();
+
+        assert_allowed(&last.decision, "the third identical read");
+        assert!(last.additional_context.is_none(), "{:?}", last.additional_context);
+        assert_eq!(context_warning_rows(&state).await, 1);
+        let again = answer(&state, run_id, "Read", read_input()).await;
+        assert!(again.additional_context.is_none());
+        assert_eq!(context_warning_rows(&state).await, 1, "said once");
+    }
+
+    #[tokio::test]
+    async fn a_looping_node_run_in_live_mode_gets_the_advisory_and_the_same_decision() {
+        let state = test_state().await;
+        set_context_warning_mode(&state, "live").await;
+        let (run_id, _, _) = seed_node_run(&state, "shadow", "leaf", Some(1_000)).await;
+
+        let first = answer(&state, run_id, "Read", read_input()).await;
+        answer(&state, run_id, "Read", read_input()).await;
+        let third = answer(&state, run_id, "Read", read_input()).await;
+
+        assert_eq!(third.decision.decision, first.decision.decision);
+        assert_eq!(third.decision.reason, first.decision.reason);
+        let context = third.additional_context.expect("the advisory");
+        assert!(context.contains("contract_request"), "got {context:?}");
+        assert!(context.contains("lib.rs"), "got {context:?}");
+        assert!(first.additional_context.is_none());
+        assert_eq!(context_warning_rows(&state).await, 0);
+    }
+
+    #[tokio::test]
+    async fn the_context_warning_ignores_a_run_without_a_node_and_a_mode_that_is_off() {
+        let state = test_state().await;
+        set_context_warning_mode(&state, "live").await;
+        let plain = seed_run(&state, "shadow", Some(1_000)).await;
+        for _ in 0..4 {
+            let answer = answer(&state, plain, "Read", read_input()).await;
+            assert!(answer.additional_context.is_none());
+        }
+        assert_eq!(context_warning_rows(&state).await, 0);
+
+        sqlx::query("UPDATE devtime_action_state SET mode = 'off'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let (run_id, _, _) = seed_node_run(&state, "shadow", "leaf", Some(1_000)).await;
+        for _ in 0..4 {
+            let answer = answer(&state, run_id, "Read", read_input()).await;
+            assert!(answer.additional_context.is_none());
+        }
+        assert_eq!(context_warning_rows(&state).await, 0);
+    }
+
+    #[tokio::test]
+    async fn two_identical_reads_of_a_node_run_say_nothing() {
+        let state = test_state().await;
+        let (run_id, _, _) = seed_node_run(&state, "shadow", "leaf", Some(1_000)).await;
+        for _ in 0..2 {
+            let answer = answer(&state, run_id, "Read", read_input()).await;
+            assert!(answer.additional_context.is_none());
+        }
+        assert_eq!(context_warning_rows(&state).await, 0);
     }
 
     /// An `open` ticket of the test project guarding `core/a.rs`, routed to the run whose node owns

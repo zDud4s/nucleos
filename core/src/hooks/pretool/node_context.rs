@@ -3,6 +3,21 @@
 
 use super::*;
 use crate::conductor::context::{Fill, allowed_for_node, handoff_path};
+
+mod loop_warning;
+
+/// Everything a node run is told on an allowed call: the warn-band hint, then the loop warning
+/// (live mode only; in shadow it only records). Fail-open: what cannot be read is not said.
+pub(super) async fn hints(
+    state: &AppState,
+    run_id: i64,
+    tool_name: &str,
+    tool_input: &Value,
+) -> Vec<String> {
+    let mut parts: Vec<String> = warn_hint(state, run_id).await.into_iter().collect();
+    parts.extend(loop_warning::loop_advisory(state, run_id, tool_name, tool_input).await);
+    parts
+}
 /// The context verdict of the node a run works for, `None` for a run without a node and when the
 /// verdict cannot be read (fail open: a read error must not stop a run, and the next call asks
 /// again). The limits come from the run's own `speed.yaml`; the model-window cap is not applied
