@@ -369,7 +369,7 @@ pub(super) fn make_link(source: &Path, link: &Path) -> Result<(), String> {
         let output = std::process::Command::new("cmd")
             .args(["/C", "mklink", "/J"])
             .arg(link.to_string_lossy().replace('/', "\\"))
-            .arg(source.to_string_lossy().replace('/', "\\"))
+            .arg(junction_target(source))
             .output()
             .map_err(|error| format!("mklink: {error}"))?;
         if output.status.success() {
@@ -387,6 +387,19 @@ pub(super) fn make_link(source: &Path, link: &Path) -> Result<(), String> {
         std::os::unix::fs::symlink(source, link)
             .map_err(|error| format!("{}: {error}", link.display()))
     }
+}
+
+/// The text a junction points at: backslashes, and an upper-case drive letter. A project root
+/// registered from VS Code reads `c:\...`, and a junction to `c:\...\shell\node_modules` made
+/// vitest load itself twice (once per drive spelling), failing every shell test file with "failed
+/// to find the current suite" (sandbox fase 1, leaf 1f, 2026-11-12).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn junction_target(source: &Path) -> String {
+    let mut text = source.to_string_lossy().replace('/', "\\");
+    if text.as_bytes().get(1) == Some(&b':') && text.as_bytes()[0].is_ascii_lowercase() {
+        text.replace_range(0..1, &text[0..1].to_ascii_uppercase());
+    }
+    text
 }
 
 /// A link name must stay inside the project: relative, with no `..`.
@@ -1108,6 +1121,16 @@ mod tests {
     use crate::execution::git_exec::testkit::{initialize_repo, space_free_tempdir};
     use crate::state::AppState;
     use crate::tree_job::commands::{self, CommandRun, Invocation, RunOutcome};
+
+    #[test]
+    fn a_junction_target_carries_an_upper_case_drive_letter() {
+        assert_eq!(
+            junction_target(Path::new("c:/Projects/x/shell/node_modules")),
+            r"C:\Projects\x\shell\node_modules"
+        );
+        assert_eq!(junction_target(Path::new(r"D:\y")), r"D:\y");
+        assert_eq!(junction_target(Path::new("rel/dir")), r"rel\dir");
+    }
     use crate::tree_job::decisions;
     use crate::tree_job::http;
     use crate::tree_job::model::{Branch, Manifest};
