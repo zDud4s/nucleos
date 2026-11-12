@@ -3,6 +3,7 @@ import { Link } from "@tanstack/react-router";
 import type { Proposal } from "../../data/system";
 import { useApproveProposal, useDeclineAction, useRejectProposal } from "../../data/waiting";
 import { Button, Callout, ConfirmButton, RelativeTime, Row, Rows } from "../../ui";
+import "./approval-card.css";
 import type { Reading } from "./reading";
 import { DecisionNotes, DecisionRefusal, QUEUES, Queue, Reasoning, dense, useOrderFreeze } from "./shared";
 import {
