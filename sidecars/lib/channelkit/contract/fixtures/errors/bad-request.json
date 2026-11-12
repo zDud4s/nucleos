@@ -1,2 +1,0 @@
-{ "error": "required_if", "at": "/conversation/parent",
-  "detail": "a thread conversation needs its parent" }

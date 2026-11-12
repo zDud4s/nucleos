@@ -1,1 +1,0 @@
-{ "kind": "telegram", "version": "2.0.0", "capabilities": { "max_text": 4096 } }
