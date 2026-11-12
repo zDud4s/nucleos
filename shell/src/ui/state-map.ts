@@ -57,6 +57,7 @@ export type StateDomain =
   | "rule"
   | "folder"
   | "knowledge"
+  | "context_fit"
   | "sidecar"
   | "channel";
 
@@ -366,6 +367,8 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
    * A healthy folder is the absence of a fact, so `ok` is absent rather than a map row nobody renders.
    */
   folder: { missing: { tone: "danger", label: "gone" }, unset: { tone: "off", label: "not named" } },
+  /** Context-fit verdicts are shell derivations of the analytics read: under is a fault, over and split are costs, fit is fine. */
+  context_fit: { under: { tone: "danger", label: "Under" }, over: { tone: "pending", label: "Over" }, split: { tone: "paused", label: "Split" }, fit: { tone: "active", label: "Fit" } },
   /** The four kinds are facts, not a severity scale, so all four use Stated Blue. */
   knowledge: { prompt: { tone: "info", label: "instruction" }, memory: { tone: "info", label: "fact" }, skill: { tone: "info", label: "how-to" }, subagent: { tone: "info", label: "delegation" } },
   /**

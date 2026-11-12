@@ -1,6 +1,6 @@
 import type { AnalyticsDays } from "../data/analytics";
 import { useContextFit, type ContextFitReport, type FitNode, type FitVerdict } from "../data/context-fit";
-import { Badge, ErrorNote, Skeleton, StaleNote, StatCard, Table, Td, Th, type BadgeTone } from "../ui";
+import { ErrorNote, Skeleton, StateBadge, StaleNote, StatCard, Table, Td, Th } from "../ui";
 import { Card, unreachable } from "./sections";
 
 /**
@@ -17,14 +17,13 @@ export interface ContextFitSectionProps {
 
 const EMPTY = "No tree nodes measured yet";
 
-const VERDICTS: { key: FitVerdict; label: string; meaning: string; tone: BadgeTone }[] = [
-  { key: "under", label: "Under", meaning: "too little context", tone: "danger" },
-  { key: "over", label: "Over", meaning: "too much context", tone: "pending" },
-  { key: "split", label: "Split", meaning: "bad division of the task", tone: "paused" },
-  { key: "fit", label: "Fit", meaning: "right context", tone: "active" },
+// Tones come from the state map's `context_fit` domain, never from here.
+const VERDICTS: { key: FitVerdict; label: string; meaning: string }[] = [
+  { key: "under", label: "Under", meaning: "too little context" },
+  { key: "over", label: "Over", meaning: "too much context" },
+  { key: "split", label: "Split", meaning: "bad division of the task" },
+  { key: "fit", label: "Fit", meaning: "right context" },
 ];
-
-const verdictOf = (key: FitVerdict) => VERDICTS.find((verdict) => verdict.key === key);
 
 export function ContextFitSection({ days, anchor }: ContextFitSectionProps) {
   const report = useContextFit(days);
@@ -112,12 +111,7 @@ function NodeRow({ node }: { node: FitNode }) {
         {node.verdicts
           .filter((verdict) => verdict !== "fit")
           .map((verdict) => {
-            const known = verdictOf(verdict);
-            return (
-              <Badge key={verdict} tone={known?.tone ?? "info"} title={known?.meaning}>
-                {known?.label ?? verdict}
-              </Badge>
-            );
+            return <StateBadge key={verdict} domain="context_fit" state={verdict} />;
           })}
       </Td>
       <Td>{node.evidence.map((item) => `${item.signal} ${item.value} vs ${item.threshold}`).join(" · ")}</Td>
