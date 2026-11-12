@@ -190,6 +190,7 @@ the contract, not a snapshot.
 | `remote/setup.rs` | Turning remote access on and off from the app: the closed list of Tailscale calls (never Funnel), the readers of `tailscale status` and `serve status`, finding the gateway page, and writing `remote.yaml`. |
 | `http/repo.rs` | Reading a project's tree (`/projects/{id}/ls`, `/cat`, `/grep`, `/log`, `/diff`…). |
 | `http/run_queue.rs` | Runs, the vcs queue, worktrees and the feed (`/runs/*`, `/vcs/*`, `/worktrees`, `/feed`). |
+| `http/sandbox.rs` | The OS sandbox's state and banner, read-only (`GET /sandbox/status`); no route changes the switch. |
 | `http/settings.rs` | Settings documents over HTTP (`/settings*`): index, read, history, PUT with optimistic versioning, rollback. |
 | `http/settings/devtime_void_tests.rs` | Test-only: a write or rollback of the `devtime` document voids the pending shadow rows decided under the old thresholds (`thresholds_hash`) and nothing else; the write itself is never in question. |
 | `http/tasks.rs` | The HTTP face of `task_claims`: `/tasks/*` per worktree (tools and runs; `/tasks/report` adds a report to a ticket without claiming it), `/projects/{id}/tasks*` for the owner only (hooks and the shell). A project off the roster is "claims unavailable", never a server error. |
