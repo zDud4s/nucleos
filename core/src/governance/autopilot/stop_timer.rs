@@ -25,9 +25,9 @@ pub(super) fn wire(hooks: &mut Map<String, Value>) {
     let Some(list) = hooks.get_mut("Stop").and_then(Value::as_array_mut) else {
         return;
     };
-    let already = list
-        .iter()
-        .any(|existing| serde_json::to_string(existing).is_ok_and(|text| text.contains(SCRIPT_TAIL)));
+    let already = list.iter().any(|existing| {
+        serde_json::to_string(existing).is_ok_and(|text| text.contains(SCRIPT_TAIL))
+    });
     if !already {
         list.push(serde_json::json!({
             "hooks": [{
