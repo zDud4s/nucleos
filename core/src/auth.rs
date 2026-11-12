@@ -610,7 +610,7 @@ fn grants(scope: &Scope, method: &Method, path: &str, target: Target) -> bool {
         Scope::Service(Service::Channel(_)) => listed(CHANNEL_ROUTES),
         Scope::Service(Service::Remote) => listed(REMOTE_GATEWAY_ROUTES),
         Scope::TeamRun(_) => listed(TEAM_ROUTES),
-        Scope::Assistant => listed(ASSISTANT_ROUTES),
+        Scope::Assistant => listed(crate::sandbox::assistant_routes::ASSISTANT_ROUTES),
         Scope::ApiToken(ApiTokenLevel::ReadOnly) => listed(READ_ONLY_ROUTES),
         Scope::ApiToken(ApiTokenLevel::RunCreating) => {
             listed(READ_ONLY_ROUTES) || listed(RUN_CREATING_ROUTES)
@@ -864,7 +864,6 @@ use remote::REMOTE_DEVICE_REFUSED_ROUTES;
 use remote::REMOTE_GATEWAY_ROUTES;
 pub use remote::{DEVICE_SESSION_HEADER, RemoteDevice, remote_device_permits};
 mod grave;
-use crate::sandbox::assistant_routes::ASSISTANT_ROUTES;
 pub use grave::{GRAVE_ROUTES, is_grave};
 
 fn is_param(segment: &str) -> bool {
@@ -7529,6 +7528,8 @@ mod tests {
             assert!(!manifest.id.contains([':', '.']));
         }
     }
+
+    use crate::sandbox::assistant_routes::ASSISTANT_ROUTES;
 
     /// Every route the owner alone may use: approving, landing, the brake and configuration.
     const OWNER_ONLY: &[(Method, &str)] = &[
