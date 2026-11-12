@@ -5,7 +5,7 @@ go 1.26
 // Pinned for the same reason the web sidecar pins it: the `go` line is a language floor and says
 // nothing about which stdlib gets compiled in. This process talks to a remote endpoint over TLS and
 // parses what comes back, so crypto/tls and encoding/json are its exposure.
-toolchain go1.26.6
+toolchain go1.27.4
 
 // No third-party dependency, and that is worth stating rather than leaving as an absence. It reads
 // two local files and calls one well-known endpoint, all of which the standard library does. The
