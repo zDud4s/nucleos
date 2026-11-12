@@ -308,7 +308,9 @@ pub(super) async fn fire_command(
                 format!("could not be measured: {error}"),
             ),
             Ok(words) => {
-                let ran = crate::gate::run_argv(
+                // The project's own checkout: queue-gate profile, never a writable grant.
+                let ran = crate::sandbox::gate::run_argv(
+                    crate::sandbox::RunMode::QueueGate,
                     &words,
                     &cwd,
                     &[],
