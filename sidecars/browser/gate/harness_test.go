@@ -298,6 +298,20 @@ func newSite(t *testing.T) *site {
 			</script>`)
 	})
 
+	// A script-made request with a method other than POST. The click is real; the verb is whatever
+	// the query says, so one page measures DELETE, PUT and PATCH alike.
+	mux.HandleFunc("/methodwrite", func(w http.ResponseWriter, r *http.Request) {
+		s.note(r)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprintf(w, `<!doctype html><title>methodwrite</title><h1 id=here>methodwrite</h1>
+			<button id=go>Send reply</button>
+			<script>
+				document.getElementById('go').addEventListener('click', () => {
+					fetch('/wrote', {method: %q, body: 'body=x'}).catch(() => {});
+				});
+			</script>`, r.URL.Query().Get("m"))
+	})
+
 	mux.HandleFunc("/download", func(w http.ResponseWriter, r *http.Request) {
 		s.note(r)
 		w.Header().Set("Content-Disposition", `attachment; filename="report.txt"`)
