@@ -13,9 +13,15 @@ use super::{
 /// did. Never the door that first wires a project: that stays somebody's decision, as does a project
 /// that switched hooks off or wired them only in its private `settings.local.json`.
 pub fn refresh_wired_hooks(dir: &Path) -> Result<bool, String> {
-    let settings = dir.join(".claude").join("settings.json");
-    let names_our_hook =
-        std::fs::read_to_string(settings).is_ok_and(|text| text.contains(HOOK_SCRIPT));
+    let config = crate::engines::unit_config::unit_config_dir(dir);
+    // The unit's own settings file is where `wire_classifier_hook` writes; the tree's copy is
+    // still honoured for a project wired before the hook left the tree.
+    let names_our_hook = [
+        crate::engines::unit_config::settings_file(&config),
+        dir.join(".claude").join("settings.json"),
+    ]
+    .into_iter()
+    .any(|settings| std::fs::read_to_string(settings).is_ok_and(|text| text.contains(HOOK_SCRIPT)));
     if !names_our_hook || !classifier_hook_is_wired(dir) {
         return Ok(false);
     }
@@ -62,17 +68,24 @@ pub async fn rewire_wired_projects(pool: &sqlx::SqlitePool) -> sqlx::Result<usiz
 /// keeps a current folder untouched: rewriting the script while a hook of another conversation is
 /// reading it would break that hook, and a project tracking these files would show a diff.
 pub fn classifier_hook_timeout_is_short(dir: &Path) -> bool {
-    std::fs::read_to_string(dir.join(".claude").join("settings.json"))
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .is_some_and(|settings| super::hook_timeout::a_timeout_is_short(&settings))
+    let config = crate::engines::unit_config::unit_config_dir(dir);
+    [
+        crate::engines::unit_config::settings_file(&config),
+        dir.join(".claude").join("settings.json"),
+    ]
+    .into_iter()
+    .filter_map(|path| std::fs::read_to_string(path).ok())
+    .filter_map(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+    .any(|settings| super::hook_timeout::a_timeout_is_short(&settings))
 }
 
 /// Whether the script in `dir` is not the one this daemon ships. Only boot asks this, when no CLI
 /// of this daemon is reading the script; a turn asks only about the timeout, since a worktree may
 /// check out a copy of its own and that would be rewritten on every turn.
 fn classifier_hook_script_is_stale(dir: &Path) -> bool {
-    std::fs::read_to_string(dir.join(HOOK_SCRIPT)).map_or(true, |script| script != HOOK_SOURCE)
+    let config = crate::engines::unit_config::unit_config_dir(dir);
+    std::fs::read_to_string(crate::engines::unit_config::hook_script(&config))
+        .map_or(true, |script| script != HOOK_SOURCE)
 }
 
 #[cfg(test)]
@@ -82,8 +95,16 @@ mod tests {
     use super::super::{stop_timer, wire_classifier_hook};
     use super::*;
 
+    fn config_of(dir: &Path) -> std::path::PathBuf {
+        crate::engines::unit_config::unit_config_dir(dir)
+    }
+
     fn settings_path(dir: &Path) -> std::path::PathBuf {
-        dir.join(".claude/settings.json")
+        crate::engines::unit_config::settings_file(&config_of(dir))
+    }
+
+    fn script_path(dir: &Path) -> std::path::PathBuf {
+        crate::engines::unit_config::hook_script(&config_of(dir))
     }
 
     fn timers_in(dir: &Path) -> usize {
@@ -106,7 +127,7 @@ mod tests {
             .unwrap()
             .retain(|entry| !entry.to_string().contains(stop_timer::SCRIPT));
         std::fs::write(settings_path(dir), settings.to_string()).unwrap();
-        std::fs::remove_dir_all(dir.join(stop_timer::SCRIPT).parent().unwrap()).unwrap();
+        std::fs::remove_dir_all(config_of(dir).join("hooks/nucleos")).unwrap();
     }
 
     #[test]
@@ -118,7 +139,11 @@ mod tests {
         assert_eq!(refresh_wired_hooks(root.path()), Ok(true));
 
         assert_eq!(timers_in(root.path()), 1);
-        assert!(root.path().join(stop_timer::SCRIPT).is_file());
+        assert!(
+            config_of(root.path())
+                .join("hooks/nucleos/stop_timer.py")
+                .is_file()
+        );
     }
 
     #[test]
@@ -128,13 +153,11 @@ mod tests {
         assert!(!root.path().join(".claude").exists());
 
         let own = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"mine"}]}]}}"#;
+        let own_settings = root.path().join(".claude/settings.json");
         std::fs::create_dir_all(root.path().join(".claude")).unwrap();
-        std::fs::write(settings_path(root.path()), own).unwrap();
+        std::fs::write(&own_settings, own).unwrap();
         assert_eq!(refresh_wired_hooks(root.path()), Ok(false));
-        assert_eq!(
-            std::fs::read_to_string(settings_path(root.path())).unwrap(),
-            own
-        );
+        assert_eq!(std::fs::read_to_string(&own_settings).unwrap(), own);
     }
 
     #[test]
@@ -157,6 +180,7 @@ mod tests {
         let root = tempfile::TempDir::new().unwrap();
         wire_classifier_hook(root.path()).unwrap();
         let claude = root.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
         std::fs::rename(
             settings_path(root.path()),
             claude.join("settings.local.json"),
@@ -171,12 +195,12 @@ mod tests {
     fn the_projects_own_copy_of_the_hook_script_is_kept() {
         let root = tempfile::TempDir::new().unwrap();
         wired_before_the_timer(root.path());
-        std::fs::write(root.path().join(HOOK_SCRIPT), "# the project's own\n").unwrap();
+        std::fs::write(script_path(root.path()), "# the project's own\n").unwrap();
 
         assert_eq!(refresh_wired_hooks(root.path()), Ok(true));
 
         assert_eq!(
-            std::fs::read_to_string(root.path().join(HOOK_SCRIPT)).unwrap(),
+            std::fs::read_to_string(script_path(root.path())).unwrap(),
             "# the project's own\n"
         );
     }

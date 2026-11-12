@@ -4694,7 +4694,11 @@ mod tests {
         )
         .await
         .unwrap();
-        std::fs::remove_file(bare.path().join(".claude/hooks/ask_daemon.py")).unwrap();
+        // Onboarding wires the hook in the unit's config dir now, outside the tree (sandbox D12).
+        std::fs::remove_file(crate::engines::unit_config::hook_script(
+            &crate::governance::autopilot::unit_config_dir(bare.path()),
+        ))
+        .unwrap();
         let (status, body) = workflow_call(
             state,
             "POST",

@@ -227,10 +227,8 @@ pub(super) fn mcp_config_path(council_id: &str) -> std::path::PathBuf {
         .chars()
         .filter(|character| character.is_ascii_alphanumeric() || *character == '-')
         .collect();
-    std::env::temp_dir().join(format!(
-        "nucleos-council-{}-{safe}.json",
-        std::process::id()
-    ))
+    let config = crate::engines::unit_config::chat_config_dir(&format!("council-{council_id}"));
+    crate::engines::unit_config::mcp_file(&config, &format!("{safe}.json"))
 }
 
 /// Starts a council: validates, checks the budget once, writes the record, and spawns the driver.
@@ -397,7 +395,7 @@ pub(super) fn write_mcp_config(path: &std::path::Path) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     let bytes = serde_json::to_vec(&crate::assistant_types::build_mcp_config(&exe))
         .map_err(|error| error.to_string())?;
-    crate::storage::write_atomic(path, &bytes).map_err(|error| error.to_string())
+    crate::engines::unit_config::write_mcp(path, &bytes)
 }
 
 /// A request's `{seat index: role}` as one entry per seat, or the refusal that names what is wrong.
