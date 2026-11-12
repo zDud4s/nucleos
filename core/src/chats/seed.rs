@@ -242,7 +242,9 @@ mod tests {
     fn a_chat_folder_wired_with_the_old_timeout_is_raised() {
         let (_root, _main, tree) = checkout_and_worktree(true);
         crate::governance::autopilot::wire_classifier_hook(&tree).unwrap();
-        let settings_path = tree.join(".claude/settings.json");
+        let settings_path = crate::engines::unit_config::settings_file(
+            &crate::engines::unit_config::unit_config_dir(&tree),
+        );
         let mut settings: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
         for event in ["PreToolUse", "PostToolUse", "PostToolUseFailure"] {
@@ -265,7 +267,12 @@ mod tests {
                 "{event}"
             );
         }
-        assert!(!unwired.join(".claude/settings.json").exists());
+        assert!(
+            !crate::engines::unit_config::settings_file(
+                &crate::engines::unit_config::unit_config_dir(&unwired)
+            )
+            .exists()
+        );
     }
 
     #[test]

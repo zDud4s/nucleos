@@ -1201,7 +1201,9 @@ mod tests {
     async fn a_docs_branch_is_refused_when_the_classifier_hook_is_not_wired() {
         let (state, app, caller, repo) = tree().await;
         // Un-wire the root: a settings file that registers nothing.
-        std::fs::write(repo.path.join(".claude/settings.json"), "{}").unwrap();
+        let config = crate::engines::unit_config::unit_config_dir(&repo.path);
+        std::fs::write(crate::engines::unit_config::settings_file(&config), "{}").unwrap();
+        let _ = std::fs::remove_file(repo.path.join(".claude/settings.json"));
         assert!(!crate::governance::autopilot::classifier_hook_is_wired(
             &repo.path
         ));
