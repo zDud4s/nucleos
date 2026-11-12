@@ -1059,32 +1059,7 @@ async fn merge(
     if parked_as_no_change(pool, job, name, parks).await? {
         return Ok(());
     }
-    // The path fence: a leaf may only merge what its declared `paths` own (and new migrations
-    // with a free number). A refusal is recorded on the branch and parks it for the owner. A git
-    // failure reading the diff fails open: the fence is a guard, and the queue's own merge reports
-    // a branch git cannot read.
-    let fenced = match job.manifest.branches.get(name) {
-        Some(held) => match super::nesting::merge_target(&job.manifest, name) {
-            Ok(target) => super::path_fence::check_branch(job, held, &target)
-                .await
-                .unwrap_or_else(|error| {
-                    tracing::warn!(job = %job.id, branch = name, %error, "the path fence could not read the diff");
-                    None
-                }),
-            Err(_) => None,
-        },
-        None => None,
-    };
-    if let Some(reason) = fenced {
-        tracing::warn!(job = %job.id, branch = name, %reason, "the path fence refused the merge");
-        if let Some(held) = job.manifest.branches.get_mut(name) {
-            held.extra
-                .insert("fence_refusal".to_owned(), Value::from(reason.clone()));
-        }
-        persist(pool, job).await?;
-        if let Some(node) = node {
-            parks.push((node, reason));
-        }
+    if super::path_fence::parked_by_fence(pool, job, name, node, parks).await? {
         return Ok(());
     }
     let repo = repo_of(pool, job).await?;

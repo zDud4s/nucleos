@@ -2,8 +2,11 @@
 //! must sit inside the `paths` it declared, and a new migration must not reuse a number the parent
 //! already has. Without it the reserved paths protect nothing and parallel leaves collide.
 
+use serde_json::Value;
+use sqlx::SqlitePool;
+
 use super::docs_paths::owned_glob_matches;
-use super::driver::git;
+use super::driver::{Park, git, persist};
 use super::model::Branch;
 use super::store::TreeJob;
 
@@ -105,6 +108,45 @@ pub(super) async fn check_branch(
                 branch.name
             )
         }))
+}
+
+/// The fence as the driver's merge step runs it: a leaf may only merge what its declared `paths`
+/// own (and new migrations with a free number). A refusal is recorded on the branch as
+/// `fence_refusal`, parks its node for the owner and answers `true`. A git failure reading the
+/// diff fails open: the fence is a guard, and the queue's own merge reports a branch git cannot
+/// read.
+pub(super) async fn parked_by_fence(
+    pool: &SqlitePool,
+    job: &mut TreeJob,
+    name: &str,
+    node: Option<String>,
+    parks: &mut Vec<Park>,
+) -> Result<bool, String> {
+    let fenced = match job.manifest.branches.get(name) {
+        Some(held) => match super::nesting::merge_target(&job.manifest, name) {
+            Ok(target) => check_branch(job, held, &target)
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!(job = %job.id, branch = name, %error, "the path fence could not read the diff");
+                    None
+                }),
+            Err(_) => None,
+        },
+        None => None,
+    };
+    let Some(reason) = fenced else {
+        return Ok(false);
+    };
+    tracing::warn!(job = %job.id, branch = name, %reason, "the path fence refused the merge");
+    if let Some(held) = job.manifest.branches.get_mut(name) {
+        held.extra
+            .insert("fence_refusal".to_owned(), Value::from(reason.clone()));
+    }
+    persist(pool, job).await?;
+    if let Some(node) = node {
+        parks.push((node, reason));
+    }
+    Ok(true)
 }
 
 fn lines(text: &str) -> Vec<String> {
