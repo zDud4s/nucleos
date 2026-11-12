@@ -13,6 +13,7 @@ import (
 
 	"nucleosbrowser/browser"
 	"nucleosbrowser/chrome"
+	"nucleosbrowser/fence"
 )
 
 // The write rule against the pinned Chromium, which is the only place it is settled.
@@ -343,6 +344,103 @@ func TestAKeyWithNoRefArmsNothing(t *testing.T) {
 	}
 	if place.reached("POST /wrote", settle) {
 		t.Fatal("a key sent wherever focus happened to be submitted a form")
+	}
+}
+
+// TestAnUngrantedOriginIsRefusedByNameWithTheWayForward.
+//
+// The refusal an agent can act on: it must say WHICH origin may not be written to, or the agent
+// cannot tell the person what to grant.
+func TestAnUngrantedOriginIsRefusedByNameWithTheWayForward(t *testing.T) {
+	place := newSite(t)
+	driver, _ := fenced(t, admitting(place))
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	session, err := driver.Open(ctx, browser.OpenRequest{URL: place.origin() + "/write"})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	snapshot, err := driver.Snapshot(ctx, session.ID, browser.SnapshotRequest{})
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	result, err := driver.Act(ctx, session.ID, browser.Action{Kind: browser.ActionClick, Ref: findRef(t, snapshot, "Send reply")})
+	if err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	if place.reached("POST /wrote", settle) {
+		t.Fatal("a form left an origin nobody granted")
+	}
+	if result.Outcome != browser.OutcomeRefused || result.Refusal == nil {
+		t.Fatalf("not refused: %+v", result)
+	}
+	if !strings.Contains(result.Refusal.Detail, place.origin()) {
+		t.Errorf("the refusal does not name the origin %q: %q", place.origin(), result.Refusal.Detail)
+	}
+	if !strings.Contains(result.Refusal.Detail, "browser_handoff") {
+		t.Errorf("the refusal does not name browser_handoff: %q", result.Refusal.Detail)
+	}
+}
+
+// TestScriptedDeletePutPatchDoNotLeaveOnAGrantedOrigin.
+//
+// The methods with a consequence that are not POST. Each is a script's request caused by a real
+// click on a granted origin, and each must be stopped.
+func TestScriptedDeletePutPatchDoNotLeaveOnAGrantedOrigin(t *testing.T) {
+	for _, method := range []string{"DELETE", "PUT", "PATCH"} {
+		t.Run(method, func(t *testing.T) {
+			place, driver, id := writing(t, "/methodwrite?m="+method)
+			ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+			defer cancel()
+
+			snapshot, err := driver.Snapshot(ctx, id, browser.SnapshotRequest{})
+			if err != nil {
+				t.Fatalf("snapshot: %v", err)
+			}
+			if _, err := driver.Act(ctx, id, browser.Action{Kind: browser.ActionClick, Ref: findRef(t, snapshot, "Send reply")}); err != nil {
+				t.Fatalf("act: %v", err)
+			}
+			if place.reached(method+" /wrote", settle) {
+				t.Fatalf("a script's %s left a granted origin", method)
+			}
+		})
+	}
+}
+
+// TestAnEphemeralProfileHasNoGrantsAndRefusesEveryWrite.
+//
+// An ephemeral profile has nobody to write as, so the form that leaves under a grant must not leave
+// here, and Writable is not even a legal setting for it.
+func TestAnEphemeralProfileHasNoGrantsAndRefusesEveryWrite(t *testing.T) {
+	place := newSite(t)
+	driver, _ := fenced(t, fence.Policy{Profile: fence.Ephemeral, Loopback: []string{place.origin()}})
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	session, err := driver.Open(ctx, browser.OpenRequest{URL: place.origin() + "/write"})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if session.Refusal != nil {
+		t.Fatalf("the page itself was refused, so this measures nothing: %+v", session.Refusal)
+	}
+	snapshot, err := driver.Snapshot(ctx, session.ID, browser.SnapshotRequest{})
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	result, err := driver.Act(ctx, session.ID, browser.Action{Kind: browser.ActionClick, Ref: findRef(t, snapshot, "Send reply")})
+	if err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	if place.reached("POST /wrote", settle) {
+		t.Fatal("a form left an ephemeral profile")
+	}
+	if result.Outcome != browser.OutcomeRefused {
+		t.Fatalf("the stopped submission was not reported as refused: %+v", result)
+	}
+	if len(result.Writes) != 0 {
+		t.Errorf("a refused submission was recorded as a write: %+v", result.Writes)
 	}
 }
 
