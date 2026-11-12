@@ -102,6 +102,10 @@ tests:
   no_test:
     # A measuring tool run by hand before and after a refactor; no gate calls it.
     - scripts/code_metrics.py
+    # Tree autonomy and leaf-context measurements, run by hand; no gate calls them or their test.
+    - scripts/leaf_initial_context.py
+    - scripts/tree_autonomy_rate.py
+    - scripts/metrics_tests/test_metrics_scripts.py
     - scripts/stage-bundle-bins.sh
     # Run by hand (or by the release workflow) inside a clean ubuntu/fedora box against downloaded assets.
     - scripts/smoke-bundle.sh
