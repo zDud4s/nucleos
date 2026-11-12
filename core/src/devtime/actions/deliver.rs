@@ -39,7 +39,12 @@ pub fn proposal_reasoning(template_id: &str, count: i64, cost_ms: i64) -> Option
 }
 
 /// PURE: the one summary line of an `inject` decision, from the closed template and two numbers.
-pub fn inject_line(template_id: &str, count: i64, cost_ms: i64, window_days: u32) -> Option<String> {
+pub fn inject_line(
+    template_id: &str,
+    count: i64,
+    cost_ms: i64,
+    window_days: u32,
+) -> Option<String> {
     let minutes = cost_ms / 60_000;
     match template_id {
         "inject.d3.v1" => Some(format!(
@@ -319,8 +324,14 @@ mod tests {
     async fn shadow_suppressed_and_demoted_rows_create_no_proposal() {
         let pool = crate::testdb::fresh_pool().await;
         set_mode(&pool, "propose", "F1", "live").await;
-        shadow(&pool, "propose", "F1", "shadow", "fire", "k-shadow", 600_000).await;
-        shadow(&pool, "propose", "F1", "live", "suppress", "k-supp", 600_000).await;
+        shadow(
+            &pool, "propose", "F1", "shadow", "fire", "k-shadow", 600_000,
+        )
+        .await;
+        shadow(
+            &pool, "propose", "F1", "live", "suppress", "k-supp", 600_000,
+        )
+        .await;
         // F2 has a pending live row, but the pair was rolled back to shadow.
         set_mode(&pool, "propose", "F2", "shadow").await;
         shadow(&pool, "propose", "F2", "live", "fire", "k-demoted", 600_000).await;
@@ -377,7 +388,9 @@ mod tests {
         shadow(&pool, "inject", "D3", "live", "fire", "D3|p1", 180_000).await;
         shadow(&pool, "inject", "D6", "live", "fire", "D6|p1", 600_000).await;
 
-        let got = inject_deliveries(&pool, &cfg(), "p1", NOW_MS).await.unwrap();
+        let got = inject_deliveries(&pool, &cfg(), "p1", NOW_MS)
+            .await
+            .unwrap();
         let rules: Vec<&str> = got.iter().map(|d| d.rule_id.as_str()).collect();
         assert_eq!(rules, ["D6", "D3"]);
         assert!(got[0].line.contains("10 min") && got[0].line.contains("background"));
@@ -407,7 +420,9 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        let got = inject_deliveries(&pool, &cfg(), "p1", NOW_MS).await.unwrap();
+        let got = inject_deliveries(&pool, &cfg(), "p1", NOW_MS)
+            .await
+            .unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].rule_id, "D3");
     }
