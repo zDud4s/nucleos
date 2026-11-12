@@ -261,7 +261,26 @@ pub async fn read_body(worktree: &Path, node: &Node) -> Result<Option<String>, L
             node.id
         )));
     }
-    match tokio::fs::read_to_string(worktree.join(path)).await {
+    // A node body is a file the unit could have written: it crosses the D12 door.
+    let read = crate::sandbox::artifacts::read_in(
+        &worktree.join(path),
+        worktree,
+        crate::sandbox::artifacts::ARTIFACT_CAP,
+    )
+    .and_then(|found| {
+        found.ok_or_else(|| {
+            crate::sandbox::CrossingError::Io(std::io::Error::from(std::io::ErrorKind::NotFound))
+        })
+    })
+    .and_then(|bytes| {
+        String::from_utf8(bytes.into_bytes()).map_err(|error| {
+            crate::sandbox::CrossingError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                error,
+            ))
+        })
+    });
+    match read {
         Ok(text) => Ok(Some(text)),
         Err(error) => Err(LaunchRefused::Invalid(format!(
             "node `{}`: body `{relative}` cannot be read from the worktree: {error}",

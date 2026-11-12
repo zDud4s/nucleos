@@ -152,6 +152,22 @@ pub fn agents_json(agents: &[Subagent]) -> String {
     serde_json::to_string(&object).unwrap_or_else(|_| "{}".to_string())
 }
 
+/// `--settings <file>` for the unit working in `cwd`, when its config dir holds a settings file
+/// (sandbox plan D12): the hook wiring is outside the tree, so the CLI is pointed at it. Empty for
+/// a run nobody wired, which has nothing to point at.
+pub fn settings_args(cwd: &std::path::Path) -> Vec<String> {
+    let settings = crate::engines::unit_config::settings_file(
+        &crate::engines::unit_config::unit_config_dir(cwd),
+    );
+    if !settings.is_file() {
+        return Vec::new();
+    }
+    let flag = crate::engines::descriptor::descriptor_for(crate::engines::CLAUDE)
+        .and_then(|descriptor| descriptor.settings_flag)
+        .unwrap_or_else(|| "--settings".to_string());
+    vec![flag, settings.to_string_lossy().into_owned()]
+}
+
 /// The full `claude` argument vector for one run. Pure, so the flags that decide what a run can
 /// reach are asserted in tests instead of inspected on a live process.
 pub fn cli_args(request: &RunRequest, model: &str) -> Vec<String> {
@@ -256,6 +272,11 @@ pub fn cli_args(request: &RunRequest, model: &str) -> Vec<String> {
     // job nodes.
     args.push("--permission-mode".to_string());
     args.push(request.permission.cli_value().to_string());
+    // The hook wiring lives in the unit's config dir, outside the tree (sandbox plan D12), so the
+    // CLI is pointed at it. Only when it exists: a run nobody wired has nothing to point at.
+    if let Some(cwd) = &request.cwd {
+        args.extend(settings_args(cwd));
+    }
     if let Some(path) = &request.mcp_config {
         args.push("--mcp-config".to_string());
         args.push(path.to_string_lossy().into_owned());

@@ -272,6 +272,29 @@ pub mod tests {
     use std::time::Duration;
     use tower::ServiceExt;
 
+    /// D7: only a refused sandbox stops a run; no backend and an owner's "off" both run as today.
+    #[test]
+    fn a_refused_status_stops_a_run_and_no_backend_does_not() {
+        use crate::sandbox::SandboxStatus;
+        let refused = SandboxStatus::Refused {
+            reason: "cannot start".to_owned(),
+        };
+        assert!(matches!(
+            sandbox_gate(&refused),
+            Err(CreateRunError::Invalid(_))
+        ));
+        for status in [
+            SandboxStatus::NoBackend,
+            SandboxStatus::Off,
+            SandboxStatus::Armed,
+        ] {
+            assert!(
+                sandbox_gate(&status).is_ok(),
+                "{status:?} must not stop a run"
+            );
+        }
+    }
+
     /// Spec B D11: every project and every run starts with the B off, independent of spec A's
     /// `judge`, and a mode nobody defined is refused. D6.1: a new run is its own root (NULL).
     #[tokio::test]

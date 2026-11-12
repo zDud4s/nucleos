@@ -660,9 +660,21 @@ pub fn wire_classifier_hook_keeping_script(dir: &Path) -> Result<(), String> {
     wire_hook(dir, false)
 }
 
+/// The placeholder every hook entry is built with; `wire_hook` swaps it for the unit config dir.
+const PROJECT_CLAUDE_PREFIX: &str = "${CLAUDE_PROJECT_DIR}/.claude/";
+
+/// Where the hook, its settings and the stop timer live for the unit working in `dir`: the unit's
+/// own config dir, outside the tree (sandbox plan D4, D12). Written through the crossing with the
+/// config dir as the only grant, so a unit never holds a hook it could rewrite.
+pub fn unit_config_dir(dir: &Path) -> std::path::PathBuf {
+    crate::engines::unit_config::unit_config_dir(dir)
+}
+
 fn wire_hook(dir: &Path, overwrite_script: bool) -> Result<(), String> {
-    let claude = dir.join(".claude");
-    let settings_path = claude.join("settings.json");
+    use crate::engines::unit_config as unit;
+    let config = unit::unit_config_dir(dir);
+    let settings_path = unit::settings_file(&config);
+    let script_path = unit::hook_script(&config);
 
     let mut settings: serde_json::Value = match std::fs::read_to_string(&settings_path) {
         Ok(text) if text.trim().is_empty() => serde_json::json!({}),
@@ -719,15 +731,21 @@ fn wire_hook(dir: &Path, overwrite_script: bool) -> Result<(), String> {
 
     let body = serde_json::to_string_pretty(&settings)
         .map_err(|error| format!("could not write the settings back: {error}"))?;
+    // The entries were built against `${CLAUDE_PROJECT_DIR}/.claude/`; the scripts are in the
+    // config dir now, named by an absolute path (a worktree's settings no longer ride along).
+    let config_prefix = format!("{}/", unit::command_path(&config));
+    let body = body.replace(PROJECT_CLAUDE_PREFIX, &config_prefix);
 
-    std::fs::create_dir_all(claude.join("hooks"))
-        .map_err(|error| format!("could not make {}: {error}", claude.display()))?;
-    let script_path = claude.join("hooks").join("ask_daemon.py");
     if overwrite_script || !script_path.is_file() {
-        std::fs::write(&script_path, HOOK_SOURCE)
-            .map_err(|error| format!("could not write the hook script: {error}"))?;
+        unit::write_in(&config, &script_path, HOOK_SOURCE.as_bytes())?;
     }
-    stop_timer::write_script(dir)?;
+    // Before the settings that name it: Python exits 2 on a script it cannot open, and on the
+    // timer's entry exit 2 wakes the session.
+    unit::write_in(
+        &config,
+        &config.join("hooks").join("nucleos").join("stop_timer.py"),
+        stop_timer::SOURCE.as_bytes(),
+    )?;
     let body = format!(
         "{body}
 "
@@ -736,10 +754,7 @@ fn wire_hook(dir: &Path, overwrite_script: bool) -> Result<(), String> {
     if std::fs::read_to_string(&settings_path).ok().as_deref() == Some(body.as_str()) {
         return Ok(());
     }
-    std::fs::write(&settings_path, body)
-        .map_err(|error| format!("could not write {}: {error}", settings_path.display()))?;
-
-    Ok(())
+    unit::write_in(&config, &settings_path, body.as_bytes())
 }
 
 /// The tools whose calls the classifier has to see for the barrier to mean anything.
@@ -786,14 +801,21 @@ pub fn classifier_hook_is_wired(dir: &Path) -> bool {
     // `.claude/settings.local.json`, so the answer comes from both: the wiring may live in either,
     // and `disableAllHooks` in either one switches every hook off. A missing or unparsable file
     // contributes nothing (it neither wires the hook nor disables it).
-    let read = |name: &str| -> Option<serde_json::Value> {
-        let text = std::fs::read_to_string(dir.join(".claude").join(name)).ok()?;
+    // The unit's own `--settings` file comes first (where `wire_classifier_hook` writes now); the
+    // tree's two files follow because the CLI still merges them and either may switch hooks off.
+    let config = crate::engines::unit_config::unit_config_dir(dir);
+    let read = |path: std::path::PathBuf| -> Option<serde_json::Value> {
+        let text = std::fs::read_to_string(path).ok()?;
         serde_json::from_str(&text).ok()
     };
-    let files: Vec<serde_json::Value> = ["settings.json", "settings.local.json"]
-        .into_iter()
-        .filter_map(read)
-        .collect();
+    let files: Vec<serde_json::Value> = [
+        config.join("settings.json"),
+        dir.join(".claude").join("settings.json"),
+        dir.join(".claude").join("settings.local.json"),
+    ]
+    .into_iter()
+    .filter_map(read)
+    .collect();
 
     // Hooks switched off wholesale classify nothing, whatever is registered.
     if files.iter().any(|settings| {
@@ -835,7 +857,9 @@ pub fn classifier_hook_is_wired(dir: &Path) -> bool {
             })
     });
 
-    registered && dir.join(HOOK_SCRIPT).is_file()
+    registered
+        && (dir.join(HOOK_SCRIPT).is_file()
+            || crate::engines::unit_config::hook_script(&config).is_file())
 }
 
 /// Resolves `.` and `..` lexically, never touching the disk and never producing a `\\?\` verbatim
@@ -1868,10 +1892,21 @@ pub mod tests {
         );
     }
 
+    /// Where wiring puts the settings of the unit working in `dir`: its config dir, not the tree.
+    fn settings_of(dir: &Path) -> std::path::PathBuf {
+        crate::engines::unit_config::settings_file(&unit_config_dir(dir))
+    }
+
+    /// Where wiring puts the hook script of the unit working in `dir`.
+    fn script_of(dir: &Path) -> std::path::PathBuf {
+        crate::engines::unit_config::hook_script(&unit_config_dir(dir))
+    }
+
+    /// Pre-seeds the unit's settings, which is the file wiring reads and carries across.
     fn write_settings(root: &TempDir, contents: &str) {
-        let claude_dir = root.path().join(".claude");
-        fs::create_dir_all(&claude_dir).unwrap();
-        fs::write(claude_dir.join("settings.json"), contents).unwrap();
+        let path = settings_of(root.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
     }
 
     /// Settings wired to THIS daemon's hook, plus the script on disk — both of which activation
@@ -1881,7 +1916,7 @@ pub mod tests {
             root,
             r#"{"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"python \"${CLAUDE_PROJECT_DIR}/.claude/hooks/ask_daemon.py\""}]}]}}"#,
         );
-        let hooks_dir = root.path().join(".claude/hooks");
+        let hooks_dir = script_of(root.path()).parent().unwrap().to_path_buf();
         fs::create_dir_all(&hooks_dir).unwrap();
         fs::write(hooks_dir.join("ask_daemon.py"), "# hook").unwrap();
     }
@@ -1907,14 +1942,14 @@ pub mod tests {
         let old = TempDir::new().unwrap();
         let bare = TempDir::new().unwrap();
         wire_classifier_hook(old.path()).unwrap();
-        let settings_path = old.path().join(".claude/settings.json");
+        let settings_path = settings_of(old.path());
         let mut settings: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
         for event in ["PreToolUse", "PostToolUse", "PostToolUseFailure"] {
             settings["hooks"][event][0]["hooks"][0]["timeout"] = serde_json::json!(3600);
         }
         fs::write(&settings_path, settings.to_string()).unwrap();
-        let script = old.path().join(".claude/hooks/ask_daemon.py");
+        let script = script_of(old.path());
         fs::write(&script, "# an older script").unwrap();
         for (id, root) in [("old", old.path()), ("bare", bare.path())] {
             sqlx::query(
@@ -1949,7 +1984,7 @@ pub mod tests {
         let pool = test_pool().await;
         let root = TempDir::new().unwrap();
         wire_classifier_hook(root.path()).unwrap();
-        let script = root.path().join(".claude/hooks/ask_daemon.py");
+        let script = script_of(root.path());
         fs::write(&script, "# an older script").unwrap();
         sqlx::query(
             "INSERT INTO autopilot_state (project_id, mode, project_root) VALUES ('p', 'active', ?)",
@@ -1970,10 +2005,8 @@ pub mod tests {
         let root = TempDir::new().unwrap();
         wire_classifier_hook(root.path()).unwrap();
 
-        let settings: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(root.path().join(".claude/settings.json")).unwrap(),
-        )
-        .unwrap();
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(settings_of(root.path())).unwrap()).unwrap();
         for event in ["PreToolUse", "PostToolUse", "PostToolUseFailure"] {
             let timeout = settings["hooks"][event][0]["hooks"][0]["timeout"].as_u64();
             assert_eq!(timeout, Some(HOOK_TIMEOUT_SECONDS), "{event}");
@@ -2016,10 +2049,9 @@ pub mod tests {
 
             wire_classifier_hook(root.path()).unwrap();
 
-            let settings: serde_json::Value = serde_json::from_str(
-                &fs::read_to_string(root.path().join(".claude/settings.json")).unwrap(),
-            )
-            .unwrap();
+            let settings: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(settings_of(root.path())).unwrap())
+                    .unwrap();
             let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
             let ours = entries
                 .iter()
@@ -2055,17 +2087,16 @@ pub mod tests {
                 })
                 .to_string(),
             );
-            let hooks_dir = root.path().join(".claude/hooks");
+            let hooks_dir = script_of(root.path()).parent().unwrap().to_path_buf();
             fs::create_dir_all(&hooks_dir).unwrap();
             fs::write(hooks_dir.join("ask_daemon.py"), "# hook").unwrap();
 
             assert!(classifier_hook_is_wired(root.path()), "{interpreter}");
             wire_classifier_hook(root.path()).unwrap();
 
-            let settings: serde_json::Value = serde_json::from_str(
-                &fs::read_to_string(root.path().join(".claude/settings.json")).unwrap(),
-            )
-            .unwrap();
+            let settings: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(settings_of(root.path())).unwrap())
+                    .unwrap();
             let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
             let ours = entries
                 .iter()
@@ -2863,8 +2894,8 @@ pub mod tests {
             &root,
             r#"{"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"python \"${CLAUDE_PROJECT_DIR}/.claude/hooks/ask_daemon.py\""}]}]}}"#,
         );
-        std::fs::create_dir_all(root.path().join(".claude/hooks")).unwrap();
-        std::fs::write(root.path().join(".claude/hooks/ask_daemon.py"), "#").unwrap();
+        std::fs::create_dir_all(script_of(root.path()).parent().unwrap()).unwrap();
+        std::fs::write(script_of(root.path()), "#").unwrap();
 
         set_project_mode(
             &pool,
@@ -3155,7 +3186,7 @@ pub mod tests {
         assert!(classifier_hook_is_wired(root.path()));
         // And the script is this daemon's, not a stub: the gate checks the file exists, and a hook
         // that cannot answer classifies nothing.
-        let written = fs::read_to_string(root.path().join(".claude/hooks/ask_daemon.py")).unwrap();
+        let written = fs::read_to_string(script_of(root.path())).unwrap();
         assert!(
             written.contains("PreToolUse"),
             "the hook script was not written"
@@ -3171,10 +3202,8 @@ pub mod tests {
 
         wire_classifier_hook(root.path()).unwrap();
 
-        let settings: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(root.path().join(".claude/settings.json")).unwrap(),
-        )
-        .unwrap();
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(settings_of(root.path())).unwrap()).unwrap();
         for event in ["PreToolUse", "PostToolUse", "PostToolUseFailure"] {
             let entries = settings["hooks"][event]
                 .as_array()
@@ -3198,10 +3227,8 @@ pub mod tests {
         wire_classifier_hook(root.path()).unwrap();
         wire_classifier_hook(root.path()).unwrap();
 
-        let settings: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(root.path().join(".claude/settings.json")).unwrap(),
-        )
-        .unwrap();
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(settings_of(root.path())).unwrap()).unwrap();
         let tool_command = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"].clone();
         for event in SESSION_EVENTS {
             let entries = settings["hooks"][event]
@@ -3218,10 +3245,7 @@ pub mod tests {
     }
 
     fn wired_settings(root: &TempDir) -> serde_json::Value {
-        serde_json::from_str(
-            &fs::read_to_string(root.path().join(".claude/settings.json")).unwrap(),
-        )
-        .unwrap()
+        serde_json::from_str(&fs::read_to_string(settings_of(root.path())).unwrap()).unwrap()
     }
 
     #[test]
@@ -3287,10 +3311,8 @@ pub mod tests {
 
         wire_classifier_hook(root.path()).unwrap();
 
-        let settings: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(root.path().join(".claude/settings.json")).unwrap(),
-        )
-        .unwrap();
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(settings_of(root.path())).unwrap()).unwrap();
         let stop = settings["hooks"]["Stop"].as_array().unwrap();
         assert_eq!(stop.len(), 3, "their hook, ours and the timer: {stop:?}");
         assert!(
@@ -3315,10 +3337,8 @@ pub mod tests {
 
         wire_classifier_hook(root.path()).unwrap();
 
-        let settings: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(root.path().join(".claude/settings.json")).unwrap(),
-        )
-        .unwrap();
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(settings_of(root.path())).unwrap()).unwrap();
         // Somebody else's settings file. Taking the tools is not a licence to rewrite the rest of
         // it, and a wiring that ate a person's PostToolUse hook would be a worse bug than the one
         // it fixes.
@@ -3363,10 +3383,8 @@ pub mod tests {
         wire_classifier_hook(root.path()).unwrap();
         wire_classifier_hook(root.path()).unwrap();
 
-        let settings: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(root.path().join(".claude/settings.json")).unwrap(),
-        )
-        .unwrap();
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(settings_of(root.path())).unwrap()).unwrap();
         let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
         let ours = entries
             .iter()
@@ -3390,7 +3408,7 @@ pub mod tests {
         // one written by a version of the CLI this daemon has never seen — and replacing it would
         // destroy settings nobody asked to lose in order to add one hook.
         assert_eq!(
-            fs::read_to_string(root.path().join(".claude/settings.json")).unwrap(),
+            fs::read_to_string(settings_of(root.path())).unwrap(),
             "{ this is not json"
         );
     }
@@ -3417,9 +3435,55 @@ pub mod tests {
 
         let bare = TempDir::new().unwrap();
         wire_classifier_hook_keeping_script(bare.path()).unwrap();
-        assert!(bare.path().join(".claude/settings.json").is_file());
-        assert!(bare.path().join(HOOK_SCRIPT).is_file());
+        assert!(settings_of(bare.path()).is_file());
+        assert!(script_of(bare.path()).is_file());
+        assert!(!bare.path().join(".claude").exists(), "nothing in the tree");
         assert!(classifier_hook_is_wired(bare.path()));
+    }
+
+    /// Sandbox plan D12: the unit can write its tree, so the hook and the settings that name it
+    /// cannot live there. Wiring puts them in the unit's config dir, through the crossing.
+    #[test]
+    fn wiring_the_hook_writes_nothing_inside_the_tree() {
+        let tree = TempDir::new().unwrap();
+
+        wire_classifier_hook(tree.path()).unwrap();
+
+        assert_eq!(
+            fs::read_dir(tree.path()).unwrap().count(),
+            0,
+            "the tree must stay empty"
+        );
+        assert!(settings_of(tree.path()).is_file());
+        assert!(script_of(tree.path()).is_file());
+        let settings = fs::read_to_string(settings_of(tree.path())).unwrap();
+        let script = crate::engines::unit_config::command_path(&script_of(tree.path()));
+        assert!(
+            settings.contains(&script),
+            "the hook command is the absolute script in the config dir: {settings}"
+        );
+        assert!(!settings.contains("${CLAUDE_PROJECT_DIR}"));
+        assert!(classifier_hook_is_wired(tree.path()));
+    }
+
+    /// The CLI only reads the config-dir settings when told to, so a wired run gets `--settings`.
+    #[test]
+    fn the_claude_run_gets_settings_from_its_config_dir() {
+        let tree = TempDir::new().unwrap();
+        assert!(
+            crate::execution::runner::settings_args(tree.path()).is_empty(),
+            "an unwired run has nothing to point at"
+        );
+
+        wire_classifier_hook(tree.path()).unwrap();
+
+        assert_eq!(
+            crate::execution::runner::settings_args(tree.path()),
+            vec![
+                "--settings".to_string(),
+                settings_of(tree.path()).to_string_lossy().into_owned()
+            ]
+        );
     }
 
     fn wire_with(root: &TempDir, matcher: Option<&str>, extra: &str) {
@@ -3430,7 +3494,7 @@ pub mod tests {
                 r#"{{{extra}"hooks":{{"PreToolUse":[{{{matcher}"hooks":[{{"type":"command","command":"python \"${{CLAUDE_PROJECT_DIR}}/.claude/hooks/ask_daemon.py\""}}]}}]}}}}"#
             ),
         );
-        let hooks_dir = root.path().join(".claude/hooks");
+        let hooks_dir = script_of(root.path()).parent().unwrap().to_path_buf();
         fs::create_dir_all(&hooks_dir).unwrap();
         fs::write(hooks_dir.join("ask_daemon.py"), "# hook").unwrap();
     }
@@ -3488,6 +3552,7 @@ pub mod tests {
         let root = TempDir::new().unwrap();
         wire_with(&root, Some("*"), "");
         assert!(classifier_hook_is_wired(root.path()));
+        fs::create_dir_all(root.path().join(".claude")).unwrap();
         fs::write(
             root.path().join(".claude/settings.local.json"),
             r#"{"disableAllHooks":true}"#,

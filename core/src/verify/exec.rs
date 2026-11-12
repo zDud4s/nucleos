@@ -18,7 +18,7 @@ use tokio::sync::Notify;
 
 use crate::config::VerifyConfig;
 use crate::execution::admission::{AdmissionBook, VerifyGrant};
-use crate::gate::{self, ArgvOutcome};
+use crate::gate::ArgvOutcome;
 use crate::tests_map::{self, MapState};
 use crate::verify::runs::{self as verify_runs, Claimed, Request, State, Submitted};
 use crate::verify::{live, resolve};
@@ -521,7 +521,16 @@ async fn run_unit(executor: Arc<Executor>, claimed: Claimed, mut reservation: Re
     } else {
         executor.limits.unit_timeout_seconds().saturating_mul(1000)
     };
-    let outcome = gate::run_argv(
+    // Post-merge and idle-probe units run in the owner's integration checkout (queue gate); every
+    // other unit measures a run's own worktree.
+    let mode = match claimed.requested_by.as_str() {
+        verify_runs::REQUESTED_BY_POSTGATE | verify_runs::REQUESTED_BY_PROBE => {
+            crate::sandbox::RunMode::QueueGate
+        }
+        _ => crate::sandbox::RunMode::RunGate,
+    };
+    let outcome = crate::sandbox::gate::run_argv(
+        mode,
         &argv,
         Path::new(&claimed.worktree),
         &env,

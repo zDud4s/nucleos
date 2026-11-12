@@ -186,7 +186,15 @@ async fn run_one(
 
     let env = step_env(run, step);
     let timeout = Duration::from_secs(step.timeout_secs.unwrap_or(DEFAULT_STEP_TIMEOUT_SECS));
-    let ran = crate::gate::run_argv(&argv, run.integration, &env, timeout).await;
+    // The integration worktree is the owner's: queue-gate profile, never a writable grant.
+    let ran = crate::sandbox::gate::run_argv(
+        crate::sandbox::RunMode::QueueGate,
+        &argv,
+        run.integration,
+        &env,
+        timeout,
+    )
+    .await;
     let summary = last_bytes(&ran.tail, STEP_SUMMARY_BYTES);
     let why = if ran.timed_out {
         Some("timed out".to_owned())

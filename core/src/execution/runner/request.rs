@@ -456,6 +456,123 @@ pub struct RunRequest {
     pub background_tasks: bool,
 }
 
+/// The minimal [`crate::sandbox::RunScope`] of a CLI run, built from its request (spec D3).
+///
+/// Only what the request says: its folder, and its `NUCLEOS_*` variables. Nothing is armed yet, so
+/// the profile this yields is not enforced and its `env` is not applied to the child.
+pub(super) fn sandbox_scope(request: &RunRequest) -> crate::sandbox::RunScope {
+    crate::sandbox::RunScope {
+        mode: crate::sandbox::RunMode::Worktree,
+        unit_dir: request.cwd.clone().unwrap_or_default(),
+        main_checkout: None,
+        main_repo_objects: None,
+        tree_caches: Vec::new(),
+        toolchain: Vec::new(),
+        api_domains: Vec::new(),
+        registry_domains: Vec::new(),
+        run_env: request.env.iter().cloned().collect(),
+        inherit: Default::default(),
+        proxy: None,
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// CLI launches made through [`start_cli`] on this thread.
+    static CLI_LAUNCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many CLI runs this thread has started through the door. Test seam: a runner test drives a
+/// current-thread runtime, so the launch happens on the test's own thread.
+#[cfg(test)]
+pub(super) fn cli_launches_on_this_thread() -> usize {
+    CLI_LAUNCHES.with(std::cell::Cell::get)
+}
+
+/// Starts a CLI runner's configured command through the sandbox door and returns the child and the
+/// killer of its tree. The one launch of `claude`, `codex` and `agy`.
+pub(super) fn start_cli(
+    command: Command,
+    request: &RunRequest,
+) -> std::io::Result<crate::sandbox::Contained> {
+    #[cfg(test)]
+    CLI_LAUNCHES.with(|count| count.set(count.get() + 1));
+    let profile = crate::sandbox::profile_for(&sandbox_scope(request));
+    crate::sandbox::spawn_prepared(command, &profile)
+}
+
+/// A request with every control at its neutral value, for the runners' launch tests.
+#[cfg(test)]
+pub(super) fn neutral_request(prompt: &str) -> RunRequest {
+    RunRequest {
+        prompt: prompt.to_string(),
+        env: Vec::new(),
+        cwd: None,
+        permission: Permission::Default,
+        resume_session_id: None,
+        mcp_config: None,
+        mcp_job: None,
+        mcp_team_run: None,
+        tool_policy: ToolPolicy::Unrestricted,
+        progress_timeout: None,
+        max_turns: None,
+        session_id: None,
+        fork_session: false,
+        include_partial_messages: false,
+        images: Vec::new(),
+        steerable: false,
+        classifier_governs_tools: false,
+        mcp_servers: Vec::new(),
+        model: None,
+        effort: None,
+        fallback_model: Vec::new(),
+        add_dirs: Vec::new(),
+        max_budget_usd: None,
+        agents: Vec::new(),
+        append_system_prompt: None,
+        denied_tools: Vec::new(),
+        session_name: None,
+        context_window: None,
+        messages: None,
+        request_tx: None,
+        allowed_mcp_tools: None,
+        background_tasks: false,
+    }
+}
+
+/// Drives `run` on a current-thread runtime, so the launch happens on the calling thread, and
+/// returns how many CLI launches it made through the door. The run itself is expected to fail
+/// (no such binary): only the launch is observed.
+#[cfg(test)]
+pub(super) fn launches_during<F: std::future::Future>(run: F) -> usize {
+    let before = cli_launches_on_this_thread();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(run);
+    cli_launches_on_this_thread() - before
+}
+
+/// How many CLI launches `run` makes through the door while `bin_var` names a program that does
+/// not exist: the launch is attempted (and counted) and fails, so no real CLI ever starts. Holds
+/// the process-wide environment lock for the duration.
+#[cfg(test)]
+pub(super) fn launches_with_missing_bin<F: std::future::Future>(bin_var: &str, run: F) -> usize {
+    let _lock = crate::execution::worktree::test_env_lock();
+    let previous = std::env::var_os(bin_var);
+    let missing = std::env::temp_dir().join("nucleos-no-such-cli-binary");
+    unsafe { std::env::set_var(bin_var, &missing) };
+    let launches = launches_during(run);
+    unsafe {
+        match previous {
+            Some(value) => std::env::set_var(bin_var, value),
+            None => std::env::remove_var(bin_var),
+        }
+    }
+    launches
+}
+
 /// A picture travelling with a turn, as the API carries one.
 ///
 /// Base64 rather than bytes, because base64 is what goes on the wire in both directions: it arrives

@@ -201,7 +201,8 @@ impl Driver {
                 None,
                 crate::speed::Capacity::solo(),
             ),
-            cwd: None,
+            // An empty folder of the council's own, so a seat never inherits the daemon's checkout.
+            cwd: seat_cwd(&self.id),
             permission: crate::execution::runner::Permission::Default,
             resume_session_id: None,
             mcp_config: with_tools.then(|| mcp_config_path(&self.id)),
@@ -593,5 +594,24 @@ impl Driver {
             answer: String::new(),
             error: None,
         })
+    }
+}
+
+/// The working directory of a council seat: an empty folder of the council's own, so the seat never
+/// inherits the daemon's checkout. `None` (the old behaviour) only if the folder cannot be made.
+fn seat_cwd(council_id: &str) -> Option<std::path::PathBuf> {
+    crate::sandbox::empty_dir::empty_run_dir("council", council_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_council_seat_starts_in_an_empty_folder_of_its_own() {
+        let dir = seat_cwd("council-test-seat-cwd").expect("the folder should be made");
+        assert!(dir.is_dir());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        assert_ne!(Some(dir), std::env::current_dir().ok());
     }
 }

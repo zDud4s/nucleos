@@ -495,6 +495,17 @@ pub async fn create_no_tools_run(
     .await
 }
 
+/// D7: a backend that exists but cannot start refuses the run rather than starting it uncontained.
+/// `NoBackend` and `Off` both run as today; nothing in the daemon arms the sandbox yet.
+pub fn sandbox_gate(status: &crate::sandbox::SandboxStatus) -> Result<(), CreateRunError> {
+    if status.refuses_runs() {
+        return Err(CreateRunError::Invalid(
+            "the OS sandbox is refused, so no run starts uncontained",
+        ));
+    }
+    Ok(())
+}
+
 /// `create_run_with` with the tool policy optionally fixed by the caller instead of derived from
 /// the mode.
 async fn create_run_with_policy(
@@ -514,6 +525,7 @@ async fn create_run_with_policy(
         account_choice,
         resume_session_id,
     } = run;
+    sandbox_gate(&crate::sandbox::status())?;
     let node = provisioning.as_ref().and_then(Provisioning::node);
     let resolution = provisioning.as_ref().and_then(Provisioning::resolution);
     let item = provisioning.as_ref().and_then(Provisioning::item);
