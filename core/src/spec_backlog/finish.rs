@@ -579,10 +579,7 @@ async fn drive_spec(
             }
             Ok(report) if matches!(report.verdict, Verdict::Inconclusive(_)) => {
                 mark_needs_owner(pool, &spec.id, &inconclusive_reason(&report)).await?;
-                return Ok(SpecRun {
-                    trees,
-                    finished: false,
-                });
+                return Ok(SpecRun::ended(trees, false));
             }
             Ok(report) => {
                 if let Some(doubts) = only_doubts_left(&report) {
