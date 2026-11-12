@@ -24,17 +24,36 @@ fn base() -> PathBuf {
     }
 }
 
-/// A stable, filesystem-safe key for a unit's working directory (FNV-1a over its text).
+/// The text a unit dir is keyed by: one spelling per directory. The daemon names the same tree as
+/// `C:\x\tree`, `C:/x/tree`, `c:/x/tree/` or `\\?\C:\x\tree` depending on where the path came
+/// from, and a key over the raw text gave each spelling its own config dir, so a hook wired under
+/// one was missing under another. Separators become `/`, a verbatim prefix and a trailing `/` go,
+/// and on Windows (a case-insensitive filesystem) the text is lowercased. Lexical only: the dir
+/// may not exist yet, and canonicalizing would resolve a junction the unit is not meant to see.
+fn key_text(unit_dir: &Path) -> String {
+    let mut text = unit_dir.to_string_lossy().replace('\\', "/");
+    if let Some(rest) = text.strip_prefix("//?/") {
+        text = rest.to_string();
+    }
+    while text.len() > 1 && text.ends_with('/') {
+        text.pop();
+    }
+    if cfg!(windows) {
+        text = text.to_lowercase();
+    }
+    text
+}
+
+/// A stable, filesystem-safe key for a unit's working directory (FNV-1a over [`key_text`]).
 fn key(unit_dir: &Path) -> String {
+    let text = key_text(unit_dir);
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in unit_dir.to_string_lossy().bytes() {
+    for byte in text.bytes() {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    let name = unit_dir
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    // From the folded text too, so two spellings also agree on the readable half of the key.
+    let name = text.rsplit('/').next().unwrap_or_default().to_string();
     let name: String = name
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
@@ -114,6 +133,20 @@ mod tests {
         assert!(!first.starts_with(tree.path()));
         let other = tempfile::TempDir::new().unwrap();
         assert_ne!(first, unit_config_dir(other.path()));
+    }
+
+    /// The tree job asks about `C:/x/repo` for a root the test (or the runner) wired as `C:\x\repo`;
+    /// both spellings must find the one config dir, or the hook is "not wired" where it is.
+    #[test]
+    fn every_spelling_of_a_unit_dir_shares_one_config_dir() {
+        let one = unit_config_dir(Path::new(r"C:\x\repo"));
+        assert_eq!(one, unit_config_dir(Path::new("C:/x/repo")));
+        assert_eq!(one, unit_config_dir(Path::new("C:/x/repo/")));
+        assert_eq!(one, unit_config_dir(Path::new(r"\\?\C:\x\repo")));
+        if cfg!(windows) {
+            assert_eq!(one, unit_config_dir(Path::new("c:/x/Repo")));
+        }
+        assert_ne!(one, unit_config_dir(Path::new("C:/x/repo2")));
     }
 
     #[test]

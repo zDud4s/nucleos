@@ -580,6 +580,38 @@ def token_file_cases():
     return cases
 
 
+def sandbox_account_cases():
+    """test_interactive_token_search_refuses_when_running_as_a_sandbox_account (sandbox plan 1e).
+
+    Inside a sandbox account the interactive search (`git` and the daemon's `--print-token`) is
+    never run: it would hand the unit the daemon's control token. With no run key of its own the
+    hook answers `(None, "sandbox")` and spawns nothing; a run key still wins, as everywhere.
+    """
+    cases = []
+    env = {"NUCLEOS_SANDBOX_ACCOUNT": "nucleos-unit-1"}
+    with mock.patch.dict(os.environ, env, clear=True):
+        with mock.patch.object(hook.subprocess, "run", side_effect=AssertionError("ran")):
+            try:
+                got = hook.read_control_token("/work/repo")
+            except AssertionError:
+                got = "ran a subprocess"
+    cases.append((
+        "test_interactive_token_search_refuses_when_running_as_a_sandbox_account",
+        "" if got == (None, "sandbox") else f"got {got!r}",
+    ))
+    with mock.patch.dict(os.environ, dict(env, NUCLEOS_DAEMON_TOKEN="7.run-key"), clear=True):
+        with mock.patch.object(hook.subprocess, "run", side_effect=AssertionError("ran")):
+            try:
+                got = hook.read_control_token("/work/repo")
+            except AssertionError:
+                got = "ran a subprocess"
+    cases.append((
+        "a sandbox account's own run key is still its answer",
+        "" if got == ("7.run-key", None) else f"got {got!r}",
+    ))
+    return cases
+
+
 def one_source_cases():
     """One hook source compiled into the daemon, and the tracked `.claude/` copy equal to it.
 
@@ -2238,6 +2270,7 @@ def main() -> int:
         + run_ask_wait_cases()
         + admit_cases()
         + one_source_cases()
+        + sandbox_account_cases()
         + session_start_cases()
         + claims_exchange_cases()
         + claims_tool_call_cases()
