@@ -193,11 +193,12 @@ pub async fn gather(pool: &SqlitePool, node: &Node, cfg: &Thresholds) -> Inputs 
          COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0) \
          FROM runs WHERE id IN {NODE_RUNS} ORDER BY id"
     );
-    let runs: Vec<(Option<i64>, Option<String>, Option<i64>, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(runs_sql))
-        .bind(id)
-        .fetch_all(pool)
-        .await
-        .unwrap_or_default();
+    let runs: Vec<(Option<i64>, Option<String>, Option<i64>, i64)> =
+        sqlx::query_as(sqlx::AssertSqlSafe(runs_sql))
+            .bind(id)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
     if !runs.is_empty() {
         inputs.initial_context = runs.first().and_then(|r| r.0);
         inputs.tools_given = runs.last().and_then(|r| r.1.as_deref()).map(strings);

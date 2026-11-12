@@ -383,10 +383,6 @@ const READ_ONLY_ROUTES: &[(Method, &str)] = &[
     (Method::GET, "/projects/{id}/analytics"),
     (Method::GET, "/analytics"),
     (Method::GET, "/analytics/quota"),
-    // The context-fit cards of work nodes (spec 2026-11-12): verdict counts, signal ids and the
-    // numbers behind them over tables this key already reads; no text, no paths.
-    (Method::GET, "/analytics/context-fit"),
-    (Method::GET, "/trees/{id}/context-fit"),
     // Pipeline and autopilot health: counts, ids, group names and shas over tables this key
     // already reads elsewhere; no free text and no command output (spec analytics-pipeline §9).
     (Method::GET, "/projects/{id}/analytics/pipeline"),
