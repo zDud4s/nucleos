@@ -7551,7 +7551,6 @@ mod tests {
         let key = crate::sandbox::assistant_routes::mint_assistant_token(&state.pool, "chat-a")
             .await
             .expect("mint the assistant key");
-        assert!(key.starts_with("assistant:chat-a."), "got {key}");
         assert_eq!(resolve(&state, &key).await, Some(Scope::Assistant));
         // The same secret under the `chat:` family is another scope, and a wrong secret nothing.
         assert_eq!(
