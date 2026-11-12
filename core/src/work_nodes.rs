@@ -326,7 +326,9 @@ pub fn normalise_glob(raw: &str) -> Result<String, NodeError> {
     let unified = raw.trim().replace('\\', "/");
     if unified.starts_with('/') || unified.as_bytes().get(1) == Some(&b':') {
         return Err(NodeError::Invalid(format!(
-            "owned path {raw:?} must be relative to the project root"
+            "owned path {raw:?} must be relative to the project root; specs and other files \
+             under the project's state_dir are not owned by tree branches; the conductor \
+             updates them"
         )));
     }
     let mut kept = Vec::new();
@@ -1299,6 +1301,29 @@ mod tests {
             assert!(
                 matches!(normalise_glob(bad), Err(NodeError::Invalid(_))),
                 "{bad:?} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn an_absolute_owned_path_is_refused_naming_the_state_dir_rule() {
+        for absolute in [
+            "C:/Users/someone/.nucleos/projects/p/specs/x.md",
+            "/etc/x.md",
+        ] {
+            let Err(NodeError::Invalid(message)) = normalise_glob(absolute) else {
+                panic!("{absolute:?} should be refused as invalid");
+            };
+            assert!(
+                message.contains("must be relative to the project root"),
+                "{message}"
+            );
+            assert!(
+                message.contains(
+                    "specs and other files under the project's state_dir are not owned by tree \
+                     branches; the conductor updates them"
+                ),
+                "{message}"
             );
         }
     }

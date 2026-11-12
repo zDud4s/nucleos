@@ -23,6 +23,7 @@ import {
   useForgetLandTarget,
   useForgetShellRule,
   useProjectGitOps,
+  gitOpName,
   useProjectGithubOps,
   useProjectLandTargets,
   useProjectShellRules,
@@ -168,7 +169,7 @@ function Standing({ projectId, stopped }: { projectId: string; stopped: boolean 
   const gitGranted =
     gitCatalogue.data === undefined || gitMine.data === undefined
       ? undefined
-      : gitCatalogue.data.filter((op) => op.declarable && gitMine.data.includes(op.kind)).length;
+      : gitCatalogue.data.filter((op) => op.declarable && gitMine.data.some((entry) => gitOpName(entry) === op.kind)).length;
   // A tool-carrying `allow` decides nothing (see `RuleList`), so it is not a command allowed.
   const allowed = rules.data?.filter(
     (rule) => rule.verdict === "allow" && rule.tool === null,
@@ -1211,6 +1212,7 @@ const GIT_OP_LABEL: Record<string, string> = {
   tag: "create a tag",
   fetch: "fetch from the remote",
   rebase: "rebase a branch",
+  "rebase-own-worktree": "rebase in the requester's own worktree",
   "branch-delete": "delete a branch",
   // The build's kind is `branch-delete`. The underscore spelling is an alias kept for a project
   // table or fixture that still stores it; nothing in the shell sends it any more.
@@ -1251,9 +1253,9 @@ function GitOps({ projectId, stopped }: { projectId: string; stopped: boolean })
     );
   }
 
-  const declared = new Set(mine.data);
+  const declared = new Set(mine.data.map(gitOpName));
   const built = new Set(catalogue.data.map((operation) => operation.kind));
-  const stranded = mine.data.filter((kind) => !built.has(kind)).sort();
+  const stranded = mine.data.map(gitOpName).filter((kind) => !built.has(kind)).sort();
 
   const rowProps = {
     declared,

@@ -9,4 +9,4 @@ go 1.26
 // code, fixed across go1.26.2 through go1.26.6. Zero after. Echo is the smallest of the five and
 // still had eleven, which is the argument for pinning here rather than only where it looks
 // dangerous: the count follows net/http and crypto/tls, not how important the sidecar is.
-toolchain go1.26.6
+toolchain go1.27.4

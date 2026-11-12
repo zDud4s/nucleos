@@ -19,7 +19,7 @@ The wall that matters for you is therefore **not** the tool list but the packet'
 `## Boundaries`: `Allowed files` is the complete set you may modify, and `Do-not-touch` is
 absolute. Widening either one is a deviation you record, not a decision you make.
 
-A leaf runs only `cargo fmt -p <crate>` and `python scripts/check_invariants.py` before closing, via `python scripts/heavy.py`, failing open; never `cargo check`, `test`, `build`, `clippy` or `--workspace`. The rest is the gate's. With `autonomy.leaf_self_check: true` it may add one `cargo check -p <crate> --tests`. You run no other test, build or check (Rule 3 in `.nucleos/workflow/workflow.md`): if you need a command run, hand back the exact command and the controller runs it.
+A leaf runs only `cargo fmt -p <crate>` and `python scripts/check_invariants.py` before closing, via `python scripts/heavy.py --agent leaf-<node id> ...`, failing open; never `cargo check`, `test`, `build`, `clippy` or `--workspace`. The rest is the gate's. With `autonomy.leaf_self_check: true` it may add one `cargo check -p <crate> --tests`. You run no other test, build or check (Rule 3 in `.nucleos/workflow/workflow.md`): if you need a command run, hand back the exact command and the controller runs it.
 
 You have no `Task` on purpose. You do not delegate, and you do not get a second opinion.
 

@@ -4418,6 +4418,7 @@ integration_steps:
                 op: crate::execution::vcs::Op::Rebase {
                     branch: "feat/x".into(),
                     onto: "master".into(),
+                    worktree: None,
                 },
                 project_id: "alpha".to_owned(),
                 project_root: repo.to_string_lossy().into_owned(),
@@ -4513,6 +4514,7 @@ integration_steps:
                 op: crate::execution::vcs::Op::Rebase {
                     branch: "feat/x".into(),
                     onto: "master".into(),
+                    worktree: None,
                 },
                 project_id: "alpha".to_owned(),
                 project_root: repo.to_string_lossy().into_owned(),
@@ -4573,6 +4575,7 @@ integration_steps:
                 op: crate::execution::vcs::Op::Rebase {
                     branch: "feat/x".into(),
                     onto: "master".into(),
+                    worktree: None,
                 },
                 project_id: "alpha".to_owned(),
                 project_root: repo.to_string_lossy().into_owned(),
@@ -4599,6 +4602,337 @@ integration_steps:
             !integration_worktree(&repo).exists(),
             "the refusal came before any computation, so no integration worktree was even made"
         );
+    }
+
+    /// Writes `name` in `dir` and commits it.
+    fn commit_file(dir: &Path, name: &str, content: &str) {
+        std::fs::write(dir.join(name), content).expect("write");
+        assert!(git_ok(dir, &[OsStr::new("add"), OsStr::new("-A")]));
+        assert!(git_ok(
+            dir,
+            &[OsStr::new("commit"), OsStr::new("-m"), OsStr::new(name)]
+        ));
+    }
+
+    /// `feat/x` checked out in a worktree of its own (the "requester's"), with `master` one commit
+    /// ahead of where `feat/x` branched. Returns the worktree.
+    fn own_worktree_behind_master(repo: &Path, container: &Path) -> PathBuf {
+        let holder = container.join("holder");
+        assert!(git_ok(
+            repo,
+            &[
+                OsStr::new("worktree"),
+                OsStr::new("add"),
+                holder.as_os_str(),
+                OsStr::new("feat/x")
+            ]
+        ));
+        commit_file(repo, "later.txt", "later\n");
+        holder
+    }
+
+    fn rebase_deadline() -> std::time::Instant {
+        std::time::Instant::now() + std::time::Duration::from_secs(120)
+    }
+
+    /// ON, own worktree, clean: the rebase runs inside it and HEAD moves onto `master`.
+    #[tokio::test]
+    async fn a_rebase_in_the_requesters_own_clean_worktree_is_performed_there() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-rebase-own-");
+        let holder = own_worktree_behind_master(&repo, container.path());
+        let master = sha_of(&repo, "refs/heads/master");
+        let before = sha_of(&holder, "HEAD");
+
+        let outcome = rebase(&repo, "feat/x", "master", Some(&holder), rebase_deadline()).await;
+
+        let sha = match outcome {
+            Outcome::Succeeded { sha, .. } => sha.expect("a rebase names its new tip"),
+            other => panic!("expected a rebase in place, got {other:?}"),
+        };
+        assert_ne!(sha, before);
+        assert_eq!(sha_of(&holder, "HEAD"), sha, "the worktree moved");
+        assert_eq!(
+            sha_of(&repo, "refs/heads/feat/x"),
+            sha,
+            "and so did the ref"
+        );
+        assert_eq!(sha_of(&repo, &format!("{sha}^1")), master, "onto master");
+        assert!(holder.join("feature.txt").exists());
+        assert!(holder.join("later.txt").exists());
+    }
+
+    /// ON, own worktree, dirty: blocked before anything is written.
+    #[tokio::test]
+    async fn a_rebase_in_a_dirty_own_worktree_is_blocked_and_touches_nothing() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-rebase-dirty-");
+        let holder = own_worktree_behind_master(&repo, container.path());
+        let before = sha_of(&holder, "HEAD");
+        std::fs::write(holder.join("feature.txt"), "edited, not committed\n").expect("write");
+
+        let outcome = rebase(&repo, "feat/x", "master", Some(&holder), rebase_deadline()).await;
+
+        match &outcome {
+            Outcome::Blocked { reason, .. } => {
+                assert!(reason.contains("uncommitted changes"), "{reason}")
+            }
+            other => panic!("a dirty worktree must block, got {other:?}"),
+        }
+        assert_eq!(sha_of(&holder, "HEAD"), before);
+        assert_eq!(
+            std::fs::read_to_string(holder.join("feature.txt")).expect("read"),
+            "edited, not committed\n",
+            "the edit is still there"
+        );
+    }
+
+    /// ON, own worktree, conflicting: aborted, HEAD back at the original sha, nothing in progress,
+    /// and the failure names the file.
+    #[tokio::test]
+    async fn a_conflicting_rebase_in_the_own_worktree_is_aborted_and_names_the_files() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-rebase-conflict-");
+        let holder = container.path().join("holder");
+        assert!(git_ok(
+            &repo,
+            &[
+                OsStr::new("worktree"),
+                OsStr::new("add"),
+                holder.as_os_str(),
+                OsStr::new("feat/x")
+            ]
+        ));
+        // `master` adds the same file `feat/x` added, with other content.
+        commit_file(&repo, "feature.txt", "from master\n");
+        let before = sha_of(&holder, "HEAD");
+
+        let outcome = rebase(&repo, "feat/x", "master", Some(&holder), rebase_deadline()).await;
+
+        match &outcome {
+            Outcome::Failed { reason, .. } => {
+                assert!(reason.contains("feature.txt"), "names the file: {reason}");
+                assert!(reason.contains("aborted"), "{reason}");
+            }
+            other => panic!("a conflict must fail, got {other:?}"),
+        }
+        assert_eq!(sha_of(&holder, "HEAD"), before, "HEAD is back");
+        assert_eq!(sha_of(&repo, "refs/heads/feat/x"), before);
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&holder)
+            .args(["status", "--porcelain", "--untracked-files=no"])
+            .output()
+            .expect("git should start");
+        assert!(
+            String::from_utf8_lossy(&status.stdout).trim().is_empty(),
+            "no conflicted or modified file is left"
+        );
+        let git_dir = Command::new("git")
+            .arg("-C")
+            .arg(&holder)
+            .args(["rev-parse", "--absolute-git-dir"])
+            .output()
+            .expect("git should start");
+        let git_dir = PathBuf::from(String::from_utf8_lossy(&git_dir.stdout).trim());
+        assert!(
+            !git_dir.join("rebase-merge").exists(),
+            "no rebase in progress"
+        );
+        assert!(
+            !git_dir.join("rebase-apply").exists(),
+            "no rebase in progress"
+        );
+    }
+
+    /// The path `rebase_in_own_worktree` takes when the `git rebase` call itself errors (deadline
+    /// kill) with a rebase half done: the shared abort puts HEAD back and clears the rebase state.
+    /// The half-done rebase is made by hand, since a killed call cannot be provoked portably.
+    #[tokio::test]
+    async fn the_abort_after_a_killed_rebase_restores_head_and_clears_the_state() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-rebase-killed-");
+        let holder = container.path().join("holder");
+        assert!(git_ok(
+            &repo,
+            &[
+                OsStr::new("worktree"),
+                OsStr::new("add"),
+                holder.as_os_str(),
+                OsStr::new("feat/x")
+            ]
+        ));
+        commit_file(&repo, "feature.txt", "from master\n");
+        let before = sha_of(&holder, "HEAD");
+        // Stops on the conflict and leaves the rebase in progress, as a killed call would.
+        assert!(!git_ok(
+            &holder,
+            &[OsStr::new("rebase"), OsStr::new("master")]
+        ));
+        let git_dir = Command::new("git")
+            .arg("-C")
+            .arg(&holder)
+            .args(["rev-parse", "--absolute-git-dir"])
+            .output()
+            .expect("git should start");
+        let git_dir = PathBuf::from(String::from_utf8_lossy(&git_dir.stdout).trim());
+        assert!(
+            git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists(),
+            "the fixture must leave a rebase in progress"
+        );
+
+        assert!(abort_restores(&holder, &git_dir, &before, rebase_deadline()).await);
+
+        assert_eq!(sha_of(&holder, "HEAD"), before);
+        assert!(!git_dir.join("rebase-merge").exists());
+        assert!(!git_dir.join("rebase-apply").exists());
+    }
+
+    /// ON, but the worktree holding the branch is not the requester's: blocked as ever.
+    #[tokio::test]
+    async fn a_rebase_whose_holder_is_another_worktree_stays_blocked_with_the_grant_given() {
+        let _lock = crate::execution::worktree::test_env_lock();
+        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-rebase-other-");
+        let holder = own_worktree_behind_master(&repo, container.path());
+        let requester = container.path().join("requester");
+        std::fs::create_dir_all(&requester).expect("create");
+        let before = sha_of(&holder, "HEAD");
+
+        let outcome = rebase(
+            &repo,
+            "feat/x",
+            "master",
+            Some(&requester),
+            rebase_deadline(),
+        )
+        .await;
+
+        match &outcome {
+            Outcome::Blocked { reason, .. } => {
+                assert!(
+                    reason.contains("will not reset a worktree it does not own"),
+                    "{reason}"
+                );
+                assert!(
+                    !reason.contains("rebase-own-worktree"),
+                    "the grant would not help here: {reason}"
+                );
+            }
+            other => panic!("another worktree's branch must be blocked, got {other:?}"),
+        }
+        assert_eq!(sha_of(&holder, "HEAD"), before);
+    }
+
+    /// A rebase request stamped with `worktree`, as the session hook stamps it.
+    fn own_worktree_request(repo: &Path, holder: &Path) -> crate::execution::vcs::ClaimedRequest {
+        crate::execution::vcs::ClaimedRequest {
+            id: 1,
+            op: crate::execution::vcs::Op::Rebase {
+                branch: "feat/x".into(),
+                onto: "master".into(),
+                worktree: Some(holder.to_string_lossy().into_owned()),
+            },
+            project_id: "alpha".to_owned(),
+            project_root: repo.to_string_lossy().into_owned(),
+            from_resolution: false,
+            run_id: None,
+            approved_map_blob: None,
+            integration_branch: None,
+        }
+    }
+
+    /// Without the `rebase-own-worktree` declaration the requester's own worktree is still refused,
+    /// and the message names the grant and the merge that does work.
+    #[tokio::test]
+    async fn without_the_grant_an_own_worktree_rebase_is_blocked_and_names_the_grant() {
+        use crate::execution::vcs::VcsExecutor;
+
+        let _lock = crate::execution::worktree::test_env_lock();
+        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-rebase-off-");
+        let _env = WorktreeRootEnv::set(&container.path().join("roots"));
+        let holder = own_worktree_behind_master(&repo, container.path());
+        let before = sha_of(&holder, "HEAD");
+        let pool = crate::testdb::fresh_pool().await;
+        roster(&pool, &repo).await;
+
+        let outcome = GitExecutor {
+            pool: Some(pool),
+            ..GitExecutor::default()
+        }
+        .execute(&own_worktree_request(&repo, &holder))
+        .await;
+
+        match &outcome {
+            Outcome::Blocked { reason, .. } => {
+                assert!(
+                    reason.contains("will not reset a worktree it does not own"),
+                    "{reason}"
+                );
+                assert!(reason.contains("rebase-own-worktree"), "{reason}");
+                assert!(reason.contains("git merge --no-ff <onto>"), "{reason}");
+            }
+            other => panic!("the default must stay blocked, got {other:?}"),
+        }
+        assert_eq!(sha_of(&holder, "HEAD"), before, "nothing was touched");
+    }
+
+    /// Declared through the project's git permissions: the request goes through and a merge still
+    /// lands exactly as before. Withdrawing the declaration (the row is deleted) blocks it again.
+    #[tokio::test]
+    async fn the_declared_grant_enables_the_own_worktree_rebase_until_it_is_withdrawn() {
+        use crate::execution::vcs::VcsExecutor;
+
+        let _lock = crate::execution::worktree::test_env_lock();
+        let (container, repo) = repo_with_a_branch_to_merge("nucleos-gitexec-rebase-on-");
+        let _env = WorktreeRootEnv::set(&container.path().join("roots"));
+        let holder = own_worktree_behind_master(&repo, container.path());
+        let before = sha_of(&holder, "HEAD");
+        let pool = crate::testdb::fresh_pool().await;
+        roster(&pool, &repo).await;
+        let executor = GitExecutor {
+            pool: Some(pool.clone()),
+            ..GitExecutor::default()
+        };
+
+        crate::project::policy::declare_git_op(&pool, "alpha", "rebase-own-worktree")
+            .await
+            .expect("declare the grant");
+        let outcome = executor
+            .execute(&own_worktree_request(&repo, &holder))
+            .await;
+        match outcome {
+            Outcome::Succeeded { sha: Some(sha), .. } => {
+                assert_ne!(sha, before);
+                assert_eq!(sha_of(&holder, "HEAD"), sha);
+            }
+            other => panic!("the grant is declared, so the rebase must run, got {other:?}"),
+        }
+
+        // A merge of the (now rebased) branch is untouched by the grant.
+        let master_before = sha_of(&repo, "master");
+        match land_ordinarily(&repo).await {
+            Outcome::Succeeded { sha: Some(sha), .. } => {
+                assert_ne!(sha, master_before);
+                assert_eq!(sha_of(&repo, "master"), sha);
+            }
+            other => panic!("a merge must still land with the grant declared, got {other:?}"),
+        }
+
+        // Withdrawn: a second rebase, asked from the same worktree, is blocked again.
+        assert!(
+            crate::project::policy::forget_git_op(&pool, "alpha", "rebase-own-worktree")
+                .await
+                .expect("withdraw the grant")
+        );
+        let held = sha_of(&holder, "HEAD");
+        let outcome = executor
+            .execute(&own_worktree_request(&repo, &holder))
+            .await;
+        assert!(
+            matches!(outcome, Outcome::Blocked { .. }),
+            "withdrawn means blocked again, got {outcome:?}"
+        );
+        assert_eq!(sha_of(&holder, "HEAD"), held, "nothing was touched");
     }
 
     /// A fetch moves the tracking ref and reports NO object id.

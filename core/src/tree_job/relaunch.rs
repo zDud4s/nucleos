@@ -260,6 +260,14 @@ const CONTINUE_PROMPT: &str = "The daemon restarted while you were working, whic
     your run. Your session is continued as it was: carry on from where you stopped, do not start \
     over, and check the worktree for what you already did.";
 
+/// The relaunches that continue the previous run's session when it fits (spec F3): fix, rescue and
+/// wrap. Died, watchdog, transient and quota relaunches follow a failed run and start cold.
+const CONTINUING_PREFIXES: [&str; 3] = [FIX_PREFIX, RESCUE_PREFIX, WRAP_PREFIX];
+
+/// What a continued fix, rescue or wrap session is told before the relaunch's own sentence.
+const SESSION_KEPT_PROMPT: &str = "Your session is continued as it was: the node packet and \
+    everything you did are already in it, so do not start over.";
+
 /// Whether a transcript of `fill` tokens is small enough to continue: strictly below half of the
 /// leaf budget, so the continued session keeps room to finish. The rest restarts cold.
 pub(super) fn fits_for_resume(fill: i64, leaf_budget: i64) -> bool {
@@ -274,6 +282,7 @@ async fn resumable_session(
     state: &AppState,
     launch: &StoredLaunch,
     dead_run: &str,
+    statuses: &[&str],
 ) -> Option<String> {
     // Only a launch that `node_run` runs as a tree run has a session to continue.
     if launch.mode != "worktree" || launch.project_id.is_none() || launch.cwd.is_none() {
@@ -299,7 +308,7 @@ async fn resumable_session(
     .flatten();
     let (status, session, fill, successor, runner) = row?;
     let session = session.filter(|session| !session.is_empty())?;
-    if status != "interrupted" || successor.is_some() {
+    if !statuses.contains(&status.as_str()) || successor.is_some() {
         return None;
     }
     // `claude -p --resume` only understands a session the claude runner wrote: a codex or agy id
@@ -351,16 +360,43 @@ async fn branch_is_parked(
 /// Why the tree budget refuses an automatic relaunch of `node_id`, or `None` when it permits one
 /// (or the node has no tree row). The owner's answer relaunch does not ask: the owner decided.
 pub(super) async fn budget_refusal(pool: &SqlitePool, node_id: &str) -> Option<String> {
-    let root: Option<String> = sqlx::query_scalar("SELECT root_id FROM work_nodes WHERE id = ?")
-        .bind(node_id)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten();
-    match budget::permits_next_node(pool, &root?).await {
+    match budget_gate(pool, node_id).await {
         // A budget that could not be read is no limit: it is not a refusal to park on (B9).
-        Permit::Yes | Permit::Retry { .. } => None,
-        Permit::No { reason } => Some(reason),
+        BudgetGate::Open | BudgetGate::Unreadable => None,
+        BudgetGate::Refused(reason) => Some(reason),
+    }
+}
+
+/// What the tree budget says about an automatic relaunch of a node.
+#[derive(Debug, PartialEq)]
+pub(super) enum BudgetGate {
+    /// Permitted, or the node has no tree row.
+    Open,
+    /// A real limit, with the reason it gave.
+    Refused(String),
+    /// The budget could not be read: no limit, so nothing to park on, but nothing to spend either.
+    /// The caller leaves the node alone and the next tick asks again (spec B9).
+    Unreadable,
+}
+
+/// [`budget_refusal`] that keeps a database error apart from "permitted".
+pub(super) async fn budget_gate(pool: &SqlitePool, node_id: &str) -> BudgetGate {
+    let root: Result<Option<String>, _> =
+        sqlx::query_scalar("SELECT root_id FROM work_nodes WHERE id = ?")
+            .bind(node_id)
+            .fetch_optional(pool)
+            .await;
+    let root = match root {
+        Ok(Some(root)) => root,
+        // No tree row: no budget to apply.
+        Ok(None) => return BudgetGate::Open,
+        // A read that failed is not "no row": the budget is unknown, not open.
+        Err(_) => return BudgetGate::Unreadable,
+    };
+    match budget::permits_next_node(pool, &root).await {
+        Permit::Yes => BudgetGate::Open,
+        Permit::Retry { .. } => BudgetGate::Unreadable,
+        Permit::No { reason } => BudgetGate::Refused(reason),
     }
 }
 
@@ -493,15 +529,26 @@ pub(super) async fn relaunch_node(
                 Some(suffix) => format!("{}{suffix}", launch.prompt),
                 None => launch.prompt.clone(),
             };
-            // Only the boot's relaunch of an interrupted node (`resume-<dead run>`, no suffix)
-            // continues the session; wrap, died, fix and rescue relaunches carry their own sentence
-            // and start cold, as a WRAPPED node's full context is the reason they exist.
-            let resume = if prompt_suffix.is_none() && key.starts_with(RESUME_PREFIX) {
-                resumable_session(state, &launch, dead_run)
-                    .await
-                    .map(|session| (session, CONTINUE_PROMPT.to_owned()))
-            } else {
-                None
+            // The boot's relaunch of an interrupted node (`resume-<dead run>`, no suffix) continues
+            // its session, and so do the fix, rescue and wrap relaunches of a run that finished or
+            // was interrupted (spec F3): the session already holds the node packet, so it is given
+            // only the relaunch's own sentence. Both need the transcript below half the leaf
+            // budget, so a run that died at its context ceiling (or a failed one) starts cold.
+            let resume = match prompt_suffix {
+                None if key.starts_with(RESUME_PREFIX) => {
+                    resumable_session(state, &launch, dead_run, &["interrupted"])
+                        .await
+                        .map(|session| (session, CONTINUE_PROMPT.to_owned()))
+                }
+                Some(suffix) if CONTINUING_PREFIXES.iter().any(|p| key.starts_with(p)) => {
+                    resumable_session(state, &launch, dead_run, &["interrupted", "completed"])
+                        .await
+                        .map(|session| {
+                            let prompt = format!("{SESSION_KEPT_PROMPT}\n\n{}", suffix.trim());
+                            (session, prompt)
+                        })
+                }
+                _ => None,
             };
             start_again_resuming(state, &launch, key, prompt, resume).await
         }
@@ -789,6 +836,16 @@ mod tests {
     const CREATED: &str = "2026-10-31T00:00:00+00:00";
 
     #[tokio::test]
+    async fn a_failed_node_read_leaves_the_budget_unreadable_not_open() {
+        let pool = crate::testdb::fresh_pool().await;
+        assert_eq!(budget_gate(&pool, NODE).await, BudgetGate::Open);
+
+        pool.close().await;
+
+        assert_eq!(budget_gate(&pool, NODE).await, BudgetGate::Unreadable);
+    }
+
+    #[tokio::test]
     async fn successor_key_first_proposal_wins() {
         let pool = crate::testdb::fresh_pool().await;
 
@@ -1059,7 +1116,7 @@ mod tests {
         .await;
         seed_resume_run(&state.pool, 81, "interrupted", Some(40_000)).await;
 
-        let session = resumable_session(&state, &worktree_launch(), "81").await;
+        let session = resumable_session(&state, &worktree_launch(), "81", &["interrupted"]).await;
 
         assert_eq!(session.as_deref(), Some("sess-abc"));
     }
@@ -1082,9 +1139,63 @@ mod tests {
 
         for run in ["82", "83", "84", "85"] {
             assert_eq!(
-                resumable_session(&state, &worktree_launch(), run).await,
+                resumable_session(&state, &worktree_launch(), run, &["interrupted"]).await,
                 None,
                 "run {run}"
+            );
+        }
+    }
+
+    /// Spec F3: a fix, rescue or wrap relaunch continues a finished run's session when it fits, and
+    /// starts cold when the transcript is at the context ceiling, unmeasured, or the run failed.
+    #[tokio::test]
+    async fn a_completed_run_resumes_for_a_fix_only_while_it_fits() {
+        let (state, _runner) = crate::execution::runs::testkit::test_state_with_runner(
+            Some(Duration::from_secs(60)),
+            Duration::from_secs(600),
+        )
+        .await;
+        seed_resume_run(&state.pool, 91, "completed", Some(40_000)).await;
+        seed_resume_run(&state.pool, 92, "completed", Some(110_000)).await;
+        seed_resume_run(&state.pool, 93, "completed", None).await;
+        seed_resume_run(&state.pool, 94, "failed", Some(40_000)).await;
+        let statuses = ["interrupted", "completed"];
+
+        let resumed = |run: &'static str| {
+            let state = &state;
+            async move { resumable_session(state, &worktree_launch(), run, &statuses).await }
+        };
+
+        assert_eq!(resumed("91").await.as_deref(), Some("sess-abc"));
+        assert_eq!(resumed("92").await, None, "at the ceiling");
+        assert_eq!(resumed("93").await, None, "no measured fill");
+        assert_eq!(resumed("94").await, None, "a failed run");
+        assert_eq!(
+            resumable_session(&state, &worktree_launch(), "91", &["interrupted"]).await,
+            None,
+            "the boot relaunch resumes interrupted runs only"
+        );
+    }
+
+    #[test]
+    fn only_fix_rescue_and_wrap_relaunches_continue_a_session() {
+        for key in ["fix-1", "rescue-1", "wrap-1"] {
+            assert!(
+                CONTINUING_PREFIXES.iter().any(|p| key.starts_with(p)),
+                "{key}"
+            );
+        }
+        for key in [
+            "died-1",
+            "watchdog-1",
+            "transient-1",
+            "quota-1",
+            "finalfix-1",
+            "resume-1",
+        ] {
+            assert!(
+                !CONTINUING_PREFIXES.iter().any(|p| key.starts_with(p)),
+                "{key}"
             );
         }
     }
@@ -1107,15 +1218,15 @@ mod tests {
         }
 
         assert_eq!(
-            resumable_session(&state, &worktree_launch(), "87").await,
+            resumable_session(&state, &worktree_launch(), "87", &["interrupted"]).await,
             None
         );
         assert_eq!(
-            resumable_session(&state, &worktree_launch(), "88").await,
+            resumable_session(&state, &worktree_launch(), "88", &["interrupted"]).await,
             None
         );
         assert_eq!(
-            resumable_session(&state, &worktree_launch(), "89")
+            resumable_session(&state, &worktree_launch(), "89", &["interrupted"])
                 .await
                 .as_deref(),
             Some("sess-abc")
@@ -1133,6 +1244,9 @@ mod tests {
         let mut launch = worktree_launch();
         launch.mode = "shadow".to_owned();
 
-        assert_eq!(resumable_session(&state, &launch, "86").await, None);
+        assert_eq!(
+            resumable_session(&state, &launch, "86", &["interrupted"]).await,
+            None
+        );
     }
 }

@@ -2,7 +2,193 @@
 
 use super::*;
 
+/// Whether two paths name the same directory, in the filesystem's own spelling when both resolve
+/// (`worktree list` and a hook's `toplevel` spell one checkout differently on Windows).
+async fn same_directory(left: &Path, right: &Path) -> bool {
+    match (
+        tokio::fs::canonicalize(left).await,
+        tokio::fs::canonicalize(right).await,
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+/// `git rebase --abort` in `worktree`, then whether HEAD is back at `old` with no rebase directory
+/// left. The deadline may be spent by the rebase itself and the abort is the one command that must
+/// still run, so it gets a fresh short budget of its own.
+pub(super) async fn abort_restores(
+    worktree: &Path,
+    git_dir: &Path,
+    old: &str,
+    deadline: std::time::Instant,
+) -> bool {
+    let abort_deadline = std::cmp::max(
+        deadline,
+        std::time::Instant::now() + std::time::Duration::from_secs(60),
+    );
+    let _ = git(worktree, &["rebase", "--abort"], abort_deadline).await;
+    let restored = revision(worktree, "HEAD", abort_deadline).await.ok();
+    let in_progress = ["rebase-merge", "rebase-apply"]
+        .iter()
+        .any(|marker| git_dir.join(marker).exists());
+    restored.as_deref() == Some(old) && !in_progress
+}
+
+/// Rebases `branch` onto `onto` INSIDE `worktree`, the requester's own checkout that holds it.
+///
+/// Reached only when the project has declared `rebase-own-worktree` and the holder is the
+/// requester's worktree. The promise is that this never leaves that directory worse than it found
+/// it: a dirty tree or a rebase/merge already in progress is `Blocked` before any command that
+/// writes; a rebase that fails is aborted and HEAD is verified back at the original sha, and the
+/// failure names the conflicting files.
+async fn rebase_in_own_worktree(
+    worktree: &Path,
+    branch: &str,
+    onto: &str,
+    deadline: std::time::Instant,
+) -> Outcome {
+    let blocked = |reason: String| Outcome::Blocked {
+        reason,
+        output_tail: String::new(),
+    };
+
+    // Tracked changes only: an untracked file that collides with the replay makes git refuse on
+    // its own, which the failure path below handles without losing anything.
+    let status = match git(
+        worktree,
+        &["status", "--porcelain", "--untracked-files=no"],
+        deadline,
+    )
+    .await
+    {
+        Ok(status) => status,
+        Err(outcome) => return outcome,
+    };
+    if !status.succeeded() {
+        return failed(
+            format!("could not read the status of {}", worktree.display()),
+            &status,
+        );
+    }
+    if !status.stdout.trim().is_empty() {
+        return blocked(format!(
+            "{} has uncommitted changes, and a rebase would rewrite the tree under them. Commit or \
+             stash them and resubmit. Nothing was changed.",
+            worktree.display()
+        ));
+    }
+
+    let git_dir = match git(worktree, &["rev-parse", "--absolute-git-dir"], deadline).await {
+        Ok(result) if result.succeeded() => std::path::PathBuf::from(result.stdout.trim()),
+        Ok(result) => {
+            return failed(
+                format!(
+                    "could not locate the git directory of {}",
+                    worktree.display()
+                ),
+                &result,
+            );
+        }
+        Err(outcome) => return outcome,
+    };
+    for marker in [
+        "rebase-merge",
+        "rebase-apply",
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+    ] {
+        if git_dir.join(marker).exists() {
+            return blocked(format!(
+                "{} already has an operation in progress ({marker}). Finish or abort it and \
+                 resubmit. Nothing was changed.",
+                worktree.display()
+            ));
+        }
+    }
+
+    let old = match revision(worktree, "HEAD", deadline).await {
+        Ok(old) => old,
+        Err(outcome) => return outcome,
+    };
+    let rebased = match git(worktree, &["rebase", "--end-of-options", onto], deadline).await {
+        Ok(rebased) => rebased,
+        // The call itself failed (deadline kill, spawn failure) and may have left a rebase half
+        // done in the requester's directory: abort it the same way the non-zero path does.
+        Err(outcome) => {
+            if abort_restores(worktree, &git_dir, &old, deadline).await {
+                return outcome;
+            }
+            return Outcome::Failed {
+                reason: format!(
+                    "the rebase of {branch} onto {onto} in {} did not finish and THE ABORT DID NOT \
+                     RESTORE {branch} to {old}: check it by hand.",
+                    worktree.display()
+                ),
+                exit_code: None,
+                output_tail: String::new(),
+            };
+        }
+    };
+    if !rebased.succeeded() {
+        // Named BEFORE the abort, which discards the index entries that say which files conflicted.
+        let conflicts = match git(
+            worktree,
+            &["diff", "--name-only", "--diff-filter=U"],
+            deadline,
+        )
+        .await
+        {
+            Ok(result) => result
+                .stdout
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>()
+                .join(", "),
+            Err(_) => String::new(),
+        };
+        let restored = abort_restores(worktree, &git_dir, &old, deadline).await;
+        let named = if conflicts.is_empty() {
+            "no conflicting file could be read".to_owned()
+        } else {
+            format!("conflicting files: {conflicts}")
+        };
+        let state = if restored {
+            format!("It was aborted and {branch} is back at {old}.")
+        } else {
+            format!(
+                "THE ABORT DID NOT RESTORE {branch} to {old}: check {} by hand.",
+                worktree.display()
+            )
+        };
+        return failed(
+            format!(
+                "rebasing {branch} onto {onto} in {} failed ({named}). {state}",
+                worktree.display()
+            ),
+            &rebased,
+        );
+    }
+
+    let new = match revision(worktree, "HEAD", deadline).await {
+        Ok(new) => new,
+        Err(outcome) => return outcome,
+    };
+    Outcome::Succeeded {
+        sha: Some(new),
+        output_tail: rebased.output_tail,
+    }
+}
+
 /// Replays `branch` onto `onto`, on a detached HEAD in the integration worktree.
+///
+/// **Two modes, per project.** Without the `rebase-own-worktree` grant, `own_worktree` is `None` and
+/// the paragraphs below are the whole story. With it, `own_worktree` is the checkout the requester
+/// asked from, and when THAT is the worktree holding `branch` the rebase runs there
+/// (`rebase_in_own_worktree`) instead of being blocked — the requester owns that directory. A
+/// holder that is any other worktree is blocked in both modes.
 ///
 /// **The holder check comes FIRST, before anything is computed, and that ordering is the operation
 /// rather than an optimisation.** Every other executor here computes and then discovers whether it
@@ -19,15 +205,30 @@ pub(super) async fn rebase(
     project_root: &Path,
     branch: &str,
     onto: &str,
+    own_worktree: Option<&Path>,
     deadline: std::time::Instant,
 ) -> Outcome {
     match worktree_holding(project_root, branch, deadline).await {
         Ok(Some(holder)) => {
+            if let Some(own) = own_worktree
+                && same_directory(own, &holder).await
+            {
+                return rebase_in_own_worktree(&holder, branch, onto, deadline).await;
+            }
+            // Only the ungranted mode names the grant: with it given, the holder is somebody else's
+            // checkout and granting it again would change nothing.
+            let hint = if own_worktree.is_none() {
+                " To have a session's own rebase performed in its worktree, grant \
+                 `rebase-own-worktree` in the project's git permissions; or bring the base in \
+                 with `git merge --no-ff <onto>`."
+            } else {
+                ""
+            };
             return Outcome::Blocked {
                 reason: format!(
                     "{branch} is checked out in {}, and a rebase rewrites it — this queue will not \
                      reset a worktree it does not own. Check that branch out somewhere else and \
-                     resubmit.",
+                     resubmit.{hint}",
                     holder.display()
                 ),
                 output_tail: String::new(),

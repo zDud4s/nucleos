@@ -250,6 +250,11 @@ func (r *Reader) fetch(ctx context.Context, token string) (*usageResponse, error
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		if r.token != "" && resp.StatusCode == http.StatusForbidden {
+			// A setup-token carries only the inference scope; the usage endpoint may refuse it
+			// without the token being dead.
+			return nil, fmt.Errorf("the usage of a setup-token account is not readable (403)")
+		}
 		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 			return nil, fmt.Errorf("the usage endpoint refused the credential (%d)", resp.StatusCode)
 		}

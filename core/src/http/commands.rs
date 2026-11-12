@@ -487,6 +487,12 @@ pub(super) struct DeclareRequest {
     /// this question must not thereby become something an autonomous run may execute.
     #[serde(default)]
     pub(super) runnable_by: Option<crate::project::commands::RunnableBy>,
+    /// Roles allowed to run it. Absent means no role restriction.
+    #[serde(default)]
+    pub(super) roles: Option<Vec<crate::role_policy::Role>>,
+    /// Deepest tree level allowed to run it. Absent means no depth limit.
+    #[serde(default)]
+    pub(super) max_depth: Option<i64>,
 }
 
 /// Declares one of this project's own commands, replacing any of the same name.
@@ -514,6 +520,14 @@ pub(super) async fn post_project_command(
         ));
     }
 
+    if body.max_depth.is_some_and(|depth| depth < 0) {
+        return Err(refusal_with_detail(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid",
+            "max_depth cannot be negative".to_owned(),
+        ));
+    }
+
     // The half `validate` cannot do: whether the directory is actually there, and is a directory.
     // Checked when it is declared so a typo is caught while the person who made it is looking at
     // it — and again when it runs, because a folder that existed on Tuesday can be gone on
@@ -535,6 +549,10 @@ pub(super) async fn post_project_command(
             runnable_by: body
                 .runnable_by
                 .unwrap_or(crate::project::commands::RunnableBy::Person),
+            permission: crate::role_policy::Permission {
+                roles: body.roles,
+                max_depth: body.max_depth,
+            },
         },
     )
     .await
@@ -631,6 +649,36 @@ pub(super) async fn post_project_command_run(
         && command.runnable_by != crate::project::commands::RunnableBy::Agent
     {
         return Err(refusal(StatusCode::FORBIDDEN, "person_only"));
+    }
+
+    if command.permission != crate::role_policy::Permission::default() {
+        // A run's key resolves through its node; the owner's token has no run and is the top-level
+        // session.
+        let run_id = match &scope {
+            crate::auth::Scope::Run(run_id) => Some(*run_id),
+            _ => None,
+        };
+        let who = crate::role_policy::resolve_requester(
+            &state.pool,
+            &crate::role_policy::Caller {
+                agent_id: None,
+                agent_type: None,
+                subagent: false,
+            },
+            run_id,
+        )
+        .await;
+        if !command.permission.admits(&who) {
+            return Err(refusal_with_detail(
+                StatusCode::FORBIDDEN,
+                "role_not_permitted",
+                format!(
+                    "`{}` may be run only by {}",
+                    command.name,
+                    command.permission.who_may()
+                ),
+            ));
+        }
     }
 
     let cwd = match command.cwd.as_deref() {

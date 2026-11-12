@@ -90,6 +90,8 @@ run() {
     case "$2" in build|check|clippy|test|nextest|run|doc) set -- heavy_run "$@" ;; esac
   elif [ "$1" = npx ] && [ "$2" = tsc ]; then
     set -- heavy_run "$@"
+  elif [ "$1" = npx ] && [ "$2" = vitest ]; then
+    set -- heavy_run "$@"
   elif [ "$1" = npm ] && [ "$2" = test ]; then
     set -- heavy_run "$@"
   elif [ "$1" = go ]; then
@@ -520,7 +522,17 @@ if [ "$target" = shell ] || [ "$target" = all ]; then
       w=$((cores / 4)); [ "$w" -lt 2 ] && w=2; [ "$w" -gt 8 ] && w=8
       export VITEST_MAX_WORKERS="$w"
     fi
-    run "shell: test"      shell npm test
+    # In a worktree `shell/node_modules` is usually a junction to the main checkout's. Vitest then
+    # loads itself a second time through the junction's real path and every file fails with "failed
+    # to find the current suite". Run it from the directory that really owns node_modules, pointing
+    # `--root` back at this tree's shell/. A real node_modules keeps plain `npm test`.
+    shell_main="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)")"
+    if [ -d "$shell_main/shell/node_modules" ] && [ shell/node_modules -ef "$shell_main/shell/node_modules" ] \
+        && [ "$(cd shell && pwd -P)" != "$(cd "$shell_main/shell" && pwd -P)" ]; then
+      run "shell: test"      "$shell_main/shell" npx vitest run --root "$(cd shell && pwd -P)" ${NUCLEOS_GATE_VITEST_ARGS:-}
+    else
+      run "shell: test"      shell npm test
+    fi
     # The one property no test runner can check, because a Content-Security-Policy is enforced by
     # the engine and jsdom does not enforce one. It matters here more than it would elsewhere:
     # `tauri.conf.json` carries a permissive `devCsp` alongside the strict `csp`, so a dependency

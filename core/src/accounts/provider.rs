@@ -48,6 +48,8 @@ pub struct LoginCommand {
 pub enum LoginEvent {
     AuthUrl(String),
     CodePrompt,
+    /// A one-time code the owner types into the browser (device-code login); never pasted back.
+    DeviceCode(String),
     Succeeded,
     Failed(String),
 }
@@ -94,7 +96,12 @@ pub fn parse_cli_login_line(line: &str) -> Option<LoginEvent> {
     }
     if let Some(start) = line.find("https://") {
         let url = line[start..].split_whitespace().next().unwrap_or_default();
+        // Prose around the URL ("visit https://x/y.", "(https://x/y)") is not part of it.
+        let url = url.trim_end_matches(['.', ',', ')', ']', '>', '"', '\'']);
         return Some(LoginEvent::AuthUrl(url.to_owned()));
+    }
+    if is_device_code(line) {
+        return Some(LoginEvent::DeviceCode(line.to_owned()));
     }
     let lower = line.to_ascii_lowercase();
     if lower.contains("paste") && lower.contains("code") {
@@ -109,9 +116,57 @@ pub fn parse_cli_login_line(line: &str) -> Option<LoginEvent> {
     None
 }
 
+/// A line that is only a device code such as `ABCD-EFGH` (INFERRED from `codex login
+/// --device-auth`, which prints the code alone on its line): two groups of 4 to 8 upper-case
+/// letters or digits joined by one dash.
+fn is_device_code(line: &str) -> bool {
+    let group = |g: &str| {
+        (4..=8).contains(&g.len())
+            && g.bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+    };
+    line.split_once('-')
+        .is_some_and(|(left, right)| group(left) && group(right))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_line_that_is_only_a_device_code_is_surfaced() {
+        assert_eq!(
+            parse_cli_login_line("  ABCD-EFGH  "),
+            Some(LoginEvent::DeviceCode("ABCD-EFGH".into()))
+        );
+        assert_eq!(
+            parse_cli_login_line("K7Q2-93XZ4"),
+            Some(LoginEvent::DeviceCode("K7Q2-93XZ4".into()))
+        );
+        // Prose, short groups and three groups are not codes.
+        assert_eq!(parse_cli_login_line("one-time code"), None);
+        assert_eq!(
+            parse_cli_login_line("Enter this one-time code ABCD-EFGH"),
+            None
+        );
+        assert_eq!(parse_cli_login_line("ABC-DEFG"), None);
+        assert_eq!(parse_cli_login_line("ABCD-EFGH-IJKL"), None);
+    }
+
+    #[test]
+    fn sentence_punctuation_after_the_url_is_not_part_of_it() {
+        for line in [
+            "Visit https://auth.example/x?y=1.",
+            "Open (https://auth.example/x?y=1)",
+            "Browser did not open, use \"https://auth.example/x?y=1\"",
+        ] {
+            assert_eq!(
+                parse_cli_login_line(line),
+                Some(LoginEvent::AuthUrl("https://auth.example/x?y=1".into())),
+                "{line}"
+            );
+        }
+    }
 
     #[test]
     fn classifies_login_lines() {

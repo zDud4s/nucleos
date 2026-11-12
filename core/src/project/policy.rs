@@ -504,13 +504,29 @@ pub async fn forget_github_op(
 /// operation this build no longer constructs is exactly what the page must be able to draw — as
 /// stranded, so somebody can withdraw it — and a read that quietly dropped it would hide the only
 /// evidence that it is there.
-pub async fn try_git_ops(pool: &SqlitePool, project_id: &str) -> Result<Vec<String>, String> {
-    sqlx::query_scalar::<_, String>(
-        "SELECT op_kind FROM project_git_ops WHERE project_id = ? ORDER BY op_kind",
+///
+/// Each operation comes with the permission its declaration carries (default = unrestricted).
+pub async fn try_git_ops(
+    pool: &SqlitePool,
+    project_id: &str,
+) -> Result<Vec<(String, crate::role_policy::Permission)>, String> {
+    sqlx::query_as::<_, (String, Option<String>, Option<i64>)>(
+        "SELECT op_kind, allowed_roles, max_depth FROM project_git_ops
+         WHERE project_id = ? ORDER BY op_kind",
     )
     .bind(project_id)
     .fetch_all(pool)
     .await
+    .map(|rows| {
+        rows.into_iter()
+            .map(|(kind, roles, depth)| {
+                (
+                    kind,
+                    crate::role_policy::permission_from_columns(roles, depth),
+                )
+            })
+            .collect()
+    })
     .map_err(|error| format!("could not read {project_id}'s git ops: {error}"))
 }
 
@@ -525,7 +541,10 @@ pub async fn try_git_ops(pool: &SqlitePool, project_id: &str) -> Result<Vec<Stri
 /// failure should land. A `Result` on this side would push the error to a caller that has no safer
 /// thing to do with it than refuse anyway — and the likelier outcome, judging by every handler that
 /// already treats an error as "carry on", is that a database blip becomes an autonomy grant.
-pub async fn git_ops(pool: &SqlitePool, project_id: &str) -> Vec<String> {
+pub async fn git_ops(
+    pool: &SqlitePool,
+    project_id: &str,
+) -> Vec<(String, crate::role_policy::Permission)> {
     try_git_ops(pool, project_id).await.unwrap_or_else(|error| {
         tracing::warn!(%error, project_id, "git ops: unreadable; this project asks about every git operation");
         Vec::new()
@@ -538,19 +557,40 @@ pub async fn git_ops(pool: &SqlitePool, project_id: &str) -> Vec<String> {
 /// original `created_at` alone, for `declare_github_op`'s reason: `DO UPDATE` would turn "when this
 /// was declared" into "when it was last redeclared", which nothing reads today and would mislead
 /// whoever later takes the column's name at face value.
+///
+/// The permission columns are the exception: re-declaring OVERWRITES them, so narrowing or widening
+/// who a declaration covers is one more declare. `created_at` is still left alone.
 pub async fn declare_git_op(
     pool: &SqlitePool,
     project_id: &str,
     op_kind: &str,
 ) -> Result<(), String> {
+    declare_git_op_with(
+        pool,
+        project_id,
+        op_kind,
+        &crate::role_policy::Permission::default(),
+    )
+    .await
+}
+
+/// [`declare_git_op`] with the roles and depth the declaration covers.
+pub async fn declare_git_op_with(
+    pool: &SqlitePool,
+    project_id: &str,
+    op_kind: &str,
+    permission: &crate::role_policy::Permission,
+) -> Result<(), String> {
     sqlx::query(
-        "INSERT INTO project_git_ops (project_id, op_kind, created_at)
-         VALUES (?, ?, datetime('now'))
+        "INSERT INTO project_git_ops (project_id, op_kind, created_at, allowed_roles, max_depth)
+         VALUES (?, ?, datetime('now'), ?, ?)
          ON CONFLICT (project_id, op_kind)
-         DO NOTHING",
+         DO UPDATE SET allowed_roles = excluded.allowed_roles, max_depth = excluded.max_depth",
     )
     .bind(project_id)
     .bind(op_kind.trim())
+    .bind(crate::role_policy::roles_to_column(&permission.roles))
+    .bind(permission.max_depth)
     .execute(pool)
     .await
     .map(|_| ())
@@ -1522,7 +1562,35 @@ mod tests {
     async fn a_declared_git_op_comes_back() {
         let pool = pool().await;
         declare_git_op(&pool, "alpha", "push").await.unwrap();
-        assert_eq!(git_ops(&pool, "alpha").await, vec!["push".to_owned()]);
+        assert_eq!(
+            git_ops(&pool, "alpha").await,
+            vec![("push".to_owned(), crate::role_policy::Permission::default())]
+        );
+    }
+
+    /// The permission a declaration carries survives the round trip, and a re-declare overwrites it.
+    #[tokio::test]
+    async fn a_git_op_permission_round_trips_and_a_redeclare_overwrites_it() {
+        let pool = pool().await;
+        let narrow = crate::role_policy::Permission {
+            roles: Some(vec![crate::role_policy::Role::Leaf]),
+            max_depth: Some(1),
+        };
+        declare_git_op_with(&pool, "alpha", "merge", &narrow)
+            .await
+            .unwrap();
+        assert_eq!(
+            git_ops(&pool, "alpha").await,
+            vec![("merge".to_owned(), narrow)]
+        );
+        declare_git_op(&pool, "alpha", "merge").await.unwrap();
+        assert_eq!(
+            git_ops(&pool, "alpha").await,
+            vec![(
+                "merge".to_owned(),
+                crate::role_policy::Permission::default()
+            )]
+        );
     }
 
     /// `declare_git_op`'s `ON CONFLICT ... DO NOTHING`. Without this a regression to a bare

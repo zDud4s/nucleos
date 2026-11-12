@@ -5,7 +5,7 @@ go 1.26.0
 // Pinned, not left to whatever the machine has: this process is the only one in NucleOS that faces
 // a network other than loopback (through `tailscale serve`), so the stdlib it is built with is its
 // exposure. Same pin as the other sidecars.
-toolchain go1.26.6
+toolchain go1.27.4
 
 require (
 	github.com/fxamacker/cbor/v2 v2.9.4

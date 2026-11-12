@@ -91,6 +91,7 @@ pub mod repo_trigger;
 pub mod resolver;
 pub mod restart_cli;
 pub mod role_policy;
+pub mod sandbox;
 pub use nucleos_base::router_client;
 pub use nucleos_base::search;
 pub use nucleos_base::secrets;

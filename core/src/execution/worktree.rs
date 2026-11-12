@@ -6,6 +6,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+mod checkpoint_guard;
 mod gc;
 mod registry;
 
@@ -1250,6 +1251,8 @@ pub async fn checkpoint_with_message(worktree_path: &Path, message: &str) -> io:
             let stderr = String::from_utf8_lossy(&add.stderr);
             return Err(io::Error::other(format!("git add failed: {stderr}")));
         }
+        // A wrong index (2026-11-12: 2407 deletions of files still on disk) is refused and unstaged.
+        checkpoint_guard::refuse_implausible_deletions(worktree_path).await?;
 
         let commit = git()
             .arg("-c")

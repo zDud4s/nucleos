@@ -9,7 +9,8 @@ go 1.26
 //
 // govulncheck against go1.26.1, 2026-08-16: 17 vulnerabilities reachable from this module's own
 // code — the highest of the five — fixed across go1.26.2 through go1.26.6. Zero after.
-toolchain go1.26.6
+// Raised to go1.27.4 on 2026-11-12: go1.27.3 carries GO-2026-6859.
+toolchain go1.27.4
 
 require github.com/emersion/go-imap/v2 v2.0.0-beta.7
 

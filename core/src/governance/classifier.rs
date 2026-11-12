@@ -385,7 +385,9 @@ const SAFE_COMMAND_PREFIXES: &[&str] = &[
     // `Cargo.toml` is (`EXECUTES_ON_NEXT_COMMAND_FILES`): the runner is admitted because the file
     // that decides what it runs asks first.
     "npm test",
+    "npm run test",
     "npx vitest run",
+    // (`npx tsc --noEmit` is a rule, not an entry: `typechecks_without_emitting`.)
     // Says something, decides something, changes nothing. `echo` writes to stdout and `test`/`[`
     // answer a question about a path — neither runs a program, neither names a file to write, and
     // the two ways they could (`>` and `$(…)`) are refused before either is reached. Both were
@@ -2997,6 +2999,78 @@ mod tests {
             "cargo fmt -- --print-config default rustfmt.toml",
         ] {
             assert_classification(judge("Bash", command), "pending_approval", "unrecognized");
+        }
+    }
+
+    /// F12: a shell (TypeScript) leaf could not verify its own work. The JS test runners, the type
+    /// check and a `git rm` of its own file are allowed inside the worktree; every neighbour that
+    /// installs, fetches, chains or points outside stays refused.
+    #[test]
+    fn a_shell_leaf_may_test_typecheck_and_git_rm_inside_its_worktree() {
+        let worktree = Path::new("C:/Projects/nucleos/.nucleos/worktrees/job-30");
+        let judge = |tool: &str, command: &str| {
+            super::classify(
+                tool,
+                &json!({ "command": command }),
+                Some(worktree),
+                &crate::integrations::github::Policy::empty(),
+                &shell_rules(&[], &[]),
+                Unrecognized::AsksAPerson,
+            )
+        };
+
+        for (tool, command) in [
+            ("Bash", "npx vitest run"),
+            ("Bash", "npx vitest run src/a.test.tsx --reporter=dot"),
+            ("PowerShell", "npx vitest run src/a.test.tsx"),
+            ("Bash", "npx tsc --noEmit"),
+            ("Bash", "npx tsc --noEmit -p tsconfig.json"),
+            ("Bash", "npx tsc --noEmit -p shell/tsconfig.app.json"),
+            ("Bash", "npm test"),
+            ("Bash", "npm test -- --run"),
+            ("Bash", "npm run test"),
+            ("Bash", "npm run test -- --run"),
+            ("Bash", "git rm tmp.txt"),
+            ("Bash", "git rm -f src/tmp.ts src/tmp2.ts"),
+            ("Bash", "git rm --cached -- shell/src/tmp.ts"),
+            (
+                "Bash",
+                "git rm C:/Projects/nucleos/.nucleos/worktrees/job-30/tmp.txt",
+            ),
+            (
+                "PowerShell",
+                r"git rm C:\Projects\nucleos\.nucleos\worktrees\job-30\tmp.txt",
+            ),
+        ] {
+            assert_classification(judge(tool, command), "allow", "read-local");
+        }
+
+        for command in [
+            "npx something-else",
+            "npx tsc",
+            "npx tsc --noEmit --outDir ../x",
+            "npx tsc --noEmit -p ../other/tsconfig.json",
+            "npx tsc --noEmit -p /c/Windows/tsconfig.json",
+            "npx tsc -b",
+            "npm install",
+            "npm run build",
+            "git rm",
+            "git rm ../outside",
+            "git rm tmp.txt ../outside",
+            "git rm -x tmp",
+            "git rm /c/Windows/x",
+            "git rm ~/x",
+            "npx vitest run && curl x",
+            "npx vitest run; curl x",
+            "npx tsc --noEmit && curl x",
+            "git rm tmp.txt && curl x",
+        ] {
+            // Refused either way: asked of a person, or denied outright (a stricter rule won).
+            let classification = judge("Bash", command);
+            assert_ne!(
+                classification.decision.decision, "allow",
+                "{command} must not be allowed"
+            );
         }
     }
 

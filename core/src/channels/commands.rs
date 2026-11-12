@@ -287,7 +287,9 @@ async fn run_note(state: &AppState, at: &ingest::Inbound<'_>, text: &str) -> Str
         return strings::render(&Text::NoteUsage);
     }
     let origin = crate::assistant::Origin::Channel(at.channel).as_wire();
-    match crate::owner_notes::create(&state.pool, text, origin).await {
+    // A secret pasted into a note is replaced by its label before anything is written (S10).
+    let text = crate::governance::redact::redact_secrets(text);
+    match crate::owner_notes::create(&state.pool, &text, origin).await {
         Ok(id) => strings::render(&Text::Noted { id }),
         Err(error) => {
             tracing::warn!(channel = at.channel, %error, "a channel note could not be saved");
@@ -930,6 +932,28 @@ mod tests {
         );
         let answer = the_one_answer(&state).await;
         assert!(answer.starts_with("Noted (#"), "{answer}");
+    }
+
+    #[tokio::test]
+    async fn execute_note_redacts_secrets_before_storing() {
+        let state = crate::channels::testkit::state().await;
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+        run(&state, Intent::Note(format!("deploy token {secret} ok"))).await;
+        let stored: String = sqlx::query_scalar("SELECT note_text FROM owner_notes")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, "deploy token [SECRET:github] ok");
+        let answer = the_one_answer(&state).await;
+        assert!(answer.starts_with("Noted (#"), "{answer}");
+        assert!(!answer.contains(secret), "{answer}");
+    }
+
+    #[tokio::test]
+    async fn execute_note_whitespace_only_answers_usage() {
+        let state = crate::channels::testkit::state().await;
+        run(&state, Intent::Note("  \n ".to_string())).await;
+        assert_eq!(the_one_answer(&state).await, "Usage: /note <text>");
     }
 
     #[tokio::test]

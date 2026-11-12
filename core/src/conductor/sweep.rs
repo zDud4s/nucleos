@@ -1,7 +1,7 @@
 //! Periodic liveness observations and their one-shot feed reports.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, Weak};
 
 use chrono::{DateTime, Duration, Utc};
 
@@ -49,9 +49,65 @@ pub struct SweepReport {
     pub marked_nodes: Vec<String>,
 }
 
-/// The tail buffer has no mtime. This process-local map gives unchanged tails a stable clock.
-type TailClocks = HashMap<(i64, usize), (String, DateTime<Utc>)>;
+/// The tail buffer has no mtime. This process-local map gives unchanged tails a stable clock. The
+/// `Weak` is the entry's lifetime: a run that ends drops its tail from `run_tails`, and
+/// `prune_tail_clocks` then forgets the entry, so the map does not grow with every run ever seen.
+type TailClocks = HashMap<(i64, usize), (String, DateTime<Utc>, Weak<Mutex<String>>)>;
 static TAIL_CLOCKS: LazyLock<Mutex<TailClocks>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Forgets the clocks of tails nothing holds any more (their run finished).
+fn prune_tail_clocks() {
+    TAIL_CLOCKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|_, (_, _, tail)| tail.strong_count() > 0);
+}
+
+/// Wakes the sweep (and with it the tree-job driver) ahead of its periodic tick. Signalled when a
+/// run ends and when a decision is answered. `Notify` keeps one permit, so a burst of events
+/// collapses into a single early pass and an event during a pass is not lost.
+static WAKE: LazyLock<tokio::sync::Notify> = LazyLock::new(tokio::sync::Notify::new);
+
+pub fn wake() {
+    WAKE.notify_one();
+}
+
+/// Resolves when `wake` has been called since the last time it resolved.
+pub async fn woken() {
+    WAKE.notified().await;
+}
+
+/// How many tree jobs the driver advances at once. Each job is serialised by its own lock, so this
+/// only bounds how many jobs' git and database work overlap; no speed.yaml knob exists for it.
+pub(crate) const MAX_PARALLEL_JOBS: usize = 4;
+
+/// Runs `work` for every item, at most `limit` at a time, and returns when all are done. A panic in
+/// one item is logged and does not stop the others.
+pub(crate) async fn for_each_bounded<F, Fut>(items: Vec<String>, limit: usize, work: F)
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(limit.max(1)));
+    let mut tasks = tokio::task::JoinSet::new();
+    for item in items {
+        let permit = permits
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("the semaphore is never closed");
+        let future = work(item);
+        tasks.spawn(async move {
+            future.await;
+            drop(permit);
+        });
+    }
+    while let Some(joined) = tasks.join_next().await {
+        if let Err(error) = joined {
+            tracing::warn!(%error, "a bounded task ended abnormally");
+        }
+    }
+}
 
 pub async fn tick(
     state: &AppState,
@@ -375,6 +431,7 @@ async fn terminal_feed(
 
 pub async fn daemon_observations(state: &AppState) -> sqlx::Result<Vec<Observed>> {
     let now = Utc::now();
+    prune_tail_clocks();
     let runs: Vec<(i64, String, String, String, Option<String>)> = sqlx::query_as(
         "SELECT id, status, mode, created_at, project_id FROM runs WHERE status = 'running'",
     )
@@ -432,8 +489,7 @@ pub async fn daemon_observations(state: &AppState) -> sqlx::Result<Vec<Observed>
         let (last_transcript_write, tool_in_flight_until) =
             tail.as_ref().map_or((None, None), |tail| {
                 let text = tail.lock().unwrap().clone();
-                let written =
-                    tail_clock(id, std::sync::Arc::as_ptr(tail) as usize, text.clone(), now);
+                let written = tail_clock(id, tail, text.clone(), now);
                 (
                     if text.is_empty() { None } else { Some(written) },
                     open_tool_deadline(&text, started_at, state, &mode),
@@ -465,18 +521,23 @@ fn parse_time(value: &str) -> Option<DateTime<Utc>> {
         .map(|time| time.with_timezone(&Utc))
 }
 
-fn tail_clock(id: i64, pointer: usize, text: String, now: DateTime<Utc>) -> DateTime<Utc> {
+fn tail_clock(
+    id: i64,
+    tail: &std::sync::Arc<Mutex<String>>,
+    text: String,
+    now: DateTime<Utc>,
+) -> DateTime<Utc> {
     let mut clocks = TAIL_CLOCKS.lock().unwrap();
-    let key = (id, pointer);
+    let key = (id, std::sync::Arc::as_ptr(tail) as usize);
     match clocks.get_mut(&key) {
-        Some((old, time)) if *old == text => *time,
-        Some((old, time)) => {
+        Some((old, time, _)) if *old == text => *time,
+        Some((old, time, _)) => {
             *old = text;
             *time = now;
             now
         }
         None => {
-            clocks.insert(key, (text, now));
+            clocks.insert(key, (text, now, std::sync::Arc::downgrade(tail)));
             now
         }
     }
@@ -1468,7 +1529,9 @@ mod tests {
     }
 
     fn commit_in(repo: &std::path::Path, file: &str, text: &str, message: &str) {
-        std::fs::write(repo.join(file), text).expect("write");
+        let path = repo.join(file);
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
+        std::fs::write(path, text).expect("write");
         git_in(repo, &["add", "-A"]);
         git_in(repo, &["commit", "-q", "-m", message]);
     }
@@ -1484,7 +1547,8 @@ mod tests {
         git_in(&repo, &["checkout", "-q", "-b", "feat/sweep"]);
         commit_in(&repo, "feature.txt", "from the feature\n", "feature");
         git_in(&repo, &["checkout", "-q", "-b", "tree/api"]);
-        commit_in(&repo, "api.txt", "from the branch\n", "api");
+        // Inside `api/**`, the paths the branch declares: the merge step fences anything else.
+        commit_in(&repo, "api/api.txt", "from the branch\n", "api");
         git_in(&repo, &["checkout", "-q", "feat/sweep"]);
         (container, repo)
     }
@@ -1982,6 +2046,72 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let moved_pass = daemon_observations(&state).await.unwrap();
         assert!(clock(&moved_pass) > first, "a new line moves the clock");
+    }
+
+    fn has_tail_clock(id: i64) -> bool {
+        TAIL_CLOCKS
+            .lock()
+            .unwrap()
+            .keys()
+            .any(|(run, _)| *run == id)
+    }
+
+    /// F5: the clock of a run that ended is forgotten, or the map grows with every run ever seen.
+    #[tokio::test]
+    async fn the_tail_clock_of_a_finished_run_is_pruned() {
+        let state = state().await;
+        let (live, done) = (880_031, 880_032);
+        seed_live_run_with_id(&state, live, Utc::now() - minutes(60)).await;
+        seed_live_run_with_id(&state, done, Utc::now() - minutes(60)).await;
+        let _live_tail = publish_tail(&state, live, "going\n");
+        let done_tail = publish_tail(&state, done, "going\n");
+        daemon_observations(&state).await.unwrap();
+        assert!(has_tail_clock(live) && has_tail_clock(done));
+
+        // What `Registration` does when the run's task ends.
+        state.run_tails.lock().unwrap().remove(&done);
+        drop(done_tail);
+        daemon_observations(&state).await.unwrap();
+        assert!(!has_tail_clock(done), "the finished run's clock is gone");
+        assert!(has_tail_clock(live), "a live run keeps its clock");
+    }
+
+    /// F1: an event wakes the loop at once, well inside the 5 s acceptance bound and far inside
+    /// the 60 s tick. (Not asserted the other way: other tests end runs and signal the same static.)
+    #[tokio::test]
+    async fn wake_resolves_woken_without_waiting_for_a_tick() {
+        wake();
+        tokio::time::timeout(std::time::Duration::from_secs(5), woken())
+            .await
+            .expect("a signalled wake resolves at once");
+    }
+
+    /// F1: the driver's fan-out never runs more than `limit` jobs at once, and runs them all.
+    #[tokio::test]
+    async fn for_each_bounded_caps_concurrency_and_finishes_every_item() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (running, peak, done) = (
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let items: Vec<String> = (0..8).map(|n| n.to_string()).collect();
+        let (r, p, d) = (running.clone(), peak.clone(), done.clone());
+        for_each_bounded(items, 3, move |_| {
+            let (r, p, d) = (r.clone(), p.clone(), d.clone());
+            async move {
+                let now = r.fetch_add(1, Ordering::SeqCst) + 1;
+                p.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                r.fetch_sub(1, Ordering::SeqCst);
+                d.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+        .await;
+        assert_eq!(done.load(Ordering::SeqCst), 8);
+        let peak = peak.load(Ordering::SeqCst);
+        assert!(peak <= 3, "at most 3 at once, saw {peak}");
+        assert!(peak >= 2, "the items overlapped, saw {peak}");
     }
 
     /// One tool call streams nothing while it runs, and the runner exempts an open call from its

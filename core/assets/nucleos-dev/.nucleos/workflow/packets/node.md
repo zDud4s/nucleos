@@ -32,7 +32,7 @@ Subtree verify: <!-- `nodes.subtree_verify` (true | false), as resolved for this
   Never content. Read only these ranges. -->
 
 ## Constraints
-- Run no build or test tool (compilers, package managers, test runners) beyond the leaf self-check in `Rules by role`: list the exact commands in the handoff for the root to run.
+- Run no build or test tool (compilers, package managers, test runners) beyond the leaf self-check named under Rules: list the exact commands in the handoff for the root to run.
 - Write state through `mcp__nucleos__node_update` on every status change, decision and context peak.
 - Dispatch only your own direct children (kind `orchestrator` or `leaf`); never another node's phases.
 - Close through `mcp__nucleos__node_close` (a top-of-branch orchestrator excepted: it returns its report and stays `running` until merge) with a summary of at most 1500 characters and the path of the full handoff, written first from `packets/handoff.md`.
@@ -43,7 +43,7 @@ Subtree verify: <!-- `nodes.subtree_verify` (true | false), as resolved for this
 <!-- Read by `scripts/tree.py prompt`: `### all` plus the subsection of the node's role are copied into the generated prompt under `## Rules`. This is the only copy of these rules; edit them here, never in a skill or in a hand-written prompt. -->
 
 ### all
-- A leaf runs only `cargo fmt -p <crate>` and `python scripts/check_invariants.py` before closing, via `python scripts/heavy.py`, failing open; never `cargo check`, `test`, `build`, `clippy` or `--workspace`. The rest is the gate's. With `autonomy.leaf_self_check: true` it may add one `cargo check -p <crate> --tests`. Put every other command you would have run in your report under `Commands for the root`; the root runs it. Orchestrators run no cargo.
+- A leaf runs only `cargo fmt -p <crate>` and `python scripts/check_invariants.py` before closing, via `python scripts/heavy.py --agent leaf-<node id> ...`, failing open; never `cargo check`, `test`, `build`, `clippy` or `--workspace`. The rest is the gate's. With `autonomy.leaf_self_check: true` it may add one `cargo check -p <crate> --tests`. Put every other command you would have run in your report under `Commands for the root`; the root runs it. Orchestrators run no cargo.
 - Run no other build or test tool either (compilers, package managers, test runners).
 - Make no commit, merge, stash or push.
 - The contract file is read-only. A gap in it that is internal to your own files: choose the smallest reading, do it, and record the choice under Decisions. Only when the choice changes an interface shared with a sibling: stop and return `Outcome: contract_request` with the options.
