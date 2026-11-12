@@ -34,7 +34,9 @@ pub fn tools_given_from_stream(stream: &str) -> Option<String> {
         let value: Value = serde_json::from_str(line).ok()?;
         let is_init = value.get("type").and_then(Value::as_str) == Some("system")
             && value.get("subtype").and_then(Value::as_str) == Some("init");
-        let tools = value.get("tools").filter(|tools| is_init && tools.is_array())?;
+        let tools = value
+            .get("tools")
+            .filter(|tools| is_init && tools.is_array())?;
         serde_json::to_string(tools).ok()
     })
 }
