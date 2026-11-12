@@ -4,6 +4,7 @@
 
 #![allow(dead_code)] // the wiring step (2.4) is the caller
 
+pub mod holdout;
 pub mod inject;
 pub mod outcome;
 pub mod propose;
@@ -97,7 +98,7 @@ pub fn decide_inject(
     } else {
         "fire"
     };
-    Decision {
+    let decision = Decision {
         action: "inject".to_string(),
         rule_id: rule_id.to_string(),
         project_id: state.project_id.clone(),
@@ -113,7 +114,8 @@ pub fn decide_inject(
         expected_saving_ms: median(&mut costs).map(|m| m / 2),
         rule_version: crate::devtime::rules::rule(rule_id).map_or(1, |r| i64::from(r.version)),
         action_version,
-    }
+    };
+    holdout::apply_holdout(decision, cfg.holdout_fraction)
 }
 
 /// The version of the action logic; a bump starts a fresh cooldown history.
@@ -349,7 +351,10 @@ pub async fn run_for_session(
                 cost_ms: f.cost_ms,
                 count: f.count,
             };
-            let d = propose::decide_propose(&state, &candidate, acfg, ACTION_VERSION);
+            let d = holdout::apply_holdout(
+                propose::decide_propose(&state, &candidate, acfg, ACTION_VERSION),
+                acfg.holdout_fraction,
+            );
             if write_decision(
                 pool,
                 acfg,
