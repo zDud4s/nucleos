@@ -1142,6 +1142,8 @@ mod tests {
                     "updated_at",
                     "rules_version",
                     "rules_at",
+                    "run_id",
+                    "node_id",
                 ],
             ),
             (
@@ -1760,6 +1762,9 @@ mod tests {
                     "sessions",
                     "rules_version",
                     "parser_version",
+                    // Migration 0305 stamps a tree node's findings with its run and node.
+                    "run_id",
+                    "node_id",
                 ],
             ),
             (
