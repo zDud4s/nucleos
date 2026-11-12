@@ -43,7 +43,10 @@ mod tests {
         let refused = view(&SandboxStatus::Refused {
             reason: "cannot start".into(),
         });
-        assert_eq!((refused["state"].clone(), refused["banner"].clone()), ("refused".into(), "cannot start".into()));
+        assert_eq!(
+            (refused["state"].clone(), refused["banner"].clone()),
+            ("refused".into(), "cannot start".into())
+        );
     }
 
     #[tokio::test]
