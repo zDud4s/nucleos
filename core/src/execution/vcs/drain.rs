@@ -712,7 +712,7 @@ pub async fn sweep_awaiting_gate(pool: &sqlx::SqlitePool) -> u64 {
         // A parked promote targets the last green sha, not the tip it parked on: any green sha
         // lets it proceed, provided the gate state is the one of the branch it promotes from.
         let any_green = state.last_green_sha.is_some() || state.covered_sha.is_some();
-        let has_promote = promote_froms.iter().any(|from| *from == state.target);
+        let has_promote = promote_froms.contains(&state.target);
         if (has_promote && any_green) || shas.iter().any(|sha| parked_push_may_proceed(&state, sha))
         {
             released += release_awaiting_gate(pool, &project_id).await;
