@@ -186,6 +186,9 @@ pub struct OwnerDecision {
     pub node_id: Option<String>,
     /// When the row was raised (same instant as `created_at`).
     pub at: String,
+    /// Why a tree decision was closed as `obsolete`; `None` otherwise.
+    #[serde(default)]
+    pub obsolete_reason: Option<String>,
 }
 
 #[cfg(test)]
