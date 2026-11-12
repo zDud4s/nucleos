@@ -497,10 +497,46 @@ const SAFE_EXACT_COMMANDS: &[&str] = &[
     "git version",
 ];
 
+/// The piece of a parked line that stopped it, and why, in words a person can act on.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+pub struct Culprit {
+    pub segment: String,
+    pub reason: String,
+}
+
 pub struct Classification {
     pub decision: Decision,
     pub action_class: &'static str,
     pub reason: String,
+    /// Set on every park, `None` on an allow (and on a deny, which is not a question).
+    pub culprit: Option<Culprit>,
+    /// The shell line split into its segments, so a UI can show where the cut fell. Empty for a
+    /// tool that is not a shell.
+    pub segments: Vec<String>,
+}
+
+impl Classification {
+    /// Names the segment and the reason it parked.
+    fn with_culprit(mut self, segment: &str, reason: String) -> Self {
+        self.culprit = Some(Culprit {
+            segment: segment.to_owned(),
+            reason,
+        });
+        self
+    }
+}
+
+/// The path a write tool names, for a culprit's reason.
+fn target_of(tool_input: &Value) -> &str {
+    ["file_path", "notebook_path", "path"]
+        .iter()
+        .find_map(|key| tool_input.get(key).and_then(Value::as_str))
+        .unwrap_or("(no path)")
+}
+
+/// The non-shell parks have no segment to point at: the tool call itself is the culprit.
+fn parked_tool(class: &'static str, reason: &str, what: &str, why: String) -> Classification {
+    classification("pending_approval", class, reason).with_culprit(what, why)
 }
 
 /// Whether this tool can only READ this machine — it changes nothing, anywhere.
@@ -670,18 +706,26 @@ pub fn classify(
     // need a cwd: a governance file is recognised by its path suffix either way, and the scoreboard
     // reads these classes, so the narrower one is the one worth recording.
     if WRITE_TOOLS.contains(&tool_name) && targets_self_governing_file(tool_input, cwd) {
-        return classification(
-            "pending_approval",
+        return parked_tool(
             "self-governing-file",
             "changes to autopilot governance files require approval",
+            tool_name,
+            format!(
+                "`{}` changes an autopilot governance file",
+                target_of(tool_input)
+            ),
         );
     }
 
     if WRITE_TOOLS.contains(&tool_name) && targets_file_that_runs_on_next_command(tool_input, cwd) {
-        return classification(
-            "pending_approval",
+        return parked_tool(
             "executes-on-next-command",
             "writes to files that run on the next allowed command require approval",
+            tool_name,
+            format!(
+                "`{}` is a file that runs on the next allowed command",
+                target_of(tool_input)
+            ),
         );
     }
 
@@ -691,10 +735,14 @@ pub fn classify(
     // left `run_handles`, so this is an ordinary state rather than a corner case. A boundary we
     // cannot establish is a reason to ask a human, not a reason to skip the check.
     if WRITE_TOOLS.contains(&tool_name) && cwd.is_none() {
-        return classification(
-            "pending_approval",
+        return parked_tool(
             "no-workspace",
             "writes without a known workspace require approval",
+            tool_name,
+            format!(
+                "`{}` is written without a known workspace",
+                target_of(tool_input)
+            ),
         );
     }
 
@@ -753,10 +801,11 @@ pub fn classify(
     // guard whose correctness depended on an earlier `return` rather than on what it says — the
     // kind of thing that holds until somebody reorders the chain for an unrelated reason.
     if !reads_github_policy(tool_name) {
-        return classification(
-            "pending_approval",
+        return parked_tool(
             "unrecognized-tool",
             &format!("unrecognized tool actions require approval. {ALT_TOOL}"),
+            tool_name,
+            format!("`{tool_name}` is not a tool this classifier knows"),
         );
     }
 
@@ -773,14 +822,19 @@ pub fn classify(
     let spelled = (shell == crate::command_reader::Shell::PowerShell)
         .then(|| area::spelled_out_powershell(command))
         .flatten();
-    classify_shell_command(
+    let mut verdict = classify_shell_command(
         spelled.as_deref().unwrap_or(command),
         cwd,
         policy,
         rules,
         shell,
         unrecognized,
-    )
+    );
+    verdict.segments = crate::command_reader::segments(command, shell)
+        .iter()
+        .map(|piece| piece.to_string())
+        .collect();
+    verdict
 }
 
 /// PURE but for the active area: the text each command of a parsed POSIX line is judged (and
@@ -996,11 +1050,13 @@ fn classify_shell_command(
         matches_any_phrase(&normalize_command(text), APPROVAL_COMMAND_PATTERNS)
             || runs_an_approval_command_word(text, shell)
     }) {
+        let piece = approval_segment(&texts, shell);
         return classification(
             "pending_approval",
             "push-merge-deploy",
             "push, merge, deploy, publish, and tag actions require approval",
-        );
+        )
+        .with_culprit(&piece, format!("`{piece}` is push/merge/deploy"));
     }
 
     // Read the RAW command, not `normalized`. `normalize_command` collapses every whitespace
@@ -1024,7 +1080,8 @@ fn classify_shell_command(
                 "pending_approval",
                 "unrecognized",
                 &unreadable_line_reason(reason),
-            );
+            )
+            .with_culprit(command, format!("line can't be parsed: {reason}"));
         }
         None => match crate::command_reader::read(command, shell) {
             crate::command_reader::Reading::Sequence(segments) => {
@@ -1039,12 +1096,14 @@ fn classify_shell_command(
                     "pending_approval",
                     "unrecognized",
                     &unreadable_line_reason(reason),
-                );
+                )
+                .with_culprit(command, format!("line can't be parsed: {reason}"));
             }
         },
     };
     if segments.is_empty() {
-        return classification("pending_approval", "unrecognized", &unrecognized_reason());
+        return classification("pending_approval", "unrecognized", &unrecognized_reason())
+            .with_culprit(command, "no command could be found in the line".to_owned());
     }
 
     let mut touches_vcs = false;
@@ -1067,8 +1126,9 @@ fn classify_shell_command(
                 outside.contains(crate::command_reader::SUBSTITUTION_PLACEHOLDER)
             });
         match classify_segment(&segment, cwd, policy, rules, shell, unrecognized) {
-            Segment::Unrecognized => {
-                return classification("pending_approval", "unrecognized", &unrecognized_reason());
+            Segment::Unrecognized(why) => {
+                return classification("pending_approval", "unrecognized", &unrecognized_reason())
+                    .with_culprit(&segment, why);
             }
             _ if unquoted_substitution => {
                 return classification(
@@ -1077,6 +1137,10 @@ fn classify_shell_command(
                     &format!(
                         "a command substitution outside quotes becomes several arguments. {ALT_SUBSTITUTION}"
                     ),
+                )
+                .with_culprit(
+                    &segment,
+                    format!("`{segment}` has a command substitution outside quotes"),
                 );
             }
             Segment::VcsLocal => touches_vcs = true,
@@ -1181,7 +1245,36 @@ enum Segment {
     /// decided outside this file, and a scoreboard that could not tell it from `ReadLocal` could
     /// not tell a compiled policy from an edited one.
     ProjectAllowed,
-    Unrecognized,
+    /// Not allowed; carries the concrete reason this segment is the culprit.
+    Unrecognized(String),
+}
+
+/// The segment of a line that matched an approval pattern, falling back to the whole text.
+fn approval_segment(texts: &[&str], shell: crate::command_reader::Shell) -> String {
+    for text in texts {
+        let hits = |piece: &str| {
+            let normalized = normalize_command(&strip_fd_duplications(piece));
+            matches_any_phrase(&normalized, APPROVAL_COMMAND_PATTERNS)
+                || names_approval_command_word(&normalized)
+        };
+        if let Some(piece) = crate::command_reader::segments(text, shell)
+            .iter()
+            .find(|piece| hits(piece))
+        {
+            return piece.trim().to_owned();
+        }
+    }
+    texts.first().map_or_else(String::new, |t| (*t).to_owned())
+}
+
+/// Whether a segment is a directory change (`cd`, `pushd`, `Set-Location`, `sl`).
+fn is_directory_change(segment: &str) -> bool {
+    segment.split_whitespace().next().is_some_and(|word| {
+        matches!(
+            word.to_ascii_lowercase().as_str(),
+            "cd" | "pushd" | "chdir" | "set-location" | "sl"
+        )
+    })
 }
 
 /// What happens to a command this file has no opinion about.
@@ -1465,7 +1558,7 @@ fn classify_segment(
     // the semicolon after it, and refusing the whole line was the only answer available to it. By
     // this point the separators have been cut away and the token stands on its own.
     if redirects_a_file(segment) {
-        return Segment::Unrecognized;
+        return Segment::Unrecognized(format!("`{segment}` redirects output to a file"));
     }
     // Only now, and only inside one command: what is left of a `>` here cannot reach a file, so it
     // is noise to every check below — `has_shell_control` among them, which reads the `>` and
@@ -1514,7 +1607,7 @@ fn classify_segment(
     // declared `cp` getting `cp x ~/.nucleos/github.yaml` for free, or a job node's `cp x
     // .nucleos/github.yaml` counting as confined to its workspace. See `names_machine_settings`.
     if segment_names_machine_settings(segment) {
-        return Segment::Unrecognized;
+        return Segment::Unrecognized(format!("`{segment}` names this machine's own settings"));
     }
     // The same for the governance files inside the workspace, and for every widening below rather
     // than for confinement alone, where it first lived. A `Write` to `.claude/settings.json` asks
@@ -1523,7 +1616,7 @@ fn classify_segment(
     // nor an owner's `gh` list a read that names one. A project allow rule is a widening the
     // project wrote, and the governance it would widen onto is the one thing it may not author.
     if segment_names_self_governing(segment, cwd) {
-        return Segment::Unrecognized;
+        return Segment::Unrecognized(format!("`{segment}` names an autopilot governance file"));
     }
     // Decision #3's widening half. After every compiled permission, so it only ever changes the
     // answer for a command this file had no opinion about; after `shell_form_is_readable`, so a
@@ -1583,7 +1676,10 @@ fn classify_segment(
         return Segment::Confined;
     }
 
-    Segment::Unrecognized
+    if is_directory_change(segment) {
+        return Segment::Unrecognized(format!("`{segment}` leaves the run's workspace"));
+    }
+    Segment::Unrecognized(format!("`{segment}` is not in the safe list"))
 }
 
 /// Which shell will run a tool call's command line.
@@ -7999,5 +8095,126 @@ mod tests {
                 "{command} was allowed"
             );
         }
+    }
+
+    // ---- the culprit: a park says WHICH piece of the line is the reason -----------------------
+
+    fn culprit_of(class: &Classification) -> (&str, &str) {
+        let culprit = class.culprit.as_ref().expect("a park carries a culprit");
+        (culprit.segment.as_str(), culprit.reason.as_str())
+    }
+
+    #[test]
+    fn an_unrecognized_command_is_the_culprit_with_its_own_text() {
+        let verdict = classify("Bash", &json!({"command": "mkdir -p y"}), None);
+        assert_eq!(verdict.decision, "pending_approval");
+        assert_eq!(
+            culprit_of(&verdict),
+            ("mkdir -p y", "`mkdir -p y` is not in the safe list")
+        );
+        assert_eq!(verdict.segments, vec!["mkdir -p y".to_owned()]);
+    }
+
+    #[test]
+    fn the_culprit_is_the_one_segment_of_a_chain_that_parks() {
+        let verdict = classify(
+            "Bash",
+            &json!({"command": "git status && mkdir -p y"}),
+            None,
+        );
+        assert_eq!(verdict.decision, "pending_approval");
+        assert_eq!(
+            culprit_of(&verdict),
+            ("mkdir -p y", "`mkdir -p y` is not in the safe list")
+        );
+        assert_eq!(
+            verdict.segments,
+            vec!["git status".to_owned(), "mkdir -p y".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_directory_change_out_of_the_workspace_names_the_cd() {
+        let cwd = Path::new("C:/Projects/nucleos/.nucleos/worktrees/job-26");
+        let verdict = classify("Bash", &json!({"command": "cd C:/x"}), Some(cwd));
+        assert_eq!(verdict.decision, "pending_approval");
+        assert_eq!(
+            culprit_of(&verdict),
+            ("cd C:/x", "`cd C:/x` leaves the run's workspace")
+        );
+    }
+
+    #[test]
+    fn push_merge_deploy_names_the_piece_that_pushes() {
+        let verdict = classify("Bash", &json!({"command": "git status && git push"}), None);
+        assert_eq!(verdict.decision, "pending_approval");
+        assert_eq!(verdict.action_class, "push-merge-deploy");
+        assert_eq!(
+            culprit_of(&verdict),
+            ("git push", "`git push` is push/merge/deploy")
+        );
+    }
+
+    #[test]
+    fn a_line_that_cannot_be_parsed_is_its_own_culprit() {
+        let verdict = classify("Bash", &json!({"command": "sleep 5 & git status"}), None);
+        assert_eq!(verdict.decision, "pending_approval");
+        let (segment, reason) = culprit_of(&verdict);
+        assert_eq!(segment, "sleep 5 & git status");
+        assert!(
+            reason.starts_with("line can't be parsed: "),
+            "reason was {reason}"
+        );
+    }
+
+    #[test]
+    fn an_output_redirect_names_the_segment_that_redirects() {
+        let verdict = classify("Bash", &json!({"command": "echo hi > out.txt"}), None);
+        assert_eq!(verdict.decision, "pending_approval");
+        let (segment, reason) = culprit_of(&verdict);
+        assert_eq!(segment, "echo hi > out.txt");
+        assert_eq!(reason, "`echo hi > out.txt` redirects output to a file");
+    }
+
+    #[test]
+    fn a_substitution_outside_quotes_names_its_segment() {
+        let verdict = classify("Bash", &json!({"command": "grep x $(ls)"}), None);
+        assert_eq!(verdict.decision, "pending_approval");
+        let (segment, reason) = culprit_of(&verdict);
+        assert_eq!(segment, "grep x $(ls)");
+        assert_eq!(
+            reason,
+            "`grep x $(ls)` has a command substitution outside quotes"
+        );
+    }
+
+    #[test]
+    fn a_tool_park_names_the_tool_and_leaves_segments_empty() {
+        let cwd = Path::new("C:/Projects/nucleos/.nucleos/worktrees/job-26");
+        let unknown = classify("Teleport", &json!({"path": "x"}), Some(cwd));
+        assert_eq!(unknown.decision, "pending_approval");
+        assert_eq!(unknown.action_class, "unrecognized-tool");
+        assert_eq!(
+            culprit_of(&unknown),
+            ("Teleport", "`Teleport` is not a tool this classifier knows")
+        );
+        assert!(unknown.segments.is_empty());
+
+        let no_workspace = classify("Write", &json!({"file_path": "src/a.rs"}), None);
+        assert_eq!(no_workspace.decision, "pending_approval");
+        assert_eq!(no_workspace.action_class, "no-workspace");
+        assert_eq!(
+            culprit_of(&no_workspace),
+            ("Write", "`src/a.rs` is written without a known workspace")
+        );
+        assert!(no_workspace.segments.is_empty());
+    }
+
+    #[test]
+    fn an_allow_has_no_culprit() {
+        let allowed = classify("Bash", &json!({"command": "git status"}), None);
+        assert_eq!(allowed.decision, "allow");
+        assert_eq!(allowed.culprit, None);
+        assert_eq!(allowed.segments, vec!["git status".to_owned()]);
     }
 }
