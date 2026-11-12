@@ -74,6 +74,11 @@ async fn pair_is_live(pool: &SqlitePool, action: &str, rule_id: &str) -> sqlx::R
     )
 }
 
+/// `(id, rule_id, project_id, template_id, basis_recent_count, basis_recent_cost_ms)`.
+type ProposeRow = (i64, String, String, String, Option<i64>, Option<i64>);
+/// `(id, rule_id, template_id, basis_recent_count, basis_recent_cost_ms)`.
+type InjectRow = (i64, String, String, Option<i64>, Option<i64>);
+
 /// Creates the `proposals` row of every `live` `propose` `fire` that has none. Returns how many.
 /// Idempotent: a row with a `proposal_id` is skipped, so a second run creates nothing.
 pub async fn deliver_proposals(
@@ -84,7 +89,7 @@ pub async fn deliver_proposals(
     if !cfg.enabled {
         return Ok(0);
     }
-    let rows: Vec<(i64, String, String, String, Option<i64>, Option<i64>)> = sqlx::query_as(
+    let rows: Vec<ProposeRow> = sqlx::query_as(
         "SELECT id, rule_id, project_id, template_id, basis_recent_count, basis_recent_cost_ms \
          FROM devtime_shadow WHERE action = 'propose' AND mode = 'live' AND decision = 'fire' \
          AND outcome_state = 'pending' AND proposal_id IS NULL ORDER BY id",
@@ -147,7 +152,7 @@ pub async fn inject_deliveries(
     let since = super::ms_text(
         now_ms.saturating_sub(i64::from(cfg.inject_window_days).saturating_mul(86_400_000)),
     );
-    let rows: Vec<(i64, String, String, Option<i64>, Option<i64>)> = sqlx::query_as(
+    let rows: Vec<InjectRow> = sqlx::query_as(
         "SELECT id, rule_id, template_id, basis_recent_count, basis_recent_cost_ms \
          FROM devtime_shadow WHERE action = 'inject' AND mode = 'live' AND decision = 'fire' \
          AND outcome_state = 'pending' AND project_id = ? AND decided_at >= ? \
