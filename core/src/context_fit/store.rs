@@ -80,13 +80,46 @@ fn strings(value: &str) -> Vec<String> {
 
 /// What the run's attempts say: the reads outside the given before the first edit, and how many
 /// pointers were read at all. `None` when the run has no ingested attempts.
+#[cfg(test)]
 fn read_signals(
     attempts: &[(String, String)],
     owned: &[String],
     pointers: &[String],
 ) -> (Option<u32>, Option<u32>) {
+    let detail = read_detail(attempts, owned, pointers, "none");
+    (detail.outside_count, detail.pointers_read)
+}
+
+/// The read signals plus the paths behind them, for the pointer learner.
+#[derive(Debug, Default)]
+struct ReadDetail {
+    outside_count: Option<u32>,
+    pointers_read: Option<u32>,
+    /// Outside reads, made repo-relative so nodes in different worktrees compare equal.
+    outside: Vec<String>,
+    read: Vec<String>,
+    unread: Vec<String>,
+}
+
+/// Cuts an absolute transcript path back to the repo-relative one: from the first segment named
+/// like the node's layer. Without a layer or a match the path is only slash-normalized.
+fn repo_relative(path: &str, layer: &str) -> String {
+    let normal = path.replace('\\', "/");
+    let segments: Vec<&str> = normal.split('/').filter(|s| !s.is_empty()).collect();
+    match segments.iter().position(|s| *s == layer) {
+        Some(at) if layer != "none" => segments[at..].join("/"),
+        _ => normal,
+    }
+}
+
+fn read_detail(
+    attempts: &[(String, String)],
+    owned: &[String],
+    pointers: &[String],
+    layer: &str,
+) -> ReadDetail {
     if attempts.is_empty() {
-        return (None, None);
+        return ReadDetail::default();
     }
     let given: Vec<String> = owned.iter().chain(pointers).cloned().collect();
     let mut outside: Vec<String> = Vec::new();
@@ -107,17 +140,18 @@ fn read_signals(
         }
     }
     let outside_count = (!given.is_empty()).then_some(outside.len() as u32);
-    let pointers_read = (!pointers.is_empty()).then(|| {
-        pointers
+    let (read, unread): (Vec<String>, Vec<String>) = pointers.iter().cloned().partition(|pointer| {
+        read_any
             .iter()
-            .filter(|pointer| {
-                read_any
-                    .iter()
-                    .any(|read| path_is_given(read, std::slice::from_ref(pointer)))
-            })
-            .count() as u32
+            .any(|read| path_is_given(read, std::slice::from_ref(pointer)))
     });
-    (outside_count, pointers_read)
+    ReadDetail {
+        outside_count,
+        pointers_read: (!pointers.is_empty()).then_some(read.len() as u32),
+        outside: outside.iter().map(|p| repo_relative(p, layer)).collect(),
+        read,
+        unread,
+    }
 }
 
 async fn count(pool: &SqlitePool, sql: &str, node_id: &str) -> u32 {
@@ -209,8 +243,12 @@ pub async fn gather(pool: &SqlitePool, node: &Node, cfg: &Thresholds) -> Inputs 
         .fetch_all(pool)
         .await
         .unwrap_or_default();
-    (inputs.outside_reads_before_edit, inputs.pointers_read) =
-        read_signals(&attempts, &node.owned_paths, &node.pointers);
+    let detail = read_detail(&attempts, &node.owned_paths, &node.pointers, &inputs.layer);
+    inputs.outside_reads_before_edit = detail.outside_count;
+    inputs.pointers_read = detail.pointers_read;
+    inputs.outside_paths = detail.outside;
+    inputs.pointers_read_paths = detail.read;
+    inputs.pointers_unread_paths = detail.unread;
 
     // Fix and rescue rounds and a conflict resolution are launches of the node, keyed by kind.
     let keys: Vec<String> =
@@ -335,6 +373,8 @@ pub async fn record_close(pool: &SqlitePool, node: &Node) {
             return;
         }
     };
+    // Learning reads the stored cards and is fail-open: it never changes the close.
+    super::learn::run(pool, node).await;
     if card.is_fit() {
         return;
     }

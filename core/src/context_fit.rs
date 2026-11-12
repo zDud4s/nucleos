@@ -8,6 +8,7 @@
 //! [`Thresholds`] (the `context_fit` section of `devtime.yaml`); the only numbers written here are
 //! the "one is enough" counts of the signals that are a plain yes/no.
 
+pub mod learn;
 pub mod store;
 
 use serde::Serialize;
@@ -17,7 +18,10 @@ pub use crate::config::DevtimeContextFitConfig as Thresholds;
 
 /// Bumped when a signal or its meaning changes: a card computed under an older version is
 /// recomputed (`store::recompute_outdated`).
-pub const RULES_VERSION: i64 = 1;
+///
+/// 2: `used` also lists the read paths (`outside_paths`, `pointers_read_paths`,
+/// `pointers_unread_paths`) the pointer learner (`learn`) groups across nodes.
+pub const RULES_VERSION: i64 = 2;
 
 /// The devtime rule ids that make a node `split` when they fire in its run (s1).
 const LOOP_RULES: [&str; 4] = ["D1", "D3", "D7", "D8"];
@@ -66,6 +70,11 @@ pub struct Inputs {
     pub outside_reads_before_edit: Option<u32>,
     /// How many of `pointers` the run read at all (o1).
     pub pointers_read: Option<u32>,
+    /// The paths behind `outside_reads_before_edit`, as read.
+    pub outside_paths: Vec<String>,
+    /// The pointers the run read, and those it never opened.
+    pub pointers_read_paths: Vec<String>,
+    pub pointers_unread_paths: Vec<String>,
     pub fence_refusals: u32,
     pub tools_requested: u32,
     pub tools_refused: u32,
@@ -258,6 +267,12 @@ fn used_of(inputs: &Inputs) -> Value {
         json!(inputs.outside_reads_before_edit),
     );
     used.insert("pointers_read".into(), json!(inputs.pointers_read));
+    used.insert("outside_paths".into(), json!(inputs.outside_paths));
+    used.insert("pointers_read_paths".into(), json!(inputs.pointers_read_paths));
+    used.insert(
+        "pointers_unread_paths".into(),
+        json!(inputs.pointers_unread_paths),
+    );
     used.insert("fence_refusals".into(), json!(inputs.fence_refusals));
     used.insert("tools_requested".into(), json!(inputs.tools_requested));
     used.insert("tools_refused".into(), json!(inputs.tools_refused));

@@ -172,13 +172,21 @@ async fn post_node(
             ));
         }
     }
+    let owned_paths = body.owned_paths.unwrap_or_default();
+    // Shadow by default: only a `live` pointer pair appends the learned pointers (never owned paths).
+    let pointers = crate::context_fit::learn::with_learned(
+        &state.pool,
+        &owned_paths,
+        body.pointers.unwrap_or_default(),
+    )
+    .await;
     let args = OpenArgs {
         parent_id: present(body.parent_id),
         kind: required("kind", body.kind)?,
         title: required("title", body.title)?,
         goal: required("goal", body.goal)?,
-        owned_paths: body.owned_paths.unwrap_or_default(),
-        pointers: body.pointers.unwrap_or_default(),
+        owned_paths,
+        pointers,
         budget_tokens: body.budget_tokens,
         task_id: present(body.task_id),
         session_id: present(body.session_id),
