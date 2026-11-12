@@ -59,7 +59,7 @@ the contract, not a snapshot.
 | `execution/runner/live.rs` | The live view of a turn read off its stream: tool calls, the plan, details and `live_from_stream`. |
 | `execution/runner/local_triage.rs` | Whether a local Ollama model can hold the triage prompt: the context probe and its errors. |
 | `execution/runner/ollama.rs` | The Ollama backend: one-shot runs and chats against the loopback API. |
-| `execution/runner/request.rs` | What a run is asked to do and what it hands back: exit codes, the turn ceiling, tool policy, permissions, `RunRequest` and `RunOutcome`. |
+| `execution/runner/request.rs` | What a run is asked to do and what it hands back: exit codes, the turn ceiling, tool policy, permissions, `RunRequest` and `RunOutcome`; and `start_cli`, the one door call the claude, codex and agy runners start their CLI through (a minimal sandbox scope built from the request). |
 | `execution/runner/stream.rs` | Single facts read off a run's stream: task events, cache TTL, model, context fill, background tasks and compaction. |
 | `execution/runner/turns.rs` | Cutting a long-lived session into turns, and the usage each turn and run reports. |
 | `execution/runner/wire.rs` | The Claude CLI's stream-json both ways: the stdin lines a run is fed, the tools it advertises, its reply and how a turn failed. |
