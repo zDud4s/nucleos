@@ -3552,6 +3552,7 @@ pub mod tests {
         let root = TempDir::new().unwrap();
         wire_with(&root, Some("*"), "");
         assert!(classifier_hook_is_wired(root.path()));
+        fs::create_dir_all(root.path().join(".claude")).unwrap();
         fs::write(
             root.path().join(".claude/settings.local.json"),
             r#"{"disableAllHooks":true}"#,

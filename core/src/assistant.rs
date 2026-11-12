@@ -2283,7 +2283,7 @@ mod tests {
         // this process's pid, which is a different number every run.
         let readable = mcp_config_path("-1001234567890");
         let readable = readable.to_string_lossy();
-        assert!(readable.ends_with("--1001234567890.json"), "got {readable}");
+        assert!(readable.ends_with("-1001234567890.json"), "got {readable}");
     }
 
     #[tokio::test]
