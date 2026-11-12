@@ -62,7 +62,10 @@ async fn rebase_in_own_worktree(
         Ok(result) if result.succeeded() => std::path::PathBuf::from(result.stdout.trim()),
         Ok(result) => {
             return failed(
-                format!("could not locate the git directory of {}", worktree.display()),
+                format!(
+                    "could not locate the git directory of {}",
+                    worktree.display()
+                ),
                 &result,
             );
         }

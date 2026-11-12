@@ -4652,7 +4652,11 @@ integration_steps:
         };
         assert_ne!(sha, before);
         assert_eq!(sha_of(&holder, "HEAD"), sha, "the worktree moved");
-        assert_eq!(sha_of(&repo, "refs/heads/feat/x"), sha, "and so did the ref");
+        assert_eq!(
+            sha_of(&repo, "refs/heads/feat/x"),
+            sha,
+            "and so did the ref"
+        );
         assert_eq!(sha_of(&repo, &format!("{sha}^1")), master, "onto master");
         assert!(holder.join("feature.txt").exists());
         assert!(holder.join("later.txt").exists());
@@ -4731,8 +4735,14 @@ integration_steps:
             .output()
             .expect("git should start");
         let git_dir = PathBuf::from(String::from_utf8_lossy(&git_dir.stdout).trim());
-        assert!(!git_dir.join("rebase-merge").exists(), "no rebase in progress");
-        assert!(!git_dir.join("rebase-apply").exists(), "no rebase in progress");
+        assert!(
+            !git_dir.join("rebase-merge").exists(),
+            "no rebase in progress"
+        );
+        assert!(
+            !git_dir.join("rebase-apply").exists(),
+            "no rebase in progress"
+        );
     }
 
     /// ON, but the worktree holding the branch is not the requester's: blocked as ever.
@@ -4745,7 +4755,14 @@ integration_steps:
         std::fs::create_dir_all(&requester).expect("create");
         let before = sha_of(&holder, "HEAD");
 
-        let outcome = rebase(&repo, "feat/x", "master", Some(&requester), rebase_deadline()).await;
+        let outcome = rebase(
+            &repo,
+            "feat/x",
+            "master",
+            Some(&requester),
+            rebase_deadline(),
+        )
+        .await;
 
         match &outcome {
             Outcome::Blocked { reason, .. } => {
