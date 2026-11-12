@@ -583,7 +583,7 @@ mod tests {
     ) -> Vec<(String, String, Option<String>, Option<i64>)> {
         sqlx::query_as(
             "SELECT kind, summary, project_id, run_id FROM feed \
-             WHERE kind LIKE 'work_tree_%' ORDER BY id",
+             WHERE kind LIKE 'work_tree_%' AND kind != 'work_tree_context_fit' ORDER BY id",
         )
         .fetch_all(pool)
         .await

@@ -229,6 +229,8 @@ const READINGS: Record<StateDomain, Record<string, StateReading>> = {
     work_tree_descent: { tone: "info", label: "node tree descended" },
     // An expired default answer was applied to an owner question (`tree_job/auto_default.rs`): a fact, said once.
     work_tree_auto_default: { tone: "info", label: "default answer applied" },
+    // A closed node whose context did not fit (`context_fit/store.rs`): a fact, said once per node.
+    work_tree_context_fit: { tone: "info", label: "node context fit" },
     // A tree with no live run, no open decision and no change for 30 minutes (`tree_job/stalled.rs`):
     // it walks a retry ladder, then asks the owner, so it is held.
     work_tree_stalled: { tone: "paused", label: "node tree stalled" },

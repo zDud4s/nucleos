@@ -334,6 +334,13 @@ pub(super) const ROUTES: &[RouteEntry] = &[
     },
     RouteEntry {
         method: "GET",
+        path: "/trees/{id}/context-fit",
+        purpose: "Get tree context fit.",
+        body: Body::None,
+        handler: "get_tree_context_fit",
+    },
+    RouteEntry {
+        method: "GET",
         path: "/trees/{id}/cost",
         purpose: "Get cost.",
         body: Body::None,

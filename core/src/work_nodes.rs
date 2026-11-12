@@ -910,6 +910,8 @@ pub async fn close(
     {
         tracing::warn!(node = %closed.id, %error, "could not file the handoff rework record");
     }
+    // The context-fit card: fail-open, logged inside, never undoes the close.
+    crate::context_fit::store::record_close(pool, &closed).await;
     Ok(closed)
 }
 
