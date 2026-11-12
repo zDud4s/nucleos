@@ -268,7 +268,10 @@ fn used_of(inputs: &Inputs) -> Value {
     );
     used.insert("pointers_read".into(), json!(inputs.pointers_read));
     used.insert("outside_paths".into(), json!(inputs.outside_paths));
-    used.insert("pointers_read_paths".into(), json!(inputs.pointers_read_paths));
+    used.insert(
+        "pointers_read_paths".into(),
+        json!(inputs.pointers_read_paths),
+    );
     used.insert(
         "pointers_unread_paths".into(),
         json!(inputs.pointers_unread_paths),

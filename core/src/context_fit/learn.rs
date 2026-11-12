@@ -285,7 +285,9 @@ async fn log_shadow(
     subject_key: &str,
     params: &Value,
 ) -> Result<(), sqlx::Error> {
-    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+    let now = chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string();
     sqlx::query(
         "INSERT INTO devtime_shadow (action, rule_id, project_id, subject_key, mode, decision, \
          template_id, params, rule_version, action_version, thresholds_hash, rules_version, \
@@ -379,7 +381,10 @@ pub async fn run_for_layer(
     if layer == "none" {
         return Ok(());
     }
-    let (pointers_mode, budget_mode) = (mode(pool, POINTERS_RULE).await, mode(pool, BUDGET_RULE).await);
+    let (pointers_mode, budget_mode) = (
+        mode(pool, POINTERS_RULE).await,
+        mode(pool, BUDGET_RULE).await,
+    );
     if pointers_mode == Mode::Off && budget_mode == Mode::Off {
         return Ok(());
     }
@@ -431,7 +436,11 @@ pub async fn with_learned(
         .into_iter()
         .filter(|s| s.change == Change::Add)
         .filter(|s| !pointers.contains(&s.path))
-        .filter(|s| !owned_paths.iter().any(|glob| work_nodes::path_contained(&s.path, glob)))
+        .filter(|s| {
+            !owned_paths
+                .iter()
+                .any(|glob| work_nodes::path_contained(&s.path, glob))
+        })
         .take(MAX_LEARNED)
         .map(|s| s.path)
         .collect::<Vec<_>>();
@@ -481,7 +490,10 @@ mod tests {
 
     #[test]
     fn two_nodes_suggest_nothing() {
-        let samples = vec![s(&["core/src/x.rs"], &[], &[]), s(&["core/src/x.rs"], &[], &[])];
+        let samples = vec![
+            s(&["core/src/x.rs"], &[], &[]),
+            s(&["core/src/x.rs"], &[], &[]),
+        ];
         assert!(suggest_pointers(&samples).is_empty());
     }
 
@@ -499,7 +511,10 @@ mod tests {
 
         let mut with_a_read = samples;
         with_a_read.push(s(&[], &["docs/a.md"], &[]));
-        assert!(suggest_pointers(&with_a_read).is_empty(), "one read keeps it");
+        assert!(
+            suggest_pointers(&with_a_read).is_empty(),
+            "one read keeps it"
+        );
     }
 
     #[test]
@@ -507,7 +522,10 @@ mod tests {
         let mut split: Vec<Sample> = (0..4).map(|_| shaped(&["split"], 90_000)).collect();
         split.extend((0..6).map(|_| shaped(&[], 60_000)));
         let down = propose_budget(&split).expect("4 of 10 split");
-        assert_eq!((down.current, down.proposed, down.split), (100_000, 75_000, 4));
+        assert_eq!(
+            (down.current, down.proposed, down.split),
+            (100_000, 75_000, 4)
+        );
 
         let small: Vec<Sample> = (0..10).map(|_| shaped(&[], 20_000)).collect();
         let up = propose_budget(&small).expect("all small fits");
@@ -535,7 +553,10 @@ mod tests {
     }
 
     async fn count(pool: &SqlitePool, sql: &str) -> i64 {
-        sqlx::query_scalar(sql).fetch_one(pool).await.unwrap()
+        sqlx::query_scalar(sqlx::AssertSqlSafe(sql.to_owned()))
+            .fetch_one(pool)
+            .await
+            .unwrap()
     }
 
     async fn set_live(pool: &SqlitePool, rule: &str) {
@@ -585,7 +606,10 @@ mod tests {
 
         let owned = vec!["core/src/a/**".to_owned()];
         let got = with_learned(&pool, &owned, vec!["docs/a.md".into()]).await;
-        assert_eq!(got, vec!["docs/a.md".to_owned(), "core/src/x.rs".to_owned()]);
+        assert_eq!(
+            got,
+            vec!["docs/a.md".to_owned(), "core/src/x.rs".to_owned()]
+        );
         assert_eq!(owned, vec!["core/src/a/**".to_owned()]);
 
         let inside = vec!["core/src/x.rs".to_owned()];
@@ -601,7 +625,14 @@ mod tests {
         let pool = crate::testdb::fresh_pool().await;
         for i in 0..10 {
             let used = json!({"peak": 10_000});
-            insert_card(&pool, &format!("n{i}"), "core", &used, &json!({"ceiling": 100_000})).await;
+            insert_card(
+                &pool,
+                &format!("n{i}"),
+                "core",
+                &used,
+                &json!({"ceiling": 100_000}),
+            )
+            .await;
         }
         set_live(&pool, BUDGET_RULE).await;
 

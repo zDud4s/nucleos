@@ -146,11 +146,12 @@ fn read_detail(
         }
     }
     let outside_count = (!given.is_empty()).then_some(outside.len() as u32);
-    let (read, unread): (Vec<String>, Vec<String>) = pointers.iter().cloned().partition(|pointer| {
-        read_any
-            .iter()
-            .any(|read| path_is_given(read, std::slice::from_ref(pointer)))
-    });
+    let (read, unread): (Vec<String>, Vec<String>) =
+        pointers.iter().cloned().partition(|pointer| {
+            read_any
+                .iter()
+                .any(|read| path_is_given(read, std::slice::from_ref(pointer)))
+        });
     ReadDetail {
         outside_count,
         pointers_read: (!pointers.is_empty()).then_some(read.len() as u32),
@@ -188,17 +189,17 @@ pub async fn gather(pool: &SqlitePool, node: &Node, cfg: &Thresholds) -> Inputs 
     };
 
     // The runs: first launch's initial context, last launch's tools, the peak and the tokens.
+    type RunRow = (Option<i64>, Option<String>, Option<i64>, i64);
     let runs_sql = format!(
         "SELECT initial_context, tools_given, context_peak, \
          COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0) \
          FROM runs WHERE id IN {NODE_RUNS} ORDER BY id"
     );
-    let runs: Vec<(Option<i64>, Option<String>, Option<i64>, i64)> =
-        sqlx::query_as(sqlx::AssertSqlSafe(runs_sql))
-            .bind(id)
-            .fetch_all(pool)
-            .await
-            .unwrap_or_default();
+    let runs: Vec<RunRow> = sqlx::query_as(sqlx::AssertSqlSafe(runs_sql))
+        .bind(id)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
     if !runs.is_empty() {
         inputs.initial_context = runs.first().and_then(|r| r.0);
         inputs.tools_given = runs.last().and_then(|r| r.1.as_deref()).map(strings);
