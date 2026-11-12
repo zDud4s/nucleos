@@ -10,7 +10,7 @@ go 1.26.0
 // govulncheck against go1.26.1, 2026-08-16: 14 vulnerabilities reachable from this module's own
 // code, fixed across go1.26.2 (crypto/x509 name-constraint auth bypass, TLS 1.3 KeyUpdate DoS),
 // go1.26.3 (HTTP/2 infinite loop on a bad SETTINGS_MAX_FRAME_SIZE) and up to go1.26.6. Zero after.
-toolchain go1.26.6
+toolchain go1.27.4
 
 // The first dependency, for one package: x/net/publicsuffix, which the ferry needs to tell whether a
 // request is same-site (SameSite cookies). A site is a registrable domain, and that cannot be

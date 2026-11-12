@@ -1212,6 +1212,7 @@ const GIT_OP_LABEL: Record<string, string> = {
   tag: "create a tag",
   fetch: "fetch from the remote",
   rebase: "rebase a branch",
+  "rebase-own-worktree": "rebase in the requester's own worktree",
   "branch-delete": "delete a branch",
   // The build's kind is `branch-delete`. The underscore spelling is an alias kept for a project
   // table or fixture that still stores it; nothing in the shell sends it any more.

@@ -49,7 +49,13 @@ impl From<sqlx::Error> for ScanError {
     }
 }
 
+/// The hash a spec is keyed by: its bytes without the daemon-written `Estado:` line
+/// ([`super::estado::hashed_view`]), so writing that line never makes the spec look edited.
 pub fn content_sha(bytes: &[u8]) -> String {
+    hex_sha(&super::estado::hashed_view(bytes))
+}
+
+fn hex_sha(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -123,8 +129,16 @@ pub async fn scan(
         let bytes = fs::read(&path);
         let bytes = bytes?;
         let sha = content_sha(&bytes);
-        let previous =
+        let mut previous =
             super::store::get_spec(pool, &super::model::spec_id(project_id, &stored_path)).await?;
+        // A spec stored while the whole file was hashed is the same spec under the new hash.
+        if let Some(old) = previous.as_mut()
+            && old.content_sha != sha
+            && old.content_sha == hex_sha(&bytes)
+        {
+            super::estado::rekey(pool, &old.id, &old.content_sha, &sha).await?;
+            old.content_sha = sha.clone();
+        }
         let spec = upsert_by_path(
             pool,
             project_id,
@@ -328,6 +342,37 @@ mod tests {
             content_sha(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    /// A spec registered while the whole file was hashed (its `Estado:` line included) is found
+    /// unchanged by the first scan that hashes it without the line: re-keyed, not re-discovered.
+    #[tokio::test]
+    async fn a_spec_hashed_with_its_estado_line_is_rekeyed_not_rediscovered() {
+        let pool = crate::testdb::fresh_pool().await;
+        let project = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let text: &[u8] = b"# Alpha\n**Estado:** aprovado\nbody\n";
+        write_file(&state_specs(state.path()), "alpha.md", text);
+        let spec = crate::spec_backlog::store::upsert_by_path(
+            &pool,
+            PROJECT,
+            "<state_dir>/specs/alpha.md",
+            "Alpha",
+            &sha_hex(text),
+        )
+        .await
+        .unwrap();
+        mark_extracted(&pool, &spec.id).await;
+
+        let report = scan(&pool, PROJECT, &roots_at(project.path(), state.path()))
+            .await
+            .unwrap();
+
+        assert_eq!((report.new, report.changed, report.unchanged), (0, 0, 1));
+        let after = stored(&pool, &spec.id).await;
+        assert_eq!(after.status, SpecStatus::Extracted);
+        assert_eq!(after.content_sha, content_sha(text));
+        assert_ne!(after.content_sha, sha_hex(text));
     }
 
     // The owner's rule: a spec file is never altered, by anything in the backlog.

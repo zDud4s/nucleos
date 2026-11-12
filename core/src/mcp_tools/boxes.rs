@@ -244,6 +244,7 @@ pub const WORKTREE_BOX_TOOLS: &[&str] = &[
     "record",
     "spec_backlog",
     "spec_finish",
+    "spec_finish_cancel",
     "task_claim",
     "task_decline",
     "task_done",
@@ -608,5 +609,91 @@ mod tests {
         .unwrap();
         let own = dir.path().to_string_lossy().into_owned();
         assert!(tree_leaf_verify_refusal(&McpBox::Worktree(own)).is_some());
+    }
+
+    /// Corpus of the unboxed server's tools that call a daemon route: with the assistant key (the
+    /// one an orchestrator turn and its MCP child now carry, instead of the control token) each
+    /// must reach its route, except the owner-only ones, which must be refused. A new tool that
+    /// calls a route is added here, or the sandboxed assistant silently loses it.
+    #[test]
+    fn every_assistant_tool_is_callable_with_the_assistant_scope() {
+        use crate::auth::{Scope, permits_route};
+        use axum::http::Method;
+        // (tool, method, route template, reachable with the assistant scope)
+        let corpus: &[(&str, Method, &str, bool)] = &[
+            ("list_projects", Method::GET, "/projects", true),
+            ("list_teams", Method::GET, "/teams", true),
+            ("create_run", Method::POST, "/runs", true),
+            ("get_run", Method::GET, "/runs/{id}", true),
+            ("cancel_run", Method::POST, "/runs/{id}/cancel", true),
+            ("create_job", Method::POST, "/jobs", true),
+            ("get_job", Method::GET, "/jobs/{id}", true),
+            ("list_jobs", Method::GET, "/jobs", true),
+            ("cancel_job", Method::POST, "/jobs/{id}/cancel", true),
+            ("list_files", Method::GET, "/files", true),
+            ("project_ls", Method::GET, "/projects/{id}/ls", true),
+            ("project_cat", Method::GET, "/projects/{id}/cat", true),
+            ("project_grep", Method::GET, "/projects/{id}/grep", true),
+            ("project_diff", Method::GET, "/projects/{id}/diff", true),
+            ("shadow_queue", Method::GET, "/shadow-decisions", true),
+            ("list_proposals", Method::GET, "/proposals", true),
+            ("latest_models", Method::GET, "/models/latest", true),
+            ("triage_email", Method::POST, "/email/triage", true),
+            ("get_email_queue", Method::GET, "/email/queue", true),
+            ("get_email", Method::GET, "/email/{id}", true),
+            ("ask_council", Method::POST, "/council", true),
+            ("get_council", Method::GET, "/council/{id}", true),
+            (
+                "send_to_chat",
+                Method::POST,
+                "/assistant/chats/{chat_id}/relay",
+                true,
+            ),
+            (
+                "browser_agent",
+                Method::POST,
+                "/assistant/browser-agents",
+                true,
+            ),
+            ("tree_launch", Method::POST, "/trees", true),
+            ("tree_status", Method::GET, "/trees/{id}", true),
+            ("tree_abandon", Method::POST, "/trees/{id}/abandon", true),
+            ("spec_backlog", Method::GET, "/backlog", true),
+            (
+                "spec_finish_cancel",
+                Method::POST,
+                "/backlog/finish/cancel",
+                true,
+            ),
+            ("wait_advice", Method::GET, "/cost/wait-advice", true),
+            // Owner-only: the owner's decision, never the assistant's.
+            (
+                "approve_proposal",
+                Method::POST,
+                "/proposals/{id}/approve",
+                false,
+            ),
+            (
+                "reject_proposal",
+                Method::POST,
+                "/proposals/{id}/reject",
+                false,
+            ),
+            ("set_kill", Method::POST, "/autopilot/kill", false),
+            ("vcs_request", Method::POST, "/vcs/requests", false),
+            ("vcs_ticket", Method::GET, "/vcs/requests/{id}", false),
+            ("github_read", Method::POST, "/github/requests", false),
+        ];
+        for (tool, method, route, reachable) in corpus {
+            assert!(
+                served_in_box(&McpBox::All, tool),
+                "{tool} is not served by the unboxed server, so it does not belong in the corpus"
+            );
+            assert_eq!(
+                permits_route(&Scope::Assistant, method, route),
+                *reachable,
+                "{tool} ({method} {route}) has the wrong reach with the assistant scope"
+            );
+        }
     }
 }

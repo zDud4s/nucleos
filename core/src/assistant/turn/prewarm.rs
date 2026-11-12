@@ -253,7 +253,7 @@ async fn warm_chat(state: &crate::state::AppState, chat_id: &str) {
         .unwrap_or(crate::chats::PermissionMode::Auto);
     let permission = crate::execution::runner::Permission::for_chat(mode);
     // No turn owns this process yet, so no run id; the conversation's key is what identifies it.
-    let mut env = chat_key::turn_env(tool_policy, true, pool, chat_id, 0, &state.token.0).await;
+    let mut env = chat_key::turn_env(tool_policy, true, pool, chat_id, 0).await;
     // A process is keyed where it is spawned, and this is where one is.
     chat_key::rekey(&mut env, pool, chat_id).await;
 

@@ -720,7 +720,6 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
     let utility_model = state.utility_model.clone();
     let assistants = state.assistants.clone();
     let (run_timeout, progress_timeout) = (state.run_timeout, state.progress_timeout);
-    let control_token = state.token.0.clone();
     // Built HERE, outside the task, and captured by the async block. A task aborted before its first
     // poll drops its captured state without ever running a line of the body, so a guard constructed
     // inside would simply never exist — and a `/cancel` racing a fresh message hits exactly that.
@@ -955,15 +954,8 @@ pub(super) fn spawn_assistant_turn(state: &crate::state::AppState, launch: TurnL
             evict_live(&turn.slot.chat_id);
         }
 
-        let mut env = chat_key::turn_env(
-            tool_policy,
-            may_live,
-            &pool,
-            &turn.slot.chat_id,
-            id,
-            &control_token,
-        )
-        .await;
+        let mut env =
+            chat_key::turn_env(tool_policy, may_live, &pool, &turn.slot.chat_id, id).await;
         env.append(&mut pick.env);
 
         // A turn with no `resume` is a conversation that was deliberately let go of — it read

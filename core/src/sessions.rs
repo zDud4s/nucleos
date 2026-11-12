@@ -276,13 +276,24 @@ fn transcripts(root: &Path) -> Vec<(PathBuf, std::time::SystemTime)> {
     out
 }
 
+/// A transcript's bytes, read through the D12 crossing: capped at `TRANSCRIPT_CAP`, and a link or a
+/// hard-linked file in a project directory reads as no transcript at all instead of as whatever it
+/// points at. The grant is the transcript's own directory.
+pub(crate) fn transcript_bytes(path: &Path) -> Option<Vec<u8>> {
+    let root = path.parent()?;
+    crate::sandbox::artifacts::read_in(path, root, crate::sandbox::artifacts::TRANSCRIPT_CAP)
+        .ok()
+        .flatten()
+        .map(crate::sandbox::Untrusted::into_bytes)
+}
+
 /// Reads one transcript far enough to describe it, or `None` if it describes nothing resumable.
 fn read_head(path: &Path, modified: std::time::SystemTime) -> Option<IdeSession> {
     use std::io::BufRead;
 
     let session_id = path.file_stem()?.to_str()?.to_string();
-    let file = std::fs::File::open(path).ok()?;
-    let mut reader = std::io::BufReader::new(file);
+    let bytes = transcript_bytes(path)?;
+    let mut reader = bytes.as_slice();
 
     let mut cwd: Option<String> = None;
     let mut title: Option<String> = None;
@@ -695,14 +706,14 @@ fn cut_to(text: String, limit: usize) -> String {
 fn read_said(path: &Path) -> Conversation {
     use std::io::BufRead;
 
-    let Ok(file) = std::fs::File::open(path) else {
+    let Some(bytes) = transcript_bytes(path) else {
         return Conversation {
             said: Vec::new(),
             cut: false,
             context_estimate: None,
         };
     };
-    let mut reader = std::io::BufReader::new(file);
+    let mut reader = bytes.as_slice();
     let mut kept: std::collections::VecDeque<Said> = std::collections::VecDeque::new();
     let mut line = String::new();
     // Set where a message is DROPPED, not where one is shortened. A long message that was cut

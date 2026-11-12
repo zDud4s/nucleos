@@ -369,8 +369,34 @@ impl crate::execution::vcs::VcsExecutor for GitExecutor {
                     .map(|integration| integration.as_str());
                 branch_delete(project_root, branch.as_str(), judged_against, deadline).await
             }
-            crate::execution::vcs::Op::Rebase { branch, onto } => {
-                rebase(project_root, branch.as_str(), onto.as_str(), deadline).await
+            crate::execution::vcs::Op::Rebase {
+                branch,
+                onto,
+                worktree,
+            } => {
+                // The project's permissions are read only when the requester named a worktree, so
+                // a rebase that cannot use the grant never depends on it. `git_ops` fails closed
+                // (unreadable = nothing declared), and no database means no grant: the grant widens
+                // what the queue does, so it never opens on a guess. Who the declaration covers
+                // (roles, depth) was judged by the hook, which withdrew the stamp otherwise.
+                let granted = match (worktree.as_ref(), self.pool.as_ref()) {
+                    (Some(_), Some(pool)) => {
+                        crate::project::policy::git_ops(pool, &request.project_id)
+                            .await
+                            .iter()
+                            .any(|(kind, _)| kind == crate::execution::vcs::REBASE_OWN_WORKTREE)
+                    }
+                    _ => false,
+                };
+                let own_worktree = worktree.as_deref().filter(|_| granted);
+                rebase(
+                    project_root,
+                    branch.as_str(),
+                    onto.as_str(),
+                    own_worktree.map(Path::new),
+                    deadline,
+                )
+                .await
             }
             // No gate here: a revert returns a tree that has been green before, and the post-merge
             // gate measures the new tip like any other. A revert that changes the test map still

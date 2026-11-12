@@ -716,8 +716,14 @@ pub(super) async fn post_project_command_run(
             // `finish` below. Without that the row would say `running` until the next restart,
             // and the conditional claim above would refuse every later click as `already_running`.
             let measured = tokio::spawn(async move {
-                crate::gate::run_gate(&cwd, &cwd, &text, crate::project::commands::COMMAND_TIMEOUT)
-                    .await
+                crate::sandbox::gate::run_gate(
+                    crate::sandbox::RunMode::QueueGate,
+                    &cwd,
+                    &cwd,
+                    &text,
+                    crate::project::commands::COMMAND_TIMEOUT,
+                )
+                .await
             })
             .await;
             let finished = match measured {

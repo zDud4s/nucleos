@@ -495,6 +495,17 @@ pub async fn create_no_tools_run(
     .await
 }
 
+/// D7: a backend that exists but cannot start refuses the run rather than starting it uncontained.
+/// `NoBackend` and `Off` both run as today; nothing in the daemon arms the sandbox yet.
+pub fn sandbox_gate(status: &crate::sandbox::SandboxStatus) -> Result<(), CreateRunError> {
+    if status.refuses_runs() {
+        return Err(CreateRunError::Invalid(
+            "the OS sandbox is refused, so no run starts uncontained",
+        ));
+    }
+    Ok(())
+}
+
 /// `create_run_with` with the tool policy optionally fixed by the caller instead of derived from
 /// the mode.
 async fn create_run_with_policy(
@@ -514,6 +525,7 @@ async fn create_run_with_policy(
         account_choice,
         resume_session_id,
     } = run;
+    sandbox_gate(&crate::sandbox::status())?;
     let node = provisioning.as_ref().and_then(Provisioning::node);
     let resolution = provisioning.as_ref().and_then(Provisioning::resolution);
     let item = provisioning.as_ref().and_then(Provisioning::item);
@@ -956,7 +968,7 @@ async fn create_run_with_policy(
         }
         completion_feed = Some((
             "worktree_run_completed".to_owned(),
-            format!("worktree run completed on {}", info.branch),
+            worktree_completion_summary(&info.branch, resolution.is_some()),
         ));
         spawn_cwd = Some(info.path);
     }
@@ -1222,10 +1234,37 @@ async fn restrict_by_account(
     })
 }
 
+/// The feed line for a worktree run whose agent stopped cleanly. For a conflict resolution that
+/// only says the agent stopped: the resolver decides afterwards whether a merge was delivered
+/// (handed to the queue) or given up (`RESOLUTION_FAILED_KIND`), so "completed" would claim both.
+fn worktree_completion_summary(branch: &str, resolution: bool) -> String {
+    if resolution {
+        format!(
+            "conflict resolution agent stopped on {branch}; delivery or hand-off to a person \
+             follows"
+        )
+    } else {
+        format!("worktree run completed on {branch}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn a_resolution_run_does_not_announce_itself_as_a_plain_completed_worktree_run() {
+        let plain = worktree_completion_summary("feat/x", false);
+        let resolution = worktree_completion_summary("feat/x", true);
+        assert_eq!(plain, "worktree run completed on feat/x");
+        // `completed` on a resolution only says the agent stopped; whether it delivered a merge is
+        // announced later by the resolver, so this row must not read as a delivery.
+        assert_ne!(resolution, plain);
+        assert!(resolution.contains("conflict resolution"), "{resolution}");
+        assert!(resolution.contains("feat/x"), "{resolution}");
+        assert!(!resolution.contains("completed"), "{resolution}");
+    }
 
     use crate::execution::runs::tests::{
         WorktreeRootEnv, init_contained_repo, space_free_tempdir, test_state_with_runner,

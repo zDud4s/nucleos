@@ -173,9 +173,19 @@ pub enum Op {
     /// `publish_by_update_ref` already performs. A run's own branch, held by its own paused
     /// worktree, is refused — and refusing it is right rather than merely safe, since rewriting a
     /// branch under a paused run is what would corrupt its state on resume.
+    ///
+    /// **One owned exception, off unless the project grants it.** `worktree` is the checkout the
+    /// REQUESTER asked from, recorded by the session hook (`hooks::session_git`) and by nothing
+    /// else — the flat tool parameters and `rebase_from_command` leave it `None`. When the project's
+    /// project has declared `rebase-own-worktree` ([`REBASE_OWN_WORKTREE`], in its git permissions)
+    /// and that checkout is the one holding `branch`, the executor rebases there, because the
+    /// requester owns that directory and asked for exactly this. Any other holder stays `Blocked`,
+    /// grant or not.
     Rebase {
         branch: Branch,
         onto: Branch,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worktree: Option<String>,
     },
     /// Undoing a merge that is already on `target` (spec 2026-10-05 §6.2, D4), **and the only
     /// operation here that the daemon queues for itself**: the post-merge gate enqueues it when a
@@ -479,6 +489,7 @@ impl Op {
             "rebase" => Ok(Op::Rebase {
                 branch: named_branch(source, "rebase", "source")?,
                 onto: named_branch(target, "rebase", "target")?,
+                worktree: None,
             }),
             // Neither unknown nor deferred: the daemon performs it, and only the daemon asks.
             "revert" => Err(
@@ -552,7 +563,25 @@ impl Op {
 /// `every_op_kind_is_in_the_declarable_catalogue`, which builds one of each variant and asks: a
 /// seventh operation that never reached this list would be one the queue performs and no project
 /// can declare, and nothing else in the tree would say so.
-pub const GIT_OP_KINDS: [&str; 6] = ["merge", "push", "tag", "fetch", "rebase", "branch-delete"];
+///
+/// **Seven entries, six of them operations.** [`REBASE_OWN_WORKTREE`] is a grant, not an `Op`: it
+/// widens what a `rebase` may do (rebase in the requester's own worktree) and is declared like an
+/// operation so the owner grants and withdraws it in the same place. It is listed in
+/// [`GRANT_ONLY_KINDS`], which is what the catalogue test subtracts.
+pub const GIT_OP_KINDS: [&str; 7] = [
+    "merge",
+    "push",
+    "tag",
+    "fetch",
+    "rebase",
+    "branch-delete",
+    REBASE_OWN_WORKTREE,
+];
+/// The declarable grant that lets a requester's `rebase` run inside its own clean worktree. Distinct
+/// from the `rebase` operation grant, which stays as it was.
+pub const REBASE_OWN_WORKTREE: &str = "rebase-own-worktree";
+/// The entries of `GIT_OP_KINDS` that are grants and no `Op::kind()`.
+pub const GRANT_ONLY_KINDS: [&str; 1] = [REBASE_OWN_WORKTREE];
 /// The operation kinds only the daemon queues. They are outside `GIT_OP_KINDS` on purpose: no
 /// project declares them, the picker never draws them and `Op::from_request` refuses them.
 /// `every_op_kind_is_in_the_declarable_catalogue` requires every kind to sit in one list or the
@@ -566,7 +595,7 @@ pub const DAEMON_OP_KINDS: [&str; 2] = ["revert", "promote"];
 /// change of value and not a change of wire.
 ///
 /// **Not a reuse of `github::OpStanding`/`DeclarableOpView`**: those carry `half`, which separates
-/// a read that is in force from an action that is recorded and inert. These six are all writes the
+/// a read that is in force from an action that is recorded and inert. These seven are the six writes the
 /// queue performs the same way, and a `half` here would be a field with no meaning.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DeclarableGitOp {
@@ -1188,6 +1217,7 @@ mod tests {
             Op::Rebase {
                 branch: Branch::new("a").unwrap(),
                 onto: Branch::new("b").unwrap(),
+                worktree: None,
             },
             Op::Revert {
                 merge_sha: CommitSha::new(&"a".repeat(40)).unwrap(),
@@ -1205,8 +1235,15 @@ mod tests {
                 op.kind()
             );
         }
+        // Every declarable entry is an operation or a named grant, and nothing else.
+        for kind in GIT_OP_KINDS {
+            assert!(
+                GRANT_ONLY_KINDS.contains(&kind) || one_of_each.iter().any(|op| op.kind() == kind),
+                "{kind} is declarable but is neither an operation nor a listed grant"
+            );
+        }
         assert_eq!(
-            GIT_OP_KINDS.len() + DAEMON_OP_KINDS.len(),
+            GIT_OP_KINDS.len() - GRANT_ONLY_KINDS.len() + DAEMON_OP_KINDS.len(),
             one_of_each.len()
         );
     }
@@ -2284,14 +2321,16 @@ mod tests {
             rebase_from_command("git rebase master", "feat/x"),
             Some(Op::Rebase {
                 branch: "feat/x".into(),
-                onto: "master".into()
+                onto: "master".into(),
+                worktree: None,
             })
         );
         assert_eq!(
             rebase_from_command("GIT REBASE Master", "feat/x"),
             Some(Op::Rebase {
                 branch: "feat/x".into(),
-                onto: "Master".into()
+                onto: "Master".into(),
+                worktree: None,
             })
         );
         // Same guard, same reason as everywhere else: a detached worktree names no branch to replay.
@@ -2641,6 +2680,7 @@ mod tests {
             Op::Rebase {
                 branch: "feat/x".into(),
                 onto: "master".into(),
+                worktree: None,
             },
             Op::Revert {
                 merge_sha: "0123456789abcdef0123456789abcdef01234567".into(),

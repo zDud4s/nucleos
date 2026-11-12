@@ -1,5 +1,9 @@
 //! The pure "finished" rule: a spec is done only with a green verify and an independent reviewer
 //! confirming every criterion against the code. In doubt, or with any fact missing, it is not done.
+//! A verdict held back by doubt alone is `Inconclusive`: another tree cannot settle a doubt, so it
+//! goes to the owner instead.
+
+use serde::{Deserialize, Serialize};
 
 use super::model::{Criterion, CriterionStatus, Spec};
 
@@ -31,9 +35,12 @@ pub struct ReviewFacts {
     pub existing_evidence: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NotDoneReason {
     VerifyNotGreen,
+    /// The spec file's header says it is implemented (`Estado: implementado`). Only ever noted in
+    /// an `Inconclusive` verdict, as the reason the doubts are weighed toward done.
+    DeclaredImplemented,
     NoCriteria,
     Unresolved {
         ordinal: i64,
@@ -53,10 +60,64 @@ pub enum NotDoneReason {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Verdict {
     Done,
     NotDone(Vec<NotDoneReason>),
+    /// Not done, but only because of doubt: every unresolved criterion is a doubt (none a clear
+    /// miss) and verify is not green, or the header declares the spec implemented. Another tree
+    /// cannot settle a doubt, so the owner decides; no tree is opened for it.
+    Inconclusive(Vec<NotDoneReason>),
+}
+
+/// Whether a spec file's header (the lines before its first `## ` section) declares it
+/// implemented: a line starting `Estado:` (after a list marker or bold markup) that says
+/// `implementado` or `implementada` and not `parcial`. `Estado anterior:` is not that line.
+pub fn declares_implemented(spec_text: &str) -> bool {
+    spec_text
+        .lines()
+        .take_while(|line| !line.trim_start().starts_with("## "))
+        .any(|line| {
+            let line = line
+                .trim_start()
+                .trim_start_matches(['-', '*', '>', ' ', '\t']);
+            let Some(value) = line.strip_prefix("Estado:") else {
+                return false;
+            };
+            let value = value.to_lowercase();
+            (value.contains("implementado") || value.contains("implementada"))
+                && !value.contains("parcial")
+        })
+}
+
+/// Turns a `NotDone` held back by doubt alone into `Inconclusive`; any other verdict is returned as
+/// it is. "Doubt alone" is: at least one criterion in doubt, every other reason `VerifyNotGreen`,
+/// and verify not green. With `declared_implemented` the header's word also counts, so doubts with
+/// a green verify are inconclusive too, and `DeclaredImplemented` is noted among the reasons.
+pub fn weigh_doubts(verdict: Verdict, declared_implemented: bool) -> Verdict {
+    let Verdict::NotDone(reasons) = verdict else {
+        return verdict;
+    };
+    let mut doubts = 0;
+    let mut verify_not_green = false;
+    for reason in &reasons {
+        match reason {
+            NotDoneReason::VerifyNotGreen => verify_not_green = true,
+            NotDoneReason::Unresolved {
+                status: CriterionStatus::Doubt,
+                ..
+            } => doubts += 1,
+            _ => return Verdict::NotDone(reasons),
+        }
+    }
+    if doubts == 0 || !(verify_not_green || declared_implemented) {
+        return Verdict::NotDone(reasons);
+    }
+    let mut reasons = reasons;
+    if declared_implemented {
+        reasons.push(NotDoneReason::DeclaredImplemented);
+    }
+    Verdict::Inconclusive(reasons)
 }
 
 /// Whether the reviewer belongs to the implementing tree's own lineage.
@@ -129,7 +190,10 @@ pub fn done(
 
 #[cfg(test)]
 mod tests {
-    use super::{NotDoneReason, ReviewFacts, ReviewerRun, Verdict, VerifyState, done};
+    use super::{
+        NotDoneReason, ReviewFacts, ReviewerRun, Verdict, VerifyState, declares_implemented, done,
+        weigh_doubts,
+    };
     use crate::spec_backlog::model::{
         Criterion, CriterionKind, CriterionStatus, Spec, SpecKind, SpecStatus,
     };
@@ -221,6 +285,9 @@ mod tests {
     fn assert_not_done(verdict: Verdict, expected: Vec<NotDoneReason>) {
         match verdict {
             Verdict::Done => panic!("expected NotDone({expected:?}), got Done"),
+            Verdict::Inconclusive(reasons) => {
+                panic!("expected NotDone({expected:?}), got Inconclusive({reasons:?})")
+            }
             Verdict::NotDone(reasons) => {
                 assert_eq!(
                     reasons.len(),
@@ -488,5 +555,132 @@ mod tests {
             done(&spec, &unresolved, VerifyState::Green, &audit()),
             vec![NotDoneReason::NoReviewer { ordinal: 2 }],
         );
+    }
+
+    fn doubt(ordinal: i64) -> NotDoneReason {
+        NotDoneReason::Unresolved {
+            ordinal,
+            status: CriterionStatus::Doubt,
+        }
+    }
+
+    /// The 2026-11-10 audit of the foundation spec: every criterion in doubt and verify not green.
+    /// That is not a miss a tree could fix, so it is inconclusive, never NotDone.
+    #[test]
+    fn only_doubts_and_verify_not_green_is_inconclusive() {
+        let spec = spec(SpecKind::Spec);
+        let criteria = [
+            with_status(1, CriterionStatus::Doubt),
+            with_status(2, CriterionStatus::Doubt),
+            with_status(3, CriterionStatus::Doubt),
+        ];
+        for verify in [VerifyState::Unknown, VerifyState::Red] {
+            let verdict = weigh_doubts(done(&spec, &criteria, verify, &facts()), false);
+            assert_eq!(
+                verdict,
+                Verdict::Inconclusive(vec![
+                    NotDoneReason::VerifyNotGreen,
+                    doubt(1),
+                    doubt(2),
+                    doubt(3),
+                ]),
+                "{verify:?}"
+            );
+        }
+        // Met criteria beside the doubts do not change that.
+        let mixed = [met(1), with_status(2, CriterionStatus::Doubt)];
+        assert_eq!(
+            weigh_doubts(done(&spec, &mixed, VerifyState::Unknown, &facts()), false),
+            Verdict::Inconclusive(vec![NotDoneReason::VerifyNotGreen, doubt(2)])
+        );
+    }
+
+    #[test]
+    fn a_clear_miss_or_another_reason_keeps_it_not_done() {
+        let spec = spec(SpecKind::Spec);
+        for status in [CriterionStatus::Unmet, CriterionStatus::Open] {
+            let criteria = [
+                with_status(1, CriterionStatus::Doubt),
+                with_status(2, status),
+            ];
+            let not_done = done(&spec, &criteria, VerifyState::Unknown, &facts());
+            let verdict = weigh_doubts(not_done, true);
+            assert!(
+                matches!(verdict, Verdict::NotDone(_)),
+                "{status:?}: {verdict:?}"
+            );
+        }
+        let missing = [
+            with_status(1, CriterionStatus::Doubt),
+            with_evidence(2, None),
+        ];
+        let verdict = weigh_doubts(done(&spec, &missing, VerifyState::Unknown, &facts()), true);
+        assert!(matches!(verdict, Verdict::NotDone(_)), "{verdict:?}");
+        // Verify alone, with no doubt, is a tree's job.
+        let verdict = weigh_doubts(done(&spec, &[met(1)], VerifyState::Red, &facts()), true);
+        assert_eq!(
+            verdict,
+            Verdict::NotDone(vec![NotDoneReason::VerifyNotGreen])
+        );
+        assert_eq!(
+            weigh_doubts(Verdict::Done, true),
+            Verdict::Done,
+            "Done stays Done"
+        );
+    }
+
+    #[test]
+    fn green_doubts_need_the_header_to_be_inconclusive() {
+        let spec = spec(SpecKind::Spec);
+        let criteria = [met(1), with_status(2, CriterionStatus::Doubt)];
+        let not_done = done(&spec, &criteria, VerifyState::Green, &facts());
+        assert_eq!(weigh_doubts(not_done.clone(), false), not_done);
+        assert_eq!(
+            weigh_doubts(not_done, true),
+            Verdict::Inconclusive(vec![doubt(2), NotDoneReason::DeclaredImplemented])
+        );
+        let unknown = done(&spec, &criteria, VerifyState::Unknown, &facts());
+        assert_eq!(
+            weigh_doubts(unknown, true),
+            Verdict::Inconclusive(vec![
+                NotDoneReason::VerifyNotGreen,
+                doubt(2),
+                NotDoneReason::DeclaredImplemented,
+            ])
+        );
+    }
+
+    #[test]
+    fn header_estado_implemented_is_read_from_the_header_only() {
+        let yes = [
+            "# T\n\n- Data: 2026-07-17\n- Estado: implementado (monorepo em master)\n\n## 1. X\n",
+            "# T\nEstado: implementada\n",
+            "# T\n**Estado:** Implementado em master\n",
+        ];
+        for text in yes {
+            assert!(declares_implemented(text), "{text:?}");
+        }
+        let no = [
+            "# T\n- Estado: parcialmente implementado\n",
+            "# T\n- Estado: proposta\n",
+            "# T\n- Estado anterior: implementado\n",
+            "# T\n- Data: x\n\n## 1. X\nEstado: implementado\n",
+            "# T\nO estado: implementado\n",
+            "",
+        ];
+        for text in no {
+            assert!(!declares_implemented(text), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn verdict_round_trips_through_json() {
+        let verdict = Verdict::Inconclusive(vec![
+            NotDoneReason::VerifyNotGreen,
+            doubt(1),
+            NotDoneReason::DeclaredImplemented,
+        ]);
+        let json = serde_json::to_string(&verdict).unwrap();
+        assert_eq!(serde_json::from_str::<Verdict>(&json).unwrap(), verdict);
     }
 }

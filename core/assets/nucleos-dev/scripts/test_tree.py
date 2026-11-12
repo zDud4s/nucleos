@@ -261,8 +261,8 @@ class PromptGoalFile(CliCase):
 
 
 class Prompt(CliCase):
-    NO_CARGO = "No subagent runs `cargo`"
-    FMT_EXCEPTION = "run `cargo fmt -p <crate>`"
+    NO_CARGO = "never `cargo check`, `test`, `build`, `clippy` or `--workspace`"
+    FMT_EXCEPTION = "runs only `cargo fmt -p <crate>`"
 
     def setUp(self):
         super().setUp()

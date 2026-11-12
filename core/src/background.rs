@@ -10,6 +10,7 @@ use crate::{conductor, integrations};
 pub fn spawn_web_retention_loop(state: AppState) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3600));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
             match integrations::web::prune(
@@ -33,8 +34,15 @@ pub fn spawn_web_retention_loop(state: AppState) {
 pub fn spawn_conductor_liveness_loop(state: AppState) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+        // A pass that overruns its slot starts the next one a full period later, not in a burst.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            ticker.tick().await;
+            // The tick is the fallback: a run that ended or a decision that was answered wakes the
+            // pass at once (`conductor::sweep::wake`), so the driver does not wait out the minute.
+            tokio::select! {
+                _ = ticker.tick() => {}
+                () = conductor::sweep::woken() => {}
+            }
             match conductor::sweep::daemon_observations(&state).await {
                 Ok(observed) => {
                     if let Err(error) = conductor::sweep::tick(

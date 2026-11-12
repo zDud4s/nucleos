@@ -290,12 +290,15 @@ pub(super) async fn github_policy_of<'a>(
 }
 
 /// The time this daemon spends on one decision request, counted from when the request began.
-/// `core/hooks/ask_daemon.py` waits longer than this: `GATE_TIMEOUT_SECONDS` (15 s) per attempt on
+/// `core/hooks/ask_daemon.py` waits longer than this: `GATE_TIMEOUT_SECONDS` (20 s) per attempt on
 /// `/hooks/pretooluse-decision`, with `GATE_TIMEOUT_RETRIES` (one) retry as a fresh request. Past
 /// the hook's timeout it refuses ("fails closed") and an answer decided afterwards is never
-/// delivered. The budget stays well inside the hook's wait on purpose, so a slow judge or git
-/// probe is cut short here and the decision still arrives; keep it below `GATE_TIMEOUT_SECONDS`.
-pub(super) const HOOK_BUDGET: Duration = Duration::from_secs(5);
+/// delivered. The budget stays inside the hook's wait on purpose, so a slow judge or git probe is
+/// cut short here and the decision still arrives; keep it strictly below `GATE_TIMEOUT_SECONDS`
+/// (a test in `hooks.rs` reads that literal and pins the order). Spec D5: ~15 s, up from 5 s, which
+/// a daemon busy with a build overran. The hook entry's own timeout is thirty days
+/// (`autopilot::HOOK_TIMEOUT_SECONDS`), so the CLI is never the first to give up.
+pub(super) const HOOK_BUDGET: Duration = Duration::from_secs(15);
 
 /// What still has to happen after the judge returns: pausing for approval, recording, answering.
 pub(super) const AFTER_JUDGE_MARGIN: Duration = Duration::from_secs(1);

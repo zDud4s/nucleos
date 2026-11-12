@@ -523,7 +523,14 @@ async fn batch_hold(
 /// Anything else (another exit, a start failure, the timeout) is "busy", with the reason.
 async fn machine_idle(command: &str, root: &Path) -> Result<(), String> {
     let words = crate::gate::split_command(command)?;
-    let outcome = crate::gate::run_argv(&words, root, &[], IDLE_PROBE_TIMEOUT).await;
+    let outcome = crate::sandbox::gate::run_argv(
+        crate::sandbox::RunMode::QueueGate,
+        &words,
+        root,
+        &[],
+        IDLE_PROBE_TIMEOUT,
+    )
+    .await;
     if let Some(error) = outcome.error {
         return Err(error);
     }

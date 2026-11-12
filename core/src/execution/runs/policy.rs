@@ -13,8 +13,8 @@ pub(super) const MAX_AUTONOMOUS_ATTEMPTS: u32 = 2;
 /// `state.token` for every run, which handed a `shadow` run — a mode that has Bash and whose
 /// classifier calls `echo $NUCLEOS_DAEMON_TOKEN` a `read-local` action — the key that approves
 /// proposals and disengages the kill switch. Autonomous runs now get their own scoped key
-/// (`auth::mint_run_token`); only orchestrator turns still carry the control token, and only
-/// because `ToolPolicy::McpOnly` leaves them nothing to read it with.
+/// (`auth::mint_run_token`), and orchestrator turns get an `assistant:` key
+/// (`sandbox::assistant_routes::mint_assistant_token`). No caller of this function holds the control token.
 ///
 /// `artifacts` is the directory a job's nodes hand work to each other through, and is `Some` only
 /// for a node of a job. An ordinary run has no successor to write to, and handing it the variable
@@ -505,9 +505,10 @@ mod tests {
         let tree = tempfile::tempdir().unwrap();
         crate::governance::autopilot::wire_classifier_hook(root.path()).unwrap();
         // Unparsable settings: the wiring refuses to touch them, so the tree stays unwired.
-        std::fs::create_dir_all(tree.path().join(".claude")).unwrap();
+        let unit = crate::engines::unit_config::unit_config_dir(tree.path());
+        std::fs::create_dir_all(&unit).unwrap();
         std::fs::write(
-            tree.path().join(".claude").join("settings.json"),
+            crate::engines::unit_config::settings_file(&unit),
             "{not json",
         )
         .unwrap();

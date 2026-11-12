@@ -2890,7 +2890,10 @@ mod tests {
         crate::governance::autopilot::wire_classifier_hook(project.path()).unwrap();
 
         let sandboxed = std::fs::read(sandbox.path().join("hooks/ask_daemon.py")).unwrap();
-        let wired = std::fs::read(project.path().join(".claude/hooks/ask_daemon.py")).unwrap();
+        let wired = std::fs::read(crate::engines::unit_config::hook_script(
+            &crate::governance::autopilot::unit_config_dir(project.path()),
+        ))
+        .unwrap();
         assert!(
             sandboxed == wired,
             "the email sandbox and a wired project run different ask_daemon.py scripts"

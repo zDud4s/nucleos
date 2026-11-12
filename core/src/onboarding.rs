@@ -555,7 +555,13 @@ mod tests {
         let pool = crate::testdb::fresh_pool().await;
         let project = tempfile::tempdir().unwrap();
         let id = "onboard-bad-hook";
-        write(&project.path().join(".claude/settings.json"), "{ not json");
+        // The hook is wired into the unit's config dir, outside the tree, so that is where the
+        // unparsable settings have to be.
+        let unit = crate::engines::unit_config::unit_config_dir(project.path());
+        write(
+            &crate::engines::unit_config::settings_file(&unit),
+            "{ not json",
+        );
 
         assert!(matches!(
             onboard(

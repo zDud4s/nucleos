@@ -13,7 +13,9 @@ impl DaemonClient {
         json_or_refusal(response, "launching a tree job").await
     }
 
-    /// `GET /trees/{id}`.
+    /// `GET /trees/{id}`, passed through as the daemon answers it: the job, its manifest (a parked
+    /// branch carries `park.question`, and `park.last_run` after repeated ends), `nodes`,
+    /// `start_refusals` and `open_decisions` (`[{id, branch, node_id, question}]`).
     pub async fn tree_status(&self, id: &str) -> Result<Value, String> {
         let path = format!("/trees/{}", super::nodes::encode_segment(id));
         let response = self

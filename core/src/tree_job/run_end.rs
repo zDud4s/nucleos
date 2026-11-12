@@ -4,7 +4,9 @@
 //! fails every `running` node whose run is no longer live (`node_run::reconcile_running`), so the
 //! node's state closes with the run and not up to a minute afterwards. The sweep still calls
 //! `reconcile_running` every tick, as the backstop for a bump nobody heard (a daemon restart, a
-//! writer that ended a run without bumping).
+//! writer that ended a run without bumping). The same bump then wakes the sweep, and with it the
+//! tree-job driver (`conductor::sweep::wake`), so a finished run advances its job without waiting
+//! out the periodic tick.
 
 use std::time::Duration;
 
@@ -45,6 +47,8 @@ pub fn spawn_listener(state: AppState) -> JoinHandle<()> {
             tokio::time::sleep(COALESCE).await;
             runs.borrow_and_update();
             settle(&state.pool).await;
+            // After the settle, so the pass the wake starts finds the node already closed.
+            crate::conductor::sweep::wake();
         }
     })
 }
@@ -139,5 +143,19 @@ mod tests {
         }
         listener.abort();
         assert!(settled, "the node stayed running after the run-end wake");
+    }
+
+    /// F1: a run ending wakes the sweep within the 5 s acceptance bound, with no tick involved.
+    #[tokio::test]
+    async fn a_run_end_wakes_the_sweep_without_its_tick() {
+        let state = crate::channels::testkit::state().await;
+        let listener = spawn_listener(state.clone());
+
+        wake::bump(Topic::Runs);
+
+        let woken =
+            tokio::time::timeout(Duration::from_secs(5), crate::conductor::sweep::woken()).await;
+        listener.abort();
+        assert!(woken.is_ok(), "the sweep was not woken by the run end");
     }
 }

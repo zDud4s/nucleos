@@ -32,7 +32,7 @@ Subtree verify: <!-- `nodes.subtree_verify` (true | false), as resolved for this
   Never content. Read only these ranges. -->
 
 ## Constraints
-- Run no build or test tool (compilers, package managers, test runners) beyond the leaf self-check in `Rules by role`: list the exact commands in the handoff for the root to run.
+- Run no build or test tool (compilers, package managers, test runners) beyond the leaf self-check named under Rules: list the exact commands in the handoff for the root to run.
 - Write state through `mcp__nucleos__node_update` on every status change, decision and context peak.
 - Dispatch only your own direct children (kind `orchestrator` or `leaf`); never another node's phases.
 - Close through `mcp__nucleos__node_close` (a top-of-branch orchestrator excepted: it returns its report and stays `running` until merge) with a summary of at most 1500 characters and the path of the full handoff, written first from `packets/handoff.md`.

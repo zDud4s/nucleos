@@ -39,9 +39,8 @@ class BundleFiles(unittest.TestCase):
         for sub in ("### all", "### leaf", "### orchestrator", "### review"):
             self.assertIn(sub, rules)
         all_rules = rules[rules.index("### all"):rules.index("### leaf")]
-        self.assertIn("No subagent runs `cargo`", all_rules)
-        self.assertIn("run `cargo fmt -p <crate>`", all_rules)
-        self.assertIn("Never run bare `rustfmt`", all_rules)
+        self.assertIn("never `cargo check`, `test`, `build`, `clippy` or `--workspace`", all_rules)
+        self.assertIn("runs only `cargo fmt -p <crate>`", all_rules)
         report = text[text.index("## Report format"):]
         for sub in ("### all", "### file", "### message"):
             self.assertIn(sub, report)

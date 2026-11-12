@@ -84,7 +84,7 @@ pub const WAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
 pub const POOL_MAX_CONNECTIONS: u32 = 12;
 
 /// How long a caller of the shared pool waits for a free connection before getting
-/// `sqlx::Error::PoolTimedOut`. Kept below the hook budget (`HOOK_BUDGET` 5 s minus
+/// `sqlx::Error::PoolTimedOut`. Kept below the hook budget (`HOOK_BUDGET` 15 s minus
 /// `AFTER_JUDGE_MARGIN` 1 s), so a hook starved of a connection gets an error that the pretool
 /// fail-closed path turns into a logged deny inside the budget, instead of the client timing out.
 /// The bound is per acquire: a hook that makes several sequential pool calls, or that acquires and

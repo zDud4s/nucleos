@@ -242,13 +242,18 @@ mod tests {
     fn a_chat_folder_wired_with_the_old_timeout_is_raised() {
         let (_root, _main, tree) = checkout_and_worktree(true);
         crate::governance::autopilot::wire_classifier_hook(&tree).unwrap();
-        let settings_path = tree.join(".claude/settings.json");
+        let settings_path = crate::engines::unit_config::settings_file(
+            &crate::engines::unit_config::unit_config_dir(&tree),
+        );
         let mut settings: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
         for event in ["PreToolUse", "PostToolUse", "PostToolUseFailure"] {
             settings["hooks"][event][0]["hooks"][0]["timeout"] = serde_json::json!(3600);
         }
         std::fs::write(&settings_path, settings.to_string()).unwrap();
+        // The hook lives outside the tree now, so the folder needs a workflow of its own to count
+        // as one that is not seeded.
+        std::fs::create_dir_all(tree.join(".claude/skills/mine")).unwrap();
         // A folder with a workflow of its own, but nothing wired: it must gain no settings.
         let (_other_root, _other_main, unwired) = checkout_and_worktree(false);
         std::fs::create_dir_all(unwired.join(".claude/skills/mine")).unwrap();
@@ -265,7 +270,12 @@ mod tests {
                 "{event}"
             );
         }
-        assert!(!unwired.join(".claude/settings.json").exists());
+        assert!(
+            !crate::engines::unit_config::settings_file(
+                &crate::engines::unit_config::unit_config_dir(&unwired)
+            )
+            .exists()
+        );
     }
 
     #[test]

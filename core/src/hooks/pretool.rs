@@ -4,6 +4,7 @@ use super::*;
 
 mod job_tools;
 mod node_context;
+mod run_cache;
 mod web_builtin;
 
 use job_tools::{job_id_of, job_node_web_builtin};
@@ -153,13 +154,11 @@ pub(super) async fn filter_rewrite(
     {
         return None;
     }
-    let project_id: Option<String> =
-        sqlx::query_scalar::<_, Option<String>>("SELECT project_id FROM runs WHERE id = ?")
-            .bind(run_id)
-            .fetch_optional(&state.pool)
-            .await
-            .ok()?
-            .flatten();
+    let project_id: Option<String> = run_cache::run_facts(state, run_id, true)
+        .await
+        .ok()??
+        .project_id
+        .clone();
     let kinds = match project_id.as_deref() {
         Some(pid) => crate::project::rules::autopilot(pid)
             .map(|r| r.command_kinds)
@@ -258,28 +257,26 @@ pub(super) async fn pretooluse_decision_from(
     // root, hence the COALESCE; an absent row is its own root too, with nothing to match.
     // Spec B D2/D10: `job_id` and the run's `judge_resolve` snapshot ride along too, for the
     // resolver's eligibility; the same query, so no extra read on the hook's path.
+    //
+    // F2: all of it comes from `run_cache`, one joined read per run per `run_cache::TTL` instead of
+    // one per tool call. `permission_mode` is therefore at most that old; see the module for why
+    // that is acceptable and what stays fresh.
+    let facts = run_cache::run_facts(&state, run_id, is_in_flight).await;
     let (cwd, mode, project_id, permission, judge_snapshot, lineage_root, job_id, resolve_snapshot) =
-        match sqlx::query_as::<
-            _,
-            (
-                Option<String>,
-                String,
-                Option<String>,
-                Option<String>,
-                String,
-                i64,
-                Option<i64>,
-                String,
-            ),
-        >(
-            "SELECT cwd, mode, project_id, permission_mode, judge, COALESCE(lineage_root_id, id),
-                job_id, judge_resolve
-         FROM runs WHERE id = ?",
-        )
-        .bind(run_id)
-        .fetch_optional(&state.pool)
-        .await
-        {
+        match facts.as_ref().map(|found| {
+            found.as_deref().map(|f| {
+                (
+                    f.cwd.clone(),
+                    f.mode.clone(),
+                    f.project_id.clone(),
+                    f.permission_mode.clone(),
+                    f.judge.clone(),
+                    f.lineage_root,
+                    f.job_id,
+                    f.judge_resolve.clone(),
+                )
+            })
+        }) {
             Ok(Some((
                 cwd,
                 mode,
@@ -512,7 +509,10 @@ pub(super) async fn pretooluse_decision_from(
         cwd.as_deref().map(Path::new),
         policy.as_ref(),
         rules.declared(),
-        unrecognized_policy_for(&state.pool, run_id, &mode).await,
+        run_cache::unrecognized(
+            facts.as_ref().ok().and_then(|found| found.as_deref()),
+            &mode,
+        ),
     ));
     if leaf_self_check_admitted(&state, &payload, run_id, cwd.as_deref(), &classification).await {
         classification = classifier::Classification {
@@ -951,7 +951,7 @@ pub(super) async fn pretooluse_decision_from(
     //   what a person approved and spend that person's denial allowance. It also means the
     //   judge is NOT free of the declared-git branch: that branch's git probes (each allowed
     //   up to 300 s) run first and can return `None`, and the judge's wait then follows them.
-    //   Both sit inside the 5 s the hook's caller allows, so the judge is given only what
+    //   Both sit inside the `HOOK_BUDGET` the hook's caller allows, so the judge is given only what
     //   `judge_wait(started)` says is left, and below that it merely observes.
     // - OUTSIDE the `pending && in_flight` block above, because a classifier `allow` never enters
     //   it, and D6 sends writes the classifier allowed to the judge.
@@ -1417,8 +1417,8 @@ pub(super) async fn pretooluse_decision_from(
         // Only for a genuinely in-flight run_id — an unknown/stale one must not terminate anything.
         if is_in_flight {
             // In its own task, on purpose. Terminating the run kills the CLI whose hook script owns
-            // the connection this handler is answering, and that script gives up after 5s anyway
-            // (`ask_daemon.py`'s `timeout=5`) — so the request can disappear mid-handler, and a
+            // the connection this handler is answering, and that script gives up after its own
+            // `GATE_TIMEOUT_SECONDS` — so the request can disappear mid-handler, and a
             // dropped request drops the handler future exactly the way `abort()` does. Awaiting the
             // JoinHandle keeps the response as synchronous as before; dropping a JoinHandle only
             // detaches its task, so the pause still gets recorded when the request goes away.
@@ -2638,6 +2638,77 @@ mod tests {
         .await;
 
         assert_allowed(&decision, "a code branch commit");
+    }
+
+    /// F2: a warm `Read` of a node run does not read the run again. The joined read behind
+    /// `run_cache` is the only thing that used to repeat (mode, node verdict twice, output-filter
+    /// project, job flag); what a warm call still asks the database is the ticket-notice look and the
+    /// shadow-decision INSERT, which is the two statements the spec allows. The pool offers no
+    /// statement counter, so the seam is the cache's own read counter, per thread (the tests run on
+    /// the current-thread runtime), and the cache's TTL is zero in every other test.
+    #[tokio::test]
+    async fn a_warm_read_does_not_read_the_run_again() {
+        run_cache::set_test_ttl(Duration::from_secs(60));
+        let state = test_state().await;
+        let (run_id, _, _) = seed_node_run(&state, "worktree", "leaf", Some(1_000)).await;
+
+        let before = run_cache::loads();
+        for call in 0..3 {
+            let answer = answer(&state, run_id, "Read", read_input()).await;
+            assert_allowed(&answer.decision, &format!("read number {call}"));
+        }
+
+        assert_eq!(
+            run_cache::loads() - before,
+            1,
+            "three reads of one run must read the run once"
+        );
+        assert_eq!(run_cache::entries_for(&state.pool), 1);
+        run_cache::set_test_ttl(Duration::ZERO);
+    }
+
+    /// The fill is the one column of the entry that moves, and the TTL is what bounds its age.
+    #[tokio::test]
+    async fn a_cached_fill_is_read_again_once_the_entry_expires() {
+        run_cache::set_test_ttl(Duration::from_millis(20));
+        let state = test_state().await;
+        let (run_id, _, _) = seed_node_run(&state, "worktree", "leaf", Some(1_000)).await;
+        assert_allowed(
+            &answer(&state, run_id, "Read", read_input()).await.decision,
+            "a read below the limits",
+        );
+
+        sqlx::query("UPDATE runs SET context_fill = ? WHERE id = ?")
+            .bind(LEAF_OVER_WRAP)
+            .bind(run_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let late = answer(&state, run_id, "Read", read_input()).await;
+        assert_forced_deny(&late.decision, "a read after the entry expired");
+        run_cache::set_test_ttl(Duration::ZERO);
+    }
+
+    /// A run that has left `run_handles` does not keep an entry, and is read fresh.
+    #[tokio::test]
+    async fn a_finished_runs_entry_is_evicted() {
+        run_cache::set_test_ttl(Duration::from_secs(60));
+        let state = test_state().await;
+        let (run_id, _, _) = seed_node_run(&state, "worktree", "leaf", Some(1_000)).await;
+        answer(&state, run_id, "Read", read_input()).await;
+        assert_eq!(run_cache::entries_for(&state.pool), 1);
+
+        state
+            .run_handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&run_id);
+        answer(&state, run_id, "Read", read_input()).await;
+
+        assert_eq!(run_cache::entries_for(&state.pool), 0);
+        run_cache::set_test_ttl(Duration::ZERO);
     }
 
     /// Pins that ordinary `worktree` runs are unchanged. Passes today.

@@ -448,7 +448,7 @@ fn telegram_bot_tokens(input: &str) -> Vec<Finding> {
 /// [`nucleos_secrets`] on its prefix alone.
 fn daemon_tokens(input: &str) -> Vec<Finding> {
     let mut findings = Vec::new();
-    for marker in ["api:", "team:", "chat:"] {
+    for marker in ["api:", "team:", "chat:", "assistant:"] {
         let mut from = 0;
         while let Some(relative) = input[from..].find(marker) {
             let start = from + relative;

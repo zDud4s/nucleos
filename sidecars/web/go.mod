@@ -8,7 +8,8 @@ go 1.26.0
 //
 // govulncheck against go1.26.1, 2026-08-16: 21 vulnerabilities reachable from this module's own
 // code, fixed across go1.26.2 through go1.26.6. Zero after.
-toolchain go1.26.6
+// Raised to go1.27.4 on 2026-11-12: go1.27.3 carries GO-2026-6859.
+toolchain go1.27.4
 
 require github.com/mackee/go-readability v0.3.1
 

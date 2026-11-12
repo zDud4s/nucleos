@@ -618,7 +618,7 @@ async fn settle_moot(pool: &sqlx::SqlitePool) {
                 source.as_str(),
                 target.as_str(),
             ),
-            vcs::Op::Rebase { branch, onto } => (
+            vcs::Op::Rebase { branch, onto, .. } => (
                 branch.as_str(),
                 onto.as_str(),
                 onto.as_str(),
@@ -2732,6 +2732,7 @@ mod tests {
         let op = crate::execution::vcs::Op::Rebase {
             branch: branch.into(),
             onto: onto.into(),
+            worktree: None,
         };
         let id =
             crate::execution::vcs::submit(pool, &repo, &op, crate::execution::vcs::Origin::Shell)
