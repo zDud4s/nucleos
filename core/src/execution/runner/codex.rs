@@ -608,17 +608,17 @@ impl CommandRunner for CodexCliRunner {
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
-        cmd.kill_on_drop(true);
-        crate::process_tree::spawn_in_own_group(&mut cmd);
 
         // The ONLY `?` from here on, for the reason spelled out in `ClaudeCliRunner`: past the spawn
         // a failure becomes a failed `RunOutcome`, because an `Err` claims no work was done.
-        let mut child = cmd.spawn()?;
+        // Through the sandbox door, which sets kill-on-drop and the own process group.
+        let crate::sandbox::Contained { killer, child } = super::request::start_cli(cmd, &request)?;
+        let mut child = child;
 
         // Declared after the child so it drops FIRST, which is what keeps the pid it names ours —
         // see `TreeKiller`. `codex` supervises its own tools, so terminating just the parent orphans
         // a build still holding locks inside the worktree the run was supposed to release.
-        let mut tree_killer = child.id().map(TreeKiller::new);
+        let mut tree_killer: Option<TreeKiller> = killer;
         let _cli_pid = super::cli_pids::register(&request.env, child.id());
         // Held by the kernel so a hard-killed daemon takes the CLI's whole tree with it.
         if let Some(pid) = child.id() {
@@ -779,6 +779,30 @@ impl CommandRunner for CodexCliRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The runner starts its CLI through the sandbox door (`start_cli`), exactly once.
+    #[test]
+    fn the_codex_runner_starts_through_the_door() {
+        let runner = CodexCliRunner {
+            model: "gpt-test".to_string(),
+            sandbox_mode: None,
+            web_search: None,
+        };
+        let (session_tx, _session_rx) = tokio::sync::mpsc::unbounded_channel();
+        let transcript = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let launches =
+            super::super::request::launches_with_missing_bin("NUCLEOS_CODEX_BIN", async {
+                let outcome = runner
+                    .run_prompt(
+                        super::super::request::neutral_request("hello"),
+                        session_tx,
+                        transcript,
+                    )
+                    .await;
+                assert!(outcome.is_err(), "the missing binary fails the spawn");
+            });
+        assert_eq!(launches, 1);
+    }
 
     /// The Codex child's environment carries the path of the key file, never the key itself.
     #[test]

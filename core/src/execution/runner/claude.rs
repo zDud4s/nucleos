@@ -330,16 +330,20 @@ impl CommandRunner for ClaudeCliRunner {
         // kill_on_drop turns an aborted awaiting-task (cancel/timeout, Task 4) into the OS `claude`
         // process actually dying. DO NOT drop this line — Chunk 5 Task 1 adds `--model` and preserves it.
         cmd.kill_on_drop(true);
-        // The other half of the `TreeKiller` below: off Windows, killing a tree means killing a
-        // process GROUP, and the child has to lead one before it can be named.
-        crate::process_tree::spawn_in_own_group(&mut cmd);
 
         // The ONLY `?` from here on. Everything below turns a failure into a failed RunOutcome
         // instead of an `Err`, because `runs::spawn_run` reads `Err` as "the CLI never ran, so a
         // retry cannot double-apply a mutation". A non-UTF-8 byte on stdout or a broken pipe used
         // to share that type with a spawn failure, so a run that had already worked for minutes
         // inside a worktree — and committed — was re-run from the top.
-        let mut child = cmd.spawn()?;
+        //
+        // Through the sandbox door, which also makes the child lead its own process group (the
+        // other half of the `TreeKiller`: off Windows a tree is killed as a GROUP).
+        let crate::sandbox::Contained { killer, child } = super::request::start_cli(cmd, &request)?;
+        // Re-bound child first, killer second: locals drop in reverse declaration order, and the
+        // pattern above declares them the other way round.
+        let mut child = child;
+        let mut tree_killer: Option<TreeKiller> = killer;
 
         // Dropped BEFORE `child` (reverse declaration order), which is what keeps this sound: tokio
         // holds the process handle for as long as `child` lives, and Windows will not reuse a pid
@@ -349,7 +353,7 @@ impl CommandRunner for ClaudeCliRunner {
         // bash, cargo, git, node — and TerminateProcess on the parent orphans every one of them:
         // a cancelled run leaves a `cargo build` holding file locks in the worktree, which is
         // exactly what makes `git worktree remove` fail through its whole backoff afterwards.
-        let mut tree_killer = child.id().map(TreeKiller::new);
+        // (Armed by the sandbox door, which owns the `TreeKiller`; see `tree_killer` above.)
         // After the killer, so it drops first; lets the liveness sweep ask the OS about this process.
         let _cli_pid = super::cli_pids::register(&request.env, child.id());
 
@@ -946,5 +950,31 @@ mod tests {
 
         assert_eq!(configured.model_for_stage(Some("triage")), None);
         assert_eq!(configured.effort_for_stage(Some("triage")), None);
+    }
+
+    /// The runner starts its CLI through the sandbox door (`start_cli`), exactly once.
+    #[test]
+    fn the_claude_runner_starts_through_the_door() {
+        let runner = ClaudeCliRunner {
+            model: "claude-sonnet-5".to_string(),
+            plan_model: None,
+            review_model: None,
+            resolve_model: None,
+            resolve_effort: None,
+        };
+        let (session_tx, _session_rx) = tokio::sync::mpsc::unbounded_channel();
+        let transcript = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let launches =
+            super::super::request::launches_with_missing_bin("NUCLEOS_CLAUDE_BIN", async {
+                let outcome = runner
+                    .run_prompt(
+                        super::super::request::neutral_request("hello"),
+                        session_tx,
+                        transcript,
+                    )
+                    .await;
+                assert!(outcome.is_err(), "the missing binary fails the spawn");
+            });
+        assert_eq!(launches, 1);
     }
 }

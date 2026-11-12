@@ -9,14 +9,9 @@
 
 use crate::source_scan;
 
-/// Agent and gate spawn sites still outside the door. Each one is deleted by sbx1-wire.
-const PENDING_MIGRATION: &[(&str, &str)] = &[
-    ("execution/runner/claude.rs", "ClaudeCliRunner"),
-    ("execution/runner/codex.rs", "CodexCliRunner"),
-    // Not named in the spec, found by this scan: the third CLI runner spawns the same way.
-    ("execution/runner/agy.rs", "agy runner"),
-    ("gate.rs", "gate::run_gate"),
-];
+/// Agent and gate spawn sites still outside the door. The CLI runners are through it; the gate is
+/// deleted by the branch that wires it.
+const PENDING_MIGRATION: &[(&str, &str)] = &[("gate.rs", "gate::run_gate")];
 
 /// Users of the same primitives that start neither an agent nor a gate: git and `gh` transport, and
 /// a kill-only sweep. They stay outside the door on purpose.
