@@ -4,6 +4,7 @@
 
 #![allow(dead_code)] // the wiring step (2.4) is the caller
 
+pub mod deliver;
 pub mod holdout;
 pub mod inject;
 pub mod outcome;
@@ -373,6 +374,7 @@ pub async fn run_for_session(
             already.push(f.finding_key.clone());
         }
     }
+    deliver::deliver_proposals(pool, acfg, now_ms).await?;
     Ok(written)
 }
 
