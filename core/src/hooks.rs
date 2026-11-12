@@ -62,6 +62,30 @@ mod tests {
         );
     }
 
+    /// The daemon's budget for one decision stays strictly below what the script waits per attempt,
+    /// or a slow answer would be cut by the script instead of by the daemon. The script's literal is
+    /// read from its source, which is the one copy the settings entry runs.
+    #[test]
+    fn the_hook_budget_is_below_the_scripts_gate_timeout() {
+        let script = include_str!("../hooks/ask_daemon.py");
+        let gate: u64 = script
+            .lines()
+            .find_map(|line| line.strip_prefix("GATE_TIMEOUT_SECONDS = "))
+            .expect("the script declares GATE_TIMEOUT_SECONDS")
+            .trim()
+            .parse()
+            .expect("GATE_TIMEOUT_SECONDS is a literal number of seconds");
+        assert!(
+            super::rules::HOOK_BUDGET < Duration::from_secs(gate),
+            "HOOK_BUDGET {:?} must stay below GATE_TIMEOUT_SECONDS {gate}",
+            super::rules::HOOK_BUDGET
+        );
+        assert!(
+            Duration::from_secs(crate::governance::autopilot::HOOK_TIMEOUT_SECONDS)
+                > Duration::from_secs(gate) * 2
+        );
+    }
+
     async fn test_state() -> AppState {
         crate::project::rules::testing::hold_shared();
         let pool = crate::testdb::fresh_pool().await;
@@ -1536,7 +1560,8 @@ mod tests {
         let judge = VerdictJudge::answering(0.99, 0.99);
         let state = judged_state(judge.clone()).await;
         let run_id = judged_run(&state, "worktree", "enforce").await;
-        let started = Instant::now() - Duration::from_millis(4_200);
+        // 0.8 s short of the budget: less than the margin, so nothing is left for the judge.
+        let started = Instant::now() - (super::rules::HOOK_BUDGET - Duration::from_millis(800));
 
         let decision = decide_started(&state, run_id, started).await;
 
@@ -1556,10 +1581,11 @@ mod tests {
     async fn the_judge_wait_is_bounded_by_what_remains_of_the_hook_budget() {
         let state = judged_state(VerdictJudge::slow(Duration::from_secs(120))).await;
         let run_id = judged_run(&state, "worktree", "enforce").await;
-        // 5 s - 2.4 s - 1 s margin = 1.6 s left, well under the 3 s `JUDGE_DEADLINE` cap, and
+        // Budget - margin - 1.6 s spent = 1.6 s left, well under the 3 s `JUDGE_DEADLINE` cap, and
         // 1.1 s above `JUDGE_FLOOR`, so a slow machine still reaches the enforced wait.
         let left = Duration::from_millis(1_600);
-        let started = Instant::now() - Duration::from_millis(2_400);
+        let started =
+            Instant::now() - (super::rules::HOOK_BUDGET - super::rules::AFTER_JUDGE_MARGIN - left);
         let waited = Instant::now();
 
         let decision = decide_started(&state, run_id, started).await;
@@ -4036,7 +4062,7 @@ mod tests {
     }
 
     /// Terminating the run kills the CLI whose hook script owns the very connection this handler is
-    /// serving, and that script gives up after 5s anyway (`ask_daemon.py`'s `timeout=5`). Either way
+    /// serving, and that script gives up after `GATE_TIMEOUT_SECONDS` anyway. Either way
     /// the request can vanish mid-handler, and a dropped request drops the handler future exactly the
     /// way `abort()` does — so everything sequenced after the termination is lost.
     ///
@@ -8403,6 +8429,96 @@ mod tests {
             owner.reason
         );
         assert_eq!(queued_rows(&state).await.len(), 1);
+    }
+
+    /// D9(b): the readable `git rebase <onto>` from a subagent is converted into a queue request,
+    /// not refused by the gate. What the subagent saw on 2026-11-09 as a refusal is the queue's own
+    /// `blocked` outcome (the branch is checked out in the caller's worktree, so the executor will
+    /// not rewrite it); the gate's part is only to admit it, and to say so in the answer.
+    #[tokio::test]
+    async fn a_subagent_rebase_onto_master_is_queued_not_refused_by_the_gate() {
+        let state = test_state().await;
+        let repo = rostered_repo(&state, "hook-session-subagent-rebase").await;
+
+        let decision = session_git_decision_within(
+            &state,
+            SessionGitPayload {
+                tool_name: "Bash".to_owned(),
+                tool_input: serde_json::json!({ "command": "git rebase master" }),
+                cwd: repo.path().to_string_lossy().into_owned(),
+                agent_id: Some("a1".to_owned()),
+                agent_type: Some("wf-leaf".to_owned()),
+                subagent: true,
+            },
+            Duration::ZERO,
+        )
+        .await
+        .0;
+
+        assert!(
+            decision.reason.contains("queued as vcs request"),
+            "{}",
+            decision.reason
+        );
+        assert_eq!(decision.request_id, Some(1), "{}", decision.reason);
+        assert_eq!(
+            queued_rows(&state).await,
+            vec![("rebase".to_owned(), "shell".to_owned())]
+        );
+    }
+
+    /// The own-worktree stamp names the SESSION's checkout only: a rebase aimed at another worktree
+    /// with `git -C` is queued unstamped, so the executor never treats it as the requester's own.
+    #[tokio::test]
+    async fn a_rebase_aimed_at_another_worktree_is_not_stamped_as_the_sessions_own() {
+        let state = test_state().await;
+        let repo = rostered_repo(&state, "hook-session-rebase-stamp").await;
+        crate::project::policy::declare_git_op(
+            &state.pool,
+            "p",
+            crate::execution::vcs::REBASE_OWN_WORKTREE,
+        )
+        .await
+        .unwrap();
+        let holder =
+            crate::execution::git_exec::testkit::space_free_tempdir("hook-session-rebase-wt");
+        let worktree = holder.path().join("wt");
+        assert!(crate::execution::git_exec::testkit::git_ok(
+            repo.path(),
+            &[
+                std::ffi::OsStr::new("worktree"),
+                std::ffi::OsStr::new("add"),
+                std::ffi::OsStr::new("-b"),
+                std::ffi::OsStr::new("side"),
+                worktree.as_os_str(),
+            ]
+        ));
+        let there = worktree.display().to_string().replace('\\', "/");
+
+        // The session stands in the main checkout and names the other worktree.
+        session_decision(
+            &state,
+            &format!("git -C {there} rebase master"),
+            repo.path(),
+        )
+        .await;
+        // The same command from the session's own checkout is stamped.
+        session_decision(&state, "git rebase master", repo.path()).await;
+
+        let stamps: Vec<Option<String>> = queued_ops(&state)
+            .await
+            .into_iter()
+            .map(|op| match op {
+                crate::execution::vcs::Op::Rebase { worktree, .. } => worktree,
+                other => panic!("not a rebase: {other:?}"),
+            })
+            .collect();
+        assert_eq!(stamps.len(), 2, "{stamps:?}");
+        assert_eq!(stamps[0], None, "a foreign worktree was stamped as own");
+        assert!(
+            stamps[1].is_some(),
+            "the session's own checkout lost its stamp"
+        );
     }
 
     fn ticket(

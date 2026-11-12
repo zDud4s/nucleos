@@ -22,7 +22,8 @@ use crate::state::AppState;
 
 const RUN_POLL: Duration = Duration::from_secs(1);
 const RUN_CEILING: Duration = Duration::from_secs(30 * 60);
-const TREE_POLL: Duration = Duration::from_secs(5);
+/// The fallback wait between reads of a job; the normal wake is `store::JOB_CHANGED`.
+const TREE_POLL: Duration = Duration::from_secs(60);
 const TREE_CEILING: Duration = Duration::from_secs(24 * 60 * 60);
 /// How often the sweeper looks for finish intents to run.
 const SWEEP_EVERY: Duration = Duration::from_secs(60);
@@ -375,6 +376,8 @@ impl DaemonLauncher<'_> {
     async fn wait_for_job(&self, tree_id: &str) -> Result<TreeOutcome, String> {
         let deadline = tokio::time::Instant::now() + TREE_CEILING;
         let root_node_id = loop {
+            // Taken before the read: a write after it still wakes this wait.
+            let changed = crate::tree_job::store::JOB_CHANGED.notified();
             let job = crate::tree_job::store::load(&self.state.pool, tree_id)
                 .await
                 .map_err(|error| error.to_string())?
@@ -388,7 +391,8 @@ impl DaemonLauncher<'_> {
                     ..Default::default()
                 });
             }
-            tokio::time::sleep(TREE_POLL).await;
+            // Woken by a job write; the poll only covers a state written another way.
+            let _ = tokio::time::timeout(TREE_POLL, changed).await;
         };
         let rows: Vec<(i64, i64)> = sqlx::query_as("SELECT id, COALESCE(lineage_root_id, id) FROM runs WHERE id IN (SELECT CAST(run_id AS INTEGER) FROM work_nodes WHERE root_id = ? AND run_id IS NOT NULL)")
             .bind(&root_node_id).fetch_all(&self.state.pool).await.map_err(|error| error.to_string())?;
@@ -706,6 +710,50 @@ pub async fn resume_finishes(state: &AppState) {
     }
 }
 
+fn intent_is_past_ceiling(created_at: &str) -> bool {
+    let age = chrono::DateTime::parse_from_rfc3339(created_at)
+        .map(|at| chrono::Utc::now() - at.with_timezone(&chrono::Utc))
+        .unwrap_or_else(|_| chrono::Duration::zero());
+    age > chrono::Duration::hours(INTENT_CEILING_HOURS)
+}
+
+/// Per project: consecutive failed passes and when the sweep may try again.
+static PASS_BACKOFF: std::sync::Mutex<BTreeMap<String, (u32, std::time::Instant)>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+const BACKOFF_BASE: Duration = Duration::from_secs(60);
+const BACKOFF_MAX: Duration = Duration::from_secs(60 * 60);
+
+/// Records a failed pass and returns the length of the streak; the next try waits 1, 2, 4... minutes
+/// (an hour at most).
+fn note_failure(project_id: &str) -> u32 {
+    let mut map = PASS_BACKOFF.lock().unwrap_or_else(|e| e.into_inner());
+    let failures = map.get(project_id).map_or(0, |(count, _)| *count) + 1;
+    let delay = BACKOFF_BASE
+        .saturating_mul(1u32 << (failures - 1).min(16))
+        .min(BACKOFF_MAX);
+    map.insert(
+        project_id.to_owned(),
+        (failures, std::time::Instant::now() + delay),
+    );
+    failures
+}
+
+fn clear_backoff(project_id: &str) {
+    PASS_BACKOFF
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(project_id);
+}
+
+fn backing_off(project_id: &str) -> bool {
+    PASS_BACKOFF
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(project_id)
+        .is_some_and(|(_, until)| std::time::Instant::now() < *until)
+}
+
 /// Settles a finish intent from the pass that served it. A pass with nothing deferred, or one that
 /// failed (the feed says so), deletes it; a pass that held specs for disk keeps it for the next
 /// sweep, until it is `INTENT_CEILING_HOURS` old, when it is announced once and dropped. Only the
@@ -723,18 +771,24 @@ pub async fn settle_intent(
 ) {
     let whole_project = matches!(scope, FinishScope::All { .. });
     let settled = match result {
-        Ok(report) if report.deferred.is_empty() => whole_project,
+        Ok(report) if report.deferred.is_empty() && report.retry.is_empty() => {
+            clear_backoff(project_id);
+            whole_project
+        }
         Ok(_) if !whole_project => {
             if let Err(error) = store::ensure_finish_intent(pool, project_id, created_at).await {
                 tracing::warn!(%error, %project_id, "could not keep a spec finish intent");
             }
             false
         }
+        // Specs held for a later pass (a refused launch, a tree live at the ceiling, an error) keep
+        // the intent whatever its age: the sweep adopts them after a backoff.
+        Ok(report) if report.deferred.is_empty() => {
+            note_failure(project_id);
+            false
+        }
         Ok(report) => {
-            let age = chrono::DateTime::parse_from_rfc3339(created_at)
-                .map(|at| chrono::Utc::now() - at.with_timezone(&chrono::Utc))
-                .unwrap_or_else(|_| chrono::Duration::zero());
-            if age > chrono::Duration::hours(INTENT_CEILING_HOURS) {
+            if intent_is_past_ceiling(created_at) {
                 // A line in the feed, never a decision: answering cannot make the disk bigger.
                 super::finish::announce_failure(
                     pool,
@@ -753,9 +807,18 @@ pub async fn settle_intent(
             }
         }
         Err(error) => {
+            // An error in one pass is not a verdict: the intent stays and the sweep retries after a
+            // backoff, until the intent is as old as the ceiling. Said once per streak, not per try.
             tracing::warn!(%error, %project_id, "the spec finish failed");
-            super::finish::announce_failure(pool, project_id, &error.to_string()).await;
-            whole_project
+            let failures = note_failure(project_id);
+            let past_ceiling = intent_is_past_ceiling(created_at);
+            if failures == 1 || past_ceiling {
+                super::finish::announce_failure(pool, project_id, &error.to_string()).await;
+            }
+            if past_ceiling {
+                clear_backoff(project_id);
+            }
+            past_ceiling
         }
     };
     if settled && let Err(error) = store::delete_finish_intent(pool, project_id, created_at).await {
@@ -780,6 +843,9 @@ where
     };
     let mut passes = tokio::task::JoinSet::new();
     for (project_id, created_at) in intents {
+        if backing_off(&project_id) {
+            continue;
+        }
         let Some(claim) = super::finish::claim_project(&project_id) else {
             continue;
         };
@@ -1610,7 +1676,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_pass_deletes_its_intent_and_announces_the_failure() {
+    async fn a_failed_pass_keeps_its_intent_and_retries_after_a_backoff() {
         let state = sweep_state().await;
         store::write_finish_intent(&state.pool, "sweep-failing")
             .await
@@ -1621,11 +1687,51 @@ mod tests {
 
         sweep_with(&state, pass).await;
 
-        assert!(intents(&state).await.is_empty());
+        assert_eq!(
+            intent_projects(&state).await,
+            vec!["sweep-failing".to_owned()]
+        );
         let lines = feed_lines(&state, "sweep-failing").await;
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].contains("no root"));
         assert!(claim_project("sweep-failing").is_some());
+        assert!(backing_off("sweep-failing"), "the retry waits");
+
+        // Inside the backoff the sweep does not run the pass again.
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = ran.clone();
+        let pass = move |_state: AppState, _project: String| {
+            let flag = flag.clone();
+            async move {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(FinishReport::default())
+            }
+        };
+        sweep_with(&state, pass).await;
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(feed_lines(&state, "sweep-failing").await.len(), 1);
+
+        // Once the backoff is over a clean pass settles the intent.
+        clear_backoff("sweep-failing");
+        let pass = |_state: AppState, _project: String| async { Ok(FinishReport::default()) };
+        sweep_with(&state, pass).await;
+        assert!(intents(&state).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_pass_on_an_intent_past_the_ceiling_drops_it() {
+        let state = sweep_state().await;
+        store::write_finish_intent_at(&state.pool, "sweep-failing-old", &hours_ago(25))
+            .await
+            .unwrap();
+        let pass = |_state: AppState, _project: String| async {
+            Err::<FinishReport, _>(FinishError::Config("no root".to_owned()))
+        };
+
+        sweep_with(&state, pass).await;
+
+        assert!(intents(&state).await.is_empty());
+        assert!(!backing_off("sweep-failing-old"));
     }
 
     #[tokio::test]

@@ -3,7 +3,6 @@
 
 use super::*;
 use crate::conductor::context::{Fill, allowed_for_node, handoff_path};
-
 /// The context verdict of the node a run works for, `None` for a run without a node and when the
 /// verdict cannot be read (fail open: a read error must not stop a run, and the next call asks
 /// again). The limits come from the run's own `speed.yaml`; the model-window cap is not applied
@@ -12,32 +11,35 @@ async fn node_verdict(
     state: &AppState,
     run_id: i64,
 ) -> Option<crate::conductor::context::NodeRunVerdict> {
-    use crate::conductor::context::verdict_for_run;
-    let verdict = match verdict_for_run(&state.pool, run_id, None, None).await {
-        Ok(Some(verdict)) => verdict,
+    use crate::conductor::context::{
+        NodeRunVerdict, limits, limits_from_speed_yaml, verdict_against,
+    };
+    // The run row and its node come from the per-run cache (`run_cache`): the fill may be up to
+    // `run_cache::TTL` old, the one column here that moves while the run works.
+    let in_flight = run_cache::in_flight(state, run_id);
+    let facts = match run_cache::run_facts(state, run_id, in_flight).await {
+        Ok(Some(facts)) => facts,
         Ok(None) => return None,
         Err(error) => {
             tracing::warn!(run_id, %error, "pretooluse-decision: could not read the node's context verdict");
             return None;
         }
     };
-    let cwd: Option<String> = sqlx::query_scalar("SELECT cwd FROM runs WHERE id = ?")
-        .bind(run_id)
-        .fetch_optional(&state.pool)
-        .await
-        .ok()
-        .flatten()
-        .flatten();
-    let yaml = cwd.and_then(|cwd| {
-        std::fs::read_to_string(Path::new(&cwd).join(".nucleos/workflow/speed.yaml")).ok()
+    let node = facts.node.as_ref()?;
+    let yaml = facts.cwd.as_deref().and_then(|cwd| {
+        std::fs::read_to_string(Path::new(cwd).join(".nucleos/workflow/speed.yaml")).ok()
     });
-    let Some(yaml) = yaml else {
-        return Some(verdict);
+    let limits = match &yaml {
+        Some(yaml) => limits_from_speed_yaml(yaml, &node.kind),
+        None => limits(&node.kind),
     };
-    match verdict_for_run(&state.pool, run_id, Some(&yaml), None).await {
-        Ok(Some(with_limits)) => Some(with_limits),
-        _ => Some(verdict),
-    }
+    Some(NodeRunVerdict {
+        fill: verdict_against(&limits, facts.context_fill),
+        node_id: node.id.clone(),
+        root_id: node.root_id.clone(),
+        kind: node.kind.clone(),
+        project_id: node.project_id.clone(),
+    })
 }
 
 /// The sentence a tree run gets instead of a park nobody would ever answer.

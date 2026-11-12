@@ -292,6 +292,50 @@ mod tests {
         assert_eq!(feed_lines(&fx).await, 0);
     }
 
+    /// B10: a tree whose node died on the weekly limit waits for the reset, which can be days off.
+    /// It is not reported as stalled before the reset, and the pause spends no nudge.
+    #[tokio::test]
+    async fn a_tree_paused_on_the_weekly_quota_is_not_stalled_before_its_reset() {
+        let fx = Fixture::new().await;
+        fx.seed_job(JOB, vec![code_branch("api", "green", None)], None)
+            .await;
+        let run = fx.run_ended(&root_node_of(JOB), None).await;
+        let now = Utc::now();
+        let reset = now + chrono::Duration::hours(3);
+        let stdout = json!({
+            "type": "result", "subtype": "success", "is_error": true,
+            "terminal_reason": "api_error", "api_error_status": 429,
+            "result": format!("You've hit your weekly limit · resets {} (UTC)", reset.format("%I:%M%P")),
+        })
+        .to_string();
+        sqlx::query("UPDATE runs SET status = 'failed', stdout = ?, completed_at = ? WHERE id = ?")
+            .bind(stdout)
+            .bind(now.to_rfc3339())
+            .bind(run)
+            .execute(&fx.state.pool)
+            .await
+            .unwrap();
+
+        // Quiet for far longer than the stall time, yet before the reset: paused, not stalled.
+        for hours in [1, 2] {
+            let at = now + chrono::Duration::hours(hours);
+            assert!(quiet(&fx.job(JOB).await, at));
+            check(&fx.state, JOB, at).await.unwrap();
+        }
+        assert_eq!(feed_lines(&fx).await, 0);
+        assert_eq!(
+            nudges_spent(&fx.job(JOB).await),
+            0,
+            "the pause spends nothing"
+        );
+
+        // Past the reset the pause is over: a tree still not moving is stalled as any other.
+        check(&fx.state, JOB, now + chrono::Duration::hours(5))
+            .await
+            .unwrap();
+        assert_eq!(feed_lines(&fx).await, 1);
+    }
+
     #[tokio::test]
     async fn a_stalled_job_gets_a_feed_line_and_a_nudge_that_restarts_the_quiet_time() {
         let fx = Fixture::new().await;

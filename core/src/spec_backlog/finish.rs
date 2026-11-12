@@ -138,6 +138,9 @@ pub struct FinishReport {
     pub deferred: Vec<String>,
     /// Not launched because the owner cancelled their finish (`POST /backlog/finish/cancel`).
     pub cancelled: Vec<String>,
+    /// Held for a later pass, intent kept: a launch the daemon refused, a tree still live at the
+    /// ceiling, or a spec whose pass errored (and what waits on them).
+    pub retry: Vec<String>,
     pub cycles: Vec<Cycle>,
 }
 
@@ -243,6 +246,19 @@ type Running<'a> =
 struct SpecRun {
     trees: Vec<String>,
     finished: bool,
+    /// Held for a later pass instead of ended: the spec keeps its status and tree id, so the next
+    /// pass adopts what it has. Never `finished`.
+    postponed: bool,
+}
+
+impl SpecRun {
+    fn ended(trees: Vec<String>, finished: bool) -> Self {
+        Self {
+            trees,
+            finished,
+            postponed: false,
+        }
+    }
 }
 
 /// A spec waiting for its turn.
@@ -364,6 +380,11 @@ async fn prepare(
     }
     if extracted.status == SpecStatus::NeedsOwner {
         return Ok(Prepared::NeedsOwner);
+    }
+    // A spec unchanged since its last audit is not audited again before its tree: that verdict
+    // was not Done (a Done spec never gets here), and the audit after the tree decides.
+    if extracted.last_audited_sha.as_deref() == Some(extracted.content_sha.as_str()) {
+        return Ok(Prepared::Ready);
     }
     let lineage = lineage_for(pool, &spec.id, &[]).await?;
     // An audit that cannot run is not a verdict: the spec still gets its tree, and the audit after
@@ -490,10 +511,7 @@ async fn drive_spec(
                         &format!("tree {tree_id} cannot be resumed: {reason}"),
                     )
                     .await?;
-                    return Ok(SpecRun {
-                        trees,
-                        finished: false,
-                    });
+                    return Ok(SpecRun::ended(trees, false));
                 }
                 waited => Some((tree_id, waited)),
             }
@@ -525,14 +543,31 @@ async fn drive_spec(
         };
         match launched {
             Ok(outcome) if outcome.still_running => {
-                mark_needs_owner(pool, &spec.id, &format!("tree {tree_id} is still live")).await?;
+                // A live tree at the ceiling is not a verdict: the spec stays `in_progress` with
+                // its tree id, and the next pass adopts the tree.
+                tracing::warn!(spec = %spec.id, %tree_id, "the tree is still live at the ceiling");
                 return Ok(SpecRun {
                     trees,
                     finished: false,
+                    postponed: true,
                 });
             }
             Ok(outcome) => outcomes.push(outcome),
             Err(reason) => {
+                // A launch the daemon never accepted spent no round: the id is recorded, so the next
+                // pass launches the same tree again.
+                let accepted = store::get_spec(pool, &spec.id)
+                    .await?
+                    .is_some_and(|stored| stored.tree_launched);
+                if !accepted {
+                    tracing::warn!(spec = %spec.id, %reason, "the tree could not be launched");
+                    trees.retain(|launched| *launched != tree_id);
+                    return Ok(SpecRun {
+                        trees,
+                        finished: false,
+                        postponed: true,
+                    });
+                }
                 last = Some(format!("round {round}: the tree failed: {reason}"));
                 continue;
             }
@@ -540,17 +575,11 @@ async fn drive_spec(
         let lineage = lineage_for(pool, &spec.id, &outcomes).await?;
         match preparer.audit(&spec.id, &lineage).await {
             Ok(report) if report.status == SpecStatus::Done && report.verdict == Verdict::Done => {
-                return Ok(SpecRun {
-                    trees,
-                    finished: true,
-                });
+                return Ok(SpecRun::ended(trees, true));
             }
             Ok(report) if matches!(report.verdict, Verdict::Inconclusive(_)) => {
                 mark_needs_owner(pool, &spec.id, &inconclusive_reason(&report)).await?;
-                return Ok(SpecRun {
-                    trees,
-                    finished: false,
-                });
+                return Ok(SpecRun::ended(trees, false));
             }
             Ok(report) => {
                 if let Some(doubts) = only_doubts_left(&report) {
@@ -563,10 +592,7 @@ async fn drive_spec(
                         ),
                     )
                     .await?;
-                    return Ok(SpecRun {
-                        trees,
-                        finished: false,
-                    });
+                    return Ok(SpecRun::ended(trees, false));
                 }
                 last = Some(format!(
                     "round {round}: the audit says {:?}",
@@ -589,10 +615,7 @@ async fn drive_spec(
         ),
     )
     .await?;
-    Ok(SpecRun {
-        trees,
-        finished: false,
-    })
+    Ok(SpecRun::ended(trees, false))
 }
 
 fn fresh_nonce() -> String {
@@ -853,9 +876,20 @@ pub async fn finish_with<'a>(
             break;
         };
         running_paths.retain(|(running_id, _)| *running_id != id);
-        let outcome = outcome?;
+        // One spec's error stays in that spec: it is retried by a later pass while the independent
+        // specs go on.
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                tracing::warn!(spec = %id, %error, "a spec's finish errored; it is retried later");
+                report.retry.push(id);
+                continue;
+            }
+        };
         report.trees.extend(outcome.trees);
-        if outcome.finished {
+        if outcome.postponed {
+            report.retry.push(id);
+        } else if outcome.finished {
             done_ids.insert(id.clone());
             report.done.push(id);
         } else {
@@ -867,6 +901,17 @@ pub async fn finish_with<'a>(
     // still queued, not failed, and handed back for the caller to retry.
     if disk_short {
         report.deferred = queue.drain(..).map(|left| left.spec.id).collect();
+    }
+    // What waits on a spec held for a later pass waits with it: still queued, not blocked.
+    // Only a spec that depends, directly or through another queued spec, on one held back goes
+    // with it; a spec waiting on something stopped or unresolved keeps the Blocked handling below.
+    while let Some(index) = queue.iter().position(|waiting| {
+        waiting
+            .waits_on
+            .iter()
+            .any(|dep| report.retry.contains(dep))
+    }) {
+        report.retry.push(queue.remove(index).spec.id);
     }
     // The rest were never ready: they wait on something that is neither done nor stopped.
     // Unfinished, and said so.
@@ -889,6 +934,7 @@ pub async fn finish_with<'a>(
         &mut report.blocked,
         &mut report.deferred,
         &mut report.cancelled,
+        &mut report.retry,
     ] {
         list.sort();
         list.dedup();
@@ -1507,6 +1553,39 @@ mod tests {
         assert_eq!(launcher.requests().len(), 1);
         assert_eq!(*preparer.calls.lock().unwrap(), vec!["before", "after"]);
         assert_eq!(id, launcher.requests()[0].spec_id);
+    }
+
+    #[tokio::test]
+    async fn a_spec_unchanged_since_its_last_audit_skips_the_audit_before_the_tree() {
+        let pool = crate::testdb::fresh_pool().await;
+        let id = add_spec(&pool, "pre-tree-audit-skipped", SpecStatus::Discovered).await;
+        sqlx::query("UPDATE specs SET last_audited_sha = ? WHERE id = ?")
+            .bind(SHA)
+            .bind(&id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let log = Log::default();
+        let launcher = FakeLauncher::new(&log);
+        let preparer = AuditPathPreparer {
+            pool: pool.clone(),
+            calls: Mutex::new(Vec::new()),
+        };
+
+        finish_with(
+            &pool,
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &preparer,
+            },
+            &cfg(),
+            scope_all(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(launcher.requests().len(), 1);
+        assert_eq!(*preparer.calls.lock().unwrap(), vec!["after"]);
     }
 
     #[tokio::test]
@@ -2421,13 +2500,117 @@ mod tests {
             "a still-running tree is not audited"
         );
         let spec = store::get_spec(&pool, &id).await.unwrap().unwrap();
-        assert_eq!(spec.status, SpecStatus::NeedsOwner);
-        assert!(
-            spec.status_reason
-                .as_deref()
-                .unwrap_or_default()
-                .contains(&report.trees[0])
+        assert_eq!(
+            spec.status,
+            SpecStatus::InProgress,
+            "a live tree at the ceiling is not a question for the owner"
         );
+        assert_eq!(spec.tree_id.as_deref(), Some(report.trees[0].as_str()));
+        assert_eq!(report.retry, vec![id.clone()]);
+        assert!(report.needs_owner.is_empty());
+    }
+
+    struct RefusingLauncher {
+        ids: Mutex<Vec<String>>,
+        refuse: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl TreeLauncher for RefusingLauncher {
+        async fn run_tree(&self, request: &TreeRequest) -> Result<TreeOutcome, String> {
+            self.ids.lock().unwrap().push(request.id.clone());
+            if self.refuse.load(Ordering::SeqCst) > 0 {
+                self.refuse.fetch_sub(1, Ordering::SeqCst);
+                return Err("POST /trees answered 503".to_owned());
+            }
+            Ok(TreeOutcome::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_launch_postpones_the_spec_without_spending_a_round() {
+        let pool = crate::testdb::fresh_pool().await;
+        let id = add_spec(&pool, "refused", SpecStatus::Extracted).await;
+        let log = Log::default();
+        let launcher = RefusingLauncher {
+            ids: Mutex::new(Vec::new()),
+            refuse: AtomicUsize::new(1),
+        };
+        let prep = FakePreparer::new(&pool, &log, &[]);
+        let mut config = cfg();
+        config.max_rounds = 1;
+        config.owned_paths = disjoint(&[&id]);
+        let deps = FinishDeps {
+            launcher: &launcher,
+            preparer: &prep,
+        };
+
+        let first = finish_with(&pool, &deps, &config, scope_all())
+            .await
+            .unwrap();
+
+        assert_eq!(first.retry, vec![id.clone()]);
+        assert!(first.trees.is_empty() && first.needs_owner.is_empty());
+        let spec = store::get_spec(&pool, &id).await.unwrap().unwrap();
+        assert_eq!(spec.status, SpecStatus::InProgress);
+        assert!(!spec.tree_launched);
+
+        // The only round was not spent: the next pass launches the same tree.
+        let second = finish_with(&pool, &deps, &config, scope_all())
+            .await
+            .unwrap();
+        let ids = launcher.ids.lock().unwrap().clone();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0], ids[1], "the same tree id is launched again");
+        assert!(second.retry.is_empty());
+    }
+
+    #[tokio::test]
+    async fn only_dependents_of_a_postponed_spec_are_retried() {
+        let pool = crate::testdb::fresh_pool().await;
+        let refused = add_spec(&pool, "postponed", SpecStatus::Extracted).await;
+        let after_refused = add_spec(&pool, "after-postponed", SpecStatus::Extracted).await;
+        let gone = add_spec(&pool, "gone", SpecStatus::Abandoned).await;
+        let stopped = add_spec(&pool, "needs-owner", SpecStatus::Extracted).await;
+        let after_stopped = add_spec(&pool, "after-needs-owner", SpecStatus::Extracted).await;
+        store::add_dep(&pool, &after_refused, &refused, DepSource::Owner)
+            .await
+            .unwrap();
+        // `stopped` waits on an abandoned spec, so it goes to the owner; `after_stopped` waits on it.
+        store::add_dep(&pool, &stopped, &gone, DepSource::Owner)
+            .await
+            .unwrap();
+        store::add_dep(&pool, &after_stopped, &stopped, DepSource::Owner)
+            .await
+            .unwrap();
+        let log = Log::default();
+        let launcher = RefusingLauncher {
+            ids: Mutex::new(Vec::new()),
+            refuse: AtomicUsize::new(1),
+        };
+        let prep = FakePreparer::new(&pool, &log, &[]);
+        let mut config = cfg();
+        config.max_rounds = 1;
+        config.owned_paths = disjoint(&[&refused, &after_refused, &stopped, &after_stopped]);
+
+        let report = finish_with(
+            &pool,
+            &FinishDeps {
+                launcher: &launcher,
+                preparer: &prep,
+            },
+            &config,
+            scope_all(),
+        )
+        .await
+        .unwrap();
+
+        let mut retry = vec![refused.clone(), after_refused.clone()];
+        retry.sort();
+        assert_eq!(report.retry, retry);
+        assert!(report.needs_owner.contains(&stopped), "{report:?}");
+        assert_eq!(report.blocked, vec![after_stopped.clone()]);
+        assert_eq!(status_of(&pool, &after_stopped).await, SpecStatus::Blocked);
     }
 
     #[tokio::test]

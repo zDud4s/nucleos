@@ -135,6 +135,10 @@ pub const UNTRUSTED_CONTEXT_DENY_REASON: &str =
 ///
 /// Fails closed in every direction: an error, a missing row, an unknown run all give
 /// `AsksAPerson`, which is what every caller got before this function existed.
+///
+/// Test-only now: the pretool path reads the same two conditions from its cached facts
+/// (`pretool::run_cache`), and these tests keep pinning the rule that cache must match.
+#[cfg(test)]
 pub(super) async fn unrecognized_policy_for(
     pool: &sqlx::SqlitePool,
     run_id: i64,

@@ -51,6 +51,22 @@ pub(super) fn queue_op(segment: &str, branch: &str) -> Option<crate::execution::
         .or_else(|| crate::execution::vcs::rebase_from_command(segment, branch))
 }
 
+/// Whether `target` (the checkout a command names) is the checkout the session itself stands in.
+/// Fails closed: a session cwd that is not a working tree, or a path that cannot be compared,
+/// is not "own".
+async fn own_checkout(target: &Path, session_cwd: &Path, deadline: Instant) -> bool {
+    let Ok(own) = crate::execution::git_exec::toplevel(session_cwd, deadline).await else {
+        return false;
+    };
+    match (
+        tokio::fs::canonicalize(target).await,
+        tokio::fs::canonicalize(&own).await,
+    ) {
+        (Ok(target), Ok(own)) => target == own,
+        _ => false,
+    }
+}
+
 #[derive(Deserialize)]
 pub struct SessionGitPayload {
     pub tool_name: String,
@@ -215,7 +231,7 @@ pub(super) async fn session_git_decision_within(
         }
         Err(_) => return no_opinion(),
     };
-    let Some(op) = queue_op(&segment.command, &branch) else {
+    let Some(mut op) = queue_op(&segment.command, &branch) else {
         // The shape matched with the stand-in and not with the real branch: the parsers refuse only
         // a detached HEAD on that ground, and it names no branch the queue could move.
         return Json(
@@ -227,6 +243,21 @@ pub(super) async fn session_git_decision_within(
             .into(),
         );
     };
+
+    // A rebase carries the worktree it was asked from, so the executor can tell the requester's own
+    // checkout from somebody else's when the project grants `rebase-own-worktree`. Only this hook
+    // stamps it, and it withdraws the stamp below when the grant's roles or depth do not cover the
+    // requester.
+    //
+    // **Stamped only when the command targets the session's OWN checkout** (the top level of the
+    // session's cwd). `git -C <another worktree> rebase ...` names somebody else's directory, and
+    // stamping that would let the executor rewrite it as "the requester's own"; it is left `None`
+    // so the normal holder block applies.
+    if let crate::execution::vcs::Op::Rebase { worktree, .. } = &mut op
+        && own_checkout(&root, Path::new(&payload.cwd), deadline).await
+    {
+        *worktree = Some(root.to_string_lossy().into_owned());
+    }
 
     // A push is accepted only from the owner's top-level session.
     if matches!(op, crate::execution::vcs::Op::Push { .. }) {
@@ -254,6 +285,28 @@ pub(super) async fn session_git_decision_within(
                 );
             }
         };
+    // The grant's roles/depth are judged here, where the caller is known: a declaration that does
+    // not cover this requester leaves the rebase unstamped, so the executor treats it as asked from
+    // nowhere in particular and blocks it. The executor separately requires the declaration itself.
+    if let crate::execution::vcs::Op::Rebase { worktree, .. } = &mut op
+        && worktree.is_some()
+    {
+        let granted = crate::project::policy::git_ops(&state.pool, &project_id)
+            .await
+            .into_iter()
+            .find(|(kind, _)| kind == crate::execution::vcs::REBASE_OWN_WORKTREE)
+            .map(|(_, permission)| permission);
+        let covered = match granted {
+            Some(permission) => {
+                let who = role_policy::resolve_requester(&state.pool, &caller, None).await;
+                permission.admits(&who)
+            }
+            None => false,
+        };
+        if !covered {
+            *worktree = None;
+        }
+    }
     let repo = match crate::execution::vcs::resolve_repo(&state.pool, &project_id).await {
         Ok(repo) => repo,
         Err(error) => {
@@ -339,15 +392,17 @@ pub(super) fn session_git_reason(
         "escalated" => "it hit a conflict and was escalated to a person. Do not retry it or \
                         resolve it by hand; the resolution arrives as a new request."
             .to_owned(),
-        // A session's rebase always names the branch its own worktree has checked out, and the
-        // executor never rewrites a checked-out branch, so this blocks every time: retrying the same
-        // command cannot help, and the advice that can is the merge the queue does perform (D9).
+        // A session's rebase always names the branch its own worktree has checked out. Unless the
+        // project granted `rebase-own-worktree` (and the worktree is clean) the executor never
+        // rewrites a checked-out branch, so this blocks: retrying the same command cannot help
+        // until that changes, and the advice that can is the merge the queue does perform (D9).
         "blocked" if kind == "rebase" => format!(
             "the queue refused to start it: {why}. Nothing was changed. Retrying the same rebase \
-             cannot succeed: the queue does not rewrite a branch a worktree has checked out, and \
-             this command always names yours. Bring the base in with `git merge --no-ff <onto>` \
-             (queued, from the same worktree), or ask for the rebase from a worktree that does not \
-             hold the branch."
+             cannot succeed until that changes: by default the queue does not rewrite a branch a \
+             worktree has checked out, and this command always names yours. Bring the base in with \
+             `git merge --no-ff <onto>` (queued, from the same worktree), ask for the rebase from \
+             a worktree that does not hold the branch, or have the owner grant \
+             `rebase-own-worktree` in the project's git permissions."
         ),
         "blocked" => format!(
             "the queue refused to start it: {why}. Nothing was changed. Clear what that names, \

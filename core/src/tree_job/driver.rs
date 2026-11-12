@@ -37,6 +37,7 @@ use super::landing::{
 };
 use super::merge_recovery;
 use super::model::{JOB_TERMINAL_STATE, Manifest};
+use super::no_change::{NO_CHANGE_KEY, parked_as_no_change};
 use super::open::{FIX_PREFIX, relaunch_node, run_is_live};
 use super::relaunch::{budget_refusal, refusal_question};
 use super::rescue;
@@ -110,11 +111,23 @@ pub async fn tick(state: &AppState) {
         }
     };
     let gate = production_gate(state);
-    for job in jobs {
-        advance(state, &job.id, gate.clone()).await;
-        // After the pass, so a job the pass just moved is not taken for a quiet one.
-        super::stalled::check_job(state, &job.id).await;
-    }
+    let ids: Vec<String> = jobs.into_iter().map(|job| job.id).collect();
+    // Jobs advance side by side, a few at a time: one slow job (a gate, a git call) no longer holds
+    // the rest of the pass. Each pass still runs under its own job's lock, and `advance` shares
+    // nothing else between jobs, so two jobs moving together cannot see each other's state.
+    crate::conductor::sweep::for_each_bounded(
+        ids,
+        crate::conductor::sweep::MAX_PARALLEL_JOBS,
+        |id| {
+            let (state, gate) = (state.clone(), gate.clone());
+            async move {
+                advance(&state, &id, gate).await;
+                // After the pass, so a job the pass just moved is not taken for a quiet one.
+                super::stalled::check_job(&state, &id).await;
+            }
+        },
+    )
+    .await;
 }
 
 /// Advance one stored tree job with the production gate (`crate::verify::installed()`). Without a
@@ -297,14 +310,14 @@ async fn branch_step(
 }
 
 /// The report of a node's latest run.
-struct NodeReport {
+pub(super) struct NodeReport {
     run_id: Option<String>,
-    live: bool,
+    pub(super) live: bool,
     /// The result of the `report` transition keyed by the run, when there is one.
     result: Option<String>,
 }
 
-async fn node_report(pool: &SqlitePool, node_id: &str) -> Result<NodeReport, String> {
+pub(super) async fn node_report(pool: &SqlitePool, node_id: &str) -> Result<NodeReport, String> {
     let run: Option<Option<String>> =
         sqlx::query_scalar("SELECT run_id FROM work_nodes WHERE id = ?")
             .bind(node_id)
@@ -510,112 +523,8 @@ async fn has_diff(job: &TreeJob, branch: &super::model::Branch) -> Result<bool, 
     Ok(counted != "0")
 }
 
-/// The record a code branch that changed nothing carries beside its park: `{"reason", "at"}`. It
-/// is not a state of its own: the branch is parked (`decisions::park`), so it is neither merged nor
-/// done, blocks the landing, and the owner's answer relaunches its node or drops it.
-pub(super) const NO_CHANGE_KEY: &str = "no_change";
-
-/// Why the branch has nothing to merge, or `None` when it changes a file. The diff is taken from
-/// the merge base with the branch it merges into (`nesting::merge_target`) to its tip, so no commit
-/// and commits that cancel out both read as no change. The worktree is checkpointed first: an
-/// implement node leaves its work uncommitted. `Err` when git cannot tell (no such branch, a parent
-/// that merges nowhere), and the caller then keeps today's path.
-async fn no_change_reason(job: &TreeJob, name: &str) -> Result<Option<String>, String> {
-    let branch = job.manifest.branches.get(name).ok_or("branch vanished")?;
-    if let Some(worktree) = &branch.worktree {
-        crate::execution::worktree::checkpoint(Path::new(worktree))
-            .await
-            .map_err(|e| e.to_string())?;
-    }
-    let Some(git_branch) = &branch.git_branch else {
-        return Ok(None);
-    };
-    let target = super::nesting::merge_target(&job.manifest, name)?;
-    let range = format!("{target}...{git_branch}");
-    let changed = git(&job.manifest.project_root, &["diff", "--name-only", &range]).await?;
-    if !changed.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(format!(
-        "{git_branch} has no change over {target}: no commit, or commits whose diff is empty"
-    )))
-}
-
-/// Records why branch `name` changed nothing and asks for its park: it is not merged and does not
-/// count as done. Nothing is asked for a branch with no node (nothing to park), nor while its node
-/// still runs (an answer resumed a green branch and relaunched it): that run may still commit.
-async fn park_no_change(
-    pool: &SqlitePool,
-    job: &mut TreeJob,
-    name: &str,
-    reason: &str,
-    parks: &mut Vec<Park>,
-) -> Result<(), String> {
-    let node = job
-        .manifest
-        .branches
-        .get(name)
-        .and_then(|held| held.node_id.clone());
-    if let Some(node) = &node
-        && node_report(pool, node).await?.live
-    {
-        return Ok(());
-    }
-    let held = job
-        .manifest
-        .branches
-        .get_mut(name)
-        .ok_or("branch vanished")?;
-    held.extra.insert(
-        NO_CHANGE_KEY.to_owned(),
-        serde_json::json!({"reason": reason, "at": now()}),
-    );
-    persist(pool, job).await?;
-    if let Some(node) = node {
-        parks.push((
-            node,
-            format!(
-                "Branch {name} produced no change ({reason}), so nothing was merged. Answer to have its node try again, or drop the branch."
-            ),
-        ));
-    }
-    Ok(())
-}
-
-/// Checks branch `name` for a change before it is gated or merged. `Ok(true)` when it changed
-/// nothing and was handed to [`park_no_change`]; a record left by an earlier empty pass is cleared
-/// once the branch changes something. A git error is logged and reads as a change.
-async fn parked_as_no_change(
-    pool: &SqlitePool,
-    job: &mut TreeJob,
-    name: &str,
-    parks: &mut Vec<Park>,
-) -> Result<bool, String> {
-    match no_change_reason(job, name).await {
-        Ok(Some(reason)) => {
-            park_no_change(pool, job, name, &reason, parks).await?;
-            Ok(true)
-        }
-        Ok(None) => {
-            let cleared = job
-                .manifest
-                .branches
-                .get_mut(name)
-                .is_some_and(|held| held.extra.remove(NO_CHANGE_KEY).is_some());
-            if cleared {
-                persist(pool, job).await?;
-            }
-            Ok(false)
-        }
-        Err(error) => {
-            tracing::warn!(job = %job.id, branch = name, %error, "could not tell whether the branch changed anything");
-            Ok(false)
-        }
-    }
-}
-
 /// Runs `git -C <root> <args>` and answers its trimmed stdout, or its stderr as the error.
-async fn git(root: &str, args: &[&str]) -> Result<String, String> {
+pub(super) async fn git(root: &str, args: &[&str]) -> Result<String, String> {
     let output = tokio::process::Command::new("git")
         // A repo-local `core.fsmonitor` would run a command on any call that reads the index.
         .args(["-c", "core.fsmonitor="])
