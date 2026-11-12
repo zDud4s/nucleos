@@ -598,14 +598,17 @@ mod forged_worktree_tests {
         .unwrap();
         let mut operation = body.operation;
         assert!(
-            matches!(&operation, vcs::Op::Rebase { worktree: Some(_), .. }),
+            matches!(
+                &operation,
+                vcs::Op::Rebase {
+                    worktree: Some(_),
+                    ..
+                }
+            ),
             "the forged field must deserialize, or this test proves nothing: {operation:?}"
         );
         forget_client_worktree(&mut operation);
-        assert!(matches!(
-            operation,
-            vcs::Op::Rebase { worktree: None, .. }
-        ));
+        assert!(matches!(operation, vcs::Op::Rebase { worktree: None, .. }));
     }
 }
 

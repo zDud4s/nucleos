@@ -8515,7 +8515,10 @@ mod tests {
             .collect();
         assert_eq!(stamps.len(), 2, "{stamps:?}");
         assert_eq!(stamps[0], None, "a foreign worktree was stamped as own");
-        assert!(stamps[1].is_some(), "the session's own checkout lost its stamp");
+        assert!(
+            stamps[1].is_some(),
+            "the session's own checkout lost its stamp"
+        );
     }
 
     fn ticket(

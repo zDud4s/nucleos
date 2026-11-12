@@ -4765,7 +4765,10 @@ integration_steps:
         commit_file(&repo, "feature.txt", "from master\n");
         let before = sha_of(&holder, "HEAD");
         // Stops on the conflict and leaves the rebase in progress, as a killed call would.
-        assert!(!git_ok(&holder, &[OsStr::new("rebase"), OsStr::new("master")]));
+        assert!(!git_ok(
+            &holder,
+            &[OsStr::new("rebase"), OsStr::new("master")]
+        ));
         let git_dir = Command::new("git")
             .arg("-C")
             .arg(&holder)
