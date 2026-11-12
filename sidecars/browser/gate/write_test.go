@@ -439,6 +439,9 @@ func TestAnEphemeralProfileHasNoGrantsAndRefusesEveryWrite(t *testing.T) {
 	if result.Outcome != browser.OutcomeRefused {
 		t.Fatalf("the stopped submission was not reported as refused: %+v", result)
 	}
+	if result.Refusal == nil || result.Refusal.Consequence != browser.ConsequenceForm {
+		t.Errorf("an ephemeral refusal must be a form refusal: %+v", result.Refusal)
+	}
 	if len(result.Writes) != 0 {
 		t.Errorf("a refused submission was recorded as a write: %+v", result.Writes)
 	}
