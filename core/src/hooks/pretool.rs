@@ -455,6 +455,7 @@ pub(super) async fn pretooluse_decision_from(
         )
         .await
         {
+            node_context::record_fence_refusal(&state, run_id, &payload).await;
             let _ = count_denial_and_stop_a_prober(&state, run_id, &payload.tool_name).await;
             return Json(Decision {
                 decision: "deny".to_owned(),
@@ -2638,6 +2639,41 @@ mod tests {
         .await;
 
         assert_allowed(&decision, "a code branch commit");
+    }
+
+    /// The node scope fence leaves the refused call in `shadow_decisions` (marker `node_scope`,
+    /// input capped to 2 KB) and answers exactly what it answered before.
+    #[tokio::test]
+    async fn a_fence_refusal_is_recorded_with_its_call() {
+        let state = test_state().await;
+        let run_id = seed_tree_branch_run(&state, "core", &["core/src/**"]).await;
+        sqlx::query("UPDATE work_nodes SET owned_paths = '[\"core/src/**\"]' WHERE run_id = ?")
+            .bind(run_id.to_string())
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let mut input = write_input(Path::new(r"C:\work\repo\shell\x.ts"));
+        input["content"] = json!("x".repeat(10_000));
+
+        let decision = decide(&state, run_id, "Write", input).await;
+
+        assert_eq!(decision.decision, "deny");
+        assert!(!decision.reason.is_empty());
+        let rows: Vec<(String, Option<String>, String, Option<String>)> = sqlx::query_as(
+            "SELECT tool_name, tool_input, decision, reason FROM shadow_decisions WHERE run_id = ?",
+        )
+        .bind(run_id)
+        .fetch_all(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let (tool, stored, verdict, reason) = &rows[0];
+        assert_eq!(tool, "Write");
+        assert_eq!(verdict, "deny");
+        assert_eq!(reason.as_deref(), Some("node_scope"));
+        let stored = stored.as_deref().unwrap();
+        assert!(stored.contains("shell"), "{stored}");
+        assert!(stored.len() < 3_000, "the input must be capped: {}", stored.len());
     }
 
     /// F2: a warm `Read` of a node run does not read the run again. The joined read behind
