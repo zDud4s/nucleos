@@ -110,6 +110,9 @@ pub fn ensure_root(data_local_dir: &Path) -> std::io::Result<PathBuf> {
 /// Finally the result is canonicalised and checked against the root, which is what catches a
 /// symlink placed inside the folder pointing out of it. The check runs against the deepest existing
 /// ancestor, since the path being created does not exist yet.
+///
+/// To READ what it names, use [`read_document`]: this only says where a path lands, and a file a
+/// delivery wrote there can be a hard link to somewhere else.
 pub fn resolve_within(root: &Path, relative: &str) -> Result<PathBuf, PathError> {
     let mut resolved = root.to_path_buf();
     for component in Path::new(relative).components() {
@@ -145,6 +148,27 @@ pub fn resolve_within(root: &Path, relative: &str) -> Result<PathBuf, PathError>
             },
         }
     }
+}
+
+/// Ceiling for one document read back through [`read_document`].
+pub const DOCUMENT_CAP: u64 = 64 * 1024 * 1024;
+
+/// The bytes of the document at `relative` inside `root`, through the D12 crossing: a link or a
+/// file with more than one hard link is refused (`Escapes`), because an agent's `file_document`
+/// delivery can plant either in the files root, and reading one as the owner would hand back
+/// whatever it points at.
+pub fn read_document(root: &Path, relative: &str) -> Result<crate::sandbox::Untrusted, PathError> {
+    use crate::sandbox::CrossingError;
+    let target = resolve_within(root, relative)?;
+    crate::sandbox::read_crossing(&target, &[root.to_path_buf()], DOCUMENT_CAP).map_err(|error| {
+        match error {
+            CrossingError::ReparsePoint(_)
+            | CrossingError::HardLinked(_)
+            | CrossingError::Outside(_) => PathError::Escapes,
+            CrossingError::Io(e) if e.kind() == std::io::ErrorKind::NotFound => PathError::NotFound,
+            other => PathError::Io(other.to_string()),
+        }
+    })
 }
 
 /// What is in a folder, directories first and then names, both case-insensitively — the order a

@@ -227,21 +227,30 @@ pub fn map_is_trusted(worktree: &Path, project_root: &Path) -> bool {
     let crate::tests_map::MapState::Valid(map) = crate::tests_map::load(worktree) else {
         return false;
     };
-    let read = |root: &Path| std::fs::read(root.join(crate::tests_map::MAP_FILE));
-    match (read(worktree), read(project_root)) {
-        (Ok(tree), Ok(root)) if tree == root => {}
+    // The worktree's copy crosses the D12 door (no link, one name); the root's is the operator's.
+    let map_path = |root: &Path| root.join(crate::tests_map::MAP_FILE);
+    let tree = crate::sandbox::artifacts::read_in(
+        &map_path(worktree),
+        worktree,
+        crate::sandbox::artifacts::ARTIFACT_CAP,
+    );
+    match (tree, std::fs::read(map_path(project_root))) {
+        (Ok(Some(tree)), Ok(root)) if tree.as_bytes() == root.as_slice() => {}
         _ => return false,
     }
-    let commands = map.tests.groups.values().flat_map(|group| {
-        [
-            Some(group.command.as_str()),
-            group.check.as_deref(),
-            group.select.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-    });
-    crate::gate::tampered_command_scripts(project_root, worktree, commands).is_none()
+    let commands = || {
+        map.tests.groups.values().flat_map(|group| {
+            [
+                Some(group.command.as_str()),
+                group.check.as_deref(),
+                group.select.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+        })
+    };
+    crate::gate::tampered_command_scripts(project_root, worktree, commands()).is_none()
+        && crate::sandbox::artifacts::tampered_scripts(project_root, worktree, commands()).is_none()
 }
 
 pub(super) async fn gate_item(

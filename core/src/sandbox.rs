@@ -18,7 +18,10 @@
 //! `env_applied`: today's runners keep the environment they build themselves until their wiring
 //! turns it on.
 
+pub mod artifacts;
 pub mod assistant_routes;
+#[cfg(test)]
+mod corpus;
 mod crossing;
 pub mod empty_dir;
 pub mod gate;
