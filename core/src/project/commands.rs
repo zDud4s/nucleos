@@ -333,6 +333,7 @@ pub fn caller_is_an_agent(scope: &crate::auth::Scope) -> bool {
         scope,
         crate::auth::Scope::Run(_)
             | crate::auth::Scope::TeamRun(_)
+            | crate::auth::Scope::Assistant
             | crate::auth::Scope::Service(_)
     )
 }

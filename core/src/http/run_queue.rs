@@ -407,7 +407,9 @@ pub(super) fn vcs_origin(scope: &Scope) -> Result<vcs::Origin, StatusCode> {
     match scope {
         Scope::Control | Scope::ApiToken(ApiTokenLevel::Admin) => Ok(vcs::Origin::Human),
         Scope::Run(id) => Ok(vcs::Origin::Run(*id)),
-        Scope::Service(_) | Scope::TeamRun(_) | Scope::ApiToken(_) => Err(StatusCode::FORBIDDEN),
+        Scope::Service(_) | Scope::TeamRun(_) | Scope::Assistant | Scope::ApiToken(_) => {
+            Err(StatusCode::FORBIDDEN)
+        }
     }
 }
 

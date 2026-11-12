@@ -17,20 +17,19 @@ pub(super) async fn turn_env(
     pool: &sqlx::SqlitePool,
     chat_id: &str,
     run_id: i64,
-    control_token: &str,
 ) -> Vec<(String, String)> {
     // WHICH key this turn carries follows from what it can read, and the two must be decided
     // together or not at all.
     //
-    // An orchestrator turn carries the daemon's control token — the key that approves proposals
-    // and disengages the kill switch — and the only reason that is safe is that `McpOnly` leaves
-    // it no Bash, no Read and no Write to look at its own environment with. A rooted turn has
-    // all three. Handing it the same key would rebuild, exactly, the hole `runs.rs` records
-    // having already closed once: a run with Bash whose classifier calls `echo
-    // $NUCLEOS_DAEMON_TOKEN` a `read-local` action.
+    // Neither kind of turn carries the daemon's control token — the key that approves proposals
+    // and disengages the kill switch. A rooted turn has Bash, Read and Write to look at its own
+    // environment with, and handing it that key would rebuild, exactly, the hole `runs.rs`
+    // records having already closed once: a run with Bash whose classifier calls `echo
+    // $NUCLEOS_DAEMON_TOKEN` a `read-local` action. An orchestrator turn used to be the
+    // exception, on the strength of `McpOnly`; the sandbox spec (D5) removed it.
     //
-    // So it gets a scoped key of its own instead, and loses the power to approve proposals and
-    // to disengage the brake. That is the right thing to lose: it is `Origin::Shell` that earned
+    // So a rooted turn gets a scoped key of its own, and loses the power to approve proposals
+    // and to disengage the brake. That is the right thing to lose: it is `Origin::Shell` that earned
     // it the tools, which means the person asking is sitting at this machine, in front of the
     // window where both of those are one click away.
     //
@@ -61,7 +60,10 @@ pub(super) async fn turn_env(
             super::evict_live(chat_id);
             fresh_chat_key(pool, chat_id).await
         }
-        _ => control_token.to_string(),
+        // An orchestrator turn no longer carries the daemon's control token (sandbox spec D5): it
+        // gets the conversation's `Assistant` key, which reaches only `ASSISTANT_ROUTES`. The
+        // approve and kill-switch tools therefore need the owner's own key from now on.
+        _ => fresh_assistant_key(pool, chat_id).await,
     };
     crate::execution::runs::run_env(&key, run_id, None, crate::speed::Capacity::solo())
 }
@@ -77,6 +79,22 @@ pub(super) async fn rekey(env: &mut Vec<(String, String)>, pool: &sqlx::SqlitePo
     {
         Some(entry) => entry.1 = key,
         None => env.push(("NUCLEOS_DAEMON_TOKEN".to_string(), key)),
+    }
+}
+
+/// Mints the conversation's `Assistant` key, rotating the one stored for it. Fails closed like
+/// [`fresh_chat_key`]: nothing stored means nothing matches.
+pub(super) async fn fresh_assistant_key(pool: &sqlx::SqlitePool, chat_id: &str) -> String {
+    match crate::sandbox::assistant_routes::mint_assistant_token(pool, chat_id).await {
+        Ok(key) => key,
+        Err(error) => {
+            tracing::warn!(
+                chat_id = %chat_id,
+                %error,
+                "could not store the assistant key — this turn's tool calls will be refused"
+            );
+            format!("assistant:{chat_id}.{}", crate::auth::mint_secret("chat"))
+        }
     }
 }
 
@@ -143,7 +161,6 @@ mod tests {
             &pool,
             chat_id,
             1,
-            "control",
         )
         .await;
 

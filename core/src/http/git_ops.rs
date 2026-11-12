@@ -678,7 +678,11 @@ pub(super) struct GithubRequestBody {
 pub(super) fn github_caller_is_allowed(scope: &Scope) -> Result<(), StatusCode> {
     match scope {
         Scope::Control | Scope::ApiToken(ApiTokenLevel::Admin) => Ok(()),
-        Scope::Run(_) | Scope::Service(_) | Scope::TeamRun(_) | Scope::ApiToken(_) => {
+        Scope::Run(_)
+        | Scope::Service(_)
+        | Scope::TeamRun(_)
+        | Scope::Assistant
+        | Scope::ApiToken(_) => {
             Err(StatusCode::FORBIDDEN)
         }
     }
