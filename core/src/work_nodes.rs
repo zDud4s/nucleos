@@ -2281,7 +2281,10 @@ mod tests {
         let without = open(&pool, None, &limits, &without).await.unwrap();
 
         let stored = get(&pool, &with.id).await.unwrap();
-        assert_eq!(stored.pointers, strings(&["core/src/a.rs", "core/src/b.rs"]));
+        assert_eq!(
+            stored.pointers,
+            strings(&["core/src/a.rs", "core/src/b.rs"])
+        );
         assert!(get(&pool, &without.id).await.unwrap().pointers.is_empty());
 
         let built = tree(&pool, &root.id, View::Brief).await.unwrap();

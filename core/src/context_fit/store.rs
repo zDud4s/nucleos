@@ -48,7 +48,11 @@ pub fn layer_of(owned_paths: &[String]) -> String {
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     for path in owned_paths {
         let normal = path.replace('\\', "/");
-        let first = normal.trim_start_matches("./").split('/').next().unwrap_or("");
+        let first = normal
+            .trim_start_matches("./")
+            .split('/')
+            .next()
+            .unwrap_or("");
         if !first.is_empty() && !first.contains(['*', '?']) {
             *counts.entry(first.to_owned()).or_default() += 1;
         }
@@ -66,7 +70,9 @@ fn path_is_given(path: &str, given: &[String]) -> bool {
     let segments: Vec<&str> = normal.split('/').filter(|s| !s.is_empty()).collect();
     (0..segments.len()).any(|start| {
         let tail = segments[start..].join("/");
-        given.iter().any(|glob| work_nodes::path_contained(&tail, glob))
+        given
+            .iter()
+            .any(|glob| work_nodes::path_contained(&tail, glob))
     })
 }
 
@@ -155,7 +161,7 @@ fn read_detail(
 }
 
 async fn count(pool: &SqlitePool, sql: &str, node_id: &str) -> u32 {
-    match sqlx::query_scalar::<_, i64>(sql)
+    match sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql.to_owned()))
         .bind(node_id)
         .fetch_one(pool)
         .await
@@ -187,17 +193,14 @@ pub async fn gather(pool: &SqlitePool, node: &Node, cfg: &Thresholds) -> Inputs 
          COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0) \
          FROM runs WHERE id IN {NODE_RUNS} ORDER BY id"
     );
-    let runs: Vec<(Option<i64>, Option<String>, Option<i64>, i64)> = sqlx::query_as(&runs_sql)
+    let runs: Vec<(Option<i64>, Option<String>, Option<i64>, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(runs_sql))
         .bind(id)
         .fetch_all(pool)
         .await
         .unwrap_or_default();
     if !runs.is_empty() {
         inputs.initial_context = runs.first().and_then(|r| r.0);
-        inputs.tools_given = runs
-            .last()
-            .and_then(|r| r.1.as_deref())
-            .map(strings);
+        inputs.tools_given = runs.last().and_then(|r| r.1.as_deref()).map(strings);
         inputs.context_peak = runs
             .iter()
             .filter_map(|r| r.2)
@@ -238,7 +241,7 @@ pub async fn gather(pool: &SqlitePool, node: &Node, cfg: &Thresholds) -> Inputs 
          JOIN devtime_sessions s ON s.session_id = a.session_id \
          WHERE s.run_id IN {NODE_RUNS} ORDER BY a.started_at, a.attempt_id"
     );
-    let attempts: Vec<(String, String)> = sqlx::query_as(&attempts_sql)
+    let attempts: Vec<(String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(attempts_sql))
         .bind(id)
         .fetch_all(pool)
         .await
@@ -251,12 +254,11 @@ pub async fn gather(pool: &SqlitePool, node: &Node, cfg: &Thresholds) -> Inputs 
     inputs.pointers_unread_paths = detail.unread;
 
     // Fix and rescue rounds and a conflict resolution are launches of the node, keyed by kind.
-    let keys: Vec<String> =
-        sqlx::query_scalar("SELECT key FROM tree_launches WHERE node_id = ?")
-            .bind(id)
-            .fetch_all(pool)
-            .await
-            .unwrap_or_default();
+    let keys: Vec<String> = sqlx::query_scalar("SELECT key FROM tree_launches WHERE node_id = ?")
+        .bind(id)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
     let launches = |prefix: &str| keys.iter().filter(|k| k.starts_with(prefix)).count() as u32;
     inputs.fix_rounds = launches("fix-");
     inputs.rescues = launches("rescue-");
@@ -280,10 +282,16 @@ pub async fn gather(pool: &SqlitePool, node: &Node, cfg: &Thresholds) -> Inputs 
         .handoff_path
         .as_deref()
         .and_then(|path| std::fs::read_to_string(path).ok())
-        .map_or(0, |text| u32::from(text.contains("Outcome: contract_request")));
+        .map_or(0, |text| {
+            u32::from(text.contains("Outcome: contract_request"))
+        });
     if node.status == "blocked" {
-        let text = format!("{} {}", node.summary.as_deref().unwrap_or(""), node.decisions.join(" "))
-            .to_lowercase();
+        let text = format!(
+            "{} {}",
+            node.summary.as_deref().unwrap_or(""),
+            node.decisions.join(" ")
+        )
+        .to_lowercase();
         inputs.blocked_asking_info = ASKING_WORDS.iter().any(|word| text.contains(word));
     }
 
@@ -379,8 +387,15 @@ pub async fn record_close(pool: &SqlitePool, node: &Node) {
         return;
     }
     let summary = feed_summary(node, &card);
-    if let Err(error) =
-        crate::feed::append(pool, node.project_id.as_deref(), FEED_KIND, &summary, None, None).await
+    if let Err(error) = crate::feed::append(
+        pool,
+        node.project_id.as_deref(),
+        FEED_KIND,
+        &summary,
+        None,
+        None,
+    )
+    .await
     {
         tracing::warn!(node = %node.id, %error, "could not write the context-fit feed line");
     }
@@ -432,7 +447,17 @@ pub struct Row {
     pub computed_at: String,
 }
 
-type RawRow = (String, String, String, String, String, String, String, i64, String);
+type RawRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    String,
+);
 
 const ROW_COLUMNS: &str =
     "node_id, tree_id, layer, verdicts, evidence, given, used, rules_version, computed_at";
@@ -472,10 +497,10 @@ fn signal_name(id: &str) -> Option<&'static str> {
 
 /// Every card of one tree, oldest first.
 pub async fn tree_rows(pool: &SqlitePool, tree_id: &str) -> Result<Vec<Row>, sqlx::Error> {
-    let raw: Vec<RawRow> = sqlx::query_as(&format!(
+    let raw: Vec<RawRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {ROW_COLUMNS} FROM node_context_fit WHERE tree_id = ? \
          ORDER BY computed_at, node_id"
-    ))
+    )))
     .bind(tree_id)
     .fetch_all(pool)
     .await?;
@@ -530,12 +555,11 @@ const RECENT_LIMIT: i64 = 50;
 /// The cards computed in the last `days` days, counted and listed.
 pub async fn analytics(pool: &SqlitePool, days: u32) -> Result<Analytics, sqlx::Error> {
     let since = (chrono::Utc::now() - chrono::Duration::days(i64::from(days))).to_rfc3339();
-    let all: Vec<(String, String)> = sqlx::query_as(
-        "SELECT layer, verdicts FROM node_context_fit WHERE computed_at >= ?",
-    )
-    .bind(&since)
-    .fetch_all(pool)
-    .await?;
+    let all: Vec<(String, String)> =
+        sqlx::query_as("SELECT layer, verdicts FROM node_context_fit WHERE computed_at >= ?")
+            .bind(&since)
+            .fetch_all(pool)
+            .await?;
     let mut by_verdict = VerdictCounts::default();
     let mut layers: BTreeMap<String, VerdictCounts> = BTreeMap::new();
     for (layer, verdicts) in &all {
@@ -543,10 +567,10 @@ pub async fn analytics(pool: &SqlitePool, days: u32) -> Result<Analytics, sqlx::
         by_verdict.add(&verdicts);
         layers.entry(layer.clone()).or_default().add(&verdicts);
     }
-    let recent: Vec<RawRow> = sqlx::query_as(&format!(
+    let recent: Vec<RawRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {ROW_COLUMNS} FROM node_context_fit WHERE computed_at >= ? \
          ORDER BY computed_at DESC, node_id LIMIT ?"
-    ))
+    )))
     .bind(&since)
     .bind(RECENT_LIMIT)
     .fetch_all(pool)
@@ -574,7 +598,10 @@ mod tests {
 
     #[test]
     fn the_layer_is_the_commonest_first_segment() {
-        assert_eq!(layer_of(&owned(&["core/src/a.rs", "core/src/b.rs"])), "core");
+        assert_eq!(
+            layer_of(&owned(&["core/src/a.rs", "core/src/b.rs"])),
+            "core"
+        );
         assert_eq!(
             layer_of(&owned(&["core/src/a.rs", "shell/x.ts", "shell/y.ts"])),
             "shell"
@@ -613,7 +640,11 @@ mod tests {
             attempt(&["/w/core/src/z.rs"], &[]),
         ];
         let (outside, read) = read_signals(&attempts, &owned_paths, &pointers);
-        assert_eq!(outside, Some(2), "x once and y; z comes after the first edit");
+        assert_eq!(
+            outside,
+            Some(2),
+            "x once and y; z comes after the first edit"
+        );
         assert_eq!(read, Some(1));
         assert_eq!(read_signals(&[], &owned_paths, &pointers), (None, None));
         assert_eq!(read_signals(&attempts, &[], &[]), (None, None));
