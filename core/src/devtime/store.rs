@@ -372,6 +372,40 @@ pub async fn upsert_session(conn: &mut SqliteConnection, row: &SessionRow) -> sq
     Ok(())
 }
 
+/// The run and tree node a transcript's session belongs to, with the run's project: `runs.session_id`
+/// joined to `work_node_runs`. The newest run wins when a session was resumed. `None` when no run
+/// with a project is bound to a node, which is how a plain daemon run stays skipped.
+pub async fn node_run_for_session(
+    pool: &SqlitePool,
+    session_id: &str,
+) -> sqlx::Result<Option<(i64, String, String)>> {
+    sqlx::query_as(
+        "SELECT r.id, n.node_id, r.project_id FROM runs r
+         JOIN work_node_runs n ON n.run_id = r.id
+         WHERE r.session_id = ? AND r.project_id IS NOT NULL
+         ORDER BY r.id DESC LIMIT 1",
+    )
+    .bind(session_id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Stamps a session with the run and node it belongs to; the rules pass copies them to its findings.
+pub async fn set_session_node(
+    pool: &SqlitePool,
+    session_id: &str,
+    run_id: i64,
+    node_id: &str,
+) -> sqlx::Result<()> {
+    sqlx::query("UPDATE devtime_sessions SET run_id = ?, node_id = ? WHERE session_id = ?")
+        .bind(run_id)
+        .bind(node_id)
+        .bind(session_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Opens the next turn of a session (`seq` = MAX + 1) and returns its `seq`.
 pub async fn open_turn(
     conn: &mut SqliteConnection,
