@@ -116,7 +116,8 @@ pub(crate) const MAX_RESOLUTION_ATTEMPTS: i64 = 3;
 /// instead of refused for good by `land_finished`. A run that finished with a failed gate, failed or
 /// gave up had its attempt, and that stays a person's. A row somebody settled (`settled_at`), one a later success already
 /// settled, or one no longer `escalated` is left alone, and `MAX_RESOLUTION_ATTEMPTS` bounds the
-/// loop. The count is `resolution_attempts`, bumped by the claim in `create_run_with`.
+/// loop. The count is `resolution_attempts`, bumped by the claim in `create_run_with`, and also
+/// by a worktree-provisioning failure there, which counts the attempt without claiming the row.
 /// Returns how many rows were released.
 async fn release_unfinished(pool: &sqlx::SqlitePool) -> u64 {
     let released = sqlx::query(
@@ -252,6 +253,11 @@ struct Candidate {
 /// dismissed row it overrides a person's "nobody needs to act". The later-success subquery below
 /// stays: it covers the tick before `settle_moot` has run, which runs after this on the same tick.
 ///
+/// **`resolution_attempts < MAX_RESOLUTION_ATTEMPTS` caps the retries of an unclaimed row.** A
+/// worktree that could not be made counts an attempt but leaves `resolution_run_id` NULL, so
+/// without the cap a permanent failure would be retried every tick for ever. For the normal path it
+/// is a no-op: `release_unfinished` only frees rows whose attempts are already under the cap.
+///
 /// Separated from `launch_once` so the filter can be tested against a pool alone. It is the part
 /// that decides which conflicts a person never has to look at, and it should not need an agent
 /// runner to prove.
@@ -262,6 +268,7 @@ async fn next_conflict(pool: &sqlx::SqlitePool) -> sqlx::Result<Option<Candidate
           WHERE status = 'escalated'
             AND op = 'merge'
             AND resolution_run_id IS NULL
+            AND resolution_attempts < ?
             AND from_resolution = 0
             AND settled_at IS NULL
             AND NOT EXISTS (
@@ -282,6 +289,7 @@ async fn next_conflict(pool: &sqlx::SqlitePool) -> sqlx::Result<Option<Candidate
           ORDER BY id
           LIMIT 1",
     )
+    .bind(MAX_RESOLUTION_ATTEMPTS)
     .fetch_optional(pool)
     .await
 }
@@ -1556,6 +1564,51 @@ mod tests {
         assert!(
             next_conflict(&pool).await.unwrap().is_none(),
             "every conflict has been attempted; a fresh agent per tick is the failure this prevents"
+        );
+    }
+
+    /// An unclaimed row whose attempts are spent is not picked up again. A worktree that cannot be
+    /// made counts an attempt but leaves `resolution_run_id` NULL, so the cap is what stops a
+    /// permanent failure from minting a run every tick; one attempt short of it still retries.
+    #[tokio::test]
+    async fn an_unclaimed_conflict_whose_attempts_are_spent_is_not_picked_up() {
+        let pool = test_pool().await;
+
+        let spent = escalated_merge_of(&pool, "feat/spent", false).await;
+        sqlx::query("UPDATE vcs_requests SET resolution_attempts = ? WHERE id = ?")
+            .bind(MAX_RESOLUTION_ATTEMPTS)
+            .bind(spent)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let retryable = escalated_merge_of(&pool, "feat/retryable", false).await;
+        sqlx::query("UPDATE vcs_requests SET resolution_attempts = ? WHERE id = ?")
+            .bind(MAX_RESOLUTION_ATTEMPTS - 1)
+            .bind(retryable)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let picked = next_conflict(&pool)
+            .await
+            .expect("the query should run")
+            .expect("the row one attempt short of the cap is still retried");
+        assert_eq!(
+            picked.id, retryable,
+            "picked {} — spent={spent}, retryable={retryable}",
+            picked.id
+        );
+
+        // Once that one spends its last attempt too, there is nothing left to start.
+        sqlx::query("UPDATE vcs_requests SET resolution_attempts = ? WHERE id = ?")
+            .bind(MAX_RESOLUTION_ATTEMPTS)
+            .bind(retryable)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            next_conflict(&pool).await.unwrap().is_none(),
+            "a conflict with its attempts spent belongs to a person, not to another run"
         );
     }
 

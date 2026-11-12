@@ -1105,11 +1105,13 @@ pub mod tests {
         );
     }
 
-    /// A conflict whose worktree cannot be made at all spends its attempt too. Request 513 in the
-    /// field: its target `aut/integ` never existed, `git worktree add` failed before the claim, and
-    /// the resolver minted a failed run every minute because `resolution_run_id` stayed NULL.
+    /// A conflict whose worktree cannot be made counts an attempt but stays unclaimed, so the
+    /// resolver retries it while attempts remain: a transient failure (index.lock, a timeout) gets
+    /// another go. Request 513 in the field: its target `aut/integ` never existed, and with nothing
+    /// counted the resolver minted a failed run every minute; now it spends at most
+    /// `MAX_RESOLUTION_ATTEMPTS` and then goes to a person through the conflict ticket.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_conflict_whose_worktree_cannot_be_made_spends_its_attempt() {
+    async fn a_conflict_whose_worktree_cannot_be_made_counts_an_attempt_and_stays_retryable() {
         let _env_lock = crate::execution::worktree::test_env_lock();
         let wt_root = space_free_tempdir("nucleos-runs-wt-");
         let _env = WorktreeRootEnv::set(wt_root.path());
@@ -1136,9 +1138,20 @@ pub mod tests {
             matches!(refused, CreateRunError::Worktree(_)),
             "provisioning is what failed: {refused:?}"
         );
-        assert!(
-            resolution_run_id_of(&state.pool, request).await.is_some(),
-            "the attempt is spent, so the resolver does not mint the same failure every tick"
+        assert_eq!(
+            resolution_run_id_of(&state.pool, request).await,
+            None,
+            "the row stays unclaimed so the resolver can retry it"
+        );
+        let (attempts,): (i64,) =
+            sqlx::query_as("SELECT resolution_attempts FROM vcs_requests WHERE id = ?")
+                .bind(request)
+                .fetch_one(&state.pool)
+                .await
+                .expect("read the attempts back");
+        assert_eq!(
+            attempts, 1,
+            "the failure counts toward the cap, so a permanent one cannot retry for ever"
         );
     }
 
