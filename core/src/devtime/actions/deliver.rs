@@ -134,6 +134,10 @@ pub async fn deliver_proposals(
             tx.rollback().await?;
         }
     }
+    if made > 0 {
+        // After the commits, so a woken reader finds the rows.
+        nucleos_base::wake::bump(nucleos_base::wake::Topic::Proposals);
+    }
     Ok(made)
 }
 
