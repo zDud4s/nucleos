@@ -505,9 +505,10 @@ mod tests {
         let tree = tempfile::tempdir().unwrap();
         crate::governance::autopilot::wire_classifier_hook(root.path()).unwrap();
         // Unparsable settings: the wiring refuses to touch them, so the tree stays unwired.
-        std::fs::create_dir_all(tree.path().join(".claude")).unwrap();
+        let unit = crate::engines::unit_config::unit_config_dir(tree.path());
+        std::fs::create_dir_all(&unit).unwrap();
         std::fs::write(
-            tree.path().join(".claude").join("settings.json"),
+            crate::engines::unit_config::settings_file(&unit),
             "{not json",
         )
         .unwrap();

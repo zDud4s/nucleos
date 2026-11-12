@@ -251,6 +251,9 @@ mod tests {
             settings["hooks"][event][0]["hooks"][0]["timeout"] = serde_json::json!(3600);
         }
         std::fs::write(&settings_path, settings.to_string()).unwrap();
+        // The hook lives outside the tree now, so the folder needs a workflow of its own to count
+        // as one that is not seeded.
+        std::fs::create_dir_all(tree.join(".claude/skills/mine")).unwrap();
         // A folder with a workflow of its own, but nothing wired: it must gain no settings.
         let (_other_root, _other_main, unwired) = checkout_and_worktree(false);
         std::fs::create_dir_all(unwired.join(".claude/skills/mine")).unwrap();
