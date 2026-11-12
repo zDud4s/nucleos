@@ -36,15 +36,38 @@
 
 use chrono::{DateTime, Duration, Utc};
 
-/// Prompts shorter than this are not cached by the API at all, and no error says so.
+/// Fallback minimum for a model not in `MIN_CACHEABLE_PREFIX_BY_MODEL`, or a run with no model.
 ///
-/// The real minimum is per-model and NOT monotonic with model age — 512 tokens on Opus 5, 1024 on
-/// Opus 4.8 and Sonnet 5, 2048 on Opus 4.7, 4096 on Opus 4.6 and Haiku 4.5. Picking the largest of
-/// them is the only safe choice while nothing in the schema records WHICH model ran a given run:
-/// `runs.answered_by` stores `cloud`, `local`, or `openrouter`, not a model id. Erring high makes
-/// the signal go quiet on short prompts; erring low would make it accuse the API of a defect in the
-/// exact range where the API is behaving exactly as documented.
+/// The most conservative value in the table: erring high makes the signal go quiet on short
+/// prompts; erring low would make it accuse the API of a defect in the exact range where the API is
+/// behaving exactly as documented.
 const MIN_CACHEABLE_PREFIX_TOKENS: i64 = 4096;
+
+/// Prompts shorter than this are not cached by the API at all, and no error says so — per model.
+///
+/// NOT monotonic with model age: 512 tokens on Opus 5, 1024 on Opus 4.8 and Sonnet 5, 2048 on
+/// Opus 4.7, 4096 on Opus 4.6 and Haiku 4.5. Indexed by the configured model (`runs.model`) as a
+/// PREFIX of the id with dots folded to dashes, so a dated or point-release id (`claude-opus-5-5`)
+/// still finds its family. The first matching row wins, so a longer prefix must precede a shorter
+/// one it contains.
+const MIN_CACHEABLE_PREFIX_BY_MODEL: &[(&str, i64)] = &[
+    ("claude-opus-4-8", 1024),
+    ("claude-opus-4-7", 2048),
+    ("claude-opus-4-6", 4096),
+    ("claude-opus-5", 512),
+    ("claude-sonnet-5", 1024),
+    ("claude-haiku-4-5", 4096),
+];
+
+/// How far below its entry level a measure must fall before the signal counts as over — the dead
+/// band that stops a measure hovering at the threshold from switching the alert on and off.
+const DEAD_BAND_PERCENT: i64 = 15;
+
+/// The probable causes of a prefix that was big enough to cache and was neither read nor written.
+/// The list is short and known, which is why the alert can name it instead of saying "investigate".
+const CACHE_COLD_CAUSES: &str = "a timestamp or UUID in the prefix, a mid-run model switch, a \
+     changed tool set, unordered JSON serialization, or the 20-block lookback exceeded by a long \
+     agentic turn";
 
 /// Context a non-chat run reached without any handoff having taken it away.
 ///
@@ -160,6 +183,9 @@ pub struct Measures {
     /// Read from here and never from `exit_code`: a run killed by the progress deadline carries
     /// `PROGRESS_TIMEOUT_EXIT_CODE`, which on its own distinguishes nothing.
     pub status: String,
+    /// The configured model, which selects the minimum cacheable prefix. `None` for a run that
+    /// never recorded one, which takes the conservative fallback.
+    pub model: Option<String>,
     pub project_id: Option<String>,
     /// Which agent session this run belongs to. Load-bearing for the baseline and nothing else: a
     /// resumed run reports the CUMULATIVE session total, so its predecessors are partial re-counts
@@ -263,7 +289,9 @@ fn median(sorted: &[i64]) -> Option<i64> {
 /// being written around whatever the constants happen to be this month.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Thresholds {
+    /// Fallback minimum when the model is unknown; see `min_prefix_for`.
     pub min_cacheable_prefix_tokens: i64,
+    pub dead_band_percent: i64,
     pub context_swelling_tokens: i64,
     pub output_starved_turns: i64,
     pub min_baseline_sample: usize,
@@ -277,6 +305,7 @@ impl Default for Thresholds {
     fn default() -> Self {
         Self {
             min_cacheable_prefix_tokens: MIN_CACHEABLE_PREFIX_TOKENS,
+            dead_band_percent: DEAD_BAND_PERCENT,
             context_swelling_tokens: CONTEXT_SWELLING_TOKENS,
             output_starved_turns: OUTPUT_STARVED_TURNS,
             min_baseline_sample: MIN_BASELINE_SAMPLE,
@@ -285,6 +314,25 @@ impl Default for Thresholds {
             streak_before_alert: STREAK_BEFORE_ALERT,
             silence_window: Duration::hours(SILENCE_WINDOW_HOURS),
         }
+    }
+}
+
+impl Thresholds {
+    /// The minimum cacheable prefix for the configured model; the fallback for an unknown one.
+    fn min_prefix_for(&self, model: Option<&str>) -> i64 {
+        let Some(model) = model else {
+            return self.min_cacheable_prefix_tokens;
+        };
+        let folded = model.to_ascii_lowercase().replace('.', "-");
+        MIN_CACHEABLE_PREFIX_BY_MODEL
+            .iter()
+            .find(|(prefix, _)| folded.starts_with(prefix))
+            .map_or(self.min_cacheable_prefix_tokens, |(_, minimum)| *minimum)
+    }
+
+    /// The level a measure must drop BELOW for a signal entered at `entry` to count as over.
+    fn exit_level(&self, entry: i64) -> i64 {
+        entry.saturating_sub(entry.saturating_mul(self.dead_band_percent) / 100)
     }
 }
 
@@ -332,7 +380,7 @@ fn cache_verdict(measures: &Measures, thresholds: &Thresholds) -> Verdict {
     // exploit the cache?" has no answer rather than the answer `no`. Undecidable and not quiet:
     // quiet resets a streak, and a run too small to be cacheable is no evidence that a cold cache
     // got warmer. It matters more the moment this threshold is ever tuned downward.
-    if total < thresholds.min_cacheable_prefix_tokens {
+    if total < thresholds.min_prefix_for(measures.model.as_deref()) {
         return Verdict::Undecidable;
     }
 
@@ -359,7 +407,23 @@ fn context_verdict(measures: &Measures, thresholds: &Thresholds) -> Verdict {
         return Verdict::Quiet;
     }
 
-    Verdict::from(fill >= thresholds.context_swelling_tokens)
+    banded(
+        fill >= thresholds.context_swelling_tokens,
+        fill < thresholds.exit_level(thresholds.context_swelling_tokens),
+    )
+}
+
+/// The dead band: at or past entry the signal fires, below the exit level it is over, and in
+/// between the reading is neither — the streak is left as it was, so a measure oscillating around
+/// the threshold cannot switch the alert on and off.
+fn banded(entered: bool, exited: bool) -> Verdict {
+    if entered {
+        Verdict::Firing
+    } else if exited {
+        Verdict::Quiet
+    } else {
+        Verdict::Undecidable
+    }
 }
 
 /// Many turns spent, and then the run did not succeed.
@@ -377,7 +441,15 @@ fn starved_verdict(measures: &Measures, thresholds: &Thresholds) -> Verdict {
         return Verdict::Undecidable;
     };
 
-    Verdict::from(turns >= thresholds.output_starved_turns && measures.status != "completed")
+    // A run that succeeded is over whatever its turn count; otherwise the turn count sits in the
+    // dead band like any other threshold.
+    if measures.status == "completed" {
+        return Verdict::Quiet;
+    }
+    banded(
+        turns >= thresholds.output_starved_turns,
+        turns < thresholds.exit_level(thresholds.output_starved_turns),
+    )
 }
 
 /// A run that cost far more than the recent runs of its own shape.
@@ -400,8 +472,10 @@ fn drift_verdict(measures: &Measures, baseline: &Baseline, thresholds: &Threshol
 
     // Saturating rather than wrapping: the values come from a `result` line the daemon does not
     // author, and in a debug build an overflow here would panic on the run-finalisation path.
-    let ceiling = median_total.saturating_add(thresholds.drift_mads.saturating_mul(mad));
-    Verdict::from(total > ceiling)
+    let excess = thresholds.drift_mads.saturating_mul(mad);
+    let ceiling = median_total.saturating_add(excess);
+    let exit = median_total.saturating_add(thresholds.exit_level(excess));
+    banded(total > ceiling, total <= exit)
 }
 
 /// PURE: whether a signal that has held for `streak` evaluations gets to say so now.
@@ -432,21 +506,24 @@ fn summarise(signal: Signal, measures: &Measures, baseline: &Baseline, streak: i
             let total = describe(measures.total_prompt_tokens());
             format!(
                 "token efficiency ({scope}): {streak} runs in a row sent a prompt of {total} tokens \
-                 and neither read nor wrote a single cached token"
+                 and neither read nor wrote a single cached token — signal cache_cold; probable \
+                 cause: {CACHE_COLD_CAUSES}"
             )
         }
         Signal::ContextSwelling => {
             let fill = describe(measures.context_fill);
             format!(
                 "token efficiency ({scope}): {streak} runs in a row reached {fill} context tokens \
-                 without handing off — the handoff should have fired at 160000"
+                 without handing off — signal context_swelling; probable cause: the handoff that \
+                 should have fired at 160000 did not (no successor run recorded)"
             )
         }
         Signal::OutputStarved => {
             let turns = describe(measures.num_turns);
             format!(
                 "token efficiency ({scope}): {streak} runs in a row spent {turns} turns and ended \
-                 `{status}`",
+                 `{status}` — signal output_starved; probable cause: a retry loop rebuilding \
+                 context or a task that does not converge",
                 status = measures.status
             )
         }
@@ -456,7 +533,9 @@ fn summarise(signal: Signal, measures: &Measures, baseline: &Baseline, streak: i
             let mad = describe(baseline.mad);
             format!(
                 "token efficiency ({scope}): {streak} runs in a row cost {total} prompt tokens \
-                 against a recent median of {median_total} (MAD {mad}, {sample} runs)",
+                 against a recent median of {median_total} (MAD {mad}, {sample} runs) — signal \
+                 cost_drift; probable cause: a prompt or context that grew, or a cache that \
+                 stopped being hit",
                 sample = baseline.sample
             )
         }
@@ -468,7 +547,7 @@ fn describe(value: Option<i64>) -> String {
     value.map_or_else(|| "?".to_string(), |value| value.to_string())
 }
 
-const SELECT_MEASURES: &str = "SELECT mode, status, project_id, session_id, successor_run_id, input_tokens, \
+const SELECT_MEASURES: &str = "SELECT mode, status, model, project_id, session_id, successor_run_id, input_tokens, \
      cache_read_tokens, cache_creation_tokens, num_turns, context_fill FROM runs WHERE id = ?";
 
 /// The recent totals of runs shaped like this one.
@@ -665,6 +744,7 @@ mod tests {
         Measures {
             mode: "real".to_string(),
             status: "completed".to_string(),
+            model: None,
             project_id: None,
             session_id: None,
             successor_run_id: None,
@@ -933,6 +1013,86 @@ mod tests {
             verdict(&long_and_useful, Signal::OutputStarved),
             Verdict::Quiet
         );
+    }
+
+    #[test]
+    fn the_cacheable_minimum_follows_the_configured_model() {
+        let thresholds = Thresholds::default();
+        let for_model = |model: Option<&str>| thresholds.min_prefix_for(model);
+
+        assert_eq!(for_model(Some("claude-opus-5-5")), 512);
+        assert_eq!(for_model(Some("claude-sonnet-5")), 1024);
+        assert_eq!(for_model(Some("claude-opus-4.8")), 1024);
+        assert_eq!(for_model(Some("claude-opus-4-7")), 2048);
+        assert_eq!(for_model(Some("claude-haiku-4-5")), 4096);
+        // Unknown and absent both take the conservative fallback, which silences the signal.
+        assert_eq!(for_model(Some("mystery-model")), 4096);
+        assert_eq!(for_model(None), 4096);
+
+        // 2_000 tokens: cacheable on Opus 5, below the minimum on the fallback.
+        let run = Measures {
+            input_tokens: Some(2_000),
+            ..cacheable_run()
+        };
+        let opus = Measures {
+            model: Some("claude-opus-5".to_string()),
+            ..run.clone()
+        };
+        assert_eq!(verdict(&opus, Signal::CacheCold), Verdict::Firing);
+        assert_eq!(verdict(&run, Signal::CacheCold), Verdict::Undecidable);
+    }
+
+    #[test]
+    fn a_measure_inside_the_dead_band_neither_fires_nor_resets() {
+        let at = |fill| Measures {
+            mode: "worktree".to_string(),
+            context_fill: Some(fill),
+            ..Measures::default()
+        };
+        // 15% below 200_000 is 170_000: at entry fires, between is held, below is over.
+        // Starved turns: entry 20, exit level 17 (turns below 17 are over).
+        assert_eq!(
+            verdict(&at(CONTEXT_SWELLING_TOKENS), Signal::ContextSwelling),
+            Verdict::Firing
+        );
+        assert_eq!(
+            verdict(&at(180_000), Signal::ContextSwelling),
+            Verdict::Undecidable
+        );
+        assert_eq!(
+            verdict(&at(169_999), Signal::ContextSwelling),
+            Verdict::Quiet
+        );
+
+        let turns = |turns| Measures {
+            status: "failed".to_string(),
+            num_turns: Some(turns),
+            ..cacheable_run()
+        };
+        assert_eq!(verdict(&turns(20), Signal::OutputStarved), Verdict::Firing);
+        assert_eq!(
+            verdict(&turns(17), Signal::OutputStarved),
+            Verdict::Undecidable
+        );
+        assert_eq!(verdict(&turns(16), Signal::OutputStarved), Verdict::Quiet);
+    }
+
+    #[test]
+    fn the_summary_names_signal_measure_and_cause() {
+        let cold = cacheable_run();
+        let text = summarise(Signal::CacheCold, &cold, &Baseline::default(), 4);
+
+        assert!(text.contains("cache_cold"));
+        assert!(text.contains("50000"));
+        for cause in [
+            "timestamp or UUID",
+            "model switch",
+            "tool set",
+            "unordered JSON",
+            "20-block lookback",
+        ] {
+            assert!(text.contains(cause), "{cause} missing from {text}");
+        }
     }
 
     #[test]
