@@ -561,8 +561,8 @@ fn original_segment_text(command: &str, segment: &str) -> String {
                     }
                 }
                 found
-            } else if rest.starts_with('`') {
-                rest[1..].find('`').map(|i| i + 2)
+            } else if let Some(stripped) = rest.strip_prefix('`') {
+                stripped.find('`').map(|i| i + 2)
             } else {
                 None
             };
