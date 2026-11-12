@@ -376,6 +376,12 @@ fn cache_verdict(measures: &Measures, thresholds: &Thresholds) -> Verdict {
         return Verdict::Undecidable;
     };
 
+    // No session id: nothing to resume, so nothing earlier could have been reused. A first run of a
+    // series has no prefix to have missed.
+    if measures.session_id.is_none() {
+        return Verdict::Undecidable;
+    }
+
     // Below the minimum cacheable length there is no cache to have exploited, so "did this run
     // exploit the cache?" has no answer rather than the answer `no`. Undecidable and not quiet:
     // quiet resets a streak, and a run too small to be cacheable is no evidence that a cold cache
@@ -746,7 +752,7 @@ mod tests {
             status: "completed".to_string(),
             model: None,
             project_id: None,
-            session_id: None,
+            session_id: Some("sess".to_string()),
             successor_run_id: None,
             input_tokens: Some(50_000),
             cache_read_tokens: Some(0),
@@ -822,6 +828,19 @@ mod tests {
         // report a defect in the one range where there is none — and answering `no` would be almost
         // as wrong, because a run too small to be cacheable is no evidence either way.
         assert_eq!(verdict(&measures, Signal::CacheCold), Verdict::Undecidable);
+    }
+
+    #[test]
+    fn a_run_without_a_session_cannot_be_cold() {
+        let first_of_series = Measures {
+            session_id: None,
+            ..cacheable_run()
+        };
+
+        assert_eq!(
+            verdict(&first_of_series, Signal::CacheCold),
+            Verdict::Undecidable
+        );
     }
 
     #[test]
@@ -1151,8 +1170,8 @@ mod tests {
     async fn insert_cold_run(pool: &sqlx::SqlitePool) -> i64 {
         sqlx::query_scalar(
             "INSERT INTO runs (prompt, status, mode, created_at, completed_at, input_tokens, \
-             cache_read_tokens, cache_creation_tokens) \
-             VALUES ('p', 'completed', 'real', ?, ?, 50000, 0, 0) RETURNING id",
+             cache_read_tokens, cache_creation_tokens, session_id) \
+             VALUES ('p', 'completed', 'real', ?, ?, 50000, 0, 0, 'sess') RETURNING id",
         )
         .bind(Utc::now().to_rfc3339())
         .bind(Utc::now().to_rfc3339())
@@ -1286,8 +1305,8 @@ mod tests {
 
         let warm: i64 = sqlx::query_scalar(
             "INSERT INTO runs (prompt, status, mode, created_at, input_tokens, \
-             cache_read_tokens, cache_creation_tokens) \
-             VALUES ('p', 'completed', 'real', ?, 100, 49900, 0) RETURNING id",
+             cache_read_tokens, cache_creation_tokens, session_id) \
+             VALUES ('p', 'completed', 'real', ?, 100, 49900, 0, 'sess') RETURNING id",
         )
         .bind(Utc::now().to_rfc3339())
         .fetch_one(&pool)
