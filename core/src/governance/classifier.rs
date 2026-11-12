@@ -526,6 +526,58 @@ impl Classification {
     }
 }
 
+/// The text of `segment` as the owner wrote it in `command`. The parser stands a placeholder where
+/// each command substitution was; a culprit must show the original, so the pieces between
+/// placeholders are located in `command` and the balanced `$(…)` / backtick span skipped. A segment
+/// with no placeholder, or one that cannot be located, comes back unchanged.
+fn original_segment_text(command: &str, segment: &str) -> String {
+    let placeholder = crate::command_reader::SUBSTITUTION_PLACEHOLDER;
+    if !segment.contains(placeholder) {
+        return segment.to_owned();
+    }
+    let first = segment.split(placeholder).next().unwrap_or("");
+    let mut search_from = 0;
+    'start: while let Some(rel) = command[search_from..].find(first) {
+        let start = search_from + rel;
+        search_from = start + first.len().max(1);
+        let mut cur = start + first.len();
+        for piece in segment.split(placeholder).skip(1) {
+            let rest = &command[cur..];
+            let bytes = rest.as_bytes();
+            let end = if rest.starts_with("$(") {
+                let mut depth = 0usize;
+                let mut found = None;
+                for (i, b) in bytes.iter().enumerate() {
+                    match b {
+                        b'(' => depth += 1,
+                        b')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                found = Some(i + 1);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                found
+            } else if rest.starts_with('`') {
+                rest[1..].find('`').map(|i| i + 2)
+            } else {
+                None
+            };
+            let Some(end) = end else { continue 'start };
+            cur += end;
+            if !command[cur..].starts_with(piece) {
+                continue 'start;
+            }
+            cur += piece.len();
+        }
+        return command[start..cur].to_owned();
+    }
+    segment.to_owned()
+}
+
 /// The path a write tool names, for a culprit's reason.
 fn target_of(tool_input: &Value) -> &str {
     ["file_path", "notebook_path", "path"]
@@ -1110,9 +1162,9 @@ fn classify_shell_command(
     let mut touches_github = false;
     let mut confined = false;
     let mut declared = false;
-    for segment in segments
+    for (raw_segment, segment) in segments
         .iter()
-        .map(|s| crate::command_reader::escapes_masked(s, shell))
+        .map(|s| (s, crate::command_reader::escapes_masked(s, shell)))
     {
         // ASYMMETRY, on purpose: a substitution inside double quotes (`"$(…)"`) is one argument, so
         // it is read like an unknown variable and keeps today's verdict. An UNQUOTED one is split by
@@ -1127,10 +1179,12 @@ fn classify_shell_command(
             });
         match classify_segment(&segment, cwd, policy, rules, shell, unrecognized) {
             Segment::Unrecognized(why) => {
+                let shown = original_segment_text(command, raw_segment);
                 return classification("pending_approval", "unrecognized", &unrecognized_reason())
-                    .with_culprit(&segment, why);
+                    .with_culprit(&shown, why.replace(raw_segment.as_str(), &shown));
             }
             _ if unquoted_substitution => {
+                let raw_segment = &original_segment_text(command, raw_segment);
                 return classification(
                     "pending_approval",
                     "unrecognized",
@@ -1139,8 +1193,8 @@ fn classify_shell_command(
                     ),
                 )
                 .with_culprit(
-                    &segment,
-                    format!("`{segment}` has a command substitution outside quotes"),
+                    raw_segment,
+                    format!("`{raw_segment}` has a command substitution outside quotes"),
                 );
             }
             Segment::VcsLocal => touches_vcs = true,
