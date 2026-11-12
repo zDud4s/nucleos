@@ -299,7 +299,44 @@ pub(super) fn is_safe_command(command: &str) -> bool {
         && (SAFE_EXACT_COMMANDS.contains(&command)
             || matches_command_prefix(command, SAFE_COMMAND_PREFIXES)
             || checks_formatting_without_writing(command)
+            || typechecks_without_emitting(command)
             || super::grammar::reads_by_grammar(command))
+}
+
+/// `npx tsc --noEmit [-p <path>] [--pretty]`: the TypeScript type check, the JS spelling of
+/// `cargo check`. An explicit allow-list rather than a prefix, because `tsc` has flags that write
+/// (`--outDir`, `--outFile`, `--build`, `--incremental`'s build-info file) and `-p` names a file.
+/// `-p`/`--project` must carry a relative path that stays inside the workspace (no `..`, no drive,
+/// no leading separator, no `~`/`$`/`%`). Anything else, a second program included, is `false`.
+/// `command` is normalized, so `--noEmit` arrives as `--noemit`.
+pub fn typechecks_without_emitting(command: &str) -> bool {
+    let words = flag_words(command);
+    let mut tokens = words.iter().map(String::as_str);
+    if tokens.next() != Some("npx") || tokens.next() != Some("tsc") {
+        return false;
+    }
+    let rest: Vec<&str> = tokens.collect();
+    if !rest.contains(&"--noemit") {
+        return false;
+    }
+    let path_stays_inside = |value: &str| {
+        !value.is_empty()
+            && !value.starts_with(['/', '\\', '-', '~'])
+            && !value.contains([':', '$', '%'])
+            && !value.split(['/', '\\']).any(|part| part == "..")
+    };
+    let mut index = 0;
+    while index < rest.len() {
+        match rest[index] {
+            "--noemit" | "--pretty" | "--skiplibcheck" => index += 1,
+            "-p" | "--project" => match rest.get(index + 1) {
+                Some(value) if path_stays_inside(value) => index += 2,
+                _ => return false,
+            },
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// PowerShell's output shapers — `Select-Object -First 100`, `Sort-Object CPU`, `Format-Table` —

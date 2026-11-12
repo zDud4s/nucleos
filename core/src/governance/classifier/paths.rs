@@ -48,6 +48,31 @@ pub fn lands_inside_the_workspace(
     if program.eq_ignore_ascii_case("cargo") && tokens.get(1).is_some_and(|word| word == "fmt") {
         return cwd.is_some() && formats_only_where_it_stands(&tokens[2..]);
     }
+    // `git rm <paths>` drops tracked files from the index and the tree: allowed where every path
+    // lands inside the workspace, with only the flags that change nothing about where.
+    if program.eq_ignore_ascii_case("git") && tokens.get(1).is_some_and(|word| word == "rm") {
+        let Some(cwd) = cwd else {
+            return false;
+        };
+        let mut paths = 0;
+        let mut after_dashes = false;
+        for token in &tokens[2..] {
+            if !after_dashes && token == "--" {
+                after_dashes = true;
+            } else if !after_dashes && token.starts_with('-') {
+                if !["-r", "-f", "-q", "--cached", "--quiet", "--ignore-unmatch"]
+                    .contains(&token.as_str())
+                {
+                    return false;
+                }
+            } else if target_lands_inside(token, cwd, shell) {
+                paths += 1;
+            } else {
+                return false;
+            }
+        }
+        return paths > 0;
+    }
     // `cd` takes one destination; `mkdir` takes as many as you like, and every one has to land
     // inside. Anything else is not judged this way at all.
     let one_target_only = if ["cd", "chdir", "set-location"]

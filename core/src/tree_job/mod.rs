@@ -34,6 +34,7 @@ mod no_change;
 pub mod node_run;
 pub mod open;
 pub mod partition;
+mod path_fence;
 mod pending_start;
 mod relaunch;
 pub mod report;

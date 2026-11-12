@@ -968,6 +968,9 @@ async fn merge(
     if parked_as_no_change(pool, job, name, parks).await? {
         return Ok(());
     }
+    if super::path_fence::parked_by_fence(pool, job, name, node, parks).await? {
+        return Ok(());
+    }
     let repo = repo_of(pool, job).await?;
     submit_merge(pool, &repo, job, name, Origin::Daemon)
         .await
@@ -1054,7 +1057,7 @@ async fn landing_step(
         if let landing::LandSettlement::NotLanded { reason } = &settled {
             tracing::warn!(job = %job.id, %reason, "the queue did not land the job");
         }
-        return super::retry::after_settle(pool, job, settled, parks).await;
+        return super::retry::after_settle(state, job, settled, parks).await;
     }
     if !root_is_done(pool, &job.root_node_id).await? {
         return Ok(());
@@ -1264,7 +1267,13 @@ pub(super) mod tests {
     // ---- fixtures: branches ----------------------------------------------------------------------
 
     pub(crate) fn code_branch(name: &str, state: &str, node: Option<&str>) -> Branch {
-        let mut branch = Branch::new(name, &[format!("{name}/**")], "backend", None);
+        // `tree_repo` commits `<name>.txt` on each branch; the path fence needs it owned.
+        let mut branch = Branch::new(
+            name,
+            &[format!("{name}/**"), format!("{name}.txt")],
+            "backend",
+            None,
+        );
         branch.state = state.to_owned();
         branch.git_branch = Some(format!("tree/{name}"));
         branch.node_id = node.map(str::to_owned);
@@ -4700,9 +4709,9 @@ pub(super) mod tests {
     /// `tree/api` and `feat/tree` each change `feature.txt`, so merging one into the other conflicts.
     fn make_api_conflict(repo: &Path) {
         assert!(git_in(repo, &["checkout", "-q", "tree/api"]));
-        commit_file(repo, "feature.txt", "theirs\n", "theirs");
+        commit_file(repo, "api.txt", "theirs\n", "theirs");
         assert!(git_in(repo, &["checkout", "-q", "feat/tree"]));
-        commit_file(repo, "feature.txt", "ours\n", "ours");
+        commit_file(repo, "api.txt", "ours\n", "ours");
     }
 
     /// A job with one green branch `api` whose merge conflicts, behind a node that reported `done`.

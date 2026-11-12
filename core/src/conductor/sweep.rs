@@ -1529,7 +1529,9 @@ mod tests {
     }
 
     fn commit_in(repo: &std::path::Path, file: &str, text: &str, message: &str) {
-        std::fs::write(repo.join(file), text).expect("write");
+        let path = repo.join(file);
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
+        std::fs::write(path, text).expect("write");
         git_in(repo, &["add", "-A"]);
         git_in(repo, &["commit", "-q", "-m", message]);
     }
@@ -1545,7 +1547,8 @@ mod tests {
         git_in(&repo, &["checkout", "-q", "-b", "feat/sweep"]);
         commit_in(&repo, "feature.txt", "from the feature\n", "feature");
         git_in(&repo, &["checkout", "-q", "-b", "tree/api"]);
-        commit_in(&repo, "api.txt", "from the branch\n", "api");
+        // Inside `api/**`, the paths the branch declares: the merge step fences anything else.
+        commit_in(&repo, "api/api.txt", "from the branch\n", "api");
         git_in(&repo, &["checkout", "-q", "feat/sweep"]);
         (container, repo)
     }

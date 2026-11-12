@@ -892,6 +892,8 @@ pub async fn settle_land(
                 job.manifest.extra.insert("land_sha".to_owned(), json!(sha));
             }
             persist(pool, job).await?;
+            // The specs this tree was opened for record that it landed (F6 option (a)).
+            crate::spec_backlog::estado::record_landed(pool, &job.id, sha.as_deref()).await;
             Ok(LandSettlement::Finished { sha })
         }
         RequestEnd::Failed { reason, escalated } => {
@@ -2625,6 +2627,61 @@ mod tests {
         assert_eq!(loaded.state, JOB_TERMINAL_STATE);
         assert_eq!(loaded.manifest.state, JOB_TERMINAL_STATE);
         assert!(listed_ids(&h.pool).await.is_empty());
+    }
+
+    /// F6 option (a): a landed tree records its merge on the specs it was opened for, and only
+    /// on those; the `Estado:` line is written from that record.
+    #[tokio::test]
+    async fn a_landed_job_records_the_landing_on_its_specs() {
+        let _lock = test_env_lock();
+        let (_container, repo) = repo_with_a_feature_to_land("nucleos-landing-spec-state-");
+        let h = harness(&repo).await;
+        let mut job = saved_job(
+            &h.pool,
+            manifest_for_repo(&repo, vec![branch_at("api", "merged")]),
+        )
+        .await;
+        for (id, tree) in [("spec-mine", job.id.as_str()), ("spec-other", "job-other")] {
+            sqlx::query(
+                "INSERT INTO specs (id, path, title, content_sha, tree_id, created_at, updated_at) \
+                 VALUES (?, ?, 'T', 'sha-1', ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(format!("<state_dir>/specs/{id}.md"))
+            .bind(tree)
+            .bind(STAMP)
+            .bind(STAMP)
+            .execute(&h.pool)
+            .await
+            .unwrap();
+        }
+
+        land_job(
+            &h.pool,
+            &h.resolved,
+            &mut job,
+            land_deadline(),
+            Origin::Daemon,
+        )
+        .await
+        .unwrap();
+        drain(&h.pool).await;
+        let settled = settle_land(&h.pool, &mut job, SETTLE_WAIT).await.unwrap();
+
+        let LandSettlement::Finished { sha } = settled else {
+            panic!("expected a landing, got {settled:?}");
+        };
+        let landed = |id: &'static str| {
+            sqlx::query_as::<_, (Option<String>, Option<String>)>(
+                "SELECT landed_sha, landed_at FROM specs WHERE id = ?",
+            )
+            .bind(id)
+            .fetch_one(&h.pool)
+        };
+        let (mine_sha, mine_at) = landed("spec-mine").await.unwrap();
+        assert_eq!(mine_sha, sha);
+        assert!(mine_at.is_some(), "the landing time is recorded");
+        assert_eq!(landed("spec-other").await.unwrap(), (None, None));
     }
 
     /// `land::submit` only admits. A landing that conflicts in the queue has not landed anything,
