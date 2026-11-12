@@ -1078,6 +1078,39 @@ mod tests {
     }
 
     #[test]
+    fn cost_drift_has_a_dead_band_below_its_entry_level() {
+        let thresholds = Thresholds::default();
+        let baseline = steady_baseline();
+        // Median 13_500, MAD 2_000: entry above 23_500, exit level at 15% below the 10_000 excess.
+        let drift = |total| {
+            let measures = Measures {
+                input_tokens: Some(total),
+                ..cacheable_run()
+            };
+            evaluate(&measures, &baseline, &thresholds)[3].1
+        };
+
+        assert_eq!(drift(23_501), Verdict::Firing);
+        assert_eq!(drift(23_500), Verdict::Undecidable);
+        assert_eq!(drift(22_001), Verdict::Undecidable);
+        assert_eq!(drift(22_000), Verdict::Quiet);
+    }
+
+    #[test]
+    fn output_starved_with_unknown_turns_is_undecidable() {
+        let unmeasured = Measures {
+            status: "failed".to_string(),
+            num_turns: None,
+            ..cacheable_run()
+        };
+
+        assert_eq!(
+            verdict(&unmeasured, Signal::OutputStarved),
+            Verdict::Undecidable
+        );
+    }
+
+    #[test]
     fn the_summary_names_signal_measure_and_cause() {
         let cold = cacheable_run();
         let text = summarise(Signal::CacheCold, &cold, &Baseline::default(), 4);
