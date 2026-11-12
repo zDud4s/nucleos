@@ -18,6 +18,7 @@
 //! branch moves them behind the door.
 
 mod crossing;
+pub mod gate;
 #[cfg(test)]
 mod guard;
 

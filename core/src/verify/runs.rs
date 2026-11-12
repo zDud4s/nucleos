@@ -139,7 +139,14 @@ pub async fn timed_gate(
     };
     let started_at = chrono::Utc::now().to_rfc3339();
     let clock = Instant::now();
-    let outcome = crate::gate::run_gate(worktree, project_root, command, timeout).await;
+    let outcome = crate::sandbox::gate::run_gate(
+        crate::sandbox::RunMode::QueueGate,
+        worktree,
+        project_root,
+        command,
+        timeout,
+    )
+    .await;
     let Some(pool) = pool else {
         return outcome;
     };

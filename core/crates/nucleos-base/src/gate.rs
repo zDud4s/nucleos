@@ -182,6 +182,7 @@ fn split_environment(mut words: Vec<String>) -> (Vec<(String, String)>, Vec<Stri
 /// `project_root` is the un-agented copy of the repository. It is not where the command runs — that
 /// is always the worktree — but the reference the gate's own script is checked against first.
 pub async fn run_gate(
+    launch: Launch<'_>,
     worktree: &Path,
     project_root: &Path,
     command: &str,
@@ -207,7 +208,7 @@ pub async fn run_gate(
         return GateOutcome::Errored { reason };
     }
 
-    let outcome = run_argv(&words, worktree, &environment, timeout).await;
+    let outcome = run_argv(launch, &words, worktree, &environment, timeout).await;
     if outcome.timed_out {
         return GateOutcome::Errored {
             reason: format!("gate command timed out after {timeout:?}"),
@@ -298,12 +299,25 @@ pub struct ArgvOutcome {
     pub error: Option<String>,
 }
 
+/// A started gate child and the killer of its whole tree.
+///
+/// Field order is load-bearing, as for the sandbox's `Contained`: the killer drops before the child.
+pub struct Launched {
+    pub killer: Option<crate::process_tree::TreeKiller>,
+    pub child: tokio::process::Child,
+}
+
+/// How a gate process is started. The caller owns the door (the sandbox lives in `nucleos-core`,
+/// above this crate), so this crate never spawns on its own.
+pub type Launch<'a> = &'a (dyn Fn(Command) -> std::io::Result<Launched> + Send + Sync);
+
 /// Runs `argv` in `cwd` with `env` added to the inherited environment and returns what happened.
 ///
 /// This is the spawn-and-drain half of [`run_gate`], with no tamper check and no verdict: callers
 /// that run something other than the project's gate command (the verification executor) share the
-/// same process-tree kill, output cap and drain deadline.
+/// same process-tree kill, output cap and drain deadline. The process is started by `launch`.
 pub async fn run_argv(
+    launch: Launch<'_>,
     argv: &[String],
     cwd: &Path,
     env: &[(String, String)],
@@ -342,17 +356,18 @@ pub async fn run_argv(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    crate::process_tree::spawn_in_own_group(&mut command);
 
-    let mut child = match command.spawn() {
-        Ok(child) => child,
+    // Pattern bindings are declared in the order written, so `tree_killer` comes after `child` and
+    // drops first, while the process handle still pins the pid — the invariant
+    // `process_tree::TreeKiller` documents. The tree rather than the child because a gate command
+    // is whatever the project put in it, and a shell may have spawned the actual work.
+    let Launched {
+        mut child,
+        killer: mut tree_killer,
+    } = match launch(command) {
+        Ok(launched) => launched,
         Err(error) => return failed(format!("failed to start gate command: {error}")),
     };
-
-    // Declared after the child so it drops first, while the process handle still pins the pid — the
-    // invariant `process_tree::TreeKiller` documents. The tree rather than the child because a gate
-    // command is whatever the project put in it, and a shell may have spawned the actual work.
-    let mut tree_killer = child.id().map(crate::process_tree::TreeKiller::new);
 
     let output = Arc::new(Mutex::new(TailBuffer::default()));
     let stdout = child.stdout.take().expect("stdout was piped");
@@ -520,10 +535,39 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        ExitVerdict, GateOutcome, classify_exit, posix_shell, run_argv, run_gate, split_environment,
+        ExitVerdict, GateOutcome, Launched, classify_exit, posix_shell, run_argv as run_argv_with,
+        run_gate as run_gate_with, split_environment,
     };
-    use std::path::PathBuf;
+    use crate::process_tree::{TreeKiller, spawn_in_own_group};
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
+
+    /// The tests start the process the way the daemon's door does, minus the sandbox: this crate
+    /// cannot see the door, and what is under test here is the drain and the verdict.
+    fn direct(mut command: tokio::process::Command) -> std::io::Result<Launched> {
+        spawn_in_own_group(&mut command);
+        let child = command.spawn()?;
+        let killer = child.id().map(TreeKiller::new);
+        Ok(Launched { child, killer })
+    }
+
+    async fn run_argv(
+        argv: &[String],
+        cwd: &Path,
+        env: &[(String, String)],
+        timeout: Duration,
+    ) -> super::ArgvOutcome {
+        run_argv_with(&direct, argv, cwd, env, timeout).await
+    }
+
+    async fn run_gate(
+        worktree: &Path,
+        project_root: &Path,
+        command: &str,
+        timeout: Duration,
+    ) -> GateOutcome {
+        run_gate_with(&direct, worktree, project_root, command, timeout).await
+    }
 
     fn argv(words: &[&str]) -> Vec<String> {
         words.iter().map(|word| (*word).to_owned()).collect()
