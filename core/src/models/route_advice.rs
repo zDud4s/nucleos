@@ -39,7 +39,7 @@ use engines::{codex_runner, engines_without_headroom_now, resolve_pin};
 pub use item_context::{ItemContext, ItemRef, failed_label, item_context};
 
 /// Where the router listens unless `router.yaml` says otherwise.
-pub const DEFAULT_URL: &str = "http://127.0.0.1:18733";
+pub const DEFAULT_URL: &str = "http://127.0.0.1:8080";
 /// The ceiling on one route call. A run waits at most this long before launching without advice.
 pub const DEFAULT_TIMEOUT_MS: u64 = 2500;
 pub(crate) const MIN_TIMEOUT_MS: u64 = 100;
@@ -93,6 +93,8 @@ pub enum Surface {
     Team,
     Council,
     Recruit,
+    /// Subagent spawns made through the Agent tool.
+    Agents,
 }
 
 impl Surface {
@@ -102,10 +104,17 @@ impl Surface {
             Self::Team => "team",
             Self::Council => "council",
             Self::Recruit => "recruit",
+            Self::Agents => "agents",
         }
     }
 
-    pub(crate) const ALL: [Self; 4] = [Self::Runs, Self::Team, Self::Council, Self::Recruit];
+    pub(crate) const ALL: [Self; 5] = [
+        Self::Runs,
+        Self::Team,
+        Self::Council,
+        Self::Recruit,
+        Self::Agents,
+    ];
 }
 
 /// A CLI the daemon can launch, named as the router names it (`route_api.RUNNERS`).
@@ -1371,7 +1380,7 @@ mod tests {
     #[test]
     fn a_router_off_this_machine_is_refused() {
         for url in [
-            "http://10.0.0.5:18733",
+            "http://10.0.0.5:8080",
             "http://router.example.com",
             "ftp://127.0.0.1:1",
             "http://user@127.0.0.1:1",
@@ -1383,7 +1392,7 @@ mod tests {
             );
         }
         for url in [
-            "http://127.0.0.1:18733",
+            "http://127.0.0.1:8080",
             "http://localhost:9",
             "http://[::1]:9",
         ] {
