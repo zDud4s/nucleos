@@ -63,6 +63,7 @@ mod remote;
 mod repo;
 mod restart;
 mod run_queue;
+mod sandbox;
 mod settings;
 mod stepup;
 mod tasks;
@@ -161,6 +162,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(stepup::routes())
         .merge(repo::routes())
         .merge(run_queue::routes())
+        .merge(sandbox::routes())
         .merge(engines::routes())
         .merge(settings::routes())
         .merge(workflow_params::routes())

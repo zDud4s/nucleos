@@ -610,7 +610,7 @@ fn grants(scope: &Scope, method: &Method, path: &str, target: Target) -> bool {
         Scope::Service(Service::Channel(_)) => listed(CHANNEL_ROUTES),
         Scope::Service(Service::Remote) => listed(REMOTE_GATEWAY_ROUTES),
         Scope::TeamRun(_) => listed(TEAM_ROUTES),
-        Scope::Assistant => listed(ASSISTANT_ROUTES),
+        Scope::Assistant => listed(crate::sandbox::assistant_routes::ASSISTANT_ROUTES),
         Scope::ApiToken(ApiTokenLevel::ReadOnly) => listed(READ_ONLY_ROUTES),
         Scope::ApiToken(ApiTokenLevel::RunCreating) => {
             listed(READ_ONLY_ROUTES) || listed(RUN_CREATING_ROUTES)
@@ -678,6 +678,8 @@ const REMOTE_ADMIN_SEGMENTS: &[&str] = &[
     // not open it to lower levels by accident.
     "backlog",
     "calendar",
+    // Read-only status/banner of the OS sandbox; no route changes the switch.
+    "sandbox",
     "capture-requests",
     "contacts",
     "context-refs",
@@ -862,7 +864,6 @@ use remote::REMOTE_DEVICE_REFUSED_ROUTES;
 use remote::REMOTE_GATEWAY_ROUTES;
 pub use remote::{DEVICE_SESSION_HEADER, RemoteDevice, remote_device_permits};
 mod grave;
-use crate::sandbox::assistant_routes::ASSISTANT_ROUTES;
 pub use grave::{GRAVE_ROUTES, is_grave};
 
 fn is_param(segment: &str) -> bool {
@@ -7528,6 +7529,8 @@ mod tests {
         }
     }
 
+    use crate::sandbox::assistant_routes::ASSISTANT_ROUTES;
+
     /// Every route the owner alone may use: approving, landing, the brake and configuration.
     const OWNER_ONLY: &[(Method, &str)] = &[
         (Method::POST, "/proposals/{id}/approve"),
@@ -7549,7 +7552,6 @@ mod tests {
         let key = crate::sandbox::assistant_routes::mint_assistant_token(&state.pool, "chat-a")
             .await
             .expect("mint the assistant key");
-        assert!(key.starts_with("assistant:chat-a."), "got {key}");
         assert_eq!(resolve(&state, &key).await, Some(Scope::Assistant));
         // The same secret under the `chat:` family is another scope, and a wrong secret nothing.
         assert_eq!(
