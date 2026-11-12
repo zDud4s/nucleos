@@ -154,6 +154,39 @@ impl State {
         self.last_green_sha.as_deref() == Some(sha) || self.covered_sha.as_deref() == Some(sha)
     }
 
+    /// The sha a promotion should move the release branch to: the later of `covered_sha` and
+    /// `last_green_sha`. `covered_sha` is only cleared by a red, so it can lag behind a newer
+    /// `last_green_sha`; when neither descends from the other, `last_green_sha` wins.
+    pub(crate) async fn promotable_green(
+        &self,
+        project_root: &std::path::Path,
+        deadline: std::time::Instant,
+    ) -> Option<String> {
+        match (self.covered_sha.as_deref(), self.last_green_sha.as_deref()) {
+            (Some(covered), Some(green)) if covered != green => {
+                let covered_is_newer = !crate::execution::git_exec::is_ancestor(
+                    project_root,
+                    covered,
+                    green,
+                    deadline,
+                )
+                .await
+                .unwrap_or(false)
+                    && crate::execution::git_exec::is_ancestor(
+                        project_root,
+                        green,
+                        covered,
+                        deadline,
+                    )
+                    .await
+                    .unwrap_or(false);
+                Some(if covered_is_newer { covered } else { green }.to_owned())
+            }
+            (Some(sha), _) | (None, Some(sha)) => Some(sha.to_owned()),
+            (None, None) => None,
+        }
+    }
+
     /// The note for a unit whose `key` (its group, or the gate command) is red on the target:
     /// `already failing on <target>@<sha>`. `None` when `key` is not red or no sha is known.
     pub fn already_failing(&self, key: &str) -> Option<String> {

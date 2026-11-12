@@ -298,6 +298,51 @@ pub async fn close_fmt_tickets(
     Ok(closed)
 }
 
+/// The key `release-diverged`: the release branch holds commits the integration branch lacks.
+pub fn release_diverged_key() -> TaskKey {
+    TaskKey::release_diverged()
+}
+
+/// Opens (or reports again) the project's one `release-diverged` ticket: a promote was refused
+/// because the release branch is not an ancestor of the green sha. Never auto-launched; the owner
+/// resolves it. A non-object `detail` is kept under `detail.detail`.
+pub async fn open_release_diverged_ticket(
+    pool: &SqlitePool,
+    project_id: &str,
+    detail: Value,
+    now: DateTime<Utc>,
+) -> sqlx::Result<TaskRow> {
+    let fields = match detail {
+        Value::Object(fields) => fields,
+        Value::Null => serde_json::Map::new(),
+        other => {
+            let mut fields = serde_json::Map::new();
+            fields.insert("detail".to_owned(), other);
+            fields
+        }
+    };
+    open_machine_ticket(
+        pool,
+        project_id,
+        release_diverged_key(),
+        "the release branch diverged from the integration branch".to_owned(),
+        Value::Object(fields),
+        Vec::new(),
+        now,
+    )
+    .await
+}
+
+/// Closes the live `release-diverged` ticket by resolution. `false` when there is none.
+pub async fn close_release_diverged(
+    pool: &SqlitePool,
+    project_id: &str,
+    note: &str,
+    now: DateTime<Utc>,
+) -> sqlx::Result<bool> {
+    close_machine_ticket(pool, project_id, &release_diverged_key(), note, now).await
+}
+
 /// Why the target moved without the queue: a write the hook did not see (`Violation`) or one it
 /// let through because `NUCLEOS_ALLOW_DIRECT_GIT` was set (`Bypass`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -690,5 +735,59 @@ mod tests {
         assert_eq!(bypass.detail["kind"], json!("bypass"));
         assert_eq!(ticket_count(&pool).await, 2);
         assert!(direct_write_key("  ").is_none(), "no target, no key");
+    }
+
+    #[tokio::test]
+    async fn release_diverged_ticket_opens_once_and_closes() {
+        let pool = crate::testdb::fresh_pool().await;
+        let now = Utc.with_ymd_and_hms(2026, 11, 11, 10, 0, 0).unwrap();
+        let first = open_release_diverged_ticket(
+            &pool,
+            "proj",
+            json!({ "release": "master", "green": "b2" }),
+            now,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.key.as_str(), "release-diverged");
+        assert!(first.key.is_machine());
+        assert_eq!(first.detail["green"], json!("b2"));
+
+        let again = open_release_diverged_ticket(
+            &pool,
+            "proj",
+            json!({ "release": "master", "green": "c3" }),
+            now,
+        )
+        .await
+        .unwrap();
+        assert_eq!(again.id, first.id, "one ticket per project");
+        let key = release_diverged_key();
+        assert_eq!(key.as_str(), "release-diverged");
+        let live = store::live_by_key(&pool, "proj", &key, now)
+            .await
+            .unwrap()
+            .expect("the ticket is live");
+        assert_eq!(live.report_count, 2);
+        assert_eq!(ticket_count(&pool).await, 1);
+
+        assert!(
+            close_release_diverged(&pool, "proj", "master is an ancestor of green again", now)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store::live_by_key(&pool, "proj", &key, now)
+                .await
+                .unwrap()
+                .is_none(),
+            "closed"
+        );
+        assert!(
+            !close_release_diverged(&pool, "proj", "again", now)
+                .await
+                .unwrap(),
+            "nothing left to close"
+        );
     }
 }

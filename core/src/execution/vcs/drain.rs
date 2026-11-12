@@ -677,8 +677,8 @@ pub(super) fn parked_push_may_proceed(
 /// [`parked_push_may_proceed`] holds for some parked row. Not unconditional, because a re-park
 /// writes a feed line each time. Returns how many rows it requeued.
 pub async fn sweep_awaiting_gate(pool: &sqlx::SqlitePool) -> u64 {
-    let parked: Vec<(String, Option<String>)> = match sqlx::query_as(
-        "SELECT project_id, output_tail FROM vcs_requests WHERE status = 'awaiting_gate'",
+    let parked: Vec<(String, Option<String>, String, String)> = match sqlx::query_as(
+        "SELECT project_id, output_tail, op, args FROM vcs_requests WHERE status = 'awaiting_gate'",
     )
     .fetch_all(pool)
     .await
@@ -689,15 +689,18 @@ pub async fn sweep_awaiting_gate(pool: &sqlx::SqlitePool) -> u64 {
             return 0;
         }
     };
-    let mut by_project: std::collections::BTreeMap<String, Vec<String>> = Default::default();
-    for (project_id, sha) in parked {
-        by_project
-            .entry(project_id)
-            .or_default()
-            .push(sha.unwrap_or_default());
+    // Per project: the parked shas, and the `from` branch of every parked promote.
+    let mut by_project: std::collections::BTreeMap<String, (Vec<String>, Vec<String>)> =
+        Default::default();
+    for (project_id, sha, op, args) in parked {
+        let entry = by_project.entry(project_id).or_default();
+        entry.0.push(sha.unwrap_or_default());
+        if let Ok(Op::Promote { from, .. }) = Op::from_stored(&op, &args) {
+            entry.1.push(from.as_str().to_owned());
+        }
     }
     let mut released = 0;
-    for (project_id, shas) in by_project {
+    for (project_id, (shas, promote_froms)) in by_project {
         let state = match crate::verify::postgate::load(pool, &project_id).await {
             Ok(state) => state,
             Err(error) => {
@@ -706,7 +709,12 @@ pub async fn sweep_awaiting_gate(pool: &sqlx::SqlitePool) -> u64 {
             }
         };
         let Some(state) = state else { continue };
-        if shas.iter().any(|sha| parked_push_may_proceed(&state, sha)) {
+        // A parked promote targets the last green sha, not the tip it parked on: any green sha
+        // lets it proceed, provided the gate state is the one of the branch it promotes from.
+        let any_green = state.last_green_sha.is_some() || state.covered_sha.is_some();
+        let has_promote = promote_froms.iter().any(|from| *from == state.target);
+        if (has_promote && any_green) || shas.iter().any(|sha| parked_push_may_proceed(&state, sha))
+        {
             released += release_awaiting_gate(pool, &project_id).await;
         }
     }

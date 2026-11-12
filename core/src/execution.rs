@@ -7,6 +7,7 @@ pub mod git_exec;
 pub mod job;
 pub mod land;
 pub mod output_filter;
+pub mod release_activation;
 pub mod run_stop;
 pub mod runner;
 pub mod runs;

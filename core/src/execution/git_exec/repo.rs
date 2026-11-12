@@ -472,6 +472,41 @@ pub async fn set_integration_config(
     Ok(())
 }
 
+/// Writes `nucleos.releaseBranch = <release>` into the LOCAL git config: the second branch the
+/// `reference-transaction` hook closes to anything but the queue. Same rules as
+/// `set_integration_config` (config only, no ref; `--local` so a non-repo is refused).
+pub async fn set_release_config(
+    root: &Path,
+    release: &str,
+    deadline: std::time::Instant,
+) -> Result<(), String> {
+    let budget = deadline.saturating_duration_since(std::time::Instant::now());
+    if budget.is_zero() {
+        return Err(
+            "the operation ran out of time before the release branch could be recorded".to_owned(),
+        );
+    }
+    let result = run_git(
+        root,
+        &[
+            OsStr::new("config"),
+            OsStr::new("--local"),
+            OsStr::new("nucleos.releaseBranch"),
+            OsStr::new(release),
+        ],
+        budget,
+    )
+    .await?;
+    if !result.succeeded() {
+        return Err(format!(
+            "could not record the release branch in {}: {}",
+            root.display(),
+            result.output_tail.trim()
+        ));
+    }
+    Ok(())
+}
+
 /// A third sanctioned entry to `run_git` (see its doc comment, which names all three): it
 /// computes what is left of the budget and refuses before spawning, which is the property that
 /// comment exists to protect.

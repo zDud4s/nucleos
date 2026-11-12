@@ -421,6 +421,9 @@ pub struct AutopilotRules {
     /// daemon sets it.
     #[serde(default)]
     pub postgate_idle_command: Option<String>,
+    /// The branch that only receives promotions of a commit the post-merge gate proved green; absent means off.
+    #[serde(default)]
+    pub release_branch: Option<String>,
     /// Whether a job asks if the owner is at the keyboard before it starts its next node.
     ///
     /// `Option`, and the absent case is the brake ON. That is deliberately not the same as
@@ -458,6 +461,51 @@ pub struct AutopilotRules {
     pub command_kinds: CommandKinds,
 }
 
+/// The preconditions for switching `release_branch` on, each refused with its own message. Pure:
+/// the caller measures the git facts and passes them in. Without `release_branch` it passes.
+pub fn release_activation_preconditions(
+    rules: &AutopilotRules,
+    integration: &str,
+    release_exists: bool,
+    integration_exists: bool,
+    release_is_ancestor: bool,
+) -> Result<(), String> {
+    let Some(release) = rules.release_branch() else {
+        return Ok(());
+    };
+    if !rules.gate_after_land {
+        return Err("release_branch needs gate_after_land to be on".to_string());
+    }
+    if rules
+        .gate_command
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+    {
+        return Err(
+            "release_branch needs gate_command to be set: without it no gate runs and a promotion would wait forever"
+                .to_string(),
+        );
+    }
+    if release == integration.trim() {
+        return Err(format!(
+            "release_branch must differ from the integration branch (both are `{release}`)"
+        ));
+    }
+    if !release_exists {
+        return Err(format!("release branch `{release}` does not exist"));
+    }
+    if !integration_exists {
+        return Err(format!("integration branch `{integration}` does not exist"));
+    }
+    if !release_is_ancestor {
+        return Err(format!(
+            "release branch `{release}` is not an ancestor of integration branch `{integration}`"
+        ));
+    }
+    Ok(())
+}
+
 /// The `command_kinds:` key. Absent means only the compiled defaults; each entry is a command
 /// prefix matched like a project shell rule.
 #[derive(Debug, Clone, Default, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq)]
@@ -490,7 +538,17 @@ impl AutopilotRules {
     /// A reader and not a field read: with one active step the merge is gated whatever
     /// `gate_before_publish` says, because a step's output must never be published unmeasured.
     pub fn merge_gate_required(&self) -> bool {
-        self.gate_before_publish || self.integration_steps.iter().any(|s| s.enabled)
+        let forced_by_steps =
+            self.release_branch().is_none() && self.integration_steps.iter().any(|s| s.enabled);
+        self.gate_before_publish || forced_by_steps
+    }
+
+    /// The release branch when one is configured and not blank.
+    pub fn release_branch(&self) -> Option<&str> {
+        self.release_branch
+            .as_deref()
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
     }
 
     /// Whether the attention brake applies, resolving the unconfigured case to ON.
@@ -2982,6 +3040,99 @@ resolve_effort: \"  \"
         )
         .unwrap_err();
         assert_eq!(with_args.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn release_branch_is_absent_by_default_and_parses_when_set() {
+        assert!(AutopilotRules::default().release_branch.is_none());
+        assert_eq!(AutopilotRules::default().release_branch(), None);
+        let rules = parse_schedule_rules("release_branch: master\n").unwrap();
+        assert_eq!(rules.release_branch(), Some("master"));
+    }
+
+    #[test]
+    fn release_branch_moves_the_step_forced_gate_to_the_promotion() {
+        let steps = "gate_command: x\n\
+             integration_steps:\n\
+             \x20 - id: on\n\
+             \x20   kind: builtin:renumber-sequence\n";
+        let without = parse_schedule_rules(steps).unwrap();
+        assert!(without.merge_gate_required());
+        let with = parse_schedule_rules(&format!("{steps}release_branch: master\n")).unwrap();
+        assert!(!with.merge_gate_required());
+        // An explicit gate_before_publish is still honoured.
+        let explicit = AutopilotRules {
+            gate_before_publish: true,
+            ..with
+        };
+        assert!(explicit.merge_gate_required());
+    }
+
+    fn release_rules() -> AutopilotRules {
+        AutopilotRules {
+            gate_after_land: true,
+            gate_command: Some("gate".into()),
+            release_branch: Some("master".into()),
+            ..AutopilotRules::default()
+        }
+    }
+
+    #[test]
+    fn release_activation_passes_when_every_precondition_holds_or_unset() {
+        assert_eq!(
+            release_activation_preconditions(&release_rules(), "integration", true, true, true),
+            Ok(())
+        );
+        // No release_branch: nothing to activate, whatever the facts say.
+        assert_eq!(
+            release_activation_preconditions(
+                &AutopilotRules::default(),
+                "master",
+                false,
+                false,
+                false
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn each_release_activation_precondition_refuses_with_its_own_message() {
+        let ok = release_rules();
+        let msg = |r: &AutopilotRules, i: &str, re: bool, ie: bool, an: bool| {
+            release_activation_preconditions(r, i, re, ie, an).unwrap_err()
+        };
+        let no_gate_after = AutopilotRules {
+            gate_after_land: false,
+            ..release_rules()
+        };
+        let no_command = AutopilotRules {
+            gate_command: None,
+            ..release_rules()
+        };
+        let messages = [
+            msg(&no_gate_after, "integration", true, true, true),
+            msg(&no_command, "integration", true, true, true),
+            msg(&ok, "master", true, true, true),
+            msg(&ok, "integration", false, true, true),
+            msg(&ok, "integration", true, false, true),
+            msg(&ok, "integration", true, true, false),
+        ];
+        assert!(messages[0].contains("gate_after_land"), "{}", messages[0]);
+        assert!(messages[1].contains("gate_command"), "{}", messages[1]);
+        assert!(messages[2].contains("differ"), "{}", messages[2]);
+        assert!(messages[3].contains("release branch"), "{}", messages[3]);
+        assert!(
+            messages[4].contains("integration branch"),
+            "{}",
+            messages[4]
+        );
+        assert!(messages[5].contains("ancestor"), "{}", messages[5]);
+        for (i, a) in messages.iter().enumerate() {
+            for b in &messages[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
     }
 
     #[test]

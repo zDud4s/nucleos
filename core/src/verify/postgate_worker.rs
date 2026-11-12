@@ -59,6 +59,7 @@ use crate::verify::{self, Caller, VerifyArgs};
 
 mod correction;
 mod incident;
+mod promotion;
 mod revert;
 
 pub use self::correction::*;
@@ -295,6 +296,8 @@ async fn tick_project(
     // turned the project green (spec 2026-10-22 task-claims §3).
     if let Some(state) = state.as_ref() {
         incident::close_if_green(pool, project_id, project_root, state).await;
+        // With a release branch, the green sha is promoted to it by the queue.
+        promotion::enqueue_promotion_if_due(pool, project_id, project_root, state, rules).await;
     }
 
     // A gate is running: finish it from its ticket, never start another. This needs neither the
@@ -3480,5 +3483,183 @@ gate_after_land: true
         };
         assert_eq!(sha, f.tip);
         assert_eq!(count(&f.pool, "verify_requests").await, 1);
+    }
+
+    // ---- Promotion of the integration branch to the release branch (spec 2026-11-11, D4) -------
+
+    const RELEASE_ON: &str =
+        "gate_command: \"git --version\"\ngate_after_land: true\nrelease_branch: main\n";
+
+    /// Creates `integ` on `main`'s tip with one more commit, and returns its tip. The checkout
+    /// goes back to `main`.
+    fn integ_one_ahead(f: &Fixture) -> String {
+        git_in(&f.root, &["branch", "integ"]);
+        git_in(&f.root, &["checkout", "-q", "integ"]);
+        std::fs::write(f.root.join("integ.txt"), "integ\n").unwrap();
+        git_in(&f.root, &["add", "-A"]);
+        git_in(&f.root, &["commit", "-q", "-m", "integ work"]);
+        let tip = git_in(&f.root, &["rev-parse", "HEAD"]);
+        git_in(&f.root, &["checkout", "-q", "main"]);
+        tip
+    }
+
+    /// Gives `main` a commit `integ` does not have.
+    fn main_goes_its_own_way(f: &Fixture) {
+        std::fs::write(f.root.join("direct.txt"), "direct\n").unwrap();
+        git_in(&f.root, &["add", "-A"]);
+        git_in(&f.root, &["commit", "-q", "-m", "a direct commit"]);
+    }
+
+    /// Runs the trigger once against the stored gate state and the published rules of `alpha`.
+    async fn run_promotion(f: &Fixture) {
+        let state = verify_postgate::load(&f.pool, "alpha")
+            .await
+            .unwrap()
+            .expect("a gate state");
+        let rules = crate::project::rules::autopilot("alpha").expect("the stored rules");
+        promotion::enqueue_promotion_if_due(&f.pool, "alpha", &f.root, &state, &rules).await;
+    }
+
+    async fn promote_rows(f: &Fixture) -> Vec<(String, String)> {
+        sqlx::query_as("SELECT status, args FROM vcs_requests WHERE op = 'promote' ORDER BY id")
+            .fetch_all(&f.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn diverged_is_open(f: &Fixture) -> bool {
+        let key = crate::task_claims::machine::release_diverged_key();
+        crate::task_claims::store::live_by_key(&f.pool, "alpha", &key, chrono::Utc::now())
+            .await
+            .unwrap()
+            .is_some()
+    }
+
+    #[tokio::test]
+    async fn promotion_is_not_enqueued_without_a_release_branch() {
+        let f = fixture(Some(GATE_ON)).await;
+        let green = integ_one_ahead(&f);
+        verify_postgate::mark_covered(&f.pool, "alpha", "integ", &green)
+            .await
+            .unwrap();
+
+        run_promotion(&f).await;
+
+        assert!(promote_rows(&f).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn promotion_is_enqueued_once_when_green_is_ahead_of_master() {
+        let f = fixture(Some(RELEASE_ON)).await;
+        let green = integ_one_ahead(&f);
+        verify_postgate::mark_covered(&f.pool, "alpha", "integ", &green)
+            .await
+            .unwrap();
+
+        run_promotion(&f).await;
+        run_promotion(&f).await;
+
+        let rows = promote_rows(&f).await;
+        assert_eq!(rows.len(), 1, "one promote while it is pending: {rows:?}");
+        let args: serde_json::Value = serde_json::from_str(&rows[0].1).unwrap();
+        assert_eq!(args["from"].as_str(), Some("integ"));
+        assert_eq!(args["to"].as_str(), Some("main"));
+        let origin: String =
+            sqlx::query_scalar("SELECT origin FROM vcs_requests WHERE op = 'promote'")
+                .fetch_one(&f.pool)
+                .await
+                .unwrap();
+        assert_eq!(origin, "daemon");
+    }
+
+    /// A stale `covered_sha` (only a red clears it) must not pin the promotion below a newer
+    /// `last_green_sha`.
+    #[tokio::test]
+    async fn a_stale_covered_sha_does_not_pin_the_promotion_below_last_green() {
+        let f = fixture(Some(RELEASE_ON)).await;
+        let green = integ_one_ahead(&f);
+        verify_postgate::mark_covered(&f.pool, "alpha", "integ", &green)
+            .await
+            .unwrap();
+        // The cover is `main`'s own tip, an ancestor of the newer green sha.
+        sqlx::query(
+            "UPDATE postgate_state SET covered_sha = ?, last_green_sha = ? WHERE project_id = 'alpha'",
+        )
+        .bind(&f.tip)
+        .bind(&green)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+
+        run_promotion(&f).await;
+
+        assert_eq!(
+            promote_rows(&f).await.len(),
+            1,
+            "the newer green is promoted"
+        );
+    }
+
+    #[tokio::test]
+    async fn promotion_is_skipped_when_master_equals_green() {
+        let f = fixture(Some(RELEASE_ON)).await;
+        // `integ` is `main`'s own tip, and green.
+        git_in(&f.root, &["branch", "integ"]);
+        verify_postgate::mark_covered(&f.pool, "alpha", "integ", &f.tip)
+            .await
+            .unwrap();
+
+        run_promotion(&f).await;
+
+        assert!(promote_rows(&f).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn promotion_is_skipped_while_release_diverged_is_open_and_not_ancestor() {
+        let f = fixture(Some(RELEASE_ON)).await;
+        let green = integ_one_ahead(&f);
+        main_goes_its_own_way(&f);
+        verify_postgate::mark_covered(&f.pool, "alpha", "integ", &green)
+            .await
+            .unwrap();
+        crate::task_claims::machine::open_release_diverged_ticket(
+            &f.pool,
+            "alpha",
+            serde_json::json!({ "release": "main", "green": green }),
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+
+        run_promotion(&f).await;
+
+        assert!(
+            promote_rows(&f).await.is_empty(),
+            "no promote while diverged"
+        );
+        assert!(diverged_is_open(&f).await, "the incident stays open");
+    }
+
+    #[tokio::test]
+    async fn promotion_closes_release_diverged_once_master_is_an_ancestor_again() {
+        let f = fixture(Some(RELEASE_ON)).await;
+        let green = integ_one_ahead(&f);
+        verify_postgate::mark_covered(&f.pool, "alpha", "integ", &green)
+            .await
+            .unwrap();
+        // The incident was opened while `main` had diverged; `main` is an ancestor of green now.
+        crate::task_claims::machine::open_release_diverged_ticket(
+            &f.pool,
+            "alpha",
+            serde_json::json!({ "release": "main", "green": green }),
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+
+        run_promotion(&f).await;
+
+        assert!(!diverged_is_open(&f).await, "the incident is closed");
+        assert_eq!(promote_rows(&f).await.len(), 1, "and the promote goes out");
     }
 }

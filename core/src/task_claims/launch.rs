@@ -109,9 +109,11 @@ pub fn launch_kind(task: &TaskRow) -> LaunchKind {
 }
 
 /// False for the keys whose owners are decided elsewhere: `master-red` (verify and the postgate) and
-/// `migration:` (the branch the land gate refused) and `direct-write:` (the owner resolves it).
+/// `migration:` (the branch the land gate refused) and `direct-write:` (the owner resolves it), and
+/// `release-diverged` (the release branch moved outside the promotion; the incident needs the owner).
 pub fn auto_launchable(key: &str) -> bool {
     key != MASTER_RED_KEY
+        && key != crate::task_claims::keys::TaskKey::release_diverged().as_str()
         && !key.starts_with(MIGRATION_PREFIX)
         && !key.starts_with(DIRECT_WRITE_PREFIX)
 }

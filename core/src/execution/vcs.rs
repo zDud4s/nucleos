@@ -193,6 +193,13 @@ pub enum Op {
         merge_sha: CommitSha,
         target: Branch,
     },
+    /// Fast-forwards the release branch (`to`) to the last sha the post-merge gate proved green on
+    /// the integration branch (`from`). Daemon-only like `Revert`: not declarable, refused by
+    /// `from_request`, and refused at `admit` from a run or a job origin.
+    Promote {
+        from: Branch,
+        to: Branch,
+    },
 }
 /// A branch name the daemon is willing to put on a git command line.
 ///
@@ -414,6 +421,7 @@ impl Op {
             Op::BranchDelete { .. } => "branch-delete",
             Op::Rebase { .. } => "rebase",
             Op::Revert { .. } => REVERT_KIND,
+            Op::Promote { .. } => "promote",
         }
     }
 
@@ -476,6 +484,11 @@ impl Op {
             "revert" => Err(
                 "revert is not something a caller asks for: the daemon's post-merge \
                  gate queues it when a bisection confirms a culprit (spec 2026-10-05 §6.2)"
+                    .to_owned(),
+            ),
+            "promote" => Err(
+                "promote is not something a caller asks for: the daemon queues it to move the \
+                 release branch to the last green sha"
                     .to_owned(),
             ),
             // **What is left on the spec's list of nine is NOT a backlog, and this arm no longer
@@ -544,7 +557,7 @@ pub const GIT_OP_KINDS: [&str; 6] = ["merge", "push", "tag", "fetch", "rebase", 
 /// project declares them, the picker never draws them and `Op::from_request` refuses them.
 /// `every_op_kind_is_in_the_declarable_catalogue` requires every kind to sit in one list or the
 /// other. `admit` refuses these kinds when they come from a run or a job origin.
-pub const DAEMON_OP_KINDS: [&str; 1] = ["revert"];
+pub const DAEMON_OP_KINDS: [&str; 2] = ["revert", "promote"];
 /// One operation a project may declare, with the flag the shell draws it by.
 ///
 /// `declarable` is always `true` today and the field is not decoration: the GitHub catalogue's
@@ -1180,6 +1193,10 @@ mod tests {
                 merge_sha: CommitSha::new(&"a".repeat(40)).unwrap(),
                 target: Branch::new("b").unwrap(),
             },
+            Op::Promote {
+                from: Branch::new("integration").unwrap(),
+                to: Branch::new("master").unwrap(),
+            },
         ];
         for op in &one_of_each {
             assert!(
@@ -1219,6 +1236,35 @@ mod tests {
             "a project must not be able to declare a revert"
         );
         assert!(DAEMON_OP_KINDS.contains(&"revert"));
+    }
+
+    /// A promote is the daemon's own operation: it sits in the daemon-only vocabulary, out of the
+    /// declarable one, survives storage, and no tool call can ask for it.
+    #[test]
+    fn promote_is_daemon_only_and_refused_from_a_request() {
+        let op = Op::Promote {
+            from: Branch::new("integration").unwrap(),
+            to: Branch::new("master").unwrap(),
+        };
+        assert_eq!(op.kind(), "promote");
+        let back = Op::from_stored(op.kind(), &op.to_args()).expect("a stored promote parses back");
+        assert_eq!(back, op);
+
+        let payload: serde_json::Value = serde_json::from_str(&op.to_args()).unwrap();
+        assert_eq!(payload["op"].as_str(), Some("promote"));
+
+        assert!(
+            !GIT_OP_KINDS.contains(&"promote"),
+            "a project must not be able to declare a promote"
+        );
+        assert!(DAEMON_OP_KINDS.contains(&"promote"));
+        assert!(DAEMON_OP_KINDS.contains(&"revert"));
+
+        let refused = Op::from_request("promote", Some("integration"), Some("master")).unwrap_err();
+        assert!(
+            !refused.contains("unknown") && !refused.contains("not yet"),
+            "neither an unknown operation nor a deferred one: {refused}"
+        );
     }
 
     /// Nobody asks for a revert through a tool call, and the commit it names is an id and never a
@@ -2600,6 +2646,10 @@ mod tests {
                 merge_sha: "0123456789abcdef0123456789abcdef01234567".into(),
                 target: "master".into(),
             },
+            Op::Promote {
+                from: "integration".into(),
+                to: "master".into(),
+            },
         ];
 
         for op in &all {
@@ -2634,7 +2684,8 @@ mod tests {
                 "fetch",
                 "branch-delete",
                 "rebase",
-                "revert"
+                "revert",
+                "promote"
             ],
             "the `op` column's vocabulary is the one the door speaks"
         );
@@ -4872,6 +4923,48 @@ mod tests {
         assert_eq!(ticket.result_sha.as_deref(), Some("cafe"));
     }
 
+    /// A promote is the daemon's own operation too: a run or job origin is refused at `admit`
+    /// and writes no row; the daemon origin is admitted.
+    #[tokio::test]
+    async fn a_run_cannot_queue_a_promote() {
+        let pool = test_pool().await;
+        let repo = ResolvedRepo::synthetic("alpha", "C:/repo", "alpha");
+        let promote = || Op::Promote {
+            from: Branch::new("integration").unwrap(),
+            to: Branch::new("master").unwrap(),
+        };
+
+        assert!(
+            submit(&pool, &repo, &promote(), Origin::Run(7))
+                .await
+                .is_err()
+        );
+        assert!(
+            submit_declared(&pool, &repo, &promote(), Origin::Run(7))
+                .await
+                .is_err()
+        );
+        assert!(
+            submit_declared(&pool, &repo, &promote(), Origin::Job(7))
+                .await
+                .is_err()
+        );
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vcs_requests")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "a refused promote leaves nothing in the queue");
+
+        submit_declared(&pool, &repo, &promote(), Origin::Daemon)
+            .await
+            .expect("the daemon's own promote is admitted");
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vcs_requests")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
     /// F3-10: a revert is the daemon's own operation (spec 2026-10-05 §6.2). `admit` is the one
     /// INSERT behind all four doors, so a run or job origin is refused there and writes no row.
     #[tokio::test]
@@ -5870,6 +5963,73 @@ mod tests {
 
         assert_eq!(sweep_awaiting_gate(&pool).await, 1);
         assert_eq!(status_of(&pool, id).await, "queued");
+    }
+
+    /// A parked promote is not tied to the tip it parked on: the promotion targets the last green
+    /// sha, so ANY green sha lets it proceed, even while the gate is still working on the parked
+    /// tip (where a parked push would stay put, as the test above shows).
+    #[tokio::test]
+    async fn a_parked_promote_proceeds_once_a_green_sha_exists() {
+        let pool = test_pool().await;
+        let promote = Op::Promote {
+            from: Branch::new("integration").unwrap(),
+            to: Branch::new("master").unwrap(),
+        };
+        let id = park_with_sha(&pool, "tip1").await;
+        sqlx::query("UPDATE vcs_requests SET op = ?, args = ? WHERE id = ?")
+            .bind(promote.kind())
+            .bind(promote.to_args())
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("make the parked row a promote");
+
+        // No green sha at all: it stays parked.
+        sqlx::query(
+            "INSERT INTO postgate_state (project_id, target, last_attempted_sha) \
+             VALUES ('alpha', 'integration', 'tip1')",
+        )
+        .execute(&pool)
+        .await
+        .expect("a gate that has not gone green yet");
+        assert_eq!(sweep_awaiting_gate(&pool).await, 0);
+        assert_eq!(status_of(&pool, id).await, "awaiting_gate");
+
+        // An older tip goes green while the gate is still on `tip1`.
+        sqlx::query("UPDATE postgate_state SET last_green_sha = 'old' WHERE project_id = 'alpha'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(sweep_awaiting_gate(&pool).await, 1);
+        assert_eq!(status_of(&pool, id).await, "queued");
+    }
+
+    /// A green sha of ANOTHER branch's gate state is no reason to release a parked promote.
+    #[tokio::test]
+    async fn a_parked_promote_of_another_branch_stays_parked() {
+        let pool = test_pool().await;
+        let promote = Op::Promote {
+            from: Branch::new("other").unwrap(),
+            to: Branch::new("master").unwrap(),
+        };
+        let id = park_with_sha(&pool, "tip1").await;
+        sqlx::query("UPDATE vcs_requests SET op = ?, args = ? WHERE id = ?")
+            .bind(promote.kind())
+            .bind(promote.to_args())
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("make the parked row a promote");
+        sqlx::query(
+            "INSERT INTO postgate_state (project_id, target, last_attempted_sha, last_green_sha) \
+             VALUES ('alpha', 'integration', 'tip1', 'old')",
+        )
+        .execute(&pool)
+        .await
+        .expect("a gate of another branch with a green sha");
+
+        assert_eq!(sweep_awaiting_gate(&pool).await, 0);
+        assert_eq!(status_of(&pool, id).await, "awaiting_gate");
     }
 
     #[test]
