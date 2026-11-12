@@ -79,8 +79,9 @@ pub async fn fresh_shared_pool() -> sqlx::SqlitePool {
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
-    let copied = template.is_some_and(|template| std::fs::copy(template, &path).is_ok());
+    let copied = template.is_some_and(|template| copy_template(template, &path).is_ok());
     if !copied {
+        let _ = std::fs::remove_file(&path);
         std::fs::write(&path, migrated_image().await).unwrap();
     }
     // The guard rides in the pool's own `after_connect` closure, which the pool owns, so the files
@@ -104,7 +105,8 @@ pub async fn fresh_shared_pool() -> sqlx::SqlitePool {
 
 const SWEEP_STAMP: &str = ".sweep-stamp";
 const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
-const SWEEP_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
+/// Idle this long (no write, so no live test) before a pool file counts as leaked.
+const SWEEP_AGE: std::time::Duration = std::time::Duration::from_secs(2 * 3600);
 /// A sweep looks at no more entries than this, so a directory that grew large costs a bounded
 /// amount per sweep and is worked down over several.
 const SWEEP_MAX_ENTRIES: usize = 512;
@@ -128,6 +130,21 @@ fn remove_db_files(path: &std::path::Path) {
         name.push(suffix);
         let _ = std::fs::remove_file(std::path::PathBuf::from(name));
     }
+}
+
+/// Copies the template into a new file of its own whose modification time is now.
+///
+/// `fs::copy` is not used: on Windows (`CopyFileEx`) and with `cp -p`-like kernels it carries the
+/// source's modification time over, and the template is hours old, so another process's sweep
+/// saw a copy still being opened as stale and deleted it (`SQLITE_CANTOPEN` in the opener). A file
+/// created here is current from its first instant, so only a file idle for the sweep age is taken.
+fn copy_template(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<u64> {
+    let mut source = std::fs::File::open(from)?;
+    let mut target = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(to)?;
+    std::io::copy(&mut source, &mut target)
 }
 
 /// True when the sweep stamp is missing or older than `interval`; the stamp is then renewed, so
@@ -430,6 +447,32 @@ mod fresh_pool_tests {
         assert!(!dir.path().join("x.sqlite-wal").exists());
         assert!(!dir.path().join("x.sqlite-shm").exists());
         assert!(dir.path().join("other").exists());
+    }
+
+    #[test]
+    fn a_copy_of_an_old_template_is_new_so_no_sweep_takes_it_from_a_live_test() {
+        let dir = tempfile::tempdir().unwrap();
+        let template = dir.path().join("template.sqlite");
+        std::fs::write(&template, b"SQLite format 3\0body").unwrap();
+        let two_hours_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        std::fs::File::options()
+            .write(true)
+            .open(&template)
+            .unwrap()
+            .set_modified(two_hours_ago)
+            .unwrap();
+        let copy = dir.path().join("copy.sqlite");
+        super::copy_template(&template, &copy).unwrap();
+        assert_eq!(
+            std::fs::read(&copy).unwrap(),
+            std::fs::read(&template).unwrap()
+        );
+        super::sweep_older_than(dir.path(), super::SWEEP_AGE, 100);
+        assert!(copy.exists(), "a just-made copy must outlive the sweep");
+        assert!(
+            !template.exists(),
+            "the old template is what the sweep takes"
+        );
     }
 
     #[test]
