@@ -1,3 +1,5 @@
+# Node Handoff
+
 Node ID: 4cebad54-01cd-4aeb-8f04-a8f970c9114b
 Root ID: fcd4f4d7-5087-4843-999b-bf1b93d9fe6a
 Status: done
@@ -10,6 +12,8 @@ Contract used: none
 Decisions affecting siblings: `Classification` now has `culprit: Option<Culprit>` and `segments: Vec<String>`; any `Classification { .. }` literal must set both (`culprit: None, segments: Vec::new()` for allows). `Segment::Unrecognized` is now `Segment::Unrecognized(String)` (the reason). What is allowed or parked is unchanged; `reason` strings are unchanged. Every park sets a culprit (segment + concrete reason), allows set None; `segments` is filled in `classify()` for shell tools and is empty for other tools. Nothing was compiled: the controller must run the commands below.
 
 ## What was done
+
+- Gate fix: the test asserts that compared `x.decision` to a string now read `x.decision.decision` (`Decision` has no Debug/PartialEq); a Grep finds none left. The report lives here because the path hook denies `.nucleos-report.md`.
 
 - classifier.rs: `Culprit` struct, two new fields, `with_culprit`, `parked_tool`, `target_of`, `approval_segment`, `is_directory_change`; concrete reasons on all park paths (unrecognized, cd out of workspace, push/merge/deploy, parse failure, redirect, own settings, governance file, substitution outside quotes, empty line, tool parks).
 - paths.rs `classification()` and shadow.rs test helper: new fields added.

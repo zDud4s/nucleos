@@ -8107,7 +8107,7 @@ mod tests {
     #[test]
     fn an_unrecognized_command_is_the_culprit_with_its_own_text() {
         let verdict = classify("Bash", &json!({"command": "mkdir -p y"}), None);
-        assert_eq!(verdict.decision, "pending_approval");
+        assert_eq!(verdict.decision.decision, "pending_approval");
         assert_eq!(
             culprit_of(&verdict),
             ("mkdir -p y", "`mkdir -p y` is not in the safe list")
@@ -8122,7 +8122,7 @@ mod tests {
             &json!({"command": "git status && mkdir -p y"}),
             None,
         );
-        assert_eq!(verdict.decision, "pending_approval");
+        assert_eq!(verdict.decision.decision, "pending_approval");
         assert_eq!(
             culprit_of(&verdict),
             ("mkdir -p y", "`mkdir -p y` is not in the safe list")
@@ -8137,7 +8137,7 @@ mod tests {
     fn a_directory_change_out_of_the_workspace_names_the_cd() {
         let cwd = Path::new("C:/Projects/nucleos/.nucleos/worktrees/job-26");
         let verdict = classify("Bash", &json!({"command": "cd C:/x"}), Some(cwd));
-        assert_eq!(verdict.decision, "pending_approval");
+        assert_eq!(verdict.decision.decision, "pending_approval");
         assert_eq!(
             culprit_of(&verdict),
             ("cd C:/x", "`cd C:/x` leaves the run's workspace")
@@ -8147,7 +8147,7 @@ mod tests {
     #[test]
     fn push_merge_deploy_names_the_piece_that_pushes() {
         let verdict = classify("Bash", &json!({"command": "git status && git push"}), None);
-        assert_eq!(verdict.decision, "pending_approval");
+        assert_eq!(verdict.decision.decision, "pending_approval");
         assert_eq!(verdict.action_class, "push-merge-deploy");
         assert_eq!(
             culprit_of(&verdict),
@@ -8158,7 +8158,7 @@ mod tests {
     #[test]
     fn a_line_that_cannot_be_parsed_is_its_own_culprit() {
         let verdict = classify("Bash", &json!({"command": "sleep 5 & git status"}), None);
-        assert_eq!(verdict.decision, "pending_approval");
+        assert_eq!(verdict.decision.decision, "pending_approval");
         let (segment, reason) = culprit_of(&verdict);
         assert_eq!(segment, "sleep 5 & git status");
         assert!(
@@ -8170,7 +8170,7 @@ mod tests {
     #[test]
     fn an_output_redirect_names_the_segment_that_redirects() {
         let verdict = classify("Bash", &json!({"command": "echo hi > out.txt"}), None);
-        assert_eq!(verdict.decision, "pending_approval");
+        assert_eq!(verdict.decision.decision, "pending_approval");
         let (segment, reason) = culprit_of(&verdict);
         assert_eq!(segment, "echo hi > out.txt");
         assert_eq!(reason, "`echo hi > out.txt` redirects output to a file");
@@ -8179,7 +8179,7 @@ mod tests {
     #[test]
     fn a_substitution_outside_quotes_names_its_segment() {
         let verdict = classify("Bash", &json!({"command": "grep x $(ls)"}), None);
-        assert_eq!(verdict.decision, "pending_approval");
+        assert_eq!(verdict.decision.decision, "pending_approval");
         let (segment, reason) = culprit_of(&verdict);
         assert_eq!(segment, "grep x $(ls)");
         assert_eq!(
@@ -8192,7 +8192,7 @@ mod tests {
     fn a_tool_park_names_the_tool_and_leaves_segments_empty() {
         let cwd = Path::new("C:/Projects/nucleos/.nucleos/worktrees/job-26");
         let unknown = classify("Teleport", &json!({"path": "x"}), Some(cwd));
-        assert_eq!(unknown.decision, "pending_approval");
+        assert_eq!(unknown.decision.decision, "pending_approval");
         assert_eq!(unknown.action_class, "unrecognized-tool");
         assert_eq!(
             culprit_of(&unknown),
@@ -8201,7 +8201,7 @@ mod tests {
         assert!(unknown.segments.is_empty());
 
         let no_workspace = classify("Write", &json!({"file_path": "src/a.rs"}), None);
-        assert_eq!(no_workspace.decision, "pending_approval");
+        assert_eq!(no_workspace.decision.decision, "pending_approval");
         assert_eq!(no_workspace.action_class, "no-workspace");
         assert_eq!(
             culprit_of(&no_workspace),
@@ -8213,7 +8213,7 @@ mod tests {
     #[test]
     fn an_allow_has_no_culprit() {
         let allowed = classify("Bash", &json!({"command": "git status"}), None);
-        assert_eq!(allowed.decision, "allow");
+        assert_eq!(allowed.decision.decision, "allow");
         assert_eq!(allowed.culprit, None);
         assert_eq!(allowed.segments, vec!["git status".to_owned()]);
     }
