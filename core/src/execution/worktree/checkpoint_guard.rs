@@ -26,9 +26,12 @@ const MASS_DELETION_FLOOR: usize = 50;
 /// trusted, and a commit nobody measured is the one it would let through.
 pub(super) async fn refuse_implausible_deletions(worktree_path: &Path) -> io::Result<()> {
     let measured = async {
-        let tracked = git_paths(worktree_path, &["ls-tree", "-r", "-z", "--name-only", "HEAD"])
-            .await?
-            .len();
+        let tracked = git_paths(
+            worktree_path,
+            &["ls-tree", "-r", "-z", "--name-only", "HEAD"],
+        )
+        .await?
+        .len();
         let deleted = git_paths(
             worktree_path,
             &["diff", "--cached", "--name-only", "-z", "--diff-filter=D"],
@@ -215,9 +218,12 @@ mod tests {
 
         assert_ne!(sha, before, "the deletion must be committed");
         assert_eq!(
-            git_out(dir, &["diff", "--name-only", "--diff-filter=D", &before, &sha])
-                .lines()
-                .count(),
+            git_out(
+                dir,
+                &["diff", "--name-only", "--diff-filter=D", &before, &sha]
+            )
+            .lines()
+            .count(),
             2
         );
         assert_eq!(git_out(dir, &["status", "--porcelain"]), "");
